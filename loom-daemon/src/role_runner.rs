@@ -340,6 +340,59 @@ pub fn no_token_pool_skip_count() -> u64 {
 }
 
 /// Process-wide count of ticks skipped with
+/// [`RoleTickOutcome::PoolExhausted`] (issue #7607) — a distinct,
+/// independently-attributable tally, deliberately never folded into the
+/// generic [`RoleTickOutcome::Failure`] count a real invocation failure
+/// increments, exactly like [`NO_TOKEN_POOL_SKIP_COUNT`]: a pool present but
+/// fully exhausted (every account bad-marked or `.ranking`-hard-excluded) is
+/// self-healing, not a code/config defect.
+static POOL_EXHAUSTED_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of role-runner ticks skipped so far because the resolved
+/// token pool was present but had zero spawnable accounts (see
+/// [`RoleTickOutcome::PoolExhausted`]). Exposed for tests and future status
+/// surfacing; the daemon does not reset this across its lifetime.
+#[must_use]
+pub fn pool_exhausted_skip_count() -> u64 {
+    POOL_EXHAUSTED_SKIP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Sink for the fleet-wide empty-pool advisory feed (issue #7607): the role
+/// runner calls this once per [`RoleTickOutcome::PoolExhausted`] tick so a
+/// pool discovered exhausted by a *role* trips the same #6614 cross-source
+/// brake (and its #5030 half-open dispatch gate) as one discovered by a sweep.
+///
+/// Injected as a trait object rather than taking the concrete
+/// [`crate::workspace_pool::WorkspacePool`] so the multi-workspace loop stays
+/// unit-testable without provisioning registries, reapers, and watchdogs — and
+/// so a deployment that runs role loops with no sweep registry at all (the
+/// `None` case at the call site) simply has no observer rather than a
+/// half-wired one.
+pub trait PoolExhaustedObserver: Send + Sync {
+    /// Note that `role`'s tick for `root` skipped its spawn because `root`'s
+    /// resolved token pool had zero spawnable accounts.
+    ///
+    /// Implementations MUST be cheap and non-blocking-ish: this runs inline on
+    /// the role loop, on the tick outcome whose entire point is that it costs
+    /// almost nothing.
+    fn note_pool_exhausted(&self, root: &Path, role: &str);
+}
+
+impl PoolExhaustedObserver for crate::workspace_pool::WorkspacePool {
+    fn note_pool_exhausted(&self, root: &Path, role: &str) {
+        // Side-effect-free lookup on purpose (#7607): never provision a
+        // registry for a workspace this daemon has not dispatched into —
+        // see `WorkspacePool::provisioned_registry_for`.
+        if let Some(registry) = self.provisioned_registry_for(root) {
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record_role_tick_pool_exhausted(role);
+        }
+    }
+}
+
+/// Process-wide count of ticks skipped with
 /// [`RoleTickOutcome::ModelRuntimeMismatch`] (#5028, follow-up to #5001 AC2/
 /// AC3) — a distinct, independently-attributable tally, deliberately never
 /// folded into the generic [`RoleTickOutcome::Failure`] count a real
@@ -596,6 +649,35 @@ pub enum RoleTickOutcome {
     /// operator provisions a pool, not a transient failure worth retrying
     /// identically forever.
     NoTokenPool,
+    /// Token pool present (unlike [`Self::NoTokenPool`]) but every account in
+    /// it is currently unusable — bad-marked (`.bad_tokens`) or hard-excluded
+    /// by `.ranking` (`exhausted`/`blocked`) — so `spawn-claude.sh`'s own
+    /// token-selection preflight is, just like `NoTokenPool`, guaranteed to
+    /// exit `78` (`EX_CONFIG`) (issue #7607: ~600 wasted spawns/host/day
+    /// observed while a shared pool read 0 spawnable). Kept distinct from
+    /// `NoTokenPool` because the operator remedy differs (wait for a
+    /// TTL/rate-limit-window clear or `tokens unblock`, vs. `tokens
+    /// bootstrap`) and because this state — unlike `NoTokenPool` — is
+    /// expected to clear itself the moment any account's cooldown or
+    /// `.ranking` window rolls over: it is re-checked fresh on every
+    /// subsequent tick with no operator action, so it must never be
+    /// mistaken for a config-shaped, non-self-healing defect. Never folded
+    /// into the generic [`Self::Failure`] tally, and — unlike `NoTokenPool`
+    /// — also kept out of [`crate::health::RoleTickSummary::persistent`]
+    /// (see [`crate::health::RoleTickSummary::pool_exhausted`]): hundreds of
+    /// identical exit-78s from a shared, fleet-wide exhausted pool must not
+    /// read as hundreds of broken roles.
+    PoolExhausted {
+        /// Total `*.token` files in the resolved pool (repo-local shadow
+        /// pool when present, else shared — #3938/#7527).
+        total: usize,
+        /// Best-effort estimate of when at least one account might become
+        /// spawnable again — see
+        /// [`crate::tokens_pool::select::pool_clear_estimate`]. Never a hard
+        /// gate: the very next tick re-checks the live pool state regardless
+        /// of this estimate.
+        next_clear_at: chrono::DateTime<chrono::Utc>,
+    },
     /// A provable model/runtime mismatch (#5028, follow-up to #5001 AC2/AC3):
     /// the admitted runtime and the resolved model are confidently-known,
     /// differing provider families (e.g. a Claude-shaped model resolved for a
@@ -837,6 +919,28 @@ pub fn record_role_tick_at(
         // surface, and the persistent-vs-transient classifier will (correctly)
         // never clear it until a pool is provisioned.
         RoleTickOutcome::NoTokenPool => (false, Some("no-token-pool".to_string())),
+        // #7607: recorded as NOT ok, same as `NoTokenPool` — a role that
+        // cannot run at all is exactly what a health check must surface —
+        // but the `RoleTickRecord::pool_exhausted` flag set below routes it
+        // into `crate::health::RoleTickSummary::pool_exhausted` instead of
+        // `persistent`, so it is never counted as (or mistaken for) an
+        // ordinary role failure. The
+        // detail is deliberately volatile (spawnable/total counts and the
+        // next-clear estimate change every tick) — unlike `NoTokenPool`'s
+        // fixed sentinel, this means it never accidentally builds an
+        // escalation streak (`consecutive_identical_failures` below), which
+        // is correct: pool exhaustion is expected to self-heal, not a
+        // config-shaped defect that "can never succeed as configured".
+        RoleTickOutcome::PoolExhausted {
+            total,
+            next_clear_at,
+        } => (
+            false,
+            Some(format!(
+                "pool-exhausted: 0/{total} spawnable, next check ~{}",
+                next_clear_at.to_rfc3339()
+            )),
+        ),
         // #5028: same reasoning as `NoTokenPool` — a permanent config
         // conflict is exactly what a health check must surface, and the
         // operator-facing `detail()` names the broken config key directly
@@ -853,6 +957,9 @@ pub fn record_role_tick_at(
             detail,
         } => (true, Some(format!("load-skipped (load/core {load_per_core:.2}): {detail}"))),
     };
+    // #7607: distinguishes a `PoolExhausted` skip from every other
+    // not-ok outcome — see `RoleTickRecord::pool_exhausted`'s doc comment.
+    let pool_exhausted = matches!(outcome, RoleTickOutcome::PoolExhausted { .. });
     let mut ring = role_tick_ring()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
@@ -865,6 +972,7 @@ pub fn record_role_tick_at(
         at,
         ok,
         detail: detail.clone(),
+        pool_exhausted,
     });
     drop(ring);
     // #6201: independent, never-evicted last-tick state — see
@@ -1112,6 +1220,43 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             );
             return RoleTickOutcome::NoTokenPool;
         }
+        // Pre-spawn token-pool SPAWNABILITY preflight (issue #7607): the
+        // check just above only catches a pool that is entirely ABSENT
+        // (#4642). A pool that is present but fully exhausted — every
+        // account bad-marked (`.bad_tokens`) or `.ranking`-hard-excluded —
+        // slips past it and was still spawning a doomed `spawn-claude.sh`
+        // that burns ~10s discovering the exact same exit-78 outcome this
+        // read already knows. Uses the SAME resolution/usability logic
+        // `spawn-claude.sh`'s own `loom-daemon tokens select` performs
+        // (`tokens_pool::select::spawnable_pool_state`, itself built on
+        // `tokens_pool::paths::resolve_tokens_dir` — the repo-local
+        // shadow-pool-if-present-else-shared precedence, #3938/#7527), so
+        // this preflight can never disagree with what a real spawn would
+        // discover. Gated on `spawn_bin.is_none()` like the checks above and
+        // below — tests that point `spawn_bin` at a fake script opt out.
+        if self.spawn_bin.is_none() {
+            let pool = crate::tokens_pool::select::spawnable_pool_state(&self.workspace_root);
+            if pool.total > 0 && pool.usable == 0 {
+                POOL_EXHAUSTED_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+                let next_clear_at = crate::tokens_pool::select::pool_clear_estimate(&pool.dir);
+                note_pre_spawn_skip(
+                    &self.logs_dir(),
+                    role,
+                    &format!(
+                        "token pool exhausted: 0/{} spawnable in {} (every account bad-marked or \
+                         hard-excluded by .ranking); next check ~{} — run `loom-daemon tokens \
+                         check --ranking` or `loom-daemon tokens unblock <name>` — #7607",
+                        pool.total,
+                        pool.dir.display(),
+                        next_clear_at.to_rfc3339()
+                    ),
+                );
+                return RoleTickOutcome::PoolExhausted {
+                    total: pool.total,
+                    next_clear_at,
+                };
+            }
+        }
         // Issue #5028 (follow-up to #5001 AC2/AC3): runtime admission now
         // resolves BEFORE the model, because the runtime is a per-role INPUT
         // to the model/runtime mismatch check just below — a Claude-shaped
@@ -1253,9 +1398,10 @@ fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
 /// `run_role_with_timeout` writes a `==== loom-daemon role_runner: … ====`
 /// header to `role-<role>.log` at the start of every invocation, and that file
 /// is the ONE artifact an operator inspects to answer "is this role still
-/// running on this workspace?". But all four of
+/// running on this workspace?". But all five of
 /// [`ScriptRoleInvocationRunner::invoke`]'s pre-spawn preflight bail-outs —
 /// unresolvable spawn bin, [`RoleTickOutcome::NoTokenPool`] (#4642),
+/// [`RoleTickOutcome::PoolExhausted`] (#7607),
 /// [`RoleTickOutcome::RuntimeRejected`], and
 /// [`RoleTickOutcome::ModelRuntimeMismatch`] (#5028) — return **before**
 /// `run_role_with_timeout` is ever called, so before this function existed a
@@ -3509,12 +3655,20 @@ where
 /// per-root failing-state map tracked across ticks (mirrors the
 /// `was_halted`/`was_pressured` state-change-dedup discipline in
 /// [`crate::work_finder`]).
+///
+/// `pool_exhausted_observer` (issue #7607) is notified once per
+/// [`RoleTickOutcome::PoolExhausted`] tick so a token pool discovered
+/// exhausted by a *role* feeds the same #6614 cross-source empty-pool brake as
+/// one discovered by a sweep's `finish_issue_dispatch`. `None` disables the
+/// feed entirely (the role loop is otherwise unchanged) — see
+/// [`PoolExhaustedObserver`].
 pub fn spawn_multi_role_task(
     spec: RoleSpec,
     fallback_root: PathBuf,
     interval: Duration,
     drain: std::sync::Arc<std::sync::atomic::AtomicBool>,
     in_progress: InProgressGuard,
+    pool_exhausted_observer: Option<std::sync::Arc<dyn PoolExhaustedObserver>>,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "role_runner: starting {} multi-workspace loop (interval={}s)",
@@ -3536,10 +3690,17 @@ pub fn spawn_multi_role_task(
         // is never conflated with (or silences the WARN for) a genuine
         // invocation failure — see `RootTickLogAction::is_no_token_pool`.
         let mut no_token_pool_roots: HashMap<PathBuf, bool> = HashMap::new();
+        // Per-root pool-exhausted state (#7607), tracked completely
+        // independently of `failing_roots`/`no_token_pool_roots` so a
+        // present-but-fully-exhausted pool skip is never conflated with (or
+        // silences the WARN for) either — see
+        // `RootTickLogAction::is_pool_exhausted`.
+        let mut pool_exhausted_roots: HashMap<PathBuf, bool> = HashMap::new();
         // Per-root model/runtime-mismatch state (#5028), tracked completely
-        // independently of both `failing_roots` and `no_token_pool_roots` so a
-        // permanent config-conflict skip is never conflated with (or silences
-        // the WARN for) either — see `RootTickLogAction::is_model_mismatch`.
+        // independently of `failing_roots`/`no_token_pool_roots`/
+        // `pool_exhausted_roots` so a permanent config-conflict skip is
+        // never conflated with (or silences the WARN for) any of them — see
+        // `RootTickLogAction::is_model_mismatch`.
         let mut model_mismatch_roots: HashMap<PathBuf, bool> = HashMap::new();
         // Disabled-root warn-once state (#4377): the per-tick disabled-skip
         // below is otherwise only a `debug!` — invisible at the default `info`
@@ -3673,15 +3834,24 @@ pub fn spawn_multi_role_task(
                 .await;
                 let elapsed = tick_start.elapsed();
                 match joined {
-                    Ok(outcome) => log_outcome_for_root_deduped(
-                        spec.name,
-                        &root,
-                        &outcome,
-                        elapsed,
-                        &mut failing_roots,
-                        &mut no_token_pool_roots,
-                        &mut model_mismatch_roots,
-                    ),
+                    Ok(outcome) => {
+                        feed_pool_exhausted_observer(
+                            pool_exhausted_observer.as_deref(),
+                            &outcome,
+                            &root,
+                            spec.name,
+                        );
+                        log_outcome_for_root_deduped(
+                            spec.name,
+                            &root,
+                            &outcome,
+                            elapsed,
+                            &mut failing_roots,
+                            &mut no_token_pool_roots,
+                            &mut pool_exhausted_roots,
+                            &mut model_mismatch_roots,
+                        );
+                    }
                     Err(e) => log::error!(
                         "role_runner: {} invocation task for {} panicked ({e}); continuing to the \
                          next repo",
@@ -3692,6 +3862,31 @@ pub fn spawn_multi_role_task(
             }
         }
     })
+}
+
+/// Feed the fleet-wide #6614 empty-pool brake from one role-tick outcome
+/// (issue #7607) — a no-op for every outcome except
+/// [`RoleTickOutcome::PoolExhausted`], and for a `None` observer.
+///
+/// Called BEFORE the log-dedup decision in
+/// [`log_outcome_for_root_deduped`], and deliberately on **every**
+/// exhausted-pool tick rather than only the dedup's WARN edge: the brake does
+/// its own distinct-source dedup, and refreshing its entry each tick is
+/// exactly what keeps the source inside the trailing window for as long as the
+/// pool stays dry. Suppressing repeats here would let the advisory age out
+/// mid-outage.
+fn feed_pool_exhausted_observer(
+    observer: Option<&dyn PoolExhaustedObserver>,
+    outcome: &RoleTickOutcome,
+    root: &Path,
+    role: &str,
+) {
+    if !matches!(outcome, RoleTickOutcome::PoolExhausted { .. }) {
+        return;
+    }
+    if let Some(observer) = observer {
+        observer.note_pool_exhausted(root, role);
+    }
 }
 
 /// True when `outcome` is a [`RoleTickOutcome::Success`] that completed
@@ -3740,6 +3935,17 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
                  ~/.loom/tokens; run `loom-daemon tokens bootstrap` for a per-repo pool, or \
                  `loom-daemon tokens bootstrap --shared` for the machine-level pool — see \
                  .loom/docs/token-pool.md, #4642)"
+            );
+        }
+        RoleTickOutcome::PoolExhausted {
+            total,
+            next_clear_at,
+        } => {
+            log::warn!(
+                "role_runner: {role} tick skipped after {elapsed:.1?} — token pool exhausted: \
+                 0/{total} spawnable (every account bad-marked or hard-excluded by .ranking); \
+                 next check ~{} (#7607)",
+                next_clear_at.to_rfc3339()
             );
         }
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => {
@@ -3804,6 +4010,16 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
              .loom/docs/token-pool.md, #4642)",
             root.display()
         ),
+        RoleTickOutcome::PoolExhausted {
+            total,
+            next_clear_at,
+        } => log::warn!(
+            "role_runner: {role} tick for {} skipped after {elapsed:.1?} — token pool exhausted: \
+             0/{total} spawnable (every account bad-marked or hard-excluded by .ranking); next \
+             check ~{} (#7607)",
+            root.display(),
+            next_clear_at.to_rfc3339()
+        ),
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => log::warn!(
             "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {} (#5028)",
             root.display(),
@@ -3856,6 +4072,18 @@ enum RootTickLogAction {
     /// but tracked completely independently of the Failure/RuntimeRejected
     /// state.
     NoTokenPoolRepeat,
+    /// First tick with a present-but-fully-exhausted token pool (edge into
+    /// this state, #7607): log at `WARN`. Distinct from both
+    /// [`Self::FailureEdge`] and [`Self::NoTokenPoolEdge`] — this is a
+    /// self-healing, shared-resource condition (not a code/config defect,
+    /// and not "no pool provisioned at all"), so it must never be tallied as
+    /// either.
+    PoolExhaustedEdge,
+    /// Repeat tick with a present-but-fully-exhausted token pool (already
+    /// warned, #7607): downgrade to `DEBUG`, mirroring
+    /// [`Self::NoTokenPoolRepeat`]'s dedup shape but tracked completely
+    /// independently of it.
+    PoolExhaustedRepeat,
     /// First tick with a model/runtime mismatch (edge into this state, #5028):
     /// log at `WARN`. Distinct from [`Self::FailureEdge`] and
     /// [`Self::NoTokenPoolEdge`] — a provable model/runtime conflict is a
@@ -3895,10 +4123,20 @@ impl RootTickLogAction {
         matches!(self, Self::NoTokenPoolEdge | Self::NoTokenPoolRepeat)
     }
 
+    /// Whether this action should mark the root as pool-exhausted for the
+    /// *next* tick's edge/repeat decision (#7607) — tracked independently of
+    /// [`Self::is_failing`] and [`Self::is_no_token_pool`] so none of the
+    /// three axes bleed into each other's dedup state.
+    #[must_use]
+    fn is_pool_exhausted(self) -> bool {
+        matches!(self, Self::PoolExhaustedEdge | Self::PoolExhaustedRepeat)
+    }
+
     /// Whether this action should mark the root as model-mismatched for the
     /// *next* tick's edge/repeat decision (#5028) — tracked independently of
-    /// both [`Self::is_failing`] and [`Self::is_no_token_pool`] so none of the
-    /// three axes bleed into each other's dedup state.
+    /// [`Self::is_failing`], [`Self::is_no_token_pool`], and
+    /// [`Self::is_pool_exhausted`] so none of the four axes bleed into each
+    /// other's dedup state.
     #[must_use]
     fn is_model_mismatch(self) -> bool {
         matches!(self, Self::ModelMismatchEdge | Self::ModelMismatchRepeat)
@@ -3906,16 +4144,22 @@ impl RootTickLogAction {
 }
 
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 fn classify_root_tick_log(
     outcome: &RoleTickOutcome,
     elapsed: Duration,
     was_failing: bool,
     was_no_token_pool: bool,
+    was_pool_exhausted: bool,
     was_model_mismatch: bool,
 ) -> RootTickLogAction {
     match outcome {
         RoleTickOutcome::NoTokenPool if was_no_token_pool => RootTickLogAction::NoTokenPoolRepeat,
         RoleTickOutcome::NoTokenPool => RootTickLogAction::NoTokenPoolEdge,
+        RoleTickOutcome::PoolExhausted { .. } if was_pool_exhausted => {
+            RootTickLogAction::PoolExhaustedRepeat
+        }
+        RoleTickOutcome::PoolExhausted { .. } => RootTickLogAction::PoolExhaustedEdge,
         RoleTickOutcome::ModelRuntimeMismatch(_) if was_model_mismatch => {
             RootTickLogAction::ModelMismatchRepeat
         }
@@ -3943,10 +4187,12 @@ fn classify_root_tick_log(
 /// *previous* tick for that root ended in [`RoleTickOutcome::Failure`] (or
 /// [`RoleTickOutcome::RuntimeRejected`]); `no_token_pool` tracks, per root and
 /// completely independently, whether the previous tick ended in
-/// [`RoleTickOutcome::NoTokenPool`] (#4642); `model_mismatch` tracks, per root
+/// [`RoleTickOutcome::NoTokenPool`] (#4642); `pool_exhausted` tracks, per root
 /// and completely independently of both, whether the previous tick ended in
-/// [`RoleTickOutcome::ModelRuntimeMismatch`] (#5028) — see [`RootTickLogAction`]
-/// for the per-transition logging rules.
+/// [`RoleTickOutcome::PoolExhausted`] (#7607); `model_mismatch` tracks, per
+/// root and completely independently of all three, whether the previous tick
+/// ended in [`RoleTickOutcome::ModelRuntimeMismatch`] (#5028) — see
+/// [`RootTickLogAction`] for the per-transition logging rules.
 #[allow(clippy::too_many_arguments)]
 fn log_outcome_for_root_deduped(
     role: &str,
@@ -3955,6 +4201,7 @@ fn log_outcome_for_root_deduped(
     elapsed: Duration,
     failing: &mut HashMap<PathBuf, bool>,
     no_token_pool: &mut HashMap<PathBuf, bool>,
+    pool_exhausted: &mut HashMap<PathBuf, bool>,
     model_mismatch: &mut HashMap<PathBuf, bool>,
 ) {
     // Record the raw outcome BEFORE the log-dedup decision (#4761): the
@@ -3964,18 +4211,21 @@ fn log_outcome_for_root_deduped(
     record_role_tick(role, root, outcome);
     let was_failing = failing.get(root).copied().unwrap_or(false);
     let was_no_token_pool = no_token_pool.get(root).copied().unwrap_or(false);
+    let was_pool_exhausted = pool_exhausted.get(root).copied().unwrap_or(false);
     let was_model_mismatch = model_mismatch.get(root).copied().unwrap_or(false);
     let action = classify_root_tick_log(
         outcome,
         elapsed,
         was_failing,
         was_no_token_pool,
+        was_pool_exhausted,
         was_model_mismatch,
     );
     let reason = match outcome {
         RoleTickOutcome::Failure(reason) => reason.as_str(),
         RoleTickOutcome::RuntimeRejected(rejection) => rejection.reason.as_str(),
         RoleTickOutcome::Success | RoleTickOutcome::NoTokenPool => "",
+        RoleTickOutcome::PoolExhausted { .. } => "",
         RoleTickOutcome::ModelRuntimeMismatch(_) => "",
         RoleTickOutcome::LoadSkipped { .. } => "",
     };
@@ -4051,6 +4301,30 @@ fn log_outcome_for_root_deduped(
                 root.display()
             );
         }
+        RootTickLogAction::PoolExhaustedEdge => {
+            if let RoleTickOutcome::PoolExhausted {
+                total,
+                next_clear_at,
+            } = outcome
+            {
+                log::warn!(
+                    "role_runner: {role} tick for {} skipped after {elapsed:.1?} — token pool \
+                     exhausted: 0/{total} spawnable (every account bad-marked or hard-excluded \
+                     by .ranking); next check ~{} (further identical skips for this root are \
+                     logged at DEBUG until the pool regains capacity, #7607)",
+                    root.display(),
+                    next_clear_at.to_rfc3339()
+                );
+            }
+        }
+        RootTickLogAction::PoolExhaustedRepeat => {
+            log::debug!(
+                "role_runner: {role} tick for {} skipped again after {elapsed:.1?} — token pool \
+                 still exhausted (repeat of an already-logged skip; not re-warned every tick — \
+                 see the skip-edge WARN above, #7607)",
+                root.display()
+            );
+        }
         RootTickLogAction::ModelMismatchEdge => {
             if let RoleTickOutcome::ModelRuntimeMismatch(mismatch) = outcome {
                 log::warn!(
@@ -4090,6 +4364,7 @@ fn log_outcome_for_root_deduped(
     }
     failing.insert(root.to_path_buf(), action.is_failing());
     no_token_pool.insert(root.to_path_buf(), action.is_no_token_pool());
+    pool_exhausted.insert(root.to_path_buf(), action.is_pool_exhausted());
     model_mismatch.insert(root.to_path_buf(), action.is_model_mismatch());
 }
 
@@ -4589,6 +4864,99 @@ mod tests {
         // is only that the token-pool gate itself let the tick past, i.e.
         // the outcome is never `NoTokenPool` once a pool exists.
         assert_ne!(outcome, RoleTickOutcome::NoTokenPool);
+
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
+    }
+
+    /// #7607: a workspace with a resolvable `spawn-worker.sh` and a per-repo
+    /// pool that HOLDS token files, but every one of them is bad-marked, must
+    /// short-circuit to `PoolExhausted` — proving the new preflight fires
+    /// before `run_role_with_timeout` ever runs the script, exactly like the
+    /// `#4642` `NoTokenPool` case above but for the "present but exhausted"
+    /// state that check does not cover.
+    #[test]
+    #[serial(loom_shared_tokens_dir_env)]
+    fn test_invoke_short_circuits_with_exhausted_token_pool_before_running_the_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+        fs::create_dir_all(root.join(".loom/tokens")).unwrap();
+        fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
+        fs::write(
+            root.join(".loom/tokens/.bad_tokens"),
+            format!("{} fake auth failure\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        .unwrap();
+        let marker = root.join("script-ran");
+        let worker = root.join(".loom/scripts/spawn-worker.sh");
+        fs::write(&worker, format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display())).unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let before = pool_exhausted_skip_count();
+        let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf());
+        let outcome = runner.invoke("curator", "/loom:curator");
+
+        let RoleTickOutcome::PoolExhausted { total, .. } = outcome else {
+            panic!("expected PoolExhausted, got {outcome:?}");
+        };
+        assert_eq!(total, 1);
+        assert!(!marker.exists(), "the doomed script must never actually run");
+        assert_eq!(pool_exhausted_skip_count(), before + 1);
+
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
+    }
+
+    /// #7607 AC: "within one tick of a readmission, role ticks resume with no
+    /// manual restart" — the preflight re-checks live pool state on every
+    /// call, so clearing the `.bad_tokens` entry (the readmission) must let
+    /// the very next `invoke()` proceed past the exhausted-pool gate with no
+    /// process restart or cached verdict.
+    #[test]
+    #[serial(loom_shared_tokens_dir_env)]
+    fn test_invoke_recovers_within_one_tick_once_the_pool_is_readmitted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+        fs::create_dir_all(root.join(".loom/tokens")).unwrap();
+        fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
+        let bad_tokens = root.join(".loom/tokens/.bad_tokens");
+        fs::write(
+            &bad_tokens,
+            format!("{} fake auth failure\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        .unwrap();
+        let worker = root.join(".loom/scripts/spawn-worker.sh");
+        fs::write(&worker, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf());
+        let outcome = runner.invoke("curator", "/loom:curator");
+        assert!(matches!(outcome, RoleTickOutcome::PoolExhausted { .. }), "{outcome:?}");
+
+        // Readmission: the operator clears the bad-token entry. No restart —
+        // just re-invoke.
+        fs::remove_file(&bad_tokens).unwrap();
+        let outcome = runner.invoke("curator", "/loom:curator");
+        assert!(
+            !matches!(outcome, RoleTickOutcome::PoolExhausted { .. }),
+            "expected the very next tick to get past the exhausted-pool gate, got {outcome:?}"
+        );
 
         match prev_shared {
             Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
@@ -8192,6 +8560,7 @@ mod tests {
                 NORMAL_TICK,
                 false,
                 false,
+                false,
                 false
             ),
             RootTickLogAction::FailureEdge
@@ -8206,6 +8575,7 @@ mod tests {
                 NORMAL_TICK,
                 true,
                 false,
+                false,
                 false
             ),
             RootTickLogAction::FailureRepeat
@@ -8215,7 +8585,14 @@ mod tests {
     #[test]
     fn test_classify_success_after_failure_is_recovery() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, true, false, false),
+            classify_root_tick_log(
+                &RoleTickOutcome::Success,
+                NORMAL_TICK,
+                true,
+                false,
+                false,
+                false
+            ),
             RootTickLogAction::Recovered
         );
     }
@@ -8223,7 +8600,14 @@ mod tests {
     #[test]
     fn test_classify_steady_state_success_is_plain() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, false, false, false),
+            classify_root_tick_log(
+                &RoleTickOutcome::Success,
+                NORMAL_TICK,
+                false,
+                false,
+                false,
+                false
+            ),
             RootTickLogAction::Success
         );
     }
@@ -8236,6 +8620,7 @@ mod tests {
                 Duration::from_millis(100),
                 false,
                 false,
+                false,
                 false
             ),
             RootTickLogAction::SuccessImplausiblyFast
@@ -8245,6 +8630,7 @@ mod tests {
                 &RoleTickOutcome::Success,
                 Duration::from_millis(100),
                 true,
+                false,
                 false,
                 false
             ),
@@ -8257,7 +8643,14 @@ mod tests {
     #[test]
     fn test_classify_first_no_token_pool_is_edge() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, false, false, false),
+            classify_root_tick_log(
+                &RoleTickOutcome::NoTokenPool,
+                NORMAL_TICK,
+                false,
+                false,
+                false,
+                false
+            ),
             RootTickLogAction::NoTokenPoolEdge
         );
     }
@@ -8265,7 +8658,14 @@ mod tests {
     #[test]
     fn test_classify_repeat_no_token_pool_is_downgraded() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, false, true, false),
+            classify_root_tick_log(
+                &RoleTickOutcome::NoTokenPool,
+                NORMAL_TICK,
+                false,
+                true,
+                false,
+                false
+            ),
             RootTickLogAction::NoTokenPoolRepeat
         );
     }
@@ -8276,7 +8676,14 @@ mod tests {
         // no-token-pool skip demoted to `Repeat` just because `was_failing`
         // is true — the two conditions are tracked on separate axes.
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, true, false, false),
+            classify_root_tick_log(
+                &RoleTickOutcome::NoTokenPool,
+                NORMAL_TICK,
+                true,
+                false,
+                false,
+                false
+            ),
             RootTickLogAction::NoTokenPoolEdge
         );
     }
@@ -8291,6 +8698,150 @@ mod tests {
         assert!(RootTickLogAction::NoTokenPoolRepeat.is_no_token_pool());
         assert!(!RootTickLogAction::FailureEdge.is_no_token_pool());
         assert!(!RootTickLogAction::FailureRepeat.is_no_token_pool());
+    }
+
+    // ---- pool-exhausted classification (#7607) -------------------------
+
+    fn pool_exhausted_outcome() -> RoleTickOutcome {
+        RoleTickOutcome::PoolExhausted {
+            total: 3,
+            next_clear_at: chrono::Utc::now() + chrono::Duration::seconds(60),
+        }
+    }
+
+    #[test]
+    fn test_classify_first_pool_exhausted_is_edge() {
+        assert_eq!(
+            classify_root_tick_log(
+                &pool_exhausted_outcome(),
+                NORMAL_TICK,
+                false,
+                false,
+                false,
+                false
+            ),
+            RootTickLogAction::PoolExhaustedEdge
+        );
+    }
+
+    #[test]
+    fn test_classify_repeat_pool_exhausted_is_downgraded() {
+        assert_eq!(
+            classify_root_tick_log(
+                &pool_exhausted_outcome(),
+                NORMAL_TICK,
+                false,
+                false,
+                true,
+                false
+            ),
+            RootTickLogAction::PoolExhaustedRepeat
+        );
+    }
+
+    #[test]
+    fn test_classify_pool_exhausted_is_independent_of_other_axes() {
+        // A root previously `Failure`-failing OR previously no-token-pool
+        // must not have its pool-exhausted skip demoted to `Repeat` just
+        // because one of the OTHER axes is `true` — all axes are tracked
+        // independently.
+        assert_eq!(
+            classify_root_tick_log(
+                &pool_exhausted_outcome(),
+                NORMAL_TICK,
+                true,
+                false,
+                false,
+                false
+            ),
+            RootTickLogAction::PoolExhaustedEdge
+        );
+        assert_eq!(
+            classify_root_tick_log(
+                &pool_exhausted_outcome(),
+                NORMAL_TICK,
+                false,
+                true,
+                false,
+                false
+            ),
+            RootTickLogAction::PoolExhaustedEdge
+        );
+    }
+
+    #[test]
+    fn test_root_tick_log_action_pool_exhausted_is_not_failing_or_no_token_pool() {
+        // #7607: a pool-exhausted skip must never contribute to the
+        // Failure/RuntimeRejected tally, nor to the NoTokenPool tally.
+        assert!(!RootTickLogAction::PoolExhaustedEdge.is_failing());
+        assert!(!RootTickLogAction::PoolExhaustedRepeat.is_failing());
+        assert!(!RootTickLogAction::PoolExhaustedEdge.is_no_token_pool());
+        assert!(!RootTickLogAction::PoolExhaustedRepeat.is_no_token_pool());
+        assert!(RootTickLogAction::PoolExhaustedEdge.is_pool_exhausted());
+        assert!(RootTickLogAction::PoolExhaustedRepeat.is_pool_exhausted());
+        assert!(!RootTickLogAction::FailureEdge.is_pool_exhausted());
+        assert!(!RootTickLogAction::NoTokenPoolEdge.is_pool_exhausted());
+    }
+
+    // ---- #6614 empty-pool brake feed from role ticks (#7607) -----------
+
+    /// Recording [`PoolExhaustedObserver`] — captures every `(root, role)` it
+    /// is notified about so the feed predicate can be asserted without a
+    /// registry, a reaper, or a real tick loop.
+    #[derive(Default)]
+    struct RecordingObserver {
+        seen: std::sync::Mutex<Vec<(PathBuf, String)>>,
+    }
+
+    impl PoolExhaustedObserver for RecordingObserver {
+        fn note_pool_exhausted(&self, root: &Path, role: &str) {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((root.to_path_buf(), role.to_string()));
+        }
+    }
+
+    #[test]
+    fn pool_exhausted_outcomes_feed_the_observer_and_nothing_else_does() {
+        let observer = RecordingObserver::default();
+        let root = PathBuf::from("/r/loom");
+
+        // Every non-PoolExhausted outcome — including the adjacent #4642
+        // "no pool at all" skip, whose remedy is `tokens bootstrap`, not the
+        // self-healing wait an exhausted pool implies — must not feed it.
+        for outcome in [
+            RoleTickOutcome::Success,
+            RoleTickOutcome::NoTokenPool,
+            RoleTickOutcome::Failure("boom".into()),
+            RoleTickOutcome::LoadSkipped {
+                load_per_core: 9.0,
+                detail: "busy".into(),
+            },
+        ] {
+            feed_pool_exhausted_observer(Some(&observer), &outcome, &root, "champion");
+        }
+        assert!(observer.seen.lock().unwrap().is_empty());
+
+        feed_pool_exhausted_observer(Some(&observer), &pool_exhausted_outcome(), &root, "champion");
+        assert_eq!(*observer.seen.lock().unwrap(), vec![(root.clone(), "champion".to_string())]);
+
+        // Deliberately NOT deduped here: the brake needs every observation to
+        // keep its entry inside the trailing window while the pool stays dry.
+        feed_pool_exhausted_observer(Some(&observer), &pool_exhausted_outcome(), &root, "champion");
+        assert_eq!(observer.seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_none_observer_is_a_silent_no_op() {
+        // A deployment with no sweep registry wired in must run role loops
+        // exactly as before, never panicking on the absent feed (#7607).
+        feed_pool_exhausted_observer(
+            None,
+            &pool_exhausted_outcome(),
+            Path::new("/r/loom"),
+            "champion",
+        );
     }
 
     // ---- model/runtime mismatch classification (#5028) -----------------
@@ -8309,7 +8860,7 @@ mod tests {
     #[test]
     fn test_classify_first_model_mismatch_is_edge() {
         assert_eq!(
-            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, false, false, false),
+            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, false, false, false, false),
             RootTickLogAction::ModelMismatchEdge
         );
     }
@@ -8317,7 +8868,7 @@ mod tests {
     #[test]
     fn test_classify_repeat_model_mismatch_is_downgraded() {
         assert_eq!(
-            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, false, false, true),
+            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, false, false, false, true),
             RootTickLogAction::ModelMismatchRepeat
         );
     }
@@ -8326,14 +8877,18 @@ mod tests {
     fn test_classify_model_mismatch_is_independent_of_failing_and_no_token_pool_state() {
         // A root previously `Failure`-failing OR previously no-token-pool must
         // not have its model-mismatch skip demoted to `Repeat` just because
-        // one of the OTHER two axes is `true` — all three are tracked
+        // one of the OTHER axes is `true` — all axes are tracked
         // independently.
         assert_eq!(
-            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, true, false, false),
+            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, true, false, false, false),
             RootTickLogAction::ModelMismatchEdge
         );
         assert_eq!(
-            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, false, true, false),
+            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, false, true, false, false),
+            RootTickLogAction::ModelMismatchEdge
+        );
+        assert_eq!(
+            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, false, false, true, false),
             RootTickLogAction::ModelMismatchEdge
         );
     }
@@ -8358,6 +8913,7 @@ mod tests {
         let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
         let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut pool_exhausted: HashMap<PathBuf, bool> = HashMap::new();
         let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
 
         // Tick 1: failure -> edge, marks failing.
@@ -8368,6 +8924,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&true));
@@ -8383,6 +8940,7 @@ mod tests {
                 NORMAL_TICK,
                 &mut failing,
                 &mut no_token_pool,
+                &mut pool_exhausted,
                 &mut model_mismatch,
             );
             assert_eq!(failing.get(&root), Some(&true));
@@ -8396,6 +8954,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&false));
@@ -8408,6 +8967,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&false));
@@ -8422,6 +8982,7 @@ mod tests {
         let root_b = PathBuf::from("/tmp/root-b");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
         let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut pool_exhausted: HashMap<PathBuf, bool> = HashMap::new();
         let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
 
         log_outcome_for_root_deduped(
@@ -8431,6 +8992,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
         log_outcome_for_root_deduped(
@@ -8440,6 +9002,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
 
@@ -8456,6 +9019,7 @@ mod tests {
         let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test-2");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
         let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut pool_exhausted: HashMap<PathBuf, bool> = HashMap::new();
         let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
 
         log_outcome_for_root_deduped(
@@ -8465,6 +9029,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
         assert_eq!(no_token_pool.get(&root), Some(&true));
@@ -8480,10 +9045,55 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&true));
         assert_eq!(no_token_pool.get(&root), Some(&false));
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn test_log_outcome_for_root_deduped_pool_exhausted_tracked_independently_of_failing() {
+        // #7607: a PoolExhausted tick must never mark `failing` or
+        // `no_token_pool` true, and a real Failure tick must never mark
+        // `pool_exhausted` true — the three maps are independent axes even
+        // for the SAME root.
+        let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test-7607");
+        let mut failing: HashMap<PathBuf, bool> = HashMap::new();
+        let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut pool_exhausted: HashMap<PathBuf, bool> = HashMap::new();
+        let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
+
+        log_outcome_for_root_deduped(
+            "auditor",
+            &root,
+            &pool_exhausted_outcome(),
+            NORMAL_TICK,
+            &mut failing,
+            &mut no_token_pool,
+            &mut pool_exhausted,
+            &mut model_mismatch,
+        );
+        assert_eq!(pool_exhausted.get(&root), Some(&true));
+        assert_eq!(failing.get(&root), Some(&false));
+        assert_eq!(no_token_pool.get(&root), Some(&false));
+
+        // A subsequent real failure must still log as a fresh `FailureEdge`
+        // (not `FailureRepeat`) even though the root was just skipped for an
+        // exhausted pool — proving the two states never cross-contaminate.
+        log_outcome_for_root_deduped(
+            "auditor",
+            &root,
+            &RoleTickOutcome::Failure("boom".into()),
+            NORMAL_TICK,
+            &mut failing,
+            &mut no_token_pool,
+            &mut pool_exhausted,
+            &mut model_mismatch,
+        );
+        assert_eq!(failing.get(&root), Some(&true));
+        assert_eq!(pool_exhausted.get(&root), Some(&false));
     }
 
     #[test]
@@ -8496,6 +9106,7 @@ mod tests {
         let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test-3");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
         let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut pool_exhausted: HashMap<PathBuf, bool> = HashMap::new();
         let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
 
         log_outcome_for_root_deduped(
@@ -8505,6 +9116,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
         assert_eq!(model_mismatch.get(&root), Some(&true));
@@ -8520,6 +9132,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&true));
@@ -8535,6 +9148,7 @@ mod tests {
         let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test-4");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
         let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut pool_exhausted: HashMap<PathBuf, bool> = HashMap::new();
         let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
 
         log_outcome_for_root_deduped(
@@ -8547,10 +9161,12 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&false));
         assert_eq!(no_token_pool.get(&root), Some(&false));
+        assert_eq!(pool_exhausted.get(&root), Some(&false));
         assert_eq!(model_mismatch.get(&root), Some(&false));
 
         // A subsequent real failure must still log as a fresh `FailureEdge`
@@ -8562,6 +9178,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut pool_exhausted,
             &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&true));
@@ -8611,6 +9228,7 @@ mod tests {
             Duration::from_millis(20),
             drain,
             in_progress,
+            None,
         );
 
         // Let a couple of ticks fire. The missing root must never be spawned
@@ -9289,6 +9907,7 @@ mod tests {
         reset_role_tick_ring();
         let mut failing = HashMap::new();
         let mut no_pool = HashMap::new();
+        let mut pool_exhausted = HashMap::new();
         let mut model_mismatch = HashMap::new();
         let root = PathBuf::from("/r/loom");
         for _ in 0..3 {
@@ -9299,6 +9918,7 @@ mod tests {
                 Duration::from_secs(30),
                 &mut failing,
                 &mut no_pool,
+                &mut pool_exhausted,
                 &mut model_mismatch,
             );
         }

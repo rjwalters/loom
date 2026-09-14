@@ -626,6 +626,52 @@ pub fn resolve_empty_pool_breaker_window_secs() -> i64 {
         .unwrap_or(DEFAULT_EMPTY_POOL_BREAKER_WINDOW_SECS)
 }
 
+/// One distinct *source* that observed the token pool being unable to satisfy
+/// a spawn, for the cross-issue empty-pool brake's distinct-source count
+/// (Issue #6614; role-tick variant added by #7607).
+///
+/// The brake's whole premise is that N **different** sources dying at the same
+/// step cannot be explained by any one of them — it can only be the pool. That
+/// argument is indifferent to what kind of thing the source is, so widening it
+/// from "distinct issues" to "distinct issues **and** distinct `(workspace,
+/// role)` role ticks" strengthens the signal without weakening the
+/// over-trigger guarantee: one role looping on one workspace refreshes a
+/// single key forever and can no more trip the brake alone than one issue
+/// cycling through its own #4485 backoff can.
+///
+/// Why role ticks need their own variant rather than reusing a synthetic issue
+/// number: a role tick has no issue, and after #7607 it does not even produce a
+/// dispatch — its pre-spawn preflight reads the pool directly and skips, so the
+/// `finish_issue_dispatch` path #6614 feeds from is never reached. Without this
+/// the fleet-wide advisory would depend entirely on which discovery path
+/// happened to see the exhausted pool first.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TokenSelectionFailureSource {
+    /// An issue dispatch that died synchronously in `spawn-claude.sh`'s
+    /// token-selection step (the original #6614 feed, via
+    /// [`SweepRegistry::finish_issue_dispatch`](crate::sweep_registry::SweepRegistry::finish_issue_dispatch)).
+    Issue(u32),
+    /// A role-runner tick that skipped its spawn because its pre-spawn
+    /// preflight found the resolved pool present but with zero spawnable
+    /// accounts (#7607). Keyed by `(workspace root, role)` so each role on
+    /// each workspace counts once.
+    RoleTick {
+        /// The workspace root the role ticks for.
+        root: PathBuf,
+        /// The role name (`champion`, `curator`, …).
+        role: String,
+    },
+}
+
+impl std::fmt::Display for TokenSelectionFailureSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Issue(n) => write!(f, "issue #{n}"),
+            Self::RoleTick { root, role } => write!(f, "role tick {role}@{}", root.display()),
+        }
+    }
+}
+
 /// Default label-flip flap window (#4485): the trailing window over which
 /// [`SweepRegistry`] counts its own `loom:issue` <-> `loom:building` writes for
 /// one issue.
@@ -1192,16 +1238,50 @@ impl SweepRegistry {
     /// advance the count: the trip condition is N *different* issues, so one
     /// issue cycling through its own #4485 backoff can never trip it.
     pub(crate) fn record_token_selection_failure(&mut self, issue: u32) {
+        self.record_token_selection_failure_from(&TokenSelectionFailureSource::Issue(issue));
+    }
+
+    /// Record that a role-runner tick for `role` on this registry's workspace
+    /// skipped its spawn because the resolved token pool was present but had
+    /// zero spawnable accounts — the **role-tick** feed into the same #6614
+    /// brake (Issue #7607).
+    ///
+    /// Called from the role runner's pre-spawn preflight, which after #7607
+    /// never spawns (and therefore never produces a dispatch
+    /// `finish_issue_dispatch` could observe) once it has read the pool as
+    /// exhausted. Without this feed the fleet-wide advisory would depend on
+    /// whether a sweep or a role happened to notice the exhausted pool first:
+    /// on a host whose work finder is idle and whose role loops are the only
+    /// traffic, it would simply never trip.
+    ///
+    /// Recording the same `(root, role)` twice refreshes its timestamp but does
+    /// not advance the distinct-source count — see
+    /// [`TokenSelectionFailureSource`] for why that keeps #6614's over-trigger
+    /// guarantee intact.
+    pub fn record_role_tick_pool_exhausted(&mut self, role: &str) {
+        let source = TokenSelectionFailureSource::RoleTick {
+            root: self.config.workspace_root.clone(),
+            role: role.to_string(),
+        };
+        self.record_token_selection_failure_from(&source);
+    }
+
+    /// Shared body of the two #6614 feeds (issue dispatch, #7607 role tick):
+    /// prune the trailing window, record/refresh this source's timestamp, and
+    /// re-evaluate the workspace pre-flight advisory — so crossing the
+    /// distinct-source threshold trips the existing #4386/#5030 hold +
+    /// `PreflightAdvisory` event rather than a second, parallel breaker.
+    fn record_token_selection_failure_from(&mut self, source: &TokenSelectionFailureSource) {
         let now = Utc::now();
         let window = chrono::Duration::seconds(resolve_empty_pool_breaker_window_secs());
         self.token_selection_failures
             .retain(|_, at| now - *at <= window);
-        self.token_selection_failures.insert(issue, now);
+        self.token_selection_failures.insert(source.clone(), now);
         let distinct = self.token_selection_failures.len();
         let threshold = resolve_empty_pool_breaker_threshold();
         log::warn!(
-            "sweep_registry: issue #{issue} died at token selection (empty/unusable token pool) \
-             — {distinct} distinct issue(s) in the last {}s have now died the same way \
+            "sweep_registry: {source} could not obtain a token at selection (empty/unusable token \
+             pool) — {distinct} distinct source(s) in the last {}s have now hit the same wall \
              (threshold {threshold}) (#6614)",
             window.num_seconds()
         );
@@ -1233,8 +1313,10 @@ impl SweepRegistry {
         true
     }
 
-    /// How many DISTINCT issues died at token selection inside the trailing
-    /// window at `now` (Issue #6614). Side-effect-free: stale entries are
+    /// How many DISTINCT sources ([`TokenSelectionFailureSource`]: issue
+    /// dispatches, plus role ticks since #7607) hit an unsatisfiable token
+    /// selection inside the trailing window at `now` (Issue #6614).
+    /// Side-effect-free: stale entries are
     /// filtered out of the count here and physically pruned on the next
     /// [`record_token_selection_failure`](Self::record_token_selection_failure).
     #[must_use]
@@ -5065,6 +5147,71 @@ mod tests {
         );
     }
 
+    // ---- role-tick feed into the #6614 brake (Issue #7607) ---------------
+
+    /// AC (#7607 proposal item 3): an exhausted pool discovered by *role ticks*
+    /// trips the same fleet-wide advisory a sweep's token-selection death does.
+    /// On a host whose work finder is idle, role loops are the only traffic, so
+    /// before this feed the advisory could never trip no matter how long the
+    /// pool stayed dry.
+    #[test]
+    fn role_ticks_on_an_exhausted_pool_trip_the_same_fleet_pause() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        for role in ["champion", "curator", "judge"] {
+            registry.record_role_tick_pool_exhausted(role);
+        }
+
+        assert_eq!(registry.token_selection_failure_count(Utc::now()), 3);
+        assert!(registry.empty_pool_breaker_tripped(Utc::now()));
+        assert!(registry.preflight_advisory().0);
+    }
+
+    /// AC (#7607): the over-trigger guard survives the widened key. ONE role
+    /// looping on ONE workspace is the role-tick analogue of "one unlucky issue
+    /// cycling through its own backoff" — it refreshes a single distinct source
+    /// forever and must never pause the fleet on its own.
+    #[test]
+    fn one_role_ticking_repeatedly_never_trips_the_fleet_pause() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        for _ in 0..10 {
+            registry.record_role_tick_pool_exhausted("hermit");
+        }
+
+        assert_eq!(
+            registry.token_selection_failure_count(Utc::now()),
+            1,
+            "ten skips by ONE role on ONE workspace is still one distinct source"
+        );
+        assert!(!registry.empty_pool_breaker_tripped(Utc::now()));
+        assert!(!registry.preflight_advisory().0);
+    }
+
+    /// AC (#7607): the two feeds share one counter, so a pool that is starving
+    /// both a sweep and role ticks reaches the threshold on their combined
+    /// distinct-source count rather than needing N of either kind alone.
+    #[test]
+    fn issue_and_role_tick_sources_count_together() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        registry.record_token_selection_failure(7607);
+        registry.record_role_tick_pool_exhausted("champion");
+        assert!(!registry.empty_pool_breaker_tripped(Utc::now()));
+
+        registry.record_role_tick_pool_exhausted("doctor");
+        assert_eq!(registry.token_selection_failure_count(Utc::now()), 3);
+        assert!(registry.empty_pool_breaker_tripped(Utc::now()));
+
+        // And the same release path clears both kinds at once: a dispatch that
+        // got past token selection is proof the pool works for role ticks too.
+        assert!(registry.clear_token_selection_failures());
+        assert!(!registry.empty_pool_breaker_tripped(Utc::now()));
+    }
+
     /// AC (#6614): failures spread further apart than the trailing window are
     /// not a systemic fault — they must age out instead of accreting toward a
     /// pause over hours. Stale entries are injected directly rather than slept
@@ -5077,8 +5224,12 @@ mod tests {
         let stale = Utc::now()
             - chrono::Duration::seconds(DEFAULT_EMPTY_POOL_BREAKER_WINDOW_SECS)
             - chrono::Duration::seconds(60);
-        registry.token_selection_failures.insert(11, stale);
-        registry.token_selection_failures.insert(22, stale);
+        registry
+            .token_selection_failures
+            .insert(TokenSelectionFailureSource::Issue(11), stale);
+        registry
+            .token_selection_failures
+            .insert(TokenSelectionFailureSource::Issue(22), stale);
 
         assert_eq!(
             registry.token_selection_failure_count(Utc::now()),

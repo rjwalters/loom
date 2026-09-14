@@ -620,8 +620,11 @@ pub struct SweepRegistry {
     /// which should be forced to `&mut self` for what is a pure read-through
     /// cache. Never held across a `gh` invocation.
     open_pr_memo: Mutex<HashMap<u32, OpenPrMemoEntry>>,
-    /// When each issue most recently died in `spawn-claude.sh`'s token-selection
-    /// pre-flight step (exit 78 / `EX_CONFIG`), keyed by issue (Issue #6614).
+    /// When each *source* most recently observed `spawn-claude.sh`'s
+    /// token-selection pre-flight step being unsatisfiable (exit 78 /
+    /// `EX_CONFIG`), keyed by
+    /// [`TokenSelectionFailureSource`](crate::sweep_registry::TokenSelectionFailureSource)
+    /// (Issue #6614; role-tick sources added by #7607).
     ///
     /// The **cross-issue** half of the empty-pool brake: the per-issue backoff
     /// ([`dispatch_backoff`](Self::dispatch_backoff)) caps how often ONE issue
@@ -632,7 +635,7 @@ pub struct SweepRegistry {
     /// So an exhausted pool re-dispatched every candidate issue on every
     /// work-finder tick indefinitely.
     ///
-    /// Counting DISTINCT issues (rather than raw failures) is what makes this
+    /// Counting DISTINCT sources (rather than raw failures) is what makes this
     /// a fleet signal rather than a louder per-issue one: one unlucky issue
     /// cycling through its own backoff can never trip it, while N different
     /// issues all dying at token selection can only mean the pool itself is
@@ -640,7 +643,14 @@ pub struct SweepRegistry {
     /// selection — the strongest available proof the pool can still hand out
     /// a credential. In-memory and window-pruned, so it is fail-open exactly
     /// like the per-issue backoff: a daemon restart or a quiet window clears it.
-    token_selection_failures: HashMap<u32, DateTime<Utc>>,
+    ///
+    /// Issue #7607 widened the key from a bare issue number so the role runner
+    /// — which discovers the identical exhausted-pool condition on its own
+    /// pre-spawn preflight, never getting far enough to produce a dispatch the
+    /// #6614 path could see — feeds the same brake. A role tick's key is
+    /// `(root, role)`, so the "distinct sources" invariant holds unchanged:
+    /// one role looping on one workspace can never trip it alone.
+    token_selection_failures: HashMap<TokenSelectionFailureSource, DateTime<Utc>>,
     /// Trailing timestamps of this registry's own `loom:issue` <->
     /// `loom:building` label writes per issue (Issue #4485), pruned to
     /// [`DEFAULT_FLAP_WINDOW_SECS`]. Powers the flap warning in

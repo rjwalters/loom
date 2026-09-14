@@ -716,7 +716,8 @@ impl SweepRegistry {
             // operator must act; the pre-#6614 behavior was a silent
             // ~15-minute re-dispatch loop with nothing above per-sweep logs.
             log::error!(
-                "sweep_registry: workspace {} DISPATCH PAUSED — {} distinct issue(s) died at \
+                "sweep_registry: workspace {} DISPATCH PAUSED — {} distinct source(s) \
+                 (issue dispatches and/or role ticks, #7607) could not obtain a credential at \
                  token selection inside the last {}s (threshold {}); the token pool is empty or \
                  every account is bad-marked. New dispatch is held (one half-open probe per \
                  cooldown, #5030) until a dispatch gets past token selection. Inspect \
@@ -847,7 +848,8 @@ impl SweepRegistry {
             // `loom-daemon status` after the fact sees the same cause the log
             // named rather than the generic streak sentence.
             format!(
-                "WARNING: dispatch paused — {} distinct issue(s) died at token selection inside \
+                "WARNING: dispatch paused — {} distinct source(s) (issue dispatches and/or role \
+                 ticks, #7607) could not obtain a credential at token selection inside \
                  the last {}s; the token pool is empty or every account is bad-marked. Inspect \
                  `.loom/tokens/.bad_tokens`, then `loom-daemon tokens check --ranking` / \
                  `loom-daemon tokens unblock <name>` / `loom-daemon tokens bootstrap` (#6614) \

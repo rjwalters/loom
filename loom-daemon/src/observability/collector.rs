@@ -1275,6 +1275,7 @@ mod tests {
             at,
             ok,
             detail: detail.map(str::to_string),
+            pool_exhausted: false,
         }
     }
 
@@ -1594,6 +1595,7 @@ mod tests {
                 at: now - chrono::Duration::minutes(i64::try_from(count - i).unwrap_or(0)),
                 ok: false,
                 detail: Some(raw_detail.clone()),
+                pool_exhausted: false,
             })
             .collect()
     }

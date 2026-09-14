@@ -559,6 +559,16 @@ pub struct RoleTickSummary {
     /// again (the success breaks the streak), so a since-fixed cause never
     /// stays escalated.
     pub escalated: Vec<RoleFailure>,
+    /// `(root, role)` pairs whose **latest** record in the window is a
+    /// [`crate::role_runner::RoleTickOutcome::PoolExhausted`] skip (issue
+    /// #7607) — the resolved token pool was present but had zero spawnable
+    /// accounts. Deliberately **disjoint** from `persistent`/`transient`:
+    /// this is a self-healing, fleet-wide-shared-resource condition, not a
+    /// per-role/per-repo defect, so it must never inflate the "N PERSISTENT
+    /// failure(s)" count an operator reads as "N broken roles" (the exact
+    /// masking effect the issue's incident report describes — 693 identical
+    /// exit-78s reading as 693 broken roles).
+    pub pool_exhausted: Vec<RoleFailure>,
 }
 
 /// Classify a role-tick window into persistent vs transient failures (#4761).
@@ -670,6 +680,15 @@ pub fn summarize_role_ticks(records: &[RoleTickRecord], since: DateTime<Utc>) ->
         };
         if latest.ok {
             summary.transient.push(failure);
+        } else if latest.pool_exhausted {
+            // Issue #7607: a pool-exhausted skip is deliberately routed into
+            // its own disjoint bucket rather than `persistent` — see
+            // `RoleTickSummary::pool_exhausted`'s doc comment. Never
+            // considered for `escalated` either: the detail is intentionally
+            // volatile tick to tick (see `record_role_tick_at`'s doc
+            // comment), so it could not build a byte-identical streak even
+            // if it were.
+            summary.pool_exhausted.push(failure);
         } else {
             // Escalated pairs stay in `persistent` (they are persistent) AND are
             // additionally called out in `escalated` — the loud "config-shaped,
@@ -1533,10 +1552,32 @@ pub fn assess_roles(inputs: &HealthInputs) -> HealthSection {
             names.join(", ")
         )
     };
-    let (verdict, line) = if summary.persistent.is_empty() {
+    // Issue #7607: a "pool exhausted (N role(s) held)" call-out, deliberately
+    // worded so it can never be confused with "N PERSISTENT failure(s)" —
+    // the exact masking `assess_roles` must not produce when a fleet-wide
+    // shared token pool runs dry (693 identical exit-78 skips must read as
+    // "pool exhausted", never as "693 broken roles").
+    let pool_exhausted_note = if summary.pool_exhausted.is_empty() {
+        String::new()
+    } else {
+        format!("; pool exhausted ({} role(s) held)", summary.pool_exhausted.len())
+    };
+    let (verdict, line) = if summary.persistent.is_empty() && summary.pool_exhausted.is_empty() {
         (
             Verdict::Green,
             format!("{}/{} ticks ok{transient_note}", summary.ok, summary.total),
+        )
+    } else if summary.persistent.is_empty() {
+        // Only pool-exhausted skips this window, zero genuine role failures
+        // — still `Degraded` (a fleet-wide exhausted pool is real,
+        // operator-actionable information), but the summary text never says
+        // "PERSISTENT failure(s)" for this state (#7607).
+        (
+            Verdict::Degraded,
+            cap_summary_line(format!(
+                "{}/{} ticks ok{pool_exhausted_note}{transient_note}",
+                summary.ok, summary.total
+            )),
         )
     } else {
         let names: Vec<String> = summary
@@ -1553,7 +1594,7 @@ pub fn assess_roles(inputs: &HealthInputs) -> HealthSection {
         (
             Verdict::Degraded,
             cap_summary_line(format!(
-                "{}/{} ticks ok; {} PERSISTENT failure(s): {}{escalated_note}{transient_note}",
+                "{}/{} ticks ok; {} PERSISTENT failure(s): {}{escalated_note}{pool_exhausted_note}{transient_note}",
                 summary.ok,
                 summary.total,
                 summary.persistent.len(),
@@ -1627,7 +1668,12 @@ impl StaleRole {
 /// (`ModelRuntimeMismatch`, `NoTokenPool`, `RuntimeRejected`) that can never
 /// self-recover without an operator config/code change, and that #6201's
 /// staleness check alone reads as perfectly alive because it never stops
-/// ticking.
+/// ticking. Deliberately excludes
+/// [`crate::role_runner::RoleTickOutcome::PoolExhausted`] (#7607): that
+/// state's `detail` is intentionally volatile tick to tick (the spawnable
+/// count and next-clear estimate change every check), so it can never build
+/// a byte-identical streak here — correctly, since pool exhaustion is
+/// expected to self-heal, unlike the three states above.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StuckRole {
     /// The workspace root this role ticks for.
@@ -4391,6 +4437,7 @@ mod tests {
             at: now() - chrono::Duration::seconds(ago_secs),
             ok,
             detail: (!ok).then(|| "boom".to_string()),
+            pool_exhausted: false,
         }
     }
 
@@ -4468,6 +4515,77 @@ mod tests {
         assert!(section.summary.contains("no role ticks in window"));
     }
 
+    // ------- pool-exhausted classification (#7607) -------
+
+    fn record_pool_exhausted(role: &str, root: &str, ago_secs: i64) -> RoleTickRecord {
+        RoleTickRecord {
+            root: PathBuf::from(root),
+            role: role.to_string(),
+            at: now() - chrono::Duration::seconds(ago_secs),
+            ok: false,
+            detail: Some("pool-exhausted: 0/3 spawnable, next check ~soon".to_string()),
+            pool_exhausted: true,
+        }
+    }
+
+    #[test]
+    fn a_pool_exhausted_tick_is_routed_to_its_own_bucket_not_persistent() {
+        let records = vec![record_pool_exhausted("champion", "/r/loom", 60)];
+        let summary = summarize_role_ticks(&records, now() - chrono::Duration::seconds(1800));
+        assert!(summary.persistent.is_empty(), "must never land in `persistent`");
+        assert!(summary.transient.is_empty());
+        assert!(summary.escalated.is_empty(), "must never escalate");
+        assert_eq!(summary.pool_exhausted.len(), 1);
+        assert_eq!(summary.pool_exhausted[0].root, PathBuf::from("/r/loom"));
+    }
+
+    #[test]
+    fn many_identical_pool_exhausted_ticks_never_escalate() {
+        // Mirrors the incident: hundreds of identical exit-78 skips across a
+        // window must never build an escalation streak the way a genuine
+        // config-shaped failure would.
+        let records: Vec<RoleTickRecord> = (0..20)
+            .map(|i| record_pool_exhausted("champion", "/r/loom", i * 10))
+            .collect();
+        let summary = summarize_role_ticks(&records, now() - chrono::Duration::seconds(1800));
+        assert_eq!(summary.pool_exhausted.len(), 1);
+        assert!(summary.escalated.is_empty());
+        assert!(summary.persistent.is_empty());
+    }
+
+    #[test]
+    fn assess_roles_distinguishes_pool_exhausted_from_persistent_failures() {
+        let mut inputs = healthy_inputs();
+
+        // Pool exhaustion alone: degraded (real, actionable), but the
+        // summary must say "pool exhausted", never "PERSISTENT failure(s)".
+        inputs.status.as_mut().unwrap().role_tick_records =
+            vec![record_pool_exhausted("champion", "/r/loom", 60)];
+        let section = assess_roles(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.contains("pool exhausted (1 role(s) held)"),
+            "{}",
+            section.summary
+        );
+        assert!(!section.summary.contains("PERSISTENT"), "{}", section.summary);
+
+        // A genuine failure alongside a pool-exhausted skip: both call-outs
+        // appear, and the PERSISTENT count reflects only the real failure.
+        inputs.status.as_mut().unwrap().role_tick_records = vec![
+            record("curator", "/r/loom", 60, false),
+            record_pool_exhausted("champion", "/r/loom", 60),
+        ];
+        let section = assess_roles(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("1 PERSISTENT failure(s)"), "{}", section.summary);
+        assert!(
+            section.summary.contains("pool exhausted (1 role(s) held)"),
+            "{}",
+            section.summary
+        );
+    }
+
     // ------- Escalation on N consecutive identical failures (#5023) -------
 
     /// A failure record with an explicit `detail`, for the identical-vs-varying
@@ -4480,6 +4598,7 @@ mod tests {
             at: now() - chrono::Duration::seconds(ago_secs),
             ok: false,
             detail: Some(detail.to_string()),
+            pool_exhausted: false,
         }
     }
 
