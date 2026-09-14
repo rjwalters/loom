@@ -874,6 +874,38 @@ Invariants a future edit must preserve:
 
 `LOOM_MAX_UNREVISED_EVALUATIONS` (default **2**) — bounds the silent-skip streak the same way `LOOM_MAX_STANDDOWN_STREAK` (default 3) bounds `judge.md`'s silent stand-downs: silence is a valid response to a repeated no-op, but never an unbounded one.
 
+#### A Curator-appended `## Revision` section is an ordinary body edit, not a special case (#7650)
+
+Curator's "De-escalating Fact-Based Champion Escalations" (`curator.md`) can
+de-escalate a `loom:operator-only` proposal Champion escalated for a
+**fact-checkable, non-dependency** finding set (see that section for when —
+this is the complement of Pass 0's dependency-only un-escalation above). It
+does so by appending a dated `## Revision` section to the body naming the
+commit it verified every cited objection against, then removing
+`loom:operator-only` and its sub-kind label in the same pass.
+
+No code change on this side was needed for that to work, and this note
+exists to make that explicit rather than leave it implicit: `BODY_HASH`
+above is computed from `.title` + `.body` verbatim, so appending ANY text to
+the body — a Curator revision section is nothing special here — produces a
+different hash and therefore a different `VERDICT_MARKER`. The next pass's
+"Idempotency check" finds no comment carrying that new marker, so it falls
+straight through to a full evaluation and a fresh verdict, exactly as if a
+human had edited the proposal themselves. `ALREADY_ROUTED` is also already
+`no` by the time this pass runs, because Curator removed `loom:operator-only`
+before this pass ever sees the issue — so the `FORCE_REEVALUATE` branch above
+(which exists for Champion's OWN Pass 0 un-escalation, still inside the same
+pass as the un-escalation) never needs to fire for this path at all; a
+Curator de-escalation and a Champion de-escalation reach the same "evaluate
+fresh" outcome by two different, non-interfering routes through this same
+hash mechanism.
+
+Verified, not assumed: `tests/test-classify-dependency-block.sh` computes
+`BODY_HASH` before and after an appended `## Revision` section with the exact
+formula above and asserts the two differ, rather than taking "this obviously
+works" on faith — the Test Plan for #7650 called this out explicitly as
+something to confirm.
+
 ### Claim (staleness-aware, run only when NOT skipped above)
 
 The staleness check below (`check-evaluating-staleness.sh`) is the SAME script the
