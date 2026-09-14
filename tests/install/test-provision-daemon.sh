@@ -1007,6 +1007,97 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# ---------- test 39: a hanging codesign identity (#7605) — sign_daemon_binary
+# must NOT block on a configured identity whose signing command never
+# returns (standing in for a real keychain GUI prompt raised when the
+# identity's private key is missing `codesign` from its ACL). Fakes `uname`
+# (Darwin), `security find-identity` (reports the identity as valid), and a
+# `codesign` that SLEEPS (via `exec sleep`, so killing its PID kills the
+# sleep directly rather than leaving an orphan) for any invocation naming
+# the identity, but answers instantly for the `-dvvv` Authority probe and
+# for the ad-hoc fallback (`-s -`) call. LOOM_CODESIGN_TIMEOUT_SECS is set
+# small so this test itself stays fast without weakening what it proves:
+# the preflight cap — not the identity's own behavior — is what bounds the
+# wait.
+# ---------------------------------------------------------------------------
+FAKE_HANG_DIR="$WORKDIR/fake-hang-identity-bin"
+mkdir -p "$FAKE_HANG_DIR"
+cat > "$FAKE_HANG_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+chmod +x "$FAKE_HANG_DIR/uname"
+cat > "$FAKE_HANG_DIR/security" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "find-identity" ]]; then
+  echo '  1) ABCDEF1234567890ABCDEF1234567890ABCDEF12 "Hanging Identity"'
+  echo '     1 valid identities found'
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_HANG_DIR/security"
+HANG_INVOKED_FILE="$WORKDIR/codesign-hang-invoked.txt"
+HANG_ADHOC_ARGS_FILE="$WORKDIR/codesign-hang-adhoc-args.txt"
+cat > "$FAKE_HANG_DIR/codesign" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "-dvvv" ]]; then
+  echo "Identifier=com.rjwalters.loom-daemon" >&2
+  exit 0
+fi
+if printf '%s\n' "\$@" | grep -q 'Hanging Identity'; then
+  echo "\$@" >> "$HANG_INVOKED_FILE"
+  # Stand in for a blocking SecurityAgent GUI prompt: never return on its
+  # own. exec (not a plain \`sleep\`) so the caller's kill -9 on THIS pid
+  # kills the sleep directly instead of orphaning it.
+  exec sleep 3600
+fi
+echo "\$@" > "$HANG_ADHOC_ARGS_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_HANG_DIR/codesign"
+
+SRC39="$WORKDIR/src39/loom-daemon"
+mkdir -p "$WORKDIR/src39"
+make_fake_bin "$SRC39" "0.19.9"
+DEST39="$WORKDIR/dest39"
+CAP39=2
+start39=$(date +%s)
+out39=$(PATH="$FAKE_HANG_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST39" \
+  LOOM_CODESIGN_IDENTITY="Hanging Identity" LOOM_CODESIGN_TIMEOUT_SECS="$CAP39" \
+  provision_machine_daemon "$SRC39" 2>&1)
+rc39=$?
+end39=$(date +%s)
+elapsed39=$((end39 - start39))
+
+assert_eq "hanging identity: provision returns 0 (non-fatal)" "0" "$rc39"
+assert_eq "hanging identity: preflight was actually attempted" "1" \
+  "$( [[ -s "$HANG_INVOKED_FILE" ]] && echo 1 || echo 0 )"
+
+TOTAL=$((TOTAL + 1))
+# Generous bound (cap + 10s) to absorb slow CI scheduling without re-allowing
+# an unbounded wait -- a regression back to the old unbounded behavior would
+# time out this test's own outer `timeout` wrapper (or run ~3600s), not
+# land just barely over this bound.
+if [[ "$elapsed39" -le $((CAP39 + 10)) ]]; then
+  echo -e "${GREEN}PASS${NC}: hanging identity: sign_daemon_binary returns within the cap (${elapsed39}s, cap ${CAP39}s)"
+  PASS=$((PASS + 1))
+else
+  echo -e "${RED}FAIL${NC}: hanging identity: sign_daemon_binary returns within the cap"
+  echo "  elapsed: ${elapsed39}s (cap ${CAP39}s)"
+  FAIL=$((FAIL + 1))
+fi
+
+hang_adhoc_args="$(cat "$HANG_ADHOC_ARGS_FILE" 2>/dev/null || echo "<missing>")"
+assert_contains "hanging identity: falls back to ad-hoc signing after the preflight times out" \
+  "$hang_adhoc_args" "-s -"
+assert_contains "hanging identity: ad-hoc fallback still uses the stable identifier" \
+  "$hang_adhoc_args" "--identifier com.rjwalters.loom-daemon"
+assert_contains "hanging identity: WARN names the identity" "$out39" "Hanging Identity"
+assert_contains "hanging identity: WARN points at the doc fix" "$out39" "macos-tcc-codesign.md"
+assert_eq "hanging identity: binary is still provisioned despite the preflight timeout" "1" \
+  "$( [[ -x "$DEST39/loom-daemon" ]] && echo 1 || echo 0 )"
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"

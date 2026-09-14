@@ -89,6 +89,82 @@ _pmd_resolve_codesign_identity() {
   loom_config_get "$repo_root" "codesign.identity" ""
 }
 
+# _pmd_codesign_capped <cap_secs> <command...>
+#
+# Issue #7605: run <command...> (always a `codesign` invocation from this
+# file) under a hard wall-clock cap, killing it if it is still running once
+# the cap elapses. macOS ships no `timeout` by default, so this reimplements
+# the same shape with background + poll + kill: a `codesign` call against an
+# identity whose private key lacks `codesign` in its keychain access control
+# list raises a blocking SecurityAgent GUI prompt instead of failing — with
+# no flag to suppress it and no bound on how long it waits, `codesign`'s own
+# exit status and stderr are simply never produced while the prompt sits
+# there, so a wall-clock cap is the only way to detect the hang from outside.
+# This is exactly the 10+ minute unattended-install hang this issue reports.
+#
+# Output (stdout+stderr) is discarded, matching every call site's prior
+# `2>/dev/null`. Returns the command's own exit status, or 124 (matching GNU
+# `timeout`'s convention) if the cap was hit.
+_pmd_codesign_capped() {
+  local cap_secs="$1"
+  shift
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/loom-codesign-capped.XXXXXX" 2>/dev/null || echo "/tmp/loom-codesign-capped.$$")"
+
+  "$@" >"$out_file" 2>&1 &
+  local pid=$!
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= cap_secs )); then
+      kill -9 "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      rm -f "$out_file"
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  local rc=0
+  wait "$pid" 2>/dev/null || rc=$?
+  rm -f "$out_file"
+  return "$rc"
+}
+
+# _pmd_preflight_codesign_identity <identity> <bin> <cap_secs>
+#
+# Issue #7605: verify a configured codesign identity can sign
+# NON-INTERACTIVELY before ever handing it the real binary. When the
+# identity's private key is missing `codesign` (specifically
+# `/usr/bin/codesign`) from its keychain access control list, `codesign -f -s
+# <identity>` raises a blocking SecurityAgent GUI prompt instead of failing —
+# on a headless host that prompt is never dismissed, so the caller hangs
+# forever. Signs a THROWAWAY COPY of <bin> (never <bin> itself), under the
+# same hard wall-clock cap as the real signing call
+# (_pmd_codesign_capped), so the preflight itself can never be the thing
+# that hangs.
+#
+# Returns 0 when the identity signs non-interactively within the cap, 1
+# otherwise (timeout OR any other codesign failure) — either way the caller
+# falls back to ad-hoc signing, matching sign_daemon_binary's existing
+# never-fatal contract.
+_pmd_preflight_codesign_identity() {
+  local identity="$1" bin="$2" cap_secs="$3"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/loom-codesign-preflight.XXXXXX" 2>/dev/null)" || return 1
+  cp "$bin" "$tmp" 2>/dev/null || {
+    rm -f "$tmp"
+    return 1
+  }
+  chmod +x "$tmp" 2>/dev/null
+
+  local rc=0
+  _pmd_codesign_capped "$cap_secs" \
+    codesign -f -s "$identity" --identifier com.rjwalters.loom-daemon.preflight "$tmp" || rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
 # sign_daemon_binary <bin>
 #
 # Issue #4016: ad-hoc-sign a freshly built/installed `loom-daemon` binary with
@@ -118,11 +194,20 @@ _pmd_resolve_codesign_identity() {
 # opt-in only: unset (or an identity the keychain doesn't have) falls back to
 # the ad-hoc path below, unchanged.
 #
+# Issue #7605: a configured identity whose private key lacks `codesign` in
+# its keychain ACL does not make `codesign -f -s <identity>` fail — it makes
+# it raise a blocking SecurityAgent GUI prompt with no timeout of its own,
+# hanging an unattended install/self-update for 10+ minutes with no output.
+# Both the real signing call below AND a non-interactive preflight of the
+# identity (signing a throwaway copy first) run under a hard wall-clock cap
+# via _pmd_codesign_capped, so neither can block this caller regardless of
+# WHY codesign is prompting.
+#
 # Darwin-only, best-effort, and NEVER fatal: the linker-signed ad-hoc
 # signature the binary already carries (from `cargo build`) is sufficient to
 # run, so an absent `codesign`, a non-Darwin host, or a `codesign` failure
-# must never fail the caller's build/provision step — this function always
-# returns 0.
+# (including a preflight timeout) must never fail the caller's
+# build/provision step — this function always returns 0.
 sign_daemon_binary() {
   local bin="${1:-}"
 
@@ -168,17 +253,28 @@ sign_daemon_binary() {
     keychain_identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
   fi
 
+  # Issue #7605: hard wall-clock cap applied to every `codesign` invocation
+  # below (preflight AND the real sign) — macOS ships no `timeout` by
+  # default. Overridable for tests via LOOM_CODESIGN_TIMEOUT_SECS; 15s is
+  # generous for a normal non-interactive sign (well under a second) while
+  # still bounding the GUI-prompt hang this issue reports.
+  local cap_secs="${LOOM_CODESIGN_TIMEOUT_SECS:-15}"
+
   if [[ -n "$identity" && "$keychain_identities" == *"$identity"* ]]; then
-    if codesign -f -s "$identity" --identifier com.rjwalters.loom-daemon "$bin" 2>/dev/null; then
-      _pmd_ok "signed $bin with identity '$identity' (identifier=com.rjwalters.loom-daemon) — TCC grants survive rebuilds"
-      return 0
+    if _pmd_preflight_codesign_identity "$identity" "$bin" "$cap_secs"; then
+      if _pmd_codesign_capped "$cap_secs" codesign -f -s "$identity" --identifier com.rjwalters.loom-daemon "$bin"; then
+        _pmd_ok "signed $bin with identity '$identity' (identifier=com.rjwalters.loom-daemon) — TCC grants survive rebuilds"
+        return 0
+      fi
+      _pmd_warn "codesign with identity '$identity' failed for $bin; falling back to ad-hoc signing"
+    else
+      _pmd_warn "codesign preflight failed or timed out after ${cap_secs}s for identity '$identity' (likely cause: its private key is missing '/usr/bin/codesign' from its keychain access control list, which raises a blocking Keychain prompt instead of signing non-interactively); falling back to ad-hoc signing — see 'Repairing an identity imported without codesign access' in defaults/docs/macos-tcc-codesign.md"
     fi
-    _pmd_warn "codesign with identity '$identity' failed for $bin; falling back to ad-hoc signing"
   elif [[ -n "$identity" ]]; then
     _pmd_warn "LOOM_CODESIGN_IDENTITY '$identity' not found via 'security find-identity -v -p codesigning'; falling back to ad-hoc signing (see defaults/docs/macos-tcc-codesign.md)"
   fi
 
-  if codesign -f -s - --identifier com.rjwalters.loom-daemon "$bin" 2>/dev/null; then
+  if _pmd_codesign_capped "$cap_secs" codesign -f -s - --identifier com.rjwalters.loom-daemon "$bin"; then
     _pmd_ok "ad-hoc signed $bin (identifier=com.rjwalters.loom-daemon)"
   else
     _pmd_warn "codesign failed for $bin (non-fatal; the binary's existing linker-signed ad-hoc signature is still sufficient to run)"

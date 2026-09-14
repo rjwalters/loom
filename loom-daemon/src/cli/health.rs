@@ -270,6 +270,15 @@ async fn collect(window: Duration) -> HealthReport {
     //    every invocation, exactly as `status` already does.
     let self_update = loom_daemon::self_update::check();
 
+    // 7. A configured codesign identity's own non-interactive preflight
+    //    (Issue #7605) — client-side, no IPC involved, so it is threaded in
+    //    exactly like `self_update` above. Runs a real `codesign` invocation
+    //    when (and only when) an identity is actually configured, so this is
+    //    deliberately last: every other input above is cheap/local, this one
+    //    is the only step in `collect()` that can itself take up to the
+    //    preflight cap.
+    let codesign_preflight = probe_codesign_identity_preflight(status.as_ref());
+
     health::assess(&HealthInputs {
         at: chrono::Utc::now(),
         window,
@@ -289,7 +298,193 @@ async fn collect(window: Duration) -> HealthReport {
         cli_build_commit: loom_daemon::self_update::BUILT_COMMIT.to_string(),
         work_finder_log_tick_age_secs,
         self_update: Some(self_update),
+        codesign_preflight,
     })
+}
+
+/// Issue #7605: probe a configured `codesign.identity` for whether it can
+/// sign NON-INTERACTIVELY, so a keychain ACL misconfiguration that would
+/// otherwise only surface as a 10+ minute hang inside
+/// `sign_daemon_binary` (`scripts/install/provision-daemon.sh`) during the
+/// next self-update roll is visible in `loom-daemon health` beforehand.
+///
+/// `None` (nothing to report) on: any non-Darwin host, no identity
+/// configured (env nor resolved repo config), or `security`/`codesign`
+/// themselves not spawnable in this process — every one of those is a case
+/// `sign_daemon_binary` already silently treats as "use ad-hoc signing",
+/// so there is nothing actionable to surface. `Some` covers both "not found
+/// in the keychain" and "found but fails the non-interactive preflight" —
+/// [`health::assess_codesign_identity`] only renders a section for the
+/// latter's failing case (`ok: false`); a passing preflight also returns
+/// `Some(.. ok: true ..)` here so a `--json` consumer can see the check ran
+/// and passed, but produces no rendered section.
+fn probe_codesign_identity_preflight(
+    status: Option<&DaemonStatusReport>,
+) -> Option<health::CodesignPreflightResult> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+
+    let identity = resolve_configured_codesign_identity(status)?;
+
+    // Mirror sign_daemon_binary's own precedence: an identity absent from
+    // the keychain listing is reported as a fact, not attempted.
+    let listing = std::process::Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()
+        .ok()?;
+    let keychain_identities = String::from_utf8_lossy(&listing.stdout);
+    if !keychain_identities.contains(identity.as_str()) {
+        return Some(health::CodesignPreflightResult {
+            identity,
+            ok: false,
+            detail: "not found via 'security find-identity -v -p codesigning'".to_string(),
+        });
+    }
+
+    let (ok, detail) = codesign_preflight_capped(&identity, CODESIGN_PREFLIGHT_CAP);
+    Some(health::CodesignPreflightResult {
+        identity,
+        ok,
+        detail,
+    })
+}
+
+/// Hard wall-clock cap on the preflight `codesign` invocation — matches
+/// `sign_daemon_binary`'s own default (`LOOM_CODESIGN_TIMEOUT_SECS`, default
+/// 15s in `scripts/install/provision-daemon.sh`). Not itself overridable by
+/// that env var: this CLI check runs at a human's convenience, not inside a
+/// self-update loop racing a build-gate budget, so there is no equivalent
+/// pressure to shrink it for a test harness here.
+const CODESIGN_PREFLIGHT_CAP: Duration = Duration::from_secs(15);
+
+/// `LOOM_CODESIGN_IDENTITY` (env) > `codesign.identity` (resolved repo
+/// config) > `None` — the same precedence
+/// `_pmd_resolve_codesign_identity` implements in
+/// `scripts/install/provision-daemon.sh`, ported here so `health`'s finding
+/// and `sign_daemon_binary`'s own resolution can never disagree about which
+/// identity is actually configured.
+///
+/// Repo root for the config lookup: `LOOM_ROOT` (env) when set, else the
+/// first repo this daemon has registered ([`DaemonStatusReport::per_repo`]),
+/// else this process's own current directory — in that order, matching
+/// `sign_daemon_binary`'s own `$LOOM_ROOT` > `git rev-parse
+/// --show-toplevel`-via-cwd fallback as closely as a `health` CLI process
+/// (which is not necessarily invoked from inside a git checkout at all) can.
+fn resolve_configured_codesign_identity(status: Option<&DaemonStatusReport>) -> Option<String> {
+    if let Ok(v) = std::env::var("LOOM_CODESIGN_IDENTITY") {
+        if !v.trim().is_empty() {
+            return Some(v);
+        }
+    }
+
+    let repo_root = std::env::var_os("LOOM_ROOT")
+        .map(std::path::PathBuf::from)
+        .or_else(|| status.and_then(|s| s.per_repo.first().map(|r| r.root.clone())))
+        .or_else(|| std::env::current_dir().ok())?;
+
+    let effective = loom_daemon::config_resolver::resolve_effective_config(&repo_root);
+    loom_daemon::config_resolver::get_path(&effective, "codesign.identity")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Sign a THROWAWAY COPY of this process's own binary with `identity` under
+/// `cap` — never `<bin>` itself, and never the real daemon binary this
+/// process is running from. Returns `(true, "")` on a non-interactive
+/// success, else `(false, <reason>)`.
+fn codesign_preflight_capped(identity: &str, cap: Duration) -> (bool, String) {
+    let Ok(exe) = std::env::current_exe() else {
+        return (
+            false,
+            "could not resolve this process's own binary to preflight against".to_string(),
+        );
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "loom-codesign-preflight-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    if std::fs::copy(&exe, &tmp).is_err() {
+        return (
+            false,
+            "could not stage a throwaway copy of this binary to preflight".to_string(),
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&tmp) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&tmp, perms);
+        }
+    }
+
+    let result = codesign_run_capped(
+        &[
+            "-f",
+            "-s",
+            identity,
+            "--identifier",
+            "com.rjwalters.loom-daemon.preflight",
+            tmp.to_string_lossy().as_ref(),
+        ],
+        cap,
+    );
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Run `codesign <args>` under a hard wall-clock cap, killing it if it is
+/// still running once the cap elapses (Issue #7605): an identity whose
+/// private key lacks `codesign` in its keychain access control list raises
+/// a blocking SecurityAgent GUI prompt with no flag to suppress it and no
+/// bound on how long it waits — only a wall-clock cap from outside the
+/// `codesign` process can detect that.
+fn codesign_run_capped(args: &[&str], cap: Duration) -> (bool, String) {
+    let mut child = match std::process::Command::new("codesign")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return (false, format!("could not spawn codesign: {e}")),
+    };
+
+    let deadline = std::time::Instant::now() + cap;
+    loop {
+        match child.try_wait() {
+            Ok(Some(exit_status)) => {
+                return if exit_status.success() {
+                    (true, String::new())
+                } else {
+                    (false, format!("codesign exited with {exit_status}"))
+                };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return (
+                        false,
+                        format!(
+                            "timed out after {}s — likely cause: this identity's private key is \
+                             missing '/usr/bin/codesign' from its keychain access control list, \
+                             which raises a blocking Keychain prompt instead of signing \
+                             non-interactively",
+                            cap.as_secs()
+                        ),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => return (false, format!("error waiting on codesign: {e}")),
+        }
+    }
 }
 
 /// One bounded `DaemonStatus` round-trip, collapsed to
@@ -493,5 +688,70 @@ mod tests {
     fn resolve_retry_timeout_never_narrows_an_already_wider_base() {
         let wide = ESCALATED_IPC_TIMEOUT + Duration::from_secs(5);
         assert_eq!(resolve_retry_timeout(wide, true), wide);
+    }
+
+    // ===================================================================
+    // Codesign identity resolution (#7605)
+    // ===================================================================
+
+    /// `LOOM_CODESIGN_IDENTITY` (env) is the highest-precedence source — the
+    /// same rule `_pmd_resolve_codesign_identity` in
+    /// `scripts/install/provision-daemon.sh` follows — and must win even
+    /// when `LOOM_ROOT` points at a repo config that sets a different value.
+    #[test]
+    #[serial_test::serial(codesign_identity_env)]
+    fn resolve_configured_codesign_identity_prefers_env_over_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+        std::fs::write(
+            tmp.path().join(".loom/config.json"),
+            r#"{"codesign": {"identity": "Config Identity"}}"#,
+        )
+        .unwrap();
+
+        std::env::set_var("LOOM_CODESIGN_IDENTITY", "Env Identity");
+        std::env::set_var("LOOM_ROOT", tmp.path());
+        let resolved = resolve_configured_codesign_identity(None);
+        std::env::remove_var("LOOM_CODESIGN_IDENTITY");
+        std::env::remove_var("LOOM_ROOT");
+
+        assert_eq!(resolved.as_deref(), Some("Env Identity"));
+    }
+
+    /// With no env override, `codesign.identity` is read from the resolved
+    /// config at `LOOM_ROOT`.
+    #[test]
+    #[serial_test::serial(codesign_identity_env)]
+    fn resolve_configured_codesign_identity_falls_back_to_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+        std::fs::write(
+            tmp.path().join(".loom/config.json"),
+            r#"{"codesign": {"identity": "Config Identity"}}"#,
+        )
+        .unwrap();
+
+        std::env::remove_var("LOOM_CODESIGN_IDENTITY");
+        std::env::set_var("LOOM_ROOT", tmp.path());
+        let resolved = resolve_configured_codesign_identity(None);
+        std::env::remove_var("LOOM_ROOT");
+
+        assert_eq!(resolved.as_deref(), Some("Config Identity"));
+    }
+
+    /// Neither env nor a resolvable config with the key set -> `None`, the
+    /// same "nothing configured" outcome `sign_daemon_binary` treats as
+    /// "use ad-hoc signing" -- never a false positive finding.
+    #[test]
+    #[serial_test::serial(codesign_identity_env)]
+    fn resolve_configured_codesign_identity_is_none_when_unconfigured() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        std::env::remove_var("LOOM_CODESIGN_IDENTITY");
+        std::env::set_var("LOOM_ROOT", tmp.path());
+        let resolved = resolve_configured_codesign_identity(None);
+        std::env::remove_var("LOOM_ROOT");
+
+        assert_eq!(resolved, None);
     }
 }
