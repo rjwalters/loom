@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-13
+- **Issue #7608** (closed): auto_update: the clean-tree gate counts UNTRACKED files as dirty — two 75-byte leftovers silenced unattended rebuilds on two fleet hosts for weeks
+- **PR #7615**: fix(daemon): clean-tree gate no longer treats unrelated untracked files as dirty
+- **Issue #7571** (closed): CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom:* labels
+- **PR #7616**: docs: correct CONTRIBUTING.md's Dependabot PR claim to match dependabot.yml
+- **Issue #7613** (closed): Champion Tier 3 backlog cap counts loom:operator-only/loom:blocked issues, permanently pinning the cap
+- **PR #7614**: fix: exclude operator-only/blocked issues from Tier 3 backlog cap
 - **Issue #7604** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7603** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
 - **Issue #7596** (closed): recover-orphans CLI path shares #7591's lease-probe read-failure/absence conflation
@@ -15,6 +21,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #7597**: fix: don't let a lease-probe read failure count as an absent lease during reconciliation
 - **PR #7588**: health: add unconditional auto_update section
 - **Issue #7584** (closed): auto_update: dirty primary checkout silently blocks rebuild for days, invisible to health/status
+- **PR #7395**: chore(deps): bump hono from 4.12.32 to 4.13.7 in /mcp-loom
 - **Issue #7586** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
 - **PR #7138**: chore(deps): bump fast-uri from 3.1.4 to 3.1.7 in /mcp-loom
 - **PR #7137**: chore(deps): bump qs from 6.15.3 to 6.16.0 in /mcp-loom

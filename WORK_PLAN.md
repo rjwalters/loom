@@ -30,12 +30,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
 - **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
 - **#7594**: fix: back off and surface permanently-failing worktree removals (#7590)
+- **#7610**: release: publish a Release with signed artifacts on every VERSION bump (#7609)
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#7605**: provision-daemon: sign_daemon_binary hangs on a keychain GUI prompt when the configured codesign identity's key lacks codesign in its ACL — preflight non-interactively and fall back
+- **#7612**: Watchdog cleanup discards a newly leased worktree before redispatch ownership check
 
 ## Ready
 
@@ -47,7 +49,13 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#7567**: Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries)
+- **#7605**: provision-daemon: sign_daemon_binary hangs on a keychain GUI prompt when the configured codesign identity's key lacks codesign in its ACL — preflight non-interactively and fall back
+- **#7606**: work_finder: a guarded issue is re-probed on every 60 s tick — put open-PR-guard refusals on the #4485 backoff ladder and short-circuit the closed-issue probe when the open-PR memo is fresh
+- **#7607**: role_runner: pre-flight the token pool's spawnable count before each role tick — ~600 ticks/host/day spawn a 10 s process that exits 78 at token selection
+- **#7609**: daemon auto-update: drive rolls from the latest Release artifact, not source-checkout staleness — the source gate is shut on every fleet host today
+- **#7612**: Watchdog cleanup discards a newly leased worktree before redispatch ownership check
+- **#7617**: Curator's blocked-issue re-check claims/unclaims loom:curating on every pass instead of checking the fingerprint first
 
 ## PRs Awaiting Review
 
@@ -110,9 +118,13 @@ Issues carrying `loom:curated`.
 - **#7526**: daemon: use #7513's phase-timing instrumentation to fix the actual status/health IPC bottleneck (ask 2/3) *(curated)*
 - **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
 - **#7567**: Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries) *(curated)*
-- **#7571**: CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom:* labels *(curated)*
 - **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility *(curated)*
 - **#7605**: provision-daemon: sign_daemon_binary hangs on a keychain GUI prompt when the configured codesign identity's key lacks codesign in its ACL — preflight non-interactively and fall back *(curated)*
+- **#7606**: work_finder: a guarded issue is re-probed on every 60 s tick — put open-PR-guard refusals on the #4485 backoff ladder and short-circuit the closed-issue probe when the open-PR memo is fresh *(curated)*
+- **#7607**: role_runner: pre-flight the token pool's spawnable count before each role tick — ~600 ticks/host/day spawn a 10 s process that exits 78 at token selection *(curated)*
+- **#7609**: daemon auto-update: drive rolls from the latest Release artifact, not source-checkout staleness — the source gate is shut on every fleet host today *(curated)*
+- **#7612**: Watchdog cleanup discards a newly leased worktree before redispatch ownership check *(curated)*
+- **#7617**: Curator's blocked-issue re-check claims/unclaims loom:curating on every pass instead of checking the fingerprint first *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -131,13 +143,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 21 |
-| Urgent | 0 |
+| Operator merge-risk holds | 22 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 7 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 22 |
-| Curated | 27 |
+| Curated | 31 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
