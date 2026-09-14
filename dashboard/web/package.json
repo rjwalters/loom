@@ -17,9 +17,9 @@
     "check": "npm run typecheck && npm run test"
   },
   "devDependencies": {
-    "happy-dom": "^15.11.7",
-    "typescript": "^5.7.2",
-    "vite": "^6.0.7",
-    "vitest": "^3.2.4"
+    "happy-dom": "^20.14.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "vitest": "^5.0.0"
   }
 }
