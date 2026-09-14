@@ -210,6 +210,15 @@ pub(crate) enum CollisionClass {
 pub(crate) struct LeaseComment {
     pub(crate) id: u64,
     pub(crate) created_at: Option<DateTime<Utc>>,
+    /// The comment's own forge-assigned `updated_at` (Issue #7612) — the
+    /// liveness signal per `defaults/docs/lease-record.md`'s load-bearing
+    /// design decision (renewal PATCHes this same comment, advancing
+    /// `updated_at` without ever creating a new one). [`resolve_lease_order`]
+    /// does not consult this field (it orders by `id`/`created_at` only,
+    /// within a claim episode); [`SweepRegistry::freshest_lease_owner`] is
+    /// what reads it, to find which sweep currently holds the most-recently
+    /// renewed lease on an issue.
+    pub(crate) updated_at: Option<DateTime<Utc>>,
     pub(crate) host: String,
     pub(crate) sweep_id: String,
 }
@@ -1519,6 +1528,11 @@ impl SweepRegistry {
                 .and_then(serde_json::Value::as_str)
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
+            let updated_at = item
+                .get("updated_at")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
             let Some(body) = item.get("body").and_then(serde_json::Value::as_str) else {
                 continue;
             };
@@ -1528,6 +1542,7 @@ impl SweepRegistry {
             out.push(LeaseComment {
                 id,
                 created_at,
+                updated_at,
                 host,
                 sweep_id,
             });
@@ -1552,9 +1567,21 @@ impl SweepRegistry {
     /// (Issue #4637), and an array-literal filter turns a multi-page result
     /// into `[...][...]`, which is not valid JSON.
     ///
-    /// FAIL-OPEN: returns `None` on any unresolved repo, timeout, or
-    /// non-zero exit — callers MUST treat `None` as "unverifiable, do not
-    /// block", matching every other forge probe in this module.
+    /// Also carries each comment's `updated_at` (Issue #7612) alongside the
+    /// `created_at` [`resolve_lease_order`] already consumed —
+    /// [`SweepRegistry::freshest_lease_owner`] (`watchdog.rs`) is the second
+    /// reader, using `updated_at` (the renewal loop's PATCH target) rather
+    /// than `created_at` (fixed at comment creation) to find which sweep
+    /// currently holds the most-recently-renewed lease on an issue.
+    ///
+    /// This function itself only reports transport success/failure — `None`
+    /// on any unresolved repo, timeout, or non-zero exit. What a caller does
+    /// with that `None` is the caller's call: [`resolve_lease_order`] treats
+    /// it as FAIL-OPEN ("unverifiable, do not block a dispatch"), while
+    /// [`SweepRegistry::freshest_lease_owner`]'s destructive-cleanup caller
+    /// deliberately treats it as FAIL-CLOSED ("unverifiable, do not destroy
+    /// data") — see that function's own doc comment for why the two
+    /// call sites disagree on purpose.
     ///
     /// [`parse_lease_comments_json`]: Self::parse_lease_comments_json
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
@@ -1570,7 +1597,7 @@ impl SweepRegistry {
             .arg("--paginate")
             .arg("--jq")
             .arg(format!(
-                r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, body: .body}}"#,
+                r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, updated_at: .updated_at, body: .body}}"#,
                 prefix = LEASE_MARKER_PREFIX,
             ));
         cmd.current_dir(&self.config.workspace_root);
