@@ -52,6 +52,19 @@ name: Build and Release
 # path in `loom-daemon-update.sh` remains the default/fallback for dev
 # machines, canaries, and forks with no Release access.
 #
+# Release on every VERSION bump (#7609): a `push` to `main` that
+# changes `VERSION` runs the `resolve` job first, which creates the tag
+# `v<VERSION>` at that commit and a GitHub Release for it (skipping cleanly
+# when the Release already exists), and every later job keys off
+# `needs.resolve.outputs.{tag,publish}` instead of the raw trigger event. A
+# Release created with the workflow's own GITHUB_TOKEN does NOT fire a second
+# `release` event, so a bump produces exactly one run. This is what keeps the
+# signed artifacts current with `main` — before it, Releases were cut by hand
+# at minor versions only, the fleet's self-update could never resolve a
+# current artifact (#6010), and every host rebuilt from source (and on macOS
+# re-signed locally, #7605). A hand-created Release or a `workflow_dispatch`
+# dry run behaves exactly as before.
+#
 # Each target builds in its own matrix job with `fail-fast: false`: one
 # platform's build failure fails that job (and therefore the overall workflow
 # run) loudly — it never silently drops just that platform's artifact while
@@ -80,12 +93,22 @@ name: Build and Release
 on:
   release:
     types: [created]
+  push:
+    branches: [main]
+    paths: [VERSION]
   workflow_dispatch:
     inputs:
       tag:
         description: 'Release tag to build for (e.g., v0.1.0)'
         required: false
         type: string
+
+# One run per tag: a second push of the same VERSION (or a manual re-run) waits
+# rather than racing the first run's asset uploads. Never cancels — a half-
+# uploaded Release is worse than a late one.
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.event.inputs.tag || github.sha }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -100,8 +123,72 @@ permissions:
   packages: write
 
 jobs:
+  # Resolves the ONE tag every later job builds, uploads to, and downloads
+  # from, and whether this run publishes at all:
+  #   release           → the created Release's tag; publish=true
+  #   workflow_dispatch → inputs.tag (may be empty = build github.ref);
+  #                       publish=false (Actions artifacts only, as before)
+  #   push (VERSION)    → v<VERSION>; creates tag + Release if absent →
+  #                       publish=true; publish=skip if it already exists
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag (and create the Release on a VERSION bump)
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            release)
+              echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            workflow_dispatch)
+              echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            push)
+              version="$(./scripts/version.sh)"
+              tag="v${version}"
+              if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+                echo "::notice::Release $tag already exists — this push publishes nothing."
+                echo "- SKIPPED: Release \`$tag\` already exists." >> "$GITHUB_STEP_SUMMARY"
+                echo "tag=$tag" >> "$GITHUB_OUTPUT"
+                echo "publish=skip" >> "$GITHUB_OUTPUT"
+              else
+                # --target creates the tag at this exact commit when it does not
+                # exist yet; --generate-notes diffs against the previous tag.
+                gh release create "$tag" --repo "$REPO" --target "$SHA" \
+                  --title "$tag" --generate-notes
+                echo "- Created Release \`$tag\` at \`${SHA:0:12}\` (VERSION bump on main)." >> "$GITHUB_STEP_SUMMARY"
+                echo "tag=$tag" >> "$GITHUB_OUTPUT"
+                echo "publish=true" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            *)
+              echo "::error::unsupported event $EVENT_NAME"; exit 1
+              ;;
+          esac
+
   build-daemon:
     name: Build loom-daemon (${{ matrix.target }})
+    needs: resolve
+    if: needs.resolve.outputs.publish != 'skip'
     runs-on: ${{ matrix.os }}
     strategy:
       # Never mask a platform's failure with another's success, and never let
@@ -126,7 +213,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.tag || github.ref }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -383,9 +470,10 @@ jobs:
           ls -la
 
       - name: Upload release assets
-        if: github.event_name == 'release'
+        if: needs.resolve.outputs.publish == 'true'
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
           # The `*.sig` glob matches the detached Linux signature when cosign
           # signing ran and matches nothing otherwise (skipped, not an error) —
           # so the same block covers signed and unsigned releases. `*.pem`
@@ -401,7 +489,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifacts (for manual runs)
-        if: github.event_name == 'workflow_dispatch'
+        if: needs.resolve.outputs.publish == 'false'
         uses: actions/upload-artifact@v7
         with:
           name: loom-daemon-${{ matrix.target }}
@@ -422,7 +510,8 @@ jobs:
     # to succeed before publishing — a failed platform build for `build-daemon`
     # fails that job as a whole, so this job never runs (and never publishes)
     # against a release the binary matrix itself considers broken.
-    needs: build-daemon
+    needs: [resolve, build-daemon]
+    if: needs.resolve.outputs.publish != 'skip'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -431,7 +520,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.tag || github.ref }}
 
       # Image version = loom version (AC): read the same version.sh every
       # other version-bearing file in the repo is kept in sync against, at
@@ -453,13 +542,13 @@ jobs:
       # consumed by this job until now (see docker/worker/README.md
       # "Versioning and publishing").
       - name: Download loom-daemon release assets (release event)
-        if: github.event_name == 'release'
+        if: needs.resolve.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          gh release download "${{ github.event.release.tag_name }}" \
+          gh release download "${{ needs.resolve.outputs.tag }}" \
             --repo "${{ github.repository }}" \
             --pattern 'loom-daemon-x86_64-unknown-linux-gnu*' \
             --pattern 'loom-daemon-aarch64-unknown-linux-gnu*' \
@@ -469,7 +558,7 @@ jobs:
           sha256sum -c loom-daemon-aarch64-unknown-linux-gnu.sha256
 
       - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+        if: needs.resolve.outputs.publish == 'false'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
@@ -478,7 +567,7 @@ jobs:
           # the default (repo root) lands it at `dist/loom-daemon-…` directly.
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+        if: needs.resolve.outputs.publish == 'false'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
@@ -551,7 +640,7 @@ jobs:
       # CI (no native arm64 runner here; see docker/worker/README.md for the
       # manual Apple-Silicon verification this still requires).
       - name: Build and push multi-arch loom-worker image
-        if: github.event_name == 'release' && github.repository == 'rjwalters/loom'
+        if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -582,7 +671,8 @@ jobs:
     # before this job's own multi-arch push step runs, so the REGISTRY
     # `ghcr.io/rjwalters/loom-worker:<version>` this job's BASE_IMAGE names
     # for that step is already a real amd64+arm64 manifest, not amd64-only.
-    needs: build-worker-image
+    needs: [resolve, build-worker-image]
+    if: needs.resolve.outputs.publish != 'skip'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -591,7 +681,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.tag || github.ref }}
 
       - name: Resolve image version
         id: version
@@ -604,13 +694,13 @@ jobs:
       # exactly (this job's local base-image rebuild below needs the same
       # per-arch staging the base Dockerfile's LOOM_DAEMON_BIN ARG expects).
       - name: Download loom-daemon release assets (release event)
-        if: github.event_name == 'release'
+        if: needs.resolve.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          gh release download "${{ github.event.release.tag_name }}" \
+          gh release download "${{ needs.resolve.outputs.tag }}" \
             --repo "${{ github.repository }}" \
             --pattern 'loom-daemon-x86_64-unknown-linux-gnu*' \
             --pattern 'loom-daemon-aarch64-unknown-linux-gnu*' \
@@ -620,13 +710,13 @@ jobs:
           sha256sum -c loom-daemon-aarch64-unknown-linux-gnu.sha256
 
       - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+        if: needs.resolve.outputs.publish == 'false'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+        if: needs.resolve.outputs.publish == 'false'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
@@ -699,7 +789,7 @@ jobs:
       # rather than resolving from this job's amd64-only local store (which
       # has no arm64 base image to offer the arm64 leg at all).
       - name: Build and push multi-arch loom-worker-session image
-        if: github.event_name == 'release' && github.repository == 'rjwalters/loom'
+        if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
         uses: docker/build-push-action@v7
         with:
           context: .
