@@ -611,11 +611,11 @@ findings are **arbitrary fact-checkable claims about repo state** instead — a
 finding like "`layout/toolchain.json` still carries the old pin" or "`file.py`
 does not exist anywhere in this repo" is exactly as self-clearing as an open
 dependency once the underlying fact changes, but verifying it requires
-*reading the repo*, which no script can do generically. `--check-fact-
-unescalate` therefore takes the caller's own per-finding verdicts (`RESOLVED`/
-`UNRESOLVED`, one per finding, evidence included) and enforces the same
-safety-guard SHAPE the dependency-timing mechanism already established
-around them:
+*reading the repo*, which no script can do generically.
+`--check-fact-unescalate` therefore takes the caller's own per-finding
+verdicts (`RESOLVED`/`UNRESOLVED`, one per finding, evidence included) and
+enforces the same safety-guard SHAPE the dependency-timing mechanism already
+established around them:
 
 | Guard | Same as `--check-unescalate`? |
 |---|---|

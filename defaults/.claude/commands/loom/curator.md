@@ -1835,11 +1835,12 @@ fi
 above being read-only.** That section re-checks a *named reference*
 (`Blocked by #N`, an epic header) and never removes anything. This section
 covers a *different* shape: a `loom:operator-only` issue Champion escalated
-via its own N=2 "repeated rejection without revision" gate (`<!-- champion:
-proposal-escalated -->`), whose recurring findings are **fact-checkable
-claims about repo state** rather than a named reference — e.g. "`layout/
-toolchain.json` still carries the old pin" or "`verification/_repo_utils.py`
-does not exist anywhere in this repo". A finding like that can go stale in
+via its own N=2 "repeated rejection without revision" gate
+(`<!-- champion:proposal-escalated -->`), whose recurring findings are
+**fact-checkable claims about repo state** rather than a named reference —
+e.g. "`layout/toolchain.json` still carries the old pin" or
+"`verification/_repo_utils.py` does not exist anywhere in this repo". A
+finding like that can go stale in
 hours (a sibling PR lands the exact fact it cited) with no mechanism to
 notice: the body hash is unchanged, so Champion keeps silently skipping, and
 `loom:operator-only` makes every other pass skip it too. The motivating
@@ -1859,9 +1860,9 @@ place — see "Choose the sub-kind before posting" in that file's escalation
 step). Do not attempt this procedure on an escalation `--check-unescalate`
 would already handle; let Pass 0 handle it.
 
-**When this applies**: a `loom:operator-only` issue that carries a `<!--
-champion:proposal-escalated -->` comment (own-marker-only — see "What this
-never does" below) whose **Recurring findings** bullets are fact-checkable
+**When this applies**: a `loom:operator-only` issue that carries a
+`<!-- champion:proposal-escalated -->` comment (own-marker-only — see "What
+this never does" below) whose **Recurring findings** bullets are fact-checkable
 claims you can independently re-verify by reading the current repo (files,
 other issues/PRs) — not a preference call, not something only Champion's own
 re-evaluation could settle.
@@ -1954,8 +1955,8 @@ re-evaluation could settle.
 
 ### What this never does
 
-- Never touches a `loom:operator-only` issue with no `<!-- champion:
-  proposal-escalated -->` comment — a label a human or any other path
+- Never touches a `loom:operator-only` issue with no
+  `<!-- champion:proposal-escalated -->` comment — a label a human or any other path
   applied carries no such record and is left strictly alone (the script
   enforces this too, but do not rely on the script alone: confirm the marker
   is present before starting step 3's investigation at all).
