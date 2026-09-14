@@ -1311,6 +1311,19 @@ pub(crate) fn running_issue_sweep_id(reg: &SweepRegistry, issue: u32) -> Option<
         .map(|i| i.sweep_id.clone())
 }
 
+/// The `PrSet` counterpart of [`running_issue_sweep_id`] (Issue #7649): finds
+/// a live sweep whose kind is exactly `PrSet(prs)` (order-sensitive, mirroring
+/// how `SweepKind::PrSet` dispatch is always called with a specific ordering).
+pub(crate) fn running_prset_sweep_id(reg: &SweepRegistry, prs: &[u32]) -> Option<String> {
+    reg.entries
+        .values()
+        .find(|i| {
+            matches!(i.state, SweepState::Running | SweepState::Pending)
+                && matches!(&i.kind, SweepKind::PrSet(set) if set.as_slice() == prs)
+        })
+        .map(|i| i.sweep_id.clone())
+}
+
 // --- closed-issue dispatch guard (Issue #4088, AC6; widened by #4504) ---
 
 /// Render the post-`--jq` payload of the #4504 issue-state probe
@@ -1441,6 +1454,102 @@ pub(crate) fn open_pr_guard_registry(
     config.spawn_bin = Some(spawn);
     config.gh_bin = Some(fake_gh);
     config.skip_label_flip = skip_label_flip;
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    (SweepRegistry::new(config), gh_log)
+}
+
+/// Like [`open_pr_guard_registry`], but the spawn script is **long-lived**
+/// (emits the account-selection line, then sleeps) rather than an
+/// echo-and-exit, mirroring [`hung_child_registry`]'s shape (Issue #7649).
+///
+/// The review-stall watchdog's recovery-conversion path needs BOTH
+/// properties `open_pr_guard_registry` and `hung_child_registry` each
+/// provide alone but never together: a sweep that stays `SweepState::Running`
+/// with a live, retained `Child` handle long enough for `review_stall_watchdog_once`
+/// to observe log silence and `cancel()` it, AND a real (`skip_label_flip =
+/// false`) #4123 open-PR guard on the recovery re-dispatch that follows.
+///
+/// The `api graphql` arm is **stateful** (a call-count file under `ws`):
+/// the FIRST `closedByPullRequestsReferences` probe always answers "no open
+/// PR" (so the fixture's own initial `dispatch()` — needed to get a sweep
+/// into `SweepState::Running` in the first place — is not itself refused by
+/// the very guard the test means to exercise on RECOVERY), and every probe
+/// from the second call onward answers `graphql_prs`/`graphql_exit`. Only a
+/// VERIFIED `OpenPrProbe::Open` answer is ever memoized (Issue #6788) — the
+/// first call's "no open PR" verdict is not cached — so the second (real,
+/// re-dispatch-triggered) probe always reaches this script rather than
+/// replaying a stale first answer.
+pub(crate) fn open_pr_review_stall_registry(
+    ws: &Path,
+    graphql_prs: &str,
+    graphql_exit: i32,
+) -> (SweepRegistry, PathBuf) {
+    let gh_log = ws.join("gh-invocations.log");
+    let fake_gh = ws.join("fake-gh.sh");
+    let graphql_calls = ws.join("graphql-call-count");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             count=$(( $(cat \"{counter}\" 2>/dev/null || echo 0) + 1 ))\n\
+             printf '%s' \"$count\" > \"{counter}\"\n\
+             if [[ \"$count\" -le 1 ]]; then\n\
+             printf '{{\"data\":{{\"repository\":{{\"issue\":{{\"closedByPullRequestsReferences\":{{\"nodes\":[]}}}}}}}}}}\\n'\n\
+             exit 0\n\
+             fi\n\
+             nodes=\"\"\n\
+             for n in {prs}; do\n\
+             [[ -n \"$nodes\" ]] && nodes=\"$nodes,\"\n\
+             nodes=\"$nodes{{\\\"number\\\":$n,\\\"state\\\":\\\"OPEN\\\"}}\"\n\
+             done\n\
+             printf '{{\"data\":{{\"repository\":{{\"issue\":{{\"closedByPullRequestsReferences\":{{\"nodes\":[%s]}}}}}}}}}}\\n' \"$nodes\"\n\
+             exit {exit_code}\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        log = gh_log.display(),
+        counter = graphql_calls.display(),
+        prs = graphql_prs,
+        exit_code = graphql_exit,
+        state = state_probe_json("open", false),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    std::fs::write(
+        &spawn,
+        "#!/usr/bin/env bash\n\
+         echo \"spawn-claude: using OAuth account 'faketok' (mode=random)\"\n\
+         sleep 30\n",
+    )
+    .unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+    touch_sweep_command(ws);
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
     config.journal_path = Some(ws.join("test-sweeps-journal.json"));
     (SweepRegistry::new(config), gh_log)
 }

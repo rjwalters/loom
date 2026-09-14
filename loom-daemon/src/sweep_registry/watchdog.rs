@@ -1689,6 +1689,20 @@ impl SweepRegistry {
     /// frozen `sweep.issue.{N}.crashed` topic. Returns the number of sweeps
     /// restarted this tick.
     ///
+    /// # Open-linked-PR handoff (Issue #7649)
+    ///
+    /// A cancelled sweep that already produced a PR is not fresh Issue work,
+    /// so its Issue-keyed recovery re-dispatch correctly hits the #4123
+    /// open-PR guard ([`OpenPrDispatchError`]). Rather than let that refusal
+    /// consume the bounded retry and strand the PR (the kicad-tools
+    /// #5366/#5371 incident this issue documents), the recovery converts to
+    /// the established `SweepKind::PrSet` Mode C surface (#5342/#6593) for
+    /// the exact PR the guard confirmed — Judge/Doctor -> Merge processing
+    /// picks it up with no Curator/Builder re-run and no worktree touch. The
+    /// conversion only fires on a downcast-matched, VERIFIED
+    /// `OpenPrDispatchError` (never a string-matched guess), so an
+    /// ambiguous/failed probe or any other refusal reason is unaffected.
+    ///
     /// [`sweep_made_progress`]: SweepRegistry::sweep_made_progress
     pub fn review_stall_watchdog_once(&mut self, timeout: Duration) -> usize {
         // Snapshot eligible candidates first so we can mutate below (mirrors
@@ -1807,11 +1821,105 @@ impl SweepRegistry {
                             );
                         }
                         Err(e) => {
-                            log::error!(
-                                "review-stall-watchdog: re-dispatch of issue #{issue} after a \
-                                 stall failed: {e} (issue left recoverable — its claim was already \
-                                 restored)."
-                            );
+                            // Issue #7649: the #4123 open-PR guard (dispatch.rs
+                            // step 2.6) correctly refuses this Issue-keyed
+                            // re-dispatch when issue #{issue} still has a
+                            // CONFIRMED open linked PR — that PR is this very
+                            // sweep's own already-built output (the review
+                            // phase that stalled was reviewing/repairing it),
+                            // not fresh Issue work. Before this fix the retry
+                            // was simply consumed here and the PR was
+                            // stranded (the kicad-tools #5366/#5371 incident
+                            // this issue documents). Route it to the
+                            // established Mode C surface instead —
+                            // `SweepKind::PrSet` (#5342), exactly the
+                            // alternative `OpenPrDispatchError`'s own
+                            // `Display` names (#6593) — so Judge/Doctor ->
+                            // Merge picks the PR up directly: no
+                            // Curator/Builder re-run, no worktree touch, and
+                            // the normal PR claim-lock dedup + capacity
+                            // admission + operator/review-hold handling that
+                            // every other PrSet dispatch already gets.
+                            //
+                            // Only a VERIFIED `OpenPrDispatchError` (produced
+                            // solely from a confirmed `OpenPrProbe::Open`,
+                            // never from an ambiguous/failed probe — see
+                            // dispatch.rs step 2.6's fail-open comment)
+                            // triggers this conversion; a downcast match
+                            // rather than string-parsing keeps that
+                            // guarantee intact. Every other refusal (park
+                            // label, backoff, workspace-commands, a spawn
+                            // failure, …) falls through to the original
+                            // error log, unchanged.
+                            if let Some(open_pr) = e.downcast_ref::<OpenPrDispatchError>() {
+                                let pr = open_pr.pr;
+                                log::warn!(
+                                    "review-stall-watchdog: issue #{issue}'s Issue-keyed \
+                                     recovery re-dispatch was refused because it already has a \
+                                     confirmed open linked PR #{pr} — converting the recovery \
+                                     to kind=PrSet([{pr}]) (Mode C, #5342/#6593) so the already- \
+                                     built PR reaches Judge/Doctor -> Merge instead of being \
+                                     stranded (#7649)."
+                                );
+                                match self.dispatch(
+                                    &SweepKind::PrSet(vec![pr]),
+                                    // Deliberately NOT the captured Issue-kind
+                                    // `idempotency_key`: `PrSet` is a distinct
+                                    // idempotency/claim domain (per-PR locks,
+                                    // not the per-issue claim lock), so reusing
+                                    // the Issue key here would dedup against
+                                    // the wrong namespace.
+                                    None,
+                                    model.as_deref(),
+                                    effort.as_deref(),
+                                    // `depends_on` (stacked-PR chaining) is
+                                    // Issue-only and silently ignored by PrSet
+                                    // dispatch regardless; pass None for
+                                    // clarity at the call site.
+                                    None,
+                                ) {
+                                    Ok(outcome) => {
+                                        restarts += 1;
+                                        log::warn!(
+                                            "review-stall-watchdog: recovered issue #{issue}'s \
+                                             stalled review onto PR #{pr} as {} (pid {}) via a \
+                                             PrSet conversion (#7649).",
+                                            outcome.sweep_id,
+                                            outcome.pid
+                                        );
+                                    }
+                                    Err(pr_err) => {
+                                        // Expected, not a bug: the PR is
+                                        // already claimed by a live peer PR
+                                        // sweep (per-PR lock collision), or a
+                                        // capacity/park/runtime-admission
+                                        // guard on the PrSet path refused —
+                                        // either way this is a deliberate
+                                        // skip, not a lost recovery: the
+                                        // issue's claim was already restored
+                                        // by `cancel()` above, and the #4123
+                                        // guard keeps refusing ordinary
+                                        // Issue-keyed re-dispatch of it for as
+                                        // long as PR #{pr} stays open, so the
+                                        // periodic Judge/Champion roles (or
+                                        // whichever sweep already owns the PR
+                                        // lock) remain the PR's path forward.
+                                        log::error!(
+                                            "review-stall-watchdog: PR-set recovery dispatch for \
+                                             issue #{issue}'s open PR #{pr} failed: {pr_err} \
+                                             (issue left recoverable — its claim was already \
+                                             restored; a live peer PR sweep or a hold on the PR \
+                                             may already own it)."
+                                        );
+                                    }
+                                }
+                            } else {
+                                log::error!(
+                                    "review-stall-watchdog: re-dispatch of issue #{issue} after a \
+                                     stall failed: {e} (issue left recoverable — its claim was \
+                                     already restored)."
+                                );
+                            }
                         }
                     }
                 }
@@ -3887,7 +3995,263 @@ mod tests {
         let _ = reg.cancel(&second_id, Duration::from_secs(2));
     }
 
-    /// Issue #5431: the watchdog give-up comment must thread a registered
+    // --- review_stall_watchdog_once: open-linked-PR handoff (Issue #7649) ---
+
+    /// Core acceptance criterion: a review-stalled sweep whose issue already
+    /// has a CONFIRMED open linked PR converts its recovery to
+    /// `SweepKind::PrSet` instead of restarting `Issue` work — no second
+    /// Builder/Curator spawn, the issue's own worktree (and any uncommitted
+    /// bytes in it) is left completely untouched, and the returned/dispatched
+    /// kind is `PrSet`, not `Issue`.
+    #[test]
+    #[serial]
+    fn review_stall_watchdog_converts_open_pr_recovery_to_prset() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = open_pr_review_stall_registry(ws, "9200", 0);
+
+        // 1. Dispatch a sweep for issue 9100 and mark it past startup with a
+        //    worktree carrying uncommitted bytes — the recovery conversion
+        //    below must leave this file untouched (never clean/reset the
+        //    worktree, per the issue's explicit constraint).
+        let out = reg
+            .dispatch(&SweepKind::Issue(9100), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS), "fixture child should start");
+        let wt = ws.join(".loom").join("worktrees").join("issue-9100");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("dirty.txt"), "uncommitted Builder output\n").unwrap();
+
+        // 2. Generous timeout ⇒ the freshly-written log is not idle ⇒ healthy.
+        assert_eq!(
+            reg.review_stall_watchdog_once(Duration::from_secs(3600)),
+            0,
+            "a sweep still emitting log output is not disturbed"
+        );
+
+        // 3. Zero timeout forces the stall verdict. The Issue-keyed recovery
+        //    re-dispatch hits the real #4123 open-PR guard (PR #9200 is
+        //    open) and is refused — the fix converts that refusal into a
+        //    `PrSet([9200])` dispatch instead of stranding the recovery.
+        let restarts = reg.review_stall_watchdog_once(Duration::ZERO);
+        assert_eq!(restarts, 1, "the conversion counts as one recovered sweep");
+
+        // No Issue-kind sweep for 9100 is running — no Builder/Curator was
+        // re-spawned for it.
+        assert!(
+            running_issue_sweep_id(&reg, 9100).is_none(),
+            "the Issue-keyed recovery must not run — its open PR already exists"
+        );
+        // A PrSet([9200]) sweep IS running — Judge/Doctor -> Merge picks up
+        // the existing PR directly.
+        let prset_id = running_prset_sweep_id(&reg, &[9200])
+            .expect("the recovery must convert to a PrSet([9200]) dispatch");
+
+        // Bounded retry bookkeeping unchanged: the single allowed attempt for
+        // issue 9100 is consumed exactly like an ordinary Issue-kind restart.
+        assert!(reg.review_stall_retried.contains(&9100), "issue marked retried (bounded)");
+
+        // The worktree — and its uncommitted bytes — must be completely
+        // untouched: no clean, no reset.
+        assert_eq!(
+            std::fs::read_to_string(wt.join("dirty.txt")).unwrap(),
+            "uncommitted Builder output\n",
+            "the PrSet conversion must never touch the issue's worktree"
+        );
+
+        // The issue's claim was restored by `cancel()` (loom:building ->
+        // loom:issue) exactly as an ordinary recovery would, but no SECOND
+        // claim flip (loom:issue -> loom:building) happened for 9100 — the
+        // guard refused before any label mutation, so the original claim
+        // (at the initial `dispatch()` above) is the ONLY claim flip issue
+        // 9100 ever sees.
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 9100 --remove-label loom:building --add-label loom:issue"),
+            "cancel() must restore the issue's claim; got: {calls:?}"
+        );
+        let claim_count = calls
+            .lines()
+            .filter(|l| {
+                l.contains("issue edit 9100 --remove-label loom:issue --add-label loom:building")
+            })
+            .count();
+        assert_eq!(
+            claim_count, 1,
+            "only the ORIGINAL dispatch may claim issue 9100 — no second reclaim on the refused \
+             recovery; got: {calls:?}"
+        );
+
+        // Cleanup: cancel the lingering PrSet child + release its PR lock.
+        let _ = reg.cancel(&prset_id, Duration::from_secs(2));
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// No linked PR ⇒ the Issue-keyed recovery is unaffected: the open-PR
+    /// guard finds nothing, so the ordinary re-dispatch proceeds exactly as
+    /// before this fix — proven against the REAL guard (`skip_label_flip =
+    /// false`), not the guard-skipping `hung_child_registry` fixture the
+    /// pre-existing bounded-retry test above uses.
+    #[test]
+    #[serial]
+    fn review_stall_watchdog_retains_issue_recovery_when_no_linked_pr() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = open_pr_review_stall_registry(ws, "", 0);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(9101), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+        let wt = ws.join(".loom").join("worktrees").join("issue-9101");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let restarts = reg.review_stall_watchdog_once(Duration::ZERO);
+        assert_eq!(restarts, 1, "an ordinary Issue-keyed restart, unconverted");
+        let second_id = running_issue_sweep_id(&reg, 9101)
+            .expect("no open PR ⇒ the Issue recovery must proceed normally");
+        assert!(
+            reg.entries
+                .values()
+                .all(|i| !matches!(i.kind, SweepKind::PrSet(_))),
+            "no PrSet conversion should ever happen when there is no open linked PR"
+        );
+
+        let _ = reg.cancel(&second_id, Duration::from_secs(2));
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// A live peer sweep already owns the PR-set claim lock for the open
+    /// linked PR (the "existing PR owner deduplicates" acceptance criterion):
+    /// the conversion attempt must fail closed (PR lock collision), never
+    /// invent a duplicate PrSet sweep, and must not panic or otherwise crash
+    /// the watchdog tick — the issue is simply left recoverable for the next
+    /// pass (bounded: the single retry for THIS issue is still consumed, so
+    /// it does not loop).
+    #[test]
+    #[serial]
+    fn review_stall_watchdog_prset_conversion_dedupes_against_existing_pr_owner() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = open_pr_review_stall_registry(ws, "9300", 0);
+
+        // A peer sweep already holds PR #9300's claim lock.
+        reg.acquire_pr_lock(9300, "peer-sweep-already-running")
+            .unwrap();
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(9102), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+        let wt = ws.join(".loom").join("worktrees").join("issue-9102");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        // The conversion is attempted but the PR lock collision refuses it —
+        // no sweep recovered this tick, and no duplicate PrSet spawned.
+        let restarts = reg.review_stall_watchdog_once(Duration::ZERO);
+        assert_eq!(restarts, 0, "a PR-lock collision must not be counted as a recovery");
+        assert!(
+            running_issue_sweep_id(&reg, 9102).is_none(),
+            "no Issue-keyed sweep should be running either — the guard still refuses it"
+        );
+        assert!(
+            running_prset_sweep_id(&reg, &[9300]).is_none(),
+            "must not spawn a duplicate PrSet sweep for a PR another sweep already owns"
+        );
+        // Bounded: the single retry is still consumed even though the
+        // conversion attempt itself failed, so this issue never loops.
+        assert!(reg.review_stall_retried.contains(&9102));
+
+        // Cleanup: release the peer's lock.
+        let _ = reg.release_pr_lock_owned(9300, "peer-sweep-already-running");
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// An ambiguous/failed open-PR probe (a `gh api graphql` outage) must
+    /// never be misread as a confirmed open PR — `dispatch()`'s guard already
+    /// fails OPEN in that case (proceeding with the ordinary Issue-keyed
+    /// dispatch, unchanged pre-#7649 behavior), so the conversion path here
+    /// is never even reached; a `downcast_ref` on a generic dispatch error
+    /// must not accidentally match.
+    #[test]
+    #[serial]
+    fn review_stall_watchdog_probe_failure_never_triggers_prset_conversion() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // `api graphql` exits non-zero ⇒ open-PR state unknown ⇒ the dispatch
+        // guard fails open, same as `dispatch_fails_open_when_open_pr_lookup_errors`.
+        let (mut reg, _gh_log) = open_pr_review_stall_registry(ws, "", 1);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(9103), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+        let wt = ws.join(".loom").join("worktrees").join("issue-9103");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let restarts = reg.review_stall_watchdog_once(Duration::ZERO);
+        assert_eq!(restarts, 1, "a probe failure fails OPEN to the ordinary Issue recovery");
+        let second_id = running_issue_sweep_id(&reg, 9103)
+            .expect("an ambiguous probe must never select an invented PR or convert to PrSet");
+        assert!(
+            reg.entries
+                .values()
+                .all(|i| !matches!(i.kind, SweepKind::PrSet(_))),
+            "no PrSet conversion may happen on a probe failure"
+        );
+
+        let _ = reg.cancel(&second_id, Duration::from_secs(2));
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// A sweep this daemon instance cannot actually cancel — no retained
+    /// `Child` handle survives to signal — must never reach either dispatch
+    /// call (the ordinary Issue path or the new PrSet-conversion path), so it
+    /// cannot spuriously dispatch a replacement for a sweep that was never
+    /// actually torn down.
+    ///
+    /// `cancel()`'s only error path (`begin_cancel`'s "unknown sweep_id") is
+    /// unreachable here: the candidate snapshot and `cancel()`'s own lookup
+    /// both read the SAME `self.entries` map inside one synchronous,
+    /// `&mut self` call, so a hand-selected candidate can never disagree with
+    /// itself moments later. Losing the retained `self.children` handle —
+    /// the daemon-restart / handle-already-reaped shape `watchdog_once`'s own
+    /// candidate filter comment documents — is the practical, reachable
+    /// equivalent: without it, `review_stall_watchdog_once`'s candidate
+    /// filter excludes the sweep entirely, which is exactly the outcome that
+    /// matters (no cancel attempt ⇒ no dispatch ⇒ no replacement, and the
+    /// bounded retry is left unconsumed for a later tick).
+    #[test]
+    fn review_stall_watchdog_uncancelable_sweep_never_dispatches_replacement() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(9104), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+        let wt = ws.join(".loom").join("worktrees").join("issue-9104");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        // Drop the retained Child handle out from under the registry before
+        // the watchdog tick runs, reproducing "nothing to cancel" without
+        // fabricating a fake error type.
+        reg.children.remove(&out.sweep_id);
+
+        let restarts = reg.review_stall_watchdog_once(Duration::ZERO);
+        assert_eq!(restarts, 0, "no dispatch without a retained handle to cancel");
+        assert!(
+            !reg.review_stall_retried.contains(&9104),
+            "a candidate with no retained Child handle is not even eligible — never counted \
+             as an attempted (let alone consumed) retry"
+        );
+    }
+
     /// cross-owner workspace's installation-token `GH_CONFIG_DIR` through to
     /// the real `gh issue comment` child, mirroring the coverage added for
     /// `guards::classify_preflip_labels` and `quarantine::apply_quarantine_label`.
