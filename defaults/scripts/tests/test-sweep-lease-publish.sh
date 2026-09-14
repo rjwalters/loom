@@ -205,6 +205,12 @@ if [[ "$1" == "api" ]]; then
     echo "{\"id\": $((9000 + n))}"
     exit 0
   fi
+  if [[ "$method" == "PATCH" && "$path" == repos/*/issues/comments/* ]]; then
+    resolve_body > "$D/renewed.body"
+    echo "$path" > "$D/renewed.path"
+    echo '{}'
+    exit 0
+  fi
   echo "stub gh: unhandled api args: method=$method path=$path" >&2
   exit 3
 fi
@@ -353,17 +359,39 @@ run_script publish 6320 --sweep-id sweep-run-A
 assert_eq "4" "$RC" "(n2) a yield record for a DIFFERENT (host, sweep) does not excuse an unrelated live peer lease"
 assert_eq "0" "$(post_count)" "(n2) nothing is posted over the still-live peer's lease"
 
-# (n3) this host's OWN previously-yielded lease is also excluded from
-# "own_fresh" -- a host that lost a prior tie-break republishes a fresh
-# lease on its next attempt rather than treating the stood-down record as
-# still covering it.
+# (n3) Yield permanently ends this exact identity. A new dispatch must use
+# a new sweep ID; a successful invisible replacement must never be published.
 reset_state
 jq -s 'add' <(lease_json "$OPAQUE_HOST" "sweep-run-A" "$FRESH_ISO") \
     <(lease_yield_json "$OPAQUE_HOST" "sweep-run-A" "$FRESH_ISO" "peer-host" "sweep-peer-1") \
     > "$STUB_DIR/comments.json"
 run_script publish 6320 --sweep-id sweep-run-A
-assert_eq "0" "$RC" "(n3) this host's own yielded lease does not count as a fresh own-claim"
-assert_eq "1" "$(post_count)" "(n3) a fresh replacement record is published rather than trusting the stood-down one"
+assert_eq "4" "$RC" "(n3) previously yielded identity is refused"
+assert_eq "0" "$(post_count)" "(n3) refused identity posts nothing"
+assert_contains "$ERR" "new sweep ID" "(n3) refusal explains recovery"
+
+# Real lifecycle: publish under a new identity, expose its actual posted body
+# through the next forge read, then require a competing publisher to stand down.
+run_script publish 6320 --sweep-id sweep-run-B
+assert_eq "0" "$RC" "(n4) new sweep ID may reclaim after old identity yielded"
+jq --arg ts "$NOW_ISO" --rawfile body "$STUB_DIR/post-1.body" \
+    '. + [{id: 9001, updated_at: $ts, body: $body}]' "$STUB_DIR/comments.json" > "$STUB_DIR/reread.json"
+mv "$STUB_DIR/reread.json" "$STUB_DIR/comments.json"
+run_script publish 6320 --host peer-host --sweep-id competing-new
+assert_eq "4" "$RC" "(n4) peer sees the actual new publication and is refused"
+assert_eq "1" "$(post_count)" "(n4) only the valid new generation posted"
+"$SCRIPTS_DIR/sweep-lease-fence.sh" check 6320 > /dev/null 2> "$STUB_DIR/fence-stderr.log"
+assert_eq "0" "$?" "(n4) fresh new-ID publication is visible to fence"
+"$SCRIPTS_DIR/sweep-lease-renew.sh" renew-once 6320 --host "$OPAQUE_HOST" --sweep-id sweep-run-B > /dev/null 2> "$STUB_DIR/renew-stderr.log"
+assert_eq "0" "$?" "(n4) fresh new-ID publication is eligible for renewal"
+assert_contains "$(cat "$STUB_DIR/renewed.path" 2>/dev/null || echo NONE)" "/issues/comments/9001" "(n4) renewal touches the actual replacement comment"
+
+# Even when the old lease record is absent/stale, its yield ends the identity.
+reset_state
+lease_yield_json "$OPAQUE_HOST" "sweep-run-A" "$STALE_ISO" peer winner > "$STUB_DIR/comments.json"
+run_script publish 6320 --sweep-id sweep-run-A
+assert_eq "4" "$RC" "(n5) historical yield alone prevents identity reuse"
+assert_eq "0" "$(post_count)" "(n5) no invisible record posted after historical yield"
 
 # --- (f) a `gh` READ failure fails open ----------------------------------
 reset_state

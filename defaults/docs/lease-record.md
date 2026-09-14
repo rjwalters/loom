@@ -428,11 +428,12 @@ whose own `(host, sweep)` has a matching yield record from ALL THREE of its
 candidate buckets — `own_fresh` (idempotency short-circuit), `peer_host`
 (the live-peer block), and `same_host_diff_fresh` (the informational
 same-host-different-sweep note) — before deciding whether to publish. A
-host whose own prior claim was itself yielded therefore republishes a fresh
-record on its next attempt rather than trusting the stood-down one, and a
+host whose own prior claim was itself yielded must use a **new sweep ID**
+to publish on its next attempt (#7644), rather than trusting or recycling
+the stood-down identity, and a
 new host is never phantom-blocked by a peer's dead, already-yielded claim.
-Regression coverage: `test-sweep-lease-publish.sh` cases (n)/(n2)/(n3)
-(single-comment unit coverage) and the dedicated
+Regression coverage: `test-sweep-lease-publish.sh` cases (n) through (n5)
+(including publication/readback/peer-publication/fence/renew lifecycle coverage) and the dedicated
 `test-sweep-lease-convergence.sh` (a simulated 3+ host simultaneous-claim
 race, asserting the whole race settles on one live claimant in a bounded,
 single-digit number of publish attempts).
@@ -478,3 +479,20 @@ Grepping `lease_evidence=` in `daemon.log` therefore answers, per reclaim,
 which evidence class drove it. `absent` deliberately renders with its own
 caveat: per this document's reader contract, a missing lease is *no evidence
 either way*, never proof of abandonment.
+
+## Yielded identities cannot be republished (#7644)
+
+A valid yield record permanently ends its exact `(host, sweep)` identity on
+that issue. Publisher, fence and renew readers exclude that identity even
+if a later lease record bears a newer timestamp. The in-session publisher
+therefore refuses reuse with exit **4**, posts nothing, and requires a new
+sweep ID. Callers must stop the yielded attempt rather than interpreting
+this refusal as successful ownership.
+
+A legitimate retry uses a different sweep ID. Historical yielded identities
+remain excluded, while the new publication becomes visible to fence/renew
+and blocks competing publishers. A one-write success test is insufficient:
+`test-sweep-lease-publish.sh` exercises publication, rereading the actual
+posted body, and a subsequent peer attempt. This does not change the existing
+best-effort behavior when the initial forge read itself fails; the refusal
+is based on successfully observed yield evidence.

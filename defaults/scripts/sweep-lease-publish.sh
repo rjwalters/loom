@@ -63,6 +63,9 @@
 #
 # ## Idempotency and peer safety
 #
+#   - A matching prior yield permanently ends this exact host+sweep identity.
+#     Publication is refused (exit 4); start a new attempt with a new sweep ID.
+#
 #   - If THIS host+sweep-id already has a FRESH (within-TTL) lease comment on
 #     the issue, this is a no-op (exit 0) -- a resumed sweep re-running
 #     pre-flight never accumulates duplicate lease comments. This is
@@ -113,8 +116,8 @@
 #          Proceed.
 #       1  Usage error (bad issue number, unknown flag, bad --ttl-minutes).
 #       2  The publish `gh` call failed. Proceed WITHOUT a lease (best-effort).
-#       4  A DIFFERENT host holds a fresh lease -- nothing published. The
-#          caller should skip this issue rather than co-occupy the claim.
+#       4  A DIFFERENT host holds a fresh lease, or this identity yielded.
+#          Nothing is published; skip or start a new sweep ID after yielding.
 #
 #     On exit 0 (published or already-held), the resolved identity is printed
 #     to stdout as a single line: `<host> <sweep-id>` -- thread it into
@@ -372,7 +375,7 @@ cmd_publish() {
         # hold simultaneously-fresh leases on the same issue, exactly the
         # double-claim state this script exists to prevent (#6333).
         #
-        # Issue #5331: a lease comment whose own (host, sweep) has a LATER
+        # Issue #5331: a lease comment whose own (host, sweep) has a matching
         # `<!-- loom:lease-yield host=... sweep=... earliest_host=... -->`
         # record on this same issue (the daemon's dispatch-time
         # claim-then-verify-order tie-break, #6287) has already stood down --
@@ -389,6 +392,19 @@ cmd_publish() {
         if [[ -n "$(printf '%s' "$yield_ndjson" | tr -d '[:space:]')" ]]; then
             yield_first_lines="$(jq -r '.body | split("\n")[0]' <<< "$yield_ndjson" 2>/dev/null || true)"
         fi
+
+        # A yield ends the exact identity for all readers (fence/renew too).
+        # Never report a successful replacement that those readers will hide.
+        # Reclamation requires a new sweep ID, even if the prior lease expired.
+        local own_yield_line own_yield_parsed
+        while IFS= read -r own_yield_line; do
+            [[ -n "$own_yield_line" ]] || continue
+            own_yield_parsed="$(parse_lease_yield_marker_line "$own_yield_line" || true)"
+            if [[ "$own_yield_parsed" == "${host}"$'\t'"${sweep_id}" ]]; then
+                echo "SKIP: issue #${issue}: host=${host} sweep=${sweep_id} already yielded; use a new sweep ID. Nothing published." >&2
+                exit 4
+            fi
+        done <<< "$yield_first_lines"
 
         local now_epoch ttl_seconds
         now_epoch="${LOOM_LEASE_PUBLISH_NOW:-$(date -u +%s)}"
