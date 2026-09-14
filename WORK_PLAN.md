@@ -52,8 +52,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#7609**: daemon auto-update: drive rolls from the latest Release artifact, not source-checkout staleness — the source gate is shut on every fleet host today
-- **#7617**: Curator's blocked-issue re-check claims/unclaims loom:curating on every pass instead of checking the fingerprint first
+_None._
 
 ## PRs Awaiting Review
 
@@ -124,7 +123,6 @@ Issues carrying `loom:curated`.
 - **#7606**: work_finder: a guarded issue is re-probed on every 60 s tick — put open-PR-guard refusals on the #4485 backoff ladder and short-circuit the closed-issue probe when the open-PR memo is fresh *(curated)*
 - **#7609**: daemon auto-update: drive rolls from the latest Release artifact, not source-checkout staleness — the source gate is shut on every fleet host today *(curated)*
 - **#7612**: Watchdog cleanup discards a newly leased worktree before redispatch ownership check *(curated)*
-- **#7617**: Curator's blocked-issue re-check claims/unclaims loom:curating on every pass instead of checking the fingerprint first *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -146,10 +144,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 26 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 2 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 26 |
-| Curated | 29 |
+| Curated | 28 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
