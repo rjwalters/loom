@@ -494,31 +494,38 @@ pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String, AccountProvide
             .copied()
             .unwrap_or(AccountProvider::Claude);
         if let Some(entry) = super::bad_tokens::blocking_entry_in_dir(tokens_dir, &name) {
-            // #7522: a **session-limit** exhaustion entry is the one blocking
-            // class whose expiry the probe itself is the authority on, so it
-            // is still probed with its live token. Skipping it made the
-            // check self-blinding: `probe_account_with_blocking` reports an
-            // empty-token account `blocked` with no utilization and no reset
-            // instant, `.ranking` records a bare `<name>|blocked` row, and
-            // that row then carries no evidence for
-            // `bad_tokens::session_window_has_reset` to act on — so the entry
-            // could only ever clear on its TTL, and the `.ranking` row stayed
-            // `blocked` until a human ran `tokens unblock`. That is exactly
-            // the host-to-host divergence the issue reports (a Mac that never
-            // marked the account read it `available` with 5h util ~0 while
-            // the workers read it `blocked`).
+            // #7522/#7538: an **exhaustion** entry (session-limit-worded or
+            // ambiguous) is a blocking class whose expiry the probe itself
+            // can be the authority on, so it is still probed with its live
+            // token. Skipping it made the check self-blinding:
+            // `probe_account_with_blocking` reports an empty-token account
+            // `blocked` with no utilization and no reset instant, `.ranking`
+            // records a bare `<name>|blocked` row, and that row then carries
+            // no evidence for `bad_tokens::session_window_has_reset` (or, for
+            // an ambiguous reason, the two-signal
+            // `bad_tokens::ambiguous_exhaustion_has_reset` check, #7538) to
+            // act on — so the entry could only ever clear on its TTL, and the
+            // `.ranking` row stayed `blocked` until a human ran `tokens
+            // unblock`. That is exactly the host-to-host divergence #7522
+            // reports (a Mac that never marked the account read it
+            // `available` with 5h util ~0 while the workers read it
+            // `blocked`).
             //
             // Probing costs one `max_tokens: 1` request and is
             // self-correcting in both directions: if the window really has
-            // reset the account comes back `available` with a real 5h
-            // utilization, and if it has not, the 429 response carries the
-            // live utilization + `s5h_reset` that let the entry expire
-            // precisely when its window rolls over. Every other blocking
-            // class (auth/billing, weekly/monthly exhaustion, malformed
-            // timestamp) is unchanged — still reported `blocked` without a
-            // network call, carrying its real class + reason (#6030).
-            let probe_anyway = entry.class == super::bad_tokens::BadReasonClass::Exhaustion
-                && super::bad_tokens::is_session_limit_reason(&entry.reason);
+            // reset the account comes back `available` with a real 5h/7d
+            // utilization, and if it has not, the 429/200 response carries
+            // the live utilization + reset instants that let the entry expire
+            // no earlier than the evidence actually supports. This only adds
+            // a cheap, harmless probe request — it does not by itself change
+            // how long an entry is held; that is still decided read-side by
+            // `bad_tokens::blocking_entry_in_dir` (#7538). Only
+            // [`super::bad_tokens::BadReasonClass::Auth`] and
+            // `MalformedTimestamp` entries are still reported `blocked`
+            // without a network call, carrying their real class + reason
+            // (#6030) — auth/malformed entries never self-heal, so probing
+            // them would be wasted.
+            let probe_anyway = entry.class == super::bad_tokens::BadReasonClass::Exhaustion;
             if !probe_anyway {
                 tokens.push((name, String::new(), provider)); // known-bad: do not probe
                 continue;
@@ -1951,28 +1958,54 @@ mod tests {
         );
     }
 
-    /// #7522 regression: every other blocking class keeps the unchanged
-    /// "surface as empty, never probe" behavior — a weekly-limit exhaustion
-    /// entry and an auth entry are both still reported without a network call.
+    /// #7522/#7538: an `Auth`-class blocking entry keeps the unchanged
+    /// "surface as empty, never probe" behavior — a broken credential never
+    /// self-heals, so probing it would be wasted. (A weekly-limit-worded
+    /// `Exhaustion` entry, by contrast, is now probed too — see
+    /// `discover_probes_an_ambiguous_exhaustion_entry_too` — #7538 widened
+    /// probe-eligibility from "session-limit match" to "any `Exhaustion`
+    /// entry" so an ambiguous reason can accumulate the `.ranking` evidence
+    /// its own two-signal release check needs.)
     #[test]
-    fn discover_does_not_probe_weekly_or_auth_blocked_accounts() {
+    fn discover_does_not_probe_auth_blocked_accounts() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("agent-weekly.token"), "sk-ant-oat01-aaa\n").unwrap();
         fs::write(tmp.path().join("agent-auth.token"), "sk-ant-oat01-bbb\n").unwrap();
         let marked = (chrono::Utc::now() - chrono::Duration::seconds(600))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         fs::write(
             tmp.path().join(".bad_tokens"),
-            format!(
-                "{marked} agent-weekly exhausted: used 100% of your weekly limit\n\
-                 {marked} agent-auth 401 unauthorized\n"
-            ),
+            format!("{marked} agent-auth 401 unauthorized\n"),
         )
         .unwrap();
         let got = discover_tokens(tmp.path());
-        assert_eq!(got.iter().find(|(n, _, _)| n == "agent-weekly").unwrap().1, "");
         assert_eq!(got.iter().find(|(n, _, _)| n == "agent-auth").unwrap().1, "");
+    }
+
+    /// #7538: an ambiguous-reason `Exhaustion` entry (does not match
+    /// `is_session_limit_reason`) is now probed with its live token too —
+    /// exactly like a session-limit-worded entry — so it can accumulate real
+    /// `.ranking` evidence for `bad_tokens::ambiguous_exhaustion_has_reset` to
+    /// act on. Probing alone does not change how long the entry is held; that
+    /// is still decided read-side by `blocking_entry_in_dir`.
+    #[test]
+    fn discover_probes_an_ambiguous_exhaustion_entry_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-weekly.token"), "sk-ant-oat01-aaa\n").unwrap();
+        let marked = (chrono::Utc::now() - chrono::Duration::seconds(600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            tmp.path().join(".bad_tokens"),
+            format!("{marked} agent-weekly exhausted: used 100% of your weekly limit\n"),
+        )
+        .unwrap();
+        let got = discover_tokens(tmp.path());
+        assert_eq!(
+            got.iter().find(|(n, _, _)| n == "agent-weekly").unwrap().1,
+            "sk-ant-oat01-aaa",
+            "an ambiguous exhaustion entry must still be probed with its live token"
+        );
     }
 
     #[test]

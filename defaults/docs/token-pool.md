@@ -918,6 +918,7 @@ text, the CLI, and this document all agree on:
 | `auth` (401 / OAuth / expired / blocked) | `loom-daemon tokens unblock <name>` — **never expires** | 30d (`AUTH_ENTRY_MIN_RETENTION_SECS`), a garbage-collection floor, *not* an expiry |
 | non-auth (`exhausted` / `rate-limited`) | the **exhaustion cooldown** — `LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default `21600` (6h) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
 | non-auth naming the **5h session limit** specifically | the earlier of: proven window reset, or `min(cooldown, 18000)` — see [Session-limit entries expire with their own window](#session-limit-entries-expire-with-their-own-window-7522) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
+| non-auth, ambiguous reason (does not name the session window) | the exhaustion cooldown (unchanged fixed TTL), **or** earlier if a re-probe proves both signals clear — see [Ambiguous exhaustion entries: two-signal early release](#ambiguous-exhaustion-entries-two-signal-early-release-7538) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
 | unparseable timestamp | never (**fail-closed** — a malformed line never silently un-blocks a token) | never (malformed lines are always retained) |
 
 **Read time** (`bad_tokens::is_bad` / `blocking_entry`, enforced by the selector
@@ -981,15 +982,20 @@ whichever of these comes first:
 Three cooperating readers keep the whole pool consistent on that one signal, so
 no host can diverge from another on an identical pool:
 
-- **`tokens check` still probes** a session-limit-blocked account with its live
-  token (`check::discover_tokens`). Every other blocking class is still reported
-  `blocked` without a network call. Skipping the probe made the check
+- **`tokens check` probes every `Exhaustion`-class entry, not only a
+  session-limit match (#7538).** `check::discover_tokens`'s probe-eligibility
+  is `entry.class == BadReasonClass::Exhaustion` — it no longer additionally
+  requires `is_session_limit_reason`. Only `Auth` and `MalformedTimestamp`
+  entries are still reported `blocked` without a network call (neither
+  self-heals, so probing them is wasted). Skipping the probe made the check
   self-blinding: an unprobed account writes a bare `<name>|blocked` `.ranking`
-  row carrying no utilization and no reset instant, so criterion 1 above had
-  nothing to read and the row stayed `blocked` until an operator intervened. The
-  probe is self-correcting either way — a reset window comes back `available`,
-  and a still-exhausted one returns a 429 whose headers record the real
-  `s5h_reset`.
+  row carrying no utilization and no reset instant, so criterion 1 above (and
+  the ambiguous-entry check below) had nothing to read and the row stayed
+  `blocked` until an operator intervened. The probe is self-correcting either
+  way — a reset window comes back `available`, and a still-exhausted one
+  returns a 429 whose headers record the real `s5h_reset`/`s7d_reset`. Probing
+  an ambiguous entry is cheap and harmless on its own: it does not by itself
+  change how long the entry is held — that is still decided read-side (below).
 - **The selector's hard-exclusion set** re-verifies a `blocked` `.ranking`
   status against the *live* `.bad_tokens` state (`select::is_hard_excluded`)
   instead of trusting the probe-time snapshot forever, so a naturally-expired
@@ -1012,6 +1018,61 @@ no host can diverge from another on an identical pool:
   state, downgrading an `available` row that is actually bad-marked. It only
   ever corrects an overcount — a non-`available` row is never promoted — so the
   daemon's own log can no longer read healthy while every spawn fails.
+
+### Ambiguous exhaustion entries: two-signal early release (#7538)
+
+Several production writers mark an account bad for the *same* 5h session-limit
+event but with a reason that does not name the session window — the daemon's
+own insta-crash classifier (`exhausted: rate-limited (daemon insta-crash,
+issue #N)`, deliberately neutral because that call site cannot distinguish a
+5h fault from a weekly one) and a few `claude-wrapper.sh` banner-text captures
+(`exhausted: usage/plan limit modal (RATE_LIMIT_ABORT)`, `exhausted: usage
+limit`, `exhausted: hit your limit`). Before #7538 these entries were invisible
+to `is_session_limit_reason` and so kept the full fixed-TTL cooldown even when
+the underlying fault was the same 5h window #7522 already fixed for the
+matching wording.
+
+Widening `is_session_limit_reason` itself was rejected by #4212 for good
+reason: mislabeling a genuinely **weekly** exhaustion as a 5h one and capping
+its hold at `SESSION_WINDOW_SECS` would readmit a still-blocked account after
+only 5h. A weekly-exhausted account's 5h utilization reads "reset" too (it is
+near zero regardless of the still-active 7-day block), so a single-signal
+check like `session_window_has_reset` is not safe to apply to an ambiguous
+reason — that is exactly the harm #4212 declined to risk.
+
+So an ambiguous (non-session-limit-matching) `Exhaustion` entry gets its own,
+separate, two-signal check — `bad_tokens::ambiguous_exhaustion_has_reset` —
+instead of being folded into the session-limit fast path:
+
+1. Prerequisite: **freshness**. The `.ranking` file's mtime must be after the
+   entry's `marked_at`, exactly like `session_window_has_reset`'s fallback
+   branch — a stale row (never re-probed since the mark) proves nothing and
+   the check falls through to the unmodified fixed-TTL cooldown. This is what
+   makes the widened probe eligibility above load-bearing: without it, an
+   ambiguous entry could never accumulate the evidence this check reads.
+2. Release only when the re-probed `.ranking` row shows **both**:
+   - 5h utilization under the load gate (`select::resolve_load_gate()` —
+     `LOOM_TOKEN_5H_LOAD_GATE`, default `0.70`; the exact threshold
+     `session_window_has_reset`'s fallback and `select`'s own tier-1 pick
+     already use — reused, not duplicated), **and**
+   - 7d utilization under the exhausted threshold
+     (`check::EXHAUSTED_THRESHOLD`, `0.99`). `.ranking`'s
+     `name|status|5h_util|limit_reset` format does not carry a raw 7d
+     utilization field, so this reads the row's `status` — which a probe
+     already set to `exhausted` iff 7d utilization cleared
+     `EXHAUSTED_THRESHOLD` (`check::status_from_utilization`) — as the
+     already-applied result of that same comparison
+     (`row.status != "exhausted"`), rather than duplicating the threshold as a
+     second arithmetic check.
+
+Never on 5h evidence alone. The session-limit-matching fast path
+(`SESSION_WINDOW_SECS` cap + `session_window_has_reset`) is completely
+unaffected — it keeps its existing single-signal behavior, unchanged.
+
+An ambiguous entry with no `.ranking` row at all (never probed, or probed
+before this change shipped) falls back to the full fixed-TTL cooldown, exactly
+as before #7538 — the two-signal check only ever narrows a hold, never widens
+one.
 
 ### Empty-pool error detail (#4643)
 

@@ -230,6 +230,77 @@ fn session_window_has_reset(
     None
 }
 
+/// Two-signal early-release check for an **ambiguous** (non-session-limit-
+/// matching) exhaustion entry (issue #7538).
+///
+/// [`session_window_has_reset`] is deliberately NOT reused here, and this is a
+/// distinct, separate check rather than a widened version of it: releasing an
+/// ambiguous entry on 5h evidence alone would risk readmitting a genuinely
+/// **weekly**-exhausted account after only 5h, because a weekly-blocked
+/// account's 5h utilization reads "reset" too (its 5h usage is near zero
+/// regardless of the still-active 7-day block) — exactly the harm issue #4212
+/// declined to risk by leaving ambiguous reasons out of the regex in the first
+/// place. So an ambiguous entry is released only when the re-probed
+/// `.ranking` row shows **both**:
+///
+/// 1. 5h utilization under the load gate ([`super::select::resolve_load_gate`],
+///    the same threshold [`session_window_has_reset`]'s fallback and
+///    `select`'s own tier-1 pick use — not a second, unrelated cutoff), AND
+/// 2. 7d utilization under the exhausted threshold
+///    ([`super::check::EXHAUSTED_THRESHOLD`]).
+///
+/// `.ranking` (`name|status|5h_util|limit_reset`, see
+/// [`super::select::parse_ranking_line`]) does not carry a raw 7d-utilization
+/// field — only the `status` string a probe already derived from it
+/// (`super::check::status_from_utilization`: `status == "exhausted"` iff 7d
+/// utilization cleared [`super::check::EXHAUSTED_THRESHOLD`]). So signal 2 is
+/// read off that pre-computed field (`row.status != "exhausted"`) rather than
+/// a second arithmetic comparison — it is the same threshold, just already
+/// applied by the probe that wrote the row.
+///
+/// Requires **freshness**, exactly like [`session_window_has_reset`]'s
+/// fallback branch: the `.ranking` file's mtime must be after `marked_at`, so
+/// a stale pre-mark row (e.g. left over from before this entry was ever
+/// probed) can never satisfy the check. This is what makes the widened
+/// probe-eligibility in `check::discover_tokens` (#7538) load-bearing — an
+/// ambiguous entry that has never been re-probed since it was marked bad has
+/// no fresh row to read, and correctly falls through to `None` (full
+/// fixed-TTL cooldown, unchanged).
+///
+/// Returns:
+/// - `Some(true)` — a fresh `.ranking` row proves both signals hold; safe to
+///   release early.
+/// - `Some(false)` — a fresh row exists but at least one signal does not hold.
+/// - `None` — no usable evidence (no `.ranking` file, no row for this
+///   account, the only row present predates the mark, or the row has no 5h
+///   utilization) — the caller falls back to the fixed-TTL cooldown.
+fn ambiguous_exhaustion_has_reset(
+    tokens_dir: &Path,
+    token_name: &str,
+    marked_at: i64,
+) -> Option<bool> {
+    let ranking_path = tokens_dir.join(".ranking");
+    let meta = std::fs::metadata(&ranking_path).ok()?;
+    let ranking_mtime: i64 = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs() as i64);
+    if ranking_mtime <= marked_at {
+        // No probe evidence taken since this entry was marked bad.
+        return None;
+    }
+    let text = std::fs::read_to_string(&ranking_path).ok()?;
+    let row = text
+        .lines()
+        .filter_map(super::select::parse_ranking_line)
+        .find(|r| r.name == token_name)?;
+    let util_5h = row.util_5h?;
+    let five_h_under_load_gate = util_5h < super::select::resolve_load_gate();
+    let seven_d_under_exhausted_threshold = row.status != "exhausted";
+    Some(five_h_under_load_gate && seven_d_under_exhausted_threshold)
+}
+
 /// Append a bad-token entry atomically.
 ///
 /// # Errors
@@ -420,6 +491,20 @@ pub fn blocking_entry_in_dir(tokens_dir: &Path, token_name: &str) -> Option<Bloc
                 if blocked
                     && session_limit
                     && session_window_has_reset(tokens_dir, token_name, marked_at, now)
+                        == Some(true)
+                {
+                    blocked = false;
+                }
+                // #7538: an AMBIGUOUS (non-session-limit-matching) exhaustion
+                // reason gets its own, distinct two-signal release check —
+                // never the single-signal `session_window_has_reset` above,
+                // and never the `SESSION_WINDOW_SECS` cap baked into
+                // `effective_cooldown` (that stays scoped to `session_limit`
+                // only). See `ambiguous_exhaustion_has_reset` for why a
+                // second signal is required.
+                if blocked
+                    && !session_limit
+                    && ambiguous_exhaustion_has_reset(tokens_dir, token_name, marked_at)
                         == Some(true)
                 {
                     blocked = false;
@@ -1448,15 +1533,24 @@ mod tests {
         assert!(is_bad(tmp.path(), "agent-1"));
     }
 
-    /// #7522 regression: a **weekly**-limit exhaustion entry must ignore
-    /// `.ranking` reset evidence entirely and keep the unmodified fixed-TTL
-    /// behavior — only a reason naming the session window specifically is
-    /// eligible for early expiry.
+    /// #7522 regression, superseded in part by #7538: a **weekly**-limit
+    /// exhaustion entry is ambiguous (does not match `is_session_limit_reason`),
+    /// so it must ignore the session-limit fast path's single-signal
+    /// `session_window_has_reset` / `SESSION_WINDOW_SECS` cap entirely — only a
+    /// reason naming the session window specifically is eligible for *that*
+    /// early-expiry path. It is NOT exempt from `.ranking` evidence
+    /// altogether, though: #7538 gives every ambiguous entry its own
+    /// two-signal check, and a re-probe proving the account genuinely rolled
+    /// over both windows (here: `available`, not `exhausted`, with low 5h
+    /// utilization) now releases it early too — see
+    /// `ambiguous_entry_low_5h_high_7d_util_is_not_released_early` for the
+    /// converse (still-`exhausted` status) that #4212 protects against, which
+    /// this reason would NOT be exempt from either.
     #[test]
     // Reads the process-global cooldown default, so it must not overlap the
     // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
     #[serial]
-    fn weekly_limit_entry_ignores_ranking_reset_evidence_stays_on_fixed_ttl() {
+    fn weekly_limit_entry_releases_early_when_reprobe_proves_both_signals_clear() {
         let tmp = make_pool();
         let dir = pool_dir(tmp.path());
         let marked = (Utc::now() - chrono::Duration::seconds(3600))
@@ -1467,18 +1561,18 @@ mod tests {
             format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
         )
         .unwrap();
-        // Ranking shows the account fully "reset" — must be ignored.
+        // Ranking shows the account fully reset on BOTH windows — a genuine
+        // recovery, not just a 5h rollover.
         let reset = (Utc::now() - chrono::Duration::seconds(60))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         fs::write(dir.join(".ranking"), format!("agent-1|available|0.01|{reset}\n")).unwrap();
 
         assert!(
-            is_bad(tmp.path(), "agent-1"),
-            "a weekly-limit entry must keep the fixed TTL regardless of .ranking"
+            !is_bad(tmp.path(), "agent-1"),
+            "both signals clear on re-probe — an ambiguous entry releases early too (#7538)"
         );
-        let entry = blocking_entry(tmp.path(), "agent-1").unwrap();
-        assert_eq!(entry.class, BadReasonClass::Exhaustion);
+        assert_eq!(blocking_entry(tmp.path(), "agent-1"), None);
     }
 
     /// #7522 regression: an auth-reason entry is unaffected by `.ranking`
@@ -1811,5 +1905,144 @@ mod tests {
         )
         .unwrap();
         assert!(!latest_block_was_session_limit(&dir, "agent-1"));
+    }
+
+    // -----------------------------------------------------------------
+    // #7538: ambiguous (non-session-limit-matching) exhaustion entries —
+    // two-signal early release.
+    // -----------------------------------------------------------------
+
+    /// #7538 core regression (the exact harm #4212 declined to risk): an
+    /// ambiguous-reason entry whose re-probed `.ranking` row shows LOW 5h
+    /// utilization but is still `exhausted` (i.e. HIGH 7d utilization — a
+    /// genuine weekly exhaustion that happened to be neutrally worded) must
+    /// NOT be released early. Releasing on 5h evidence alone would readmit a
+    /// still-weekly-blocked account.
+    #[test]
+    #[serial]
+    fn ambiguous_entry_low_5h_high_7d_util_is_not_released_early() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        // Marked 1h ago — well within the 6h default cooldown, and this
+        // reason does NOT match `is_session_limit_reason`.
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: rate-limited (daemon insta-crash, issue #123)\n"),
+        )
+        .unwrap();
+        // Re-probed AFTER the mark: 5h utilization is low, but the account is
+        // still `exhausted` — 7d utilization is still over the threshold.
+        fs::write(dir.join(".ranking"), "agent-1|exhausted|0.02\n").unwrap();
+
+        assert!(
+            is_bad(tmp.path(), "agent-1"),
+            "low 5h util alone must not release a still-weekly-exhausted ambiguous entry"
+        );
+        let entry = blocking_entry(tmp.path(), "agent-1").expect("still blocked");
+        assert_eq!(entry.class, BadReasonClass::Exhaustion);
+    }
+
+    /// #7538: the converse — an ambiguous-reason entry whose re-probed
+    /// `.ranking` row shows LOW 5h AND LOW 7d utilization (not `exhausted`)
+    /// IS released early, the same outcome a matching session-limit entry
+    /// gets from its own single-signal check.
+    #[test]
+    #[serial]
+    fn ambiguous_entry_low_5h_and_low_7d_util_is_released_early() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: usage/plan limit modal (RATE_LIMIT_ABORT)\n"),
+        )
+        .unwrap();
+        // Re-probed AFTER the mark: both signals clear — available, low 5h
+        // utilization, not `exhausted`.
+        fs::write(dir.join(".ranking"), "agent-1|available|0.05\n").unwrap();
+
+        assert!(
+            !is_bad(tmp.path(), "agent-1"),
+            "both signals clear — the ambiguous entry should release early"
+        );
+        assert_eq!(blocking_entry(tmp.path(), "agent-1"), None);
+    }
+
+    /// #7538: the 5h signal alone is not sufficient even when it clears the
+    /// load gate — a `rate_limited`/`exhausted` status (7d signal not clear)
+    /// must still hold the entry blocked. Mirrors the "high util keeps it
+    /// blocked" converse test already covering the session-limit fast path.
+    #[test]
+    #[serial]
+    fn ambiguous_entry_low_5h_but_exhausted_status_stays_blocked() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".bad_tokens"), format!("{marked} agent-1 exhausted: usage limit\n"))
+            .unwrap();
+        fs::write(dir.join(".ranking"), "agent-1|exhausted|0.01\n").unwrap();
+
+        assert!(is_bad(tmp.path(), "agent-1"));
+    }
+
+    /// #7538 edge case: an ambiguous entry with NO `.ranking` row at all
+    /// (never probed, or probed before this change shipped) falls back to the
+    /// full fixed-TTL cooldown, exactly as before this change — the
+    /// two-signal check only ever narrows a hold, never widens one.
+    #[test]
+    #[serial]
+    fn ambiguous_entry_with_no_ranking_falls_back_to_fixed_ttl() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".bad_tokens"), format!("{marked} agent-1 exhausted: hit your limit\n"))
+            .unwrap();
+        assert!(!dir.join(".ranking").exists());
+
+        assert!(is_bad(tmp.path(), "agent-1"));
+        let entry = blocking_entry(tmp.path(), "agent-1").expect("fixed-TTL fallback still blocks");
+        assert_eq!(entry.class, BadReasonClass::Exhaustion);
+        let remaining = entry
+            .cooldown_remaining_secs
+            .expect("TTL entry has a remaining");
+        // 1h old, 6h default cooldown → ~5h remaining (not capped at the
+        // session window — this reason is ambiguous, not session-limit).
+        assert!(
+            (4 * 3600..=5 * 3600).contains(&remaining),
+            "expected ~5h remaining on the unmodified fixed TTL, got {remaining}"
+        );
+    }
+
+    /// #7538: a `.ranking` row present BEFORE the entry was marked bad (i.e.
+    /// stale, predating the mark) must not satisfy the freshness requirement
+    /// — otherwise an ambiguous entry could be released without ever having
+    /// been re-probed since it was marked bad.
+    #[test]
+    #[serial]
+    fn ambiguous_entry_ignores_a_ranking_row_that_predates_the_mark() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        // Write the (stale) low-util ranking row FIRST...
+        fs::write(dir.join(".ranking"), "agent-1|available|0.01\n").unwrap();
+        // ...then mark bad AFTER it, so the ranking row's mtime predates the
+        // mark and must be treated as having no usable evidence.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let marked = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        fs::write(dir.join(".bad_tokens"), format!("{marked} agent-1 exhausted: hit your limit\n"))
+            .unwrap();
+
+        assert!(
+            is_bad(tmp.path(), "agent-1"),
+            "a stale pre-mark .ranking row must not release the entry"
+        );
     }
 }
