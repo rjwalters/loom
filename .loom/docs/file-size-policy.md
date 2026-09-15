@@ -167,10 +167,10 @@ is `loom-daemon/src/cli/` or `loom-daemon/src/script_helpers/`.
 
 | Tier | Action |
 |---|---|
-| Vendored (`guard-destructive*.sh`) | Exempt — upstream owns it |
-| Bootstrap (`install.sh`, `install-loom.sh`, `loom-daemon-{update,start}.sh`) | Ratchet only; never port (chicken-and-egg) |
+| Vendored (`guard-destructive*.sh`) | Exempt here — [rjwalters/repo](https://github.com/rjwalters/repo) owns the structure. Rewriting it is an upstream proposal (#7760), not a Loom change. |
+| Bootstrap (`install.sh`, `install-loom.sh`, `loom-daemon-{update,start}.sh`) | Ratchet. **How much must stay shell is unresolved** — `auto_update.rs` already implements fetch/rebuild/restart in Rust, so the earlier "never port, chicken-and-egg" claim is being re-derived in #7758. |
 | Port candidates (`merge-pr.sh`, `worktree.sh`, `claude-wrapper.sh`) | Finish the port — all three already have a `loom-daemon forge` delegation ladder, so this is incremental |
-| Shell tests | Split, don't port — bash testing bash is legitimate |
+| Shell tests | Split (#7741). Note these are shell **because the code under test is shell** — that is a consequence of the implementation language, not an independent reason to keep either. |
 
 Porting also improves hook latency: `PreToolUse` fires on every tool call, and a
 binary exec beats parsing a multi-thousand-line bash script. The vendoring
