@@ -384,6 +384,20 @@ jobs:
       - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
         run: bash scripts/check-docs-defaults-parity.sh
 
+  doc-tocs:
+    name: Doc Table-of-Contents Freshness
+    # Cheap structural check; always runs. Claude PREVIEWS a doc reached through
+    # a reference (e.g. `head -100`) rather than reading it whole, so the TOC is
+    # what tells it which sections exist; daemon-reference.md has 27 top-level
+    # sections across ~9k lines and had none (#7739). A stale TOC is worse than
+    # no TOC, because it claims a section is absent when it is not — hence
+    # generated-and-checked rather than hand-maintained.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check generated TOCs are current
+        run: bash scripts/check-doc-tocs.sh
+
   hooks-defaults-parity:
     name: Hooks/Scripts Defaults Parity Check
     # Cheap structural check; always runs. .loom/hooks/ and .loom/scripts/ are
