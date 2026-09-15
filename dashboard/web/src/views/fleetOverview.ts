@@ -187,6 +187,47 @@ function sweepCountsByRepo(host: HostView): Map<string, number> {
   return counts;
 }
 
+/** The idle-roster `<summary>` text (#7662): the count of named idle repos,
+ * plus a trailing `", N private"` clause when the redacted roster also hides
+ * some. Kept as one string builder so the "N idle repositories" wording used
+ * by both the collapsed-details summary and the zero-sweep edge case (where
+ * it stands in for the whole roster) can't drift apart. */
+function idleReposSummaryText(idleNamedCount: number, hiddenPrivateCount: number): string {
+  const base = `${idleNamedCount} idle repositor${idleNamedCount === 1 ? "y" : "ies"}`;
+  return hiddenPrivateCount > 0 ? `${base}, ${hiddenPrivateCount} private` : base;
+}
+
+/** localStorage key for a host card's idle-roster open/closed state (#7662).
+ * Storing per host id, not globally, so expanding one busy host's idle list
+ * does not also expand every other card's. */
+function idleReposOpenStorageKey(hostId: string): string {
+  return `loom-dashboard:idle-repos-open:${hostId}`;
+}
+
+/** Reads the persisted open/closed state for a host card's idle-roster
+ * `<details>` (#7662) — defaults closed (`false`) whenever storage is
+ * unavailable (private browsing, a pre-render/test environment with no
+ * `window`) or has never recorded a preference for this host. */
+function readIdleReposOpen(hostId: string): boolean {
+  try {
+    return window.localStorage.getItem(idleReposOpenStorageKey(hostId)) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Persists a host card's idle-roster open/closed state (#7662). Best-effort
+ * only — a `localStorage` write can fail (quota, private browsing, a
+ * disabled storage policy) without it being this feature's job to surface
+ * that failure; the state just won't survive the next reload. */
+function writeIdleReposOpen(hostId: string, open: boolean): void {
+  try {
+    window.localStorage.setItem(idleReposOpenStorageKey(hostId), open ? "1" : "0");
+  } catch {
+    // Storage unavailable — nothing to do; the toggle itself still worked.
+  }
+}
+
 export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
   const sweepCount = host.sweeps.length;
   const repos = managedRepos(host);
@@ -198,6 +239,48 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
   // nothing but "private" (Issue #4976's anti-leak contract).
   const namedRepos = repos.filter((repo): repo is ManagedRepoEntry & { slug: string } => Boolean(repo.slug));
   const hiddenPrivateCount = repoCount - namedRepos.length;
+  // Split the roster into the handful the card exists to answer ("what is
+  // this host doing") and the rest, folded into a closed-by-default
+  // <details> so ~45 idle rows don't bury a couple of busy ones (#7662).
+  // Active: in-flight count desc, then slug — busiest first. Idle: the same
+  // alphabetical order the flat list used before the split.
+  const activeRepos = namedRepos
+    .filter((repo) => (sweepCounts.get(repo.slug) ?? 0) > 0)
+    .sort((a, b) => {
+      const byCount = (sweepCounts.get(b.slug) ?? 0) - (sweepCounts.get(a.slug) ?? 0);
+      return byCount !== 0 ? byCount : a.slug.localeCompare(b.slug);
+    });
+  const idleRepos = namedRepos
+    .filter((repo) => (sweepCounts.get(repo.slug) ?? 0) === 0)
+    .sort((a, b) => a.slug.localeCompare(b.slug));
+
+  // The idle roster: rendered only when there is something to fold away —
+  // when every named repo is active (and nothing is redacted), no <details>
+  // exists at all. Built as a standalone element (rather than inline in the
+  // `el(...)` tree below) because the open/closed persistence (#7662's "ask"
+  // item 4) needs to read/write it after construction.
+  const idleCount = idleRepos.length + hiddenPrivateCount;
+  let idleDetails: HTMLDetailsElement | null = null;
+  if (idleCount > 0) {
+    idleDetails = el(
+      "details",
+      { class: "card__repos-idle", data: { testid: "card-repos-idle" } },
+      el("summary", {}, idleReposSummaryText(idleRepos.length, hiddenPrivateCount)),
+      el(
+        "ul",
+        { class: "card__repos" },
+        idleRepos.map((repo) => el("li", { class: "card__repo" }, el("span", { class: "card__repo-label" }, repo.slug))),
+        hiddenPrivateCount > 0
+          ? el("li", { class: "card__repo card__repo--private" }, `+ ${hiddenPrivateCount} private`)
+          : null,
+      ),
+    );
+    idleDetails.open = readIdleReposOpen(host.hostId);
+    idleDetails.addEventListener("toggle", () => {
+      writeIdleReposOpen(host.hostId, idleDetails!.open);
+    });
+  }
+
   return el(
     "article",
     { class: `card card--${host.status}`, data: { testid: "host-card", host: host.hostId } },
@@ -268,31 +351,22 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
           ),
         )
       : null,
-    repoCount > 0
+    activeRepos.length > 0
       ? el(
           "ul",
           { class: "card__repos", data: { testid: "card-repos" } },
-          namedRepos
-            .slice()
-            .sort((a, b) => a.slug.localeCompare(b.slug))
-            .map((repo) => {
-              const count = sweepCounts.get(repo.slug) ?? 0;
-              return el(
-                "li",
-                { class: "card__repo" },
-                el("span", { class: "card__repo-label" }, repo.slug),
-                count > 0 ? el("span", { class: "chip" }, `×${count}`) : null,
-              );
-            }),
-          hiddenPrivateCount > 0
-            ? el(
-                "li",
-                { class: "card__repo card__repo--private" },
-                `+ ${hiddenPrivateCount} private`,
-              )
-            : null,
+          activeRepos.map((repo) => {
+            const count = sweepCounts.get(repo.slug) ?? 0;
+            return el(
+              "li",
+              { class: "card__repo" },
+              el("span", { class: "card__repo-label" }, repo.slug),
+              el("span", { class: "chip" }, `×${count}`),
+            );
+          }),
         )
       : null,
+    idleDetails,
   );
 }
 
