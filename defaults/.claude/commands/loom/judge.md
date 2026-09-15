@@ -1477,7 +1477,16 @@ version-bearing files yourself:
 ```bash
 # Take origin/main's side for every conflicting (version-bearing) file, then
 # re-derive a fresh bump on top of it.
-git checkout --theirs -- $CONFLICTED
+#
+# `--ours` is correct here, NOT `--theirs`: mid-`git rebase` the two are
+# REVERSED relative to `git merge`. A rebase replays your commits on top of the
+# upstream, so "ours" is the branch being rebased ONTO (origin/main) and
+# "theirs" is the commit being replayed (this branch's own, already-superseded
+# bump). Using `--theirs` here would keep the stale bump and then bump patch on
+# top of that stale base, which can yield a version that is NOT ahead of
+# origin/main's tip -- exactly the #7684 race this recipe exists to end. Do not
+# "correct" this back to `--theirs`.
+git checkout --ours -- $CONFLICTED
 git add $CONFLICTED
 ./scripts/version.sh bump patch
 git add $(./scripts/version.sh list)
