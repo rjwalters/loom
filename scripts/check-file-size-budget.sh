@@ -1,51 +1,53 @@
 #!/usr/bin/env bash
 # check-file-size-budget.sh — ratchet oversized source files so they stop growing.
 #
-# Why (#7711): Loom's source files grow monotonically because every individual
-# addition is defensible while the aggregate is the problem — the same failure
-# mode check-claude-md-budget.sh (#4014) was built to counter, now playing out
-# in loom-daemon/src/*.rs and defaults/scripts/*.sh. Measured on 2026-09-15:
-# 86 of 228 Rust files exceeded 1000 lines and held 79% of all Rust LOC, and the
-# five worst files had reached their ENTIRE current size within 90 days at an
-# add-to-delete ratio of roughly 20:1. Agents add; they essentially never
-# restructure.
+# Why (#7711): large files are hard for an LLM coding agent to work with. Opening
+# one spends context on everything you did not need, edits land further from the
+# code that constrains them, and a failed attempt has to re-read the whole thing
+# to try again. Loom's source grows monotonically toward that state because every
+# individual addition is defensible while the aggregate is the problem — the same
+# failure mode check-claude-md-budget.sh (#4014) was built to counter. The
+# measurements that motivated this live in #7711; they are deliberately not
+# repeated here, because a number in a comment goes stale and then misleads.
 #
 # WHAT THIS IS NOT: a hard line limit, and NOT a "you touched a big file, now
-# refactor it" rule. That rule was considered and rejected in #7711 — ipc.rs is
-# touched more than once a day, so it would tax nearly every sweep, bloat
-# feature diffs far past the +160/-24 mean touch, and collide across the
-# parallel worktrees the fleet runs. Judge review gets worse, not better.
+# refactor it" rule. That rule was considered and rejected in #7711 — the hottest
+# files are touched more than once a day, so it would tax nearly every sweep,
+# bloat feature diffs far past a typical touch, and collide across the parallel
+# worktrees the fleet runs. Judge review gets worse, not better.
 #
-# WHAT THIS IS: a one-way ratchet. A file already over threshold is frozen at
-# its CURRENT size — it may shrink freely, it may not grow. Files under
-# threshold are unconstrained. Nothing has to be refactored up front; the gate
-# fires only at the moment an agent makes a known-bad file worse.
+# WHAT THIS IS: a one-way ratchet. A file already over threshold is frozen at its
+# CURRENT size — it may shrink freely, it may not grow. Files under threshold are
+# unconstrained. Nothing has to be refactored up front; the gate fires only at
+# the moment a change makes a known-bad file worse.
 #
-# The rule this enforces: when you need to add to an over-threshold file, put
-# the new code in a NEW sibling module and leave a small dispatch/match arm
-# behind. In Rust that is cheap (`mod foo;` + a new file). Do NOT raise the
-# threshold or hand-edit a baseline entry upward to fit an addition — that is
-# the ratchet slipping, which is the whole thing this prevents.
+# The rule this enforces: when you need to add to an over-threshold file, put the
+# new code in a NEW sibling module and leave a small dispatch/match arm behind.
+# In Rust that is cheap (`mod foo;` plus a new file). Do NOT raise the threshold
+# or hand-edit a baseline entry upward to fit an addition — that is the ratchet
+# slipping, which is the whole thing this prevents.
 #
 # Counting: code lines only — blank lines and comment-only lines never count.
-# For Rust, only PRODUCTION lines count: everything before the first
-# `#[cfg(test)]` module. Inline test modules are idiomatic Rust and are 49% of
-# this repo's Rust bulk; taxing them would push tests out of the codebase for
-# the wrong reason. (Extracting them to sibling files is worthwhile, but that is
-# a separate track — see .loom/docs/file-size-policy.md.)
+# The WHOLE file counts, including inline `#[cfg(test)]` modules. A big file is
+# hard to work with whatever is in it, and an agent editing the production half
+# still pays for the test half sitting in the same buffer. Extracting a test
+# module to a sibling file is a real improvement and the ratchet records it as
+# one: the parent shrinks, and the extracted file is measured on its own terms.
 #
 # Usage:
 #   check-file-size-budget.sh              Check the tree against the baseline.
 #   check-file-size-budget.sh --update     Regenerate the baseline (see below).
 #   check-file-size-budget.sh --list       Print every file's code-line count.
 #   check-file-size-budget.sh --self-test  Verify the gate itself still works.
-#   check-file-size-budget.sh --threshold N  Override the 1000-line threshold.
+#   check-file-size-budget.sh --threshold N  Override the default threshold.
 #   check-file-size-budget.sh --help
 #
 # --update is for two legitimate cases: (1) recording shrinkage after a real
 # refactor, so the ratchet tightens; (2) a deliberate, reviewed decision to admit
-# a new over-threshold file. It is NOT a way to silence a failure — a reviewer
-# should treat an --update that RAISES any number as a red flag.
+# a new over-threshold file — for example a split that moves lines OUT of a
+# larger file into a new one. It is NOT a way to silence a failure. A reviewer
+# should treat an --update that raises an existing number, or that grows the
+# ledger total, as a red flag.
 #
 # Exit codes: 0 = within budget; 1 = a file grew or newly crossed; 2 = bad args.
 
@@ -61,7 +63,7 @@ while [[ $# -gt 0 ]]; do
     --list)      MODE="list"; shift ;;
     --self-test) MODE="self-test"; shift ;;
     --threshold) THRESHOLD="${2:?--threshold needs a value}"; shift 2 ;;
-    --help|-h)   sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h)   sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           echo "check-file-size-budget: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -76,23 +78,24 @@ BASELINE="$ROOT/scripts/file-size-baseline.txt"
 
 # --- Exemptions -------------------------------------------------------------
 #
-# EXEMPT means "not measured at all". Only two categories qualify, and both are
-# cases where a violation would be permanently unfixable in this repo:
+# EXEMPT means "not measured at all". Only cases where a violation would be
+# permanently unfixable in this repo qualify:
 #
 #   1. VENDORED — the canonical copy lives in rjwalters/repo and is re-vendored
-#      here at release time. guard-destructive-generic.sh is the single largest
-#      shell file in the repo (8872 lines) and its own header explicitly forbids
-#      hand-editing generic pattern behavior. Splitting it locally would be
-#      reverted by the next re-vendor.
+#      here at release time. The guard's own header explicitly forbids
+#      hand-editing generic pattern behavior, so a local split would be reverted
+#      by the next re-vendor. Structural fixes belong upstream.
 #   2. INSTALLED MIRRORS — .loom/hooks/, .loom/scripts/, .loom/docs/ etc. are
 #      resync copies of defaults/. Measuring both would double-count every
-#      violation and make the baseline churn on every resync commit.
+#      violation and churn the baseline on every resync commit.
 #
 # Bootstrap scripts (install.sh, install-loom.sh, loom-daemon-{update,start}.sh)
-# are deliberately NOT exempt. They run before, or manage, the loom-daemon
-# binary and so can never be ported into it (#7711's tier table) — but "can't be
-# ported to Rust" is not "may grow without bound". The ratchet is exactly the
-# right mechanism for them.
+# are deliberately NOT exempt. They run before, or manage, the loom-daemon binary
+# and so can never be ported into it — but "cannot be ported to Rust" is not "may
+# grow without bound". The ratchet is exactly the right mechanism for them.
+#
+# Test files are NOT exempt either, in any language. A large test file is just as
+# awkward to open and edit as a large production file.
 is_exempt() {
   case "$1" in
     # Installed mirrors of defaults/ — measured at their defaults/ source.
@@ -101,13 +104,6 @@ is_exempt() {
     defaults/hooks/guard-destructive-generic.sh)  return 0 ;;
     defaults/hooks/guard-destructive.sh)          return 0 ;;
     defaults/scripts/resync-installed.sh)         return 0 ;;
-    # Rust test modules extracted to their own file (#7718). The policy does not
-    # tax Rust tests, inline or extracted -- and counting an extracted module as
-    # production would make this gate FAIL the very refactor it exists to
-    # reward: moving `#[cfg(test)] mod tests` out of ipc.rs creates a 4400-line
-    # ipc/tests.rs that newly "crosses" the threshold, while the production code
-    # it was measuring did not change by a single line.
-    */tests.rs|*/tests/*.rs)                      return 0 ;;
     # Build/dependency output that git may track in some checkouts.
     target/*|node_modules/*|*/node_modules/*|*/dist/*) return 0 ;;
   esac
@@ -115,8 +111,11 @@ is_exempt() {
 }
 
 # --- Measurement ------------------------------------------------------------
-# One awk pass over every candidate file. Code lines only; for .rs, stop at the
-# first `#[cfg(test)]` so inline test modules are excluded (see header).
+# One awk pass over every candidate file: count lines that are neither blank nor
+# comment-only. No language-specific structure is parsed. An earlier revision
+# tried to separate production from test lines by tracking `#[cfg(test)]`, and
+# that produced two silent bugs in opposite directions before it was abandoned
+# (#7711) — counting the whole file needs none of that machinery.
 measure_all() {
   local files=()
   while IFS= read -r f; do
@@ -128,48 +127,14 @@ measure_all() {
   [[ ${#files[@]} -eq 0 ]] && return 0
 
   awk '
-    FNR == 1 { skip = 0; pending = 0; if (!(FILENAME in count)) count[FILENAME] = 0 }
-
-    # --- Rust: skip TOP-LEVEL `#[cfg(test)] mod ... { ... }` blocks only ------
-    # Not "everything after the first #[cfg(test)]": that attribute also marks
-    # test-only helper FUNCTIONS, which sit mid-file with thousands of
-    # production lines below them (role_runner.rs line 894, work_finder.rs
-    # line 1004). Truncating there silently undercounted two of the largest
-    # files in the repo to ~900 lines and kept them out of the baseline.
-    #
-    # A top-level module ends at a `}` in column 0 — everything inside it is
-    # indented — so no brace counting (and no string/comment escaping) is
-    # needed. A raw string containing a column-0 `}` would end the skip early;
-    # that fails toward counting MORE lines, which is the safe direction.
-    FILENAME ~ /\.rs$/ {
-      if (skip) { if ($0 ~ /^\}[ \t]*$/) skip = 0; next }
-      if ($0 ~ /^#\[cfg\(test\)\]/) { pending = 1; next }
-      if (pending) {
-        # Attributes may sit between #[cfg(test)] and the item it decorates, and
-        # they may span multiple lines:
-        #     #[cfg(test)]
-        #     #[allow(
-        #         clippy::unwrap_used,
-        #     )]
-        #     mod tests {
-        # So stay pending through anything that is not a column-0 item keyword:
-        # further attributes, their indented continuation lines, the closing
-        # `)]`, and blanks. Decide only when a real item starts in column 0.
-        if ($0 ~ /^[ \t]/ || $0 ~ /^#\[/ || $0 ~ /^\)\]/ || $0 ~ /^[ \t]*$/) next
-        if ($0 ~ /^(pub )?mod /) { pending = 0; if ($0 !~ /\}[ \t]*$/) skip = 1; next }
-        # #[cfg(test)] on a non-module item (a helper fn): the item itself is
-        # test-only, but production code continues after it, so resume counting.
-        pending = 0
-      }
-    }
-
+    FNR == 1 { if (!(FILENAME in count)) count[FILENAME] = 0 }
     {
       line = $0
       sub(/^[ \t]+/, "", line)
       if (line == "") next
-      if (FILENAME ~ /\.rs$/  && line ~ /^\/\//) next
-      if (FILENAME ~ /\.sh$/  && line ~ /^#/)    next
-      if (FILENAME ~ /\.ts$/  && (line ~ /^\/\// || line ~ /^\*/ || line ~ /^\/\*/)) next
+      if (FILENAME ~ /\.rs$/ && line ~ /^\/\//) next
+      if (FILENAME ~ /\.sh$/ && line ~ /^#/)    next
+      if (FILENAME ~ /\.ts$/ && (line ~ /^\/\// || line ~ /^\*/ || line ~ /^\/\*/)) next
       count[FILENAME]++
     }
     END { for (f in count) printf "%d %s\n", count[f], f }
@@ -177,7 +142,6 @@ measure_all() {
 }
 
 baseline_for() {
-  # Baseline lines are "<count> <path>"; match the path field exactly.
   awk -v p="$1" '$1 !~ /^#/ && $2 == p { print $1; found = 1; exit } END { if (!found) print "" }' "$BASELINE"
 }
 
@@ -190,9 +154,10 @@ write_baseline() {
     echo "# listed file GROWS past its recorded number, or when an unlisted file crosses"
     echo "# the threshold. Shrinking is always allowed."
     echo "#"
-    echo "# These numbers are a debt ledger, not a target. They should only ever go DOWN."
-    echo "# A diff here that raises a number, or adds a row without a clear reason in the"
-    echo "# PR description, is the ratchet slipping — see .loom/docs/file-size-policy.md."
+    echo "# This is a debt ledger, not a target. The numbers should only ever go DOWN, and"
+    echo "# the list should only ever get shorter. A diff that raises a number, or that"
+    echo "# grows the total, needs a clear reason in the PR description — see"
+    echo "# .loom/docs/file-size-policy.md."
     echo "#"
     echo "# <code-lines> <path>"
     measure_all | while read -r n f; do
@@ -205,12 +170,12 @@ write_baseline() {
 }
 
 # --- Self-test ---------------------------------------------------------------
-# A ratchet that silently stops measuring is worse than no ratchet: it reports
-# OK forever while the files it guards keep growing. This exercises the counting
-# rules and all three verdicts against synthetic fixtures in a throwaway repo, so
-# a future edit to the awk pass (or to the exemption list) fails loudly in CI
-# rather than quietly disarming the gate. Mirrors the --self-test convention
-# already used by check-docs-defaults-parity.sh.
+# A ratchet that silently stops measuring is worse than no ratchet: it reports OK
+# forever while the files it guards keep growing. This exercises the counting
+# rules, the exemptions and all three verdicts against synthetic fixtures in a
+# throwaway repo, so a future edit fails loudly in CI rather than quietly
+# disarming the gate. Mirrors the --self-test convention already used by
+# check-docs-defaults-parity.sh.
 self_test() {
   local tmp rc=0 out S T
   tmp="$(mktemp -d)"
@@ -223,43 +188,30 @@ self_test() {
   git -C "$tmp" config user.email t@t.test
   git -C "$tmp" config user.name t
 
-  # 12 code lines, then comments, blanks and a large inline test module. Under a
-  # threshold of 20 this must measure as 12, not as its 60-odd raw lines.
+  # 12 code lines plus blanks and comment-only lines, which must not count.
   {
     for i in $(seq 1 12); do echo "pub const C_$i: u8 = $i;"; done
     echo ""
     echo "// a comment"
     echo ""
     echo "   // an indented comment"
-    echo "#[cfg(test)]"
-    echo "#[allow("
-    echo "    clippy::unwrap_used,"
-    echo "    clippy::panic"
-    echo ")]"
-    echo "mod tests {"
-    for i in $(seq 1 40); do echo "    pub const T_$i: u8 = $i;"; done
-    echo "}"
   } > "$tmp/src/small.rs"
+
+  # An inline test module DOES count toward the file's size.
+  {
+    for i in $(seq 1 12); do echo "pub const D_$i: u8 = $i;"; done
+    echo "#[cfg(test)]"
+    echo "mod tests {"
+    for i in $(seq 1 12); do echo "    pub const T_$i: u8 = $i;"; done
+    echo "}"
+  } > "$tmp/src/withtests.rs"
 
   # 30 code lines -> over a threshold of 20.
   for i in $(seq 1 30); do echo "pub const B_$i: u8 = $i;"; done > "$tmp/src/big.rs"
 
-  # A test-only helper FN mid-file must not truncate the count: production code
-  # continues below it. This is the role_runner.rs / work_finder.rs shape, which
-  # an earlier revision undercounted by ~1300 lines.
-  {
-    for i in $(seq 1 10); do echo "pub const P_$i: u8 = $i;"; done
-    echo "#[cfg(test)]"
-    echo "fn helper() {}"
-    for i in $(seq 1 10); do echo "pub const Q_$i: u8 = $i;"; done
-  } > "$tmp/src/midhelper.rs"
-
-  # Exemption fixtures: all are far over threshold and must never be measured.
+  # Exemption fixtures: both are over threshold and must never be measured.
   for i in $(seq 1 50); do echo "echo $i"; done > "$tmp/.loom/scripts/mirror.sh"
   for i in $(seq 1 50); do echo "echo $i"; done > "$tmp/defaults/hooks/guard-destructive-generic.sh"
-  # An extracted Rust test module (#7718) -- test code, not production.
-  mkdir -p "$tmp/src/big"
-  for i in $(seq 1 60); do echo "pub const TT_$i: u8 = $i;"; done > "$tmp/src/big/tests.rs"
 
   git -C "$tmp" add -A >/dev/null
   git -C "$tmp" commit -qm fixtures
@@ -277,25 +229,18 @@ self_test() {
     fi
   }
 
-  # Counting: inline tests, comment-only lines and blanks are all excluded.
   out="$( (cd "$tmp" && $S $T --list) | awk '$2=="src/small.rs"{print $1}')"
-  _expect "rust inline #[cfg(test)]/comments/blanks excluded" "12" "$out"
+  _expect "blank and comment-only lines excluded" "12" "$out"
 
-  # A mid-file #[cfg(test)] helper fn must not truncate: 20 consts + the fn.
-  out="$( (cd "$tmp" && $S $T --list) | awk '$2=="src/midhelper.rs"{print $1}')"
-  _expect "mid-file #[cfg(test)] helper fn does not truncate the count" "21" "$out"
+  # 12 production + 1 attribute + 1 mod line + 12 test consts + 1 closing brace.
+  out="$( (cd "$tmp" && $S $T --list) | awk '$2=="src/withtests.rs"{print $1}')"
+  _expect "inline test module counts toward file size" "27" "$out"
 
-  # Exemptions: neither fixture appears in the measured set at all.
   out="$( (cd "$tmp" && $S $T --list) | grep -c 'mirror\.sh\|guard-destructive-generic' || true)"
   _expect "installed-mirror and vendored paths not measured" "0" "$out"
 
-  out="$( (cd "$tmp" && $S $T --list) | grep -c 'big/tests\.rs' || true)"
-  _expect "extracted rust test modules not measured" "0" "$out"
-
   (cd "$tmp" && $S $T --update >/dev/null)
 
-  # Assert membership, not a raw count: the fixture repo also contains the copy
-  # of this script under scripts/, which is itself well over a threshold of 20.
   out="$(awk '$2=="src/big.rs"{print "y"}' "$tmp/scripts/file-size-baseline.txt")"
   _expect "baseline records the over-threshold file" "y" "$out"
   out="$(awk '$2=="src/small.rs"{print "y"}' "$tmp/scripts/file-size-baseline.txt")"
@@ -304,26 +249,21 @@ self_test() {
   (cd "$tmp" && $S $T >/dev/null 2>&1) && out=0 || out=$?
   _expect "clean tree passes" "0" "$out"
 
-  # Growth of a listed file fails.
   echo "pub const EXTRA: u8 = 0;" >> "$tmp/src/big.rs"
   (cd "$tmp" && $S $T >/dev/null 2>&1) && out=0 || out=$?
   _expect "growth of an over-threshold file fails" "1" "$out"
 
-  # Shrinking below the recorded number passes.
   for i in $(seq 1 25); do echo "pub const B_$i: u8 = $i;"; done > "$tmp/src/big.rs"
   (cd "$tmp" && $S $T >/dev/null 2>&1) && out=0 || out=$?
   _expect "shrinking passes" "0" "$out"
 
-  # A brand-new file crossing the threshold fails.
   for i in $(seq 1 30); do echo "pub const B_$i: u8 = $i;"; done > "$tmp/src/big.rs"
   for i in $(seq 1 40); do echo "pub const N_$i: u8 = $i;"; done > "$tmp/src/newbig.rs"
   git -C "$tmp" add -A >/dev/null
   (cd "$tmp" && $S $T >/dev/null 2>&1) && out=0 || out=$?
   _expect "new file crossing the threshold fails" "1" "$out"
 
-  # Growing ONLY an inline test module is always allowed. (Truncating newbig.rs
-  # rather than deleting it keeps this loop free of rm-on-a-variable, which the
-  # repo's own destructive-command guard refuses to reason about.)
+  # Growing a test module is NOT a free pass under whole-file counting.
   : > "$tmp/src/newbig.rs"
   {
     echo "#[cfg(test)]"
@@ -332,7 +272,7 @@ self_test() {
     echo "}"
   } >> "$tmp/src/big.rs"
   (cd "$tmp" && $S $T >/dev/null 2>&1) && out=0 || out=$?
-  _expect "inline test-module growth is allowed" "0" "$out"
+  _expect "inline test-module growth is not exempt" "1" "$out"
 
   if [[ $rc -eq 0 ]]; then
     echo "check-file-size-budget --self-test: all checks passed."
@@ -414,6 +354,9 @@ if (( ${#grew[@]} > 0 || ${#crossed[@]} > 0 )); then
     echo "  - Put the new code in a NEW sibling module and leave a dispatch/match arm"
     echo "    behind (in Rust: 'mod foo;' plus a new file). This is the intended path."
     echo "  - Or remove at least as much as you added from the same file."
+    echo ""
+    echo "If this change legitimately SPLITS a large file into smaller ones, run"
+    echo "--update and say so in the PR description: the ledger total should drop."
     echo ""
     echo "Do NOT raise the threshold, and do NOT hand-edit the baseline upward — that"
     echo "is the ratchet slipping. See .loom/docs/file-size-policy.md."
