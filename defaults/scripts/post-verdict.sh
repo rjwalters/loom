@@ -247,7 +247,16 @@ if [[ "$VERDICT" == "approved" && "${GATE_SKIPPED:-false}" != "true" ]]; then
   GATE_INLINE_UNRESOLVED="$(gate_field INLINE_THREADS_UNRESOLVED)"
   GATE_SOURCE="$(gate_field INLINE_RESOLUTION_SOURCE)"
   GATE_BLOCKING_IDS="$(gate_field REVIEW_BLOCKING_IDS)"
+  GATE_INLINE_BLOCKING_IDS="$(gate_field INLINE_BLOCKING_IDS)"
   GATE_FINDINGS_FILE="$(gate_field REVIEW_FEEDBACK_FINDINGS_FILE)"
+  # Formal-review ids and unresolved-inline-thread ids are both "things a
+  # BLOCKING/NEEDS_RECONCILIATION disposition must cite" — an inline-thread-only
+  # block must not be waved through with a citation that only ever names formal
+  # review ids (#7647 follow-up: the original cut only wired the formal half).
+  # `read -ra` both trims and collapses whitespace, so two empty inputs collapse
+  # to a genuinely empty string rather than a single stray space.
+  read -ra _gate_all_ids <<< "$GATE_BLOCKING_IDS $GATE_INLINE_BLOCKING_IDS"
+  GATE_ALL_BLOCKING_IDS="${_gate_all_ids[*]}"
 
   if [[ "$GATE_STATE" == "CLEAR" ]]; then
     RECONCILIATION_MARKER="<!-- loom:review-reconciliation state=clear reviews=${GATE_REVIEWS:-0} blocking_current=0 blocking_older=0 inline_unresolved=0 source=${GATE_SOURCE:-none} reconciled=n/a -->"
@@ -266,7 +275,7 @@ if [[ "$VERDICT" == "approved" && "${GATE_SKIPPED:-false}" != "true" ]]; then
         fi
         echo
         echo "Reconcile each finding above against the current tree, then re-run with:"
-        echo "  --reviews-reconciled \"<which findings were fixed / superseded / remain blocking, citing review ids${GATE_BLOCKING_IDS:+: $GATE_BLOCKING_IDS}>\""
+        echo "  --reviews-reconciled \"<which findings were fixed / superseded / remain blocking, citing review/thread ids${GATE_ALL_BLOCKING_IDS:+: $GATE_ALL_BLOCKING_IDS}>\""
         echo "An UNKNOWN state means the read itself failed — re-run the gate before asserting anything about it."
         echo "Never dismiss a review to clear this gate, and never assert a resolution you did not verify."
       } >&2
@@ -278,19 +287,25 @@ if [[ "$VERDICT" == "approved" && "${GATE_SKIPPED:-false}" != "true" ]]; then
       exit 3
     fi
 
-    # A BLOCKING state names concrete review ids; the disposition must cite
-    # each one, so "reconciled" cannot be a blanket sentence that never read
-    # the findings.
+    # A BLOCKING state names concrete review/thread ids; the disposition must
+    # cite each one — formal review ids AND unresolved inline-thread ids alike
+    # (#7647 follow-up) — so "reconciled" cannot be a blanket sentence that
+    # never read the findings. The match is boundary-anchored, not a bare
+    # substring: an unanchored match would let a short id spuriously match
+    # inside an unrelated longer number/opaque token. Quoting "$id" inside the
+    # =~ pattern keeps it literal, so ids containing regex metacharacters
+    # cannot corrupt the match.
     MISSING_IDS=""
-    for id in $GATE_BLOCKING_IDS; do
-      case "$RECONCILED" in
-        *"$id"*) ;;
-        *) MISSING_IDS="${MISSING_IDS:+$MISSING_IDS }$id" ;;
-      esac
+    for id in $GATE_ALL_BLOCKING_IDS; do
+      if [[ "$RECONCILED" =~ (^|[^[:alnum:]])"$id"($|[^[:alnum:]]) ]]; then
+        :
+      else
+        MISSING_IDS="${MISSING_IDS:+$MISSING_IDS }$id"
+      fi
     done
     if [[ -n "$MISSING_IDS" ]]; then
-      echo "post-verdict.sh: REFUSING to post an approval — --reviews-reconciled does not address review id(s): $MISSING_IDS (#7647)" >&2
-      echo "Cite each blocking review id and state what happened to its request." >&2
+      echo "post-verdict.sh: REFUSING to post an approval — --reviews-reconciled does not address review/thread id(s): $MISSING_IDS (#7647)" >&2
+      echo "Cite each blocking review/thread id and state what happened to its request." >&2
       exit 3
     fi
 

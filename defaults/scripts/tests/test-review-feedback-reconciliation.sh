@@ -319,10 +319,26 @@ run_gate --number 5369 --head-sha "$HEAD_SHA"
 assert_eq "10" "$GATE_RC" "unresolved non-outdated inline thread -> exit 10 (BLOCKING)"
 assert_contains "$GATE_OUT" "INLINE_THREADS_UNRESOLVED=1" "only the unresolved thread is counted"
 assert_contains "$GATE_OUT" "INLINE_RESOLUTION_SOURCE=graphql" "resolution state came from the supported interface"
+assert_contains "$GATE_OUT" "INLINE_BLOCKING_IDS=\"PRRT_open\"" "the unresolved thread's id is reported for citation, the resolved one is not"
 
 run_pv 5369 approved "$HEAD_SHA" --body "Approved, CI green."
 assert_eq "3" "$PV_RC" "approval refused while an inline thread is unresolved"
 assert_eq "" "$PV_PR" "no approval comment posted"
+assert_contains "$PV_OUT" "PRRT_open" "refusal names the unresolved inline thread id"
+
+# A blanket disposition that never cites the thread id is refused, exactly
+# like an uncited formal-review id in T2 — an inline-thread-only block must
+# not be waved through on a citation that only ever names formal review ids.
+run_pv 5369 approved "$HEAD_SHA" --body "Approved." \
+  --reviews-reconciled "I looked at the inline feedback and consider everything adequately addressed already."
+assert_eq "3" "$PV_RC" "blanket reconciliation text that cites no thread id -> still refused"
+assert_eq "" "$PV_PR" "still no approval comment posted"
+
+# Citing the thread id lets the approval through.
+run_pv 5369 approved "$HEAD_SHA" --body "Approved." \
+  --reviews-reconciled "Thread PRRT_open (missing test coverage for the branch) was addressed in commit 23a0289: the branch is now exercised by tests/test_dfm_branch.py."
+assert_eq "0" "$PV_RC" "explicit, thread-id-citing reconciliation -> approval posts"
+assert_contains "$PV_BODY" "PRRT_open" "posted comment records which inline thread was dispositioned"
 
 # --- T4: older-head finding, repaired, with evidence ------------------------
 echo ""
@@ -469,6 +485,24 @@ PV_BODY="$(cat "$FIX_DIR/last-body.txt" 2>/dev/null || true)"
 assert_eq "0" "$PV_RC" "a missing gate script does not block the approval (availability over a self-inflicted stall)"
 assert_contains "$PV_OUT" "WARNING" "the missing gate is reported loudly on stderr"
 assert_contains "$PV_BODY" "state=gate-unavailable" "the forge record shows the approval was NOT review-reconciled"
+
+# --- T10: id citation is boundary-anchored, not a bare substring match ------
+# A naive `*"$id"*` match lets a short id spuriously match inside an unrelated
+# longer number (e.g. blocking id "42" inside "4242"). The disposition must
+# name the id as its own token.
+echo ""
+echo "T10: word-boundary-safe id citation"
+reset_fixtures
+cat > "$FIX_DIR/reviews-page-1.json" << JSON
+[{"id":42,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"alice"},"body":"needs a fix"}]
+JSON
+run_pv 5369 approved "$HEAD_SHA" --body "Approved." \
+  --reviews-reconciled "See PR #4242 and issue 4200 for background; this is fully resolved now, I promise."
+assert_eq "3" "$PV_RC" "id '42' embedded only inside longer numbers (4242, 4200) does not satisfy citation"
+
+run_pv 5369 approved "$HEAD_SHA" --body "Approved." \
+  --reviews-reconciled "Review 42 (needs a fix) was addressed in commit 23a0289: the fix landed and is covered by a new test."
+assert_eq "0" "$PV_RC" "id '42' cited as its own token satisfies citation"
 
 # --- Summary ---
 echo ""

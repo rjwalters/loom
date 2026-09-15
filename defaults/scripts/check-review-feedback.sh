@@ -60,6 +60,7 @@
 #   INLINE_COMMENTS_TOTAL=<int>
 #   INLINE_THREADS_UNRESOLVED=<int>
 #   INLINE_THREADS_UNRESOLVED_OUTDATED=<int>
+#   INLINE_BLOCKING_IDS="<thread/comment ids, space separated>"
 #   INLINE_RESOLUTION_SOURCE=graphql|rest-unknown|none
 #   REVIEW_FEEDBACK_FINDINGS_FILE=<path>
 #
@@ -165,6 +166,7 @@ BLOCKING_IDS=""
 INLINE_COMMENTS_TOTAL=0
 INLINE_UNRESOLVED=0
 INLINE_UNRESOLVED_OUTDATED=0
+INLINE_BLOCKING_IDS=""
 INLINE_SOURCE="none"
 FAILURE_REASON=""
 
@@ -189,6 +191,7 @@ _emit_and_exit() {
             --argjson inline_total "$INLINE_COMMENTS_TOTAL" \
             --argjson inline_unresolved "$INLINE_UNRESOLVED" \
             --argjson inline_unresolved_outdated "$INLINE_UNRESOLVED_OUTDATED" \
+            --arg inline_blocking_ids "$INLINE_BLOCKING_IDS" \
             --arg inline_source "$INLINE_SOURCE" \
             --arg findings_file "$FINDINGS_FILE" \
             --arg failure_reason "$FAILURE_REASON" \
@@ -200,6 +203,7 @@ _emit_and_exit() {
               inline_comments_total:$inline_total,
               inline_threads_unresolved:$inline_unresolved,
               inline_threads_unresolved_outdated:$inline_unresolved_outdated,
+              inline_blocking_ids:($inline_blocking_ids | split(" ") | map(select(. != ""))),
               inline_resolution_source:$inline_source,
               findings_file:$findings_file,
               failure_reason:$failure_reason}' 2>/dev/null \
@@ -215,6 +219,7 @@ _emit_and_exit() {
         echo "INLINE_COMMENTS_TOTAL=$INLINE_COMMENTS_TOTAL"
         echo "INLINE_THREADS_UNRESOLVED=$INLINE_UNRESOLVED"
         echo "INLINE_THREADS_UNRESOLVED_OUTDATED=$INLINE_UNRESOLVED_OUTDATED"
+        echo "INLINE_BLOCKING_IDS=\"$INLINE_BLOCKING_IDS\""
         echo "INLINE_RESOLUTION_SOURCE=$INLINE_SOURCE"
         echo "REVIEW_FEEDBACK_FINDINGS_FILE=$FINDINGS_FILE"
     fi
@@ -337,13 +342,15 @@ if [[ $THREADS_RC -eq 0 ]]; then
           }
         | . + {
             findings: ([.unresolved[] | "inline thread \(.id) UNRESOLVED on \(.path) by \(.author) [CURRENT DIFF] :: \((.body | split("\n")[0] // "")[0:200])"]
-                     + [.unresolved_outdated[] | "inline thread \(.id) UNRESOLVED+OUTDATED on \(.path) by \(.author) [older head — needs evidence of repair or explicit disposition] :: \((.body | split("\n")[0] // "")[0:200])"])
+                     + [.unresolved_outdated[] | "inline thread \(.id) UNRESOLVED+OUTDATED on \(.path) by \(.author) [older head — needs evidence of repair or explicit disposition] :: \((.body | split("\n")[0] // "")[0:200])"]),
+            blocking_ids: ([.unresolved[] | .id | tostring] + [.unresolved_outdated[] | .id | tostring])
           }
     ' 2>/dev/null)
     [[ -n "$THREAD_SUMMARY" ]] || _fail_unknown "the review-thread payload could not be parsed — resolution state is unknown"
     INLINE_COMMENTS_TOTAL=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.total')
     INLINE_UNRESOLVED=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.unresolved | length')
     INLINE_UNRESOLVED_OUTDATED=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.unresolved_outdated | length')
+    INLINE_BLOCKING_IDS=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.blocking_ids | join(" ")')
     printf '%s' "$THREAD_SUMMARY" | jq -r '.findings[]' >> "$FINDINGS_FILE"
 else
     # GraphQL is unavailable (exhausted, unsupported forge, or an error). Fall
@@ -364,13 +371,15 @@ else
           }
         | . + {
             findings: ([.current[] | "inline comment \(.id) on \(.path) by \(.author) [resolution state UNKNOWN — GraphQL reviewThreads unavailable] :: \((.body | split("\n")[0] // "")[0:200])"]
-                     + [.outdated[] | "inline comment \(.id) on \(.path) by \(.author) [OUTDATED, resolution state UNKNOWN] :: \((.body | split("\n")[0] // "")[0:200])"])
+                     + [.outdated[] | "inline comment \(.id) on \(.path) by \(.author) [OUTDATED, resolution state UNKNOWN] :: \((.body | split("\n")[0] // "")[0:200])"]),
+            blocking_ids: ([.current[] | .id | tostring] + [.outdated[] | .id | tostring])
           }
     ' 2>/dev/null)
     [[ -n "$INLINE_SUMMARY" ]] || _fail_unknown "the inline-comment payload could not be parsed — inline feedback state is unknown"
     INLINE_COMMENTS_TOTAL=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.total')
     INLINE_UNRESOLVED=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.current | length')
     INLINE_UNRESOLVED_OUTDATED=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.outdated | length')
+    INLINE_BLOCKING_IDS=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.blocking_ids | join(" ")')
     printf '%s' "$INLINE_SUMMARY" | jq -r '.findings[]' >> "$FINDINGS_FILE"
 fi
 
