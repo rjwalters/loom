@@ -663,7 +663,11 @@ fn resolve_spread_top_n(workspace: &Path) -> Option<usize> {
 /// env var (parsed as a float) → the constant default [`DEFAULT_5H_LOAD_GATE`].
 /// An unset or unparseable env value falls back to the default. Mirrors
 /// `select.py:_resolve_load_gate` so both implementations gate identically.
-fn resolve_load_gate() -> f64 {
+///
+/// `pub(crate)` (rather than private) so [`super::bad_tokens`]'s ambiguous-entry
+/// early-release check (#7538) reuses this exact resolution — including the env
+/// override — instead of duplicating the threshold.
+pub(crate) fn resolve_load_gate() -> f64 {
     if let Ok(raw) = std::env::var("LOOM_TOKEN_5H_LOAD_GATE") {
         if let Ok(v) = raw.trim().parse::<f64>() {
             return v;
