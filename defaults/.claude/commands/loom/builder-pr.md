@@ -821,7 +821,7 @@ git rebase origin/main
 Do this **unconditionally**, not only when your diff happens to touch a file
 you know is contested. A branch cut even a few hours ago against a busy repo
 can be stale by the time you are ready to push, and the cost of skipping this
-is not hypothetical: three consecutive PRs (2AMLogic/gf180-tmds-tx#164, #165,
+is not hypothetical: three consecutive PRs (example-org/tool-repo#164, #165,
 #166) each landed `DIRTY` with CI never run, purely because every branch was
 cut before the previous PR in the sequence merged and each touched the same
 narrow, frequently-updated surface (a README status paragraph). Each one cost
