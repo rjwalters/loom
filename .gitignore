@@ -14,6 +14,15 @@ coverage/
 .ruff_cache/
 .mypy_cache/
 
+# aider session artifacts (#7746). Named individually rather than as `.aider*`
+# so `.aider.conf.yml` -- which teams legitimately commit to share aider
+# config -- stays committable. .aider.chat.history.md is a verbatim transcript
+# of the session, and this repo's agents run `git add -A` as a documented
+# Builder step against a public remote.
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v*/
+
 # Env files
 .env
 .env.local
