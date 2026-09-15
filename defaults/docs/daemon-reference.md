@@ -1544,11 +1544,18 @@ SOURCE-side edit is never in this class's domain either way (only the *installed
 copy maps to its source, not the reverse), so editing `defaults/docs/x.md`
 directly and then resyncing still correctly skips the gate on that edit.
 
-`resync-installed.sh` also prints the exact `git add … && git commit` command in
-its summary when a run leaves the tree dirty with nothing but this kind of resync
-output — worth running so the dirt doesn't linger indefinitely (ignorable ≠
-committed; the gate proceeds either way, but an uncommitted resync is still a
-correctness gap in the repo's history).
+`resync-installed.sh` also recommends `./.loom/scripts/land-resync-commit.sh`
+in its summary when a run leaves the tree dirty with nothing but this kind of
+resync output — worth running so the dirt doesn't linger indefinitely
+(ignorable ≠ committed; the gate proceeds either way, but an uncommitted
+resync is still a correctness gap in the repo's history). That script is what
+actually commits and pushes the change onto the primary clone's default
+branch — conservatively: it never rebases or force/bypass-pushes to reconcile
+with a diverged `origin`, and it stops (commit made, nothing pushed) rather
+than rewrite an operator's own unpushed commit to make room for it. See
+`.loom/docs/troubleshooting.md` → "Landing a resync commit on the primary
+clone (#6646)" for the full policy and the reflog recipe for telling this
+script's own behavior apart from an unexpected rewrite of the branch.
 
 `defaults/scripts/check-main-clean.sh` (the sweep-lifecycle backstop for builder
 contamination on `main`, #2802/#3513) deliberately does **not** adopt this

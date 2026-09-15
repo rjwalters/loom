@@ -1101,7 +1101,13 @@ printf 'NEW-TEST\n' > "$REPO/defaults/scripts/check-defaults-version-bump.sh"   
 git -C "$REPO" add defaults/scripts/check-defaults-version-bump.sh >/dev/null 2>&1
 git -C "$REPO" commit -qm "add new shipped defaults/ file" >/dev/null 2>&1
 OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
-commit_line="$(grep -m1 '^ *git add ' <<<"$OUT")"
+# #6646: the actionable recommendation is now land-resync-commit.sh (which
+# commits AND lands, never rebasing/bypass-pushing on its own) rather than a
+# raw 'git add && git commit' -- but the note line still embeds the resolved
+# resync_paths list ("would be: git add <paths>") so this test can keep
+# verifying suggest_commit_if_resync_only_dirt()'s CLASSIFICATION logic
+# (retired-vs-shipped, #7336) independently of how the commit is landed.
+commit_line="$(grep -m1 'would be: git add ' <<<"$OUT")"
 if [[ -n "$commit_line" ]]; then
     pass "(#7336) fixture precondition: the dirty-tree commit hint fired"
 else
@@ -1125,6 +1131,11 @@ if grep -q 'install-metadata\.json' <<<"$commit_line"; then
     pass "(#7336) other hardcoded single-file case (install-metadata.json) remains in the commit suggestion"
 else
     fail "(#7336) other hardcoded single-file case (install-metadata.json) unexpectedly dropped from the commit suggestion"
+fi
+if grep -q './.loom/scripts/land-resync-commit\.sh' <<<"$OUT"; then
+    pass "(#6646) the actionable recommendation points at land-resync-commit.sh"
+else
+    fail "(#6646) the actionable recommendation points at land-resync-commit.sh"
 fi
 if grep -qi "excluded from the commit suggestion" <<<"$OUT" && grep -q 'defaults/\.loom-retired\.list' <<<"$OUT"; then
     pass "(#7336) retired-but-unlisted path gets its own remedy pointing at defaults/.loom-retired.list"
