@@ -68,10 +68,16 @@ considered and rejected:
 
 Code lines only. Blank lines and comment-only lines never count.
 
-**Rust counts production lines only** — everything before the first
-`#[cfg(test)]`. Inline test modules are idiomatic Rust and are **49% of this
-repo's Rust bulk** (142,674 of 289,955 lines). Taxing them would push tests out
-of the codebase for the wrong reason. Growing a test module is always allowed.
+**Rust counts production lines only** — everything outside a top-level
+`#[cfg(test)] mod ... { ... }` block. Note this is *not* "everything before the
+first `#[cfg(test)]`": that attribute also marks test-only helper **functions**,
+which sit mid-file with thousands of production lines below them. Truncating
+there undercounted `role_runner.rs` by 1,315 lines and kept it out of the
+baseline entirely.
+
+Inline test modules are idiomatic Rust and are **49% of this repo's Rust bulk**
+(142,674 of 289,955 lines). Taxing them would push tests out of the codebase for
+the wrong reason. Growing a test module is always allowed.
 
 This is why the ledger numbers look smaller than `wc -l`: `role_runner.rs` is
 9,949 raw lines but only 2,208 production lines.
