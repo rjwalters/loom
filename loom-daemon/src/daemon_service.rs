@@ -212,6 +212,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 abort_drain,
                 then_exit,
                 reload_supervisor,
+                verify_only,
+                verify_supervisor,
+                verify_pre_pid,
             } => {
                 handle_restart_command(
                     drain,
@@ -220,6 +223,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     abort_drain,
                     then_exit,
                     reload_supervisor,
+                    cli::restart::VerifyOnlyArgs {
+                        verify_only,
+                        verify_supervisor,
+                        verify_pre_pid,
+                    },
                 )
                 .await
             }
