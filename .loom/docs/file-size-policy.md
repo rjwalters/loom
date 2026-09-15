@@ -118,6 +118,27 @@ is the ratchet slipping, which is the entire thing this prevents. A baseline
 diff that raises a number, or grows the total, without a stated reason should be
 treated by Judge as a red flag.
 
+## When the baseline goes stale under you
+
+CI evaluates the **merge result**, not your branch in isolation. So if an
+over-threshold file grows on `main` after your baseline snapshot was taken, your
+PR fails for growth it did not cause.
+
+This is mostly a one-time bootstrap artifact: once the gate is live, growth is
+caught on the PR that causes it. The residual case is two PRs in flight — A
+grows a file and merges, B was opened earlier and now fails. The remedy is the
+same either way:
+
+```
+git rebase origin/main
+scripts/check-file-size-budget.sh --update
+```
+
+and **say in the PR description that the raised number came from `main`, not
+from your change**. This is the one legitimate reason for a baseline number to
+go up, and it should be visibly justified every time, because the policy
+otherwise treats an upward edit as the ratchet slipping.
+
 ## Mechanical refactors: use the compiler's tooling, never text surgery
 
 When moving code — extracting a test module, splitting a file — **move the text

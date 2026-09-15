@@ -85,4 +85,4 @@
 1488 scripts/install-loom.sh
 2739 scripts/test-installer.sh
 1264 scripts/uninstall-loom.sh
-4484 tests/hooks/test-guard-destructive.sh
+4501 tests/hooks/test-guard-destructive.sh
