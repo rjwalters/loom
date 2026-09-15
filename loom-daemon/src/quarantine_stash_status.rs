@@ -16,8 +16,11 @@
 //! whole repo) — the daemon-side *aggregation* into a per-repo summary is the
 //! new part, not the underlying stash-discovery walk.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -283,9 +286,189 @@ pub fn collect_stash_summary(root: &Path) -> StashSummary {
     summarize(&entries, now_epoch)
 }
 
+// ============================================================================
+// Per-root cache (Issue #7526)
+// ============================================================================
+//
+// `collect_stash_summary` above is a `git stash list` subprocess spawn —
+// #7525's phase instrumentation, run against a live 50-root macOS fleet host
+// (2026-09-14, cited verbatim in #7526's issue body — quoted again in this
+// module's changelog PR description, not re-derived here) measured it as
+// `stash_git_shellout`, the single dominant contributor to
+// `build_daemon_status` exceeding the fleet's 5s IPC budget: 2.0s / 3.8s /
+// 1.8s of three 1.9-5.3s slow builds across 50 roots. `build_daemon_status`
+// (`ipc.rs`) now reads from the cache below instead of calling
+// `collect_stash_summary` synchronously; [`spawn_multi_stash_summary_refresh_task`]
+// is what keeps the cache warm, refreshing every registered root's entry on
+// its own background tick — mirroring the existing process-global-snapshot
+// caching pattern in `deep_clean.rs` / `host_breaker.rs` / `auto_update.rs`
+// (`OnceLock<Mutex<..>>`, published by a background loop, read by
+// `build_daemon_status` via a cheap lock+clone with no I/O under the lock).
+
+/// One cached [`StashSummary`] plus when it was collected (Issue #7526) — the
+/// "age" the acceptance criteria ask for: how stale this entry is relative to
+/// `now`, independent of [`StashSummary::oldest_stash_age_secs`] (which is a
+/// property of the *stash reflog itself*, not of this cache entry).
+#[derive(Debug, Clone, Copy)]
+pub struct CachedStashSummary {
+    /// The most recently collected summary for this root.
+    pub summary: StashSummary,
+    /// When [`refresh`] most recently collected `summary` for this root.
+    refreshed_at: Instant,
+}
+
+impl CachedStashSummary {
+    /// How long ago this entry was refreshed, relative to `now` — callers
+    /// pass in `Instant::now()` rather than this reading it itself, so tests
+    /// can assert staleness deterministically without a real sleep.
+    #[must_use]
+    pub fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.refreshed_at)
+    }
+}
+
+type StashCacheMap = BTreeMap<PathBuf, CachedStashSummary>;
+
+/// Process-global per-root cache, published by [`refresh`]/[`refresh_all`],
+/// read by [`cached_summary`] — mirrors `deep_clean.rs`'s `GLOBAL_STATE`
+/// (Issue #7526).
+static STASH_CACHE: OnceLock<Mutex<StashCacheMap>> = OnceLock::new();
+
+fn stash_cache() -> &'static Mutex<StashCacheMap> {
+    STASH_CACHE.get_or_init(|| Mutex::new(StashCacheMap::new()))
+}
+
+/// Collect `root`'s stash summary (the synchronous `git stash list`
+/// shellout) and publish it into the process-global cache. This is the
+/// **only** call site left in the daemon that still pays for the shellout —
+/// called from [`spawn_multi_stash_summary_refresh_task`]'s background tick,
+/// never from `build_daemon_status` directly.
+pub fn refresh(root: &Path) {
+    let summary = collect_stash_summary(root);
+    let mut guard = stash_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.insert(
+        root.to_path_buf(),
+        CachedStashSummary {
+            summary,
+            refreshed_at: Instant::now(),
+        },
+    );
+}
+
+/// Refresh every root in `roots`, sequentially (mirrors the worktree
+/// reaper's per-root passes — bursting several repos' `git` shellouts at
+/// once buys nothing).
+pub fn refresh_all(roots: &[PathBuf]) {
+    for root in roots {
+        refresh(root);
+    }
+}
+
+/// The cached summary for `root`, or `None` when it has never been refreshed
+/// yet — a root registered after the daemon started but before the next
+/// background tick, or (in a test) before [`refresh`] was ever called for it.
+/// Callers must treat `None` as "not yet warm" (fall back to the zero-valued
+/// default) rather than blocking on a synchronous [`collect_stash_summary`]
+/// call — that synchronous fallback is exactly the bottleneck this cache
+/// exists to remove. A **stale-but-present** entry (the background tick fell
+/// behind, or `git` is hanging on this root) is still served as-is: serving
+/// stale data beats blocking `status`/`health` on it.
+#[must_use]
+pub fn cached_summary(root: &Path) -> Option<CachedStashSummary> {
+    stash_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(root)
+        .copied()
+}
+
+/// Every root's current cached entry, root-sorted — test/diagnostic seam
+/// mirroring `deep_clean::snapshot`.
+#[must_use]
+pub fn snapshot() -> Vec<(PathBuf, CachedStashSummary)> {
+    stash_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
+/// Drop all cached state. Test-only seam (the process-global would otherwise
+/// leak between `#[serial]` tests in the same binary).
+#[doc(hidden)]
+pub fn reset_cache_for_test() {
+    stash_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+/// Default cadence for [`spawn_multi_stash_summary_refresh_task`]'s
+/// background tick. No config knob (unlike `worktreeReaper`/
+/// `tokenRankingRefresh`): this loop only ever populates an in-memory read
+/// cache with no destructive or dispatch side effect, so there is nothing
+/// for an operator to need to tune or disable.
+pub const DEFAULT_STASH_SUMMARY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Spawn the multi-workspace stash-summary cache-refresh loop (Issue #7526)
+/// on the shared daemon runtime — mirrors
+/// [`crate::worktree_reaper::spawn_multi_worktree_reaper_task`]'s
+/// `effective_roots` re-read-every-tick shape, but always-on (no enable
+/// knob, see [`DEFAULT_STASH_SUMMARY_REFRESH_INTERVAL`]'s doc comment) and
+/// with an **immediate** first tick (unlike the worktree reaper, which
+/// defers its first tick because reaping is destructive — refreshing a
+/// read-only cache is not, so there is no reason to leave `status`/`health`
+/// cold for a full `interval` after a fresh daemon start/restart).
+///
+/// Every `interval` it re-reads
+/// [`crate::workspace_registry::WorkspaceRegistry::effective_roots`] against
+/// `fallback_root` and refreshes every registered repo's cached
+/// [`StashSummary`] via [`refresh`] — sequentially, like the worktree
+/// reaper's per-root passes.
+pub fn spawn_multi_stash_summary_refresh_task(
+    fallback_root: PathBuf,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    log::info!(
+        "quarantine_stash_status: starting multi-workspace cache-refresh loop (interval={}s)",
+        interval.as_secs()
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let roots = crate::workspace_registry::WorkspaceRegistry::load_default()
+                .unwrap_or_else(|e| {
+                    log::warn!(
+                        "quarantine_stash_status: could not load workspace registry ({e}); \
+                         using fallback"
+                    );
+                    crate::workspace_registry::WorkspaceRegistry::default()
+                })
+                .effective_roots(&fallback_root);
+            for root in roots {
+                let root_for_task = root.clone();
+                let joined = tokio::task::spawn_blocking(move || refresh(&root_for_task)).await;
+                if let Err(e) = joined {
+                    log::error!(
+                        "quarantine_stash_status: refresh for {} panicked ({e}); continuing \
+                         to the next repo",
+                        root.display()
+                    );
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn entry(committed_at_epoch: i64, subject: &str) -> StashEntry {
         StashEntry {
@@ -537,5 +720,129 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let summary = collect_stash_summary(dir.path());
         assert_eq!(summary, StashSummary::default());
+    }
+
+    // ========================================================================
+    // Per-root cache (Issue #7526)
+    // ========================================================================
+
+    /// A root that has never been refreshed reports no cached entry — the
+    /// caller (`build_daemon_status`) must degrade to the zero-valued
+    /// default rather than falling back to a synchronous shellout.
+    #[test]
+    #[serial]
+    fn cached_summary_is_none_before_the_first_refresh() {
+        reset_cache_for_test();
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(cached_summary(dir.path()).is_none());
+    }
+
+    /// [`refresh`] populates the cache with a real repo's stash counts, and
+    /// [`cached_summary`] serves exactly that — no synchronous shellout on
+    /// the read path.
+    #[test]
+    #[serial]
+    fn refresh_then_cached_summary_reflects_the_real_repo_state() {
+        reset_cache_for_test();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("README.md"), "hello\n").expect("write README");
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        std::fs::write(root.join("README.md"), "hello\nwip\n").expect("edit");
+        git(&["stash", "push", "-m", "loom-quarantine: issue=1"]);
+
+        assert!(cached_summary(root).is_none(), "must be cold before the first refresh");
+        refresh(root);
+        let cached = cached_summary(root).expect("populated by refresh");
+        assert_eq!(cached.summary.total_count, 1);
+        assert_eq!(cached.summary.quarantine_count, 1);
+    }
+
+    /// [`CachedStashSummary::age`] grows relative to whatever `now` the
+    /// caller supplies — deterministic, no real sleep required.
+    #[test]
+    #[serial]
+    fn cached_stash_summary_age_grows_with_elapsed_time() {
+        reset_cache_for_test();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Not a git repo — `refresh` still populates a zero-valued entry
+        // (best-effort, per `collect_stash_summary`'s doc comment) with a
+        // real `refreshed_at`, which is all this test needs.
+        refresh(dir.path());
+        let cached = cached_summary(dir.path()).expect("populated by refresh");
+
+        assert_eq!(
+            cached.age(cached.refreshed_at),
+            Duration::ZERO,
+            "age must be zero at the instant of refresh"
+        );
+        let later = cached.refreshed_at + Duration::from_secs(90);
+        assert!(
+            cached.age(later) >= Duration::from_secs(90),
+            "age must reflect the elapsed time since refresh"
+        );
+    }
+
+    /// A **stale-but-present** entry is still served as-is — never falls
+    /// back to `None`/blocking just because it has aged past some implicit
+    /// threshold. `cached_summary` has no staleness ceiling by design (see
+    /// its doc comment): serving stale data beats blocking `status`/`health`.
+    #[test]
+    #[serial]
+    fn cached_summary_serves_a_stale_entry_rather_than_going_cold() {
+        reset_cache_for_test();
+        let dir = tempfile::tempdir().expect("tempdir");
+        refresh(dir.path());
+        let first = cached_summary(dir.path()).expect("populated by refresh");
+        // No second refresh — simulate the background tick having fallen
+        // behind (a slow/hung `git` on some OTHER root, or a long interval).
+        let second = cached_summary(dir.path()).expect("still present though stale");
+        assert_eq!(first.summary, second.summary);
+    }
+
+    /// [`refresh_all`] populates the cache for every root in the slice, not
+    /// just the first one — the multi-workspace tick's per-root fan-out.
+    #[test]
+    #[serial]
+    fn refresh_all_populates_every_root() {
+        reset_cache_for_test();
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let roots = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
+
+        refresh_all(&roots);
+
+        assert!(cached_summary(dir_a.path()).is_some());
+        assert!(cached_summary(dir_b.path()).is_some());
+    }
+
+    /// [`snapshot`] renders every cached root, root-sorted, for
+    /// tests/diagnostics — mirrors `deep_clean::snapshot`.
+    #[test]
+    #[serial]
+    fn snapshot_lists_every_cached_root() {
+        reset_cache_for_test();
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        refresh(dir_a.path());
+        refresh(dir_b.path());
+
+        let snap = snapshot();
+        let roots: Vec<&PathBuf> = snap.iter().map(|(root, _)| root).collect();
+        assert!(roots.contains(&&dir_a.path().to_path_buf()));
+        assert!(roots.contains(&&dir_b.path().to_path_buf()));
     }
 }

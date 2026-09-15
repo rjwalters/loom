@@ -2386,33 +2386,42 @@ pub fn build_daemon_status(
             crate::sweep_registry::resolve_stale_sweep_age(&stale_sweep_config);
         let stale_sweep_log_silence =
             crate::sweep_registry::resolve_review_stall_timeout(&stale_sweep_config);
-        let root_stale: Vec<crate::sweep_registry::StaleSweepFinding>;
-        let (live, quarantined_issues, locked_unregistered): (
-            Vec<crate::types::SweepInfo>,
-            Vec<u32>,
-            Vec<(u32, u32)>,
-        ) = {
+        // #7526: take a read snapshot of the registry's raw state — clone the
+        // in-memory entries/children/config paths while the lock is held (no
+        // filesystem I/O, so this is fast regardless of contention), then
+        // drop the guard immediately and compute everything below from the
+        // owned snapshot. Before this, the four calls below (`list`'s
+        // live-phase checkpoint-read overlay, `stale_sweep_findings`'s
+        // `kill(pid, 0)` probe + log `stat`, `unregistered_locked_issues`'s
+        // `.loom/locks/` directory walk + `owner.json` reads) all ran while
+        // still holding this root's registry mutex — real I/O serialized by
+        // the same lock every dispatch/reap/status call on this root
+        // contends for. See `SweepRegistry::snapshot`'s doc comment for the
+        // full rationale and the live fleet measurement that motivated it.
+        let snapshot = {
             let sr = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // In-flight = sweeps still live (Pending / Running). Terminal sweeps
-            // (Exited / Crashed) linger in the registry but are not "in flight".
-            let live = sr
-                .list(None)
-                .into_iter()
-                .filter(|info| !info.state.is_terminal())
-                .collect();
-            // Insta-crash quarantine (#3939): surface which issues this repo is
-            // currently refusing to re-dispatch, so a repo with a visible backlog
-            // that is dispatching nothing is explained.
-            root_stale = if crate::sweep_registry::resolve_stale_sweep_enabled(&stale_sweep_config)
-            {
-                sr.stale_sweep_findings(stale_sweep_min_age, stale_sweep_log_silence)
+            sr.snapshot()
+        };
+        // In-flight = sweeps still live (Pending / Running). Terminal sweeps
+        // (Exited / Crashed) linger in the registry but are not "in flight".
+        let live: Vec<crate::types::SweepInfo> = snapshot
+            .list(None)
+            .into_iter()
+            .filter(|info| !info.state.is_terminal())
+            .collect();
+        // Insta-crash quarantine (#3939): surface which issues this repo is
+        // currently refusing to re-dispatch, so a repo with a visible backlog
+        // that is dispatching nothing is explained.
+        let root_stale: Vec<crate::sweep_registry::StaleSweepFinding> =
+            if crate::sweep_registry::resolve_stale_sweep_enabled(&stale_sweep_config) {
+                snapshot.stale_sweep_findings(stale_sweep_min_age, stale_sweep_log_silence)
             } else {
                 Vec::new()
             };
-            (live, sr.quarantined_issues_sorted(), sr.unregistered_locked_issues())
-        };
+        let quarantined_issues = snapshot.quarantined_issues_sorted();
+        let locked_unregistered = snapshot.unregistered_locked_issues();
         stale_sweeps.extend(
             root_stale
                 .into_iter()
@@ -2507,18 +2516,25 @@ pub fn build_daemon_status(
             crate::capacity::ranking_file_state(&repo_token_pool_dir);
         phase_token_pool += phase_start.elapsed();
         let phase_start = Instant::now();
-        // Fleet-wide quarantine-stash visibility (#5692): a `git stash list`
-        // shell-out per registered root, aggregated into this repo's own
-        // counts. Best-effort (see `collect_stash_summary`'s doc comment) —
-        // a repo with no stashes, or that is transiently unreadable, simply
-        // reports zeros rather than failing this whole status build.
-        //
-        // #7513: this is the one candidate in this loop that is a subprocess
-        // spawn rather than a stat/read, so it is timed as its own named
-        // phase — `phase_stash_git_shellout` in the slow-build log below is
-        // the number that would confirm or rule out the "one shell-out per
-        // root" hypothesis fleet reports raised.
-        let repo_stash_summary = crate::quarantine_stash_status::collect_stash_summary(root);
+        // Fleet-wide quarantine-stash visibility (#5692): read from the
+        // per-root cache [`crate::quarantine_stash_status::spawn_multi_stash_summary_refresh_task`]'s
+        // background tick keeps warm, instead of shelling out to
+        // `git stash list` synchronously on every `status`/`health` call
+        // (Issue #7526). The #7525 instrumentation's live fleet data (quoted
+        // in #7526's issue body) measured that shellout —
+        // `phase_stash_git_shellout` below — as the dominant contributor to
+        // `build_daemon_status` exceeding the fleet's 5s IPC budget on a
+        // 50-root host (2.0s / 3.8s / 1.8s of three 1.9-5.3s slow builds), so
+        // this phase is now a cache lookup: a mutex lock + `BTreeMap` get +
+        // `Copy`, no I/O, no subprocess spawn. A root the cache has never
+        // refreshed yet (freshly registered, or the daemon just started)
+        // degrades to the zero-valued default rather than falling back to a
+        // synchronous shellout — that fallback would reintroduce the exact
+        // bottleneck this cache exists to remove; the background tick warms
+        // it within one cycle.
+        let repo_stash_summary = crate::quarantine_stash_status::cached_summary(root)
+            .map(|cached| cached.summary)
+            .unwrap_or_default();
         phase_stash_git_shellout += phase_start.elapsed();
         let phase_start = Instant::now();
         // Issue #5682: recomputed live (a cheap `stat`), not read once from the

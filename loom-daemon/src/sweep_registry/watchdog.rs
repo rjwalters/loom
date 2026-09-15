@@ -794,6 +794,70 @@ pub(crate) enum LeaseOwnerProbeResult {
     ReadFailed,
 }
 
+/// The pure, no-`&self` half of [`SweepRegistry::log_idle`] — the method
+/// never actually touched `self`, so this is the same body under a
+/// standalone name usable from [`scan_stale_sweep_findings`] below (and from
+/// [`crate::sweep_registry::RegistrySnapshot::stale_sweep_findings`], Issue
+/// #7526) without a `&SweepRegistry` receiver.
+fn log_idle_pure(log_path: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(log_path).ok()?.modified().ok()?;
+    modified.elapsed().ok()
+}
+
+/// The pure per-entry scan half of [`SweepRegistry::stale_sweep_findings`]
+/// (Issue #7526): takes an entries iterator + an "is this daemon's own
+/// child" predicate instead of `&SweepRegistry` directly, so it can run
+/// without holding the registry's mutex — see
+/// [`crate::sweep_registry::RegistrySnapshot::stale_sweep_findings`], which
+/// calls this on a cloned snapshot outside the lock, and the original
+/// instance method below, which still calls it inline (under the lock, as
+/// before) for every other caller.
+#[must_use]
+pub(crate) fn scan_stale_sweep_findings<'a>(
+    entries: impl Iterator<Item = (&'a SweepId, &'a SweepInfo)>,
+    is_own_child: &dyn Fn(&SweepId) -> bool,
+    min_age: Duration,
+    log_silence_timeout: Duration,
+) -> Vec<StaleSweepFinding> {
+    let now = Utc::now();
+    entries
+        .filter(|(id, info)| {
+            matches!(info.state, SweepState::Running | SweepState::Pending)
+                && matches!(info.kind, SweepKind::Issue(_))
+                // The complement of the other two watchdogs' eligibility
+                // gate: ONLY sweeps this daemon instance did not itself
+                // spawn are candidates here, so nothing is ever
+                // double-covered (or double-reaped) between this backstop
+                // and `watchdog_once`/`review_stall_watchdog_once`.
+                && !is_own_child(id)
+        })
+        .filter_map(|(id, info)| {
+            let SweepKind::Issue(issue) = info.kind else {
+                return None;
+            };
+            if !is_pid_alive(info.pid) {
+                // Already dead: the ordinary reaper's dead-pid path
+                // already handles this on its own next tick — not this
+                // backstop's job, and a dead pid was never "held
+                // indefinitely" by anything.
+                return None;
+            }
+            let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
+            let log_idle = log_idle_pure(&info.log_path);
+            if !is_stale_untracked_sweep(elapsed, min_age, log_idle, log_silence_timeout) {
+                return None;
+            }
+            Some(StaleSweepFinding {
+                issue,
+                sweep_id: id.clone(),
+                pid: info.pid,
+                elapsed,
+                log_idle,
+            })
+        })
+        .collect()
+}
+
 impl SweepRegistry {
     // ------------------------------------------------------------------------
     // Startup watchdog (Issue #3887)
@@ -2148,44 +2212,12 @@ impl SweepRegistry {
         min_age: Duration,
         log_silence_timeout: Duration,
     ) -> Vec<StaleSweepFinding> {
-        let now = Utc::now();
-        self.entries
-            .iter()
-            .filter(|(id, info)| {
-                matches!(info.state, SweepState::Running | SweepState::Pending)
-                    && matches!(info.kind, SweepKind::Issue(_))
-                    // The complement of the other two watchdogs' eligibility
-                    // gate: ONLY sweeps this daemon instance did not itself
-                    // spawn are candidates here, so nothing is ever
-                    // double-covered (or double-reaped) between this backstop
-                    // and `watchdog_once`/`review_stall_watchdog_once`.
-                    && !self.children.contains_key(*id)
-            })
-            .filter_map(|(id, info)| {
-                let SweepKind::Issue(issue) = info.kind else {
-                    return None;
-                };
-                if !is_pid_alive(info.pid) {
-                    // Already dead: the ordinary reaper's dead-pid path
-                    // already handles this on its own next tick — not this
-                    // backstop's job, and a dead pid was never "held
-                    // indefinitely" by anything.
-                    return None;
-                }
-                let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
-                let log_idle = self.log_idle(&info.log_path);
-                if !is_stale_untracked_sweep(elapsed, min_age, log_idle, log_silence_timeout) {
-                    return None;
-                }
-                Some(StaleSweepFinding {
-                    issue,
-                    sweep_id: id.clone(),
-                    pid: info.pid,
-                    elapsed,
-                    log_idle,
-                })
-            })
-            .collect()
+        scan_stale_sweep_findings(
+            self.entries.iter(),
+            &|id| self.children.contains_key(id),
+            min_age,
+            log_silence_timeout,
+        )
     }
 
     /// Run one stale-untracked-sweep backstop tick (Issue #7529): reap every
