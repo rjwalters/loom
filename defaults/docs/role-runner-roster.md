@@ -465,5 +465,3 @@ ring depends on it.
 - [`dispatcher-repo-sharding.md`](dispatcher-repo-sharding.md) (#6243) — the second consumer of the same ring, and the precedent for rejecting a mesh-derived rank
 - [`lease-record.md`](lease-record.md) / [`lease-renewal.md`](lease-renewal.md) — the marker-comment + `updated_at` liveness idiom this reuses
 - `loom-daemon/src/role_shard.rs`, `loom-daemon/src/role_runner.rs`, `loom-daemon/src/role_collision.rs`
-</content>
-</invoke>
