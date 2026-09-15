@@ -36,7 +36,34 @@
 use std::fs;
 use std::path::PathBuf;
 
-const SWEEP_MD_RELATIVE: &str = "../defaults/.claude/commands/loom/sweep.md";
+const SWEEP_SKILL_DIR_RELATIVE: &str = "../defaults/.claude/commands/loom";
+
+/// The `/loom:sweep` skill in document order: the `sweep.md` dispatcher followed
+/// by its sibling reference files, exactly as #7726 split them out of the single
+/// 2,851-line `sweep.md`.
+///
+/// Concatenating in this fixed order is what keeps the byte-offset ORDERING
+/// assertions below meaningful (e.g. Step 1a before Step 1b, the Mode B
+/// GraphQL-exhaustion fallback before the `### Mode C — PR-set mode` heading
+/// before the Mode C one): it reproduces the pre-split reading order, so a
+/// relative-position contract that held in the monolith still holds here.
+///
+/// Add a new sibling to this list when one is added to the skill, or its
+/// contract text becomes invisible to every assertion in this file.
+const SWEEP_SKILL_FILES: &[&str] = &[
+    "sweep.md",
+    "sweep-arguments.md",
+    "sweep-examples.md",
+    "sweep-execution-model.md",
+    "sweep-backend-detection.md",
+    "sweep-scheduling-signals.md",
+    "sweep-dry-run.md",
+    "sweep-mode-c-lifecycle.md",
+    "sweep-wave-lifecycle.md",
+    "sweep-summary-output.md",
+    "sweep-run-hygiene.md",
+    "sweep-reference.md",
+];
 
 /// CONTRACT: all six frozen topic strings from the Phase B taxonomy. These are
 /// wire identifiers frozen for v0.10.0 — a rename is a real contract break, not
@@ -50,15 +77,31 @@ const REQUIRED_TOPICS: &[&str] = &[
     "sweep.global.completed",
 ];
 
+/// Reads the whole `/loom:sweep` skill — the dispatcher plus every sibling
+/// reference file — as one string, in [`SWEEP_SKILL_FILES`] order.
+///
+/// Before #7726 this read the single monolithic `sweep.md`. The split moved
+/// content between files but deleted none of it, so every `contains()`
+/// assertion in this file is unchanged in meaning: the contract text must
+/// still exist SOMEWHERE in the skill. A missing sibling is a hard failure
+/// (the file it documents would silently stop being linted otherwise).
 fn read_sweep_md() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SWEEP_MD_RELATIVE);
-    fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "sweep.md not found at {} (CWD-relative path: {}): {e}",
-            path.display(),
-            SWEEP_MD_RELATIVE,
-        );
-    })
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SWEEP_SKILL_DIR_RELATIVE);
+    let mut combined = String::new();
+    for name in SWEEP_SKILL_FILES {
+        let path = dir.join(name);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "sweep skill file `{name}` not found at {} (dir-relative path: {}): {e} — \
+                 if it was intentionally renamed/removed, update SWEEP_SKILL_FILES",
+                path.display(),
+                SWEEP_SKILL_DIR_RELATIVE,
+            );
+        });
+        combined.push_str(&text);
+        combined.push('\n');
+    }
+    combined
 }
 
 /// AC #3: assert the `## Daemon event bus` section is present.
