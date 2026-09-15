@@ -226,6 +226,13 @@ pub(crate) fn build_status_json_value(
         // and log-silent for far longer than any watchdog would tolerate.
         "stale_sweeps_count": report.stale_sweeps.len(),
         "stale_sweeps": report.stale_sweeps,
+        // Backed-off worktree removals (Issue #7590): a removal that has
+        // failed with a permission-class cause (or `REMOVAL_FAILURE_CAP`
+        // consecutive times of any cause) and so is no longer retried every
+        // reap tick. Non-empty here means a worktree cannot self-resolve
+        // without operator intervention (typically a manual `sudo rm -rf`).
+        "stuck_worktree_reclaims_count": report.stuck_worktree_reclaims.len(),
+        "stuck_worktree_reclaims": report.stuck_worktree_reclaims,
         // "Currently binding" vs "smallest ceiling" (#4031): the cap only binds
         // once in-flight reaches it. `false` ⇒ the limiter is work availability,
         // not any resource term, so scripted consumers don't misread the
@@ -1670,6 +1677,31 @@ pub(crate) fn print_status_human(
                 s.pid,
                 s.elapsed_secs,
                 s.root.display()
+            );
+        }
+    }
+
+    // Backed-off worktree removals (Issue #7590): a removal that failed with
+    // a permission-class cause (root-owned build-cache directories are the
+    // motivating case), or that failed `REMOVAL_FAILURE_CAP` consecutive
+    // times of any cause, is no longer retried every reap tick — see
+    // `assess_worktree_reaper` in `loom-daemon health` for the same signal
+    // rolled up into a verdict.
+    if !report.stuck_worktree_reclaims.is_empty() {
+        println!(
+            "\nWARNING: {} worktree removal(s) backed off after repeated/permission-class \
+             failures (#7590) — will not self-resolve without operator intervention:",
+            report.stuck_worktree_reclaims.len()
+        );
+        for r in &report.stuck_worktree_reclaims {
+            println!(
+                "  {}-{} ({} attempt(s) since {}) in {}: {}",
+                r.kind,
+                r.number,
+                r.attempt_count,
+                r.first_failure_at,
+                r.repo_root.display(),
+                r.cause
             );
         }
     }

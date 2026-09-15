@@ -1432,6 +1432,7 @@ pub(crate) mod status_client_tests {
             peer_claims: None,
             deep_clean: Vec::new(),
             idle_exit: None,
+            stuck_worktree_reclaims: Vec::new(),
         }
     }
 

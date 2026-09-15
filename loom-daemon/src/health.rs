@@ -29,6 +29,7 @@
 //! | throughput | [`crate::pipeline_snapshot`] (`merged_24h`, over the requested window) |
 //! | peer_coordination | [`crate::types::DaemonStatusReport::safehouse`] (RPC socket reachability) + [`crate::types::DaemonStatusReport::peer_claims`]`.coordination` (published by [`crate::peer_claims::PeerClaimView::evaluate_coordination`], Issue #6157) |
 //! | auto_update | [`crate::types::DaemonStatusReport::auto_update_*`] (the daemon-side rebuild loop's own state, Issue #4055) + [`crate::self_update::check`] (this CLI process's own source-vs-built-commit staleness magnitude, Issue #6261) — unconditional, mirroring `liveness`/`dispatch` (Issue #7584) |
+//! | worktree_reaper | [`crate::types::DaemonStatusReport::stuck_worktree_reclaims`] (published by [`crate::worktree_reaper::stuck_worktree_removals`], Issue #7590) |
 //! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`] (published by [`crate::observability::HostIdStatus`]) + [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
@@ -2468,6 +2469,70 @@ pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
 }
 
 // ============================================================================
+// Stuck worktree-removal backoff section (Issue #7590)
+// ============================================================================
+
+/// Assess [`DaemonStatusReport::stuck_worktree_reclaims`]: worktree removals
+/// the periodic reaper has backed off after a permission-class failure (or a
+/// fixed retry-count cap) — see
+/// [`crate::worktree_reaper::stuck_worktree_removals`]'s doc comment for the
+/// exact classification. Before #7590 a worktree in this state retried the
+/// exact same removal, and failed the exact same way, every single reaper
+/// tick forever, with nothing on this surface to notice it — this section
+/// closes that gap.
+///
+/// **Unconditional** (mirrors `stale_sweeps`/`liveness`/`dispatch`), not the
+/// anomaly-only `Option`-returning pattern [`assess_observability`] uses: a
+/// stuck removal is otherwise invisible on every existing surface, so a
+/// section that only appears once an operator already suspects trouble would
+/// defeat the point.
+#[must_use]
+pub fn assess_worktree_reaper(inputs: &HealthInputs) -> HealthSection {
+    let Some(status) = &inputs.status else {
+        return unknown_section("worktree_reaper", &no_status_reason(inputs));
+    };
+
+    if status.stuck_worktree_reclaims.is_empty() {
+        return HealthSection::new(
+            "worktree_reaper",
+            Verdict::Green,
+            "no worktree removals backed off",
+            serde_json::json!({ "count": 0 }),
+        );
+    }
+
+    let summary = status
+        .stuck_worktree_reclaims
+        .iter()
+        .map(|r| {
+            format!(
+                "{}-{} @ {} ({} attempt(s), first failed {}): {}",
+                r.kind,
+                r.number,
+                repo_label(&r.repo_root),
+                r.attempt_count,
+                format_age((inputs.at - r.first_failure_at).num_seconds()),
+                r.cause
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    HealthSection::new(
+        "worktree_reaper",
+        Verdict::Degraded,
+        format!(
+            "{} worktree removal(s) backed off after repeated/permission-class failures \
+             (#7590 — will not self-resolve without operator intervention): {summary}",
+            status.stuck_worktree_reclaims.len()
+        ),
+        serde_json::json!({
+            "count": status.stuck_worktree_reclaims.len(),
+            "stuck": status.stuck_worktree_reclaims,
+        }),
+    )
+}
+
+// ============================================================================
 // Observability section (Issue #4830) — conditional
 // ============================================================================
 
@@ -2751,6 +2816,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_peer_coordination(inputs),
         assess_stale_sweeps(inputs),
         assess_auto_update(inputs),
+        assess_worktree_reaper(inputs),
     ];
     sections.extend(assess_observability(inputs));
     sections.extend(assess_codesign_identity(inputs));
@@ -3568,11 +3634,12 @@ mod tests {
         let with_mismatch = assess(&mismatched_inputs(60));
         let keys: Vec<&str> = with_mismatch.sections.iter().map(|s| s.key).collect();
         assert_eq!(keys.last(), Some(&"observability"));
-        // 10 always-present sections (#6157 added `peer_coordination`; #6201
+        // 11 always-present sections (#6157 added `peer_coordination`; #6201
         // added `role_liveness`; #7529 added `stale_sweeps`; #7584 added
-        // `auto_update`) + the conditional trailing `observability` note.
-        assert_eq!(keys.len(), 11);
-        assert_eq!(assess(&healthy_inputs()).sections.len(), 10);
+        // `auto_update`; #7590 added `worktree_reaper`) + the conditional
+        // trailing `observability` note.
+        assert_eq!(keys.len(), 12);
+        assert_eq!(assess(&healthy_inputs()).sections.len(), 11);
     }
 
     // ===================================================================
@@ -3616,10 +3683,10 @@ mod tests {
         let report = assess(&inputs);
         assert!(report.section("observability").is_none());
         assert_eq!(report.overall, Verdict::Green);
-        // 10 always-present sections: + `peer_coordination` (#6157),
-        // `role_liveness` (#6201), `stale_sweeps` (#7529), and `auto_update`
-        // (#7584).
-        assert_eq!(report.sections.len(), 10);
+        // 11 always-present sections: + `peer_coordination` (#6157),
+        // `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
+        // (#7584), and `worktree_reaper` (#7590).
+        assert_eq!(report.sections.len(), 11);
     }
 
     #[test]
@@ -3778,7 +3845,8 @@ mod tests {
                 "throughput",
                 "peer_coordination",
                 "stale_sweeps",
-                "auto_update"
+                "auto_update",
+                "worktree_reaper"
             ]
         );
     }
@@ -3790,9 +3858,9 @@ mod tests {
         let lines: Vec<&str> = rendered.lines().collect();
         // liveness, dispatch, tokens, roles, role_liveness (#6201), queues,
         // throughput, peer_coordination (#6157), stale_sweeps (#7529),
-        // auto_update (#7584), + overall.
-        assert_eq!(lines.len(), 11);
-        assert!(lines[10].starts_with("overall"));
+        // auto_update (#7584), worktree_reaper (#7590), + overall.
+        assert_eq!(lines.len(), 12);
+        assert!(lines[11].starts_with("overall"));
     }
 
     #[test]
@@ -3800,10 +3868,10 @@ mod tests {
         let report = assess(&healthy_inputs());
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["overall"], "green");
-        // 10 always-present sections: + `peer_coordination` (#6157),
-        // `role_liveness` (#6201), `stale_sweeps` (#7529), and `auto_update`
-        // (#7584).
-        assert_eq!(value["sections"].as_array().unwrap().len(), 10);
+        // 11 always-present sections: + `peer_coordination` (#6157),
+        // `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
+        // (#7584), and `worktree_reaper` (#7590).
+        assert_eq!(value["sections"].as_array().unwrap().len(), 11);
     }
 
     // ===================================================================
@@ -6076,8 +6144,7 @@ mod tests {
 
     // ===================================================================
     // Codesign identity preflight (#7605)
-    // ===================================================================
-
+    // ============================================================
     #[test]
     fn codesign_identity_absent_produces_no_section() {
         // The healthy baseline: no identity configured at all.
@@ -6143,5 +6210,56 @@ mod tests {
         status.auto_update_enabled = true;
         let detail = assess_auto_update(&inputs).detail;
         assert_eq!(detail["artifact_available"], serde_json::Value::Null);
+    }
+
+    // ===================================================================
+    // Stuck worktree-removal backoff section (Issue #7590)
+    // ===================================================================
+
+    fn stuck_reclaim_fixture(
+        attempt_count: u32,
+        cause: &str,
+    ) -> crate::types::StuckWorktreeReclaim {
+        crate::types::StuckWorktreeReclaim {
+            repo_root: PathBuf::from("/repos/loom"),
+            kind: "issue".to_string(),
+            number: 7590,
+            path: PathBuf::from("/repos/loom/.loom/worktrees/issue-7590"),
+            cause: cause.to_string(),
+            first_failure_at: now() - chrono::Duration::hours(6),
+            last_attempt_at: now() - chrono::Duration::minutes(5),
+            attempt_count,
+        }
+    }
+
+    #[test]
+    fn worktree_reaper_is_green_when_nothing_stuck() {
+        let section = assess_worktree_reaper(&healthy_inputs());
+        assert_eq!(section.verdict, Verdict::Green);
+        assert!(section.summary.contains("no worktree removals"));
+    }
+
+    #[test]
+    fn worktree_reaper_is_degraded_and_names_the_stuck_path() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().stuck_worktree_reclaims =
+            vec![stuck_reclaim_fixture(1, "Permission denied (os error 13)")];
+        let section = assess_worktree_reaper(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded, "{}", section.summary);
+        assert!(section.summary.contains("issue-7590"), "{}", section.summary);
+        assert!(section.summary.contains("loom"), "{}", section.summary);
+        assert!(section.summary.contains("Permission denied"), "{}", section.summary);
+        assert_eq!(section.detail["count"], serde_json::json!(1));
+        // A stuck removal must flip the overall roll-up too — this is meant
+        // to be a hard finding, not merely informational.
+        assert_eq!(assess(&inputs).overall, Verdict::Degraded);
+    }
+
+    #[test]
+    fn worktree_reaper_is_unknown_without_a_status_round_trip() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        inputs.ipc_error = Some("connection refused".to_string());
+        assert_eq!(assess_worktree_reaper(&inputs).verdict, Verdict::Unknown);
     }
 }
