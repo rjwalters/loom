@@ -469,6 +469,67 @@ fn sweep_md_step_1a_self_claim_check_precedes_loom_building_skip_bullet() {
     );
 }
 
+/// #7672: Step 1a's lease-renewal `start` is now issued by dispatch code
+/// (`SweepRegistry::finish_issue_dispatch`), but the prompt must keep a
+/// **fallback** `start` gated on the capability marker that dispatch exports —
+/// not withdraw the instruction outright.
+///
+/// The installed prompt and the daemon binary roll on different cadences: an
+/// ordinary `git pull` / `resync-installed.sh` refreshes
+/// `.claude/commands/loom/sweep.md`, while `loom-daemon` is only rebuilt by
+/// `loom update`. "New prompt, pre-#7672 binary" is therefore a reachable
+/// state, and under an unconditional withdrawal every sweep dispatched during
+/// that skew would run with **no** renewal loop from either side — the exact
+/// stale-lease reclamation #7672 exists to prevent (~25 claim/yield cycles
+/// over 2.5h and a near-miss shared-worktree double-claim,
+/// 2AMLogic/klayout-tools#1658), applied fleet-wide.
+///
+/// This lint is the mechanical guard against a future edit "simplifying" the
+/// gate away.
+#[test]
+fn sweep_md_step_1a_keeps_a_marker_gated_lease_renewal_fallback() {
+    let content = read_sweep_md();
+
+    // CONTRACT: the env var name is a shared identifier with
+    // `LEASE_RENEW_STARTED_ENV` in `loom-daemon/src/sweep_registry/dispatch.rs`.
+    // Renaming one side without the other silently disables the fallback (the
+    // marker never matches ⇒ every healthy dispatch forks a duplicate loop) or
+    // the skip (the marker always mismatches). Keep EXACT.
+    assert!(
+        content.contains("LOOM_SWEEP_LEASE_RENEW_DISPATCHED"),
+        "sweep.md's Step 1a must gate its lease-renewal fallback on the \
+         `LOOM_SWEEP_LEASE_RENEW_DISPATCHED` capability marker the dispatch \
+         exports (#7672) — without the gate, a new prompt running against a \
+         pre-#7672 daemon binary starts no renewal loop at all and its lease \
+         ages into a peer's reclamation gate (#6286)"
+    );
+
+    // CONTRACT: the fallback must still actually invoke `start`. A doc that
+    // merely *mentions* the marker while having dropped the command is the
+    // same failure with better prose.
+    assert!(
+        content.contains("sweep-lease-renew.sh start \"$N\""),
+        "sweep.md's Step 1a must retain the `./.loom/scripts/sweep-lease-renew.sh \
+         start \"$N\"` fallback invocation (#6180/#7672) for the pre-#7672-daemon \
+         case — naming the marker without the command it guards leaves the skew \
+         window with no renewal loop"
+    );
+
+    // CONTRACT: the fallback must be CONDITIONAL on the marker, not
+    // unconditional — an unguarded `start` under a #7672 daemon forks a second
+    // loop PATCHing the same comment on every healthy dispatch.
+    let marker_pos = content.find("LOOM_SWEEP_LEASE_RENEW_DISPATCHED").unwrap();
+    let start_pos = content
+        .find("sweep-lease-renew.sh start \"$N\"")
+        .expect("asserted present above");
+    assert!(
+        marker_pos < start_pos,
+        "the `LOOM_SWEEP_LEASE_RENEW_DISPATCHED` test (byte offset {marker_pos}) must \
+         precede Step 1a's `sweep-lease-renew.sh start` fallback (byte offset \
+         {start_pos}) — the `start` is the guarded branch, not the default (#7672)"
+    );
+}
+
 /// #3725: the canary guardrail and the exact-per-role-cost harvest are pinned.
 #[test]
 fn sweep_md_documents_experiment_guardrail_and_harvest() {
