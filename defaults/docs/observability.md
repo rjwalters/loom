@@ -68,6 +68,13 @@ Precedence is **env > config > default**, the same rule every other
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
 | `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | `"https"` (or `"otlp"`, §3) |
 
+**`endpoint` resolution order is env > `.loom-local/local.json` > the committed
+`.loom/config.json`** (`config_resolver.rs`/`config-resolver.sh`), so — like
+`ingestKeyFile` below — the committed file must never carry a live ingest
+endpoint; ship only a placeholder (e.g. `https://dashboard.example.com/ingest`)
+there and deliver each operator's real endpoint through
+`LOOM_OBSERVABILITY_ENDPOINT` or the gitignored local-config tier (#6650).
+
 The ingest key is **never inline in config** — `ingestKeyFile` is a path the
 daemon reads once at startup and holds only in memory, sent solely as an
 `Authorization: Bearer` header. A misconfigured block (missing endpoint or
