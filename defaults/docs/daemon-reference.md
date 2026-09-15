@@ -511,6 +511,15 @@ sweep's lease and invite exactly the reclamation this mechanism exists to
 prevent. It is also best-effort — no helper script, a non-zero `start`, or a
 spawn failure only logs, and the lease then ages out as it did before.
 
+The `start` handshake itself (the subprocess spawn plus its bounded wait for
+the loop pid) runs on a **detached thread**, never inline:
+`finish_issue_dispatch` holds the global registry mutex — on a tokio worker
+thread for both the IPC and work-finder dispatch paths — and a pathological
+helper must not be able to pin it for up to 10 s per `Issue` dispatch and
+starve `list_sweeps` / `cancel` / concurrent dispatches. Same hazard, and same
+shape of fix, as the #6592/#7307 split that moved the account-selection poll
+out from under the lock.
+
 Manual / `--no-daemon` / GH Actions sweeps have no dispatch code to do this, so
 they still publish and start their own loop at Step 1b (#6320). Full mechanism:
 [`lease-renewal.md`](lease-renewal.md) · [`lease-record.md`](lease-record.md).

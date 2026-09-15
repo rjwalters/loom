@@ -45,14 +45,16 @@ pub(crate) const LEASE_RENEW_SCRIPT_REL: &str = ".loom/scripts/sweep-lease-renew
 /// [`SweepRegistry::start_lease_renewal_loop`]).
 pub(crate) const LEASE_RENEW_STARTED_ENV: &str = "LOOM_SWEEP_LEASE_RENEW_DISPATCHED";
 
-/// How long [`SweepRegistry::start_lease_renewal_loop`] waits for
-/// `sweep-lease-renew.sh start` to return before abandoning (killing) it.
+/// How long [`run_lease_renewal_start`] waits for `sweep-lease-renew.sh start`
+/// to return before abandoning (killing) it.
 ///
 /// `start` does **no** network I/O — it resolves a watch PID, forks ONE
 /// detached loop, `disown`s it and prints the loop's pid — so it returns in
 /// milliseconds. The bound exists only so a pathological helper (a wedged
-/// filesystem, a `bash` that never execs) can never hold the registry mutex:
-/// this call site runs inside `finish_issue_dispatch`, which is lock-scoped.
+/// filesystem, a `bash` that never execs) cannot wait forever. That wait runs
+/// on its own detached thread ([`SweepRegistry::start_lease_renewal_loop`]),
+/// never on the caller's thread, so it holds neither the registry mutex nor a
+/// tokio worker for its duration.
 const LEASE_RENEW_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolve the process group of a just-spawned sweep leader (Issue #4980).
@@ -2499,10 +2501,17 @@ impl SweepRegistry {
         // bounded gap (the account-selection poll, <= `TOKEN_NAME_CAPTURE_
         // TIMEOUT`) between the lease being written and the loop starting —
         // during which the lease comment is seconds old and nowhere near any
-        // reclamation TTL. Both are still ONE synchronous dispatch call: there
-        // is no deferred tick a daemon restart could drop on the floor.
+        // reclamation TTL. Both are still ONE dispatch call: there is no
+        // deferred tick a daemon restart could drop on the floor.
+        //
+        // The returned `JoinHandle` is deliberately dropped: the `start`
+        // handshake runs on its own thread precisely so this lock-scoped
+        // function stays O(1) (see `start_lease_renewal_loop`'s "Why the
+        // `start` handshake runs on its own thread"), and nothing in this
+        // dispatch depends on its result — it is best-effort in both
+        // directions.
         if matches!(kind, SweepKind::Issue(_)) {
-            self.start_lease_renewal_loop(issue_number, &sweep_id, pid, &log_path);
+            drop(self.start_lease_renewal_loop(issue_number, &sweep_id, pid, &log_path));
         }
 
         // Retain the handle so the reaper can `try_wait()` it (Issue #3801).
@@ -3235,158 +3244,230 @@ impl SweepRegistry {
     /// below also keeps a process-group-targeted teardown of the daemon — e.g.
     /// launchd stopping its job — from reaching it).
     ///
+    /// # Why the `start` handshake runs on its own thread
+    ///
+    /// Every caller of [`Self::finish_issue_dispatch`] — `ipc.rs`'s
+    /// `dispatch_sweep_nonblocking` Phase 3, `dispatch_issue_releasing_poll_lock`'s
+    /// Phase 3, `dispatch_inner`, and the reaper's resume path — invokes it
+    /// **holding the registry's `Arc<Mutex<SweepRegistry>>`**, and the first two
+    /// do so directly on a tokio worker thread. So this method must be O(1) on
+    /// the calling thread: it reads what it needs out of `self` (both cheap,
+    /// in-memory) and hands the subprocess spawn plus the bounded
+    /// `LEASE_RENEW_START_TIMEOUT` wait to a detached OS thread. In the normal
+    /// case that handshake is sub-millisecond, but a pathological helper (a
+    /// wedged filesystem, a `bash` that never execs) would otherwise pin the
+    /// *global* registry mutex for up to 10s on every `Issue` dispatch —
+    /// starving `list_sweeps`, `cancel`, and every concurrent dispatch behind
+    /// it. That is the same hazard class the #6592/#7307 split moved out from
+    /// under the lock for the account-selection poll
+    /// ([`poll_and_classify_spawned_child`], run via `spawn_blocking` with the
+    /// lock released); doing it here inside the registry method covers all four
+    /// call sites at once rather than one caller's phase.
+    ///
+    /// Returns the thread's [`JoinHandle`](std::thread::JoinHandle) (yielding
+    /// the detached loop's pid, or `None`) purely so tests can wait for the
+    /// handshake deterministically. Production drops it: the thread is
+    /// fire-and-forget, exactly like the loop it starts.
+    ///
     /// # Best-effort, exactly like the lease write it renews
     ///
-    /// Returns the loop's pid when one was started, `None` otherwise. Every
-    /// failure mode (no helper script in this workspace, a non-zero `start`, a
-    /// spawn error) only logs: a dispatch must never fail because the lease it
-    /// documents could not be kept fresh. `None` degrades to exactly the
-    /// pre-#7672 behavior for that sweep — the lease ages out — so this is
-    /// strictly additive to the claim's safety.
-    ///
-    /// `stderr` is pointed at the sweep's own log file rather than discarded:
-    /// `start` dups its stderr onto fd 9 for the detached loop (#6541), so a
-    /// renewal failure *mid-sweep* lands in the same log an operator already
-    /// reads for that sweep. It must be a **file**, never a pipe — the loop
-    /// holds its inherited copy open for the sweep's whole lifetime, so a
-    /// piped stderr would make any read-to-EOF wait here hang for hours.
+    /// Every failure mode (no helper script in this workspace, a non-zero
+    /// `start`, a spawn error, even a failure to spawn the thread) only logs: a
+    /// dispatch must never fail because the lease it documents could not be
+    /// kept fresh. No loop degrades to exactly the pre-#7672 behavior for that
+    /// sweep — the lease ages out — so this is strictly additive to the claim's
+    /// safety.
     pub(crate) fn start_lease_renewal_loop(
         &self,
         issue: u32,
         sweep_id: &str,
         child_pid: u32,
         log_path: &Path,
-    ) -> Option<u32> {
-        let script = self.config.workspace_root.join(LEASE_RENEW_SCRIPT_REL);
-        if !script.is_file() {
+    ) -> Option<std::thread::JoinHandle<Option<u32>>> {
+        // Captured here, under the caller's lock, because both are pure
+        // in-memory reads of this registry's own state: the workspace root is a
+        // `PathBuf` clone, and `published_host_id()` is a hostname read plus a
+        // hash. Everything that can block — the `is_file()` stat, the spawn,
+        // the wait — lives in the thread body below.
+        let workspace_root = self.config.workspace_root.clone();
+        let host = self.published_host_id();
+        let sweep_id = sweep_id.to_string();
+        let log_path = log_path.to_path_buf();
+        match std::thread::Builder::new()
+            .name(format!("lease-renew-start-{issue}"))
+            .spawn(move || {
+                run_lease_renewal_start(
+                    issue,
+                    &sweep_id,
+                    child_pid,
+                    &log_path,
+                    &workspace_root,
+                    &host,
+                )
+            }) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                log::warn!(
+                    "sweep_registry: could not spawn the lease-renewal start thread for issue \
+                     #{issue} (#7672, best-effort — dispatch continues, the lease will age \
+                     out): {e}"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// The blocking half of [`SweepRegistry::start_lease_renewal_loop`]: spawn
+/// `sweep-lease-renew.sh start` and wait (bounded by
+/// [`LEASE_RENEW_START_TIMEOUT`]) for its one-shot handshake to return the
+/// detached loop's pid.
+///
+/// Free function, and deliberately takes no `&SweepRegistry`: it runs on a
+/// detached thread *after* the registry mutex has been left behind, so it must
+/// not be able to touch registry state at all. Returns the loop's pid when one
+/// was started, `None` otherwise; every failure mode only logs (see the caller's
+/// best-effort contract).
+///
+/// `stderr` is pointed at the sweep's own log file rather than discarded:
+/// `start` dups its stderr onto fd 9 for the detached loop (#6541), so a
+/// renewal failure *mid-sweep* lands in the same log an operator already reads
+/// for that sweep. It must be a **file**, never a pipe — the loop holds its
+/// inherited copy open for the sweep's whole lifetime, so a piped stderr would
+/// make any read-to-EOF wait here hang for hours.
+fn run_lease_renewal_start(
+    issue: u32,
+    sweep_id: &str,
+    child_pid: u32,
+    log_path: &Path,
+    workspace_root: &Path,
+    host: &str,
+) -> Option<u32> {
+    let script = workspace_root.join(LEASE_RENEW_SCRIPT_REL);
+    if !script.is_file() {
+        log::debug!(
+            "sweep_registry: no {LEASE_RENEW_SCRIPT_REL} in {} — skipping the dispatch-time \
+             lease-renewal start for issue #{issue} (#7672); the lease will age out as it \
+             did before this hand-off existed",
+            workspace_root.display()
+        );
+        return None;
+    }
+    let mut cmd = Command::new(&script);
+    cmd.arg("start")
+        .arg(issue.to_string())
+        .arg("--watch-pid")
+        .arg(child_pid.to_string())
+        // Exact-match targeting (#6485): without BOTH of these the loop
+        // falls back to "newest lease wins" and can spend the sweep
+        // renewing a PEER dispatcher's lease comment while this claim's
+        // own `updated_at` never advances. The daemon knows both values
+        // exactly — it published them itself in `write_lease_comment`.
+        .arg("--host")
+        .arg(host)
+        .arg("--sweep-id")
+        .arg(sweep_id)
+        // Same workspace every other forge mutation in this registry runs
+        // in, so `gh` resolves this repo in a multi-workspace daemon
+        // (#3928/#3937).
+        .current_dir(workspace_root)
+        .stdin(Stdio::null())
+        // Piped and read below purely to capture the loop pid `start`
+        // prints. Safe to read to EOF: the detached loop redirects its OWN
+        // stdout to /dev/null, so nothing holds this pipe open past
+        // `start`'s return.
+        .stdout(Stdio::piped());
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        Ok(f) => {
+            cmd.stderr(Stdio::from(f));
+        }
+        Err(e) => {
             log::debug!(
-                "sweep_registry: no {LEASE_RENEW_SCRIPT_REL} in {} — skipping the dispatch-time \
-                 lease-renewal start for issue #{issue} (#7672); the lease will age out as it \
-                 did before this hand-off existed",
-                self.config.workspace_root.display()
+                "sweep_registry: could not open {} for the lease-renewal loop's stderr \
+                 ({e}); discarding it instead (#7672)",
+                log_path.display()
+            );
+            cmd.stderr(Stdio::null());
+        }
+    }
+    // Its own process group, for the same reason the sweep child gets one
+    // (#3800/#4980) and for one more: a supervisor that tears the daemon
+    // down by process group must not take the renewal loop of a still-live
+    // sweep with it.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    // #5401: a cross-owner managed repo needs its own owner's
+    // installation-token `GH_CONFIG_DIR` for the `gh api` PATCHes the loop
+    // makes — a no-op for single-owner fleets / the root owner.
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, workspace_root);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "sweep_registry: failed to start the lease-renewal loop for issue #{issue} \
+                 sweep_id={sweep_id} (#7672, best-effort — dispatch continues, the lease \
+                 will age out): {e}"
             );
             return None;
         }
-        let host = self.published_host_id();
-        let mut cmd = Command::new(&script);
-        cmd.arg("start")
-            .arg(issue.to_string())
-            .arg("--watch-pid")
-            .arg(child_pid.to_string())
-            // Exact-match targeting (#6485): without BOTH of these the loop
-            // falls back to "newest lease wins" and can spend the sweep
-            // renewing a PEER dispatcher's lease comment while this claim's
-            // own `updated_at` never advances. The daemon knows both values
-            // exactly — it published them itself in `write_lease_comment`.
-            .arg("--host")
-            .arg(&host)
-            .arg("--sweep-id")
-            .arg(sweep_id)
-            // Same workspace every other forge mutation in this registry runs
-            // in, so `gh` resolves this repo in a multi-workspace daemon
-            // (#3928/#3937).
-            .current_dir(&self.config.workspace_root)
-            .stdin(Stdio::null())
-            // Piped and read below purely to capture the loop pid `start`
-            // prints. Safe to read to EOF: the detached loop redirects its OWN
-            // stdout to /dev/null, so nothing holds this pipe open past
-            // `start`'s return.
-            .stdout(Stdio::piped());
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-        {
-            Ok(f) => {
-                cmd.stderr(Stdio::from(f));
-            }
-            Err(e) => {
-                log::debug!(
-                    "sweep_registry: could not open {} for the lease-renewal loop's stderr \
-                     ({e}); discarding it instead (#7672)",
-                    log_path.display()
-                );
-                cmd.stderr(Stdio::null());
-            }
-        }
-        // Its own process group, for the same reason the sweep child gets one
-        // (#3800/#4980) and for one more: a supervisor that tears the daemon
-        // down by process group must not take the renewal loop of a still-live
-        // sweep with it.
-        #[cfg(unix)]
-        cmd.process_group(0);
-        // #5401: a cross-owner managed repo needs its own owner's
-        // installation-token `GH_CONFIG_DIR` for the `gh api` PATCHes the loop
-        // makes — a no-op for single-owner fleets / the root owner.
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
+    };
+    let deadline = Instant::now() + LEASE_RENEW_START_TIMEOUT;
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break child.wait_with_output().ok(),
+            Ok(None) => {}
             Err(e) => {
                 log::warn!(
-                    "sweep_registry: failed to start the lease-renewal loop for issue #{issue} \
-                     sweep_id={sweep_id} (#7672, best-effort — dispatch continues, the lease \
-                     will age out): {e}"
-                );
-                return None;
-            }
-        };
-        let deadline = Instant::now() + LEASE_RENEW_START_TIMEOUT;
-        let output = loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break child.wait_with_output().ok(),
-                Ok(None) => {}
-                Err(e) => {
-                    log::warn!(
-                        "sweep_registry: lease-renewal start for issue #{issue} could not be \
-                         waited on (#7672): {e}"
-                    );
-                    break None;
-                }
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                log::warn!(
-                    "sweep_registry: lease-renewal start for issue #{issue} exceeded {}s and was \
-                     killed (#7672) — the claim keeps its label but its lease will age out",
-                    LEASE_RENEW_START_TIMEOUT.as_secs()
+                    "sweep_registry: lease-renewal start for issue #{issue} could not be \
+                     waited on (#7672): {e}"
                 );
                 break None;
             }
-            std::thread::sleep(REAP_GH_POLL_INTERVAL);
-        };
-
-        let output = output?;
-        if !output.status.success() {
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
             log::warn!(
-                "sweep_registry: lease-renewal start for issue #{issue} sweep_id={sweep_id} \
-                 exited {:?} (#7672, best-effort — see the sweep log for the helper's own \
-                 stderr)",
-                output.status.code()
+                "sweep_registry: lease-renewal start for issue #{issue} exceeded {}s and was \
+                 killed (#7672) — the claim keeps its label but its lease will age out",
+                LEASE_RENEW_START_TIMEOUT.as_secs()
             );
-            return None;
+            break None;
         }
-        let loop_pid = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u32>()
-            .ok();
-        match loop_pid {
-            Some(p) => log::info!(
-                "sweep_registry: issue #{issue} sweep_id={sweep_id} — started detached lease \
-                 renewal loop pid {p} watching child pid {child_pid} (#7672; the loop outlives \
-                 this daemon and stops with the sweep, never with the daemon)"
-            ),
-            None => log::debug!(
-                "sweep_registry: lease-renewal start for issue #{issue} succeeded but printed no \
-                 loop pid (#7672)"
-            ),
-        }
-        loop_pid
+        std::thread::sleep(REAP_GH_POLL_INTERVAL);
+    };
+
+    let output = output?;
+    if !output.status.success() {
+        log::warn!(
+            "sweep_registry: lease-renewal start for issue #{issue} sweep_id={sweep_id} \
+             exited {:?} (#7672, best-effort — see the sweep log for the helper's own \
+             stderr)",
+            output.status.code()
+        );
+        return None;
     }
+    let loop_pid = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok();
+    match loop_pid {
+        Some(p) => log::info!(
+            "sweep_registry: issue #{issue} sweep_id={sweep_id} — started detached lease \
+             renewal loop pid {p} watching child pid {child_pid} (#7672; the loop outlives \
+             this daemon and stops with the sweep, never with the daemon)"
+        ),
+        None => log::debug!(
+            "sweep_registry: lease-renewal start for issue #{issue} succeeded but printed no \
+             loop pid (#7672)"
+        ),
+    }
+    loop_pid
 }
 
 /// Poll `child`'s log for its account-selection marker and classify an
@@ -7993,13 +8074,13 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
             .dispatch(&SweepKind::Issue(7672), None, None, None, None)
             .expect("dispatch should succeed");
 
-        // A short budget deliberately, unlike the fixture-child waits
-        // elsewhere in this module: the helper is invoked and waited on
-        // SYNCHRONOUSLY inside `dispatch()`, so by the time it returns the
-        // record is already on disk. The few seconds only absorb filesystem
-        // latency — a genuinely missing invocation should fail fast.
+        // `dispatch()` hands the `start` handshake to a detached thread (so it
+        // never runs under the registry mutex — see `start_lease_renewal_loop`),
+        // so wait for the recording stub's LAST line rather than reading the
+        // log the instant dispatch returns. A few seconds is a generous budget
+        // for a `bash` fork — a genuinely missing invocation still fails fast.
         assert!(
-            wait_for_contents(&renew_log, "argv: start ", 5_000),
+            wait_for_contents(&renew_log, "PWD=", 5_000),
             "dispatch must invoke {LEASE_RENEW_SCRIPT_REL} — Step 1a is now the daemon's job, \
              not the spawned session's prose (#7672)"
         );
@@ -8040,6 +8121,11 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
     ///
     /// This is why the `start` lives in `finish_issue_dispatch` (after the
     /// #4689 check) rather than next to `Command::spawn()`.
+    ///
+    /// Asserted through a bounded *wait* for evidence rather than a bare
+    /// `!exists()`: the `start` handshake now runs on a detached thread, so a
+    /// regression that moved the call before the #4689 check would otherwise be
+    /// able to win a race against an instantaneous assertion.
     #[test]
     #[serial]
     fn immediate_preflight_death_starts_no_renewal_loop() {
@@ -8055,7 +8141,7 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
         assert!(err.downcast_ref::<TokenSelectionDispatchError>().is_some(), "got: {err}");
 
         assert!(
-            !renew_log.exists(),
+            !wait_for_contents(&renew_log, "argv: start ", 1_000),
             "a dispatch that unwound its own claim must not leave a renewal loop watching a \
              dead pid (#7672); got: {:?}",
             std::fs::read_to_string(&renew_log).unwrap_or_default()
@@ -8090,10 +8176,14 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
         let log_path = dir.path().join("sweep-issue-76722.log");
 
         let started = Instant::now();
-        let loop_pid = registry
+        let handshake = registry
             .start_lease_renewal_loop(76_722, "sweep-76722-0", std::process::id(), &log_path)
-            .expect("the stub prints a loop pid, so one must be returned");
+            .expect("the handshake thread must spawn");
         let elapsed = started.elapsed();
+        let loop_pid = handshake
+            .join()
+            .expect("the handshake thread must not panic")
+            .expect("the stub prints a loop pid, so one must be returned");
 
         assert!(
             elapsed < LEASE_RENEW_START_TIMEOUT,
@@ -8153,12 +8243,11 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
         let renew_log = install_recording_lease_renew(dir.path(), "echo boom >&2\nexit 1\n");
         let log_path = dir.path().join("sweep-issue-76724.log");
 
-        let started = registry.start_lease_renewal_loop(
-            76_724,
-            "sweep-76724-0",
-            std::process::id(),
-            &log_path,
-        );
+        let started = registry
+            .start_lease_renewal_loop(76_724, "sweep-76724-0", std::process::id(), &log_path)
+            .expect("the handshake thread must spawn")
+            .join()
+            .expect("the handshake thread must not panic");
 
         assert!(started.is_none(), "a failed `start` must report no loop pid");
         assert!(renew_log.exists(), "the helper was still invoked");
@@ -8169,5 +8258,86 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
             sweep_log.contains("boom"),
             "the helper's stderr must be captured into the sweep log; got: {sweep_log:?}"
         );
+    }
+
+    /// Liveness regression (PR #7693 review): the `start` handshake must not be
+    /// performed while the registry mutex is held.
+    ///
+    /// `start_lease_renewal_loop` is called from `finish_issue_dispatch`, which
+    /// every caller — `ipc.rs`'s `dispatch_sweep_nonblocking` Phase 3,
+    /// `dispatch_issue_releasing_poll_lock`'s Phase 3, `dispatch_inner`, the
+    /// reaper's resume path — invokes holding the global
+    /// `Arc<Mutex<SweepRegistry>>`, the first two directly on a tokio worker.
+    /// A pathological helper (a wedged filesystem, a `bash` that never execs)
+    /// would therefore pin that mutex for up to `LEASE_RENEW_START_TIMEOUT` on
+    /// every `Issue` dispatch, starving `list_sweeps` / `cancel` / concurrent
+    /// dispatches — the same hazard
+    /// `list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst`
+    /// (`ipc.rs`, #7307) pins for the Phase 2 account-selection poll, which that
+    /// test cannot see on this Phase 3 path.
+    ///
+    /// Driven with a helper that sleeps far longer than any lock-sensitive
+    /// budget, invoked from inside a lock scope shaped exactly like
+    /// `finish_issue_dispatch`'s. Reverting the call to a synchronous,
+    /// inline wait fails both assertions below.
+    #[test]
+    #[serial]
+    fn a_slow_lease_renew_start_never_holds_the_registry_lock() {
+        const SLOW_HELPER_SECS: u64 = 5;
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+        let renew_log = install_recording_lease_renew(
+            dir.path(),
+            &format!("sleep {SLOW_HELPER_SECS}\necho 4242\nexit 0\n"),
+        );
+        let log_path = dir.path().join("sweep-issue-76727.log");
+        let registry = Arc::new(Mutex::new(registry));
+
+        let (handshake, call_elapsed, waiter) = {
+            // The lock scope `finish_issue_dispatch` runs under.
+            let sr = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A `list_sweeps`-shaped reader, already queued on the same mutex
+            // before the call below: it measures how long the dispatch path
+            // keeps the lock, which is the whole point.
+            let waiter = {
+                let registry = Arc::clone(&registry);
+                std::thread::spawn(move || {
+                    let queued = Instant::now();
+                    let _guard = registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    queued.elapsed()
+                })
+            };
+            std::thread::sleep(Duration::from_millis(50));
+
+            let called = Instant::now();
+            let handshake =
+                sr.start_lease_renewal_loop(76_727, "sweep-76727-0", std::process::id(), &log_path);
+            (handshake, called.elapsed(), waiter)
+        };
+
+        let slow = Duration::from_secs(SLOW_HELPER_SECS);
+        assert!(
+            call_elapsed < slow / 2,
+            "the lock-scoped call must return without waiting on the helper; it took \
+             {call_elapsed:?} against a helper that sleeps {SLOW_HELPER_SECS}s"
+        );
+        let blocked_for = waiter.join().expect("the waiter thread must not panic");
+        assert!(
+            blocked_for < slow / 2,
+            "a concurrent registry-lock consumer (list_sweeps/cancel/another dispatch) must not \
+             be starved behind the lease-renewal helper; it waited {blocked_for:?}"
+        );
+
+        // ...and the handshake still completes, off-lock, with the loop pid.
+        let loop_pid = handshake
+            .expect("the handshake thread must spawn")
+            .join()
+            .expect("the handshake thread must not panic");
+        assert_eq!(loop_pid, Some(4242), "the off-lock handshake must still be performed");
+        assert!(renew_log.exists(), "the helper was invoked");
     }
 }

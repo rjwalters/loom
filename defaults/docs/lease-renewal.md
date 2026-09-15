@@ -58,7 +58,7 @@ the lease aged out, a peer's reclamation gate (#6286) correctly judged the
 claim dead, and it reclaimed live work.
 
 So for a daemon-dispatched `--claim-owned` sweep, `loom-daemon` now issues
-the one-shot `start` itself, synchronously, in
+the one-shot `start` itself, once per dispatch, from
 `SweepRegistry::finish_issue_dispatch` — see "Where it is wired in" below.
 The #6129 constraint above is untouched, because the *only* thing that moved
 is the invocation:
@@ -156,9 +156,20 @@ keeps an older installed `sweep.md` correct. Explicit flags always win.
   --watch-pid "$CHILD_PID" --host "$PUBLISHED_HOST" --sweep-id "$SWEEP_ID"
 ```
 
-- **Once per dispatch**, synchronously, inside the same `dispatch()` call
-  that spawned the child — not from a tick, a timer, or any later
-  daemon-driven step a restart could lose.
+- **Once per dispatch**, inside the same `dispatch()` call that spawned the
+  child — not from a tick, a timer, or any later daemon-driven step a restart
+  could lose.
+- **Off the registry lock.** `finish_issue_dispatch` runs holding the global
+  `Arc<Mutex<SweepRegistry>>` (on a tokio worker thread, for the IPC and
+  work-finder dispatch paths), so `start_lease_renewal_loop` reads what it
+  needs out of the registry and hands the `start` handshake — the subprocess
+  spawn plus its 10 s `LEASE_RENEW_START_TIMEOUT` wait — to a detached
+  thread. The handshake is sub-millisecond in the normal case, but a
+  pathological helper (a wedged filesystem, a `bash` that never execs) must
+  not be able to pin that mutex and starve `list_sweeps` / `cancel` /
+  concurrent dispatches behind it. Same reasoning, and same shape, as the
+  #6592/#7307 split that moved the account-selection poll out from under the
+  lock.
 - **After** the #4689 immediate-preflight-death check, deliberately: that
   branch unwinds the whole claim (label, claim lock, peer-claim ad) for a
   child that is already dead, and a loop must never be left watching a pid
