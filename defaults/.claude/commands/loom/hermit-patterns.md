@@ -830,7 +830,7 @@ rg "export.*function|export.*class" -n
 # -> Found unused function, create issue
 
 # Pass 2 (random selection: random-file)
-mcp__loom__get_random_file
+./.loom/scripts/random-file.sh
 cat <file-path>
 # -> Found over-engineered class, create issue
 
