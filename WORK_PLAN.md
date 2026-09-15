@@ -10,86 +10,66 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6890**: chore(deps-dev): bump happy-dom from 15.11.7 to 20.11.6 in /dashboard/web
-- **#7396**: chore(deps): bump @vitest/mocker and vitest in /dashboard/web
-- **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
-- **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
-- **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
-- **#7438**: fix(tokens): re-probe monitor ranking rows frozen past their own reset (#7420)
 - **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 - **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
-- **#7473**: chore(deps): bump @vitest/mocker and vitest in /mcp-loom
-- **#7474**: chore(deps-dev): bump vitest from 4.1.10 to 4.1.11 in /mcp-loom
 - **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
 - **#7536**: tokens: expire session-limit bad-marks with their own 5h window
-- **#7569**: chore(deps): bump the all-dependencies group across 1 directory with 2 updates
-- **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
-- **#7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
-- **#7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
-- **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
 - **#7594**: fix: back off and surface permanently-failing worktree removals (#7590)
-- **#7610**: release: publish a Release with signed artifacts on every VERSION bump (#7609)
-- **#7619**: fix: back off guarded issues via the #4485 ladder and short-circuit 2.5 on a fresh open-PR memo
-- **#7624**: fix(daemon): fence midbuild-watchdog cleanup against a fresher forge lease
-- **#7625**: fix: preflight codesign identities non-interactively to prevent install hangs
-- **#7626**: feat(daemon): drive auto-update rolls from the latest Release artifact, not source-checkout staleness
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
+- **#7647**: Judge: reconcile paginated formal reviews and inline threads before approval
+- **#7652**: classify-dependency-block.sh: dependency-keyword regex misses 'cannot start until #N' phrasing
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
+- **#7647**: Judge: reconcile paginated formal reviews and inline threads before approval
+- **#7652**: classify-dependency-block.sh: dependency-keyword regex misses 'cannot start until #N' phrasing
+- **#7664**: watchdog: peer-coordination escalation needs hysteresis and dedup — refiles a tracking issue on every self-recovering flap
+- **#7668**: Builder/Doctor: rebase onto origin/main immediately before opening a PR that touches a hot-churn file (3 consecutive merge-conflict rejections on one README status paragraph)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#7658**: Hermit/Architect: verify every cited path, line range and repo-state claim against origin/main before filing (verify-proposal-refs.sh)
+- **#7659**: Proposer roles: cite only paths that exist in the dispatched workspace; sibling checkouts named in a repo docs are context, never a citation target
+- **#7660**: Doctor: Priority-1 conflict query does not exclude loom:operator-held PRs, so a held PR is claimed, rebased, then stood down
+- **#7662**: dashboard: host card roster — show active repos, fold the idle set into a closed-by-default accordion
+- **#7663**: dashboard: @cloudflare/vitest-pool-workers 0.22.0 upgrade needs vitest v4 config migration + breaks D1 per-test storage isolation
+- **#7665**: champion-pr-merge.md: one remaining 'for file in $FILES' loop (line 1092) breaks under zsh
+- **#7666**: champion: a passing, already-decomposed epic is escalated to the operator after repeated identical stand-down passes
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#7653**: fix(classify-dependency-block): recognize "cannot start/proceed until" phrasing
+- **#7656**: fix(judge): reconcile paginated formal reviews and inline threads before approval
+- **#7669**: fix(champion-pr-merge): convert remaining for-loop to zsh-safe while-read
+- **#7670**: fix(champion): stop escalating a passing, already-decomposed epic to the operator
+- **#7671**: fix(dashboard): complete vitest-pool-workers 0.22.0 upgrade, fix D1 test isolation regression
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6890**: chore(deps-dev): bump happy-dom from 15.11.7 to 20.11.6 in /dashboard/web
-- **#7396**: chore(deps): bump @vitest/mocker and vitest in /dashboard/web
-- **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
-- **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
-- **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
-- **#7438**: fix(tokens): re-probe monitor ranking rows frozen past their own reset (#7420)
 - **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 - **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
-- **#7473**: chore(deps): bump @vitest/mocker and vitest in /mcp-loom
-- **#7474**: chore(deps-dev): bump vitest from 4.1.10 to 4.1.11 in /mcp-loom
 - **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
 - **#7536**: tokens: expire session-limit bad-marks with their own 5h window
-- **#7569**: chore(deps): bump the all-dependencies group across 1 directory with 2 updates
-- **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
-- **#7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
-- **#7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
-- **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
 - **#7594**: fix: back off and surface permanently-failing worktree removals (#7590)
-- **#7610**: release: publish a Release with signed artifacts on every VERSION bump (#7609)
-- **#7619**: fix: back off guarded issues via the #4485 ladder and short-circuit 2.5 on a fresh open-PR memo
-- **#7624**: fix(daemon): fence midbuild-watchdog cleanup against a fresher forge lease
-- **#7625**: fix: preflight codesign identities non-interactively to prevent install hangs
-- **#7626**: feat(daemon): drive auto-update rolls from the latest Release artifact, not source-checkout staleness
 
 ## Proposed
 
@@ -108,10 +88,6 @@ Issues carrying `loom:curated`.
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7356**: Guard friction: worktree-write-confinement-unresolved-var denies mktemp/tmp-scoped writes (44/126 = top guard-decision volume) *(curated)*
 - **#7359**: merge=ours driver on .loom/install-metadata.json can silently drop non-loom_version field edits during rebase, uncaught by version-check-gate.sh *(curated)*
-- **#7415**: Worktree-isolation guard blocks cp/mv into a registered worktree nested under the main checkout (.claude/worktrees/<name>) *(curated)*
-- **#7419**: merge-pr.sh should refuse a PR that is not loom:pr unless explicitly overridden *(curated)*
-- **#7420**: tokens check --ranking shows revoked accounts as exhausted with a reset date in the past instead of re-probing to auth-dead *(curated)*
-- **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
 - **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
 - **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
 - **#7515**: Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292 *(curated)*
@@ -119,10 +95,18 @@ Issues carrying `loom:curated`.
 - **#7526**: daemon: use #7513's phase-timing instrumentation to fix the actual status/health IPC bottleneck (ask 2/3) *(curated)*
 - **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
 - **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility *(curated)*
-- **#7605**: provision-daemon: sign_daemon_binary hangs on a keychain GUI prompt when the configured codesign identity's key lacks codesign in its ACL — preflight non-interactively and fall back *(curated)*
-- **#7606**: work_finder: a guarded issue is re-probed on every 60 s tick — put open-PR-guard refusals on the #4485 backoff ladder and short-circuit the closed-issue probe when the open-PR memo is fresh *(curated)*
-- **#7609**: daemon auto-update: drive rolls from the latest Release artifact, not source-checkout staleness — the source gate is shut on every fleet host today *(curated)*
-- **#7612**: Watchdog cleanup discards a newly leased worktree before redispatch ownership check *(curated)*
+- **#7647**: Judge: reconcile paginated formal reviews and inline threads before approval *(curated)*
+- **#7652**: classify-dependency-block.sh: dependency-keyword regex misses 'cannot start until #N' phrasing *(curated)*
+- **#7657**: Champion: close a proposal whose central premise is verified false instead of escalating it as an operator decision *(curated)*
+- **#7658**: Hermit/Architect: verify every cited path, line range and repo-state claim against origin/main before filing (verify-proposal-refs.sh) *(curated)*
+- **#7659**: Proposer roles: cite only paths that exist in the dispatched workspace; sibling checkouts named in a repo docs are context, never a citation target *(curated)*
+- **#7660**: Doctor: Priority-1 conflict query does not exclude loom:operator-held PRs, so a held PR is claimed, rebased, then stood down *(curated)*
+- **#7662**: dashboard: host card roster — show active repos, fold the idle set into a closed-by-default accordion *(curated)*
+- **#7663**: dashboard: @cloudflare/vitest-pool-workers 0.22.0 upgrade needs vitest v4 config migration + breaks D1 per-test storage isolation *(curated)*
+- **#7664**: watchdog: peer-coordination escalation needs hysteresis and dedup — refiles a tracking issue on every self-recovering flap *(curated)*
+- **#7665**: champion-pr-merge.md: one remaining 'for file in $FILES' loop (line 1092) breaks under zsh *(curated)*
+- **#7666**: champion: a passing, already-decomposed epic is escalated to the operator after repeated identical stand-down passes *(curated)*
+- **#7668**: Builder/Doctor: rebase onto origin/main immediately before opening a PR that touches a hot-churn file (3 consecutive merge-conflict rejections on one README status paragraph) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -141,13 +125,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 26 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 26 |
-| Curated | 28 |
+| Operator merge-risk holds | 8 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 5 |
+| In Progress (`loom:building`) | 7 |
+| PRs awaiting review | 5 |
+| Approved PRs awaiting merge | 8 |
+| Curated | 32 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->

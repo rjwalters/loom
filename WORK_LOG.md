@@ -7,10 +7,29 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-15
+- **Issue #7421** (closed): Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern)
+- **PR #7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
+- **Issue #7419** (closed): merge-pr.sh should refuse a PR that is not loom:pr unless explicitly overridden
+- **PR #7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
+- **Issue #7415** (closed): Worktree-isolation guard blocks cp/mv into a registered worktree nested under the main checkout (.claude/worktrees/<name>)
+- **PR #7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
+- **Issue #7420** (closed): tokens check --ranking shows revoked accounts as exhausted with a reset date in the past instead of re-probing to auth-dead
+- **PR #7438**: fix(tokens): re-probe monitor ranking rows frozen past their own reset (#7420)
 - **Issue #7650** (closed): Curator: de-escalate a Champion "repeated rejection" escalation when its cited objections have since resolved on main, instead of parking it for the operator
 - **PR #7661**: feat(curator): de-escalate fact-based Champion escalations once objections resolve
 
 ### 2026-09-14
+- **Issue #7609** (closed): daemon auto-update: drive rolls from the latest Release artifact, not source-checkout staleness — the source gate is shut on every fleet host today
+- **PR #7626**: feat(daemon): drive auto-update rolls from the latest Release artifact, not source-checkout staleness
+- **Issue #7612** (closed): Watchdog cleanup discards a newly leased worktree before redispatch ownership check
+- **PR #7624**: fix(daemon): fence midbuild-watchdog cleanup against a fresher forge lease
+- **Issue #7605** (closed): provision-daemon: sign_daemon_binary hangs on a keychain GUI prompt when the configured codesign identity's key lacks codesign in its ACL — preflight non-interactively and fall back
+- **PR #7625**: fix: preflight codesign identities non-interactively to prevent install hangs
+- **PR #7569**: chore(deps): bump the all-dependencies group across 1 directory with 2 updates
+- **PR #7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
+- **PR #7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
+- **PR #7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
+- **PR #7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
 - **PR #7610**: release: publish a Release with signed artifacts on every VERSION bump (#7609)
 - **Issue #7649** (closed): review-stall watchdog strands post-Builder work by redispatching Issue instead of its existing PR
 - **PR #7651**: fix: review-stall watchdog converts open-PR recovery to PrSet instead of stranding it
