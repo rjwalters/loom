@@ -1478,6 +1478,17 @@ pub(crate) async fn run_daemon() -> Result<()> {
         );
     }
 
+    // Role-runner roster heartbeat (Issue #7690, Phase A of #6704). Opt-in via
+    // `autonomous.roleRunner.roster.enabled` (+ `.issue`), resolved once at
+    // startup from the daemon's primary workspace — the roster is a
+    // fleet-wide, host-level concern like the static shard posture above, not
+    // a per-workspace one. Disabled (the default) spawns nothing and makes
+    // zero extra forge calls. Purely observational in this phase: it does not
+    // affect `role_shard::decide()`'s verdict — see that function's own
+    // module docs and `defaults/docs/role-runner-roster.md`.
+    let _roster_heartbeat_handle =
+        role_runner::spawn_roster_heartbeat_task(sweep_workspace.clone());
+
     // Reactive main-health backstop loop (Issue #3812 — Phase C of epic #3809).
     // Opt-in via `LOOM_MAIN_HEALTH_GATE` AND a `buildGate` block in
     // `.loom/config.json`. On a red `main` (a non-zero `buildGate.command`) it

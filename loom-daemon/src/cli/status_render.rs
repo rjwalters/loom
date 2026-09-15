@@ -365,6 +365,24 @@ pub(crate) fn build_status_json_value(
             "count": s.count,
             "configured": s.configured,
             "summary": s.summary,
+            // Roster section (Issue #7690, Phase A of #6704) — `null` when
+            // the roster is disabled (the default) or has never completed a
+            // heartbeat cycle. Observational only: does not feed `index`/
+            // `count` above in this phase.
+            "roster": s.roster.as_ref().map(|r| serde_json::json!({
+                "issue": r.issue,
+                "live_count": r.live_count,
+                "seen_count": r.seen_count,
+                "generation": r.generation,
+                "settled_secs": r.settled_secs,
+                "members": r.members.iter().map(|m| serde_json::json!({
+                    "host": m.host,
+                    "fresh": m.fresh,
+                    "last_beat_secs_ago": m.last_beat_secs_ago,
+                    "serves_count": m.serves_count,
+                    "is_this_host": m.is_this_host,
+                })).collect::<Vec<_>>(),
+            })),
         })),
         // Startup forge-credential preflight (#4005) — resolved once at
         // daemon boot, before the daemon's first `gh` consumer. Never
@@ -1524,6 +1542,52 @@ fn render_role_runner_shard_header_line(report: &DaemonStatusReport) -> Option<S
     Some(format!("Role runner (sharding): {}", shard.summary))
 }
 
+/// Render the roster section (Issue #7690, Phase A of #6704), printed
+/// directly under [`render_role_runner_shard_header_line`] — the issue, the
+/// live/seen member counts, the current generation and how long it has been
+/// settled, and one line per member. `None` when the daemon reported no
+/// roster (disabled — the default — or no heartbeat cycle has completed yet).
+///
+/// An EXPIRED member is rendered, never dropped: silence about a dead host is
+/// exactly how the pre-#6374 `LOOM_ROLE_RUNNER=0` mitigation became invisible
+/// (the same rationale [`render_role_runner_shard_header_line`]'s doc comment
+/// gives for a misconfigured-but-configured shard).
+#[must_use]
+fn render_roster_lines(report: &DaemonStatusReport) -> Vec<String> {
+    let Some(roster) = report
+        .role_runner_shard
+        .as_ref()
+        .and_then(|s| s.roster.as_ref())
+    else {
+        return Vec::new();
+    };
+    let gen_str = roster
+        .generation
+        .map(|g| g.to_rfc3339())
+        .unwrap_or_else(|| "(none)".to_string());
+    let settled_str = roster
+        .settled_secs
+        .map(|s| format!(" (settled {}m)", s / 60))
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "  Roster: issue {} · {} live / {} seen · gen {gen_str}{settled_str}",
+        roster.issue, roster.live_count, roster.seen_count,
+    )];
+    for m in &roster.members {
+        let freshness = if m.fresh { "fresh  " } else { "EXPIRED" };
+        let this_host = if m.is_this_host {
+            "   ← this host"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "    {:<14} {freshness} (last beat {}s ago)   serves {}{this_host}",
+            m.host, m.last_beat_secs_ago, m.serves_count,
+        ));
+    }
+    lines
+}
+
 /// Render the per-root "which host carries this workspace's role slice" line
 /// (#6374) — `None` on an unsharded host, where every workspace is carried
 /// here and the line would be pure noise on every row.
@@ -2394,6 +2458,14 @@ pub(crate) fn print_status_human(
     // single-host install should not grow a line about a feature it does not
     // use.
     if let Some(line) = render_role_runner_shard_header_line(report) {
+        println!("{line}");
+    }
+    // Roster section (Issue #7690, Phase A of #6704) — printed immediately
+    // below the sharding header, when the daemon has one to show. `None`
+    // (nothing printed) whenever the roster is disabled (the default) or has
+    // never completed a heartbeat cycle, so a default install's `status`
+    // output is byte-identical to pre-#7690.
+    for line in render_roster_lines(report) {
         println!("{line}");
     }
 
@@ -5032,6 +5104,7 @@ mod role_runner_shard_render_tests {
             count: configured.then_some(4),
             summary: summary.to_string(),
             configured,
+            roster: None,
         }
     }
 
@@ -5156,5 +5229,94 @@ mod role_runner_shard_render_tests {
         assert!(line.contains("LOOM_ROLE_RUNNER_SHARD_INDEX"), "{line}");
         assert!(line.contains("rjwalters/loom"), "must name the key: {line}");
         assert!(line.contains("git-remote"), "must name the key's tier: {line}");
+    }
+}
+
+#[cfg(test)]
+mod roster_render_tests {
+    //! Issue #7690, Phase A of #6704: the roster section must be silent on a
+    //! default (disabled) install, and must never hide an EXPIRED member —
+    //! the same "misconfiguration must render" principle
+    //! `role_runner_shard_render_tests` pins for the sharding header above.
+    use super::render_roster_lines;
+    use crate::cli::status::status_client_tests::sample_report;
+    use loom_daemon::types::{
+        DaemonStatusReport, RoleRunnerShardPosture, RosterMemberStatus, RosterStatus,
+    };
+
+    fn member(host: &str, fresh: bool, is_this_host: bool) -> RosterMemberStatus {
+        RosterMemberStatus {
+            host: host.to_string(),
+            fresh,
+            last_beat_secs_ago: 41,
+            serves_count: 27,
+            is_this_host,
+        }
+    }
+
+    fn posture_with_roster(roster: Option<RosterStatus>) -> RoleRunnerShardPosture {
+        RoleRunnerShardPosture {
+            index: Some(1),
+            count: Some(4),
+            summary: "shard 1 of 4 (index from env, count from config)".to_string(),
+            configured: true,
+            roster,
+        }
+    }
+
+    #[test]
+    fn no_lines_when_the_daemon_reported_no_shard_posture_at_all() {
+        let report = DaemonStatusReport {
+            role_runner_shard: None,
+            ..sample_report()
+        };
+        assert!(render_roster_lines(&report).is_empty());
+    }
+
+    #[test]
+    fn no_lines_when_the_roster_is_disabled_or_never_published() {
+        let report = DaemonStatusReport {
+            role_runner_shard: Some(posture_with_roster(None)),
+            ..sample_report()
+        };
+        assert!(render_roster_lines(&report).is_empty());
+    }
+
+    #[test]
+    fn renders_the_header_and_one_line_per_member_including_expired_ones() {
+        let roster = RosterStatus {
+            issue: "rjwalters/loom#1234".to_string(),
+            live_count: 2,
+            seen_count: 3,
+            generation: None,
+            settled_secs: Some(22 * 60),
+            members: vec![
+                member("host-a3f9c1d2", true, false),
+                member("host-d9142cf3", true, true),
+                member("host-e1d4c843", false, false),
+            ],
+        };
+        let report = DaemonStatusReport {
+            role_runner_shard: Some(posture_with_roster(Some(roster))),
+            ..sample_report()
+        };
+        let lines = render_roster_lines(&report);
+        assert_eq!(lines.len(), 4, "1 header + 3 members: {lines:?}");
+        assert!(lines[0].contains("rjwalters/loom#1234"), "{}", lines[0]);
+        assert!(lines[0].contains("2 live / 3 seen"), "{}", lines[0]);
+        assert!(lines[0].contains("settled 22m"), "{}", lines[0]);
+        // An EXPIRED member stays visible, never dropped.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("host-e1d4c843") && l.contains("EXPIRED")),
+            "expired member must render: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("host-d9142cf3") && l.contains("this host")),
+            "this host must be marked: {lines:?}"
+        );
     }
 }
