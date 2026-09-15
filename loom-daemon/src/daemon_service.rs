@@ -26,6 +26,7 @@ use loom_daemon::observability;
 use loom_daemon::orphan_process_reaper;
 use loom_daemon::primary_checkout_reaper;
 use loom_daemon::quarantine_reconciliation;
+use loom_daemon::quarantine_stash_status;
 use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_collision;
 use loom_daemon::role_runner;
@@ -1613,6 +1614,25 @@ pub(crate) async fn run_daemon() -> Result<()> {
             );
             None
         };
+
+    // Stash-summary cache-refresh loop (Issue #7526): keeps
+    // `quarantine_stash_status`'s per-root `StashSummary` cache warm so
+    // `build_daemon_status` never has to shell out to `git stash list`
+    // synchronously — see that module's doc comment for the fleet
+    // measurement that motivated it. Always-on, no enable knob (like
+    // `token_ranking_refresh`): a read-only cache-warmer with no destructive
+    // or dispatch side effect.
+    let _stash_summary_refresh_handle = {
+        let interval = quarantine_stash_status::DEFAULT_STASH_SUMMARY_REFRESH_INTERVAL;
+        log::info!(
+            "quarantine_stash_status: enabled (multi-workspace, interval={}s)",
+            interval.as_secs()
+        );
+        quarantine_stash_status::spawn_multi_stash_summary_refresh_task(
+            sweep_workspace.clone(),
+            interval,
+        )
+    };
 
     // Install/host invariant self-check (#5035): periodically verify the
     // install/host invariants the daemon's own operation depends on — the MCP

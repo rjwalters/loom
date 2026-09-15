@@ -142,6 +142,63 @@ pub(crate) struct LockOwner {
     pub(crate) pgid: Option<u32>,
 }
 
+/// The pure filesystem-scan half of [`SweepRegistry::unregistered_locked_issues`]
+/// (Issue #7526): walks `locks_dir` and cross-checks each live lock's issue
+/// against `is_tracked` instead of `&SweepRegistry` directly, so it can run
+/// without holding the registry's mutex — see
+/// [`crate::sweep_registry::RegistrySnapshot::unregistered_locked_issues`],
+/// which calls this on a cloned snapshot outside the lock, and the original
+/// instance method above, which still calls it inline (under the lock, as
+/// before) for every other caller.
+///
+/// Returns `(issue, owner_pid)` pairs, sorted ascending by issue number.
+#[must_use]
+pub(crate) fn scan_unregistered_locked_issues(
+    locks_dir: &Path,
+    is_tracked: &dyn Fn(u32) -> bool,
+) -> Vec<(u32, u32)> {
+    let mut result = Vec::new();
+    let Ok(read_dir) = std::fs::read_dir(locks_dir) else {
+        return result;
+    };
+    for entry in read_dir {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let Some(issue_str) = name.strip_prefix("issue-") else {
+            continue;
+        };
+        let Ok(issue): Result<u32, _> = issue_str.parse() else {
+            continue;
+        };
+        let owner_path = path.join("owner.json");
+        let owner: Option<LockOwner> = std::fs::read_to_string(&owner_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        let Some(owner) = owner else {
+            // No (or unparsable) owner.json: nothing durable to cross-check
+            // against — `reconstruct()`'s stale-lock cleanup owns this case.
+            continue;
+        };
+        if !is_pid_alive(owner.owner_pid) {
+            // Stale lock (dead owner): the sweep has actually finished or
+            // crashed, not "unregistered" — do not report it as alive.
+            continue;
+        }
+        if !is_tracked(issue) {
+            result.push((issue, owner.owner_pid));
+        }
+    }
+    result.sort_unstable();
+    result
+}
+
 impl SweepRegistry {
     /// Cross-check `.loom/locks/issue-<N>/` against this registry's own
     /// in-memory entries and surface any issue whose lock has a **live**
@@ -169,47 +226,9 @@ impl SweepRegistry {
     /// Returns `(issue, owner_pid)` pairs, sorted ascending by issue number.
     #[must_use]
     pub fn unregistered_locked_issues(&self) -> Vec<(u32, u32)> {
-        let locks_dir = self.config.locks_dir();
-        let mut result = Vec::new();
-        let Ok(read_dir) = std::fs::read_dir(&locks_dir) else {
-            return result;
-        };
-        for entry in read_dir {
-            let Ok(entry) = entry else { continue };
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            let Some(issue_str) = name.strip_prefix("issue-") else {
-                continue;
-            };
-            let Ok(issue): Result<u32, _> = issue_str.parse() else {
-                continue;
-            };
-            let owner_path = path.join("owner.json");
-            let owner: Option<LockOwner> = std::fs::read_to_string(&owner_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok());
-            let Some(owner) = owner else {
-                // No (or unparsable) owner.json: nothing durable to cross-check
-                // against — `reconstruct()`'s stale-lock cleanup owns this case.
-                continue;
-            };
-            if !is_pid_alive(owner.owner_pid) {
-                // Stale lock (dead owner): the sweep has actually finished or
-                // crashed, not "unregistered" — do not report it as alive.
-                continue;
-            }
-            if !self.has_tracked_sweep_for(issue) {
-                result.push((issue, owner.owner_pid));
-            }
-        }
-        result.sort_unstable();
-        result
+        scan_unregistered_locked_issues(&self.config.locks_dir(), &|issue| {
+            self.has_tracked_sweep_for(issue)
+        })
     }
 
     // ------------------------------------------------------------------------

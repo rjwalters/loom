@@ -1281,19 +1281,7 @@ impl SweepRegistry {
     /// only — the stored entry in `self.entries` is untouched; callers apply
     /// it to an already-cloned [`SweepInfo`].
     pub(crate) fn overlay_live_phase(&self, info: &mut SweepInfo) {
-        if info.latest_phase.is_none()
-            && matches!(info.state, SweepState::Running | SweepState::Pending)
-        {
-            if let SweepKind::Issue(issue) = info.kind {
-                let checkpoint = self
-                    .config
-                    .checkpoint_dir()
-                    .join(format!("issue-{issue}.json"));
-                if checkpoint_written_by_run(&checkpoint, info.started_at) {
-                    info.latest_phase = read_checkpoint_phase(&checkpoint);
-                }
-            }
-        }
+        overlay_live_phase_at(&self.config.checkpoint_dir(), info);
     }
 
     /// Return all tracked sweeps matching the optional state filter, with the
@@ -1313,6 +1301,45 @@ impl SweepRegistry {
                 info
             })
             .collect()
+    }
+
+    /// Clone the raw, in-memory state needed to compute the status-surface
+    /// derivations ([`RegistrySnapshot::list`],
+    /// [`RegistrySnapshot::stale_sweep_findings`],
+    /// [`RegistrySnapshot::unregistered_locked_issues`],
+    /// [`RegistrySnapshot::quarantined_issues_sorted`]) WITHOUT holding this
+    /// registry's mutex across their filesystem work (Issue #7526).
+    ///
+    /// Before this existed, `build_daemon_status` (`ipc.rs`) called
+    /// `list`/`stale_sweep_findings`/`unregistered_locked_issues` one after
+    /// another while still holding the lock returned by
+    /// `Mutex::lock` — and each of those does real I/O per entry (a
+    /// checkpoint-file read for `list`'s live-phase overlay, a `kill(pid, 0)`
+    /// probe + log-file `stat` for `stale_sweep_findings`, a full
+    /// `.loom/locks/` directory walk + `owner.json` reads for
+    /// `unregistered_locked_issues`). On a host with many registered roots
+    /// and/or many in-flight sweeps, that I/O — run once per root, all under
+    /// the same root's mutex — was measured (#7525 instrumentation, live
+    /// fleet data cited in #7526) as the fleet's #2 contributor to
+    /// `status`/`health` exceeding the 5s IPC budget, second only to
+    /// `stash_git_shellout` (`quarantine_stash_status`).
+    ///
+    /// This method holds the lock only for the cheap in-memory clones below —
+    /// no filesystem I/O, no syscalls — so a caller that locks, calls this,
+    /// then immediately drops the guard pays for the mutex exactly as long as
+    /// the underlying `BTreeMap`s take to clone, independent of how much I/O
+    /// the derivations above would otherwise have done under the lock.
+    #[must_use]
+    pub fn snapshot(&self) -> RegistrySnapshot {
+        let mut quarantined_issues_sorted: Vec<u32> = self.quarantined.keys().copied().collect();
+        quarantined_issues_sorted.sort_unstable();
+        RegistrySnapshot {
+            entries: self.entries.clone(),
+            children: self.children.keys().cloned().collect(),
+            checkpoint_dir: self.config.checkpoint_dir(),
+            locks_dir: self.config.locks_dir(),
+            quarantined_issues_sorted,
+        }
     }
 
     /// Internal helper: publish an event on the attached bus (if any).
@@ -1380,6 +1407,106 @@ impl SweepRegistry {
         self.entries.values().find(|info| {
             matches!(info.state, SweepState::Running | SweepState::Pending)
                 && info.idempotency_key.as_deref() == Some(key)
+        })
+    }
+}
+
+/// The pure, no-`&self` half of [`SweepRegistry::overlay_live_phase`] — the
+/// only field it read was `self.config.checkpoint_dir()`, so this is the same
+/// body taking that path directly, usable from [`RegistrySnapshot::list`]
+/// (Issue #7526) without a `&SweepRegistry` receiver / the registry's mutex.
+fn overlay_live_phase_at(checkpoint_dir: &Path, info: &mut SweepInfo) {
+    if info.latest_phase.is_none()
+        && matches!(info.state, SweepState::Running | SweepState::Pending)
+    {
+        if let SweepKind::Issue(issue) = info.kind {
+            let checkpoint = checkpoint_dir.join(format!("issue-{issue}.json"));
+            if checkpoint_written_by_run(&checkpoint, info.started_at) {
+                info.latest_phase = read_checkpoint_phase(&checkpoint);
+            }
+        }
+    }
+}
+
+/// A point-in-time clone of one [`SweepRegistry`]'s raw state, produced by
+/// [`SweepRegistry::snapshot`] (Issue #7526) — see that method's doc comment
+/// for the motivating measurement. Every method here reproduces the exact
+/// same logic as its `SweepRegistry` instance-method counterpart (`list`,
+/// `stale_sweep_findings`, `unregistered_locked_issues`,
+/// `quarantined_issues_sorted`), but reads from this owned clone instead of
+/// `&self`, so none of them need the registry's mutex held — the intended
+/// caller (`build_daemon_status`, `ipc.rs`) locks once for
+/// [`SweepRegistry::snapshot`], drops the guard, then calls these.
+#[derive(Debug, Clone)]
+pub struct RegistrySnapshot {
+    entries: BTreeMap<SweepId, SweepInfo>,
+    /// Sweep IDs this daemon instance spawned itself (retains a `Child`
+    /// handle) — mirrors [`SweepRegistry::stale_sweep_findings`]'s
+    /// `!self.children.contains_key` eligibility gate.
+    children: HashSet<SweepId>,
+    checkpoint_dir: PathBuf,
+    locks_dir: PathBuf,
+    quarantined_issues_sorted: Vec<u32>,
+}
+
+impl RegistrySnapshot {
+    /// Snapshot counterpart of [`SweepRegistry::list`] — same filter +
+    /// live-phase overlay, applied to the cloned `entries` instead of
+    /// `&self.entries`, with no mutex held while the overlay's checkpoint
+    /// read happens.
+    #[must_use]
+    pub fn list(&self, filter: Option<&SweepState>) -> Vec<SweepInfo> {
+        self.entries
+            .values()
+            .filter(|info| match filter {
+                None => true,
+                Some(target) => {
+                    std::mem::discriminant(&info.state) == std::mem::discriminant(target)
+                }
+            })
+            .cloned()
+            .map(|mut info| {
+                overlay_live_phase_at(&self.checkpoint_dir, &mut info);
+                info
+            })
+            .collect()
+    }
+
+    /// Snapshot counterpart of [`SweepRegistry::stale_sweep_findings`].
+    #[must_use]
+    pub fn stale_sweep_findings(
+        &self,
+        min_age: Duration,
+        log_silence_timeout: Duration,
+    ) -> Vec<StaleSweepFinding> {
+        scan_stale_sweep_findings(
+            self.entries.iter(),
+            &|id| self.children.contains(id),
+            min_age,
+            log_silence_timeout,
+        )
+    }
+
+    /// Snapshot counterpart of [`SweepRegistry::unregistered_locked_issues`].
+    #[must_use]
+    pub fn unregistered_locked_issues(&self) -> Vec<(u32, u32)> {
+        scan_unregistered_locked_issues(&self.locks_dir, &|issue| self.has_tracked_sweep_for(issue))
+    }
+
+    /// Snapshot counterpart of [`SweepRegistry::quarantined_issues_sorted`] —
+    /// already computed (cheaply, no I/O) at [`SweepRegistry::snapshot`]
+    /// time, so this is just a clone of the stored `Vec`.
+    #[must_use]
+    pub fn quarantined_issues_sorted(&self) -> Vec<u32> {
+        self.quarantined_issues_sorted.clone()
+    }
+
+    /// Snapshot counterpart of the private `SweepRegistry::has_tracked_sweep_for`
+    /// helper `unregistered_locked_issues` depends on.
+    #[must_use]
+    fn has_tracked_sweep_for(&self, issue: u32) -> bool {
+        self.entries.values().any(|info| {
+            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
         })
     }
 }
@@ -1856,6 +1983,137 @@ mod tests {
                 "state": "Crashed",
                 "details": {"at": "2026-06-05T10:05:00Z"}
             })
+        );
+    }
+
+    // ========================================================================
+    // `RegistrySnapshot` (Issue #7526) — every method here must reproduce its
+    // locked-instance-method counterpart byte-for-byte; the whole point of
+    // `snapshot()` is to move the SAME computation outside the registry's
+    // mutex, never to change what it returns.
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn snapshot_list_matches_the_locked_instance_method() {
+        let tmp = tempdir().unwrap();
+        let (mut reg, _rec) = fixture_registry(tmp.path());
+        insert_running_with_pid_at(&mut reg, 7526, 1, std::process::id(), Utc::now());
+
+        let direct = reg.list(None);
+        let snapshotted = reg.snapshot().list(None);
+        // `SweepInfo` has no `PartialEq` — compare the fields that matter
+        // here (id, state discriminant, live-phase overlay result) instead
+        // of the whole struct.
+        assert_eq!(direct.len(), snapshotted.len());
+        assert_eq!(direct.len(), 1, "the inserted entry must be present");
+        assert_eq!(direct[0].sweep_id, snapshotted[0].sweep_id);
+        assert_eq!(direct[0].latest_phase, snapshotted[0].latest_phase);
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_stale_sweep_findings_matches_the_locked_instance_method() {
+        let tmp = tempdir().unwrap();
+        let (mut reg, _rec) = fixture_registry(tmp.path());
+        // Old enough + no retained `Child` handle (inserted directly into
+        // `entries`, never dispatched) to trip the stale-sweep backstop —
+        // mirrors `watchdog.rs`'s own
+        // `stale_sweep_findings_surfaces_an_untracked_aged_sweep_with_zero_tick_activity`.
+        let old_start = Utc::now() - chrono::Duration::seconds(20_000);
+        insert_running_with_pid_at(&mut reg, 7527, 1, std::process::id(), old_start);
+
+        let direct = reg.stale_sweep_findings(Duration::from_secs(3600), Duration::from_secs(2700));
+        let snapshotted = reg
+            .snapshot()
+            .stale_sweep_findings(Duration::from_secs(3600), Duration::from_secs(2700));
+        assert_eq!(direct.len(), 1, "the aged untracked entry must be found");
+        assert_eq!(snapshotted.len(), 1);
+        // NOT `assert_eq!(direct, snapshotted)`: each call independently reads
+        // `Utc::now()` to compute `elapsed`, so the two `elapsed` values
+        // legitimately differ by however much wall-clock time passed between
+        // the two calls (observed: ~100µs) — asserting exact equality here
+        // would be flaky, not a real behavioral difference. Compare every
+        // OTHER field exactly, and assert `elapsed` is within a generous
+        // tolerance instead.
+        assert_eq!(direct[0].issue, snapshotted[0].issue);
+        assert_eq!(direct[0].sweep_id, snapshotted[0].sweep_id);
+        assert_eq!(direct[0].pid, snapshotted[0].pid);
+        assert_eq!(direct[0].log_idle, snapshotted[0].log_idle);
+        let elapsed_diff = direct[0].elapsed.abs_diff(snapshotted[0].elapsed);
+        assert!(
+            elapsed_diff < Duration::from_secs(1),
+            "elapsed must match within a generous tolerance, not diverge by seconds: \
+             direct={:?}, snapshotted={:?}",
+            direct[0].elapsed,
+            snapshotted[0].elapsed
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_unregistered_locked_issues_matches_the_locked_instance_method() {
+        let tmp = tempdir().unwrap();
+        let (reg, _rec) = fixture_registry(tmp.path());
+        // A live lock dir with no matching registry entry — the case
+        // `unregistered_locked_issues` exists to surface (Issue #4214).
+        let lock_dir = reg.config().locks_dir().join("issue-9001");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        std::fs::write(
+            lock_dir.join("owner.json"),
+            serde_json::json!({
+                "issue": 9001,
+                "owner_pid": std::process::id(),
+                "acquired_at": Utc::now().to_rfc3339(),
+                "sweep_id": "sweep-issue-9001-1",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let direct = reg.unregistered_locked_issues();
+        let snapshotted = reg.snapshot().unregistered_locked_issues();
+        assert_eq!(direct, snapshotted);
+        assert_eq!(direct, vec![(9001, std::process::id())]);
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_quarantined_issues_sorted_matches_the_locked_instance_method() {
+        let tmp = tempdir().unwrap();
+        let (mut reg, _rec) = fixture_registry(tmp.path());
+        reg.seed_quarantine_for_test(7530);
+        reg.seed_quarantine_for_test(7501);
+
+        let direct = reg.quarantined_issues_sorted();
+        let snapshotted = reg.snapshot().quarantined_issues_sorted();
+        assert_eq!(direct, snapshotted);
+        assert_eq!(direct, vec![7501, 7530], "must render sorted ascending");
+    }
+
+    /// [`SweepRegistry::snapshot`] itself must not require any filesystem
+    /// I/O — it is called WHILE the registry's mutex is held, so any real
+    /// I/O there would defeat the whole point of Issue #7526. This can't
+    /// assert "no I/O happened" directly, but it pins the observable
+    /// contract every other test in this section already exercises: the
+    /// snapshot's own fields are plain in-memory clones of `self`'s state,
+    /// not re-derived from disk.
+    #[test]
+    #[serial]
+    fn snapshot_is_a_pure_in_memory_clone_of_registry_state() {
+        let tmp = tempdir().unwrap();
+        let (mut reg, _rec) = fixture_registry(tmp.path());
+        insert_running_with_pid_at(&mut reg, 7531, 1, std::process::id(), Utc::now());
+
+        let snap = reg.snapshot();
+        // Mutating the live registry after the snapshot was taken must never
+        // be observed through the already-taken snapshot (it is an owned
+        // clone, not a live view).
+        reg.entries.clear();
+        assert_eq!(
+            snap.list(None).len(),
+            1,
+            "the snapshot must retain its own clone, independent of later registry mutation"
         );
     }
 }
