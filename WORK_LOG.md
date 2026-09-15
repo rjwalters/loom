@@ -7,6 +7,22 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-15
+- **Issue #7672** (closed): daemon: --claim-owned dispatch should own lease renewal (prose-mandated Step 1a skipped once → 2.5h fleet thrash + shared-worktree near-miss)
+- **PR #7693**: feat(daemon): start the lease-renewal loop from --claim-owned dispatch code (#7672)
+- **Issue #7647** (closed): Judge: reconcile paginated formal reviews and inline threads before approval
+- **PR #7656**: fix(judge): reconcile paginated formal reviews and inline threads before approval
+- **Issue #7526** (closed): daemon: use #7513's phase-timing instrumentation to fix the actual status/health IPC bottleneck (ask 2/3)
+- **PR #7698**: perf(daemon): cache stash summaries and snapshot the registry lock in status builds
+- **Issue #7689** (closed): merge-pr.sh: _check_champion_hold_state_staleness() silently exits 1 on any PR with no champion:hold-state marker (pipefail/errexit bug) (closed as duplicate of #7678)
+- **Issue #7696** (closed): merge-pr.sh silently exits 1 on any PR with no prior champion:hold-state marker (set -e + pipefail interaction, regression from #7435) (closed as duplicate of #7678)
+- **Issue #5512** (closed): Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues
+- **PR #7695**: feat(daemon): classify refs/stash entries by origin, surface unrecoverable ones (#5512)
+- **Issue #7684** (closed): Recurring Judge rejection: PR VERSION bump goes stale before review lands as main advances (post-#6675 recurrence, 3 instances)
+- **PR #7687**: fix(judge): add Simple-conflict case for version-bearing-file-only rebase conflicts
+- **Issue #7356** (closed): Guard friction: worktree-write-confinement-unresolved-var denies mktemp/tmp-scoped writes (44/126 = top guard-decision volume)
+- **PR #7686**: test(guard): pin the #7356 qsplit false-positive as already-fixed by #6956/#6472
+- **Issue #7652** (closed): classify-dependency-block.sh: dependency-keyword regex misses 'cannot start until #N' phrasing
+- **PR #7653**: fix(classify-dependency-block): recognize "cannot start/proceed until" phrasing
 - **Issue #7660** (closed): Doctor: Priority-1 conflict query does not exclude loom:operator-held PRs, so a held PR is claimed, rebased, then stood down
 - **PR #7674**: docs(doctor): explain why Priority 2 query doesn't exclude loom:operator
 - **Issue #7668** (closed): Builder/Doctor: rebase onto origin/main immediately before opening a PR that touches a hot-churn file (3 consecutive merge-conflict rejections on one README status paragraph)
@@ -18,6 +34,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #7671**: fix(dashboard): complete vitest-pool-workers 0.22.0 upgrade, fix D1 test isolation regression
 - **Issue #7662** (closed): dashboard: host card roster — show active repos, fold the idle set into a closed-by-default accordion
 - **PR #7675**: dashboard: host card roster — active repos visible, idle set folded into closed-by-default accordion
+- **Issue #6648** (closed): scrub: redact two third-party personal emails from issue #5137 body
+- **Issue #6245** (closed): Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
+- **PR #6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **Issue #5668** (closed): Auditor Capability Request: macOS ad-hoc codesign of test binaries fails post-#2298 (regression, macOS 26.6) (closed as fixed by #6452)
 - **Issue #7421** (closed): Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern)
 - **PR #7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **Issue #7419** (closed): merge-pr.sh should refuse a PR that is not loom:pr unless explicitly overridden
