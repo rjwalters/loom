@@ -410,6 +410,37 @@ jobs:
       - name: Check for dangling internal markdown links
         run: bash scripts/check-dangling-links.sh
 
+  guard-destructive-drift:
+    name: Guard-Destructive Vendored/Canonical Drift Check (advisory)
+    # ADVISORY ONLY — never blocks the PR (continue-on-error, and the script
+    # itself always exits 0). defaults/hooks/guard-destructive-generic.sh is
+    # a documented VENDORED COPY of Repo Skills' canonical
+    # hooks/repo/guard-destructive.sh (rjwalters/repo) — its own header says
+    # "DO NOT hand-edit generic pattern behavior here — send fixes upstream",
+    # but that convention went unenforced and the vendored copy drifted
+    # ~2,200+ lines ahead of upstream before anyone noticed (issue #5660).
+    # Two of #5660's three resolutions have already shipped (the dispatcher's
+    # capability probe, #4894/#5916; the reconciliation of the known drift,
+    # rjwalters/repo#188/#192) — this job is the third: fetch the canonical
+    # file from rjwalters/repo and diff its top-level function-name set and
+    # pattern-table set against the vendored copy, posting the delta as a job
+    # summary so the *next* multi-thousand-line drift is visible in weeks,
+    # not months. Runs on every push/PR (cheap: one network fetch + a local
+    # diff, no build step) but is explicitly non-blocking on both axes: a
+    # fetch failure (rate limit, outage) is reported "inconclusive" rather
+    # than failing, and continue-on-error covers any other unexpected script
+    # failure.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Self-test the drift-check extraction logic
+        run: bash scripts/check-guard-destructive-drift.sh --self-test
+      - name: Diff vendored guard-destructive-generic.sh against its canonical upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/check-guard-destructive-drift.sh
+
   gitignore-convergence:
     name: .gitignore Convergence Check
     # Always runs (not gated on backend changes — a drifted .gitignore is
