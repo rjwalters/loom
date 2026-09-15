@@ -92,7 +92,7 @@
   ],
   "safehouse": {
     "enabled": false,
-    "room": "!MQP2aSTA5uDu7czxYZ:safehouse.2amlogic.com",
+    "room": "!ROOM_ID:safehouse.example.com",
     "persona": "loom_daemon",
     "workerPersonas": [
       "loom_builder_1",
@@ -116,7 +116,7 @@
   },
   "observability": {
     "enabled": true,
-    "endpoint": "https://dashboard.2amlogic.com/ingest",
+    "endpoint": "https://dashboard.example.com/ingest",
     "batchSize": 50,
     "flushIntervalSecs": 30,
     "queueCapacity": 2000
