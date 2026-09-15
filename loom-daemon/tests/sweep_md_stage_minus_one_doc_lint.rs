@@ -51,17 +51,51 @@
 use std::fs;
 use std::path::PathBuf;
 
-const SWEEP_MD_RELATIVE: &str = "../defaults/.claude/commands/loom/sweep.md";
+const SWEEP_SKILL_DIR_RELATIVE: &str = "../defaults/.claude/commands/loom";
 
+/// The `/loom:sweep` skill in document order — the `sweep.md` dispatcher plus
+/// the sibling reference files #7726 split out of the pre-split monolith. Kept
+/// in sync with the identical list in `sweep_md_doc_lint.rs`.
+///
+/// Stage -1 itself now lives in `sweep-backend-detection.md`, and the flag
+/// documentation it cross-checks (`--no-daemon` / `--claim-owned` occurrence
+/// floors) lives in `sweep-arguments.md`, so the occurrence-count assertions
+/// below only remain meaningful against the concatenated skill.
+const SWEEP_SKILL_FILES: &[&str] = &[
+    "sweep.md",
+    "sweep-arguments.md",
+    "sweep-examples.md",
+    "sweep-execution-model.md",
+    "sweep-backend-detection.md",
+    "sweep-scheduling-signals.md",
+    "sweep-dry-run.md",
+    "sweep-mode-c-lifecycle.md",
+    "sweep-wave-lifecycle.md",
+    "sweep-summary-output.md",
+    "sweep-run-hygiene.md",
+    "sweep-reference.md",
+];
+
+/// Reads the whole `/loom:sweep` skill as one string, in [`SWEEP_SKILL_FILES`]
+/// order. A missing sibling is a hard failure — otherwise the file it documents
+/// would silently stop being linted.
 fn read_sweep_md() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SWEEP_MD_RELATIVE);
-    fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "sweep.md not found at {} (CWD-relative path: {}): {e}",
-            path.display(),
-            SWEEP_MD_RELATIVE,
-        );
-    })
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SWEEP_SKILL_DIR_RELATIVE);
+    let mut combined = String::new();
+    for name in SWEEP_SKILL_FILES {
+        let path = dir.join(name);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "sweep skill file `{name}` not found at {} (dir-relative path: {}): {e} — \
+                 if it was intentionally renamed/removed, update SWEEP_SKILL_FILES",
+                path.display(),
+                SWEEP_SKILL_DIR_RELATIVE,
+            );
+        });
+        combined.push_str(&text);
+        combined.push('\n');
+    }
+    combined
 }
 
 /// AC #1: assert the Stage -1 section header is present.
