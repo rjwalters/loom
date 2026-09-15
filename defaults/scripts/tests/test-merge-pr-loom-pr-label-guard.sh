@@ -284,6 +284,48 @@ run_guard
 assert_eq "1" "$LAST_RC" "Empty label array -> merge hard-blocked (exit 1)"
 assert_contains "$LAST_OUT" "<none>" "Empty label array -> message uses <none> placeholder, not a blank line"
 
+# T10: regression test for #7719 — a `set -e`/`pipefail` crash in
+# _check_champion_hold_state_staleness's `hold_head="$(... | grep -o ... |
+# tail -1 | sed -n ...)"` pipeline when NO champion:hold-state marker exists
+# at all (grep -o finds nothing -> pipeline exits 1 -> pipefail propagates
+# that 1 as the assignment's exit status). This is exactly T8's scenario, but
+# T8 alone CANNOT catch the regression: run_guard (above) wraps the call in
+# `set +e` before invoking it, and a command-substitution subshell inherits
+# the parent's errexit state at fork time, so with errexit already off T8's
+# subshell never had `set -e` active in the first place — it cannot
+# reproduce the crash it's nominally guarding against. Reproducing it
+# requires a FRESH bash process with `set -euo pipefail` genuinely active
+# end-to-end, never masked by an enclosing `set +e` — hence the separate
+# subprocess below instead of another run_guard() call.
+echo ""
+echo "Testing set -e/pipefail interaction regression (#7719)..."
+REGRESSION_SCRIPT="$(mktemp)"
+cat > "$REGRESSION_SCRIPT" <<'REGEOF'
+set -euo pipefail
+info()    { :; }
+success() { :; }
+warning() { :; }
+error()   { echo "ERROR: $*" >&2; exit 1; }
+forge_get_pr_comments() { printf '%s' "Just a regular Judge approval comment, no marker here."; }
+PR_NUMBER="999"
+REPO_NWO="owner/repo"
+PR_LABELS="loom:pr"
+PR_HEAD_SHA="deadbeef"
+DRY_RUN=false
+ALLOW_UNAPPROVED=false
+# shellcheck disable=SC1090
+source "$1"
+_check_loom_pr_label
+echo "REACHED_END"
+REGEOF
+set +e
+REGRESSION_OUT="$(bash "$REGRESSION_SCRIPT" "$FUNCS_FILE" 2>&1)"
+REGRESSION_RC=$?
+set -e
+rm -f "$REGRESSION_SCRIPT"
+assert_eq "0" "$REGRESSION_RC" "Under genuine set -euo pipefail, no-hold-marker case does not abort the script (regression #7719)"
+assert_contains "$REGRESSION_OUT" "REACHED_END" "Guard call returns control to the caller (script continues past the guard) under real set -e"
+
 # --- Source-contains guards (fail if a refactor drops the key behavior) ---
 echo ""
 echo "Testing merge-pr.sh source guards..."
