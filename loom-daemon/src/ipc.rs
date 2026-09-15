@@ -1128,11 +1128,21 @@ pub fn relaunch_verify_note(supervisor: &str, verify_poll_secs: u64) -> String {
     } else {
         "the supervisor's own relaunch-on-success policy"
     };
+    // #7707 review: on systemd the detached verifier lives in the unit's own
+    // cgroup, which `KillMode=mixed` SIGKILLs the instant the main process
+    // exits — so the note must not promise a 30s bound there. See
+    // `restart_verify`'s module doc, "What this actually closes".
+    let verifier_caveat = if supervisor.eq_ignore_ascii_case("systemd") {
+        " NOTE: that child is best-effort under systemd (KillMode=mixed kills this unit's cgroup \
+         on main-process exit), so the watchdog is in practice the real bound here."
+    } else {
+        ""
+    };
     format!(
         "Expected relaunch path: {mechanism}. A detached `restart --verify-only` child will \
          confirm a new, live pid within {verify_poll_secs}s or self-heal \
          (kickstart/reset-failed+start); the unattended watchdog poll (~300s) is the outer bound \
-         if that also fails to confirm."
+         if that also fails to confirm.{verifier_caveat}"
     )
 }
 
@@ -10180,6 +10190,19 @@ exit 0
         assert!(note.contains("systemd"));
         assert!(note.contains("30s"));
         assert!(note.contains("watchdog"));
+        // #7707 review: the systemd note must flag the detached verifier as
+        // best-effort rather than promising a bound `KillMode=mixed` prevents
+        // it from delivering; the launchd note carries no such caveat because
+        // `process_group(0)` really does let the child survive there.
+        assert!(
+            note.contains("best-effort under systemd"),
+            "expected the KillMode=mixed caveat, got: {note}"
+        );
+        let launchd = relaunch_verify_note("launchd", 30);
+        assert!(
+            !launchd.contains("best-effort"),
+            "launchd's verifier is not best-effort — it survives the pgid sweep: {launchd}"
+        );
     }
 
     /// Issue #5340 (AC: the `TimedOutRefuse` message names the exact local
