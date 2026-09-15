@@ -121,10 +121,42 @@ measure_all() {
   [[ ${#files[@]} -eq 0 ]] && return 0
 
   awk '
-    FNR == 1 { past_prod[FILENAME] = 0; if (!(FILENAME in count)) count[FILENAME] = 0 }
+    FNR == 1 { skip = 0; pending = 0; if (!(FILENAME in count)) count[FILENAME] = 0 }
+
+    # --- Rust: skip TOP-LEVEL `#[cfg(test)] mod ... { ... }` blocks only ------
+    # Not "everything after the first #[cfg(test)]": that attribute also marks
+    # test-only helper FUNCTIONS, which sit mid-file with thousands of
+    # production lines below them (role_runner.rs line 894, work_finder.rs
+    # line 1004). Truncating there silently undercounted two of the largest
+    # files in the repo to ~900 lines and kept them out of the baseline.
+    #
+    # A top-level module ends at a `}` in column 0 — everything inside it is
+    # indented — so no brace counting (and no string/comment escaping) is
+    # needed. A raw string containing a column-0 `}` would end the skip early;
+    # that fails toward counting MORE lines, which is the safe direction.
+    FILENAME ~ /\.rs$/ {
+      if (skip) { if ($0 ~ /^\}[ \t]*$/) skip = 0; next }
+      if ($0 ~ /^#\[cfg\(test\)\]/) { pending = 1; next }
+      if (pending) {
+        # Attributes may sit between #[cfg(test)] and the item it decorates, and
+        # they may span multiple lines:
+        #     #[cfg(test)]
+        #     #[allow(
+        #         clippy::unwrap_used,
+        #     )]
+        #     mod tests {
+        # So stay pending through anything that is not a column-0 item keyword:
+        # further attributes, their indented continuation lines, the closing
+        # `)]`, and blanks. Decide only when a real item starts in column 0.
+        if ($0 ~ /^[ \t]/ || $0 ~ /^#\[/ || $0 ~ /^\)\]/ || $0 ~ /^[ \t]*$/) next
+        if ($0 ~ /^(pub )?mod /) { pending = 0; if ($0 !~ /\}[ \t]*$/) skip = 1; next }
+        # #[cfg(test)] on a non-module item (a helper fn): the item itself is
+        # test-only, but production code continues after it, so resume counting.
+        pending = 0
+      }
+    }
+
     {
-      if (FILENAME ~ /\.rs$/ && $0 ~ /^#\[cfg\(test\)\]/) past_prod[FILENAME] = 1
-      if (past_prod[FILENAME]) next
       line = $0
       sub(/^[ \t]+/, "", line)
       if (line == "") next
@@ -193,6 +225,10 @@ self_test() {
     echo ""
     echo "   // an indented comment"
     echo "#[cfg(test)]"
+    echo "#[allow("
+    echo "    clippy::unwrap_used,"
+    echo "    clippy::panic"
+    echo ")]"
     echo "mod tests {"
     for i in $(seq 1 40); do echo "    pub const T_$i: u8 = $i;"; done
     echo "}"
@@ -200,6 +236,16 @@ self_test() {
 
   # 30 code lines -> over a threshold of 20.
   for i in $(seq 1 30); do echo "pub const B_$i: u8 = $i;"; done > "$tmp/src/big.rs"
+
+  # A test-only helper FN mid-file must not truncate the count: production code
+  # continues below it. This is the role_runner.rs / work_finder.rs shape, which
+  # an earlier revision undercounted by ~1300 lines.
+  {
+    for i in $(seq 1 10); do echo "pub const P_$i: u8 = $i;"; done
+    echo "#[cfg(test)]"
+    echo "fn helper() {}"
+    for i in $(seq 1 10); do echo "pub const Q_$i: u8 = $i;"; done
+  } > "$tmp/src/midhelper.rs"
 
   # Exemption fixtures: both are far over threshold and must never be measured.
   for i in $(seq 1 50); do echo "echo $i"; done > "$tmp/.loom/scripts/mirror.sh"
@@ -224,6 +270,10 @@ self_test() {
   # Counting: inline tests, comment-only lines and blanks are all excluded.
   out="$( (cd "$tmp" && $S $T --list) | awk '$2=="src/small.rs"{print $1}')"
   _expect "rust inline #[cfg(test)]/comments/blanks excluded" "12" "$out"
+
+  # A mid-file #[cfg(test)] helper fn must not truncate: 20 consts + the fn.
+  out="$( (cd "$tmp" && $S $T --list) | awk '$2=="src/midhelper.rs"{print $1}')"
+  _expect "mid-file #[cfg(test)] helper fn does not truncate the count" "21" "$out"
 
   # Exemptions: neither fixture appears in the measured set at all.
   out="$( (cd "$tmp" && $S $T --list) | grep -c 'mirror\.sh\|guard-destructive-generic' || true)"

@@ -26,11 +26,13 @@
 1303 loom-daemon/src/auto_update.rs
 1774 loom-daemon/src/claim_reconciliation.rs
 1649 loom-daemon/src/cli/status_render.rs
+1222 loom-daemon/src/daemon_service.rs
 1107 loom-daemon/src/fleet/add_worker.rs
 1748 loom-daemon/src/health.rs
 3136 loom-daemon/src/ipc.rs
 1286 loom-daemon/src/main.rs
 1842 loom-daemon/src/main_health_gate.rs
+2208 loom-daemon/src/role_runner.rs
 2440 loom-daemon/src/safehouse.rs
 1615 loom-daemon/src/script_helpers/validate_phase.rs
 1599 loom-daemon/src/sweep_registry/dispatch.rs
@@ -39,6 +41,7 @@
 1212 loom-daemon/src/sweep_registry/watchdog.rs
 1682 loom-daemon/src/terminal.rs
 1269 loom-daemon/src/types.rs
+1918 loom-daemon/src/work_finder.rs
 2367 loom-daemon/src/worktree_ops/clean.rs
 1468 mcp-loom/src/tools/sweeps.ts
 1082 mcp-loom/src/tools/terminals.ts
