@@ -28,7 +28,7 @@
         "workerType": "claude",
         "roleFile": "worker.md",
         "targetInterval": 0,
-        "intervalPrompt": "Find and implement loom:ready issues"
+        "intervalPrompt": "Find and implement loom:issue issues"
       },
       "worktreePath": "",
       "theme": "forest"

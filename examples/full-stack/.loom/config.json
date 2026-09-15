@@ -60,7 +60,7 @@
         "workerType": "claude",
         "roleFile": "worker.md",
         "targetInterval": 60000,
-        "intervalPrompt": "Find and implement loom:ready issues"
+        "intervalPrompt": "Find and implement loom:issue issues"
       },
       "worktreePath": "",
       "theme": "forest"
@@ -76,7 +76,7 @@
         "workerType": "claude",
         "roleFile": "worker.md",
         "targetInterval": 60000,
-        "intervalPrompt": "Find and implement loom:ready issues"
+        "intervalPrompt": "Find and implement loom:issue issues"
       },
       "worktreePath": "",
       "theme": "forest"
@@ -108,7 +108,7 @@
         "workerType": "claude",
         "roleFile": "critic.md",
         "targetInterval": 900000,
-        "intervalPrompt": "Analyze the codebase for opportunities to simplify, remove bloat, or eliminate unnecessary complexity. Create a GitHub issue with loom:critic-suggestion label if you find something concrete"
+        "intervalPrompt": "Analyze the codebase for opportunities to simplify, remove bloat, or eliminate unnecessary complexity. Create a GitHub issue with the loom:hermit label if you find something concrete"
       },
       "worktreePath": "",
       "theme": "gray"
@@ -124,7 +124,7 @@
         "workerType": "codex",
         "roleFile": "worker.md",
         "targetInterval": 60000,
-        "intervalPrompt": "Find and implement loom:ready issues"
+        "intervalPrompt": "Find and implement loom:issue issues"
       },
       "worktreePath": "",
       "theme": "crimson"
