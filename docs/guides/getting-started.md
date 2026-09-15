@@ -510,15 +510,27 @@ the labels on the forge** (that happens only on a Full Install), so a
 # `gh` has no `label sync` subcommand — use the shipped script, which
 # handles both GitHub and Gitea
 .loom/scripts/sync-labels.sh
-
-# Verify — compares the live label set against .github/labels.yml on either
-# forge, so it catches a partial sync. Exits 0 (in sync), 3 (drift found),
-# 1 (forge/lookup error).
-.loom/scripts/sync-labels.sh --check
 ```
 
-`gh label list | grep "loom:"` also works, but only on GitHub, and it shows
-only that *some* `loom:` label exists — not that the expected set is complete.
+The sync's own last line — `✓ Synced N labels` — is the verification, and it
+works on either forge. `N` should equal the number of labels declared in
+`.github/labels.yml`:
+
+```bash
+grep -c '^- name:' .github/labels.yml
+```
+
+On GitHub you can also look at the result directly, though this only shows that
+*some* `loom:` label exists, not that the set is complete:
+
+```bash
+gh label list | grep "loom:"
+```
+
+> `sync-labels.sh --check` is a proper report-only drift check against
+> `labels.yml` and is the right tool here once fixed — but it currently requires
+> bash ≥ 4 and crashes on macOS's stock bash 3.2 (#7717). Use the count
+> comparison until then.
 
 See [WORKFLOWS.md](../workflows.md) for what each label means.
 
