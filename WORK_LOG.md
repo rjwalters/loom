@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-14
+- **PR #7610**: release: publish a Release with signed artifacts on every VERSION bump (#7609)
+- **Issue #7649** (closed): review-stall watchdog strands post-Builder work by redispatching Issue instead of its existing PR
+- **PR #7651**: fix: review-stall watchdog converts open-PR recovery to PrSet instead of stranding it
+- **Issue #7606** (closed): work_finder: a guarded issue is re-probed on every 60 s tick — put open-PR-guard refusals on the #4485 backoff ladder and short-circuit the closed-issue probe when the open-PR memo is fresh
+- **PR #7619**: fix: back off guarded issues via the #4485 ladder and short-circuit 2.5 on a fresh open-PR memo
+- **Issue #7644** (closed): fix(leases): reject publication under a previously yielded sweep identity
 - **Issue #7643** (closed): leases: reject reuse of yielded sweep identities before publication
 - **PR #7646**: fix(leases): reject reuse of yielded sweep identities
 - **Issue #7639** (closed): Port yielded-lease publish exclusion to defaults so resync preserves the fix
