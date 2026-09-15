@@ -353,7 +353,7 @@ common fixes. Quick fixes:
 ```bash
 loom-clean --force                              # stale worktrees/branches
 loom-recover-orphans --recover                   # orphaned loom:building issues
-gh label sync --file .github/labels.yml          # re-sync labels
+.loom/scripts/sync-labels.sh                     # re-sync labels
 ```
 
 **Branching does not protect uncommitted edits in the primary clone from

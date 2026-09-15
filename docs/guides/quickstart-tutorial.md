@@ -12,7 +12,8 @@ MOM is where you manually run Claude Code terminals with specialized role assign
 
 Before starting this tutorial, ensure you have:
 
-- ✅ Loom installed in your repository (`loom-daemon init` completed)
+- ✅ Loom installed in your repository (`./install.sh /path/to/your/repo` completed)
+- ✅ Workflow labels created on the forge (`.loom/scripts/sync-labels.sh`)
 - ✅ GitHub CLI (`gh`) installed and authenticated
 - ✅ Claude Code installed and available via `claude` command
 - ✅ Git configured with your identity
@@ -64,7 +65,13 @@ The Curator role enhances issues with implementation details, acceptance criteri
 Open a new terminal and start Claude Code with the Curator role:
 
 ```bash
-claude code "/loom:curator"
+claude
+```
+
+Then, inside the Claude Code session, invoke the role:
+
+```
+/loom:curator
 ```
 
 **What this does:** Loads the Curator role definition from `.loom/roles/curator.md` and provides context about issue curation workflow.
@@ -123,7 +130,13 @@ Now we'll implement the feature as a Builder.
 In a new terminal (or the same one after exiting Curator):
 
 ```bash
-claude code "/loom:builder"
+claude
+```
+
+Then, inside the session:
+
+```
+/loom:builder
 ```
 
 ### Claim the Issue
@@ -168,6 +181,7 @@ The Builder will make code changes, following the implementation guidance from t
 
 **4. Run tests:**
 ```bash
+# whatever your project's test command is — Loom does not impose one
 pnpm check:ci
 ```
 
@@ -209,7 +223,13 @@ The Judge role performs thorough code reviews.
 ### Launch Judge Terminal
 
 ```bash
-claude code "/loom:judge"
+claude
+```
+
+Then, inside the session:
+
+```
+/loom:judge
 ```
 
 ### Find and Review the PR
@@ -253,12 +273,17 @@ loom:review-requested → loom:pr (approved, ready to merge)
 If the Judge finds issues, it will request changes:
 
 ```bash
-gh pr review 43 --request-changes --body "Needs fixes:
+gh pr comment 43 --body "Changes requested:
 - [ ] Add dark mode variant
 - [ ] Fix color contrast"
 
-gh pr edit 43 --remove-label "loom:review-requested" --add-label "loom:building"
+gh pr edit 43 --remove-label "loom:review-requested" --add-label "loom:changes-requested"
 ```
+
+> **Note**: this is `gh pr comment`, not `gh pr review --request-changes`, for
+> the same self-review reason given above — and the PR moves to
+> `loom:changes-requested`, a PR-lane label. `loom:building` is an **issue**-lane
+> label and does not belong on a PR.
 
 Then the Builder would address the feedback and re-request review.
 

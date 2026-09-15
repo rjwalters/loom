@@ -98,7 +98,7 @@ This starts both the Vite dev server and the Tauri development window with hot r
 ### Setting up Loom labels
 
 ```bash
-gh label sync --file .github/labels.yml
+.loom/scripts/sync-labels.sh
 ```
 
 ### Working on an issue

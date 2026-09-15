@@ -356,7 +356,7 @@ Specify custom Unix socket path for daemon IPC.
 - **Example:**
   ```bash
   export LOOM_SOCKET_PATH=/tmp/loom-test.sock
-  loom-daemon start
+  ./.loom/scripts/cli/loom-daemon-start.sh
   ```
 
 #### `RUST_LOG`
