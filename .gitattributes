@@ -6,5 +6,22 @@
 # alone is inert: the `ours` driver must also be enabled in local (never
 # committed) git config -- `git config merge.ours.driver true` -- which Loom's
 # install and resync scripts set automatically (see #4528).
+#
+# Field-level guardrail (#7359): this `merge=ours` driver silently discards
+# whichever side loses on ANY field of this file, but only the `loom_version`
+# field is actually checked afterward -- by scripts/version.sh's
+# check_versions() (invoked as `./scripts/version.sh check`) and the
+# version-check-gate.sh CI gate. The other fields (`installed_files`,
+# `loom_source_remote`, `install_date`, `last_resync`, etc.) have no such
+# gate: a hand-edit to any of them that collides with an upstream touch to
+# this file during a rebase/merge would be silently dropped with nothing to
+# catch it. This is accepted as-is (see #7359) rather than broadening the
+# gate, because every field but `loom_version` is resync-owned and, per the
+# note above, "fully re-derived by the next resync regardless of which side
+# wins" -- so a dropped hand-edit to those fields is expected to self-heal on
+# the next resync. Consequently: never hand-edit `installed_files`,
+# `loom_source_remote`, `install_date`, or `last_resync` in a feature commit;
+# only defaults/scripts/resync-installed.sh's restamp_metadata() should write
+# them.
 .loom/install-metadata.json merge=ours
 # END LOOM-MANAGED (merge drivers, #4528)

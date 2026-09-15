@@ -43,6 +43,14 @@ VERSION_FILES=(
 # resync-installed.sh) so the two paths don't fight over the same fields —
 # they compose in either order because each only ever writes the fields it
 # owns.
+#
+# This also means `loom_version` is the ONLY field of this file that
+# check_versions()/`./scripts/version.sh check` (and version-check-gate.sh)
+# ever verify. Every other field — `installed_files`, `loom_source_remote`,
+# `install_date`, `last_resync`, etc. — is resync-owned, not gated, and
+# rebase-fragile by design under the file's `.gitattributes` `merge=ours`
+# driver (see the extended comment there, and #7359): never hand-edit them in
+# a feature commit.
 INSTALL_METADATA_FILE="$REPO_ROOT/.loom/install-metadata.json"
 
 get_version() {
