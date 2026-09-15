@@ -5020,6 +5020,18 @@ Automatic reassignment needs a liveness protocol whose failure modes are exactly
 the zero-or-two-owner races this static scheme rules out arithmetically, so it is
 deliberately a follow-up (#6704) rather than part of the same change.
 
+The design for that follow-up is now recorded in
+[`role-runner-roster.md`](role-runner-roster.md) — a **forge-backed roster**
+(one marker comment per host on a designated roster issue, liveness from the
+comment's forge-assigned `updated_at`, as with lease records) plus a
+**generation-fenced ring** (a host acts only under the newest membership
+generation it has observed, and only after that generation has been settled for
+a full role-tick interval, so a membership disagreement yields rather than
+duplicating). Nothing in it is live yet: the doc is the reviewed decision, and
+the behavior lands in two phases (roster publication + `status` rendering
+first, then rank-from-roster + bounded reassignment). Until Phase B ships, this
+section describes the whole of what the daemon does.
+
 ### Completion narration → public fleet feed (#4426)
 
 When a sweep exits, the narration sink additionally asks the forge whether that
