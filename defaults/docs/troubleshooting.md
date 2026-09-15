@@ -1687,6 +1687,71 @@ in-session sweep's claim because the claim itself carries no lease record —
 the same "no authoritative liveness record for in-session work" gap,
 approached from the claim-record side rather than the lock side.
 
+### Design decision: no pre-`worktree.sh` live-sibling-process probe (#7694)
+
+**Question considered.** Before `worktree.sh <N>` touches an *existing*
+`.loom/worktrees/issue-N` directory, should the Builder combine (a) worktree
+dirtiness with (b) a live-process filesystem scan
+(`loom-daemon/src/worktree_ops/safety.rs`'s `find_processes_executing_within`
+/ `find_processes_using_directory`) and stand down when both are true, as a
+generalization of the #6765 "task-liveness check before Builder re-dispatch"
+pattern in `defaults/.claude/commands/loom/sweep.md`? This was raised by
+#7672's near-miss, where a second Builder's claim went live while the first
+was still actively working in the same worktree directory.
+
+**Decision: do not build it.** The false-positive cost dominates the
+near-miss cost it would prevent, for three independent reasons:
+
+1. **The signal #6765 actually uses does not generalize the way #7694
+   proposes.** #6765/"Task-liveness check before Builder re-dispatch" queries
+   the harness's own liveness surface for a *specific, known dispatched task
+   ID* (`TaskOutput` on the original dispatch) — a precise question the
+   orchestrator can only ask about work it itself dispatched. #7694 instead
+   proposes a system-wide process/fd scan that has no notion of "which
+   process is the entitled sibling Builder" — it can only answer "is *some*
+   process touching this directory," which is a categorically weaker signal.
+2. **The reused scan is deliberately tuned for a different, cheaper failure
+   mode.** `find_processes_using_directory`'s own doc comment (safety.rs)
+   states it counts a process with only a **read-only** open handle under the
+   directory as "in use" — a `git status`, a `tail -f`, an editor with a file
+   open, a linter/watcher, a human's shell merely `cd`'d in, or a background
+   indexer would all match. That over-inclusiveness is an accepted, explicit
+   trade for the worktree-*removal* safety gate it was built for, where a
+   false positive costs one deferred reset (retried on the next tick,
+   harmless). Reusing it to gate a Builder's *decision to start work at all*
+   inherits the same false-positive rate for a much more expensive outcome —
+   a legitimate Builder standing down on a mere bystander process.
+3. **The genuinely destructive path is already closed, more narrowly, by
+   #6334.** The only git-level mutation `worktree.sh` performs against an
+   *existing* registered worktree is the "stale, no uncommitted changes"
+   reset — a worktree with uncommitted changes is already routed to
+   "preserve and exit" before any reset is attempted. The reset path itself
+   re-derives dirtiness immediately before the destructive `git reset --hard`
+   (`lib/worktree-race-rescue.sh`, `loom_worktree_reset_or_rescue`) and
+   rescues any newly-appeared tracked diff to a patch file (or refuses
+   outright on new commits) rather than discarding it — closing exactly the
+   "false positives are expensive" / "stale-but-dirty recovery worktree"
+   window #7694's own sketch worried about, without needing a new gate. A
+   one-shot pre-probe would not add meaningfully to this: it fires once at
+   invocation and cannot prevent a race that unfolds over the following
+   working session (a genuine second-writer collision on files, not a `git
+   reset`), and a durable fix for *that* belongs at the acquisition/lease
+   layer (#4028), not as a filesystem heuristic bolted in front of
+   `worktree.sh`.
+
+This is also consistent with this repo's "repair over gate" / full-autonomy
+default: the destructive-data-loss instance of this risk already has a
+narrow, low-false-positive repair (#6334); adding a broad-signal stand-down
+gate on top of it trades a well-understood, cheap failure mode (occasional
+deferred reset) for a new, harder-to-diagnose one (Builders silently
+refusing to start because an unrelated process happened to have a read
+handle open in their worktree). If a future incident shows the #6334 rescue
+path itself is insufficient — e.g. two processes genuinely writing
+concurrently, not just one resetting past the other — revisit with a
+narrower signal than a system-wide process scan, such as extending the lease
+record itself (the #4028 acquisition-race track) rather than a local
+filesystem heuristic that can't see cross-host siblings anyway.
+
 ## Sweep Dispatch Troubleshooting
 
 Multi-issue dispatch is driven by the Rust `loom-daemon` binary via `mcp__loom__dispatch_sweep`. The daemon holds the sweep registry, event bus, and reaper in memory — there is no on-disk orchestration state file to inspect. (The v0.9.x `spawn-loop.sh` and its `.loom/spawn-loop-state.json` state file were removed in v0.11.0.)
