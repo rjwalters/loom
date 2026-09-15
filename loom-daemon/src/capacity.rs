@@ -192,6 +192,25 @@ impl RankingSnapshot {
 /// pool). A malformed no-`|` row is still skipped here (rather than counted with
 /// an empty/unknown status) so an unparseable ranking is treated as absent, not
 /// as a genuine 0-healthy snapshot.
+///
+/// # Live `.bad_tokens` intersection (issue #7522)
+///
+/// `.ranking`'s status word is a snapshot taken at the last `tokens check`
+/// probe -- it does not move again until the next probe runs. Between probes,
+/// a `.bad_tokens` exhaustion entry can be written for an `available` row (a
+/// spawn hit the session limit moments after the last probe), or a
+/// session-limit entry that WAS live when `.ranking` was last written can
+/// since have expired on its own (the #7522 early-expiry: the account's 5h
+/// window actually reset). Either way, trusting the stale status word alone
+/// means this `healthy=N` count can diverge from what
+/// [`crate::tokens_pool::select::select_token`] actually hands out next --
+/// exactly the "daemon logs healthy while every spawn fails" gap the issue
+/// reports. A row read as `available` is therefore re-verified against the
+/// LIVE `.bad_tokens` state
+/// ([`crate::tokens_pool::bad_tokens::blocking_entry_in_dir`] -- the same
+/// authoritative, cooldown-and-session-aware check `is_bad` uses) and
+/// downgraded to `blocked` for this count when it disagrees. This never
+/// rewrites `.ranking` itself, only the in-memory tally callers read.
 #[must_use]
 pub fn read_ranking_at(pool_dir: &Path) -> Option<RankingSnapshot> {
     let ranking_path = pool_dir.join(".ranking");
@@ -199,8 +218,8 @@ pub fn read_ranking_at(pool_dir: &Path) -> Option<RankingSnapshot> {
     let mut snap = RankingSnapshot::default();
     for line in contents.lines() {
         // A row must carry a `|` (a status field). A no-`|` row is genuinely
-        // malformed and is skipped, not counted as an empty-status account —
-        // preserving the "unparseable ranking ⇒ absent, not 0-healthy"
+        // malformed and is skipped, not counted as an empty-status account --
+        // preserving the "unparseable ranking is absent, not 0-healthy"
         // fallback (see the module doc + `read_ranking_malformed_*` tests).
         if !line.contains('|') {
             continue;
@@ -209,7 +228,13 @@ pub fn read_ranking_at(pool_dir: &Path) -> Option<RankingSnapshot> {
             continue;
         };
         snap.total += 1;
-        match AccountHealth::parse(&row.status) {
+        let mut health = AccountHealth::parse(&row.status);
+        if health == AccountHealth::Available
+            && crate::tokens_pool::bad_tokens::blocking_entry_in_dir(pool_dir, &row.name).is_some()
+        {
+            health = AccountHealth::Blocked;
+        }
+        match health {
             AccountHealth::Available => snap.available += 1,
             AccountHealth::Exhausted => snap.exhausted += 1,
             AccountHealth::RateLimited => snap.rate_limited += 1,
@@ -656,6 +681,66 @@ mod tests {
         assert_eq!(snap.blocked, 1);
         assert_eq!(snap.unknown, 1);
         assert_eq!(snap.unhealthy(), 4);
+    }
+
+    /// #7522: `.ranking` says `available`, but a LIVE `.bad_tokens` entry
+    /// (still within its cooldown) says otherwise — the healthy count must
+    /// reflect the live truth `spawn-claude` actually acts on, not the stale
+    /// probe snapshot. This is the exact "daemon logs healthy while every
+    /// spawn actually fails" gap the issue reports.
+    #[test]
+    fn read_ranking_at_downgrades_available_row_still_live_blocked_in_bad_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(tmp.path(), "a|available\nb|available\n");
+        let marked = (chrono::Utc::now() - chrono::Duration::seconds(60))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            tmp.path().join(".bad_tokens"),
+            format!("{marked} b exhausted: hit your session limit\n"),
+        )
+        .unwrap();
+
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 2);
+        assert_eq!(snap.available, 1, "only 'a' is actually dispatchable");
+        assert_eq!(snap.blocked, 1, "'b' is downgraded to blocked for this count");
+    }
+
+    /// #7522: the converse — once the live `.bad_tokens` entry backing a
+    /// `blocked` `.ranking` row has cleared (e.g. a session-limit entry whose
+    /// window has since reset), the row must NOT stay downgraded; only
+    /// `available` rows are ever re-verified live, and a `blocked` row's
+    /// live-cleared account is exactly the population
+    /// [`crate::tokens_pool::select::select_token`]'s fail-safe now readmits
+    /// (see `tokens_pool::select` tests) — this count must not contradict
+    /// that by still marking it unhealthy.
+    #[test]
+    fn read_ranking_at_leaves_available_row_alone_once_bad_tokens_entry_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(tmp.path(), "a|available\n");
+        // No `.bad_tokens` file at all — nothing live to intersect against.
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 1);
+        assert_eq!(snap.available, 1);
+        assert_eq!(snap.blocked, 0);
+    }
+
+    /// #7522: a row already reported `exhausted`/`rate_limited`/`blocked` by
+    /// the probe is left exactly as-is — only `available` rows are
+    /// re-verified, so this never *inflates* the healthy count, only ever
+    /// corrects an overcount.
+    #[test]
+    fn read_ranking_at_never_upgrades_a_non_available_row_via_bad_tokens_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(tmp.path(), "a|blocked\n");
+        // No `.bad_tokens` entry backs it (a stale-but-not-yet-reprobed row) —
+        // this reader must not promote it to available on its own; that is
+        // `select`'s fail-safe's job at spawn time, not this count's.
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 1);
+        assert_eq!(snap.available, 0);
+        assert_eq!(snap.blocked, 1);
     }
 
     #[test]
