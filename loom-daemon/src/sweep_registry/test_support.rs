@@ -138,6 +138,7 @@ pub(crate) fn fixture_registry(workspace: &Path) -> (SweepRegistry, PathBuf) {
   printf 'SCCACHE_SERVER_PORT=%s\n' "${{SCCACHE_SERVER_PORT:-unset}}"
   printf 'AWS_PROFILE=%s\n' "${{AWS_PROFILE:-unset}}"
   printf 'LOOM_SWEEP_CLAIM_OWNED=%s\n' "${{LOOM_SWEEP_CLAIM_OWNED:-unset}}"
+  printf 'LOOM_SWEEP_LEASE_RENEW_DISPATCHED=%s\n' "${{LOOM_SWEEP_LEASE_RENEW_DISPATCHED:-unset}}"
   printf 'LOOM_TERMINAL_ID=%s\n' "${{LOOM_TERMINAL_ID:-unset}}"
   printf 'CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=%s\n' "${{CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}}"
   printf 'GH_CONFIG_DIR=%s\n' "${{GH_CONFIG_DIR:-unset}}"
