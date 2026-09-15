@@ -6,6 +6,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-15
+- **Issue #7650** (closed): Curator: de-escalate a Champion "repeated rejection" escalation when its cited objections have since resolved on main, instead of parking it for the operator
+- **PR #7661**: feat(curator): de-escalate fact-based Champion escalations once objections resolve
+
 ### 2026-09-14
 - **PR #7610**: release: publish a Release with signed artifacts on every VERSION bump (#7609)
 - **Issue #7649** (closed): review-stall watchdog strands post-Builder work by redispatching Issue instead of its existing PR
