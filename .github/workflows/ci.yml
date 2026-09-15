@@ -27,6 +27,7 @@ jobs:
   cancel-superseded:
     name: Cancel Superseded Runs (same ref)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       actions: write
     steps:
@@ -55,6 +56,7 @@ jobs:
   changes:
     name: Detect Changes
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.event_name == 'pull_request'
     permissions:
       pull-requests: read
@@ -115,6 +117,7 @@ jobs:
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -130,6 +133,7 @@ jobs:
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -157,6 +161,7 @@ jobs:
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -180,6 +185,7 @@ jobs:
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -206,6 +212,7 @@ jobs:
     # Wrangler will not parse `wrangler.toml` (and therefore Miniflare will not
     # boot) until `web/dist/` exists.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -226,6 +233,7 @@ jobs:
     # Cheap structural check; always runs (CLAUDE.md is prepended to every
     # agent's context, so its size is load-bearing — see #4014).
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Check CLAUDE.md line budget
@@ -246,6 +254,7 @@ jobs:
     # corruption can land in any file, including one whose path group the
     # PR did not otherwise touch.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Self-test the conflict-marker detector
@@ -287,6 +296,7 @@ jobs:
     # Must NOT be path-filtered, for the same reason conflict-markers is not:
     # #7721 landed in a file nobody editing it thought was in scope.
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -330,6 +340,7 @@ jobs:
     # fails if the checked-in artifact is stale, keeping instructions
     # single-source (#4479, epic #4167).
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Check AGENTS.md is in sync with its source
@@ -347,6 +358,7 @@ jobs:
     # tier, independent of changed-path filtering, so it catches a
     # newly-committed offender wherever it lands.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Self-test the host-path detector
@@ -364,6 +376,7 @@ jobs:
     # The self-test step regression-tests the checker itself against a
     # synthetic fixture reproducing that exact case.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Self-test the checker against a synthetic fixture
@@ -385,6 +398,7 @@ jobs:
     # self-test step regression-tests the checker itself against a synthetic
     # fixture reproducing that exact case.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Self-test the checker against a synthetic fixture
@@ -404,6 +418,7 @@ jobs:
     # self-test step regression-tests the checker itself against synthetic
     # clean/dirty fixtures.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Self-test the checker against synthetic fixtures
@@ -424,6 +439,7 @@ jobs:
     # #5846 changing 5 role prompts + a doc with no version bump).
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # fetch-depth: 0 + an explicit head sha (instead of the default
       # single-commit fetch of the synthetic refs/pull/<N>/merge ref) are
@@ -456,6 +472,7 @@ jobs:
     # synthetic fixture (dangling link, fenced-code-block example, valid
     # link, templated placeholder).
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Self-test the checker against a synthetic fixture
@@ -484,6 +501,7 @@ jobs:
     # than failing, and continue-on-error covers any other unexpected script
     # failure.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
@@ -505,6 +523,7 @@ jobs:
     # the binary, run update-gitignore against the checked-out repo, then
     # diff .gitignore against the PR's committed version.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -520,6 +539,7 @@ jobs:
     if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
     # Portable across GNU/BSD sed (temp-file + mv idiom) — runs on ubuntu (#3515)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Check role prompts reference only real labels (#3786)
@@ -555,6 +575,7 @@ jobs:
     # and no credential is required. `codex` is deliberately NOT on PATH here,
     # which also exercises the missing-binary (exit 127) path.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Syntax-check the Codex adapter and its test
@@ -657,6 +678,7 @@ jobs:
     # (fake/stub binaries or local python3 AST fixtures, no live network or
     # forge calls) and run in well under a second each.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Configure git identity for suite fixtures
@@ -675,6 +697,7 @@ jobs:
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.docker == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -710,6 +733,7 @@ jobs:
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.docker == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
