@@ -101,6 +101,13 @@ is_exempt() {
     defaults/hooks/guard-destructive-generic.sh)  return 0 ;;
     defaults/hooks/guard-destructive.sh)          return 0 ;;
     defaults/scripts/resync-installed.sh)         return 0 ;;
+    # Rust test modules extracted to their own file (#7718). The policy does not
+    # tax Rust tests, inline or extracted -- and counting an extracted module as
+    # production would make this gate FAIL the very refactor it exists to
+    # reward: moving `#[cfg(test)] mod tests` out of ipc.rs creates a 4400-line
+    # ipc/tests.rs that newly "crosses" the threshold, while the production code
+    # it was measuring did not change by a single line.
+    */tests.rs|*/tests/*.rs)                      return 0 ;;
     # Build/dependency output that git may track in some checkouts.
     target/*|node_modules/*|*/node_modules/*|*/dist/*) return 0 ;;
   esac
@@ -247,9 +254,12 @@ self_test() {
     for i in $(seq 1 10); do echo "pub const Q_$i: u8 = $i;"; done
   } > "$tmp/src/midhelper.rs"
 
-  # Exemption fixtures: both are far over threshold and must never be measured.
+  # Exemption fixtures: all are far over threshold and must never be measured.
   for i in $(seq 1 50); do echo "echo $i"; done > "$tmp/.loom/scripts/mirror.sh"
   for i in $(seq 1 50); do echo "echo $i"; done > "$tmp/defaults/hooks/guard-destructive-generic.sh"
+  # An extracted Rust test module (#7718) -- test code, not production.
+  mkdir -p "$tmp/src/big"
+  for i in $(seq 1 60); do echo "pub const TT_$i: u8 = $i;"; done > "$tmp/src/big/tests.rs"
 
   git -C "$tmp" add -A >/dev/null
   git -C "$tmp" commit -qm fixtures
@@ -278,6 +288,9 @@ self_test() {
   # Exemptions: neither fixture appears in the measured set at all.
   out="$( (cd "$tmp" && $S $T --list) | grep -c 'mirror\.sh\|guard-destructive-generic' || true)"
   _expect "installed-mirror and vendored paths not measured" "0" "$out"
+
+  out="$( (cd "$tmp" && $S $T --list) | grep -c 'big/tests\.rs' || true)"
+  _expect "extracted rust test modules not measured" "0" "$out"
 
   (cd "$tmp" && $S $T --update >/dev/null)
 

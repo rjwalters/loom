@@ -91,6 +91,12 @@ would be permanently unfixable here:
    resync copies of `defaults/`. They are measured at their `defaults/` source;
    measuring both would double-count every violation and churn the baseline on
    every resync commit.
+3. **Extracted Rust test modules** — `*/tests.rs` and `*/tests/*.rs`. The policy
+   does not tax Rust tests whether they are inline or extracted, and counting an
+   extracted module as production would make this gate **fail the very refactor
+   it exists to reward**: moving `#[cfg(test)] mod tests` out of `ipc.rs`
+   creates a 4,400-line `ipc/tests.rs` that newly "crosses" the threshold, while
+   the production code being measured did not change by a single line.
 
 **Bootstrap scripts are deliberately NOT exempt.** `install.sh`,
 `scripts/install-loom.sh`, `loom-daemon-update.sh` and `loom-daemon-start.sh`
