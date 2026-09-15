@@ -1427,6 +1427,7 @@ echo "Branch rebased successfully, continuing evaluation"
 - Both sides adding to same list/config (e.g., `pyproject.toml` entry points, `package.json` scripts)
 - Whitespace or formatting conflicts
 - Independent additions to same file (non-overlapping)
+- **Conflict confined entirely to version-bearing files** (per `./scripts/version.sh list` — VERSION, CLAUDE.md, `.loom/install-metadata.json`, `package.json`, `mcp-loom/package.json`, `loom-daemon/Cargo.toml`, `loom-api/Cargo.toml` as of this writing, but always re-run `./scripts/version.sh list` rather than trusting this cached snapshot). This is the recurring "VERSION bump goes stale before review lands" race (#7684): `main` bumps these single-line/single-field values on nearly every merge, so if another PR merges first it collides on the exact same lines this branch's own bump touched — not a real code conflict. **Only applies when EVERY conflicting file is on that list** — see the "Multiple conflicting files" rule under Edge Cases below, which this case does not override.
 
 **Complex conflicts (Doctor handles):**
 - Overlapping code changes in same function/block
@@ -1450,6 +1451,55 @@ fi
 
 git push --force-with-lease
 gh pr comment <number> --body "🔀 Rebased branch and resolved merge conflict (both sides added entries to config)"
+```
+
+### For Version-Bearing-File-Only Conflicts (Judge Resolves)
+
+**First, confirm EVERY conflicting file is version-bearing.** If even one is
+not, this recipe does not apply — abort it and fall through to "For Complex
+Conflicts" instead (the "if ANY conflict is complex, treat entire rebase as
+complex" rule in Edge Cases still governs):
+
+```bash
+CONFLICTED="$(git diff --name-only --diff-filter=U)"
+NON_VERSION_CONFLICTS="$(comm -23 <(sort <<<"$CONFLICTED") <(./scripts/version.sh list | sort))"
+if [ -n "$NON_VERSION_CONFLICTS" ]; then
+  echo "Non-version-bearing file(s) also conflicted -- this is a complex conflict:"
+  echo "$NON_VERSION_CONFLICTS"
+  # Do NOT continue with this recipe -- use "For Complex Conflicts" below instead.
+fi
+```
+
+Once confirmed, discard this branch's now-superseded bump and re-derive a
+fresh one from `origin/main`'s post-rebase tip — never hand-patch the
+version-bearing files yourself:
+
+```bash
+# Take origin/main's side for every conflicting (version-bearing) file, then
+# re-derive a fresh bump on top of it.
+#
+# `--ours` is correct here, NOT `--theirs`: mid-`git rebase` the two are
+# REVERSED relative to `git merge`. A rebase replays your commits on top of the
+# upstream, so "ours" is the branch being rebased ONTO (origin/main) and
+# "theirs" is the commit being replayed (this branch's own, already-superseded
+# bump). Using `--theirs` here would keep the stale bump and then bump patch on
+# top of that stale base, which can yield a version that is NOT ahead of
+# origin/main's tip -- exactly the #7684 race this recipe exists to end. Do not
+# "correct" this back to `--theirs`.
+git checkout --ours -- $CONFLICTED
+git add $CONFLICTED
+./scripts/version.sh bump patch
+git add $(./scripts/version.sh list)
+git rebase --continue
+
+# Same gate as every other rebase path -- must pass before pushing.
+if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
+  echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - aborting push"
+  exit 1
+fi
+
+git push --force-with-lease
+gh pr comment <number> --body "🔀 Rebased branch and re-derived a fresh VERSION bump — the previous bump was superseded by main advancing further while this PR waited for review (#7684), not a defect in the PR's own change."
 ```
 
 ### For Complex Conflicts (Request Changes)
@@ -1479,7 +1529,7 @@ FEEDBACK
 - **Rebase succeeds but CI fails**: Continue with evaluation (CI failure is a code issue, not a conflict issue)
 - **PR already rebased by someone else**: `BEHIND` status should be gone, continue normally
 - **Rebase creates new test failures**: Continue evaluation - Judge catches this during normal CI check phase
-- **Multiple conflicting files**: If ANY conflict is complex, treat entire rebase as complex (request changes)
+- **Multiple conflicting files**: If ANY conflict is complex, treat entire rebase as complex (request changes) — this governs the version-bearing-files case above too: it only fires when EVERY conflicting file is version-bearing, and a single non-version-bearing conflicting file still routes to this "treat entire rebase as complex" path unchanged
 
 ### Relationship with Doctor
 
