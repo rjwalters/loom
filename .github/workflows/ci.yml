@@ -587,9 +587,12 @@ jobs:
     #
     # Since #4769 ci-wired.txt also covers the tests/hooks/ Claude-path guard
     # suites (repo root, not defaults/scripts/tests/ — previously unwired
-    # entirely). tests/hooks/test-guard-destructive.sh alone adds several
-    # minutes (531 assertions); run-ci-suites.sh's per-suite timeout was
-    # raised accordingly (see its header comment).
+    # entirely). The guard-destructive family is the expensive one: ~1480
+    # assertions taking several minutes in total, which is why #7741 split it
+    # from one 8.9k-line suite into tests/hooks/test-guard-destructive-*.sh --
+    # eleven suites the runner can schedule independently. run-ci-suites.sh's
+    # per-suite timeout was raised for the monolith (see its header comment) and
+    # is now generous for every slice.
     #
     # Since #4451 ci-wired.txt also covers defaults/hooks/tests/ — the last
     # unwired guard-hook location (background-subagents, loom-workspace,

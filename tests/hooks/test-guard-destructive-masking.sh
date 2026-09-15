@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+# Test suite for defaults/hooks/guard-destructive-generic.sh — masking.
+#
+# One slice of the former monolithic tests/hooks/test-guard-destructive.sh,
+# split per #7741. Shared fixtures, assertions and catastrophic-phrase payloads
+# live in tests/hooks/lib/guard-destructive-harness.sh.
+#
+# Usage: ./tests/hooks/test-guard-destructive-masking.sh
+
+set -euo pipefail
+# shellcheck source=tests/hooks/lib/guard-destructive-harness.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/guard-destructive-harness.sh"
+
+echo -e "${YELLOW}--- ASK-tier heredoc-body masking for force-op / stash-scope (#5779) ---${NC}"
+# =========================================================================
+#
+# COMMAND_ASK_SCAN (which parse_force_ops()'s force-op:detached/force-op:protected
+# and the stash-scope:* checks both read) never had heredoc-body masking applied
+# to it, unlike the catastrophic-tier gh-api-rawfield-body-literal-at check
+# (#5181/#5198, tested above at line ~629). So a SINGLE-QUOTED heredoc body that
+# merely QUOTES a force-op/stash phrase as inert prose (e.g. a report destined
+# for a file, discussing the anti-pattern) tripped an ask exactly like a live
+# invocation would -- an unanswerable stall in a headless run. Fixed by reusing
+# the same tested mask_heredoc_bodies_selective() primitive to build
+# COMMAND_ASK_SCAN, gated on literal '<<' presence.
+
+# --- False positive fixed: a heredoc body destined for a plain file sink (not
+# an interpreter) that merely quotes a force-op phrase stays allowed ----------
+assert_allow "#5779: Allow a single-quoted heredoc body that merely QUOTES 'git reset --hard' as inert prose" \
+    'cat > /tmp/report-5779-a.md <<'"'"'EOF'"'"'
+Documentation example -- do NOT actually run this:
+git reset --hard origin/main
+EOF
+echo done'
+
+assert_allow "#5779: Allow a single-quoted heredoc body that merely QUOTES 'git push --force' (non-main) as inert prose" \
+    'cat > /tmp/report-5779-b.md <<'"'"'EOF'"'"'
+Documentation example -- do NOT actually run this:
+git push --force origin feature/my-branch
+EOF
+echo done'
+
+# --- stash-scope companion (#5754 follow-up, same root cause) ---------------
+ST5779_REPO=$(make_wt_repo_linked)
+assert_allow "#5779: Allow a single-quoted heredoc body that merely QUOTES 'git stash pop' as inert prose (main checkout)" \
+    'cat > /tmp/report-5779-c.md <<'"'"'EOF'"'"'
+Documentation example -- do NOT actually run this:
+git stash pop
+EOF
+echo done' "$ST5779_REPO"
+
+# --- Narrows, never widens: a REAL (non-heredoc) invocation must keep asking,
+# both standalone and sitting in the same multi-line command as an unrelated
+# heredoc (mirrors the #5181 "narrows, never widens" test at line ~645) ------
+assert_ask "#5779: A live (non-heredoc) git reset --hard invocation still asks (regression guard)" \
+    "git reset --hard HEAD~1"
+
+assert_ask "#5779: A live (non-heredoc) git stash pop invocation still asks in main checkout (regression guard)" \
+    "git stash pop" "$ST5779_REPO"
+
+assert_ask "#5779: A real force-op invocation AFTER an unrelated heredoc in the same command still asks" \
+    'cat > /tmp/report-5779-d.md <<'"'"'EOF'"'"'
+just some unrelated prose
+EOF
+git reset --hard HEAD~1'
+
+assert_ask "#5779: A real stash-pop invocation AFTER an unrelated heredoc in the same command still asks" \
+    'cat > /tmp/report-5779-e.md <<'"'"'EOF'"'"'
+just some unrelated prose
+EOF
+git stash pop' "$ST5779_REPO"
+
+# --- Interpreter-fed heredoc: a force-op/stash phrase piped into a real
+# interpreter is genuinely LIVE code and must still ask (mirrors the #5198
+# interpreter-fed-heredoc tests at line ~666) --------------------------------
+assert_ask "#5779: A live git reset --hard wrapped in 'bash <<EOF ... EOF' still asks (interpreter-fed heredoc)" \
+    'bash <<'"'"'EOF'"'"'
+git reset --hard HEAD~1
+EOF'
+
+assert_ask "#5779: A live git stash pop wrapped in 'bash <<EOF ... EOF' still asks (interpreter-fed heredoc)" \
+    'bash <<'"'"'EOF'"'"'
+git stash pop
+EOF' "$ST5779_REPO"
+
+# --- Unquoted delimiter + command substitution: the outer shell evaluates
+# $(...)/backticks inside an UNQUOTED heredoc body while constructing it --
+# genuinely live code -- even when the block's sink is an inert command like
+# `cat`. heredoc_delim_at() must distinguish a quoted delimiter (<<'EOF',
+# masked, inert) from a bare one (<<EOF / <<-EOF, left visible), or this
+# reopens the exact class of bypass #5779 closed, just via $(...) instead of
+# prose (security regression found in review of PR #5781, fixed by gating
+# mask_heredoc_bodies_selective() on HEREDOC_DELIM_QUOTED).
+#
+# Both patterns below are the regex/substring ASK_PATTERNS + stash-scope
+# scans (which read COMMAND_ASK_SCAN as plain text and so are directly what
+# this masking fix protects); force-op patterns like `git reset --hard` are
+# deliberately NOT used here -- those are recognized by parse_force_ops'
+# command-word SEGMENT tokenizer, which requires the segment's first token to
+# be exactly `git` and so never matches a `$(git ...)` prefix regardless of
+# masking (a separate, pre-existing tokenizer limitation, out of scope for
+# this heredoc-masking fix). ---------------------------------------------
+assert_ask "#5781: An unquoted <<EOF heredoc body containing a live \$( git clean -fd) substitution still asks" \
+    'cat > /tmp/report-5781-a.md <<EOF
+$( git clean -fd)
+EOF'
+
+assert_ask "#5781: An unquoted <<-EOF heredoc body containing a live \$( git clean -fd) substitution still asks" \
+    'cat > /tmp/report-5781-b.md <<-EOF
+$( git clean -fd)
+EOF'
+
+assert_ask "#5781: An unquoted <<EOF heredoc body containing a live \$(git stash pop ) substitution still asks (main checkout)" \
+    'cat > /tmp/report-5781-c.md <<EOF
+$(git stash pop )
+EOF' "$ST5779_REPO"
+
+assert_ask "#5781: An unquoted <<-EOF heredoc body containing a live \$(git stash pop ) substitution still asks (main checkout)" \
+    'cat > /tmp/report-5781-d.md <<-EOF
+$(git stash pop )
+EOF' "$ST5779_REPO"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- UNQUOTED-delimiter cat-heredoc body masking (#6056) ---${NC}"
+# =========================================================================
+#
+# #5779/#5781 left every UNQUOTED-delimiter heredoc body (`cat <<EOF`) visible
+# to COMMAND_ASK_SCAN, because the outer shell expands $(...)/backticks inside
+# such a body. Correct as a default, but too strict for the routine Judge idiom
+#   gh pr comment N --body "$(cat <<EOF ... EOF)"
+# whose prose merely QUOTES a force-op as coaching for a human reviewer: both
+# occurrences logged in #6056 were "Changes Requested - Merge Conflict" comments
+# that force-op:protected asked on, stalling a headless run with nobody to
+# answer. mask_unquoted_cat_heredoc_bodies() masks that body ONLY when the cat
+# capture is confined to a text-data flag value AND the body is proven free of
+# `$(` / unescaped-backtick expansion (a bare $VAR parameter expansion is text,
+# not execution, so it does NOT disqualify -- both real occurrences carried a
+# `sha=$VERDICT_SHA` trailer).
+
+# --- False positive fixed (the #6056 reproduction) --------------------------
+assert_allow "#6056: Allow gh pr comment --body unquoted-delimiter heredoc quoting a force-op as prose" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+Changes Requested - Merge Conflict
+
+Please rebase and force-push:
+git reset --hard origin/main
+EOF
+)"'
+
+# Exact real-world shape: markdown fenced code block (escaped backticks) plus a
+# $VERDICT_SHA parameter expansion in the trailer. Both logged occurrences
+# carried exactly these two features, so a "no $ and no backtick at all" rule
+# (as used by the guard-loom-workflow.sh sibling fix) would not have fixed them.
+assert_allow "#6056: Allow the real Judge merge-conflict comment shape (escaped fences + \$VAR trailer)" \
+    'VERDICT_SHA="aa2c1b0"
+gh pr comment 6056 --body "$(cat <<EOF
+Please rebase and resolve:
+\`\`\`bash
+git rebase origin/main
+git reset --hard origin/main
+\`\`\`
+
+<!-- loom:verdict-sha sha=$VERDICT_SHA verdict=changes-requested -->
+EOF
+)" && gh pr edit 6056 --add-label "loom:changes-requested"'
+
+# The `<<-` tab-stripping unquoted variant gets the same treatment.
+assert_allow "#6056: Allow the unquoted <<- tab-stripping variant of the same shape" \
+    'gh pr comment 6056 --body "$(cat <<-EOF
+Please avoid running this:
+git reset --hard origin/main
+EOF
+)"'
+
+# `gh api -f body=` field syntax is in the same confinement allowlist.
+assert_allow "#6056: Allow gh api -f body= unquoted-delimiter heredoc quoting a force-op as prose" \
+    'gh api repos/o/r/issues/1/comments -f body="$(cat <<EOF
+Do not run this here:
+git reset --hard origin/main
+EOF
+)"'
+
+# Escaped backticks are literal text and do NOT disqualify the body, so a
+# markdown inline-code span quoting an ask-phrase is masked like any prose.
+assert_allow "#6056: Allow a body whose only backticks are backslash-ESCAPED (markdown inline code)" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+Do not run \`git clean -fd\` in prose:
+git reset --hard origin/main
+EOF
+)"'
+
+# --- Narrows, never widens: content-gated, not delimiter-gated --------------
+# A body that ACTUALLY contains a live $(...) command substitution stays fully
+# visible and still asks, even though it is captured into --body. This is what
+# proves the relaxation cannot smuggle a real invocation through a "prose" body.
+# (These use ASK_PATTERNS phrases rather than a force-op: parse_force_ops
+# requires a segment whose FIRST token is `git`, so it never matches a
+# `$(git ...)` prefix regardless of masking -- the same tokenizer limitation
+# the #5781 tests above call out.)
+assert_ask "#6056: An unquoted --body heredoc whose body contains a live \$( git clean -fd) still asks" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+prose $( git clean -fd) more
+EOF
+)"'
+
+assert_ask "#6056: An unquoted --body heredoc whose body contains a live backtick substitution still asks" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+prose `git clean -fd` more
+EOF
+)"'
+
+# An ESCAPED backslash does not swallow the backtick that follows it, so this
+# backtick is live and the body must stay visible.
+assert_ask "#6056: A backtick preceded by an ESCAPED backslash is live and still asks" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+ends with a backslash \\`git clean -fd` more
+EOF
+)"'
+
+# --- Confinement proof is required: unconfined unquoted heredocs unchanged --
+assert_ask "#6056: An unquoted cat-heredoc piped into bash still asks (no text-data-flag capture)" \
+    'cat <<EOF | bash
+git reset --hard origin/main
+EOF'
+
+assert_ask "#6056: An unquoted cat-heredoc redirected to a file still asks (no text-data-flag capture)" \
+    'cat > /tmp/report-6056-a.md <<EOF
+git reset --hard origin/main
+EOF'
+
+assert_ask "#6056: An unquoted heredoc captured by eval (not a text-data flag) still asks" \
+    'eval "$(cat <<EOF
+git reset --hard origin/main
+EOF
+)"'
+
+# --- Regression guards: real invocations keep asking ------------------------
+assert_ask "#6056: A live (non-heredoc) git reset --hard origin/main still asks" \
+    "git reset --hard origin/main"
+
+assert_ask "#6056: A real force-op AFTER a masked --body heredoc in the same command still asks" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+just some unrelated prose
+EOF
+)" && git reset --hard origin/main'
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #7355: printenv.*SECRET/TOKEN/KEY ask-tier false positives ---${NC}"
+# =========================================================================
+#
+# Guard-decision telemetry (#3898) found the printenv.*(SECRET|TOKEN|KEY)
+# ASK_PATTERNS entries false-asking on two DISTINCT non-live shapes:
+#
+#   1. A heredoc captured via a PLAIN VARIABLE ASSIGNMENT (unquoted delimiter,
+#      `REPORT=$(cat <<EOF ... EOF)`) was not covered by
+#      mask_unquoted_cat_heredoc_bodies()'s capre allowlist -- that allowlist
+#      only recognized capture into a fixed set of text-data FLAGS
+#      (-m/--body/--title/etc.), never a bare shell variable. Fixed by
+#      widening capre to also admit a `NAME=` capture immediately before the
+#      `$(`/backtick opener.
+#   2. A jq/grep/rg command whose own QUOTED filter/pattern argument merely
+#      CONTAINS the word "printenv" (with SECRET/TOKEN/KEY elsewhere in the
+#      same argument) false-asked because COMMAND_ASK_SCAN deliberately never
+#      gets grep/rg/jq positional-argument masking -- it also feeds
+#      SQL_DDL_PATTERN below, which intentionally still scans a
+#      `grep '<pattern>' file` argument for a live DDL phrase, so masking
+#      COMMAND_ASK_SCAN itself would silently blind that check. Fixed by
+#      giving the three printenv patterns their OWN further-masked scan copy
+#      (COMMAND_ASK_SCAN_PRINTENV), mirroring how COMMAND_CLOUD_ASK_SCAN is
+#      already branched off COMMAND_ASK_SCAN for the toggleable cloud-ask
+#      tier (#6002) -- never fed back into COMMAND_ASK_SCAN itself, so
+#      SQL_DDL_PATTERN keeps reading the fully unmasked copy.
+#
+# Note: a BARE `grep '<pattern>' file` / `jq '<filter>' file` (no pipe, no
+# other shell metacharacter) is unconditionally admitted by the read-only
+# fast path (fastpath_builtin_admits()) BEFORE any ASK_PATTERNS scan ever
+# runs, regardless of this fix -- see the #5263 fast-path section above. The
+# false positives here reproduce with a REAL jq filter's own internal `|`
+# (jq's pipe operator, which fastpath_structural_ok() rejects unconditionally
+# and not quote-aware) or a genuinely piped/chained grep/rg, matching the
+# actual occurrence shapes logged in #3898 -- not the artificially-bare form
+# that was already fast-pathed before this fix and is untouched by it.
+
+# --- False positive #1 fixed: heredoc body via plain variable assignment ---
+assert_allow "#7355: Allow unquoted-delimiter heredoc captured by a PLAIN VARIABLE assignment quoting 'printenv SECRET' as past-fix prose" \
+    'REPORT=$(cat <<EOF
+Past fix: this issue was previously resolved by running printenv SECRET_KEY to check for leaks.
+EOF
+)
+echo "$REPORT"'
+
+assert_allow "#7355: Allow the same plain-variable-assignment heredoc shape mentioning printenv TOKEN" \
+    'REPORT=$(cat <<EOF
+The regression test replays a printenv TOKEN invocation from the incident log.
+EOF
+)
+echo "$REPORT"'
+
+assert_allow "#7355: Allow the same plain-variable-assignment heredoc shape mentioning printenv KEY" \
+    'REPORT=$(cat <<EOF
+Root cause: an old script ran printenv KEY_NAME directly in CI.
+EOF
+)
+echo "$REPORT"'
+
+# --- Regression check: quoted-delimiter heredoc (already masked before this
+#     fix, via mask_heredoc_bodies_selective()) stays unaffected -----------
+assert_allow "#7355 regression: a QUOTED-delimiter heredoc plain-variable-assignment capturing the same prose was already masked before this fix" \
+    'REPORT=$(cat <<'"'"'EOF'"'"'
+Past fix: this issue was previously resolved by running printenv SECRET_KEY to check for leaks.
+EOF
+)
+echo "$REPORT"'
+
+# --- False positive #2 fixed: jq/grep/rg quoted argument merely mentions
+#     "printenv" (plus SECRET/TOKEN/KEY elsewhere in the same argument) ----
+assert_allow "#7355: Allow a jq filter (internal pipe disqualifies the read-only fast path) whose quoted string argument mentions 'printenv TOKEN_VALUE' as data, no live printenv call" \
+    "jq -c 'select(.title | contains(\"ran printenv TOKEN_VALUE previously\"))' guard-decisions.log"
+
+assert_allow "#7355: Allow a chained (non-fast-pathed) grep whose quoted pattern mentions 'printenv SECRET_KEY' as prose, no live printenv call" \
+    "grep -n 'run printenv SECRET_KEY to check' guard-decisions.log | grep foo | head"
+
+assert_allow "#7355: Allow a chained (non-fast-pathed) rg whose quoted pattern mentions 'printenv KEY_NAME' as prose, no live printenv call" \
+    "rg 'via printenv KEY_NAME earlier' guard-decisions.log | grep foo | head"
+
+# --- Regression guard: SQL_DDL_PATTERN (also fed by COMMAND_ASK_SCAN) must
+#     still fire, UNCHANGED, on a real grep '<DDL phrase>' file -- proving
+#     this fix did NOT widen positional masking onto COMMAND_ASK_SCAN itself
+#     (which would silently blind this check, the exact regression the
+#     COMMAND_ASK_SCAN_PRINTENV branch-off is designed to avoid) -----------
+assert_deny "#7355 regression: a real DDL grep (declines the fast path via a second pipe) still denies via SQL_DDL_PATTERN, unaffected by the printenv masking fix" \
+    "grep '$_HD_DDL' schema.sql | grep foo | head"
+assert_deny_env "#7355 regression: a real DDL grep with the read-only fast path disabled still denies via SQL_DDL_PATTERN" \
+    "LOOM_GUARD_READONLY_FASTPATH=0" "grep '$_HD_DDL' schema.sql"
+
+# --- Regression guard: a genuine LIVE printenv invocation still asks -------
+assert_ask "#7355 regression: a live (non-heredoc, non-quoted-argument) 'printenv SECRET_KEY' invocation still asks" \
+    "printenv SECRET_KEY"
+assert_ask "#7355 regression: a live 'printenv' invocation of a TOKEN-named variable still asks" \
+    "printenv MY_TOKEN"
+assert_ask "#7355 regression: a live 'printenv' invocation of a KEY-named variable still asks" \
+    "printenv API_KEY"
+
+# --- Regression guard (PR #6207 Judge review): the "read elsewhere" fail-
+#     closed branch must apply to the COMMAND_ASK_SCAN_PRINTENV copy too ----
+#
+# mask_catastrophic_var_assignment()'s call site feeding COMMAND_ASK_SCAN_PRINTENV
+# was passing only its own input buffer as the function's sole argument,
+# never the true original $COMMAND as the second ($2) argument the other two
+# call sites pass. That left ORIG_COMMAND_FOR_READ_CHECK permanently empty
+# for this scan, so the "is $NAME read elsewhere in the command" fail-closed
+# branch could never fire here -- a printenv-secret assignment that IS
+# live-read via eval was masked and silently allowed instead of asking, even
+# though the read makes the printenv output live.
+assert_ask "#6207 regression: a NOTE var quoting 'printenv SECRET_KEY' IS read via eval later in the same command still asks (fail closed -- was silently allowed pre-fix)" \
+    'NOTE="ran printenv SECRET_KEY earlier"
+eval "$NOTE"'
+assert_ask "#6207 regression: a NOTE var quoting a printenv TOKEN phrase IS read via eval later in the same command still asks (fail closed)" \
+    'NOTE="ran printenv MY_TOKEN earlier"
+eval "$NOTE"'
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #6252: COMMAND_NO_COMMENT quote-awareness (ADR-0016 sed test matrix) ---${NC}"
+# =========================================================================
+#
+# ADR-0016 (docs/adr/0016-write-target-confinement-approach.md, "Sed /
+# argument-position false positive") root-caused a live, previously
+# unreported unsound false-negative: COMMAND_NO_COMMENT's `#`-comment
+# stripper was quote-UNAWARE, so a `#` inside ANY whitespace-preceded quoted
+# write-idiom argument (a sed script, a `--body`/`-m` prose string, a PR/
+# issue reference like `#958`) truncated COMMAND_ASK_SCAN at that point —
+# and COMMAND_ASK_SCAN is also extract_write_targets()'s input for the
+# worktree-write-confinement DENY (WRITE_TARGETS). The real write target,
+# sitting textually AFTER the quoted `#`, silently vanished from the scan,
+# producing a silent ALLOW where #4178/#4921 require a DENY.
+#
+# Fixture: a DEDICATED linked-worktree fixture (make_wt_repo_linked(), the
+# same helper the #4921 section above uses) -- NOT a reuse of WT_LINKED_DIR/
+# WT_REPO_LINKED, which are already `rm -rf`'d earlier in this file (see the
+# cleanup right after the #4933/#5363 cd-tracking section). A cwd pointed at
+# a since-deleted directory makes the guard's own git/worktree detection
+# silently no-op, which would make every assertion below pass VACUOUSLY
+# (looking like a real DENY check while actually never exercising the
+# write-confinement path at all) -- so this section gets its own live
+# fixture instead.
+WT6252_REPO=$(make_wt_repo_linked)
+WT6252_DIR="$WT6252_REPO/.loom/worktrees/issue-1"
+#
+# Cases 1-2 below are the ADR's own two confirmed repros; case 3 proves the
+# fix is not sed-specific (a `#` in an UNRELATED quoted argument, followed by
+# a write through a DIFFERENT idiom, still gets scanned); case 4 is the
+# "must not over-deny" control; case 5 is the ASK/DDL tier's own pre-existing
+# regression floor, unaffected by the quote-awareness fix.
+
+# 1. Exact live repro from ADR-0016 / issue #6252: `$SP` is a same-command
+#    unresolved variable (no assignment anywhere in the command), so the
+#    correct outcome is the ordinary #4921 fail-closed DENY, naming the real
+#    write target ('$SP/file.md') -- NEVER a sed-script fragment like
+#    "958/' $SP/file.md" (the pre-fix truncated-scan symptom), and NEVER a
+#    silent ALLOW (the pre-fix unsound-bypass symptom).
+assert_deny_reason_matches "write-confinement (#6252 case 1): sed -i script with a quoted '#958' no longer truncates the scan before the real \$SP write target" \
+    "sed -i '' 's/x/y #958/' \$SP/file.md" \
+    '\$SP/file\.md' "$WT6252_DIR"
+
+# 2. The exact originally-reported repro cited in ADR-0016 (a sed script
+#    replacing prose that itself contains a `#`-issue-reference).
+assert_deny_reason_matches "write-confinement (#6252 case 2): ADR-0016's originally-reported sed repro denies, naming the real \$SP write target" \
+    "sed -i '' 's/**Blocked by 3a** (per-block em-export/**Blocked by #958** (3a: per-block em-export/' \$SP/issue-3b.md" \
+    '\$SP/issue-3b\.md' "$WT6252_DIR"
+
+# 3. A `#` inside an UNRELATED quoted argument (a gh --body value, not part
+#    of the write idiom at all), followed LATER in the same command by a
+#    write through a DIFFERENT idiom -- proves the fix is not sed-specific,
+#    per ADR-0016's own required case 3.
+assert_deny_reason_matches "write-confinement (#6252 case 3): quoted '#123' in an unrelated --body value does not swallow a later '>' write target" \
+    'gh pr comment 1 --body "notes #123" && echo hi > $SP/f.md' \
+    '\$SP/f\.md' "$WT6252_DIR"
+
+# 3b-3e. The same "unrelated quoted #, write happens through a different
+# idiom" shape repeated across every other idiom sharing COMMAND_ASK_SCAN
+# (the #6252 audit item) -- each one silently ALLOWed pre-fix (verified
+# directly against origin/main @ 06df09c8) and now denies, naming the real
+# target, not a fragment of the quoted text preceding the `#`.
+assert_deny_reason_matches "write-confinement (#6252 audit): '>' redirect target survives a preceding quoted '#123' argument" \
+    "echo 'note #123' > \$SP/file.md" \
+    '\$SP/file\.md' "$WT6252_DIR"
+assert_deny_reason_matches "write-confinement (#6252 audit): '>>' redirect target survives a preceding quoted '#123' argument" \
+    "echo 'note #123' >> \$SP/file.md" \
+    '\$SP/file\.md' "$WT6252_DIR"
+assert_deny_reason_matches "write-confinement (#6252 audit): 'tee' target survives an unrelated preceding quoted '#123' argument" \
+    "printf '%s' 'note #123' | tee \$SP/out.txt" \
+    '\$SP/out\.txt' "$WT6252_DIR"
+assert_deny_reason_matches "write-confinement (#6252 audit): 'cp' destination survives a '#123'-bearing quoted SOURCE argument" \
+    "cp 'notes #123.md' \$SP/dest.md" \
+    '\$SP/dest\.md' "$WT6252_DIR"
+assert_deny_reason_matches "write-confinement (#6252 audit): 'mv' destination survives a '#123'-bearing quoted SOURCE argument" \
+    "mv 'todo #123.md' \$SP/dest.md" \
+    '\$SP/dest\.md' "$WT6252_DIR"
+
+# 4. Control (ADR-0016 case 4): a literal, non-main-checkout `#`-containing
+#    sed write must still ALLOW -- the fix must not turn every `#`-bearing
+#    sed command into a deny.
+assert_allow "write-confinement (#6252 case 4): sed -i script with a quoted '#z' on a /tmp target still allows" \
+    "sed -i '' 's/x/y #z/' /tmp/loom-test-$$-6252-scratch.md" "$WT6252_DIR"
+
+# 5. Control (ADR-0016 case 5): a genuine end-of-line shell comment with no
+#    attached write idiom is unaffected -- regression guard on the ASK/DDL
+#    tier's existing, correctly-scoped comment-stripping behavior (mirrors
+#    the #3553 coverage above, kept here as an #6252-tagged case for
+#    traceability to the ADR's own test matrix).
+assert_allow "write-confinement (#6252 case 5): a genuine trailing comment with no write idiom is unaffected" \
+    "echo hi # this really is a comment" "$WT6252_DIR"
+
+rm -rf "$WT6252_REPO"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #6394: catastrophic-tier whole-line #-comment masking ---${NC}"
+# =========================================================================
+#
+# Guard-Decision Telemetry Review finding (#3898 standing policy): the raw
+# ALWAYS_BLOCK_PATTERNS substring scan hard-denied a plain `#`-prefixed shell
+# comment that merely QUOTES a catastrophic-tier phrase for documentation/
+# forensic purposes, single-line or (unlike a bare single-command `echo`,
+# which the #3687 read-only fast path already admits) multi-line too, since
+# comments were never masked before reaching this scan. Distinct from #6068
+# (the sibling echo/printf-positional-arg gap, covered in its own PR) — this
+# section covers ONLY the `#`-comment case, mask_catastrophic_comment_lines()'s
+# own new masking pass.
+#
+# Case 1-2 are the issue's own two repro cases (now fixed); case 3-5 are the
+# safety-floor regression guards proving the fix is WHOLE-LINE-ONLY, quote-
+# aware, and heredoc-conservative — a real catastrophic invocation must
+# still deny in every one of these adjacent shapes.
+
+# 1. Exact repro: a single-line whole-line `#`-comment quoting a
+#    catastrophic-tier phrase now allows.
+assert_allow "#6394 case 1: single-line whole-line '#'-comment quoting 'aws s3 rb' allows" \
+    "# aws s3 rb mentioned here only, single line comment"
+
+# 2. Exact repro: the SAME comment as one line among several (mixed with
+#    real, unrelated read-only lines) now allows — the multi-line shape the
+#    #3687 read-only fast path does not reach.
+assert_allow "#6394 case 2: multi-line command with a whole-line '#'-comment quoting 'aws s3 rb' among real lines allows" \
+    "$(printf 'echo hello\n# aws s3 rb mentioned here only, single line comment\necho world')"
+
+# 2b. Same shape for the sibling 'docker system prune' catastrophic pattern,
+#     and for a leading-whitespace-indented comment line.
+assert_allow "#6394 case 2b: whole-line '#'-comment quoting 'docker system prune' allows" \
+    "$(printf 'echo start\n    # docker system prune mentioned here only\necho end')"
+
+# 3. SAFETY FLOOR (AC2): a real, unwrapped catastrophic invocation on its own
+#    line, preceded by an unrelated whole-line comment on the PRIOR line,
+#    still denies — masking one line must never blind the scan to a real
+#    command on an adjacent line.
+assert_deny "#6394 case 3: real 'aws s3 rb' invocation after an unrelated whole-line comment still denies" \
+    "$(printf '# unrelated comment, nothing dangerous here\naws s3 rb s3://prod-bucket --force')"
+
+# 4. SAFETY FLOOR (AC1 residual-gap regression guard): a TRAILING comment on
+#    a line that ALSO carries a real catastrophic invocation is deliberately
+#    NOT masked by this whole-line-only pass (see
+#    mask_catastrophic_comment_lines()'s header comment, contract #1, for the
+#    documented accepted gap) — the command portion must still deny.
+assert_deny "#6394 case 4: real 'aws s3 rb' invocation with a trailing same-line comment still denies" \
+    "aws s3 rb s3://prod-bucket --force  # decommissioning this bucket"
+
+# 5. SAFETY FLOOR (AC2 quote-awareness): a line that LOOKS like a whole-line
+#    '#'-comment (first non-whitespace char is '#') but is actually still
+#    inside an OPEN double-quoted span from a prior line must never be
+#    mistaken for a real comment start — stays fully visible to the raw scan,
+#    still denies. (Matches this file's existing raw-substring-scan posture:
+#    quoted data is only ever exempted via a specific, narrow masking pass,
+#    never a blanket "if quoted, allow" rule — see the header comment on
+#    ALWAYS_BLOCK_PATTERNS' 'aws s3 rm'/'aws s3 rb' entries above.)
+assert_deny "#6394 case 5: '#'-looking line still inside an open quote from a prior line still denies" \
+    "$(printf 'echo "line one\n# aws s3 rb looks like a comment but is quoted data\nline three"')"
+
+# 6. SAFETY FLOOR (AC2 heredoc-conservative): a '#'-prefixed line inside a
+#    heredoc body must stay visible to the scan and still deny — this pass
+#    fails closed (does nothing) for the WHOLE buffer whenever '<<' appears
+#    anywhere in it, mirroring mask_heredoc_bodies_selective()'s existing
+#    interpreter-fed exclusion by simply never touching heredocs at all.
+#    Unchanged from pre-#6394 behavior (verified against origin/main): this
+#    case denies with or without the fix, proving no regression.
+assert_deny "#6394 case 6: '#'-prefixed line inside a heredoc body still denies (heredoc-conservative)" \
+    "$(printf "cat <<'EOF'\n# aws s3 rb mentioned inside a heredoc body\nEOF")"
+
+echo ""
+
+# =========================================================================
+
+print_summary
