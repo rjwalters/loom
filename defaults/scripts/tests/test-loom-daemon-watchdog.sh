@@ -2590,6 +2590,263 @@ fi
 rm -rf "$STUB53"
 
 # ===================================================================
+# 54-59. #7664: dedup window layered on top of the #7258 cooldown — a repeat
+#        degradation landing AFTER the cooldown elapses but still inside the
+#        (longer) LOOM_WATCHDOG_PEER_COORD_DEDUP_WINDOW_SECS comments on (and
+#        reopens) the SAME tracking issue instead of filing a fresh one, and
+#        carries a running flap count in PEER_COORD_COOLDOWN_STATE. Fixes the
+#        chronically-flapping-host shape from anvil#1270, where the #7258
+#        cooldown alone still refiled once per cooldown window forever.
+# ===================================================================
+
+# ---- 54. A repeat degradation AFTER the cooldown has elapsed, but still ----
+#          within the dedup window, COMMENTS ON + REOPENS the prior tracking
+#          issue instead of filing a new one, and bumps the flap count.
+rm -f "$PEER_COORD_SENTINEL"
+ISSUE54="$WORKDIR/create-issue54.log"; : > "$ISSUE54"
+cat > "$WORKDIR/.loom/scripts/create-issue.sh" <<EOF
+#!/usr/bin/env bash
+echo "create-issue.sh called" >> "$ISSUE54"
+echo "https://example.invalid/repo/issues/5401"
+exit 0
+EOF
+chmod +x "$WORKDIR/.loom/scripts/create-issue.sh"
+GHLOG54="$WORKDIR/gh54.log"; : > "$GHLOG54"
+GHSTUB54="$(mktemp -d)"
+cat > "$GHSTUB54/gh" <<EOF
+#!/usr/bin/env bash
+echo "gh \$*" >> "$GHLOG54"
+exit 0
+EOF
+chmod +x "$GHSTUB54/gh"
+# 300s past a 100s cooldown -- comfortably inside the default 86400s dedup
+# window -- with a hand-crafted <ts> <issue-ref> <flap-count> state line
+# standing in for what a real recovery would have written.
+echo "$(( $(date -u +%s) - 300 )) https://example.invalid/repo/issues/6001 1" > "$PEER_COORD_COOLDOWN_STATE"
+STUB54="$(make_peer_coord_stub degraded)"
+: > "$WDLOG"
+run_watchdog PATH="$GHSTUB54:$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB54/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE="$PEER_COORD_COOLDOWN_STATE" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_SECS=100
+if [[ "$(wc -l < "$ISSUE54" | tr -d ' ')" == "0" ]]; then
+    pass "#7664 dedup window: a repeat excursion inside the dedup window does NOT file a new issue"
+else
+    fail "#7664 dedup window: expected create-issue.sh to stay unused ($(cat "$ISSUE54"))"
+fi
+if grep -q 'issue comment https://example.invalid/repo/issues/6001' "$GHLOG54"; then
+    pass "#7664 dedup window: comments on the prior tracking issue instead"
+else
+    fail "#7664 dedup window: expected a gh issue comment on the prior issue ($(cat "$GHLOG54"))"
+fi
+if grep -q 'issue reopen https://example.invalid/repo/issues/6001' "$GHLOG54"; then
+    pass "#7664 dedup window: reopens the prior tracking issue"
+else
+    fail "#7664 dedup window: expected a gh issue reopen call ($(cat "$GHLOG54"))"
+fi
+if [[ -f "$PEER_COORD_SENTINEL" ]] && grep -q 'https://example.invalid/repo/issues/6001' "$PEER_COORD_SENTINEL"; then
+    pass "#7664 dedup window: the sentinel is re-armed against the SAME issue"
+else
+    fail "#7664 dedup window: expected the sentinel to reference the reopened issue ($(cat "$PEER_COORD_SENTINEL" 2>/dev/null))"
+fi
+if [[ -f "$PEER_COORD_COOLDOWN_STATE" ]] && grep -q ' https://example\.invalid/repo/issues/6001 2$' "$PEER_COORD_COOLDOWN_STATE"; then
+    pass "#7664 dedup window: the flap count is bumped to 2 in the cooldown-state file"
+else
+    fail "#7664 dedup window: expected flap count 2 in cooldown-state ($(cat "$PEER_COORD_COOLDOWN_STATE" 2>/dev/null))"
+fi
+if grep -q 'flap #2' "$GHLOG54"; then
+    pass "#7664 dedup window: the comment body names the flap count"
+else
+    fail "#7664 dedup window: expected the comment body to name flap #2 ($(cat "$GHLOG54"))"
+fi
+if log_hasi 'Repeat flap #2' && log_hasi 'dedup window'; then
+    pass "#7664 dedup window: the watchdog log records the dedup escalation"
+else
+    fail "#7664 dedup window: expected a dedup-window log note ($(cat "$WDLOG"))"
+fi
+if grep -qi 'advertised' "$GHLOG54" && grep -qi 'anvil#1270' "$GHLOG54"; then
+    pass "#7664 dedup window: the comment names the anvil#1270 advertised/dispatch-time hypothesis"
+else
+    fail "#7664 dedup window: expected the anvil#1270 hypothesis in the comment ($(cat "$GHLOG54"))"
+fi
+
+# ---- 55. The flap count keeps incrementing across a full flap -> recover -> ----
+#          flap cycle (Ask #3: surface the flap count across the window, not
+#          just a single dedup comment).
+GHSTUB55="$(mktemp -d)"
+cat > "$GHSTUB55/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$GHSTUB55/gh"
+STUB55G="$(make_peer_coord_stub green)"
+run_watchdog PATH="$GHSTUB55:$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB55G/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE="$PEER_COORD_COOLDOWN_STATE"
+rm -rf "$STUB55G" "$GHSTUB55"
+if [[ -f "$PEER_COORD_COOLDOWN_STATE" ]] && grep -q ' https://example\.invalid/repo/issues/6001 2$' "$PEER_COORD_COOLDOWN_STATE"; then
+    pass "#7664 dedup window: a recovery preserves the running flap count (still 2) while refreshing the timestamp"
+else
+    fail "#7664 dedup window: expected the recovery to carry the flap count forward ($(cat "$PEER_COORD_COOLDOWN_STATE" 2>/dev/null))"
+fi
+
+# Backdate the freshly-stamped state past the (test-scoped) cooldown again,
+# simulating the SAME host flapping a second time.
+echo "$(( $(date -u +%s) - 300 )) https://example.invalid/repo/issues/6001 2" > "$PEER_COORD_COOLDOWN_STATE"
+GHLOG55B="$WORKDIR/gh55b.log"; : > "$GHLOG55B"
+GHSTUB55B="$(mktemp -d)"
+cat > "$GHSTUB55B/gh" <<EOF
+#!/usr/bin/env bash
+echo "gh \$*" >> "$GHLOG55B"
+exit 0
+EOF
+chmod +x "$GHSTUB55B/gh"
+STUB55B="$(make_peer_coord_stub degraded)"
+: > "$WDLOG"
+run_watchdog PATH="$GHSTUB55B:$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB55B/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE="$PEER_COORD_COOLDOWN_STATE" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_SECS=100
+if grep -q 'flap #3' "$GHLOG55B" && log_hasi 'Repeat flap #3'; then
+    pass "#7664 dedup window: a third excursion in the same window reports flap #3"
+else
+    fail "#7664 dedup window: expected flap #3 on the second dedup cycle ($(cat "$GHLOG55B"); log: $(cat "$WDLOG"))"
+fi
+rm -rf "$STUB54" "$STUB55B" "$GHSTUB54"
+
+# ---- 56. Once the DEDUP WINDOW itself elapses, a repeat excursion files ----
+#          fresh again and the flap count resets — the window is anchored to
+#          the last recovery, not open-ended.
+rm -f "$PEER_COORD_SENTINEL"
+ISSUE56="$WORKDIR/create-issue56.log"; : > "$ISSUE56"
+cat > "$WORKDIR/.loom/scripts/create-issue.sh" <<EOF
+#!/usr/bin/env bash
+echo "create-issue.sh called" >> "$ISSUE56"
+echo "https://example.invalid/repo/issues/5601"
+exit 0
+EOF
+chmod +x "$WORKDIR/.loom/scripts/create-issue.sh"
+echo "$(( $(date -u +%s) - 100000 )) https://example.invalid/repo/issues/6001 5" > "$PEER_COORD_COOLDOWN_STATE"   # ~27.8h ago > default 24h dedup window
+STUB56="$(make_peer_coord_stub degraded)"
+: > "$WDLOG"
+run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB56/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE="$PEER_COORD_COOLDOWN_STATE"
+if [[ "$(wc -l < "$ISSUE56" | tr -d ' ')" == "1" ]]; then
+    pass "#7664 dedup window: once the dedup window elapses, a repeat excursion files fresh again"
+else
+    fail "#7664 dedup window: expected a fresh filing once the dedup window elapsed ($(cat "$ISSUE56"))"
+fi
+if [[ -f "$PEER_COORD_SENTINEL" ]] && grep -q 'https://example.invalid/repo/issues/5601' "$PEER_COORD_SENTINEL"; then
+    pass "#7664 dedup window: the fresh filing writes its own sentinel against the NEW issue"
+else
+    fail "#7664 dedup window: expected a fresh sentinel referencing the new issue ($(cat "$PEER_COORD_SENTINEL" 2>/dev/null))"
+fi
+rm -rf "$STUB56"
+
+# ---- 57. Boundary: an excursion landing exactly AT the dedup window ----
+#          (elapsed == LOOM_WATCHDOG_PEER_COORD_DEDUP_WINDOW_SECS) is treated
+#          as window-ELAPSED (strict `<`), mirroring the #7258 cooldown's own
+#          boundary convention, and files fresh.
+rm -f "$PEER_COORD_SENTINEL"
+ISSUE57="$WORKDIR/create-issue57.log"; : > "$ISSUE57"
+cat > "$WORKDIR/.loom/scripts/create-issue.sh" <<EOF
+#!/usr/bin/env bash
+echo "create-issue.sh called" >> "$ISSUE57"
+echo "https://example.invalid/repo/issues/5701"
+exit 0
+EOF
+chmod +x "$WORKDIR/.loom/scripts/create-issue.sh"
+echo "$(( $(date -u +%s) - 500 )) https://example.invalid/repo/issues/6001 3" > "$PEER_COORD_COOLDOWN_STATE"   # exactly 500s ago
+STUB57="$(make_peer_coord_stub degraded)"
+: > "$WDLOG"
+run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB57/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE="$PEER_COORD_COOLDOWN_STATE" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_SECS=100 \
+    LOOM_WATCHDOG_PEER_COORD_DEDUP_WINDOW_SECS=500
+if [[ "$(wc -l < "$ISSUE57" | tr -d ' ')" == "1" ]]; then
+    pass "#7664 dedup window: elapsed == dedup window is treated as elapsed (strict <), files fresh"
+else
+    fail "#7664 dedup window: expected the exact-boundary tick to escalate fresh ($(cat "$ISSUE57"))"
+fi
+rm -rf "$STUB57"
+
+# ---- 58. A missing/corrupt issue reference inside the dedup window FAILS ----
+#          OPEN: no gh call is possible against a reference that is not
+#          there, so a fresh issue is filed instead of silently dropping the
+#          escalation. Distinct from #52 (corrupt TIMESTAMP): this drives an
+#          otherwise-valid, in-window timestamp with the issue-ref field
+#          simply absent (an old bare-epoch #7258 state file, pre-#7664).
+rm -f "$PEER_COORD_SENTINEL"
+ISSUE58="$WORKDIR/create-issue58.log"; : > "$ISSUE58"
+cat > "$WORKDIR/.loom/scripts/create-issue.sh" <<EOF
+#!/usr/bin/env bash
+echo "create-issue.sh called" >> "$ISSUE58"
+echo "https://example.invalid/repo/issues/5801"
+exit 0
+EOF
+chmod +x "$WORKDIR/.loom/scripts/create-issue.sh"
+echo "$(( $(date -u +%s) - 300 ))" > "$PEER_COORD_COOLDOWN_STATE"   # bare epoch, no issue-ref field
+STUB58="$(make_peer_coord_stub degraded)"
+: > "$WDLOG"
+run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB58/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE="$PEER_COORD_COOLDOWN_STATE" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_SECS=100
+if [[ "$(wc -l < "$ISSUE58" | tr -d ' ')" == "1" ]]; then
+    pass "#7664 dedup window: a missing issue-ref field fails open (files fresh, not an error)"
+else
+    fail "#7664 dedup window: a missing issue-ref should fail open, not suppress ($(cat "$ISSUE58"))"
+fi
+rm -rf "$STUB58"
+
+# ---- 59. A failed gh comment call (offline host / no forge auth) inside ----
+#          the dedup window ALSO fails open to a fresh filing, rather than
+#          silently dropping the escalation.
+rm -f "$PEER_COORD_SENTINEL"
+ISSUE59="$WORKDIR/create-issue59.log"; : > "$ISSUE59"
+cat > "$WORKDIR/.loom/scripts/create-issue.sh" <<EOF
+#!/usr/bin/env bash
+echo "create-issue.sh called" >> "$ISSUE59"
+echo "https://example.invalid/repo/issues/5901"
+exit 0
+EOF
+chmod +x "$WORKDIR/.loom/scripts/create-issue.sh"
+GHSTUB59="$(mktemp -d)"
+cat > "$GHSTUB59/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$GHSTUB59/gh"
+echo "$(( $(date -u +%s) - 300 )) https://example.invalid/repo/issues/6001 1" > "$PEER_COORD_COOLDOWN_STATE"
+STUB59="$(make_peer_coord_stub degraded)"
+: > "$WDLOG"
+run_watchdog PATH="$GHSTUB59:$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB59/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE="$PEER_COORD_COOLDOWN_STATE" \
+    LOOM_WATCHDOG_PEER_COORD_COOLDOWN_SECS=100
+if [[ "$(wc -l < "$ISSUE59" | tr -d ' ')" == "1" ]]; then
+    pass "#7664 dedup window: a failed gh issue comment call fails open (files fresh)"
+else
+    fail "#7664 dedup window: a failed gh comment should fail open, not suppress ($(cat "$ISSUE59"))"
+fi
+if [[ -f "$PEER_COORD_SENTINEL" ]] && grep -q 'https://example.invalid/repo/issues/5901' "$PEER_COORD_SENTINEL"; then
+    pass "#7664 dedup window: the fresh filing's sentinel references the NEW issue, not the unreachable one"
+else
+    fail "#7664 dedup window: expected the sentinel to reference the fresh issue ($(cat "$PEER_COORD_SENTINEL" 2>/dev/null))"
+fi
+rm -rf "$STUB59" "$GHSTUB59"
+
+# ---- --help documents the #7664 dedup-window knob. ----
+help_out_7664=$(bash "$WATCHDOG" --help 2>/dev/null)
+if grep -q 'LOOM_WATCHDOG_PEER_COORD_DEDUP_WINDOW_SECS' <<< "$help_out_7664"; then
+    pass "--help documents the #7664 peer-coordination dedup-window knob"
+else
+    fail "--help missing the #7664 peer-coordination dedup-window knob documentation"
+fi
+
+# ===================================================================
 # #7508: STATIC guard against the bash-3.2 heredoc-in-command-substitution
 #        parser bug that silently dropped escalate_peer_coordination_degraded()'s
 #        issue body 1099x on a host whose launchd plist hardcodes /bin/bash
@@ -2617,7 +2874,7 @@ extract_func_body() {
     ' "$WATCHDOG"
 }
 
-# ---- 54. escalate_peer_coordination_degraded() must not rebuild its body ----
+# ---- 60. escalate_peer_coordination_degraded() must not rebuild its body ----
 #          via the vulnerable `body="$(cat <<EOF ... EOF)"` construct --
 #          #7508's fix moved it to `read -r -d '' body <<EOF ... EOF`, which
 #          reads the heredoc directly with no `$(...)` wrapper and so never
@@ -2636,7 +2893,7 @@ else
     fail "#7508 static: expected escalate_peer_coordination_degraded() to build its body via read -d '' <<EOF"
 fi
 
-# ---- 55. Both escalation heredoc bodies stay free of the two confirmed ----
+# ---- 61. Both escalation heredoc bodies stay free of the two confirmed ----
 #          bash-3.2 trigger shapes, as a defense-in-depth belt-and-suspenders
 #          check even though #54 already proves escalate_peer_coordination_degraded()
 #          no longer goes through the vulnerable construct at all: a bare
