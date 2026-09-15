@@ -1089,9 +1089,11 @@ pub fn drain_exit_code(then_exit: bool) -> i32 {
 /// The two terminal actions **must** produce visibly different lines — a host
 /// log has to say which one fired without the reader guessing. Extracted as a
 /// pure function so that distinctness is a test assertion rather than a
-/// convention. `supervisor` is only interpolated on the relaunch line.
+/// convention. `supervisor` and `verify_poll_secs` are only interpolated on
+/// the relaunch line (`verify_poll_secs` is unused on the `then_exit` branch —
+/// there is no relaunch to verify there).
 #[must_use]
-pub fn drain_complete_log_line(then_exit: bool, supervisor: &str) -> String {
+pub fn drain_complete_log_line(then_exit: bool, supervisor: &str, verify_poll_secs: u64) -> String {
     if then_exit {
         format!(
             "drain complete — 0 in-flight sweeps; exiting {EXIT_SHUTDOWN} and staying down \
@@ -1100,9 +1102,38 @@ pub fn drain_complete_log_line(then_exit: bool, supervisor: &str) -> String {
     } else {
         format!(
             "drain complete — 0 in-flight sweeps; exiting {EXIT_RESTART} for a \
-             {supervisor}-supervised relaunch. No sweep was killed; no orphan left behind."
+             {supervisor}-supervised relaunch. No sweep was killed; no orphan left behind. \
+             {}",
+            relaunch_verify_note(supervisor, verify_poll_secs)
         )
     }
+}
+
+/// The shared "here is what confirms this relaunch, and by when" sentence
+/// appended to every in-process drain-and-restart exit that expects a
+/// relaunch (Issue #6969 AC2 — the auto-update roll's own "drain-and-restart
+/// triggered" note states the expected relaunch path and the verifier's
+/// bound, so a future gap like the one this issue observed — a launchd
+/// relaunch that took ~4 minutes — is attributable from the log alone).
+///
+/// Extracted as a pure function (same rationale as [`drain_complete_log_line`]
+/// and [`drain_timeout_refuse_note`]) so the exact wording is a test
+/// assertion.
+#[must_use]
+pub fn relaunch_verify_note(supervisor: &str, verify_poll_secs: u64) -> String {
+    let mechanism = if supervisor.eq_ignore_ascii_case("launchd") {
+        "launchd KeepAlive.SuccessfulExit"
+    } else if supervisor.eq_ignore_ascii_case("systemd") {
+        "systemd Restart=on-success"
+    } else {
+        "the supervisor's own relaunch-on-success policy"
+    };
+    format!(
+        "Expected relaunch path: {mechanism}. A detached `restart --verify-only` child will \
+         confirm a new, live pid within {verify_poll_secs}s or self-heal \
+         (kickstart/reset-failed+start); the unattended watchdog poll (~300s) is the outer bound \
+         if that also fails to confirm."
+    )
 }
 
 /// The operator-facing note recorded (and logged) when a drain times out and
@@ -1209,6 +1240,17 @@ async fn run_drain_supervisor(
     my_generation: u64,
     poll_interval: Duration,
 ) {
+    // Issue #6969: the bound a detached post-exit verifier polls against,
+    // resolved once per supervisor rather than per tick — it is a plain env
+    // read (`LOOM_DAEMON_RESTART_POLL_SECS`, default 30s), the same knob
+    // `restart_verify::verify_and_heal` itself resolves, so the log line and
+    // the verifier it describes can never disagree about the bound.
+    let verify_poll_secs = crate::restart_verify::resolve_secs(
+        std::env::var(crate::restart_verify::POLL_SECS_ENV)
+            .ok()
+            .as_deref(),
+        crate::restart_verify::DEFAULT_POLL_SECS,
+    );
     loop {
         // Superseded / aborted: a newer drain or an abort bumped the generation,
         // so this supervisor is stale — stop WITHOUT ending the process. This is
@@ -1243,7 +1285,7 @@ async fn run_drain_supervisor(
                     serde_json::json!({ "in_flight": 0, "then_exit": then_exit }),
                 );
                 if then_exit {
-                    log::warn!("{}", drain_complete_log_line(true, ""));
+                    log::warn!("{}", drain_complete_log_line(true, "", verify_poll_secs));
                     std::process::exit(drain_exit_code(true));
                 }
                 // This path only runs after `handle_drain_request` proved
@@ -1251,7 +1293,15 @@ async fn run_drain_supervisor(
                 // here; fall back to a generic label rather than hardcoding
                 // launchd if the environment somehow changed underneath us.
                 let sup = detect_supervisor().unwrap_or_else(|| "supervisor".to_string());
-                log::warn!("{}", drain_complete_log_line(false, &sup));
+                log::warn!("{}", drain_complete_log_line(false, &sup, verify_poll_secs));
+                // Issue #6969: spawn the detached post-exit verifier BEFORE
+                // exiting — see `restart_verify::spawn_detached_verifier`'s doc
+                // for why it cannot run in-band here. `pre_pid` is this
+                // process's own pid: the supervisor's current record of the
+                // daemon that is about to exit.
+                if let Some(supervisor) = crate::restart_verify::Supervisor::parse(&sup) {
+                    crate::restart_verify::spawn_detached_verifier(supervisor, std::process::id());
+                }
                 std::process::exit(drain_exit_code(false));
             }
             DrainTick::TimedOutRefuse => {
@@ -1345,10 +1395,20 @@ async fn run_drain_supervisor(
                     );
                     std::process::exit(drain_exit_code(true));
                 }
+                // Same detection/fallback as the `DrainTick::Complete` relaunch
+                // branch above; this path only reaches here after
+                // `handle_drain_request` already proved supervision.
+                let sup = detect_supervisor().unwrap_or_else(|| "supervisor".to_string());
                 log::warn!(
                     "drain timed out with {in_flight} in-flight; --force-after-timeout cancelled \
-                     {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch"
+                     {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch. {}",
+                    relaunch_verify_note(&sup, verify_poll_secs)
                 );
+                // Issue #6969: same detached post-exit verifier as the
+                // `DrainTick::Complete` relaunch branch above.
+                if let Some(supervisor) = crate::restart_verify::Supervisor::parse(&sup) {
+                    crate::restart_verify::spawn_detached_verifier(supervisor, std::process::id());
+                }
                 std::process::exit(drain_exit_code(false));
             }
         }
@@ -10088,13 +10148,38 @@ exit 0
     /// `run_drain_supervisor`'s `DrainTick::Complete` arm emits.
     #[test]
     fn test_drain_complete_log_lines_remain_distinct() {
-        let then_exit_line = drain_complete_log_line(true, "launchd");
-        let relaunch_line = drain_complete_log_line(false, "launchd");
+        let then_exit_line = drain_complete_log_line(true, "launchd", 30);
+        let relaunch_line = drain_complete_log_line(false, "launchd", 30);
         assert_ne!(then_exit_line, relaunch_line);
         assert!(then_exit_line.contains("staying down"));
         assert!(then_exit_line.contains("143"));
         assert!(relaunch_line.contains("supervised relaunch"));
         assert!(!relaunch_line.contains("staying down"));
+    }
+
+    /// Issue #6969 AC2 — the relaunch line states BOTH the expected relaunch
+    /// path (which supervisor mechanism) and the detached verifier's bound, so
+    /// a future gap (the ~4-minute launchd observation this issue records) is
+    /// attributable from the log alone.
+    #[test]
+    fn test_drain_complete_log_line_states_relaunch_path_and_verifier_bound() {
+        let relaunch_line = drain_complete_log_line(false, "launchd", 45);
+        assert!(relaunch_line.contains("launchd"));
+        assert!(relaunch_line.contains("KeepAlive"));
+        assert!(relaunch_line.contains("45s"));
+        assert!(relaunch_line.contains("verify-only"));
+        // The then_exit branch has no relaunch to verify, so it must not carry
+        // the note even though a bound is technically passed in.
+        let then_exit_line = drain_complete_log_line(true, "launchd", 45);
+        assert!(!then_exit_line.contains("verify-only"));
+    }
+
+    #[test]
+    fn test_relaunch_verify_note_names_path_and_bound() {
+        let note = relaunch_verify_note("systemd", 30);
+        assert!(note.contains("systemd"));
+        assert!(note.contains("30s"));
+        assert!(note.contains("watchdog"));
     }
 
     /// Issue #5340 (AC: the `TimedOutRefuse` message names the exact local

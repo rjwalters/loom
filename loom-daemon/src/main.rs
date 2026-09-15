@@ -545,6 +545,30 @@ enum Commands {
         /// non-launchd host.
         #[arg(long)]
         reload_supervisor: bool,
+        /// **Internal use only** (Issue #6969): run ONLY the post-restart
+        /// relaunch verification + self-heal (`restart_verify::verify_and_heal`)
+        /// against the given `--verify-supervisor` / `--verify-pre-pid`, without
+        /// sending any request to a daemon. This is what
+        /// `restart_verify::spawn_detached_verifier` execs as a DETACHED child
+        /// right before an in-process `DrainAndRestartDaemon` exit (the
+        /// autonomous self-update roll, most notably): a verification poll
+        /// cannot run *inside* the process that is about to exit (see
+        /// `restart_verify.rs`'s module doc), so it runs here instead, in a
+        /// separate process that survives the parent's exit. Requires
+        /// `--verify-supervisor` and `--verify-pre-pid`. Not a stable/documented
+        /// CLI surface — hidden from `--help`.
+        #[arg(long, hide = true)]
+        verify_only: bool,
+        /// Supervisor to verify against with `--verify-only` (`launchd` or
+        /// `systemd`) — the exiting process's own authoritative
+        /// `detect_supervisor()` reading, passed through rather than
+        /// re-detected in the child.
+        #[arg(long, hide = true)]
+        verify_supervisor: Option<String>,
+        /// The exiting process's own pid, so `--verify-only` can tell "a NEW
+        /// pid showed up" apart from "the old process is still mid-teardown".
+        #[arg(long, hide = true)]
+        verify_pre_pid: Option<u32>,
     },
 
     /// Manage the multi-account OAuth token pool at `.loom/tokens/` (Issue
