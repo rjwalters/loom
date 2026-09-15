@@ -68,7 +68,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use crate::main_health_gate::is_ignorable_dirt_with_readers;
-use crate::quarantine_stash_status::QUARANTINE_STASH_LABEL;
+use crate::quarantine_stash_status::{self, StashOrigin, QUARANTINE_STASH_LABEL};
 
 /// How far back through a path's history [`superseding_commit`] will look for
 /// a commit whose blob at that path is byte-identical to the stash's. Bounded
@@ -165,21 +165,22 @@ fn parse_label_tokens(label: &str) -> (Option<u64>, Option<String>) {
     (issue, run_id)
 }
 
-/// Enumerate every `loom-quarantine:` stash in `repo_root`'s reflog. Returns
-/// an empty vec (not an error) when `refs/stash` does not exist at all,
-/// mirroring `check-quarantine-stashes.sh`'s treatment of "no stashes" as the
-/// normal steady state rather than a failure.
-pub fn list_quarantine_stashes(repo_root: &Path) -> Result<Vec<QuarantineStashEntry>, String> {
+/// Read `refs/stash`'s reflog via `git log -g --format=<fmt> refs/stash` in
+/// `repo_root`. Returns an empty string (not an error) when `refs/stash`
+/// does not exist at all — the "no stashes" steady state — shared by
+/// [`list_quarantine_stashes`] and [`list_all_stashes`] so both commands
+/// agree on exactly what "no `refs/stash`" means.
+fn stash_reflog(repo_root: &Path, format: &str) -> Result<String, String> {
     let verify = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", "refs/stash"])
         .current_dir(repo_root)
         .output()
         .map_err(|e| format!("failed to spawn `git rev-parse`: {e}"))?;
     if !verify.status.success() {
-        return Ok(Vec::new());
+        return Ok(String::new());
     }
     let output = Command::new("git")
-        .args(["log", "-g", "--format=%gd|%H|%cr|%gs", "refs/stash"])
+        .args(["log", "-g", &format!("--format={format}"), "refs/stash"])
         .current_dir(repo_root)
         .output()
         .map_err(|e| format!("failed to spawn `git log -g`: {e}"))?;
@@ -190,7 +191,82 @@ pub fn list_quarantine_stashes(repo_root: &Path) -> Result<Vec<QuarantineStashEn
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(parse_quarantine_reflog(&String::from_utf8_lossy(&output.stdout)))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Enumerate every `loom-quarantine:` stash in `repo_root`'s reflog. Returns
+/// an empty vec (not an error) when `refs/stash` does not exist at all,
+/// mirroring `check-quarantine-stashes.sh`'s treatment of "no stashes" as the
+/// normal steady state rather than a failure.
+pub fn list_quarantine_stashes(repo_root: &Path) -> Result<Vec<QuarantineStashEntry>, String> {
+    let reflog = stash_reflog(repo_root, "%gd|%H|%cr|%gs")?;
+    Ok(parse_quarantine_reflog(&reflog))
+}
+
+// ============================================================================
+// Origin-labeled enumeration of EVERY `refs/stash` entry (#5512)
+// ============================================================================
+
+/// One `refs/stash` entry of ANY origin — the superset
+/// [`list_quarantine_stashes`] narrows down to the `loom-quarantine:`-labeled
+/// subset. #5512's residual widening: `stashes list`/`retire` previously only
+/// ever looked at (or reported on) that narrower subset, so an operator
+/// pre-resync stash, an agent's ad-hoc WIP, or an Auditor drift-shelf entry
+/// sitting on the same shared `refs/stash` stack was invisible to both
+/// commands — exactly the shape that hid the #6129 quiesce work whose
+/// half-applied pop broke `spawn-claude.sh` (#6162).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnyStashEntry {
+    /// See [`QuarantineStashEntry::stash_ref`] — same "display/ordering
+    /// only, not a durable identity" caveat applies here.
+    pub stash_ref: String,
+    /// See [`QuarantineStashEntry::commit`].
+    pub commit: String,
+    /// See [`QuarantineStashEntry::age`].
+    pub age: String,
+    /// The raw reflog subject text (`"On <branch>: ..."` / `"WIP on
+    /// <branch>: ..."`), unmodified — the same text
+    /// [`quarantine_stash_status::classify_stash_origin`] was fed to produce
+    /// [`Self::origin`].
+    pub subject: String,
+    /// This entry's origin, per
+    /// [`quarantine_stash_status::classify_stash_origin`].
+    pub origin: StashOrigin,
+}
+
+fn parse_all_stash_reflog(reflog: &str) -> Vec<AnyStashEntry> {
+    reflog
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '|');
+            let stash_ref = parts.next()?.to_string();
+            let commit = parts.next()?.to_string();
+            let age = parts.next()?.to_string();
+            let subject = parts.next()?.to_string();
+            let origin = quarantine_stash_status::classify_stash_origin(&subject);
+            Some(AnyStashEntry {
+                stash_ref,
+                commit,
+                age,
+                subject,
+                origin,
+            })
+        })
+        .collect()
+}
+
+/// Enumerate EVERY `refs/stash` entry in `repo_root`, of any origin, each
+/// labeled via [`quarantine_stash_status::classify_stash_origin`] (#5512).
+///
+/// **Never used as retirement input.** Only [`list_quarantine_stashes`]'s
+/// narrower `loom-quarantine:` subset — a different, `QuarantineStashEntry`
+/// -typed collection — ever reaches [`classify_stash`] /
+/// [`plan_and_execute_retirement`], so an [`AnyStashEntry`] this function
+/// returns is structurally impossible to auto-retire: there is no function
+/// in this module whose signature even accepts one.
+pub fn list_all_stashes(repo_root: &Path) -> Result<Vec<AnyStashEntry>, String> {
+    let reflog = stash_reflog(repo_root, "%gd|%H|%cr|%gs")?;
+    Ok(parse_all_stash_reflog(&reflog))
 }
 
 // ============================================================================
@@ -922,6 +998,79 @@ stash@{5}|fff666|5 days ago|On main: loom-quarantine: unattributed\n\
     #[test]
     fn parse_quarantine_reflog_empty_input_is_empty_output() {
         assert!(parse_quarantine_reflog("").is_empty());
+    }
+
+    // ---------- origin-labeled enumeration of every entry (#5512) ----------
+
+    /// The same six-entry reflog as
+    /// [`parse_quarantine_reflog_filters_to_labeled_entries_only`] above —
+    /// but here every entry is expected back, each labeled by origin,
+    /// instead of only the three `loom-quarantine:` ones.
+    #[test]
+    fn parse_all_stash_reflog_labels_every_entry_by_origin() {
+        let reflog = "\
+stash@{0}|aaa111|4 hours ago|WIP on feature/issue-5654: 0e703af1 docs: update WORK_LOG\n\
+stash@{1}|bbb222|23 hours ago|On feature/issue-5577: judge-5584: parking pre-existing staged reversion\n\
+stash@{2}|ccc333|1 day ago|On main: auditor: stray package-lock.json diff before sync\n\
+stash@{3}|ddd444|4 hours ago|On main: loom-quarantine: issue=5388\n\
+stash@{4}|eee555|5 days ago|On main: loom-quarantine: run=sweep-20260804T023938Z-79774 issue=5187\n\
+stash@{5}|fff666|5 days ago|On main: loom-quarantine: unattributed\n\
+";
+        let entries = parse_all_stash_reflog(reflog);
+        assert_eq!(
+            entries.len(),
+            6,
+            "every entry must be returned, not just the quarantine subset"
+        );
+
+        assert_eq!(entries[0].stash_ref, "stash@{0}");
+        assert_eq!(entries[0].origin, StashOrigin::AgentWip);
+        assert_eq!(entries[1].origin, StashOrigin::AgentWip);
+        assert_eq!(entries[2].origin, StashOrigin::Auditor);
+        assert_eq!(entries[3].origin, StashOrigin::Quarantine);
+        assert_eq!(entries[4].origin, StashOrigin::Quarantine);
+        assert_eq!(entries[5].origin, StashOrigin::Quarantine);
+    }
+
+    #[test]
+    fn parse_all_stash_reflog_empty_input_is_empty_output() {
+        assert!(parse_all_stash_reflog("").is_empty());
+    }
+
+    #[test]
+    fn list_all_stashes_enumerates_every_origin_in_a_real_repo() {
+        let repo = TestRepo::new();
+        repo.write("README.md", "hello\n");
+        repo.commit_all("initial");
+
+        repo.write("README.md", "hello\nquarantined\n");
+        repo.quarantine_stash("issue=42");
+
+        repo.write("README.md", "hello\nan operator's own local edit\n");
+        run(
+            repo.path(),
+            &[
+                "stash",
+                "push",
+                "-u",
+                "-m",
+                "loom-install: preserving user changes before --quick reinstall",
+            ],
+        );
+
+        let entries = list_all_stashes(repo.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        let origins: Vec<StashOrigin> = entries.iter().map(|e| e.origin).collect();
+        assert!(origins.contains(&StashOrigin::Quarantine));
+        assert!(origins.contains(&StashOrigin::Operator));
+    }
+
+    #[test]
+    fn list_all_stashes_on_a_repo_with_no_stash_ref_is_empty_not_an_error() {
+        let repo = TestRepo::new();
+        repo.write("README.md", "hello\n");
+        repo.commit_all("initial");
+        assert!(list_all_stashes(repo.path()).unwrap().is_empty());
     }
 
     // ---------- generated-artifact classification ----------

@@ -2930,6 +2930,21 @@ pub struct RepoStatus {
     /// compatible.
     #[serde(default)]
     pub stash_oldest_age_secs: Option<u64>,
+    /// Of the non-quarantine entries in this repo's `refs/stash`, how many
+    /// are NOT [`crate::quarantine_stash_status::is_presumed_recoverable`]
+    /// (Issue #5512) — i.e. every origin except Auditor's regenerable drift
+    /// shelf. A nonzero count means there is at least one stash on this
+    /// repo's stack whose content exists nowhere else that `status` can
+    /// see (an operator pre-resync stash, an agent's ad-hoc WIP, …).
+    /// `#[serde(default)]` keeps pre-#5512 wire data compatible.
+    #[serde(default)]
+    pub stash_non_quarantine_unrecoverable_count: usize,
+    /// Age, in seconds, of the OLDEST entry counted in
+    /// `Self::stash_non_quarantine_unrecoverable_count` (Issue #5512) —
+    /// `None` when that count is 0. `#[serde(default)]` keeps pre-#5512
+    /// wire data compatible.
+    #[serde(default)]
+    pub stash_non_quarantine_unrecoverable_oldest_age_secs: Option<u64>,
     /// Whether `root` is missing `.claude/commands/loom/sweep.md` (Issue
     /// #5682) — i.e. `!SweepRegistryConfig::new(root).has_sweep_command()`,
     /// recomputed live at every status snapshot (not just once at
@@ -3857,6 +3872,8 @@ mod tests {
             stash_total_count: 0,
             stash_quarantine_count: 0,
             stash_oldest_age_secs: None,
+            stash_non_quarantine_unrecoverable_count: 0,
+            stash_non_quarantine_unrecoverable_oldest_age_secs: None,
             sweep_command_missing: false,
         }
     }
