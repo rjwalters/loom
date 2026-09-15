@@ -5595,6 +5595,66 @@ assert_deny_reason_matches "write-confinement (#6953): plain-literal-valued doub
 # recognize it as safe, and ALLOW would flip back to a fail-closed DENY --
 # failing these tests too. No separate negative assertion is needed.
 
+# -------------------------------------------------------------------------
+# #7356: Curator-revised diagnosis for the highest-volume guard-decision
+# telemetry pattern -- a real log line (`.loom/logs/guard-decisions.log`,
+# ts=2026-09-08T00:50:21Z) denied `worktree-write-confinement-unresolved-var`
+# on a write target of `"$D/comments.json";` -- a trailing `;` glued onto an
+# otherwise-resolvable same-command mktemp write target. The Curator's
+# 2026-09-08T05:16Z hypothesis: qsplit()'s "span carries a command
+# substitution, keep separators active" branch loses track of its own
+# already-located closing quote once a double-quoted span CONTAINING that
+# span's own inner `$((` (bash arithmetic expansion, e.g.
+# `"@$((NOW-120))"` inside `F1=$(date -u -d "@$((NOW-120))" +"...")`)
+# is scanned earlier in the same command -- reprocessing the real closing
+# quote as a fresh quote-open and desyncing quote-parity forward, corrupting
+# a LATER write target.
+#
+# Traced and CONFIRMED as a real (now historical) defect: this is the exact
+# root cause already fixed by #6956 (closing #6953, merged 2026-09-08
+# 17:51 -- about 12.5 hours AFTER the Curator's revision, but before this
+# issue was picked up) -- see that commit's own header, which independently
+# describes the identical mechanism ("qsplit()'s...branch emitted only the
+# OPENING quote character and fell through the main loop with no memory of
+# being inside a quote, so the span's REAL, already-located closing quote
+# was mistaken for a brand-new quote-open on the next iteration"). #6472
+# (merged earlier) fixed the same qsplit() defect for a differently-shaped
+# trigger (a `$((...))`-carrying `sed -n` script piped to a later segment).
+#
+# Verified directly against the CURRENT tokenizer (`bash
+# defaults/hooks/guard-destructive-generic.sh` fed the log line's exact
+# command, standalone `awk -f`'d `_QSPLIT_AWK` snippet, and this suite's own
+# `$WT_REPO` fixture): the exact reproduced command no longer false-denies
+# `worktree-write-confinement-unresolved-var`. Replaying the FULL,
+# unmodified log-line command (including its `rm -f "$D"/post-count
+# "$D"/post-*.body`) now denies for a DIFFERENT, correct reason instead --
+# `rm-scope-unresolved-var` -- because rm-scope's OWN same-command mktemp
+# resolver (`rm_scope_mktemp_same_command_safe()`, #6520) deliberately
+# excludes a SUFFIXED rm target (`$NAME/sub`, not a bare `$NAME`/`${NAME}`)
+# from its fast path (see that function's own header doc) -- a documented,
+# pre-existing, unrelated scope limitation, not a bug this issue tracks. No
+# hook-logic changes are needed; these are pin/regression tests only.
+D_MKTEMP_ARITH_SEGMENTS='NOW=$(date -u +%s) && F1=$(date -u -d "@$((NOW-120))" +"%Y-%m-%dT%H:%M:%SZ") && F2=$(date -u -d "@$((NOW-60))" +"%Y-%m-%dT%H:%M:%SZ")'
+
+assert_allow "write-confinement (#7356): mktemp-resolved write target, preceded by TWO \$((...))-containing double-quoted assignment spans in the same command, ';'-terminated -> allows (the exact false-positive shape from the cited log line, now fixed by #6953/#6472)" \
+    "D=\$(mktemp -d) && echo first > \"\$D/gh\" && $D_MKTEMP_ARITH_SEGMENTS && echo second > \"\$D/comments.json\"; echo done" \
+    "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#7356): literal in-repo \$D write target, preceded by the same \$((...))-containing spans -> still denies with the INTACT resolved target (not the '\"\$D/comments.json\";' corrupted splice)" \
+    "D=$WT_REPO/defaults/hooks && $D_MKTEMP_ARITH_SEGMENTS && echo second > \"\$D/comments.json\"; echo done" \
+    "defaults/hooks/comments\.json" "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#7356 fail-open check): a genuinely UNRESOLVABLE \$VAR write target, preceded by the same \$((...))-containing spans, still fails closed with the INTACT target (not corrupted, not silently allowed)" \
+    "$D_MKTEMP_ARITH_SEGMENTS && echo pwned > \"\$NEVER_ASSIGNED_7356/evil.sh\"; echo done" \
+    'write target '"'"'\$NEVER_ASSIGNED_7356/evil\.sh'"'"'' "$WT_REPO"
+
+# Pin the FULL, byte-for-byte log-line command (ts=2026-09-08T00:50:21Z) as a
+# regression fixture: it must deny (never silently allow), and the reason
+# must be the rm-scope check -- not a reversion to the write-confinement
+# false positive this issue was filed against.
+GUARD_LOG_LINE_CMD_7356='D=$(mktemp -d) && sed -n '"'"'118,195p'"'"' defaults/scripts/tests/test-sweep-lease-publish.sh > "$D/gh" && chmod +x "$D/gh" && export LOOM_TEST_STUB_DIR="$D" PATH="$D:$PATH" LOOM_HOST_ID="studio-host" && NOW=$(date -u +%s) && F1=$(date -u -d "@$((NOW-120))" +"%Y-%m-%dT%H:%M:%SZ") && F2=$(date -u -d "@$((NOW-60))" +"%Y-%m-%dT%H:%M:%SZ") && jq -n --arg p "XXX" --arg o "XXX" '"'"'[{updated_at:$p, body:"<!-- loom:lease host=peer-host sweep=sweep-peer-1 -->\nprose"},{updated_at:$o, body:"<!-- loom:lease host=host-471642b3 sweep=sweep-old-local -->\nprose"}]'"'"' > "$D/comments.json" && ./defaults/scripts/sweep-lease-publish.sh publish 6320 --sweep-id sweep-run-NEW; echo "RC=$?"; echo "posts=$(cat "$D/post-count" 2>/dev/null || echo 0)"; echo "--- now malformed-freshest case ---"; rm -f "$D"/post-count "$D"/post-*.body; jq -n --arg p "XXX" --arg o "XXX" '"'"'[{updated_at:$p, body:"<!-- loom:lease host=peer-host sweep=sweep-peer-1 -->\nprose"},{updated_at:$o, body:"<!-- loom:lease host=broken-no-close\nprose"}]'"'"' > "$D/comments.json"; ./defaults/scripts/sweep-lease-publish.sh publish 6320 --sweep-id sweep-run-NEW; echo "RC=$?"; echo "posts=$(cat "$D/post-count" 2>/dev/null || echo 0)"; rm -rf "$D"'
+assert_deny_reason_matches "write-confinement (#7356): FULL cited log-line command (ts=2026-09-08T00:50:21Z) denies for a DIFFERENT, correct reason (rm-scope, #6520's documented suffixed-target exclusion) -- not the write-confinement false positive this issue tracked" \
+    "$GUARD_LOG_LINE_CMD_7356" \
+    '^BLOCKED: rm target' "$WT_REPO"
+
 # CONFLICTING ASSIGNMENTS POISON THE VARIABLE (#4914 review). The assignment
 # scan is not control-flow aware -- qsplit() flattens `||`/`&&`/`;` into plain
 # segments -- so `A=<in-repo> || A=/tmp/outside` reaches record_assign() as two
