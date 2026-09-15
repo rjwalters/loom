@@ -7,6 +7,31 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-15
+- **Issue #7721** (closed): classify-dependency-block.sh fails bash 3.2 parse, blocking resync-installed.sh on all macOS hosts
+- **PR #7722**: fix: make classify-dependency-block.sh parse under bash 3.2 (unblocks resync on macOS)
+- **Issue #5660** (closed): Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe
+- **PR #7683**: ci: add warn-only guard-destructive vendored/canonical drift check
+- **Issue #7430** (closed): [Epic #6896] Phase 3: Per-sweep resource limits and containment observability
+- **PR #7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
+- **Issue #7706** (closed): merge-pr.sh silently exits 1 on any loom:pr PR with comments but no champion:hold-state marker (pipefail + set -e bug)
+- **Issue #7515** (closed): Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292
+- **PR #7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
+- **Issue #7713** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **PR #7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
+- **Issue #7530** (closed): Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip
+- **PR #7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
+- **Issue #7522** (closed): tokens: readmit session-limit accounts when the 5h window resets instead of holding them for the 6h exhaustion cooldown
+- **PR #7536**: tokens: expire session-limit bad-marks with their own 5h window
+- **Issue #7590** (closed): worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility
+- **PR #7594**: fix: back off and surface permanently-failing worktree removals (#7590)
+- **Issue #7697** (closed): peer-claim coordination is DEGRADED on robb-studio (#6157 Layer 3)
+- **PR #7692**: docs(daemon): design record for roster-driven role-runner shard assignment (#6704)
+- **Issue #7665** (closed): champion-pr-merge.md: one remaining 'for file in $FILES' loop (line 1092) breaks under zsh
+- **PR #7669**: fix(champion-pr-merge): convert remaining for-loop to zsh-safe while-read
+- **Issue #7359** (closed): merge=ours driver on .loom/install-metadata.json can silently drop non-loom_version field edits during rebase, uncaught by version-check-gate.sh
+- **PR #7704**: docs: document install-metadata.json fields beyond loom_version are ungated
+- **Issue #7701** (closed): merge-pr.sh: set -euo pipefail + grep -o with no match silently kills every merge (champion hold-state check)
+- **Issue #7702** (closed): merge-pr.sh: _check_champion_hold_state_staleness silently aborts EVERY merge via set -e + pipefail on grep-no-match (regression in #7435, fleet-wide)
 - **Issue #7672** (closed): daemon: --claim-owned dispatch should own lease renewal (prose-mandated Step 1a skipped once → 2.5h fleet thrash + shared-worktree near-miss)
 - **PR #7693**: feat(daemon): start the lease-renewal loop from --claim-owned dispatch code (#7672)
 - **Issue #7647** (closed): Judge: reconcile paginated formal reviews and inline threads before approval
