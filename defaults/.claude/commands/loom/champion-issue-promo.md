@@ -605,7 +605,10 @@ mechanism, no human step.
 ### 6. Quality Standards
 - [ ] Proposal adds meaningful context (not just reformatting)
 - [ ] Technical details are accurate
-- [ ] References to code/files are correct
+- [ ] References to code/files are correct — for Architect/Hermit proposals (which
+      skip Curator's own cited-path check), confirm the proposer ran
+      `./.loom/scripts/verify-proposal-refs.sh` on the body before filing (#7658);
+      if it wasn't run, re-run it yourself against the issue body before promoting
 
 ### 7. Risk Assessment
 - [ ] Breaking changes are clearly marked
@@ -614,7 +617,10 @@ mechanism, no human step.
 
 ### 8. Completeness
 - [ ] All relevant sections are filled (problem, solution, acceptance criteria)
-- [ ] Code references include file paths and line numbers
+- [ ] Code references include file paths and line numbers — same
+      `verify-proposal-refs.sh` check as criterion 6 above (#7658): a miss here
+      means the proposal cites a path/line that does not exist on `origin/main`,
+      or a false "tracked" file-count claim
 - [ ] Test strategy is outlined
 
 ---
