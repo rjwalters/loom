@@ -75,6 +75,20 @@
 //! static scheme avoids by construction — two hosts with different views of
 //! roster membership disagree about the ring *size*, and therefore about every
 //! workspace's owner, not just the departed host's slice.
+//!
+//! **The design for #6704 has now been recorded** (but *not* implemented — this
+//! module is still the static ring described above): `defaults/docs/role-runner-roster.md`
+//! selects a forge-backed roster (one marker comment per host, liveness from
+//! the comment's forge-assigned `updated_at`, as with lease records) plus a
+//! generation-fenced ring — a host acts only under the newest membership
+//! generation it has observed, and only once that generation has been settled
+//! for a full role-tick interval, so a membership disagreement yields instead
+//! of duplicating. When it lands it changes only the *source* of
+//! `(index, count)` in [`ShardPosture::Sharded`]; [`hash_key`], [`owns`], and
+//! the static env pair (which stays as the higher-precedence escape hatch) are
+//! untouched.
+//!
+//! [`owns`]: ShardPosture::owns
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
