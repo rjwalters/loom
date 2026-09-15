@@ -68,6 +68,7 @@ set -euo pipefail
 # orphan.
 ORPHAN_ALLOWLIST=(
   "survey-*.md" # dated one-off survey notes (e.g. survey-orca-2026-07-31.md) — repo-local, never shipped
+  "file-size-policy.md" # governs loom's OWN source; its gate lives in scripts/, not defaults/scripts/, so it never ships (#7711)
 )
 
 is_allowlisted() {
