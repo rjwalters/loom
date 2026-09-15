@@ -126,6 +126,7 @@ test-install-sync-labels.sh
 test-judge-fallback-cap.sh
 test-judge-fanout-experiment.sh
 test-label-preflight.sh
+test-land-resync-commit.sh
 test-live-state-sandbox.sh
 test-locate-daemon-bin.sh
 test-loom-daemon-launchd-plist.sh
