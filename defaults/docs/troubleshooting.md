@@ -2190,7 +2190,13 @@ cd <main checkout>                              # NOT .loom/worktrees/issue-N (#
 git merge --ff-only origin/main                 # bring defaults/ current
 ./.loom/scripts/resync-installed.sh --dry-run   # preview what would change (exits 2 on drift)
 ./.loom/scripts/resync-installed.sh             # apply
+./.loom/scripts/land-resync-commit.sh           # commit + land it (never rebases/bypass-pushes, #6646)
 ```
+
+The last step is what actually commits and pushes the refreshed surfaces onto
+the primary clone's default branch — see "Landing a resync commit on the
+primary clone (#6646)" below for exactly what it will and will not do on its
+own.
 
 `--dry-run` makes no changes and exits `2` when drift is detected (so it doubles
 as a check). To pin an intentional per-repo customization so resync never
@@ -2242,3 +2248,82 @@ The same list also declares a file **repo-owned**, so the installer's reinstall
 clean sweep never deletes it — see
 [`repo-owned-files.md`](repo-owned-files.md) for the full ownership rule that
 governs files living inside `.loom/hooks/` and the other managed directories.
+
+### Landing a resync commit on the primary clone (#6646)
+
+**`resync-installed.sh` itself never commits or pushes anything** (see its own
+header) — it only refreshes the installed copies and, when that leaves the
+tree dirty with nothing but resync output, PRINTS a suggested `git add && git
+commit` command. **Actually landing that commit onto the primary clone's
+default branch — including pushing it — is a sweep/agent action, not a config
+toggle or an operator-approval gate**: any sweep or role that finds the
+primary checkout dirty with only resync-managed output may commit and push it
+directly, no human sign-off required. This is deliberate — keeping the
+installed surfaces current is routine maintenance, and gating every one behind
+a human would defeat the point of automating it.
+
+The **landing** step itself always goes through
+`./.loom/scripts/land-resync-commit.sh` (never a hand-rolled `git commit && git
+push`), which is intentionally conservative about how far it will go on its
+own:
+
+- It only ever commits paths inside the known resync-managed surfaces
+  (`.loom/hooks|scripts|roles|docs|bin|runtimes/`, `.claude/commands/loom/`,
+  and the handful of single-file targets `resync-installed.sh` itself
+  resyncs). If the tree is dirty with anything else alongside that output, it
+  refuses to commit **anything** — an unrelated (possibly in-progress
+  operator) change is never swept into a "chore: resync" commit.
+- **It never rebases the primary clone's default branch, and it never
+  force- or bypass-pushes to reconcile with a diverged `origin`.** This is
+  the direct fix for the incident that motivated this script: an operator
+  had just fast-forward-landed a not-yet-pushed local commit in the primary
+  clone when a sweep committed its own resync change on top, rebased local
+  `main` onto `origin/main` (which had gained several merged PRs in the
+  meantime — silently re-creating the operator's commit under a new SHA),
+  and bypass-pushed the result past the branch's required status checks.
+  Nothing was actually lost (the recreated commit had identical content),
+  but the operator's recorded SHA vanished from `git log`, a
+  branch-protection bypass push happened from automation with no
+  announcement, and establishing that this was benign took a reflog read.
+- Concretely: if the primary checkout's default branch is already ahead of
+  `origin` by one or more commits **not authored by the checkout's own
+  configured git identity** (`git config user.email` — presumed to be an
+  operator's own in-flight, not-yet-pushed work), the script commits the
+  resync change locally and **stops** — nothing is pushed, nothing is
+  rebased, nothing is forced. The operator's commit SHA is left exactly as
+  they made it. A human has to push or reconcile by hand before the next
+  resync can land (exit code `3`; the script's own stderr names the commit(s)
+  it stopped for).
+- Otherwise — every commit ahead of `origin` is this checkout's own
+  automation — it attempts a plain `git push`, which ordinary git semantics
+  make fast-forward-only by construction. If that push is rejected (`origin`
+  advanced with commits this checkout doesn't have yet, or the forge's
+  branch protection requires a PR rather than a direct push), it does
+  **not** retry with a rebase or a forced push: it lands the commit via a
+  short-lived `chore/resync-installed-<timestamp>` branch + PR instead — the
+  same path (`create-pr.sh`) other automated commits already use — then
+  resets the primary checkout's default branch back to `origin`'s current
+  tip so it never sits diverged waiting on that PR to merge.
+
+**How to tell "expected" from "something rewrote my branch".** Since this
+script never rebases, a commit already on the default branch — yours or
+anyone else's — keeps its original SHA forever; a resync landing never
+recreates it. If you ever see the primary clone's default branch move in a
+way you didn't expect (a SHA you just recorded is no longer in `git log`, or
+`git status` reports it's diverged from `origin` after you left the checkout
+untouched), the reflog is the fastest way to establish whether it's benign:
+
+```bash
+git reflog show <default-branch>   # every ref update this local checkout has seen, newest first
+```
+
+Look for an entry whose message is `commit: chore: resync installed Loom
+surfaces` (a fresh commit — the direct-push case above) versus one that reads
+`pull --ff-only` / `merge <sha>: Fast-forward` (an ordinary fast-forward
+picking up someone else's merged PR — also benign). A `rebase (finish):` or
+`reset:` entry immediately preceding a SHA change is the signature this
+script is specifically designed never to produce for the default branch — if
+you see one, it did **not** come from `land-resync-commit.sh`; track down
+what did. If a commit's SHA legitimately changed for some other reason,
+`git diff <old-sha> <new-sha>` being empty confirms the content is identical
+(the #6646 incident's actual outcome) even though the identity changed.
