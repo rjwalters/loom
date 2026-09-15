@@ -243,7 +243,12 @@ regresses installs that have no reason to want it.
 - **Containment becomes the *default* on Linux fleet hosts after a defined
   soak period** (the soak criteria and the mechanical default-flip are epic
   #6896 Phase 3 scope, not this ADR's — this ADR records only that
-  fleet-default-after-soak, not opt-in-forever, is the settled target).
+  fleet-default-after-soak, not opt-in-forever, is the settled target). The
+  concrete soak criteria (duration + failure-rate/incident thresholds) and
+  the rollback path are operationalized in
+  [`defaults/docs/runtime-adapters.md` → "Fleet-default rollout"](https://github.com/rjwalters/loom/blob/main/defaults/docs/runtime-adapters.md#fleet-default-rollout--soak-criteria-and-rollback-path-issue-7431-epic-6896-phase-3)
+  (issue #7431); the mechanical default flip itself is deferred to a
+  follow-up issue once a real soak window has elapsed.
   Bare installs and macOS/operator hosts keep bare-metal dispatch,
   config-selectable — consistent with `docker/worker/README.md`'s existing
   macOS-bind-mount-performance rationale (VirtioFS is slow for cargo-scale

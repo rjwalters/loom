@@ -1878,6 +1878,75 @@ claude -p "/loom:architect" --dangerously-skip-permissions
 claude -p "/loom:hermit"    --dangerously-skip-permissions
 ```
 
+### Reverting containment to opt-in on a Linux fleet host (#7431)
+
+**Symptom / scenario**: a Linux fleet host has containerized sweep dispatch
+(`runtimes.containment.enabled`) turned on — either because it was
+individually opted in, or because it was promoted to the fleet-default
+per the soak criteria in
+[`defaults/docs/runtime-adapters.md` → "Fleet-default rollout"](../../defaults/docs/runtime-adapters.md#fleet-default-rollout--soak-criteria-and-rollback-path-issue-7431-epic-6896-phase-3)
+— and it needs to go back to bare-metal dispatch (opt-in only, or off
+entirely) on that host alone, without touching any other host or the
+repo's shared, committed `.loom/config.json` default.
+
+**This is a config-only change — never a code change or a PR.** The
+intended per-host override lives at config-resolver tier 4,
+`<repo_root>/.loom-local/local.json` (git-ignored, highest precedence — see
+`defaults/scripts/lib/config-resolver.sh`), so editing it on one host has no
+effect anywhere else:
+
+```bash
+# On the affected host, in the repo root (main checkout, not a worktree):
+mkdir -p .loom-local
+cat > .loom-local/local.json <<'EOF'
+{
+  "runtimes": {
+    "containment": {
+      "enabled": false
+    }
+  }
+}
+EOF
+```
+
+If `.loom-local/local.json` already exists with other keys, merge the
+`runtimes.containment.enabled: false` key into it (e.g. with `jq`) rather
+than overwriting the file — a plain overwrite would silently drop any other
+per-host overrides already recorded there:
+
+```bash
+jq '.runtimes.containment.enabled = false' .loom-local/local.json \
+  > .loom-local/local.json.tmp && mv .loom-local/local.json.tmp .loom-local/local.json
+```
+
+Alternatively, deleting the file (or just the `runtimes.containment` key)
+falls back to whatever the next-lower tier (`.loom-project/project.json`,
+then the committed `.loom/config.json`) resolves to for this host — use the
+explicit `false` above instead if you specifically want opt-in-only
+behavior on this host regardless of what a lower tier says.
+
+**No daemon restart is required.** `spawn-claude.sh` sources
+`config-resolver.sh` and re-resolves the containment setting fresh on
+**every** sweep dispatch — it is not cached in daemon memory or read once at
+daemon startup. The very next sweep dispatched on this host after the file
+is saved picks up the reverted value; sweeps already in flight are
+unaffected (they already resolved their own containment decision at their
+own dispatch time and keep running as originally dispatched).
+
+**Verify the revert took effect** on the next dispatch by checking the
+sweep's own log for the canonical marker (see
+`defaults/docs/runtime-adapters.md` → "Per-sweep resource limits +
+containment observability"):
+
+```bash
+grep "LOOM_DISPATCH_MODE" <path-to-the-next-sweep's-log>
+# expect: # LOOM_DISPATCH_MODE mode=bare-metal
+```
+
+or, for an in-flight view across the host, check the `CTR` column in
+`loom-daemon status` — it should show `-` for sweeps dispatched after the
+revert.
+
 ## Overnight / long-running orchestration
 
 > **Supervising a long window: `/loom:watch` (#4762).** The tick loop that probes
