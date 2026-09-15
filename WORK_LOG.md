@@ -7,6 +7,17 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-15
+- **Issue #7660** (closed): Doctor: Priority-1 conflict query does not exclude loom:operator-held PRs, so a held PR is claimed, rebased, then stood down
+- **PR #7674**: docs(doctor): explain why Priority 2 query doesn't exclude loom:operator
+- **Issue #7668** (closed): Builder/Doctor: rebase onto origin/main immediately before opening a PR that touches a hot-churn file (3 consecutive merge-conflict rejections on one README status paragraph)
+- **PR #7681**: docs(builder): rebase onto origin/main immediately before opening/re-opening a PR
+- **Issue #7679** (closed): merge-pr.sh: _check_champion_hold_state_staleness crashes the whole script under set -euo pipefail when a PR has no champion:hold-state comment (closed as duplicate of #7678)
+- **Issue #7658** (closed): Hermit/Architect: verify every cited path, line range and repo-state claim against origin/main before filing (verify-proposal-refs.sh)
+- **PR #7677**: Hermit/Architect: verify proposal path/line/tracked-file citations before filing
+- **Issue #7663** (closed): dashboard: @cloudflare/vitest-pool-workers 0.22.0 upgrade needs vitest v4 config migration + breaks D1 per-test storage isolation
+- **PR #7671**: fix(dashboard): complete vitest-pool-workers 0.22.0 upgrade, fix D1 test isolation regression
+- **Issue #7662** (closed): dashboard: host card roster — show active repos, fold the idle set into a closed-by-default accordion
+- **PR #7675**: dashboard: host card roster — active repos visible, idle set folded into closed-by-default accordion
 - **Issue #7421** (closed): Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern)
 - **PR #7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **Issue #7419** (closed): merge-pr.sh should refuse a PR that is not loom:pr unless explicitly overridden
