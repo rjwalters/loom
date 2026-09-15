@@ -2749,6 +2749,53 @@ pub struct RoleRunnerShardPosture {
     /// shard reports `true` here so it is never rendered silently.
     #[serde(default)]
     pub configured: bool,
+    /// The roster section (Issue #7690, Phase A of #6704) — `None` whenever
+    /// the roster is disabled (the default) or has never completed a
+    /// heartbeat cycle. Purely additive: this field does not participate in
+    /// [`Self::index`]/[`Self::count`] in this phase.
+    #[serde(default)]
+    pub roster: Option<RosterStatus>,
+}
+
+/// One roster member's row for `status` (Issue #7690) —
+/// [`crate::role_shard::roster::RosterMemberView`] flattened for the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RosterMemberStatus {
+    /// The member's opaque host id.
+    pub host: String,
+    /// Whether this member is currently live.
+    pub fresh: bool,
+    /// Seconds since this member's last heartbeat.
+    pub last_beat_secs_ago: i64,
+    /// How many workspace shard keys this member currently serves.
+    pub serves_count: usize,
+    /// Whether this row is the host `status` is running on.
+    pub is_this_host: bool,
+}
+
+/// The role-runner roster section for `status`/`--json` (Issue #7690, Phase A
+/// of #6704) — [`crate::role_shard::roster::RosterStatusView`] flattened for
+/// the wire. Observational only: nothing here feeds [`RoleRunnerShardPosture::index`]/
+/// [`RoleRunnerShardPosture::count`] yet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RosterStatus {
+    /// `owner/repo#N` of the roster issue.
+    pub issue: String,
+    /// How many members are currently live.
+    pub live_count: usize,
+    /// How many roster comments exist at all, live or expired.
+    pub seen_count: usize,
+    /// The current membership generation, `None` for an empty roster.
+    #[serde(default)]
+    pub generation: Option<DateTime<Utc>>,
+    /// Seconds since [`Self::generation`], `None` alongside it.
+    #[serde(default)]
+    pub settled_secs: Option<i64>,
+    /// Per-member rows, sorted by host id. An expired member stays in this
+    /// list (`fresh: false`) rather than being dropped — silence about a dead
+    /// host is exactly how the pre-#6374 `LOOM_ROLE_RUNNER=0` mitigation
+    /// became invisible.
+    pub members: Vec<RosterMemberStatus>,
 }
 
 /// One registered managed-workspace's status line in [`DaemonStatusReport`]

@@ -89,10 +89,23 @@
 //! untouched.
 //!
 //! [`owns`]: ShardPosture::owns
+//!
+//! ## Roster (Issue #7690, Phase A of #6704) — observational only
+//!
+//! The [`roster`] submodule adds a forge-backed host **roster**: one marker
+//! comment per host on a designated issue, refreshed by a per-daemon
+//! heartbeat task ([`crate::role_runner`]'s roster loop). It is purely
+//! additive in this phase — [`decide`] and [`resolve_posture`] above are
+//! completely unaware of it, and its verdict is provably unchanged whether
+//! the roster is enabled or not (see the `roster_does_not_change_decide`
+//! test). Nothing here feeds [`ShardPosture::Sharded`]'s `(index, count)` yet;
+//! that is Phase B (#6704), gated entirely behind `roster.enabled`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
+
+pub mod roster;
 
 // ============================================================================
 // Constants
@@ -1327,5 +1340,35 @@ mod tests {
                 .cloned(),
             Some(unsharded.describe(root))
         );
+    }
+
+    // ---- Roster is purely additive (Issue #7690, Phase A of #6704): `decide`
+    // must be byte-identical whether the roster is configured or not ----
+
+    #[test]
+    #[serial]
+    fn decide_verdict_is_unchanged_whether_the_roster_is_enabled_or_not() {
+        clear_nwo_cache();
+        let root = Path::new("/repos/loom");
+        let posture = sharded(1, 4);
+
+        let baseline = decide_with(posture.clone(), root, Some("rjwalters/loom"));
+
+        // Enabling the roster (even with a fully valid issue) must not change
+        // `decide`'s verdict at all in Phase A -- nothing here wires it in.
+        std::env::set_var(roster::ROSTER_ENABLED_ENV, "1");
+        std::env::set_var(roster::ROSTER_ISSUE_ENV, "rjwalters/loom#1234");
+        let with_roster = decide_with(posture.clone(), root, Some("rjwalters/loom"));
+        std::env::remove_var(roster::ROSTER_ENABLED_ENV);
+        std::env::remove_var(roster::ROSTER_ISSUE_ENV);
+
+        assert_eq!(baseline, with_roster);
+
+        // Same check for the misconfigured (enabled, no issue) roster state.
+        std::env::set_var(roster::ROSTER_ENABLED_ENV, "1");
+        let with_misconfigured_roster = decide_with(posture, root, Some("rjwalters/loom"));
+        std::env::remove_var(roster::ROSTER_ENABLED_ENV);
+
+        assert_eq!(baseline, with_misconfigured_roster);
     }
 }
