@@ -270,6 +270,67 @@ jobs:
             jq -e . .loom/config.json > /dev/null
           fi
 
+  shell-syntax:
+    name: Shell Syntax (${{ matrix.os }})
+    # #7728: `check-shell-syntax.sh` existed since #6162 but was never wired
+    # into CI -- the only match for it in this file was a COMMENT. The single
+    # `bash -n` coverage CI had was two hand-listed files (spawn-codex.sh and
+    # its test), leaving ~828 of 830 tracked scripts unparsed on every PR.
+    #
+    # The macOS leg is the point of the matrix, not redundancy. Stock macOS
+    # ships /bin/bash 3.2.57 -- Apple froze it at the GPLv3 boundary -- and
+    # `#!/usr/bin/env bash` resolves straight to it on an unmodified Mac, so
+    # it is the interpreter a large share of operators actually run. Two
+    # defects reached main on the same day because nothing exercised it:
+    #   #7721  an apostrophe inside a `$(cat <<EOF ...)` heredoc; bash 3.2
+    #          does not skip heredoc bodies when scanning for the closing
+    #          paren, so the file failed to PARSE -- which made
+    #          check-shell-syntax.sh fail, which made resync-installed.sh
+    #          refuse wholesale, blocking every resync on every macOS host.
+    #   #7717  `local -A` and `${x,,}` (bash 4.0+), then an empty-array
+    #          expansion under `set -u` (bash 3.2 calls it unbound; fixed
+    #          upstream in 4.4). The first masked the second.
+    # Both parse and run fine on bash 5, so both were invisible at every gate.
+    #
+    # Must NOT be path-filtered, for the same reason conflict-markers is not:
+    # #7721 landed in a file nobody editing it thought was in scope.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Report the bash under test
+        run: |
+          echo "PATH bash (the one 'bash -n' actually uses): $(command -v bash)"
+          bash --version | head -1
+          echo "/bin/bash: $(/bin/bash --version | head -1)"
+      - name: Assert this leg really is bash 3.x
+        if: runner.os == 'macOS'
+        # check-shell-syntax.sh shells out to `bash -n` (line 163), resolved
+        # through PATH -- NOT through its own `#!/usr/bin/env bash`. So this
+        # leg only tests 3.2 for as long as PATH bash is 3.2. If a future
+        # runner image puts a 4.x/5.x bash ahead of /bin/bash, the leg would
+        # quietly become a second copy of the ubuntu one and re-open the exact
+        # blind spot this job exists to close. Fail loudly instead of silently.
+        run: |
+          major="$(bash -c 'echo "${BASH_VERSINFO[0]}"')"
+          if [ "$major" -ge 4 ]; then
+            echo "::error::PATH bash is ${major}.x, not the 3.2 this leg exists to test."
+            echo "This leg is now redundant with ubuntu-latest. Pin /bin/bash for the"
+            echo "scan step, or install a 3.2 shim, before trusting this job again."
+            exit 1
+          fi
+          echo "PATH bash is ${major}.x -- bash 3.2 coverage confirmed."
+      - name: Parse every tracked shell script
+        # `--dir .` rather than a hand-maintained directory list: a new
+        # top-level directory holding scripts would otherwise be silently
+        # unscanned. This job only checks out -- it installs no dependencies
+        # and builds nothing -- so the tree is exactly what is tracked.
+        # ~830 scripts, ~3s.
+        run: bash defaults/scripts/check-shell-syntax.sh --quiet --dir .
+
   agents-md-sync:
     name: AGENTS.md Sync Check
     # Cheap structural check; always runs. defaults/.loom/AGENTS.md is generated
