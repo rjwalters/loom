@@ -213,20 +213,125 @@ describe("hostCard", () => {
     expect(idle.querySelector('[data-testid="card-sweeps"]')).toBeNull();
   });
 
-  // #4976: the "Repositories" section, below "Active sweeps".
+  // #4976: the "Repositories" section, below "Active sweeps". #7662 split it
+  // into an always-visible active tier and a closed-by-default idle
+  // <details> so a long idle roster doesn't bury the busy rows.
   it("lists the host's managed repositories, with an in-flight count for the busy one", () => {
     const card = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
     expect(fieldValue(card, "Repositories")).toBe("3");
-    const repoRows = [...card.querySelectorAll(".card__repo")];
-    expect(repoRows).toHaveLength(3);
-    // Both live sweeps target "rjwalters/loom" — its row must show ×2.
-    const loomRow = repoRows.find((row) => row.textContent?.includes("rjwalters/loom"));
-    expect(loomRow?.querySelector(".chip")?.textContent).toBe("×2");
-    // The two idle, registered-but-never-dispatched-into repos still appear
-    // — an idle repo is not the same as an unregistered one (#4976's whole
-    // point) — but carry no in-flight chip.
-    const idleRow = repoRows.find((row) => row.textContent?.includes("2AMLogic/gf180-pll"));
+
+    // Active tier: only "rjwalters/loom" has in-flight sweeps, and its row
+    // shows the ×2 chip. It is the only entry in the visible list.
+    const visibleRows = [...card.querySelector('[data-testid="card-repos"]')!.querySelectorAll(".card__repo")];
+    expect(visibleRows).toHaveLength(1);
+    expect(visibleRows[0]?.textContent).toContain("rjwalters/loom");
+    expect(visibleRows[0]?.querySelector(".chip")?.textContent).toBe("×2");
+
+    // Idle tier: the two registered-but-never-dispatched-into repos live
+    // inside the closed-by-default <details> — an idle repo is not the same
+    // as an unregistered one (#4976's whole point) — with no in-flight chip.
+    const details = card.querySelector('[data-testid="card-repos-idle"]') as HTMLDetailsElement | null;
+    expect(details).not.toBeNull();
+    expect(details?.open).toBe(false);
+    expect(details?.querySelector("summary")?.textContent).toBe("2 idle repositories");
+    const idleRows = [...details!.querySelectorAll(".card__repo")];
+    expect(idleRows).toHaveLength(2);
+    const idleRow = idleRows.find((row) => row.textContent?.includes("2AMLogic/gf180-pll"));
+    expect(idleRow).toBeDefined();
     expect(idleRow?.querySelector(".chip")).toBeNull();
+  });
+
+  // #7662: the split's two edge cases.
+  describe("active/idle repo roster split (#7662)", () => {
+    it("shows no visible list and a summary that stands in for the whole roster when the host has zero sweeps", () => {
+      const card = hostCard(findHost(view(), IDLE_HOST_ID)!, NOW);
+      expect(fieldValue(card, "Repositories")).toBe("3");
+      expect(card.querySelector('[data-testid="card-repos"]')).toBeNull();
+      const details = card.querySelector('[data-testid="card-repos-idle"]');
+      expect(details).not.toBeNull();
+      // 1 named idle repo ("rjwalters/loom") + 2 redacted private entries —
+      // the same 3 the "Repositories" field counts.
+      expect(details?.querySelector("summary")?.textContent).toBe("1 idle repository, 2 private");
+    });
+
+    it("renders no <details> at all when every named repo is active", () => {
+      const built = buildFleetView(
+        parseFleetSnapshot({
+          hosts: {
+            h: {
+              health: {
+                record: {
+                  kind: "host.health",
+                  managed_repos: [{ slug: "a/one", visibility: "public" }, { slug: "a/two", visibility: "public" }],
+                },
+                updatedAt: isoMinutesBefore(1),
+              },
+            },
+          },
+          activeSweeps: [
+            { hostId: "h", sweepId: "s1", repo: "a/one" },
+            { hostId: "h", sweepId: "s2", repo: "a/two" },
+          ],
+        }),
+        NOW,
+      );
+      const card = hostCard(findHost(built, "h")!, NOW);
+      expect(card.querySelector('[data-testid="card-repos-idle"]')).toBeNull();
+      const visibleRows = [...card.querySelector('[data-testid="card-repos"]')!.querySelectorAll(".card__repo")];
+      expect(visibleRows).toHaveLength(2);
+    });
+
+    it("sorts the active tier by in-flight count desc, then slug", () => {
+      const built = buildFleetView(
+        parseFleetSnapshot({
+          hosts: {
+            h: {
+              health: {
+                record: {
+                  kind: "host.health",
+                  managed_repos: [
+                    { slug: "z/low", visibility: "public" },
+                    { slug: "a/high", visibility: "public" },
+                    { slug: "m/idle", visibility: "public" },
+                  ],
+                },
+                updatedAt: isoMinutesBefore(1),
+              },
+            },
+          },
+          activeSweeps: [
+            { hostId: "h", sweepId: "s1", repo: "z/low" },
+            { hostId: "h", sweepId: "s2", repo: "a/high" },
+            { hostId: "h", sweepId: "s3", repo: "a/high" },
+            { hostId: "h", sweepId: "s4", repo: "a/high" },
+          ],
+        }),
+        NOW,
+      );
+      const card = hostCard(findHost(built, "h")!, NOW);
+      const visibleRows = [...card.querySelector('[data-testid="card-repos"]')!.querySelectorAll(".card__repo-label")];
+      expect(visibleRows.map((row) => row.textContent)).toEqual(["a/high", "z/low"]);
+      const details = card.querySelector('[data-testid="card-repos-idle"]');
+      expect(details?.querySelector("summary")?.textContent).toBe("1 idle repository");
+      expect(details?.textContent).toContain("m/idle");
+    });
+
+    it("remembers the idle roster's open/closed state per host in localStorage", () => {
+      window.localStorage.clear();
+      const host = findHost(view(), HEALTHY_HOST_ID)!;
+      const first = hostCard(host, NOW);
+      const details = first.querySelector('[data-testid="card-repos-idle"]') as HTMLDetailsElement;
+      expect(details.open).toBe(false);
+
+      details.open = true;
+      details.dispatchEvent(new Event("toggle"));
+
+      const second = hostCard(host, NOW);
+      const detailsAgain = second.querySelector('[data-testid="card-repos-idle"]') as HTMLDetailsElement;
+      expect(detailsAgain.open).toBe(true);
+
+      window.localStorage.clear();
+    });
   });
 
   // #5022: compact per-host role-tick indicator.
