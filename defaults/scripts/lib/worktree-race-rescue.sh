@@ -121,44 +121,67 @@
 #      runs immediately before a destructive reset, and cheap next to
 #      losing a live agent's work.
 #
-# Fail-safe: if lsof is unavailable, or the scan itself fails to complete
-# (an exit status other than "matches found"/"no matches found"), this
-# treats the worktree as IN USE (returns true / "has a live process") rather
-# than silently proceeding — an unverifiable liveness signal must never be
-# read as "safe to reset".
+# Probe order and posture mirror the Rust twin exactly
+# (`worktree_ops::safety::find_processes_using_directory`, which is what
+# `worktree_in_use()` calls for this signal):
+#
+#   - Linux: walk `/proc/<pid>/cwd` directly. No external tool involved, so
+#     a minimal host or a hermetic CI runner without `lsof` still gets a real
+#     answer — the original lsof-only shape refused EVERY reset on such a
+#     host (the CI runner has no lsof), which silently disabled the
+#     stale-worktree rescue path there rather than protecting it.
+#   - Everywhere else (macOS/BSD): `lsof +D <dir> -F pf`, cwd-field matches.
+#   - Neither probe available, or the probe itself fails: contribute
+#     NOTHING — "unknown ⇒ no live holder found", the same
+#     fail-open-to-empty contract the Rust side documents. This is the one
+#     place the two twins must agree: this signal is defense in depth behind
+#     the git-level checks `loom_worktree_reset_or_rescue` already makes
+#     (new commits, new tracked changes → rescue patch), not the primary
+#     gate, and an unprobable host must not be a host where stale worktrees
+#     can never be reset. The degraded case is reported on stderr so it is
+#     visible in the role log.
 #
 # Returns 0 (true) if a live process other than the caller has its cwd
-# inside <worktree_path> (or the scan is unavailable/failed), 1 (false) if
-# no such process was found.
+# inside <worktree_path>; 1 (false) if none was found or the host cannot be
+# probed.
 loom_worktree_has_live_process() {
     local worktree_path="$1"
 
     local worktree_real
     worktree_real="$(cd "$worktree_path" 2>/dev/null && pwd -P)" || {
-        echo "loom_worktree_has_live_process: could not resolve $worktree_path -- treating as in-use (fail-safe)" >&2
-        return 0
+        # Nothing to protect if the directory cannot even be entered; the
+        # caller's own `git -C` will report the real problem. Mirrors
+        # `worktree_in_use()`'s `!wt.exists() ⇒ empty`.
+        return 1
     }
 
-    if ! command -v lsof >/dev/null 2>&1; then
-        echo "loom_worktree_has_live_process: lsof is unavailable -- cannot verify liveness of $worktree_path, treating as in-use (fail-safe)" >&2
-        return 0
+    local active_pids=""
+    if [[ "$(uname -s 2>/dev/null)" == "Linux" && -d /proc/self ]]; then
+        # Linux: /proc/<pid>/cwd symlinks. An unreadable entry (another
+        # user's process, or one that exited mid-scan) is skipped, never an
+        # error — same as the Rust walk.
+        local proc_dir pid cwd
+        for proc_dir in /proc/[0-9]*; do
+            pid="${proc_dir#/proc/}"
+            [[ "$pid" == "$$" || "$pid" == "${BASHPID:-}" ]] && continue
+            cwd="$(readlink "$proc_dir/cwd" 2>/dev/null)" || continue
+            if [[ "$cwd" == "$worktree_real" || "$cwd" == "$worktree_real"/* ]]; then
+                active_pids+="$pid"$'\n'
+            fi
+        done
+    elif command -v lsof >/dev/null 2>&1; then
+        local lsof_output
+        # Not gated on lsof's exit status (lsof exits 1 for "no matches",
+        # and on macOS even for some genuine matches — #7488); the awk
+        # parse below treats empty/garbled stdout as "no matches".
+        lsof_output="$(lsof +D "$worktree_real" -F pf 2>/dev/null || true)"
+        active_pids="$(printf '%s\n' "$lsof_output" | awk '/^p/{pid=substr($0,2)} /^fcwd/{print pid}' | grep -v -x "$$" || true)"
+    else
+        echo "loom_worktree_has_live_process: no process probe available on this host (no /proc, no lsof) -- cannot verify liveness of $worktree_path; contributing no evidence (matches worktree_in_use()'s unknown-is-empty contract)" >&2
+        return 1
     fi
 
-    local lsof_output lsof_status
-    lsof_output="$(lsof +D "$worktree_real" -F pf 2>/dev/null)"
-    lsof_status=$?
-    # lsof exits 1 when +D finds nothing open under the directory -- a
-    # normal "no matches" result, not a scan failure. Any other non-zero
-    # status means lsof itself could not complete the scan.
-    if [[ "$lsof_status" -gt 1 ]]; then
-        echo "loom_worktree_has_live_process: lsof scan of $worktree_path failed (exit $lsof_status) -- treating as in-use (fail-safe)" >&2
-        return 0
-    fi
-
-    local active_pids
-    active_pids="$(printf '%s\n' "$lsof_output" | awk '/^p/{pid=substr($0,2)} /^fcwd/{print pid}' | grep -v -x "$$" || true)"
-
-    [[ -n "$active_pids" ]]
+    [[ -n "${active_pids//[[:space:]]/}" ]]
 }
 
 # loom_worktree_reset_or_rescue <worktree_path> <target_ref> [<rescue_label>]
