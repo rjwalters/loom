@@ -285,7 +285,26 @@ gh pr edit 43 --remove-label "loom:review-requested" --add-label "loom:changes-r
 > `loom:changes-requested`, a PR-lane label. `loom:building` is an **issue**-lane
 > label and does not belong on a PR.
 
-Then the Builder would address the feedback and re-request review.
+**Doctor**, not Builder, owns a PR in this state: it finds PRs labeled
+`loom:changes-requested`, fixes them on the PR branch, and signals completion by
+relabeling back to `loom:review-requested` — which hands the PR to a Judge for a
+**fresh review**. Doctor never applies `loom:pr` itself, so an approval always
+comes from a second Judge pass over the fixed tree:
+
+```bash
+# Doctor, after pushing the fix
+gh pr edit 43 --remove-label "loom:changes-requested" --add-label "loom:review-requested"
+```
+
+The loop is Judge → Doctor → Judge → merge, and it repeats until a Judge
+approves. Verdicts are scoped to the commit they were rendered against, so once
+the PR's head SHA moves, a leftover `loom:changes-requested` (or `loom:pr`) is
+cleared and the PR returns to `loom:review-requested` automatically — a verdict
+from an older commit is never trusted.
+
+Doctor runs **only** when a Judge requests changes. If Step 4 had approved the
+PR, you would skip straight to Step 5; that is why the lifecycle is written
+Curator → Builder → Judge → *Doctor (if needed)* → Merge.
 
 ---
 

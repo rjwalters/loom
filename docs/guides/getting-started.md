@@ -60,13 +60,14 @@ Minimal requirements to use Loom:
    service wrapper — `defaults/scripts/lib/launchd-domain.sh` and
    `defaults/scripts/lib/systemd-user.sh`)
 2. **Git repository** (any existing project)
-3. **tmux** (usually pre-installed on macOS)
+3. **tmux** (not shipped with macOS — install it)
    ```bash
    # Verify tmux is installed
    tmux -V
 
-   # Install if needed (macOS)
-   brew install tmux
+   # Install if needed
+   brew install tmux          # macOS
+   sudo apt install tmux      # Debian/Ubuntu
    ```
 4. **Claude Code** (optional, for AI agents)
    ```bash
@@ -510,9 +511,14 @@ the labels on the forge** (that happens only on a Full Install), so a
 # handles both GitHub and Gitea
 .loom/scripts/sync-labels.sh
 
-# Verify
-gh label list | grep "loom:"
+# Verify — compares the live label set against .github/labels.yml on either
+# forge, so it catches a partial sync. Exits 0 (in sync), 3 (drift found),
+# 1 (forge/lookup error).
+.loom/scripts/sync-labels.sh --check
 ```
+
+`gh label list | grep "loom:"` also works, but only on GitHub, and it shows
+only that *some* `loom:` label exists — not that the expected set is complete.
 
 See [WORKFLOWS.md](../workflows.md) for what each label means.
 
@@ -524,9 +530,22 @@ See [WORKFLOWS.md](../workflows.md) for what each label means.
 ./scripts/install/setup-repository-settings.sh /path/to/your/repo
 ```
 
+Both scripts handle GitHub (rulesets API) and Gitea (branch protection API),
+and need admin rights on the target repo. On Gitea, rules without an equivalent
+— linear history, role-based bypass — are skipped with a warning.
+
 This creates a ruleset requiring linear history and a pull request with **0
 approvals** — the 0-approval part is what lets Champion auto-merge an approved
 PR without a human in the loop.
+
+**0 required approvals is an unattended-automation policy, not a general
+branch-protection recommendation, and it does not mean "unreviewed".** Review
+still happens; it is recorded as Judge's `loom:pr` label rather than as a
+GitHub formal approval. The two gates are independent — GitHub's
+required-approval count knows nothing about Loom's labels, so any non-zero
+count deadlocks Champion (no agent can satisfy it; GitHub's API blocks
+self-review). Keep a non-zero count if your repo needs a person on every merge,
+and drive merges by hand with `./.loom/scripts/merge-pr.sh <PR>`.
 
 ### 3. Your First Sweep
 
@@ -545,12 +564,47 @@ claude
 /loom:sweep 42
 ```
 
-Scale up once you trust it:
+**Make the first one small and bounded**: one issue, scoped so you can read
+the whole diff. Before you start, confirm `gh auth status` succeeds and that
+you know the project's real test command — a sweep runs it, and a first run
+that fails on a missing toolchain teaches you nothing about Loom.
+
+#### What happens when the Judge asks for changes
+
+`/loom:sweep` runs this loop for you, but it is worth recognizing, because a
+PR sitting in it is not finished work:
+
+| PR label | Who acts next | What they do |
+|----------|---------------|--------------|
+| `loom:review-requested` | **Judge** | Reviews the diff, then applies exactly one verdict |
+| `loom:changes-requested` | **Doctor** | Addresses the feedback on the PR branch, then relabels back to `loom:review-requested` |
+| `loom:pr` | **Champion** | Auto-merges (this is the only terminal state) |
+
+So Doctor — not Builder — owns a rejected PR, and the cycle is
+Judge → Doctor → **Judge again** → merge. Doctor never applies `loom:pr`
+itself; re-review is mandatory. **Doctor is conditional**: it runs only if the
+Judge requested changes. On an approval the PR goes straight to merge, which is
+why the lifecycle is written Curator → Builder → Judge → *Doctor (if needed)* →
+Merge.
+
+Verdicts are scoped to the tree they were rendered against (#5686): once a PR's
+head SHA moves, a stale `loom:changes-requested` or `loom:pr` is cleared and the
+PR returns to `loom:review-requested` for a fresh evaluation. A verdict label
+left over from an older commit is never trusted.
+
+#### Scaling up
+
+Once you trust it:
 
 ```
 /loom:sweep 42 43 44     # parallel builder waves
-/loom:sweep all          # the whole open backlog
+/loom:sweep all          # the whole open backlog — aggressive; see below
 ```
+
+`/loom:sweep all` is the deliberately fast/sloppy "build everything" path: it
+takes **every** open issue regardless of label, promotes uncurated ones, and
+reclaims stale claims. It prompts for confirmation with the resolved candidate
+set before spawning anything — read that list. It is not an onboarding command.
 
 You can also drive a single stage by hand — `/loom:builder`, `/loom:judge`,
 `/loom:curator`, `/loom:doctor` — but the full lifecycle must run in order;
@@ -563,26 +617,67 @@ a PR labeled `loom:review-requested` is only the Builder stage, not finished wor
 ./.loom/scripts/cli/loom-status.sh
 ```
 
-By default the daemon is **not a work generator** — it only runs sweeps you
-enqueue via `mcp__loom__dispatch_sweep`. To make it continuous, opt in through
-the `autonomous` block in `.loom/config.json`:
+By default the daemon is **not a work generator**. It runs only the sweeps you
+hand it. There are three distinct ways work reaches it — know which one you are
+using:
+
+| | Where it runs | Work comes from |
+|---|---|---|
+| `/loom:sweep 42` | Your current Claude session, in the foreground | You, one command at a time |
+| `loom-daemon dispatch 42` | The daemon, in the background | You, enqueued |
+| `autonomous.workFinder` | The daemon, in the background | The daemon finds its own |
+
+To enqueue one issue and watch it, with the daemon running:
+
+```bash
+# Enqueue — prints the sweep id it accepted
+loom-daemon dispatch 42
+
+# Confirm it was accepted and watch progress
+loom-daemon status
+
+# Back out if you change your mind (never hand-kill the pids)
+loom-daemon cancel --issue 42
+```
+
+Inside a Claude session with the Loom MCP server registered, the same three
+operations are the `mcp__loom__dispatch_sweep`, `get_sweep_status`, and
+`cancel_sweep` tools. Those are MCP tool names, not shell commands — you ask
+Claude for them, you do not type them in a terminal.
+
+To let the daemon generate its own work, opt in through the `autonomous` block
+in `.loom/config.json`:
 
 ```json
 "autonomous": {
   "roleRunner": { "enabled": true, "roles": ["curator", "champion", "judge", "doctor", "guide"] },
-  "workFinder": { "enabled": true, "maxConcurrent": 8 }
+  "workFinder": { "enabled": true, "maxConcurrent": 3 }
 }
 ```
 
 Enable `roleRunner` first (it runs the periodic support roles), then
-`workFinder` (it finds its own work) once the support roles behave. Full
-reference: [`.loom/docs/daemon-reference.md`](../../.loom/docs/daemon-reference.md).
+`workFinder` (it finds its own work) once the support roles behave.
+
+**Editing this block while the daemon is running does not uniformly take
+effect.** The `autonomous.roleRunner.*` sub-block is re-read on the next tick,
+so those edits are live. But `workFinder.enabled` and `workFinder.maxConcurrent`
+are resolved once during bring-up and frozen for the life of the process — a
+config edit alone changes nothing, so **restart the daemon** after touching them
+(#5963). The `work_finder: enabled (…)` startup log line names the resolved
+value and which layer supplied it, so you can confirm the edit landed.
+
+`maxConcurrent` is a per-machine, workload-dependent ceiling; the shipped
+default is `3`. Raise it only from evidence (`loom-daemon calibrate`,
+`loom-daemon status`) — ~10 is reasonable on an 8-core API-bound worker, while
+2–3 is right on the same hardware running heavier sweeps. Full reference:
+[`.loom/docs/daemon-reference.md`](../../.loom/docs/daemon-reference.md).
 
 ### 5. Provision a Token Pool (before long runs)
 
-A single Claude account will hit its weekly limit and stall the pipeline —
-`spawn-claude.sh` exits `78` (`EX_CONFIG`) on an exhausted pool. Rotate across
-several accounts:
+Optional, and not needed for your first sweeps. A single account is fine until
+its weekly limit becomes the thing that stalls the pipeline — on an exhausted
+pool `spawn-claude.sh` exits `78` (`EX_CONFIG`). Before a long unattended run,
+rotate across several accounts so one account's limit cannot stall everything:
 
 ```bash
 loom-daemon tokens bootstrap

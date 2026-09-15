@@ -701,8 +701,10 @@ with `git commit --allow-empty -m test && git log -1 --format='%an <%ae>'`
 .loom/scripts/sync-labels.sh
 ```
 
-Label sync is a manual/install-time step (`./scripts/install/sync-labels.sh .`),
-not something CI re-applies when `.github/labels.yml` changes. If a label is
+Label sync is a manual/install-time step, not something CI re-applies when
+`.github/labels.yml` changes. (In an installed repo the script is
+`.loom/scripts/sync-labels.sh`, as above; `./scripts/install/sync-labels.sh` is
+the installer-side copy and exists only in a Loom source checkout.) If a label is
 defined in `labels.yml` but missing from the live repo, applying it fails with
 `failed to update 1 issue` (the standard `gh` error for "label does not exist").
 Run the sync script — or create the one label directly — to reconcile:
