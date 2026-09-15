@@ -4392,6 +4392,8 @@ mod tests {
                 stash_total_count: 0,
                 stash_quarantine_count: 0,
                 stash_oldest_age_secs: None,
+                stash_non_quarantine_unrecoverable_count: 0,
+                stash_non_quarantine_unrecoverable_oldest_age_secs: None,
                 sweep_command_missing: false,
             },
             crate::types::RepoStatus {
@@ -4422,6 +4424,8 @@ mod tests {
                 stash_total_count: 0,
                 stash_quarantine_count: 0,
                 stash_oldest_age_secs: None,
+                stash_non_quarantine_unrecoverable_count: 0,
+                stash_non_quarantine_unrecoverable_oldest_age_secs: None,
                 sweep_command_missing: false,
             },
         ];
@@ -4489,6 +4493,8 @@ mod tests {
             stash_total_count: 0,
             stash_quarantine_count: 0,
             stash_oldest_age_secs: None,
+            stash_non_quarantine_unrecoverable_count: 0,
+            stash_non_quarantine_unrecoverable_oldest_age_secs: None,
             sweep_command_missing: false,
         }];
 
@@ -4927,6 +4933,8 @@ mod tests {
             stash_total_count: 0,
             stash_quarantine_count: 0,
             stash_oldest_age_secs: None,
+            stash_non_quarantine_unrecoverable_count: 0,
+            stash_non_quarantine_unrecoverable_oldest_age_secs: None,
             sweep_command_missing: false,
         }
     }

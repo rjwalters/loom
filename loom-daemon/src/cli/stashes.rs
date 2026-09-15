@@ -7,10 +7,11 @@
 
 use anyhow::Result;
 
+use loom_daemon::quarantine_stash_status::StashOrigin;
 use loom_daemon::repo_root::resolve_repo_root;
 use loom_daemon::stash_retirement::{
-    self, DropOutcome, GhIssueStateLookup, PathVerdict, QuarantineStashEntry, RetireVerdict,
-    RetirementReport, RETIREMENT_LOG_RELPATH,
+    self, AnyStashEntry, DropOutcome, GhIssueStateLookup, PathVerdict, QuarantineStashEntry,
+    RetireVerdict, RetirementReport, RETIREMENT_LOG_RELPATH,
 };
 
 use crate::StashesAction;
@@ -52,26 +53,75 @@ fn run(
         entries.retain(|e| e.issue == Some(issue));
     }
 
-    if entries.is_empty() {
+    let reports: Vec<RetirementReport> = if entries.is_empty() {
+        Vec::new()
+    } else {
+        let mut lookup = GhIssueStateLookup::new(repo_root.clone());
+        stash_retirement::plan_and_execute_retirement(&repo_root, &entries, &mut lookup, execute)
+    };
+
+    // #5512: label every OTHER `refs/stash` entry by origin too — never fed
+    // to `plan_and_execute_retirement` above (that call only ever sees the
+    // narrower `QuarantineStashEntry` collection filtered from
+    // `list_quarantine_stashes`, a different type entirely), so nothing
+    // below can ever be auto-retired. Skipped when `--issue` scopes the run
+    // to one issue's quarantine stashes — an unrelated operator/agent/
+    // auditor stash is out of scope for that narrower view.
+    let other_entries: Vec<AnyStashEntry> = if issue_filter.is_none() {
+        stash_retirement::list_all_stashes(&repo_root)
+            .map_err(|e| anyhow::anyhow!("failed to enumerate stashes: {e}"))?
+            .into_iter()
+            .filter(|e| e.origin != StashOrigin::Quarantine)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if reports.is_empty() && other_entries.is_empty() {
         if json {
-            println!("[]");
+            println!("{{\"quarantine\":[],\"other\":[]}}");
         } else {
             println!("no outstanding loom-quarantine: stashes.");
         }
         return Ok(());
     }
 
-    let mut lookup = GhIssueStateLookup::new(repo_root.clone());
-    let reports =
-        stash_retirement::plan_and_execute_retirement(&repo_root, &entries, &mut lookup, execute);
-
     if json {
-        println!("{}", serde_json::to_string_pretty(&reports)?);
+        let payload = serde_json::json!({
+            "quarantine": reports,
+            "other": other_entries,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         render_human(&reports, execute, show_paths);
+        render_other(&other_entries);
     }
 
     Ok(())
+}
+
+/// #5512: print every non-quarantine `refs/stash` entry, labeled by origin
+/// only — no retire verdict, since none of these ever reach the retirement
+/// classifier. Purely informational; a no-op when `other` is empty (either
+/// because there genuinely are none, or because `--issue` scoped the run).
+fn render_other(other: &[AnyStashEntry]) {
+    if other.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{} other refs/stash entrie(s) (never auto-retirable — informational only):",
+        other.len()
+    );
+    for entry in other {
+        println!(
+            "  {}  [{}]  ({})  {}",
+            entry.stash_ref,
+            entry.origin.label(),
+            entry.age,
+            entry.subject
+        );
+    }
 }
 
 fn render_human(reports: &[RetirementReport], execute: bool, show_paths: bool) {

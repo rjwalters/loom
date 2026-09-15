@@ -436,6 +436,12 @@ pub(crate) fn build_status_json_value(
                 "total_count": r.stash_total_count,
                 "quarantine_count": r.stash_quarantine_count,
                 "oldest_age_secs": r.stash_oldest_age_secs,
+                // #5512: of the non-quarantine entries, how many are NOT
+                // presumed recoverable elsewhere (an operator pre-resync
+                // stash, an agent's ad-hoc WIP, …) — see
+                // `quarantine_stash_status::is_presumed_recoverable`.
+                "non_quarantine_unrecoverable_count": r.stash_non_quarantine_unrecoverable_count,
+                "non_quarantine_unrecoverable_oldest_age_secs": r.stash_non_quarantine_unrecoverable_oldest_age_secs,
             },
         })).collect::<Vec<_>>(),
         // Worktree footprint per managed repo (#5939) — how many worktrees the
@@ -2431,6 +2437,23 @@ pub(crate) fn print_status_human(
                     "        stashes: {} total ({} loom-quarantine:), oldest {age} old",
                     r.stash_total_count, r.stash_quarantine_count
                 );
+                // #5512: of the non-quarantine entries, how many are NOT
+                // presumed recoverable elsewhere (an operator pre-resync
+                // stash, an agent's ad-hoc WIP, …) — the population that hid
+                // the #6129 quiesce work behind a half-applied pop until it
+                // broke `spawn-claude.sh` (#6162). Silent when there are
+                // none.
+                if r.stash_non_quarantine_unrecoverable_count > 0 {
+                    let other_age = r
+                        .stash_non_quarantine_unrecoverable_oldest_age_secs
+                        .map(format_stash_age)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    println!(
+                        "          of which {} non-quarantine stash(es) are not presumed \
+                         recoverable elsewhere, oldest {other_age} old",
+                        r.stash_non_quarantine_unrecoverable_count
+                    );
+                }
             }
             // #4377/#6470: onIdle configured but the per-root gate is off is
             // exactly the silent no-op #4377 fixes — call it out explicitly
@@ -4420,6 +4443,18 @@ mod stash_status_render_tests {
         quarantine: usize,
         oldest_age_secs: Option<u64>,
     ) -> loom_daemon::types::RepoStatus {
+        repo_with_stashes_full(total, quarantine, oldest_age_secs, 0, None)
+    }
+
+    /// #5512: the same fixture as [`repo_with_stashes`], with the two
+    /// non-quarantine-unrecoverable fields also settable.
+    fn repo_with_stashes_full(
+        total: usize,
+        quarantine: usize,
+        oldest_age_secs: Option<u64>,
+        non_quarantine_unrecoverable_count: usize,
+        non_quarantine_unrecoverable_oldest_age_secs: Option<u64>,
+    ) -> loom_daemon::types::RepoStatus {
         loom_daemon::types::RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             priority: 100,
@@ -4447,6 +4482,9 @@ mod stash_status_render_tests {
             stash_total_count: total,
             stash_quarantine_count: quarantine,
             stash_oldest_age_secs: oldest_age_secs,
+            stash_non_quarantine_unrecoverable_count: non_quarantine_unrecoverable_count,
+            stash_non_quarantine_unrecoverable_oldest_age_secs:
+                non_quarantine_unrecoverable_oldest_age_secs,
             sweep_command_missing: false,
         }
     }
@@ -4471,6 +4509,26 @@ mod stash_status_render_tests {
         assert_eq!(stash["total_count"], 0);
         assert_eq!(stash["quarantine_count"], 0);
         assert!(stash["oldest_age_secs"].is_null());
+    }
+
+    #[test]
+    fn per_repo_json_carries_non_quarantine_unrecoverable_count_and_age() {
+        let mut report = sample_report();
+        report.per_repo = vec![repo_with_stashes_full(5, 2, Some(3600), 2, Some(7200))];
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
+        let stash = &value["per_repo"][0]["stash"];
+        assert_eq!(stash["non_quarantine_unrecoverable_count"], 2);
+        assert_eq!(stash["non_quarantine_unrecoverable_oldest_age_secs"], 7200);
+    }
+
+    #[test]
+    fn per_repo_json_non_quarantine_unrecoverable_oldest_age_is_null_when_count_is_zero() {
+        let mut report = sample_report();
+        report.per_repo = vec![repo_with_stashes(5, 5, Some(3600))];
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
+        let stash = &value["per_repo"][0]["stash"];
+        assert_eq!(stash["non_quarantine_unrecoverable_count"], 0);
+        assert!(stash["non_quarantine_unrecoverable_oldest_age_secs"].is_null());
     }
 
     #[test]
@@ -4672,6 +4730,8 @@ mod role_runner_diagnostic_source_render_tests {
             stash_total_count: 0,
             stash_quarantine_count: 0,
             stash_oldest_age_secs: None,
+            stash_non_quarantine_unrecoverable_count: 0,
+            stash_non_quarantine_unrecoverable_oldest_age_secs: None,
             sweep_command_missing: false,
         }
     }

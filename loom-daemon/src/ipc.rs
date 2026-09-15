@@ -2566,6 +2566,10 @@ pub fn build_daemon_status(
             stash_total_count: repo_stash_summary.total_count,
             stash_quarantine_count: repo_stash_summary.quarantine_count,
             stash_oldest_age_secs: repo_stash_summary.oldest_stash_age_secs,
+            stash_non_quarantine_unrecoverable_count: repo_stash_summary
+                .non_quarantine_unrecoverable_count,
+            stash_non_quarantine_unrecoverable_oldest_age_secs: repo_stash_summary
+                .non_quarantine_unrecoverable_oldest_age_secs,
             sweep_command_missing,
         });
         in_flight.extend(live);
@@ -8442,6 +8446,8 @@ exit 0
                 stash_total_count: 0,
                 stash_quarantine_count: 0,
                 stash_oldest_age_secs: None,
+                stash_non_quarantine_unrecoverable_count: 0,
+                stash_non_quarantine_unrecoverable_oldest_age_secs: None,
                 sweep_command_missing: false,
             }],
             role_runner_host_env_override: None,
