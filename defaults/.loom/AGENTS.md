@@ -130,6 +130,15 @@ worktree; the script merges via the forge API directly and handles worktree
 cleanup automatically. A `PreToolUse` hook redirects `gh pr merge` calls to
 this script.
 
+### CI is dumb and reliable, on purpose
+
+Prefer a slow correct job to a clever fast one. **Never cancel verification of a
+distinct commit** — superseding is for PR branches; every default-branch commit
+is distinct work. Path-filtering is an optimisation, not a correctness tool. One
+mechanism per behaviour: two that both cancel, skip or retry will surprise
+someone. A check that *cannot run* must never look like one that passed. Rules +
+the incidents behind them: [`.loom/docs/ci-principles.md`](.loom/docs/ci-principles.md).
+
 ## Claude Code only today
 
 The coordination mechanics above (labels, worktrees, the sweep lifecycle,

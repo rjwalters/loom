@@ -2,7 +2,7 @@
 
 This repository uses **Loom** for AI-powered development orchestration.
 
-**Loom Version**: 0.19.56
+**Loom Version**: 0.19.57
 **Installation Date**: 2026-04-21
 
 > **This file is the operating core** — only what an agent must know to act
@@ -191,6 +191,13 @@ lane, **unconditionally**. This is a predicate on the *change* (evaluated by
 whoever files), not a config toggle, opt-out, or human-approval gate. **Judge and
 Champion are unaffected** — both run unmodified; only Curator may be skipped.
 
+### CI is dumb and reliable, on purpose
+
+Slow correct job over clever fast one. **Never cancel verification of a distinct
+commit** — superseding is for PR branches; every `main` commit is distinct work.
+Path-filtering is an optimisation, not a correctness tool; one mechanism per
+behaviour. Rules + the incidents behind them: [`ci-principles`](.loom/docs/ci-principles.md).
+
 ### Builder Workflow
 
 1. Find issue: `gh issue list --label="loom:issue"`
@@ -295,22 +302,15 @@ time](.loom/docs/troubleshooting.md).
 
 ## Migration History
 
-Completed-migration history (v0.10.0 shepherd/daemon deprecation, the Rust
-`loom-daemon` rebuild, `spawn-loop.sh` removal in v0.11.0) lives in
-[`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md)
-and [ADR-0009](docs/adr/0009-shepherd-deprecation.md) — not inline here.
+Completed-migration history (v0.10.0 shepherd/daemon deprecation, the Rust `loom-daemon` rebuild, `spawn-loop.sh` removal in v0.11.0) lives in
+[`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md) and [ADR-0009](docs/adr/0009-shepherd-deprecation.md) — not inline here.
 
 ## Resources
 
-- **Repository**: https://github.com/rjwalters/loom · **Roles**: `.loom/roles/*.md`
-  · **Labels**: `.github/labels.yml` · **Scripts**: `.loom/scripts/`
-- **Docs**: [daemon-reference](.loom/docs/daemon-reference.md) ·
-  [token-pool](.loom/docs/token-pool.md) ·
-  [troubleshooting](.loom/docs/troubleshooting.md) ·
-  [build-gate](.loom/docs/build-gate.md) ·
-  [forge-auth](.loom/docs/forge-authentication.md) /
-  [github-auth](.loom/docs/github-authentication.md) ·
-  [safehouse](.loom/docs/safehouse.md) ·
+- **Repository**: https://github.com/rjwalters/loom · **Roles**: `.loom/roles/*.md` · **Labels**: `.github/labels.yml` · **Scripts**: `.loom/scripts/`
+- **Docs**: [daemon-reference](.loom/docs/daemon-reference.md) · [token-pool](.loom/docs/token-pool.md) · [troubleshooting](.loom/docs/troubleshooting.md) ·
+  [build-gate](.loom/docs/build-gate.md) · [ci-principles](.loom/docs/ci-principles.md) · [safehouse](.loom/docs/safehouse.md) ·
+  [forge-auth](.loom/docs/forge-authentication.md) / [github-auth](.loom/docs/github-authentication.md) ·
   [blame-issue](.loom/docs/blame-issue.md) · [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md)
 
 ---
