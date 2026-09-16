@@ -7,6 +7,43 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7853** (closed): [Epic #6896] Phase 4: run-job seam contract + host executor
+- **PR #7875**: feat(run-job): ship the run-job seam contract + loopback/SSH host executor
+- **Issue #6650** (closed): .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier?
+- **PR #7699**: fix(config): replace live safehouse room / observability endpoint with placeholders
+- **PR #7891**: test(ci): pin the version-bump workflow's App pushing identity (#7829)
+- **Issue #6704** (closed): Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring)
+- **Issue #7852** (closed): Split role_shard.rs/roster.rs and shrink 6 frozen files to satisfy File Size Ratchet (blocks PR #7796)
+- **Issue #7691** (closed): [Phase B of #6704] Rank the role-runner ring from the live roster, generation-fenced, with bounded reassignment
+- **PR #7796**: feat(role-runner): rank the role-runner ring from the live roster, generation-fenced (#7691)
+- **Issue #7829** (closed): Activate version-bump-on-merge: push via the loom-fleet-dispatch App token (GITHUB_TOKEN cannot bypass the main ruleset on a user-owned repo)
+- **Issue #7777** (closed): ADR-0018 (draft): Rust owns behavior; shell exists only to reach it
+- **PR #7892**: docs(adr): add ADR-0018 — Rust owns behavior; shell exists only to reach it
+- **Issue #7793** (closed): RCA: agent errors in this session cluster into 4 classes, 2 of which are the repo's own tracked defect classes
+- **PR #7889**: docs: add verification-recipes.md and generalize the text-surgery rule
+- **Issue #6565** (closed): Dogfood config: loom-repo curator starved 3d — runtime=codex admitted with no codex model configured (#5028 skip, DEBUG-silent)
+- **Issue #3979** (closed): Architecture: elastic compute — expand sweep parallelism onto cloud worker hosts when local CPU saturates
+- **Issue #4136** (closed): measure: every sweep phase re-reads the repo from scratch — quantify the duplicated-read cost
+- **Issue #7760** (closed): Design: replace regex masking with a real shell tokenizer (external dep) — ADR-0016's no-dependency argument is circular
+- **Issue #7789** (closed): [tracking] 25 CI flake issues in 60 days, 22 closed: fix the mechanisms, not the instances
+- **Issue #7838** (closed): Build/runtime failure on main: Dangling Link Check fails — .loom/docs/ anchors stale vs defaults/docs/
+- **Issue #7716** (closed): [tracking] Budget agent-facing markdown by tokens
+- **Issue #7765** (closed): worktree.sh silently creates a main-HEAD branch shadowing an open cross-repo PR's branch name
+- **PR #7863**: fix(worktree): query the forge for an open PR before creating a shadowing fresh branch
+- **Issue #7790** (closed): Close the pipefail + early-exit-consumer SIGPIPE class: 4 flakes and 1 production wrong-answer from one idiom
+- **Issue #7771** (closed): verify-proposal-refs.sh: pipefail + grep -qFx SIGPIPE causes false MISSING FILE reports
+- **Issue #7736** (closed): verify-proposal-refs.sh: full_tree() can hit 'printf: write error: Broken pipe' under CI (observed in Shell Test Suites)
+- **PR #7885**: feat(ci): ratchet the pipefail + early-exit-consumer SIGPIPE class
+- **Issue #7882** (closed): Guard decision-log defaults into defaults/logs/ when invoked from source, polluting the vendored tree
+- **PR #7888**: fix(guard): resolve hook log dir to .loom/logs when running from defaults/hooks
+- **Issue #6969** (closed): auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation
+- **PR #7707**: fix(daemon): spawn a detached post-exit verifier on the auto-update drain-and-restart path
+- **Issue #7862** (closed): flaky CI: assert_contains's 'printf | grep -q' races SIGPIPE under pipefail, reporting present substrings as absent
+- **PR #7890**: fix(tests): avoid SIGPIPE race in assert_contains/assert_not_contains under pipefail
+- **Issue #7817** (closed): dispatch_sweep false cross-host collision refusal on a loom:triage-only issue (#7743)
+- **PR #7871**: fix(ci): publish version bumps with repository App identity
+- **Issue #7791** (closed): Retry-once-and-record for the shared shell suite: one flaky assertion currently blocks every concurrent PR
+- **PR #7886**: feat(ci): retry-once-and-record for the shared shell CI suite
 - **PR #7884**: test(bounded-run): score the wedge case only on attempts that actually started the child
 - **Issue #7788** (closed): test-bounded-run.sh flakes in CI on unrelated branches — portable-mode fixture races on the wedged child's pid
 - **PR #7881**: docs(builder): add proactive File Size Ratchet check before opening a PR
