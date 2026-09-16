@@ -290,6 +290,32 @@ jobs:
       - name: Check file size budget
         run: bash scripts/check-file-size-budget.sh
 
+  shell-allowlist:
+    name: Shell Allowlist
+    # Cheap structural check; always runs. #7762 / ADR-0018: new executable
+    # logic is a loom-daemon subcommand, and a new `.sh` needs a category plus a
+    # one-line reason in scripts/shell-allowlist.txt. A prose-only version of
+    # that policy would rot — #7755 is this repo's own receipt for a safety
+    # contract written as a comment and silently violated.
+    #
+    # Must NOT be path-filtered, for the same reason conflict-markers and
+    # shell-syntax are not: a new `.sh` appearing in a directory nobody thought
+    # was in scope is precisely the case this exists to catch, and a filter on
+    # 'scripts/**' + 'defaults/**' would miss it.
+    #
+    # Needs no toolchain: this is a shell/grep scan over `git ls-files`, with no
+    # cargo step and no loom-daemon binary (objection 3 in the #7762 ruling).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # Self-test first: a gate that silently stops checking reports OK forever
+      # while unjustified shell keeps landing.
+      - name: Self-test the gate
+        run: bash scripts/check-shell-allowlist.sh --self-test
+      - name: Check every tracked .sh is accounted for
+        run: bash scripts/check-shell-allowlist.sh
+
   markdown-token-budget:
     name: Markdown Token Ratchet
     # Same ratchet as File Size Ratchet above, applied to agent-facing
@@ -399,6 +425,16 @@ jobs:
         # and builds nothing -- so the tree is exactly what is tracked.
         # ~830 scripts, ~3s.
         run: bash defaults/scripts/check-shell-syntax.sh --quiet --dir .
+      - name: Run the shell-allowlist gate's self-test under bash 3.2
+        if: runner.os == 'macOS'
+        # #7762 requires check-shell-allowlist.sh to be bash-3.2-clean, and
+        # `bash -n` above only proves it PARSES. The self-test actually executes
+        # every rule, so running it here is the only thing that proves the gate
+        # guarding against the bash 3.2 class (#7717/#7728/#7730/#7749/#7751)
+        # does not itself belong to it. The invariant check proper runs once, in
+        # the ubuntu-only `Shell Allowlist` job -- this leg is portability
+        # coverage, not a second copy of the gate.
+        run: bash scripts/check-shell-allowlist.sh --self-test
       - name: Ratchet the pipefail + early-exit-consumer SIGPIPE class
         # #7790 (parent #7789). `set -o pipefail` plus a consumer that exits
         # before reading all input (head, grep -q, grep -m, read) lets the

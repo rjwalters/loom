@@ -241,6 +241,7 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   (`LOOM_RUNTIME` env > `runtimes.default` > `"claude"`), execing `spawn-<runtime>.sh`:
   [`.loom/docs/runtime-adapters.md`](.loom/docs/runtime-adapters.md).
 - **File size policy** — over-threshold files are ratcheted (frozen at current size; may shrink, not grow), NOT refactor-on-touch: [`.loom/docs/file-size-policy.md`](.loom/docs/file-size-policy.md).
+- **Language policy** — new executable logic is a `loom-daemon` subcommand, NOT a new `.sh`; a new script needs a category + reason in `scripts/shell-allowlist.txt` (CI-enforced, `contract` is baseline-only): [`.loom/docs/shell-language-policy.md`](.loom/docs/shell-language-policy.md).
 - **Custom roles** — add `.loom/roles/<name>.md` (and optional `<name>.json`).
 - **Branch rulesets & repository settings** — set at install time or via `./scripts/install/setup-branch-protection.sh` / `setup-repository-settings.sh`.
 - **Guard hooks** — `PreToolUse` guards block/ask on destructive commands and
@@ -248,9 +249,8 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   `cloudCli`, `reversibleGh`, `rmScope`, `forceScope`, `readOnlyFastPath`,
   `decisionLog`, `worktreeIsolation`, `stashScope`, each with an `LOOM_*` env
   override) let a repo opt out — above an **ungated denial floor** no toggle can disable. Catalog: [`defaults/docs/guard-hooks.md`](defaults/docs/guard-hooks.md); forge text is untrusted input: [`defaults/docs/untrusted-external-content.md`](defaults/docs/untrusted-external-content.md).
-- **MCP hooks** — the unified `mcp-loom` server is registered once per machine at
-  user scope (`scripts/install-loom.sh`, refreshed by `loom update`); `setup-mcp.sh`
-  is demoted to a bundle-rebuild/legacy-migration tool. See the mcp-loom README.
+- **MCP hooks** — the unified `mcp-loom` server is registered once per machine at user
+  scope (`scripts/install-loom.sh`, refreshed by `loom update`); `setup-mcp.sh` is demoted to a bundle-rebuild/legacy-migration tool. See the mcp-loom README.
 - **Fleet dashboard** (`loom-daemon serve`, opt-in, read-only, loopback by default): [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Fleet dashboard.
 - **Fleet observability** (`observability` config block: daemon → Cloudflare backend → dashboard) — [`.loom/docs/observability.md`](.loom/docs/observability.md).
 
