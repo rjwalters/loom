@@ -214,6 +214,21 @@ When creating a proposal:
 > - **If `create-issue.sh` exits `75`, it DEFERRED and filed nothing.** Another agent held the lock past its bounded wait. Do not retry in a tight loop and do not work around it — stop filing, say in your output that the burst was deferred, and let the next tick pick it up. Filing unserialized is precisely what corrupted those five issues.
 > - **Still never place an issue-creating agent in a parallel wave.** The lock is a safety net for the concurrency the daemon creates on its own; deliberately fanning out filers just makes them queue (or defer). See `sweep.md` → "Execution Model → Only Builders parallelize". Parallel **Builders** (implementing already-filed issues) stay safe — only issue *creation* is serialized.
 
+### Citation Scope (CRITICAL)
+
+The repo under review is `$LOOM_WORKSPACE` (= `$PWD`) — every cited path, line
+number, and code-state claim in a proposal must hold on **that repo's**
+`origin/main`. Sibling or source repos named in the target repo's own docs
+(e.g., a CLAUDE.md saying "copy the `verification/` layout from
+`some-org/sibling-repo`") are read-only context for understanding intent —
+they are **never a citation target**. Never cite a path, line, or file from a
+sibling repo as if it exists in this repo.
+
+If a target repo's docs say a file "will be ported from" a sibling and that
+file does not exist yet in this repo, a proposal about it must be phrased as a
+follow-up to the port issue ("when X is ported, do not carry over Y") — never
+as a removal from this repo, since there is nothing here yet to remove.
+
 ### Duplicate Detection (CRITICAL)
 
 **BEFORE creating any issue, check for potential duplicates:**
