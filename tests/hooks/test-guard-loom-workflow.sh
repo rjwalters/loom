@@ -292,6 +292,23 @@ EOF
 assert_deny "Still block gh pr merge in a flag-captured cat-heredoc redirected to a file then bash'd (#5122)" \
     "$GH_5122_FLAG_CAPTURED_REDIRECT_FILE_CMD"
 
+# Issue #7773: a cat-heredoc redirected to a FILE that is never executed --
+# just later referenced as inert data (e.g. --body-file) -- is still denied,
+# because mask_cat_heredoc_bodies() only neutralizes a heredoc CAPTURED by a
+# text-data-consuming command, not one parked in a file (the #5122 case right
+# above shows why: a later command on the same line could execute that file).
+# That denial is correct and must not change. What #7773 adds is a hint in
+# the deny reason so the false-positive case (documenting this very rule)
+# isn't left guessing why an apparently-inert command was denied.
+GH_7773_HEREDOC_FILE_CMD='cat > /tmp/loom-test-7773.md <<'"'"'DELIM'"'"'
+Some prose that quotes '"'"''"$PHRASE_CMD"''"'"' as documentation.
+DELIM
+gh issue edit 1234 --body-file /tmp/loom-test-7773.md'
+assert_deny "Still block gh pr merge quoted in a heredoc parked in a file for --body-file (#7773)" \
+    "$GH_7773_HEREDOC_FILE_CMD"
+assert_deny_reason_matches "Heredoc-to-file deny reason hints at the non-Bash-tool workaround (#7773)" \
+    "$GH_7773_HEREDOC_FILE_CMD" "heredoc body being written to a file"
+
 # The `<<-` (dash) heredoc variant (strips leading tabs from the body) must
 # get the same treatment -- the opener-line-suffix check does not special-
 # case the `-` after `<<`.
