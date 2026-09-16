@@ -91,6 +91,6 @@
 1468 mcp-loom/src/tools/sweeps.ts
 1082 mcp-loom/src/tools/terminals.ts
 1488 scripts/install-loom.sh
-2739 scripts/test-installer.sh
+2729 scripts/test-installer.sh
 1264 scripts/uninstall-loom.sh
 1098 tests/hooks/test-guard-destructive-write-confinement.sh
