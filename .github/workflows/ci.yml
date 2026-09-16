@@ -814,8 +814,25 @@ jobs:
           git config --global user.name "Loom CI"
       - name: Assert the wired/excluded manifest invariant (#4455)
         run: bash defaults/scripts/tests/check-ci-suite-manifest.sh
+      # Retry-once-and-record (#7791): a suite that fails its first attempt is
+      # re-run exactly once; a suite failing BOTH attempts still fails this
+      # step exactly as before. Every retry is recorded twice — a distinct
+      # "PASS (retried once …)" / "FAIL … failed both attempts" line in this
+      # step's own log, AND a $GITHUB_STEP_SUMMARY table (populated by
+      # run-ci-suites.sh itself, since GITHUB_STEP_SUMMARY is already set in
+      # every Actions job) — plus the durable TSV record uploaded below, so
+      # the retry data survives past this run for #7789's quarantine
+      # measurement rather than only ever being read by eye.
       - name: Run the CI-wired shell test suites
         run: bash defaults/scripts/tests/run-ci-suites.sh
+      - name: Upload CI suite retry log (#7791)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-suite-retry-log
+          path: /tmp/ci-suite-retry-log.tsv
+          if-no-files-found: ignore
+          retention-days: 14
 
   worker-image-smoke:
     name: loom-worker Image Smoke Test
