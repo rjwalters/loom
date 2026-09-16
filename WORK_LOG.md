@@ -7,6 +7,18 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **PR #7869**: refactor(worktree): one shared `branch_landed` primitive replacing four per-tool squash heuristics (#7812)
+- **Issue #7812** (closed): One shared 'has this branch landed?' primitive (forge state + merge-tree equality) to replace four per-tool squash heuristics
+- **Issue #7773** (closed): guard-loom-workflow.sh denies writing a FILE that merely quotes the merge command, and the obvious fix opens a bypass
+- **PR #7857**: fix(guard): hint that a heredoc-to-file merge-phrase match may be inert docs
+- **Issue #7784** (closed): classify-dependency-block.sh: 'blocks'/'blocking'/'blocker' ref-first shapes lost by #7764's after-phrase window
+- **PR #7868**: fix: match ref-first 'blocks'/'blocking'/'blocker' dependency findings
+- **Issue #7757** (closed): daemon: #4123 open-PR guard's verified NoneOpen short-circuits before the REST/timeline union check, missing non-closing 'Part of #N' PRs
+- **PR #7859**: fix(dispatch): check non-closing PR references before dispatch
+- **Issue #7827** (closed): merge-pr.sh's #7302 VERSION-bump guard is incompatible with #7743's no-hand-bump policy
+- **PR #7866**: fix(merge): align version guard with automatic merge-time bumps
+- **Issue #7849** (closed): bug(worktree.sh): orphan guard rm -rf's a LIVE worktree when its path contains a space — #3717 instance missed at worktree.sh:390
+- **PR #7858**: fix(worktree.sh): parse porcelain worktree paths with substr so the orphan guard stops deleting live space-path worktrees
 - **Issue #7761** (closed): PreToolUse guards fail OPEN when absent or non-executable, with no signal, in workspaces that expect them
 - **PR #7847**: fix: deny/warn instead of silently allowing on a broken guard install
 - **Issue #7753** (closed): Extend generated TOCs to role prompts and slash commands
