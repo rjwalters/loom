@@ -166,7 +166,7 @@ workflow_code() {
 # Literal substring must be present on an executable (non-comment) line.
 assert_present() {
     local needle="$1" msg="$2"
-    if workflow_code | grep -qF -- "$needle"; then
+    if workflow_code | grep -F -- "$needle" >/dev/null; then
         pass "$msg"
     else
         fail "$msg" "Expected to find literally (outside comments): $needle"
@@ -190,7 +190,7 @@ assert_absent_from_code() {
 # Regex must match an executable line.
 assert_matches() {
     local pattern="$1" msg="$2"
-    if workflow_code | grep -qE -- "$pattern"; then
+    if workflow_code | grep -E -- "$pattern" >/dev/null; then
         pass "$msg"
     else
         fail "$msg" "No executable line matched: $pattern"
@@ -220,7 +220,7 @@ assert_no_match() {
 
 # First line number whose executable text contains a literal ("" when absent).
 line_of() {
-    workflow_code | grep -nF -- "$1" | head -1 | cut -d: -f1
+    workflow_code | grep -nF -- "$1" | sed -n '1p' | cut -d: -f1
 }
 
 # Assert one literal appears strictly before another in (executable) file order.
@@ -486,7 +486,7 @@ if [[ "$RUN_MUTATION_CONTROLS" -eq 1 ]]; then
         elif ! grep -qF -- "FAIL: $expected_fail" "$MUTANT_LOG"; then
             fail "$msg" "child failed, but not on the guarding assertion" \
                 "expected: FAIL: $expected_fail" \
-                "$(grep 'FAIL' "$MUTANT_LOG" | head -5)"
+                "$(grep 'FAIL' "$MUTANT_LOG" | sed -n '1,5p')"
         else
             pass "$msg"
         fi
