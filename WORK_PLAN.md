@@ -10,59 +10,47 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
 - **#7699**: fix(config): replace live safehouse room / observability endpoint with placeholders
+- **#7871**: fix(ci): publish version bumps with repository App identity
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
-- **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone
-- **#7431**: [Epic #6896] Phase 3: Fleet-default rollout — soak criteria, flip containment default on Linux fleet hosts
+- **#7691**: [Phase B of #6704] Rank the role-runner ring from the live roster, generation-fenced, with bounded reassignment
+- **#7852**: Split role_shard.rs/roster.rs and shrink 6 frozen files to satisfy File Size Ratchet (blocks PR #7796)
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
-- **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation
-- **#7431**: [Epic #6896] Phase 3: Fleet-default rollout — soak criteria, flip containment default on Linux fleet hosts
-- **#7659**: Proposer roles: cite only paths that exist in the dispatched workspace; sibling checkouts named in a repo docs are context, never a citation target
-- **#7664**: watchdog: peer-coordination escalation needs hysteresis and dedup — refiles a tracking issue on every self-recovering flap
-- **#7666**: champion: a passing, already-decomposed epic is escalated to the operator after repeated identical stand-down passes
 - **#7691**: [Phase B of #6704] Rank the role-runner ring from the live roster, generation-fenced, with bounded reassignment
-- **#7694**: Builder: probe for a live sibling worktree before worktree.sh touches files (generalizing #6765)
-- **#7726**: Restructure sweep.md under progressive disclosure
-- **#7756**: classify-dependency-block.sh: 'prerequisite' phrase word false-positives a merits finding as a self-clearing dependency (regression risk: infinite re-evaluation loop)
+- **#7765**: worktree.sh silently creates a main-HEAD branch shadowing an open cross-repo PR's branch name
+- **#7785**: docs: .loom/README.md and defaults/.loom-README.md sample config still references nonexistent worker.md role file
+- **#7788**: test-bounded-run.sh flakes in CI on unrelated branches — portable-mode fixture races on the wedged child's pid
+- **#7865**: Judge rejection pattern: Builder doesn't proactively check the File Size Ratchet before opening a PR (#7863, #7796, #7707)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#7748**: tokens_pool: blocking_entry_reports_exhaustion_class_and_cooldown_remaining flaked in CI (wall-clock jump, not code)
-- **#7821**: epic #7810 PR 1: shared bounded subprocess execution — drain-safe, group-terminating, with self_update.rs as first migration
+- **#7829**: Activate version-bump-on-merge: push via the loom-fleet-dispatch App token (GITHUB_TOKEN cannot bypass the main ruleset on a user-owned repo)
+- **#7853**: [Epic #6896] Phase 4: run-job seam contract + host executor
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7670**: fix(champion): stop escalating a passing, already-decomposed epic to the operator
-- **#7673**: docs(roles): citation-scope rules for hermit/architect; fix stale get_random_file example
-- **#7680**: fix(watchdog): dedup peer-coordination escalations across the cooldown window (#7664)
-- **#7685**: feat(resync): land resync commits conservatively, never rebase/bypass-push (#6646)
-- **#7700**: Builder: probe for a live sibling worktree before worktree.sh touches files (generalizing #6765)
-- **#7707**: fix(daemon): spawn a detached post-exit verifier on the auto-update drain-and-restart path
-- **#7759**: docs(sweep): restructure sweep.md under progressive disclosure (#7726)
-- **#7764**: fix: classify-dependency-block.sh 'prerequisite' false-positive on narrative co-occurrence (#7756)
-- **#7769**: docs(runtime-adapters): document containment fleet-default soak criteria and rollback path
-- **#7828**: feat(daemon): shared bounded subprocess execution — drain-safe, group-terminating (epic #7810 PR 1)
-- **#7830**: fix(tests): widen wall-clock tolerance in cooldown-remaining assertions
+- **#7863**: fix(worktree): query the forge for an open PR before creating a shadowing fresh branch
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#7699**: fix(config): replace live safehouse room / observability endpoint with placeholders
+- **#7871**: fix(ci): publish version bumps with repository App identity
 
 ## Proposed
 
@@ -72,24 +60,20 @@ Issues carrying `loom:curated`.
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
 - **#6544**: provision-hooks.sh emits unquoted ${CLAUDE_PROJECT_DIR} — every hook breaks when the project path contains a space *(curated)*
 - **#6565**: Dogfood config: loom-repo curator starved 3d — runtime=codex admitted with no codex model configured (#5028 skip, DEBUG-silent) *(curated)*
-- **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
 - **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
-- **#7431**: [Epic #6896] Phase 3: Fleet-default rollout — soak criteria, flip containment default on Linux fleet hosts *(curated)*
 - **#7657**: Champion: close a proposal whose central premise is verified false instead of escalating it as an operator decision *(curated)*
-- **#7659**: Proposer roles: cite only paths that exist in the dispatched workspace; sibling checkouts named in a repo docs are context, never a citation target *(curated)*
-- **#7664**: watchdog: peer-coordination escalation needs hysteresis and dedup — refiles a tracking issue on every self-recovering flap *(curated)*
-- **#7666**: champion: a passing, already-decomposed epic is escalated to the operator after repeated identical stand-down passes *(curated)*
 - **#7691**: [Phase B of #6704] Rank the role-runner ring from the live roster, generation-fenced, with bounded reassignment *(curated)*
-- **#7694**: Builder: probe for a live sibling worktree before worktree.sh touches files (generalizing #6765) *(curated)*
 - **#7705**: Version-bump commits are landing with Cargo.lock / mcp-loom/package-lock.json desynced from the bumped version *(curated)*
 - **#7716**: [tracking] Budget agent-facing markdown by tokens *(curated)*
-- **#7726**: Restructure sweep.md under progressive disclosure *(curated)*
-- **#7748**: tokens_pool: blocking_entry_reports_exhaustion_class_and_cooldown_remaining flaked in CI (wall-clock jump, not code) *(curated)*
-- **#7756**: classify-dependency-block.sh: 'prerequisite' phrase word false-positives a merits finding as a self-clearing dependency (regression risk: infinite re-evaluation loop) *(curated)*
 - **#7758**: Re-derive which bootstrap scripts must stay shell — auto_update.rs already duplicates loom-daemon-update.sh *(curated)*
+- **#7765**: worktree.sh silently creates a main-HEAD branch shadowing an open cross-repo PR's branch name *(curated)*
+- **#7785**: docs: .loom/README.md and defaults/.loom-README.md sample config still references nonexistent worker.md role file *(curated)*
+- **#7788**: test-bounded-run.sh flakes in CI on unrelated branches — portable-mode fixture races on the wedged child's pid *(curated)*
+- **#7789**: [tracking] 25 CI flake issues in 60 days, 22 closed: fix the mechanisms, not the instances *(curated)*
 - **#7794**: Seven scripts read their own source to print --help; the tear-race has broken CI three times *(curated)*
+- **#7829**: Activate version-bump-on-merge: push via the loom-fleet-dispatch App token (GITHUB_TOKEN cannot bypass the main ruleset on a user-owned repo) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -97,6 +81,7 @@ Issues carrying `loom:curated`.
 - **#4167**: Proposal: first-class multi-runtime worker support (Claude Code, Codex, Amp, oh-my-pi) via a runtime adapter contract *(architect)*
 - **#4196**: Proposal: safehouse room as the primary Loom operator interface (narrate → workers speak → steer → parity) *(architect)*
 - **#7777**: ADR-0018 (draft): Rust owns behavior; shell exists only to reach it *(architect)*
+- **#7854**: [Epic #6896] Phase 4: migrate docker-requiring callers onto the run-job seam *(architect)*
 
 ## Epics
 
@@ -109,13 +94,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 1 |
+| Operator merge-risk holds | 2 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 11 |
+| Ready (`loom:issue`) | 7 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 11 |
-| Approved PRs awaiting merge | 1 |
-| Curated | 22 |
-| Architect / Hermit proposals | 4 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 2 |
+| Curated | 18 |
+| Architect / Hermit proposals | 5 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
