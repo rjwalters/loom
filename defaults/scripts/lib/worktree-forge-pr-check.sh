@@ -19,14 +19,22 @@
 # It is also blind to the difference between "origin confirmed it has no such
 # ref" and "the fetch itself failed" — only the former is evidence.
 #
-# This file holds both halves of the fix: the forge lookup
-# (`_worktree_open_pr_for_branch`) and the decision arm the caller runs in
-# place of the old unconditional fall-through
-# (`_worktree_guard_fresh_branch_against_open_pr`). It lives here rather than
-# inline in worktree.sh per `.loom/docs/file-size-policy.md` — worktree.sh is
-# over the 1000-line ratchet threshold and therefore frozen at its current
-# size, and "new sibling module, small dispatch arm left behind" is that
-# policy's own preferred remedy.
+# This file holds the fix and the branch-resolution decision it gates:
+#
+#   _worktree_open_pr_for_branch                    forge lookup (open PR
+#                                                   head-matching a branch)
+#   _worktree_guard_fresh_branch_against_open_pr    the #7765 decision arm
+#   _worktree_resolve_origin_branch_reuse           worktree.sh's whole
+#                                                   "reuse origin/<branch> or
+#                                                   branch fresh?" decision
+#                                                   (#4823 / #5657 / #7765)
+#
+# They live here rather than inline in worktree.sh per
+# `.loom/docs/file-size-policy.md` — worktree.sh is over the 1000-line ratchet
+# threshold and therefore frozen at its current size, and "new sibling module,
+# small dispatch arm left behind" is that policy's own preferred remedy.
+# worktree.sh calls `_worktree_resolve_origin_branch_reuse` and reads back
+# `_WT_REUSE_REMOTE_BRANCH`; the other two are internal to this file.
 #
 # Both functions depend on worktree.sh's `print_error` / `print_info`, and on
 # fd 3 being open for `--json` output; fallbacks are defined below so the file
@@ -40,8 +48,8 @@ if ! declare -F print_info >/dev/null 2>&1; then
 fi
 
 # Look up an OPEN pull request whose head branch matches <branch>, via the
-# forge (same `loom-daemon forge` / `gh` convention as worktree.sh's
-# `_worktree_merged_pr_head_sha`, the #5657 sibling check). Unlike that
+# forge (same `loom-daemon forge` / `gh` convention as `branch_landed` in
+# lib/branch-landed.sh, the #5657/#7812 sibling check). Unlike that
 # helper, this one is used to decide whether it is SAFE to fall through to
 # creating a brand-new branch named <branch> off the base ref — so, per
 # #7765, "could not determine" must NOT be treated the same as "confirmed
@@ -85,7 +93,7 @@ _worktree_open_pr_for_branch() {
         return 0
     fi
     # A missing `jq` is a basic tooling gap, not a forge-reachability signal
-    # (worktree.sh already treats it that way for the sibling #5657 check, and
+    # (`branch_landed` already treats it that way for the #5657 check, and
     # other worktree.sh features are exercised with jq deliberately absent
     # expecting plain worktree creation to keep working) - degrade the same
     # way as "no forge remote" rather than refusing.
@@ -260,5 +268,102 @@ _worktree_guard_fresh_branch_against_open_pr() {
             exit 1
             ;;
     esac
+    return 0
+}
+
+# _worktree_resolve_origin_branch_reuse <branch> <issue-number> <json-output>
+#                          <base-display> <base-ref> <default-branch>
+#
+# Decide, for a branch that has no LOCAL ref yet, whether worktree.sh should
+# reuse origin's branch of the same name or create a fresh one off the base
+# ref. Moved out of worktree.sh together with the #7765 check it now gates on
+# (file-size ratchet — see the header of this file); the three arms are:
+#
+#   - origin has the ref and it has NOT landed on the default branch -> reuse
+#     it (the #4823 in-flight-cycle case: a Doctor fixing review feedback must
+#     continue the real PR history, not a fresh branch off main)
+#   - origin has the ref but it has already LANDED -> do not reuse; fall
+#     through to a fresh branch (#5657, the reused partial-slice branch name)
+#   - origin has no such ref -> hand off to
+#     `_worktree_guard_fresh_branch_against_open_pr` above, which asks the
+#     forge before allowing the fresh branch (#7765)
+#
+# The origin fetch's own result is classified rather than swallowed: "no such
+# ref on origin" and "the fetch itself failed" (network/auth/rate-limit) look
+# identical to a bare `|| true`, but only the former is proof that origin has
+# no branch of this name, and the #7765 arm needs to tell them apart.
+# `if VAR=$(...); then` (not a bare assignment) so a non-zero exit does not
+# trip `set -e` before we inspect it.
+#
+# Sets the caller's `_WT_REUSE_REMOTE_BRANCH` global (deliberately not local);
+# depends on the shared `branch_landed` primitive (lib/branch-landed.sh,
+# #7812/#7869) for the landed arm — worktree.sh sources it, with a fail-open
+# shim when it is missing. Always returns 0 — refusals exit the script
+# outright, same control flow as when this ran inline.
+_worktree_resolve_origin_branch_reuse() {
+    local branch="$1"
+    local issue_number="$2"
+    local json_output="$3"
+    local base_display="$4"
+    local base_ref="$5"
+    local default_branch="$6"
+    local origin_fetch_result origin_fetch_output
+    origin_fetch_result="ok"
+    if ! origin_fetch_output="$(git fetch origin "$branch" 2>&1)"; then
+        if echo "$origin_fetch_output" | grep -qi "couldn't find remote ref"; then
+            origin_fetch_result="no-such-ref"
+        else
+            origin_fetch_result="fetch-failed"
+        fi
+    fi
+    _WT_REUSE_REMOTE_BRANCH=false
+    if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        # #5657: before reusing the remote branch, check whether it has
+        # already LANDED on the default branch (e.g. a partial-increment
+        # slice whose branch name — feature/issue-N — gets reused by the next
+        # slice, and the forge left the ref on origin because
+        # auto-delete-head-branches is off). Reusing an already-merged branch
+        # produces a worktree whose history conflicts with main and a PR with
+        # zero real diff, not the in-flight-cycle case #4823 was written to
+        # protect.
+        #
+        # #7812: asked via the shared `branch_landed` primitive, so this is
+        # now correct for a squash merge (forge PR state), a rebase merge
+        # (SHAs rewritten — tree equality), and a merge commit (ancestry)
+        # alike. `unknown` fails closed to REUSE: a forge outage must never
+        # block worktree creation, and reuse is the pre-#5657 behaviour.
+        #
+        # Plain statement, NOT `$(...)` — command substitution runs in a
+        # subshell, which would silently discard the BRANCH_LANDED_* globals
+        # this sets.
+        # No LOCAL branch of this name exists here (that is this arm's whole
+        # premise), so `branch_landed`'s resolution ladder lands on
+        # refs/remotes/origin/$branch — the ref actually under question.
+        branch_landed "$branch" "$default_branch" >/dev/null
+        if [[ "$BRANCH_LANDED_VERDICT" == "landed" ]]; then
+            if [[ "$json_output" != "true" ]]; then
+                if [[ -n "$BRANCH_LANDED_PR_NUMBER" ]]; then
+                    print_info "origin/$branch is the head of already-merged PR #${BRANCH_LANDED_PR_NUMBER} - creating a fresh branch from $base_display instead"
+                else
+                    print_info "origin/$branch has already landed on $base_display (${BRANCH_LANDED_EVIDENCE}) - creating a fresh branch from $base_display instead"
+                fi
+            fi
+        else
+            # not-landed (checked, still live) or unknown (forge unreachable
+            # AND the tree comparison unavailable — fail open, never block
+            # worktree creation on an outage): preserve today's reuse
+            # behavior exactly.
+            _WT_REUSE_REMOTE_BRANCH=true
+        fi
+    else
+        # #7765: origin has no ref of this name, so we are about to create a
+        # FRESH branch under it. Ref-absence on origin is NOT proof that no PR
+        # already claims the name (a fork PR's head never appears as
+        # origin/<branch>), and the fetch above may simply have failed. Ask
+        # the forge before deciding. May set _WT_REUSE_REMOTE_BRANCH=true
+        # (same-repo PR, fetched via refs/pull/<n>/head) or exit non-zero
+        # rather than let a fresh branch shadow a real PR.
+        _worktree_guard_fresh_branch_against_open_pr "$branch" "$issue_number" "$json_output" "$base_display" "$base_ref" "$origin_fetch_result"
+    fi
     return 0
 }

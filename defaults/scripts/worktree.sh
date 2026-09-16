@@ -2493,78 +2493,16 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
 else
     # No local branch by this name. Before falling back to a fresh branch off
-    # BASE_REF, check whether origin already has a pushed branch of the exact
-    # same name — e.g. an existing PR branch from a prior Builder/Doctor cycle
-    # (#4823). Without this check, a Doctor fixing review feedback on an
-    # already-pushed PR would silently get a NEW branch created from
-    # origin/$DEFAULT_BRANCH instead of the real PR history, risking a
-    # PR-clobbering force-push or a diff against the wrong base. This is
-    # independent of --base (which only chooses the start point when we DO
-    # need to create a fresh branch, below).
-    #
-    # #7765: don't swallow the fetch's own result — "no such ref on origin"
-    # and "the fetch itself failed" (network/auth/rate-limit) look identical
-    # to a bare `|| true`, but only the former is proof that origin has no
-    # branch of this name. `if VAR=$(...); then` (not a bare assignment) so a
-    # non-zero exit doesn't trip `set -e` before we inspect it.
-    _WT_ORIGIN_FETCH_RESULT="ok"
-    if ! _wt_origin_fetch_output="$(git fetch origin "$BRANCH_NAME" 2>&1)"; then
-        if echo "$_wt_origin_fetch_output" | grep -qi "couldn't find remote ref"; then
-            _WT_ORIGIN_FETCH_RESULT="no-such-ref"
-        else
-            _WT_ORIGIN_FETCH_RESULT="fetch-failed"
-        fi
-    fi
-    _WT_REUSE_REMOTE_BRANCH=false
-    if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
-        # #5657: before reusing the remote branch, check whether it has
-        # already LANDED on the default branch (e.g. a partial-increment
-        # slice whose branch name — feature/issue-N — gets reused by the next
-        # slice, and the forge left the ref on origin because
-        # auto-delete-head-branches is off). Reusing an already-merged branch
-        # produces a worktree whose history conflicts with main and a PR with
-        # zero real diff, not the in-flight-cycle case #4823 was written to
-        # protect.
-        #
-        # #7812: asked via the shared `branch_landed` primitive, so this is
-        # now correct for a squash merge (forge PR state), a rebase merge
-        # (SHAs rewritten — tree equality), and a merge commit (ancestry)
-        # alike. `unknown` fails closed to REUSE: a forge outage must never
-        # block worktree creation, and reuse is the pre-#5657 behaviour.
-        #
-        # Plain statement, NOT `$(...)` — command substitution runs in a
-        # subshell, which would silently discard the BRANCH_LANDED_* globals
-        # this sets.
-        # No LOCAL branch of this name exists here (that is this `else` arm's
-        # whole premise), so `branch_landed`'s resolution ladder lands on
-        # refs/remotes/origin/$BRANCH_NAME — the ref actually under question.
-        branch_landed "$BRANCH_NAME" "$DEFAULT_BRANCH" >/dev/null
-        if [[ "$BRANCH_LANDED_VERDICT" == "landed" ]]; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                if [[ -n "$BRANCH_LANDED_PR_NUMBER" ]]; then
-                    print_info "origin/$BRANCH_NAME is the head of already-merged PR #${BRANCH_LANDED_PR_NUMBER} - creating a fresh branch from $BASE_DISPLAY instead"
-                else
-                    print_info "origin/$BRANCH_NAME has already landed on $BASE_DISPLAY (${BRANCH_LANDED_EVIDENCE}) - creating a fresh branch from $BASE_DISPLAY instead"
-                fi
-            fi
-        else
-            # not-landed (checked, still live) or unknown (forge unreachable
-            # AND the tree comparison unavailable — fail open, never block
-            # worktree creation on an outage): preserve today's reuse
-            # behavior exactly.
-            _WT_REUSE_REMOTE_BRANCH=true
-        fi
-    else
-        # #7765: origin has no ref of this name, so we are about to create
-        # a FRESH branch under it. Ref-absence on origin is NOT proof that
-        # no PR already claims the name (a fork PR's head never appears as
-        # origin/<branch>), and the fetch above may simply have failed. Ask
-        # the forge before deciding - see lib/worktree-forge-pr-check.sh for
-        # the full rationale and the outcomes it distinguishes. May set
-        # _WT_REUSE_REMOTE_BRANCH=true (same-repo PR, fetched via
-        # refs/pull/<n>/head) or exit non-zero rather than shadow a real PR.
-        _worktree_guard_fresh_branch_against_open_pr "$BRANCH_NAME" "$ISSUE_NUMBER" "$JSON_OUTPUT" "$BASE_DISPLAY" "$BASE_REF" "$_WT_ORIGIN_FETCH_RESULT"
-    fi
+    # BASE_REF, resolve the name against origin AND the forge: an existing
+    # pushed PR branch from a prior Builder/Doctor cycle (#4823), a stale
+    # already-merged one whose ref origin still carries (#5657), or an open PR
+    # whose head never appears as origin/<branch> at all (#7765 — a fork PR's
+    # cross-repo head, or a same-repo head the plain-name fetch missed).
+    # The whole decision lives in lib/worktree-forge-pr-check.sh: it sets
+    # _WT_REUSE_REMOTE_BRANCH, or exits non-zero rather than create a branch
+    # that would silently shadow a real PR. Independent of --base, which only
+    # chooses the start point when we DO create a fresh branch, below.
+    _worktree_resolve_origin_branch_reuse "$BRANCH_NAME" "$ISSUE_NUMBER" "$JSON_OUTPUT" "$BASE_DISPLAY" "$BASE_REF" "$DEFAULT_BRANCH"
 
     if [[ "$_WT_REUSE_REMOTE_BRANCH" == "true" ]]; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then
