@@ -53,7 +53,40 @@ trap 'rm -f "$raw"' EXIT
 # --offline: never touch the network. External URL checking is deliberately out
 # of scope -- it is rate-limited and flaky, and would turn a deterministic
 # sub-second check into a source of random red builds.
-lychee --offline --include-fragments=anchor-only --no-progress "${FILES[@]}" >"$raw" 2>&1 || true
+#
+# Capture the real exit status instead of discarding it with `|| true`: lychee
+# exits 0 when every link resolves and 2 when it found link errors (fragment
+# or otherwise) -- both are normal outcomes this script interprets itself via
+# the "Cannot find fragment" grep below. Any OTHER exit status (a crash, a
+# usage error from a flag a future lychee release removes) means lychee did
+# not actually run the check, and must not be allowed to silently read as a
+# pass.
+set +e
+lychee --offline --include-fragments=anchor-only --no-progress "${FILES[@]}" >"$raw" 2>&1
+lychee_status=$?
+set -e
+
+if [[ "$lychee_status" -ne 0 && "$lychee_status" -ne 2 ]]; then
+  echo "check-doc-anchors: FAIL - lychee exited with status $lychee_status (expected 0 = clean or 2 = link errors found); it did not complete the check." >&2
+  echo "" >&2
+  cat "$raw" >&2
+  exit 1
+fi
+
+# Guard against a false OK/false structured-error read: lychee prints its own
+# "<N> Total (in <duration>)" summary line on every completed run, whether
+# clean (0) or with errors (2). Require it before trusting either exit status
+# -- otherwise a usage error or crash that happens to also exit 2 (confirmed
+# by hand: a stub lychee printing "unrecognized argument" and exiting 2 has no
+# "Cannot find fragment" in its output, so it fell through to a false OK
+# before this check existed) would either read as a pass or, worse, silently
+# skip real fragment errors because the grep below never matches.
+if ! grep -q "Total (in" "$raw"; then
+  echo "check-doc-anchors: FAIL - lychee exited $lychee_status but printed no summary line; treating as an incomplete run rather than a pass." >&2
+  echo "" >&2
+  cat "$raw" >&2
+  exit 1
+fi
 
 if grep -q "Cannot find fragment" "$raw"; then
   {
