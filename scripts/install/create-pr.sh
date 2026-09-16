@@ -24,7 +24,11 @@
 # Environment variables:
 #   LOOM_VERSION       - Loom version string (default: "unknown")
 #   LOOM_COMMIT        - Loom commit hash (default: "unknown")
-#   FORCE_AUTO_MERGE   - If "true", attempt to auto-merge the PR (default: "false")
+#   FORCE_AUTO_MERGE   - If "true", attempt to auto-merge the PR (default: "false").
+#                        The merge strategy is probed from the target repo's
+#                        allowed methods (squash > merge > rebase) rather than
+#                        hardcoded to squash — see detect_merge_method() in
+#                        forge-detect.sh (#7844).
 #   SKIP_TARGET_CI     - If "true", add `[skip ci]` prefix to PR title and
 #                        commit subject (default: "false"). Opt-in via the
 #                        `--skip-target-ci` flag on install-loom.sh.
@@ -421,13 +425,21 @@ MERGE_STATUS="manual"
 if [[ "$FORCE_AUTO_MERGE" == "true" ]]; then
   info "Force mode: Attempting to merge PR..."
 
+  # Detect the merge strategy this repository actually allows instead of
+  # hardcoding squash (#7844, follow-up to #7754): a repo configured for
+  # merge-commit-only or rebase-only rejects a squash outright ("Squash merges
+  # are not allowed on this repository"). Always one of squash|merge|rebase,
+  # failing open to squash on a probe error.
+  MERGE_METHOD=$(detect_merge_method)
+  info "Merge method: $MERGE_METHOD"
+
   if [[ "$FORGE_TYPE" == "github" ]]; then
-    if gh pr merge "$PR_URL" --squash --delete-branch 2>/dev/null; then
+    if gh pr merge "$PR_URL" "--${MERGE_METHOD}" --delete-branch 2>/dev/null; then
       success "PR merged successfully"
       MERGE_STATUS="merged"
     else
       info "Immediate merge not available (ruleset may require reviews)"
-      if gh pr merge "$PR_URL" --auto --squash --delete-branch 2>/dev/null; then
+      if gh pr merge "$PR_URL" --auto "--${MERGE_METHOD}" --delete-branch 2>/dev/null; then
         success "Auto-merge enabled - PR will merge once requirements are met"
         MERGE_STATUS="auto"
       else
@@ -442,7 +454,7 @@ if [[ "$FORCE_AUTO_MERGE" == "true" ]]; then
     # Extract PR number for Gitea merge
     GITEA_PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$' || echo "")
     if [[ -n "$GITEA_PR_NUMBER" ]]; then
-      MERGE_RESPONSE=$(gitea_api POST "/repos/${FORGE_OWNER}/${FORGE_REPO}/pulls/${GITEA_PR_NUMBER}/merge" '{"Do":"squash","delete_branch_after_merge":true}')
+      MERGE_RESPONSE=$(gitea_api POST "/repos/${FORGE_OWNER}/${FORGE_REPO}/pulls/${GITEA_PR_NUMBER}/merge" "{\"Do\":\"${MERGE_METHOD}\",\"delete_branch_after_merge\":true}")
       MERGE_CODE=$(echo "$MERGE_RESPONSE" | tail -1)
 
       if [[ "$MERGE_CODE" == "200" || "$MERGE_CODE" == "204" ]]; then
