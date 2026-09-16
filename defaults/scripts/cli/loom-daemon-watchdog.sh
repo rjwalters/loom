@@ -491,7 +491,8 @@
 #                                is treated as cooldown-elapsed and escalates
 #                                fresh, same as one landing after it. 0
 #                                disables the cooldown outright (fires every
-#                                time, today's behavior).
+#                                time — as a dedup comment rather than a fresh
+#                                issue when a #7664 tracking ref exists).
 #   LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE  #7258/#7664: path to the cooldown
 #                                state file a successful recovery writes
 #                                (default <loom dir>
@@ -1677,7 +1678,7 @@ escalate_peer_coordination_degraded() {
                 IFS= read -r -d '' dedup_body <<EOF || true
 peer-claim coordination has gone DEGRADED again on \`$hostname_str\` (${PEER_COORD_SUMMARY:-see the daemon peer-claims report}).
 
-This is flap #${flap_count} within the ${PEER_COORD_DEDUP_WINDOW_SECS}s dedup window (#7664) since this tracking issue was first filed — commenting here instead of filing a fresh issue.
+This is flap #${flap_count} since this tracking issue was first filed, landing within the ${PEER_COORD_DEDUP_WINDOW_SECS}s dedup window (#7664) since the last recovery — commenting here instead of filing a fresh issue.
 
 **Suspected cause** (unverified, per anvil#1270): \`advertised\` only moves at dispatch time, so a RAM/disk-throttled host with cap 0 never advertises and cannot reach the sustained-receive recovery threshold.
 
