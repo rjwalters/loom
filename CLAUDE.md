@@ -109,16 +109,8 @@ merge-risk hold only so far: [`.loom/docs/label-state-machine.md`](.loom/docs/la
 
 ### Issues Are Suggestions (Role Autonomy)
 
-Filed issues are the *input queue*, not mandates — this repo runs
-autonomy-by-default. In autonomous mode **Curator, Builder, and Judge** may
-**close** (rationale commented first, then `--reason "not planned"`) or
-**rescope** (relabel back to `loom:triage`/`loom:curated` if the scope no
-longer matches) an issue rather than build it as filed, when it is obsolete,
-duplicate, low value, or the wrong approach. **Never** close an issue that
-encodes a still-pending human decision — use `loom:blocked`/
-`loom:operator-only` instead. Full guardrails live in each role prompt's own
-"Issues Are Suggestions" section: `.loom/roles/curator.md`, `builder.md`,
-`judge.md`.
+Filed issues are the *input queue*, not mandates — this repo runs autonomy-by-default. In autonomous mode **Curator, Builder, and Judge** may **close** (rationale commented first, then `--reason "not planned"`) or **rescope** (relabel back to `loom:triage`/`loom:curated` if the scope no longer matches) an issue rather than build it as filed, when it is obsolete, duplicate, low value, or the wrong approach. **Never** close an issue that encodes a still-pending human decision — use `loom:blocked`/`loom:operator-only` instead. Full guardrails live in each role prompt's own "Issues Are Suggestions" section: `.loom/roles/curator.md`, `builder.md`, `judge.md`.
+**Champion** gets one narrow addition (#7657): it may close a Hermit/Architect/Auditor proposal for the `premise-false` kind only — every recurring finding across its N=2 unrevised evaluations re-verified false on current `main` — `--reason "not planned"` after a rationale comment; any mixed finding set still escalates to `loom:operator-only` as before.
 
 ## Git Worktree Workflow
 
