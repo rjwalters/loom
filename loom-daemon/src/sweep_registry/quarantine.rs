@@ -549,12 +549,9 @@ impl SweepRegistry {
         };
 
         if token_name == UNKNOWN_TOKEN_NAME {
-            log::warn!(
-                "sweep_registry: issue #{issue} sweep {sweep_id} insta-crashed on \
-                 account-exhaustion signature '{signature}' but the spawn account was never \
-                 captured (token=unknown) — NOT charging the issue's quarantine tally, but cannot \
-                 mark an account bad (#4122)"
-            );
+            // #7860 split the wording of this one warning in two — see
+            // [`unknown_token_exhaustion_warning`] for why.
+            log::warn!("{}", unknown_token_exhaustion_warning(issue, sweep_id, signature, &tail));
             return true;
         }
 
@@ -2616,3 +2613,7 @@ exit 0
         );
     }
 }
+
+#[cfg(test)]
+#[path = "quarantine_empty_pool_tests.rs"]
+mod empty_pool_tests;

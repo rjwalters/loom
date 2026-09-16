@@ -667,7 +667,59 @@ pub(crate) enum PreflightOutcome {
     /// The log was unreadable/missing, OR an account-exhaustion signature
     /// matched (exhaustion wins — that death is already attributed to the
     /// account, #4122). Neutral: neither increments nor resets the streak.
+    ///
+    /// One exception to "exhaustion wins": a
+    /// [`TOKEN_SELECTION_PREFLIGHT_LABEL`] tail is reported as `Preflight`
+    /// even when an exhaustion signature also matches it (#7860) — see
+    /// [`classify_preflight_outcome`].
     Unknown,
+}
+
+/// The one [`preflight_death_signatures`] label that outranks the
+/// `classify_account_exhaustion` "exhaustion wins" precedence in
+/// [`classify_preflight_outcome`] (Issue #7860). See that function's
+/// `token-selection` branch for why.
+pub(crate) const TOKEN_SELECTION_PREFLIGHT_LABEL: &str = "preflight-token-selection-failed";
+
+/// The operator-facing warning for an insta-crash that matched an exhaustion
+/// `signature` but whose spawn account was never captured (`token=unknown`) —
+/// see `SweepRegistry::insta_crash_is_account_exhaustion`.
+///
+/// Issue #7860 split this wording in two, because exactly two very different
+/// deaths land here and the single pre-#7860 sentence described only one of
+/// them. When `spawn-claude.sh`'s token-selection step finds an unusable
+/// pool it prints a diagnostic listing every pooled account together with
+/// that account's stored `.bad_tokens` reason — prose like `exhausted: hit
+/// your session limit`, which [`classify_account_exhaustion`] matches
+/// verbatim. The old wording therefore reported an "account-exhaustion
+/// signature" for a death in which no account was ever selected, which
+/// misdirected two separate investigations (#6917, #7860) toward a
+/// per-account theory when the real fault was "this workspace has no usable
+/// credential at all".
+///
+/// Message-only: the caller's return value, the #4122 carve-out, and the
+/// account-marking path are all unchanged.
+pub(crate) fn unknown_token_exhaustion_warning(
+    issue: u32,
+    sweep_id: &str,
+    signature: &str,
+    tail: &str,
+) -> String {
+    if classify_preflight_death(tail) == Some(TOKEN_SELECTION_PREFLIGHT_LABEL) {
+        return format!(
+            "sweep_registry: issue #{issue} sweep {sweep_id} insta-crashed in spawn-claude.sh's \
+             TOKEN SELECTION step — the pool held no usable account, so none was ever selected \
+             (token=unknown) and none can be marked bad. The '{signature}' prose in the log tail \
+             is the pool's own per-account diagnostic listing, NOT this sweep's own death cause. \
+             NOT charging the issue's quarantine tally; this death feeds the #4386 workspace \
+             pre-flight streak instead (#7860)"
+        );
+    }
+    format!(
+        "sweep_registry: issue #{issue} sweep {sweep_id} insta-crashed on account-exhaustion \
+         signature '{signature}' but the spawn account was never captured (token=unknown) — NOT \
+         charging the issue's quarantine tally, but cannot mark an account bad (#4122)"
+    )
 }
 
 /// Classify a dead sweep's (possibly absent) log tail for the #4386 pre-flight
@@ -677,13 +729,41 @@ pub(crate) fn classify_preflight_outcome(tail: Option<&str>) -> PreflightOutcome
     let Some(t) = tail else {
         return PreflightOutcome::Unknown;
     };
+    let preflight = classify_preflight_death(t);
+    // Issue #7860: the token-selection pre-flight death OUTRANKS the
+    // "exhaustion wins" precedence below, and it is the only signature that
+    // does. When `spawn-claude.sh`'s token-selection step (exit 78) finds an
+    // unusable pool it prints a diagnostic listing EVERY pooled account
+    // together with that account's stored `.bad_tokens` reason — verbatim
+    // prose like `exhausted: hit your session limit` / `exhausted: hit your
+    // org's monthly spend limit`. Those strings match
+    // [`exhaustion_signatures`]'s `rate-limited` regex exactly, so an
+    // empty-pool death classified as account exhaustion — even though NO
+    // account was ever selected (the caller sees `token=unknown`) and there
+    // is therefore nothing to attribute the death to.
+    //
+    // The consequence was not cosmetic: returning `Unknown` here leaves the
+    // #4386 streak neither incremented nor reset, so the ONE dampener built
+    // for precisely this failure ("when the whole pool is dead, every future
+    // dispatch dies identically at token selection" — #4644) never armed from
+    // an issue dispatch. The work finder kept re-offering the same backlog,
+    // and every attempt cost a `loom:issue` -> `loom:building` -> `loom:issue`
+    // label-flip pair on a real issue: the redispatch/claim-yield storm
+    // reported on kicad-tools#5333 (152 flips) and observed live on #7815.
+    //
+    // Deliberately narrow — every OTHER exhaustion shape still yields to
+    // `classify_account_exhaustion` on the next line, because those deaths
+    // really are attributable to a named spawn account (#4122).
+    if preflight == Some(TOKEN_SELECTION_PREFLIGHT_LABEL) {
+        return PreflightOutcome::Preflight(TOKEN_SELECTION_PREFLIGHT_LABEL);
+    }
     if classify_account_exhaustion(t).is_some() {
         // Exhaustion wins (#4122): this death is already attributed to the
         // spawn account, so it must not also be counted toward — or reset —
         // the pre-flight streak.
         return PreflightOutcome::Unknown;
     }
-    match classify_preflight_death(t) {
+    match preflight {
         Some(label) => PreflightOutcome::Preflight(label),
         None => PreflightOutcome::NonPreflight,
     }
@@ -1487,3 +1567,7 @@ spawn-claude: using OAuth account 'stale-account' (mode=random)
         assert!(!ranking_has_capacity("|available\na|exhausted"));
     }
 }
+
+#[cfg(test)]
+#[path = "crash_signals_empty_pool_tests.rs"]
+mod empty_pool_tests;
