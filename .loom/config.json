@@ -40,6 +40,10 @@
     "loadThreshold": 0.9,
     "maxDeferSeconds": 1800
   },
+  "guards": {
+    "sqlDdl": false,
+    "decisionLog": true
+  },
   "terminals": [
     {
       "id": "terminal-1",
