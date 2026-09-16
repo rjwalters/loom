@@ -46,6 +46,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 GUARD="$REPO_ROOT/defaults/hooks/guard-destructive-generic.sh"
 
+# Hermetic default cwd (#7808). The guard resolves REPO_ROOT from the hook
+# input's cwd (git rev-parse --show-toplevel) and reads THAT repo's
+# .loom/config.json for every guards.* toggle. With the checkout as the
+# default cwd, every assertion silently tested this repo's committed dogfood
+# config instead of the guard's defaults — #7799 flipped guards.sqlDdl and
+# four suites went red on main with the PR's run skipped. So the default cwd
+# is a throwaway repo with NO .loom/config.json: every toggle at its shipped
+# default, whatever this repo's own config says. Suites that need the real
+# checkout (rm-scope's path-confinement cases, decision-log's file paths)
+# pass "$REPO_ROOT" explicitly; suites that need a specific config build a
+# temp repo via make_sql_repo. Canonicalised with pwd -P because the guard
+# compares git's resolved toplevel (/private/var/... on macOS) against cwd.
+TEST_REPO=$(mktemp -d 2>/dev/null || mktemp -d -t loom-guard-test)
+TEST_REPO=$(cd "$TEST_REPO" && pwd -P)
+git -C "$TEST_REPO" init -q >/dev/null 2>&1
+git -C "$TEST_REPO" checkout -q -b main >/dev/null 2>&1 || true
+git -C "$TEST_REPO" -c user.email=guard-test@loom -c user.name=guard-test \
+    commit -q --allow-empty -m "hermetic guard test repo" >/dev/null 2>&1
+
 PASS=0
 FAIL=0
 TOTAL=0
@@ -103,7 +122,7 @@ echo ""
 
 make_input() {
     local cmd="$1"
-    local cwd="${2:-$REPO_ROOT}"
+    local cwd="${2:-$TEST_REPO}"
     jq -n --arg cmd "$cmd" --arg cwd "$cwd" '{
         tool_name: "Bash",
         tool_input: { command: $cmd },
@@ -113,7 +132,7 @@ make_input() {
 
 run_guard() {
     local cmd="$1"
-    local cwd="${2:-$REPO_ROOT}"
+    local cwd="${2:-$TEST_REPO}"
     local output
     local exit_code
     output=$(make_input "$cmd" "$cwd" | "$GUARD" 2>&1) || exit_code=$?
@@ -124,7 +143,7 @@ run_guard() {
 
 run_guard_in_worktree() {
     local cmd="$1"
-    local cwd="${2:-$REPO_ROOT}"
+    local cwd="${2:-$TEST_REPO}"
     local output
     local exit_code
     output=$(LOOM_WORKTREE_PATH="$cwd" make_input "$cmd" "$cwd" | LOOM_WORKTREE_PATH="$cwd" "$GUARD" 2>&1) || exit_code=$?
@@ -146,7 +165,7 @@ make_sql_repo() {
 run_guard_env() {
     local env_kv="$1"
     local cmd="$2"
-    local cwd="${3:-$REPO_ROOT}"
+    local cwd="${3:-$TEST_REPO}"
     local output
     local exit_code=0
     if [[ -n "$env_kv" ]]; then
@@ -159,7 +178,7 @@ run_guard_env() {
 }
 
 assert_deny_env() {
-    local description="$1"; local env_kv="$2"; local cmd="$3"; local cwd="${4:-$REPO_ROOT}"
+    local description="$1"; local env_kv="$2"; local cmd="$3"; local cwd="${4:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
     local output
     output=$(run_guard_env "$env_kv" "$cmd" "$cwd") || true
@@ -176,7 +195,7 @@ assert_deny_env() {
 }
 
 assert_allow_env() {
-    local description="$1"; local env_kv="$2"; local cmd="$3"; local cwd="${4:-$REPO_ROOT}"
+    local description="$1"; local env_kv="$2"; local cmd="$3"; local cwd="${4:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
     local output
     local exit_code=0
@@ -196,7 +215,7 @@ assert_allow_env() {
 }
 
 assert_ask_env() {
-    local description="$1"; local env_kv="$2"; local cmd="$3"; local cwd="${4:-$REPO_ROOT}"
+    local description="$1"; local env_kv="$2"; local cmd="$3"; local cwd="${4:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
     local output
     output=$(run_guard_env "$env_kv" "$cmd" "$cwd") || true
@@ -215,7 +234,7 @@ assert_ask_env() {
 assert_deny_in_worktree() {
     local description="$1"
     local cmd="$2"
-    local cwd="${3:-$REPO_ROOT}"
+    local cwd="${3:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
 
     local output
@@ -236,7 +255,7 @@ assert_deny_in_worktree() {
 assert_allow_in_worktree() {
     local description="$1"
     local cmd="$2"
-    local cwd="${3:-$REPO_ROOT}"
+    local cwd="${3:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
 
     local output
@@ -260,7 +279,7 @@ assert_allow_in_worktree() {
 assert_deny() {
     local description="$1"
     local cmd="$2"
-    local cwd="${3:-$REPO_ROOT}"
+    local cwd="${3:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
 
     local output
@@ -281,7 +300,7 @@ assert_deny() {
 assert_ask() {
     local description="$1"
     local cmd="$2"
-    local cwd="${3:-$REPO_ROOT}"
+    local cwd="${3:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
 
     local output
@@ -303,7 +322,7 @@ assert_ask_reason_matches() {
     local description="$1"
     local cmd="$2"
     local pattern="$3"
-    local cwd="${4:-$REPO_ROOT}"
+    local cwd="${4:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
 
     local output reason
@@ -327,7 +346,7 @@ assert_deny_reason_matches() {
     local description="$1"
     local cmd="$2"
     local pattern="$3"
-    local cwd="${4:-$REPO_ROOT}"
+    local cwd="${4:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
 
     local output reason
@@ -350,7 +369,7 @@ assert_deny_reason_matches() {
 assert_allow() {
     local description="$1"
     local cmd="$2"
-    local cwd="${3:-$REPO_ROOT}"
+    local cwd="${3:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
 
     local output
@@ -410,7 +429,7 @@ assert_allow_permissive() {
 }
 
 assert_allow_silent() {
-    local description="$1"; local cmd="$2"; local cwd="${3:-$REPO_ROOT}"
+    local description="$1"; local cmd="$2"; local cwd="${3:-$TEST_REPO}"
     TOTAL=$((TOTAL + 1))
     local output; local exit_code=0
     output=$(run_guard "$cmd" "$cwd") || exit_code=$?
@@ -603,6 +622,7 @@ _S3SYNC="aws s3 syn""c"
 # Printed by every suite at exit; the partition's totals must sum to the
 # monolith's count.
 print_summary() {
+    rm -rf "$TEST_REPO"
     echo ""
     echo "========================================="
     echo -e "  Total:  $TOTAL"
