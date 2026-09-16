@@ -134,6 +134,16 @@
 #     fresh while its own claim's `updated_at` never advances. When neither
 #     can be resolved (manual `/loom:sweep`, GH Actions cron, `--no-daemon`),
 #     `start` falls back to the previous "newest wins" behavior unchanged.
+#     `start` REFUSES (exit 1, no loop forked) a `--host`/`--sweep-id` pair
+#     that cannot possibly match its own lease comment: either value
+#     containing whitespace, or exactly one of the two given non-empty
+#     (Issue #7876). Passing neither remains legal. That shape is what a
+#     caller produces when it word-splits `sweep-lease-publish.sh publish`'s
+#     "<host> <sweep-id>" line under zsh, which does not split unquoted
+#     parameters -- and a loop that can never renew is worse than no loop,
+#     because the caller believes renewal is running while the lease ages
+#     out. Split that line with `read -r LEASE_HOST LEASE_SWEEP
+#     <<<"$LEASE_IDENT"`, which behaves identically in bash and zsh.
 #
 #   sweep-lease-renew.sh renew-once <issue> [--host HOST] [--sweep-id ID]
 #     Perform exactly one renewal cycle synchronously (used internally by
@@ -546,6 +556,38 @@ cmd_start() {
 
     if ! [[ "$interval" =~ ^[0-9]+$ ]] || ! ((interval > 0)); then
         echo "ERROR: --interval must be a positive integer (got: '$interval')" >&2
+        exit 1
+    fi
+
+    # Refuse a mis-split identity pair instead of forking a doomed loop
+    # (Issue #7876). `sweep-lease-publish.sh publish` prints ONE line,
+    # "<host> <sweep-id>"; a caller that splits it with bash's unquoted
+    # word-splitting gets the WHOLE line as --host and an empty --sweep-id
+    # under zsh (SH_WORD_SPLIT is off there), which is exactly what the
+    # orchestrator's login shell did. That combination forks a loop whose
+    # exact-match targeting (#6485) can never match its own lease comment, so
+    # the lease silently ages out while the operator believes renewal is
+    # running -- strictly worse than no loop at all. Fail loudly at `start`.
+    local ident_hint
+    ident_hint="use 'read -r LEASE_HOST LEASE_SWEEP <<<\"\$LEASE_IDENT\"' (bash AND zsh) to split sweep-lease-publish.sh's \"<host> <sweep-id>\" output, never 'set -- \$LEASE_IDENT'"
+    if [[ "$host" =~ [[:space:]] ]]; then
+        echo "ERROR: start: --host must not contain whitespace (got: '$host') -- $ident_hint" >&2
+        exit 1
+    fi
+    if [[ "$sweep_id" =~ [[:space:]] ]]; then
+        echo "ERROR: start: --sweep-id must not contain whitespace (got: '$sweep_id') -- $ident_hint" >&2
+        exit 1
+    fi
+    # Exact-match targeting needs BOTH fields; `renew-once` rejects a partial
+    # pair, so a `start` that forwards one alone produces a loop that fails
+    # every cycle. Passing NEITHER stays legal (the documented "newest wins"
+    # fallback plus the auto-resolution below).
+    if [[ -n "$host" && -z "$sweep_id" ]]; then
+        echo "ERROR: start: --host '$host' given without a non-empty --sweep-id -- $ident_hint" >&2
+        exit 1
+    fi
+    if [[ -n "$sweep_id" && -z "$host" ]]; then
+        echo "ERROR: start: --sweep-id '$sweep_id' given without a non-empty --host -- $ident_hint" >&2
         exit 1
     fi
 

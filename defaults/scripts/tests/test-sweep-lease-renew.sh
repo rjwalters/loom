@@ -51,6 +51,12 @@
 #       unconditionally sent to /dev/null for detachment -- and does NOT log
 #       a "failure" line for the normal exit-2 (no lease) or exit-4
 #       (#6485 own-yield guard) outcomes, which are not failures
+#   (n) start REFUSES (exit 1, no loop forked) a --host/--sweep-id pair that
+#       could never match its own lease comment (#7876): whitespace in either
+#       value -- the exact shape a zsh caller's `set -- $LEASE_IDENT`
+#       produces, since zsh does not word-split unquoted parameters -- or a
+#       half-empty pair; while passing NEITHER (the documented "newest wins"
+#       fallback) and passing a correctly split pair both still work
 #
 # Usage:
 #   ./.loom/scripts/tests/test-sweep-lease-renew.sh
@@ -653,6 +659,72 @@ wait "$WATCH_PID_M3" 2> /dev/null || true
 kill "$LOOP_PID_M3" 2> /dev/null || true
 M3_ERR="$(cat "$STUB_DIR/start-m3-stderr.log" 2> /dev/null || true)"
 assert_true "$([[ "$M3_ERR" != *FAILED* ]] && echo true || echo false)" "(m3) the own-yield-guard outcome (exit 4) does not log a FAILED line"
+
+# --- (n) start refuses an unusable --host/--sweep-id pair (#7876) ---------
+echo ""
+echo "--- (n) start refuses an identity pair that could never match its own lease ---"
+
+# (n1) the exact shape a zsh caller produces from `set -- $LEASE_IDENT`: the
+# WHOLE "<host> <sweep-id>" line lands in --host and --sweep-id is empty. This
+# must be refused, not forked -- a loop that can never match its own lease
+# comment is worse than no loop, because the caller believes renewal is running
+# while the lease silently ages out (the #7876 incident).
+reset_state
+run_script start 7876 --watch-pid $$ --host "host-d9142cf3 sweep-20260916T105816Z" --sweep-id ""
+assert_eq "1" "$RC" "(n1) start refuses a whitespace-bearing --host (the zsh set-- mis-split shape)"
+assert_contains "$ERR" "--host must not contain whitespace" "(n1) the error names the whitespace-in---host problem"
+assert_contains "$ERR" "read -r LEASE_HOST LEASE_SWEEP" "(n1) the error hands the caller the shell-agnostic split to use instead"
+
+# (n2) a whitespace-bearing --sweep-id is refused symmetrically.
+reset_state
+run_script start 7876 --watch-pid $$ --host some-host --sweep-id "sweep-a sweep-b"
+assert_eq "1" "$RC" "(n2) start refuses a whitespace-bearing --sweep-id"
+assert_contains "$ERR" "--sweep-id must not contain whitespace" "(n2) the error names the whitespace-in---sweep-id problem"
+
+# (n3) a half-empty pair is refused in BOTH directions: renew-once requires
+# both or neither, so forwarding one alone forks a loop that fails every cycle.
+reset_state
+run_script start 7876 --watch-pid $$ --host lone-host --sweep-id ""
+assert_eq "1" "$RC" "(n3) start refuses --host given with an empty --sweep-id"
+assert_contains "$ERR" "without a non-empty --sweep-id" "(n3) the error names the missing --sweep-id"
+reset_state
+run_script start 7876 --watch-pid $$ --host "" --sweep-id lone-sweep
+assert_eq "1" "$RC" "(n3) start refuses --sweep-id given with an empty --host"
+assert_contains "$ERR" "without a non-empty --host" "(n3) the error names the missing --host"
+
+# (n4) passing NEITHER stays legal -- the documented "newest wins" fallback for
+# manual /loom:sweep, GH Actions cron and --no-daemon paths is unchanged.
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 1, "body": "nothing to see here"}]
+JSON
+sleep 3 &
+WATCH_PID_N=$!
+LOOP_PID_N="$("$SCRIPT" start 7876 --interval 1 --watch-pid "$WATCH_PID_N" 2> "$STUB_DIR/start-n-stderr.log")"
+START_RC_N=$?
+assert_eq "0" "$START_RC_N" "(n4) start with NEITHER --host nor --sweep-id still succeeds (newest-wins fallback)"
+assert_true "$([[ "$LOOP_PID_N" =~ ^[0-9]+$ ]] && echo true || echo false)" "(n4) it still prints the forked loop's pid"
+kill "$WATCH_PID_N" 2> /dev/null || true
+wait "$WATCH_PID_N" 2> /dev/null || true
+kill "$LOOP_PID_N" 2> /dev/null || true
+
+# (n5) a well-formed pair -- exactly what the fixed Step 1b snippet produces
+# via `read -r LEASE_HOST LEASE_SWEEP <<<"$LEASE_IDENT"` -- is still accepted.
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 77, "body": "<!-- loom:lease host=n-host sweep=n-sweep -->\nprose"}]
+JSON
+LEASE_IDENT_N="n-host n-sweep"
+read -r SPLIT_HOST_N SPLIT_SWEEP_N <<< "$LEASE_IDENT_N"
+sleep 3 &
+WATCH_PID_N5=$!
+LOOP_PID_N5="$("$SCRIPT" start 7876 --interval 1 --watch-pid "$WATCH_PID_N5" --host "$SPLIT_HOST_N" --sweep-id "$SPLIT_SWEEP_N" 2> "$STUB_DIR/start-n5-stderr.log")"
+START_RC_N5=$?
+assert_eq "0" "$START_RC_N5" "(n5) start accepts a correctly split --host/--sweep-id pair"
+assert_true "$([[ "$LOOP_PID_N5" =~ ^[0-9]+$ ]] && echo true || echo false)" "(n5) it forks a loop and prints its pid"
+kill "$WATCH_PID_N5" 2> /dev/null || true
+wait "$WATCH_PID_N5" 2> /dev/null || true
+kill "$LOOP_PID_N5" 2> /dev/null || true
 
 # --- Contract checks (mirrors test-check-quarantine-stashes.sh's style) ---
 "$SCRIPT" --help > "$STUB_DIR/help.out" 2>&1
