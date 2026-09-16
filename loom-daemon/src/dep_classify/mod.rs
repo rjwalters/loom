@@ -16,6 +16,7 @@
 //! with an assertion.
 
 pub mod finding;
+pub mod findings;
 pub mod fingerprint;
 pub mod refs;
 pub mod subset;
