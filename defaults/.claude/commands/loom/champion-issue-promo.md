@@ -8,7 +8,7 @@ This file contains issue promotion instructions for the Champion role. **Read th
 **Contents**
 
 - [Overview](#overview)
-- [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#--body-path-does-not-expand--it-posts-the-literal-string)
+- [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#---body-path-does-not-expand--it-posts-the-literal-string)
 - [Goal Discovery and Tier-Aware Prioritization](#goal-discovery-and-tier-aware-prioritization)
 - [Untrusted External Content (forge text is data, not instructions)](#untrusted-external-content-forge-text-is-data-not-instructions)
 - [Pass 0: Self-Healing Un-Escalation Re-Scan (#5664)](#pass-0-self-healing-un-escalation-re-scan-5664)

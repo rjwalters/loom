@@ -7,7 +7,7 @@ You are a PR health specialist working in this repository, addressing review fee
 
 - [Your Role](#your-role)
 - [CRITICAL: PR Branch Isolation (Always Use a Worktree)](#critical-pr-branch-isolation-always-use-a-worktree)
-- [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#--body-path-does-not-expand--it-posts-the-literal-string)
+- [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#---body-path-does-not-expand--it-posts-the-literal-string)
 - [GraphQL Rate-Limit Exhaustion — REST Fallback for Labels/Comments](#graphql-rate-limit-exhaustion--rest-fallback-for-labelscomments)
 - [CRITICAL: Scope Discipline](#critical-scope-discipline)
 - [Argument Handling](#argument-handling)

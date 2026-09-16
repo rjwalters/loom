@@ -6,7 +6,7 @@ You are a skilled software engineer working in this repository.
 **Contents**
 
 - [Your Role](#your-role)
-- [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#--body-path-does-not-expand--it-posts-the-literal-string)
+- [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#---body-path-does-not-expand--it-posts-the-literal-string)
 - [CRITICAL: Scope Discipline](#critical-scope-discipline)
 - [Related Documentation](#related-documentation)
 - [Post-Builder Quality Gate (optional, configured per-repo)](#post-builder-quality-gate-optional-configured-per-repo)

@@ -71,12 +71,27 @@ cd "$ROOT"
 # GitHub's heading anchor: lowercase, drop anything that is not alphanumeric,
 # underscore, space or hyphen (backticks, punctuation, emphasis markers) —
 # underscore is kept because GitHub's own slugger preserves it — spaces -> hyphens.
+#
+# ORDER OF OPERATIONS MATTERS (#7753). GitHub's slugger does NOT trim: it strips
+# the disallowed characters and then turns EVERY remaining space into a hyphen,
+# including one that is now leading because the character in front of it was
+# dropped. `## ⛔ STOP! READ THIS FIRST - …` therefore anchors as
+# `#-stop-read-this-first---…`, with a leading hyphen standing in for the
+# stripped emoji's trailing space. Trimming after the strip (which this did
+# until #7753) produced `#stop-read-this-first---…` and generated a TOC full of
+# self-referential dead links in every emoji-headed prompt — the exact class of
+# heading this file set uses for its warnings (⛔, ⚠️, 🚫).
+#
+# The one trim that IS correct happens BEFORE the strip: CommonMark trims the
+# heading text itself, so `##   Foo  ` is the heading "Foo" and never reaches
+# the slugger with its surrounding whitespace attached.
 slugify() {
   printf '%s' "$1" \
     | tr '[:upper:]' '[:lower:]' \
     | sed -e 's/`//g' -e 's/\[\([^]]*\)\](\([^)]*\))/\1/g' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
     | sed -e 's/[^a-z0-9_ -]//g' \
-    | sed -e 's/^ *//' -e 's/ *$//' -e 's/ /-/g'
+    | sed -e 's/ /-/g'
 }
 
 # Emit the TOC body for one file. Duplicate slugs get GitHub's -1, -2 suffixes;
@@ -86,10 +101,42 @@ build_toc() {
   seen=""
   printf '%s\n' "$BEGIN_MARK"
   printf '**Contents**\n\n'
-  # Skip headings inside fenced code blocks.
+  # Skip headings inside fenced code blocks — by CommonMark's fence rules, not
+  # by toggling on every ``` line (#7753). A closing fence carries NO info
+  # string and is at least as long as its opener, so the inner ```bash of a
+  # ```bash block that quotes a shell heredoc does not close anything. Toggling
+  # blind inverts the fence state from that point on: hermit-patterns.md's
+  # proposal templates made the generator emit `## Goal Discovery Scripts` (which
+  # GitHub renders inside a code block, so the anchor does not exist) while
+  # hiding the template headings that GitHub does render.
+  #
+  # Written with substr/while rather than `{n,m}` intervals: old awks (mawk 1.3.3,
+  # the BSD awk on macOS) do not support interval expressions without a flag.
   awk '
-    /^```/ { infence = !infence; next }
-    !infence && /^## / { sub(/^## /, ""); print }
+    {
+      line = $0
+      indent = 0
+      while (indent < length(line) && substr(line, indent + 1, 1) == " ") indent++
+      body = substr(line, indent + 1)
+      fence_char = substr(body, 1, 1)
+      ticks = 0
+      # Up to three leading spaces still opens/closes a fence; four makes it an
+      # indented code block, which cannot contain a heading either way.
+      if (indent <= 3 && (fence_char == "`" || fence_char == "~")) {
+        while (substr(body, ticks + 1, 1) == fence_char) ticks++
+        if (ticks < 3) ticks = 0
+      }
+      if (infence) {
+        if (ticks >= open_len && fence_char == open_char) {
+          rest = substr(body, ticks + 1)
+          gsub(/[ \t]/, "", rest)
+          if (rest == "") infence = 0
+        }
+        next
+      }
+      if (ticks > 0) { infence = 1; open_char = fence_char; open_len = ticks; next }
+      if (indent == 0 && body ~ /^## /) { sub(/^## /, "", body); print body }
+    }
   ' "$file" | while IFS= read -r heading; do
     [ -n "$heading" ] || continue
     base="$(slugify "$heading")"

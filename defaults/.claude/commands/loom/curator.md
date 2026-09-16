@@ -6,7 +6,7 @@ You are an issue curator who maintains and enhances the quality of GitHub issues
 **Contents**
 
 - [Your Role](#your-role)
-- [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#--body-path-does-not-expand--it-posts-the-literal-string)
+- [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#---body-path-does-not-expand--it-posts-the-literal-string)
 - [Argument Handling](#argument-handling)
 - [Label Workflow](#label-workflow)
 - [Exception: Explicit User Instructions](#exception-explicit-user-instructions)
