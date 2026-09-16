@@ -19,9 +19,49 @@
 //! `.loom/scripts/cli/loom-daemon-update.sh`, a shell script — deliberately
 //! NOT wired to auto-run from here.
 
+use crate::proc_exec::{run_bounded, Completion, ExecError};
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
+
+/// Per-probe ceiling for the read-only `git` calls below (epic #7810, PR 1).
+///
+/// These run on `loom-daemon status`, an interactive operator command. Before
+/// this they used bare `.output()` — unbounded — so a wedged `git` (a stale
+/// `index.lock`, a network-backed filesystem, an `fsmonitor` hang) blocked the
+/// status output indefinitely with no way to tell it apart from slowness. The
+/// value is generous because none of these commands should take a second; it is
+/// a hang ceiling, not a performance budget.
+const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run a read-only `git` probe in `repo_root`, returning its output only when
+/// the command genuinely ran and succeeded.
+///
+/// Every other outcome — could not start, timed out, ran and failed — yields
+/// `None`, which every caller below renders as **unknown**. That collapse is
+/// deliberate and it is one-directional: the callers' contract is that an
+/// unanswerable probe must never be reported as "clean" or "up to date", so
+/// losing the distinction between "git is missing" and "git timed out" is
+/// acceptable here in a way that losing the distinction between "unknown" and
+/// "nothing to report" would not be. `proc_exec` keeps all four apart; this
+/// helper is where a caller that does not need them says so explicitly, rather
+/// than where the information is quietly destroyed.
+fn git_probe(mut cmd: Command, repo_root: &Path) -> Option<Output> {
+    cmd.current_dir(repo_root);
+    // Nothing here reads stdin; leaving it inherited lets a `git` that decides
+    // to prompt (credentials, a pager) block on the operator's terminal.
+    cmd.stdin(Stdio::null());
+    match run_bounded(cmd, GIT_PROBE_TIMEOUT) {
+        Ok(Completion::Exited(o)) if o.status.success() => Some(o),
+        // Ran and said no (nonzero exit): e.g. `from` unreachable in a shallow
+        // clone. Indistinguishable from "unknown" to these callers by design.
+        Ok(Completion::Exited(_)) => None,
+        // Did not answer within the budget. Explicitly NOT success.
+        Ok(Completion::TimedOut { .. }) => None,
+        Err(ExecError::Spawn(_) | ExecError::Collect(_)) => None,
+    }
+}
 
 /// The commit this binary was BUILT from, baked in at compile time via
 /// `build.rs` -> `LOOM_DAEMON_GIT_COMMIT` (the same value folded into
@@ -209,14 +249,9 @@ fn source_head_commit() -> Option<String> {
     if !repo_root.join(".git").exists() {
         return None;
     }
-    let output = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(&repo_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--short", "HEAD"]);
+    let output = git_probe(cmd, &repo_root)?;
     let commit = String::from_utf8(output.stdout).ok()?.trim().to_string();
     if commit.is_empty() {
         None
@@ -282,14 +317,15 @@ fn parse_porcelain_line(line: &str) -> Option<(&str, &str)> {
 /// cannot reach `cargo build --release` for this crate. `None` when `git
 /// status` could not be run.
 fn dirty_paths_in(repo_root: &Path) -> Option<Vec<String>> {
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    // `git status --porcelain` is the one probe here whose output scales with
+    // repo state — a heavily dirty tree can exceed a pipe buffer. It is only
+    // safe under a deadline because `proc_exec` drains concurrently; the
+    // pre-extraction executor would have reported a large result as a timeout,
+    // and a timeout here means "unknown", which is precisely the answer this
+    // function must never turn into "clean".
+    let mut cmd = Command::new("git");
+    cmd.args(["status", "--porcelain"]);
+    let output = git_probe(cmd, repo_root)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut dirty = Vec::new();
     for line in stdout.lines() {
@@ -343,14 +379,9 @@ pub fn source_tree_dirty_paths() -> Vec<String> {
 /// failure (including `from` not being reachable in this checkout's history,
 /// e.g. a shallow clone or a history-rewriting rebase/force-push).
 fn commits_between(repo_root: &Path, from: &str, to: &str) -> Option<u32> {
-    let output = Command::new("git")
-        .args(["rev-list", "--count", &format!("{from}..{to}")])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-list", "--count", &format!("{from}..{to}")]);
+    let output = git_probe(cmd, repo_root)?;
     String::from_utf8(output.stdout).ok()?.trim().parse().ok()
 }
 
@@ -359,14 +390,12 @@ fn commits_between(repo_root: &Path, from: &str, to: &str) -> Option<u32> {
 /// been sitting unbuilt. `None` on any git failure or an empty/unparseable
 /// range.
 fn hours_since_oldest(repo_root: &Path, from: &str, to: &str) -> Option<u32> {
-    let output = Command::new("git")
-        .args(["log", "--format=%ct", &format!("{from}..{to}")])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    // One line per commit in the range, so this also scales with repo state —
+    // see the note in `dirty_paths_in` about why draining makes the deadline
+    // safe to add here at all.
+    let mut cmd = Command::new("git");
+    cmd.args(["log", "--format=%ct", &format!("{from}..{to}")]);
+    let output = git_probe(cmd, repo_root)?;
     let stdout = String::from_utf8(output.stdout).ok()?;
     // `git log` lists newest-first, so the OLDEST commit in the range is the
     // last line.
@@ -630,6 +659,119 @@ mod tests {
                 .expect("rev-parse");
             String::from_utf8(output.stdout).unwrap().trim().to_string()
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Bounded-probe migration (epic #7810, PR 1).
+    //
+    // These four probes moved from an unbounded `.output()` onto
+    // `proc_exec::run_bounded`. The contract that must survive that move is
+    // one-directional: an unanswerable probe reports UNKNOWN, never "clean"
+    // and never "up to date". These pin both halves — that unknown stays
+    // unknown, and that it stays distinguishable from a real empty answer.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn dirty_paths_in_a_clean_repo_is_an_empty_answer_not_unknown() {
+        let repo = TestRepo::new();
+        assert_eq!(
+            dirty_paths_in(repo.dir.path()),
+            Some(Vec::new()),
+            "a clean tree is a definite answer: Some(empty)"
+        );
+    }
+
+    #[test]
+    fn dirty_paths_in_a_non_repo_is_unknown_not_clean() {
+        // The distinction the whole migration has to preserve. `Some(vec![])`
+        // here would read as "nothing is dirty, safe to proceed"; the truth is
+        // "we could not find out".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let answer = dirty_paths_in(dir.path());
+        assert_eq!(answer, None, "a failed probe must be unknown, got {answer:?}");
+        assert_ne!(answer, Some(Vec::new()), "unknown must never be reported as clean");
+    }
+
+    #[test]
+    fn commits_between_in_a_non_repo_is_unknown_not_zero() {
+        // `Some(0)` would read as "you are up to date".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let answer = commits_between(dir.path(), "aaaaaaa", "bbbbbbb");
+        assert_eq!(answer, None, "a failed probe must be unknown, got {answer:?}");
+        assert_ne!(answer, Some(0), "unknown must never be reported as up to date");
+    }
+
+    #[test]
+    fn hours_since_oldest_in_a_non_repo_is_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(hours_since_oldest(dir.path(), "aaaaaaa", "bbbbbbb"), None);
+    }
+
+    /// The migration-specific regression. These probes previously used an
+    /// unbounded `.output()`, which drains correctly; adding a deadline is only
+    /// safe because `proc_exec` drains concurrently. Under the pre-extraction
+    /// executor a dirty tree large enough to fill a pipe buffer would have
+    /// reported a timeout — i.e. UNKNOWN — turning a routine dirty checkout
+    /// into "we cannot tell", on the operator's `status` command.
+    ///
+    /// 4000 untracked paths produce well over 64 KiB of porcelain output.
+    #[test]
+    fn a_dirty_tree_larger_than_a_pipe_buffer_still_produces_a_definite_answer() {
+        let repo = TestRepo::new();
+        let root = repo.dir.path();
+        let nested = root.join("loom-daemon/src");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+
+        // `git status --porcelain` collapses a WHOLLY-untracked directory into a
+        // single `?? dir/` entry, which would keep the output tiny and make this
+        // test vacuous. Tracking one file in that directory forces git to list
+        // its untracked siblings individually, which is what generates the
+        // volume this test is about.
+        std::fs::write(nested.join("tracked_anchor.rs"), b"// anchor\n").expect("write anchor");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["add", "loom-daemon/src/tracked_anchor.rs"]);
+        run(&["commit", "--quiet", "-m", "anchor"]);
+
+        const FILES: usize = 4000;
+        for i in 0..FILES {
+            std::fs::write(nested.join(format!("generated_file_{i:05}.rs")), b"// x\n")
+                .expect("write fixture");
+        }
+
+        // Sanity-check the fixture really does exceed a pipe buffer, so a pass
+        // cannot be vacuous.
+        let raw = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(root)
+            .output()
+            .expect("git status");
+        assert!(
+            raw.stdout.len() > 128 * 1024,
+            "fixture must exceed a pipe buffer to be meaningful, produced {} bytes",
+            raw.stdout.len()
+        );
+
+        let answer = dirty_paths_in(root);
+        let paths = answer.expect(
+            "a large dirty tree must still yield a definite answer — \
+             None here means the probe timed out on its own output",
+        );
+        assert!(
+            paths.len() >= FILES,
+            "every build-relevant untracked path must be reported, got {}",
+            paths.len()
+        );
     }
 
     #[test]
