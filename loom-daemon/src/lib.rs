@@ -146,6 +146,7 @@ pub mod daemon_heartbeat;
 pub mod daemon_install_state;
 pub mod daemon_pidfile;
 pub mod deep_clean;
+pub mod dep_classify;
 pub mod disk_headroom;
 pub mod docker_image_clean;
 pub mod eager_reclaim;
