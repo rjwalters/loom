@@ -102,6 +102,11 @@ jobs:
               # drift here without a matching defaults/ change should still
               # re-run shell-suite-tests on the PR, not just on push to main.
               - '.loom/hooks/**'
+              # .loom/config.json is this repo's dogfood guard config, and the
+              # guard suites read it through REPO_ROOT (sql_guard_enabled et al.),
+              # so a config-only PR must run them: #7799 flipped guards.sqlDdl
+              # with shell-suite-tests SKIPPED on the PR and turned main red (#7808).
+              - '.loom/config.json'
               # check-dependabot-labels.sh (#7577) asserts that every
               # lockfile-bearing package manifest is covered by a labeled
               # .github/dependabot.yml entry. Both sides of that invariant have
