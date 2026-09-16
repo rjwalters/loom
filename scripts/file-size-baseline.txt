@@ -91,7 +91,7 @@
 2370 loom-daemon/src/worktree_ops/clean.rs
 1702 loom-daemon/src/worktree_ops/clean/tests.rs
 1589 loom-daemon/src/worktree_ops/orphan_recovery.rs
-2216 loom-daemon/src/worktree_reaper.rs
+1969 loom-daemon/src/worktree_reaper.rs
 1468 mcp-loom/src/tools/sweeps.ts
 1082 mcp-loom/src/tools/terminals.ts
 1488 scripts/install-loom.sh

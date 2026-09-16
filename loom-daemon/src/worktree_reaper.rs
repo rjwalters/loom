@@ -110,12 +110,12 @@
 //! slow-motion outage. Opt out with `LOOM_WORKTREE_REAPER=0` or
 //! `autonomous.worktreeReaper.enabled=false`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 use crate::workspace_registry::WorkspaceRegistry;
 use crate::worktree_ops::clean::{
@@ -719,7 +719,20 @@ pub fn try_enter_reclaim(repo_root: &Path) -> Option<ReclaimGuard> {
 
 // ============================================================================
 // Removal-failure backoff + stuck-worktree health surfacing (#7590)
+//
+// The state machine itself lives in the `removal_backoff` sibling module (this
+// file is over the file-size ratchet's threshold); only the kind tag, which the
+// reaper's own log lines and classify paths also use, stays here. The names
+// below are re-exported so `crate::worktree_reaper::stuck_worktree_removals`
+// and friends keep resolving exactly as before.
 // ============================================================================
+
+mod removal_backoff;
+
+pub use removal_backoff::{
+    is_permission_denied_cause, stuck_worktree_removals, REMOVAL_BACKOFF_SECS, REMOVAL_FAILURE_CAP,
+};
+use removal_backoff::{prune_orphaned_removal_records, remove_with_backoff};
 
 /// Which reap pass a tracked removal failure belongs to — threaded through so
 /// a stuck path can be named `issue-<N>` or `pr-<N>` on the health surface,
@@ -738,211 +751,6 @@ impl WorktreeKind {
             Self::Pr => "pr",
         }
     }
-}
-
-/// Per-path removal-failure state, tracked across reaper ticks (#7590). Never
-/// persisted across a daemon restart — an acceptable trade-off given the
-/// daemon restarts far less often than the 15-minute reap tick, called out
-/// explicitly here rather than silently accepted.
-#[derive(Debug, Clone)]
-struct RemovalFailureRecord {
-    repo_root: PathBuf,
-    kind: WorktreeKind,
-    number: u32,
-    last_cause: String,
-    first_failure_at: DateTime<Utc>,
-    last_attempt_at: DateTime<Utc>,
-    attempt_count: u32,
-    /// Set once the failure is classified as permanent (a permission-class
-    /// error) — as opposed to merely having crossed [`REMOVAL_FAILURE_CAP`]
-    /// consecutive failures of an unclassified (potentially transient) cause.
-    /// Both conditions back off identically; this only changes the wording of
-    /// the surfaced explanation.
-    permanent: bool,
-}
-
-/// How many consecutive failed removal attempts (of any cause) before a
-/// worktree backs off even when the cause is not classified as a permanent
-/// permission error (AC1 of #7590: "at minimum, retries ... are capped in
-/// frequency"). A single transient failure (a lock, a race with a concurrent
-/// `git worktree` op) must never trip this — only a *run* of consecutive
-/// failures for the exact same path does, and a single intervening success
-/// clears the run entirely (see [`remove_with_backoff`]).
-pub const REMOVAL_FAILURE_CAP: u32 = 3;
-
-/// How long a backed-off path waits before its next retry attempt (#7590 AC1:
-/// "no more than once per N hours" — exact cadence is an implementation
-/// choice, documented here). Six hours: frequent enough that a fix (an
-/// operator's `sudo rm -rf`, or the underlying condition resolving itself)
-/// is picked up the same day, infrequent enough to eliminate the "every
-/// single tick, forever" log noise and wasted `git worktree remove` calls
-/// this issue was filed for.
-pub const REMOVAL_BACKOFF_SECS: i64 = 6 * 3600;
-
-/// Whether a `cleanup_worktree`/`cleanup_pr_worktree` failure `cause` string
-/// names a permission-class error — precisely the root cause #7590 was filed
-/// for: `std::fs::remove_dir_all`'s `Permission denied (os error 13)`,
-/// embedded verbatim in the propagated `Err` string at `clean.rs`'s untracked-
-/// orphan-directory fallback. Classified by substring match on the
-/// `std::io::Error` `Display` text rather than by threading a richer error
-/// type through `clean::cleanup_worktree`'s public contract (the issue's
-/// "Option B") — cheaper, and that contract is deliberately preserved for
-/// operator log visibility (#4877). A permission-class failure cannot
-/// self-resolve without a manual `sudo` intervention, so it is always
-/// permanent — unlike a merely-repeated failure of unknown cause, which only
-/// backs off once it has actually repeated (see [`REMOVAL_FAILURE_CAP`]).
-#[must_use]
-pub fn is_permission_denied_cause(cause: &str) -> bool {
-    cause.to_ascii_lowercase().contains("permission denied")
-}
-
-/// Process-global removal-failure tracker, keyed by the worktree's on-disk
-/// path (already unique per call site — no need to additionally key by repo
-/// root or worktree number). Mirrors the [`RECLAIM_IN_FLIGHT`] process-global
-/// pattern directly above.
-static REMOVAL_FAILURES: OnceLock<Mutex<HashMap<PathBuf, RemovalFailureRecord>>> = OnceLock::new();
-
-fn removal_failures() -> &'static Mutex<HashMap<PathBuf, RemovalFailureRecord>> {
-    REMOVAL_FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Attempt a worktree removal through the shared backoff/tracking state
-/// (#7590) — the common body behind both the `issue-<N>` and `pr-<N>`
-/// removers in [`reap_worktrees_only`].
-///
-/// Returns `true` iff `attempt` ran AND succeeded this call. When `path` is
-/// currently backed off, `attempt` is not invoked at all — skipping the
-/// syscalls entirely, not merely downgrading the log line, is the point.
-///
-/// A cause classified [`is_permission_denied_cause`] backs off immediately
-/// (AC1/AC3: cannot self-resolve, so there is nothing to gain by retrying
-/// every tick). Any other cause only backs off after [`REMOVAL_FAILURE_CAP`]
-/// *consecutive* failures for the same path — a single transient failure (a
-/// lock, a race) is retried again next tick exactly as before #7590, and a
-/// success at any point clears the run.
-fn remove_with_backoff(
-    repo_root: &Path,
-    kind: WorktreeKind,
-    number: u32,
-    path: &Path,
-    attempt: impl FnOnce() -> Result<(), String>,
-) -> bool {
-    let now = Utc::now();
-    let label = kind.as_str();
-
-    // Fast path: honor an active backoff without running `attempt` at all.
-    {
-        let failures = removal_failures()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(record) = failures.get(path) {
-            let backed_off = record.permanent || record.attempt_count >= REMOVAL_FAILURE_CAP;
-            let elapsed_secs = (now - record.last_attempt_at).num_seconds();
-            if backed_off && elapsed_secs < REMOVAL_BACKOFF_SECS {
-                // Known-stuck, already surfaced on `loom-daemon health` — quiet
-                // by design (#7590 AC4): debug, not warn, for a path that is
-                // not going to remove itself between ticks.
-                log::debug!(
-                    "worktree_reaper: {} skipping {label}-{number} ({}) — backed off after {} \
-                     failed attempt(s) (next retry in ~{}s), last cause: {}",
-                    repo_root.display(),
-                    path.display(),
-                    record.attempt_count,
-                    REMOVAL_BACKOFF_SECS - elapsed_secs,
-                    record.last_cause,
-                );
-                return false;
-            }
-        }
-    }
-
-    match attempt() {
-        Ok(()) => {
-            // A removal that actually succeeds — e.g. an operator ran `sudo
-            // rm -rf` by hand, or a transient cause simply resolved itself —
-            // must always clear any prior backoff state; it must never
-            // outlive the condition that caused it.
-            removal_failures()
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(path);
-            true
-        }
-        Err(cause) => {
-            let permanent_this_attempt = is_permission_denied_cause(&cause);
-            let mut failures = removal_failures()
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let record =
-                failures
-                    .entry(path.to_path_buf())
-                    .or_insert_with(|| RemovalFailureRecord {
-                        repo_root: repo_root.to_path_buf(),
-                        kind,
-                        number,
-                        last_cause: cause.clone(),
-                        first_failure_at: now,
-                        last_attempt_at: now,
-                        attempt_count: 0,
-                        permanent: false,
-                    });
-            record.attempt_count += 1;
-            record.last_attempt_at = now;
-            record.last_cause = cause.clone();
-            record.permanent = record.permanent || permanent_this_attempt;
-            let newly_or_still_stuck =
-                record.permanent || record.attempt_count >= REMOVAL_FAILURE_CAP;
-            let attempt_count = record.attempt_count;
-            drop(failures);
-
-            if newly_or_still_stuck {
-                log::warn!(
-                    "worktree_reaper: {} could not remove {label}-{number} ({}): {cause} — \
-                     backing off further retries (next attempt in ~{REMOVAL_BACKOFF_SECS}s); \
-                     surfaced on `loom-daemon health` (#7590)",
-                    repo_root.display(),
-                    path.display(),
-                );
-            } else {
-                log::warn!(
-                    "worktree_reaper: {} could not remove {label}-{number} ({}): {cause} \
-                     (attempt {attempt_count}/{REMOVAL_FAILURE_CAP} before backing off)",
-                    repo_root.display(),
-                    path.display(),
-                );
-            }
-            false
-        }
-    }
-}
-
-/// Snapshot every worktree removal currently backed off (#7590 AC2) — the
-/// input [`crate::ipc::build_daemon_status`] threads into
-/// [`crate::types::DaemonStatusReport::stuck_worktree_reclaims`], and from
-/// there into `loom-daemon health`/`status` and the `/api/health` route.
-///
-/// Only entries that have actually crossed into backed-off state are
-/// returned — a lone, still-being-retried transient failure never appears
-/// here, matching the same predicate [`remove_with_backoff`] uses to decide
-/// whether to skip a retry.
-#[must_use]
-pub fn stuck_worktree_removals() -> Vec<crate::types::StuckWorktreeReclaim> {
-    removal_failures()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .filter(|(_, r)| r.permanent || r.attempt_count >= REMOVAL_FAILURE_CAP)
-        .map(|(path, r)| crate::types::StuckWorktreeReclaim {
-            repo_root: r.repo_root.clone(),
-            kind: r.kind.as_str().to_string(),
-            number: r.number,
-            path: path.clone(),
-            cause: r.last_cause.clone(),
-            first_failure_at: r.first_failure_at,
-            last_attempt_at: r.last_attempt_at,
-            attempt_count: r.attempt_count,
-        })
-        .collect()
 }
 
 /// The worktree-only half of [`reap_repo`]: merged-PR `issue-<N>` and `pr-<N>`
@@ -982,6 +790,11 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
         );
         return ReapReport::default();
     };
+    // #7709: a tracked removal failure whose directory is confirmed gone can
+    // never be cleared by a successful retry — there is nothing left to
+    // enumerate — so drop those before the pass rather than letting the
+    // tracker accumulate dead entries between status calls.
+    prune_orphaned_removal_records();
     let opts = reaper_clean_options(resolve_grace_period(config));
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
 
@@ -3075,198 +2888,5 @@ mod tests {
                 DEFAULT_DISK_WARN_FREE_GB,
             );
         }
-    }
-
-    // ===================================================================
-    // Removal-failure backoff (#7590)
-    //
-    // `REMOVAL_FAILURES` is a process-global keyed by path, shared across the
-    // whole test binary. Every test below uses a distinct synthetic path (no
-    // two tests collide), and — since the map is never cleared — assertions
-    // on [`stuck_worktree_removals`] filter down to the path under test
-    // rather than asserting on the map's total size.
-    // ===================================================================
-
-    fn unique_test_path(label: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        PathBuf::from(format!("/fake/repo/.loom/worktrees/{label}-{n}"))
-    }
-
-    #[test]
-    fn is_permission_denied_cause_matches_the_real_remove_dir_all_message() {
-        // The exact wording `clean::cleanup_worktree` propagates from
-        // `std::fs::remove_dir_all`'s `Err` on a real permission failure
-        // (`clean.rs`'s untracked-orphan-directory fallback).
-        assert!(is_permission_denied_cause(
-            "git worktree remove failed (fatal: ...); direct removal of the untracked worktree \
-             directory also failed: Permission denied (os error 13)"
-        ));
-        // Case-insensitive, since not every OS/locale capitalizes identically.
-        assert!(is_permission_denied_cause("permission denied"));
-        // A merely-repeated, unrelated cause must NOT be misclassified.
-        assert!(!is_permission_denied_cause("fatal: not a working tree"));
-        assert!(!is_permission_denied_cause("resource busy or locked"));
-    }
-
-    #[test]
-    fn a_single_transient_failure_is_retried_next_tick_not_backed_off() {
-        // AC3 of #7590: one ordinary (non-permission) failure must not be
-        // penalized — `remove_with_backoff` must invoke `attempt` again on
-        // the very next call for the same path.
-        let repo_root = PathBuf::from("/fake/repo");
-        let path = unique_test_path("issue-1");
-        let calls = std::cell::Cell::new(0);
-
-        let ok1 = remove_with_backoff(&repo_root, WorktreeKind::Issue, 1, &path, || {
-            calls.set(calls.get() + 1);
-            Err("resource busy or locked".to_string())
-        });
-        assert!(!ok1);
-        assert_eq!(calls.get(), 1);
-
-        // A single failure is well under `REMOVAL_FAILURE_CAP` — the next
-        // call must invoke `attempt` again, not skip it.
-        let ok2 = remove_with_backoff(&repo_root, WorktreeKind::Issue, 1, &path, || {
-            calls.set(calls.get() + 1);
-            Err("resource busy or locked".to_string())
-        });
-        assert!(!ok2);
-        assert_eq!(calls.get(), 2, "a lone transient failure must still retry next tick");
-
-        // And it must not (yet) be surfaced as stuck.
-        assert!(!stuck_worktree_removals().iter().any(|r| r.path == path));
-    }
-
-    #[test]
-    fn a_permission_denied_failure_backs_off_immediately_without_reattempting() {
-        // AC1/AC3 of #7590: a permission-class failure cannot self-resolve,
-        // so it backs off on the very FIRST failure — unlike the transient
-        // case above, which tolerates a single failure.
-        let repo_root = PathBuf::from("/fake/repo");
-        let path = unique_test_path("issue-2");
-        let calls = std::cell::Cell::new(0);
-
-        let ok1 = remove_with_backoff(&repo_root, WorktreeKind::Issue, 2, &path, || {
-            calls.set(calls.get() + 1);
-            Err("Permission denied (os error 13)".to_string())
-        });
-        assert!(!ok1);
-        assert_eq!(calls.get(), 1);
-
-        // The very next call must skip `attempt` entirely — the whole point
-        // is to stop paying the removal syscalls, not just quiet the log.
-        let ok2 = remove_with_backoff(&repo_root, WorktreeKind::Issue, 2, &path, || {
-            calls.set(calls.get() + 1);
-            Err("Permission denied (os error 13)".to_string())
-        });
-        assert!(!ok2);
-        assert_eq!(calls.get(), 1, "a backed-off path must not re-invoke `attempt` at all");
-    }
-
-    #[test]
-    fn repeated_unclassified_failures_back_off_once_the_cap_is_reached() {
-        // AC1 of #7590: even a cause that is never classified as a
-        // permission error must eventually back off once it has repeated
-        // `REMOVAL_FAILURE_CAP` times in a row — the fixed retry-count cap.
-        let repo_root = PathBuf::from("/fake/repo");
-        let path = unique_test_path("issue-3");
-        let calls = std::cell::Cell::new(0);
-        let cause = || {
-            calls.set(calls.get() + 1);
-            Err("some unclassified, persistent failure".to_string())
-        };
-
-        for _ in 0..REMOVAL_FAILURE_CAP {
-            let ok = remove_with_backoff(&repo_root, WorktreeKind::Issue, 3, &path, cause);
-            assert!(!ok);
-        }
-        assert_eq!(calls.get(), u64::from(REMOVAL_FAILURE_CAP));
-
-        // The cap has now been reached — the next call must skip `attempt`.
-        let ok_after_cap = remove_with_backoff(&repo_root, WorktreeKind::Issue, 3, &path, cause);
-        assert!(!ok_after_cap);
-        assert_eq!(
-            calls.get(),
-            u64::from(REMOVAL_FAILURE_CAP),
-            "once the cap is reached, `attempt` must not be re-invoked until the backoff window \
-             elapses"
-        );
-    }
-
-    #[test]
-    fn stuck_worktree_removals_reflects_a_backed_off_path() {
-        // AC2 of #7590: once backed off, the path must be visible on
-        // `stuck_worktree_removals` — the input the health/status surfaces
-        // read from — naming the repo, the kind/number, and the cause.
-        let repo_root = PathBuf::from("/fake/repo/stuck");
-        let path = unique_test_path("issue-4");
-        let _ = remove_with_backoff(&repo_root, WorktreeKind::Issue, 4, &path, || {
-            Err("Permission denied (os error 13)".to_string())
-        });
-
-        let stuck = stuck_worktree_removals();
-        let entry = stuck
-            .iter()
-            .find(|r| r.path == path)
-            .expect("the backed-off path must appear in the snapshot");
-        assert_eq!(entry.repo_root, repo_root);
-        assert_eq!(entry.kind, "issue");
-        assert_eq!(entry.number, 4);
-        assert!(entry.cause.contains("Permission denied"));
-        assert_eq!(entry.attempt_count, 1);
-    }
-
-    #[test]
-    fn a_successful_removal_clears_prior_failure_state() {
-        // The recorded failure state must never survive a removal that
-        // actually succeeds — e.g. a transient lock/race resolved itself by
-        // the next tick. (A path already fully backed off is, by design, not
-        // retried again until the backoff window elapses — see
-        // `a_permission_denied_failure_backs_off_immediately_without_reattempting`
-        // — so this exercises the pre-backoff case: a single failure below
-        // both the permanent classification and `REMOVAL_FAILURE_CAP`.)
-        let repo_root = PathBuf::from("/fake/repo");
-        let path = unique_test_path("issue-5");
-
-        let ok1 = remove_with_backoff(&repo_root, WorktreeKind::Issue, 5, &path, || {
-            Err("resource busy or locked".to_string())
-        });
-        assert!(!ok1);
-        assert!(
-            stuck_worktree_removals().iter().all(|r| r.path != path),
-            "one transient failure alone must not yet be surfaced as stuck"
-        );
-
-        let ok2 = remove_with_backoff(&repo_root, WorktreeKind::Issue, 5, &path, || Ok(()));
-        assert!(ok2, "a lone prior failure must not itself block the next retry");
-        assert!(
-            !stuck_worktree_removals().iter().any(|r| r.path == path),
-            "a successful removal must clear the prior failure state"
-        );
-    }
-
-    #[test]
-    fn pr_worktree_removal_failures_are_tracked_and_backed_off_too() {
-        // #7590's fix applies identically to the `pr-<N>` remover — a
-        // `pr-<N>` worktree is exactly as susceptible to a root-owned,
-        // permission-denied nested build-cache directory as an `issue-<N>`
-        // one.
-        let repo_root = PathBuf::from("/fake/repo");
-        let path = unique_test_path("pr-6");
-
-        let ok1 = remove_with_backoff(&repo_root, WorktreeKind::Pr, 6, &path, || {
-            Err("Permission denied (os error 13)".to_string())
-        });
-        assert!(!ok1);
-
-        let stuck = stuck_worktree_removals();
-        let entry = stuck
-            .iter()
-            .find(|r| r.path == path)
-            .expect("the backed-off pr-<N> path must appear in the snapshot");
-        assert_eq!(entry.kind, "pr");
-        assert_eq!(entry.number, 6);
     }
 }
