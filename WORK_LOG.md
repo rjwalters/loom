@@ -7,6 +7,36 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7851** (closed): peer-claim coordination is DEGRADED on ip-172-31-74-176 (#6157 Layer 3)
+- **Issue #7832** (closed): Dangling Link Check fails fleet-wide: .loom/docs/ installed copies never resynced after PR #7806's anchor fix
+- **Issue #7831** (closed): 3 dangling doc anchors remain broken on main after #7806's 15-anchor fix
+- **Issue #7835** (closed): CI red on main: Dangling Link Check fails — .loom/docs/ anchor copies drifted from defaults/docs/
+- **Issue #7848** (closed): bug(worktree.sh): orphan guard rm -rf's a LIVE worktree when its path contains a space — #3717 instance missed in worktree.sh:390
+- **Issue #7726** (closed): Restructure sweep.md under progressive disclosure
+- **PR #7841**: docs(proc_exec): fix a dangling intra-doc link introduced in #7828
+- **PR #7759**: docs(sweep): restructure sweep.md under progressive disclosure (#7726)
+- **Issue #7431** (closed): [Epic #6896] Phase 3: Fleet-default rollout — soak criteria, flip containment default on Linux fleet hosts
+- **PR #7769**: docs(runtime-adapters): document containment fleet-default soak criteria and rollback path
+- **Issue #7756** (closed): classify-dependency-block.sh: 'prerequisite' phrase word false-positives a merits finding as a self-clearing dependency (regression risk: infinite re-evaluation loop)
+- **PR #7764**: fix: classify-dependency-block.sh 'prerequisite' false-positive on narrative co-occurrence (#7756)
+- **Issue #7694** (closed): Builder: probe for a live sibling worktree before worktree.sh touches files (generalizing #6765)
+- **Issue #7850** (closed): peer-claim coordination is DEGRADED on robb-studio (#6157 Layer 3)
+- **Issue #7755** (closed): Root cause: lossy guard scan strings carry prose-only tier contracts, and violating one produced a silent ALLOW
+- **PR #7846**: feat(ci): machine-check tier contracts on guard scan strings
+- **Issue #7754** (closed): Squash-only costs fanout throughput: a worker at 1/6 capacity, broken PRs, branch litter every merge — from a hardcoded flag, not a decision
+- **PR #7845**: fix(forge): detect and respect target repo's allowed merge method instead of hardcoding squash
+- **Issue #7837** (closed): main is red: #7806's anchor fixes never reached the .loom/docs mirror; the parity gate checks existence, not content
+- **PR #7842**: fix: convert .loom/docs/ real files with defaults/docs/ counterparts to symlinks
+- **Issue #7752** (closed): .loom/docs mixes symlinks and real files, so defaults/docs edits carry variable resync debt
+- **Issue #7664** (closed): watchdog: peer-coordination escalation needs hysteresis and dedup — refiles a tracking issue on every self-recovering flap
+- **Issue #7659** (closed): Proposer roles: cite only paths that exist in the dispatched workspace; sibling checkouts named in a repo docs are context, never a citation target
+- **Issue #7666** (closed): champion: a passing, already-decomposed epic is escalated to the operator after repeated identical stand-down passes
+- **PR #7828**: feat(daemon): shared bounded subprocess execution — drain-safe, group-terminating (epic #7810 PR 1)
+- **Issue #7821** (closed): epic #7810 PR 1: shared bounded subprocess execution — drain-safe, group-terminating, with self_update.rs as first migration
+- **PR #7830**: fix(tests): widen wall-clock tolerance in cooldown-remaining assertions
+- **Issue #7748** (closed): tokens_pool: blocking_entry_reports_exhaustion_class_and_cooldown_remaining flaked in CI (wall-clock jump, not code)
+- **Issue #6646** (closed): Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone
+- **Issue #7463** (closed): Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it
 - **Issue #7743** (closed): Ten version-bump issues in 60 days, nine closed and recurring: move the bump out of feature PRs instead of patching compliance again
 - **PR #7823**: feat(ci): bump versions at merge, not in feature PRs (#7743)
 - **Issue #7801** (closed): ci: markdown anchor fragments are never validated — 15 broken anchors on main today
