@@ -58,12 +58,18 @@
 #          branch push failure), the next run finds a clean tree with that
 #          Loom-authored commit still ahead of origin and lands it instead
 #          of reporting "nothing to land" and stranding it.
-#   4. Before attempting a direct push it asks the forge (GitHub only,
-#      fail-open) whether the default branch has an active `pull_request` /
+#   4. Before attempting a direct push it asks the forge (GitHub only)
+#      whether the default branch has an active `pull_request` /
 #      `required_status_checks` rule or legacy branch protection. If it does,
 #      the direct push is SKIPPED regardless of whether this identity could
 #      bypass it -- a plain push from a bypass-capable identity is exactly the
-#      incident shape above. Otherwise a plain `git push` is attempted;
+#      incident shape above. The rules lookup FAILS CLOSED: a non-zero exit
+#      (rate limit, 5xx, DNS, a token without rulesets read) or an
+#      unparseable answer is treated as "protected", because a transient
+#      REST failure must not turn into a bypass push. It fails OPEN only when
+#      there is no `gh` on PATH or the forge is Gitea (LOOM_FORGE_TYPE=gitea)
+#      -- and on a definitive "no rules" answer. Otherwise a plain `git push`
+#      is attempted;
 #      ordinary git push semantics make this fast-forward-only by
 #      construction (rejected if origin has advanced), and its stderr is
 #      inspected even on success: a `Bypassed rule violations` warning is
@@ -118,7 +124,7 @@
 #       (the forge said so on stderr). The commit IS on origin -- this script
 #       never force-pushes, so it does not undo it -- but the run is reported
 #       as a failure so the bypass is never silent. Fix the identity/ruleset
-#       (or the forge reachability that made the pre-check fail open).
+#       (or whatever made the pre-check fail open: no `gh`, a Gitea forge).
 
 set -uo pipefail
 
@@ -466,18 +472,24 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     exit "$EXIT_OK"
 fi
 
-# ---------- branch-protection pre-check (GitHub only; fail-open) ----------
+# ---------- branch-protection pre-check (GitHub only; fails CLOSED on error) ----------
 #
 # Returns 0 ("protected: do NOT direct-push") when the forge reports an active
 # pull_request / required_status_checks rule (rulesets API) or legacy branch
-# protection with PR reviews / status checks on the default branch. Returns 1
-# otherwise -- INCLUDING on any API error, a non-GitHub forge, or a missing
-# `gh` (fail-open, so a Gitea/offline host still works). A plain push is then
-# attempted, and the post-push bypass check below is the second line of
-# defense. The point of asking at all: for an identity on the ruleset's
-# bypass list, GitHub ACCEPTS a plain push to a protected branch and only
-# warns on stderr -- so "the push was rejected" is not a signal we can rely
-# on to route protected branches to the PR path (#6646).
+# protection with PR reviews / status checks on the default branch -- AND
+# whenever the rulesets call itself fails (non-zero exit: rate limit, 5xx,
+# DNS, a token without rulesets read) or answers something unparseable. A
+# failed lookup is deliberately NOT the same as "no rules": on a repo whose
+# pushing identity is on the bypass list, treating an API hiccup as
+# "unprotected" would reproduce the exact incident this script exists to
+# prevent (the post-push bypass check below only makes it loud, not
+# prevented). Returns 1 (fail-open, a plain push is attempted) ONLY when
+# there is no `gh` on PATH, the forge is Gitea, or the forge definitively
+# answers "no rules" and the legacy /protection lookup is negative (its 404
+# means "not protected"). The point of asking at all: for an identity on the
+# ruleset's bypass list, GitHub ACCEPTS a plain push to a protected branch
+# and only warns on stderr -- so "the push was rejected" is not a signal we
+# can rely on to route protected branches to the PR path (#6646).
 PROTECTION_SOURCE=""
 default_branch_requires_pr() {
     case "$(printf '%s' "${LOOM_FORGE_TYPE:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -485,7 +497,14 @@ default_branch_requires_pr() {
     esac
     command -v gh >/dev/null 2>&1 || return 1
     local rule_types
-    rule_types="$(cd "$REPO_ROOT" && gh api "repos/{owner}/{repo}/rules/branches/$DEFAULT_BRANCH" --jq '.[].type' 2>/dev/null || true)"
+    if ! rule_types="$(cd "$REPO_ROOT" && gh api "repos/{owner}/{repo}/rules/branches/$DEFAULT_BRANCH" --jq '.[].type' 2>/dev/null)"; then
+        PROTECTION_SOURCE="rules API call failed — assumed protected, refusing to direct-push on GitHub (fail closed; #6646)"
+        return 0
+    fi
+    if grep -qvE '^[A-Za-z0-9_]*$' <<< "$rule_types"; then
+        PROTECTION_SOURCE="rules API answer unparseable — assumed protected, refusing to direct-push on GitHub (fail closed; #6646)"
+        return 0
+    fi
     if grep -qxE 'pull_request|required_status_checks' <<< "$rule_types"; then
         PROTECTION_SOURCE="ruleset rule(s): $(grep -xE 'pull_request|required_status_checks' <<< "$rule_types" | tr '\n' ' ' | sed 's/ $//')"
         return 0
@@ -515,7 +534,7 @@ else
             err "  The commit IS on origin/$DEFAULT_BRANCH — this script never force-pushes, so it is not undone here —"
             err "  but this run is a FAILURE: automation must never bypass-push (#6646). Fix the pushing identity /"
             err "  ruleset bypass list, or whatever made the branch-protection pre-check fail open (gh missing,"
-            err "  API unreachable), before the next resync lands. See .loom/docs/troubleshooting.md"
+            err "  a Gitea forge), before the next resync lands. See .loom/docs/troubleshooting.md"
             err "  \"Landing a resync commit on the primary clone (#6646)\"."
             exit "$EXIT_BYPASS_PUSHED"
         fi

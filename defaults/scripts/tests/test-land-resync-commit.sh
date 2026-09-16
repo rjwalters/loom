@@ -52,6 +52,10 @@
 #                                               land" with a stranded commit)
 #   (l2) clean tree, only an operator commit-> exit 0, nothing pushed, the
 #       ahead of origin                          operator's commit untouched
+#   (m) the rules API call FAILS (non-zero  -> treated as PROTECTED (fail
+#       exit), bare origin would accept the     closed): direct push SKIPPED,
+#       plain push                              branch + PR instead; origin/
+#                                               <default> untouched
 #
 # Usage:
 #   ./.loom/scripts/tests/test-land-resync-commit.sh
@@ -95,7 +99,10 @@ LOOM_NAME="Loom CI"
 # The script calls gh for exactly three things, all routed through here:
 #   gh api repos/{owner}/{repo}/rules/branches/<default> --jq '.[].type'
 #       -> answers with the contents of $GH_RULES_FILE (one rule type per
-#          line, as gh's --jq would print; empty/missing file = no rules)
+#          line, as gh's --jq would print; empty/missing file = no rules);
+#          if $GH_RULES_FAIL_FILE exists the call FAILS instead (exit 1 with
+#          an HTTP-style error on stderr, nothing on stdout) -- the
+#          transient-REST-failure case of test (m)
 #   gh api repos/{owner}/{repo}/branches/<default>/protection ...
 #       -> always "Branch not protected" (exit 1), the legacy-API negative
 #   gh pr list --head <branch> ...  (create-pr.sh's adopt-first lookup)
@@ -109,6 +116,7 @@ LOOM_NAME="Loom CI"
 STUB_BIN="$WORKDIR/stub-bin"
 mkdir -p "$STUB_BIN"
 GH_RULES_FILE="$WORKDIR/gh-rules"
+GH_RULES_FAIL_FILE="$WORKDIR/gh-rules-fail"
 GH_EXISTING_PR_FILE="$WORKDIR/gh-existing-pr"
 GH_CALLS_LOG="$WORKDIR/gh-calls.log"
 cat > "$STUB_BIN/gh" <<'STUB'
@@ -118,7 +126,9 @@ printf '%s\n' "gh $*" | tr '\n' ' ' >> "$D/gh-calls.log"; echo >> "$D/gh-calls.l
 case "$1 $2" in
     "pr list") cat "$D/gh-existing-pr" 2>/dev/null || echo null ;;
     "pr create") echo "https://example.invalid/pr/999" ;;
-    api\ */rules/branches/*) cat "$D/gh-rules" 2>/dev/null; exit 0 ;;
+    api\ */rules/branches/*)
+        if [[ -e "$D/gh-rules-fail" ]]; then echo 'gh: HTTP 503: Service Unavailable' >&2; exit 1; fi
+        cat "$D/gh-rules" 2>/dev/null; exit 0 ;;
     api\ */protection) echo '{"message":"Branch not protected"}' >&2; exit 1 ;;
     *) echo "stub gh: unhandled args: $*" >&2; exit 3 ;;
 esac
@@ -127,11 +137,12 @@ chmod +x "$STUB_BIN/gh"
 export PATH="$STUB_BIN:$PATH"
 export LOOM_FORGE_TYPE=github
 
-# gh_stub_reset [rule types...] -> clears the call log and the adopted-PR
-# answer, and sets the rules answer to the given types (none = unprotected).
+# gh_stub_reset [rule types...] -> clears the call log, the adopted-PR
+# answer and the rules-call-fails switch, and sets the rules answer to the
+# given types (none = unprotected).
 gh_stub_reset() {
     : > "$GH_CALLS_LOG"
-    rm -f "$GH_EXISTING_PR_FILE"
+    rm -f "$GH_EXISTING_PR_FILE" "$GH_RULES_FAIL_FILE"
     : > "$GH_RULES_FILE"
     local t
     for t in "$@"; do printf '%s\n' "$t" >> "$GH_RULES_FILE"; done
@@ -567,6 +578,36 @@ if [[ $RC -eq 0 ]] && grep -q "nothing to land" <<< "$OUT" && grep -q "operator 
     pass "an operator's unpushed commit on a clean tree is neither pushed nor touched"
 else
     fail "an operator's unpushed commit on a clean tree is neither pushed nor touched (rc=$RC, out=$OUT)"
+fi
+
+echo ""
+echo "=== (m) the rules API call FAILS (non-zero exit) -> treated as protected: direct push skipped, branch + PR ==="
+gh_stub_reset
+touch "$GH_RULES_FAIL_FILE"
+make_origin origin-m
+make_primary origin-m primary-m
+# NO divergence and NO rules answer at all: the bare origin WOULD accept a
+# plain push. Before the fail-closed narrowing, "the rules call failed" and
+# "the forge reported no rules" were indistinguishable, so a transient REST
+# failure with a bypass-capable identity still bypass-pushed (#6646).
+printf 'updated\n' > "$WORKDIR/primary-m/.loom/hooks/foo.sh"
+OUT="$(cd "$WORKDIR/primary-m" && "$SCRIPT" 2>&1)"; RC=$?
+ORIGIN_MAIN_LOG="$(git --git-dir="$WORKDIR/origin-m.git" log --oneline main)"
+if [[ $RC -eq 0 ]] && grep -q "fail closed" <<< "$OUT" && grep -q "opened https://example.invalid/pr/999" <<< "$OUT"; then
+    pass "a FAILED rules lookup is treated as protected and routes to the branch + PR path (fail closed)"
+else
+    fail "a FAILED rules lookup is treated as protected and routes to the branch + PR path (fail closed) (rc=$RC, out=$OUT)"
+fi
+if ! grep -q "resync installed Loom surfaces" <<< "$ORIGIN_MAIN_LOG" && \
+   git --git-dir="$WORKDIR/origin-m.git" show-ref --verify --quiet refs/heads/chore/resync-installed; then
+    pass "origin/<default> did NOT receive the commit (no direct push was attempted); the side branch was pushed instead"
+else
+    fail "origin/<default> did NOT receive the commit (no direct push was attempted); the side branch was pushed instead (origin_main_log=$ORIGIN_MAIN_LOG)"
+fi
+if grep -q "rules/branches/main" "$GH_CALLS_LOG" && ! grep -q "branches/main/protection" "$GH_CALLS_LOG"; then
+    pass "the rules endpoint was consulted and its failure short-circuited (no legacy /protection lookup could downgrade it to 'unprotected')"
+else
+    fail "the rules endpoint was consulted and its failure short-circuited (calls=$(cat "$GH_CALLS_LOG"))"
 fi
 
 echo ""

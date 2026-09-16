@@ -2306,16 +2306,21 @@ own:
   account / the fleet App, admin on the repo) and merely reported on stderr
   as `remote: Bypassed rule violations for refs/heads/main:`. So on a
   protected branch the direct push is skipped outright, regardless of
-  whether this identity could bypass. The pre-check fails **open** (API
-  error, no `gh`, a Gitea forge) so an offline/non-GitHub host still works —
+  whether this identity could bypass. The pre-check fails **closed** on a
+  GitHub API *error*: a non-zero exit from the rules call (rate limit, 5xx,
+  DNS, a token without rulesets read) or an unparseable answer is treated as
+  "protected" and routed to the branch + PR path, because a transient REST
+  failure must never turn into a bypass push from a bypass-capable identity.
+  It fails **open** only when there is no `gh` on PATH or the forge is Gitea
+  (`LOOM_FORGE_TYPE=gitea`), so an offline/non-GitHub host still works —
   which is why there is a second line of defense: a plain push's stderr is
   inspected *even on success*, and a `Bypassed rule violations` warning
   turns the run into a loud failure (exit code `4`, naming the commit and
   quoting the forge). The commit *is* on origin at that point — this script
   never force-pushes, so it does not undo it — but the run is reported as
   failed so a bypass push can never happen silently again; fix the pushing
-  identity / ruleset bypass list (or whatever made the pre-check fail open)
-  before the next resync lands.
+  identity / ruleset bypass list (or whatever made the pre-check fail open:
+  no `gh`, a Gitea forge) before the next resync lands.
 - When the branch is unprotected, a plain `git push` is attempted — ordinary
   git semantics make it fast-forward-only by construction. If it is
   rejected (`origin` advanced with commits this checkout doesn't have yet),
