@@ -7,7 +7,16 @@
 #   ./scripts/install/setup-repository-settings.sh /path/to/target-repo [--dry-run]
 #
 # Configures:
-#   - Merge strategy (squash merge only)
+#   - Merge strategy: respects whatever the target repo already allows
+#     (#7754) -- only defaults to enabling squash-merge when the repo
+#     currently has EVERY merge strategy disabled (a degenerate state
+#     neither forge's own UI normally permits). Previously this
+#     unconditionally forced squash-only (allow_merge_commit=false,
+#     allow_squash_merge=true, allow_rebase_merge=false) on every installed
+#     repo, which broke `merge-pr.sh`'s auto-merge on any repo an operator
+#     had deliberately configured for merge-commit-only or rebase-only
+#     (the original #1258 bug: "Squash merges are not allowed on this
+#     repository").
 #   - Auto-delete head branches
 #   - Allow auto-merge
 #   - Suggest updating branches (GitHub only; Gitea has no equivalent)
@@ -39,15 +48,44 @@ setup_github_repo_settings() {
     warning "Attempting anyway (may fail with permission error)..."
   fi
 
-  # Define the settings to apply
-  local settings_json='{
-    "allow_merge_commit": false,
-    "allow_squash_merge": true,
-    "allow_rebase_merge": false,
-    "delete_branch_on_merge": true,
-    "allow_auto_merge": true,
-    "allow_update_branch": true
-  }'
+  # Detect the repo's CURRENT merge-strategy settings (#7754) instead of
+  # unconditionally forcing squash-only -- an operator who has deliberately
+  # configured merge-commit-only or rebase-only must not have that silently
+  # reverted by (re-)running the installer.
+  local current_json current_squash current_merge current_rebase
+  current_json=$(gh api "repos/${owner}/${repo}" 2>/dev/null || echo '{}')
+  current_squash=$(echo "$current_json" | jq -r '.allow_squash_merge // false' 2>/dev/null || echo "false")
+  current_merge=$(echo "$current_json" | jq -r '.allow_merge_commit // false' 2>/dev/null || echo "false")
+  current_rebase=$(echo "$current_json" | jq -r '.allow_rebase_merge // false' 2>/dev/null || echo "false")
+
+  local respect_existing=false
+  if [[ "$current_squash" == "true" || "$current_merge" == "true" || "$current_rebase" == "true" ]]; then
+    respect_existing=true
+  fi
+
+  # Build the settings payload: the merge-strategy trio (allow_merge_commit /
+  # allow_squash_merge / allow_rebase_merge) is included ONLY when nothing is
+  # currently enabled (a degenerate state GitHub's own UI does not normally
+  # allow) -- in that fallback case we enable squash so the repo can merge at
+  # all. Otherwise we leave the trio out of the PATCH entirely so the repo's
+  # existing choice is untouched.
+  local settings_json
+  if [[ "$respect_existing" == "true" ]]; then
+    settings_json='{
+      "delete_branch_on_merge": true,
+      "allow_auto_merge": true,
+      "allow_update_branch": true
+    }'
+  else
+    settings_json='{
+      "allow_merge_commit": false,
+      "allow_squash_merge": true,
+      "allow_rebase_merge": false,
+      "delete_branch_on_merge": true,
+      "allow_auto_merge": true,
+      "allow_update_branch": true
+    }'
+  fi
 
   # In dry-run mode, just display what would be changed
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -57,10 +95,21 @@ setup_github_repo_settings() {
     echo "  Repository: ${owner}/${repo}"
     echo "  Forge: GitHub"
     echo ""
+    if [[ "$respect_existing" == "true" ]]; then
+      echo "  Current merge-strategy settings (unchanged):"
+      echo "    allow_merge_commit: ${current_merge}"
+      echo "    allow_squash_merge: ${current_squash}"
+      echo "    allow_rebase_merge: ${current_rebase}"
+      echo ""
+      info "Repository already allows at least one merge strategy -- respecting existing configuration"
+    else
+      echo "  No merge strategy is currently enabled -- would apply a fallback default:"
+      echo "    allow_merge_commit: false (disabled)"
+      echo "    allow_squash_merge: true (default strategy - flattens PR to single commit)"
+      echo "    allow_rebase_merge: false (disabled)"
+    fi
+    echo ""
     echo "  Settings to be configured:"
-    echo "    allow_merge_commit: false (disabled)"
-    echo "    allow_squash_merge: true (default strategy - flattens PR to single commit)"
-    echo "    allow_rebase_merge: false (disabled)"
     echo "    delete_branch_on_merge: true (auto-cleanup branches)"
     echo "    allow_auto_merge: true (enables Champion auto-merge)"
     echo "    allow_update_branch: true (suggest branch updates)"
@@ -74,9 +123,13 @@ setup_github_repo_settings() {
     success "Repository settings configured successfully"
     echo ""
     echo "Applied settings:"
-    echo "  - Allow merge commits: No (disabled)"
-    echo "  - Allow squash merging: Yes (default strategy - flattens PR to single commit)"
-    echo "  - Allow rebase merging: No (disabled)"
+    if [[ "$respect_existing" == "true" ]]; then
+      echo "  - Merge strategy: unchanged (repo already allows: merge=${current_merge}, squash=${current_squash}, rebase=${current_rebase})"
+    else
+      echo "  - Allow merge commits: No (disabled)"
+      echo "  - Allow squash merging: Yes (default strategy - flattens PR to single commit)"
+      echo "  - Allow rebase merging: No (disabled)"
+    fi
     echo "  - Delete branches on merge: Yes (auto-cleanup)"
     echo "  - Allow auto-merge: Yes (enables Champion workflow)"
     echo "  - Suggest updating branches: Yes"
@@ -94,9 +147,7 @@ setup_github_repo_settings() {
     echo "  1. Go to: https://github.com/${owner}/${repo}/settings"
     echo "  2. Scroll to 'Pull Requests' section"
     echo "  3. Configure merge options:"
-    echo "     - Disable: Allow merge commits"
-    echo "     - Enable: Allow squash merging"
-    echo "     - Disable: Allow rebase merging"
+    echo "     - Enable at least one of: Allow merge commits / Allow squash merging / Allow rebase merging"
     echo "     - Enable: Always suggest updating pull request branches"
     echo "     - Enable: Automatically delete head branches"
     echo "     - Enable: Allow auto-merge"
@@ -114,15 +165,39 @@ setup_gitea_repo_settings() {
     return 1
   fi
 
-  # Gitea repo settings payload
-  # Note: default_merge_style enforces squash-only merging
-  local settings_json='{
-    "allow_merge_commits": false,
-    "allow_squash_merge": true,
-    "allow_rebase_merge": false,
-    "default_delete_branch_after_merge": true,
-    "default_merge_style": "squash"
-  }'
+  # Detect the repo's CURRENT merge-strategy settings (#7754) instead of
+  # unconditionally forcing squash-only.
+  local current_json current_squash current_merge current_rebase current_style
+  current_json=$(gitea_api GET "/repos/${owner}/${repo}" 2>/dev/null | sed '$d')
+  current_squash=$(echo "$current_json" | jq -r '.allow_squash_merge // false' 2>/dev/null || echo "false")
+  current_merge=$(echo "$current_json" | jq -r '.allow_merge_commits // false' 2>/dev/null || echo "false")
+  current_rebase=$(echo "$current_json" | jq -r '.allow_rebase_merge // false' 2>/dev/null || echo "false")
+  current_style=$(echo "$current_json" | jq -r '.default_merge_style // empty' 2>/dev/null || echo "")
+
+  local respect_existing=false
+  if [[ "$current_squash" == "true" || "$current_merge" == "true" || "$current_rebase" == "true" ]]; then
+    respect_existing=true
+  fi
+
+  # Gitea repo settings payload: the merge-strategy trio + default_merge_style
+  # is included ONLY when nothing is currently enabled (fallback: enable
+  # squash so the repo can merge at all). Otherwise the trio and merge style
+  # are left out of the PATCH so an operator's existing choice (e.g.
+  # merge-commit-only or rebase-only, the original #1258 bug) is untouched.
+  local settings_json
+  if [[ "$respect_existing" == "true" ]]; then
+    settings_json='{
+      "default_delete_branch_after_merge": true
+    }'
+  else
+    settings_json='{
+      "allow_merge_commits": false,
+      "allow_squash_merge": true,
+      "allow_rebase_merge": false,
+      "default_delete_branch_after_merge": true,
+      "default_merge_style": "squash"
+    }'
+  fi
 
   # In dry-run mode, just display what would be changed
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -132,12 +207,24 @@ setup_gitea_repo_settings() {
     echo "  Repository: ${owner}/${repo}"
     echo "  Forge: Gitea"
     echo ""
+    if [[ "$respect_existing" == "true" ]]; then
+      echo "  Current merge-strategy settings (unchanged):"
+      echo "    allow_merge_commits: ${current_merge}"
+      echo "    allow_squash_merge: ${current_squash}"
+      echo "    allow_rebase_merge: ${current_rebase}"
+      echo "    default_merge_style: ${current_style:-unset}"
+      echo ""
+      info "Repository already allows at least one merge strategy -- respecting existing configuration"
+    else
+      echo "  No merge strategy is currently enabled -- would apply a fallback default:"
+      echo "    allow_merge_commits: false (disabled)"
+      echo "    allow_squash_merge: true (default strategy - flattens PR to single commit)"
+      echo "    allow_rebase_merge: false (disabled)"
+      echo "    default_merge_style: squash"
+    fi
+    echo ""
     echo "  Settings to be configured:"
-    echo "    allow_merge_commits: false (disabled)"
-    echo "    allow_squash_merge: true (default strategy - flattens PR to single commit)"
-    echo "    allow_rebase_merge: false (disabled)"
     echo "    default_delete_branch_after_merge: true (auto-cleanup branches)"
-    echo "    default_merge_style: squash (enforce squash-only merging)"
     echo ""
     warning "Gitea does not support 'allow_update_branch' (suggest branch updates)."
     echo "  This is a cosmetic GitHub UI feature with low impact."
@@ -158,11 +245,15 @@ setup_gitea_repo_settings() {
     success "Repository settings configured successfully"
     echo ""
     echo "Applied settings:"
-    echo "  - Allow merge commits: No (disabled)"
-    echo "  - Allow squash merging: Yes (default strategy - flattens PR to single commit)"
-    echo "  - Allow rebase merging: No (disabled)"
+    if [[ "$respect_existing" == "true" ]]; then
+      echo "  - Merge strategy: unchanged (repo already allows: merge=${current_merge}, squash=${current_squash}, rebase=${current_rebase})"
+    else
+      echo "  - Allow merge commits: No (disabled)"
+      echo "  - Allow squash merging: Yes (default strategy - flattens PR to single commit)"
+      echo "  - Allow rebase merging: No (disabled)"
+      echo "  - Default merge style: squash (enforces squash-only merging)"
+    fi
     echo "  - Delete branches on merge: Yes (auto-cleanup)"
-    echo "  - Default merge style: squash (enforces squash-only merging)"
     echo ""
 
     # Graceful degradation warnings
@@ -186,11 +277,9 @@ setup_gitea_repo_settings() {
     info "To configure manually:"
     echo "  1. Go to your Gitea repository settings"
     echo "  2. Under 'Repository', configure merge options:"
-    echo "     - Disable: Allow merge commits"
-    echo "     - Enable: Allow squash merging"
-    echo "     - Disable: Allow rebase merging"
+    echo "     - Enable at least one of: Allow merge commits / Allow squash merging / Allow rebase merging"
     echo "     - Enable: Automatically delete head branches"
-    echo "     - Set default merge style to: squash"
+    echo "     - Set default merge style to match your enabled strategy"
     return 1
   fi
 }
