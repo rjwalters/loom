@@ -1607,7 +1607,14 @@ mod tests {
     #[test]
     fn empty_pool_error_enumerates_per_token_exclusion_detail() {
         let tmp = make_pool(&["exh", "auth"]);
-        let ts = (chrono::Utc::now() - chrono::Duration::seconds(3600))
+        // Deliberately a few seconds shy of the 1h mark rather than exactly
+        // `3600` — at exactly 3600s the remaining cooldown
+        // (`SESSION_WINDOW_SECS` - elapsed) lands exactly on the 4h boundary,
+        // so any wall-clock drift between computing `ts` here and
+        // `select_token` re-deriving "now" below can push the rendered
+        // duration to "3h59m" and flake the `contains("clears in 4h")`
+        // assertion below (#7792).
+        let ts = (chrono::Utc::now() - chrono::Duration::seconds(3600 - 5))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         fs::write(
