@@ -7,6 +7,17 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7743** (closed): Ten version-bump issues in 60 days, nine closed and recurring: move the bump out of feature PRs instead of patching compliance again
+- **PR #7823**: feat(ci): bump versions at merge, not in feature PRs (#7743)
+- **Issue #7801** (closed): ci: markdown anchor fragments are never validated — 15 broken anchors on main today
+- **PR #7806**: ci: validate markdown anchor fragments with lychee, fix 15 broken anchors
+- **Issue #7725** (closed): Extend the size ratchet to agent-facing markdown, measured in tokens
+- **PR #7824**: feat(ci): add markdown-token ratchet for agent-facing prompts
+- **Issue #7811** (closed): main is red: guard suites read the repo's own committed config, so #7799's opt-out broke them
+- **Issue #7808** (closed): main is red: #7799 (.loom/config.json only) skipped the guard suites on the PR, and the SQL assertions read the committed config
+- **PR #7809**: fix(tests): hermetic default cwd for the guard suites; run them on .loom/config.json PRs (#7808)
+- **Issue #7804** (closed): Record a 'dumb reliable CI' principle in CLAUDE.md: three failures today came from individually-justified cleverness
+- **PR #7805**: docs: record a 'dumb reliable CI' principle in CLAUDE.md, paid for within the 320-line budget
 - **Issue #7802** (closed): Exhaustive bash 3.2 scan: 2 silently-wrong constructs + 338 unguarded array expansions — and why the Rust port changes the fix order
 - **Issue #7783** (closed): post-verdict.sh: ${_gate_all_ids[*]} is an unbound variable on macOS bash 3.2 — blocks every Judge verdict on the clean path
 - **PR #7807**: fix: three bash 3.2 correctness bugs, all of them silent (#7783, #7802 Class 1)

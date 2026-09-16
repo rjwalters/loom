@@ -9,7 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-_None._
+- **#7699**: fix(config): replace live safehouse room / observability endpoint with placeholders
 
 ## Urgent
 
@@ -17,7 +17,7 @@ Issues flagged as highest priority (`loom:urgent`).
 
 - **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone
-- **#7664**: watchdog: peer-coordination escalation needs hysteresis and dedup — refiles a tracking issue on every self-recovering flap
+- **#7431**: [Epic #6896] Phase 3: Fleet-default rollout — soak criteria, flip containment default on Linux fleet hosts
 
 ## Ready
 
@@ -25,7 +25,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 - **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone
-- **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier?
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation
 - **#7431**: [Epic #6896] Phase 3: Fleet-default rollout — soak criteria, flip containment default on Linux fleet hosts
 - **#7659**: Proposer roles: cite only paths that exist in the dispatched workspace; sibling checkouts named in a repo docs are context, never a citation target
@@ -34,17 +33,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#7691**: [Phase B of #6704] Rank the role-runner ring from the live roster, generation-fenced, with bounded reassignment
 - **#7694**: Builder: probe for a live sibling worktree before worktree.sh touches files (generalizing #6765)
 - **#7726**: Restructure sweep.md under progressive disclosure
-- **#7730**: cargo test --lib fails on macOS: embedded shell driver uses bash 4 'declare -A' (bash 3.2)
 - **#7756**: classify-dependency-block.sh: 'prerequisite' phrase word false-positives a merits finding as a self-clearing dependency (regression risk: infinite re-evaluation loop)
-- **#7783**: post-verdict.sh: ${_gate_all_ids[*]} is an unbound variable on macOS bash 3.2 — blocks every Judge verdict on the clean path
-- **#7801**: ci: markdown anchor fragments are never validated — 15 broken anchors on main today
-- **#7804**: Record a 'dumb reliable CI' principle in CLAUDE.md: three failures today came from individually-justified cleverness
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#7811**: main is red: guard suites read the repo's own committed config, so #7799's opt-out broke them
+- **#7748**: tokens_pool: blocking_entry_reports_exhaustion_class_and_cooldown_remaining flaked in CI (wall-clock jump, not code)
+- **#7821**: epic #7810 PR 1: shared bounded subprocess execution — drain-safe, group-terminating, with self_update.rs as first migration
 
 ## PRs Awaiting Review
 
@@ -54,20 +50,19 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#7673**: docs(roles): citation-scope rules for hermit/architect; fix stale get_random_file example
 - **#7680**: fix(watchdog): dedup peer-coordination escalations across the cooldown window (#7664)
 - **#7685**: feat(resync): land resync commits conservatively, never rebase/bypass-push (#6646)
-- **#7699**: fix(config): replace live safehouse room / observability endpoint with placeholders
 - **#7700**: Builder: probe for a live sibling worktree before worktree.sh touches files (generalizing #6765)
 - **#7707**: fix(daemon): spawn a detached post-exit verifier on the auto-update drain-and-restart path
 - **#7759**: docs(sweep): restructure sweep.md under progressive disclosure (#7726)
 - **#7764**: fix: classify-dependency-block.sh 'prerequisite' false-positive on narrative co-occurrence (#7756)
-- **#7778**: fix: make champion:hold-state pipeline pipefail-safe in merge-pr.sh
-- **#7782**: fix(daemon): drop bash-4 declare -A from the shell_is_ignored test driver
-- **#7805**: docs: record a 'dumb reliable CI' principle in CLAUDE.md, paid for within the 320-line budget
+- **#7769**: docs(runtime-adapters): document containment fleet-default soak criteria and rollback path
+- **#7828**: feat(daemon): shared bounded subprocess execution — drain-safe, group-terminating (epic #7810 PR 1)
+- **#7830**: fix(tests): widen wall-clock tolerance in cooldown-remaining assertions
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-_None._
+- **#7699**: fix(config): replace live safehouse room / observability endpoint with placeholders
 
 ## Proposed
 
@@ -91,10 +86,9 @@ Issues carrying `loom:curated`.
 - **#7705**: Version-bump commits are landing with Cargo.lock / mcp-loom/package-lock.json desynced from the bumped version *(curated)*
 - **#7716**: [tracking] Budget agent-facing markdown by tokens *(curated)*
 - **#7726**: Restructure sweep.md under progressive disclosure *(curated)*
-- **#7730**: cargo test --lib fails on macOS: embedded shell driver uses bash 4 'declare -A' (bash 3.2) *(curated)*
+- **#7748**: tokens_pool: blocking_entry_reports_exhaustion_class_and_cooldown_remaining flaked in CI (wall-clock jump, not code) *(curated)*
 - **#7756**: classify-dependency-block.sh: 'prerequisite' phrase word false-positives a merits finding as a self-clearing dependency (regression risk: infinite re-evaluation loop) *(curated)*
 - **#7758**: Re-derive which bootstrap scripts must stay shell — auto_update.rs already duplicates loom-daemon-update.sh *(curated)*
-- **#7783**: post-verdict.sh: ${_gate_all_ids[*]} is an unbound variable on macOS bash 3.2 — blocks every Judge verdict on the clean path *(curated)*
 - **#7794**: Seven scripts read their own source to print --help; the tear-race has broken CI three times *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -115,13 +109,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 0 |
+| Operator merge-risk holds | 1 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 16 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 12 |
-| Approved PRs awaiting merge | 0 |
-| Curated | 23 |
+| Ready (`loom:issue`) | 11 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 11 |
+| Approved PRs awaiting merge | 1 |
+| Curated | 22 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
