@@ -21,6 +21,7 @@
 18444 defaults/.claude/commands/loom/builder.md
 4803 defaults/.claude/commands/loom/bump.md
 7185 defaults/.claude/commands/loom/champion-common.md
+1422 defaults/.claude/commands/loom/champion-epic-guard-invariants.md
 1836 defaults/.claude/commands/loom/champion-epic-standdown.md
 13793 defaults/.claude/commands/loom/champion-epic.md
 23150 defaults/.claude/commands/loom/champion-issue-promo.md
