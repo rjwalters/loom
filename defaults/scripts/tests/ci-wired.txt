@@ -191,6 +191,7 @@ test-run-ci-suites-daemon-guard.sh
 test-run-ci-suites-failure-excerpt.sh
 test-run-ci-suites-retry.sh
 test-run-ci-suites-serial-lane.sh
+test-run-job.sh
 test-safe-stash-pop.sh
 test-safehoused-service.sh
 test-spawn-generic.sh

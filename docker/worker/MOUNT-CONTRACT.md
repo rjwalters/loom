@@ -202,6 +202,13 @@ consistent with `test-image.sh`'s own CI wiring.
 - #6013 / #6014 — the `CARGO_TARGET_DIR` rebuild-storm finding §4 addresses.
 - Epic **#6896** — session containers (this contract is Phase 1's
   filesystem-contract deliverable; every later phase mounts under it).
+- [`.loom/docs/run-job-seam.md`](../../.loom/docs/run-job-seam.md) — Phase
+  4's `run-job` seam, whose job-spec mounts are §1 path parity expressed as a
+  data shape (one absolute path + a mode, no `src:dst` form), and which
+  refuses a container-runtime socket mount outright.
+- [`test-run-job.sh`](test-run-job.sh) — that seam's end-to-end proof: a
+  `run-job` client inside a worker container with **no** docker socket, a
+  loopback executor on the host, real parity-mounted job containers.
 - [`.loom/docs/runtime-adapters.md`](../../.loom/docs/runtime-adapters.md) —
   the broader multi-runtime dispatch contract this mount contract's consumers
   (containerized `spawn-worker.sh` dispatch, Codex session containers) plug

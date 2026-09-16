@@ -108,6 +108,14 @@ jobs:
             docker:
               - 'docker/**'
               - '.dockerignore'
+              # The run-job seam (#7853) is the one thing outside docker/ that
+              # this filter's jobs prove: docker/worker/test-run-job.sh drives
+              # these two scripts inside a real worker container to show the
+              # container needs no docker socket. A seam-only PR must re-run
+              # that leg, or the only test that can catch a regression in the
+              # containment story is skipped on exactly the PRs that cause one.
+              - 'defaults/scripts/run-job.sh'
+              - 'defaults/scripts/lib/run-job-exec.sh'
               - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
@@ -881,6 +889,13 @@ jobs:
         run: ./docker/worker/test-image.sh loom-worker:ci-smoke
       - name: Run the mount-contract worktree-correctness test
         run: ./docker/worker/test-mount-contract.sh loom-worker:ci-smoke
+      # Epic #6896 Phase 4 (#7853). The hermetic suite in
+      # defaults/scripts/tests/ proves the seam's logic against a fake docker;
+      # this leg is the only place the claim under test can actually be made —
+      # a run-job client inside the shipped image, with no docker socket, against
+      # this runner's real docker daemon.
+      - name: Run the run-job seam end-to-end test (client in a socket-less container)
+        run: ./docker/worker/test-run-job.sh loom-worker:ci-smoke
 
   session-image-smoke:
     name: loom-worker-session Image Smoke Test
