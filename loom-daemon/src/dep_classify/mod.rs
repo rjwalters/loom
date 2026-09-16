@@ -15,5 +15,7 @@
 //! behaviour. Translating them into Rust unit tests would replace that evidence
 //! with an assertion.
 
+pub mod finding;
+pub mod fingerprint;
 pub mod refs;
 pub mod subset;
