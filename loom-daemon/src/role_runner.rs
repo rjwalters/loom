@@ -719,42 +719,6 @@ impl RoleTickOutcome {
     }
 }
 
-/// The detail carried by [`RoleTickOutcome::ModelRuntimeMismatch`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelRuntimeMismatch {
-    /// The role that was ticked (e.g. `"judge"`).
-    pub role: String,
-    /// The admitted runtime (e.g. `"codex"`).
-    pub runtime: String,
-    /// The model resolved by [`resolve_role_runner_model`] (or the test-only
-    /// `with_model` override) for this role.
-    pub model: String,
-    /// The config/env tier label [`resolve_role_runner_model`] attributes the
-    /// model to (e.g. `"default"`, `"autonomous.roleRunner.model"`), unchanged
-    /// from what a successful spawn's log header would have recorded.
-    pub model_source: String,
-    /// The [`crate::sweep_registry::model_runtime_mismatch`] reason string
-    /// naming the two conflicting families.
-    pub reason: String,
-}
-
-impl ModelRuntimeMismatch {
-    /// One-line, operator-facing detail. `record_role_tick` stores this
-    /// verbatim on the ring record, and `assess_roles` in `health.rs` already
-    /// renders a persistent failure's `detail` as-is — so `loom-daemon
-    /// health` names the broken config key without an operator reading a
-    /// spawn transcript (#5028 AC2).
-    #[must_use]
-    pub fn detail(&self) -> String {
-        format!(
-            "model/runtime mismatch: {} (model source={}); set \
-             autonomous.roleRunner.roleModels.{} to a model the {} runtime accepts, or point \
-             this role back at a Claude runtime",
-            self.reason, self.model_source, self.role, self.runtime
-        )
-    }
-}
-
 // ============================================================================
 // Role-tick health ring (Issue #4761)
 // ============================================================================
@@ -1284,14 +1248,29 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             Some(m) => (m.clone(), "override".to_string()),
             None => resolve_role_runner_model(&self.workspace_root, role),
         };
+        // Issue #7894: an UNPINNED model that conflicts with the admitted
+        // runtime degrades to the runtime CLI's own default rather than being
+        // refused below — see `reconcile_unpinned_model_with_runtime`. Only the
+        // shipped-default tier is touched, so an explicit pin still reaches
+        // #5028's refusal unchanged.
+        let (model, model_source) = match &admission {
+            Some(admitted) => {
+                reconcile_unpinned_model_with_runtime(&admitted.runtime, model, model_source)
+            }
+            None => (model, model_source),
+        };
         // Issue #5028: refuse a launch whose resolved model is a provable
         // conflict with the just-admitted runtime — e.g.
-        // `runtimes.roles.judge = "codex"` with no matching
-        // `autonomous.roleRunner.roleModels.judge` override still resolves the
-        // Claude-shaped default (`sonnet`), which the Codex adapter rejects
-        // with an HTTP 400. Detected here, before any spawn, so the role
-        // runner skips the doomed launch instead of burning a tick (and a
-        // token draw) on a guaranteed failure every time (#5001 AC2/AC3).
+        // `runtimes.roles.judge = "codex"` with
+        // `autonomous.roleRunner.roleModels.judge = "sonnet"`, a Claude-shaped
+        // pin the Codex adapter rejects with an HTTP 400. Detected here, before
+        // any spawn, so the role runner skips the doomed launch instead of
+        // burning a tick (and a token draw) on a guaranteed failure every time
+        // (#5001 AC2/AC3). Since #7894 this only ever fires on a model that
+        // came from a tier an operator actually configured: an unpinned
+        // conflict was already degraded to the CLI-default pass-through just
+        // above, so the refusal is now exclusively about a wrong *stated
+        // intent*, never about a default nobody chose.
         // Gated on `admission` being `Some` — tests that opt out of admission
         // via `spawn_bin` have no resolved runtime to check against, and are
         // unaffected (mirrors the token-pool preflight's `spawn_bin.is_none()`
@@ -1325,64 +1304,6 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             self.load_per_core_override,
         )
     }
-}
-
-/// Issue #4501 / #5001: resolve the model a role-runner child must run with,
-/// joining the SAME precedence chain sweep dispatch uses
-/// ([`sweep_registry::resolve_dispatch_model`]) with a per-role override and the
-/// role-runner-specific global `autonomous.roleRunner.model` occupying the
-/// "explicit request" tier:
-///
-/// **`autonomous.roleRunner.roleModels.<role>` >
-/// `autonomous.roleRunner.model` > `autonomous.model` > shipped
-/// [`sweep_registry::DEFAULT_DISPATCH_MODEL`] (`sonnet`)**
-///
-/// Empty/whitespace values are treated as unset at every tier, so the resolved
-/// model is never the empty string and never the CLI-inherited interactive
-/// default. Returns the model plus a label naming the tier that supplied it (for
-/// the per-role log header).
-///
-/// # Why the per-role tier (#5001)
-///
-/// `LOOM_RUNTIME_<ROLE>` gives each role its own **runtime** axis (Claude vs
-/// Codex etc.), but before #5001 the model was a single global value shared by
-/// every role. The moment one role (e.g. Judge) was pointed at a different
-/// provider via `LOOM_RUNTIME_JUDGE=codex`, the globally-pinned Claude alias
-/// (`sonnet`) was forwarded verbatim to the Codex adapter, which rejected it with
-/// an HTTP 400 — so every Judge tick failed silently, fleet-wide. The per-role
-/// override closes that gap: a repo can run Judge on Codex with a Codex-valid
-/// model while Curator/Champion keep a Claude alias, all from config.
-///
-/// Before #4501, `run_role_with_timeout` emitted **no** `--model` argument at
-/// all, so every scheduled curator/champion/judge/auditor/guide child inherited
-/// whatever the selected account's interactive `claude` default happened to be —
-/// the live defect this resolution exists to prevent.
-#[must_use]
-pub fn resolve_role_runner_model(repo_root: &Path, role: &str) -> (String, String) {
-    let config = read_role_runner_config(repo_root);
-    let role_key = role.trim().to_ascii_lowercase();
-    // Per-role override (#5001) wins over the single global
-    // `autonomous.roleRunner.model`; both occupy `resolve_dispatch_model`'s
-    // "explicit request" (`Param`) tier, so a `per_role` flag disambiguates the
-    // log label. A blank per-role value never reaches here — blanks are dropped
-    // at parse time in `read_role_runner_config`, so it falls through to the
-    // global tier just like an absent key.
-    let (configured, per_role) = match config.role_models.get(&role_key) {
-        Some(m) => (Some(m.clone()), true),
-        None => (config.model.clone(), false),
-    };
-    let (model, source) = sweep_registry::resolve_dispatch_model(repo_root, configured.as_deref());
-    let label = match source {
-        sweep_registry::ModelSource::Param if per_role => {
-            format!("autonomous.roleRunner.roleModels.{role_key}")
-        }
-        // `Param` without `per_role` can only arise from the global
-        // `autonomous.roleRunner.model` — this function is its only caller.
-        sweep_registry::ModelSource::Param => "autonomous.roleRunner.model".to_string(),
-        sweep_registry::ModelSource::Config => "autonomous.model".to_string(),
-        sweep_registry::ModelSource::Default => "default".to_string(),
-    };
-    (model, label)
 }
 
 /// The per-role log file every invocation — real or skipped — writes to:
@@ -1479,10 +1400,18 @@ fn run_role_with_timeout(
             // The resolved model + the tier that supplied it are recorded in the
             // per-role log header (#4501) so an operator can confirm from
             // `role-<role>.log` alone which model a scheduled child ran with —
-            // the manual verification this fix needs on a live host.
+            // the manual verification this fix needs on a live host. An empty
+            // model is the deliberate CLI-default pass-through (#7894) — render
+            // it as a name rather than as `model=` followed by nothing, which
+            // reads like a bug in the header itself.
+            let model_display = if model.is_empty() {
+                "<runtime CLI default>"
+            } else {
+                model
+            };
             let _ = writeln!(
                 f,
-                "\n==== loom-daemon role_runner: {} role={role} model={model} \
+                "\n==== loom-daemon role_runner: {} role={role} model={model_display} \
                  (source={model_source}) ====",
                 chrono::Utc::now().to_rfc3339()
             );
@@ -4389,6 +4318,15 @@ fn log_outcome_for_root_deduped(
 // see `role_runner/roster.rs`.
 mod roster;
 pub use roster::spawn_roster_heartbeat_task;
+
+// Model resolution + runtime reconciliation (#4501/#5001/#7894) —
+// see `role_runner/model_resolution.rs`.
+mod model_resolution;
+use model_resolution::reconcile_unpinned_model_with_runtime;
+pub use model_resolution::{
+    is_cli_default_model_sentinel, resolve_role_runner_model, ModelRuntimeMismatch,
+    CLI_DEFAULT_MODEL_SENTINEL,
+};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
