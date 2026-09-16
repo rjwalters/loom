@@ -615,19 +615,12 @@ impl SweepRegistry {
     /// differs (this one is timeout-bounded and runs the registry's configured
     /// `gh_bin` in its own workspace).
     ///
-    /// **REST fallback (#5911).** The GraphQL closes-graph query above shares a
-    /// quota with every other GraphQL caller in the fleet, and quota exhaustion
-    /// under concurrent agents is a documented recurring failure mode in this
-    /// repo. Pre-#5911 that exhaustion made this probe answer `ProbeFailed`,
-    /// which the #4123 dispatch guard (by design) treats as "proceed" — so a
-    /// GraphQL-starved tick would silently let the guard fall open and
-    /// re-dispatch an issue whose PR was, in fact, still open (observed
-    /// repeatedly on #5565/#5569). Only when the GraphQL probe itself fails to
-    /// answer, retry over REST (`issues/{n}/timeline`) before falling open —
-    /// REST is a *separate* rate-limit bucket from GraphQL, the same rationale
-    /// already used by the #4444 park-label probe below. A verified GraphQL
-    /// answer (`Open` or `NoneOpen`) is trusted as-is and never pays the extra
-    /// REST round trip.
+    /// **REST union (#5911, #7757).** An open closing PR is decisive. Otherwise
+    /// consult `issues/{n}/timeline` for non-closing references too, including
+    /// when GraphQL successfully returns `NoneOpen`. REST also recovers
+    /// GraphQL quota exhaustion using a separate rate-limit bucket (#5911).
+    /// Only the complete timeline probe may establish verified absence;
+    /// failure remains `ProbeFailed`, preserving dispatch/no-progress policy.
     ///
     /// **Bounded whole-probe retry (#6058).** #5911's REST fallback recovers a
     /// GraphQL-only outage, but production logs from this very flap (issue
@@ -936,10 +929,9 @@ impl SweepRegistry {
         crate::worktree_ops::gh::parse_open_linked_pr(&String::from_utf8_lossy(&output.stdout))
     }
 
-    /// REST fallback (#5911) for [`probe_open_linked_pr`], consulted only when
-    /// the GraphQL closes-graph probe above returns [`OpenPrProbe::ProbeFailed`]
-    /// (most commonly GraphQL quota exhaustion — REST is billed against a
-    /// separate limit, mirroring the #4444 park-label probe's own rationale).
+    /// REST union for [`probe_open_linked_pr`], consulted when GraphQL returns
+    /// either `NoneOpen` (#7757) or `ProbeFailed` (#5911). REST uses a separate
+    /// quota, mirroring the #4444 park-label probe's rationale.
     ///
     /// Walks `issues/{n}/timeline` for `cross-referenced` events whose source
     /// is an OPEN pull request in this same repo — the same "source 2" union
