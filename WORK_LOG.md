@@ -7,6 +7,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7802** (closed): Exhaustive bash 3.2 scan: 2 silently-wrong constructs + 338 unguarded array expansions — and why the Rust port changes the fix order
+- **Issue #7783** (closed): post-verdict.sh: ${_gate_all_ids[*]} is an unbound variable on macOS bash 3.2 — blocks every Judge verdict on the clean path
+- **PR #7807**: fix: three bash 3.2 correctness bugs, all of them silent (#7783, #7802 Class 1)
+- **Issue #7730** (closed): cargo test --lib fails on macOS: embedded shell driver uses bash 4 'declare -A' (bash 3.2)
+- **PR #7782**: fix(daemon): drop bash-4 declare -A from the shell_is_ignored test driver
 - **Issue #7779** (closed): ci.yml cancels in-progress runs on main, so most main commits are never verified (21 of last 30 cancelled)
 - **PR #7803**: ci: stop cancelling main's own verification (22 of last 30 main runs cancelled)
 - **Issue #7740** (closed): Extract inline test modules: second batch (files not touched by #7723)
