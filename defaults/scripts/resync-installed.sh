@@ -965,7 +965,7 @@ record_blocked() {
 # only asks "would this specific write destroy content that was NOT put there
 # by Loom's own install/resync tooling", which is exactly the condition the
 # incident hinged on.
-RESYNC_COMMIT_SUBJECT_RE='^(chore: install Loom v[0-9]|chore: resync installed Loom surfaces$|(\[skip ci\] )?chore\(loom\): Install Loom [^[:space:]]+ orchestration framework$)'
+RESYNC_COMMIT_SUBJECT_RE='^(chore: install Loom v[0-9]|chore: resync installed Loom surfaces( \(#[0-9]+\))?$|(\[skip ci\] )?chore\(loom\): Install Loom [^[:space:]]+ orchestration framework( \(#[0-9]+\))?$)'
 
 # removed_line_count <src> <dst>
 #   Count of non-blank lines present in dst but ABSENT from src (a line-SET
