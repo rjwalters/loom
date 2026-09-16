@@ -139,24 +139,50 @@ from your change**. This is the one legitimate reason for a baseline number to
 go up, and it should be visibly justified every time, because the policy
 otherwise treats an upward edit as the ratchet slipping.
 
-## Mechanical refactors: use the compiler's tooling, never text surgery
+## Mechanical refactors: use the language's own tooling, never text surgery
 
-When moving code — extracting a test module, splitting a file — **move the text
-verbatim and let `rustfmt` re-indent it.** Do not hand-transform indentation.
+When moving text — extracting a test module, splitting a file, dedenting,
+bulk-renaming — **move it verbatim and let the language's own formatter or
+parser do the reshaping.** Do not hand-transform indentation or patch by regex.
 
-This is not style advice. A dedent implemented as "strip four spaces from every
-line" is a *lexical* operation applied to a *syntactic* structure: it cannot
-tell code from the inside of a raw string literal, so it silently rewrites
-embedded shell scripts, JSON fixtures and config blobs. That bug occurred once
-during #7718 and was invisible in the diff, invisible to the compiler, and
-invisible to the test suite, because the corrupted fixtures happened to be
-whitespace-insensitive. `rustfmt` has a real Rust lexer, knows exactly where
-literals begin and end, and is already enforced in CI.
+This is not style advice. A line-oriented transform is a *lexical* operation
+applied to a *syntactic* structure: it cannot tell code from the inside of a
+string literal, from a comment, or from a markdown heading's depth. The failures
+are silent and land in the minority case:
 
-**Acceptance test for any mechanical move:** every string literal is
-byte-identical before and after, checked by something that lexes the language —
-not by reading the diff. Verbatim move plus `cargo fmt` makes that true by
-construction.
+- **Rust** (#7718) — a dedent implemented as "strip four spaces from every line"
+  rewrote the interiors of raw string literals, silently corrupting embedded
+  shell scripts and JSON fixtures in 4 of 8 files. Invisible in the diff,
+  invisible to the compiler, and invisible to the test suite, because the
+  corrupted fixtures happened to be whitespace-insensitive.
+- **Shell** (#7741) — a column-0 `^VAR=` regex treated continuation lines inside
+  multi-line quoted test payloads as assignments and hoisted 16 of them out of
+  the middle of test strings.
+- **Counting, in any language** (#7751, #7766) — grepping for a construct
+  matched *comments naming* that construct, inflating an at-risk survey from 8
+  files to 13 and reporting a removal as incomplete when code-only it was zero.
+  Exclude comment lines before reporting any count, and say "code-only" in the
+  report.
+- **Markdown** (#7793) — a heading edit anchored on `## …` matched inside a
+  `### …` heading (`##` is a substring of `###`), ate one `#`, and silently
+  demoted a section. Its guard, `assert body.count(old) == 1`, *passed*:
+  counting occurrences does not detect matching the wrong kind of text.
+
+**Acceptance test for any mechanical move:** an invariant that must survive the
+move is byte-identical before and after, checked by something that parses the
+relevant syntax — not by reading the diff and not by counting matches. The tool
+differs by language; the rule does not:
+
+| Language | Invariant to assert | Tool that can see it |
+|---|---|---|
+| Rust | every string literal unchanged | verbatim move + `cargo fmt` (real lexer, already in CI) |
+| Shell | every quoted payload/heredoc unchanged | `shfmt -d`, `shellcheck` |
+| Markdown | heading depths and the full heading list unchanged | dump every heading before/after and diff the lists |
+
+Verbatim move plus the language's formatter makes that true by construction.
+Full recipe, plus the four other verification classes from #7793 (postcondition
+checks, CI-state enumeration, `--body-file`, falsifying-fact checks):
+[`verification-recipes.md`](verification-recipes.md).
 
 ## Shell: port to Rust, tiered
 
