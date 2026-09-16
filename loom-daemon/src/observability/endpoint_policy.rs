@@ -39,32 +39,19 @@ const RESERVED_ENDPOINT_SUFFIXES: &[&str] = &[
     "test",
 ];
 
-/// Extract the lowercased host from an endpoint URL, tolerating a missing
-/// scheme, userinfo, a port, an IPv6 literal, and a trailing root dot.
-///
-/// Hand-rolled rather than pulled in from a URL crate on purpose: it feeds
-/// only the placeholder classification below, so it must be *conservative* —
-/// anything it cannot parse is simply not classified, and export proceeds
-/// exactly as it did before the check existed — rather than strictly
-/// correct. It must never be repurposed as a general URL parser.
+/// Extract the normalized host using the outbound HTTP client's URL parser.
+/// Percent encoding, IDNA separators, and special-scheme syntax must have the
+/// same interpretation here and in reqwest before any ingest key is loaded.
+/// Scheme-less inputs retain their documented classification via an HTTPS base;
+/// this fallback never replaces a successfully parsed URL that has a host.
 fn endpoint_host(endpoint: &str) -> Option<String> {
-    let after_scheme = endpoint
-        .split_once("://")
-        .map_or(endpoint, |(_, rest)| rest);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    // `user:pass@host` — the last `@` separates userinfo from the host.
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        // IPv6 literal: `[::1]:4318` ⇒ `::1`.
-        rest.split_once(']').map_or(rest, |(host, _)| host)
-    } else {
-        authority
-            .split_once(':')
-            .map_or(authority, |(host, _)| host)
-    };
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let url = reqwest::Url::parse(endpoint)
+        .ok()
+        .filter(|url| url.host_str().is_some())
+        .or_else(|| {
+            reqwest::Url::parse(&format!("https://{}", endpoint.trim_start_matches("//"))).ok()
+        })?;
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
     (!host.is_empty()).then_some(host)
 }
 
@@ -113,6 +100,33 @@ mod tests {
             "dashboard.example.com/ingest",          // no scheme at all
         ] {
             assert!(reserved_placeholder_host(endpoint).is_some(), "must be refused: {endpoint}");
+        }
+    }
+
+    #[test]
+    fn rejects_normalized_reserved_hosts() {
+        for endpoint in [
+            "https://%65xample.com/ingest",
+            "https://example%2ecom/ingest",
+            "https://example。com/ingest",
+            "https://example．com/ingest",
+            "https:example.com/ingest",
+            r"https://example.com\@real.company/ingest",
+            "https://%65xample.com.:8443/ingest",
+            "https://collector.%74est/ingest",
+            "dashboard.example.com:8443/ingest",
+            "//dashboard.example.com/ingest",
+        ] {
+            assert!(reserved_placeholder_host(endpoint).is_some(), "must be refused: {endpoint}");
+        }
+        // A reserved spelling in userinfo or a path does not make the real host reserved.
+        for endpoint in [
+            "https://example.com@real.company/ingest",
+            "https://real.company/example.com",
+            "https://%62adexample.com/ingest",
+            "http://[::1]:4318/ingest",
+        ] {
+            assert_eq!(reserved_placeholder_host(endpoint), None, "must be allowed: {endpoint}");
         }
     }
 
