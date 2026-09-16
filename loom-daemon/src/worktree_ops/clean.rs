@@ -2272,7 +2272,7 @@ pub fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
 /// separate, less-contended pool — see [`check_pr_merged_rest`]'s docs),
 /// falling back to the GraphQL-backed [`check_pr_status_for_branch`] only
 /// when REST cannot answer. Mirrors
-/// [`super::aggressive`]'s `pr_is_merged` for an arbitrary branch name rather
+/// [`super::landed`]'s `pr_merged_status` for an arbitrary branch name rather
 /// than an issue-numbered one.
 fn branch_pr_merged(repo_root: &Path, branch: &str) -> bool {
     let status = match repo_owner_rest(repo_root)

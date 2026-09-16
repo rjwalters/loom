@@ -43,6 +43,7 @@ use std::time::SystemTime;
 
 use super::clean;
 use super::gh;
+use super::landed::{self, Landed};
 use super::naming;
 
 /// A single record parsed from `git worktree list --porcelain`.
@@ -144,8 +145,13 @@ pub enum Reason {
     ReachableFromOriginMain,
     /// The branch's PR is merged (including squash-merged, whose original
     /// commits are never reachable from `origin/main`) — the work is landed
-    /// regardless of git reachability (#5177).
+    /// regardless of git reachability (#5177). Since #7812 this also covers a
+    /// rebase merge, proved by tree equality rather than by a merged PR.
     PrMerged,
+    /// Neither the forge nor the offline tree comparison could say whether
+    /// the work has landed (#7812). Fails closed: never reaped, not even
+    /// under `--force` — `unknown` is not `not-landed`.
+    LandedUnknown,
     TooRecent,
     UnreachableHead,
     ForceOverrideUnreachable,
@@ -164,6 +170,7 @@ impl Reason {
             Reason::IssueStillOpen => "issue_still_open",
             Reason::ReachableFromOriginMain => "reachable_from_origin_main",
             Reason::PrMerged => "pr_merged",
+            Reason::LandedUnknown => "landed_unknown",
             Reason::TooRecent => "too_recent",
             Reason::UnreachableHead => "unreachable_head",
             Reason::ForceOverrideUnreachable => "force_override_unreachable",
@@ -178,7 +185,7 @@ pub const LOOM_MANAGED_SENTINEL: &str = ".loom-managed";
 pub const DEFAULT_AGGRESSIVE_MIN_AGE: u64 = 86400;
 
 /// Apply the aggressive decision tree to a single worktree. Pure except for
-/// the injected `head_reachable` / `has_open_pr` / `uncommitted` /
+/// the injected `landed` / `has_open_pr` / `uncommitted` /
 /// `age_seconds` closures/values, so the full 8-step decision order is
 /// unit-testable without git/gh. Mirrors `clean.py::evaluate_aggressive_candidate`
 /// step for step (first hit wins — "skip" beats "remove"):
@@ -189,10 +196,11 @@ pub const DEFAULT_AGGRESSIVE_MIN_AGE: u64 = 86400;
 /// 4. missing `.loom-managed` sentinel / non-canonical path -> keep
 /// 5. uncommitted changes (unless `force`) -> keep
 /// 6. issue not `CLOSED` and the removal is not backed by landed work -> keep (#5950)
-/// 7. HEAD reachable from origin/main -> remove
-/// 8. PR merged (including squash-merged) -> remove (#5177)
-/// 9. younger than `min_age_seconds` -> keep
-/// 10. fallback: `force && !safe` -> remove (`ForceOverrideUnreachable`), else keep
+/// 7. landed, reachable from origin/main -> remove
+/// 8. landed under rewritten SHAs (squash/rebase) -> remove (#5177/#7812)
+/// 9. landed state `Unknown` -> keep (`LandedUnknown`, #7812)
+/// 10. younger than `min_age_seconds` -> keep
+/// 11. fallback: `force && !safe` -> remove (`ForceOverrideUnreachable`), else keep
 ///
 /// Step 6 is the issue-open gate (#5950), and it is the one step whose input is
 /// **lazily** probed: `issue_state` is `None` for a worktree with no `issue-N`
@@ -211,18 +219,25 @@ pub const DEFAULT_AGGRESSIVE_MIN_AGE: u64 = 86400;
 /// precisely "`--force` is about to override uncommitted work on an open
 /// issue".
 ///
-/// Step 8 is the squash-merge fix (#5177): this repo squash-merges, so a
-/// merged branch's original commits are never an ancestor of `origin/main`.
-/// Raw reachability (step 7) therefore cannot distinguish a safely-landed
-/// squash-merged worktree from one holding genuinely unmerged work, and the
-/// fallback (step 10) used to keep it forever under `UnreachableHead`. A merged
-/// PR means the work IS landed regardless of reachability. Placing it AFTER
-/// the uncommitted / open-PR / active-shepherd guards keeps it purely
-/// **additive**: it can only turn a would-be "unreachable, keep" into a
-/// remove, never override a guard that protects genuinely unmerged or
-/// uncommitted work.
+/// Step 8 is the squash-merge fix (#5177), generalized in #7812: this repo
+/// squash-merges, so a merged branch's original commits are never an ancestor
+/// of `origin/main`. Raw reachability (step 7) therefore cannot distinguish a
+/// safely-landed squash-merged worktree from one holding genuinely unmerged
+/// work, and the fallback (step 11) used to keep it forever under
+/// `UnreachableHead`. [`Landed::Rewritten`] — a merged PR, or tree equality
+/// against `origin/main`, which also covers a rebase merge — means the work IS
+/// landed regardless of reachability. Placing it AFTER the uncommitted /
+/// open-PR / active-shepherd guards keeps it purely **additive**: it can only
+/// turn a would-be "unreachable, keep" into a remove, never override a guard
+/// that protects genuinely unmerged or uncommitted work.
 ///
-/// Step 10's `safe` guard is issue #5735: `--safe` is documented as
+/// Step 9 is the fail-closed arm of the same change (#7812). [`Landed::Unknown`]
+/// means neither the forge nor the offline tree comparison could answer — it is
+/// NOT `not-landed`, and must never fall through to step 11, where `--force`
+/// would reap a worktree during a forge outage. It is the one removal-blocking
+/// state `--force` cannot override.
+///
+/// Step 11's `safe` guard is issue #5735: `--safe` is documented as
 /// "merged-PR-only mode", and step 8 above is exactly that (a merged PR is
 /// landed regardless of raw reachability). But `force` alone used to bypass
 /// the *unreachable, unmerged* fallback too, silently destroying work that
@@ -240,8 +255,7 @@ pub fn evaluate_aggressive_candidate(
     is_under_loom: bool,
     has_sentinel: bool,
     is_uncommitted: bool,
-    head_reachable: bool,
-    pr_merged: bool,
+    landed: Landed,
     age_seconds: Option<u64>,
     min_age_seconds: u64,
     force: bool,
@@ -276,20 +290,22 @@ pub fn evaluate_aggressive_candidate(
     // #5950: the issue-open gate. Probed lazily and only here, so a worktree
     // settled by any local gate above costs no forge call.
     if let Some(state) = issue_state.map(|probe| probe()) {
-        let landed = head_reachable || pr_merged;
-        if state != "CLOSED" && (is_uncommitted || !landed) {
+        if state != "CLOSED" && (is_uncommitted || !landed.is_landed()) {
             return (Decision::Keep, Reason::IssueStillOpen);
         }
     }
 
-    if head_reachable {
-        return (Decision::Remove, Reason::ReachableFromOriginMain);
-    }
-
-    // #5177: squash-merged work is landed even though its commits are never
-    // reachable from origin/main. Additive to the reachability check above.
-    if pr_merged {
-        return (Decision::Remove, Reason::PrMerged);
+    match landed {
+        Landed::Reachable => return (Decision::Remove, Reason::ReachableFromOriginMain),
+        // #5177/#7812: work landed under rewritten SHAs (squash or rebase) is
+        // landed even though its commits are never reachable from origin/main.
+        // Additive to the reachability arm above.
+        Landed::Rewritten => return (Decision::Remove, Reason::PrMerged),
+        // #7812: fail closed. An undetermined answer must not fall through to
+        // the `force && !safe` override below, which would reap on a forge
+        // outage — the one outcome that loses work irrecoverably.
+        Landed::Unknown => return (Decision::Keep, Reason::LandedUnknown),
+        Landed::NotLanded => {}
     }
 
     if let Some(age) = age_seconds {
@@ -333,21 +349,17 @@ fn decide_for_worktree(
     let is_under_loom = crate::worktree_root::is_worktree_path(&resolved_wt, &resolved_repo);
     let has_sentinel = resolved_wt.join(LOOM_MANAGED_SENTINEL).exists();
     let is_uncommitted = super::safety::check_uncommitted_changes(&resolved_wt);
-    let head_reachable = wt
-        .head
-        .as_deref()
-        .is_some_and(|h| is_ancestor_of_origin_main(repo_root, h));
-    // #5177: only probe the forge for merged status when reachability already
-    // failed — a reachable HEAD is landed anyway, so the (rate-limited) forge
-    // call is pure waste there. This is the squash-merge escape hatch for the
-    // otherwise-`UnreachableHead` class.
-    let pr_merged = !head_reachable && issue_num.is_some_and(|n| pr_is_merged(repo_root, n));
+    // #7812: the one shared "has this branch landed?" answer — ancestry, then
+    // (only if that failed) the forge, then offline tree equality. Three-way:
+    // `Unknown` reaches the decision tree as its own state, never flattened
+    // into a bool here. See `worktree_ops::landed`.
+    let landed_state = landed::probe(repo_root, wt.head.as_deref(), issue_num);
     let age_seconds = worktree_age_seconds(&resolved_wt);
 
     // #5950: issue-open state, probed lazily by the decision tree (only when no
     // earlier, purely local gate already settled the worktree). REST, not the
-    // GraphQL-backed `gh issue view` — same rationale as `pr_is_merged` above
-    // and `worktree_reaper`'s own probe: GraphQL exhaustion is a live failure
+    // GraphQL-backed `gh issue view` — same rationale as `landed::probe`'s own
+    // forge rung and `worktree_reaper`'s probe: GraphQL exhaustion is a live failure
     // mode here, and `--aggressive` is a bulk pass over every worktree.
     // `None` for a worktree with no `issue-N` branch — nothing to ask about.
     let issue_state_probe = issue_num.map(|n| move || gh::issue_state_rest(repo_root, n));
@@ -362,43 +374,13 @@ fn decide_for_worktree(
         is_under_loom,
         has_sentinel,
         is_uncommitted,
-        head_reachable,
-        pr_merged,
+        landed_state,
         age_seconds,
         min_age_seconds,
         force,
         safe,
         issue_state,
     )
-}
-
-/// Whether `issue_num`'s branch has a **merged** PR (including squash-merged).
-///
-/// Reuses `clean.rs`'s shared PR-merged probe (#5177) rather than building a
-/// second squash-detection path. REST first — the daemon-side reaper's
-/// rationale applies here too: `gh pr list` goes through the routinely-exhausted
-/// GraphQL quota, while `gh api .../pulls` uses the separate, less-contended
-/// REST pool — falling back to the GraphQL-backed probe only when REST cannot
-/// answer.
-fn pr_is_merged(repo_root: &Path, issue_num: u32) -> bool {
-    let status = match clean::repo_owner_rest(repo_root)
-        .map(|owner| clean::check_pr_merged_rest(repo_root, &owner, issue_num))
-    {
-        Some(clean::PrStatus::Unknown) | None => clean::check_pr_merged(repo_root, issue_num),
-        Some(status) => status,
-    };
-    matches!(status, clean::PrStatus::Merged { .. })
-}
-
-fn is_ancestor_of_origin_main(repo_root: &Path, head_sha: &str) -> bool {
-    if head_sha.is_empty() {
-        return false;
-    }
-    Command::new("git")
-        .args(["merge-base", "--is-ancestor", head_sha, "origin/main"])
-        .current_dir(repo_root)
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 fn worktree_age_seconds(path: &Path) -> Option<u64> {
@@ -566,6 +548,13 @@ pub fn clean_aggressive(
                             );
                         }
                     }
+                    Reason::LandedUnknown => {
+                        stats.skipped_unreachable += 1;
+                        println!(
+                            "  Skip (could not determine whether the work landed — \
+                             forge unreachable and tree comparison unavailable): {label}"
+                        );
+                    }
                     Reason::ReachableFromOriginMain
                     | Reason::PrMerged
                     | Reason::ForceOverrideUnreachable => {
@@ -714,8 +703,7 @@ mod tests {
         is_under_loom: bool,
         has_sentinel: bool,
         is_uncommitted: bool,
-        head_reachable: bool,
-        pr_merged: bool,
+        landed: Landed,
         age_seconds: Option<u64>,
         min_age_seconds: u64,
         force: bool,
@@ -729,8 +717,7 @@ mod tests {
             is_under_loom,
             has_sentinel,
             is_uncommitted,
-            head_reachable,
-            pr_merged,
+            landed,
             age_seconds,
             min_age_seconds,
             force,
@@ -761,7 +748,18 @@ mod tests {
         let mut w = wt();
         w.bare = true;
         let (d, r) = eval_closed_issue(
-            &w, false, None, false, true, true, false, true, false, None, 86400, false, false,
+            &w,
+            false,
+            None,
+            false,
+            true,
+            true,
+            false,
+            Landed::Reachable,
+            None,
+            86400,
+            false,
+            false,
         );
         assert_eq!(d, Decision::Keep);
         assert_eq!(r, Reason::BareMainWorktree);
@@ -778,8 +776,7 @@ mod tests {
             true,
             true,
             false,
-            true,
-            false,
+            Landed::Reachable,
             None,
             86400,
             true, // even with force
@@ -800,8 +797,7 @@ mod tests {
             true,
             true,
             false,
-            true,
-            false,
+            Landed::Reachable,
             None,
             86400,
             false,
@@ -822,8 +818,7 @@ mod tests {
             true,
             true,
             false,
-            true,
-            false,
+            Landed::Reachable,
             None,
             86400,
             false,
@@ -844,8 +839,7 @@ mod tests {
             true,
             false,
             false,
-            true,
-            false,
+            Landed::Reachable,
             None,
             86400,
             false,
@@ -866,8 +860,7 @@ mod tests {
             false,
             true,
             false,
-            true,
-            false,
+            Landed::Reachable,
             None,
             86400,
             false,
@@ -888,8 +881,7 @@ mod tests {
             true,
             true,
             true,
-            true,
-            false,
+            Landed::Reachable,
             None,
             86400,
             false,
@@ -906,8 +898,7 @@ mod tests {
             true,
             true,
             true,
-            true,
-            false,
+            Landed::Reachable,
             None,
             86400,
             true,
@@ -927,8 +918,7 @@ mod tests {
             true,
             true,
             false,
-            true,
-            false,
+            Landed::Reachable,
             Some(1), // 1 second old — would fail the age gate if reached
             86400,
             false,
@@ -949,8 +939,7 @@ mod tests {
             true,
             true,
             false,
-            false,
-            false,
+            Landed::NotLanded,
             Some(10),
             86400,
             false,
@@ -971,8 +960,7 @@ mod tests {
             true,
             true,
             false,
-            false,
-            false,
+            Landed::NotLanded,
             Some(999_999),
             86400,
             false,
@@ -993,8 +981,7 @@ mod tests {
             true,
             true,
             false,
-            false,
-            false,
+            Landed::NotLanded,
             Some(999_999),
             86400,
             true,
@@ -1021,8 +1008,7 @@ mod tests {
             true,
             true,
             false,
-            false,
-            false, // PR not merged either — nothing lands this work
+            Landed::NotLanded, // PR not merged either — nothing lands this work
             Some(999_999),
             86400,
             true, // --force
@@ -1047,8 +1033,7 @@ mod tests {
             true,
             true,
             false,
-            false, // HEAD not reachable (squash-merged)
-            true,  // ...but the PR is merged
+            Landed::Rewritten, // HEAD not reachable (squash-merged) ...but the PR is merged
             Some(999_999),
             86400,
             false, // --force not even needed
@@ -1071,10 +1056,9 @@ mod tests {
             false,
             true,
             true,
-            false,         // not uncommitted
-            false,         // HEAD not reachable (squash-merged)
-            true,          // ...but the PR is merged
-            Some(999_999), // old enough that the age gate would otherwise not matter
+            false,             // not uncommitted
+            Landed::Rewritten, // HEAD not reachable (squash-merged) ...but the PR is merged
+            Some(999_999),     // old enough that the age gate would otherwise not matter
             86400,
             false, // no --force needed
             false,
@@ -1095,9 +1079,8 @@ mod tests {
             false,
             true,
             true,
-            true,  // uncommitted work present
-            false, // HEAD not reachable
-            true,  // PR merged
+            true,              // uncommitted work present
+            Landed::Rewritten, // HEAD not reachable PR merged
             None,
             86400,
             false, // not forced
@@ -1120,8 +1103,7 @@ mod tests {
             true,
             true,
             false,
-            false,
-            true, // even if a merged-status probe somehow also said yes
+            Landed::Rewritten, // even if a merged-status probe somehow also said yes
             None,
             86400,
             false,
@@ -1152,10 +1134,9 @@ mod tests {
             false,               // no claim-lock: a manually run Builder session has none
             true,
             true,
-            false,         // working tree itself is clean — everything is committed locally
-            false,         // ...but those commits are unpushed ⇒ unreachable from origin/main
-            false,         // and no merged PR lands them either
-            Some(999_999), // old enough that the age gate does not save it
+            false,             // working tree itself is clean — everything is committed locally
+            Landed::NotLanded, // ...but those commits are unpushed ⇒ unreachable from origin/main and no merged PR lands them either
+            Some(999_999),     // old enough that the age gate does not save it
             86400,
             true,  // --force
             false, // no --safe
@@ -1182,9 +1163,8 @@ mod tests {
             false,
             true,
             true,
-            true, // uncommitted edits in flight
-            true, // HEAD still == origin/main (nothing committed yet)
-            false,
+            true,              // uncommitted edits in flight
+            Landed::Reachable, // HEAD still == origin/main (nothing committed yet)
             Some(1),
             86400,
             true, // --force would otherwise override the uncommitted guard
@@ -1210,8 +1190,7 @@ mod tests {
             true,
             true,
             false,
-            false,
-            false,
+            Landed::NotLanded,
             Some(999_999),
             86400,
             true,
@@ -1237,9 +1216,8 @@ mod tests {
             false,
             true,
             true,
-            false, // clean working tree
-            false, // squash-merged ⇒ unreachable
-            true,  // ...but the PR is merged: the work IS landed
+            false,             // clean working tree
+            Landed::Rewritten, // squash-merged ⇒ unreachable ...but the PR is merged: the work IS landed
             Some(999_999),
             86400,
             false, // no --force needed
@@ -1262,9 +1240,8 @@ mod tests {
             false,
             true,
             true,
-            false, // clean working tree
-            true,  // HEAD is on origin/main
-            false,
+            false,             // clean working tree
+            Landed::Reachable, // HEAD is on origin/main
             Some(999_999),
             86400,
             false,
@@ -1291,8 +1268,7 @@ mod tests {
             true,
             true,
             false,
-            false,
-            false,
+            Landed::NotLanded,
             Some(999_999),
             86400,
             true,
@@ -1318,8 +1294,7 @@ mod tests {
             true,
             false, // no .loom-managed sentinel
             false,
-            false,
-            false,
+            Landed::NotLanded,
             Some(999_999),
             86400,
             true,
@@ -1348,8 +1323,7 @@ mod tests {
             true,
             true,
             false,
-            false,
-            false,
+            Landed::NotLanded,
             None,
             86400,
             true,
@@ -1425,7 +1399,14 @@ mod tests {
                 "main",
             ],
         );
-        git(&wt_path, &["commit", "-q", "--allow-empty", "-m", "unpushed work"]);
+        // Real content, not `--allow-empty` (#7812): the point of this fixture
+        // is work that would be LOST, and since the landed check compares
+        // trees, a content-free commit is (correctly) landed — see
+        // `landed::probe`'s tree-equality rung and
+        // `empty_commit_worktree_is_landed_because_it_holds_no_content` below.
+        std::fs::write(wt_path.join("unpushed.txt"), "work that only exists here\n").unwrap();
+        git(&wt_path, &["add", "-A"]);
+        git(&wt_path, &["commit", "-q", "-m", "unpushed work"]);
         std::fs::write(wt_path.join(LOOM_MANAGED_SENTINEL), "").unwrap();
 
         (repo_dir, wt_path)
