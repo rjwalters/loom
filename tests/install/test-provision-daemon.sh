@@ -1098,6 +1098,71 @@ assert_contains "hanging identity: WARN points at the doc fix" "$out39" "macos-t
 assert_eq "hanging identity: binary is still provisioned despite the preflight timeout" "1" \
   "$( [[ -x "$DEST39/loom-daemon" ]] && echo 1 || echo 0 )"
 
+# ---------- test 40: the "already signed" Authority guard must survive a
+# realistic `codesign -dvvv` listing under `set -o pipefail`.
+#
+# Same defect class as test 38 (#6662), ten lines earlier in the same
+# function: sign_daemon_binary decided "does this binary already carry a
+# certificate-backed signature?" with `codesign -dvvv "$bin" 2>&1 | grep -q
+# '^Authority='`. `grep -q` exits at its FIRST match and closes the pipe;
+# real `codesign -dvvv` keeps writing (~20 more lines: further Authority=
+# lines, TeamIdentifier, Sealed Resources, Internal requirements, ...), dies
+# of SIGPIPE, and under `set -o pipefail` — set by every production caller
+# and by this suite — the pipeline's status becomes 141 even though the
+# Authority line WAS there. The guard therefore reported "not signed" for
+# every Developer ID-signed release artifact, and the very next line
+# `codesign -f -s -` force-resigned it ad-hoc — silently downgrading the
+# certificate-anchored designated requirement to a per-build cdhash, i.e.
+# reintroducing the TCC-grant churn the fetch path (#5020) was meant to end.
+# Measured 300/300 against a real Developer ID-signed release binary on a
+# real host, so this was deterministic, not a race.
+#
+# Test 16 did not catch it because its stub prints only two lines, which
+# always land before grep exits. This stub prints a realistic-length listing
+# (Authority early, many lines after it, one write per line) so any
+# re-introduced early-exit pipe reliably kills the producer mid-listing.
+# ---------------------------------------------------------------------------
+FAKE_LONG_SIGNED_DIR="$WORKDIR/fake-long-signed-bin"
+mkdir -p "$FAKE_LONG_SIGNED_DIR"
+cat > "$FAKE_LONG_SIGNED_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+chmod +x "$FAKE_LONG_SIGNED_DIR/uname"
+CODESIGN_LONG_SIGNED_ARGS_FILE="$WORKDIR/codesign-args-long-signed.txt"
+cat > "$FAKE_LONG_SIGNED_DIR/codesign" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "-dvvv" ]]; then
+  echo "Executable=\${2:-}" >&2
+  echo "Identifier=loom-daemon-aarch64-apple-darwin" >&2
+  echo "Format=Mach-O thin (arm64)" >&2
+  echo "CodeDirectory v=20500 size=179180 flags=0x10000(runtime) hashes=5593+2 location=embedded" >&2
+  echo "Authority=Developer ID Application: Test Authority (TESTTEAM)" >&2
+  echo "Authority=Developer ID Certification Authority" >&2
+  echo "Authority=Apple Root CA" >&2
+  echo "TeamIdentifier=TESTTEAM" >&2
+  for i in \$(seq 1 300); do
+    echo "Internal requirements line \$i" >&2
+  done
+  exit 0
+fi
+echo "\$@" >> "$CODESIGN_LONG_SIGNED_ARGS_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_LONG_SIGNED_DIR/codesign"
+
+SRC40="$WORKDIR/src40/loom-daemon"
+mkdir -p "$WORKDIR/src40"
+make_fake_bin "$SRC40" "0.19.68"
+DEST40="$WORKDIR/dest40"
+out40=$(PATH="$FAKE_LONG_SIGNED_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST40" provision_machine_daemon "$SRC40" 2>&1)
+rc40=$?
+assert_eq "long -dvvv listing: provision returns 0" "0" "$rc40"
+assert_eq "long -dvvv listing: binary is still provisioned" "1" "$( [[ -x "$DEST40/loom-daemon" ]] && echo 1 || echo 0 )"
+assert_contains "long -dvvv listing: says it is not re-signing" "$out40" "already signed with a real certificate"
+assert_eq "long -dvvv listing: codesign -f is NEVER invoked (no SIGPIPE-driven ad-hoc downgrade)" "0" \
+  "$( [[ -s "$CODESIGN_LONG_SIGNED_ARGS_FILE" ]] && echo 1 || echo 0 )"
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"

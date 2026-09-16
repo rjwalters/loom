@@ -227,7 +227,22 @@ sign_daemon_binary() {
   # this function was originally written for) never has one -- cargo's own
   # linker-applied signature is always ad-hoc -- so this check is a no-op for
   # that path and changes nothing there.
-  if codesign -dvvv "$bin" 2>&1 | grep -q '^Authority='; then
+  #
+  # READ the listing, THEN match it — never `codesign … | grep -q`. Same
+  # SIGPIPE-under-pipefail defect as the keychain match below (#6662): `grep
+  # -q` exits at its first match and closes the pipe, real `codesign -dvvv`
+  # keeps writing (~20 more lines after the first `Authority=`), dies of
+  # SIGPIPE, and under `set -o pipefail` the pipeline reports 141 even though
+  # the Authority line WAS present. That made this guard report "not signed"
+  # for every Developer ID-signed release artifact (measured 300/300 on a real
+  # host), so the `codesign -f -s -` fallback below force-resigned each fetched
+  # release ad-hoc — silently downgrading its certificate-anchored designated
+  # requirement to a per-build cdhash and reintroducing the exact TCC-grant
+  # churn the fetch path exists to end. Test 40 in
+  # tests/install/test-provision-daemon.sh pins this deterministically.
+  local existing_sig=""
+  existing_sig="$(codesign -dvvv "$bin" 2>&1 || true)"
+  if grep -q '^Authority=' <<<"$existing_sig"; then
     _pmd_ok "already signed with a real certificate (not re-signing): $bin"
     return 0
   fi
