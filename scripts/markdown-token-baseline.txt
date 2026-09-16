@@ -23,10 +23,10 @@
 7185 defaults/.claude/commands/loom/champion-common.md
 1836 defaults/.claude/commands/loom/champion-epic-standdown.md
 13793 defaults/.claude/commands/loom/champion-epic.md
-21638 defaults/.claude/commands/loom/champion-issue-promo.md
+23150 defaults/.claude/commands/loom/champion-issue-promo.md
 47291 defaults/.claude/commands/loom/champion-pr-merge.md
-12821 defaults/.claude/commands/loom/champion-reference.md
-3700 defaults/.claude/commands/loom/champion.md
+12955 defaults/.claude/commands/loom/champion-reference.md
+3749 defaults/.claude/commands/loom/champion.md
 1100 defaults/.claude/commands/loom/comment-body-literal-path.md
 34641 defaults/.claude/commands/loom/curator.md
 21981 defaults/.claude/commands/loom/doctor.md
@@ -35,7 +35,7 @@
 38671 defaults/.claude/commands/loom/guide.md
 1968 defaults/.claude/commands/loom/help.md
 9970 defaults/.claude/commands/loom/hermit-patterns.md
-5779 defaults/.claude/commands/loom/hermit.md
+5868 defaults/.claude/commands/loom/hermit.md
 4102 defaults/.claude/commands/loom/imagine.md
 2491 defaults/.claude/commands/loom/judge-reference.md
 41959 defaults/.claude/commands/loom/judge.md

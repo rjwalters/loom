@@ -556,3 +556,5 @@ uninstall.sh                                                                   b
 
 # @section new
 defaults/scripts/tests/lib/heredoc-body-safety.sh                              test        Shell test harness for the watchdog suites — scans shell source for the bash-3.2 heredoc trap, so its subject is shell (#7834).
+defaults/scripts/tests/test-champion-premise-false-close.sh                    test        Tests the `premise-false` close gate in champion-issue-promo.md — shell because its subject is shell; follows its subject, never an independent reason (#7758).
+defaults/scripts/tests/test-classify-dependency-block-premise-false.sh         test        Tests `classify-dependency-block.sh`'s premise-false interaction with --check-defer (#7904) — shell because its subject is shell; follows its subject, never an independent reason (#7758).
