@@ -657,6 +657,50 @@ issue can. Without this feed the advisory depended entirely on which discovery
 path noticed first: on a host whose work finder is idle and whose role loops
 are the only traffic, it would simply never trip.
 
+### The pool's own diagnostic used to defeat the issue-dispatch feed (#7860)
+
+For a year the *issue-dispatch* half of the feed above never fired in
+production, and the symptom was a redispatch storm: the work finder re-offered
+the same candidates every tick, each attempt costing a `loom:issue` →
+`loom:building` → `loom:issue` label-flip pair. Measured on 2026-09-16:
+**152** such flips on `kicad-tools#5333`, **94** on `rjwalters/loom#7815` (four
+hosts cycling the same claim), and **147** misclassified deaths in ~24h of one
+host's `daemon.log`.
+
+The cause was a text collision, not a missing guard. When `spawn-claude.sh`'s
+token-selection step finds an unusable pool it prints a diagnostic listing
+**every pooled account together with that account's stored `.bad_tokens`
+reason** — prose like `exhausted: hit your session limit`. That prose matches
+the daemon's `rate-limited` exhaustion signature verbatim, so the reaper
+classified the death as *account exhaustion* even though **no account was ever
+selected** (`token=unknown`). Under the #4122 "exhaustion wins" precedence that
+verdict is neutral: the pre-flight streak is neither incremented nor reset, so
+the one dampener built for exactly this fault never armed, and the log line
+named a per-account cause for a workspace-wide one — misdirecting two separate
+investigations (#6917, #7860).
+
+`classify_preflight_outcome` now gives the `preflight-token-selection-failed`
+signature precedence over the exhaustion match, and **only** that signature:
+every other exhaustion shape still yields to #4122, because those deaths really
+are attributable to a named spawn account. The issues stay clean either way —
+the #4122 carve-out is untouched, so a dead pool still never charges an issue's
+quarantine tally or parks it `loom:blocked`.
+
+Two things this does **not** change:
+
+- **The `.ranking` force-trip (#4644) is unaffected.** It short-circuits the
+  streak whenever the live snapshot shows zero healthy accounts. The streak
+  matters precisely when that snapshot is stale — which it was during the
+  2026-09-16 incident.
+- **The #4689 synchronous fast path still does not fire for this death.** It
+  needs the child to be confirmed dead within `TOKEN_NAME_CAPTURE_TIMEOUT`
+  (5 s), and a real token-selection death takes longer: 86/86 sampled sweeps
+  took ≥5.0 s from dispatch to the error line, median 10 s. The reaper picks
+  the death up either way — which is why the classification fix above lives on
+  the reaper path — but the dispatch still reports `Success` with
+  `Token: unknown` rather than the hard `Err` #4689 intended. Tracked
+  separately.
+
 ## Role ticks pre-flight the pool instead of spawning into it (#7607)
 
 The role runner already skipped a tick when the workspace had **no** token pool
