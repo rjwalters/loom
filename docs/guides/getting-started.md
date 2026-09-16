@@ -10,7 +10,6 @@ This comprehensive guide walks you through installing and setting up Loom, wheth
   - [Option 1: Download Binary (Easiest)](#option-1-download-binary-easiest)
   - [Option 2: Build from Source](#option-2-build-from-source)
   - [Option 3: Interactive Install Script](#option-3-interactive-install-script)
-  - [Option 4: GUI Application](#option-4-gui-application)
 - [First-Time Setup](#first-time-setup)
 - [Verifying Your Setup](#verifying-your-setup)
 - [Next Steps](#next-steps)
@@ -24,7 +23,8 @@ Loom transforms your repository into an AI-orchestrated workspace where agents c
 
 ### What Gets Installed
 
-Running `loom-daemon init` creates these files in your repository:
+Running `./install.sh /path/to/your/repo` (which invokes `loom-daemon init`)
+creates these files in your repository:
 
 **Configuration (Commit these)**:
 - `.loom/config.json` - Terminal settings and role assignments
@@ -56,15 +56,18 @@ That's it! Loom is non-invasive and everything important can be committed to ver
 
 Minimal requirements to use Loom:
 
-1. **macOS** (currently macOS-only, Linux support planned)
+1. **macOS or Linux** (the daemon ships both a launchd and a systemd-user
+   service wrapper — `defaults/scripts/lib/launchd-domain.sh` and
+   `defaults/scripts/lib/systemd-user.sh`)
 2. **Git repository** (any existing project)
-3. **tmux** (usually pre-installed on macOS)
+3. **tmux** (not shipped with macOS — install it)
    ```bash
    # Verify tmux is installed
    tmux -V
 
-   # Install if needed (macOS)
-   brew install tmux
+   # Install if needed
+   brew install tmux          # macOS
+   sudo apt install tmux      # Debian/Ubuntu
    ```
 4. **Claude Code** (optional, for AI agents)
    ```bash
@@ -311,7 +314,7 @@ loom-daemon init --defaults ./custom-defaults
 
 ## First-Time Setup
 
-After installing Loom (via GUI or CLI), you'll find the following files in your repository:
+After installing Loom, you'll find the following files in your repository:
 
 ### Workspace Configuration (`.loom/`)
 
@@ -362,7 +365,7 @@ AGENTS.md             # Technical context for OpenAI Codex and other AGENTS.md-a
 
 **What to do:**
 1. Review label definitions in `labels.yml`
-2. Sync labels to GitHub: `gh label sync -f .github/labels.yml`
+2. Sync labels to the forge: `.loom/scripts/sync-labels.sh`
 3. Customize labels for your project's workflow
 
 ### Gitignore Updates
@@ -444,11 +447,13 @@ tree .loom
 # ├── config.json
 # └── roles
 #     ├── architect.md
+#     ├── auditor.md
 #     ├── builder.md
+#     ├── champion.md
 #     ├── curator.md
+#     ├── doctor.md
 #     ├── driver.md
 #     ├── guide.md
-#     ├── doctor.md
 #     ├── hermit.md
 #     └── judge.md
 ```
@@ -479,84 +484,221 @@ grep -A 4 "Loom - AI Development Orchestration" .gitignore
 ### 4. Test Daemon (Optional)
 
 ```bash
-# Start daemon manually
-loom-daemon start
+# Start the daemon. The binary has no start/stop subcommands — those
+# wrappers live under .loom/scripts/cli/
+./.loom/scripts/cli/loom-daemon-start.sh
 
 # Check health
 loom-daemon health
 
-# Stop daemon
-loom-daemon stop
-```
-
-### 5. Launch GUI (If Installed)
-
-```bash
-# Launch with current directory as workspace
-open -a Loom --args --workspace $(pwd)
-
-# Or launch and select workspace via UI
-open -a Loom
+# Stop the daemon
+./.loom/scripts/cli/loom-daemon-stop.sh
 ```
 
 ## Next Steps
 
 Now that Loom is installed and configured, you can:
 
-### 1. Create Agent Terminals
+### 1. Create the Workflow Labels (required)
 
-**Via GUI:**
-1. Click "+" button to add terminals
-2. Click settings icon on each terminal
-3. Assign roles (Builder, Judge, Curator, etc.)
-4. Configure autonomous intervals if desired
-
-**Via CLI:**
-- Manually edit `.loom/config.json` to add terminals
-- Define role assignments and autonomous settings
-- Restart Loom to load new configuration
-
-### 2. Set Up GitHub Labels
+Labels are the entire coordination substrate — agents claim work and hand it off
+by relabeling. **A Quick Install ships `.github/labels.yml` but does not create
+the labels on the forge** (that happens only on a Full Install), so a
+`--quick` install has no working workflow until you run:
 
 ```bash
-# Sync Loom workflow labels to GitHub
-gh label sync -f .github/labels.yml
+# `gh` has no `label sync` subcommand — use the shipped script, which
+# handles both GitHub and Gitea
+.loom/scripts/sync-labels.sh
+```
 
-# Verify labels were created
+The sync's own last line — `✓ Synced N labels` — is the verification, and it
+works on either forge. `N` should equal the number of labels declared in
+`.github/labels.yml`:
+
+```bash
+grep -c '^- name:' .github/labels.yml
+```
+
+On GitHub you can also look at the result directly, though this only shows that
+*some* `loom:` label exists, not that the set is complete:
+
+```bash
 gh label list | grep "loom:"
 ```
 
-Labels enable workflow coordination between agents. See [WORKFLOWS.md](../workflows.md) for details.
+> `sync-labels.sh --check` is a proper report-only drift check against
+> `labels.yml` and is the right tool here once fixed — but it currently requires
+> bash ≥ 4 and crashes on macOS's stock bash 3.2 (#7717). Use the count
+> comparison until then.
 
-### 3. Start Using Agents
+See [WORKFLOWS.md](../workflows.md) for what each label means.
 
-#### Manual Mode (Builder, Doctor, Driver)
+### 2. Protect the Default Branch
 
 ```bash
-# Launch Claude Code with a role
-claude --role builder
-
-# Follow the Builder workflow
-# 1. Find "loom:ready" issue
-# 2. Claim issue (add "loom:building" label)
-# 3. Create worktree: pnpm worktree <issue-number>
-# 4. Implement, test, commit
-# 5. Create PR with "loom:review-requested" label
+# from your Loom checkout
+./scripts/install/setup-branch-protection.sh /path/to/your/repo
+./scripts/install/setup-repository-settings.sh /path/to/your/repo
 ```
 
-#### Autonomous Mode (Judge, Curator, Architect, Hermit, Guide)
+Both scripts handle GitHub (rulesets API) and Gitea (branch protection API),
+and need admin rights on the target repo. On Gitea, rules without an equivalent
+— linear history, role-based bypass — are skipped with a warning.
 
-These roles run automatically at configured intervals:
+This creates a ruleset requiring linear history and a pull request with **0
+approvals** — the 0-approval part is what lets Champion auto-merge an approved
+PR without a human in the loop.
 
-- **Judge** (5 min) - Reviews PRs with `loom:review-requested`
-- **Curator** (5 min) - Enhances issues, marks as `loom:ready`
-- **Architect** (15 min) - Creates `loom:architect` proposals
-- **Hermit** (15 min) - Identifies bloat, creates `loom:hermit` issues
-- **Guide** (15 min) - Prioritizes issues with `loom:priority-*` labels
+**0 required approvals is an unattended-automation policy, not a general
+branch-protection recommendation, and it does not mean "unreviewed".** Review
+still happens; it is recorded as Judge's `loom:pr` label rather than as a
+GitHub formal approval. The two gates are independent — GitHub's
+required-approval count knows nothing about Loom's labels, so any non-zero
+count deadlocks Champion (no agent can satisfy it; GitHub's API blocks
+self-review). Keep a non-zero count if your repo needs a person on every merge,
+and drive merges by hand with `./.loom/scripts/merge-pr.sh <PR>`.
 
-Configure intervals via terminal settings in the GUI.
+### 3. Your First Sweep
 
-### 4. Customize Roles
+`/loom:sweep` is the main entry point: it runs the whole
+Curator → Builder → Judge → Doctor → Merge lifecycle on one issue, checkpointed
+under `.loom/sweep-checkpoint/` so a crash resumes rather than restarts.
+
+Write a real issue, then from Claude Code in your repo:
+
+```bash
+cd /path/to/your/repo
+claude
+```
+
+```
+/loom:sweep 42
+```
+
+**Make the first one small and bounded**: one issue, scoped so you can read
+the whole diff. Before you start, confirm `gh auth status` succeeds and that
+you know the project's real test command — a sweep runs it, and a first run
+that fails on a missing toolchain teaches you nothing about Loom.
+
+#### What happens when the Judge asks for changes
+
+`/loom:sweep` runs this loop for you, but it is worth recognizing, because a
+PR sitting in it is not finished work:
+
+| PR label | Who acts next | What they do |
+|----------|---------------|--------------|
+| `loom:review-requested` | **Judge** | Reviews the diff, then applies exactly one verdict |
+| `loom:changes-requested` | **Doctor** | Addresses the feedback on the PR branch, then relabels back to `loom:review-requested` |
+| `loom:pr` | **Champion** | Auto-merges (this is the only terminal state) |
+
+So Doctor — not Builder — owns a rejected PR, and the cycle is
+Judge → Doctor → **Judge again** → merge. Doctor never applies `loom:pr`
+itself; re-review is mandatory. **Doctor is conditional**: it runs only if the
+Judge requested changes. On an approval the PR goes straight to merge, which is
+why the lifecycle is written Curator → Builder → Judge → *Doctor (if needed)* →
+Merge.
+
+Verdicts are scoped to the tree they were rendered against (#5686): once a PR's
+head SHA moves, a stale `loom:changes-requested` or `loom:pr` is cleared and the
+PR returns to `loom:review-requested` for a fresh evaluation. A verdict label
+left over from an older commit is never trusted.
+
+#### Scaling up
+
+Once you trust it:
+
+```
+/loom:sweep 42 43 44     # parallel builder waves
+/loom:sweep all          # the whole open backlog — aggressive; see below
+```
+
+`/loom:sweep all` is the deliberately fast/sloppy "build everything" path: it
+takes **every** open issue regardless of label, promotes uncurated ones, and
+reclaims stale claims. It prompts for confirmation with the resolved candidate
+set before spawning anything — read that list. It is not an onboarding command.
+
+You can also drive a single stage by hand — `/loom:builder`, `/loom:judge`,
+`/loom:curator`, `/loom:doctor` — but the full lifecycle must run in order;
+a PR labeled `loom:review-requested` is only the Builder stage, not finished work.
+
+### 4. Start the Daemon (continuous mode)
+
+```bash
+./.loom/scripts/cli/loom-daemon-start.sh
+./.loom/scripts/cli/loom-status.sh
+```
+
+By default the daemon is **not a work generator**. It runs only the sweeps you
+hand it. There are three distinct ways work reaches it — know which one you are
+using:
+
+| | Where it runs | Work comes from |
+|---|---|---|
+| `/loom:sweep 42` | Your current Claude session, in the foreground | You, one command at a time |
+| `loom-daemon dispatch 42` | The daemon, in the background | You, enqueued |
+| `autonomous.workFinder` | The daemon, in the background | The daemon finds its own |
+
+To enqueue one issue and watch it, with the daemon running:
+
+```bash
+# Enqueue — prints the sweep id it accepted
+loom-daemon dispatch 42
+
+# Confirm it was accepted and watch progress
+loom-daemon status
+
+# Back out if you change your mind (never hand-kill the pids)
+loom-daemon cancel --issue 42
+```
+
+Inside a Claude session with the Loom MCP server registered, the same three
+operations are the `mcp__loom__dispatch_sweep`, `get_sweep_status`, and
+`cancel_sweep` tools. Those are MCP tool names, not shell commands — you ask
+Claude for them, you do not type them in a terminal.
+
+To let the daemon generate its own work, opt in through the `autonomous` block
+in `.loom/config.json`:
+
+```json
+"autonomous": {
+  "roleRunner": { "enabled": true, "roles": ["curator", "champion", "judge", "doctor", "guide"] },
+  "workFinder": { "enabled": true, "maxConcurrent": 3 }
+}
+```
+
+Enable `roleRunner` first (it runs the periodic support roles), then
+`workFinder` (it finds its own work) once the support roles behave.
+
+**Editing this block while the daemon is running does not uniformly take
+effect.** The `autonomous.roleRunner.*` sub-block is re-read on the next tick,
+so those edits are live. But `workFinder.enabled` and `workFinder.maxConcurrent`
+are resolved once during bring-up and frozen for the life of the process — a
+config edit alone changes nothing, so **restart the daemon** after touching them
+(#5963). The `work_finder: enabled (…)` startup log line names the resolved
+value and which layer supplied it, so you can confirm the edit landed.
+
+`maxConcurrent` is a per-machine, workload-dependent ceiling; the shipped
+default is `3`. Raise it only from evidence (`loom-daemon calibrate`,
+`loom-daemon status`) — ~10 is reasonable on an 8-core API-bound worker, while
+2–3 is right on the same hardware running heavier sweeps. Full reference:
+[`.loom/docs/daemon-reference.md`](../../.loom/docs/daemon-reference.md).
+
+### 5. Provision a Token Pool (before long runs)
+
+Optional, and not needed for your first sweeps. A single account is fine until
+its weekly limit becomes the thing that stalls the pipeline — on an exhausted
+pool `spawn-claude.sh` exits `78` (`EX_CONFIG`). Before a long unattended run,
+rotate across several accounts so one account's limit cannot stall everything:
+
+```bash
+loom-daemon tokens bootstrap
+loom-daemon tokens check --ranking
+```
+
+Full reference: [`.loom/docs/token-pool.md`](../../.loom/docs/token-pool.md).
+
+### 6. Customize Roles
 
 Create custom role definitions for your project:
 
@@ -591,7 +733,7 @@ EOF
 
 See [defaults/roles/README.md](../../defaults/roles/README.md) for role creation guidance.
 
-### 5. Learn the Workflows
+### 7. Learn the Workflows
 
 Read the comprehensive workflow documentation:
 
@@ -718,7 +860,7 @@ brew install gh
 gh auth login
 
 # Sync labels
-gh label sync -f .github/labels.yml
+.loom/scripts/sync-labels.sh
 ```
 
 ### Need More Help?
@@ -734,7 +876,7 @@ You've successfully installed Loom and are ready to start orchestrating AI agent
 
 **Key Takeaways:**
 - ✅ Loom works within git repositories
-- ✅ Use GUI for visual management or CLI for headless setup
+- ✅ `/loom:sweep <issue>` runs the full lifecycle; the daemon runs it continuously
 - ✅ Configuration lives in `.loom/` (partially gitignored)
 - ✅ Agents coordinate via GitHub labels
 - ✅ Customize roles for your project's needs

@@ -64,7 +64,8 @@ After initializing a workspace:
 
 ```bash
 # Sync labels defined in .github/labels.yml
-gh label sync -f .github/labels.yml
+# (gh has no `label sync` subcommand — this script creates/updates them)
+.loom/scripts/sync-labels.sh
 
 # Verify
 gh label list | grep "loom:"

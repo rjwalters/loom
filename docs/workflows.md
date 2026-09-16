@@ -86,7 +86,7 @@ This issue cannot proceed until all dependencies above are complete.
 
 **Key behaviors**:
 - GitHub auto-checks boxes when linked issues close
-- **Curator**: Only marks `loom:ready` if all dependencies checked
+- **Curator**: Only marks `loom:curated` if all dependencies checked
 - **Worker**: Verifies dependencies before claiming
 - Blocked issues get `loom:blocked` label
 

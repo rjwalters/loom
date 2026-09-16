@@ -438,8 +438,8 @@ intentionally out of scope for now — see follow-up #3381.
 # Check repository labels
 gh label list
 
-# Re-sync labels
-gh label sync --file .github/labels.yml
+# Re-sync labels (gh has no `label sync` subcommand)
+.loom/scripts/sync-labels.sh
 ```
 
 ### Conflicting Work

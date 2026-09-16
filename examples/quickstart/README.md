@@ -15,7 +15,7 @@ This template provides **3 pre-configured terminals**:
 - **Role**: General development worker
 - **Mode**: Manual by default (can enable autonomous mode)
 - **Use for**: Implementing features, fixing bugs, writing code
-- **Suggested prompt**: "Find and implement loom:ready issues"
+- **Suggested prompt**: "Find and implement loom:issue issues"
 
 ### 3. Reviewer
 - **Role**: Code review specialist
@@ -45,9 +45,9 @@ This template provides **3 pre-configured terminals**:
 ### Basic Development Flow
 
 1. **Create an issue** on GitHub describing what needs to be done
-2. **Add the `loom:ready` label** to signal it's ready for implementation
+2. **Add the `loom:issue` label** to signal it's ready for implementation
 3. **Activate the Worker terminal** and give it a task:
-   - "Find and implement loom:ready issues"
+   - "Find and implement loom:issue issues"
    - Or manually: "Implement issue #42"
 4. **Worker creates a PR** when the feature is complete
 5. **Activate the Reviewer terminal**: "Review PR #43"
@@ -58,7 +58,7 @@ This template provides **3 pre-configured terminals**:
 
 This template uses GitHub labels to coordinate work:
 
-- `loom:ready` (green) - Issue is ready for implementation
+- `loom:issue` (blue) - Issue is approved and ready for implementation
 - `loom:building` (yellow) - Worker is currently working on it
 - `loom:review-requested` (green) - PR is ready for review
 - `loom:reviewing` (amber) - Reviewer is currently reviewing
@@ -110,7 +110,7 @@ Once you're comfortable with the basics:
 ### Workers not finding issues?
 
 - Make sure you have GitHub CLI (`gh`) installed and authenticated
-- Create issues with the `loom:ready` label
+- Create issues with the `loom:issue` label
 - Try giving explicit instructions: "Implement issue #42"
 
 ### Need help?

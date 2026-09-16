@@ -127,7 +127,7 @@ Visit `http://localhost:8787/docs` to see the Swagger UI.
 ### Setting up Loom labels
 
 ```bash
-gh label sync --file .github/labels.yml
+.loom/scripts/sync-labels.sh
 ```
 
 ### Working on an issue
