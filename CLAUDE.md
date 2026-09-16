@@ -233,9 +233,9 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
 - **Runtime dispatch (`runtimes`)** — `spawn-worker.sh` selects the worker runtime
   (`LOOM_RUNTIME` env > `runtimes.default` > `"claude"`), execing `spawn-<runtime>.sh`:
   [`.loom/docs/runtime-adapters.md`](.loom/docs/runtime-adapters.md).
+- **File size policy** — over-threshold files are ratcheted (frozen at current size; may shrink, not grow), NOT refactor-on-touch: [`.loom/docs/file-size-policy.md`](.loom/docs/file-size-policy.md).
 - **Custom roles** — add `.loom/roles/<name>.md` (and optional `<name>.json`).
-- **Branch rulesets & repository settings** — set at install time or via
-  `./scripts/install/setup-branch-protection.sh` / `setup-repository-settings.sh`.
+- **Branch rulesets & repository settings** — set at install time or via `./scripts/install/setup-branch-protection.sh` / `setup-repository-settings.sh`.
 - **Guard hooks** — `PreToolUse` guards block/ask on destructive commands and
   confine Edit/Write to a builder's worktree; category toggles (`guards.sqlDdl`,
   `cloudCli`, `reversibleGh`, `rmScope`, `forceScope`, `readOnlyFastPath`,

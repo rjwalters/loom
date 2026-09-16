@@ -239,6 +239,24 @@ jobs:
       - name: Check CLAUDE.md line budget
         run: bash scripts/check-claude-md-budget.sh
 
+  file-size-budget:
+    name: File Size Ratchet
+    # Cheap structural check; always runs. Source files grow monotonically
+    # because every individual addition is defensible while the aggregate is
+    # the problem (#7711): 86 of 228 Rust files were over 1000 lines and held
+    # 79% of all Rust LOC, at a ~20:1 add-to-delete ratio. This does NOT demand
+    # an up-front refactor — it freezes already-oversized files at their current
+    # size so they cannot grow further. See .loom/docs/file-size-policy.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Self-test first: a ratchet that silently stops measuring reports OK
+      # forever while the files it guards keep growing.
+      - name: Self-test the ratchet
+        run: bash scripts/check-file-size-budget.sh --self-test
+      - name: Check file size budget
+        run: bash scripts/check-file-size-budget.sh
+
   conflict-markers:
     name: Conflict Marker Check
     # Cheap structural check; always runs, on every path group. #6499: an
