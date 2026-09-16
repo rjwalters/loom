@@ -27,8 +27,11 @@
 #   2. LINT -- every literal mention of the marker token lives in an
 #      allowlisted section (the guard, Step 0's non-counting carve-out, Step 4).
 #   3. WIRING -- the dedicated stand-down path for an already-decomposed epic
-#      exists, uses its OWN marker name, is deduped per body hash, and carries
-#      no escalation counter / operator-only routing.
+#      exists (as the sibling file champion-epic-standdown.md, reached from
+#      champion-epic.md's "Step 0.5" stub -- split out so champion-epic.md
+#      stays under its markdown-token ratchet, #7725), uses its OWN marker
+#      name, is deduped per body hash, and carries no escalation counter /
+#      operator-only routing.
 #   4. WIRING -- the guard's prose states the single-writer rule and the
 #      "only NEEDS REVISION verdicts count" rule as hard constraints, and its
 #      skip/escalate branches route through the stand-down first.
@@ -52,6 +55,10 @@ else
 fi
 
 CHAMPION_EPIC="$ROLE_DIR/champion-epic.md"
+# Step 0.5's body lives in a sibling prompt file, referenced from the
+# "### Step 0.5" stub in champion-epic.md (same on-demand-read pattern
+# champion.md uses for champion-epic.md itself).
+CHAMPION_EPIC_STANDDOWN="$ROLE_DIR/champion-epic-standdown.md"
 
 RESERVED_TOKEN='champion:epic-verdict:body-'
 UMBRELLA_TOKEN='champion:epic-tracking-umbrella:body-'
@@ -205,9 +212,13 @@ if [[ ! -f "$CHAMPION_EPIC" ]]; then
     fail "champion-epic.md not found at $CHAMPION_EPIC"
 else
     POST_HITS="$(scan_posts "$CHAMPION_EPIC")"
-    OFFENDERS="$(printf '%s\n' "$POST_HITS" | grep -v '^$' | grep -v 'Step 4: Reject' || true)"
+    # The sibling stand-down file has no Step 4, so ANY posting hit there is
+    # an offender -- this is the exact site the #7666 misuse would live in.
+    STANDDOWN_POST_HITS=""
+    [[ -f "$CHAMPION_EPIC_STANDDOWN" ]] && STANDDOWN_POST_HITS="$(scan_posts "$CHAMPION_EPIC_STANDDOWN")"
+    OFFENDERS="$(printf '%s\n%s\n' "$(printf '%s\n' "$POST_HITS" | grep -v 'Step 4: Reject' || true)" "$STANDDOWN_POST_HITS" | grep -v '^$' || true)"
     if [[ -z "$OFFENDERS" ]]; then
-        pass "no posting site outside Step 4 emits the reserved marker"
+        pass "no posting site outside Step 4 (in champion-epic.md or champion-epic-standdown.md) emits the reserved marker"
     else
         fail "reserved marker posted outside Step 4:"$'\n'"$OFFENDERS"
     fi
@@ -233,8 +244,12 @@ if [[ -f "$CHAMPION_EPIC" ]]; then
         | grep -v 'Idempotency Guard for Unrevised Epics' \
         | grep -v 'Step 0: Completion-First Check' \
         | grep -v 'Step 4: Reject' || true)"
+    # No section of the sibling stand-down file is allowlisted.
+    STANDDOWN_MENTIONS=""
+    [[ -f "$CHAMPION_EPIC_STANDDOWN" ]] && STANDDOWN_MENTIONS="$(scan_mentions "$CHAMPION_EPIC_STANDDOWN")"
+    MENTION_OFFENDERS="$(printf '%s\n%s\n' "$MENTION_OFFENDERS" "$STANDDOWN_MENTIONS" | grep -v '^$' || true)"
     if [[ -z "$MENTION_OFFENDERS" ]]; then
-        pass "all reserved-token mentions are in the guard / Step 0 / Step 4"
+        pass "all reserved-token mentions are in the guard / Step 0 / Step 4 (none in champion-epic-standdown.md)"
     else
         fail "reserved token mentioned in an unexpected section:"$'\n'"$MENTION_OFFENDERS"
     fi
@@ -246,9 +261,19 @@ fi
 echo ""
 echo "Test 5: the tracking-umbrella stand-down exists, is body-hash deduped, and never escalates"
 if [[ -f "$CHAMPION_EPIC" ]]; then
-    STANDDOWN="$(section_body "$CHAMPION_EPIC" 'Step 0.5')"
+    # Wiring: champion-epic.md's Step 0.5 stub must point at the sibling file
+    # by its installed path, the same way champion.md points at champion-epic.md.
+    STUB="$(section_body "$CHAMPION_EPIC" 'Step 0.5')"
+    if [[ -n "$STUB" ]] && grep -q 'champion-epic-standdown\.md' <<<"$STUB"; then
+        pass "champion-epic.md's Step 0.5 stub references champion-epic-standdown.md"
+    else
+        fail "champion-epic.md has no 'Step 0.5' stub referencing champion-epic-standdown.md"
+    fi
+
+    STANDDOWN=""
+    [[ -f "$CHAMPION_EPIC_STANDDOWN" ]] && STANDDOWN="$(cat "$CHAMPION_EPIC_STANDDOWN")"
     if [[ -z "$STANDDOWN" ]]; then
-        fail "no 'Step 0.5' stand-down section found in champion-epic.md"
+        fail "stand-down body not found at $CHAMPION_EPIC_STANDDOWN"
     else
         if grep -qF "$UMBRELLA_TOKEN" <<<"$STANDDOWN"; then
             pass "stand-down uses its own marker name ($UMBRELLA_TOKEN)"

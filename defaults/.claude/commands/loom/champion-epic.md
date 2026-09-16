@@ -75,37 +75,22 @@ For each epic proposal, evaluate against these **6 criteria**. All must pass for
 
 ## Idempotency Guard for Unrevised Epics (`champion:epic-verdict:body-*`)
 
-**Problem this section fixes (#5865)**: Step 4 below used to re-evaluate the 6
-criteria and post a fresh "Epic Needs Revision" comment on **every** Champion
-pass, with nothing checking whether the epic had actually changed since the last
-rejection. An epic that is never revised therefore accumulates one near-identical
-rejection comment per cycle, indefinitely, and no human is ever pulled in.
-Observed downstream on example-org/fleet-repo#301: three rejections inside three hours
-(16:40:55Z, 18:10:39Z, 19:17:50Z), the same finding each time, no edit to the
-body in between.
+**Problem this section fixes (#5865)**: without it, Step 4 re-evaluated the 6
+criteria and posted a fresh "Epic Needs Revision" comment on **every** pass, so
+an unrevised epic accumulated one near-identical rejection per cycle indefinitely
+and no human was ever pulled in. This ports `champion-issue-promo.md`'s
+"Concurrency Guard and Idempotency (`loom:evaluating`)" (#4954/#4966/#4967) —
+its "Bounding the silent skip" invariants apply verbatim, with `Champion Review:
+Epic Needs Revision` for `Champion Review: NEEDS REVISION`. Only what differs is
+restated below.
 
-This is the same failure `champion-issue-promo.md`'s "Concurrency Guard and
-Idempotency (`loom:evaluating`)" closes for proposals (#4954/#4966/#4967), ported
-here in the epic workflow's own terms. **Read that section for the full
-rationale** — the invariants under its "Bounding the silent skip" apply verbatim
-to this port, with `Champion Review: Epic Needs Revision` substituted for
-`Champion Review: NEEDS REVISION`. Only what differs is restated below.
-
-**What is deliberately NOT ported.**
-
-- **The `loom:evaluating` claim label.** Epic approvals are rate-limited to one
-  per iteration ("Epic Rate Limiting" below) and epic evaluation is not part of
-  the high-frequency proposal batch loop, so the concurrent-evaluation race the
-  claim closes is far less pressing here. If two Champion hosts ever do evaluate
-  the same epic at once, the body-hash marker still bounds the outcome to one
-  extra comment rather than an unbounded stream.
-- **The dependency-timing gate and Pass 0 self-healing un-escalation (#5664).**
-  Those exist because a *proposal* can be rejected for a finding that clears
-  itself when a blocker closes. None of the 6 epic criteria is a
-  blocker-state finding — they are all structural (phases, milestone, success
-  criteria, scope) and only a human editing the epic can clear them. An epic
-  whose *phase* names an external blocker is handled by Step 2.5, which holds
-  the phase without posting a verdict at all (see below).
+**Deliberately NOT ported.** The `loom:evaluating` claim label — epic approvals
+are rate-limited to one per iteration and sit outside the high-frequency proposal
+loop, so a concurrent-evaluation race is bounded by the body-hash marker to one
+extra comment. The dependency-timing gate and Pass 0 self-healing un-escalation
+(#5664) — none of the 6 epic criteria is a blocker-state finding that clears
+itself; an epic whose *phase* names an external blocker is held by Step 2.5
+without a verdict at all.
 
 **What this guard must never suppress.** The marker is written by, and read for,
 **rejections only**. It keys on posted `Champion Review: Epic Needs Revision`
@@ -113,60 +98,42 @@ comments, so:
 
 - An **approved** epic never carries the marker. Step 2.5's Epic-Aware Blocker
   Check and everything under "Phase Progression" run on every pass exactly as
-  before. This mirrors the #5211 caveat in `champion-issue-promo.md`: a blocker's
-  state changes underneath an unchanged body, so a body hash can never be allowed
-  to gate it.
+  before (the #5211 caveat: a blocker's state changes underneath an unchanged
+  body, so a body hash can never gate it).
 - A phase **held** by Step 2.5 posts a hold comment, not a verdict — no marker is
   written, and the blocker is re-checked on every later pass.
-- **Step 0's Completion-First Check (#6516).** Whether an epic is *finished* is a
-  property of its children and its deliverables, not of its own text — children
-  close underneath a byte-identical body all the time. An epic that was rejected
-  for structure and then quietly completed is the single most important case this
-  whole file has to get right, and it carries a matching marker by construction,
-  so a marker match must run Step 0 **before** it skips or escalates. Same
-  reasoning as the #5211 caveat above, applied to child state instead of blocker
-  state.
-- **Step 0.5's Tracking-Umbrella Stand-Down (#7666).** An epic can acquire
-  children *after* a structural rejection — decomposed by a Curator, by native
-  sub-issues, or by a hand-written task list — and none of that edits the epic's
-  own text, so the marker keeps matching. Whether the epic is still *awaiting
-  decomposition* is therefore also a fact about its children, and a marker match
-  must run Step 0.5 **before** it skips or escalates, for the same reason it must
-  run Step 0: otherwise a healthy, now-decomposed umbrella escalates on the
-  strength of a stale, superseded rejection.
+- **Step 0's Completion-First Check (#6516) and Step 0.5's Tracking-Umbrella
+  Stand-Down (#7666).** Whether an epic is *finished*, or has been *decomposed
+  by someone other than Step 3*, is a fact about its children, not its text —
+  children close or appear underneath a byte-identical body, so the marker keeps
+  matching. A rejected-then-completed or rejected-then-decomposed epic carries a
+  matching marker by construction, so a marker match must run Step 0 and Step
+  0.5 **before** it skips or escalates — otherwise a healthy epic escalates on
+  the strength of a stale, superseded rejection.
 
 **Hard constraint: this marker has exactly one writer.**
 `champion:epic-verdict:body-*` is emitted **only** by Step 4's rejection
 template (the `Champion Review: Epic Needs Revision` comment). It is not a
-general-purpose "Champion already looked at this epic" fingerprint, and no
-other step, template, or improvised status comment may emit it — for any
-reason, however structurally similar the situation looks. Everything
-downstream reads its presence as *proof that a rejection was posted*:
+"Champion already looked at this epic" fingerprint; no other step, template, or
+improvised status comment may emit it, however similar the situation looks.
+Everything downstream reads its presence as *proof that a rejection was posted*:
 
-- `PRIOR_REJECTIONS`, `SKIP_STREAK`, and `UNREVISED_EVALS` count **`Champion
-  Review: Epic Needs Revision` verdicts only**. A passing verdict, a stand-down
-  note, a phase-progress update, or any other non-rejection comment must never
-  contribute to them. A marker match with `PRIOR_REJECTIONS == 0` is a stray
-  marker, not an unrevised rejection, and the check below refuses to escalate
-  on it.
-- `loom:operator-only` / `loom:operator-decision` may therefore only ever be
-  applied by Step 4's escalation branch, to an epic with real, recurring
-  rejection findings. **A passing epic is never routed to the operator by this
-  file.** "It passes and there is nothing left to do" is a terminal-for-now
-  state, not a stuck one; parking it with a human both manufactures operator
-  load and takes the epic out of Step 0's completion-first check, so it can no
-  longer auto-close when its last child lands.
-
-This is not hypothetical (#7666): eleven consecutive passes on an external epic
-posted a *passing* "already decomposed, standing down" comment because no
-template existed for that case, and the eleventh borrowed this marker's name.
-The guard counted the borrowed marker as repeated rejection-without-revision and
-escalated a healthy epic — waiting only on a child that was `loom:building` — to
-`loom:operator-only`. **If you are about to post a comment and this file has no
-template for the situation you are in, that is a signal to add one (as #7666
-did, in Step 0.5), never to reuse a marker name documented for something else.**
-`defaults/scripts/tests/test-champion-epic-verdict-marker-scope.sh` enforces the
-single-writer rule statically, so a future edit cannot quietly reintroduce it.
+- `PRIOR_REJECTIONS`, `SKIP_STREAK`, and `UNREVISED_EVALS` count
+  **`Champion Review: Epic Needs Revision` verdicts only**. A passing verdict,
+  stand-down note, or phase-progress update must never contribute to them; a
+  marker match with `PRIOR_REJECTIONS == 0` is a stray marker, and the check
+  below refuses to escalate on it.
+- `loom:operator-only` / `loom:operator-decision` may only ever be applied by
+  Step 4's escalation branch, to an epic with real, recurring rejection findings.
+  **A passing epic is never routed to the operator by this file.** "It passes
+  and there is nothing left to do" is terminal-for-now, not stuck; parking it
+  with a human manufactures operator load and removes it from Step 0's
+  completion-first check, so it can no longer auto-close when its last child
+  lands.
+- **If this file has no template for the situation you are in, add one** (as
+  #7666 did, in Step 0.5) — never reuse a marker name documented for something
+  else. `defaults/scripts/tests/test-champion-epic-verdict-marker-scope.sh`
+  enforces the single-writer rule statically.
 
 ### The check (run FIRST, once per epic — before Step 0)
 
@@ -192,10 +159,8 @@ _sha256() {
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256
   else cksum; fi
 }
-# NOTE: use `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq`, for any
-# variable holding captured `gh --json` output — zsh's `echo` builtin
-# reinterprets `\n`/`\t` escapes and corrupts the JSON before jq parses it
-# (#5094).
+# `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` — zsh's `echo`
+# reinterprets escapes and corrupts captured `gh --json` output (#5094).
 BODY_HASH=$(printf '%s\n%s' \
   "$(printf '%s\n' "$EPIC_JSON" | jq -r '.title // ""')" \
   "$(printf '%s\n' "$EPIC_JSON" | jq -r '.body // ""')" \
@@ -287,13 +252,9 @@ A silent skip is neither an approval nor a rejection, so it never counts against
 
 #### Why a hash of title + body, and NOT the epic's `updatedAt`
 
-`updatedAt` is **self-invalidating**: the marker baked into a verdict comment
-necessarily records the value read *before* that comment was posted, and posting
-the comment bumps `updatedAt` forward — so the marker can never match and every
-pass re-evaluates and re-comments, which is the exact loop this section closes.
-A hash of title + body changes if and only if the epic is actually edited;
-comments, label churn, and Champion's own verdict all leave it untouched. Full
-derivation, and the parallel with `loom:reviewing` claim staleness, in
+`updatedAt` is **self-invalidating** — posting the verdict comment bumps it, so
+the marker could never match and every pass would re-comment. A title + body hash
+changes if and only if the epic is actually edited. Full derivation:
 `champion-issue-promo.md` → "Why a body hash and NOT the issue's `updatedAt`
 (#4966)".
 
@@ -305,10 +266,9 @@ derivation, and the parallel with `loom:reviewing` claim staleness, in
 | `SKIP_STREAK` | silent skips recorded for the **current** body hash | the skip path's in-place `PATCH` of the existing verdict comment | **Yes — this is the counter that keeps advancing** |
 | `UNREVISED_EVALS` = `PRIOR_REJECTIONS + SKIP_STREAK` | evaluation cycles spent on an unrevised epic | derived | Yes — the single escalation gate, used identically by the skip path and Step 4 |
 
-Suppressing duplicate comments must never suppress the escalation that eventually
-puts a stuck epic in front of a human — that regression already happened once on
-the proposal path (#4967). Traced against an epic that fails at body hash H1 and
-is never revised:
+Suppressing duplicate comments must never suppress the escalation that puts a
+stuck epic in front of a human (#4967). Traced against an epic that fails at
+body hash H1 and is never revised:
 
 | Cycle | Marker match? | `PRIOR_REJECTIONS` | `SKIP_STREAK` | `UNREVISED_EVALS` | Outcome | Comments posted |
 |---|---|---|---|---|---|---|
@@ -330,18 +290,14 @@ Invariants a future edit must preserve:
 - **`ALREADY_ROUTED=yes` short-circuits everything**, and here it is
   unconditional: there is no epic analogue of the #5664 self-healing
   un-escalation, because no epic criterion is a self-clearing dependency finding.
-- **Escalation requires a posted rejection to escalate about.**
+- **Escalation requires a posted rejection to escalate about (#7666).**
   `PRIOR_REJECTIONS ≥ 1` is a precondition of both the skip tally and the
-  escalation (#7666). Every row of the trace above satisfies it by construction,
-  because `SKIP_STREAK` can only advance by `PATCH`ing a verdict comment that
-  Step 4 posted. A match with `PRIOR_REJECTIONS == 0` therefore means something
-  other than Step 4 wrote the marker, and the only safe reading of it is "ignore
-  it" — counting it would escalate an epic nobody has ever rejected, which is
-  exactly the #7666 failure.
-- **Only rejections feed the counter, and only rejections escalate.** Any future
-  verdict type added to this file (a pass, a stand-down, a status note) must
-  carry its own marker name and its own idempotency rule — see the "Hard
-  constraint" above and Step 0.5's stand-down for the worked example.
+  escalation; every trace row satisfies it because `SKIP_STREAK` only advances by
+  `PATCH`ing a comment Step 4 posted. A match with `PRIOR_REJECTIONS == 0` means
+  something else wrote the marker — ignore it; counting it would escalate an epic
+  nobody ever rejected. Any future verdict type (a pass, a stand-down, a status
+  note) must carry its own marker name and idempotency rule — Step 0.5 is the
+  worked example.
 
 `LOOM_MAX_UNREVISED_EVALUATIONS` (default **2**) is the same knob the proposal
 path reads — one threshold, both surfaces.
@@ -350,34 +306,23 @@ path reads — one threshold, both surfaces.
 
 ## Epic Approval Workflow
 
-**Run the "Idempotency Guard for Unrevised Epics" above FIRST.** It has five
-outcomes. `ALREADY_ROUTED=yes` ends the pass immediately (a human owns the epic).
-The other four — stray marker / skip silently / escalate / evaluate — **all
-enter Step 0 and then Step 0.5 first**, because both "is it finished?" and "is it
-already decomposed?" are facts about the epic's *children*, not about its text,
-and the marker-matching outcomes are precisely the ones a rejected-then-completed
-(#6516) or rejected-then-decomposed (#7666) epic lands on. Only after both
-decline to act do they resume their own behavior (drop the stray marker, skip,
-Step 4's escalation, or Step 1).
+**Run the "Idempotency Guard for Unrevised Epics" above FIRST.**
+`ALREADY_ROUTED=yes` ends the pass immediately (a human owns the epic). Its other
+four outcomes — stray marker / skip silently / escalate / evaluate — **all enter
+Step 0 and then Step 0.5 first**, because "is it finished?" and "is it already
+decomposed?" are facts about the epic's *children*, not its text (#6516, #7666).
+Only after both decline to act do they resume their own behavior.
 
 ### Step 0: Completion-First Check — ask "is this already done?" before "is this well-shaped?" (#6516)
 
-The 6 criteria above describe an epic **awaiting decomposition**: they ask
-whether the phases, sizing, and success criteria are shaped well enough to
-*start* creating issues from. Run against an epic whose work is already
-decomposed, executed, and merged, they are not merely useless — they are a
-**permanent deadlock**, because nobody retrofits a Phase 1/2/3 skeleton onto
-finished work, so the finding can never clear and the epic stays open forever,
-blocking every dependent that cites it.
-
-That is not hypothetical. In the incident behind #6516 an external epic had all
-four of its children closed and its named deliverable merged to `main`, while
-Champion kept re-filing a "missing phase structure" objection against it and two
-buildable downstream issues sat `loom:blocked` behind it for days in a fleet that
-was starved for work.
-
-So: **completion is checked first, and a completion candidate never reaches Step
-2's structural criteria on that pass.**
+The 6 criteria above describe an epic **awaiting decomposition**. Run against an
+epic whose work is already decomposed, executed, and merged, they are a
+**permanent deadlock**: nobody retrofits a Phase 1/2/3 skeleton onto finished
+work, so the finding never clears and the epic stays open forever, blocking every
+dependent that cites it (the #6516 incident: all four children closed, deliverable
+merged, and two buildable downstream issues sat `loom:blocked` for days). So:
+**completion is checked first, and a completion candidate never reaches Step 2's
+structural criteria on that pass.**
 
 #### 0a. Discover the children (marker-independent — this is the load-bearing part)
 
@@ -393,10 +338,9 @@ EPIC_BODY=$(printf '%s\n' "$EPIC_JSON" | jq -r '.body // ""')   # fetched by the
 ```
 
 **Do NOT substitute "Detecting Phase Completion" below for this.** That query
-matches `<!-- loom:epic:N:phase:M -->`, so it sees only children *this file's*
-Step 3 created — precisely the population an epic decomposed some other way, or
-one that arrived already fully executed, is missing from. Depending on the
-marker here would reproduce the #6516 blind spot exactly.
+matches `<!-- loom:epic:N:phase:M -->`, so it sees only children Step 3 created
+— exactly what an epic decomposed some other way lacks. Depending on the marker
+here would reproduce the #6516 blind spot.
 
 | Discovery result | Outcome |
 |---|---|
@@ -425,12 +369,12 @@ for P in $DELIVERABLES; do
 done
 ```
 
-An epic naming no path-shaped deliverable satisfies this vacuously — that is the
-same evidence standard "Epic Completion" below has always closed on. A **non-empty**
-`$MISSING` downgrades the candidate to 0c's operator ask, and the ask must state
-the missing path and must **not** assert that the epic is complete. The grep is a
-floor, not a ceiling: if you can *see* the epic promising an artifact this pattern
-did not capture, verify it too, and ask rather than close when you cannot.
+An epic naming no path-shaped deliverable satisfies this vacuously — the same
+evidence standard "Epic Completion" below closes on. A **non-empty** `$MISSING`
+downgrades the candidate to 0c's operator ask, which must name the missing path
+and must **not** assert completion. The grep is a floor: if you can *see* the
+epic promising an artifact it did not capture, verify that too, and ask rather
+than close when you cannot.
 
 #### 0c. Close, or ask the operator to
 
@@ -475,14 +419,14 @@ fi
 ```
 
 `$UNCERTAINTY` is the one specific reason this is an ask rather than a close —
-the missing deliverable path from 0b, "containment was never established
-(prose references only)", or the outstanding-content-work comment from
-criterion 4. A bare "not confident" does not satisfy it.
+0b's missing path, "containment was never established (prose references only)",
+or criterion 4's outstanding-content comment. A bare "not confident" does not
+satisfy it.
 
 Either branch **ends the pass for this epic**: do not fall through to Step 1.
-Neither counts against "Epic Rate Limiting" below (a close is not an approval),
-and the guard's `ALREADY_ROUTED=yes` short-circuit drops an asked epic from every
-later pass — so the comment budget for a complete-but-open epic is exactly **one**.
+Neither counts against "Epic Rate Limiting" below, and the guard's
+`ALREADY_ROUTED=yes` short-circuit drops an asked epic from every later pass — so
+the comment budget for a complete-but-open epic is exactly **one**.
 
 #### 0d. Behavioral checks (what a change to this section must still produce)
 
@@ -495,7 +439,7 @@ defined by:
 | Same, but already carrying two "Epic Needs Revision" rejections | Same close — the body-hash marker match must not skip past Step 0 |
 | All children closed, but the body names `x/y.spice` that is **not** on `main` | `loom:operator-mechanical` ask naming `x/y.spice`. **No** close, and no claim that the epic is complete |
 | Only prose "Epic #N" references, all closed | `loom:operator-mechanical` ask. **No** close |
-| No children found by any source (undecomposed epic) | Falls through to Step 0.5 (which does not fire — no children) → Step 1 → Step 2's 6 criteria, byte-for-byte the behavior that existed before this section |
+| No children found by any source (undecomposed epic) | Falls through Step 0.5 (no children, does not fire) → Step 1 → Step 2's 6 criteria, byte-for-byte the pre-existing behavior |
 | One child still open, **carrying a phase marker** (Champion decomposed it) | Falls through Step 0.5 to Step 1; "Phase Progression" unaffected |
 | One child still open, **discovered without any phase marker** (Curator decomposition / sub-issues / task list) | Step 0.5's tracking-umbrella stand-down: one comment per body hash, then silence. **No** structural evaluation, no `loom:operator-only` (#7666) |
 
@@ -512,119 +456,15 @@ defined by:
 
 ### Step 0.5: Tracking-Umbrella Stand-Down — an already-decomposed epic is not awaiting decomposition (#7666)
 
-Step 0 asks "is this epic **finished**?". This step asks the other question the
-6 criteria cannot answer: "has this epic already been **decomposed**, by
-someone other than Step 3?"
-
-The 6 criteria describe an epic *awaiting decomposition* — they check the
-phases, sizing, and success criteria that Step 3 needs in order to create Phase
-1 issues. An epic whose children already exist and are being worked is past
-that point. Those children may come from a **Curator** decomposition pass, from
-native GitHub sub-issues, or from a hand-written `- [ ] #N` task list, none of
-which carries the `<!-- loom:epic:$EPIC_NUMBER:phase:N -->` marker that Step
-2.75 and "Detecting Phase Completion" search for — so neither phase creation
-nor phase progression can see them, and a literal reading of Step 2.75 would
-report `EXISTING_COUNT=0` and create a **duplicate** Phase 1 set. Champion has
-nothing left to do for such an epic except watch it finish, which Step 0
-already does on every pass.
-
-**Problem this section fixes (#7666)**: this case had no template. On an
-external epic (three Curator-created children, one of them `loom:building`)
-eleven consecutive Champion passes improvised a free-form "passes, already
-decomposed, standing down" comment, and the eleventh embedded the reserved
-`VERDICT_MARKER` name. The guard then read its own reserved marker back,
-counted those identical *passing* stand-downs as repeated
-rejection-without-revision, and routed a healthy epic to `loom:operator-only` —
-which also removed it from Step 0's completion-first check, so it could no
-longer auto-close when its last child landed. A passing epic is never a stuck
-epic: the correct handling is one durable note and then silence.
-
-#### 0.5a. Detect the tracking umbrella
-
-**Reuses Step 0a's discovery — do NOT re-run `discover_epic_children`.**
-
-```bash
-# Set by Step 0a: EPIC_CHILD_STRONG_{OPEN,CLOSED}, EPIC_CHILD_SOURCES.
-# `phase-marker` in EPIC_CHILD_SOURCES means discovery source (a) contributed,
-# i.e. Champion decomposed this epic itself and "Phase Progression" owns it
-# from here — such an epic must fall through to Step 1 exactly as before.
-case ",$EPIC_CHILD_SOURCES," in
-  *,phase-marker,*)
-    IS_TRACKING_UMBRELLA=no ;;                  # Champion's own decomposition
-  *)
-    if [ "$EPIC_CHILD_STRONG_OPEN" -gt 0 ]; then
-      IS_TRACKING_UMBRELLA=yes                  # decomposed elsewhere, still in flight
-    else
-      IS_TRACKING_UMBRELLA=no                   # undecomposed (Step 1), or complete (Step 0 owned it)
-    fi ;;
-esac
-```
-
-| Discovery state | `IS_TRACKING_UMBRELLA` | Why |
-|---|---|---|
-| `EPIC_CHILD_SOURCES` contains `phase-marker` | `no` | Champion decomposed this epic; Step 2.75 + "Phase Progression" already handle it, and standing down here would freeze phase advancement |
-| `STRONG_OPEN > 0`, no `phase-marker` source | **`yes`** | Children exist by containment and are still in flight, but Step 3 did not create them — nothing to decompose, nothing to evaluate |
-| `STRONG_OPEN == 0` | `no` | Either undecomposed (all counters 0 → Step 1) or a completion candidate, which Step 0 already acted on before this step ran |
-| Weak (prose) references only | `no` | Prose is never containment — Step 0's operator ask is the only thing weak evidence may reach |
-
-#### 0.5b. Stand down — once per body hash, no counter, no escalation
-
-```bash
-if [ "$IS_TRACKING_UMBRELLA" = "yes" ]; then
-  # Keyed to the SAME $BODY_HASH the guard computed, and to NOTHING else: a
-  # genuine revision (new phases, changed scope) earns one fresh note, while a
-  # child changing state does not — "this epic is decomposed and being worked"
-  # is what the note says, and that stays true as children move. Distinct
-  # marker name; NEVER the reserved rejection marker (see the guard's "Hard
-  # constraint" above).
-  UMBRELLA_MARKER="<!-- champion:epic-tracking-umbrella:body-$BODY_HASH -->"
-  if printf '%s\n' "$EPIC_JSON" | jq -e --arg m "$UMBRELLA_MARKER" \
-       '.comments[] | select(.body | contains($m))' >/dev/null; then
-    echo "#$EPIC_NUMBER is a tracking umbrella already noted at body revision $BODY_HASH — standing down silently (no comment, no tally, no label change)"
-  else
-    gh issue comment "$EPIC_NUMBER" --body "$UMBRELLA_MARKER
-**Champion: Epic Already Decomposed — Tracking Only**
-
-This epic's children already exist ($EPIC_CHILD_STRONG_OPEN open / $EPIC_CHILD_STRONG_CLOSED closed, discovered via: $EPIC_CHILD_SOURCES) but were not created by Champion's own phase-issue flow, so it is a **tracking umbrella**, not an epic awaiting decomposition. Champion is not creating phase issues for it and is not re-running the pre-decomposition structural criteria against it.
-
-Nothing is required of anyone. The epic stays open and keeps \`loom:epic\`; Champion re-checks it for completion on every pass and will close it automatically once its last child is closed and every deliverable it names is present on \`${DEFAULT_BRANCH:-main}\`.
-
----
-*Automated by Champion role*"
-  fi
-  # END THE PASS FOR THIS EPIC either way: do not fall through to Step 1.
-  # No label change, no tally, no escalation — continue to the next epic.
-fi
-```
-
-#### 0.5c. Behavioral checks and invariants
-
-| Epic shape | Required outcome |
-|---|---|
-| Curator-decomposed epic, children open, first pass at this body hash | **One** "Epic Already Decomposed — Tracking Only" comment, then the pass ends |
-| Same epic, every later pass with an unchanged body | Silent skip — no comment, no label, no counter. Step 0 still runs first, so it closes on its own when the last child lands |
-| Same epic, body genuinely edited (new phases/scope) | New hash → one fresh stand-down note (still no evaluation, still no escalation) |
-| Same epic, carrying an old, superseded "Epic Needs Revision" marker | Stand-down still wins: Step 0.5 runs **before** the guard's skip/escalate branches commit, so a rejected-then-decomposed epic never escalates on a stale finding |
-| Champion-decomposed epic (phase-marker children) | Step 0.5 declines → Step 1 → unchanged Step 2/2.5/2.75/Phase Progression behavior |
-| Undecomposed epic (no children) | Step 0.5 declines → Step 1 → Step 2's 6 criteria, byte-for-byte the pre-existing behavior |
-
-**Invariants a future edit must preserve:**
-
-- **A stand-down is never a rejection.** This step writes
-  `champion:epic-tracking-umbrella:body-*` and nothing else. It must never write
-  the Step 4 rejection marker, never touch `PRIOR_REJECTIONS` / `SKIP_STREAK`,
-  and never apply `loom:operator-only` — a passing epic waiting on its own
-  children is not an operator problem.
-- **No escalation ladder, deliberately.** Same reasoning as "Phase
-  Progression"'s own idempotency guard: an unchanged, in-progress epic is not
-  stuck, it is *waiting*. Bounding a state that resolves itself when the last
-  child closes would only reintroduce the noise this step removes.
-- **Step 0 still runs on every pass.** The stand-down suppresses the *structural
-  evaluation*, never the completion check — that is what lets the epic close
-  automatically instead of sitting open forever.
-- **The `phase-marker` carve-out is load-bearing.** Widening this step to fire
-  on epics Champion decomposed itself would freeze phase progression at whatever
-  phase was open when the stand-down first fired.
+Step 0 asks "is this epic **finished**?"; this step asks "has it already been
+**decomposed** by someone other than Step 3?" — a Curator pass, native
+sub-issues, or a hand-written task list, none of which carry the phase marker,
+so a literal Step 2.75 would create a duplicate Phase 1 set. **Read and follow
+instructions in `.claude/commands/loom/champion-epic-standdown.md`**: it reuses
+Step 0a's discovery, stands such an epic down with its own
+`champion:epic-tracking-umbrella:body-*` marker (once per body hash, no
+counter, no operator routing), and ends the pass. An epic Champion decomposed
+itself (`phase-marker` source) or an undecomposed one falls through to Step 1.
 
 ### Step 1: Read the Epic
 
@@ -641,15 +481,11 @@ Check each of the 6 criteria above. If ANY criterion fails, skip to Step 4 (reje
 ### Step 2.5: Epic-Aware Blocker Check Before Creating Phase Issues (#5211)
 
 An epic's own phase description sometimes names an external blocker — e.g.
-"Phase 1 — Blocked by: `owner/repo#N`" — pointing at another issue, often
-another epic, sometimes in a different repo entirely (the incident that
-motivated this section: example-org/downstream-repo#101's Phase 1 named
-example-org/tool-repo#202 as its blocker). **Do not read that reference as a
-bare `state == OPEN` check** — an epic can sit open for months after every one
-of its capability children has closed and shipped, simply because nobody ran
-"Epic Completion" below to close it. Treating that as a live block twice
-(2026-08-04, 01:33 and 02:10) is exactly what turned into an unrecoverable
-cross-repo deadlock in the incident this section fixes.
+"Phase 1 — Blocked by: `owner/repo#N`" — often another epic, sometimes in a
+different repo. **Do not read that reference as a bare `state == OPEN` check** —
+an epic can sit open for months after every capability child has shipped, simply
+because nobody ran "Epic Completion" below to close it; treating that as a live
+block is what produced the unrecoverable cross-repo deadlock behind #5211.
 
 If the phase you are about to create issues for (Step 3, or a later phase
 under "Phase Progression") names such a reference:
@@ -680,29 +516,20 @@ sites — Step 3 (Phase 1) below and "Creating Next Phase Issues" (Phase N+1)
 under "Phase Progression" — never only at one.**
 
 **Problem this section fixes (#6601)**: neither creation site had *any*
-pre-creation existence check. On example-org/tool-repo#372, Champion's approval
-comment created the canonical Phase 1 set (product-repo#79/#80/#81); those issues
-were completed, closed, and their PRs merged; a later pass re-ran phase-issue
-creation for the same phase and, having nothing to consult, created a second,
-duplicate set (product-repo#84/#85/#86) carrying the identical
-`<!-- loom:epic:372:phase:1 -->` marker. This is a straightforward
-missing-idempotency-check bug, not a concurrency race — the two creations were
-~2 hours apart, not simultaneous — so the fix is a query, not a lock (see
+pre-creation existence check, so a later pass re-ran phase-issue creation for an
+already-completed-and-closed phase and created a second, duplicate set carrying
+the identical marker. The two creations were ~2 hours apart, not simultaneous —
+a missing idempotency check, not a race — so the fix is a query, not a lock (see
 "Why this alone is sufficient — no mutex change" below).
 
 **Phase-form normalization (#6967)**: the marker's phase token is not always a
-plain integer — a historical/foreign epic convention (or a phase marker
-written by a different tool) can leave a letter-form marker (`phase:B`) on an
-existing issue. A later pass that re-derives a numeric `$PHASE` for that same
-logical phase (`PHASE=2`) must still recognize it as "already exists", or it
-creates a duplicate — an exact literal-string `--search` match alone cannot do
-that (GitHub's search treats `phase:B` and `phase:2` as unrelated strings).
-`canonicalize_phase()` below maps both forms (`A`/`B`/`C`/… and `1`/`2`/`3`/…,
-case-insensitively) to the same canonical integer so the comparison is
-form-agnostic; an unrecognized token (neither a bare integer nor a single
-letter) is left as-is so it can never *falsely* collapse into a match — see
-"two genuinely different phases must never collapse" in the regression test
-below.
+plain integer — a foreign convention or another tool can leave a letter-form
+marker (`phase:B`) on an existing issue, and a later pass re-deriving `PHASE=2`
+must still recognize it as "already exists" or it creates a duplicate; an exact
+literal `--search` match cannot (GitHub treats `phase:B` and `phase:2` as
+unrelated). `canonicalize_phase()` maps both forms (`A`/`B`/`C`/… and
+`1`/`2`/`3`/…, case-insensitively) to the same integer; an unrecognized token
+is left as-is so it can never *falsely* collapse into a match.
 
 ```bash
 EPIC_NUMBER=<number>
@@ -796,31 +623,16 @@ fi
 #### Why this alone is sufficient — no mutex change (#6601, addresses the mutex-scope AC)
 
 The `#3707` `IssueCreationMutex` (`loom-daemon/src/issue_creation_mutex.rs`) is
-an in-process `tokio::sync::Mutex`, acquired only inside `epic_supervisor.rs`'s
-own dispatch loop — it cannot and does not serialize a plain Champion pass
-(a separate `claude` process reading this prose file, dispatched via the role
-runner or a GH Actions cron job) against the daemon's opt-in epic supervisor;
-those are different OS processes with no shared memory to hold a `Mutex` in.
-Extending it to cover that boundary would need a persistent, forge-visible
-lock (e.g. a claim label), which is a materially bigger change than this
-incident's actual failure mode calls for.
-
-That failure mode was **not** two creators racing simultaneously — the two
-creations on example-org/tool-repo#372 were ~2 hours apart (15:31Z and 17:42Z)
-with the first phase fully closed in between. The existence check above closes exactly
-that gap: any pass, no matter how far apart, now queries the forge
-immediately before creating and finds the already-closed canonical set. The
-narrower residual — two creators evaluating this same check in the same
-instant, both observing `EXISTING_COUNT=0`, and both proceeding to create —
-is the same class of already-accepted risk the "Idempotency Guard for
-Unrevised Epics" above documents for its own marker check ("If two Champion
-hosts ever do evaluate the same epic at once, the body-hash marker still
-bounds the outcome to one extra comment rather than an unbounded stream"):
-bounded to one extra (dedupable-on-next-pass, since the marker itself is now
-present the moment either burst completes) duplicate set rather than an
-unbounded, indefinitely-repeating one. No incident evidence implicates that
-narrower window, so this PR treats the existence check as sufficient on its
-own and does not extend mutex coverage.
+an in-process `tokio::sync::Mutex` held only inside `epic_supervisor.rs`; it
+cannot serialize a plain Champion pass (a separate `claude` process) against the
+daemon, and extending it would need a persistent forge-visible lock — a
+materially bigger change than the failure calls for. That failure was two
+creations ~2 hours apart with the first phase closed in between, which the
+existence check above closes exactly. The residual — two creators evaluating
+this check in the same instant, both observing `EXISTING_COUNT=0` — is the same
+already-accepted risk the "Idempotency Guard for Unrevised Epics" documents for
+its own marker check: bounded to one extra, dedupable-on-next-pass set rather
+than an unbounded stream. No incident evidence implicates that window.
 
 ### Step 3: Approve and Create Phase 1 Issues
 
@@ -828,7 +640,7 @@ If all 6 criteria pass (and Step 2.5 above did not hold this phase):
 
 > **Run "Step 2.75: Pre-Creation Existence Check for Phase Issues" above FIRST, with `PHASE=1`.** If it stood down (existing Phase 1 issues found), stop here — do not run the creation loop below.
 
-> **Serialize this phase-issue creation loop against any other issue-creating agent (#3707).** Do not run the `gh issue create` loop below while another issue-creating agent (Architect / Curator-decomposition / another Champion epic-phase run) is filing issues in the same repo — concurrent `gh issue create` bursts race on server-assigned issue numbers and cross-contaminate bodies. One filer must finish its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the invariant.
+> **Serialize this phase-issue creation loop against any other issue-creating agent (#3707).** Concurrent `gh issue create` bursts (Architect / Curator-decomposition / another Champion epic-phase run) race on server-assigned issue numbers and cross-contaminate bodies; one filer must finish its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize".
 
 1. **Create Phase 1 issues** with `loom:architect` label:
 
@@ -899,16 +711,13 @@ UNREVISED_EVALS=$(( PRIOR_REJECTIONS + SKIP_STREAK ))
 
 **If `ESCALATE_UNREVISED=yes`, or `UNREVISED_EVALS >= ${LOOM_MAX_UNREVISED_EVALUATIONS:-2}`
 — and, in both cases, `PRIOR_REJECTIONS >= 1` and `ALREADY_ROUTED=no`** — escalate
-to the operator instead of rejecting again. `PRIOR_REJECTIONS >= 1` is what keeps
-this branch tied to a **real, posted** `Champion Review: Epic Needs Revision`
-comment: the escalation exists to put a *repeatedly rejected* epic in front of a
-human, so an epic nobody has ever rejected must never reach it, whatever markers
-its thread happens to carry (#7666).
-Keep `loom:epic` (the epic is parked for a human, not withdrawn), and use the
-`loom:operator-decision` sub-kind (#5671, `.loom/docs/label-state-machine.md`
-→ "operator-only sub-kinds"): an epic that keeps failing structural criteria is a
-judgement call about how the work should be shaped, never a self-clearing
-dependency wait, so `loom:operator-blocked` is never the right sub-kind here.
+to the operator instead of rejecting again. `PRIOR_REJECTIONS >= 1` ties this
+branch to a **real, posted** `Champion Review: Epic Needs Revision` comment: an
+epic nobody has ever rejected must never reach it, whatever markers its thread
+carries (#7666). Keep `loom:epic` (parked, not withdrawn) and use the
+`loom:operator-decision` sub-kind (#5671): repeatedly failing structural criteria
+is a judgement call about shape, never a self-clearing dependency wait, so
+`loom:operator-blocked` is never right here.
 
 ```bash
 ESCALATE_MARKER="<!-- champion:epic-escalated -->"
@@ -930,25 +739,16 @@ issues instead of phases).
 ```
 
 **Anti-regression caveat (#6715): the escalation `gh issue edit` above is
-add-only and must never also remove `loom:epic`.** It names only the
-operator-only pair in its `--add-label` argument — the whole point of
-escalating is to park the epic for a human while it stays discoverable as an
-epic. Stripping `loom:epic` here would make the epic invisible to every
-subsequent Champion pass (which discovers epics by that label), including any
-pass that runs **after** a human revises it, since nothing would ever
-re-apply the label. If a future edit to this block adds a label-removal flag
-for any reason, that flag must never target `loom:epic`.
+add-only and must never also remove `loom:epic`.** Escalating parks the epic for
+a human while it stays discoverable as an epic; stripping `loom:epic` would hide
+it from every later Champion pass (which discovers epics by that label), including
+the one after a human revises it, since nothing re-applies the label. If a future
+edit adds a label-removal flag here, it must never target `loom:epic`.
 
 When you arrive here via `ESCALATE_UNREVISED=yes` you have **not** re-run the 6
-criteria, and must not: the epic's title and body are byte-identical to the
-revision the prior verdict was written against, so the verdict is unchanged by
-construction. Lift the **Recurring findings** verbatim from that prior "Epic
-Needs Revision" comment (`$COMMENT_BODY`, fetched by the guard) rather than
-re-deriving them.
-
-The guard's `ALREADY_ROUTED=yes` short-circuit is what keeps this comment to
-exactly one per epic — champion.md's Priority 4 discovery query does not filter
-`loom:operator-only` on its own.
+criteria, and must not: the title and body are byte-identical to the revision the
+prior verdict was written against. Lift the **Recurring findings** verbatim from
+that prior "Epic Needs Revision" comment (`$COMMENT_BODY`, fetched by the guard).
 
 **Otherwise** (first or second evaluation, not yet routed): leave detailed
 feedback and keep the `loom:epic` label.
@@ -976,17 +776,15 @@ Keeping \`loom:epic\` label. The Architect can revise and resubmit.
 *Automated by Champion role*"
 ```
 
-`$VERDICT_MARKER` and `$BODY_HASH` come from the guard above, keyed to a hash of
-this epic's title + body. **This rejection template is the only place in this
-file that may emit `$VERDICT_MARKER`** — the single-writer rule stated under the
-guard's "Hard constraint" and enforced by
-`defaults/scripts/tests/test-champion-epic-verdict-marker-scope.sh`. Omitting the
-verdict marker — or substituting a
-timestamp-keyed one — reopens the duplicate-comment loop this mechanism exists to
-close; omitting the `champion:epic-unrevised-skips:$BODY_HASH:0` line beside it
-reopens the opposite failure, where skips are free, `UNREVISED_EVALS` never
-advances past `PRIOR_REJECTIONS`, and an unrevised epic is skipped quietly
-forever instead of escalating. **Both markers ship together or neither works.**
+`$VERDICT_MARKER` and `$BODY_HASH` come from the guard above. **This rejection
+template is the only place in this file that may emit `$VERDICT_MARKER`** — the
+single-writer rule under the guard's "Hard constraint", enforced by
+`defaults/scripts/tests/test-champion-epic-verdict-marker-scope.sh`. Omitting
+the verdict marker (or substituting a timestamp-keyed one) reopens the
+duplicate-comment loop; omitting the `champion:epic-unrevised-skips:$BODY_HASH:0`
+line beside it makes skips free, so `UNREVISED_EVALS` never advances past
+`PRIOR_REJECTIONS` and an unrevised epic is skipped quietly forever. **Both
+markers ship together or neither works.**
 
 ---
 
@@ -1001,35 +799,24 @@ at any phase boundary, not just Phase 1.
 
 ### Detecting Phase Completion
 
-This checks whether **this epic's own** Phase N children are all closed, in
-order to decide whether to create Phase N+1. It is deliberately scoped to one
-phase at a time. `champion-common.md` → "Epic-Aware Blocker Check" Step 2
-generalizes the same query across **every** phase of a *different* epic that
-this one names as a blocker, to answer "is that epic's delivered capability
-done" rather than "should I create the next phase of this one" — read that
-section, not this one, when evaluating a blocker reference (#5211). And read
-**Step 0** when the question is "is *this* epic finished overall": this query
-answers it only for epics Champion itself decomposed, which is why Step 0 uses
-`discover_epic_children` instead (#6516).
+This checks whether **this epic's own** Phase N children are all closed, to
+decide whether to create Phase N+1 — one phase at a time. `champion-common.md`
+→ "Epic-Aware Blocker Check" Step 2 generalizes the same query across every
+phase of a *different* epic named as a blocker (#5211); **Step 0** answers "is
+*this* epic finished overall" via `discover_epic_children`, since this query
+sees only children Champion created itself (#6516).
 
 **Idempotency guard on the "not yet complete" branch
-(`champion:epic-phase-progress:*`, #7188)**: when Phase N is not yet
-complete, a `**Champion: Phase progress update**` status comment is only
-ever posted when the *observed state* actually changed since the last such
-comment on this epic — a hash of the phase's open/closed issue-number sets
-plus any epic-text gate status is embedded in the comment and checked before
-posting, so an unchanged epic is silently skipped instead of accumulating
-one near-identical comment per pass. Observed downstream on
-example-org/tool-repo#202: 12 near-identical "Phase progress update"
-comments in ~27 hours before this guard existed, each confirming that
-nothing had changed. Unlike the "Idempotency Guard for Unrevised Epics"
-above (Step 4's rejection path), **no escalation ladder is added here** — an
-unchanged, in-progress epic is not stuck, it is *waiting* (on issues to
-close, or on a gate to lift), the same "isn't stuck, just waiting" state
-Step 2.5's blocker hold already treats with permanent silence, and the same
-choice Step 0.5's tracking-umbrella stand-down makes for the same reason
-(#7666). Indefinite silent-skip on no change is therefore the correct steady
-state, not a bug to bound.
+(`champion:epic-phase-progress:*`, #7188)**: a `**Champion: Phase progress
+update**` comment is posted only when the *observed state* changed since the
+last one — a hash of the phase's open/closed issue-number sets plus any
+epic-text gate status is embedded in the comment and checked before posting, so
+an unchanged epic is skipped silently instead of accumulating one near-identical
+comment per pass. Unlike the "Idempotency Guard for Unrevised Epics" above,
+**no escalation ladder is added here**: an unchanged, in-progress epic is not
+stuck, it is *waiting* — the same state Step 2.5's blocker hold and Step 0.5's
+tracking-umbrella stand-down (#7666) treat with permanent silence. Indefinite
+silent-skip on no change is the correct steady state, not a bug to bound.
 
 ```bash
 # Check if all Phase N issues for an epic are closed
@@ -1082,9 +869,7 @@ PHASE_ISSUES=$(printf '%s\n' "$CANDIDATE_PHASE_ISSUES" | jq -c '.[]' | while IFS
   fi
 done | jq -s '.')
 
-# Count open vs closed. NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" |
-# jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escapes by default, which
-# corrupts captured `gh --json` output before jq ever parses it (#5094).
+# Count open vs closed (`printf`, never `echo`, into jq — #5094).
 OPEN_COUNT=$(printf '%s\n' "$PHASE_ISSUES" | jq '[.[] | select(.state == "OPEN")] | length')
 CLOSED_COUNT=$(printf '%s\n' "$PHASE_ISSUES" | jq '[.[] | select(.state == "CLOSED")] | length')
 
@@ -1172,11 +957,10 @@ Otherwise, when Phase N completes, create Phase N+1 issues following the same pa
 ### Epic Completion
 
 When all phases are complete. This is the *phase-marker* route into closure —
-Champion decomposed the epic itself, walked it phase by phase, and knows the last
-phase just closed. **Step 0's Completion-First Check is the other route**, for an
-epic whose children Champion did not create and therefore cannot recognize here
-(#6516); the two close on the same evidence standard (all children closed, named
-deliverables present), differing only in how the children are found.
+Champion decomposed the epic itself and knows the last phase just closed.
+**Step 0's Completion-First Check is the other route**, for children Champion did
+not create (#6516); both close on the same evidence standard, differing only in
+how the children are found.
 
 ```bash
 # Close the epic
