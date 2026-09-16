@@ -25,7 +25,7 @@
 1853 defaults/scripts/worktree.sh
 1367 install.sh
 1598 loom-daemon/src/agent_session/spawn.rs
-1306 loom-daemon/src/auto_update.rs
+1309 loom-daemon/src/auto_update.rs
 1457 loom-daemon/src/auto_update/tests.rs
 1777 loom-daemon/src/claim_reconciliation.rs
 2606 loom-daemon/src/claim_reconciliation/tests.rs
@@ -34,7 +34,7 @@
 1146 loom-daemon/src/cli/tokens.rs
 1913 loom-daemon/src/credential_preflight.rs
 1840 loom-daemon/src/daemon_install_state.rs
-1298 loom-daemon/src/daemon_service.rs
+1281 loom-daemon/src/daemon_service.rs
 1575 loom-daemon/src/epic_supervisor.rs
 1110 loom-daemon/src/fleet/add_worker.rs
 1488 loom-daemon/src/fleet/add_worker/tests.rs
@@ -46,9 +46,9 @@
 2299 loom-daemon/src/init/scaffolding/tests.rs
 1916 loom-daemon/src/init/tests.rs
 1344 loom-daemon/src/install_self_check.rs
-3167 loom-daemon/src/ipc.rs
-4410 loom-daemon/src/ipc/tests.rs
-1286 loom-daemon/src/main.rs
+3171 loom-daemon/src/ipc.rs
+4414 loom-daemon/src/ipc/tests.rs
+1273 loom-daemon/src/main.rs
 1845 loom-daemon/src/main_health_gate.rs
 2318 loom-daemon/src/main_health_gate/tests.rs
 1379 loom-daemon/src/observability/collector.rs

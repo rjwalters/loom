@@ -133,6 +133,8 @@ use crate::event_bus::EventBus;
 use crate::ipc::DrainState;
 use crate::workspace_pool::WorkspacePool;
 
+mod relaunch_verify_note;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -2077,7 +2079,7 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                      reduced priority]"
                 );
             }
-            note = with_relaunch_verify_note(note, drain_accepted);
+            note = relaunch_verify_note::with_relaunch_verify_note(note, drain_accepted);
             log_roll_outcome(&outcome, &note);
             note
         }
@@ -2115,40 +2117,13 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                      reduced priority]"
                 );
             }
-            note = with_relaunch_verify_note(note, drain_accepted);
+            note = relaunch_verify_note::with_relaunch_verify_note(note, drain_accepted);
             log_roll_outcome(&outcome, &note);
             note
         }
     };
 
     status.publish(state.snapshot(true, last_check, note, &artifact));
-}
-
-/// Append the expected relaunch path + detached-verifier bound (Issue #6969
-/// AC2) to a roll's outcome note when this tick actually triggered a
-/// drain-and-restart — so the auto-update roll's OWN "drain-and-restart
-/// triggered" log line states which relaunch mechanism is expected and by
-/// when a future gap (like the ~4-minute launchd observation that motivated
-/// this) becomes attributable from the log alone, without having to
-/// cross-reference the later `run_drain_supervisor` drain-complete line.
-///
-/// A no-op when `drain_accepted` is `false` (nothing was triggered — the note
-/// already says so) or the host has no recognized supervisor (nothing to
-/// verify against, mirroring every other best-effort branch in this module).
-fn with_relaunch_verify_note(note: String, drain_accepted: bool) -> String {
-    if !drain_accepted {
-        return note;
-    }
-    let Some(supervisor) = crate::ipc::detect_supervisor() else {
-        return note;
-    };
-    let verify_poll_secs = crate::restart_verify::resolve_secs(
-        std::env::var(crate::restart_verify::POLL_SECS_ENV)
-            .ok()
-            .as_deref(),
-        crate::restart_verify::DEFAULT_POLL_SECS,
-    );
-    format!("{note} {}", crate::ipc::relaunch_verify_note(&supervisor, verify_poll_secs))
 }
 
 /// Log a roll's outcome at the severity its kind warrants — a terminal failure

@@ -513,63 +513,7 @@ enum Commands {
     /// sweeps survive a launchd bootout/bootstrap (they reparent to launchd,
     /// ppid=1), so no drain is required first — unlike systemd, where a
     /// restart's stop job reaps the unit's cgroup (#5119).
-    Restart {
-        /// Finish all in-flight sweeps before restarting, instead of restarting
-        /// immediately (#4090). New dispatch is paused for the duration.
-        #[arg(long)]
-        drain: bool,
-        /// Max seconds to wait for in-flight sweeps to drain (with `--drain`).
-        /// Defaults to the daemon's built-in timeout (tens of minutes).
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// On drain timeout, cancel the remaining sweeps and restart anyway
-        /// (with `--drain`). Without this, a timeout refuses the restart and
-        /// keeps the daemon running (fail-safe).
-        #[arg(long)]
-        force_after_timeout: bool,
-        /// Abort an in-progress drain and resume normal dispatch (no restart).
-        #[arg(long)]
-        abort_drain: bool,
-        /// With `--drain`, stop (and stay down) instead of restarting once
-        /// drained (Issue #4343). Requires `--drain`; the daemon does not
-        /// require a recognized supervisor for this variant (there is
-        /// nothing to prove supervision for — a `then-exit` drain never
-        /// wants a relaunch).
-        #[arg(long)]
-        then_exit: bool,
-        /// Boot the launchd job out and back in (bounded, EIO-aware bootstrap
-        /// retry) so a hand-edited plist's `EnvironmentVariables` actually
-        /// takes effect (Issue #6682) — see the command doc above. A local
-        /// operation, independent of the running daemon's IPC socket; never
-        /// combine with `--drain`/`--abort-drain`/`--then-exit`. Refuses on a
-        /// non-launchd host.
-        #[arg(long)]
-        reload_supervisor: bool,
-        /// **Internal use only** (Issue #6969): run ONLY the post-restart
-        /// relaunch verification + self-heal (`restart_verify::verify_and_heal`)
-        /// against the given `--verify-supervisor` / `--verify-pre-pid`, without
-        /// sending any request to a daemon. This is what
-        /// `restart_verify::spawn_detached_verifier` execs as a DETACHED child
-        /// right before an in-process `DrainAndRestartDaemon` exit (the
-        /// autonomous self-update roll, most notably): a verification poll
-        /// cannot run *inside* the process that is about to exit (see
-        /// `restart_verify.rs`'s module doc), so it runs here instead, in a
-        /// separate process that survives the parent's exit. Requires
-        /// `--verify-supervisor` and `--verify-pre-pid`. Not a stable/documented
-        /// CLI surface — hidden from `--help`.
-        #[arg(long, hide = true)]
-        verify_only: bool,
-        /// Supervisor to verify against with `--verify-only` (`launchd` or
-        /// `systemd`) — the exiting process's own authoritative
-        /// `detect_supervisor()` reading, passed through rather than
-        /// re-detected in the child.
-        #[arg(long, hide = true)]
-        verify_supervisor: Option<String>,
-        /// The exiting process's own pid, so `--verify-only` can tell "a NEW
-        /// pid showed up" apart from "the old process is still mid-teardown".
-        #[arg(long, hide = true)]
-        verify_pre_pid: Option<u32>,
-    },
+    Restart(cli::restart::RestartArgs),
 
     /// Manage the multi-account OAuth token pool at `.loom/tokens/` (Issue
     /// #4082/#4108, epic #4081 "eliminate Python from Loom"). Native Rust
@@ -2839,7 +2783,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Watch is handled in main() before handle_cli_command")
         }
-        Commands::Restart { .. } => {
+        Commands::Restart(..) => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Restart is handled in main() before handle_cli_command")

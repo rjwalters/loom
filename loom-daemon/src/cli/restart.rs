@@ -10,16 +10,84 @@ use loom_daemon::types::{Request, Response};
 
 use super::common::{query_daemon, resolve_socket_path};
 
+/// `restart` subcommand args (Issue #4712 split, moved wholesale out of
+/// `main.rs`'s `Commands::Restart` variant by Issue #6969's file-size-ratchet
+/// fix: `main.rs` is already over `.loom/docs/file-size-policy.md`'s
+/// threshold and frozen, so adding the 3 new `--verify-*` fields there could
+/// only land by moving the WHOLE bundle to this already-under-threshold
+/// module instead of leaving a few new fields behind as dispatch debt).
+#[derive(clap::Args)]
+pub(crate) struct RestartArgs {
+    /// Finish all in-flight sweeps before restarting, instead of restarting
+    /// immediately (#4090). New dispatch is paused for the duration.
+    #[arg(long)]
+    pub(crate) drain: bool,
+    /// Max seconds to wait for in-flight sweeps to drain (with `--drain`).
+    /// Defaults to the daemon's built-in timeout (tens of minutes).
+    #[arg(long)]
+    pub(crate) timeout: Option<u64>,
+    /// On drain timeout, cancel the remaining sweeps and restart anyway
+    /// (with `--drain`). Without this, a timeout refuses the restart and
+    /// keeps the daemon running (fail-safe).
+    #[arg(long)]
+    pub(crate) force_after_timeout: bool,
+    /// Abort an in-progress drain and resume normal dispatch (no restart).
+    #[arg(long)]
+    pub(crate) abort_drain: bool,
+    /// With `--drain`, stop (and stay down) instead of restarting once
+    /// drained (Issue #4343). Requires `--drain`; the daemon does not
+    /// require a recognized supervisor for this variant (there is
+    /// nothing to prove supervision for — a `then-exit` drain never
+    /// wants a relaunch).
+    #[arg(long)]
+    pub(crate) then_exit: bool,
+    /// Boot the launchd job out and back in (bounded, EIO-aware bootstrap
+    /// retry) so a hand-edited plist's `EnvironmentVariables` actually
+    /// takes effect (Issue #6682) — see the command doc above. A local
+    /// operation, independent of the running daemon's IPC socket; never
+    /// combine with `--drain`/`--abort-drain`/`--then-exit`. Refuses on a
+    /// non-launchd host.
+    #[arg(long)]
+    pub(crate) reload_supervisor: bool,
+    /// The `--verify-only`/`--verify-supervisor`/`--verify-pre-pid` flags
+    /// (Issue #6969) — internal use only; see `VerifyOnlyArgs`'s doc for
+    /// what they do and why they're grouped.
+    #[command(flatten)]
+    pub(crate) verify: VerifyOnlyArgs,
+}
+
 /// The three `--verify-only`/`--verify-supervisor`/`--verify-pre-pid` flags
-/// (Issue #6969), bundled into one argument so `handle_restart_command` stays
-/// under clippy's `too_many_arguments` threshold. They only ever travel
-/// together — `--verify-only` is meaningless without the other two, and
-/// [`restart_verify::spawn_detached_verifier`] always sets all three at once —
-/// so grouping them costs nothing at the two call sites (`main.rs`'s `Commands`
-/// destructure and this module's own tests).
+/// (Issue #6969), bundled into one `#[command(flatten)]` argument nested
+/// inside [`RestartArgs`] so `handle_restart_command` stays under clippy's
+/// `too_many_arguments` threshold. They only ever travel together —
+/// `--verify-only` is meaningless without the other two, and
+/// [`restart_verify::spawn_detached_verifier`] always sets all three at
+/// once — so grouping them costs nothing at its one call site.
+#[derive(clap::Args)]
 pub(crate) struct VerifyOnlyArgs {
+    /// **Internal use only** (Issue #6969): run ONLY the post-restart
+    /// relaunch verification + self-heal (`restart_verify::verify_and_heal`)
+    /// against the given `--verify-supervisor` / `--verify-pre-pid`, without
+    /// sending any request to a daemon. This is what
+    /// `restart_verify::spawn_detached_verifier` execs as a DETACHED child
+    /// right before an in-process `DrainAndRestartDaemon` exit (the
+    /// autonomous self-update roll, most notably): a verification poll
+    /// cannot run *inside* the process that is about to exit (see
+    /// `restart_verify.rs`'s module doc), so it runs here instead, in a
+    /// separate process that survives the parent's exit. Requires
+    /// `--verify-supervisor` and `--verify-pre-pid`. Not a stable/documented
+    /// CLI surface — hidden from `--help`.
+    #[arg(long, hide = true)]
     pub(crate) verify_only: bool,
+    /// Supervisor to verify against with `--verify-only` (`launchd` or
+    /// `systemd`) — the exiting process's own authoritative
+    /// `detect_supervisor()` reading, passed through rather than
+    /// re-detected in the child.
+    #[arg(long, hide = true)]
     pub(crate) verify_supervisor: Option<String>,
+    /// The exiting process's own pid, so `--verify-only` can tell "a NEW
+    /// pid showed up" apart from "the old process is still mid-teardown".
+    #[arg(long, hide = true)]
     pub(crate) verify_pre_pid: Option<u32>,
 }
 
@@ -39,15 +107,16 @@ pub(crate) struct VerifyOnlyArgs {
 /// proved not to be enough on a busy systemd host: a **pre-restart stale-unit
 /// warning**, and a **post-restart relaunch verification with supervisor
 /// self-heal** ([`verify_relaunch`]).
-pub(crate) async fn handle_restart_command(
-    drain: bool,
-    timeout: Option<u64>,
-    force_after_timeout: bool,
-    abort_drain: bool,
-    then_exit: bool,
-    reload_supervisor: bool,
-    verify: VerifyOnlyArgs,
-) -> Result<()> {
+pub(crate) async fn handle_restart_command(args: RestartArgs) -> Result<()> {
+    let RestartArgs {
+        drain,
+        timeout,
+        force_after_timeout,
+        abort_drain,
+        then_exit,
+        reload_supervisor,
+        verify,
+    } = args;
     // Issue #6969: `--verify-only` never talks to a daemon at all — it is the
     // detached child `restart_verify::spawn_detached_verifier` execs right
     // before an in-process `DrainAndRestartDaemon` exit (the auto-update

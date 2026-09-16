@@ -5166,53 +5166,28 @@ fn test_supervisor_branch_follows_live_then_exit() {
 /// **distinct**, so a host log tells an operator which terminal action fired
 /// without guessing. Asserted against the exact bodies
 /// `run_drain_supervisor`'s `DrainTick::Complete` arm emits.
+///
+/// Also Issue #6969 AC2 — the relaunch line states BOTH the expected
+/// relaunch path (which supervisor mechanism) and the detached verifier's
+/// bound, so a future gap (the ~4-minute launchd observation this issue
+/// records) is attributable from the log alone; the then_exit branch has no
+/// relaunch to verify, so it must not carry that note even though a bound is
+/// technically passed in.
 #[test]
 fn test_drain_complete_log_lines_remain_distinct() {
-    let then_exit_line = drain_complete_log_line(true, "launchd", 30);
-    let relaunch_line = drain_complete_log_line(false, "launchd", 30);
+    let then_exit_line = drain_complete_log_line(true, "launchd", 45);
+    let relaunch_line = drain_complete_log_line(false, "launchd", 45);
     assert_ne!(then_exit_line, relaunch_line);
     assert!(then_exit_line.contains("staying down"));
     assert!(then_exit_line.contains("143"));
     assert!(relaunch_line.contains("supervised relaunch"));
     assert!(!relaunch_line.contains("staying down"));
-}
-
-/// Issue #6969 AC2 — the relaunch line states BOTH the expected relaunch
-/// path (which supervisor mechanism) and the detached verifier's bound, so
-/// a future gap (the ~4-minute launchd observation this issue records) is
-/// attributable from the log alone.
-#[test]
-fn test_drain_complete_log_line_states_relaunch_path_and_verifier_bound() {
-    let relaunch_line = drain_complete_log_line(false, "launchd", 45);
-    assert!(relaunch_line.contains("launchd"));
+    // "KeepAlive" only appears in the launchd-specific mechanism wording, so
+    // this subsumes a separate `.contains("launchd")` check.
     assert!(relaunch_line.contains("KeepAlive"));
     assert!(relaunch_line.contains("45s"));
     assert!(relaunch_line.contains("verify-only"));
-    // The then_exit branch has no relaunch to verify, so it must not carry
-    // the note even though a bound is technically passed in.
-    let then_exit_line = drain_complete_log_line(true, "launchd", 45);
     assert!(!then_exit_line.contains("verify-only"));
-}
-
-#[test]
-fn test_relaunch_verify_note_names_path_and_bound() {
-    let note = relaunch_verify_note("systemd", 30);
-    assert!(note.contains("systemd"));
-    assert!(note.contains("30s"));
-    assert!(note.contains("watchdog"));
-    // #7707 review: the systemd note must flag the detached verifier as
-    // best-effort rather than promising a bound `KillMode=mixed` prevents
-    // it from delivering; the launchd note carries no such caveat because
-    // `process_group(0)` really does let the child survive there.
-    assert!(
-        note.contains("best-effort under systemd"),
-        "expected the KillMode=mixed caveat, got: {note}"
-    );
-    let launchd = relaunch_verify_note("launchd", 30);
-    assert!(
-        !launchd.contains("best-effort"),
-        "launchd's verifier is not best-effort — it survives the pgid sweep: {launchd}"
-    );
 }
 
 /// Issue #5340 (AC: the `TimedOutRefuse` message names the exact local

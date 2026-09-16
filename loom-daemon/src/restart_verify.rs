@@ -385,6 +385,51 @@ pub fn resolve_secs(raw: Option<&str>, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Resolve the configured post-restart verification poll bound from
+/// [`POLL_SECS_ENV`] (or [`DEFAULT_POLL_SECS`]) — the exact knob
+/// [`verify_and_heal`] itself resolves, so every caller describing this bound
+/// in a log line (Issue #6969) can never disagree with the verifier that
+/// actually polls against it.
+#[must_use]
+pub fn resolve_configured_poll_secs() -> u64 {
+    resolve_secs(std::env::var(POLL_SECS_ENV).ok().as_deref(), DEFAULT_POLL_SECS)
+}
+
+/// The shared "here is what confirms this relaunch, and by when" sentence
+/// appended to every in-process drain-and-restart exit that expects a
+/// relaunch (Issue #6969 AC2 — the auto-update roll's own "drain-and-restart
+/// triggered" note states the expected relaunch path and the verifier's
+/// bound, so a future gap like the one this issue observed — a launchd
+/// relaunch that took ~4 minutes — is attributable from the log alone).
+///
+/// Extracted as a pure function so the exact wording is a test assertion.
+#[must_use]
+pub fn relaunch_verify_note(supervisor: &str, verify_poll_secs: u64) -> String {
+    let mechanism = if supervisor.eq_ignore_ascii_case("launchd") {
+        "launchd KeepAlive.SuccessfulExit"
+    } else if supervisor.eq_ignore_ascii_case("systemd") {
+        "systemd Restart=on-success"
+    } else {
+        "the supervisor's own relaunch-on-success policy"
+    };
+    // #7707 review: on systemd the detached verifier lives in the unit's own
+    // cgroup, which `KillMode=mixed` SIGKILLs the instant the main process
+    // exits — so the note must not promise a 30s bound there. See this
+    // module's doc, "What this actually closes".
+    let verifier_caveat = if supervisor.eq_ignore_ascii_case("systemd") {
+        " NOTE: that child is best-effort under systemd (KillMode=mixed kills this unit's cgroup \
+         on main-process exit), so the watchdog is in practice the real bound here."
+    } else {
+        ""
+    };
+    format!(
+        "Expected relaunch path: {mechanism}. A detached `restart --verify-only` child will \
+         confirm a new, live pid within {verify_poll_secs}s or self-heal \
+         (kickstart/reset-failed+start); the unattended watchdog poll (~300s) is the outer bound \
+         if that also fails to confirm.{verifier_caveat}"
+    )
+}
+
 /// Read the poll interval, which the shell implementation allows to be
 /// fractional (e.g. `0.2`). Falls back to [`DEFAULT_POLL_INTERVAL_MS`] on
 /// absent/unparsable/non-positive input.
@@ -1010,6 +1055,21 @@ pub fn spawn_detached_verifier(supervisor: Supervisor, pre_pid: u32) {
     }
 }
 
+/// Re-detect the current supervisor label ([`crate::ipc::detect_supervisor`],
+/// falling back to `"supervisor"` the same way every `run_drain_supervisor`
+/// exit point already does) and spawn [`spawn_detached_verifier`] against it
+/// — a no-op on an unrecognized label, since there is nothing to verify
+/// against. Bundles both steps (Issue #6969) so `ipc.rs`'s two
+/// `run_drain_supervisor` exit points share one call instead of each
+/// re-detecting the supervisor and parsing it themselves.
+pub fn detect_and_spawn_verifier(pre_pid: u32) -> String {
+    let sup = crate::ipc::detect_supervisor().unwrap_or_else(|| "supervisor".to_string());
+    if let Some(supervisor) = Supervisor::parse(&sup) {
+        spawn_detached_verifier(supervisor, pre_pid);
+    }
+    sup
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1028,6 +1088,27 @@ mod tests {
         assert_eq!(Supervisor::parse(""), None);
         assert_eq!(Supervisor::Launchd.as_str(), "launchd");
         assert_eq!(Supervisor::Systemd.as_str(), "systemd");
+    }
+
+    /// #7707 review: the systemd note must flag the detached verifier as
+    /// best-effort rather than promising a bound `KillMode=mixed` prevents it
+    /// from delivering; the launchd note carries no such caveat because
+    /// `process_group(0)` really does let the child survive there.
+    #[test]
+    fn relaunch_verify_note_names_path_and_bound() {
+        let note = relaunch_verify_note("systemd", 30);
+        assert!(note.contains("systemd"));
+        assert!(note.contains("30s"));
+        assert!(note.contains("watchdog"));
+        assert!(
+            note.contains("best-effort under systemd"),
+            "expected the KillMode=mixed caveat, got: {note}"
+        );
+        let launchd = relaunch_verify_note("launchd", 30);
+        assert!(
+            !launchd.contains("best-effort"),
+            "launchd's verifier is not best-effort — it survives the pgid sweep: {launchd}"
+        );
     }
 
     #[test]
