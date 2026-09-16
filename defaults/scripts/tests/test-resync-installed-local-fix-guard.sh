@@ -275,6 +275,57 @@ else
     fail "(#7864) a no-history installed file was incorrectly blocked (rc=$RC); out=$OUT"
 fi
 
+# Exercise the real installer through its commit, stopping at the first push.
+# The wrapper prevents network access; all local Git operations remain real.
+echo "Test group 8: real installer commit provenance"
+INSTALLER="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)/scripts/install/create-pr.sh"
+export LOOM_TEST_REAL_GIT
+LOOM_TEST_REAL_GIT="$(command -v git)"
+mkdir -p "$WORKDIR/git-bin"
+cat > "$WORKDIR/git-bin/git" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "push" ]]; then
+    echo "TEST_STOP_BEFORE_PUSH" >&2
+    exit 97
+fi
+exec "$LOOM_TEST_REAL_GIT" "$@"
+SH
+chmod +x "$WORKDIR/git-bin/git"
+for INSTALL_CASE in normal skip-ci custom-fix; do
+    REPO8="$(make_fixture)"
+    git -C "$REPO8" remote add origin https://github.com/example/fixture.git
+    printf 'OLD\nINSTALLER-CONTENT\n' > "$REPO8/.loom/hooks/guard.sh"
+    SKIP_CASE=false
+    CUSTOM_MESSAGE=""
+    [[ "$INSTALL_CASE" == skip-ci ]] && SKIP_CASE=true
+    [[ "$INSTALL_CASE" == custom-fix ]] && CUSTOM_MESSAGE="fix(guard): preserve a custom installer hotfix"
+    BEFORE_INSTALL="$(git -C "$REPO8" rev-parse HEAD)"
+    INSTALL_OUT="$(PATH="$WORKDIR/git-bin:$PATH" LOOM_VERSION=0.19.60 \
+        LOOM_COMMIT=fixture SKIP_TARGET_CI="$SKIP_CASE" COMMIT_MSG="$CUSTOM_MESSAGE" \
+        bash "$INSTALLER" "$REPO8" main 2>&1)"
+    INSTALL_RC=$?
+    if [[ $INSTALL_RC -ne 0 ]] && [[ "$BEFORE_INSTALL" != "$(git -C "$REPO8" rev-parse HEAD)" ]] \
+        && [[ "$INSTALL_OUT" == *TEST_STOP_BEFORE_PUSH* ]]; then
+        pass "real installer committed $INSTALL_CASE and stopped before network access"
+    else
+        fail "installer fixture failed for $INSTALL_CASE: $INSTALL_OUT"
+        continue
+    fi
+    OUT="$(cd "$REPO8" && bash "$SCRIPT" 2>&1)"
+    RC=$?
+    if [[ "$INSTALL_CASE" == custom-fix ]]; then
+        if [[ $RC -eq 1 ]] && [[ "$(cat "$REPO8/.loom/hooks/guard.sh")" == $'OLD\nINSTALLER-CONTENT' ]]; then
+            pass "custom installer fix message remains protected"
+        else
+            fail "custom installer fix was not protected: $OUT"
+        fi
+    elif [[ $RC -eq 0 ]] && [[ "$(cat "$REPO8/.loom/hooks/guard.sh")" == A ]]; then
+        pass "real $INSTALL_CASE install permits routine upstream resync"
+    else
+        fail "real $INSTALL_CASE install falsely blocks routine resync: $OUT"
+    fi
+done
+
 # --- summary -----------------------------------------------------------------
 echo ""
 echo "========================================"

@@ -951,9 +951,9 @@ record_blocked() {
 #      (nothing removed) is the overwhelmingly common shape of a routine
 #      upstream improvement and is never gated; and
 #   2. the installed file's own git history shows its most recent change was
-#      NOT a routine install/resync commit (the "chore: install Loom vX.Y.Z"
-#      the installer makes, or a later "chore: resync installed Loom
-#      surfaces") — i.e. its content has diverged from pure upstream lineage
+#      NOT a routine install/resync commit. Recognize the current installer
+#      subject (with optional "[skip ci]"), legacy install and resync subjects.
+#      Any other last touch means the installed content has diverged
 #      since the last time Loom's own tooling touched it, exactly the
 #      #98/#100 shape. A file whose last touch WAS one of those (or that has
 #      no git history at all — nothing to protect) is never gated, regardless
@@ -965,7 +965,7 @@ record_blocked() {
 # only asks "would this specific write destroy content that was NOT put there
 # by Loom's own install/resync tooling", which is exactly the condition the
 # incident hinged on.
-RESYNC_COMMIT_SUBJECT_RE='^(chore: install Loom v[0-9]|chore: resync installed Loom surfaces$)'
+RESYNC_COMMIT_SUBJECT_RE='^(chore: install Loom v[0-9]|chore: resync installed Loom surfaces$|(\[skip ci\] )?chore\(loom\): Install Loom [^[:space:]]+ orchestration framework$)'
 
 # removed_line_count <src> <dst>
 #   Count of non-blank lines present in dst but ABSENT from src (a line-SET
