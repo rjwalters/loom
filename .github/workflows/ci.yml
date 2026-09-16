@@ -443,6 +443,36 @@ jobs:
       - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
         run: bash scripts/check-docs-defaults-parity.sh
 
+  guard-scan-contracts:
+    name: Guard Scan-String Tier Contracts
+    # Cheap structural check; always runs. guard-destructive-generic.sh decides
+    # "is this executable code or inert data?" by building a chain of LOSSY
+    # derived copies of $COMMAND (regex/awk masking passes); each derivation's
+    # masking was only ever proven safe for ONE consumer tier (ask-only <
+    # deny-safe < catastrophic-safe), a claim that used to be prose only. It was
+    # violated once already (#6252, see ADR-0016): an ask-justified masking pass
+    # was routed into a deny-emitting write-confinement check, silently
+    # converting an accepted-risk tradeoff (a missed ask) into a security bypass
+    # (a missed deny). Nobody changed the masking — they added a reader.
+    # check-guard-scan-contracts.sh (#7755) makes the reservation
+    # machine-checkable: every derived scan copy carries a
+    # `# scan-contract: <VAR>=<TIER> from=<PARENT>` marker, every deny()/ask()
+    # call carries a `# scan-reads: <VAR>[,...]` marker, each site's own tier is
+    # derived mechanically from the line, and the job fails when a site decides
+    # at a stricter tier than the copy it reads was declared for (or when a copy
+    # is declared safer than the copy it was derived from). Inventory:
+    # defaults/docs/guard-scan-contracts.md. The self-test step
+    # regression-tests the checker itself against synthetic fixtures
+    # reproducing that exact bypass shape.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Self-test the checker against synthetic fixtures
+        run: bash scripts/check-guard-scan-contracts.sh --self-test
+      - name: Check guard-destructive-generic.sh's scan-string tier contracts
+        run: bash scripts/check-guard-scan-contracts.sh
+
   doc-tocs:
     name: Doc Table-of-Contents Freshness
     # Cheap structural check; always runs. Claude PREVIEWS a doc reached through

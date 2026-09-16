@@ -1,0 +1,1 @@
+../../defaults/docs/guard-scan-contracts.md
