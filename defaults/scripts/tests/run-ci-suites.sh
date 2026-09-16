@@ -392,7 +392,10 @@ for suite in "${suites[@]}"; do
     running=$((running + 1))
     if [[ "$running" -ge "$PARALLELISM" ]]; then
         wait "${_RUN_PIDS[0]}" 2>/dev/null || true
-        _RUN_PIDS=(${_RUN_PIDS[@]:1})
+        # Quoted: SC2206. Safe under `set -u` on bash 3.2 because an array
+        # SLICE of an empty/exhausted array expands to nothing rather than
+        # tripping the unbound-variable error that bare "${arr[@]}" does there.
+        _RUN_PIDS=("${_RUN_PIDS[@]:1}")
         running=$((running - 1))
     fi
 done
