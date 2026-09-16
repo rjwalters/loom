@@ -53,20 +53,6 @@ mod gh_shapes {
         pub number: i64,
     }
 
-    /// `--json state` → `{"state":"OPEN"}`
-    #[derive(Debug, Deserialize)]
-    pub(super) struct Stated {
-        #[serde(default)]
-        pub state: String,
-    }
-
-    /// `--json title` → `{"title":"..."}`
-    #[derive(Debug, Deserialize)]
-    pub(super) struct Titled {
-        #[serde(default)]
-        pub title: String,
-    }
-
     /// `--json files` → `{"files":[{"path":..,"additions":..,"deletions":..}]}`
     #[derive(Debug, Deserialize)]
     pub(super) struct Filed {
@@ -91,6 +77,20 @@ mod gh_shapes {
 /// same way. What changes is that a malformed response is no longer silently
 /// identical to "this PR has no labels".
 fn gh_label_names(entity: &str, number: i64, repo_root: &Path) -> Vec<String> {
+    match gh_labels_query(entity, number, repo_root) {
+        Query::Populated(names) => names,
+        _ => Vec::new(),
+    }
+}
+
+/// Label names, keeping the outcome classification.
+///
+/// Callers that must tell "this has no labels" from "the labels could not be
+/// read" use this directly. Under `--jq .labels[].name` those were the same
+/// thing — both produced no lines — so a forge hiccup read as an unlabelled
+/// issue, which is how a Curator check could silently pass on a PR nobody had
+/// looked at.
+fn gh_labels_query(entity: &str, number: i64, repo_root: &Path) -> Query<Vec<String>> {
     let n = number.to_string();
     let q: Query<gh_shapes::Labelled> = super::gh_query(
         &[entity, "view", &n, "--json", "labels"],
@@ -99,8 +99,49 @@ fn gh_label_names(entity: &str, number: i64, repo_root: &Path) -> Vec<String> {
         |l: &gh_shapes::Labelled| l.labels.is_empty(),
     );
     match q {
-        Query::Populated(l) => l.labels.into_iter().map(|x| x.name).collect(),
-        _ => Vec::new(),
+        Query::Populated(l) => Query::Populated(l.labels.into_iter().map(|x| x.name).collect()),
+        Query::Empty => Query::Empty,
+        Query::Malformed { raw, error } => Query::Malformed { raw, error },
+        Query::Failed { status, stderr } => Query::Failed { status, stderr },
+        Query::Unavailable(u) => Query::Unavailable(u),
+    }
+}
+
+/// One string field of an issue/PR via `--json <field>`, classified.
+///
+/// The field name is dynamic, so this decodes to a JSON object and pulls the
+/// named key rather than using a per-field struct. The four-way classification
+/// is what matters here and survives: a missing key or a non-string value is
+/// `Malformed`, an empty string is `Empty`, and a failed command stays `Failed`
+/// — distinctions `--jq .<field>` flattened into one empty string.
+fn gh_string_field(
+    entity: &str,
+    number: i64,
+    field: &str,
+    repo_root: &Path,
+    use_cache: bool,
+) -> Query<String> {
+    let n = number.to_string();
+    let outcome = run_gh(&[entity, "view", &n, "--json", field], repo_root, use_cache);
+    let q: Query<serde_json::Map<String, serde_json::Value>> =
+        crate::cmd_out::decode_json(outcome, |m: &serde_json::Map<String, serde_json::Value>| {
+            m.get(field)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+        });
+    match q {
+        Query::Populated(m) => match m.get(field).and_then(serde_json::Value::as_str) {
+            Some(v) => Query::Populated(v.to_string()),
+            None => Query::Malformed {
+                raw: Vec::new(),
+                error: format!("response had no string field `{field}`"),
+            },
+        },
+        Query::Empty => Query::Empty,
+        Query::Malformed { raw, error } => Query::Malformed { raw, error },
+        Query::Failed { status, stderr } => Query::Failed { status, stderr },
+        Query::Unavailable(u) => Query::Unavailable(u),
     }
 }
 
@@ -370,35 +411,24 @@ fn find_pr_for_issue(
     cached_pr: Option<i64>,
 ) -> Option<(i64, &'static str)> {
     if let Some(cached) = cached_pr {
-        let cached_s = cached.to_string();
-        let r = run_gh(
-            &["pr", "view", &cached_s, "--json", "state", "--jq", ".state"],
-            repo_root,
-            true,
-        );
-        if r.succeeded() && r.stdout_trimmed() == "OPEN" {
+        // #7810 PR 2: only a decoded "OPEN" counts. Previously a failed query
+        // produced an empty string that merely failed the `== "OPEN"` compare,
+        // so "the PR is closed" and "we could not check" took the same path.
+        if matches!(
+            gh_string_field("pr", cached, "state", repo_root, true),
+            Query::Populated(ref st) if st == "OPEN"
+        ) {
             return Some((cached, "caller_cached"));
         }
     }
 
     let head = format!("feature/issue-{issue}");
-    let r = run_gh(
+    if let Some(pr) = gh_first_pr_number(
         &[
-            "pr",
-            "list",
-            "--head",
-            &head,
-            "--state",
-            "open",
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number",
+            "pr", "list", "--head", &head, "--state", "open", "--json", "number",
         ],
         repo_root,
-        true,
-    );
-    if let Some(pr) = parse_pr_number(&r.stdout_lossy()) {
+    ) {
         return Some((pr, "branch_name"));
     }
 
@@ -408,23 +438,12 @@ fn find_pr_for_issue(
         ("Resolves", "resolves_keyword"),
     ] {
         let search = format!("{keyword} #{issue}");
-        let r = run_gh(
+        if let Some(pr) = gh_first_pr_number(
             &[
-                "pr",
-                "list",
-                "--search",
-                &search,
-                "--state",
-                "open",
-                "--json",
-                "number",
-                "--jq",
-                ".[0].number",
+                "pr", "list", "--search", &search, "--state", "open", "--json", "number",
             ],
             repo_root,
-            true,
-        );
-        if let Some(pr) = parse_pr_number(&r.stdout_lossy()) {
+        ) {
             return Some((pr, found_by));
         }
     }
@@ -484,11 +503,12 @@ pub fn closing_references(body: &str) -> Vec<(String, i64)> {
 /// may have solved a different issue than the one being validated.
 fn ensure_pr_body_references_issue(repo_root: &Path, pr: i64, issue: i64, task_id: Option<&str>) {
     let pr_s = pr.to_string();
-    let r = run_gh(&["pr", "view", &pr_s, "--json", "body", "--jq", ".body"], repo_root, true);
-    let mut body = if r.succeeded() {
-        r.stdout_trimmed().to_string()
-    } else {
-        String::new()
+    // Best-effort: an unreadable body and an empty body are both "nothing to
+    // work from" here, so the collapse is kept — but it is now stated, and a
+    // malformed response can no longer arrive looking like real body text.
+    let mut body = match gh_string_field("pr", pr, "body", repo_root, true) {
+        Query::Populated(b) => b.trim().to_string(),
+        _ => String::new(),
     };
 
     let refs = closing_references(&body);
@@ -584,18 +604,18 @@ pub fn generic_title_reason(title: &str) -> Option<&'static str> {
 /// validation here would disrupt the pipeline. The warning surfaces in logs and
 /// milestones so the pattern can be tracked.
 fn warn_generic_pr_title(repo_root: &Path, pr: i64, task_id: Option<&str>) {
-    let pr_s = pr.to_string();
-    let r = run_gh(&["pr", "view", &pr_s, "--json", "title", "--jq", ".title"], repo_root, true);
-    if !r.succeeded() {
+    let Query::Populated(title) = gh_string_field("pr", pr, "title", repo_root, true) else {
+        // No title, or no answer — either way there is nothing to pattern-match,
+        // and this is advisory, so stay silent rather than warn on a guess.
         return;
-    }
-    if let Some(pattern) = generic_title_reason(&r.stdout_trimmed()) {
+    };
+    if let Some(pattern) = generic_title_reason(title.trim()) {
         report_milestone(
             task_id,
             repo_root,
             &format!(
                 "warning: PR #{pr} has generic title matching anti-pattern /{pattern}/: {:?}",
-                r.stdout_trimmed()
+                title.trim()
             ),
         );
     }
@@ -636,42 +656,36 @@ fn closing_reference_only_line(line: &str) -> Option<i64> {
 /// Enrich a PR body that carries no meaningful summary.
 fn recover_minimal_pr_body(repo_root: &Path, pr: i64, issue: i64, task_id: Option<&str>) {
     let pr_s = pr.to_string();
-    let r = run_gh(&["pr", "view", &pr_s, "--json", "body", "--jq", ".body"], repo_root, false);
-    if !r.succeeded() {
-        return;
-    }
-    let body = {
-        let t = r.stdout_trimmed();
-        if t.is_empty() || t == "null" {
-            String::new()
-        } else {
-            t.to_string()
-        }
+    // Uncached deliberately — this reads a body it is about to rewrite.
+    //
+    // The `t == "null"` guard below is gone: it existed because `--jq .body` on
+    // a PR with no body printed the literal four characters `null`, which then
+    // had to be special-cased back into an empty string. Decoding JSON makes
+    // that a real absent/empty value instead of a magic string.
+    let body = match gh_string_field("pr", pr, "body", repo_root, false) {
+        Query::Populated(b) => b.trim().to_string(),
+        Query::Empty => String::new(),
+        // Unanswered: do not rewrite a body we could not read.
+        _ => return,
     };
     if !is_minimal_pr_body(&body) {
         return;
     }
 
-    let r = run_gh(
-        &[
-            "pr",
-            "view",
-            &pr_s,
-            "--json",
-            "files",
-            "--jq",
-            r#".files[] | "\(.path) (+\(.additions)/-\(.deletions))""#,
-        ],
+    // The only `--jq` here that FORMATTED rather than selected: it interpolated
+    // `"\(.path) (+\(.additions)/-\(.deletions))"` inside the gh subprocess.
+    // That string building now happens in Rust, where the numbers are numbers.
+    let files_q: Query<gh_shapes::Filed> = super::gh_query(
+        &["pr", "view", &pr_s, "--json", "files"],
         repo_root,
         false,
+        |f: &gh_shapes::Filed| f.files.is_empty(),
     );
-    let file_lines: Vec<String> = if r.succeeded() {
-        r.stdout_lossy()
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
+    let file_lines: Vec<String> = if let Query::Populated(f) = files_q {
+        f.files
+            .iter()
             .take(25)
-            .map(|l| format!("- `{l}`"))
+            .map(|c| format!("- `{} (+{}/-{})`", c.path, c.additions, c.deletions))
             .collect()
     } else {
         Vec::new()
@@ -935,22 +949,11 @@ fn gather_builder_diagnostics(repo_root: &Path, issue: i64, worktree: &str) -> B
     }
 
     // Issue labels.
-    let issue_s = issue.to_string();
-    let r = run_gh(
-        &[
-            "issue",
-            "view",
-            &issue_s,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-        repo_root,
-        true,
-    );
-    if r.succeeded() && !r.stdout_trimmed().is_empty() {
-        diag.issue_labels = r.stdout_trimmed().replace('\n', ", ");
+    // #7810 PR 2: a diagnostic, so an unreadable label set and an unlabelled
+    // issue both leave the field blank — but only `Populated` now fills it, so
+    // a malformed response cannot masquerade as a real label list.
+    if let Query::Populated(names) = gh_labels_query("issue", issue, repo_root) {
+        diag.issue_labels = names.join(", ");
     }
 
     // Uncommitted changes on the main checkout (the workflow-violation signal).
@@ -1246,16 +1249,11 @@ pub fn conventional_pr_title(issue_title: &str, issue: i64) -> String {
 /// A recovery commit message: the issue title as a conventional commit when it
 /// can be fetched, else a file-based summary, else a generic message.
 fn derive_commit_message(repo_root: &Path, issue: i64, staged_files: &[String]) -> String {
-    let issue_s = issue.to_string();
-    let r = run_gh(
-        &[
-            "issue", "view", &issue_s, "--json", "title", "--jq", ".title",
-        ],
-        repo_root,
-        false,
-    );
-    if r.succeeded() && !r.stdout_trimmed().is_empty() {
-        return conventional_pr_title(&r.stdout_trimmed(), issue);
+    if let Query::Populated(title) = gh_string_field("issue", issue, "title", repo_root, false) {
+        let title = title.trim();
+        if !title.is_empty() {
+            return conventional_pr_title(title, issue);
+        }
     }
     if !staged_files.is_empty() {
         let names: Vec<&str> = staged_files
@@ -1282,28 +1280,31 @@ fn derive_commit_message(repo_root: &Path, issue: i64, staged_files: &[String]) 
 pub fn validate_curator(repo_root: &Path, opts: &ValidateOpts) -> ValidationResult {
     let issue = opts.issue;
     let issue_s = issue.to_string();
-    let r = run_gh(
-        &[
-            "issue",
-            "view",
-            &issue_s,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-        repo_root,
-        true,
-    );
-    if !r.succeeded() {
-        return ValidationResult::new(
-            "curator",
-            issue,
-            ValidationStatus::Failed,
-            "Could not fetch issue labels",
-        );
-    }
-    if r.stdout_lossy().lines().any(|l| l.trim() == "loom:curated") {
+    // #7810 PR 2: `Empty` (the issue genuinely has no labels) must keep flowing
+    // to the "missing loom:curated" path below, while every way of NOT KNOWING
+    // fails the check. Under `--jq .labels[].name` both produced no lines, so a
+    // forge hiccup was indistinguishable from an uncurated issue — and the old
+    // `!r.succeeded()` guard could not catch it, because `gh` had exited zero.
+    let labels: Vec<String> = match gh_labels_query("issue", issue, repo_root) {
+        Query::Populated(names) => names,
+        Query::Empty => Vec::new(),
+        other => {
+            return ValidationResult::new(
+                "curator",
+                issue,
+                ValidationStatus::Failed,
+                &format!(
+                    "Could not fetch issue labels ({})",
+                    if other.is_unanswered() {
+                        "unanswered"
+                    } else {
+                        "unexpected"
+                    }
+                ),
+            );
+        }
+    };
+    if labels.iter().any(|l| l.trim() == "loom:curated") {
         return ValidationResult::new(
             "curator",
             issue,
@@ -1367,32 +1368,21 @@ pub fn validate_judge(repo_root: &Path, opts: &ValidateOpts) -> ValidationResult
             "PR number required for judge phase validation",
         );
     };
-    let pr_s = pr.to_string();
-    let probe = run_gh(
-        &[
-            "pr",
-            "view",
-            &pr_s,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-        repo_root,
-        true,
-    );
-    if !probe.succeeded() {
-        return ValidationResult::new(
-            "judge",
-            issue,
-            ValidationStatus::Failed,
-            "Could not fetch PR labels",
-        );
-    }
-    let labels_raw = probe.stdout_lossy();
-    let labels: Vec<&str> = labels_raw.lines().map(str::trim).collect();
-
-    if labels.contains(&"loom:pr") {
+    // #7810 PR 2: `Empty` — a PR with no labels at all — is a real answer and
+    // must reach the checks below. Only a genuinely unanswered query fails here.
+    let labels: Vec<String> = match gh_labels_query("pr", pr, repo_root) {
+        Query::Populated(names) => names,
+        Query::Empty => Vec::new(),
+        _ => {
+            return ValidationResult::new(
+                "judge",
+                issue,
+                ValidationStatus::Failed,
+                "Could not fetch PR labels",
+            );
+        }
+    };
+    if labels.iter().any(|l| l.trim() == "loom:pr") {
         return ValidationResult::new(
             "judge",
             issue,
@@ -1400,7 +1390,7 @@ pub fn validate_judge(repo_root: &Path, opts: &ValidateOpts) -> ValidationResult
             format!("PR #{pr} approved (loom:pr)"),
         );
     }
-    if labels.contains(&"loom:changes-requested") {
+    if labels.iter().any(|l| l.trim() == "loom:changes-requested") {
         return ValidationResult::new(
             "judge",
             issue,
@@ -1412,7 +1402,7 @@ pub fn validate_judge(repo_root: &Path, opts: &ValidateOpts) -> ValidationResult
     // Issue #1998: after Doctor applies fixes it removes
     // `loom:changes-requested` and adds `loom:review-requested`. Seeing that
     // here is an expected intermediate state, worth naming distinctly.
-    let msg = if labels.contains(&"loom:review-requested") {
+    let msg = if labels.iter().any(|l| l.trim() == "loom:review-requested") {
         format!(
             "PR #{pr} has loom:review-requested (Doctor applied fixes) but judge did not \
              produce outcome label yet"
@@ -1446,33 +1436,21 @@ pub fn validate_doctor(repo_root: &Path, opts: &ValidateOpts) -> ValidationResul
             "PR number required for doctor phase validation",
         );
     };
-    let pr_s = pr.to_string();
-    let probe = run_gh(
-        &[
-            "pr",
-            "view",
-            &pr_s,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-        repo_root,
-        true,
-    );
-    if !probe.succeeded() {
-        return ValidationResult::new(
-            "doctor",
-            issue,
-            ValidationStatus::Failed,
-            "Could not fetch PR labels",
-        );
-    }
-    if probe
-        .stdout_lossy()
-        .lines()
-        .any(|l| l.trim() == "loom:review-requested")
-    {
+    // #7810 PR 2: `Empty` — a PR with no labels at all — is a real answer and
+    // must reach the checks below. Only a genuinely unanswered query fails here.
+    let labels: Vec<String> = match gh_labels_query("pr", pr, repo_root) {
+        Query::Populated(names) => names,
+        Query::Empty => Vec::new(),
+        _ => {
+            return ValidationResult::new(
+                "doctor",
+                issue,
+                ValidationStatus::Failed,
+                "Could not fetch PR labels",
+            );
+        }
+    };
+    if labels.iter().any(|l| l.trim() == "loom:review-requested") {
         return ValidationResult::new(
             "doctor",
             issue,
@@ -1534,14 +1512,11 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     }
 
     // Already-closed issue: a close with no PR means the Builder abandoned it.
-    let state = run_gh(
-        &[
-            "issue", "view", &issue_s, "--json", "state", "--jq", ".state",
-        ],
-        repo_root,
-        true,
-    );
-    if state.succeeded() && state.stdout_trimmed() == "CLOSED" {
+    let state = gh_string_field("issue", issue, "state", repo_root, true);
+    // Only a decoded "CLOSED" counts as closed. An unanswered query must not
+    // conclude the issue is closed — that path declares the Builder abandoned
+    // the work, which is not something to infer from a forge hiccup.
+    if matches!(state, Query::Populated(ref st) if st == "CLOSED") {
         if let Some((pr, _)) = find_pr_for_issue(repo_root, issue, opts.pr_number) {
             return ValidationResult::new(
                 "builder",
@@ -1552,23 +1527,13 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
         }
         // Merged PRs do not appear in an open search.
         let head = format!("feature/issue-{issue}");
-        let merged = run_gh(
+        let merged = gh_first_pr_number(
             &[
-                "pr",
-                "list",
-                "--head",
-                &head,
-                "--state",
-                "merged",
-                "--json",
-                "number",
-                "--jq",
-                ".[0].number",
+                "pr", "list", "--head", &head, "--state", "merged", "--json", "number",
             ],
             repo_root,
-            true,
         );
-        if let Some(pr) = parse_pr_number(&merged.stdout_lossy()) {
+        if let Some(pr) = merged {
             return ValidationResult::new(
                 "builder",
                 issue,
@@ -1863,17 +1828,11 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     }
 
     let rate_limited = is_rate_limited_builder_exit(repo_root, issue);
-    let title_probe = run_gh(
-        &[
-            "issue", "view", &issue_s, "--json", "title", "--jq", ".title",
-        ],
-        repo_root,
-        true,
-    );
-    let raw_title = if title_probe.succeeded() {
-        title_probe.stdout_trimmed()
-    } else {
-        String::new()
+    // An unreadable title falls back to the generic conventional-commit title,
+    // exactly as before — `conventional_pr_title` handles an empty input.
+    let raw_title = match gh_string_field("issue", issue, "title", repo_root, true) {
+        Query::Populated(t) => t.trim().to_string(),
+        _ => String::new(),
     };
     let pr_title = conventional_pr_title(&raw_title, issue);
     let pr_body = build_recovery_pr_body(issue, worktree, rate_limited);

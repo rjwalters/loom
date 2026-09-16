@@ -351,7 +351,7 @@ where
     F: FnOnce(&T) -> bool,
 {
     debug_assert!(
-        !args.iter().any(|a| *a == "--jq"),
+        !args.contains(&"--jq"),
         "gh_json decodes in-process; passing --jq flattens the JSON in the subprocess \
          and reintroduces the ambiguity this exists to remove"
     );
