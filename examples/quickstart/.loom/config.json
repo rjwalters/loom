@@ -10,7 +10,6 @@
       "role": "default",
       "roleConfig": {
         "workerType": "none",
-        "roleFile": "default.md",
         "targetInterval": 0,
         "intervalPrompt": ""
       },
@@ -20,13 +19,13 @@
     {
       "configId": "terminal-2",
       "id": "__needs_session__",
-      "name": "Worker",
+      "name": "Builder",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "worker.md",
+        "roleFile": "builder.md",
         "targetInterval": 0,
         "intervalPrompt": "Find and implement loom:issue issues"
       },
@@ -36,13 +35,13 @@
     {
       "configId": "terminal-3",
       "id": "__needs_session__",
-      "name": "Reviewer",
+      "name": "Judge",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "reviewer.md",
+        "roleFile": "judge.md",
         "targetInterval": 0,
         "intervalPrompt": "Find and review PRs with loom:review-requested label"
       },
