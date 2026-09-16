@@ -558,55 +558,9 @@ run_cdb --issue 5 --repo o/r --check-defer
 assert_eq "1" "$RC" "one merits finding disqualifies the whole set"
 assert_contains "$OUT" "REASON: merits-finding" "mixed set reports merits-finding"
 
-echo
-echo "--- #7904: a premise-false finding mixed with a genuine open dependency still DEFERS ---"
-# #7657 added a separate premise-false close gate to champion-issue-promo.md;
-# its own acceptance criteria require that a MIXED premise-false + open-
-# dependency finding set still defer via THIS gate, not fall through to
-# escalation. A [premise-false]-tagged bullet is not itself dependency-
-# attributable, so it must be excluded from the "every finding must be
-# dependency-shaped" check rather than disqualifying the whole set.
-reset_state
-issue_fixture 'o/r#5' OPEN 'A proposal. Blocked by #3.' 'loom:architect' \
-    '**Champion Review: NEEDS REVISION**
-
-- [premise-false] Criterion 8: `src/does/not/exist.rs` is not on `origin/main` -- verified via: `git ls-tree -r origin/main --name-only | grep -Fx src/does/not/exist.rs` (no output).
-- Technical Feasibility: depends on #3, still open.
-'
-issue_fixture 'o/r#3' OPEN 'Still open.' ''
-run_cdb --issue 5 --repo o/r --check-defer
-assert_eq "0" "$RC" "exit 0 - a premise-false bullet does not disqualify an otherwise-deferrable set (#7904)"
-assert_contains "$OUT" "DEFER" "DEFER marker present"
-assert_contains "$OUT" "OPEN_BLOCKERS: o/r#3" "the open blocker is still named with the premise-false bullet stripped"
-
-echo
-echo "--- #7904: EVERY finding premise-false -> NO_DEFER premise-false-only (falls through to the close gate) ---"
-reset_state
-issue_fixture 'o/r#5' OPEN 'A proposal.' 'loom:architect' \
-    '**Champion Review: NEEDS REVISION**
-
-- [premise-false] Criterion 6: the cited test file does not exist.
-- [premise-false] Criterion 8: the cited line range does not exist.
-'
-run_cdb --issue 5 --repo o/r --check-defer
-assert_eq "1" "$RC" "exit 1 - nothing left to defer on once premise-false bullets are stripped"
-assert_contains "$OUT" "NO_DEFER" "NO_DEFER marker present"
-assert_contains "$OUT" "REASON: premise-false-only" \
-    "a distinct reason from merits-finding, so the caller can route to the close gate instead of escalation"
-
-echo
-echo "--- REGRESSION GUARD (#7904): premise-false + an ORDINARY merits finding still escalates ---"
-reset_state
-issue_fixture 'o/r#5' OPEN 'A proposal.' 'loom:architect' \
-    '**Champion Review: NEEDS REVISION**
-
-- [premise-false] Criterion 8: the cited path does not exist.
-- Scope Appropriateness: this is three issues in one.
-'
-run_cdb --issue 5 --repo o/r --check-defer
-assert_eq "1" "$RC" "exit 1 - an ordinary merits finding alongside premise-false still escalates"
-assert_contains "$OUT" "REASON: merits-finding" \
-    "reason is merits-finding, not premise-false-only -- a real merits finding is never masked by a co-occurring premise-false bullet"
+# Premise-false interaction with --check-defer (#7904) is covered in the
+# sibling module test-classify-dependency-block-premise-false.sh -- extracted
+# to keep this file under the file-size-policy.md threshold.
 
 echo
 echo "--- REGRESSION GUARD: a real dependency CYCLE still escalates ---"

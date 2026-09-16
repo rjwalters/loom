@@ -67,6 +67,7 @@ test-check-verified-corrections-preserved.sh
 test-claim-staleness.sh
 test-classify-ac-verification.sh
 test-classify-capacity-defer.sh
+test-classify-dependency-block-premise-false.sh
 test-classify-dependency-block.sh
 test-classify-error.sh
 test-clean-stale-binary.sh
