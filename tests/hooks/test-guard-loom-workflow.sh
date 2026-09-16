@@ -1707,6 +1707,52 @@ else
     dlw_assert "live-backtick --body value still left unredacted in the decision log (#7495)" 1 "command: ${_dlw_cmd:-<none>}"
 fi
 
+# (h-#7882) DEFAULT decision-log path (no LOOM_GUARD_DECISION_LOG_FILE seam)
+# must not depend on whether the guard ran from an INSTALLED copy
+# (.loom/hooks/) or from its SOURCE location (defaults/hooks/). The old
+# ${SCRIPT_DIR}/../logs expression sent a source-location invocation's live
+# telemetry into defaults/logs/ — inside the VENDORED tree that is
+# copy-installed into every consumer repo and scanned by
+# scripts/check-vendored-private-refs.sh. Resolution is kept in lockstep with
+# guard-destructive-generic.sh, so this mirrors that suite's (k)/(l) cases.
+_dlw_nonrepo="$(mktemp -d)"
+_dlw_resolver="$REPO_ROOT/defaults/scripts/lib/config-resolver.sh"
+
+_dlw_src_root="$(mktemp -d)"
+mkdir -p "$_dlw_src_root/defaults/hooks" "$_dlw_src_root/defaults/scripts/lib"
+cp "$GUARD" "$_dlw_src_root/defaults/hooks/guard-loom-workflow.sh"
+cp "$_dlw_resolver" "$_dlw_src_root/defaults/scripts/lib/config-resolver.sh" 2>/dev/null || true
+make_input "gh pr merge 123" "$_dlw_nonrepo" | \
+    env LOOM_GUARD_DECISION_LOG=1 \
+        "$_dlw_src_root/defaults/hooks/guard-loom-workflow.sh" >/dev/null 2>&1 || true
+_dlw_src_rec="$(tail -1 "$_dlw_src_root/.loom/logs/guard-decisions.log" 2>/dev/null)" || _dlw_src_rec=""
+if [[ ! -e "$_dlw_src_root/defaults/logs" ]] && \
+   [[ "$(printf '%s' "$_dlw_src_rec" | jq -r '.decision' 2>/dev/null)" == "deny" ]]; then
+    dlw_assert "#7882: source layout (defaults/hooks/) logs to .loom/logs/, never defaults/logs/" 0
+else
+    dlw_assert "#7882: source layout (defaults/hooks/) logs to .loom/logs/, never defaults/logs/" 1 \
+        "defaults/logs present: $( [[ -e "$_dlw_src_root/defaults/logs" ]] && echo yes || echo no ); record: ${_dlw_src_rec:-<none>}"
+fi
+
+_dlw_inst_root="$(mktemp -d)"
+mkdir -p "$_dlw_inst_root/.loom/hooks" "$_dlw_inst_root/.loom/scripts/lib"
+cp "$GUARD" "$_dlw_inst_root/.loom/hooks/guard-loom-workflow.sh"
+cp "$_dlw_resolver" "$_dlw_inst_root/.loom/scripts/lib/config-resolver.sh" 2>/dev/null || true
+make_input "gh pr merge 123" "$_dlw_nonrepo" | \
+    env LOOM_GUARD_DECISION_LOG=1 \
+        "$_dlw_inst_root/.loom/hooks/guard-loom-workflow.sh" >/dev/null 2>&1 || true
+_dlw_inst_rec="$(tail -1 "$_dlw_inst_root/.loom/logs/guard-decisions.log" 2>/dev/null)" || _dlw_inst_rec=""
+if [[ "$(printf '%s' "$_dlw_inst_rec" | jq -r '.decision' 2>/dev/null)" == "deny" ]]; then
+    dlw_assert "#7882: installed layout (.loom/hooks/) still logs to .loom/logs/" 0
+else
+    dlw_assert "#7882: installed layout (.loom/hooks/) still logs to .loom/logs/" 1 \
+        "record: ${_dlw_inst_rec:-<none>}"
+fi
+
+for _dlw_fixture in "$_dlw_src_root" "$_dlw_inst_root" "$_dlw_nonrepo"; do
+    [[ -n "$_dlw_fixture" && "$_dlw_fixture" != "/" && -d "$_dlw_fixture" ]] && rm -rf "$_dlw_fixture"
+done
+
 [[ -n "$DLW_DIR" && "$DLW_DIR" != "/" && -d "$DLW_DIR" ]] && rm -rf "$DLW_DIR"
 
 echo ""

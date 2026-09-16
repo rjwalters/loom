@@ -104,6 +104,41 @@ host_allowed() {
   return 1
 }
 
+# scan_matches <ere-pattern> <dir> -> prints `file:lineno:match` lines
+#
+# This check is about what defaults/ SHIPS — i.e. committed content (#6190).
+# Untracked or gitignored local state that happens to sit under defaults/ is
+# never copy-installed anywhere, so it must not be able to fail the check: a
+# stray runtime log dropped there by a locally-invoked guard hook used to do
+# exactly that on long-lived fleet checkouts (#7882). So when the tree is
+# inside a git work tree, scan `git ls-files` instead of walking the
+# filesystem; otherwise (a --self-test fixture, or defaults/ extracted outside
+# git) fall back to the raw recursive walk so the check still works.
+#
+# Symlinks are skipped, matching `grep -r`'s traversal semantics — defaults/
+# carries symlinks (roles/*.md -> .claude/commands/loom/*.md) whose targets are
+# themselves tracked, and following both would report every violation twice.
+scan_matches() {
+  local pattern="$1" dir="$2"
+  local top prefix f
+  local -a files=()
+
+  if top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" && [[ -n "$top" ]]; then
+    prefix="$(git -C "$dir" rev-parse --show-prefix 2>/dev/null || true)"
+    while IFS= read -r -d '' f; do
+      [[ -L "$top/$f" ]] && continue
+      files+=("$f")
+    done < <(git -C "$top" ls-files -z -- "${prefix:-.}" 2>/dev/null || true)
+    [[ ${#files[@]} -eq 0 ]] && return 0
+    # The trailing /dev/null forces grep to prefix every match with its
+    # filename even when the list happens to hold exactly one file.
+    ( cd "$top" && grep -noE "$pattern" -- "${files[@]}" /dev/null 2>/dev/null ) || true
+    return 0
+  fi
+
+  grep -rnoE "$pattern" "$dir" 2>/dev/null || true
+}
+
 # scan_tree <defaults-dir> -> prints violations, returns 1 if any
 scan_tree() {
   local dir="$1"
@@ -122,7 +157,7 @@ scan_tree() {
       echo "  $file:$lineno: cross-repo reference to a non-allowlisted owner: $ref"
       violations=1
     fi
-  done < <(grep -rnoE '[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]*[A-Za-z0-9]#[0-9]+' "$dir" 2>/dev/null || true)
+  done < <(scan_matches '[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]*[A-Za-z0-9]#[0-9]+' "$dir")
 
   # 2. Hostnames.
   local host
@@ -134,7 +169,7 @@ scan_tree() {
       echo "  $file:$lineno: non-allowlisted hostname: $host"
       violations=1
     fi
-  done < <(grep -rnoE '\b[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.(com|net|org|io|dev)\b' "$dir" 2>/dev/null || true)
+  done < <(scan_matches '\b[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.(com|net|org|io|dev)\b' "$dir")
 
   return $violations
 }
@@ -174,6 +209,41 @@ EOF
     echo "self-test: OK — dirty fixture reports both the private ref and the private host"
   else
     echo "self-test: FAIL — dirty fixture was not fully detected. Got:" >&2
+    echo "$out" >&2
+    fails=1
+  fi
+
+  # Git-scoped fixture (#7882): inside a work tree the scan follows
+  # `git ls-files`, so a TRACKED private ref still fails while an UNTRACKED one
+  # (local-only state that is never copy-installed anywhere — a stray runtime
+  # log, an editor scratch file) is ignored.
+  mkdir -p "$tmp/gitrepo/defaults/docs"
+  git -C "$tmp/gitrepo" init -q >/dev/null 2>&1 || true
+  cat > "$tmp/gitrepo/defaults/docs/tracked.md" <<'EOF'
+See example-org/tool-repo#202, hosted at dashboard.example.com.
+EOF
+  git -C "$tmp/gitrepo" add defaults/docs/tracked.md >/dev/null 2>&1 || true
+  cat > "$tmp/gitrepo/defaults/docs/untracked.md" <<'EOF'
+This local-only file names PrivateOrg/secret-repo#56 at dashboard.privateorg.com.
+EOF
+  if scan_tree "$tmp/gitrepo/defaults" >/dev/null; then
+    echo "self-test: OK — untracked file under a git-tracked defaults/ is ignored"
+  else
+    echo "self-test: FAIL — untracked local state failed a check about committed content" >&2
+    scan_tree "$tmp/gitrepo/defaults" >&2 || true
+    fails=1
+  fi
+
+  cat > "$tmp/gitrepo/defaults/docs/tracked.md" <<'EOF'
+This tracked file names PrivateOrg/secret-repo#56 at dashboard.privateorg.com.
+EOF
+  git -C "$tmp/gitrepo" add defaults/docs/tracked.md >/dev/null 2>&1 || true
+  out="$(scan_tree "$tmp/gitrepo/defaults" || true)"
+  if grep -q 'PrivateOrg/secret-repo#56' <<<"$out" \
+     && grep -q 'dashboard.privateorg.com' <<<"$out"; then
+    echo "self-test: OK — tracked file under a git-tracked defaults/ is still scanned"
+  else
+    echo "self-test: FAIL — tracked violation was not detected inside a work tree. Got:" >&2
     echo "$out" >&2
     fails=1
   fi
