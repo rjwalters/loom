@@ -173,3 +173,84 @@ gitea_api() {
 
   curl "${curl_args[@]}" "$url"
 }
+
+# Detect which merge strategy the target repository actually allows (#7844).
+#
+# Mirrors defaults/scripts/lib/forge-merge-method.sh's forge_detect_merge_method
+# (#7754), but for the installer's pre-binary bootstrap call path: it reuses
+# THIS file's FORGE_TYPE / FORGE_OWNER / FORGE_REPO / gitea_api() state instead
+# of forge-helpers.sh's. Sourcing that module here would clobber the forge
+# state detect_forge_and_repo already established (forge-helpers.sh resets
+# FORGE_TYPE and friends at source time), so the probe is reimplemented against
+# the state this file already owns rather than shared.
+#
+# Usage: detect_merge_method
+# Outputs on stdout: "squash", "merge", or "rebase" — never anything else.
+#
+# Preference order when more than one strategy is allowed: squash > merge >
+# rebase. This matches forge-merge-method.sh and Loom's own installer default
+# (setup-repository-settings.sh) purely as a tie-break — it is NOT a claim that
+# squash is universally available.
+#
+# Fails OPEN to "squash" (the historical hardcoded behavior) on a network/auth
+# error, an unparseable response, or a forge reporting every allow_* flag
+# false. A transient probe failure therefore never blocks a merge outright —
+# worst case it reproduces the pre-#7844 behavior for that one call.
+detect_merge_method() {
+  local allow_squash="" allow_merge="" allow_rebase=""
+
+  if [[ "${FORGE_TYPE:-}" == "gitea" ]]; then
+    local response body code parsed
+    response=$(gitea_api GET "/repos/${FORGE_OWNER}/${FORGE_REPO}" 2>/dev/null) || {
+      echo "squash"
+      return 0
+    }
+    code=$(printf '%s\n' "$response" | tail -1)
+    body=$(printf '%s\n' "$response" | sed '$d')
+
+    if [[ "$code" != "200" ]]; then
+      echo "squash"
+      return 0
+    fi
+
+    # Gitea spells the merge-commit flag `allow_merge_commits` (plural).
+    parsed=$(printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print("%s %s %s" % (
+    str(data.get("allow_squash_merge", "")).lower(),
+    str(data.get("allow_merge_commits", "")).lower(),
+    str(data.get("allow_rebase_merge", "")).lower(),
+))
+' 2>/dev/null) || {
+      echo "squash"
+      return 0
+    }
+    read -r allow_squash allow_merge allow_rebase <<< "$parsed"
+  else
+    local tsv
+    # GitHub spells the merge-commit flag `allow_merge_commit` (singular).
+    # `gh api --jq` uses gh's built-in jq engine, so this adds no `jq`
+    # dependency to the GitHub install path.
+    tsv=$(gh api "repos/${FORGE_OWNER}/${FORGE_REPO}" \
+      --jq '[(.allow_squash_merge // false), (.allow_merge_commit // false), (.allow_rebase_merge // false)] | @tsv' \
+      2>/dev/null) || {
+      echo "squash"
+      return 0
+    }
+    IFS=$'\t' read -r allow_squash allow_merge allow_rebase <<< "$tsv"
+  fi
+
+  if [[ "$allow_squash" == "true" ]]; then
+    echo "squash"
+  elif [[ "$allow_merge" == "true" ]]; then
+    echo "merge"
+  elif [[ "$allow_rebase" == "true" ]]; then
+    echo "rebase"
+  else
+    echo "squash"
+  fi
+}
