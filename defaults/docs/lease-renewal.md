@@ -232,10 +232,34 @@ publish their own record and start renewal at **Step 1b** (#6320,
 
 ```bash
 LEASE_IDENT="$(./.loom/scripts/sweep-lease-publish.sh publish "$N" --sweep-id "$RUN_ID")"
-# shellcheck disable=SC2086
-set -- $LEASE_IDENT
-./.loom/scripts/sweep-lease-renew.sh start "$N" --host "$1" --sweep-id "$2" > /dev/null 2>&1 || true
+# `read` splits the "<host> <sweep-id>" line identically in bash and zsh.
+read -r LEASE_HOST LEASE_SWEEP <<<"$LEASE_IDENT"
+./.loom/scripts/sweep-lease-renew.sh start "$N" --watch-pid "$PPID" \
+  --host "$LEASE_HOST" --sweep-id "$LEASE_SWEEP" > /dev/null 2>&1 || true
 ```
+
+Three details of that invocation are load-bearing, and all three were learned
+the hard way (#7876):
+
+- **Never split `LEASE_IDENT` with `set -- $LEASE_IDENT`.** That relies on
+  bash's word-splitting of an unquoted parameter, and the orchestrator's Bash
+  tool runs the operator's **login shell** — zsh on macOS, where
+  `SH_WORD_SPLIT` is off and an unquoted parameter is *not* split. Under zsh
+  `$1` becomes the whole `"<host> <sweep-id>"` line and `$2` is empty, so the
+  loop forks with a bogus `--host` and an empty `--sweep-id`, its exact-match
+  targeting (#6485) never finds its own lease comment, and the lease ages out
+  at the 15-minute TTL while the operator believes renewal is running. Two
+  sweeps lost a build to the pre-push fence (#6309) this way before it was
+  found. `read -r … <<<"$…"` behaves identically in both shells.
+  `sweep-lease-renew.sh start` now also **refuses** a whitespace-bearing or
+  half-empty `--host`/`--sweep-id` pair rather than forking a doomed loop.
+- **Pass `--watch-pid "$PPID"` explicitly**, for the same reason Step 0a's
+  `sweep-run-registry.sh new --pid "$PPID"` does (#4691): the tool-call shell
+  is reaped the instant the call returns, so leaving `start` to resolve a
+  liveness PID by walking its own ancestry from inside a tool call is fragile.
+- **Keep `> /dev/null 2>&1`.** The loop is disowned but inherits whatever
+  stdout it was given; attach a pipe (e.g. `| tail`) and the calling tool call
+  blocks until the loop exits — i.e. for the lifetime of the sweep.
 
 ## What this does not do (Phase 1 scope)
 
