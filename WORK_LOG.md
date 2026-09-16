@@ -7,6 +7,30 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7779** (closed): ci.yml cancels in-progress runs on main, so most main commits are never verified (21 of last 30 cancelled)
+- **PR #7803**: ci: stop cancelling main's own verification (22 of last 30 main runs cancelled)
+- **Issue #7740** (closed): Extract inline test modules: second batch (files not touched by #7723)
+- **PR #7800**: refactor(daemon): extract inline test modules — second batch, 7 files (#7740)
+- **Issue #7719** (closed): critical: merge-pr.sh silently aborts (exit 1, no output) for any loom:pr PR with no prior Champion hold (regression in #7435)
+- **Issue #7797** (closed): guards config: disable the SQL DDL category (no production DB here) and enable decision telemetry for the standing review
+- **PR #7799**: config(guards): disable the SQL DDL category (no production DB here), enable decision telemetry
+- **Issue #7751** (closed): Six scripts still use bash 4 constructs, including the CI suite-manifest checker
+- **PR #7798**: fix: remove the last bash 4 builtins — all six scripts now run on macOS bash 3.2 (#7751)
+- **Issue #7738** (closed): peer-claim coordination is DEGRADED on robb-studio (#6157 Layer 3)
+- **Issue #7780** (closed): Use Cargo workspace inheritance for the crate versions: two hardcoded versions that can drift, in a workspace that already inherits dependencies
+- **PR #7781**: refactor: inherit the crate version from the workspace (6 version sources -> 5, removes a drift mode)
+- **Issue #7710** (closed): docs: onboarding guides instruct commands that do not exist
+- **Issue #7717** (closed): sync-labels.sh --check crashes on macOS stock bash 3.2 (local -A / ${x,,} are bash 4+)
+- **Issue #7678** (closed): merge-pr.sh silently exits 1 on every PR without a champion:hold-state marker (regression in #7435/bf4f1965)
+- **Issue #7749** (closed): resync-installed.sh uses declare -A and silently degrades on macOS bash 3.2 (exit 0, wrong dead-pin output)
+- **PR #7766**: fix: resync-installed.sh silently degrades on macOS bash 3.2 (declare -A, exit 0)
+- **Issue #7739** (closed): Add tables of contents to large reference docs so partial reads reveal scope
+- **PR #7744**: feat(docs): generate and CI-check tables of contents for large reference docs (#7739)
+- **Issue #7711** (closed): Establish a file-size policy: ratchet oversized Rust/shell files, tier the shell→Rust port
+- **Issue #7732** (closed): examples/*/.loom/config.json reference five role files that do not exist
+- **PR #7787**: fix: regenerate examples/*/.loom/config.json against current role vocabulary
+- **Issue #7774** (closed): ci: no job in ci.yml sets timeout-minutes — a hang strands a runner for 6 hours
+- **PR #7775**: ci: bound every ci.yml job with timeout-minutes: 30
 - **Issue #7763** (closed): ci: revert the five heavy jobs to ubuntu-latest (#6624 routing measured net-negative)
 - **PR #7768**: ci: revert the five heavy jobs to ubuntu-latest (#6624 routing measured net-negative)
 - **Issue #7720** (closed): Remove nonexistent 'gh label sync' from loom.md role prompt and the guard-hooks .md/.sh pair
