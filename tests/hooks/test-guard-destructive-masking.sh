@@ -569,5 +569,152 @@ assert_deny "#6394 case 6: '#'-prefixed line inside a heredoc body still denies 
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #7498: escaped vs live \$( / backtick in the masking-eligibility gates ---${NC}"
+# =========================================================================
+#
+# Eight masking-eligibility gates in guard-destructive-generic.sh decided
+# "does this quoted span carry a command substitution?" with a byte-presence
+# check -- index(inner, "$(") / index(inner, "`") -- which cannot tell a
+# backslash-ESCAPED backtick / `\$(` (a literal character inside a
+# double-quoted string: the standard way to write a markdown code span, and
+# what every automated Champion/Judge/Curator/Doctor comment contains) from a
+# genuinely live one. The escaped form has zero execution risk, so vetoing
+# masking on it is a false positive: the whole span -- including any inert
+# mention of a catastrophic/ask-tier phrase -- stayed visible and denied/asked.
+# Same class as #5109, #6464/#6866, #7495 (guard-loom-workflow.sh, fixed by
+# PR #7496) and #7558; this section covers the guard-destructive-generic.sh
+# half, one sub-block per converted site. Every site gets BOTH directions:
+# escaped -> masked (allow), AND a genuinely live/mixed span -> still visible
+# (deny/ask) -- the fail-safe floor the conversion must not weaken.
+
+# --- Site 1: qsplit() (shared _QSPLIT_AWK snippet) ---------------------------
+# The #3755 reproducer shape (4-way lifecycle alternation, target word not
+# adjacent to the closing quote) with an escaped-backtick code span added
+# inside the same double-quoted pattern. Pre-fix the backtick byte made the
+# span "active", the `|`s were treated as real pipes and the phantom `halt`
+# segment hard-denied a read-only grep.
+assert_allow "#7498 site 1 (qsplit): grep alternation carrying an escaped-backtick code span stays an inert span (allow)" \
+    'grep -E "see \`x\` lifecycle|halt|poweroff|init 0" file'
+assert_allow "#7498 site 1 (qsplit): grep alternation carrying an escaped \\\$(...) stays an inert span (allow)" \
+    'grep -E "see \$(x) lifecycle|halt|poweroff|init 0" file'
+assert_deny "#7498 site 1 (qsplit): a GENUINELY live backtick inside the same alternation keeps its separators active (still denies)" \
+    'grep -E "see `x` lifecycle|halt|poweroff|init 0" file'
+assert_deny "#7498 site 1 (qsplit): mixed escaped + live backtick inside the same alternation still denies" \
+    'grep -E "see \`x\` and `y` lifecycle|halt|poweroff|init 0" file'
+
+# --- Site 2: _heredoc_body_expansion_free() (mask_unquoted_cat_heredoc_bodies,
+#     the #6056 --body "$(cat <<EOF ...)" idiom, ask tier) -----------------------
+# The function's backtick branch already walked backslash parity (see the
+# #6056 escaped-backtick case above); its `$(` branch was presence-only, so a
+# body that merely spelled `\$(...)` as literal text (the shell's own rule for
+# an unquoted-delimiter heredoc: backslash escapes `$`, backtick, `\`) lost
+# masking for the WHOLE body and the force-op line below it asked.
+assert_allow "#7498 site 2 (_heredoc_body_expansion_free): unquoted --body heredoc whose only \$( is backslash-ESCAPED is still masked (allow)" \
+    'gh pr comment 7498 --body "$(cat <<EOF
+Prose that spells \$(date) as literal text, then advice:
+git reset --hard origin/main
+EOF
+)"'
+assert_ask "#7498 site 2: the same body with an ESCAPED BACKSLASH before \$( (a LIVE substitution) stays visible and still asks" \
+    'gh pr comment 7498 --body "$(cat <<EOF
+Prose with \\$(date) then advice:
+git reset --hard origin/main
+EOF
+)"'
+assert_ask "#7498 site 2: a body mixing an escaped \\\$( and a live \$(...) on another line stays visible and still asks" \
+    'gh pr comment 7498 --body "$(cat <<EOF
+Literal \$(date) here, but a live $(date) there:
+git reset --hard origin/main
+EOF
+)"'
+
+# --- Site 3: strip_literal_text() (double-quoted branch; catastrophic tier) ---
+assert_allow "#7498 site 3 (strip_literal_text): --body double-quoted value quoting a catastrophic phrase inside an escaped-backtick code span is redacted (allow)" \
+    'gh issue comment 7498 --body "Never run \`'"$_S3RB"' s3://prod-bucket --force\` by hand."'
+assert_allow "#7498 site 3 (strip_literal_text): --body value quoting the phrase inside an escaped \\\$(...) is redacted (allow)" \
+    'gh issue comment 7498 --body "Never run \$('"$_S3RB"' s3://prod-bucket --force) by hand."'
+assert_deny "#7498 site 3 (strip_literal_text): --body value with a GENUINELY live backtick substitution stays visible (still denies)" \
+    'gh issue comment 7498 --body "Result: `'"$_S3RB"' s3://prod-bucket --force`"'
+assert_deny "#7498 site 3 (strip_literal_text): --body value with a live \$(...) substitution stays visible (still denies)" \
+    'gh issue comment 7498 --body "Result: $('"$_S3RB"' s3://prod-bucket --force)"'
+assert_deny "#7498 site 3 (strip_literal_text): mixed escaped + live backtick in the same --body value still denies" \
+    'gh issue comment 7498 --body "Safe: \`echo hi\`. Unsafe: `'"$_S3RB"' s3://prod-bucket --force`"'
+
+# --- Site 4: mask_ask_positional_args() (check-duplicate.sh, ask tier) -------
+assert_allow "#7498 site 4 (mask_ask_positional_args): check-duplicate.sh DESCRIPTION quoting an ask-tier phrase inside an escaped-backtick code span is masked (allow)" \
+    './.loom/scripts/check-duplicate.sh "Title" "see \`git clean -fd\` as prose"'
+assert_allow "#7498 site 4 (mask_ask_positional_args): check-duplicate.sh DESCRIPTION quoting the phrase inside an escaped \\\$(...) is masked (allow)" \
+    './.loom/scripts/check-duplicate.sh "Title" "see \$(git clean -fd) as prose"'
+assert_ask "#7498 site 4 (mask_ask_positional_args): check-duplicate.sh DESCRIPTION with a GENUINELY live backtick substitution stays visible (still asks)" \
+    './.loom/scripts/check-duplicate.sh "Title" "see `git clean -fd` as prose"'
+assert_ask "#7498 site 4 (mask_ask_positional_args): check-duplicate.sh DESCRIPTION with a live \$(...) substitution stays visible (still asks)" \
+    './.loom/scripts/check-duplicate.sh "Title" "see $(git clean -fd) as prose"'
+assert_ask "#7498 site 4 (mask_ask_positional_args): mixed escaped + live backtick in the same DESCRIPTION still asks" \
+    './.loom/scripts/check-duplicate.sh "Title" "safe \`x\`, unsafe `git clean -fd`"'
+
+# --- Site 5: mask_catastrophic_positional_args() (grep/echo/printf, catastrophic tier) ---
+assert_allow "#7498 site 5 (mask_catastrophic_positional_args): grep pattern quoting a catastrophic phrase inside an escaped-backtick code span is masked (allow)" \
+    'grep -n "run \`'"$_S3RB"'\` here" notes.md'
+assert_allow "#7498 site 5 (mask_catastrophic_positional_args): echo heading quoting the phrase inside an escaped-backtick code span is masked (allow)" \
+    'echo "=== \`'"$_DPRUNE"'\` ==="'
+assert_allow "#7498 site 5 (mask_catastrophic_positional_args): printf argument quoting the phrase inside an escaped \\\$(...) is masked (allow)" \
+    'printf "see \$('"$_DPRUNE"') here\n"'
+assert_deny "#7498 site 5 (mask_catastrophic_positional_args): echo argument with a GENUINELY live backtick substitution stays unmasked (still denies)" \
+    'echo "`'"$_DPRUNE"'`"'
+assert_deny "#7498 site 5 (mask_catastrophic_positional_args): grep pattern with a live \$(...) substitution stays unmasked (still denies)" \
+    'grep -n "$('"$_S3RB"' s3://prod-bucket --force)" notes.md'
+assert_deny "#7498 site 5 (mask_catastrophic_positional_args): mixed escaped + live backtick in the same echo argument still denies" \
+    'echo "safe \`x\` then `'"$_DPRUNE"'`"'
+
+# --- Site 6: mask_stash_scan_positional_args() (COMMAND_STASH_SCAN, main checkout) ---
+# NB: the stash-scope regex's trailing boundary class is `[[:space:]]`/`;&|)`
+# /backtick/end-of-string, so `\`git stash pop\`` -- where a BACKSLASH
+# directly follows `pop` -- never matched even pre-fix; the code span below
+# therefore carries a flag after `pop` so the phrase sits on a real boundary
+# and the case genuinely reproduces the pre-fix false ask.
+ST7498_REPO=$(make_wt_repo_linked)
+assert_allow "#7498 site 6 (mask_stash_scan_positional_args): grep search quoting 'git stash pop --quiet' inside an escaped-backtick code span is masked (main checkout, allow)" \
+    'grep -n "see \`git stash pop --quiet\` here" notes.md' "$ST7498_REPO"
+assert_allow "#7498 site 6 (mask_stash_scan_positional_args): grep search quoting 'git stash pop' inside an escaped \\\$(...) is masked (main checkout, allow)" \
+    'grep -n "see \$(git stash pop) here" notes.md' "$ST7498_REPO"
+assert_ask "#7498 site 6 (mask_stash_scan_positional_args): grep search with a GENUINELY live backtick substitution stays visible (main checkout, still asks)" \
+    'grep -n "see `git stash pop` here" notes.md' "$ST7498_REPO"
+assert_ask "#7498 site 6 (mask_stash_scan_positional_args): grep search with a live \$(...) substitution stays visible (main checkout, still asks)" \
+    'grep -n "see $(git stash pop) here" notes.md' "$ST7498_REPO"
+assert_ask "#7498 site 6 (mask_stash_scan_positional_args): mixed escaped + live backtick in the same search pattern still asks" \
+    'grep -n "safe \`x\`, unsafe `git stash pop`" notes.md' "$ST7498_REPO"
+
+# --- Site 7: mask_catastrophic_var_assignment() -- INVERTED polarity ---------
+# This gate is the mirror image of the other seven: presence of `$(`/backtick
+# FORCED "never mask". Converted as `if (has_live_subst(inner)) never-mask`,
+# so an escaped code span in a dead assignment is now maskable, while a live
+# substitution -- or ANY later `$NAME`/`${NAME}` read, escaped or not -- stays
+# fail-closed exactly as before.
+assert_allow "#7498 site 7 (mask_catastrophic_var_assignment): dead assignment whose value quotes the phrase inside an escaped-backtick code span is masked (allow)" \
+    'PATTERN="see \`'"$_S3RB_CAT"'\` here"'
+assert_allow "#7498 site 7 (mask_catastrophic_var_assignment): dead assignment whose value quotes the phrase inside an escaped \\\$(...) is masked (allow)" \
+    'PATTERN="see \$('"$_S3RB"' s3://prod-bucket --force) here"'
+assert_deny "#7498 site 7 (mask_catastrophic_var_assignment): assignment whose value carries a GENUINELY live backtick substitution is never masked (still denies)" \
+    'PATTERN="`'"$_S3RB"' s3://prod-bucket --force`"'
+assert_deny "#7498 site 7 (mask_catastrophic_var_assignment): mixed escaped + live backtick in the same value still denies" \
+    'PATTERN="safe \`x\` then `'"$_S3RB"' s3://prod-bucket --force`"'
+assert_deny "#7498 site 7 (mask_catastrophic_var_assignment): escaped-backtick value that IS read via eval later in the same command stays fail-closed (still denies)" \
+    'PATTERN="see \`'"$_S3RB_CAT"'\` here"; eval "$PATTERN"'
+
+# --- Site 8: mask_catastrophic_forloop_wordlist() (catastrophic tier) --------
+assert_allow "#7498 site 8 (mask_catastrophic_forloop_wordlist): word-list literal quoting the phrase inside an escaped-backtick code span, --search fed the loop var, is masked (allow)" \
+    'for q in "sql-ddl" "\`'"$_S3RB_CAT"'\`"; do gh issue list --search "$q" --limit 5; done'
+assert_allow "#7498 site 8 (mask_catastrophic_forloop_wordlist): word-list literal quoting the phrase inside an escaped \\\$(...) is masked (allow)" \
+    'for q in "sql-ddl" "\$('"$_S3RB"' s3://prod-bucket --force)"; do gh issue list --search "$q" --limit 5; done'
+assert_deny "#7498 site 8 (mask_catastrophic_forloop_wordlist): word-list literal carrying a GENUINELY live backtick substitution is never masked (still denies)" \
+    'for q in "sql-ddl" "`'"$_S3RB"' s3://prod-bucket --force`"; do gh issue list --search "$q" --limit 5; done'
+assert_deny "#7498 site 8 (mask_catastrophic_forloop_wordlist): word-list literal carrying a live \$(...) substitution is never masked (still denies)" \
+    'for q in "sql-ddl" "$('"$_S3RB"' s3://prod-bucket --force)"; do gh issue list --search "$q" --limit 5; done'
+assert_deny "#7498 site 8 (mask_catastrophic_forloop_wordlist): mixed escaped + live backtick in the same word-list literal still denies" \
+    'for q in "sql-ddl" "safe \`x\` then `'"$_S3RB"' s3://prod-bucket --force`"; do gh issue list --search "$q" --limit 5; done'
+
+echo ""
+
+# =========================================================================
 
 print_summary
