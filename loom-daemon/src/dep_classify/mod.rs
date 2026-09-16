@@ -15,8 +15,10 @@
 //! behaviour. Translating them into Rust unit tests would replace that evidence
 //! with an assertion.
 
+pub mod apply;
 pub mod cycle;
 pub mod defer;
+pub mod fact;
 pub mod finding;
 pub mod findings;
 pub mod fingerprint;
