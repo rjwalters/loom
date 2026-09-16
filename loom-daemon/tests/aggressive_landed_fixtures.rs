@@ -237,6 +237,17 @@ fn undeterminable_worktree_is_never_reaped_even_with_force() {
         stats.forced_unreachable, 0,
         "the force override must not fire on an undetermined answer"
     );
+    // #7872: `LandedUnknown` ("could not determine") must be counted
+    // separately from `UnreachableHead` ("confirmed unreachable") — they are
+    // different answers, not the same skip bucketed two ways.
+    assert_eq!(
+        stats.skipped_landed_unknown, 1,
+        "an undeterminable verdict must land in its own counter, not `skipped_unreachable`"
+    );
+    assert_eq!(
+        stats.skipped_unreachable, 0,
+        "an undeterminable verdict must not also inflate the unreachable counter"
+    );
     assert!(wt.exists(), "worktree directory must survive");
 }
 
