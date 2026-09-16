@@ -391,6 +391,25 @@ jobs:
         # and builds nothing -- so the tree is exactly what is tracked.
         # ~830 scripts, ~3s.
         run: bash defaults/scripts/check-shell-syntax.sh --quiet --dir .
+      - name: Ratchet the pipefail + early-exit-consumer SIGPIPE class
+        # #7790 (parent #7789). `set -o pipefail` plus a consumer that exits
+        # before reading all input (head, grep -q, grep -m, read) lets the
+        # producer take SIGPIPE, and pipefail reports the pipeline as failed.
+        # One idiom produced four CI flakes (#7060, #7285, #7540, #7736) and,
+        # in #7771, a silent WRONG ANSWER in production -- verify-proposal-refs.sh
+        # reporting a present file as `MISSING FILE`.
+        #
+        # A one-way ratchet, like check-file-size-budget.sh: every occurrence
+        # that exists today is frozen at its per-file count in
+        # scripts/pipefail-early-exit-baseline.txt, and this fails only when a
+        # file GAINS one. --require-baseline so that deleting the ledger reads
+        # as a failure rather than as "all clear".
+        #
+        # Runs on BOTH legs on purpose: the scan is one awk pass, and ubuntu and
+        # macOS ship different awks. If they ever disagree on the count, that is
+        # a portability bug in a script operators run locally, and this is where
+        # it should surface. Adds ~0.4s.
+        run: bash scripts/check-pipefail-early-exit.sh --quiet --require-baseline
 
   agents-md-sync:
     name: AGENTS.md Sync Check
