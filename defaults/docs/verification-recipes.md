@@ -84,7 +84,9 @@ So for any command with long output, **grep the whole output for error markers**
 rather than reading its end:
 
 ```bash
-"$CMD" >"$LOG" 2>&1; RC=$?
+CMD=(gh pr checks "$PR")
+RC=0
+"${CMD[@]}" >"$LOG" 2>&1 || RC=$?
 grep -nEi 'error|invalid option|not found|failed|denied' "$LOG" || true
 echo "rc=$RC"
 ```
@@ -102,13 +104,22 @@ every state that means *not yet*. `pending` is a state, not an absence of
 failure.
 
 ```bash
-# Done means: rows exist, AND none of them are pending/queued/in_progress.
-out="$(gh pr checks "$PR" 2>/dev/null)"
-rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-[ "$rows" -gt 0 ] || { echo "NOT SETTLED: zero rows (forge blip?) — retry"; }
-printf '%s\n' "$out" | grep -qE '(pending|queued|in_progress)' \
-  && echo "NOT SETTLED" || echo "SETTLED"
+# Require nonempty structured checks with only recognized terminal buckets.
+rc=0
+out="$(gh pr checks "$PR" --json bucket 2>/dev/null)" || rc=$?
+if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } &&
+  printf '%s\n' "$out" | jq -e '
+    type == "array" and length > 0 and
+    all(.[]; .bucket | IN("pass", "fail", "skipping", "cancel"))
+  ' >/dev/null 2>&1; then
+  echo "SETTLED"
+else
+  echo "NOT SETTLED: pending, empty, unknown, or unavailable checks — retry"
+fi
 ```
+
+`SETTLED` means terminal, not passing: failed and cancelled checks still need
+attention. Exit 1 may carry failed-check results; pending checks return 8.
 
 A monitor that modelled only `FAILURE` and `RUN` reported "all four resolved /
 COMPLETE" while all four PRs still had `pending` checks — *absence of failure*
