@@ -598,7 +598,19 @@ _apply_unescalation() {
     local body
 
     if [[ "$mode" == "subset" ]]; then
-        body="$(cat <<EOF
+        # Assigned via `read`, NOT `"$(cat <<EOF ...)"` (#7508): bash 3.2 -- the
+        # stock macOS /bin/bash -- does not skip heredoc bodies when scanning a
+        # command substitution for its closing paren, so punctuation in the prose
+        # below (here, the `#5664` issue reference inside parentheses) is misread
+        # as opening a region it never closes: `bad substitution: no closing )`,
+        # an EMPTY body, and a silently failed un-escalation. `read` never enters
+        # that scan. It returns non-zero at EOF, hence `|| true`.
+        #
+        # `_apply_fact_unescalation` below was already converted; these two were
+        # missed, which is why every `--apply` assertion in
+        # tests/test-classify-dependency-block.sh failed on macOS while passing
+        # on CI's bash 5 (#7930).
+        IFS= read -r -d '' body <<EOF || true
 **Champion: Un-escalating — a startable subset was never actually blocked**
 
 This proposal was routed to \`$OPERATOR_ONLY_LABEL\` for a **timing** finding, not a
@@ -622,9 +634,20 @@ the merits finding) and it will not be un-escalated again.
 *Automated by Champion role (classify-dependency-block.sh, #5664)*
 $marker
 EOF
-)"
     else
-        body="$(cat <<EOF
+        # Assigned via `read`, NOT `"$(cat <<EOF ...)"` (#7508): bash 3.2 -- the
+        # stock macOS /bin/bash -- does not skip heredoc bodies when scanning a
+        # command substitution for its closing paren, so punctuation in the prose
+        # below (here, the `#5664` issue reference inside parentheses) is misread
+        # as opening a region it never closes: `bad substitution: no closing )`,
+        # an EMPTY body, and a silently failed un-escalation. `read` never enters
+        # that scan. It returns non-zero at EOF, hence `|| true`.
+        #
+        # `_apply_fact_unescalation` below was already converted; these two were
+        # missed, which is why every `--apply` assertion in
+        # tests/test-classify-dependency-block.sh failed on macOS while passing
+        # on CI's bash 5 (#7930).
+        IFS= read -r -d '' body <<EOF || true
 **Champion: Un-escalating — the recorded blocker has closed**
 
 This proposal was routed to \`$OPERATOR_ONLY_LABEL\` for a **timing** finding, not a
@@ -642,7 +665,6 @@ the label (or state the merits finding) and it will not be un-escalated again.
 *Automated by Champion role (classify-dependency-block.sh, #5664)*
 $marker
 EOF
-)"
     fi
 
     # WRITE ORDER IS LOAD-BEARING -- label first, comment second.
