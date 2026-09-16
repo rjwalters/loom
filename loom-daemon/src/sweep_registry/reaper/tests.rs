@@ -1,0 +1,3317 @@
+use super::*;
+use crate::sweep_registry::test_support::*;
+use serial_test::serial;
+use std::os::unix::fs::PermissionsExt;
+use std::time::SystemTime;
+use tempfile::tempdir;
+
+/// Issue #4111 (the consumer-side regression this issue is really about):
+/// a checkpoint-less, clean (`exit 0`) sweep death for a daemon-dispatched
+/// self-claim check — i.e. exactly the "deliberate skip" shape the #3939
+/// insta-crash guard is SUPPOSED to exempt — must NOT increment the
+/// insta-crash tally when the reaper retains the real `Child` handle
+/// (poll_liveness observes `exit_code == Some(0)`, not the `None`
+/// fallback the other insta-crash fixtures in this file simulate via a
+/// dead/unretained PID). This exercises the reaper's `exit_code !=
+/// Some(0)` guard (`sweep_registry.rs`) against a REAL spawned process
+/// rather than a synthetic dead-PID fixture, closing the gap the issue's
+/// Finding 1 flagged: every other insta-crash test in this file only ever
+/// observes `exit_code = None` (no retained handle), so a real Some(0)
+/// exit was never actually exercised before.
+#[test]
+fn reaper_real_clean_exit_does_not_count_as_insta_crash() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+
+    // A real, fast, clean-exit child (mirrors what a #4111 self-skip
+    // looks like on the wire: no checkpoint written, exits 0 quickly).
+    let child = Command::new("true")
+        .spawn()
+        .expect("spawn `true` fixture child");
+    let pid = child.id();
+    // Give the OS a moment to actually finish the process before we poll.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let sweep_id = "sweep-issue-4111-clean-exit".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(41_110),
+            pid,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(41_110),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+    // Retain the handle (mirrors `dispatch()`'s `self.children.insert`) so
+    // `poll_liveness` uses the real exit code instead of the no-handle
+    // `kill(pid, 0)` fallback that always yields `exit_code = None`.
+    registry.children.insert(sweep_id.clone(), child);
+
+    registry.reap_once();
+
+    assert_eq!(
+        registry.insta_crash_count(41_110),
+        0,
+        "a real, handle-observed clean (exit 0) death must not count toward quarantine"
+    );
+    assert!(
+        !registry.is_quarantined(41_110),
+        "a single clean exit must never quarantine the issue"
+    );
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(
+        matches!(info.state, SweepState::Exited { code: Some(0), .. }),
+        "expected an Exited{{code: Some(0)}} terminal state; got: {:?}",
+        info.state
+    );
+}
+
+/// AC: exit 0 + no checkpoint + no open linked PR + issue open → counted
+/// as a failed attempt, and 3 consecutive occurrences quarantine exactly
+/// like 3 consecutive insta-crashes would — the whole point of the
+/// backstop is that this failure shape must NOT be exempt from the tally
+/// just because the exit code was 0.
+#[test]
+fn reaper_counts_no_progress_clean_exit_and_quarantines_at_threshold() {
+    let dir = tempdir().unwrap();
+    let mut registry = no_progress_test_registry(dir.path(), "OPEN", "", false);
+    assert_eq!(registry.quarantine_config().threshold, 3);
+
+    for seq in 0..3 {
+        insert_clean_exit_running(&mut registry, 43_660, seq);
+        let changed = registry.reap_once();
+        assert!(changed >= 1, "reap_once should observe the dead fixture child");
+    }
+
+    assert_eq!(
+        registry.insta_crash_count(43_660),
+        3,
+        "3 consecutive no-progress clean exits must accrue exactly like insta-crashes"
+    );
+    assert!(
+        registry.is_quarantined(43_660),
+        "3rd consecutive no-progress exit must quarantine the issue"
+    );
+}
+
+/// Issue #6350 (Ask 2, generalizing #4485): a clean exit whose self-skip
+/// was a verified open linked PR is exempt from the QUARANTINE tally
+/// (asserted by the sibling test right below), but it MUST still arm
+/// this issue's per-issue dispatch backoff — otherwise nothing damps the
+/// work-finder's very next tick from re-dispatching the same issue,
+/// which is exactly the "9 same-host lease re-acquisitions" shape
+/// observed on 2AMLogic/klayout-tools#994.
+#[test]
+fn reaper_open_linked_pr_clean_exit_arms_dispatch_backoff() {
+    let dir = tempdir().unwrap();
+    let mut registry = no_progress_test_registry(dir.path(), "OPEN", "4400", false);
+
+    assert_eq!(
+        registry.dispatch_failure_count(43_667),
+        0,
+        "no backoff must be armed before the sweep exits"
+    );
+
+    insert_clean_exit_running(&mut registry, 43_667, 0);
+    registry.reap_once();
+
+    assert_eq!(
+        registry.dispatch_failure_count(43_667),
+        1,
+        "yielding to an already-open linked PR must arm the same per-issue dispatch \
+             backoff a failed dispatch does (#6350), even though it is exempt from quarantine"
+    );
+    assert!(
+        registry
+            .dispatch_backoff_remaining(43_667, Utc::now())
+            .is_some(),
+        "the armed backoff must actually be in effect immediately after the reap"
+    );
+    assert!(
+        !registry.is_quarantined(43_667),
+        "arming dispatch backoff must not also quarantine a legitimate self-skip"
+    );
+}
+
+// ====================================================================
+// Hard-exclusion decline detection (Issue #7528)
+// ====================================================================
+
+/// The core #7528 AC: a checkpoint-less clean exit on an issue that
+/// carries a hard-exclusion label (`external`) is recognized as a
+/// **decline on a label rule**, not an ordinary self-skip, and arms a
+/// decline cooldown naming the rule — so the work finder stops re-offering
+/// the candidate every tick.
+#[test]
+fn reaper_checkpointless_clean_exit_on_external_arms_a_decline_cooldown() {
+    let dir = tempdir().unwrap();
+    let mut registry = hard_exclusion_test_registry(dir.path(), "OPEN", "", "external");
+
+    assert_eq!(registry.decline_count(5197), 0);
+
+    insert_clean_exit_running(&mut registry, 5197, 0);
+    registry.reap_once();
+
+    assert_eq!(
+        registry.decline_count(5197),
+        1,
+        "a clean checkpoint-less exit on an `external` issue must be recorded as a decline"
+    );
+    assert_eq!(
+        registry.decline_rule(5197).as_deref(),
+        Some("external"),
+        "the record must name the rule so the WARN and the log line can quote it"
+    );
+    assert!(
+        registry
+            .decline_cooldown_remaining(5197, Utc::now())
+            .is_some(),
+        "the cooldown must be in effect immediately after the reap"
+    );
+    assert!(
+        registry.decline_cooldown_issues(Utc::now()).contains(&5197),
+        "the work finder's declined-skip set must contain the issue"
+    );
+}
+
+/// THE regression this change must not cause (#7528 AC4): the ordinary
+/// #3823b self-skip / no-work checkpoint-less clean exit — same exit code,
+/// same absent checkpoint, no hard-exclusion label — must be completely
+/// unaffected. No decline record, nothing held out of dispatch.
+#[test]
+fn reaper_ordinary_checkpointless_clean_exit_records_no_decline() {
+    let dir = tempdir().unwrap();
+    // Identical fixture, except the issue carries NO hard-exclusion label.
+    let mut registry = hard_exclusion_test_registry(dir.path(), "OPEN", "", "");
+
+    insert_clean_exit_running(&mut registry, 38_230, 0);
+    registry.reap_once();
+
+    assert_eq!(
+        registry.decline_count(38_230),
+        0,
+        "an ordinary self-skip / no-work exit is NOT a hard-exclusion decline"
+    );
+    assert!(registry.decline_rule(38_230).is_none());
+    assert!(registry
+        .decline_cooldown_remaining(38_230, Utc::now())
+        .is_none());
+    assert!(
+        registry.decline_cooldown_issues(Utc::now()).is_empty(),
+        "nothing may be held out of dispatch by the #3823b path"
+    );
+}
+
+/// #7528 AC ("dispatched at most once per cooldown, not once per tick"),
+/// reaper half: three consecutive declines accrue one tally (they do not
+/// reset each cycle, which is why `clear_decline_cooldown` is deliberately
+/// NOT called from `dispatch`) and cross the WARN threshold.
+#[test]
+fn reaper_consecutive_declines_accrue_and_cross_the_warn_threshold() {
+    let dir = tempdir().unwrap();
+    let mut registry = hard_exclusion_test_registry(dir.path(), "OPEN", "", "external");
+    let threshold = registry.decline_cooldown_config().warn_threshold;
+    assert_eq!(threshold, 3, "shipped default");
+
+    for seq in 0..3 {
+        insert_clean_exit_running(&mut registry, 5198, seq);
+        registry.reap_once();
+    }
+
+    assert_eq!(
+        registry.decline_count(5198),
+        3,
+        "each decline must accrue — the tally is what drives the threshold WARN"
+    );
+    assert!(registry
+        .decline_cooldown_remaining(5198, Utc::now())
+        .is_some());
+}
+
+/// A later checkpoint-less clean exit that is NOT a decline (the
+/// maintainer removed the label) clears the record, so the issue becomes
+/// immediately dispatchable again and a stale tally cannot produce a
+/// spurious WARN.
+#[test]
+fn reaper_clears_a_decline_record_once_the_label_is_gone() {
+    let dir = tempdir().unwrap();
+    let mut registry = hard_exclusion_test_registry(dir.path(), "OPEN", "", "external");
+    insert_clean_exit_running(&mut registry, 5199, 0);
+    registry.reap_once();
+    assert_eq!(registry.decline_count(5199), 1);
+
+    // Re-point the fixture's `gh` at a build that reports NO labels — the
+    // "a maintainer removed `external`" state.
+    let cleared = hard_exclusion_test_registry(dir.path(), "OPEN", "", "");
+    registry.config.gh_bin = cleared.config().gh_bin.clone();
+
+    insert_clean_exit_running(&mut registry, 5199, 1);
+    registry.reap_once();
+
+    assert_eq!(
+        registry.decline_count(5199),
+        0,
+        "the decline record must clear once the rule no longer applies"
+    );
+    assert!(registry.decline_cooldown_issues(Utc::now()).is_empty());
+}
+
+/// Issue #7553: a checkpoint-less clean exit whose hard-exclusion label
+/// probe FAILS (forge outage, `gh` error) must NOT clear an already-armed
+/// decline cooldown. Before this fix, `issue_hard_exclusion_label`
+/// collapsed "probe failed" and "confirmed absent" into the same `None`,
+/// so a transient forge hiccup would silently wipe the cooldown and the
+/// consecutive-decline tally that drives the WARN threshold — the
+/// opposite of the "positive evidence only" contract
+/// `clear_decline_cooldown` documents.
+#[test]
+fn reaper_probe_failure_does_not_clear_an_armed_decline_cooldown() {
+    let dir = tempdir().unwrap();
+    // First, genuinely arm a decline cooldown on a healthy hard-exclusion probe.
+    let mut registry = hard_exclusion_test_registry(dir.path(), "OPEN", "", "external");
+    insert_clean_exit_running(&mut registry, 7553, 0);
+    registry.reap_once();
+    assert_eq!(registry.decline_count(7553), 1, "cooldown must be armed first");
+
+    // Now re-point the fixture's `gh` at a build whose label probe always
+    // fails — simulating a forge outage on the very next tick.
+    let failing = hard_exclusion_probe_failure_registry(dir.path(), "OPEN", "");
+    registry.config.gh_bin = failing.config().gh_bin.clone();
+
+    insert_clean_exit_running(&mut registry, 7553, 1);
+    registry.reap_once();
+
+    assert_eq!(
+        registry.decline_count(7553),
+        1,
+        "a failed probe must leave the existing decline record untouched, \
+             not clear it — an unverifiable read is not positive evidence the \
+             rule no longer applies"
+    );
+    assert!(
+        registry
+            .decline_cooldown_remaining(7553, Utc::now())
+            .is_some(),
+        "the cooldown must still be in effect after the failed-probe tick"
+    );
+    assert!(
+        registry.decline_cooldown_issues(Utc::now()).contains(&7553),
+        "the work finder's declined-skip set must still contain the issue"
+    );
+}
+
+/// Issue #7553, the mirror AC: a checkpoint-less clean exit whose probe
+/// fails on an issue with NO pre-existing decline record must not
+/// manufacture one either — `Unknown` means "leave state as it is" in
+/// both directions, not "assume excluded".
+#[test]
+fn reaper_probe_failure_on_a_fresh_issue_arms_no_decline() {
+    let dir = tempdir().unwrap();
+    let mut registry = hard_exclusion_probe_failure_registry(dir.path(), "OPEN", "");
+
+    insert_clean_exit_running(&mut registry, 7554, 0);
+    registry.reap_once();
+
+    assert_eq!(
+        registry.decline_count(7554),
+        0,
+        "an unverifiable probe must not manufacture a decline record from nothing"
+    );
+    assert!(registry
+        .decline_cooldown_remaining(7554, Utc::now())
+        .is_none());
+}
+
+/// `skip_label_flip` (the hermetic unit-test / no-forge-credentials mode)
+/// disables the decline probe entirely, exactly like every other forge
+/// probe in this branch — the path stays a pure no-op.
+#[test]
+fn reaper_decline_probe_is_noop_under_skip_label_flip() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _log) = fixture_registry(dir.path());
+    assert!(registry.config.skip_label_flip);
+
+    insert_clean_exit_running(&mut registry, 5200, 0);
+    registry.reap_once();
+
+    assert_eq!(
+        registry.decline_count(5200),
+        0,
+        "skip_label_flip must disable the hard-exclusion probe entirely"
+    );
+}
+
+/// AC: exit 0 with an open linked PR is NOT counted — the #4123 open-PR
+/// dispatch-guard self-skip is a legitimate zero-progress-this-run
+/// outcome, not a parked-on-monitor failure.
+#[test]
+fn reaper_open_linked_pr_exempts_clean_exit_from_no_progress() {
+    let dir = tempdir().unwrap();
+    let mut registry = no_progress_test_registry(dir.path(), "OPEN", "4400", false);
+
+    insert_clean_exit_running(&mut registry, 43_661, 0);
+    registry.reap_once();
+
+    assert_eq!(
+        registry.insta_crash_count(43_661),
+        0,
+        "a clean exit with an open linked PR must not count toward quarantine"
+    );
+    assert!(!registry.is_quarantined(43_661));
+}
+
+/// AC: exit 0 with the issue already closed is NOT counted — a legitimate
+/// curator close-as-not-planned (or already-done) self-skip is a valid
+/// zero-PR, zero-checkpoint outcome.
+#[test]
+fn reaper_closed_issue_exempts_clean_exit_from_no_progress() {
+    let dir = tempdir().unwrap();
+    let mut registry = no_progress_test_registry(dir.path(), "CLOSED", "", false);
+
+    insert_clean_exit_running(&mut registry, 43_662, 0);
+    registry.reap_once();
+
+    assert_eq!(
+        registry.insta_crash_count(43_662),
+        0,
+        "a clean exit on an already-closed issue must not count toward quarantine"
+    );
+    assert!(!registry.is_quarantined(43_662));
+}
+
+/// AC (PR #4408 judge feedback): the no-progress predicate must FAIL OPEN
+/// when the forge probes themselves fail. [`Self::issue_is_closed_or_pr`] returns
+/// `None` on a missing/failed/timed-out/unparseable `gh` answer and its
+/// contract says callers MUST treat that as "don't punish" — the original
+/// `!= Some(true)` spelling was *satisfied* by `None`, so a rate-limited or
+/// timed-out probe during a forge outage silently converted every benign
+/// self-skip into a counted failed attempt and wrongly quarantined the
+/// issue. Requiring a positive `== Some(false)` ("the issue is verifiably
+/// open") verdict means a probe failure yields `no_progress == false`.
+///
+/// The fixture answers `issue view` with an unparseable `"WEDGED"` state
+/// (the same shape a truncated/garbled `gh` response has), which makes
+/// `issue_is_closed_or_pr` return `None`. Three consecutive clean exits under
+/// that condition — enough to trip the quarantine threshold if any of them
+/// counted — must leave the tally at 0 and the issue un-quarantined.
+#[test]
+fn reaper_probe_failure_fails_open_and_does_not_count_no_progress() {
+    let dir = tempdir().unwrap();
+    let mut registry = no_progress_test_registry(dir.path(), "WEDGED", "", false);
+    assert_eq!(registry.quarantine_config().threshold, 3);
+
+    for seq in 0..3 {
+        insert_clean_exit_running(&mut registry, 43_665, seq);
+        let changed = registry.reap_once();
+        assert!(changed >= 1, "reap_once should observe the dead fixture child");
+    }
+
+    assert_eq!(
+        registry.insta_crash_count(43_665),
+        0,
+        "an unresolvable issue-state probe must fail open — a clean exit during a forge \
+             outage must never accrue toward quarantine"
+    );
+    assert!(
+        !registry.is_quarantined(43_665),
+        "3 consecutive probe-failure clean exits must not quarantine the issue"
+    );
+}
+
+/// #4452 regression: a PARTIAL forge outage — the open-linked-PR probe fails
+/// (`api graphql` exits non-zero) while `issue view` still answers OPEN —
+/// must NOT count a clean exit toward quarantine. The old `Option<u32>`
+/// return conflated "the PR probe failed" with "verified no open PR", so
+/// `first_open_linked_pr(issue).is_none()` was satisfied and the predicate
+/// wrongly fired. With the three-state [`OpenPrProbe`], the predicate now
+/// requires a VERIFIED `NoneOpen`, so a `ProbeFailed` yields
+/// `no_progress == false`. Three consecutive clean exits under this
+/// condition — enough to trip the threshold if any counted — must leave the
+/// tally at 0 and the issue un-quarantined.
+#[test]
+fn reaper_pr_probe_failure_with_open_issue_fails_open_and_does_not_count() {
+    let dir = tempdir().unwrap();
+    let mut registry = no_progress_pr_probe_fail_registry(dir.path(), "OPEN");
+    assert_eq!(registry.quarantine_config().threshold, 3);
+
+    for seq in 0..3 {
+        insert_clean_exit_running(&mut registry, 43_666, seq);
+        let changed = registry.reap_once();
+        assert!(changed >= 1, "reap_once should observe the dead fixture child");
+    }
+
+    assert_eq!(
+        registry.insta_crash_count(43_666),
+        0,
+        "a PR-probe failure (partial outage) with the issue still OPEN must fail open — a \
+             clean exit must never accrue toward quarantine (#4452)"
+    );
+    assert!(
+        !registry.is_quarantined(43_666),
+        "3 consecutive PR-probe-failure clean exits must not quarantine the issue (#4452)"
+    );
+}
+
+/// AC: `skip_label_flip` disables the whole no-progress probe (no `gh`
+/// call at all, matching every other real-forge probe in this branch) —
+/// a clean exit under `skip_label_flip` never counts, regardless of what
+/// the (unconsulted) forge state would have been. Uses the plain
+/// `fixture_registry` (no `gh_bin` configured at all) so a regression
+/// that removed the gate would fail loudly (an unconfigured `gh` binary
+/// erroring out, not silently answering "no PR / open issue").
+#[test]
+fn reaper_no_progress_probe_is_noop_under_skip_label_flip() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    assert!(registry.config.skip_label_flip, "fixture_registry sets skip_label_flip = true");
+
+    let sweep_id = insert_clean_exit_running(&mut registry, 43_663, 0);
+    registry.reap_once();
+
+    assert_eq!(
+        registry.insta_crash_count(43_663),
+        0,
+        "skip_label_flip must disable the no-progress probe entirely"
+    );
+    assert!(!registry.is_quarantined(43_663));
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Exited { code: Some(0), .. }));
+}
+
+/// AC: the `SweepExited` event carries `no_progress: true` for the
+/// failure shape and `no_progress: false` for the exempted shapes, so
+/// operators (and #4137 durable telemetry) can distinguish the failure
+/// class without re-deriving it from `exit_code` + `duration_sec` alone.
+#[tokio::test]
+async fn reaper_sweep_exited_event_carries_no_progress_classification() {
+    use crate::event_bus::EventBus;
+
+    let dir = tempdir().unwrap();
+    let mut registry = no_progress_test_registry(dir.path(), "OPEN", "", false);
+    let bus = Arc::new(EventBus::new());
+    registry.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    insert_clean_exit_running(&mut registry, 43_664, 0);
+    registry.reap_once();
+
+    let mut saw_no_progress_true = false;
+    for _ in 0..4 {
+        let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+            break;
+        };
+        if let Event::SweepExited {
+            issue, no_progress, ..
+        } = ev.unwrap()
+        {
+            assert_eq!(issue, 43_664);
+            assert!(no_progress, "expected no_progress=true for a parked-on-monitor clean exit");
+            saw_no_progress_true = true;
+        }
+    }
+    assert!(saw_no_progress_true, "expected a sweep.issue.43664.exited event");
+}
+
+/// AC #2: reaper emits `sweep.issue.{N}.crashed` AND re-arms the
+/// `loom:building` -> `loom:issue` label when a dead pid has a
+/// checkpoint on disk. We don't actually invoke `gh` here (that's
+/// covered by integration tests with `skip_label_flip = false`); we
+/// assert the event payload and the registry state transition, which
+/// is the contract Phase B exposes to subscribers.
+#[tokio::test]
+async fn reaper_emits_crashed_event_with_checkpoint_phase() {
+    use crate::event_bus::EventBus;
+
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let bus = Arc::new(EventBus::new());
+    registry.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    let cp_dir = registry.config.checkpoint_dir();
+    std::fs::create_dir_all(&cp_dir).unwrap();
+    std::fs::write(cp_dir.join("issue-55.json"), r#"{"phase":"doctor","issue":55}"#).unwrap();
+
+    let sweep_id = "sweep-issue-55-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(55),
+            pid: 2_147_483_640,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(55),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let changed = registry.reap_once();
+    assert!(changed >= 1);
+
+    // Should observe: sweep.issue.55.crashed + sweep.global.completed
+    let mut saw_crashed = false;
+    let mut saw_completed = false;
+    for _ in 0..2 {
+        let ev = sub.recv().await.unwrap();
+        match ev {
+            Event::SweepCrashed {
+                issue,
+                checkpoint_phase,
+                ..
+            } => {
+                assert_eq!(issue, 55);
+                assert_eq!(checkpoint_phase.as_deref(), Some("doctor"));
+                saw_crashed = true;
+            }
+            Event::SweepGlobalCompleted {
+                sweep_id: sid,
+                outcome,
+            } => {
+                assert_eq!(sid, sweep_id);
+                assert_eq!(outcome, SweepOutcome::Crashed);
+                saw_completed = true;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(saw_crashed, "expected sweep.issue.55.crashed event");
+    assert!(saw_completed, "expected sweep.global.completed event");
+
+    // And the registry state should be Crashed (the label re-arm
+    // side-effect is suppressed because skip_label_flip is true in
+    // the fixture; the contract is the state transition + event
+    // emission, which together signal the re-arm has happened in
+    // production).
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Crashed { .. }));
+}
+
+/// Issue #4255: the reaper's `sweep.issue.{N}.crashed` payload carries a
+/// best-effort error classification derived from the dead sweep's log tail,
+/// alongside `checkpoint_phase`. A log whose terminal output is the chronic
+/// `Execution error` string is labeled `execution-error`.
+#[tokio::test]
+async fn reaper_crashed_event_carries_classification() {
+    use crate::event_bus::EventBus;
+
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let bus = Arc::new(EventBus::new());
+    registry.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    let cp_dir = registry.config.checkpoint_dir();
+    std::fs::create_dir_all(&cp_dir).unwrap();
+    std::fs::write(cp_dir.join("issue-57.json"), r#"{"phase":"builder","issue":57}"#).unwrap();
+
+    // Write a sweep log whose terminal line is the bare `Execution error`
+    // fatal — the exact death mode this issue targets.
+    let log_path = registry.compute_log_path(57);
+    std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    std::fs::write(&log_path, "spawn-claude: preamble\nExecution error\n").unwrap();
+
+    let sweep_id = "sweep-issue-57-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(57),
+            pid: 2_147_483_641,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path,
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let changed = registry.reap_once();
+    assert!(changed >= 1);
+
+    let mut saw_classified = false;
+    for _ in 0..2 {
+        let ev = sub.recv().await.unwrap();
+        if let Event::SweepCrashed {
+            issue,
+            checkpoint_phase,
+            classification,
+            ..
+        } = ev
+        {
+            assert_eq!(issue, 57);
+            assert_eq!(checkpoint_phase.as_deref(), Some("builder"));
+            assert_eq!(
+                classification.as_deref(),
+                Some("execution-error"),
+                "expected the crashed event to carry the execution-error classification"
+            );
+            saw_classified = true;
+        }
+    }
+    assert!(saw_classified, "expected a classified sweep.issue.57.crashed event");
+}
+
+/// Clean-exit (no checkpoint) emits `sweep.issue.{N}.exited` plus
+/// `sweep.global.completed{outcome=Exited}`.
+#[tokio::test]
+async fn reaper_emits_exited_event_for_clean_exit() {
+    use crate::event_bus::EventBus;
+
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let bus = Arc::new(EventBus::new());
+    registry.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    let sweep_id = "sweep-issue-66-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(66),
+            pid: 2_147_483_640,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(66),
+            idempotency_key: None,
+            started_at: Utc::now() - chrono::Duration::seconds(10),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let changed = registry.reap_once();
+    assert!(changed >= 1);
+
+    let mut saw_exited = false;
+    let mut saw_completed = false;
+    for _ in 0..2 {
+        let ev = sub.recv().await.unwrap();
+        match ev {
+            Event::SweepExited {
+                issue,
+                duration_sec,
+                ..
+            } => {
+                assert_eq!(issue, 66);
+                assert!(duration_sec >= 0);
+                saw_exited = true;
+            }
+            Event::SweepGlobalCompleted { outcome, .. } => {
+                assert_eq!(outcome, SweepOutcome::Exited);
+                saw_completed = true;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(saw_exited);
+    assert!(saw_completed);
+}
+
+#[test]
+fn reap_marks_dead_pid_exited_when_no_checkpoint() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+
+    // Stuff an entry with a guaranteed-dead PID (very large pid_t).
+    let sweep_id = "sweep-issue-21-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(21),
+            pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(21),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let changed = registry.reap_once();
+    assert!(changed >= 1);
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Exited { .. }));
+}
+
+/// The reaper-driven resume path (#4256) is exempt: it re-dispatches an
+/// issue's OWN open PR and is already bounded by `MAX_RESUME_ATTEMPTS`, so the
+/// backoff must not block it (which would strand a PR at review).
+#[test]
+fn reaper_resume_dispatch_bypasses_the_backoff() {
+    let dir = tempdir().unwrap();
+    let mut registry = backoff_registry(dir.path(), 60, 900);
+    registry.record_dispatch_failure(35);
+
+    assert!(
+        registry
+            .dispatch(&SweepKind::Issue(35), None, None, None, None)
+            .is_err(),
+        "an ordinary dispatch is refused"
+    );
+    assert!(
+        registry.dispatch_resume_after_crash(35, 777).is_ok(),
+        "the bounded #4256 resume path is exempt"
+    );
+}
+
+/// Issue #6691 AC: `reap_once_releasing_poll_lock` — the entry point
+/// [`spawn_reaper_task`] actually drives — must not hold the registry
+/// mutex across a crash-resume dispatch's account-selection poll.
+///
+/// Sets up a crashed sweep whose checkpoint (`builder-done`) and open
+/// linked PR make it resume-eligible (mirroring
+/// `reaper_resumes_crashed_sweep_at_builder_done_with_open_pr`), but
+/// with a spawn fixture that deliberately delays its account-selection
+/// log line, then races a concurrent status-style read (a plain
+/// `registry.lock()` + `list(None)`, standing in for
+/// `build_daemon_status`'s per-root read) against the resume dispatch
+/// running on its own thread. Before this issue's fix (a single
+/// `registry.lock()` held for the whole `reap_once()` call, as
+/// `spawn_reaper_task` used to do), the read would have blocked for the
+/// full `poll_delay`.
+///
+/// Issue #6712: the reap thread's "get past the guard chain and into the
+/// unlocked poll" moment used to be approximated with a fixed 150ms
+/// sleep on the test thread. Under host CPU contention the guard chain's
+/// own subprocess execs (closed-issue probe, open-PR probe,
+/// workspace-command check — all run under the *first*, expected, lock
+/// hold) can plausibly exceed 150ms, so the fixed sleep raced the wrong
+/// thing and produced false failures on a loaded host even though
+/// `reap_once_releasing_poll_lock` released the lock correctly. This now
+/// blocks on [`test_hooks::set_entering_unlocked_poll_hook`] — a channel
+/// `reap_once_releasing_poll_lock` fires the instant its locked
+/// guard-chain pass actually completes — so the wait is exact regardless
+/// of host load, while still catching a regression: if the fix
+/// regresses to holding the lock across the loop, the hook still fires
+/// at the same code point, but the lock is still held, so the timed read
+/// below still blocks and the final assertion still fails (verified
+/// locally by temporarily reverting the #6691 lock-release fix).
+#[test]
+#[serial]
+fn reap_once_releasing_poll_lock_does_not_hold_lock_across_resume_poll() {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, gh_log) = open_pr_guard_registry(ws, "6691", 0, false);
+
+    // Overwrite the benign echo-and-exit spawn fixture `open_pr_guard_registry`
+    // installs with one that delays its account-selection log line —
+    // the one genuinely multi-second step this issue is about.
+    let poll_delay = Duration::from_millis(700);
+    let spawn = ws.join(".loom").join("scripts").join("spawn-claude.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nsleep {:.2}\n\
+             echo \"spawn-claude: using OAuth account 'agent-6691' (mode=random)\" >&2\n\
+             sleep 5\n",
+        poll_delay.as_secs_f64()
+    );
+    std::fs::write(&spawn, &script).unwrap();
+    let mut perms = std::fs::metadata(&spawn).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+
+    write_checkpoint(&reg, 6691, "builder-done");
+    insert_dead_running_entry(&mut reg, 6691, "sweep-issue-6691-crashed");
+
+    let registry = Arc::new(Mutex::new(reg));
+
+    // Issue #6712: synchronize on the actual guard-chain-complete signal
+    // instead of guessing a fixed sleep. `HookGuard` clears the
+    // process-wide slot on every exit path (including a panic from an
+    // assertion below), so a failure here can't leak the hook into a
+    // later `#[serial]` test.
+    let (entering_poll_tx, entering_poll_rx) = mpsc::channel();
+    test_hooks::set_entering_unlocked_poll_hook(entering_poll_tx);
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            test_hooks::clear_entering_unlocked_poll_hook();
+        }
+    }
+    let _hook_guard = HookGuard;
+
+    // Drive the actual production entry point `spawn_reaper_task` calls,
+    // on its own thread — exactly the shape it runs in (a synchronous
+    // call with no `.await` of its own).
+    let reap_registry = Arc::clone(&registry);
+    let reap_handle = std::thread::spawn(move || reap_once_releasing_poll_lock(&reap_registry));
+
+    // Block until the reap thread signals it has cleared the locked
+    // guard-chain pass — exact regardless of how long that pass takes
+    // under host load, unlike the fixed sleep this replaces. A generous
+    // timeout (well above any observed guard-chain duration, including
+    // the loaded-host repro that motivated this issue) turns a genuine
+    // hang into a clear diagnostic instead of a misleading timing
+    // assertion failure below.
+    entering_poll_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect(
+            "reap_once_releasing_poll_lock did not signal guard-chain completion within 15s \
+             — either host load is extreme or the #6712 synchronization hook itself regressed",
+        );
+
+    let read_registry = Arc::clone(&registry);
+    let read_start = Instant::now();
+    let read_handle = std::thread::spawn(move || {
+        let r = read_registry.lock().unwrap();
+        let _ = r.list(None);
+    });
+    read_handle
+        .join()
+        .expect("status-style read thread panicked");
+    let read_elapsed = read_start.elapsed();
+
+    assert!(
+        read_elapsed < poll_delay / 2,
+        "a concurrent status-style read took {read_elapsed:?} — should complete in well \
+             under the {poll_delay:?} account-selection poll delay if the resume dispatch \
+             released the registry lock for the poll (Issue #6691); looks blocked behind it \
+             instead"
+    );
+
+    let changed = reap_handle.join().expect("reap thread panicked");
+    assert!(changed >= 1, "the original crashed entry's own state transition must count");
+
+    // The resume dispatch itself must still have succeeded — same
+    // outcome as the fully-synchronous `reap_once()` path
+    // (`reaper_resumes_crashed_sweep_at_builder_done_with_open_pr`).
+    let reg = registry.lock().unwrap();
+    let resumed_id = running_issue_sweep_id(&reg, 6691);
+    assert!(resumed_id.is_some(), "resume dispatch must have created a new Running entry");
+    assert_ne!(resumed_id.unwrap(), "sweep-issue-6691-crashed");
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        calls.contains("issue edit 6691") && calls.contains("loom:building"),
+        "the resume dispatch must flip the label like an ordinary dispatch; got: {calls:?}"
+    );
+    drop(reg);
+
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// Issue #3823b: orphaned-claim recovery. A daemon-owned sweep that exits
+/// cleanly with NO checkpoint (the self-skip / no-work case) must have its
+/// pre-dispatch loom:building claim restored to loom:issue by the reaper —
+/// otherwise the claim is orphaned and needs manual reclamation (the exact
+/// dogfood symptom). Point `gh_bin` at a fake recorder with the real label
+/// path enabled (`skip_label_flip = false`) and assert the restore fired.
+#[test]
+fn reap_restores_label_for_orphaned_clean_exit_without_pr() {
+    let dir = tempdir().unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    // Fake gh: record the space-joined argv and exit 0.
+    let fake_gh = dir.path().join("fake-gh.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+        gh_log.display()
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false; // exercise the real restore path
+    let mut registry = SweepRegistry::new(config);
+
+    let sweep_id = "sweep-issue-77-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(77),
+            pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(77),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None, // no PR produced -> recoverable claim
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    // No checkpoint file exists -> Exited branch -> orphaned-claim recovery.
+    let changed = registry.reap_once();
+    assert!(changed >= 1);
+
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Exited { .. }));
+
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        gh_calls.contains("issue edit 77 --remove-label loom:building --add-label loom:issue"),
+        "expected reaper to restore loom:building -> loom:issue for an orphaned \
+             clean exit without a PR; got gh invocations: {gh_calls:?}"
+    );
+}
+
+/// Issue #3827: a cancelled daemon-owned Issue sweep that never opened a
+/// PR must have its pre-dispatch loom:building claim restored to loom:issue
+/// by `finish_cancel` — mirroring the reaper's clean-exit recovery (#3823b).
+/// Otherwise cancelling a daemon-owned sweep strands the issue in
+/// loom:building forever (the live repro: #3780/#3785).
+#[test]
+fn cancel_restores_label_when_no_pr_produced() {
+    let dir = tempdir().unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    let fake_gh = dir.path().join("fake-gh.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+        gh_log.display()
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false; // exercise the real restore path
+    let mut registry = SweepRegistry::new(config);
+
+    let kind = SweepKind::Issue(88);
+    let started_at = Utc::now();
+    let sweep_id = "sweep-issue-88-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: kind.clone(),
+            pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(88),
+            idempotency_key: None,
+            started_at,
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None, // no PR produced -> recoverable claim
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    // exited_within_grace = true: no SIGKILL, straight to terminal path.
+    let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+    assert!(outcome.was_running);
+
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Exited { .. }));
+
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        gh_calls.contains("issue edit 88 --remove-label loom:building --add-label loom:issue"),
+        "expected finish_cancel to restore loom:building -> loom:issue for a \
+             cancelled sweep without a PR; got gh invocations: {gh_calls:?}"
+    );
+}
+
+/// Issue #3827: a cancelled sweep that DID open a PR (`pr_number` set) must
+/// NOT have its label reset — that would yank loom:building out from under
+/// an in-flight PR's issue and undo real progress.
+#[test]
+fn cancel_does_not_restore_label_when_pr_produced() {
+    let dir = tempdir().unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    let fake_gh = dir.path().join("fake-gh.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+        gh_log.display()
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false; // real restore path enabled but must not fire
+    let mut registry = SweepRegistry::new(config);
+
+    let kind = SweepKind::Issue(99);
+    let started_at = Utc::now();
+    let sweep_id = "sweep-issue-99-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: kind.clone(),
+            pid: 2_147_483_640,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(99),
+            idempotency_key: None,
+            started_at,
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: Some(456), // PR opened -> must NOT reset the label
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+    assert!(outcome.was_running);
+
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Exited { .. }));
+
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !gh_calls.contains("--remove-label loom:building"),
+        "expected finish_cancel to NOT restore the label when a PR was \
+             produced; got gh invocations: {gh_calls:?}"
+    );
+}
+
+/// Issue #3827: `SweepKind::PrSet` cancels must be unaffected — the
+/// `if let SweepKind::Issue` scoping already excludes them, so no
+/// `restore_label_to_ready` call is ever attempted.
+#[test]
+fn cancel_prset_does_not_restore_label() {
+    let dir = tempdir().unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    let fake_gh = dir.path().join("fake-gh.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+        gh_log.display()
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
+    let mut registry = SweepRegistry::new(config);
+
+    let kind = SweepKind::PrSet(vec![101, 102]);
+    let started_at = Utc::now();
+    let sweep_id = "sweep-prset-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: kind.clone(),
+            pid: 2_147_483_640,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(0),
+            idempotency_key: None,
+            started_at,
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+    assert!(outcome.was_running);
+
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Exited { .. }));
+
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !gh_calls.contains("--remove-label loom:building"),
+        "expected finish_cancel to NOT touch labels for a PrSet cancel; \
+             got gh invocations: {gh_calls:?}"
+    );
+}
+
+#[test]
+fn reap_marks_dead_pid_crashed_when_checkpoint_present() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+
+    // Create a checkpoint file so the reaper picks Crashed over Exited.
+    let cp_dir = registry.config.checkpoint_dir();
+    std::fs::create_dir_all(&cp_dir).unwrap();
+    std::fs::write(cp_dir.join("issue-33.json"), r#"{"phase":"builder","issue":33}"#).unwrap();
+
+    let sweep_id = "sweep-issue-33-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(33),
+            pid: 2_147_483_640,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(33),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let changed = registry.reap_once();
+    assert!(changed >= 1);
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Crashed { .. }));
+}
+
+/// Regression (Test Plan item 3): `finish_cancel` on a stale entry whose
+/// issue lock is owned by a NEWER live sweep must leave that lock intact AND
+/// must not restore the label out from under the newer sweep.
+#[test]
+fn cancel_preserves_lock_and_skips_restore_when_superseded() {
+    let dir = tempdir().unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    let fake_gh = dir.path().join("fake-gh.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+        gh_log.display()
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false; // real restore path enabled but must NOT fire
+    let mut registry = SweepRegistry::new(config);
+
+    // A newer live sweep owns the lock.
+    let lock = write_lock_owner(&registry, 8801, "sweep-issue-8801-newer", std::process::id());
+
+    // The OLDER sweep being cancelled.
+    let kind = SweepKind::Issue(8801);
+    let started_at = Utc::now();
+    let sweep_id = "sweep-issue-8801-older".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: kind.clone(),
+            pid: 2_147_483_640,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(8801),
+            idempotency_key: None,
+            started_at,
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+    assert!(outcome.was_running);
+
+    // The newer sweep's lock survives untouched.
+    assert!(lock.exists(), "cancelling an older sweep must not free the newer sweep's lock");
+    let owner: LockOwner =
+        serde_json::from_str(&std::fs::read_to_string(lock.join("owner.json")).unwrap()).unwrap();
+    assert_eq!(owner.sweep_id, "sweep-issue-8801-newer");
+
+    // The label must NOT be restored — the newer sweep still holds the claim.
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !gh_calls.contains("--remove-label loom:building"),
+        "a superseded cancel must not restore loom:building -> loom:issue; got: {gh_calls:?}"
+    );
+}
+
+/// Issue #5017/#5282 regression: the LOCAL lock check alone cannot see a
+/// cross-host race — `.loom/locks/issue-<N>` is host-local, so a peer
+/// host's live claim on the same issue leaves the local check believing
+/// nothing else owns the lock (`Released`, not `Superseded`). This test
+/// simulates exactly that: no local lock at all (mirrors the real
+/// incident, where the cancelling host's own `.loom/locks/` never
+/// recorded the OTHER host's claim), but the forge's `loom:building`
+/// labeled-event timeline shows the label was (re-)applied AFTER this
+/// sweep's own `started_at` — the cross-host claim-ownership signal.
+/// `finish_cancel` MUST leave the label alone in that case; restoring it
+/// would repeat the loom#5270 incident (cancelling a losing duplicate
+/// destroyed a live peer host's claim).
+#[test]
+fn cancel_skips_restore_when_forge_shows_a_newer_claim_from_another_host() {
+    let dir = tempdir().unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    let fake_gh = dir.path().join("fake-gh.sh");
+    // Any `gh api ... /timeline ...` call answers with a labeling
+    // timestamp comfortably AFTER this sweep's `started_at` (set below to
+    // `now - 1h`); every other `gh` call (the label-restore edit itself)
+    // behaves like the other fixtures: logged, empty stdout, exit 0. A
+    // real `restore_label_to_ready` call would show up in the log as a
+    // `--remove-label loom:building` invocation, so asserting its absence
+    // is sufficient to prove the forge check vetoed the restore.
+    let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo \"\\\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\\\"\"\nfi\nexit 0\n",
+            gh_log.display()
+        );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false; // real restore path enabled but must NOT fire
+    let mut registry = SweepRegistry::new(config);
+
+    // No local lock at all — models the cross-host case where this
+    // host's `.loom/locks/issue-<N>` never recorded the other host's
+    // claim (release_lock_owned would answer `Released`, not
+    // `Superseded`, with no forge-side check).
+    let kind = SweepKind::Issue(8802);
+    let started_at = Utc::now() - chrono::Duration::hours(1);
+    let sweep_id = "sweep-issue-8802-loser".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: kind.clone(),
+            pid: 2_147_483_640,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(8802),
+            idempotency_key: None,
+            started_at,
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+    assert!(outcome.was_running);
+
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        gh_calls.contains("api repos/{owner}/{repo}/issues/8802/timeline"),
+        "expected finish_cancel to consult the forge-side claim timeline; got: {gh_calls:?}"
+    );
+    assert!(
+        !gh_calls.contains("--remove-label loom:building"),
+        "a cancel whose forge timeline shows a newer claim must NOT restore \
+             loom:building -> loom:issue (would destroy a peer host's live claim, #5017/#5282); \
+             got gh invocations: {gh_calls:?}"
+    );
+}
+
+/// Issue #5017/#5282: the SAME cross-host claim-ownership check must
+/// apply to the reaper's natural-exit/crash label-restore path
+/// (`reap_once`'s checkpoint-present branch), not just `finish_cancel` —
+/// the Curator's "Suspected Cause (unverified)" flagged this as the
+/// likely-but-unconfirmed second call site by code-path symmetry; this
+/// test confirms it.
+#[test]
+fn reap_skips_restore_when_forge_shows_a_newer_claim_from_another_host() {
+    let dir = tempdir().unwrap();
+    let (mut registry, gh_log) = fixture_registry(dir.path());
+    // Override the fixture's fake `gh` so `gh api .../timeline` answers
+    // with a labeling timestamp AFTER `started_at` (set below).
+    let fake_gh = dir.path().join("fake-gh-timeline.sh");
+    let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo \"\\\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\\\"\"\nfi\nexit 0\n",
+            gh_log.display()
+        );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    registry.config.gh_bin = Some(fake_gh);
+    registry.config.skip_label_flip = false;
+
+    // Checkpoint present so the reaper picks the Crashed/label-restore
+    // branch under test.
+    let cp_dir = registry.config.checkpoint_dir();
+    std::fs::create_dir_all(&cp_dir).unwrap();
+    std::fs::write(cp_dir.join("issue-8803.json"), r#"{"phase":"builder","issue":8803}"#).unwrap();
+
+    let started_at = Utc::now() - chrono::Duration::hours(1);
+    let sweep_id = "sweep-issue-8803-loser".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(8803),
+            pid: 2_147_483_640, // near-certainly dead
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(8803),
+            idempotency_key: None,
+            started_at,
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let changed = registry.reap_once();
+    assert!(changed >= 1);
+
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        gh_calls.contains("api repos/{owner}/{repo}/issues/8803/timeline"),
+        "expected reap_once to consult the forge-side claim timeline; got: {gh_calls:?}"
+    );
+    assert!(
+        !gh_calls.contains("--remove-label loom:building"),
+        "a reap whose forge timeline shows a newer claim must NOT restore \
+             loom:building -> loom:issue (would destroy a peer host's live claim, #5017/#5282); \
+             got gh invocations: {gh_calls:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn reaper_interval_env_override() {
+    // Serialized: this test mutates a process-wide env var.
+    std::env::remove_var(REAPER_INTERVAL_ENV);
+    let d = resolve_reaper_interval();
+    assert_eq!(d.as_secs(), DEFAULT_REAPER_INTERVAL_SECS);
+
+    std::env::set_var(REAPER_INTERVAL_ENV, "7");
+    let d = resolve_reaper_interval();
+    assert_eq!(d.as_secs(), 7);
+    std::env::remove_var(REAPER_INTERVAL_ENV);
+}
+
+// ========================================================================
+// Phase C tests (Issue #3455)
+// ========================================================================
+
+#[test]
+fn get_status_returns_clone_or_none() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+
+    assert!(registry.get_status("missing").is_none());
+
+    let sweep_id = "sweep-status-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(42),
+            pid: 1234,
+            token_name: "agent-1.token".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(42),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: Some("builder".into()),
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let info = registry.get_status(&sweep_id).expect("status should exist");
+    assert_eq!(info.pid, 1234);
+    assert!(matches!(info.kind, SweepKind::Issue(42)));
+    assert!(matches!(info.state, SweepState::Running));
+}
+
+#[test]
+fn tail_log_returns_last_n_lines() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+
+    let log_path = registry.compute_log_path(99);
+    std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    let body = (1..=20)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&log_path, body).unwrap();
+
+    let sweep_id = "sweep-tail-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(99),
+            pid: 1,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: log_path.clone(),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let (path, tail) = registry.tail_log(&sweep_id, 5).unwrap();
+    assert_eq!(path, log_path);
+    assert_eq!(tail.len(), 5);
+    assert_eq!(tail[0], "line 16");
+    assert_eq!(tail[4], "line 20");
+
+    // Requesting more lines than the file has should yield the whole file.
+    let (_path, tail) = registry.tail_log(&sweep_id, 1000).unwrap();
+    assert_eq!(tail.len(), 20);
+
+    // Zero is honored (returns empty vec).
+    let (_path, tail) = registry.tail_log(&sweep_id, 0).unwrap();
+    assert!(tail.is_empty());
+}
+
+#[test]
+fn tail_log_rejects_unknown_sweep() {
+    let dir = tempdir().unwrap();
+    let (registry, _record_log) = fixture_registry(dir.path());
+    let err = registry.tail_log("nope", 10).unwrap_err();
+    assert!(err.to_string().contains("unknown sweep_id"));
+}
+
+#[test]
+fn cancel_unknown_sweep_returns_error() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let err = registry
+        .cancel("does-not-exist", Duration::from_millis(50))
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown sweep_id"));
+}
+
+#[test]
+fn cancel_on_already_terminal_is_idempotent_noop() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+
+    let sweep_id = "sweep-already-exited".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(11),
+            pid: 1,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(11),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Exited {
+                code: Some(0),
+                at: Utc::now(),
+            },
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let outcome = registry
+        .cancel(&sweep_id, Duration::from_millis(50))
+        .unwrap();
+    assert!(!outcome.was_running);
+    assert!(!outcome.sigkill_sent);
+    // State should remain Exited (not flipped to Exited{None, now}).
+    let info = registry.get(&sweep_id).unwrap();
+    if let SweepState::Exited { code, .. } = &info.state {
+        assert_eq!(*code, Some(0));
+    } else {
+        panic!("state should remain Exited");
+    }
+}
+
+#[test]
+fn cancel_dead_pid_transitions_to_exited_without_sigkill() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+
+    let sweep_id = "sweep-dead-pid".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(22),
+            pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(22),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    let outcome = registry
+        .cancel(&sweep_id, Duration::from_millis(200))
+        .unwrap();
+    assert!(outcome.was_running);
+    // SIGTERM to a dead pid is a no-op success; the poll loop sees
+    // pid dead immediately and never escalates to SIGKILL.
+    assert!(!outcome.sigkill_sent);
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Exited { .. }));
+}
+
+/// AC #3: SIGTERM -> grace -> SIGKILL against a fixture child that
+/// ignores SIGTERM. Spawns `bash -c 'trap "" TERM; sleep 5'`, asks
+/// the registry to cancel with a short grace, and asserts that the
+/// registry transitioned + sigkill_sent=true. We then `wait()` on the
+/// `Child` handle to reap the zombie before asserting liveness.
+#[test]
+fn cancel_escalates_to_sigkill_when_child_ignores_sigterm() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+
+    // Spawn a real child that traps SIGTERM and sleeps for 30s.
+    // We need a real PID so SIGTERM/SIGKILL paths are exercised end
+    // to end. We keep the Child handle so we can `wait()` after the
+    // cancel — without that, SIGKILL leaves the child as a zombie
+    // and `kill(pid, 0)` still returns success (the PID is still in
+    // the process table).
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg("trap '' TERM; sleep 30")
+        .spawn()
+        .expect("spawn fixture child");
+    let pid = child.id();
+
+    // Give bash a moment to install the trap before we try to TERM it.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let sweep_id = "sweep-trap-term".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(77),
+            pid,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(77),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    // Use a short grace — long enough for SIGTERM to be delivered to
+    // a healthy bash (~200ms), short enough to keep the test fast.
+    let outcome = registry
+        .cancel(&sweep_id, Duration::from_millis(500))
+        .expect("cancel should succeed");
+    assert!(outcome.was_running);
+    assert!(
+        outcome.sigkill_sent,
+        "trap '' TERM child should have survived SIGTERM and escalated to SIGKILL"
+    );
+
+    // Reap the zombie so the PID is truly gone from the process table.
+    let exit_status = child.wait().expect("wait on cancelled child");
+    // Exit status: killed by SIGKILL means no clean exit code on Unix;
+    // `success()` should be false. We don't assert specifics — the
+    // platform's signal-vs-exit-code reporting varies.
+    assert!(!exit_status.success(), "child should not have exited cleanly after SIGKILL");
+
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Exited { .. }));
+}
+
+/// Issue #3807 core AC: the SIGTERM → grace-poll → SIGKILL escalation must
+/// NOT hold the registry lock for the full grace window. We drive the split
+/// `begin_cancel` → `poll_cancel` (unlocked sleeps between polls) →
+/// `finish_cancel` orchestration on one thread against a real trap-TERM
+/// child (forced to run the FULL grace before escalating), and assert a
+/// concurrent `get_status` on a DIFFERENT sweep returns PROMPTLY — well
+/// under the grace window — rather than blocking for it. With the old
+/// `cancel(&mut self)` (lock held throughout) the concurrent read would
+/// block for the entire grace.
+#[test]
+fn split_cancel_does_not_hold_lock_across_grace_window() {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let dir = tempdir().unwrap();
+    let (registry, _record_log) = fixture_registry(dir.path());
+    let registry = Arc::new(Mutex::new(registry));
+
+    // A real child that traps (ignores) SIGTERM and sleeps, so the cancel
+    // is forced to poll for the full grace before escalating to SIGKILL.
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg("trap '' TERM; sleep 30")
+        .spawn()
+        .expect("spawn fixture child");
+    let target_pid = child.id();
+    // Give bash a moment to install the trap before we TERM it.
+    thread::sleep(Duration::from_millis(100));
+
+    let target = "sweep-cancel-target".to_string();
+    let other = "sweep-concurrent-reader".to_string();
+    {
+        let mut reg = registry.lock().unwrap();
+        let target_log = reg.compute_log_path(880);
+        let other_log = reg.compute_log_path(881);
+        reg.entries.insert(
+            target.clone(),
+            SweepInfo {
+                pgid: None,
+                sweep_id: target.clone(),
+                kind: SweepKind::Issue(880),
+                pid: target_pid,
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                runtime_source: None,
+                log_path: target_log,
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+        reg.entries.insert(
+            other.clone(),
+            SweepInfo {
+                pgid: None,
+                sweep_id: other.clone(),
+                kind: SweepKind::Issue(881),
+                pid: 2_147_483_640, // ~i32::MAX, harmless dead pid
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                runtime_source: None,
+                log_path: other_log,
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+    }
+
+    // 1s grace: long enough that a lock held throughout would clearly
+    // block the concurrent read for ~1s, short enough to keep the test fast.
+    let grace = Duration::from_millis(1000);
+
+    // Thread A: run the split orchestration (mirrors the IPC handler),
+    // releasing the mutex between the 100ms poll sleeps.
+    let reg_a = Arc::clone(&registry);
+    let target_a = target.clone();
+    let canceller = thread::spawn(move || {
+        let (pid, kind, started_at) = match reg_a.lock().unwrap().begin_cancel(&target_a).unwrap() {
+            BeginCancel::Signalled {
+                pid,
+                kind,
+                started_at,
+            } => (pid, kind, started_at),
+            BeginCancel::AlreadyTerminal(_) => panic!("target should be running"),
+        };
+        let deadline = std::time::Instant::now() + grace;
+        let mut exited = reg_a.lock().unwrap().poll_cancel(&target_a, pid);
+        while !exited && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+            exited = reg_a.lock().unwrap().poll_cancel(&target_a, pid);
+        }
+        reg_a
+            .lock()
+            .unwrap()
+            .finish_cancel(&target_a, pid, &kind, started_at, exited)
+    });
+
+    // Let thread A send SIGTERM and enter the (unlocked) poll loop.
+    thread::sleep(Duration::from_millis(150));
+
+    // Concurrent read on the OTHER sweep: must return well under the grace
+    // window because the poll loop releases the mutex between polls.
+    let start = std::time::Instant::now();
+    let info = registry.lock().unwrap().get_status(&other);
+    let elapsed = start.elapsed();
+    assert!(info.is_some(), "other sweep should still be queryable");
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "concurrent get_status blocked for {elapsed:?} — the registry mutex \
+             was held across the grace window (grace was {grace:?})"
+    );
+
+    let outcome = canceller.join().expect("cancel thread panicked");
+    assert!(outcome.was_running);
+    assert!(
+        outcome.sigkill_sent,
+        "trap-TERM child should have survived SIGTERM and escalated to SIGKILL"
+    );
+
+    // Reap the zombie so the PID leaves the process table.
+    let exit_status = child.wait().expect("wait on cancelled child");
+    assert!(!exit_status.success(), "child should not have exited cleanly after SIGKILL");
+
+    let final_state = registry.lock().unwrap().get(&target).unwrap().state.clone();
+    assert!(matches!(final_state, SweepState::Exited { .. }));
+}
+
+#[test]
+fn cancel_emits_exited_and_completed_events() {
+    // Bus emission path: cancel a dead-pid sweep and confirm we
+    // see sweep.issue.{N}.exited + sweep.global.completed.
+    use crate::event_bus::EventBus;
+
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let bus = Arc::new(EventBus::new());
+    registry.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    let sweep_id = "sweep-cancel-event".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(88),
+            pid: 2_147_483_640,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(88),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    registry
+        .cancel(&sweep_id, Duration::from_millis(100))
+        .unwrap();
+
+    // Drain two events synchronously (cancel emits inline).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut saw_exited = false;
+        let mut saw_completed = false;
+        for _ in 0..2 {
+            match sub.recv().await.unwrap() {
+                Event::SweepExited { issue, .. } => {
+                    assert_eq!(issue, 88);
+                    saw_exited = true;
+                }
+                Event::SweepGlobalCompleted { outcome, .. } => {
+                    assert_eq!(outcome, SweepOutcome::Exited);
+                    saw_completed = true;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(saw_exited);
+        assert!(saw_completed);
+    });
+}
+
+/// Issue #3800: `cancel()` must tear down the WHOLE process tree, not just
+/// the tracked leader PID. We dispatch a fixture whose leader forks a
+/// backgrounded grandchild (both in the leader's process group, thanks to
+/// `dispatch()`'s `process_group(0)`), then cancel and assert BOTH the
+/// leader and the grandchild are gone within the grace window. A
+/// single-PID kill would orphan the backgrounded grandchild — this test
+/// fails without the group-kill fix.
+#[test]
+#[serial]
+fn cancel_terminates_whole_process_group_including_grandchild() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path();
+    let gc_pidfile = workspace.join("grandchild.pid");
+
+    // Leader (= group leader after process_group(0)) forks a background
+    // grandchild that sleeps, records its PID, then blocks in a foreground
+    // sleep. All three processes share the leader's process group.
+    let script = format!(
+        "#!/usr/bin/env bash\nsleep 300 &\necho \"$!\" > \"{gc}\"\nsleep 300\n",
+        gc = gc_pidfile.display()
+    );
+    let mut registry = lifecycle_registry(workspace, &script);
+
+    let outcome = registry
+        .dispatch(&SweepKind::Issue(4242), None, None, None, None)
+        .expect("dispatch should succeed");
+    let leader_pid = outcome.pid;
+    let sweep_id = outcome.sweep_id.clone();
+
+    let gc_pid = read_pid_file(&gc_pidfile, FIXTURE_CHILD_WAIT_MS)
+        .expect("grandchild pid should be recorded");
+    assert!(is_pid_alive(leader_pid), "leader should be running post-dispatch");
+    assert!(is_pid_alive(gc_pid), "grandchild should be running post-dispatch");
+    assert_ne!(leader_pid, gc_pid);
+
+    // None of the processes trap SIGTERM, so a group SIGTERM tears the
+    // whole tree down inside the grace window (no SIGKILL escalation).
+    let cancel = registry
+        .cancel(&sweep_id, Duration::from_secs(3))
+        .expect("cancel should succeed");
+    assert!(cancel.was_running);
+
+    // The ENTIRE tree must be gone. The grandchild assertion is the crux:
+    // it proves the signal reached the whole process group (#3800), not
+    // just the tracked leader PID.
+    assert!(
+        wait_until_dead(leader_pid, FIXTURE_CHILD_WAIT_MS),
+        "leader still alive after cancel"
+    );
+    assert!(
+        wait_until_dead(gc_pid, FIXTURE_CHILD_WAIT_MS),
+        "grandchild survived cancel — group-kill did not reach it (single-PID regression)"
+    );
+
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Exited { .. }));
+}
+
+/// Issue #4980, the crux regression test: cancelling a **reconstructed**
+/// entry must still tear down the whole process group.
+///
+/// [`cancel_terminates_whole_process_group_including_grandchild`] above only
+/// proves group-kill works while the *spawning* registry still holds the
+/// in-memory `Child` handle. That was the entire gate on the group path
+/// (`if self.children.contains_key(sweep_id)`), so the two situations an
+/// operator actually hits at 3am both silently degraded to a single-PID kill:
+/// a daemon that has since restarted (this test, via `reconstruct()`), and
+/// **every** `loom-daemon cancel` invocation, which runs in a fresh process
+/// that never held a handle at all.
+///
+/// The second registry here models both: same workspace, same on-disk lock,
+/// zero retained handles. The grandchild assertion is what fails on a
+/// regression — a single-PID kill leaves it running, which is precisely the
+/// zombie-agent shape of the 2026-08-03 incident.
+#[test]
+#[serial]
+fn cancel_reconstructed_entry_kills_whole_group() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path();
+    let gc_pidfile = workspace.join("grandchild.pid");
+
+    let script = format!(
+        "#!/usr/bin/env bash\nsleep 300 &\necho \"$!\" > \"{gc}\"\nsleep 300\n",
+        gc = gc_pidfile.display()
+    );
+    let mut spawner = lifecycle_registry(workspace, &script);
+
+    let outcome = spawner
+        .dispatch(&SweepKind::Issue(4980), None, None, None, None)
+        .expect("dispatch should succeed");
+    let leader_pid = outcome.pid;
+    let sweep_id = outcome.sweep_id.clone();
+
+    let gc_pid = read_pid_file(&gc_pidfile, FIXTURE_CHILD_WAIT_MS)
+        .expect("grandchild pid should be recorded");
+    assert!(is_pid_alive(leader_pid), "leader should be running post-dispatch");
+    assert!(is_pid_alive(gc_pid), "grandchild should be running post-dispatch");
+
+    // The pgid must have been persisted to the claim lock at spawn time —
+    // this is what survives the daemon, and the OS cannot re-derive it once
+    // the leader dies.
+    let owner_path = spawner
+        .config
+        .locks_dir()
+        .join("issue-4980")
+        .join("owner.json");
+    let owner: LockOwner =
+        serde_json::from_str(&std::fs::read_to_string(&owner_path).unwrap()).unwrap();
+    assert_eq!(owner.owner_pid, leader_pid);
+    assert_eq!(
+        owner.pgid,
+        Some(leader_pid),
+        "owner.json must record the child's process group (#4980)"
+    );
+
+    // Simulate the daemon restart / fresh CLI process: a brand-new registry
+    // over the same workspace, rebuilt from disk. It has NO `Child` handle
+    // for this sweep — the exact condition that used to disable group-kill.
+    let mut restarted = lifecycle_registry(workspace, &script);
+    let admitted = restarted.reconstruct().expect("reconstruct should succeed");
+    assert_eq!(admitted, 1, "the live lock should be admitted as a Running entry");
+    assert!(
+        !restarted.children.contains_key(&sweep_id),
+        "a reconstructed entry must not have a retained Child handle — that is the \
+             whole point of this test"
+    );
+    assert_eq!(
+        restarted.get(&sweep_id).unwrap().pgid,
+        Some(leader_pid),
+        "reconstruct() must restore the persisted process group"
+    );
+
+    let cancel = restarted
+        .cancel(&sweep_id, Duration::from_secs(1))
+        .expect("cancel should succeed");
+    assert!(cancel.was_running);
+
+    // THE assertion: the grandchild is not a direct child of anything this
+    // registry tracks, so only a group-scoped signal can reach it.
+    assert!(
+        wait_until_dead(gc_pid, FIXTURE_CHILD_WAIT_MS),
+        "grandchild survived a cancel of a RECONSTRUCTED entry — the group-kill degraded \
+             to a single-PID kill (#4980 regression)"
+    );
+
+    // The leader was SIGKILLed but is still a child of THIS test process
+    // (the original registry spawned it), so it lingers as a zombie until
+    // someone `wait()`s it — in production the old daemon is gone and init
+    // reaps it. Reap it through the spawner's retained handle, then assert
+    // it is genuinely gone.
+    let _ = spawner.reap_handle(&sweep_id);
+    assert!(
+        wait_until_dead(leader_pid, FIXTURE_CHILD_WAIT_MS),
+        "leader still alive after cancel"
+    );
+}
+
+/// Issue #4980 edge case: an `owner.json` written by a **pre-#4980** daemon
+/// binary has no `pgid` key at all. It must still deserialize (a parse
+/// failure is read everywhere as "no owner", which would drop a *live*
+/// sweep's lock), reconstruct into an entry with `pgid: None`, and cancel
+/// via a documented single-PID fallback rather than panicking.
+#[test]
+#[serial]
+fn reconstruct_tolerates_pre_pgid_owner_json_and_degrades_gracefully() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path();
+    let mut registry = lifecycle_registry(workspace, "#!/usr/bin/env bash\nsleep 300\n");
+
+    // A long-lived process to stand in for the live sweep leader. Spawned
+    // WITHOUT `process_group(0)`, exactly like a pre-#4980 daemon's child
+    // would appear to a registry that has no record of its group.
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg("sleep 300")
+        .spawn()
+        .expect("spawn fixture child");
+    let pid = child.id();
+
+    // Byte-for-byte the old on-disk schema: four keys, no `pgid`.
+    let locks = registry.config.locks_dir();
+    let lock = locks.join("issue-4979");
+    std::fs::create_dir_all(&lock).unwrap();
+    std::fs::write(
+        lock.join("owner.json"),
+        format!(
+            r#"{{"issue":4979,"owner_pid":{pid},"acquired_at":"{}","sweep_id":"sweep-legacy"}}"#,
+            Utc::now().to_rfc3339()
+        ),
+    )
+    .unwrap();
+
+    let admitted = registry
+        .reconstruct()
+        .expect("a pre-#4980 owner.json must not fail reconstruction");
+    assert_eq!(admitted, 1, "the legacy lock must still be admitted");
+    let info = registry.get("sweep-legacy").expect("legacy entry admitted");
+    assert_eq!(info.pid, pid);
+    assert_eq!(info.pgid, None, "no group is recorded in a pre-#4980 owner.json");
+
+    // Cancel must fall back to single-PID delivery — no panic, no
+    // group-signal against an unknown group.
+    let outcome = registry
+        .cancel("sweep-legacy", Duration::from_secs(1))
+        .expect("cancel of a legacy entry should succeed");
+    assert!(outcome.was_running);
+    let _ = child.wait();
+    assert!(wait_until_dead(pid, FIXTURE_CHILD_WAIT_MS), "legacy child should be gone");
+}
+
+/// Issue #4980: a recorded pgid that the OS contradicts (PID recycled across
+/// a daemon restart, so the live `owner_pid` leads some *other* group) must
+/// be discarded, not trusted. Trusting it would aim a later `kill(-pgid, 9)`
+/// at a stranger's process group.
+#[test]
+#[serial]
+fn reconstruct_discards_a_pgid_the_os_contradicts() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path();
+    let mut registry = lifecycle_registry(workspace, "#!/usr/bin/env bash\nsleep 300\n");
+
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg("sleep 300")
+        .spawn()
+        .expect("spawn fixture child");
+    let pid = child.id();
+
+    // This child was NOT spawned as a group leader, so `getpgid(pid)` is the
+    // test harness's group — never `pid` itself. Claim otherwise on disk.
+    let lock = registry.config.locks_dir().join("issue-4978");
+    std::fs::create_dir_all(&lock).unwrap();
+    let owner = LockOwner {
+        issue: 4978,
+        owner_pid: pid,
+        acquired_at: Utc::now().to_rfc3339(),
+        sweep_id: "sweep-stale-pgid".to_string(),
+        pgid: Some(pid),
+    };
+    std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
+
+    registry.reconstruct().expect("reconstruct should succeed");
+    assert_eq!(
+        registry.get("sweep-stale-pgid").unwrap().pgid,
+        None,
+        "a pgid the OS does not confirm must be discarded (#4980)"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Issue #4980 acceptance criterion 2 (the crash path): a sweep whose
+/// **leader is already dead** but whose process group still holds live
+/// members must have that group reaped — not left running unclaimed work.
+///
+/// This is the incident shape verbatim: the registry showed `in_flight: 0`
+/// while a surviving `claude` agent kept mutating a repo whose claim had
+/// already been returned to the queue. `signal_sweep` cannot help here (the
+/// OS will not report a dead pid's group), which is exactly why the pgid is
+/// persisted while the leader is alive.
+#[test]
+#[serial]
+fn reaper_reaps_the_surviving_group_of_a_dead_leader() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let gc_pidfile = dir.path().join("orphan.pid");
+
+    // A group leader that forks a long-lived background child and then
+    // exits: the leader dies, the group lives on with an orphan in it.
+    let mut leader = {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(format!(
+            "sleep 300 &\necho \"$!\" > \"{gc}\"\nexit 0\n",
+            gc = gc_pidfile.display()
+        ));
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.spawn().expect("spawn fixture leader")
+    };
+    let leader_pid = leader.id();
+    let orphan_pid =
+        read_pid_file(&gc_pidfile, FIXTURE_CHILD_WAIT_MS).expect("orphan pid should be recorded");
+    // Reap the leader so it is genuinely dead (not a zombie that
+    // `kill(pid, 0)` would still report as alive).
+    let _ = leader.wait();
+    assert!(wait_until_dead(leader_pid, FIXTURE_CHILD_WAIT_MS), "leader should be gone");
+    assert!(is_pid_alive(orphan_pid), "orphan should have survived its leader");
+
+    let sweep_id = "sweep-orphaned-group".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(4977),
+            pid: leader_pid,
+            // Persisted at spawn time; the ONLY remaining handle on the
+            // survivors now that the leader is gone.
+            pgid: Some(leader_pid),
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(4977),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    registry.reap_once();
+
+    assert!(
+        wait_until_dead(orphan_pid, FIXTURE_CHILD_WAIT_MS),
+        "the dead leader's surviving process group was not reaped — a zombie agent would \
+             keep running unclaimed work (#4980)"
+    );
+}
+
+/// Issue #4980: a group that ignores the crash-path SIGTERM is escalated to
+/// SIGKILL on a later reaper tick. The escalation is deliberately deferred
+/// rather than slept through inline — `reap_once` runs on the `ListSweeps`
+/// read path under the registry mutex, where blocking is the 2026-07-26
+/// wedge shape — so this test drives the two ticks directly.
+#[test]
+#[serial]
+fn pending_group_reap_escalates_to_sigkill_on_a_later_tick() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let gc_pidfile = dir.path().join("stubborn.pid");
+
+    // The background child traps (ignores) SIGTERM, so only SIGKILL ends it.
+    let mut leader = {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(format!(
+            "bash -c 'trap \"\" TERM; sleep 300' &\necho \"$!\" > \"{gc}\"\nexit 0\n",
+            gc = gc_pidfile.display()
+        ));
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.spawn().expect("spawn fixture leader")
+    };
+    let leader_pid = leader.id();
+    let orphan_pid =
+        read_pid_file(&gc_pidfile, FIXTURE_CHILD_WAIT_MS).expect("orphan pid should be recorded");
+    let _ = leader.wait();
+    // Give the inner bash a moment to install its TERM trap.
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        registry.reap_orphaned_group("sweep-stubborn", Some(4976), leader_pid),
+        "a group with live members must be reaped"
+    );
+    assert!(
+        registry.pending_group_reaps.contains_key("sweep-stubborn"),
+        "a SIGKILL escalation must be registered"
+    );
+    // The SIGTERM is ignored, so the orphan is still there.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(is_pid_alive(orphan_pid), "trap-TERM orphan should have survived SIGTERM");
+
+    // Bring the deadline forward rather than sleeping out the real grace.
+    registry
+        .pending_group_reaps
+        .get_mut("sweep-stubborn")
+        .unwrap()
+        .escalate_at = Instant::now();
+    registry.escalate_pending_group_reaps();
+
+    assert!(
+        wait_until_dead(orphan_pid, FIXTURE_CHILD_WAIT_MS),
+        "the stubborn orphan survived the SIGKILL escalation (#4980)"
+    );
+    assert!(
+        registry.pending_group_reaps.is_empty(),
+        "a completed escalation must be dropped from the pending map"
+    );
+}
+
+/// Issue #4980 safety floor: a recorded pgid naming **this process's own
+/// group** must never be signalled. `kill(-our_pgid, 9)` would take down the
+/// daemon and every sweep it owns — the one mistake in this area that is
+/// worse than the bug being fixed.
+#[test]
+#[serial]
+fn group_signalling_refuses_this_processs_own_group() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let own_group = current_process_group().expect("unix test host");
+
+    assert!(
+        !registry.reap_orphaned_group("sweep-self", None, own_group),
+        "reap_orphaned_group must refuse our own process group"
+    );
+    assert!(registry.pending_group_reaps.is_empty());
+
+    // `signal_sweep` falls back to single-PID delivery rather than group
+    // delivery. Signal 0 (liveness probe) keeps the test harmless: it proves
+    // which target was chosen without killing anything.
+    let sweep_id = "sweep-self-entry".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(4975),
+            pid: std::process::id(),
+            pgid: Some(own_group),
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(4975),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+    assert!(
+        registry.signal_sweep(&sweep_id, std::process::id(), 0),
+        "the single-PID fallback should still reach the (live) pid"
+    );
+}
+
+/// Issue #3801: a child killed OUT OF BAND (operator `kill -KILL`, not via
+/// `cancel()`) must be reaped by the reaper — no `<defunct>` zombie — and
+/// the registry entry must transition out of `Running`. Without the
+/// retained-`Child`-handle `try_wait()`, the killed leader becomes a
+/// zombie whose `kill(pid, 0)` still reports alive, so `reap_once()` would
+/// leave the entry stuck `Running` forever.
+#[test]
+#[serial]
+fn reaper_reaps_out_of_band_killed_child_and_transitions_state() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path();
+
+    let mut registry = lifecycle_registry(workspace, "#!/usr/bin/env bash\nsleep 300\n");
+
+    let outcome = registry
+        .dispatch(&SweepKind::Issue(5151), None, None, None, None)
+        .expect("dispatch should succeed");
+    let pid = outcome.pid;
+    let sweep_id = outcome.sweep_id.clone();
+
+    // Let the child start.
+    assert!(wait_until_alive(pid, FIXTURE_CHILD_WAIT_MS), "child should have started");
+    assert!(matches!(registry.get(&sweep_id).unwrap().state, SweepState::Running));
+
+    // Kill out of band: SIGKILL the leader PID directly (mimics an
+    // operator `kill -KILL <pid>`), bypassing cancel(). The leader is now
+    // a zombie under the daemon (test) PID until we wait() it.
+    assert!(send_signal(pid, 9), "SIGKILL to live child should succeed");
+
+    // Drive reaper ticks. The retained handle's try_wait() reaps the
+    // zombie and observes the exit, transitioning the entry to terminal.
+    let mut transitioned = false;
+    for _ in 0..80 {
+        registry.reap_once();
+        match registry.get(&sweep_id).map(|i| i.state.clone()) {
+            Some(SweepState::Running | SweepState::Pending) => {}
+            _ => {
+                transitioned = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        transitioned,
+        "reaper did not transition the out-of-band-killed sweep out of Running"
+    );
+
+    // No zombie: because try_wait() reaped the child, kill(pid, 0) now
+    // fails (the PID is no longer in the process table).
+    assert!(
+        wait_until_dead(pid, FIXTURE_CHILD_WAIT_MS),
+        "killed child left a <defunct> zombie — reaper did not wait() it"
+    );
+}
+
+/// Issue #3893: a read path (`reap_liveness`, wired into `ListSweeps` /
+/// `GetSweepStatus` / the work-finder occupancy seed) must transition a
+/// sweep whose child has already exited out of `Running` promptly —
+/// bounded to seconds — WITHOUT waiting for the 30s reaper timer. This is
+/// the regression that made `list_sweeps` over-report active work across a
+/// burst of merges.
+#[test]
+#[serial]
+fn read_path_reaps_exited_child_out_of_running_promptly() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path();
+
+    // A fake spawn that exits immediately: mirrors a sweep whose lifecycle
+    // has completed (PR merged) and whose process has already exited.
+    let mut registry = lifecycle_registry(workspace, "#!/usr/bin/env bash\nexit 0\n");
+
+    let outcome = registry
+        .dispatch(&SweepKind::Issue(4242), None, None, None, None)
+        .expect("dispatch should succeed");
+    let sweep_id = outcome.sweep_id.clone();
+
+    // Phase 1 (#4044): wait generously for the fixture child to actually
+    // exit. Under host exec-latency pressure (syspolicyd, AV scanners),
+    // launching the child and running it to `exit 0` can itself take far
+    // longer than the promptness bound below — that latency is a host
+    // condition, not the property under test, so it gets the same
+    // generous ceiling as every other fixture-child wait.
+    assert!(
+        wait_until_dead(outcome.pid, FIXTURE_CHILD_WAIT_MS),
+        "fixture child did not exit within the wait budget"
+    );
+
+    // Phase 2: reap-on-read reconciles liveness via the retained handle's
+    // `try_wait()`. Bound THIS loop to ~2s to prove "prompt" — a healthy
+    // implementation transitions on the first reconcile once the child is
+    // confirmed dead (`try_wait` reaps the zombie and yields the exit
+    // status). Because Phase 1 already confirmed death, this bound now
+    // measures reap promptness from confirmed death, not from dispatch —
+    // it can no longer be falsely reddened by the child's own launch
+    // latency.
+    let mut still_running = true;
+    for _ in 0..80 {
+        registry.reap_liveness();
+        let running = registry.list(Some(&SweepState::Running));
+        if !running.iter().any(|i| i.sweep_id == sweep_id) {
+            still_running = false;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !still_running,
+        "exited child still reported Running after a read-path reconcile (#3893)"
+    );
+    assert!(
+        matches!(registry.get(&sweep_id).unwrap().state, SweepState::Exited { .. }),
+        "exited child should have transitioned to terminal Exited state"
+    );
+    // And it should no longer count as in-flight for occupancy accounting.
+    assert!(
+        registry.list(Some(&SweepState::Running)).is_empty(),
+        "no sweep should remain Running after the exited child was reaped"
+    );
+}
+
+// ===================================================================
+// Read-path forge I/O is bounded (Issue #3973)
+// ===================================================================
+//
+// The reaper's `gh` shell-outs run on the `ListSweeps` / `GetSweepStatus`
+// read path via `reap_liveness`. During the 2026-07-26 incident a wedged
+// `gh`/XPC blocked that read under the registry mutex for ~15 minutes.
+// These tests pin the bounded-subprocess fix.
+
+#[test]
+fn output_with_timeout_returns_output_for_a_fast_command() {
+    let mut cmd = Command::new("/bin/echo");
+    cmd.arg("hi");
+    let out = output_with_timeout(cmd, Duration::from_secs(5))
+        .expect("spawn should succeed")
+        .expect("a fast command must complete inside the window");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+}
+
+#[test]
+fn output_with_timeout_kills_a_hung_command() {
+    let mut cmd = Command::new("/bin/sleep");
+    cmd.arg("30");
+    let start = Instant::now();
+    let out = output_with_timeout(cmd, Duration::from_millis(300)).expect("spawn should succeed");
+    let elapsed = start.elapsed();
+    assert!(out.is_none(), "a command exceeding the timeout must be killed and yield None");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "kill-on-timeout should be prompt, took {elapsed:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn reap_gh_timeout_honors_env_override() {
+    std::env::set_var(REAP_GH_TIMEOUT_ENV, "3");
+    assert_eq!(reap_gh_timeout(), Duration::from_secs(3));
+    // Zero and non-numeric both fall back to the compiled default.
+    std::env::set_var(REAP_GH_TIMEOUT_ENV, "0");
+    assert_eq!(reap_gh_timeout(), REAP_GH_TIMEOUT);
+    std::env::set_var(REAP_GH_TIMEOUT_ENV, "notanumber");
+    assert_eq!(reap_gh_timeout(), REAP_GH_TIMEOUT);
+    std::env::remove_var(REAP_GH_TIMEOUT_ENV);
+    assert_eq!(reap_gh_timeout(), REAP_GH_TIMEOUT);
+}
+
+/// End-to-end: a wedged `gh` must NOT block the `ListSweeps` /
+/// `GetSweepStatus` read path (`reap_liveness`) indefinitely, and the
+/// in-memory liveness transition must still complete when the forge label
+/// flip is killed for exceeding its timeout (Issue #3973).
+#[test]
+#[serial]
+fn read_path_reap_is_bounded_when_gh_wedges() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path();
+    let scripts_dir = workspace.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    // This test runs with `skip_label_flip = false`, so it exercises the
+    // real #4027 workspace-commands guard too — install the marker so
+    // dispatch proceeds to the gh-wedge scenario under test.
+    touch_sweep_command(workspace);
+
+    // A fake `gh` that hangs far longer than the reap timeout, simulating
+    // the wedged gh/XPC from the incident.
+    let fake_gh = scripts_dir.join("gh-hang.sh");
+    std::fs::write(&fake_gh, "#!/usr/bin/env bash\nsleep 60\n").unwrap();
+    let mut ghp = std::fs::metadata(&fake_gh).unwrap().permissions();
+    ghp.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, ghp).unwrap();
+
+    // A fake spawn that exits immediately so the read-path reap finds a
+    // dead child and attempts the forge label restore.
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    std::fs::write(&spawn, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+    let mut sp = std::fs::metadata(&spawn).unwrap().permissions();
+    sp.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sp).unwrap();
+
+    let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    // Force the reaper's `gh` shell-out (byte-for-byte the incident path).
+    config.skip_label_flip = false;
+    config.journal_path = Some(workspace.join("test-sweeps-journal.json"));
+    let mut registry = SweepRegistry::new(config);
+
+    // Bound each reaper gh call tightly so the test is fast.
+    std::env::set_var(REAP_GH_TIMEOUT_ENV, "1");
+
+    let outcome = registry
+        .dispatch(&SweepKind::Issue(4243), None, None, None, None)
+        .expect("dispatch should succeed");
+    let sweep_id = outcome.sweep_id.clone();
+
+    // Ensure the child has actually exited before we reap-on-read. This
+    // gate is generous (#4044) — it is not part of the bounded-gh
+    // property under test below, which starts timing only after this
+    // point.
+    assert!(
+        wait_until_dead(outcome.pid, FIXTURE_CHILD_WAIT_MS),
+        "fake spawn child did not exit within the wait budget"
+    );
+
+    // The read-path reap must return well under the ~15-minute hang. It
+    // kills the wedged gh at the 1s bound; generous headroom covers poll
+    // slack and any second bounded call.
+    let start = Instant::now();
+    registry.reap_liveness();
+    let elapsed = start.elapsed();
+    std::env::remove_var(REAP_GH_TIMEOUT_ENV);
+
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "reap_liveness on the read path took {elapsed:?} — a wedged gh must not block it \
+             indefinitely (#3973)"
+    );
+    // The liveness transition still completes despite the killed gh.
+    assert!(
+        matches!(
+            registry.get(&sweep_id).unwrap().state,
+            SweepState::Exited { .. } | SweepState::Crashed { .. }
+        ),
+        "exited child should transition to a terminal state even when the forge label flip \
+             is killed for exceeding its timeout"
+    );
+}
+
+/// THE CORE REGRESSION (#4444): a checkpoint-resume dispatch — which
+/// deliberately bypasses the 2.6 open-PR guard for its OWN PR — must still be
+/// refused by the 2.7 park guard when the issue was parked after the crash.
+/// This is the path that overrode a `loom:blocked` park on #4366.
+///
+/// The refusal must be failure-visible, not silent: the reaper still emits
+/// `SweepResumeDispatched { dispatched: false }` (and logs the refusal, whose
+/// message names the park label), and no fresh `Running` entry is created.
+#[tokio::test]
+#[serial]
+async fn reaper_resume_refused_when_issue_parked_after_crash() {
+    use crate::event_bus::EventBus;
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    // Open linked PR #4501 (so the resume path engages and the 2.6 bypass
+    // matches) AND a `loom:blocked` park applied after the crash.
+    let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "4501", false);
+    let bus = Arc::new(EventBus::new());
+    reg.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    write_checkpoint(&reg, 4366, "builder-done");
+    insert_dead_running_entry(&mut reg, 4366, "sweep-issue-4366-crashed");
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    let mut saw_resume_false = false;
+    for _ in 0..8 {
+        let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+            break;
+        };
+        if let Event::SweepResumeDispatched {
+            issue,
+            pr,
+            dispatched,
+            ..
+        } = ev.unwrap()
+        {
+            assert_eq!(issue, 4366);
+            assert_eq!(pr, 4501);
+            assert!(!dispatched, "a park applied after the crash must refuse the resume dispatch");
+            saw_resume_false = true;
+        }
+    }
+    assert!(
+        saw_resume_false,
+        "the park refusal must stay failure-visible on the resume path (not silent)"
+    );
+
+    assert!(
+        running_issue_sweep_id(&reg, 4366).is_none(),
+        "a refused resume must not create a fresh Running entry"
+    );
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        calls.contains("api repos/rjwalters/loom/issues/4366 --jq .labels[].name"),
+        "the resume dispatch went through the central 2.7 REST probe; got: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.contains("api repos/rjwalters/loom/issues/4366 --jq .labels[].name"))
+            .count(),
+        1,
+        "exactly ONE park-label probe per resume dispatch (deduped with the old \
+             call-site-only check); got: {calls:?}"
+    );
+    // The park survives: the crash-path restore removed the stale claim but
+    // did NOT re-add `loom:issue` (#4206), and no fresh claim was flipped on.
+    assert!(
+        !calls.contains("--add-label loom:issue"),
+        "the operator's park must not be clobbered back to loom:issue; got: {calls:?}"
+    );
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// Companion to the test above: with the SAME fixture but no park label, the
+/// resume dispatch succeeds — proving the refusal above is caused by the park
+/// label and not by some other property of the fixture.
+#[tokio::test]
+#[serial]
+async fn reaper_resume_succeeds_when_issue_not_parked() {
+    use crate::event_bus::EventBus;
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, _gh_log) = park_guard_registry(ws, "loom:curated", 0, "4502", false);
+    let bus = Arc::new(EventBus::new());
+    reg.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    write_checkpoint(&reg, 4367, "builder-done");
+    insert_dead_running_entry(&mut reg, 4367, "sweep-issue-4367-crashed");
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    let mut saw_resume_true = false;
+    for _ in 0..8 {
+        let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+            break;
+        };
+        if let Event::SweepResumeDispatched { dispatched, .. } = ev.unwrap() {
+            assert!(dispatched, "an unparked issue must still resume normally");
+            saw_resume_true = true;
+        }
+    }
+    assert!(saw_resume_true, "expected a successful resume dispatch");
+    assert!(running_issue_sweep_id(&reg, 4367).is_some());
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// AC (Test Plan item 1): a crashed sweep whose checkpoint reads
+/// `builder-done` AND whose issue has an open linked PR is resumed by the
+/// reaper — the resume dispatch bypasses the #4123 open-PR guard (a
+/// second `issue edit ... loom:building` shows up in the gh log for a
+/// FRESH sweep entry), and a `SweepResumeDispatched` event is published so
+/// the recovery attempt is visible on the event bus (AC: "not silent").
+#[tokio::test]
+#[serial]
+async fn reaper_resumes_crashed_sweep_at_builder_done_with_open_pr() {
+    use crate::event_bus::EventBus;
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, gh_log) = open_pr_guard_registry(ws, "4300", 0, false);
+    let bus = Arc::new(EventBus::new());
+    reg.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    write_checkpoint(&reg, 4256, "builder-done");
+    insert_dead_running_entry(&mut reg, 4256, "sweep-issue-4256-crashed");
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    let mut saw_resume = false;
+    let mut saw_crashed = false;
+    // Crashed, GlobalCompleted, GlobalDispatch (resume spawn), plus our
+    // ResumeDispatched — drain generously and match by variant.
+    for _ in 0..8 {
+        let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+            break;
+        };
+        match ev.unwrap() {
+            Event::SweepResumeDispatched {
+                issue,
+                pr,
+                checkpoint_phase,
+                dispatched,
+                ..
+            } => {
+                assert_eq!(issue, 4256);
+                assert_eq!(pr, 4300);
+                assert_eq!(checkpoint_phase.as_deref(), Some("builder-done"));
+                assert!(dispatched, "the resume dispatch itself must have succeeded");
+                saw_resume = true;
+            }
+            Event::SweepCrashed { issue, .. } => {
+                assert_eq!(issue, 4256);
+                saw_crashed = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_crashed, "expected the normal sweep.issue.4256.crashed event too");
+    assert!(saw_resume, "expected a sweep.issue.4256.resume_dispatched event");
+
+    // A fresh Running entry exists for issue 4256 under a NEW sweep_id
+    // (the original crashed one is retained, terminal).
+    let resumed_id = running_issue_sweep_id(&reg, 4256);
+    assert!(resumed_id.is_some(), "resume dispatch must have created a new Running entry");
+    assert_ne!(resumed_id.unwrap(), "sweep-issue-4256-crashed");
+
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        calls.contains("issue edit 4256") && calls.contains("loom:building"),
+        "the resume dispatch must flip the label like an ordinary dispatch; got: {calls:?}"
+    );
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// Core regression (Issue #4463, Test Plan item 1): reaping an OLD dead
+/// sweep for issue N while a NEWER live sweep owns N's lock must (a) leave
+/// the lock intact and (b) fire NO resume dispatch — even though the
+/// checkpoint phase (`builder-done`) and an open linked PR would otherwise
+/// make this exactly the resume-eligible case. Without the ownership gate,
+/// the reaper would delete the live sweep's lock and re-dispatch a second
+/// sweep into the same worktree (the 43s-apart double-dispatch incident).
+#[test]
+#[serial]
+fn reap_dead_sweep_preserves_newer_sweep_lock_and_skips_resume() {
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    // graphql returns a PR ⇒ `probe_open_linked_pr` WOULD report one, so the
+    // ONLY thing that can prevent a resume dispatch is the #4463 gate.
+    let (mut reg, gh_log) = open_pr_guard_registry(ws, "9300", 0, false);
+
+    // A newer, still-live sweep B owns the issue lock (our own PID ⇒ alive).
+    let lock = write_lock_owner(&reg, 9256, "sweep-issue-9256-newer", std::process::id());
+    reg.entries.insert(
+        "sweep-issue-9256-newer".to_string(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: "sweep-issue-9256-newer".to_string(),
+            kind: SweepKind::Issue(9256),
+            pid: std::process::id(), // alive
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: reg.compute_log_path(9256),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    // A resume-eligible checkpoint + the OLD dead sweep A that lost the lock.
+    write_checkpoint(&reg, 9256, "builder-done");
+    insert_dead_running_entry(&mut reg, 9256, "sweep-issue-9256-dead");
+
+    let before = reg.entries.len();
+    reg.reap_once();
+
+    // (a) The live sweep's lock is intact and still owned by sweep B.
+    assert!(
+        lock.exists(),
+        "a newer live sweep's lock must survive reaping the old dead sweep"
+    );
+    let owner: LockOwner =
+        serde_json::from_str(&std::fs::read_to_string(lock.join("owner.json")).unwrap()).unwrap();
+    assert_eq!(owner.sweep_id, "sweep-issue-9256-newer");
+
+    // (b) No resume: the superseded gate short-circuits BEFORE the open-PR
+    // probe and BEFORE any label flip, and creates no fresh entry.
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !calls.contains("api graphql"),
+        "a superseded reap must not probe for a resume PR; got: {calls:?}"
+    );
+    assert!(
+        !calls.contains("issue edit"),
+        "a superseded reap must not flip or restore any label; got: {calls:?}"
+    );
+    assert_eq!(
+        reg.entries.len(),
+        before,
+        "no new sweep entry may be dispatched on a superseded reap"
+    );
+
+    // Exactly one live sweep remains (sweep B); sweep A is terminal.
+    assert!(matches!(
+        reg.get("sweep-issue-9256-dead").unwrap().state,
+        SweepState::Crashed { .. }
+    ));
+    assert!(matches!(reg.get("sweep-issue-9256-newer").unwrap().state, SweepState::Running));
+
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// AC (Test Plan item 3): a crashed sweep whose checkpoint is
+/// `curator-done` (pre-PR) is NOT resumed even though `probe_open_linked_pr`
+/// would report one — resume is gated on a Builder-or-later checkpoint
+/// phase, and a pre-PR crash gets ONLY the normal crash handling.
+#[tokio::test]
+#[serial]
+async fn reaper_does_not_resume_pre_builder_checkpoint() {
+    use crate::event_bus::EventBus;
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, gh_log) = open_pr_guard_registry(ws, "4301", 0, false);
+    let bus = Arc::new(EventBus::new());
+    reg.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    write_checkpoint(&reg, 4257, "curator-done");
+    insert_dead_running_entry(&mut reg, 4257, "sweep-issue-4257-crashed");
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    for _ in 0..2 {
+        let ev = sub.recv().await.unwrap();
+        assert!(
+            !matches!(ev, Event::SweepResumeDispatched { .. }),
+            "a pre-Builder checkpoint must never trigger a resume dispatch"
+        );
+    }
+
+    assert!(
+        running_issue_sweep_id(&reg, 4257).is_none(),
+        "no resume dispatch means no fresh Running entry for the issue"
+    );
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !calls.contains("api graphql"),
+        "resume-eligibility check must not even probe the closes-graph for a \
+             pre-Builder checkpoint phase; got: {calls:?}"
+    );
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// Edge case (Test Plan item 4): the crashed sweep's PR already
+/// merged/closed by the time the reaper ticks — `probe_open_linked_pr`
+/// returns `NoneOpen` (empty post-`--jq` output), so no resume is attempted
+/// and no error surfaces; only the normal crash handling fires.
+#[tokio::test]
+#[serial]
+async fn reaper_skips_resume_when_pr_already_closed() {
+    use crate::event_bus::EventBus;
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    // Empty graphql stdout ⇒ no OPEN-state linked PR.
+    let (mut reg, gh_log) = open_pr_guard_registry(ws, "", 0, false);
+    let bus = Arc::new(EventBus::new());
+    reg.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    write_checkpoint(&reg, 4258, "judge-done");
+    insert_dead_running_entry(&mut reg, 4258, "sweep-issue-4258-crashed");
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    for _ in 0..2 {
+        let ev = sub.recv().await.unwrap();
+        assert!(
+            !matches!(ev, Event::SweepResumeDispatched { .. }),
+            "no open PR means no resume dispatch, even at a resumable phase"
+        );
+    }
+
+    assert!(
+        running_issue_sweep_id(&reg, 4258).is_none(),
+        "no resume dispatch means no fresh Running entry for the issue"
+    );
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        calls.contains("api graphql"),
+        "the resume-eligibility check DID probe the closes-graph; got: {calls:?}"
+    );
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// Bounded resume attempts (#4256, Judge residual-risk backstop): once an
+/// issue has accumulated `MAX_RESUME_ATTEMPTS` consecutive checkpoint-less
+/// resume crashes, the reaper stops resuming it — it emits a
+/// failure-visible `SweepResumeDispatched { dispatched: false }` event,
+/// creates NO fresh Running entry, and adds NO labels beyond the ones
+/// already present. This is the replacement for the #4123 open-PR backstop
+/// that the resume path deliberately bypasses, closing the ~2s..stall
+/// infinite-resume window. The checkpoint is deliberately made STALE
+/// (mtime before this run's `started_at`) so the reset-on-progress branch
+/// does not clear the seeded tally — the exact pathology the cap bounds.
+#[tokio::test]
+#[serial]
+async fn reaper_stops_resuming_after_attempt_cap() {
+    use crate::event_bus::EventBus;
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, gh_log) = open_pr_guard_registry(ws, "4310", 0, false);
+    let bus = Arc::new(EventBus::new());
+    reg.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    write_checkpoint(&reg, 4260, "builder-done");
+    insert_dead_running_entry(&mut reg, 4260, "sweep-issue-4260-crashed");
+    // Stale inherited checkpoint: `started_at` AFTER the checkpoint mtime,
+    // so `checkpoint_written_by_run` is false and the reset-on-progress
+    // branch never clears the seeded tally.
+    reg.entries
+        .get_mut("sweep-issue-4260-crashed")
+        .unwrap()
+        .started_at = Utc::now() + chrono::Duration::seconds(30);
+    // Pre-seed the issue exactly AT the cap — the next resume is refused.
+    reg.resume_attempt_counts.insert(4260, MAX_RESUME_ATTEMPTS);
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    let mut saw_resume_false = false;
+    for _ in 0..8 {
+        let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+            break;
+        };
+        if let Event::SweepResumeDispatched {
+            issue,
+            pr,
+            dispatched,
+            ..
+        } = ev.unwrap()
+        {
+            assert_eq!(issue, 4260);
+            assert_eq!(pr, 4310);
+            assert!(
+                !dispatched,
+                "at the attempt cap the reaper must NOT resume (dispatched:false)"
+            );
+            saw_resume_false = true;
+        }
+    }
+    assert!(
+        saw_resume_false,
+        "exhaustion must still emit a failure-visible resume_dispatched event (not silent)"
+    );
+
+    // No resume dispatch ⇒ no fresh Running entry for the issue.
+    assert!(
+        running_issue_sweep_id(&reg, 4260).is_none(),
+        "no resume dispatch at the cap means no fresh Running entry"
+    );
+    // The cap is not exceeded.
+    assert_eq!(
+        reg.resume_attempt_counts.get(&4260).copied(),
+        Some(MAX_RESUME_ATTEMPTS),
+        "an exhausted issue's counter stays pinned at the cap, never grows"
+    );
+    // No extra label was applied on exhaustion (the PR is left as-is for
+    // the periodic Judge role / operator).
+    // No NEW label is applied on exhaustion. `restore_label_to_ready`
+    // still flips loom:building→loom:issue (existing behavior, not a new
+    // label), and `issue_has_blocked_label` mentions "loom:blocked" only
+    // inside its read-only `--jq` query — so assert specifically that no
+    // `--add-label loom:blocked` (quarantine) edit was issued.
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !calls.contains("add-label loom:blocked"),
+        "exhaustion must NOT add labels beyond the existing ones; got: {calls:?}"
+    );
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// Boundary companion to `reaper_stops_resuming_after_attempt_cap`: one
+/// below the cap the resume still fires and ticks the per-issue counter up
+/// to exactly `MAX_RESUME_ATTEMPTS`, so the cap value itself is locked (the
+/// Nth attempt succeeds; only the (N+1)th is refused). Uses the same stale
+/// checkpoint so the seeded tally survives into the resume decision.
+#[tokio::test]
+#[serial]
+async fn reaper_still_resumes_one_below_attempt_cap() {
+    use crate::event_bus::EventBus;
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, _gh_log) = open_pr_guard_registry(ws, "4311", 0, false);
+    let bus = Arc::new(EventBus::new());
+    reg.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    write_checkpoint(&reg, 4261, "judge-rejected");
+    insert_dead_running_entry(&mut reg, 4261, "sweep-issue-4261-crashed");
+    reg.entries
+        .get_mut("sweep-issue-4261-crashed")
+        .unwrap()
+        .started_at = Utc::now() + chrono::Duration::seconds(30);
+    reg.resume_attempt_counts
+        .insert(4261, MAX_RESUME_ATTEMPTS - 1);
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    let mut saw_resume_true = false;
+    for _ in 0..8 {
+        let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+            break;
+        };
+        if let Event::SweepResumeDispatched {
+            issue, dispatched, ..
+        } = ev.unwrap()
+        {
+            assert_eq!(issue, 4261);
+            assert!(dispatched, "one below the cap the resume must still fire");
+            saw_resume_true = true;
+        }
+    }
+    assert!(saw_resume_true, "expected a successful resume dispatch below the cap");
+    assert!(
+        running_issue_sweep_id(&reg, 4261).is_some(),
+        "a below-cap resume must create a fresh Running entry"
+    );
+    assert_eq!(
+        reg.resume_attempt_counts.get(&4261).copied(),
+        Some(MAX_RESUME_ATTEMPTS),
+        "the resume attempt must tick the per-issue counter up to the cap"
+    );
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// Deterministic-no-op guard (Issue #5614) — the label-flap regression.
+///
+/// Reproduces the #5565 shape exactly: a resumable checkpoint phase
+/// (`judge-done`) plus an open linked PR, where the sweep exited **cleanly**
+/// (`exit_code == Some(0)`, via a REAL retained child, not the no-handle
+/// `None` fallback) without touching the checkpoint. In production that is
+/// a sweep reporting "PR held under `loom:operator` — human merge decision
+/// required" and stopping on purpose. Pre-#5614 the reaper read the
+/// surviving checkpoint as a crash and resumed it, and because the resume
+/// path bypasses the #4123 open-PR guard AND the #4485 dispatch backoff,
+/// each cycle re-claimed the issue ~3s after the reaper released it —
+/// ~10 `loom:issue`/`loom:building` transitions in 7 minutes.
+///
+/// The guard must: refuse the resume, say so visibly
+/// (`SweepResumeDispatched { dispatched: false }`), create no fresh
+/// `Running` entry (no re-claim, no flap), and — unlike the attempt-cap
+/// refusal — leave the resume runway untouched, since a human-gated pause
+/// is not a failed attempt.
+#[tokio::test]
+#[serial]
+async fn reaper_does_not_resume_a_clean_exit_that_made_no_checkpoint_progress() {
+    use crate::event_bus::EventBus;
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, _gh_log) = open_pr_guard_registry(ws, "5569", 0, false);
+    let bus = Arc::new(EventBus::new());
+    reg.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    // Checkpoint written BEFORE the entry's `started_at`, so
+    // `checkpoint_written_by_run` is false: this run inherited the
+    // checkpoint and left it exactly as it found it.
+    write_checkpoint(&reg, 5565, "judge-done");
+    let sweep_id = insert_clean_exit_running(&mut reg, 5565, 1);
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    let mut saw_resume_false = false;
+    for _ in 0..8 {
+        let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+            break;
+        };
+        if let Event::SweepResumeDispatched {
+            issue,
+            pr,
+            dispatched,
+            ..
+        } = ev.unwrap()
+        {
+            assert_eq!(issue, 5565);
+            assert_eq!(pr, 5569);
+            assert!(
+                !dispatched,
+                "a clean exit that made no checkpoint progress must NOT be resumed (#5614)"
+            );
+            saw_resume_false = true;
+        }
+    }
+    assert!(
+        saw_resume_false,
+        "the refusal must be failure-visible on the bus, not a silent skip"
+    );
+
+    // The load-bearing assertion: no fresh Running entry means no resume
+    // dispatch, and therefore no `loom:issue` -> `loom:building` re-claim
+    // seconds after the reaper restored the label — i.e. no flap.
+    assert!(
+        running_issue_sweep_id(&reg, 5565).is_none(),
+        "no resume dispatch means no fresh Running entry (and no re-claim flap)"
+    );
+    // A human-gated pause is not a failed attempt: the runway is untouched,
+    // so clearing the hold leaves the full #4256 resume budget available.
+    assert_eq!(
+        reg.resume_attempt_counts.get(&5565).copied(),
+        None,
+        "the deterministic-no-op refusal must not consume a resume attempt"
+    );
+    // Sanity: the fixture really did observe a clean exit, not the
+    // no-handle `None` fallback that the pre-#5614 behavior still allows.
+    let info = reg.entries.get(&sweep_id).unwrap();
+    assert!(
+        matches!(info.state, SweepState::Crashed { .. }),
+        "a surviving checkpoint still classifies the entry as Crashed; got: {:?}",
+        info.state
+    );
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// Narrowness companion to the test above (#5614): the guard keys on a
+/// **clean** exit, so #4256's actual remit — a genuine crash whose exit
+/// code is not `Some(0)` — must still resume on the first attempt. The
+/// no-handle reap path reports `exit_code == None`, which is exactly the
+/// reconstructed-entry / signal-death case the guard deliberately fails
+/// open on.
+#[tokio::test]
+#[serial]
+async fn reaper_still_resumes_a_non_clean_exit_with_no_checkpoint_progress() {
+    use crate::event_bus::EventBus;
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, _gh_log) = open_pr_guard_registry(ws, "5570", 0, false);
+    let bus = Arc::new(EventBus::new());
+    reg.set_event_bus(bus.clone());
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    write_checkpoint(&reg, 5566, "judge-done");
+    insert_dead_running_entry(&mut reg, 5566, "sweep-issue-5566-crashed");
+    // Same stale-checkpoint setup as the clean-exit test: the ONLY
+    // difference between the two is the exit code.
+    reg.entries
+        .get_mut("sweep-issue-5566-crashed")
+        .unwrap()
+        .started_at = Utc::now() + chrono::Duration::seconds(30);
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    let mut saw_resume_true = false;
+    for _ in 0..8 {
+        let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+            break;
+        };
+        if let Event::SweepResumeDispatched {
+            issue, dispatched, ..
+        } = ev.unwrap()
+        {
+            assert_eq!(issue, 5566);
+            assert!(
+                dispatched,
+                "a non-clean exit is a real crash — #4256's resume must still fire"
+            );
+            saw_resume_true = true;
+        }
+    }
+    assert!(
+        saw_resume_true,
+        "expected the #4256 resume to still dispatch for a genuine crash"
+    );
+    assert!(
+        running_issue_sweep_id(&reg, 5566).is_some(),
+        "a genuine crash resume must still create a fresh Running entry"
+    );
+    assert_eq!(
+        reg.resume_attempt_counts.get(&5566).copied(),
+        Some(1),
+        "a genuine crash resume still consumes one attempt from the runway"
+    );
+    std::env::remove_var("LOOM_REPO");
+}
