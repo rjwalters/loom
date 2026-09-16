@@ -133,6 +133,7 @@ test-loom-daemon-quiesce.sh
 test-loom-daemon-start.sh
 test-loom-daemon-stop.sh
 test-loom-daemon-update.sh
+test-loom-daemon-watchdog-dedup.sh
 test-loom-daemon-watchdog.sh
 test-loom-dispatcher.sh
 test-loom-status.sh

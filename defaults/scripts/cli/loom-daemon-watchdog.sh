@@ -602,6 +602,16 @@ if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/locate-daemon-bin.sh" ]]; then
     # shellcheck source=../lib/locate-daemon-bin.sh
     source "$_LOOM_LAUNCHD_LIB_DIR/locate-daemon-bin.sh"
 fi
+# peer_coord_dedup_comment() / peer_coord_carry_flap_count() (#7664) — the
+# same-issue dedup window layered on the #7258 cooldown, split out into a
+# sibling lib because this file is frozen by the File Size Ratchet (#7711).
+# Also owns the PEER_COORD_DEDUP_WINDOW_SECS knob. A missing lib fails OPEN:
+# both call sites below guard with `declare -F` and fall through to today's
+# fresh-filing / flap-count-1 behavior.
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/watchdog-peer-coord-dedup.sh" ]]; then
+    # shellcheck source=../lib/watchdog-peer-coord-dedup.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/watchdog-peer-coord-dedup.sh"
+fi
 
 VERBOSE=false
 while [[ $# -gt 0 ]]; do
@@ -638,11 +648,9 @@ PEER_COORD_TIMEOUT_SECS="${LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS:-$PROBE_TIMEOUT
 # other numeric knob in this file.
 PEER_COORD_COOLDOWN_SECS="${LOOM_WATCHDOG_PEER_COORD_COOLDOWN_SECS:-21600}"
 [[ "$PEER_COORD_COOLDOWN_SECS" =~ ^[0-9]+$ ]] || PEER_COORD_COOLDOWN_SECS=21600
-# #7664: same-issue dedup window layered on top of the #7258 cooldown above —
-# default 24h, a non-numeric override fails open to the default exactly like
-# every other numeric knob in this file.
-PEER_COORD_DEDUP_WINDOW_SECS="${LOOM_WATCHDOG_PEER_COORD_DEDUP_WINDOW_SECS:-86400}"
-[[ "$PEER_COORD_DEDUP_WINDOW_SECS" =~ ^[0-9]+$ ]] || PEER_COORD_DEDUP_WINDOW_SECS=86400
+# #7664: the same-issue dedup window layered on top of the #7258 cooldown
+# above (PEER_COORD_DEDUP_WINDOW_SECS, default 24h) is parsed by
+# lib/watchdog-peer-coord-dedup.sh, sourced near the top of this file.
 PROBE_FAIL_THRESHOLD="${LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD:-3}"
 [[ "$PROBE_FAIL_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || PROBE_FAIL_THRESHOLD=3
 # Mirrors daemon_install_state::DEFAULT_STARTUP_GRACE_SECS (90) and honors the
@@ -1628,18 +1636,17 @@ check_peer_coordination_health() {
 # also anchored to the last recovery — and if the excursion is still inside
 # it AND the cooldown-state file has a usable issue reference, COMMENTS ON
 # (and reopens) that same tracking issue instead of filing a new one, bumping
-# a running flap count. Sets PEER_COORD_ESCALATE_MODE to "dedup" (with
-# PEER_COORD_DEDUP_ISSUE_REF / PEER_COORD_DEDUP_FLAP_COUNT populated) so the
-# caller's log line can say a comment was posted rather than a fresh filing.
-# Any failure along this path (no `gh`, no/corrupt issue reference, a failed
-# comment/reopen call) FAILS OPEN straight through to filing a fresh issue —
-# never a reason to drop a genuine degradation.
+# a running flap count (peer_coord_dedup_comment() in
+# lib/watchdog-peer-coord-dedup.sh). Either path sets PEER_COORD_ESCALATE_NOTE
+# so the caller's log line can say whether a comment was posted or a fresh
+# issue filed. Any failure along the dedup path (no `gh`, no/corrupt issue
+# reference, a failed comment/reopen call, the lib itself missing) FAILS OPEN
+# straight through to filing a fresh issue — never a reason to drop a genuine
+# degradation.
 escalate_peer_coordination_degraded() {
     PEER_COORD_ESCALATE_SKIP_REASON=""
     PEER_COORD_COOLDOWN_REMAINING=""
-    PEER_COORD_ESCALATE_MODE=""
-    PEER_COORD_DEDUP_ISSUE_REF=""
-    PEER_COORD_DEDUP_FLAP_COUNT=""
+    PEER_COORD_ESCALATE_NOTE=""
     [[ "${LOOM_WATCHDOG_ESCALATE:-}" =~ ^(0|false|no)$ ]] && return 1
     [[ -f "$PEER_COORD_SENTINEL" ]] && return 1
 
@@ -1650,8 +1657,7 @@ escalate_peer_coordination_degraded() {
     # Boundary is a strict `<` throughout: elapsed seconds exactly equal to
     # a window's length count as elapsed, not still-inside-the-window.
     if [[ -f "$PEER_COORD_COOLDOWN_STATE" ]]; then
-        local cooldown_ts cooldown_issue_ref cooldown_flap_count now_epoch elapsed
-        cooldown_ts=""; cooldown_issue_ref=""; cooldown_flap_count=""
+        local cooldown_ts="" cooldown_issue_ref="" cooldown_flap_count="" now_epoch elapsed
         read -r cooldown_ts cooldown_issue_ref cooldown_flap_count < "$PEER_COORD_COOLDOWN_STATE" 2>/dev/null || true
         if [[ "$cooldown_ts" =~ ^[0-9]+$ ]]; then
             now_epoch="$(date -u +%s)"
@@ -1663,39 +1669,12 @@ escalate_peer_coordination_degraded() {
             fi
             # #7664: cooldown has elapsed. If we're still inside the (longer)
             # dedup window AND have a usable prior issue reference, comment on
-            # it instead of filing fresh. A missing gh / issue ref / failed gh
-            # call falls through to the normal filing path below.
-            if (( elapsed >= 0 && elapsed < PEER_COORD_DEDUP_WINDOW_SECS )) \
-                && [[ -n "$cooldown_issue_ref" ]] \
-                && command -v gh >/dev/null 2>&1; then
-                local flap_count hostname_str dedup_body
-                flap_count="$cooldown_flap_count"
-                [[ "$flap_count" =~ ^[0-9]+$ ]] || flap_count=1
-                flap_count=$(( flap_count + 1 ))
-                hostname_str="$(hostname 2>/dev/null || echo unknown-host)"
-                # #7508-style construction (read -d '' <<EOF, no $(...) wrapper)
-                # — see the identical rationale on the body below.
-                IFS= read -r -d '' dedup_body <<EOF || true
-peer-claim coordination has gone DEGRADED again on \`$hostname_str\` (${PEER_COORD_SUMMARY:-see the daemon peer-claims report}).
-
-This is flap #${flap_count} since this tracking issue was first filed, landing within the ${PEER_COORD_DEDUP_WINDOW_SECS}s dedup window (#7664) since the last recovery — commenting here instead of filing a fresh issue.
-
-**Suspected cause** (unverified, per anvil#1270): \`advertised\` only moves at dispatch time, so a RAM/disk-throttled host with cap 0 never advertises and cannot reach the sustained-receive recovery threshold.
-
-Filed automatically by the loom-daemon-watchdog.sh peer-coordination escalation (#6222, dedup by #7664).
-EOF
-                if gh issue comment "$cooldown_issue_ref" --body "$dedup_body" >/dev/null 2>&1; then
-                    gh issue reopen "$cooldown_issue_ref" >/dev/null 2>&1 || true
-                    mkdir -p "$(dirname "$PEER_COORD_SENTINEL")" 2>/dev/null || true
-                    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$cooldown_issue_ref" > "$PEER_COORD_SENTINEL" 2>/dev/null || true
-                    mkdir -p "$(dirname "$PEER_COORD_COOLDOWN_STATE")" 2>/dev/null || true
-                    printf '%s %s %s\n' "$cooldown_ts" "$cooldown_issue_ref" "$flap_count" > "$PEER_COORD_COOLDOWN_STATE" 2>/dev/null || true
-                    PEER_COORD_ESCALATE_MODE="dedup"
-                    PEER_COORD_DEDUP_ISSUE_REF="$cooldown_issue_ref"
-                    PEER_COORD_DEDUP_FLAP_COUNT="$flap_count"
-                    return 0
-                fi
-                # gh comment failed — fall through to file fresh (fail open).
+            # it instead of filing fresh (lib/watchdog-peer-coord-dedup.sh).
+            # A missing lib / gh / issue ref, or a failed gh call, returns 1
+            # and falls through to the normal filing path below (fail open).
+            if declare -F peer_coord_dedup_comment >/dev/null \
+                && peer_coord_dedup_comment "$cooldown_ts" "$cooldown_issue_ref" "$cooldown_flap_count" "$elapsed"; then
+                return 0
             fi
         fi
     fi
@@ -1773,7 +1752,7 @@ EOF
 
     mkdir -p "$(dirname "$PEER_COORD_SENTINEL")" 2>/dev/null || true
     printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$issue_url" > "$PEER_COORD_SENTINEL" 2>/dev/null || true
-    PEER_COORD_ESCALATE_MODE="filed"
+    PEER_COORD_ESCALATE_NOTE="ESCALATED out-of-band: filed a forge tracking issue so this degradation is not confined to a logfile nobody tails (#6222)."
     return 0
 }
 
@@ -1795,10 +1774,12 @@ EOF
 # #7664: the stamped cooldown-state line now carries the running flap count
 # forward too (`<epoch> <issue-ref> <flap-count>`) — read back from whatever
 # PEER_COORD_COOLDOWN_STATE already says for THIS SAME issue reference before
-# overwriting it, so a dedup-comment escalation's bumped count survives this
-# recovery and continues from there on the NEXT dedup-window excursion,
-# instead of resetting to 1 every recovery. A missing/corrupt/mismatched
-# prior count defaults to 1 (this episode's own original filing).
+# overwriting it (peer_coord_carry_flap_count() in
+# lib/watchdog-peer-coord-dedup.sh), so a dedup-comment escalation's bumped
+# count survives this recovery and continues from there on the NEXT
+# dedup-window excursion, instead of resetting to 1 every recovery. A
+# missing/corrupt/mismatched prior count defaults to 1 (this episode's own
+# original filing).
 clear_peer_coordination_escalation() {
     [[ -f "$PEER_COORD_SENTINEL" ]] || return 1
     local ts issue_ref
@@ -1817,18 +1798,10 @@ clear_peer_coordination_escalation() {
 
     if gh issue close "$issue_ref" --reason completed >/dev/null 2>&1; then
         rm -f "$PEER_COORD_SENTINEL" 2>/dev/null || true
-        local prev_ref prev_flap flap_count
-        prev_ref=""; prev_flap=""
-        if [[ -f "$PEER_COORD_COOLDOWN_STATE" ]]; then
-            # First field (the prior epoch) is intentionally discarded here —
-            # this recovery is about to stamp its OWN fresh epoch below.
-            read -r _ prev_ref prev_flap < "$PEER_COORD_COOLDOWN_STATE" 2>/dev/null || true
-        fi
-        if [[ "$prev_ref" == "$issue_ref" && "$prev_flap" =~ ^[0-9]+$ ]]; then
-            flap_count="$prev_flap"
-        else
-            flap_count=1
-        fi
+        # #7664: carry the running flap count for THIS issue forward (lib);
+        # a missing lib stamps 1, this episode's own original filing.
+        local flap_count=1
+        declare -F peer_coord_carry_flap_count >/dev/null && flap_count="$(peer_coord_carry_flap_count "$issue_ref")"
         mkdir -p "$(dirname "$PEER_COORD_COOLDOWN_STATE")" 2>/dev/null || true
         printf '%s %s %s\n' "$(date -u +%s)" "$issue_ref" "$flap_count" > "$PEER_COORD_COOLDOWN_STATE" 2>/dev/null || true
         return 0
@@ -2353,11 +2326,9 @@ if [[ "$probe_verdict" == "healthy" ]]; then
             if [[ -f "$PEER_COORD_SENTINEL" ]]; then
                 report OK "peer-coordination degradation already escalated out-of-band (sentinel ${PEER_COORD_SENTINEL})."
             elif escalate_peer_coordination_degraded; then
-                if [[ "$PEER_COORD_ESCALATE_MODE" == "dedup" ]]; then
-                    report DIVERGENCE "peer-claim coordination is DEGRADED: ${PEER_COORD_SUMMARY}. Repeat flap #${PEER_COORD_DEDUP_FLAP_COUNT} within the ${PEER_COORD_DEDUP_WINDOW_SECS}s dedup window (#7664) — commented on the existing tracking issue ${PEER_COORD_DEDUP_ISSUE_REF} instead of filing a new one."
-                else
-                    report DIVERGENCE "peer-claim coordination is DEGRADED: ${PEER_COORD_SUMMARY}. ESCALATED out-of-band: filed a forge tracking issue so this degradation is not confined to a logfile nobody tails (#6222)."
-                fi
+                # PEER_COORD_ESCALATE_NOTE says whether a fresh issue was filed
+                # (#6222) or an existing one commented on (#7664 dedup window).
+                report DIVERGENCE "peer-claim coordination is DEGRADED: ${PEER_COORD_SUMMARY}. ${PEER_COORD_ESCALATE_NOTE}"
             elif [[ "$PEER_COORD_ESCALATE_SKIP_REASON" == "cooldown" ]]; then
                 report DIVERGENCE "peer-claim coordination is DEGRADED: ${PEER_COORD_SUMMARY}. Suppressing a duplicate tracking issue: a previous episode on this host recovered within the last ${PEER_COORD_COOLDOWN_SECS}s cooldown window (#7258) — ${PEER_COORD_COOLDOWN_REMAINING:-?}s remaining before a repeat degradation would file fresh again. ${WATCHDOG_LOG} is the signal for this flap."
             else
