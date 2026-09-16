@@ -1052,11 +1052,17 @@ CRITICAL_PATTERNS=(
   "_migration.py"
 )
 
-# Version-only diff carve-out (#6147): `scripts/version.sh bump` — which CI's
-# "defaults/ Changes Require a VERSION Bump" check forces on every PR
-# touching `defaults/` — mechanically rewrites exactly these 6 files with
-# nothing but a version-string change, no matter what the rest of the PR
-# does. Without this carve-out, every one of them trips a CRITICAL_PATTERNS
+# Version-only diff carve-out (#6147): a version bump mechanically rewrites
+# exactly these 6 files with nothing but a version-string change, no matter
+# what the rest of the PR does.
+#
+# The bump no longer comes from the PR. #7743 inverted the policy: CI's
+# "defaults/ Changes Require a VERSION Bump" check (#5874) — which this comment
+# used to cite as forcing a bump on every defaults/-touching PR — was replaced
+# by "PRs Must Not Hand-Edit Version-Bearing Files", and the bump moved to a
+# single post-merge workflow. The carve-out is still needed, because that
+# workflow's commit lands on main with exactly this shape; only its origin
+# changed. Without this carve-out, every one of them trips a CRITICAL_PATTERNS
 # entry above on every single defaults/-touching, Judge-approved PR — a
 # 100%-reproducing false positive confirmed on 7 separate PRs (#6018, #6092,
 # #6114, #6118, #6137, #6142, #6146) that permanently blocked auto-merge with
