@@ -2069,10 +2069,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let reg = no_progress_test_registry(dir.path(), "OPEN", "not-a-number", false);
         assert_eq!(
-            reg.probe_open_linked_pr(9004),
+            reg.probe_open_linked_pr_graphql(9004),
             OpenPrProbe::ProbeFailed,
-            "unparseable non-empty stdout is a PROBE FAILURE (#4452)"
+            "unparseable non-empty GraphQL stdout is a PROBE FAILURE (#4452)"
         );
+        // The independent, verified-empty timeline can still recover absence.
+        assert_eq!(reg.probe_open_linked_pr_transports(9004), OpenPrProbe::NoneOpen);
     }
 
     /// #5911: when the GraphQL closes-graph probe cannot answer (e.g. quota

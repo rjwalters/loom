@@ -326,6 +326,7 @@ pub(crate) fn wait_for_condition(timeout_ms: u64, mut condition: impl FnMut() ->
 /// `worktree_ops::gh::parse_open_linked_pr` so it can be unit-tested), so a
 /// non-numeric `graphql_prs` token synthesizes MALFORMED JSON — which is how
 /// the `ProbeFailed`-on-garbled-output leg is still exercised here.
+// The timeline is empty too: absence requires both transports (#7757).
 pub(crate) fn no_progress_test_registry(
     ws: &Path,
     issue_state: &str,
@@ -336,7 +337,7 @@ pub(crate) fn no_progress_test_registry(
     let script = format!(
         "#!/usr/bin/env bash\n\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
-             printf '%s\\n' '{state}'\n\
+             [[ \"$2\" == */timeline ]] && exit 0; printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
              {gql}\
@@ -1530,6 +1531,8 @@ pub(crate) fn open_pr_guard_registry(
 /// first call's "no open PR" verdict is not cached — so the second (real,
 /// re-dispatch-triggered) probe always reaches this script rather than
 /// replaying a stale first answer.
+// Keep the initial timeline empty; later GraphQL discovers the PR.
+// A configured forge failure must fail both transports (#7757).
 pub(crate) fn open_pr_review_stall_registry(
     ws: &Path,
     graphql_prs: &str,
@@ -1557,7 +1560,7 @@ pub(crate) fn open_pr_review_stall_registry(
              exit {exit_code}\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
-             printf '%s\\n' '{state}'\n\
+             [[ \"$2\" == */timeline ]] && exit {exit_code}; printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
