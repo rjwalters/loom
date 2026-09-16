@@ -184,6 +184,16 @@ _worktree_open_pr_for_branch() {
     if [[ $rc -ne 0 ]]; then
         if grep -qi "none of the git remotes configured for this repository point to a known GitHub host" "$pr_stderr_file" 2>/dev/null; then
             _WT_OPEN_PR_STATUS="no_forge_remote"
+        elif grep -qi "is not handled natively" "$pr_stderr_file" 2>/dev/null; then
+            # `loom-daemon forge` DECLINES (EX_FORGE_DECLINED, exit 3) forges it
+            # does not handle natively -- Gitea today. This check is a GitHub
+            # `gh pr list --json isCrossRepository,headRepository` query and has
+            # no Gitea shape at all, so a decline means "nothing this check can
+            # consult", not "the forge is down". Filing it as `unavailable`
+            # refused EVERY fresh-branch worktree on a Gitea repo; there is no
+            # PR shadow this check can detect there, so proceed as if the repo
+            # had no forge remote.
+            _WT_OPEN_PR_STATUS="no_forge_remote"
         fi
         rm -f "$pr_stderr_file"
         return 0

@@ -363,6 +363,45 @@ cleanup_repo "$REPO"
 rm -rf "$FAKE_BIN"
 rm -f "$OUT_LOG"
 
+# --- Test 8: loom-daemon forge declines the forge (Gitea) -> proceed ---
+# `loom-daemon forge pr list` exits 3 (EX_FORGE_DECLINED) with "gitea is not
+# handled natively" on a Gitea remote. The helper prefers loom-daemon over gh
+# when both are on PATH, so before this case that decline was misfiled as
+# `unavailable` and every fresh-branch worktree on a Gitea repo was refused.
+echo ""
+echo "Test 8: loom-daemon forge declines (gitea not handled natively) -> still creates the fresh branch"
+REPO=$(setup_repo gitea1)
+FAKE_BIN=$(install_fake_gh)
+cat > "$FAKE_BIN/loom-daemon" << 'EOF'
+#!/bin/bash
+if [[ "$1" == "forge" && "$2" == "pr" && "$3" == "list" ]]; then
+    echo "loom-daemon forge: gitea is not handled natively; falling back to the caller's shell path" >&2
+    exit 3
+fi
+echo "fake loom-daemon: unsupported invocation: $*" >&2
+exit 1
+EOF
+chmod +x "$FAKE_BIN/loom-daemon"
+OUT_LOG="/tmp/wtforge-gitea.$$"
+(
+    cd "$REPO"
+    PATH="$FAKE_BIN:$PATH" FAKE_GH_MODE=unavailable ./.loom/scripts/worktree.sh 77 >"$OUT_LOG" 2>&1 || { echo "FAILED"; cat "$OUT_LOG"; }
+)
+if [[ -d "$REPO/.loom/worktrees/issue-77" ]]; then
+    pass "worktree was created from base (forge declined by loom-daemon -> nothing this check can consult)"
+else
+    fail "worktree.sh refused after loom-daemon forge declined a non-GitHub forge"
+    cat "$OUT_LOG"
+fi
+if grep -q "forge-check-unavailable\|refusing to create a same-named branch" "$OUT_LOG"; then
+    fail "emitted a forge-unavailable refusal for a forge loom-daemon declined to handle"
+else
+    pass "no forge-unavailable refusal was emitted"
+fi
+cleanup_repo "$REPO"
+rm -rf "$FAKE_BIN"
+rm -f "$OUT_LOG"
+
 # --- Summary ---
 echo ""
 echo "Tests run: $TESTS_RUN, Passed: $TESTS_PASSED, Failed: $TESTS_FAILED"
