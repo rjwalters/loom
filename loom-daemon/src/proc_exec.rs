@@ -31,7 +31,7 @@
 //!
 //! # Process-group safety
 //!
-//! [`ProcExec::run`] calls `process_group(0)` before spawning, so the child
+//! [`run_bounded`] calls `process_group(0)` before spawning, so the child
 //! becomes the leader of a brand-new group whose id equals its pid. Termination
 //! therefore signals a group this module created and whose only members are the
 //! child and its descendants. It never signals pgid 0 or a negative pid derived
