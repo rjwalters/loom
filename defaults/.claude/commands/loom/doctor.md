@@ -568,19 +568,14 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
       # must keep their Signed-off-by: trailer — use `git commit --amend --signoff`
       # when re-authoring a commit during the rebase. See defaults/docs/commit-signoff.md.
 
-      # Version-bearing-file sync gate (#7168, largely moot after #7743): a
-      # rebase silently absorbs whatever version-bearing values origin/main
-      # already had. Since #7743, no PR (including this rebase target's own
-      # commits) may touch a version-bearing file's value at all -- bumps are
-      # exclusively .github/workflows/version-bump-on-merge.yml's job, run
-      # once, automatically, after merge -- so a normal rebase now always
-      # lands your branch on exactly origin/main's current version-bearing
-      # values, with nothing of yours that could go stale. Still run this
-      # gate as cheap defense-in-depth, since this path pushes directly and
-      # never goes through create-pr.sh's own check. If it DOES fire, that is
-      # unexpected: do NOT "fix" it by hand-editing VERSION/CLAUDE.md/
-      # Cargo.toml/etc. or by running `./scripts/version.sh bump patch` --
-      # stop and report the anomaly (comment on the PR, do not push) instead.
+      # Version-bearing-file sync gate (#7168, largely moot after #7743): no
+      # PR may carry an edit to a version-bearing file's value anymore (bumps
+      # are version-bump-on-merge.yml's job, once, after merge), so a rebase
+      # now lands exactly origin/main's values with nothing of yours to go
+      # stale. Kept as cheap defense-in-depth -- this path pushes directly,
+      # never through create-pr.sh. If it fires, that is an anomaly: do NOT
+      # hand-edit a version-bearing file or run `version.sh bump patch` --
+      # stop, do not push, report it on the PR.
       if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
         echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
         exit 1
@@ -953,18 +948,12 @@ git push --force-with-lease
 ```
 
 **Never hand-patch VERSION/CLAUDE.md/`Cargo.toml`/… to "re-add a bump the rebase
-dropped"** — and, since #7743, never run `./scripts/version.sh bump ...` here
-either, even if the gate's own Fix: line suggests it. Version bumps are now
-exclusively `.github/workflows/version-bump-on-merge.yml`'s job, run once,
-automatically, after merge; no PR (including the one you are rebasing) may
-carry its own edit to a version-bearing file's value, so under normal
-operation this gate should never actually fire on a rebase anymore — nothing
-of yours ever touched those files in the first place. If it fires anyway,
-treat it as an anomaly: stop, do not push, and report it (comment on the PR)
-rather than hand-bumping. (Historical context for why the old advice existed:
-a hand-rolled bump reproduced `bef3e07a`, #7341 — all 8 core files patched,
-`.loom/install-metadata.json` missed, CI red. That failure mode is exactly
-what removing hand-bumping from every PR eliminates.)
+dropped"** — and since #7743 never run `./scripts/version.sh bump …` here either,
+even if the gate's Fix: line suggests it. Bumps are `version-bump-on-merge.yml`'s
+job (once, after merge) and no PR may carry its own, so this gate should never
+fire on a rebase anymore. If it does, stop, do not push, and report it on the PR
+rather than hand-bumping — a hand-rolled bump is what produced `bef3e07a` (#7341:
+8 core files patched, `.loom/install-metadata.json` missed, CI red).
 
 **Standing down** (a concurrent fix already landed):
 
@@ -1472,17 +1461,14 @@ git add <file>
 # Continue rebase after all conflicts resolved
 git rebase --continue
 
-# Version-bearing-file sync gate (#7168, largely moot after #7743): a rebase
-# silently absorbs whatever version-bearing values origin/main already had.
-# Since #7743, no PR may touch a version-bearing file's value at all -- bumps
-# are exclusively .github/workflows/version-bump-on-merge.yml's job, run once,
-# automatically, after merge -- so a normal rebase now always lands your
-# branch on exactly origin/main's current version-bearing values. Still run
-# this gate as cheap defense-in-depth, since this path pushes directly and
-# never goes through create-pr.sh's own check. If it DOES fire, that is
-# unexpected: do NOT "fix" it by hand-editing a version-bearing file or by
-# running `./scripts/version.sh bump patch` -- stop and report the anomaly
-# (comment on the PR, do not push) instead.
+# Version-bearing-file sync gate (#7168, largely moot after #7743): no PR may
+# carry an edit to a version-bearing file's value anymore (bumps are
+# version-bump-on-merge.yml's job, once, after merge), so a rebase now lands
+# exactly origin/main's values with nothing of yours to go stale. Kept as
+# cheap defense-in-depth -- this path pushes directly, never through
+# create-pr.sh. If it fires, that is an anomaly: do NOT hand-edit a
+# version-bearing file or run `version.sh bump patch` -- stop, do not push,
+# report it on the PR.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
   exit 1
