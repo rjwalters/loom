@@ -91,8 +91,7 @@ heredoc_body_verdict() {
 
     if [[ -z "$openers" ]]; then
         construction="none"
-    # shellcheck disable=SC2016  # matching the literal characters `$(`, not expanding
-    elif printf '%s\n' "$openers" | grep -q '\$('; then
+    elif printf '%s\n' "$openers" | grep -q '[$]('; then   # literal `$(`, bracketed so it reads as text to humans and linters alike
         construction="cmdsubst"
     elif [[ "$(printf '%s\n' "$openers" | grep -Ec "read ([-a-zA-Z]+ )*-d ''")" == "$(printf '%s\n' "$openers" | grep -c '')" ]]; then
         construction="read-d"
