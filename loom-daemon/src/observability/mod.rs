@@ -81,6 +81,7 @@
 
 pub mod backfill;
 pub mod collector;
+pub mod endpoint_policy;
 pub mod exporter;
 #[cfg(feature = "otlp")]
 pub mod otlp;
@@ -94,6 +95,7 @@ use std::time::{Duration, Instant};
 use crate::event_bus::EventBus;
 use crate::workspace_pool::WorkspacePool;
 
+use endpoint_policy::reserved_placeholder_host;
 use exporter::HttpsExporter;
 use queue::DurableQueue;
 
@@ -221,6 +223,13 @@ pub fn resolve_enabled(config: &ObservabilityConfig) -> bool {
 
 /// **env > config**, no built-in default — a missing endpoint means "not
 /// configured", handled by [`spawn_task`] as a degrade-to-disabled case.
+///
+/// Deliberately a *pure precedence* resolver: it answers "which tier's value
+/// wins", never "is that value fit to export to". The reserved-placeholder
+/// refusal lives at the point of use in [`spawn_task`]
+/// ([`reserved_placeholder_host`], Issue #7815) so that this function stays
+/// usable for reporting the configured value (`status`/`health`) even when
+/// that value is one export must refuse.
 #[must_use]
 pub fn resolve_endpoint(config: &ObservabilityConfig) -> Option<String> {
     env_nonempty(ENDPOINT_ENV).or_else(|| config.endpoint.clone())
@@ -621,6 +630,24 @@ pub fn spawn_task(
         register_global_export_status(Arc::new(ExportStatus::misconfigured(None, detail)));
         return None;
     };
+    // Refuse reserved placeholder domains BEFORE the ingest key is read
+    // (Issue #7815) — a placeholder is "not configured", not a destination,
+    // and the key must never be loaded for one, let alone sent to it.
+    if let Some(host) = reserved_placeholder_host(&endpoint) {
+        let detail = format!(
+            "observability.endpoint {endpoint} points at the reserved placeholder \
+             domain {host} (RFC 2606/6761) — refusing to export so the ingest key \
+             is never sent there; set a real endpoint via \
+             $LOOM_OBSERVABILITY_ENDPOINT or .loom-local/local.json, or leave \
+             observability.enabled=false"
+        );
+        log::warn!("observability: enabled but {detail} — export off");
+        register_global_export_status(Arc::new(ExportStatus::misconfigured(
+            Some(endpoint),
+            detail,
+        )));
+        return None;
+    }
     let Some(key_file) = resolve_ingest_key_file(config) else {
         let detail = "observability.ingestKeyFile not configured \
              (set observability.ingestKeyFile or $LOOM_OBSERVABILITY_INGEST_KEY_FILE)"
@@ -808,6 +835,17 @@ mod tests {
             std::env::remove_var(var);
         }
     }
+
+    /// Endpoint for every `spawn_task` fixture that must reach *past* the
+    /// endpoint check — i.e. the ones asserting a missing/unreadable key
+    /// file, a missing Cargo feature, or a successful spawn. Deliberately
+    /// **not** an `example.com` address: `spawn_task` now refuses reserved
+    /// placeholder domains outright (Issue #7815), so such a fixture would
+    /// either make a success case fail or make a `returns_none` case pass
+    /// for the wrong reason. `.internal` is
+    /// non-resolvable private-use space, and these tests never let the
+    /// sender reach its first flush anyway.
+    const SAFE_TEST_ENDPOINT: &str = "https://ingest.test-fixture.internal/v1/telemetry";
 
     /// A freshly-constructed, empty [`WorkspacePool`] — `spawn_task` now
     /// requires one (Issue #4955) to thread through to the collector.
@@ -1195,6 +1233,39 @@ mod tests {
         assert!(handles.is_none());
     }
 
+    /// Issue #7815: a *placeholder* endpoint is as under-configured as an
+    /// unset one. The fixture is the exact committed placeholder (#6650)
+    /// plus a perfectly readable ingest key — the worst case, where every
+    /// other precondition for exporting is satisfied — and must still
+    /// return `None` rather than hand that key to a reserved domain.
+    #[tokio::test]
+    #[serial]
+    async fn spawn_task_placeholder_endpoint_returns_none() {
+        clear_env();
+        let bus = EventBus::new();
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("ingest.key");
+        std::fs::write(&key_path, "s3cr3t\n").unwrap();
+        let config = ObservabilityConfig {
+            enabled: Some(true),
+            endpoint: Some("https://dashboard.example.com/ingest".to_string()),
+            ingest_key_file: Some(key_path.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
+        assert!(
+            handles.is_none(),
+            "a reserved placeholder endpoint must never start an exporter, \
+             however complete the rest of the config is"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn spawn_task_enabled_without_ingest_key_file_returns_none() {
@@ -1203,7 +1274,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = ObservabilityConfig {
             enabled: Some(true),
-            endpoint: Some("https://ingest.example.com/v1/telemetry".to_string()),
+            endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
             ..Default::default()
         };
         let handles = spawn_task(
@@ -1224,7 +1295,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = ObservabilityConfig {
             enabled: Some(true),
-            endpoint: Some("https://ingest.example.com/v1/telemetry".to_string()),
+            endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
             ingest_key_file: Some(
                 dir.path()
                     .join("does-not-exist.key")
@@ -1253,7 +1324,7 @@ mod tests {
         std::fs::write(&key_path, "s3cr3t\n").unwrap();
         let config = ObservabilityConfig {
             enabled: Some(true),
-            endpoint: Some("https://ingest.example.com/v1/telemetry".to_string()),
+            endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
             ingest_key_file: Some(key_path.to_string_lossy().to_string()),
             flush_interval_secs: Some(3600), // avoid a real network attempt during the test
             ..Default::default()
@@ -1294,7 +1365,7 @@ mod tests {
         std::fs::write(&key_path, "s3cr3t\n").unwrap();
         let config = ObservabilityConfig {
             enabled: Some(true),
-            endpoint: Some("https://ingest.example.com/v1/telemetry".to_string()),
+            endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
             ingest_key_file: Some(key_path.to_string_lossy().to_string()),
             exporter: Some("otlp".to_string()),
             ..Default::default()
@@ -1324,7 +1395,7 @@ mod tests {
         std::fs::write(&key_path, "s3cr3t\n").unwrap();
         let config = ObservabilityConfig {
             enabled: Some(true),
-            endpoint: Some("https://collector.example.com".to_string()),
+            endpoint: Some("https://collector.test-fixture.internal".to_string()),
             ingest_key_file: Some(key_path.to_string_lossy().to_string()),
             exporter: Some("otlp".to_string()),
             flush_interval_secs: Some(3600), // avoid a real network attempt during the test
