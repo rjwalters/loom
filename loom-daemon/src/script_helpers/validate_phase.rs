@@ -1288,19 +1288,14 @@ pub fn validate_curator(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     let labels: Vec<String> = match gh_labels_query("issue", issue, repo_root) {
         Query::Populated(names) => names,
         Query::Empty => Vec::new(),
-        other => {
+        // Malformed / Failed / Unavailable: we could not read the labels, which
+        // is not the same as the issue having none.
+        _ => {
             return ValidationResult::new(
                 "curator",
                 issue,
                 ValidationStatus::Failed,
-                &format!(
-                    "Could not fetch issue labels ({})",
-                    if other.is_unanswered() {
-                        "unanswered"
-                    } else {
-                        "unexpected"
-                    }
-                ),
+                "Could not fetch issue labels",
             );
         }
     };
