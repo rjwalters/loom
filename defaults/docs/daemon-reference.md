@@ -12,7 +12,7 @@
 **Contents**
 
 - [What the daemon is](#what-the-daemon-is)
-- [The `LOOM_ROLE` env-var contract (#6507)](#the-loomrole-env-var-contract-6507)
+- [The `LOOM_ROLE` env-var contract (#6507)](#the-loom_role-env-var-contract-6507)
 - [Architecture (Phases A-C)](#architecture-phases-a-c)
 - [IPC surface (Request/Response variants)](#ipc-surface-requestresponse-variants)
 - [Event taxonomy (frozen for v0.10.0)](#event-taxonomy-frozen-for-v0100)
@@ -23,7 +23,7 @@
 - [Fleet — operator-triggered multi-host worker fanout (`fleet`, #4340)](#fleet--operator-triggered-multi-host-worker-fanout-fleet-4340)
 - [Token pool provisioning for managed repos (#3938)](#token-pool-provisioning-for-managed-repos-3938)
 - [Per-repo status breakdown + per-repo main-health gate (#3930 — phase d)](#per-repo-status-breakdown--per-repo-main-health-gate-3930--phase-d)
-- [Gate verdicts: VERIFIED_RED vs UNEVALUATED (#3974)](#gate-verdicts-verifiedred-vs-unevaluated-3974)
+- [Gate verdicts: VERIFIED_RED vs UNEVALUATED (#3974)](#gate-verdicts-verified_red-vs-unevaluated-3974)
 - [Per-workspace priority tiers (#3946)](#per-workspace-priority-tiers-3946)
 - [Forge-side pipeline snapshot (`status --pipeline`, #3977)](#forge-side-pipeline-snapshot-status---pipeline-3977)
 - [One-shot fleet vitals (`loom-daemon health`, #4761)](#one-shot-fleet-vitals-loom-daemon-health-4761)
@@ -235,7 +235,7 @@ below. The `daemon.capacity.advisory` topic was authorized by **#3902** (epic
 #3809): the autonomous work finder publishes it on a token-capacity **pressure
 state change** (entered/left the token-bound state), never every tick, so the
 operator gets one add-capacity advisory on the way in and one recovery on the way
-out. See [Token-capacity backpressure](#token-capacity-backpressure-3902) below.
+out. See [Token-capacity backpressure](#token-capacity-backpressure-3902-token-axis-retired-from-the-cap-by-5270) below.
 Four of the `daemon.drain.*` topics were authorized by **#4090** for the scheduled
 drain-and-restart primitive — `started` when a drain is accepted, `completed`
 when the last in-flight sweep finishes (right before the supervised relaunch),
@@ -6160,7 +6160,7 @@ tally, `loom-daemon health`'s `roles` section names the broken config key
 directly via the outcome's `detail()` (no spawn transcript needed), and the
 per-root log warns once on the edge and downgrades to `DEBUG` on repeat. Full
 mechanism and the `spawn-codex.sh`-side counterpart:
-[`runtime-adapters.md` § "Model/runtime mismatch refusal (#5028)"](runtime-adapters.md#model-runtime-mismatch-refusal-5028).
+[`runtime-adapters.md` § "Model/runtime mismatch refusal (#5028)"](runtime-adapters.md#modelruntime-mismatch-refusal-5028).
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). **It is an allowlist, not an
