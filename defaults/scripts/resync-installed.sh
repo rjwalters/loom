@@ -733,21 +733,45 @@ IGNORE_FILE="$WRITE_ROOT/.loom/resync-ignore"
 # matched at least one of them this run (keyed by the trimmed, comment-
 # stripped line — same string report_dead_pins re-derives when it walks
 # IGNORE_FILE a second time at the end).
-declare -A SEEN_RELS=()
-declare -A PIN_HIT=()
+# Indexed arrays, NOT `declare -A` (#7749). Bash 3.2 -- the stock macOS
+# /bin/bash that `#!/usr/bin/env bash` resolves to -- has no associative
+# arrays, and this script is `set -uo pipefail` with no `-e`, so the two
+# `declare -A` calls this replaces failed with "invalid option", execution
+# continued, and every string-subscripted write below silently degraded.
+# Result: dead-pin reporting was wrong on every macOS resync while the run
+# still exited 0.
+#
+# Both of these are pure SETS -- keys only, value always 1 -- so an indexed
+# array plus a linear membership test is exactly equivalent. Appends are
+# unconditional (O(1)); the only scans are in report_dead_pins, which runs
+# once at the end over the handful of lines in .loom/resync-ignore.
+SEEN_RELS=()
+PIN_HIT=()
+
+# `${arr[@]+"${arr[@]}"}` rather than a bare `"${arr[@]}"`: under `set -u`,
+# bash 3.2 treats an EMPTY indexed array's "${arr[@]}" as an unbound variable
+# and aborts. Fixed upstream in bash 4.4, so the bare form works everywhere
+# except the interpreter this fix exists for.
+_pin_was_hit() {
+    local needle="$1" e
+    for e in ${PIN_HIT[@]+"${PIN_HIT[@]}"}; do
+        [[ "$e" == "$needle" ]] && return 0
+    done
+    return 1
+}
 
 is_ignored() {
     # $1 = relative path like "hooks/foo.sh", "roles/bar.md", "bin/loom", etc.
     [[ -f "$IGNORE_FILE" ]] || return 1
     local rel="$1" line normalized
-    SEEN_RELS["$rel"]=1
+    SEEN_RELS+=("$rel")
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%%#*}"                       # strip trailing comment
         line="${line#"${line%%[![:space:]]*}"}"  # ltrim
         line="${line%"${line##*[![:space:]]}"}"   # rtrim
         [[ -z "$line" ]] && continue
         if [[ "$line" == "$rel" ]]; then
-            PIN_HIT["$line"]=1
+            PIN_HIT+=("$line")
             return 0
         fi
         # #6515: also accept the natural repo-relative spelling. This
@@ -779,7 +803,7 @@ is_ignored() {
         normalized="${line#./}"
         normalized="${normalized#.loom/}"
         if [[ "$normalized" != "$line" && "$normalized" == */* && "$normalized" == "$rel" ]]; then
-            PIN_HIT["$line"]=1
+            PIN_HIT+=("$line")
             return 0
         fi
     done < "$IGNORE_FILE"
@@ -800,7 +824,7 @@ report_dead_pins() {
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" ]] && continue
-        [[ -n "${PIN_HIT[$line]:-}" ]] && continue
+        _pin_was_hit "$line" && continue
 
         # "did you mean" hint: the walked "$rel" (if any) sharing this pin's
         # basename — cheap and good enough to catch the common cases (a
@@ -808,7 +832,7 @@ report_dead_pins() {
         # typo) without pulling in a real fuzzy-match dependency.
         base="${line##*/}"
         closest=""
-        for rel in "${!SEEN_RELS[@]}"; do
+        for rel in ${SEEN_RELS[@]+"${SEEN_RELS[@]}"}; do
             if [[ "${rel##*/}" == "$base" ]]; then
                 closest="$rel"
                 break
