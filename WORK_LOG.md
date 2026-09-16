@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **PR #7884**: test(bounded-run): score the wedge case only on attempts that actually started the child
+- **Issue #7788** (closed): test-bounded-run.sh flakes in CI on unrelated branches — portable-mode fixture races on the wedged child's pid
+- **PR #7881**: docs(builder): add proactive File Size Ratchet check before opening a PR
+- **Issue #7865** (closed): Judge rejection pattern: Builder doesn't proactively check the File Size Ratchet before opening a PR (#7863, #7796, #7707)
+- **PR #7879**: docs: fix stale worker.md role reference in sample config snippets (#7785)
+- **Issue #7785** (closed): docs: .loom/README.md and defaults/.loom-README.md sample config still references nonexistent worker.md role file
 - **PR #7869**: refactor(worktree): one shared `branch_landed` primitive replacing four per-tool squash heuristics (#7812)
 - **Issue #7812** (closed): One shared 'has this branch landed?' primitive (forge state + merge-tree equality) to replace four per-tool squash heuristics
 - **Issue #7773** (closed): guard-loom-workflow.sh denies writing a FILE that merely quotes the merge command, and the obvious fix opens a bypass

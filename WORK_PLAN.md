@@ -10,6 +10,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
 - **#7699**: fix(config): replace live safehouse room / observability endpoint with placeholders
+- **#7707**: fix(daemon): spawn a detached post-exit verifier on the auto-update drain-and-restart path
 - **#7871**: fix(ci): publish version bumps with repository App identity
 
 ## Urgent
@@ -17,40 +18,42 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
-- **#7691**: [Phase B of #6704] Rank the role-runner ring from the live roster, generation-fenced, with bounded reassignment
-- **#7852**: Split role_shard.rs/roster.rs and shrink 6 frozen files to satisfy File Size Ratchet (blocks PR #7796)
+- **#7765**: worktree.sh silently creates a main-HEAD branch shadowing an open cross-repo PR's branch name
+- **#7853**: [Epic #6896] Phase 4: run-job seam contract + host executor
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
-- **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation
-- **#7691**: [Phase B of #6704] Rank the role-runner ring from the live roster, generation-fenced, with bounded reassignment
 - **#7765**: worktree.sh silently creates a main-HEAD branch shadowing an open cross-repo PR's branch name
-- **#7785**: docs: .loom/README.md and defaults/.loom-README.md sample config still references nonexistent worker.md role file
-- **#7788**: test-bounded-run.sh flakes in CI on unrelated branches — portable-mode fixture races on the wedged child's pid
-- **#7865**: Judge rejection pattern: Builder doesn't proactively check the File Size Ratchet before opening a PR (#7863, #7796, #7707)
+- **#7829**: Activate version-bump-on-merge: push via the loom-fleet-dispatch App token (GITHUB_TOKEN cannot bypass the main ruleset on a user-owned repo)
+- **#7853**: [Epic #6896] Phase 4: run-job seam contract + host executor
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#7829**: Activate version-bump-on-merge: push via the loom-fleet-dispatch App token (GITHUB_TOKEN cannot bypass the main ruleset on a user-owned repo)
-- **#7853**: [Epic #6896] Phase 4: run-job seam contract + host executor
+- **#7791**: Retry-once-and-record for the shared shell suite: one flaky assertion currently blocks every concurrent PR
+- **#7792**: tokens_pool: empty_pool_error_enumerates_per_token_exclusion_detail flakes on the 4h/session-limit-window hour boundary
+- **#7862**: flaky CI: assert_contains's 'printf | grep -q' races SIGPIPE under pipefail, reporting present substrings as absent
+- **#7882**: Guard decision-log defaults into defaults/logs/ when invoked from source, polluting the vendored tree
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7863**: fix(worktree): query the forge for an open PR before creating a shadowing fresh branch
+- **#7875**: feat(run-job): ship the run-job seam contract + loopback/SSH host executor
+- **#7886**: feat(ci): retry-once-and-record for the shared shell CI suite
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#7699**: fix(config): replace live safehouse room / observability endpoint with placeholders
+- **#7707**: fix(daemon): spawn a detached post-exit verifier on the auto-update drain-and-restart path
 - **#7871**: fix(ci): publish version bumps with repository App identity
+- **#7885**: feat(ci): ratchet the pipefail + early-exit-consumer SIGPIPE class
 
 ## Proposed
 
@@ -69,11 +72,15 @@ Issues carrying `loom:curated`.
 - **#7716**: [tracking] Budget agent-facing markdown by tokens *(curated)*
 - **#7758**: Re-derive which bootstrap scripts must stay shell — auto_update.rs already duplicates loom-daemon-update.sh *(curated)*
 - **#7765**: worktree.sh silently creates a main-HEAD branch shadowing an open cross-repo PR's branch name *(curated)*
-- **#7785**: docs: .loom/README.md and defaults/.loom-README.md sample config still references nonexistent worker.md role file *(curated)*
-- **#7788**: test-bounded-run.sh flakes in CI on unrelated branches — portable-mode fixture races on the wedged child's pid *(curated)*
 - **#7789**: [tracking] 25 CI flake issues in 60 days, 22 closed: fix the mechanisms, not the instances *(curated)*
+- **#7790**: Close the pipefail + early-exit-consumer SIGPIPE class: 4 flakes and 1 production wrong-answer from one idiom *(curated)*
+- **#7791**: Retry-once-and-record for the shared shell suite: one flaky assertion currently blocks every concurrent PR *(curated)*
+- **#7792**: tokens_pool: empty_pool_error_enumerates_per_token_exclusion_detail flakes on the 4h/session-limit-window hour boundary *(curated)*
+- **#7793**: RCA: agent errors in this session cluster into 4 classes, 2 of which are the repo's own tracked defect classes *(curated)*
 - **#7794**: Seven scripts read their own source to print --help; the tear-race has broken CI three times *(curated)*
+- **#7795**: Guard ASK tier: which sites steer toward a safe alternative, and which are a bare 'are you sure?' that stalls headless runs *(curated)*
 - **#7829**: Activate version-bump-on-merge: push via the loom-fleet-dispatch App token (GITHUB_TOKEN cannot bypass the main ruleset on a user-owned repo) *(curated)*
+- **#7862**: flaky CI: assert_contains's 'printf | grep -q' races SIGPIPE under pipefail, reporting present substrings as absent *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -94,13 +101,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
+| Operator merge-risk holds | 3 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 7 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 18 |
+| Ready (`loom:issue`) | 4 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 2 |
+| Approved PRs awaiting merge | 4 |
+| Curated | 22 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
