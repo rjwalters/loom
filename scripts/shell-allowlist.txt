@@ -555,4 +555,4 @@ tests/install/test-uninstall-shim-cleanup.sh                                   t
 uninstall.sh                                                                   bootstrap   Pre-binary bootstrap: curl-pipe uninstall entry point; must keep working once the binary it removes is gone.
 
 # @section new
-# (nothing yet — add new .sh files here, with a category from the list above)
+defaults/scripts/tests/lib/heredoc-body-safety.sh                              test        Shell test harness for the watchdog suites — scans shell source for the bash-3.2 heredoc trap, so its subject is shell (#7834).
