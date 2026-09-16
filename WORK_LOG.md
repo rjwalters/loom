@@ -7,6 +7,20 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7761** (closed): PreToolUse guards fail OPEN when absent or non-executable, with no signal, in workspaces that expect them
+- **PR #7847**: fix: deny/warn instead of silently allowing on a broken guard install
+- **Issue #7753** (closed): Extend generated TOCs to role prompts and slash commands
+- **PR #7843**: feat(docs): extend generated TOCs to role prompts and slash commands
+- **PR #7700**: Builder: probe for a live sibling worktree before worktree.sh touches files (generalizing #6765)
+- **PR #7680**: fix(watchdog): dedup peer-coordination escalations across the cooldown window (#7664)
+- **PR #7673**: docs(roles): citation-scope rules for hermit/architect; fix stale get_random_file example
+- **PR #7670**: fix(champion): stop escalating a passing, already-decomposed epic to the operator
+- **PR #7685**: feat(resync): land resync commits conservatively, never rebase/bypass-push (#6646)
+- **PR #7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
+- **PR #7712**: docs: replace nonexistent commands in onboarding guides
+- **PR #7733**: fix: make sync-labels.sh --check work on macOS stock bash 3.2
+- **PR #7682**: fix(merge-pr): guard hold_head assignment against pipefail abort
+- **PR #7714**: feat(ci): ratchet oversized source files instead of refactor-on-touch (#7711)
 - **Issue #7851** (closed): peer-claim coordination is DEGRADED on ip-172-31-74-176 (#6157 Layer 3)
 - **Issue #7832** (closed): Dangling Link Check fails fleet-wide: .loom/docs/ installed copies never resynced after PR #7806's anchor fix
 - **Issue #7831** (closed): 3 dangling doc anchors remain broken on main after #7806's 15-anchor fix
