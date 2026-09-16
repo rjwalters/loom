@@ -179,8 +179,9 @@ constraint blocks this for the guard specifically.
 ## Related tracks
 
 - **#7718** — extract inline `#[cfg(test)]` modules to sibling files.
-- **#7716** — the same problem in agent-facing markdown (role prompts and slash
-  commands), measured in tokens rather than lines.
+- **#7716** / **#7725** — the same ratchet, applied to agent-facing markdown
+  (role prompts and slash commands), measured in tokens rather than lines. See
+  ["Markdown token budget"](#markdown-token-budget) below.
 - Semantic decomposition of what remains over threshold: Architect-proposed, one
   file at a time, scheduled when that file has no open PRs touching it.
 
@@ -190,3 +191,55 @@ constraint blocks this for the guard specifically.
 synthetic fixtures. CI runs it before the real check, so an edit that silently
 disarms the measurement fails loudly instead of reporting OK forever. Both bugs
 found in the first revision reported a green gate.
+
+## Markdown token budget
+
+Enforced by `scripts/check-markdown-token-budget.sh` (CI job **Markdown Token
+Ratchet**). Same ratchet mechanism as the source-file gate above — read that
+section first — applied to a different category of file, for a different
+reason (#7716, #7725).
+
+**Why a separate gate instead of extending the one above**: role prompts and
+slash-command bodies are not source code. They are prepended into an agent's
+context on *every* invocation — the same load-bearing category
+`check-claude-md-budget.sh` (#4014) already guards for `CLAUDE.md` alone —
+and there is no code-line/comment-line distinction to make in prose. A single
+gate that tried to cover both would need two counting rules and two
+exemption lists; two small gates are easier to reason about than one gate
+with a branch in the middle.
+
+**Counting.** No real LLM tokenizer is available in CI as of 2026-09-16, so
+`check-markdown-token-budget.sh` approximates tokens from raw byte count:
+`tokens = ceil(bytes / 4)`, the commonly-cited rough heuristic for English
+prose (~4 bytes/token). This is not exact, but a growth ratchet only needs
+the estimate to be monotonic in file size — it never compares one file's
+estimate to another's, only to its own prior recorded estimate.
+
+**Measured set.** Every `*.md` under `defaults/.claude/commands/loom/` (role
+prompts and slash-command bodies both live there), plus every `*.md` directly
+under `defaults/roles/` that is not `README.md` and not a symlink. In this
+repo, every non-`README.md` entry under `defaults/roles/` **is** such a
+symlink — pointing at its real content in
+`defaults/.claude/commands/loom/` — so today's measured set is exactly those
+`defaults/.claude/commands/loom/*.md` files, with `defaults/roles/`
+contributing nothing extra; the symlink check is what keeps a symlinked pair
+from being double-counted, checked structurally (git mode `120000`) rather
+than via a hardcoded filename list. `defaults/docs/*.md` and its
+`.loom/docs/*.md` install mirror are explicitly **out of scope** — reference
+documentation, never inlined into a prompt — as is every `.loom/*` installed
+mirror generally, for the same reason the source-file gate exempts
+`.loom/hooks`, `.loom/scripts`, and `.loom/docs`.
+
+**Baseline.** Unlike `scripts/file-size-baseline.txt` (which lists only
+files already over threshold), `scripts/markdown-token-baseline.txt` records
+**every** file in the measured set, unconditionally — the set is small and
+fully enumerable, so tracking all of it costs nothing and catches growth in
+any file, not just the biggest ones. `--threshold` still exists for parity
+with the source-file gate's flag surface, and matters only for a file that
+is not yet in the baseline (a brand-new slash command): if that file is
+already over threshold on arrival, the gate treats it the same as a source
+file newly crossing 1000 lines.
+
+Same rules for hitting the gate, the same `--update` discipline, and the
+same stale-baseline-under-you remedy as the source-file gate above — nothing
+about those parts changes for markdown.
