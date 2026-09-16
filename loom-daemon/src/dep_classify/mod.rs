@@ -16,6 +16,7 @@
 //! with an assertion.
 
 pub mod cycle;
+pub mod defer;
 pub mod finding;
 pub mod findings;
 pub mod fingerprint;
