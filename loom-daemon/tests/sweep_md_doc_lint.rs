@@ -1015,13 +1015,39 @@ fn sweep_md_step_1b_publishes_an_in_session_lease_after_step_1a() {
         "Step 1b must key the lease on Step 0a's stable `$RUN_ID`, so the lease, \
          the run registry, and the checkpoints all name one identity"
     );
-    assert!(
-        content.contains("--host \"$1\" --sweep-id \"$2\""),
-        "Step 1b must thread the published record's host/sweep-id into \
-         `sweep-lease-renew.sh start` — under renewal's default 'newest lease \
-         wins' a peer's later lease comment would be the one this sweep keeps \
-         alive while its own expired (#6320)"
-    );
+    // #7950: assert the REQUIREMENT, not one spelling of it.
+    //
+    // This used to pin the literal `--host "$1" --sweep-id "$2"`. #7876 then
+    // fixed a real bug — `set -- $LEASE_IDENT` does not word-split under zsh —
+    // by switching to named variables, and this assertion failed on the
+    // CORRECTED doc, taking `main` red for ten commits. The failure message
+    // talked about lease-renewal races while the actual problem was that two
+    // strings no longer matched, so the next reader was pointed away from the
+    // cause.
+    //
+    // What must hold is that the `start` invocation is threaded with the host
+    // and sweep-id that `publish` returned, rather than letting renewal fall
+    // back to "newest lease wins". Any variable names satisfy that; dropping
+    // either flag does not.
+    // Anchored at Step 1b, not the first match in the file: Step 1a ALSO calls
+    // `sweep-lease-renew.sh start`, and legitimately without these flags — the
+    // daemon already wrote that lease at dispatch. Searching from position zero
+    // finds 1a's call and fails on a correct document.
+    let step_1b = &content[step_1b_pos..];
+    let start_invocation = step_1b
+        .find("sweep-lease-renew.sh start")
+        .map(|i| &step_1b[i..(i + 400).min(step_1b.len())])
+        .expect("Step 1b must invoke `sweep-lease-renew.sh start`");
+    for flag in ["--host", "--sweep-id"] {
+        assert!(
+            start_invocation.contains(flag),
+            "Step 1b's `sweep-lease-renew.sh start` must pass `{flag}`, carrying the \
+             identity `sweep-lease-publish.sh publish` returned — under renewal's \
+             default 'newest lease wins' a peer's later lease comment would be the \
+             one this sweep keeps alive while its own expired (#6320). Found: \
+             {start_invocation:?}"
+        );
+    }
 
     // The peer-lease skip is the safety half: exit 4 means a LIVE peer holds
     // the claim, and publishing over it would hide that worker from every
