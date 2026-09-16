@@ -9,8 +9,8 @@ This directory contains example Loom workspace configurations to help you get st
 
 **Terminals**:
 - Shell - Manual terminal for exploring and debugging
-- Worker - General development worker (implements features and fixes bugs)
-- Reviewer - Code review specialist (reviews PRs)
+- Builder - General development worker (implements features and fixes bugs)
+- Judge - Code review specialist (reviews PRs)
 
 **Use when**: You want a simple setup to learn Loom or work on small projects.
 
@@ -20,14 +20,35 @@ This directory contains example Loom workspace configurations to help you get st
 **Terminals**:
 - Architect - Creates feature proposals and architectural improvements
 - Curator - Enhances issues with implementation details
-- Reviewer - Reviews pull requests thoroughly
-- Worker 1, 2, 3 - Parallel feature implementation
-- Fixer - Addresses review feedback and polishes PRs
-- Critic - Identifies opportunities to simplify and remove bloat
+- Judge - Reviews pull requests thoroughly
+- Builder 1, 2, 3 - Parallel feature implementation
+- Doctor - Addresses review feedback and polishes PRs
+- Hermit - Identifies opportunities to simplify and remove bloat
 
 **Use when**: You want the complete Loom experience with specialized agents for every part of the development workflow.
 
 ## How to Use These Templates
+
+These templates model **manual orchestration mode**: long-lived terminals, each
+bound to one role, polling on a `targetInterval`. For most work — especially your
+first run — prefer `/loom:sweep <issue>` instead, which drives a single issue
+through the full Curator → Builder → Judge → Doctor → Merge lifecycle in one
+command without you provisioning any terminals at all:
+
+```bash
+/loom:sweep 123
+```
+
+The daemon's `roleRunner` (`autonomous.roleRunner.enabled=true` in
+`.loom/config.json`) is the equivalent of these long-lived terminals for
+continuous/autonomous operation — it runs the periodic support roles (Champion,
+Curator, Judge, Doctor, Auditor, Guide, Hermit) on a schedule using the same
+rotated token pool as sweeps, so you don't need to keep a terminal open per role.
+See [`.loom/docs/daemon-reference.md`](../.loom/docs/daemon-reference.md) for the
+full role runner reference.
+
+If you still want the manual, terminal-per-role shape these templates provide
+(e.g. to watch each role's output live, or for a repo not running the daemon):
 
 ### Option 1: Copy to Existing Project
 
@@ -39,7 +60,7 @@ cd /path/to/your/project
 cp -r /path/to/loom/examples/quickstart/.loom .
 
 # Start Loom and select your project as workspace
-# Click "Start Workspace" to create terminals
+# Start each terminal to begin its role's polling loop
 ```
 
 ### Option 2: Start a New Project
@@ -53,7 +74,7 @@ git init
 # Copy template
 cp -r /path/to/loom/examples/full-stack/.loom .
 
-# Open Loom, select this directory, and start workspace
+# Open Loom, select this directory, and start each terminal
 ```
 
 ## What Gets Committed
@@ -115,7 +136,7 @@ See [../docs/workflows.md](../docs/workflows.md) for complete workflow documenta
 - Check Claude Code is installed and in PATH
 - Review console logs for errors
 
-### Workers not finding issues?
+### Builders not finding issues?
 - Install GitHub CLI: `brew install gh` (macOS) or equivalent
 - Authenticate: `gh auth login`
 - Create issues with `loom:issue` label
