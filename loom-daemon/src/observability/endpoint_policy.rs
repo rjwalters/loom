@@ -1,0 +1,165 @@
+//! Which resolved `observability.endpoint` values are fit to export to.
+//!
+//! A separate module from [`super`] on purpose (file-size policy: new code
+//! goes in a new sibling rather than growing `mod.rs`), and a narrow one: it
+//! answers exactly one question — *is this endpoint a reserved placeholder
+//! domain?* — with no config, env, or network dependencies, so the whole
+//! policy is unit-testable as pure string classification.
+//!
+//! Issue #7815: the committed `.loom/config.json` ships a **placeholder**
+//! endpoint (`https://dashboard.example.com/ingest`, #6650) and
+//! `observability.ingestKeyFile` defaults to
+//! `$HOME/.loom/observability/ingest.key`. A placeholder is a syntactically
+//! valid `https://` URL, so before this check any host that resolved
+//! `enabled: true` without also overriding the endpoint would POST its
+//! **real** ingest key as an `Authorization: Bearer` header to a
+//! third-party reserved domain — forever, since `sender.rs` retries
+//! indefinitely. [`super::spawn_task`] therefore treats a placeholder
+//! exactly like an unset endpoint: warn, register `misconfigured`, return
+//! before the key file is even read.
+//!
+//! This is defense in depth, not the primary guard — the committed block
+//! also ships `enabled: false` — so that a future placeholder or typo
+//! cannot reopen the exposure.
+
+/// Domain suffixes permanently reserved for documentation and testing, which
+/// can therefore never be a real telemetry backend: the RFC 2606 §3
+/// second-level names (`example.com`/`.net`/`.org`) and the RFC 2606 §2 /
+/// RFC 6761 reserved TLDs (`.example`, `.invalid`, `.test`).
+///
+/// `localhost` is deliberately **absent** (RFC 6761 reserves it too): a
+/// loopback endpoint is a legitimate local-dev / integration-test sink, and
+/// an ingest key sent there never leaves the host.
+const RESERVED_ENDPOINT_SUFFIXES: &[&str] = &[
+    "example.com",
+    "example.net",
+    "example.org",
+    "example",
+    "invalid",
+    "test",
+];
+
+/// Extract the lowercased host from an endpoint URL, tolerating a missing
+/// scheme, userinfo, a port, an IPv6 literal, and a trailing root dot.
+///
+/// Hand-rolled rather than pulled in from a URL crate on purpose: it feeds
+/// only the placeholder classification below, so it must be *conservative* —
+/// anything it cannot parse is simply not classified, and export proceeds
+/// exactly as it did before the check existed — rather than strictly
+/// correct. It must never be repurposed as a general URL parser.
+fn endpoint_host(endpoint: &str) -> Option<String> {
+    let after_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // `user:pass@host` — the last `@` separates userinfo from the host.
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: `[::1]:4318` ⇒ `::1`.
+        rest.split_once(']').map_or(rest, |(host, _)| host)
+    } else {
+        authority
+            .split_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// `true` when `host` **is** `suffix` or sits strictly under it as a DNS
+/// child — so `example.com` and `dashboard.example.com` match `example.com`,
+/// while `badexample.com` and `example.community` do not.
+fn host_is_under(host: &str, suffix: &str) -> bool {
+    host == suffix
+        || (host.len() > suffix.len()
+            && host.ends_with(suffix)
+            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.')
+}
+
+/// The reserved placeholder host this endpoint points at, if any — `None`
+/// means "not a placeholder", i.e. safe to export to as far as this check is
+/// concerned. The returned host is what the `misconfigured` detail names, so
+/// an operator reading `loom-daemon status` sees exactly what was refused.
+#[must_use]
+pub fn reserved_placeholder_host(endpoint: &str) -> Option<String> {
+    let host = endpoint_host(endpoint)?;
+    RESERVED_ENDPOINT_SUFFIXES
+        .iter()
+        .any(|suffix| host_is_under(&host, suffix))
+        .then_some(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure classification — no env, no runtime, no fixtures.
+    // `super::super::tests::spawn_task_placeholder_endpoint_returns_none`
+    // covers the wiring into `spawn_task`'s degrade-to-disabled path.
+
+    #[test]
+    fn rejects_rfc2606_documentation_domains() {
+        for endpoint in [
+            "https://example.com/ingest",
+            "https://dashboard.example.com/ingest", // the committed placeholder (#6650)
+            "https://ingest.example.net/v1/telemetry",
+            "http://collector.example.org",
+            "https://EXAMPLE.COM/ingest",            // case-insensitive
+            "https://dashboard.example.com./ingest", // fully-qualified trailing dot
+            "https://dashboard.example.com:8443/ingest", // explicit port
+            "https://user:pass@dashboard.example.com/ingest", // userinfo
+            "dashboard.example.com/ingest",          // no scheme at all
+        ] {
+            assert!(reserved_placeholder_host(endpoint).is_some(), "must be refused: {endpoint}");
+        }
+    }
+
+    #[test]
+    fn rejects_reserved_tlds() {
+        for endpoint in [
+            "https://ingest.example/v1",
+            "https://ingest.invalid/v1",
+            "https://ingest.test/v1",
+            "https://example/v1",
+            "https://deeply.nested.sub.test/v1",
+        ] {
+            assert!(reserved_placeholder_host(endpoint).is_some(), "must be refused: {endpoint}");
+        }
+    }
+
+    #[test]
+    fn allows_localhost_and_real_hosts() {
+        for endpoint in [
+            // `localhost`/loopback is a legitimate local-dev and
+            // integration-test sink — the key never leaves the host.
+            "http://localhost:4318/v1/logs",
+            "http://127.0.0.1:8787/ingest",
+            "http://[::1]:8787/ingest",
+            "https://loom-observability.workers.dev/ingest",
+            "https://ingest.test-fixture.internal/v1/telemetry",
+            // Near-misses that merely *contain* a reserved label: only a
+            // whole-label DNS-child match counts.
+            "https://badexample.com/ingest",
+            "https://example.community/ingest",
+            "https://latest.example.co/ingest",
+            "https://testing.dev/ingest",
+        ] {
+            assert_eq!(reserved_placeholder_host(endpoint), None, "must be allowed: {endpoint}");
+        }
+    }
+
+    #[test]
+    fn names_the_offending_host() {
+        assert_eq!(
+            reserved_placeholder_host("https://dashboard.example.com/ingest").as_deref(),
+            Some("dashboard.example.com"),
+            "the misconfigured detail must be able to name what it refused"
+        );
+        // Unparseable garbage is never classified — the check can only ever
+        // *add* a refusal, never turn a working endpoint into one.
+        assert_eq!(reserved_placeholder_host(""), None);
+        assert_eq!(reserved_placeholder_host("https://"), None);
+    }
+}
