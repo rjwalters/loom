@@ -794,25 +794,43 @@ assert_ask "#5783: Ask for no-space \$(...)-wrapped git restore ." \
 
 # --- git read-tree without GIT_INDEX_FILE isolation (#3637) ---
 # A bare `git read-tree` empties the real staging index with no reflog trace.
-assert_ask "Ask for bare git read-tree (#3637)" \
+#
+# TIER (#7795, was ask through #3637): promoted to DENY by the ask-tier sizing
+# pass. #3637's stated reason for the middle tier — "an isolated form is
+# legitimate" — argues for the GIT_INDEX_FILE carve-out (asserted further down
+# in this file), not for a prompt: the isolated form never reaches this check.
+# What reaches it would clobber the REAL index, refusing is lossless (the index
+# is untouched, the caller reruns isolated), and the replacement is named
+# exactly in the message.
+assert_deny "Deny bare git read-tree (#3637, tier #7795)" \
     "git read-tree"
 
-assert_ask "Ask for git read-tree with a tree-ish but no GIT_INDEX_FILE (#3637)" \
+assert_deny "Deny git read-tree with a tree-ish but no GIT_INDEX_FILE (#3637, tier #7795)" \
     "git read-tree HEAD"
 
 # #5783: backtick-wrapped git read-tree used to be invisible to this check
 # (leading class had no backtick), same root cause as the ASK_PATTERNS gap
 # above.
-assert_ask "#5783: Ask for backtick-wrapped bare git read-tree" \
+assert_deny "#5783: Deny backtick-wrapped bare git read-tree" \
     'echo `git read-tree`'
-assert_ask "#5783: Ask for no-space \$(...)-wrapped git read-tree" \
+assert_deny "#5783: Deny no-space \$(...)-wrapped git read-tree" \
     'echo $(git read-tree)'
 
-assert_ask "Ask for git read-tree -m merge sim without isolation (#3637)" \
+assert_deny "Deny git read-tree -m merge sim without isolation (#3637, tier #7795)" \
     "git read-tree -m HEAD origin/main"
 
-assert_ask "Ask for git read-tree at the end of a compound command (#3637)" \
+assert_deny "Deny git read-tree at the end of a compound command (#3637, tier #7795)" \
     "git fetch origin && git read-tree origin/main"
+
+# #7795: the denial must still steer toward BOTH guard-free alternatives and
+# say that nothing ran — a deny with guidance is the whole point of the
+# promotion. A bare "Blocked:" with no replacement would be a regression.
+assert_deny_reason_matches "git read-tree deny names merge-tree --write-tree and GIT_INDEX_FILE (#7795)" \
+    "git read-tree HEAD" \
+    "git merge-tree --write-tree.*GIT_INDEX_FILE"
+assert_deny_reason_matches "git read-tree deny states nothing was run (lossless refusal, #7795)" \
+    "git read-tree HEAD" \
+    "Nothing has been run"
 
 # --- #3757: reversible GitHub state changes no longer ask by default ---
 # gh pr close / gh issue close / gh label delete are trivially reversible
@@ -943,10 +961,16 @@ assert_ask "#5823: docker rm -fv (combined short flags with v) still asks" \
 assert_allow "#5823: container name containing '-v' substring does not false-ask" \
     "docker rm my-container-v1"
 
-assert_ask "Ask for docker rmi" \
+# #7795 (tier sizing) examined `docker rmi`/`stop`/`kill`/`restart` and left
+# them UNCHANGED: the operator's 2026-09-16 ruling on #7440 held the
+# `docker rmi` entry as-is and adopted a role-guidance remedy instead (steer
+# the Auditor to the ungated, dangling-only `docker image prune -f`). These
+# assertions are the regression lock on that ruling — a future tier pass that
+# drops them needs a fresh operator decision, not just telemetry.
+assert_ask "Ask for docker rmi (#7795: held as-is per the #7440 operator ruling)" \
     "docker rmi my-image"
 
-assert_ask "Ask for docker restart" \
+assert_ask "Ask for docker restart (#7795: held as-is per the #7440 operator ruling)" \
     "docker restart my-container"
 
 assert_ask "Ask for systemctl restart" \

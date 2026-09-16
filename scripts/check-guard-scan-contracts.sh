@@ -15,7 +15,6 @@
 #    |- COMMAND_HEREDOC_MASKED       -> COMMAND_GH_API_RAWFIELD_SCAN
 #    `- COMMAND_NO_COMMENT           -> COMMAND_ASK_SCAN
 #                                        |- COMMAND_CLOUD_ASK_SCAN
-#                                        |- COMMAND_ASK_SCAN_PRINTENV
 #                                        `- COMMAND_STASH_SCAN
 #
 # Every derivation carries a safety claim SCOPED TO A CONSUMER TIER. Historically
