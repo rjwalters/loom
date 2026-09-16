@@ -6,7 +6,30 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-16
+- **Issue #7763** (closed): ci: revert the five heavy jobs to ubuntu-latest (#6624 routing measured net-negative)
+- **PR #7768**: ci: revert the five heavy jobs to ubuntu-latest (#6624 routing measured net-negative)
+- **Issue #7720** (closed): Remove nonexistent 'gh label sync' from loom.md role prompt and the guard-hooks .md/.sh pair
+- **PR #7729**: fix: replace nonexistent 'gh label sync' in loom.md role prompt and the guard-hooks pair
+- **Issue #7745** (closed): resync-installed.sh exits 0 when its label-drift check crashes — a broken check is indistinguishable from a passing one
+- **PR #7772**: fix: a broken label check no longer reads as a passing one (resync exits 0 on a crashed check)
+
 ### 2026-09-15
+- **Issue #7718** (closed): Extract inline #[cfg(test)] modules to sibling files in the eight largest Rust files
+- **PR #7723**: refactor(daemon): extract inline test modules from the eight largest Rust files (#7718)
+- **Issue #7741** (closed): Split oversized shell test suites (the two largest files in the size ledger)
+- **PR #7750**: refactor(tests): split the 8.9k-line guard-destructive suite into 11 subject suites (#7741)
+- **Issue #7715** (closed): examples/*/.loom/config.json still seed agents with the removed loom:ready label
+- **PR #7731**: fix: example configs seed agents with labels that cannot exist
+- **Issue #7728** (closed): CI never runs check-shell-syntax.sh, and no runner is bash 3.2 — two macOS-only defects reached main today
+- **PR #7735**: ci: run check-shell-syntax.sh, on bash 3.2 as well as bash 5
+- **Issue #7746** (closed): Untracked .aider chat-history artifacts are not gitignored, and agents here run 'git add -A'
+- **PR #7747**: chore: gitignore aider session artifacts, resync installed token-pool.md
+- **Issue #7690** (closed): [Phase A of #6704] Publish + expire a forge-backed role-runner host roster, render it in status
+- **PR #7742**: feat(role-runner): publish + expire forge-backed roster, render in status
+- **Issue #7724** (closed): Decide scope for the markdown token budget
+- **Issue #7538** (closed): tokens: 5h session-limit marks written with neutral/ambiguous reasons miss the #7522 window cap
+- **PR #7727**: tokens: release ambiguous exhaustion marks via two-signal re-probe evidence
 - **Issue #7721** (closed): classify-dependency-block.sh fails bash 3.2 parse, blocking resync-installed.sh on all macOS hosts
 - **PR #7722**: fix: make classify-dependency-block.sh parse under bash 3.2 (unblocks resync on macOS)
 - **Issue #5660** (closed): Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe
