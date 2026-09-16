@@ -23,6 +23,25 @@
 #      notes). Symlinks are skipped structurally (`find -type f` never matches
 #      a symlink) — those already round-trip through defaults/docs/ by
 #      construction.
+#   1b. Symlink form (#7752) — the mirror image of 1: a `.loom/docs/` real
+#      file that DOES have a defaults/docs/ counterpart should be a symlink
+#      (`ln -sf ../../defaults/docs/<name> .loom/docs/<name>`), not a second
+#      real copy, unless it is on SYMLINK_EXCEPTION_ALLOWLIST below. A real
+#      copy silently drifts from defaults/docs/ until the next
+#      `chore: resync installed Loom surfaces` commit lands (#7739 produced
+#      six such drifted copies in one PR); a symlink is always current. This
+#      check is purely internal to THIS source repo's own .loom/docs/ — every
+#      CONSUMER repo's .loom/docs/ is real files by construction (installed by
+#      install.sh/resync-installed.sh, which never symlink into a consumer),
+#      so it never runs there (see the `no defaults/ under $ROOT` no-op below).
+#      Investigated for #7752: no legitimate real-file exception was found
+#      among the 29 candidates — the three that had drifted from their
+#      defaults/docs/ counterpart (guardrail-parity-codex.md,
+#      machine-dispatcher.md, telemetry-schema.md, all a stale pre-#7806
+#      anchor-fragment spelling) are evidence of accidental drift, not
+#      deliberate divergence. SYMLINK_EXCEPTION_ALLOWLIST therefore starts
+#      empty; add an entry only with a recorded reason a real copy must stay
+#      real despite having a defaults/docs/ counterpart.
 #   2. Link resolution — every same-directory sibling markdown link in
 #      defaults/docs/*.md (e.g. `[x](safehouse.md)` or
 #      `[x](safehouse.md#anchor)`) must resolve to a real file in
@@ -48,13 +67,15 @@
 #           downstream repo with no source tree), the check is a clean no-op.
 #
 #   check-docs-defaults-parity.sh --self-test
-#     Runs an isolated, synthetic-fixture regression test of the three checks
-#     above (the "safehouse.md case": a defaults/docs/ file linking a sibling
-#     that exists only in .loom/docs/; and the "#4935 case": a defaults/docs/
-#     file with a `../`-relative link that escapes every vendored root) and
-#     asserts they fail on the broken fixtures and pass once corrected. Exits
-#     non-zero if any check's discriminating power has regressed. Does not
-#     touch the real repo tree.
+#     Runs an isolated, synthetic-fixture regression test of the checks above
+#     (the "safehouse.md case": a defaults/docs/ file linking a sibling that
+#     exists only in .loom/docs/; the "#7752 case": a .loom/docs/ real file
+#     that has a defaults/docs/ counterpart and should be a symlink, plus its
+#     allowlist exception; and the "#4935 case": a defaults/docs/ file with a
+#     `../`-relative link that escapes every vendored root) and asserts they
+#     fail on the broken fixtures and pass once corrected. Exits non-zero if
+#     any check's discriminating power has regressed. Does not touch the real
+#     repo tree.
 #
 # Exit codes: 0 = clean (or self-test passed); 1 = violation(s) found (or
 # self-test failed) — details printed to stderr.
@@ -74,6 +95,30 @@ ORPHAN_ALLOWLIST=(
 is_allowlisted() {
   local name="$1" pattern
   for pattern in "${ORPHAN_ALLOWLIST[@]}"; do
+    # Intentional glob match against $pattern, not a literal string compare.
+    # shellcheck disable=SC2053
+    if [[ "$name" == $pattern ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Filenames (glob patterns ok) that DO have a defaults/docs/ counterpart but
+# are intentionally kept as a real file in .loom/docs/ rather than a symlink
+# (#7752). Empty by default — investigated once for the 29 real files that
+# existed at filing time and found none; add an entry only with a one-line
+# reason, same discipline as ORPHAN_ALLOWLIST above.
+SYMLINK_EXCEPTION_ALLOWLIST=()
+
+is_symlink_exception() {
+  local name="$1" pattern
+  # `${arr[@]+"${arr[@]}"}` rather than a bare `"${arr[@]}"`: under `set -u`,
+  # bash < 4.4 calls an EMPTY array's expansion an unbound variable and
+  # aborts. macOS ships 3.2.57 and will not ship newer (#7783/#7807). This
+  # array starts empty by design (see the comment above it), so the guard is
+  # load-bearing, not defensive boilerplate.
+  for pattern in "${SYMLINK_EXCEPTION_ALLOWLIST[@]+"${SYMLINK_EXCEPTION_ALLOWLIST[@]}"}"; do
     # Intentional glob match against $pattern, not a literal string compare.
     # shellcheck disable=SC2053
     if [[ "$name" == $pattern ]]; then
@@ -108,7 +153,11 @@ is_vendored_path() {
 }
 
 # --- Check 1: parity ----------------------------------------------------------
-# Prints violations to stderr. Returns 0 if clean, 1 if any orphan found.
+# Prints violations to stderr. Returns 0 if clean, 1 if any orphan or
+# should-be-symlink violation found. `find -type f` (below) only ever matches
+# a real file, never a symlink, so every $f visited here is already known to
+# be a real file — the two branches below just differ on whether it HAS a
+# defaults/docs/ counterpart (should-be-symlink) or not (orphan).
 check_parity() {
   local loom_docs="$1" defaults_docs="$2"
   local fail=0 f name
@@ -126,6 +175,13 @@ check_parity() {
       fi
       echo "ORPHANED: ${loom_docs}/${name} has no defaults/docs/${name} counterpart and is not on the allowlist" >&2
       echo "  fix: add defaults/docs/${name} (it will ship), or add \"${name}\" to ORPHAN_ALLOWLIST in $(basename "$0") if it is intentionally repo-local" >&2
+      fail=1
+    else
+      if is_symlink_exception "$name"; then
+        continue
+      fi
+      echo "SHOULD-BE-SYMLINK: ${loom_docs}/${name} is a real file but has a defaults/docs/${name} counterpart (#7752)" >&2
+      echo "  fix: ln -sf ../../defaults/docs/${name} ${loom_docs}/${name}  (or add \"${name}\" to SYMLINK_EXCEPTION_ALLOWLIST in $(basename "$0") if it is intentionally a real file)" >&2
       fail=1
     fi
   done < <(find "$loom_docs" -maxdepth 1 -type f -name '*.md' -print0 | sort -z)
@@ -259,18 +315,36 @@ check_escaping_links() {
 }
 
 # --- Self-test -----------------------------------------------------------------
-# Builds an isolated synthetic fixture reproducing the safehouse.md case,
-# asserts both checks fail on it, "fixes" it the same way #4796 does (add the
-# missing counterpart to defaults/docs/), and asserts both checks then pass.
+# Builds an isolated synthetic fixture reproducing the safehouse.md case and
+# the #7752 should-be-symlink case, asserts the checks fail on them, "fixes"
+# them the same way #4796/#7752 fix the real instances, and asserts the
+# checks then pass.
 run_self_test() {
   local tmp
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
+
+  # Restore SYMLINK_EXCEPTION_ALLOWLIST (temporarily extended below to
+  # exercise the exception mechanism) alongside the usual fixture cleanup.
+  local -a _orig_symlink_exception_allowlist
+  _orig_symlink_exception_allowlist=("${SYMLINK_EXCEPTION_ALLOWLIST[@]+"${SYMLINK_EXCEPTION_ALLOWLIST[@]}"}")
+  trap 'SYMLINK_EXCEPTION_ALLOWLIST=("${_orig_symlink_exception_allowlist[@]+"${_orig_symlink_exception_allowlist[@]}"}"); rm -rf "$tmp"' RETURN
 
   mkdir -p "$tmp/defaults/docs" "$tmp/.loom/docs"
 
   # An orphan: authored only in .loom/docs/, never shipped from defaults/docs/.
   echo "# Orphan doc" >"$tmp/.loom/docs/orphan-fixture.md"
+
+  # #7752 case: a .loom/docs/ real file WITH a defaults/docs/ counterpart —
+  # should be a symlink, not a second real copy.
+  echo "# Should be a symlink" >"$tmp/.loom/docs/should-be-symlink-fixture.md"
+  echo "# Should be a symlink" >"$tmp/defaults/docs/should-be-symlink-fixture.md"
+
+  # #7752 allowlist case: same shape, but exempted via
+  # SYMLINK_EXCEPTION_ALLOWLIST — must NOT be flagged even though it also has
+  # a defaults/docs/ counterpart and is a real file.
+  echo "# Allowlisted real-file exception" >"$tmp/.loom/docs/allowlisted-real-file-fixture.md"
+  echo "# Allowlisted real-file exception" >"$tmp/defaults/docs/allowlisted-real-file-fixture.md"
+  SYMLINK_EXCEPTION_ALLOWLIST+=("allowlisted-real-file-fixture.md")
 
   # A shipped doc that links the orphan as a sibling — exactly the
   # fleet-comms.md / github-authentication.md / daemon-reference.md shape.
@@ -290,13 +364,27 @@ EOF
 
   local self_test_fail=0
 
-  echo "check-docs-defaults-parity --self-test: asserting ALL THREE checks fail on the broken fixtures..."
+  echo "check-docs-defaults-parity --self-test: asserting ALL checks fail on the broken fixtures..."
   if check_parity "$tmp/.loom/docs" "$tmp/defaults/docs" >/tmp/self-test-parity.$$ 2>&1; then
-    echo "SELF-TEST FAIL: check_parity did not detect the orphan fixture" >&2
+    echo "SELF-TEST FAIL: check_parity did not detect the orphan/should-be-symlink fixtures" >&2
     cat /tmp/self-test-parity.$$ >&2
     self_test_fail=1
   else
     echo "  ok: check_parity correctly flagged the orphan"
+  fi
+  if ! grep -q "SHOULD-BE-SYMLINK:.*should-be-symlink-fixture.md" /tmp/self-test-parity.$$; then
+    echo "SELF-TEST FAIL: check_parity did not detect the should-be-symlink fixture" >&2
+    cat /tmp/self-test-parity.$$ >&2
+    self_test_fail=1
+  else
+    echo "  ok: check_parity correctly flagged the should-be-symlink fixture"
+  fi
+  if grep -q "allowlisted-real-file-fixture.md" /tmp/self-test-parity.$$; then
+    echo "SELF-TEST FAIL: check_parity flagged the allowlisted real-file fixture, which should be exempt" >&2
+    cat /tmp/self-test-parity.$$ >&2
+    self_test_fail=1
+  else
+    echo "  ok: check_parity correctly left the allowlisted real-file fixture alone"
   fi
   rm -f /tmp/self-test-parity.$$
 
@@ -318,17 +406,22 @@ EOF
   fi
   rm -f /tmp/self-test-escape.$$
 
-  # Now correct the fixtures the way #4796/#4935 correct the real instances:
-  # add the missing counterpart to defaults/docs/, and rewrite the escaping
-  # link to an absolute URL (the fix this issue applies to the real docs).
+  # Now correct the fixtures the way #4796/#4935/#7752 correct the real
+  # instances: add the missing counterpart to defaults/docs/ AND symlink it
+  # (an orphan fix that only adds the counterpart would immediately trip the
+  # #7752 should-be-symlink check, since it now has one), symlink the
+  # should-be-symlink fixture, and rewrite the escaping link to an absolute
+  # URL (the fix this issue applies to the real docs).
   cp "$tmp/.loom/docs/orphan-fixture.md" "$tmp/defaults/docs/orphan-fixture.md"
+  ln -sf ../../defaults/docs/orphan-fixture.md "$tmp/.loom/docs/orphan-fixture.md"
+  ln -sf ../../defaults/docs/should-be-symlink-fixture.md "$tmp/.loom/docs/should-be-symlink-fixture.md"
   cat >"$tmp/defaults/docs/escape-fixture.md" <<'EOF'
 # Escape fixture
 
 See [ADR-9999](https://github.com/rjwalters/loom/blob/main/docs/adr/9999-fake-adr.md) for details.
 EOF
 
-  echo "check-docs-defaults-parity --self-test: asserting ALL THREE checks pass once corrected..."
+  echo "check-docs-defaults-parity --self-test: asserting ALL checks pass once corrected..."
   if ! check_parity "$tmp/.loom/docs" "$tmp/defaults/docs"; then
     echo "SELF-TEST FAIL: check_parity still fails after the fixture was corrected" >&2
     self_test_fail=1
@@ -356,7 +449,7 @@ EOF
     return 1
   fi
 
-  echo "check-docs-defaults-parity --self-test: OK — all three checks fail on the broken fixtures and pass once corrected."
+  echo "check-docs-defaults-parity --self-test: OK — all checks fail on the broken fixtures, correctly skip allowlisted exceptions, and pass once corrected."
   return 0
 }
 
@@ -397,13 +490,15 @@ if [[ "$overall_fail" -ne 0 ]]; then
     echo "check-docs-defaults-parity: FAIL — see violations above."
     echo ""
     echo "Consumer repos populate .loom/docs/ FROM defaults/docs/ (resync-installed.sh)."
-    echo "A doc authored only in .loom/docs/ never ships, a defaults/docs/ link to a"
-    echo "sibling that only exists in .loom/docs/ is a dead link in every install, and a"
-    echo "defaults/docs/ '../'-relative link that escapes every vendored root points at"
-    echo "a file that only exists in the loom source repo (#4935)."
+    echo "A doc authored only in .loom/docs/ never ships, a .loom/docs/ real file that"
+    echo "has a defaults/docs/ counterpart should be a symlink instead (#7752, else it"
+    echo "silently drifts), a defaults/docs/ link to a sibling that only exists in"
+    echo ".loom/docs/ is a dead link in every install, and a defaults/docs/"
+    echo "'../'-relative link that escapes every vendored root points at a file that"
+    echo "only exists in the loom source repo (#4935)."
   } >&2
   exit 1
 fi
 
-echo "check-docs-defaults-parity: OK — .loom/docs/ has no unshipped orphans, defaults/docs/ sibling links resolve, and no escaping link leaves the vendored tree."
+echo "check-docs-defaults-parity: OK — .loom/docs/ has no unshipped orphans or should-be-symlink real files, defaults/docs/ sibling links resolve, and no escaping link leaves the vendored tree."
 exit 0
