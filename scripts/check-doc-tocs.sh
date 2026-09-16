@@ -17,6 +17,22 @@
 # The TOC lists TOP-LEVEL (`##`) sections only. A full heading dump would
 # recreate the problem it solves.
 #
+# File set (#7753 extends #7739's defaults/docs/*.md to the agent-facing
+# prompt set too — bigger and hotter, and #7724 confirmed these are the files
+# that actually dominate agent context):
+#   - defaults/docs/*.md               (reference docs, #7739's original scope)
+#   - defaults/.claude/commands/loom/*.md, EXCEPT bump.md (a generic,
+#     non-Loom-specific command — #7724's canonical 33-file prompt set is 18
+#     role prompts + 15 command-only files, not 34)
+#
+# defaults/roles/*.md (other than README.md, a docs index) are NOT globbed
+# separately: every one of them is a symlink into
+# defaults/.claude/commands/loom/ (confirmed structurally, not by name list —
+# see check-markdown-token-budget.sh, #7724/#7725), so generating on the
+# commands/loom/ side is automatically visible through the symlink. Writing
+# through defaults/roles/<name>.md instead would replace the symlink with a
+# standalone file via `mv` and desynchronize the pair.
+#
 # Usage:
 #   check-doc-tocs.sh           Fail if any doc's TOC is missing or stale.
 #   check-doc-tocs.sh --fix     Insert/refresh the TOC in place.
@@ -41,7 +57,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --fix)       MODE="fix"; shift ;;
     --threshold) THRESHOLD="${2:?--threshold needs a value}"; shift 2 ;;
-    --help|-h)   sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h)   sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           echo "check-doc-tocs: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -126,8 +142,11 @@ stale=""
 fixed=0
 checked=0
 
-for f in defaults/docs/*.md; do
+for f in defaults/docs/*.md defaults/.claude/commands/loom/*.md; do
   [ -f "$f" ] || continue
+  case "$f" in
+    */bump.md) continue ;;  # generic, non-Loom-specific — not part of the prompt set
+  esac
   qualifies "$f" || continue
   checked=$((checked + 1))
   rendered="$(render "$f")"
