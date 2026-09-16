@@ -27,14 +27,11 @@ name: Version Bump on Merge
 # push that happens to share that identity, for no benefit, since the path
 # filter already makes the loop structurally impossible.
 #
-# Activation dependency (not a blocker for merging this workflow itself --
-# see #7743's PR description): the push step below needs this repo's branch
-# ruleset to list this workflow's pushing identity (the default
-# `github-actions[bot]` `GITHUB_TOKEN` actor, unless a dedicated bot identity
-# is provisioned instead) in `bypass_actors`. Until a repo admin adds that
-# entry, the final push step 403s -- everything up to it (checkout, bump,
-# commit) still runs and is harmless to leave enabled while that one-time
-# repo-settings change is pending.
+# The repository's main ruleset permits the loom-fleet-dispatch App to push
+# version commits. The default GITHUB_TOKEN cannot bypass that ruleset on a
+# user-owned repository (#7829). Provision the two named App secrets before
+# activation; missing credentials must fail rather than fall back to a
+# different identity. This workflow does not change repository rules.
 
 on:
   push:
@@ -53,7 +50,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   bump-version:
@@ -61,6 +58,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Create repository-scoped version publisher token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.LOOM_FLEET_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.LOOM_FLEET_DISPATCH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
       # No `ref:`/pinned sha here -- always check out the CURRENT tip of
       # `main` at run start. For a queued run that matters: it must bump from
       # wherever `main` actually is now, not from the commit that originally
@@ -70,6 +77,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 1
+          token: ${{ steps.app-token.outputs.token }}
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v7
@@ -77,11 +85,16 @@ jobs:
           node-version: "24"
 
       - name: Bump version and push (retries on a racing push to main)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
         run: |
           set -euo pipefail
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          bot_login="${APP_SLUG}[bot]"
+          bot_id="$(gh api "users/$bot_login" --jq '.id')"
+          git config user.name "$bot_login"
+          git config user.email "${bot_id}+${bot_login}@users.noreply.github.com"
 
           attempts=5
           for attempt in $(seq 1 "$attempts"); do
