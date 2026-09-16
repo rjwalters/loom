@@ -40,7 +40,7 @@
 //! the same way: the only stateful part of the fence, the
 //! generation high-water mark, is passed in as an argument.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -750,11 +750,17 @@ pub fn admission(
 // Generation high-water mark (condition 2's only state)
 // ----------------------------------------------------------------------------
 
-/// The newest generation this process has observed, plus the comment ids it
-/// was derived from.
+/// The newest generation this process has observed, plus the per-record
+/// `updated_at` of the comment set it was derived from (`id -> updated_at`).
+///
+/// Keying on `updated_at` and not merely on the id **set** is what makes the
+/// ratchet's release rule decidable: a boundary can stop existing without any
+/// id disappearing (see [`observe_generation`]), and the only signal that
+/// distinguishes that legitimate case from a stale read is the direction the
+/// same id's `updated_at` moved.
 #[derive(Debug, Clone)]
 struct GenerationFence {
-    ids: BTreeSet<u64>,
+    updated: BTreeMap<u64, DateTime<Utc>>,
     newest: DateTime<Utc>,
 }
 
@@ -763,30 +769,71 @@ fn generation_fence_cell() -> &'static Mutex<Option<GenerationFence>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
-/// Record `raw_gen` (computed from the comment set `ids`) as observed, and
-/// return the newest generation observed so far — the value condition 2
-/// compares against.
+/// Record `raw_gen` (computed from `comments`) as observed, and return the
+/// newest generation observed so far — the value condition 2 compares
+/// against.
 ///
-/// **The ratchet resets when a previously observed comment disappears.** A
-/// vanished record (an operator tidying the roster issue, or a host
-/// republishing after eviction — see [`resolve_publish_action`]) invalidates
-/// the boundaries the high-water mark was derived from, and without the reset
-/// the host would yield **forever** against a generation no live data can ever
-/// reach again. Resetting is safe because the settle check still gates on the
-/// forge-assigned `gen`, which every host computes identically from the same
-/// comment set, so a reset cannot make two hosts act under different rings.
-pub fn observe_generation(ids: &BTreeSet<u64>, raw_gen: DateTime<Utc>) -> DateTime<Utc> {
+/// **The ratchet only holds against a view that is provably STALER than the
+/// one it was derived from** (issue #7895). The high-water mark exists to
+/// discard stale reads (a cached / ETag-stale response, a lagging replica),
+/// and a stale read is identified by the direction a *shared* record's
+/// `updated_at` moved — not by the generation instant alone. Three cases:
+///
+/// 1. **A previously observed id is gone** — the boundaries the mark was
+///    derived from are invalid (an operator tidied the roster issue, or a host
+///    republished after eviction, see [`resolve_publish_action`]). Reset.
+/// 2. **Every previously observed id is still present, but at least one
+///    carries an `updated_at` OLDER than what was already observed for it** —
+///    this view genuinely predates the one the mark came from. Ratchet
+///    (`prev.newest.max(raw_gen)`), so condition 2 still yields.
+/// 3. **Every shared id's `updated_at` is at least as new as what was already
+///    observed** — the view is provably at least as fresh, so `raw_gen` is
+///    authoritative *even when it is lower than the mark*. It can only be
+///    lower because a boundary moved **forward**: [`generation`] takes the max
+///    over `{created_at} ∪ {updated_at + ttl}` restricted to `<= now`, and a
+///    plain `Patch` (same comment id, newer `updated_at`) pushes that
+///    record's expiry boundary into the future, so a boundary that was
+///    observed once legitimately ceases to exist with no id vanishing. Without
+///    this arm the host yields **forever** in a stable fleet: no live host's
+///    expiry boundary ever passes `<= now` again and no join adds a fresh
+///    `created_at`, so nothing can ever reach the stranded mark.
+///
+/// Resetting is safe in cases 1 and 3 because the settle check still gates on
+/// the forge-assigned `gen`, which every host computes identically from the
+/// same comment set, so a reset can only let a host act *again* — it can never
+/// make two hosts act under different rings.
+pub fn observe_generation(comments: &[RosterComment], raw_gen: DateTime<Utc>) -> DateTime<Utc> {
+    // Duplicate ids cannot occur on a forge, but fold defensively the same way
+    // `own_comment` does: the freshest record wins.
+    let mut observed: BTreeMap<u64, DateTime<Utc>> = BTreeMap::new();
+    for c in comments {
+        observed
+            .entry(c.id)
+            .and_modify(|u| *u = (*u).max(c.updated_at))
+            .or_insert(c.updated_at);
+    }
     let mut cell = generation_fence_cell()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let newest = match cell.as_ref() {
-        Some(prev) if prev.ids.is_subset(ids) => prev.newest.max(raw_gen),
-        // First observation, or the comment set shrank — take the fresh
-        // reading as authoritative.
+        // Case 2 above: nothing vanished, and at least one shared id moved
+        // BACKWARDS — this read is stale, so hold the mark.
+        Some(prev)
+            if prev.updated.iter().all(|(id, _)| observed.contains_key(id))
+                && prev
+                    .updated
+                    .iter()
+                    .any(|(id, seen)| observed.get(id).is_some_and(|u| u < seen)) =>
+        {
+            prev.newest.max(raw_gen)
+        }
+        // First observation (no state), case 1 (an id disappeared), or case 3
+        // (the view is at least as fresh) — take the fresh reading as
+        // authoritative.
         _ => raw_gen,
     };
     *cell = Some(GenerationFence {
-        ids: ids.clone(),
+        updated: observed,
         newest,
     });
     newest
@@ -807,11 +854,16 @@ pub(crate) fn clear_generation_fence_for_tests() {
 /// The snapshot's own `ttl_secs`/`settle_secs` are used rather than a
 /// re-resolved config, so the fence and `status` always describe the same
 /// read with the same windows.
+///
+/// Note that this **mutates** the process-global high-water mark, and
+/// read-only callers reach it too (`loom-daemon status`, see `ipc.rs`). That
+/// is benign under [`observe_generation`]'s release rule — any view at least
+/// as fresh as the last one re-takes the reading as authoritative — but it is
+/// why the rule has to be release-capable rather than a pure ratchet (#7895).
 #[must_use]
 pub fn admit(snapshot: &RosterSnapshot, key_digest: u64, now: DateTime<Utc>) -> RosterAdmission {
-    let ids: BTreeSet<u64> = snapshot.comments.iter().map(|c| c.id).collect();
     let newest = generation(&snapshot.comments, now, snapshot.ttl_secs)
-        .map(|raw| observe_generation(&ids, raw));
+        .map(|raw| observe_generation(&snapshot.comments, raw));
     admission(
         &snapshot.comments,
         &snapshot.host,
