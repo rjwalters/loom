@@ -913,6 +913,12 @@ enum Commands {
     #[command(flatten)]
     DepClassify(cli::dep_classify::DepClassifyCommand),
 
+    /// Curator's re-check fingerprints (epic #7810 PR 4): the
+    /// `dep-recheck-fingerprint` subcommand family. Args and docs live in
+    /// `cli::dep_recheck` because this file is frozen by the file-size ratchet.
+    #[command(subcommand)]
+    DepRecheckFingerprint(cli::dep_recheck::DepRecheckCommand),
+
     /// Validate a sweep phase contract and attempt mechanical recovery (native
     /// port of `loom_tools.validate_phase`, #4275). Backs `validate-phase.sh`.
     ///
@@ -2576,6 +2582,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
         Commands::DepClassify(cmd) => cmd.run(),
+        Commands::DepRecheckFingerprint(cmd) => cmd.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
             phase,

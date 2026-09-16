@@ -257,7 +257,7 @@ these an API change rather than a rewrite.
 | `lib/forge-helpers.sh` | 1,072 | forge dispatch already in the daemon | none of its own — it evaporates as its callers port, so it follows its consumers |
 | `check-main-clean.sh` | 489 | — (git-state inspection) | the build-gate invocation name, which stays behind as a stub |
 | ~~`classify-dependency-block.sh`~~ | ~470 → 7 | `dep_classify/` (#7952) | **Done.** Ported with its two sourced helpers (`detect-dependency-cycle.sh`, `detect-startable-subset.sh`) — one unit, since `classify` sourced both. All three names stay as thin stubs: role prompts invoke them by path and parse their stdout line-wise |
-| `dep-recheck-fingerprint.sh` | 390 | — | deterministic hashing, #7810 Phase 4 |
+| ~~`dep-recheck-fingerprint.sh`~~ | 390 → 7 | `dep_recheck/` (#7961) | **Done.** All five subcommands ported; the name stays as a thin stub because `curator.md` invokes it by path and `eval`s its `KEY=VALUE` output |
 | `claim-staleness.sh` | 280 | — | a pure decision function over forge state |
 
 Counts are code lines as derived in #7758 on 2026-09-16 and drift within days;

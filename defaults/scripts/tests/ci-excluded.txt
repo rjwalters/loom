@@ -25,6 +25,7 @@ test-classify-dependency-block.sh  Needs a built loom-daemon; wired in the "Depe
 test-classify-dependency-block-premise-false.sh  Needs a built loom-daemon; wired in the "Dependency Classification Suites" job (#7952), which builds one first.
 test-detect-dependency-cycle.sh  Needs a built loom-daemon; wired in the "Dependency Classification Suites" job (#7952), which builds one first.
 test-detect-startable-subset.sh  Needs a built loom-daemon; wired in the "Dependency Classification Suites" job (#7952), which builds one first.
+test-dep-recheck-fingerprint.sh  Needs a built loom-daemon; wired in the "Dependency Classification Suites" job (#7961), which builds one first.
 
 # scripts/ (repo root, top-level only) — since #5278. Each of these already
 # runs as its own direct step in ci.yml and/or build-gate.sh; excluded here
