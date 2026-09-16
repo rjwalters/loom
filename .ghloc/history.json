@@ -1,0 +1,177 @@
+[
+  {
+    "total_loc": 455909,
+    "total_files": 1304,
+    "languages": [
+      {
+        "language": "JSON",
+        "lines": 10773,
+        "code": 10761,
+        "comments": 0,
+        "blanks": 12,
+        "files": 56
+      },
+      {
+        "language": "Docker ignore",
+        "lines": 19,
+        "code": 5,
+        "comments": 14,
+        "blanks": 0,
+        "files": 1
+      },
+      {
+        "language": "#!",
+        "lines": 1714,
+        "code": 1557,
+        "comments": 0,
+        "blanks": 157,
+        "files": 11
+      },
+      {
+        "language": "TypeScript",
+        "lines": 34238,
+        "code": 24818,
+        "comments": 5908,
+        "blanks": 3512,
+        "files": 185
+      },
+      {
+        "language": "TypeScript Typings",
+        "lines": 25,
+        "code": 8,
+        "comments": 16,
+        "blanks": 1,
+        "files": 3
+      },
+      {
+        "language": "JavaScript",
+        "lines": 704,
+        "code": 484,
+        "comments": 172,
+        "blanks": 48,
+        "files": 4
+      },
+      {
+        "language": "Rust",
+        "lines": 292736,
+        "code": 193830,
+        "comments": 76920,
+        "blanks": 21986,
+        "files": 245
+      },
+      {
+        "language": "TOML",
+        "lines": 676,
+        "code": 226,
+        "comments": 392,
+        "blanks": 58,
+        "files": 13
+      },
+      {
+        "language": "Shell",
+        "lines": 223753,
+        "code": 136993,
+        "comments": 69430,
+        "blanks": 17330,
+        "files": 481
+      },
+      {
+        "language": "YAML",
+        "lines": 3279,
+        "code": 1941,
+        "comments": 1053,
+        "blanks": 285,
+        "files": 25
+      },
+      {
+        "language": "gitignore",
+        "lines": 336,
+        "code": 170,
+        "comments": 117,
+        "blanks": 49,
+        "files": 6
+      },
+      {
+        "language": "HTML",
+        "lines": 649,
+        "code": 583,
+        "comments": 22,
+        "blanks": 44,
+        "files": 4
+      },
+      {
+        "language": "Plain Text",
+        "lines": 404,
+        "code": 397,
+        "comments": 0,
+        "blanks": 7,
+        "files": 3
+      },
+      {
+        "language": "Python",
+        "lines": 91,
+        "code": 67,
+        "comments": 10,
+        "blanks": 14,
+        "files": 6
+      },
+      {
+        "language": "License",
+        "lines": 21,
+        "code": 17,
+        "comments": 0,
+        "blanks": 4,
+        "files": 1
+      },
+      {
+        "language": "SQL",
+        "lines": 178,
+        "code": 88,
+        "comments": 77,
+        "blanks": 13,
+        "files": 4
+      },
+      {
+        "language": "CSS",
+        "lines": 949,
+        "code": 825,
+        "comments": 47,
+        "blanks": 77,
+        "files": 4
+      },
+      {
+        "language": "Markdown",
+        "lines": 101425,
+        "code": 82792,
+        "comments": 0,
+        "blanks": 18633,
+        "files": 234
+      },
+      {
+        "language": "JSONC",
+        "lines": 146,
+        "code": 36,
+        "comments": 110,
+        "blanks": 0,
+        "files": 4
+      },
+      {
+        "language": "SVG",
+        "lines": 344,
+        "code": 207,
+        "comments": 73,
+        "blanks": 64,
+        "files": 12
+      },
+      {
+        "language": "Dockerfile",
+        "lines": 337,
+        "code": 104,
+        "comments": 206,
+        "blanks": 27,
+        "files": 2
+      }
+    ],
+    "created_at": "2026-09-16T03:31:32.289498803Z"
+  }
+]
