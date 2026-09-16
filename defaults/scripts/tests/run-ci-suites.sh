@@ -275,7 +275,12 @@ elif command -v gtimeout >/dev/null 2>&1; then
     timeout_cmd="gtimeout"
 fi
 
-mapfile -t suites < <(sed -E 's/#.*$//' "$WIRED_MANIFEST" | awk 'NF { print $1 }')
+# `mapfile` is bash 4+; macOS ships 3.2 and this runs on developer machines
+# too (#7751). Empty lines are already filtered by the awk NF test.
+suites=()
+while IFS= read -r _suite; do
+    suites+=("$_suite")
+done < <(sed -E 's/#.*$//' "$WIRED_MANIFEST" | awk 'NF { print $1 }')
 
 passed=0
 failed=0
