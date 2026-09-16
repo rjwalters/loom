@@ -126,13 +126,55 @@ comments, so:
   so a marker match must run Step 0 **before** it skips or escalates. Same
   reasoning as the #5211 caveat above, applied to child state instead of blocker
   state.
+- **Step 0.5's Tracking-Umbrella Stand-Down (#7666).** An epic can acquire
+  children *after* a structural rejection — decomposed by a Curator, by native
+  sub-issues, or by a hand-written task list — and none of that edits the epic's
+  own text, so the marker keeps matching. Whether the epic is still *awaiting
+  decomposition* is therefore also a fact about its children, and a marker match
+  must run Step 0.5 **before** it skips or escalates, for the same reason it must
+  run Step 0: otherwise a healthy, now-decomposed umbrella escalates on the
+  strength of a stale, superseded rejection.
+
+**Hard constraint: this marker has exactly one writer.**
+`champion:epic-verdict:body-*` is emitted **only** by Step 4's rejection
+template (the `Champion Review: Epic Needs Revision` comment). It is not a
+general-purpose "Champion already looked at this epic" fingerprint, and no
+other step, template, or improvised status comment may emit it — for any
+reason, however structurally similar the situation looks. Everything
+downstream reads its presence as *proof that a rejection was posted*:
+
+- `PRIOR_REJECTIONS`, `SKIP_STREAK`, and `UNREVISED_EVALS` count **`Champion
+  Review: Epic Needs Revision` verdicts only**. A passing verdict, a stand-down
+  note, a phase-progress update, or any other non-rejection comment must never
+  contribute to them. A marker match with `PRIOR_REJECTIONS == 0` is a stray
+  marker, not an unrevised rejection, and the check below refuses to escalate
+  on it.
+- `loom:operator-only` / `loom:operator-decision` may therefore only ever be
+  applied by Step 4's escalation branch, to an epic with real, recurring
+  rejection findings. **A passing epic is never routed to the operator by this
+  file.** "It passes and there is nothing left to do" is a terminal-for-now
+  state, not a stuck one; parking it with a human both manufactures operator
+  load and takes the epic out of Step 0's completion-first check, so it can no
+  longer auto-close when its last child lands.
+
+This is not hypothetical (#7666): eleven consecutive passes on an external epic
+posted a *passing* "already decomposed, standing down" comment because no
+template existed for that case, and the eleventh borrowed this marker's name.
+The guard counted the borrowed marker as repeated rejection-without-revision and
+escalated a healthy epic — waiting only on a child that was `loom:building` — to
+`loom:operator-only`. **If you are about to post a comment and this file has no
+template for the situation you are in, that is a signal to add one (as #7666
+did, in Step 0.5), never to reuse a marker name documented for something else.**
+`defaults/scripts/tests/test-champion-epic-verdict-marker-scope.sh` enforces the
+single-writer rule statically, so a future edit cannot quietly reintroduce it.
 
 ### The check (run FIRST, once per epic — before Step 0)
 
 Compute a marker keyed to a **hash of the epic's own text** (title + body), so a
 genuine revision always gets a fresh evaluation while an unchanged epic is never
-re-commented. The check is **three-way**, not two-way: no match → evaluate; match
-with skips left in the budget → skip silently; match with the budget exhausted →
+re-commented. The check is **four-way**, not two-way: no match → evaluate; match
+with no posted rejection behind it → ignore the stray marker (#7666); match with
+skips left in the budget → skip silently; match with the budget exhausted →
 **escalate**.
 
 ```bash
@@ -192,11 +234,21 @@ elif printf '%s\n' "$EPIC_JSON" | jq -e --arg m "$VERDICT_MARKER" \
   SKIP_STREAK=${SKIP_STREAK:-0}
   UNREVISED_EVALS=$(( PRIOR_REJECTIONS + SKIP_STREAK ))
 
-  # NOTE: both branches below are reached only if Step 0's Completion-First Check
-  # did not act. Run Step 0 first — an epic can finish under an unchanged body,
-  # and this marker matches by construction on exactly the rejected-then-completed
-  # epics that must not be skipped into silence (#6516).
-  if [ "$UNREVISED_EVALS" -ge "${LOOM_MAX_UNREVISED_EVALUATIONS:-2}" ]; then
+  # NOTE: the branches below are reached only if Step 0's Completion-First Check
+  # and Step 0.5's Tracking-Umbrella Stand-Down both declined to act. Run them
+  # first — an epic can finish, or be decomposed by someone else, under an
+  # unchanged body, and this marker matches by construction on exactly the
+  # rejected-then-completed (#6516) and rejected-then-decomposed (#7666) epics
+  # that must not be skipped into silence or escalated.
+  if [ "$PRIOR_REJECTIONS" -eq 0 ]; then
+    # Stray marker: the marker matched, but no "Champion Review: Epic Needs
+    # Revision" comment was ever posted. Only Step 4's rejection branch may
+    # write this marker (see "Hard constraint" above), so this is a defect in
+    # whatever wrote it — not an unrevised rejection and not a stuck epic.
+    # Never tally it and NEVER escalate on it (#7666).
+    echo "#$EPIC_NUMBER carries a verdict marker but has no posted 'Epic Needs Revision' comment — stray marker (#7666): no tally, no escalation, no comment"
+    # Continue to the next epic; do not read further.
+  elif [ "$UNREVISED_EVALS" -ge "${LOOM_MAX_UNREVISED_EVALUATIONS:-2}" ]; then
     # Silence is not free forever: the skip budget is spent, so this pass does NOT
     # skip. Jump straight to Step 4's escalation branch — no re-evaluation, since
     # the text is unchanged and therefore so is the verdict.
@@ -224,9 +276,10 @@ fi
 
 | Guard outcome | Next action |
 |---|---|
-| No marker match — a new epic, or one revised since its last rejection | Step 0 (Completion-First Check) → Step 1 (Read) → Step 2 (Evaluate) → Step 2.5 → Step 3 or 4. Step 0 may end the pass on its own (close / operator ask); only an epic that is **not** a completion candidate reaches the structural criteria — that part is then a **full** re-evaluation, exactly as before this section existed |
-| Marker match, `UNREVISED_EVALS < ${LOOM_MAX_UNREVISED_EVALUATIONS:-2}` | **Run Step 0 first.** If it acts (close / operator ask), the pass ends there. Otherwise tally the skip in place (`PATCH` the existing verdict comment) and continue to the next epic: no new comment, no label change, no structural evaluation |
-| Marker match, budget exhausted (`ESCALATE_UNREVISED=yes`) | **Run Step 0 first**, then — if it did not act — go **straight to Step 4's escalation branch**, skipping Steps 1–3: the text is byte-identical, so re-evaluating the criteria cannot change the verdict |
+| No marker match — a new epic, or one revised since its last rejection | Step 0 (Completion-First Check) → Step 0.5 (Tracking-Umbrella Stand-Down) → Step 1 (Read) → Step 2 (Evaluate) → Step 2.5 → Step 3 or 4. Either of Step 0 / Step 0.5 may end the pass on its own (close / operator ask / stand-down); only an epic that is neither finished nor already decomposed reaches the structural criteria — that part is then a **full** re-evaluation, exactly as before this section existed |
+| Marker match, `PRIOR_REJECTIONS == 0` (stray marker, #7666) | **Run Step 0 and Step 0.5 first.** If neither acts, continue to the next epic — no tally, no escalation, no comment. Only Step 4's rejection branch may write this marker, so a match with no posted rejection is a defect in the writer, never evidence of a stuck epic |
+| Marker match, `PRIOR_REJECTIONS ≥ 1` and `UNREVISED_EVALS < ${LOOM_MAX_UNREVISED_EVALUATIONS:-2}` | **Run Step 0, then Step 0.5, first.** If either acts (close / operator ask / stand-down), the pass ends there. Otherwise tally the skip in place (`PATCH` the existing verdict comment) and continue to the next epic: no new comment, no label change, no structural evaluation |
+| Marker match, budget exhausted (`ESCALATE_UNREVISED=yes`) | **Run Step 0, then Step 0.5, first**, then — if neither acted — go **straight to Step 4's escalation branch**, skipping Steps 1–3: the text is byte-identical, so re-evaluating the criteria cannot change the verdict |
 | `ALREADY_ROUTED=yes` | Continue to the next epic — no tally, no re-escalation, no comment; a human already owns it |
 
 A silent skip is neither an approval nor a rejection, so it never counts against
@@ -277,6 +330,18 @@ Invariants a future edit must preserve:
 - **`ALREADY_ROUTED=yes` short-circuits everything**, and here it is
   unconditional: there is no epic analogue of the #5664 self-healing
   un-escalation, because no epic criterion is a self-clearing dependency finding.
+- **Escalation requires a posted rejection to escalate about.**
+  `PRIOR_REJECTIONS ≥ 1` is a precondition of both the skip tally and the
+  escalation (#7666). Every row of the trace above satisfies it by construction,
+  because `SKIP_STREAK` can only advance by `PATCH`ing a verdict comment that
+  Step 4 posted. A match with `PRIOR_REJECTIONS == 0` therefore means something
+  other than Step 4 wrote the marker, and the only safe reading of it is "ignore
+  it" — counting it would escalate an epic nobody has ever rejected, which is
+  exactly the #7666 failure.
+- **Only rejections feed the counter, and only rejections escalate.** Any future
+  verdict type added to this file (a pass, a stand-down, a status note) must
+  carry its own marker name and its own idempotency rule — see the "Hard
+  constraint" above and Step 0.5's stand-down for the worked example.
 
 `LOOM_MAX_UNREVISED_EVALUATIONS` (default **2**) is the same knob the proposal
 path reads — one threshold, both surfaces.
@@ -285,13 +350,15 @@ path reads — one threshold, both surfaces.
 
 ## Epic Approval Workflow
 
-**Run the "Idempotency Guard for Unrevised Epics" above FIRST.** It has four
+**Run the "Idempotency Guard for Unrevised Epics" above FIRST.** It has five
 outcomes. `ALREADY_ROUTED=yes` ends the pass immediately (a human owns the epic).
-The other three — skip silently / escalate / evaluate — **all enter Step 0
-first**, because completion is a fact about the epic's children, not about its
-text, and the two marker-matching outcomes are precisely the ones a
-rejected-then-completed epic lands on. Only after Step 0 declines to act do they
-resume their own behavior (skip, Step 4's escalation, or Step 1).
+The other four — stray marker / skip silently / escalate / evaluate — **all
+enter Step 0 and then Step 0.5 first**, because both "is it finished?" and "is it
+already decomposed?" are facts about the epic's *children*, not about its text,
+and the marker-matching outcomes are precisely the ones a rejected-then-completed
+(#6516) or rejected-then-decomposed (#7666) epic lands on. Only after both
+decline to act do they resume their own behavior (drop the stray marker, skip,
+Step 4's escalation, or Step 1).
 
 ### Step 0: Completion-First Check — ask "is this already done?" before "is this well-shaped?" (#6516)
 
@@ -334,7 +401,7 @@ marker here would reproduce the #6516 blind spot exactly.
 | Discovery result | Outcome |
 |---|---|
 | `STRONG_CLOSED == 0` and `WEAK_CLOSED == 0` — no children found by any source | **Not a completion candidate.** An epic that was never decomposed is exactly what the structural criteria are for → continue to Step 1 |
-| `STRONG_OPEN > 0` — containment children still open | Not complete → continue to Step 1 (and "Phase Progression" handles the next phase) |
+| `STRONG_OPEN > 0` — containment children still open | Not complete → continue to **Step 0.5**, which stands the epic down if those children were created by someone other than Step 3 (#7666); an epic Champion decomposed itself falls through Step 0.5 to Step 1, and "Phase Progression" handles its next phase |
 | `STRONG_OPEN == 0` and `STRONG_CLOSED > 0` | **Completion candidate** → 0b |
 | No strong children at all, but `WEAK_OPEN == 0` and `WEAK_CLOSED > 0` | **Low-confidence candidate**: prose references only, containment never established → 0c's operator ask, **never** an autonomous close |
 
@@ -428,8 +495,9 @@ defined by:
 | Same, but already carrying two "Epic Needs Revision" rejections | Same close — the body-hash marker match must not skip past Step 0 |
 | All children closed, but the body names `x/y.spice` that is **not** on `main` | `loom:operator-mechanical` ask naming `x/y.spice`. **No** close, and no claim that the epic is complete |
 | Only prose "Epic #N" references, all closed | `loom:operator-mechanical` ask. **No** close |
-| No children found by any source (undecomposed epic) | Falls through to Step 1 → Step 2's 6 criteria, byte-for-byte the behavior that existed before this section |
-| One child still open | Falls through to Step 1; "Phase Progression" unaffected |
+| No children found by any source (undecomposed epic) | Falls through to Step 0.5 (which does not fire — no children) → Step 1 → Step 2's 6 criteria, byte-for-byte the behavior that existed before this section |
+| One child still open, **carrying a phase marker** (Champion decomposed it) | Falls through Step 0.5 to Step 1; "Phase Progression" unaffected |
+| One child still open, **discovered without any phase marker** (Curator decomposition / sub-issues / task list) | Step 0.5's tracking-umbrella stand-down: one comment per body hash, then silence. **No** structural evaluation, no `loom:operator-only` (#7666) |
 
 **Invariants a future edit must preserve:**
 
@@ -440,7 +508,123 @@ defined by:
 - **Nothing closes on prose alone.** Weak (`Epic #N` mention) evidence may only
   reach the operator ask; autonomous closure requires containment.
 - **Absence of children is undecomposed, not done.** All-zero counts must route
-  to Step 1, never to 0c.
+  to Step 0.5 (which declines) and on to Step 1, never to 0c.
+
+### Step 0.5: Tracking-Umbrella Stand-Down — an already-decomposed epic is not awaiting decomposition (#7666)
+
+Step 0 asks "is this epic **finished**?". This step asks the other question the
+6 criteria cannot answer: "has this epic already been **decomposed**, by
+someone other than Step 3?"
+
+The 6 criteria describe an epic *awaiting decomposition* — they check the
+phases, sizing, and success criteria that Step 3 needs in order to create Phase
+1 issues. An epic whose children already exist and are being worked is past
+that point. Those children may come from a **Curator** decomposition pass, from
+native GitHub sub-issues, or from a hand-written `- [ ] #N` task list, none of
+which carries the `<!-- loom:epic:$EPIC_NUMBER:phase:N -->` marker that Step
+2.75 and "Detecting Phase Completion" search for — so neither phase creation
+nor phase progression can see them, and a literal reading of Step 2.75 would
+report `EXISTING_COUNT=0` and create a **duplicate** Phase 1 set. Champion has
+nothing left to do for such an epic except watch it finish, which Step 0
+already does on every pass.
+
+**Problem this section fixes (#7666)**: this case had no template. On an
+external epic (three Curator-created children, one of them `loom:building`)
+eleven consecutive Champion passes improvised a free-form "passes, already
+decomposed, standing down" comment, and the eleventh embedded the reserved
+`VERDICT_MARKER` name. The guard then read its own reserved marker back,
+counted those identical *passing* stand-downs as repeated
+rejection-without-revision, and routed a healthy epic to `loom:operator-only` —
+which also removed it from Step 0's completion-first check, so it could no
+longer auto-close when its last child landed. A passing epic is never a stuck
+epic: the correct handling is one durable note and then silence.
+
+#### 0.5a. Detect the tracking umbrella
+
+**Reuses Step 0a's discovery — do NOT re-run `discover_epic_children`.**
+
+```bash
+# Set by Step 0a: EPIC_CHILD_STRONG_{OPEN,CLOSED}, EPIC_CHILD_SOURCES.
+# `phase-marker` in EPIC_CHILD_SOURCES means discovery source (a) contributed,
+# i.e. Champion decomposed this epic itself and "Phase Progression" owns it
+# from here — such an epic must fall through to Step 1 exactly as before.
+case ",$EPIC_CHILD_SOURCES," in
+  *,phase-marker,*)
+    IS_TRACKING_UMBRELLA=no ;;                  # Champion's own decomposition
+  *)
+    if [ "$EPIC_CHILD_STRONG_OPEN" -gt 0 ]; then
+      IS_TRACKING_UMBRELLA=yes                  # decomposed elsewhere, still in flight
+    else
+      IS_TRACKING_UMBRELLA=no                   # undecomposed (Step 1), or complete (Step 0 owned it)
+    fi ;;
+esac
+```
+
+| Discovery state | `IS_TRACKING_UMBRELLA` | Why |
+|---|---|---|
+| `EPIC_CHILD_SOURCES` contains `phase-marker` | `no` | Champion decomposed this epic; Step 2.75 + "Phase Progression" already handle it, and standing down here would freeze phase advancement |
+| `STRONG_OPEN > 0`, no `phase-marker` source | **`yes`** | Children exist by containment and are still in flight, but Step 3 did not create them — nothing to decompose, nothing to evaluate |
+| `STRONG_OPEN == 0` | `no` | Either undecomposed (all counters 0 → Step 1) or a completion candidate, which Step 0 already acted on before this step ran |
+| Weak (prose) references only | `no` | Prose is never containment — Step 0's operator ask is the only thing weak evidence may reach |
+
+#### 0.5b. Stand down — once per body hash, no counter, no escalation
+
+```bash
+if [ "$IS_TRACKING_UMBRELLA" = "yes" ]; then
+  # Keyed to the SAME $BODY_HASH the guard computed, and to NOTHING else: a
+  # genuine revision (new phases, changed scope) earns one fresh note, while a
+  # child changing state does not — "this epic is decomposed and being worked"
+  # is what the note says, and that stays true as children move. Distinct
+  # marker name; NEVER the reserved rejection marker (see the guard's "Hard
+  # constraint" above).
+  UMBRELLA_MARKER="<!-- champion:epic-tracking-umbrella:body-$BODY_HASH -->"
+  if printf '%s\n' "$EPIC_JSON" | jq -e --arg m "$UMBRELLA_MARKER" \
+       '.comments[] | select(.body | contains($m))' >/dev/null; then
+    echo "#$EPIC_NUMBER is a tracking umbrella already noted at body revision $BODY_HASH — standing down silently (no comment, no tally, no label change)"
+  else
+    gh issue comment "$EPIC_NUMBER" --body "$UMBRELLA_MARKER
+**Champion: Epic Already Decomposed — Tracking Only**
+
+This epic's children already exist ($EPIC_CHILD_STRONG_OPEN open / $EPIC_CHILD_STRONG_CLOSED closed, discovered via: $EPIC_CHILD_SOURCES) but were not created by Champion's own phase-issue flow, so it is a **tracking umbrella**, not an epic awaiting decomposition. Champion is not creating phase issues for it and is not re-running the pre-decomposition structural criteria against it.
+
+Nothing is required of anyone. The epic stays open and keeps \`loom:epic\`; Champion re-checks it for completion on every pass and will close it automatically once its last child is closed and every deliverable it names is present on \`${DEFAULT_BRANCH:-main}\`.
+
+---
+*Automated by Champion role*"
+  fi
+  # END THE PASS FOR THIS EPIC either way: do not fall through to Step 1.
+  # No label change, no tally, no escalation — continue to the next epic.
+fi
+```
+
+#### 0.5c. Behavioral checks and invariants
+
+| Epic shape | Required outcome |
+|---|---|
+| Curator-decomposed epic, children open, first pass at this body hash | **One** "Epic Already Decomposed — Tracking Only" comment, then the pass ends |
+| Same epic, every later pass with an unchanged body | Silent skip — no comment, no label, no counter. Step 0 still runs first, so it closes on its own when the last child lands |
+| Same epic, body genuinely edited (new phases/scope) | New hash → one fresh stand-down note (still no evaluation, still no escalation) |
+| Same epic, carrying an old, superseded "Epic Needs Revision" marker | Stand-down still wins: Step 0.5 runs **before** the guard's skip/escalate branches commit, so a rejected-then-decomposed epic never escalates on a stale finding |
+| Champion-decomposed epic (phase-marker children) | Step 0.5 declines → Step 1 → unchanged Step 2/2.5/2.75/Phase Progression behavior |
+| Undecomposed epic (no children) | Step 0.5 declines → Step 1 → Step 2's 6 criteria, byte-for-byte the pre-existing behavior |
+
+**Invariants a future edit must preserve:**
+
+- **A stand-down is never a rejection.** This step writes
+  `champion:epic-tracking-umbrella:body-*` and nothing else. It must never write
+  the Step 4 rejection marker, never touch `PRIOR_REJECTIONS` / `SKIP_STREAK`,
+  and never apply `loom:operator-only` — a passing epic waiting on its own
+  children is not an operator problem.
+- **No escalation ladder, deliberately.** Same reasoning as "Phase
+  Progression"'s own idempotency guard: an unchanged, in-progress epic is not
+  stuck, it is *waiting*. Bounding a state that resolves itself when the last
+  child closes would only reintroduce the noise this step removes.
+- **Step 0 still runs on every pass.** The stand-down suppresses the *structural
+  evaluation*, never the completion check — that is what lets the epic close
+  automatically instead of sitting open forever.
+- **The `phase-marker` carve-out is load-bearing.** Widening this step to fire
+  on epics Champion decomposed itself would freeze phase progression at whatever
+  phase was open when the stand-down first fired.
 
 ### Step 1: Read the Epic
 
@@ -714,7 +898,12 @@ UNREVISED_EVALS=$(( PRIOR_REJECTIONS + SKIP_STREAK ))
 ```
 
 **If `ESCALATE_UNREVISED=yes`, or `UNREVISED_EVALS >= ${LOOM_MAX_UNREVISED_EVALUATIONS:-2}`
-and `ALREADY_ROUTED=no`** — escalate to the operator instead of rejecting again.
+— and, in both cases, `PRIOR_REJECTIONS >= 1` and `ALREADY_ROUTED=no`** — escalate
+to the operator instead of rejecting again. `PRIOR_REJECTIONS >= 1` is what keeps
+this branch tied to a **real, posted** `Champion Review: Epic Needs Revision`
+comment: the escalation exists to put a *repeatedly rejected* epic in front of a
+human, so an epic nobody has ever rejected must never reach it, whatever markers
+its thread happens to carry (#7666).
 Keep `loom:epic` (the epic is parked for a human, not withdrawn), and use the
 `loom:operator-decision` sub-kind (#5671, `.loom/docs/label-state-machine.md`
 → "operator-only sub-kinds"): an epic that keeps failing structural criteria is a
@@ -788,7 +977,11 @@ Keeping \`loom:epic\` label. The Architect can revise and resubmit.
 ```
 
 `$VERDICT_MARKER` and `$BODY_HASH` come from the guard above, keyed to a hash of
-this epic's title + body. Omitting the verdict marker — or substituting a
+this epic's title + body. **This rejection template is the only place in this
+file that may emit `$VERDICT_MARKER`** — the single-writer rule stated under the
+guard's "Hard constraint" and enforced by
+`defaults/scripts/tests/test-champion-epic-verdict-marker-scope.sh`. Omitting the
+verdict marker — or substituting a
 timestamp-keyed one — reopens the duplicate-comment loop this mechanism exists to
 close; omitting the `champion:epic-unrevised-skips:$BODY_HASH:0` line beside it
 reopens the opposite failure, where skips are free, `UNREVISED_EVALS` never
@@ -833,9 +1026,10 @@ nothing had changed. Unlike the "Idempotency Guard for Unrevised Epics"
 above (Step 4's rejection path), **no escalation ladder is added here** — an
 unchanged, in-progress epic is not stuck, it is *waiting* (on issues to
 close, or on a gate to lift), the same "isn't stuck, just waiting" state
-Step 2.5's blocker hold already treats with permanent silence. Indefinite
-silent-skip on no change is therefore the correct steady state, not a bug to
-bound.
+Step 2.5's blocker hold already treats with permanent silence, and the same
+choice Step 0.5's tracking-umbrella stand-down makes for the same reason
+(#7666). Indefinite silent-skip on no change is therefore the correct steady
+state, not a bug to bound.
 
 ```bash
 # Check if all Phase N issues for an epic are closed
