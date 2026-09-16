@@ -973,8 +973,19 @@ mod tests {
         let remaining = entry
             .cooldown_remaining_secs
             .expect("TTL entry has a remaining");
+        // #7748: `remaining` is derived from an internal `Utc::now()` call
+        // inside `blocking_entry`, taken some real time after the `Utc::now()`
+        // above that produced `ts` — normally microseconds apart, but a
+        // CI-runner wall-clock jump between the two calls widens that gap
+        // unpredictably (observed once: `remaining=14399`, i.e. an apparent
+        // ~1h jump, one second under the previous 4h floor). The lower bound
+        // is deliberately loose — down to 3h instead of a tight-to-5h window —
+        // to tolerate at least a ~2h clock jump between the two calls without
+        // masking a real regression in the cooldown-remaining calculation
+        // (which would still show up as `remaining` far outside 3h..=5h, e.g.
+        // ~0 or negative, or unchanged at ~6h).
         assert!(
-            (4 * 3600..=5 * 3600).contains(&remaining),
+            (3 * 3600..=5 * 3600).contains(&remaining),
             "expected ~5h remaining, got {remaining}"
         );
     }
@@ -2016,8 +2027,13 @@ mod tests {
             .expect("TTL entry has a remaining");
         // 1h old, 6h default cooldown → ~5h remaining (not capped at the
         // session window — this reason is ambiguous, not session-limit).
+        // #7748: lower bound widened from 4h to 3h — same shape (and same
+        // fixture) as `blocking_entry_reports_exhaustion_class_and_cooldown_remaining`,
+        // which flaked in CI on a wall-clock jump between the `Utc::now()`
+        // that stamps the fixture and the internal `Utc::now()` inside
+        // `blocking_entry`; see that test for the full rationale.
         assert!(
-            (4 * 3600..=5 * 3600).contains(&remaining),
+            (3 * 3600..=5 * 3600).contains(&remaining),
             "expected ~5h remaining on the unmodified fixed TTL, got {remaining}"
         );
     }

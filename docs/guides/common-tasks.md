@@ -198,7 +198,7 @@ loom-daemon init --force
 ```
 
 **See also:**
-- [Troubleshooting Guide](troubleshooting.md#initialization-issues) - Complete debugging guide
+- [Troubleshooting Guide](troubleshooting.md#installation-issues) - Complete debugging guide
 - [Getting Started](getting-started.md#troubleshooting) - Common setup issues
 
 ## Adding a New Agent Terminal Property
