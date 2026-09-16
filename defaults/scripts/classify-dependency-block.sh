@@ -409,6 +409,25 @@ is_dependency_finding() {
     printf '%s' "$windows" | grep -qE "$ref_re"
 }
 
+# _strip_premise_false <findings, one per line>
+#
+# Drops any bullet tagged `[premise-false]` -- champion-issue-promo.md's
+# premise-false close gate vocabulary (#7657). That finding kind self-clears
+# through its OWN separate gate (re-verifying the cited mechanical check
+# against current `main`), never by waiting on a blocker, so it must not count
+# as a disqualifying "merits" finding for --check-defer's all-or-nothing
+# dependency classification below. #7904: previously a `[premise-false]`
+# bullet mixed with a genuine open-dependency bullet made
+# findings_are_dependency_only() fail (it is not itself dependency-shaped),
+# so the set fell through to ordinary escalation instead of deferring -- the
+# issue's own stated edge case ("a mixed premise-false + open-dependency
+# finding set should still defer"). Scoped to check_defer() only: an
+# ALREADY-escalated issue's --check-unescalate path is a different life-cycle
+# question and is untouched.
+_strip_premise_false() {
+    printf '%s\n' "$1" | grep -v '^[[:space:]]*[-*][[:space:]]*\[premise-false\]'
+}
+
 # findings_are_dependency_only <findings, one per line>
 # True (0) only when there is at least one finding and EVERY finding is
 # dependency-attributable. A single merits finding disqualifies the whole set:
@@ -538,11 +557,25 @@ check_defer() {
     findings="$(extract_findings "$source_body")"
     [[ -n "${findings//[[:space:]]/}" ]] || _no_defer "no-findings"
 
-    # A single merits finding means the escalation is about the merits. Unchanged
-    # behaviour: escalate.
-    findings_are_dependency_only "$findings" || _no_defer "merits-finding"
+    # #7904: classify on the finding set with `[premise-false]`-tagged bullets
+    # removed -- see _strip_premise_false() above for why those must not count
+    # as a disqualifying merits finding here.
+    local dep_check_findings
+    dep_check_findings="$(_strip_premise_false "$findings")"
+    if [[ -z "${dep_check_findings//[[:space:]]/}" ]]; then
+        # Every finding was premise-false: nothing left to classify as a
+        # dependency wait, but this is not a merits finding either. Fall
+        # through to escalate (DEP_RC=1) so the caller's separate
+        # premise-false close gate gets to run against the full, unfiltered
+        # finding set.
+        _no_defer "premise-false-only"
+    fi
 
-    _resolve_blockers "$findings" "$body"
+    # A single ordinary merits finding means the escalation is about the
+    # merits. Unchanged behaviour: escalate.
+    findings_are_dependency_only "$dep_check_findings" || _no_defer "merits-finding"
+
+    _resolve_blockers "$dep_check_findings" "$body"
     [[ -n "${BLOCKER_REFS//[[:space:]]/}" ]] || _no_defer "no-recorded-blocker"
 
     _classify_refs "$BLOCKER_REFS"
