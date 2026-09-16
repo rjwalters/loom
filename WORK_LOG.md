@@ -7,6 +7,27 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7860** (closed): Investigate blocked-label removal and rapid redispatch on kicad-tools#5333
+- **PR #7946**: fix(daemon): stop the pool's own diagnostic from masking a token-selection death as account exhaustion
+- **PR #7943**: feat(daemon): port both dependency-helper scripts' pure logic, with differential proofs against the shell (#7929)
+- **Issue #7941** (closed): CLAUDE.md and champion-pr-merge.md still teach the retired per-PR VERSION bump (superseded by #7743)
+- **PR #7942**: docs: CLAUDE.md and champion-pr-merge.md still taught the retired per-PR VERSION bump (#7941)
+- **Issue #7950** (closed): main is red (10 commits): sweep_md_doc_lint pins the pre-#7876 Step 1b literal, so the corrected snippet fails it
+- **PR #7951**: fix(test): assert Step 1b's lease threading by requirement, not by literal — unbreaks main (#7950)
+- **Issue #7903** (closed): Docs/code drift: check-file-size-budget.sh's header still says loom-daemon-{update,start}.sh 'can never be ported' (retired by #7758/#7900)
+- **PR #7944**: docs: point the ratchet's bootstrap comment at the doc instead of a stale file list
+- **Issue #7896** (closed): run-job: client pre-flight ancestor check misses non-canonical mount spellings (/run//, //run, /run/.) — executor holds, docs overstate
+- **PR #7940**: fix(run-job): require a canonical mount path so the client pre-flight holds (#7896)
+- **Issue #7825** (closed): sweep-lease-renew.sh outlives its sweep — 6 orphan renewers on loom-worker-1 (oldest 18 d) kept dead sweeps "in flight" and their issue leases fresh fleet-wide
+- **PR #7934**: fix(lease): identity-pinned watch + zombie fix + absolute age cap for sweep-lease-renew (#7825)
+- **Issue #7930** (closed): test-classify-dependency-block.sh: passes on CI, fails 38/239 locally on the same commit — blocks using it as the #7929 port's equivalence proof
+- **PR #7937**: fix(champion): un-escalation silently did nothing on macOS — the #7508 heredoc trap, unfixed in two functions (#7930)
+- **Issue #7709** (closed): worktree_reaper: a stuck-removal record never clears after the operator removes the directory by hand
+- **PR #7938**: fix(worktree_reaper): clear a stuck-removal record once its worktree is confirmed gone
+- **Issue #7876** (closed): bug(sweep): Step 1b lease-renew snippet breaks under zsh — `set -- $LEASE_IDENT` never splits, loop forks with empty --sweep-id and the sweep's own lease silently expires
+- **PR #7936**: fix(sweep): split the Step 1b lease identity with `read` so renewal works under zsh
+- **Issue #7872** (closed): branch_landed: rung-2/rung-3 unresolvable-tip asymmetry + minor cleanup in #7812's landed primitive
+- **PR #7931**: fix(branch-landed): rung-2/rung-3 unresolvable-tip asymmetry + minor cleanup
 - **Issue #7854** (closed): [Epic #6896] Phase 4: migrate docker-requiring callers onto the run-job seam
 - **PR #7924**: feat(run-job): migrate docker-requiring callers onto the run-job seam
 - **Issue #7844** (closed): create-pr.sh's force-auto-merge path still hardcodes squash (follow-up to #7754 Part 1)
