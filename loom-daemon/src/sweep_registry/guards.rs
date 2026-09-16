@@ -615,19 +615,12 @@ impl SweepRegistry {
     /// differs (this one is timeout-bounded and runs the registry's configured
     /// `gh_bin` in its own workspace).
     ///
-    /// **REST fallback (#5911).** The GraphQL closes-graph query above shares a
-    /// quota with every other GraphQL caller in the fleet, and quota exhaustion
-    /// under concurrent agents is a documented recurring failure mode in this
-    /// repo. Pre-#5911 that exhaustion made this probe answer `ProbeFailed`,
-    /// which the #4123 dispatch guard (by design) treats as "proceed" — so a
-    /// GraphQL-starved tick would silently let the guard fall open and
-    /// re-dispatch an issue whose PR was, in fact, still open (observed
-    /// repeatedly on #5565/#5569). Only when the GraphQL probe itself fails to
-    /// answer, retry over REST (`issues/{n}/timeline`) before falling open —
-    /// REST is a *separate* rate-limit bucket from GraphQL, the same rationale
-    /// already used by the #4444 park-label probe below. A verified GraphQL
-    /// answer (`Open` or `NoneOpen`) is trusted as-is and never pays the extra
-    /// REST round trip.
+    /// **REST union (#5911, #7757).** An open closing PR is decisive. Otherwise
+    /// consult `issues/{n}/timeline` for non-closing references too, including
+    /// when GraphQL successfully returns `NoneOpen`. REST also recovers
+    /// GraphQL quota exhaustion using a separate rate-limit bucket (#5911).
+    /// Only the complete timeline probe may establish verified absence;
+    /// failure remains `ProbeFailed`, preserving dispatch/no-progress policy.
     ///
     /// **Bounded whole-probe retry (#6058).** #5911's REST fallback recovers a
     /// GraphQL-only outage, but production logs from this very flap (issue
@@ -885,19 +878,16 @@ impl SweepRegistry {
         guard.insert(issue, OpenPrMemoEntry { pr, verified_at });
     }
 
-    /// One GraphQL-then-REST-fallback round of [`probe_open_linked_pr`],
-    /// extracted so the #6058 retry loop above can invoke it more than once
+    /// One GraphQL/REST union round of [`probe_open_linked_pr`]. A closing PR
+    /// is decisive; an empty closes-graph still needs the timeline (#7757).
+    /// Extracted so the #6058 retry loop above can invoke it more than once
     /// without duplicating the transport-selection logic.
     fn probe_open_linked_pr_transports(&self, issue: u32) -> OpenPrProbe {
         let graphql = self.probe_open_linked_pr_graphql(issue);
-        if graphql != OpenPrProbe::ProbeFailed {
+        if matches!(graphql, OpenPrProbe::Open(_)) {
             return graphql;
         }
-        log::debug!(
-            "sweep_registry: GraphQL open-PR probe for issue #{issue} failed to answer \
-             (commonly GraphQL quota exhaustion) — retrying over REST (#5911), a separate \
-             rate-limit bucket"
-        );
+        log::debug!("issue #{issue}: GraphQL {graphql:?}; checking REST timeline (#5911, #7757)");
         self.probe_open_linked_pr_rest(issue)
     }
 
@@ -939,10 +929,9 @@ impl SweepRegistry {
         crate::worktree_ops::gh::parse_open_linked_pr(&String::from_utf8_lossy(&output.stdout))
     }
 
-    /// REST fallback (#5911) for [`probe_open_linked_pr`], consulted only when
-    /// the GraphQL closes-graph probe above returns [`OpenPrProbe::ProbeFailed`]
-    /// (most commonly GraphQL quota exhaustion — REST is billed against a
-    /// separate limit, mirroring the #4444 park-label probe's own rationale).
+    /// REST union for [`probe_open_linked_pr`], consulted when GraphQL returns
+    /// either `NoneOpen` (#7757) or `ProbeFailed` (#5911). REST uses a separate
+    /// quota, mirroring the #4444 park-label probe's rationale.
     ///
     /// Walks `issues/{n}/timeline` for `cross-referenced` events whose source
     /// is an OPEN pull request in this same repo — the same "source 2" union
@@ -2049,11 +2038,11 @@ mod tests {
     fn probe_open_linked_pr_distinguishes_none_open_from_probe_failure() {
         // Verified no open PR: gh succeeds with empty stdout.
         let dir = tempdir().unwrap();
-        let reg = no_progress_test_registry(dir.path(), "OPEN", "", false);
+        let (reg, _) = union_tests::empty_graphql_registry(dir.path(), "", 0);
         assert_eq!(
             reg.probe_open_linked_pr(9001),
             OpenPrProbe::NoneOpen,
-            "empty successful graphql output is a VERIFIED absence"
+            "empty successful GraphQL and REST output is a VERIFIED absence"
         );
 
         // Verified open PR: gh succeeds and prints a PR number.
@@ -2080,10 +2069,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let reg = no_progress_test_registry(dir.path(), "OPEN", "not-a-number", false);
         assert_eq!(
-            reg.probe_open_linked_pr(9004),
+            reg.probe_open_linked_pr_graphql(9004),
             OpenPrProbe::ProbeFailed,
-            "unparseable non-empty stdout is a PROBE FAILURE (#4452)"
+            "unparseable non-empty GraphQL stdout is a PROBE FAILURE (#4452)"
         );
+        // The independent, verified-empty timeline can still recover absence.
+        assert_eq!(reg.probe_open_linked_pr_transports(9004), OpenPrProbe::NoneOpen);
     }
 
     /// #5911: when the GraphQL closes-graph probe cannot answer (e.g. quota
@@ -2222,7 +2213,7 @@ mod tests {
         std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
         let dir = tempdir().unwrap();
         // The fake forge now reports NO open linked PR.
-        let (reg, log) = open_pr_guard_registry(dir.path(), "", 0, true);
+        let (reg, log) = union_tests::empty_graphql_registry(dir.path(), "", 0);
         // A memo older than the freshness window claims PR #6484 is open.
         let stale = Utc::now()
             - chrono::Duration::from_std(OPEN_PR_MEMO_FRESH).unwrap()
@@ -3912,3 +3903,7 @@ exit 0
         );
     }
 }
+
+#[cfg(test)]
+#[path = "guards_union_tests.rs"]
+mod union_tests;
