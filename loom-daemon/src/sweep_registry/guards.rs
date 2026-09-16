@@ -885,19 +885,16 @@ impl SweepRegistry {
         guard.insert(issue, OpenPrMemoEntry { pr, verified_at });
     }
 
-    /// One GraphQL-then-REST-fallback round of [`probe_open_linked_pr`],
-    /// extracted so the #6058 retry loop above can invoke it more than once
+    /// One GraphQL/REST union round of [`probe_open_linked_pr`]. A closing PR
+    /// is decisive; an empty closes-graph still needs the timeline (#7757).
+    /// Extracted so the #6058 retry loop above can invoke it more than once
     /// without duplicating the transport-selection logic.
     fn probe_open_linked_pr_transports(&self, issue: u32) -> OpenPrProbe {
         let graphql = self.probe_open_linked_pr_graphql(issue);
-        if graphql != OpenPrProbe::ProbeFailed {
+        if matches!(graphql, OpenPrProbe::Open(_)) {
             return graphql;
         }
-        log::debug!(
-            "sweep_registry: GraphQL open-PR probe for issue #{issue} failed to answer \
-             (commonly GraphQL quota exhaustion) — retrying over REST (#5911), a separate \
-             rate-limit bucket"
-        );
+        log::debug!("issue #{issue}: GraphQL {graphql:?}; checking REST timeline (#5911, #7757)");
         self.probe_open_linked_pr_rest(issue)
     }
 
@@ -2049,11 +2046,11 @@ mod tests {
     fn probe_open_linked_pr_distinguishes_none_open_from_probe_failure() {
         // Verified no open PR: gh succeeds with empty stdout.
         let dir = tempdir().unwrap();
-        let reg = no_progress_test_registry(dir.path(), "OPEN", "", false);
+        let (reg, _) = union_tests::empty_graphql_registry(dir.path(), "", 0);
         assert_eq!(
             reg.probe_open_linked_pr(9001),
             OpenPrProbe::NoneOpen,
-            "empty successful graphql output is a VERIFIED absence"
+            "empty successful GraphQL and REST output is a VERIFIED absence"
         );
 
         // Verified open PR: gh succeeds and prints a PR number.
@@ -2222,7 +2219,7 @@ mod tests {
         std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
         let dir = tempdir().unwrap();
         // The fake forge now reports NO open linked PR.
-        let (reg, log) = open_pr_guard_registry(dir.path(), "", 0, true);
+        let (reg, log) = union_tests::empty_graphql_registry(dir.path(), "", 0);
         // A memo older than the freshness window claims PR #6484 is open.
         let stale = Utc::now()
             - chrono::Duration::from_std(OPEN_PR_MEMO_FRESH).unwrap()
@@ -3912,3 +3909,7 @@ exit 0
         );
     }
 }
+
+#[cfg(test)]
+#[path = "guards_union_tests.rs"]
+mod union_tests;
