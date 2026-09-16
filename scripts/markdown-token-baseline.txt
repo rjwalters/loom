@@ -17,8 +17,8 @@
 9895 defaults/.claude/commands/loom/auditor.md
 5701 defaults/.claude/commands/loom/builder-complexity.md
 12597 defaults/.claude/commands/loom/builder-pr.md
-3761 defaults/.claude/commands/loom/builder-worktree.md
-18448 defaults/.claude/commands/loom/builder.md
+3902 defaults/.claude/commands/loom/builder-worktree.md
+18444 defaults/.claude/commands/loom/builder.md
 4803 defaults/.claude/commands/loom/bump.md
 7185 defaults/.claude/commands/loom/champion-common.md
 1836 defaults/.claude/commands/loom/champion-epic-standdown.md
