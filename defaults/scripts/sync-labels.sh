@@ -101,7 +101,9 @@ Options:
                     set against labels.yml and report missing/stale declared
                     labels plus unknown loom:-prefixed extras. Never creates,
                     updates, or deletes anything. Exits 0 (in sync), 3 (drift
-                    found), or 1 (forge/lookup error). Independent of
+                    found), 4 (could not reach the forge -- benign, the check
+                    did not run), or 1 (unexpected failure, i.e. a defect in
+                    this script). Independent of
                     --prune-defaults/--force/--dry-run.
       --prune-defaults
                     Opt in to deleting GitHub's default labels (the pre-#5066
@@ -236,6 +238,24 @@ NC='\033[0m'
 error() {
   echo -e "${RED}✗ Error: $*${NC}" >&2
   exit 1
+}
+
+# check_unavailable: --check could not REACH the forge, as distinct from
+# --check having run and found something (#7745).
+#
+# Exit 4 is the "I could not perform the check" signal. It exists because
+# callers previously could not tell an unreachable forge (benign: no `gh`
+# auth, no remote, a misconfigured Gitea) apart from this script being
+# BROKEN -- a bash incompatibility or a typo also exits non-zero, and
+# resync-installed.sh's catch-all treated both as "skip, carry on, exit 0".
+# A checker that cannot distinguish "checked, fine" from "could not check"
+# reports the second as the first.
+#
+# 1 therefore keeps its narrower meaning here: an unexpected failure that
+# should be treated as a defect, not absorbed.
+check_unavailable() {
+  echo -e "${RED}✗ Error: $*${NC}" >&2
+  exit 4
 }
 
 info() {
@@ -574,7 +594,7 @@ github_check_labels() {
   local live_tsv
   if ! live_tsv=$(gh label list -R "$REPO" --json name,color,description \
         --jq '.[] | [.name, .color, .description] | @tsv' --limit 300 2>&1); then
-    error "Could not list labels for $REPO: $live_tsv"
+    check_unavailable "Could not list labels for $REPO: $live_tsv"
   fi
 
   diff_declared_against_live_tsv "$live_tsv"
@@ -703,7 +723,7 @@ gitea_check_labels() {
 
   local body
   body=$(gitea_api GET "repos/${FORGE_OWNER}/${FORGE_REPO}/labels" 2>&1) \
-    || error "Could not list labels for $REPO: $body"
+    || check_unavailable "Could not list labels for $REPO: $body"
 
   local live_tsv
   live_tsv=$(echo "$body" | python3 -c "

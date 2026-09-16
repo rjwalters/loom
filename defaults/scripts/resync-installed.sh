@@ -720,6 +720,12 @@ INSTALLED_SCRIPTS="$WRITE_ROOT/.loom/scripts"
 
 # ---------- local-override ignore list ----------
 
+# Set when the forge label-drift check did not actually run (#7745).
+# _SKIPPED is benign (forge unreachable); _BROKEN means the checker itself
+# failed and is carried into the exit status so a caller can tell.
+LABEL_CHECK_SKIPPED=0
+LABEL_CHECK_BROKEN=0
+
 IGNORE_FILE="$WRITE_ROOT/.loom/resync-ignore"
 
 # #6515: every distinct "$rel" ever checked against is_ignored (the "did you
@@ -2177,9 +2183,23 @@ if [[ -f "$WRITE_ROOT/.github/labels.yml" && -x "$LABELS_SYNC_SCRIPT" ]]; then
                 fi
             fi
             ;;
-        *)
-            warn "Skipped forge label drift check (sync-labels.sh --check exited $check_rc). Surface sync still applied."
+        4)
+            # Benign: the forge was unreachable (no gh auth, no remote, a
+            # misconfigured Gitea). The check did not run, but nothing is
+            # wrong with the check itself, so this stays a soft skip.
+            warn "Could not reach the forge to check label drift. Surface sync still applied."
             printf '%b\n' "$check_output" | sed 's/^/    /' >&2
+            LABEL_CHECK_SKIPPED=1
+            ;;
+        *)
+            # Anything else means sync-labels.sh itself failed -- a crash, a
+            # bash incompatibility, a typo. Previously indistinguishable from
+            # the case above, and absorbed into a clean exit 0 (#7745), which
+            # is how a broken check went unnoticed on every macOS resync for
+            # weeks. Surface it as a defect and carry it into the exit code.
+            warn "Forge label drift check FAILED to run (sync-labels.sh --check exited $check_rc). This is a defect in the check, not an unreachable forge. Surface sync still applied, but labels were NOT verified."
+            printf '%b\n' "$check_output" | sed 's/^/    /' >&2
+            LABEL_CHECK_BROKEN=1
             ;;
     esac
 fi
@@ -2336,9 +2356,27 @@ fi
 # future refactor adds another early-return path between the two)
 clear_resync_marker
 
+# A check that did not run is stated in the summary line, not only in a
+# warning that scrolled past 400 lines ago (#7745).
+CHECK_NOTE=""
+if [[ "$LABEL_CHECK_BROKEN" -eq 1 ]]; then
+    CHECK_NOTE=" ${RED}[label check FAILED TO RUN -- labels unverified]${NC}"
+elif [[ "$LABEL_CHECK_SKIPPED" -eq 1 ]]; then
+    CHECK_NOTE=" ${YELLOW}[label check skipped -- forge unreachable]${NC}"
+fi
+
 if [[ "$N_UPDATED" -gt 0 || "$N_REMOVED" -gt 0 ]]; then
-    printf '%b\n' "${GREEN}${BOLD}[resync] ${N_UPDATED} file(s) updated, ${N_REMOVED} removed, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped.${NC}"
+    printf '%b\n' "${GREEN}${BOLD}[resync] ${N_UPDATED} file(s) updated, ${N_REMOVED} removed, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped.${NC}${CHECK_NOTE}"
 else
-    printf '%b\n' "${GREEN}[resync] Already in sync (${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped).${NC}"
+    printf '%b\n' "${GREEN}[resync] Already in sync (${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped).${NC}${CHECK_NOTE}"
+fi
+
+# 75 (EX_TEMPFAIL), matching create-issue.sh's DEFERRED convention: the
+# surface sync itself SUCCEEDED and must not be re-run blindly, but one
+# check did not execute, so this run is not a clean bill of health. A
+# benign unreachable forge still exits 0 -- resync must keep working
+# offline, which is the whole reason that case is soft.
+if [[ "$LABEL_CHECK_BROKEN" -eq 1 ]]; then
+    exit 75
 fi
 exit 0
