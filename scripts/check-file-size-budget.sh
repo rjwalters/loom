@@ -89,10 +89,14 @@ BASELINE="$ROOT/scripts/file-size-baseline.txt"
 #      resync copies of defaults/. Measuring both would double-count every
 #      violation and churn the baseline on every resync commit.
 #
-# Bootstrap scripts (install.sh, install-loom.sh, loom-daemon-{update,start}.sh)
-# are deliberately NOT exempt. They run before, or manage, the loom-daemon binary
-# and so can never be ported into it — but "cannot be ported to Rust" is not "may
-# grow without bound". The ratchet is exactly the right mechanism for them.
+# Bootstrap scripts are deliberately NOT exempt. Bootstrap is a responsibility,
+# not a file-level exemption (ADR-0018): having to run on a machine where the
+# binary is absent, unbuilt, or being removed constrains what a script may
+# depend on, never how large it may grow. Which files actually carry that
+# responsibility is enumerated once, in .loom/docs/file-size-policy.md
+# § Exemptions — deliberately not restated here so the two cannot drift apart.
+# Either way, "cannot be ported to Rust" is not "may grow without bound": the
+# ratchet is exactly the right mechanism for them.
 #
 # Test files are NOT exempt either, in any language. A large test file is just as
 # awkward to open and edit as a large production file.
