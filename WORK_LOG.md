@@ -7,6 +7,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7318** (closed): Guard friction: stash-scope:create-redirect recurs on bare 'git stash' inside issue worktrees despite a documented per-worktree alternative
+- **PR #7899**: docs(builder-worktree): document stash-push/stash-pop clean-baseline pattern
+- **Issue #7792** (closed): tokens_pool: empty_pool_error_enumerates_per_token_exclusion_detail flakes on the 4h/session-limit-window hour boundary
+- **PR #7905**: fix: avoid exact-hour-boundary flake in token exclusion detail test
+- **Issue #7440** (closed): Guard telemetry: cloud-cli ASK on Auditor's own docker image cleanup (rmi) stalls headless runs
+- **PR #7898**: docs: document docker image prune -f as safe alternative to guarded docker rmi
+- **Issue #7705** (closed): Version-bump commits are landing with Cargo.lock / mcp-loom/package-lock.json desynced from the bumped version
+- **PR #7902**: fix(scripts): catch uncommitted lockfile bumps in version-check-gate.sh
+- **Issue #7758** (closed): Re-derive which bootstrap scripts must stay shell — fold the inventory into .loom/docs/file-size-policy.md's tier table (docs-only)
+- **PR #7900**: docs: correct the shell tier table with #7758's derived bootstrap inventory
+- **Issue #7826** (closed): Split PR #7680's #7664 watchdog dedup additions into sibling files to clear the File Size Ratchet
+- **Issue #7822** (closed): role-runner ring-ranking (#7691/PR #7796) trips file-size ratchet on 8 files
+- **PR #7897**: chore: resync installed Loom surfaces
 - **Issue #7853** (closed): [Epic #6896] Phase 4: run-job seam contract + host executor
 - **PR #7875**: feat(run-job): ship the run-job seam contract + loopback/SSH host executor
 - **Issue #6650** (closed): .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier?
