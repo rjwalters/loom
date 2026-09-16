@@ -196,6 +196,12 @@ pub mod role_shard;
 pub mod role_validation;
 pub mod runtime_admission;
 pub mod safehouse;
+/// Inbound safehouse ChatOps steering (#7893, Phase 3a of #4196). A sibling
+/// module rather than a `safehouse::` submodule: `safehouse.rs` is an
+/// over-threshold file frozen by the file-size ratchet
+/// (`.loom/docs/file-size-policy.md`), and the whole point of the ratchet is
+/// that new code lands in a new module instead.
+pub mod safehouse_chatops;
 pub mod scratch_reclaim;
 pub mod script_helpers;
 pub mod self_update;
