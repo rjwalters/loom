@@ -46,41 +46,11 @@ CHAMPION_MD="$PROMPT_DIR/champion.md"
 CHAMPION_REF_MD="$PROMPT_DIR/champion-reference.md"
 CURATOR_MD="$PROMPT_DIR/curator.md"
 
-# The subject is now `loom-daemon classify-dependency-block` behind a thin stub
-# (epic #7810 PR 3). Resolve the binary ONCE and pin it, so the stub cannot
-# silently exec a stale installed copy instead of the build under test.
-#
-# This FAILS rather than SKIPs when no binary is found. These assertions are the
-# equivalence evidence for deleting 861 lines of shell; a suite that skipped
-# itself would remove that evidence from CI while still reporting green, which
-# is the failure this whole epic keeps running into.
-# shellcheck source=../lib/locate-daemon-bin.sh
-source "$SCRIPTS_DIR/lib/locate-daemon-bin.sh"
-LOOM_LOCATE_DAEMON_BIN_QUIET=1
-export LOOM_LOCATE_DAEMON_BIN_QUIET
-# Prefer a repo build over a machine-level install: in this source repo the
-# point is to test what was just built, and an older $HOME/.local/bin copy would
-# silently answer instead. In an installed consumer repo there is no repo build,
-# so this falls through to the installed binary exactly as before.
-LOOM_PREFER_REPO_BUILD=1
-export LOOM_PREFER_REPO_BUILD
-DAEMON_BIN="$(loom_locate_daemon_bin "$(cd "$SCRIPTS_DIR/../.." && pwd)")"
-if [[ -z "$DAEMON_BIN" ]]; then
-    echo "FATAL: no loom-daemon binary found. Build it with" >&2
-    echo "  cargo build --package loom-daemon" >&2
-    echo "or set LOOM_DAEMON_BIN=/path/to/loom-daemon." >&2
-    exit 1
-fi
-export LOOM_DAEMON_BIN="$DAEMON_BIN"
-
-# Fail on the RESOLVED binary being too old, here, with one legible message --
-# rather than as ~200 assertions that each exit 2 for reasons that look like
-# logic failures.
-if ! "$DAEMON_BIN" classify-dependency-block --help >/dev/null 2>&1; then
-    echo "FATAL: $DAEMON_BIN does not know 'classify-dependency-block'." >&2
-    echo "It predates epic #7810 PR 3. Rebuild it: cargo build --package loom-daemon" >&2
-    exit 1
-fi
+# Pin the loom-daemon this suite tests against — the subject is a thin stub over
+# `loom-daemon classify-dependency-block` now (epic #7810 PR 3). FATAL, not SKIP: see the helper.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$TEST_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "classify-dependency-block"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

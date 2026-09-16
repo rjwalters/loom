@@ -42,6 +42,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 2, not the default 1: exit 1 here MEANS "cycle detected". A caller branching
 # on the code alone would read a missing binary as a detected cycle and park a
 # perfectly startable issue for a human.
+# shellcheck disable=SC2034  # read by loom_exec_script_helper, sourced below
 LOOM_SCRIPT_HELPER_MISSING_RC=2
 
 # shellcheck source=/dev/null

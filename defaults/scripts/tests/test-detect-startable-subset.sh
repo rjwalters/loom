@@ -33,33 +33,11 @@ else
 fi
 CHAMPION_PROMO_MD="$PROMPT_DIR/champion-issue-promo.md"
 
-# The subject is now a `loom-daemon` subcommand behind a thin stub (epic #7810
-# PR 3). Resolve the binary ONCE and pin it, preferring a repo build, so the
-# stub cannot silently exec a stale installed copy instead of the build under
-# test. In an installed consumer repo there is no repo build and this falls
-# through to the installed binary exactly as before.
-#
-# FATAL, not SKIP: these assertions were written against the shell
-# implementation and are the evidence that the port preserved its behaviour. A
-# suite that skipped itself would drop that evidence while reporting green.
-# shellcheck source=../lib/locate-daemon-bin.sh
-source "$SCRIPTS_DIR/lib/locate-daemon-bin.sh"
-LOOM_LOCATE_DAEMON_BIN_QUIET=1
-LOOM_PREFER_REPO_BUILD=1
-export LOOM_LOCATE_DAEMON_BIN_QUIET LOOM_PREFER_REPO_BUILD
-DAEMON_BIN="$(loom_locate_daemon_bin "$(cd "$SCRIPTS_DIR/../.." && pwd)")"
-if [[ -z "$DAEMON_BIN" ]]; then
-    echo "FATAL: no loom-daemon binary found. Build it with" >&2
-    echo "  cargo build --package loom-daemon" >&2
-    echo "or set LOOM_DAEMON_BIN=/path/to/loom-daemon." >&2
-    exit 1
-fi
-export LOOM_DAEMON_BIN="$DAEMON_BIN"
-if ! "$DAEMON_BIN" detect-startable-subset --help >/dev/null 2>&1; then
-    echo "FATAL: $DAEMON_BIN does not know 'detect-startable-subset'." >&2
-    echo "It predates epic #7810 PR 3. Rebuild it: cargo build --package loom-daemon" >&2
-    exit 1
-fi
+# Pin the loom-daemon this suite tests against — the subject is a thin stub over
+# `loom-daemon detect-startable-subset` now (epic #7810 PR 3). FATAL, not SKIP: see the helper.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$TEST_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "detect-startable-subset"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

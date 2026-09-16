@@ -46,6 +46,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 2, not the default 1: exit 1 here MEANS "no subset declared". A missing binary
 # must not be read as a proposal having made no carve-out.
+# shellcheck disable=SC2034  # read by loom_exec_script_helper, sourced below
 LOOM_SCRIPT_HELPER_MISSING_RC=2
 
 # shellcheck source=/dev/null
