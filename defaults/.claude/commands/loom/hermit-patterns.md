@@ -524,7 +524,6 @@ rg "^pub struct \w+;$" --type rust -n
 rg "^pub struct \w+ \{\}$" --type rust -n
 ```
 
-
 ---
 
 ## Analysis Scripts
@@ -831,7 +830,7 @@ rg "export.*function|export.*class" -n
 
 # Pass 2 (random selection: random-file)
 ./.loom/scripts/random-file.sh
-cat <file-path>
+cat <file>
 # -> Found over-engineered class, create issue
 
 # Pass 3 (random selection: unused-dependencies)
