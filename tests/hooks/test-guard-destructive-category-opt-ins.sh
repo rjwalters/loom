@@ -158,6 +158,8 @@ assert_allow "Cloud: aws sns list-topics is read-only (allow, #3595)" \
 # --- Docker verbs unchanged: mutating asks, read-only allowed (toggle on) ---
 # #5823: bare `docker rm` no longer asks (see the dedicated section below); the
 # volume-destroying `-v`/`--volumes` variant is what exercises the toggle here.
+# #7795 (tier sizing) left the docker half of CLOUD_ASK_PATTERNS untouched —
+# the operator's 2026-09-16 ruling on #7440 held `docker rmi` as-is.
 assert_ask "Cloud: docker rm -v still asks" \
     "docker rm -v my-container"
 assert_ask "Cloud: docker stop still asks" \

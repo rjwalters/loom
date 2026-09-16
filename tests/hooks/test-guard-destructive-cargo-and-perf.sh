@@ -58,15 +58,28 @@ assert_allow "Cargo clean: .cargo/config.toml with a repo-RELATIVE target-dir (r
 assert_allow "Cargo clean: repo-RELATIVE target-dir still allows when the repo is reached via a SYMLINKED path (#6684 macOS /var regression)" \
     "cargo clean" "$CARGO_SYMLINK_LOCAL_REPO"
 
-# --- Hermetic case 2 (acceptance criteria): shared external target-dir -> ask ---
-assert_ask "Cargo clean: .cargo/config.toml build.target-dir resolves OUTSIDE the repo asks" \
+# --- Hermetic case 2 (acceptance criteria): shared external target-dir -> DENY ---
+#
+# TIER (#7795, was ask through #6684): promoted to deny by the ask-tier sizing
+# pass. The refusal is lossless — nothing has been deleted when the guard says
+# no, so the caller just reruns with `-p <pkg>` or CARGO_TARGET_DIR, both of
+# which the message names. An ask here blocked a headless run anyway (an
+# unanswered ask denies) but without an actionable verdict, and invited a
+# reflex "yes" interactively on a host-wide delete.
+assert_deny "Cargo clean: .cargo/config.toml build.target-dir resolves OUTSIDE the repo DENIES (#7795, was ask)" \
     "cargo clean" "$CARGO_SHARED_REPO"
-assert_ask_reason_matches "Cargo clean ask names the resolved shared path and the fix" \
+assert_deny_reason_matches "Cargo clean deny names the resolved shared path and both fixes" \
     "cargo clean" "target-dir is shared at '/tmp/loom-test-shared-cargo-target-6684'.*cargo clean -p.*CARGO_TARGET_DIR" \
     "$CARGO_SHARED_REPO"
-# Symlink-resolving the containment test must not neuter the ask: a genuinely
-# shared target-dir still asks when the repo is reached via a symlinked path.
-assert_ask "Cargo clean: shared external target-dir still asks when the repo is reached via a SYMLINKED path" \
+assert_deny_reason_matches "Cargo clean deny states nothing was deleted (lossless refusal, #7795)" \
+    "cargo clean" "Nothing has been deleted" \
+    "$CARGO_SHARED_REPO"
+assert_deny_reason_matches "Cargo clean deny names the category opt-out (#7795)" \
+    "cargo clean" "guards.cargoCleanScope:false.*LOOM_GUARD_CARGO_CLEAN=0" \
+    "$CARGO_SHARED_REPO"
+# Symlink-resolving the containment test must not neuter the guard: a genuinely
+# shared target-dir still denies when the repo is reached via a symlinked path.
+assert_deny "Cargo clean: shared external target-dir still denies when the repo is reached via a SYMLINKED path" \
     "cargo clean" "$CARGO_SYMLINK_SHARED_REPO"
 
 # --- Hermetic case 3 (acceptance criteria): -p-scoped clean against a shared
@@ -86,11 +99,11 @@ assert_allow_env "Cargo clean: process-env CARGO_TARGET_DIR=<scratch> overrides 
 
 # --- Toggle: guards.cargoCleanScope:false opts out, LOOM_GUARD_CARGO_CLEAN
 #     env override wins over config either direction ---
-assert_allow "Cargo clean config-off (guards.cargoCleanScope:false): shared target-dir no longer asks" \
+assert_allow "Cargo clean config-off (guards.cargoCleanScope:false): shared target-dir no longer gated" \
     "cargo clean" "$CARGO_OFF_REPO"
-assert_ask_env "LOOM_GUARD_CARGO_CLEAN=1 overrides config-off: shared target-dir still asks" \
+assert_deny_env "LOOM_GUARD_CARGO_CLEAN=1 overrides config-off: shared target-dir still denies (#7795)" \
     "LOOM_GUARD_CARGO_CLEAN=1" "cargo clean" "$CARGO_OFF_REPO"
-assert_allow_env "LOOM_GUARD_CARGO_CLEAN=0 overrides config-on: shared target-dir no longer asks" \
+assert_allow_env "LOOM_GUARD_CARGO_CLEAN=0 overrides config-on: shared target-dir no longer gated" \
     "LOOM_GUARD_CARGO_CLEAN=0" "cargo clean" "$CARGO_SHARED_REPO"
 
 # --- Opt-out must NOT weaken unrelated guards ---

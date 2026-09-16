@@ -252,6 +252,20 @@ echo ""
 echo -e "${YELLOW}--- #7355: printenv.*SECRET/TOKEN/KEY ask-tier false positives ---${NC}"
 # =========================================================================
 #
+# STATUS (#7795): the substring BACKSTOP this section was written for
+# (PRINTENV_ASK_PATTERNS + its dedicated COMMAND_ASK_SCAN_PRINTENV scan copy)
+# was RETIRED by the ask-tier sizing pass — 11 hits in 30 days of
+# `.loom/logs/guard-decisions.log`, 11 of them false positives and none a live
+# invocation. The precise, segment-parsed `printenv_ask_reason()` check
+# (#6245) survives and still asks on every real `printenv <CREDENTIAL>`
+# invocation, so the "must still ask" assertions below are unchanged and are
+# now the load-bearing coverage for this class. The retired backstop's own
+# unique shape (the phrase quoted in a variable that is later read) is
+# asserted as an ALLOW below, with the tier rationale inline.
+#
+# The historical narrative below is kept because it explains WHY the copies it
+# describes existed; the copies themselves are gone.
+#
 # Guard-decision telemetry (#3898) found the printenv.*(SECRET|TOKEN|KEY)
 # ASK_PATTERNS entries false-asking on two DISTINCT non-live shapes:
 #
@@ -345,23 +359,43 @@ assert_ask "#7355 regression: a live 'printenv' invocation of a TOKEN-named vari
 assert_ask "#7355 regression: a live 'printenv' invocation of a KEY-named variable still asks" \
     "printenv API_KEY"
 
-# --- Regression guard (PR #6207 Judge review): the "read elsewhere" fail-
-#     closed branch must apply to the COMMAND_ASK_SCAN_PRINTENV copy too ----
+# --- TIER CHANGE (#7795): the "phrase quoted in a variable that is read
+#     later" shape is no longer gated -------------------------------------
 #
-# mask_catastrophic_var_assignment()'s call site feeding COMMAND_ASK_SCAN_PRINTENV
-# was passing only its own input buffer as the function's sole argument,
-# never the true original $COMMAND as the second ($2) argument the other two
-# call sites pass. That left ORIG_COMMAND_FOR_READ_CHECK permanently empty
-# for this scan, so the "is $NAME read elsewhere in the command" fail-closed
-# branch could never fire here -- a printenv-secret assignment that IS
-# live-read via eval was masked and silently allowed instead of asking, even
-# though the read makes the printenv output live.
-assert_ask "#6207 regression: a NOTE var quoting 'printenv SECRET_KEY' IS read via eval later in the same command still asks (fail closed -- was silently allowed pre-fix)" \
+# History: #6207 made this shape fail CLOSED. mask_catastrophic_var_assignment()'s
+# call site feeding COMMAND_ASK_SCAN_PRINTENV was not passing the true original
+# $COMMAND as its second argument, so the "is $NAME read elsewhere in the
+# command" branch could never fire for the printenv backstop, and a
+# printenv-secret assignment that IS live-read via eval was masked and silently
+# allowed. #6207 fixed the argument; #7795 retired the backstop the fix served.
+#
+# Why that is the right call rather than a hole:
+#   * The heuristic cannot distinguish `eval "$NOTE"` (executes) from
+#     `printf '%s' "$NOTE"` (does not). Every one of the 11 logged hits in
+#     2026-08-18..09-16 was the SECOND shape — Guide/Champion digest builders
+#     whose variables quote issue TITLES containing the phrase (#6245's own
+#     title is one of them) and print them back out.
+#   * The gated operation is a credential READ, not a destruction: the worst
+#     case is a secret in a local transcript, recoverable by rotation.
+#   * It was never a boundary — `echo $GITHUB_TOKEN`, `env | grep TOKEN` and
+#     any interpreter one-liner print the same value and were never scanned.
+#   * Headless (this fleet's primary mode) the ask protected nothing; it
+#     stalled the role tick that tripped it.
+# A LIVE `printenv <CREDENTIAL>` invocation still asks — see the assertions
+# immediately above, which are unchanged.
+assert_allow "#7795: a NOTE var quoting 'printenv SECRET_KEY' read via eval no longer asks (backstop retired; 11/11 logged hits were inert prose)" \
     'NOTE="ran printenv SECRET_KEY earlier"
 eval "$NOTE"'
-assert_ask "#6207 regression: a NOTE var quoting a printenv TOKEN phrase IS read via eval later in the same command still asks (fail closed)" \
+assert_allow "#7795: a NOTE var quoting a printenv TOKEN phrase read via eval no longer asks (backstop retired)" \
     'NOTE="ran printenv MY_TOKEN earlier"
 eval "$NOTE"'
+
+# --- #7795 regression: the exact FALSE-POSITIVE shape that convicted the
+#     backstop — a digest builder whose variable quotes an ISSUE TITLE
+#     containing the phrase, printed back out (never eval'd) ---------------
+assert_allow "#7795: a digest variable quoting an issue title that mentions 'printenv SECRET/TOKEN/KEY', printed back out, no longer asks (the 11/11 logged false-positive shape)" \
+    'HELD="- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive"
+printf "%s\n" "$HELD"'
 
 echo ""
 
