@@ -1202,7 +1202,7 @@ aggregation script would be a reasonable, but separate, follow-up.
 containment-opt-in) back to bare-metal-opt-in is a config-only change, never
 a code change or a PR — see
 [`.loom/docs/troubleshooting.md` → "Reverting containment to opt-in on a
-Linux fleet host"](../../.loom/docs/troubleshooting.md#reverting-containment-to-opt-in-on-a-linux-fleet-host-7431)
+Linux fleet host"](troubleshooting.md#reverting-containment-to-opt-in-on-a-linux-fleet-host-7431)
 for the exact command sequence.
 
 **What this issue defers.** There is currently **no existing mechanism in

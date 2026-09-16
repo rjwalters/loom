@@ -1884,7 +1884,7 @@ claude -p "/loom:hermit"    --dangerously-skip-permissions
 (`runtimes.containment.enabled`) turned on — either because it was
 individually opted in, or because it was promoted to the fleet-default
 per the soak criteria in
-[`defaults/docs/runtime-adapters.md` → "Fleet-default rollout"](../../defaults/docs/runtime-adapters.md#fleet-default-rollout--soak-criteria-and-rollback-path-issue-7431-epic-6896-phase-3)
+[`defaults/docs/runtime-adapters.md` → "Fleet-default rollout"](runtime-adapters.md#fleet-default-rollout--soak-criteria-and-rollback-path-issue-7431-epic-6896-phase-3)
 — and it needs to go back to bare-metal dispatch (opt-in only, or off
 entirely) on that host alone, without touching any other host or the
 repo's shared, committed `.loom/config.json` default.
