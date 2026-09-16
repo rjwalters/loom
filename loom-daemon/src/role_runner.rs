@@ -3070,11 +3070,11 @@ pub fn plan_idle_runs(
     // to cover BOTH dispatch surfaces or it does not hold.
     let shard = crate::role_shard::decide(root);
     crate::role_shard::log_decision_once(root, &shard);
-    if !shard.owned {
+    if !shard.admits_role_tick() {
         log::debug!(
-            "role_runner: idle edge for {} suppressed — this workspace's role slice belongs to \
-             another host (#6374)",
-            root.display()
+            "role_runner: idle edge for {} suppressed — {} (#6374/#6704)",
+            root.display(),
+            describe_shard_refusal(&shard)
         );
         return Vec::new();
     }
@@ -3132,6 +3132,23 @@ pub fn plan_idle_runs(
         out.push((spec, guard));
     }
     out
+}
+
+/// Why a shard decision refused a role tick, for the `debug!` line both
+/// dispatch surfaces emit.
+///
+/// Distinguishes the two refusals that look identical from the outside but
+/// mean opposite things operationally: **another host owns this slice** (the
+/// #6374 steady state — someone is rotating this workspace) versus **this host
+/// is yielding under the roster fence** (#6704 — possibly *nobody* is
+/// rotating it right now, by design, for a bounded window).
+fn describe_shard_refusal(decision: &crate::role_shard::ShardDecision) -> String {
+    match &decision.roster {
+        crate::role_shard::RosterMode::Yield(reason) => {
+            format!("the roster fence is yielding role ticks on this host: {}", reason.describe())
+        }
+        _ => "this workspace's role slice belongs to another host".to_string(),
+    }
 }
 
 /// Emit a warn-once-per-root line (#4377) when an idle edge fires for `root`
@@ -3406,12 +3423,12 @@ fn decide_root_tick(
     // own every workspace, so this is a no-op on a single-host install.
     let shard = crate::role_shard::decide(root);
     crate::role_shard::log_decision_once(root, &shard);
-    if !shard.owned {
+    if !shard.admits_role_tick() {
         log::debug!(
-            "role_runner: {} tick for {} skipped — this workspace's role slice belongs to \
-             another host (#6374)",
+            "role_runner: {} tick for {} skipped — {} (#6374/#6704)",
             spec.name,
-            root.display()
+            root.display(),
+            describe_shard_refusal(&shard)
         );
         return None;
     }
@@ -4369,14 +4386,17 @@ fn log_outcome_for_root_deduped(
 }
 
 // ============================================================================
-// Roster heartbeat task (Issue #7690, Phase A of #6704) — observational only.
+// Roster heartbeat task (Issue #7690 Phase A + #7691 Phase B of #6704).
 // ============================================================================
 //
 // One per daemon, not per workspace: this publishes/refreshes a SINGLE
 // comment (this host's own) on the fleet-wide roster issue, advertising the
 // union of every registered workspace's shard key this host currently rotates
-// role ticks for. Nothing here feeds `crate::role_shard::decide()` — see that
-// module's own doc comment and its `decide_verdict_is_unchanged_...` test.
+// role ticks for, and caches the read-back for both `status` and — with
+// `roster.enabled` — `crate::role_shard::decide`'s fence. It is the ONLY
+// writer of this host's record, and the only producer of the snapshot the
+// fence reads; a host that cannot run this loop therefore self-fences within
+// `ttl` instead of acting on a stale ring.
 
 /// Resolve this host's `serves` digest set: the [`crate::role_shard::hash_key`]
 /// digest of every registered workspace's resolved shard key, for every
@@ -4493,6 +4513,39 @@ fn create_roster_comment(
     }
 }
 
+/// `DELETE` a roster comment (this host's own stale record, when it is being
+/// replaced rather than patched — see
+/// [`crate::role_shard::roster::resolve_publish_action`]). `false` on any
+/// failure; the caller then keeps the old record and retries next cycle
+/// rather than leaving two records for one host.
+fn delete_roster_comment(gh: &Path, cwd: &Path, owner: &str, repo: &str, comment_id: u64) -> bool {
+    let mut cmd = Command::new(gh);
+    cmd.arg("api")
+        .arg(format!("repos/{owner}/{repo}/issues/comments/{comment_id}"))
+        .arg("--method")
+        .arg("DELETE");
+    cmd.current_dir(cwd);
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, cwd);
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    match cmd.output() {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            log::warn!(
+                "role_runner: roster comment delete {comment_id} on {owner}/{repo} exited {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!(
+                "role_runner: roster comment delete {comment_id} on {owner}/{repo} failed: {e}"
+            );
+            false
+        }
+    }
+}
+
 /// `PATCH` this host's existing roster comment. Idempotent: the body is
 /// regenerated wholesale every cycle (see
 /// [`crate::role_shard::roster::build_roster_comment_body`]), so the only content
@@ -4561,11 +4614,51 @@ fn roster_heartbeat_once(
         return;
     };
 
-    let existing = comments.iter().find(|c| c.host == host);
+    let existing = crate::role_shard::roster::own_comment(&comments, &host);
     let body = crate::role_shard::roster::build_roster_comment_body(&host, &serves);
-    let ok = match existing {
-        Some(c) => patch_roster_comment(gh, fallback_root, &issue.owner, &issue.repo, c.id, &body),
-        None => {
+    // A record is PATCHed in place while it is live and its `serves` set is
+    // unchanged; otherwise it is REPLACED so its fresh `created_at` becomes a
+    // membership boundary every host observes identically (Issue #7691). See
+    // `resolve_publish_action` for why an unfenced membership change is the
+    // one thing the generation fence cannot absorb.
+    let action = crate::role_shard::roster::resolve_publish_action(
+        existing,
+        &serves,
+        chrono::Utc::now(),
+        ttl_secs,
+    );
+    let ok = match action {
+        crate::role_shard::roster::RosterPublish::Patch { id } => {
+            patch_roster_comment(gh, fallback_root, &issue.owner, &issue.repo, id, &body)
+        }
+        crate::role_shard::roster::RosterPublish::Create => {
+            create_roster_comment(gh, fallback_root, &issue.owner, &issue.repo, issue.number, &body)
+        }
+        crate::role_shard::roster::RosterPublish::Republish { id, reason } => {
+            log::info!(
+                "role_runner: replacing this host's roster record on {} — {} (a fresh created_at \
+                 is the membership boundary peers fence on, Issue #6704)",
+                issue.display(),
+                reason.label(),
+            );
+            // Delete-then-create, and create EVEN IF the delete failed. The
+            // fallback is deliberately not "PATCH it instead": patching
+            // resurrects this host into every peer's ring with no boundary
+            // and no settle window, so peers would switch rings at whatever
+            // instant each happened to read — the two-owner race the fence
+            // exists to rule out. A leftover record is harmless by
+            // comparison: `members`/`ring` key on the host id (deduped),
+            // `own_comment` takes the freshest, and every boundary the
+            // orphan contributes is already in the past. It only shows up as
+            // an extra EXPIRED row in `status`.
+            if !delete_roster_comment(gh, fallback_root, &issue.owner, &issue.repo, id) {
+                log::warn!(
+                    "role_runner: could not delete this host's stale roster comment {id} on {} — \
+                     publishing the replacement anyway and leaving the stale record behind \
+                     (correct fencing matters more; delete it by hand to tidy up)",
+                    issue.display(),
+                );
+            }
             create_roster_comment(gh, fallback_root, &issue.owner, &issue.repo, issue.number, &body)
         }
     };
@@ -4632,12 +4725,16 @@ pub fn spawn_roster_heartbeat_task(fallback_root: PathBuf) -> Option<tokio::task
             let settle_secs = config.settle_secs;
             log::info!(
                 "role_runner: roster heartbeat enabled -- publishing to {} every {}s (ttl={}s, \
-                 settle={}s; Issue #6704 Phase A, observational only -- does not yet affect role \
-                 ownership)",
+                 settle={}s; Issue #6704). This host's role-runner ring is now derived from the \
+                 live roster and fenced by generation+settle: a dead host's slice is reassigned \
+                 within ttl+settle+one interval, and any membership disagreement YIELDS role \
+                 ticks here rather than duplicating them. Set {}/{} to pin a static ring instead.",
                 issue.display(),
                 config.heartbeat_secs,
                 ttl_secs,
                 settle_secs,
+                crate::role_shard::SHARD_INDEX_ENV,
+                crate::role_shard::SHARD_COUNT_ENV,
             );
             Some(tokio::spawn(async move {
                 loop {
