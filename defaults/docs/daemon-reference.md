@@ -5683,6 +5683,17 @@ installed, permission error) is treated as "unknown", never "zero images" —
 the pass skips rather than guesses. See
 `loom-daemon/src/docker_image_clean.rs`.
 
+**Fleet-side `audit-smoke`/`audit-test` automation should rely on this pass
+too.** Any script outside this repo that cleans up a locally-built
+`loom-worker`/`loom-worker-session` test image after an Auditor-role docker
+smoke test should not call tag-targeted `docker rmi <tag>` directly — that
+matches the `cloud-cli` guard's `docker rmi` ASK pattern
+(`defaults/hooks/guard-destructive-generic.sh`) and blocks indefinitely in a
+headless run with no human to answer the prompt. Either leave the superseded
+image for this reaper to reclaim on its next tick, or run `docker image prune
+-f` for immediate reclaim — it only removes dangling (untagged) images and is
+not gated by the guard.
+
 #### Eager (out-of-cycle) reclaim from the dispatch loop (#7512)
 
 **The gap this closes.** Every reclaim pass above runs on the **worktree

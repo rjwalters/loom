@@ -370,6 +370,18 @@ else
 fi
 ```
 
+**Cleaning up the locally-built test image afterward.** Never remove it with a
+tag-targeted `docker rmi <tag>` (e.g. `docker rmi loom-worker:audit-test`) —
+that command matches the `cloud-cli` guard's `docker rmi` ASK pattern
+(`defaults/hooks/guard-destructive-generic.sh`), and in a headless run there is
+no human available to answer the prompt, so it blocks indefinitely. Instead,
+either leave the superseded image in place for the existing docker image
+retention reaper (#7332, see `.loom/docs/daemon-reference.md` §"Docker image
+retention (#7332)") to reclaim automatically on its next tick, or — if
+immediate reclaim is needed — run `docker image prune -f`, which only removes
+dangling (untagged) images, achieves the same disk-reclaim goal, and is not in
+`CLOUD_ASK_PATTERNS` at all.
+
 Exit code `3` from `--job` covers two distinct forge-reported states —
 `--quiet` distinguishes them by printed string (`not_found` vs `skipped`) if
 you need to tell them apart in the audit output: the job never ran for this
