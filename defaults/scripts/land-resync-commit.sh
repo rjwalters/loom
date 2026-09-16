@@ -41,7 +41,11 @@
 #      `.claude/commands/loom/`, and the handful of single-file targets
 #      resync-installed.sh itself resyncs), it refuses to commit ANYTHING --
 #      an unrelated (possibly operator) change must never be swept into a
-#      "chore: resync" commit.
+#      "chore: resync" commit. One exception: `.loom/gh-config/` and
+#      `.loom/gh-config-by-owner/` (live GitHub App installation-token state,
+#      #7818) are never staged and never block the commit either -- they are
+#      silently excluded, unconditionally, even if a host's `.gitignore` is
+#      missing the corresponding entries.
 #   3. Otherwise it commits the resync-managed dirt (if any), fetches origin,
 #      and inspects every commit the primary checkout's default branch now
 #      has that origin does not:
@@ -276,6 +280,31 @@ is_resync_surface_path() {
     esac
 }
 
+# #7818: daemon-owned GH_CONFIG_DIR trees holding live GitHub App installation
+# tokens (.loom/gh-config/, .loom/gh-config-by-owner/<owner>/ -- #4458/#5401).
+# These must NEVER be staged by this script, belt-and-braces alongside the
+# loom-daemon-managed .gitignore entries (post_init.rs EPHEMERAL_PATTERNS):
+# checked UNCONDITIONALLY, before is_resync_surface_path(), so a host whose
+# .gitignore is missing or stale still cannot have this script sweep a live
+# credential into a commit. This is what let a resync commit on
+# rjwalters/anvil (2026-08-23) carry a live installation token into a public
+# repo -- is_resync_surface_path() alone was already allowlist-based (so this
+# script itself never staged the leak), but a matching path here is silently
+# EXCLUDED (like a retired pure-copy path) rather than treated as blocking
+# FOREIGN dirt, so an untracked credential file never stops an otherwise-clean
+# resync from landing.
+is_credential_leak_path() {
+    case "$1" in
+        .loom/gh-config | .loom/gh-config/* | \
+            .loom/gh-config-by-owner | .loom/gh-config-by-owner/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # Narrower than is_resync_surface_path(): the subset resync-installed.sh calls
 # a "pure-copy surface" -- a directory whose every file is copied verbatim
 # from a same-shaped defaults/ subdirectory (mirrors
@@ -322,6 +351,7 @@ IS_LOOM_SOURCE_REPO=0
 RESYNC_PATHS=()
 FOREIGN_PATHS=()
 RETIRED_PATHS=()
+CREDENTIAL_PATHS=()
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     code="${line:0:2}"
@@ -329,6 +359,10 @@ while IFS= read -r line; do
     path="${path%\"}"
     path="${path#\"}"
     [[ "$path" == *" -> "* ]] && path="${path##* -> }"
+    if is_credential_leak_path "$path"; then
+        CREDENTIAL_PATHS+=("$path")
+        continue
+    fi
     if ! is_resync_surface_path "$path"; then
         FOREIGN_PATHS+=("$path")
         continue
@@ -342,6 +376,17 @@ while IFS= read -r line; do
     fi
     RESYNC_PATHS+=("$path")
 done <<< "$STATUS"
+
+if [[ "${#CREDENTIAL_PATHS[@]}" -gt 0 ]]; then
+    warn "Excluded from the commit — never staged, even if .gitignore is missing/stale (#7818):"
+    for p in "${CREDENTIAL_PATHS[@]}"; do
+        warn "    $p"
+    done
+    warn "  These are the daemon-owned GH_CONFIG_DIR credential trees (.loom/gh-config/,"
+    warn "  .loom/gh-config-by-owner/) — host-local, never committed. If they show up"
+    warn "  here your .gitignore is missing the entries loom-daemon's managed block"
+    warn "  writes (loom-daemon update-gitignore repairs it)."
+fi
 
 if [[ "${#FOREIGN_PATHS[@]}" -gt 0 ]]; then
     err "Refusing to land: the working tree has non-resync dirt alongside resync output:"

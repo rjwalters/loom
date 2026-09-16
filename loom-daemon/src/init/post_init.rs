@@ -125,6 +125,15 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// pins that worktree permanently dirty, defeating both worktree.sh's staleness
 /// check and the daemon's `cleanup_stale_worktree`. See the entry's own comment
 /// below for why it does not belong in `BUILD_ARTIFACT_PATTERNS` instead.
+///
+/// #7818: added `.loom/gh-config/` and `.loom/gh-config-by-owner/` — the
+/// daemon-owned `GH_CONFIG_DIR` trees holding host-local GitHub App
+/// installation tokens (`hosts.yml`/`config.yml`, #4458/#5401). Both were
+/// already ignored in this source repo's own `.gitignore` but missing from
+/// this installer-managed list, so a consumer repo's block never picked them
+/// up: a resync commit on `rjwalters/anvil` (2026-08-23) swept a live
+/// installation token into a public repo via `git add .loom`. Security-
+/// relevant — never remove without an equivalent replacement.
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
     // Per-worktree builder progress checkpoint. Its WRITER moved from Python to
@@ -246,6 +255,18 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // silently looking like "never updated" (#5980). Removed on a completed,
     // non-partial success — machine-local runtime state, never committed.
     ".loom/.resync-in-progress",
+    // Daemon-owned GH_CONFIG_DIR for GitHub App installation-token delivery
+    // (#4458) — host-local hosts.yml/config.yml holding a live short-TTL
+    // installation token, rewritten atomically by the credential refresh
+    // tick. Never committed (mirrors `.loom/tokens/` above).
+    ".loom/gh-config/",
+    // Per-owner GH_CONFIG_DIR subtree for cross-owner GitHub App installation
+    // tokens (#5401) — same host-local, never-committed contract as
+    // `.loom/gh-config/` above, one subdirectory per non-root managed-repo
+    // owner. Missing from this list is what let #7818 happen: a resync
+    // commit's `git add .loom` swept a live installation token into a
+    // public repo.
+    ".loom/gh-config-by-owner/",
 ];
 
 /// Build the Loom-managed `.gitignore` block (marker lines + header + patterns),
@@ -692,6 +713,12 @@ mod tests {
         assert!(contents.contains(".loom/account-health.lock"));
         assert!(!contents.contains(".loom/accounts.json"));
 
+        // #7818: the daemon-owned GH_CONFIG_DIR trees (host-local GitHub App
+        // installation tokens) must be ignored so a resync's `git add .loom`
+        // can never sweep a live credential into the tree.
+        assert!(contents.contains(".loom/gh-config/"));
+        assert!(contents.contains(".loom/gh-config-by-owner/"));
+
         // Retired daemon-brain patterns must NOT be emitted (Phase 3.5, #3402)
         assert!(!contents.contains(".loom/daemon-state.json"));
         assert!(!contents.contains(".loom/[0-9][0-9]-daemon-state.json"));
@@ -756,6 +783,10 @@ mod tests {
         // #6334: the in-worktree race-rescue patch directory must not duplicate
         // across runs either.
         assert_eq!(contents.matches(".snapshots/").count(), 1);
+        // #7818: the GH_CONFIG_DIR credential trees must not duplicate across
+        // runs either.
+        assert_eq!(contents.matches(".loom/gh-config/").count(), 1);
+        assert_eq!(contents.matches(".loom/gh-config-by-owner/").count(), 1);
     }
 
     #[test]
@@ -824,6 +855,11 @@ mod tests {
             // #4641/#5014: salvage/backup sidecars from torn atomic writes.
             ".loom/*.bak",
             ".loom/logs/",
+            // #7818: daemon-owned GH_CONFIG_DIR credential trees — must be
+            // ignored so a resync's `git add .loom` can never sweep a live
+            // GitHub App installation token into the tree.
+            ".loom/gh-config/",
+            ".loom/gh-config-by-owner/",
         ];
 
         for pattern in &expected {

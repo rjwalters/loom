@@ -134,6 +134,7 @@ use crate::ipc::DrainState;
 use crate::workspace_pool::WorkspacePool;
 
 mod relaunch_verify_note;
+mod resolve_json;
 
 // ============================================================================
 // Constants
@@ -884,8 +885,8 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
                 root.display()
             ));
         };
-        match run_resolve_json(&script, &root, ARTIFACT_RESOLVE_TIMEOUT) {
-            Ok(stdout) => parse_resolve_json(&stdout),
+        match resolve_json::run_resolve_json(&script, &root, ARTIFACT_RESOLVE_TIMEOUT) {
+            Ok((stdout, stderr)) => resolve_json::parse_resolve_json(&stdout, &stderr, &script),
             Err(reason) => ArtifactResolution::Unresolved(reason),
         }
     }
@@ -1142,115 +1143,6 @@ fn run_update_script_with(
     };
     let _ = std::fs::remove_file(&log_path);
     outcome
-}
-
-/// Run `loom-daemon-update.sh --resolve-json` in `cwd` and return its stdout
-/// (the single JSON object) — or an `Err` reason when it could not be run.
-///
-/// Read-only by contract on the script's side (no download of the binary, no
-/// `git fetch`, no build/provision/restart), so this is safe to call on every
-/// tick. stdout is captured to a temp file rather than a pipe for the same
-/// reason [`run_update_script`] does: a chatty child on a pipe with nobody
-/// draining it deadlocks. **The exit code is deliberately ignored** — the
-/// script exits `1` for the entirely ordinary "no release resolved" case and
-/// still prints the JSON, so the JSON is the contract, not the status.
-fn run_resolve_json(script: &Path, cwd: &Path, timeout: Duration) -> Result<String, String> {
-    let out_path = std::env::temp_dir()
-        .join(format!("loom-auto-update-resolve-{}.json", uuid::Uuid::new_v4()));
-    let out_file = std::fs::File::create(&out_path)
-        .map_err(|e| format!("could not create the resolve output file: {e}"))?;
-
-    let mut command = Command::new(script);
-    command
-        .arg("--resolve-json")
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::null());
-
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_file(&out_path);
-            return Err(format!("could not spawn `{} --resolve-json`: {e}", script.display()));
-        }
-    };
-
-    let start = Instant::now();
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => break Ok(()),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(format!(
-                        "`{} --resolve-json` timed out after {}s",
-                        script.display(),
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(REBUILD_POLL_INTERVAL);
-            }
-            Err(e) => break Err(format!("could not poll `{}`: {e}", script.display())),
-        }
-    };
-    let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
-    let _ = std::fs::remove_file(&out_path);
-    result.map(|()| stdout)
-}
-
-/// Parse `--resolve-json`'s single JSON object into an [`ArtifactResolution`].
-/// Any shape surprise (unparseable, `ok:false`, a missing version) becomes
-/// `Unresolved` with a reason rather than an error: "we could not learn about
-/// a newer artifact" must always degrade to the source path, never to a
-/// failure that stalls the loop.
-#[must_use]
-fn parse_resolve_json(stdout: &str) -> ArtifactResolution {
-    let line = stdout
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with('{'))
-        .unwrap_or("");
-    if line.is_empty() {
-        return ArtifactResolution::Unresolved(
-            "`loom-daemon-update.sh --resolve-json` printed no JSON object".to_string(),
-        );
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return ArtifactResolution::Unresolved(
-            "`loom-daemon-update.sh --resolve-json` printed unparseable JSON".to_string(),
-        );
-    };
-    let string_field = |key: &str| {
-        value
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        return ArtifactResolution::Unresolved(
-            string_field("reason").unwrap_or_else(|| "no release artifact resolved".to_string()),
-        );
-    }
-    let Some(version) = string_field("version") else {
-        return ArtifactResolution::Unresolved(
-            "release resolution reported ok but no version".to_string(),
-        );
-    };
-    ArtifactResolution::Resolved(ArtifactInfo {
-        tag: string_field("tag").unwrap_or_else(|| version.clone()),
-        version,
-        published_at: string_field("published_at"),
-        asset_sha256: string_field("asset_sha256"),
-        target: string_field("target"),
-        // The script reports the literal string "unknown" for a commit it
-        // could not read; a version it could not read is already `null`.
-        installed_version: string_field("installed_version").filter(|v| v != "unknown"),
-        installed_sha256: string_field("installed_sha256"),
-    })
 }
 
 /// Nice the child (and, by inheritance, the `cargo`/`rustc` processes it
