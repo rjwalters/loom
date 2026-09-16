@@ -137,6 +137,7 @@ pub mod calibrate;
 pub mod capability;
 pub mod capacity;
 pub mod claim_reconciliation;
+pub mod cmd_out;
 pub mod config_resolver;
 pub mod cpu_headroom;
 pub mod credential_preflight;

@@ -62,12 +62,20 @@
 //!   username and refuses `http://` unless `LOOM_ALLOW_INSECURE_BASIC_AUTH=1`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 
+use crate::cmd_out::{run_command, CmdOutcome};
 use crate::config_resolver::{get_path, resolve_effective_config};
+
+/// Ceiling for a `git`/`gh` invocation from the forge CLI surface.
+///
+/// #7810 PR 2: these were unbounded, each with its own ad-hoc error handling
+/// (`.ok()?`, `Err(_) => return base`, bespoke `match`). The handling is kept
+/// where it was — only the execution management is now shared.
+const FORGE_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Exit code the native subcommands use to signal "this forge is not handled
 /// natively; fall back to the shell path". Distinct from a genuine failure
@@ -136,15 +144,17 @@ pub fn canonical_repo_root(cwd: Option<&Path>) -> PathBuf {
     let mut command = Command::new("git");
     command.args(["rev-parse", "--git-common-dir"]);
     command.current_dir(&base);
+    command.stdin(Stdio::null());
 
-    let output = match command.output() {
-        Ok(o) => o,
-        Err(_) => return base,
-    };
-    if !output.status.success() {
+    // #7810 PR 2: bounded, and every non-success path falls back to `base`
+    // exactly as before — "git is absent", "not a repo", and "timed out" all
+    // mean the same thing to this function (use the directory we were given),
+    // which is why collapsing them here is safe and stated rather than implicit.
+    let outcome = run_command(command, FORGE_CMD_TIMEOUT);
+    let Some(out) = outcome.ok_output() else {
         return base;
-    }
-    let raw = match String::from_utf8(output.stdout) {
+    };
+    let raw = match std::str::from_utf8(&out.stdout) {
         Ok(s) => s.trim().to_string(),
         Err(_) => return base,
     };
@@ -207,15 +217,13 @@ fn parse_host(url: &str) -> Option<String> {
 
 /// Get the `origin` remote URL from `cwd`, or `None`.
 fn get_remote_url(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
+    let mut cmd = Command::new("git");
+    cmd.args(["remote", "get-url", "origin"])
         .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        .stdin(Stdio::null());
+    let outcome = run_command(cmd, FORGE_CMD_TIMEOUT);
+    let out = outcome.ok_output()?;
+    let url = std::str::from_utf8(&out.stdout).ok()?.trim().to_string();
     if url.is_empty() {
         None
     } else {
@@ -420,6 +428,14 @@ fn gh_passthrough(entity: &str, args: &[String]) -> Result<()> {
         );
     }
 
+    // NOT migrated to the shared bounded runner (#7810 PR 2), deliberately.
+    //
+    // This is an exec-passthrough: `.status()` inherits stdin/stdout/stderr so
+    // `gh` talks to the operator's terminal directly — prompts, pagers, progress
+    // and colour all belong to `gh`, and this process then exits with its code.
+    // Capturing it would break every one of those, and a deadline is wrong for a
+    // command whose whole job is to be interactive for as long as the operator
+    // needs. Different lifetime contract, out of scope for the capture layer.
     let mut command = Command::new(gh_bin());
     command.arg(entity);
     command.args(args);
@@ -463,33 +479,44 @@ fn github_auto_merge(pr: u32, method: &str, expected_head_sha: Option<&str>) -> 
     };
 
     // Step 1: look up the PR node_id (required by the mutation).
-    let node_out = Command::new(&gh)
-        .args([
-            "api",
-            &format!("repos/{owner}/{repo}/pulls/{pr}"),
-            "--jq",
-            ".node_id",
-        ])
-        .output();
-    let node_id = match node_out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr);
+    // #7810 PR 2: no `--jq`. Asking gh to flatten the payload to a bare scalar
+    // inside the subprocess made "no such PR", "field absent" and "empty
+    // node_id" the same empty string. Decoding here keeps them apart.
+    #[derive(serde::Deserialize)]
+    struct NodeId {
+        node_id: String,
+    }
+    let mut node_cmd = Command::new(&gh);
+    node_cmd
+        .args(["api", &format!("repos/{owner}/{repo}/pulls/{pr}")])
+        .stdin(Stdio::null());
+    let node_out = run_command(node_cmd, FORGE_CMD_TIMEOUT);
+    let node_id = match crate::cmd_out::decode_json::<NodeId, _>(node_out, |n| n.node_id.is_empty())
+    {
+        crate::cmd_out::Query::Populated(n) => n.node_id,
+        crate::cmd_out::Query::Empty => {
             eprintln!(
-                "Failed to enable auto-merge for PR #{pr}: could not fetch node_id: {}",
-                err.trim()
+                "Failed to enable auto-merge for PR #{pr}: the API returned no node_id for it"
             );
             return 1;
         }
-        Err(e) => {
-            eprintln!("Failed to enable auto-merge for PR #{pr}: could not fetch node_id: {e}");
+        crate::cmd_out::Query::Malformed { error, .. } => {
+            eprintln!(
+                "Failed to enable auto-merge for PR #{pr}: could not decode the API response: {error}"
+            );
+            return 1;
+        }
+        crate::cmd_out::Query::Failed { stderr, .. } => {
+            eprintln!(
+                "Failed to enable auto-merge for PR #{pr}: could not fetch node_id: {stderr}"
+            );
+            return 1;
+        }
+        crate::cmd_out::Query::Unavailable(u) => {
+            eprintln!("Failed to enable auto-merge for PR #{pr}: could not fetch node_id: {u}");
             return 1;
         }
     };
-    if node_id.is_empty() {
-        eprintln!("Failed to enable auto-merge for PR #{pr}: empty node_id");
-        return 1;
-    }
 
     // Step 2: enable auto-merge via GraphQL. mergeMethod must be uppercase.
     // The $expectedHeadOid variable is only declared/bound when the caller
@@ -533,13 +560,15 @@ fn github_auto_merge(pr: u32, method: &str, expected_head_sha: Option<&str>) -> 
         args.push(format!("expectedHeadOid={sha}"));
     }
 
-    let result = Command::new(&gh).args(&args).output();
+    let mut merge_cmd = Command::new(&gh);
+    merge_cmd.args(&args).stdin(Stdio::null());
+    let result = run_command(merge_cmd, FORGE_CMD_TIMEOUT);
     match result {
-        Ok(o) if o.status.success() => {
+        ref o if o.succeeded() => {
             println!("Auto-merge enabled for PR #{pr}");
             0
         }
-        Ok(o) => {
+        CmdOutcome::Ran(ref o) => {
             // Surface gh's stderr verbatim so merge-pr.sh's disabled/clean/
             // unstable substring detection keeps working.
             let err = String::from_utf8_lossy(&o.stderr);
@@ -556,8 +585,13 @@ fn github_auto_merge(pr: u32, method: &str, expected_head_sha: Option<&str>) -> 
                 1
             }
         }
-        Err(e) => {
-            eprintln!("Failed to enable auto-merge for PR #{pr}: {e}");
+        CmdOutcome::Unavailable(ref u) => {
+            // #7810 PR 2: this arm used to also catch a spawn failure reported
+            // as a generic io error. It now names whether gh could not be
+            // started, or started and outlived its deadline — a distinction
+            // that matters here, because "the mutation may have been applied"
+            // is only possible in the timeout case.
+            eprintln!("Failed to enable auto-merge for PR #{pr}: {u}");
             1
         }
     }
@@ -588,27 +622,30 @@ fn repo_nwo(gh: &str) -> Option<String> {
 }
 
 fn repo_nwo_in(gh: &str, cwd: Option<&Path>) -> Option<String> {
+    // #7810 PR 2: `--json` without `--jq`. The scalar the filter produced could
+    // not distinguish "not a repo", "gh not authenticated" and "empty name".
+    #[derive(serde::Deserialize)]
+    struct NameWithOwner {
+        #[serde(rename = "nameWithOwner")]
+        name_with_owner: String,
+    }
     let mut cmd = Command::new(gh);
-    cmd.args([
-        "repo",
-        "view",
-        "--json",
-        "nameWithOwner",
-        "--jq",
-        ".nameWithOwner",
-    ]);
+    cmd.args(["repo", "view", "--json", "nameWithOwner"]);
+    cmd.stdin(Stdio::null());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    if let Ok(out) = cmd.output() {
-        if out.status.success() {
-            if let Ok(raw) = String::from_utf8(out.stdout) {
-                let nwo = raw.trim().to_string();
-                if !nwo.is_empty() {
-                    return Some(nwo);
-                }
-            }
-        }
+    let q =
+        crate::cmd_out::decode_json::<NameWithOwner, _>(run_command(cmd, FORGE_CMD_TIMEOUT), |n| {
+            n.name_with_owner.is_empty()
+        });
+    // Populated is the only case that answers; Empty / Malformed / Failed /
+    // Unavailable all fall through to the git-remote fallback below, which is
+    // what the previous code did for every one of them too — the difference is
+    // that they are now distinguishable if a caller ever needs to tell them
+    // apart.
+    if let crate::cmd_out::Query::Populated(n) = q {
+        return Some(n.name_with_owner);
     }
     // `gh repo view` failed or returned nothing — fall back to the local git
     // remote, exactly as the shell helper does.
@@ -1081,7 +1118,10 @@ mod tests {
         // git-remote fallback.
         init_repo(dir.path(), "git@github.com:other/mismatch.git");
         let path = dir.path().join("fake-gh.sh");
-        std::fs::write(&path, "#!/bin/sh\nprintf 'acme/widgets'\n").unwrap();
+        // #7810 PR 2: real `gh repo view --json nameWithOwner` emits JSON. The
+        // bare scalar this used to print was the `--jq .nameWithOwner` shape.
+        std::fs::write(&path, "#!/bin/sh\nprintf '{\"nameWithOwner\":\"acme/widgets\"}'\n")
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1151,12 +1191,16 @@ mod tests {
         std::fs::write(
             &path,
             r#"#!/bin/sh
+# #7810 PR 2: these two answers are now the JSON `gh` actually emits, not the
+# scalar a `--jq` filter used to reduce it to. The filtered shapes ('acme/widgets',
+# 'NODEID123') were what made this fixture pass while hiding that a malformed or
+# absent field was indistinguishable from an empty one.
 if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
-  printf 'acme/widgets'
+  printf '{"nameWithOwner":"acme/widgets"}'
   exit 0
 fi
 if [ "$1" = "api" ] && [ "$2" != "graphql" ]; then
-  printf 'NODEID123'
+  printf '{"node_id":"NODEID123"}'
   exit 0
 fi
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then

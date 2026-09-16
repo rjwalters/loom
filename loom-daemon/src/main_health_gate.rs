@@ -88,7 +88,15 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
+use crate::cmd_out::run_command;
 use crate::workspace_registry::WorkspaceRegistry;
+
+/// Ceiling for a `git` invocation made by the main-health gate.
+///
+/// Covers `git fetch`, which reaches the network — generous enough for a slow
+/// remote, short enough that a wedged fetch cannot hold the gate open forever.
+/// Before #7810 PR 2 these calls had no deadline at all.
+const GIT_GATE_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ============================================================================
 // Constants
@@ -1861,15 +1869,15 @@ pub fn decide_gate_run(
 /// fetch+reset at all. `None` on any failure (offline, no such remote, `git`
 /// missing) — callers must fail safe and treat that as "must run".
 fn resolve_remote_main_sha(repo_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["ls-remote", GATE_REMOTE, GATE_BRANCH])
+    // #7810 PR 2: bounded. `ls-remote` reaches the NETWORK, and this ran with no
+    // deadline at all — an unreachable or hanging remote could stall the gate
+    // indefinitely before it had even decided whether to run.
+    let mut cmd = Command::new("git");
+    cmd.args(["ls-remote", GATE_REMOTE, GATE_BRANCH])
         .current_dir(repo_root)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+        .stdin(Stdio::null());
+    let outcome = run_command(cmd, GIT_GATE_TIMEOUT);
+    let output = outcome.ok_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let sha = stdout.split_whitespace().next()?;
     if sha.is_empty() {
@@ -1900,15 +1908,12 @@ fn diff_touches_globs(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let output = Command::new("git")
-        .args(["diff", "--name-only", &format!("{from_sha}..{to_sha}")])
+    let mut cmd = Command::new("git");
+    cmd.args(["diff", "--name-only", &format!("{from_sha}..{to_sha}")])
         .current_dir(repo_root)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+        .stdin(Stdio::null());
+    let outcome = run_command(cmd, GIT_GATE_TIMEOUT);
+    let output = outcome.ok_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let changed: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
     Some(
@@ -2398,27 +2403,27 @@ pub enum PrepOutcome {
 /// zero exit or `Err(reason)` describing the failure (spawn error or non-zero
 /// exit with captured stderr). Trims trailing whitespace from captured streams.
 fn run_git(repo_root: &Path, args: &[&str]) -> std::result::Result<(String, String), String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_root)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("failed to spawn `git {}`: {e}", args.join(" ")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if output.status.success() {
-        Ok((stdout, stderr))
+    // Epic #7810 PR 2: this used to be its own runner — `Command::new` +
+    // unbounded `.output()`, with a spawn failure and a non-zero exit both
+    // flattened into an `Err(String)`. Two things change.
+    //
+    // It is now BOUNDED. `git fetch` below reaches the network, and an
+    // unbounded fetch could wedge the health gate indefinitely — the same
+    // failure mode that motivated bounding the reaper's `gh` calls.
+    //
+    // And the error text now names WHICH kind of failure it was ("could not
+    // start" / "timed out after ..." / "exited with ..."), because these call
+    // sites surface it verbatim as a `Skip` reason an operator has to act on.
+    // Every caller still fails safe — any `Err` skips the gate — so the
+    // `Result` shape is deliberately unchanged; only the duplicate execution
+    // management goes away.
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(repo_root).stdin(Stdio::null());
+    let outcome = run_command(cmd, GIT_GATE_TIMEOUT);
+    if outcome.succeeded() {
+        Ok((outcome.stdout_trimmed(), outcome.stderr_trimmed()))
     } else {
-        Err(format!(
-            "`git {}` exited with {}{}",
-            args.join(" "),
-            output.status,
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        ))
+        Err(outcome.failure_reason(&format!("git {}", args.join(" "))))
     }
 }
 
@@ -2432,27 +2437,20 @@ fn run_git(repo_root: &Path, args: &[&str]) -> std::result::Result<(String, Stri
 /// #3950). Trailing trim is still safe — trailing whitespace never carries
 /// meaning in porcelain output.
 fn git_status_porcelain(repo_root: &Path) -> std::result::Result<String, String> {
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
+    let mut cmd = Command::new("git");
+    cmd.args(["status", "--porcelain"])
         .current_dir(repo_root)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("failed to spawn `git status --porcelain`: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!(
-            "`git status --porcelain` exited with {}{}",
-            output.status,
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        ));
+        .stdin(Stdio::null());
+    let outcome = run_command(cmd, GIT_GATE_TIMEOUT);
+    if !outcome.succeeded() {
+        return Err(outcome.failure_reason("git status --porcelain"));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .trim_end()
-        .to_string())
+    // `trim_end()` only — NEVER a full trim. Porcelain v1 is column-sensitive:
+    // the first status line can legitimately begin with a space (`" M file"`,
+    // an unstaged modification of a tracked file), and eating it changes what
+    // the line means. `cmd_out` returns untrimmed bytes precisely so this
+    // decision stays here, where the format is known.
+    Ok(outcome.stdout_lossy().trim_end().to_string())
 }
 
 /// Prepare `repo_root` to reflect `origin/main` before a gate run.
