@@ -614,11 +614,32 @@ fn every_yield_reason_labels_and_describes_itself() {
 #[serial]
 fn the_generation_high_water_mark_ratchets_upward() {
     clear_generation_fence_for_tests();
-    let ids: BTreeSet<u64> = [1, 2, 3].into_iter().collect();
+    let fresh: Vec<RosterComment> = ["host-a", "host-b", "host-c"]
+        .iter()
+        .enumerate()
+        .map(|(i, host)| {
+            comment_id(
+                u64::try_from(i).unwrap() + 1,
+                host,
+                &[1],
+                FLEET_CREATED,
+                "2026-01-01T04:45:00Z",
+            )
+        })
+        .collect();
     let newer = dt("2026-01-01T05:00:00Z");
-    assert_eq!(observe_generation(&ids, newer), newer);
-    // An older reading over the SAME comment set does not lower it.
-    assert_eq!(observe_generation(&ids, dt("2026-01-01T00:00:00Z")), newer);
+    assert_eq!(observe_generation(&fresh, newer), newer);
+    // A genuinely STALER reading over the same comment set — same ids, every
+    // `updated_at` older than the one already observed, as a cached / lagging
+    // read presents them — does not lower the mark.
+    let replay: Vec<RosterComment> = fresh
+        .iter()
+        .map(|c| RosterComment {
+            updated_at: dt("2026-01-01T00:30:00Z"),
+            ..c.clone()
+        })
+        .collect();
+    assert_eq!(observe_generation(&replay, dt("2026-01-01T00:00:00Z")), newer);
     clear_generation_fence_for_tests();
 }
 
@@ -630,10 +651,22 @@ fn the_generation_high_water_mark_resets_when_a_comment_disappears() {
     // eviction) would yield FOREVER against a generation no live comment
     // set can reach again.
     clear_generation_fence_for_tests();
-    let ids: BTreeSet<u64> = [1, 2, 3].into_iter().collect();
+    let all: Vec<RosterComment> = ["host-a", "host-b", "host-c"]
+        .iter()
+        .enumerate()
+        .map(|(i, host)| {
+            comment_id(
+                u64::try_from(i).unwrap() + 1,
+                host,
+                &[1],
+                FLEET_CREATED,
+                "2026-01-01T04:45:00Z",
+            )
+        })
+        .collect();
     let high = dt("2026-01-01T05:00:00Z");
-    assert_eq!(observe_generation(&ids, high), high);
-    let shrunk: BTreeSet<u64> = [1, 2].into_iter().collect();
+    assert_eq!(observe_generation(&all, high), high);
+    let shrunk: Vec<RosterComment> = all.iter().take(2).cloned().collect();
     let lower = dt("2026-01-01T00:00:00Z");
     assert_eq!(
         observe_generation(&shrunk, lower),
@@ -681,6 +714,94 @@ fn admit_folds_the_high_water_mark_into_the_pure_fence() {
             RosterAdmission::Yield(RosterYield::StaleGeneration { .. })
         ),
         "a replayed older view must be discarded by the high-water mark"
+    );
+    clear_generation_fence_for_tests();
+}
+
+#[test]
+#[serial]
+fn a_late_patch_that_moves_an_observed_expiry_boundary_does_not_strand_a_peer() {
+    // Issue #7895. `generation()`'s boundary set includes `updated_at + ttl`,
+    // so a boundary can be observed once and then legitimately CEASE TO EXIST
+    // — moved into the future by an ordinary `Patch` — without any comment id
+    // disappearing. Keying the high-water mark's release rule on the id set
+    // alone stranded the observing host in `StaleGeneration` until membership
+    // actually changed (in a stable fleet: forever).
+    clear_generation_fence_for_tests();
+    let base = dt("2026-01-05T00:00:00Z");
+    let at = |secs: i64| base + ChronoDuration::seconds(secs);
+    // host-a's view of a 3-host fleet whose `created_at`s are days old.
+    // `beats` is each host's `updated_at` as an offset from `base`; comment
+    // ids are stable, because a `Patch` never changes them.
+    let view = |beats: [i64; 3]| RosterSnapshot {
+        issue: RosterIssueRef::parse("rjwalters/loom#1234").unwrap(),
+        host: "host-a".to_string(),
+        comments: ["host-a", "host-b", "host-c"]
+            .iter()
+            .enumerate()
+            .map(|(i, host)| RosterComment {
+                id: u64::try_from(i).unwrap() + 1,
+                host: (*host).to_string(),
+                serves: [1].into_iter().collect(),
+                created_at: dt(FLEET_CREATED),
+                updated_at: at(beats[i]),
+            })
+            .collect(),
+        ttl_secs: 900,
+        settle_secs: 900,
+        fetched_at: base,
+    };
+
+    // t=905: host-b missed a heartbeat (a `gh` timeout), so host-a's snapshot
+    // still carries host-b's t=0 beat. host-b's *stale* expiry boundary
+    // (0 + ttl = 900) is the newest boundary <= now, and observing it ratchets
+    // the high-water mark to t=900. The verdict here is `NotSettled` — that
+    // boundary is 5s old — which is expected and harmless; the damage is what
+    // the ratchet does to the NEXT read.
+    let stale_view = view([620, 0, 620]);
+    assert!(
+        matches!(
+            admit(&stale_view, 1, at(905)),
+            RosterAdmission::Yield(RosterYield::NotSettled { .. })
+        ),
+        "a boundary 5s old is inside the settle window"
+    );
+
+    // t=920: host-a's snapshot refreshes and picks up host-b's late PATCH —
+    // same comment id, `updated_at` moved forward to t=640, so host-b's expiry
+    // boundary moved to t=1540 and the boundary observed at t=905 no longer
+    // exists. Every remaining boundary is a days-old `created_at`, so `gen`
+    // REGRESSES with no id having disappeared. The view is provably at least
+    // as fresh as the one the mark came from, so it must be authoritative.
+    let patched = view([620, 640, 620]);
+    let verdict = admit(&patched, 1, at(920));
+    assert!(
+        matches!(
+            verdict,
+            RosterAdmission::Ring {
+                index: 0,
+                count: 3,
+                ..
+            }
+        ),
+        "a PATCH that moves an observed expiry boundary into the future must \
+         not strand this host in StaleGeneration, got {verdict:?}"
+    );
+
+    // The release rule does NOT weaken condition 2. A genuinely newer view
+    // first: host-c stops beating, so its expiry boundary (t=1900) becomes the
+    // newest generation and the two survivors act under it.
+    assert!(matches!(
+        admit(&view([3540, 3540, 1000]), 1, at(3600)),
+        RosterAdmission::Ring { count: 2, .. }
+    ));
+    // ...and now the earlier view replayed — same ids, every `updated_at`
+    // OLDER than already observed, i.e. a cached / lagging read — is still
+    // discarded, exactly as before the fix.
+    let verdict = admit(&patched, 1, at(920));
+    assert!(
+        matches!(verdict, RosterAdmission::Yield(RosterYield::StaleGeneration { .. })),
+        "a replayed staler view must still yield StaleGeneration, got {verdict:?}"
     );
     clear_generation_fence_for_tests();
 }
