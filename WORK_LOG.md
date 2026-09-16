@@ -7,6 +7,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7895** (closed): role-runner roster: generation high-water mark strands a peer when a late PATCH moves an observed expiry boundary into the future (#7691 follow-up)
+- **PR #7914**: fix(roster): release the generation fence when a PATCH moves an observed boundary
+- **Issue #7794** (closed): Eight scripts read their own source for --help: concise usage block for the non-wrappers, interim single-read for the five loom-daemon-*.sh wrappers
+- **PR #7912**: refactor: stop printing design rationale from `--help`; end the self-read race (#7794)
+- **Issue #7819** (closed): flaky: test-sync-labels-repo-flag.sh fails on an assertion whose needle IS in the printed output
+- **PR #7913**: fix: eliminate fork-based flake in test-sync-labels-repo-flag.sh assertions
+- **Issue #7867** (closed): merge-pr.sh's defaults/ VERSION-bump collision guard (#7302) contradicts CI's forbid-bump policy (#7743)
+- **Issue #7762** (closed): Adopt a language policy: new logic in Rust, new shell only from a CI-enforced allowlist
+- **PR #7906**: feat: adopt a language policy — new logic in Rust, new shell from a CI-enforced allowlist
 - **Issue #7318** (closed): Guard friction: stash-scope:create-redirect recurs on bare 'git stash' inside issue worktrees despite a documented per-worktree alternative
 - **PR #7899**: docs(builder-worktree): document stash-push/stash-pop clean-baseline pattern
 - **Issue #7792** (closed): tokens_pool: empty_pool_error_enumerates_per_token_exclusion_detail flakes on the 4h/session-limit-window hour boundary
