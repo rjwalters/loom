@@ -512,6 +512,13 @@ EXTRA_LABELS=()
 # --check exit code: 0 (no drift), 3 (drift found). Never called on a
 # forge/lookup failure — those are reported directly by the caller via
 # error() (exit 1) before this runs.
+# Every array expansion below uses the `${arr[@]+"${arr[@]}"}` guard: under
+# `set -u`, bash 3.2 (stock macOS /bin/bash) treats an EMPTY indexed array's
+# "${arr[@]}" as an unbound variable and aborts. Bash fixed this in 4.4, so
+# the bare form works everywhere except the interpreter a large share of
+# operators actually run. `${#arr[@]}` is safe on 3.2 and stays as-is. Only
+# reachable at all since #7717 -- this function previously crashed before
+# these lines ran.
 print_label_check_report() {
   local n s
 
@@ -521,13 +528,13 @@ print_label_check_report() {
   fi
 
   warning "Label drift detected on $REPO (${#DECL_NAMES[@]} declared, ${#MISSING_LABELS[@]} missing, ${#STALE_LABELS[@]} stale, ${#EXTRA_LABELS[@]} unknown extra):"
-  for n in "${MISSING_LABELS[@]}"; do
+  for n in ${MISSING_LABELS[@]+"${MISSING_LABELS[@]}"}; do
     echo "  MISSING       $n (declared in labels.yml, absent on $REPO)" >&2
   done
-  for s in "${STALE_LABELS[@]}"; do
+  for s in ${STALE_LABELS[@]+"${STALE_LABELS[@]}"}; do
     echo "  STALE         $s" >&2
   done
-  for n in "${EXTRA_LABELS[@]}"; do
+  for n in ${EXTRA_LABELS[@]+"${EXTRA_LABELS[@]}"}; do
     echo "  UNKNOWN EXTRA $n (present on $REPO, not declared in labels.yml — never deleted automatically)" >&2
   done
   if [[ "${#MISSING_LABELS[@]}" -gt 0 || "${#STALE_LABELS[@]}" -gt 0 ]]; then
@@ -548,34 +555,61 @@ print_label_check_report() {
 # MISSING_LABELS/STALE_LABELS/EXTRA_LABELS, and hands the result to
 # print_label_check_report. Returns that function's exit code (0 no drift, 3
 # drift found).
+# Lowercase helper. `${x,,}` is bash 4.0+ and this repo targets bash 3.2+
+# (.shellcheckrc: "Target bash for macOS compatibility (bash 3.2+)"), because
+# stock macOS ships /bin/bash 3.2 and `#!/usr/bin/env bash` resolves to it.
+_lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
 diff_declared_against_live_tsv() {
   local live_tsv="$1"
 
-  local -A LIVE_COLOR=() LIVE_DESC=() LIVE_SEEN=()
+  # Parallel indexed arrays + linear search rather than associative arrays:
+  # `local -A` is bash 4.0+, same 3.2 constraint as _lower() above (#7717).
+  # This mirrors the DECL_NAMES/DECL_COLORS/DECL_DESCS + is_declared_label()
+  # pattern already used in this file. A live label set is dozens of entries,
+  # so the O(n*m) scan costs nothing next to the forge call that produced it.
+  local LIVE_NAMES=() LIVE_COLORS=() LIVE_DESCS=()
   local name color desc
   while IFS=$'\t' read -r name color desc; do
     [[ -z "$name" ]] && continue
-    LIVE_SEEN["$name"]=1
-    LIVE_COLOR["$name"]="${color,,}"
-    LIVE_DESC["$name"]="$desc"
+    LIVE_NAMES+=("$name")
+    LIVE_COLORS+=("$(_lower "$color")")
+    LIVE_DESCS+=("$desc")
   done <<<"$live_tsv"
 
   MISSING_LABELS=()
   STALE_LABELS=()
   EXTRA_LABELS=()
-  local i decl_name decl_color decl_desc
+  local i j decl_name decl_color decl_desc found live_color live_desc
   for ((i = 0; i < ${#DECL_NAMES[@]}; i++)); do
     decl_name="${DECL_NAMES[$i]}"
-    decl_color="${DECL_COLORS[$i],,}"
+    decl_color="$(_lower "${DECL_COLORS[$i]}")"
     decl_desc="${DECL_DESCS[$i]}"
-    if [[ -z "${LIVE_SEEN[$decl_name]:-}" ]]; then
+    found=""
+    live_color=""
+    live_desc=""
+    for ((j = 0; j < ${#LIVE_NAMES[@]}; j++)); do
+      if [[ "${LIVE_NAMES[$j]}" == "$decl_name" ]]; then
+        found=1
+        live_color="${LIVE_COLORS[$j]}"
+        live_desc="${LIVE_DESCS[$j]}"
+        break
+      fi
+    done
+    if [[ -z "$found" ]]; then
       MISSING_LABELS+=("$decl_name")
-    elif [[ "${LIVE_COLOR[$decl_name]}" != "$decl_color" || "${LIVE_DESC[$decl_name]}" != "$decl_desc" ]]; then
-      STALE_LABELS+=("$decl_name (color: live=${LIVE_COLOR[$decl_name]} vs declared=$decl_color; description: live=\"${LIVE_DESC[$decl_name]}\" vs declared=\"$decl_desc\")")
+    elif [[ "$live_color" != "$decl_color" || "$live_desc" != "$decl_desc" ]]; then
+      STALE_LABELS+=("$decl_name (color: live=$live_color vs declared=$decl_color; description: live=\"$live_desc\" vs declared=\"$decl_desc\")")
     fi
   done
 
-  for name in "${!LIVE_SEEN[@]}"; do
+  # Iterates the live set in forge order. The associative-array version this
+  # replaced iterated "${!LIVE_SEEN[@]}", i.e. bash hash order, so unknown
+  # extras are now reported deterministically instead of arbitrarily.
+  for ((j = 0; j < ${#LIVE_NAMES[@]}; j++)); do
+    name="${LIVE_NAMES[$j]}"
     if [[ "$name" == loom:* ]] && ! is_declared_label "$name"; then
       EXTRA_LABELS+=("$name")
     fi
