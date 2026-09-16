@@ -721,10 +721,19 @@ _check_champion_hold_state_staleness() {
 
   # Mirrors champion-pr-merge.md's own extraction (same marker, same capture
   # group); "last" match wins in case of multiple hold episodes on one PR.
+  #
+  # `|| true` is REQUIRED here: under `set -euo pipefail` (line ~105), a PR
+  # with no champion:hold-state marker at all (the common case — any PR
+  # approved on first pass) makes `grep -o` find nothing and exit 1; pipefail
+  # then makes the whole pipeline's exit status 1, which — without `|| true`
+  # — makes `set -e` abort the entire script right here, before the
+  # `[[ -n "$hold_head" ]] || return 0` guard below is ever reached (#7719,
+  # regression from #7435). This silently broke merge-pr.sh for the
+  # overwhelming majority of PRs.
   hold_head="$(printf '%s\n' "$comments" \
     | grep -o 'champion:hold-state head=[0-9a-f]*' \
     | tail -1 \
-    | sed -n 's/.*head=\([0-9a-f]*\)/\1/p')"
+    | sed -n 's/.*head=\([0-9a-f]*\)/\1/p')" || true
   [[ -n "$hold_head" ]] || return 0
 
   if [[ "$hold_head" != "$PR_HEAD_SHA" ]]; then
