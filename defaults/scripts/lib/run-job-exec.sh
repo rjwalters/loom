@@ -7,8 +7,8 @@
 #   1. The program that runs ON THE EXECUTOR HOST (a real docker host). It is
 #      self-contained on purpose — `run-job.sh`'s ssh transport pipes this
 #      exact file to `bash -s` on the remote host, so the executor host needs
-#      NO Loom installation: bash, docker, jq and base64 are the whole
-#      dependency list.
+#      NO Loom installation: bash, docker, jq and coreutils (base64,
+#      mktemp, mkfifo, readlink) are the whole dependency list.
 #   2. A sourceable library. `run-job.sh` sources it (with
 #      LOOM_RUN_JOB_SOURCE_ONLY=1) to reuse the SAME spec validation and the
 #      SAME `docker run` argv builder it would execute remotely — so
@@ -84,6 +84,21 @@ LOOM_RUN_JOB_CONTAINER_PREFIX="loom-job-"
 _rj_docker() { command "${LOOM_RUN_JOB_DOCKER:-docker}" "$@"; }
 _rj_err() { printf 'run-job-exec: %s\n' "$*" >&2; }
 
+# _rj_docker_quiet <args...> — `_rj_docker` with both streams discarded.
+#
+# The SUBSHELL is the point here, not decoration (#7875). `_rj_docker` is a
+# shell FUNCTION, and `_rj_docker … >/dev/null 2>&1` applies that redirection
+# to THIS SHELL for the entire duration of the call. A drain SIGTERM arriving
+# inside that window runs `_rj_on_signal` while fd 2 still points at
+# /dev/null, so `# LOOM_RUN_JOB_DETACHED` is written and silently discarded —
+# and because the executor's own `run-job-exec:` diagnostics are suppressed by
+# the same redirection, `run-job.sh` then sees nothing at all and reports
+# "the executor is unreachable — the job did NOT run" (69) for a job that is
+# alive and well on the executor host. That is a fabricated result in exactly
+# the drain scenario #5119 restart safety exists for. Redirecting a subshell
+# instead leaves this shell's descriptors — and so the handler's — untouched.
+_rj_docker_quiet() { (_rj_docker "$@") >/dev/null 2>&1; }
+
 # Decode base64 on stdin. GNU coreutils and newer macOS use `-d`; older BSD
 # base64 only understands `-D`. Both spellings are tried before giving up.
 _rj_b64_decode() {
@@ -91,6 +106,31 @@ _rj_b64_decode() {
     data="$(cat)"
     printf '%s' "$data" | base64 -d 2>/dev/null ||
         printf '%s' "$data" | base64 -D 2>/dev/null
+}
+
+# _rj_realpath <path>
+#
+# Best-effort canonicalization: every symlink in every component resolved.
+# Prints the resolved path, or the input unchanged when THIS host cannot
+# resolve it (the path does not exist here, or neither `readlink -f` nor
+# `realpath` is available). Never fails, never prints nothing.
+#
+# Only the EXECUTOR host's answer is meaningful — it is the host whose docker
+# daemon resolves a bind mount's source — which is why the mount checks that
+# use this are part of `loom_job_validate_spec`, the function that runs again
+# executor-side. The client's pre-flight copy simply cannot resolve a path it
+# cannot see, and falls back to the literal path there by design.
+_rj_realpath() {
+    local p="$1" r=""
+    if r="$(readlink -f -- "$p" 2>/dev/null)" && [[ -n "$r" ]]; then
+        printf '%s' "$r"
+        return 0
+    fi
+    if r="$(realpath -- "$p" 2>/dev/null)" && [[ -n "$r" ]]; then
+        printf '%s' "$r"
+        return 0
+    fi
+    printf '%s' "$p"
 }
 
 # loom_job_spec_defaults <spec-json>
@@ -126,6 +166,13 @@ loom_job_spec_defaults() {
 # the client as pre-flight, once here on the executor host — precisely so a
 # buggy or compromised client cannot talk this executor into a privileged
 # container.
+#
+# For that claim to hold, the mount checks below match the RESOLVED source
+# path, not just its spelling: docker resolves a bind's source on this host, so
+# a pattern list that only ever saw a symlink's innocent name would be no
+# boundary at all. Resolution is meaningful only here, on the host that will do
+# the mounting — which is what makes the executor-side run load-bearing rather
+# than merely belt-and-braces.
 loom_job_validate_spec() {
     local spec="$1"
     local errors=()
@@ -179,7 +226,7 @@ loom_job_validate_spec() {
     # src:dst form to get wrong, so docker/worker/MOUNT-CONTRACT.md §1 (path
     # parity) is structurally enforced by the spec shape itself rather than by
     # a rule callers have to follow.
-    local path mode
+    local path mode real candidate
     while IFS=$'\t' read -r path mode; do
         [[ -z "$path$mode" ]] && continue
         if [[ "$path" != /* ]]; then
@@ -192,14 +239,40 @@ loom_job_validate_spec() {
             ro | rw) ;;
             *) errors+=("mount mode must be \"ro\" or \"rw\" (got \"$mode\" for \"$path\")") ;;
         esac
-        case "$path" in
-            */docker.sock | */docker.sock/* | /var/run/docker* | /run/docker* | */containerd.sock | */podman.sock | */crio.sock)
-                errors+=("refusing docker/container-runtime socket mount \"$path\": a mounted container-runtime socket is host-root-equivalent and is exactly what this seam exists to avoid (ADR-0017 Decision 3)")
-                ;;
-            /proc* | /sys* | /dev*)
-                errors+=("refusing host kernel-interface mount \"$path\" (/proc, /sys and /dev are not mountable through this seam)")
-                ;;
-        esac
+
+        # Resolve the source path BEFORE the refusal patterns below, and check
+        # BOTH spellings against them.
+        #
+        # Matching the literal path string alone is not a boundary: docker
+        # resolves a bind mount's source on the executor host at run time, so
+        # `/srv/work/innocent.sock -> /var/run/docker.sock` would put the real
+        # socket inside the job container while sailing past a pattern list
+        # that only ever saw the link's own harmless name. An agent inside a
+        # worker container can create exactly that link inside any `rw` parity
+        # mount it already holds — i.e. precisely the adversary ADR-0017
+        # Decision 3 is about.
+        #
+        # A symlink is refused outright rather than silently rewritten: the
+        # seam's mount shape is ONE path, bound at the identical path inside
+        # the container (MOUNT-CONTRACT.md §1), so substituting the resolved
+        # path would quietly break the parity guarantee callers rely on. Pass
+        # the resolved path explicitly instead.
+        real="$(_rj_realpath "$path")"
+        [[ "$real" == "$path" ]] && real=""
+        if [[ -n "$real" ]]; then
+            errors+=("mount path \"$path\" is a symlink to \"$real\": the executor's docker daemon binds the RESOLVED path, so a link would break this seam's path-parity guarantee and could smuggle a refused path past the checks below — pass \"$real\" explicitly instead")
+        fi
+
+        for candidate in "$path" ${real:+"$real"}; do
+            case "$candidate" in
+                */docker.sock | */docker.sock/* | /var/run/docker* | /run/docker* | */containerd.sock | */podman.sock | */crio.sock)
+                    errors+=("refusing docker/container-runtime socket mount \"$candidate\": a mounted container-runtime socket is host-root-equivalent and is exactly what this seam exists to avoid (ADR-0017 Decision 3)")
+                    ;;
+                /proc* | /sys* | /dev*)
+                    errors+=("refusing host kernel-interface mount \"$candidate\" (/proc, /sys and /dev are not mountable through this seam)")
+                    ;;
+            esac
+        done
     done < <(jq -r '.mounts[]? | [.path // "", .mode // ""] | @tsv' <<<"$spec")
 
     while IFS= read -r v; do
@@ -293,15 +366,66 @@ loom_job_docker_argv() {
 _RJ_DETACHED=0
 _RJ_LOGS_PID=""
 _RJ_WAIT_PID=""
+_RJ_TIMEOUT_PID=""
 _RJ_JOB_ID=""
+
+# _rj_watchdog_sleep <seconds>
+#
+# Sleep for N seconds WITHOUT forking a `sleep(1)` child, so a watchdog
+# subshell that runs it can be killed cleanly and leaves NOTHING behind.
+#
+# Why this is not just `sleep N` (issue #7875): a watchdog written the obvious
+# way — `( sleep N; ...; ) &` — makes `sleep` a SEPARATE child of the subshell.
+# `kill`ing the subshell therefore orphans that sleep, and the orphan keeps
+# every descriptor it inherited open, including this executor's stderr.
+# `run-job.sh` captures the executor's stderr through a FIFO drained by `tee`,
+# so `tee` never reaches EOF and the CLIENT blocks for the whole remaining
+# sleep on a job that already finished. A file-backed transport hides this (a
+# held fd on a file blocks nobody); a real, pipe-backed ssh hop does not.
+#
+# `read -t` on a FIFO opened read-write (`<>`, so it never sees EOF) blocks
+# inside this very process: there is no child to orphan. `mkfifo` is coreutils,
+# same package as the `base64`/`mktemp` this executor already needs; if it is
+# somehow missing we fall back to plain `sleep` rather than failing the job.
+_rj_watchdog_sleep() {
+    local secs="$1" fifo=""
+    fifo="$(mktemp -u 2>/dev/null)" || fifo=""
+    if [[ -n "$fifo" ]] && mkfifo "$fifo" 2>/dev/null; then
+        exec 9<>"$fifo"
+        rm -f "$fifo"
+        read -r -t "$secs" -u 9 || true
+        exec 9>&-
+        return 0
+    fi
+    sleep "$secs"
+}
+
+# _rj_cancel_timeout
+#
+# Stop the job-timeout watchdog. Called on BOTH exits from a streamed job — the
+# normal one (the job finished before its timeout) and the detach path in
+# `_rj_on_signal` — because either way the watchdog is now pointless and, until
+# it is gone, it holds this executor's stderr open (see `_rj_watchdog_sleep`).
+_rj_cancel_timeout() {
+    [[ -n "$_RJ_TIMEOUT_PID" ]] && kill "$_RJ_TIMEOUT_PID" 2>/dev/null
+    _RJ_TIMEOUT_PID=""
+    return 0
+}
 
 _rj_on_signal() {
     _RJ_DETACHED=1
-    # Kill only OUR OWN observer processes (`docker logs -f`, `docker wait`).
-    # Restart safety: DO NOT stop, kill, or remove the container here. The job
-    # keeps running on the executor host; only this stream is going away.
+    # Kill only OUR OWN observer processes (`docker logs -f`, `docker wait`,
+    # the timeout watchdog). Restart safety: DO NOT stop, kill, or remove the
+    # container here. The job keeps running on the executor host; only this
+    # stream is going away.
     [[ -n "$_RJ_LOGS_PID" ]] && kill "$_RJ_LOGS_PID" 2>/dev/null
     [[ -n "$_RJ_WAIT_PID" ]] && kill "$_RJ_WAIT_PID" 2>/dev/null
+    _rj_cancel_timeout
+    # This marker reaching the REAL stderr is load-bearing: it is the only
+    # thing that tells `run-job.sh` "detached, the job is still running on the
+    # executor" rather than "the executor never spoke". See `_rj_docker_quiet`
+    # for why every quieted docker call runs in a subshell — without that, a
+    # signal landing mid-call would find fd 2 pointing at /dev/null here.
     printf '# LOOM_RUN_JOB_DETACHED id=%s reason=signal\n' "$_RJ_JOB_ID" >&2
     exit 75
 }
@@ -312,7 +436,7 @@ _rj_require() {
     command -v "${LOOM_RUN_JOB_DOCKER:-docker}" >/dev/null 2>&1 || missing+=("${LOOM_RUN_JOB_DOCKER:-docker}")
     if ((${#missing[@]} > 0)); then
         _rj_err "executor host is missing required command(s): ${missing[*]}"
-        _rj_err "the run-job executor needs: bash, docker (or LOOM_RUN_JOB_DOCKER), jq, base64"
+        _rj_err "the run-job executor needs: bash, docker (or LOOM_RUN_JOB_DOCKER), jq, coreutils (base64/mktemp/mkfifo/readlink)"
         return 78
     fi
     return 0
@@ -329,7 +453,7 @@ _rj_stream_and_wait() {
     local name
     name="$(loom_job_container_name "$id")"
 
-    if ! _rj_docker inspect "$name" >/dev/null 2>&1; then
+    if ! _rj_docker_quiet inspect "$name"; then
         _rj_err "no job container for id '$id' (already reaped, or never started)"
         return 69
     fi
@@ -355,9 +479,12 @@ _rj_stream_and_wait() {
     [[ "$code" =~ ^[0-9]+$ ]] || code=""
 
     # The follower exits on its own once the container exits; a watchdog keeps
-    # a wedged `docker logs -f` from hanging the executor forever.
+    # a wedged `docker logs -f` from hanging the executor forever. Its timer is
+    # fork-free on purpose — see `_rj_watchdog_sleep`: killing this subshell
+    # below must not leave an orphan holding the executor's stderr, or the
+    # client stalls for the remaining 10s on an already-finished job.
     (
-        sleep 10
+        _rj_watchdog_sleep 10
         kill "$_RJ_LOGS_PID" 2>/dev/null || true
     ) &
     local watchdog=$!
@@ -374,7 +501,7 @@ _rj_stream_and_wait() {
     # own exit status — as the authoritative job result, which is what makes
     # "the job exited 255" distinguishable from "ssh failed with 255".
     printf '# LOOM_RUN_JOB_EXIT id=%s code=%s\n' "$id" "$code" >&2
-    _rj_docker rm --force "$name" >/dev/null 2>&1 || true
+    _rj_docker_quiet rm --force "$name" || true
     return "$code"
 }
 
@@ -413,19 +540,19 @@ _rj_verb_run() {
         return 69
     fi
 
-    local timeout_pid=""
+    _RJ_TIMEOUT_PID=""
     if [[ "$timeout" =~ ^[0-9]+$ ]] && ((timeout > 0)); then
         (
-            sleep "$timeout"
+            _rj_watchdog_sleep "$timeout"
             printf '# LOOM_RUN_JOB_TIMEOUT id=%s after=%ss\n' "$_RJ_JOB_ID" "$timeout" >&2
-            _rj_docker stop --time "${LOOM_RUN_JOB_STOP_GRACE:-30}" "$(loom_job_container_name "$_RJ_JOB_ID")" >/dev/null 2>&1 || true
+            _rj_docker_quiet stop --time "${LOOM_RUN_JOB_STOP_GRACE:-30}" "$(loom_job_container_name "$_RJ_JOB_ID")" || true
         ) &
-        timeout_pid=$!
+        _RJ_TIMEOUT_PID=$!
     fi
 
     local rc=0
     _rj_stream_and_wait "$_RJ_JOB_ID" || rc=$?
-    [[ -n "$timeout_pid" ]] && kill "$timeout_pid" 2>/dev/null
+    _rj_cancel_timeout
     return "$rc"
 }
 
@@ -468,13 +595,13 @@ _rj_verb_cancel() {
     }
     local name
     name="$(loom_job_container_name "$id")"
-    if ! _rj_docker inspect "$name" >/dev/null 2>&1; then
+    if ! _rj_docker_quiet inspect "$name"; then
         _rj_err "cancel: no job container for id '$id'"
         return 69
     fi
     # GRACEFUL only: `docker stop` sends SIGTERM and waits out the grace period
     # before docker itself escalates. This executor never runs `docker kill`.
-    _rj_docker stop --time "${LOOM_RUN_JOB_STOP_GRACE:-30}" "$name" >/dev/null 2>&1 || true
+    _rj_docker_quiet stop --time "${LOOM_RUN_JOB_STOP_GRACE:-30}" "$name" || true
     printf '# LOOM_RUN_JOB_CANCELLED id=%s grace=%ss\n' "$id" "${LOOM_RUN_JOB_STOP_GRACE:-30}" >&2
     return 0
 }

@@ -99,6 +99,13 @@ echo "   seam:     $SEAM_DIR"
 # World-writable throughout: the client runs as the image's uid 1000 while the
 # host executor runs as the invoking user, and on a CI runner those differ.
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/loom-run-job-e2e.XXXXXX")"
+# Canonicalized on purpose: the seam refuses a symlinked mount source (it would
+# break the path-parity guarantee, and it is how a refused path could otherwise
+# be smuggled past validation — see §4). On a host where TMPDIR sits behind a
+# symlink (`/tmp -> /private/tmp` on macOS) an uncanonicalized scratch path
+# would be refused, so resolve it once here rather than shipping a test that
+# only passes on Linux runners.
+SCRATCH="$(cd "$SCRATCH" && pwd -P)"
 # Host-only, deliberately NOT mounted into any container: the docker shim the
 # executor calls lives here, so nothing that can reach a container runtime is
 # ever visible from inside the worker container.
@@ -220,7 +227,25 @@ serve() {
     local line
     while IFS= read -r line; do argv+=("$line"); done <"$req/argv"
 
-    bash "$req/program" ${argv[@]+"${argv[@]}"} >"$req/out" 2>"$req/err" &
+    # PIPE-backed stdio, deliberately — not a plain `>"$req/out"` redirect.
+    #
+    # A real ssh hop hands the executor PIPES for stdout/stderr, and a pipe is
+    # what makes a leaked background child on the executor observable: it holds
+    # the descriptor open, the reader never sees EOF, and the caller blocks.
+    # Redirecting straight to FILES made this suite blind to exactly that class
+    # of bug (#7875: an orphaned watchdog `sleep` stalled the client for the
+    # whole `--timeout`), because a held descriptor on a regular file blocks
+    # nobody. The relays below drain each pipe into the file the client polls
+    # for, and `rc` is published only after BOTH relays have seen EOF — so a
+    # descriptor leak now shows up here as it would over a real ssh hop.
+    rm -f "$req/out.pipe" "$req/err.pipe"
+    mkfifo "$req/out.pipe" "$req/err.pipe"
+    cat "$req/out.pipe" >"$req/out" &
+    local out_relay=$!
+    cat "$req/err.pipe" >"$req/err" &
+    local err_relay=$!
+
+    bash "$req/program" ${argv[@]+"${argv[@]}"} >"$req/out.pipe" 2>"$req/err.pipe" &
     local prog=$! hupped=0 now=0 seen=0
     while kill -0 "$prog" 2>/dev/null; do
         # Stand in for ssh's own connection-drop SIGHUP: if the client's
@@ -237,7 +262,13 @@ serve() {
         sleep 0.5
     done
     wait "$prog"
-    printf '%s\n' "$?" >"$req/rc.part"
+    local rc=$?
+    # EOF on both relays means nothing on the executor side still holds the
+    # stream open. Only then is the captured output complete and `rc` honest.
+    wait "$out_relay" 2>/dev/null || true
+    wait "$err_relay" 2>/dev/null || true
+    rm -f "$req/out.pipe" "$req/err.pipe"
+    printf '%s\n' "$rc" >"$req/rc.part"
     mv "$req/rc.part" "$req/rc" # atomic: the client polls for rc
 }
 
@@ -297,15 +328,26 @@ JOB_IDS+=("$JOB_OK")
 OUT_FILE="$SCRATCH/client-ok.out"
 ERR_FILE="$SCRATCH/client-ok.err"
 rc=0
+ok_start=$SECONDS
 "${DOCKER[@]}" "${CLIENT_ARGS[@]}" "$IMAGE" \
     "$RUN_JOB" --id "$JOB_OK" --image "$IMAGE" \
     --mount "$SCRATCH/work" --workdir "$SCRATCH/work" \
     --cpus 1 --memory 1g --timeout 300 \
     -- bash -lc "echo JOB_STDOUT_MARKER; echo JOB_STDERR_MARKER >&2; id -u > '$SCRATCH/work/artifact.txt'; exit 0" \
     >"$OUT_FILE" 2>"$ERR_FILE" || rc=$?
+ok_elapsed=$((SECONDS - ok_start))
 ok_out="$(cat "$OUT_FILE")"
 ok_err="$(cat "$ERR_FILE")"
 assert_eq "0" "$rc" "a successful job exits 0 through the seam"
+# The job above is instantaneous but carries `--timeout 300`. The client must
+# return when the JOB finishes, not when the timeout expires (#7875) — the
+# pipe-backed transport above is what makes a stranded watchdog visible here.
+if ((ok_elapsed < 120)); then
+    pass "the client returns when the job does (${ok_elapsed}s), not when its --timeout 300 does"
+else
+    fail "the client returns when the job does, not when its --timeout 300 does" \
+        "took ${ok_elapsed}s — the executor is stranding a watchdog on the stderr pipe"
+fi
 assert_contains "$ok_out" "JOB_STDOUT_MARKER" "the job's stdout reached the caller's stdout"
 assert_contains "$ok_err" "JOB_STDERR_MARKER" "the job's stderr reached the caller's stderr"
 assert_contains "$ok_err" "# LOOM_RUN_JOB_EXIT id=$JOB_OK code=0" "the authoritative exit sentinel came back"
@@ -348,6 +390,24 @@ assert_eq "78" "$rc" "a job requesting a docker-socket mount is rejected (EX_CON
 assert_contains "$evil_out" "host-root-equivalent" "the refusal cites the security rationale"
 created="$("${DOCKER[@]}" ps -a --filter "name=loom-job-$JOB_EVIL" --format '{{.Names}}' 2>/dev/null || true)"
 assert_eq "" "$created" "no container was created for the rejected job"
+
+# ...and the refusal cannot be walked around with a symlink (#7875). This is
+# the adversary ADR-0017 Decision 3 is actually about: an agent inside the
+# worker container plants the link in an rw parity mount it already holds, and
+# the link's own name matches no refusal pattern. Docker resolves a bind's
+# SOURCE on the executor host, so without resolution the real socket would land
+# in the job container.
+JOB_SYM="e2e-symlink-$$"
+JOB_IDS+=("$JOB_SYM")
+rc=0
+sym_out="$("${DOCKER[@]}" "${CLIENT_ARGS[@]}" "$IMAGE" bash -lc "
+  ln -sf /var/run/docker.sock '$SCRATCH/work/innocent.sock'
+  '$RUN_JOB' --id '$JOB_SYM' --image '$IMAGE' --mount '$SCRATCH/work/innocent.sock' -- true" 2>&1)" || rc=$?
+assert_eq "78" "$rc" "a symlink pointing at the docker socket is rejected too (EX_CONFIG)"
+assert_contains "$sym_out" "is a symlink to" "the symlink refusal names the real target it resolves to"
+created="$("${DOCKER[@]}" ps -a --filter "name=loom-job-$JOB_SYM" --format '{{.Names}}' 2>/dev/null || true)"
+assert_eq "" "$created" "no container was created for the smuggled socket mount"
+rm -f "$SCRATCH/work/innocent.sock" 2>/dev/null || true
 
 echo ""
 echo "-- 5. An unreachable executor is EX_UNAVAILABLE, never a fake job result --"

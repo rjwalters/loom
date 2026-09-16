@@ -108,6 +108,10 @@ case "$verb" in
     echo "${FAKE_JOB_EXIT:-0}"
     ;;
   inspect)
+    # Widens the window in which the executor is inside a `_rj_docker …`
+    # FUNCTION call that redirects the shell's own stderr, so a test can land a
+    # signal there deterministically (see section 9b).
+    sleep "${FAKE_DOCKER_INSPECT_SLEEP:-0}"
     fmt=""
     if [[ "${1:-}" == "--format" ]]; then fmt="$2"; shift 2; fi
     name="${1:-}"
@@ -175,7 +179,7 @@ reset_state() {
     : >"$FAKE_DOCKER_LOG"
     : >"$FAKE_SSH_LOG"
     unset FAKE_JOB_EXIT FAKE_JOB_STDOUT FAKE_JOB_STDERR FAKE_JOB_WAIT_SLEEP
-    unset FAKE_DOCKER_RUN_RC FAKE_DOCKER_INFO_RC FAKE_SSH_FAIL
+    unset FAKE_DOCKER_RUN_RC FAKE_DOCKER_INFO_RC FAKE_DOCKER_INSPECT_SLEEP FAKE_SSH_FAIL
 }
 
 echo ""
@@ -243,6 +247,46 @@ out="$("$RUN_JOB" --dry-run --image alpine --mount /run/podman/podman.sock -- tr
 assert_eq "78" "$?" "refuses a podman socket mount too"
 out="$("$RUN_JOB" --dry-run --image alpine --mount /proc -- true 2>&1)"
 assert_eq "78" "$?" "refuses a /proc mount"
+
+# ...AND the refusal cannot be walked around with a symlink whose own name is
+# innocent (#7875). Docker resolves a bind mount's SOURCE on the executor host
+# at run time, so matching the literal path string alone was never a boundary:
+# an agent inside a worker container can drop this link into any rw parity
+# mount it already holds and the real socket would land in the job container.
+SYMDIR="$TMP_ROOT/symlinks"
+mkdir -p "$SYMDIR"
+ln -sf /var/run/docker.sock "$SYMDIR/innocent.sock"
+out="$("$RUN_JOB" --dry-run --image alpine --mount "$SYMDIR/innocent.sock" -- true 2>&1)"
+assert_eq "78" "$?" "refuses a symlink that POINTS AT a docker socket, despite its innocent name"
+assert_contains "$out" "is a symlink to" "the symlink refusal names the real target"
+assert_contains "$out" "host-root-equivalent" "the resolved path is still matched against the socket refusal"
+argv="$("$RUN_JOB" --dry-run --image alpine --mount "$SYMDIR/innocent.sock" -- true 2>/dev/null || true)"
+assert_not_contains "$argv" "innocent.sock" "no docker argv is produced for the smuggled socket mount"
+
+# Parity, not just sockets: ANY symlinked mount source is refused, because the
+# executor would bind the resolved path while the spec promises the given one.
+mkdir -p "$SYMDIR/real-target"
+ln -sf "$SYMDIR/real-target" "$SYMDIR/link-to-dir"
+out="$("$RUN_JOB" --dry-run --image alpine --mount "$SYMDIR/link-to-dir" -- true 2>&1)"
+assert_eq "78" "$?" "refuses a symlinked mount source even when its target is harmless (path parity)"
+assert_contains "$out" "pass \"$SYMDIR/real-target\" explicitly instead" "the refusal tells the caller the resolvable fix"
+
+# A plain, real directory is of course still accepted — the check must not
+# turn every legitimate mount into a rejection.
+out="$("$RUN_JOB" --dry-run --image alpine --mount "$SYMDIR/real-target" -- true 2>&1)"
+assert_eq "0" "$?" "a real (non-symlinked) mount source is still accepted"
+
+# The executor re-checks on its OWN host, which is the only place resolution
+# means anything: a client that never resolved (or lied) is still refused.
+sym_evil="$(jq -nc --arg p "$SYMDIR/innocent.sock" \
+    '{schema:"loom.run-job/v1", id:"job-symevil", image:"alpine",
+      command:["true"], workdir:"", network:"none",
+      mounts:[{path:$p, mode:"rw"}],
+      env:{}, limits:{cpus:"",memory:""}, timeoutSeconds:0}')"
+out="$(bash "$EXEC_LIB" run "$(printf '%s' "$sym_evil" | base64 | tr -d '\n')" 2>&1)"
+assert_eq "78" "$?" "executor independently rejects a symlinked socket mount"
+assert_contains "$out" "host-root-equivalent" "executor-side symlink refusal cites the security rationale"
+assert_not_contains "$(cat "$FAKE_DOCKER_LOG")" "innocent.sock" "no docker run was issued for the smuggled socket mount"
 
 # The executor re-validates independently: a client that skips its own
 # pre-flight (or lies) still cannot talk the executor into a socket mount.
@@ -352,8 +396,12 @@ spec="$(jq -nc '{schema:"loom.run-job/v1", id:"job-drain", image:"alpine",
                  env:{}, limits:{cpus:"",memory:""}, timeoutSeconds:0}')"
 bash "$EXEC_LIB" run "$(printf '%s' "$spec" | base64 | tr -d '\n')" >/dev/null 2>"$errfile" &
 exec_pid=$!
-# Wait for the container to exist, then send the drain signal.
-for _ in $(seq 1 50); do
+# Wait for the container to exist, then send the drain signal. The budget is
+# deliberately generous (30s, not 5s): this suite runs inside run-ci-suites.sh's
+# parallel pool, and on a loaded host a 5s cap can expire before the executor
+# has even installed its trap — which lands the signal on bash's DEFAULT
+# handler and turns a real assertion into a 143-exit flake.
+for _ in $(seq 1 300); do
     [[ -f "$FAKE_DOCKER_STATE/loom-job-job-drain" ]] && break
     sleep 0.1
 done
@@ -371,6 +419,51 @@ if [[ -f "$FAKE_DOCKER_STATE/loom-job-job-drain" ]]; then
 else
     fail "the job container is still in flight after the drain" "container state file is gone"
 fi
+
+echo ""
+echo "=== 9b. The detach marker survives a signal that lands mid-redirection ==="
+# REGRESSION GUARD (#7875). `_rj_docker` is a shell FUNCTION, so
+# `_rj_docker inspect "$name" >/dev/null 2>&1` redirects THIS SHELL's fd 2 to
+# /dev/null for the duration of the call. A drain SIGTERM landing inside that
+# window used to run the trap with stderr still pointing at /dev/null, so
+# `# LOOM_RUN_JOB_DETACHED` was written and discarded — and with the executor's
+# own diagnostics suppressed by the same redirection, run-job.sh saw nothing at
+# all and reported "the executor is unreachable — the job did NOT run" (69) for
+# a job that was alive and well on the executor host.
+#
+# The fake docker's `inspect` sleeps here purely to make that window wide
+# enough to hit on purpose, instead of ~1-in-50 by luck.
+#
+# NOTE: deliberately no `reset_state` — section 10 reattaches to the container
+# section 9 left in flight, so the fake docker's state must survive. Only the
+# call log is cleared (its section 9 assertions have already run), and this
+# case uses its own job id.
+: >"$FAKE_DOCKER_LOG"
+export FAKE_JOB_EXIT=5
+export FAKE_JOB_WAIT_SLEEP=30
+export FAKE_DOCKER_INSPECT_SLEEP=4
+errfile="$TMP_ROOT/err.9b"
+spec="$(jq -nc '{schema:"loom.run-job/v1", id:"job-redir", image:"alpine",
+                 command:["sleep","300"], workdir:"", network:"none", mounts:[],
+                 env:{}, limits:{cpus:"",memory:""}, timeoutSeconds:0}')"
+bash "$EXEC_LIB" run "$(printf '%s' "$spec" | base64 | tr -d '\n')" >/dev/null 2>"$errfile" &
+exec_pid=$!
+# Wait for the container, then for the executor to be INSIDE the slow inspect.
+for _ in $(seq 1 300); do
+    [[ -f "$FAKE_DOCKER_STATE/loom-job-job-redir" ]] && break
+    sleep 0.1
+done
+for _ in $(seq 1 300); do
+    grep -q '^inspect ' "$FAKE_DOCKER_LOG" && break
+    sleep 0.1
+done
+sleep 0.5
+kill -TERM "$exec_pid" 2>/dev/null
+wait "$exec_pid"
+rc=$?
+assert_eq "75" "$rc" "a signal landing mid-redirection still detaches (EX_TEMPFAIL)"
+assert_contains "$(cat "$errfile")" "# LOOM_RUN_JOB_DETACHED id=job-redir" "the detach marker is NOT swallowed by a function-call redirection"
+unset FAKE_DOCKER_INSPECT_SLEEP FAKE_JOB_WAIT_SLEEP
 
 echo ""
 echo "=== 10. Reattach after a restart recovers logs AND the exit code ==="
@@ -478,6 +571,121 @@ while IFS= read -r f; do
     fi
 done < <(find "$SCRIPTS_DIR" -name '*.sh' -type f)
 assert_eq "" "$offenders" "no shipped script binds a container-runtime socket into a container"
+
+echo ""
+echo "=== 16. A nonzero --timeout never outlives the job it guards (#7875) ==="
+# REGRESSION GUARD, and the reason it lives here rather than in the E2E suite.
+#
+# The timeout watchdog used to be `( sleep N; ...; ) &`. `sleep` is a SEPARATE
+# child of that subshell, so killing the subshell on the normal path orphaned
+# it — and an orphaned `sleep` keeps every descriptor it inherited open,
+# including the EXECUTOR'S STDERR. run-job.sh drains that stderr through a FIFO
+# piped to `tee`, so `tee` never reached EOF and the client blocked for the
+# FULL timeout on a job that had already exited.
+#
+# Every transport exercised below is PIPE-backed, which is the whole point: a
+# file-backed transport stand-in cannot observe this class of bug at all (a
+# held descriptor on a regular file blocks nobody), which is exactly how a
+# 100%-green suite shipped a broken `--timeout`. `timeout 30` bounds a
+# regression to a fast failure instead of a 45s one.
+reset_state
+export FAKE_JOB_EXIT=0
+start=$SECONDS
+timeout 30 "$RUN_JOB" --executor local --id job-to-local --image alpine --timeout 45 -- true >/dev/null 2>&1
+rc=$?
+elapsed=$((SECONDS - start))
+assert_eq "0" "$rc" "local transport: a job carrying --timeout 45 still exits 0"
+if ((elapsed < 15)); then
+    pass "local transport: the client returns when the JOB does (${elapsed}s), not when the timeout does"
+else
+    fail "local transport: the client returns when the JOB does, not when the timeout does" \
+        "took ${elapsed}s with --timeout 45 — the watchdog is stranding a descriptor again"
+fi
+
+reset_state
+export FAKE_JOB_EXIT=0
+start=$SECONDS
+LOOM_JOB_EXECUTOR_HOST=to.example \
+    timeout 30 "$RUN_JOB" --executor ssh --id job-to-ssh --image alpine --timeout 40 -- true >/dev/null 2>&1
+rc=$?
+elapsed=$((SECONDS - start))
+assert_eq "0" "$rc" "ssh transport: a job carrying --timeout 40 still exits 0"
+if ((elapsed < 15)); then
+    pass "ssh transport: the client returns when the JOB does (${elapsed}s), not when the timeout does"
+else
+    fail "ssh transport: the client returns when the JOB does, not when the timeout does" \
+        "took ${elapsed}s with --timeout 40 — the watchdog is stranding a descriptor again"
+fi
+
+# The fix must not have simply disarmed the feature: a job that really does
+# outlive its timeout is still stopped, gracefully, and says so.
+reset_state
+export FAKE_JOB_EXIT=0
+export FAKE_JOB_WAIT_SLEEP=5
+errfile="$TMP_ROOT/err.16"
+timeout 40 "$RUN_JOB" --executor local --id job-to-fire --image alpine --timeout 1 -- true >/dev/null 2>"$errfile"
+assert_contains "$(cat "$errfile")" "# LOOM_RUN_JOB_TIMEOUT id=job-to-fire after=1s" "an expired timeout still fires and announces itself"
+assert_contains "$(cat "$FAKE_DOCKER_LOG")" "stop --time" "an expired timeout stops the job GRACEFULLY (never docker kill)"
+assert_not_contains "$(cat "$FAKE_DOCKER_LOG")" "kill loom-job-job-to-fire" "an expired timeout never SIGKILLs the job"
+unset FAKE_JOB_WAIT_SLEEP
+
+# The DETACH path must release the watchdog too: `_rj_on_signal` never touched
+# it, so detaching stranded a timer on the same pipe. `tee` below is the
+# client's own drain, so `wait`ing on it is precisely the client-side hang.
+reset_state
+export FAKE_JOB_EXIT=5
+export FAKE_JOB_WAIT_SLEEP=30
+dt_fifo="$TMP_ROOT/detach.fifo"
+dt_cap="$TMP_ROOT/detach.cap"
+rm -f "$dt_fifo"
+mkfifo "$dt_fifo"
+tee "$dt_cap" <"$dt_fifo" >/dev/null &
+dt_tee=$!
+spec="$(jq -nc '{schema:"loom.run-job/v1", id:"job-todetach", image:"alpine",
+                 command:["sleep","300"], workdir:"", network:"none", mounts:[],
+                 env:{}, limits:{cpus:"",memory:""}, timeoutSeconds:45}')"
+start=$SECONDS
+bash "$EXEC_LIB" run "$(printf '%s' "$spec" | base64 | tr -d '\n')" >/dev/null 2>"$dt_fifo" &
+exec_pid=$!
+for _ in $(seq 1 300); do
+    [[ -f "$FAKE_DOCKER_STATE/loom-job-job-todetach" ]] && break
+    sleep 0.1
+done
+kill -TERM "$exec_pid" 2>/dev/null
+wait "$exec_pid"
+rc=$?
+wait "$dt_tee" 2>/dev/null # EOF arrives only once NOTHING still holds the pipe
+elapsed=$((SECONDS - start))
+assert_eq "75" "$rc" "detaching from a job that carries a timeout still exits 75"
+if ((elapsed < 15)); then
+    pass "detaching releases the timeout watchdog too (pipe drained in ${elapsed}s, not 45s)"
+else
+    fail "detaching releases the timeout watchdog too" \
+        "the stderr pipe stayed open for ${elapsed}s after the detach — _rj_on_signal is stranding the watchdog"
+fi
+unset FAKE_JOB_WAIT_SLEEP
+
+echo ""
+echo "=== 17. A malformed invocation errors out; it never spins (#7875) ==="
+# `shift 2` with only one positional left does NOT shift — bash leaves the
+# positional parameters untouched and returns non-zero — so the parser's
+# `while [[ $# -gt 0 ]]` loop spun at 100% CPU forever on a trailing
+# value-taking flag. `set -e` is deliberately off in run-job.sh, so nothing
+# else caught it. For a CLI the daemon invokes programmatically, a silent spin
+# is a far worse failure shape than an error.
+reset_state
+for flag in --spec --image --mount --workdir --env --cpus --memory --network --timeout --id --executor; do
+    out="$(timeout 10 "$RUN_JOB" "$flag" 2>&1)"
+    rc=$?
+    assert_eq "78" "$rc" "'run-job.sh $flag' with no value exits 78 (it does not spin)"
+    assert_contains "$out" "'$flag' requires a value" "'$flag' with no value names the offending flag"
+done
+out="$(timeout 10 "$RUN_JOB" --nonesuch 2>&1)"
+assert_eq "78" "$?" "an unknown option still exits 78"
+assert_contains "$out" "unknown option" "an unknown option is named as such"
+out="$(timeout 10 "$RUN_JOB" attach 2>&1)"
+assert_eq "78" "$?" "'attach' with no job id exits 78 (it does not spin)"
+assert_contains "$out" "requires a job id" "'attach' with no id says a job id is required"
 
 echo ""
 echo "======================================"

@@ -112,11 +112,28 @@ container-runtime socket** (`docker.sock`, `containerd.sock`, `podman.sock`,
 the validator rejects the socket paths explicitly with the rationale in the
 message.
 
+**The refusal matches the *resolved* path, not just the spelling.** Docker
+resolves a bind mount's source on the executor host at run time, so a check
+against the literal string alone would not be a boundary at all: a symlink
+whose own name matches nothing —
+`/srv/work/innocent.sock -> /var/run/docker.sock` — would put the real socket
+inside the job container. An agent inside a worker container can create
+exactly that link in any `rw` parity mount it already holds. So the validator
+canonicalizes each mount source and **refuses any mount whose real path
+differs from the given path**, then matches both spellings against the
+refusal patterns above. A symlink is refused rather than silently rewritten
+because the seam's mount shape is one path bound at the identical path
+(MOUNT-CONTRACT.md §1) — substituting the target would quietly break the
+parity guarantee. Pass the resolved path explicitly instead; the error message
+names it.
+
 Validation runs **twice, from one implementation**: `run-job.sh` sources
 `loom_job_validate_spec` from the executor program for its client-side
 pre-flight, and the executor runs the same function again on its own host. A
 client that skips its pre-flight, or lies, still cannot talk an executor into
-a privileged container.
+a privileged container. The executor-side run is also the only one whose path
+resolution is meaningful — it is the host that will do the mounting — which is
+why the re-validation is load-bearing rather than merely belt-and-braces.
 
 ## Using it
 
@@ -189,7 +206,8 @@ because the same-host executor always exists).
 
 ### Executor host requirements
 
-`bash`, `docker` (or whatever `LOOM_RUN_JOB_DOCKER` names), `jq`, `base64`.
+`bash`, `docker` (or whatever `LOOM_RUN_JOB_DOCKER` names), `jq`, and the
+coreutils that ship as one package (`base64`, `mktemp`, `mkfifo`, `readlink`).
 **No Loom installation.** The ssh transport pipes the executor program itself
 to a remote `bash -s`, so the executor host never has to be provisioned with,
 or kept in sync with, a Loom checkout — the program that runs there is always
@@ -223,8 +241,13 @@ No sentinel and no word from the executor ⇒ transport failure ⇒ `69`, never 
 fabricated job result. A job that genuinely exits 255 reports 255.
 
 The other machine-readable markers, all on stderr:
-`# LOOM_RUN_JOB_START`, `# LOOM_RUN_JOB_STATUS`, `# LOOM_RUN_JOB_DETACHED`,
+`# LOOM_RUN_JOB_START`, `# LOOM_RUN_JOB_DETACHED`,
 `# LOOM_RUN_JOB_CANCELLED`, `# LOOM_RUN_JOB_TIMEOUT`.
+
+`# LOOM_RUN_JOB_STATUS` is the exception, and deliberately so: it is not a
+side-channel diagnostic accompanying a job's own streams — it *is* the entire
+output of the `status` verb, so it goes to **stdout** where a caller can read
+it with an ordinary command substitution.
 
 ## Restart safety (#5119 drain semantics)
 

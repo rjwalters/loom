@@ -32,7 +32,10 @@
 #   --mount <path>[:ro|:rw]  Mount an ABSOLUTE host path at the identical
 #                          absolute path inside the job container (path parity,
 #                          docker/worker/MOUNT-CONTRACT.md §1). Repeatable.
-#                          Default mode is rw.
+#                          Default mode is rw. A SYMLINKED source is refused
+#                          (it would break parity, and it is how a refused path
+#                          could otherwise be smuggled past validation) — pass
+#                          the resolved path instead.
 #   --workdir <abs-path>   Working directory inside the job container.
 #   --env KEY=VALUE        Environment variable for the job. Repeatable.
 #   --cpus <n>             Job CPU cap (`docker run --cpus`).
@@ -178,50 +181,76 @@ case "${1:-}" in
         ;;
 esac
 
+# _require_value <flag> <remaining-argc>
+#
+# Every branch below that consumes a value MUST call this first. `shift 2` with
+# only one positional left does NOT shift — bash leaves the parameters untouched
+# and returns non-zero — so `run-job.sh --image` (no value) would spin this
+# `while` loop at 100% CPU forever. `set -e` is deliberately off here, so
+# nothing else catches it. For a CLI that agents and the daemon invoke
+# programmatically, a silent spin is a far worse failure shape than an error.
+_require_value() {
+    if (($2 < 2)); then
+        log_error "run-job: '$1' requires a value"
+        exit 78
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --spec)
-            SPEC_FILE="${2:-}"
+            _require_value "$1" $#
+            SPEC_FILE="$2"
             shift 2
             ;;
         --image)
-            IMAGE="${2:-}"
+            _require_value "$1" $#
+            IMAGE="$2"
             shift 2
             ;;
         --mount)
-            MOUNTS+=("${2:-}")
+            _require_value "$1" $#
+            MOUNTS+=("$2")
             shift 2
             ;;
         --workdir)
-            WORKDIR="${2:-}"
+            _require_value "$1" $#
+            WORKDIR="$2"
             shift 2
             ;;
         --env)
-            ENVS+=("${2:-}")
+            _require_value "$1" $#
+            ENVS+=("$2")
             shift 2
             ;;
         --cpus)
-            CPUS="${2:-}"
+            _require_value "$1" $#
+            CPUS="$2"
             shift 2
             ;;
         --memory)
-            MEMORY="${2:-}"
+            _require_value "$1" $#
+            MEMORY="$2"
             shift 2
             ;;
         --network)
-            NETWORK="${2:-}"
+            _require_value "$1" $#
+            NETWORK="$2"
             shift 2
             ;;
         --timeout)
-            TIMEOUT="${2:-}"
+            _require_value "$1" $#
+            TIMEOUT="$2"
             shift 2
             ;;
         --id)
-            JOB_ID="${2:-}"
+            _require_value "$1" $#
+            JOB_ID="$2"
             shift 2
             ;;
         --executor)
-            EXECUTOR_MODE="${2:-}"
+            _require_value "$1" $#
+            EXECUTOR_MODE="$2"
             shift 2
             ;;
         --print-spec)
@@ -481,8 +510,8 @@ else
     fi
 
     # The executor program travels on stdin to `bash -s`, so the executor host
-    # needs no Loom installation at all — bash, docker, jq and base64 are the
-    # whole remote dependency list.
+    # needs no Loom installation at all — bash, docker, jq and coreutils
+    # (base64, mktemp, mkfifo, readlink) are the whole remote dependency list.
     TRANSPORT=("$SSH_CMD" ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$SSH_TARGET" bash -s --)
     TRANSPORT_STDIN="$EXEC_LIB"
 fi
@@ -557,6 +586,6 @@ fi
 log_error "run-job: executor ${EXECUTOR_LABEL} is unreachable (transport exit ${RC}, no job result received)."
 log_error "run-job: the job did NOT run — this is a transport failure, not a job exit code."
 if [[ "$EXECUTOR_MODE" == "ssh" ]]; then
-    log_error "run-job: check ssh reachability of ${EXEC_HOST}, and that it has bash + docker + jq + base64."
+    log_error "run-job: check ssh reachability of ${EXEC_HOST}, and that it has bash + docker + jq + coreutils."
 fi
 exit 69 # EX_UNAVAILABLE
