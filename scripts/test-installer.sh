@@ -2426,10 +2426,10 @@ echo ""
 
 # Test 62: ./scripts/version.sh list emits the expected version-bearing files
 #
-# The base set is the 6 always-present files -- "VERSION" (issue #5517, the
+# The base set is the 5 always-present files -- "VERSION" (issue #5517, the
 # root plain-text file required by the tool-package installer contract's C8
 # "Honest source version") joined the original 5 alongside CLAUDE.md.
-# `.loom/install-metadata.json` is a conditional 7th entry (#4842): it exists
+# `.loom/install-metadata.json` is a conditional 6th entry (#4842): it exists
 # only on a dogfooded install (loom installed on its own repo — which IS the
 # case for this repo's own CI run), and version.sh's `list` arm
 # existence-checks it before emitting. Mirror that same presence check here
@@ -2439,8 +2439,7 @@ echo "Test 62: 'scripts/version.sh list' emits the version-bearing files"
 LIST_OUTPUT="$("$LOOM_ROOT/scripts/version.sh" list)"
 EXPECTED_LIST="package.json
 mcp-loom/package.json
-loom-daemon/Cargo.toml
-loom-api/Cargo.toml
+Cargo.toml
 CLAUDE.md
 VERSION"
 if [[ -f "$LOOM_ROOT/.loom/install-metadata.json" ]]; then
@@ -2502,19 +2501,12 @@ EOF
 }
 EOF
 
-  cat > "$dir/loom-daemon/Cargo.toml" <<EOF
-[package]
-name = "loom-daemon"
-version = "$version"
-edition = "2021"
-EOF
-
-  cat > "$dir/loom-api/Cargo.toml" <<EOF
-[package]
-name = "loom-api"
-version = "$version"
-edition = "2021"
-EOF
+  # Root manifest: since #7780 members inherit [workspace.package] version, so
+  # version.sh edits THIS file and the fixture must provide it (#7794-adjacent:
+  # without it, version.sh's awk pass fails "can't open file .../Cargo.toml").
+  printf '[workspace]\nmembers = ["loom-daemon", "loom-api"]\nresolver = "2"\n\n[workspace.package]\nversion = "%s"\nedition = "2021"\n' "$version" > "$dir/Cargo.toml"
+  printf '[package]\nname = "loom-daemon"\nversion.workspace = true\nedition.workspace = true\n' > "$dir/loom-daemon/Cargo.toml"
+  printf '[package]\nname = "loom-api"\nversion.workspace = true\nedition.workspace = true\n' > "$dir/loom-api/Cargo.toml"
 
   cat > "$dir/CLAUDE.md" <<EOF
 # Scratch

@@ -27,8 +27,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION_FILES=(
   "package.json"
   "mcp-loom/package.json"
-  "loom-daemon/Cargo.toml"
-  "loom-api/Cargo.toml"
+  "Cargo.toml"
   "CLAUDE.md"
   "VERSION"
 )
@@ -180,14 +179,18 @@ set_version() {
     echo "  Updated $file"
   done
 
-  # Cargo.toml files - sed the version line in [package] section
+  # Workspace root Cargo.toml - the single crate version (#7780). Both
+  # members carry `version.workspace = true` and inherit it, so this one
+  # edit covers loom-daemon and loom-api.
+  #
   # Uses awk instead of sed to reliably replace only the first 'version =' line
-  # (BSD sed on macOS doesn't support GNU sed's 0,/pattern/ address)
-  for file in loom-daemon/Cargo.toml loom-api/Cargo.toml; do
-    awk -v ver="$new_version" '!done && /^version = "/ { print "version = \"" ver "\""; done=1; next } 1' \
-      "$REPO_ROOT/$file" > "$REPO_ROOT/$file.tmp" && mv "$REPO_ROOT/$file.tmp" "$REPO_ROOT/$file"
-    echo "  Updated $file"
-  done
+  # (BSD sed on macOS doesn't support GNU sed's 0,/pattern/ address). The first
+  # such line is [workspace.package]'s: entries under [workspace.dependencies]
+  # are `name = { version = "..." }`, which does not match the `^version = "`
+  # anchor.
+  awk -v ver="$new_version" '!done && /^version = "/ { print "version = \"" ver "\""; done=1; next } 1' \
+    "$REPO_ROOT/Cargo.toml" > "$REPO_ROOT/Cargo.toml.tmp" && mv "$REPO_ROOT/Cargo.toml.tmp" "$REPO_ROOT/Cargo.toml"
+  echo "  Updated Cargo.toml"
 
   # CLAUDE.md — portable in-place edit via temp file + mv (matches the
   # Cargo.toml idiom above; avoids BSD vs GNU `sed -i` divergence).
@@ -242,7 +245,7 @@ do_tag() {
   (
     cd "$REPO_ROOT"
     git add package.json mcp-loom/package.json mcp-loom/package-lock.json \
-           loom-daemon/Cargo.toml loom-api/Cargo.toml \
+           Cargo.toml \
            CLAUDE.md VERSION Cargo.lock
     [ -f "CHANGELOG.md" ] && git add CHANGELOG.md
     [ -f ".loom/install-metadata.json" ] && git add .loom/install-metadata.json
