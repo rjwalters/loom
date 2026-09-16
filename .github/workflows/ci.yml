@@ -282,6 +282,22 @@ jobs:
       - name: Check file size budget
         run: bash scripts/check-file-size-budget.sh
 
+  markdown-token-budget:
+    name: Markdown Token Ratchet
+    # Same ratchet as File Size Ratchet above, applied to agent-facing
+    # markdown (role prompts + slash-command bodies) instead of source files,
+    # measured in a byte-count token proxy rather than code lines (#7725,
+    # #7716). This content is prepended into an agent's context on every
+    # invocation, the same load-bearing category check-claude-md-budget.sh
+    # guards for CLAUDE.md — see .loom/docs/file-size-policy.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Self-test the ratchet
+        run: bash scripts/check-markdown-token-budget.sh --self-test
+      - name: Check markdown token budget
+        run: bash scripts/check-markdown-token-budget.sh
+
   conflict-markers:
     name: Conflict Marker Check
     # Cheap structural check; always runs, on every path group. #6499: an
