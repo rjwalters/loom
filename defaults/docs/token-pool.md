@@ -681,6 +681,21 @@ is visible on `kicad-tools#5333` — 287 recorded label events (142 `loom:issue`
 over ~16 h, every one of them authored by `loom-fleet-dispatch[bot]`. The same
 pattern ran **94** flips deep on `rjwalters/loom#7815`.
 
+**Which executable this was, and why that matters.** Every token-selection
+death in the 2026-09-16 window logs its own deciding binary (#4643), so the
+incident binds to specific revisions rather than to whatever `origin/main`
+happened to say afterwards: `0.19.60` (`6c608ee`) for the bulk, plus
+`ebcb66d`, `8de4d92`, `084b9b6` and `f2614fb` (`0.19.68`) as the host rolled
+through the day. All post-date **#4444** (park guard, 2026-07-29) and
+**#6917** (noop-cooldown guard, 2026-08-25) — so both guards were compiled
+into the running code, and "a guard was missing from the deployment" is
+excluded as an explanation. The mutations themselves are daemon claim/release,
+not a direct wrapper or agent edit: on `#7815` all 89 `loom:issue` ↔
+`loom:building` events are authored by `loom-fleet-dispatch[bot]`, and the
+`loom:blocked` event count is **zero**. The admission decision that let each
+one through is `work_finder.rs`'s `preflight_dispatch_gate` returning `Open`,
+which is exactly what an unarmed streak produces.
+
 The cause was a text collision, not a missing guard. When `spawn-claude.sh`'s
 token-selection step finds an unusable pool it prints a diagnostic listing
 **every pooled account together with that account's stored `.bad_tokens`
@@ -750,7 +765,7 @@ The code agrees, and is the part that generalizes past this one incident:
   A claim *cannot* remove a park. Even the fail-open park-probe path — where
   #4444 is structurally blind — yields a visible dual
   `loom:blocked` + `loom:building` state, never a silent unpark. Pinned by
-  `dispatch/park_survival_tests.rs`.
+  `sweep_registry/guards_union_tests.rs`.
 - The daemon's one and only `loom:blocked` → `loom:issue` transition is the
   startup pass in `quarantine_reconciliation.rs`, and `decide` short-circuits
   to `Keep` unless the issue carries the daemon's own
