@@ -2501,18 +2501,32 @@ EOF
 }
 EOF
 
+  # Root workspace manifest. Since #7780 the members inherit their version from
+  # [workspace.package] rather than each hardcoding it, so version.sh edits THIS
+  # file and the fixture must provide it — without it, version.sh's awk pass
+  # fails with "can't open file .../Cargo.toml" and the bump exits non-zero.
+  cat > "$dir/Cargo.toml" <<EOF
+[workspace]
+members = ["loom-daemon", "loom-api"]
+resolver = "2"
+
+[workspace.package]
+version = "$version"
+edition = "2021"
+EOF
+
   cat > "$dir/loom-daemon/Cargo.toml" <<EOF
 [package]
 name = "loom-daemon"
-version = "$version"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 EOF
 
   cat > "$dir/loom-api/Cargo.toml" <<EOF
 [package]
 name = "loom-api"
-version = "$version"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 EOF
 
   cat > "$dir/CLAUDE.md" <<EOF
