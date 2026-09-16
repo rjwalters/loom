@@ -40,6 +40,7 @@ struct Recorder {
     calls: Vec<String>,
     fail_label: Option<String>,
     fail_comment: bool,
+    fail_body: bool,
 }
 
 impl Writer for Recorder {
@@ -55,6 +56,13 @@ impl Writer for Recorder {
             .push(format!("comment {}", body.lines().next().unwrap_or("")));
         if self.fail_comment {
             return refused("simulated comment failure");
+        }
+        ok()
+    }
+    fn edit_body(&mut self, _body: &str) -> CmdOutcome {
+        self.calls.push("edit-body".to_string());
+        if self.fail_body {
+            return refused("simulated body failure");
         }
         ok()
     }
@@ -203,4 +211,161 @@ fn both_bodies_say_a_human_can_re_park_the_proposal() {
             "the body must tell an operator how to re-park it: {body}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The fact path (#7650)
+// ---------------------------------------------------------------------------
+
+const OPERATOR_DECISION: &str = "loom:operator-decision";
+const REVISION_MARKER: &str = "<!-- curator:fact-revision:fact-abc -->";
+
+fn fact_labels() -> FactLabels<'static> {
+    FactLabels {
+        operator_only: OPERATOR_ONLY,
+        operator_decision: OPERATOR_DECISION,
+    }
+}
+
+fn apply_fact(w: &mut Recorder, current_body: &str) -> Result<(), ApplyError> {
+    apply_fact_unescalation(
+        w,
+        &fact_labels(),
+        current_body,
+        "revised body",
+        REVISION_MARKER,
+        "comment body",
+    )
+}
+
+#[test]
+fn the_fact_path_writes_body_then_label_then_comment() {
+    let mut w = Recorder::default();
+    apply_fact(&mut w, "original body").unwrap();
+    assert_eq!(
+        w.calls,
+        vec![
+            "edit-body".to_string(),
+            format!("remove-label {OPERATOR_ONLY}"),
+            format!("remove-label {OPERATOR_DECISION}"),
+            "comment comment body".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_failed_body_edit_changes_no_label_and_posts_no_comment() {
+    // The retryable direction: a later re-scan finds the body unrevised and
+    // starts the whole sequence over.
+    let mut w = Recorder {
+        fail_body: true,
+        ..Default::default()
+    };
+    let err = apply_fact(&mut w, "original body").unwrap_err();
+    assert!(matches!(err, ApplyError::BodyEdit(_)), "got {err:?}");
+    assert_eq!(w.calls, vec!["edit-body".to_string()]);
+}
+
+#[test]
+fn a_retry_after_a_failed_label_removal_does_not_append_the_section_twice() {
+    // The reason the body edit is guarded on the marker rather than on a
+    // "did we already run" flag: the retry re-reads an ALREADY-revised body.
+    let mut first = Recorder {
+        fail_label: Some(OPERATOR_ONLY.to_string()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        apply_fact(&mut first, "original body").unwrap_err(),
+        ApplyError::LabelRemoval(_)
+    ));
+    assert!(first.calls.contains(&"edit-body".to_string()));
+
+    // The retry sees the marker the first attempt left in the body.
+    let mut retry = Recorder::default();
+    apply_fact(&mut retry, &format!("original body\n{REVISION_MARKER}")).unwrap();
+    assert!(
+        !retry.calls.contains(&"edit-body".to_string()),
+        "the revision section must not be appended a second time: {:?}",
+        retry.calls
+    );
+    assert!(retry.calls.iter().any(|c| c.starts_with("comment")));
+}
+
+#[test]
+fn the_fact_path_drops_operator_decision_not_operator_blocked() {
+    // The two mechanisms park proposals under DIFFERENT sub-kind labels.
+    // Removing the wrong one fails silently — removing an absent label
+    // succeeds — so this asserts the name, not just that two removals happened.
+    let mut w = Recorder::default();
+    apply_fact(&mut w, "body").unwrap();
+    assert!(w
+        .calls
+        .contains(&format!("remove-label {OPERATOR_DECISION}")));
+    assert!(
+        !w.calls
+            .contains(&format!("remove-label {OPERATOR_BLOCKED}")),
+        "{:?}",
+        w.calls
+    );
+}
+
+#[test]
+fn the_fact_sub_label_removal_is_best_effort() {
+    let mut w = Recorder {
+        fail_label: Some(OPERATOR_DECISION.to_string()),
+        ..Default::default()
+    };
+    assert!(apply_fact(&mut w, "body").is_ok(), "{:?}", w.calls);
+}
+
+// ---------------------------------------------------------------------------
+// Fact bodies
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_resolutions_summary_strips_the_tag_only_at_line_start() {
+    let out = resolutions_summary("RESOLVED: first\nprose mentioning RESOLVED: mid-line\n");
+    assert_eq!(out, "- first\nprose mentioning RESOLVED: mid-line");
+}
+
+#[test]
+fn the_revision_section_names_the_verifying_commit_and_ends_with_its_marker() {
+    let out = fact_revised_body(
+        "Original body.",
+        "2026-09-16",
+        "abc1234",
+        "- first\n- second",
+        REVISION_MARKER,
+    );
+    assert!(out.starts_with("Original body.\n\n## Revision (2026-09-16)\n"), "{out}");
+    assert!(out.contains("`abc1234`"), "{out}");
+    assert!(out.contains("- first\n- second"), "{out}");
+    assert!(
+        out.ends_with(REVISION_MARKER),
+        "no trailing newline, matching the shell's strip: {out:?}"
+    );
+}
+
+#[test]
+fn the_revision_section_preserves_the_body_it_appends_to() {
+    // Appending is the whole mechanism — this edit REPLACES the issue body, so
+    // dropping any of the original would destroy the proposal.
+    let original = "## Proposal\n\nSome detail.\n\n- a bullet\n";
+    let out = fact_revised_body(original, "2026-09-16", "abc", "- r", REVISION_MARKER);
+    assert!(out.starts_with(original), "{out:?}");
+}
+
+#[test]
+fn the_fact_comment_names_both_labels_and_ends_with_its_marker() {
+    let out = fact_comment_body(
+        OPERATOR_ONLY,
+        OPERATOR_DECISION,
+        "abc1234",
+        "- first",
+        "<!-- m:fact-abc -->",
+    );
+    assert!(out.contains(OPERATOR_ONLY) && out.contains(OPERATOR_DECISION), "{out}");
+    assert!(out.contains("`abc1234`"), "{out}");
+    assert!(out.contains("re-add the label"), "the escape hatch: {out}");
+    assert!(out.ends_with("<!-- m:fact-abc -->"), "{out:?}");
 }

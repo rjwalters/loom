@@ -95,103 +95,21 @@ fn issue_7877_the_window_is_too_narrow_current_behaviour_is_wrong() {
 }
 
 // ---------------------------------------------------------------------------
-// Differential tests against the shell original
+// The differential tests that used to live here (epic #7810, PR 3)
 // ---------------------------------------------------------------------------
-
-fn shell_script() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("defaults/scripts/classify-dependency-block.sh")
-}
-
-/// Call the shell's `is_dependency_finding` directly by sourcing the script.
-fn shell_is_dependency_finding(bullet: &str) -> bool {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("loom-finding-diff-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("tmp dir");
-    let bullet_file = dir.join("bullet.txt");
-    std::fs::write(&bullet_file, bullet).expect("write bullet");
-
-    let driver = format!(
-        r#"set -uo pipefail
-source "{script}" --help >/dev/null 2>&1 || true
-bullet="$(cat "{bullet_file}")"
-if is_dependency_finding "$bullet"; then echo YES; else echo NO; fi
-"#,
-        script = shell_script().display(),
-        bullet_file = bullet_file.display(),
-    );
-    let driver_path = dir.join("driver.sh");
-    std::fs::write(&driver_path, driver).expect("write driver");
-
-    let out = std::process::Command::new("bash")
-        .arg(&driver_path)
-        .output()
-        .expect("the shell implementation must be runnable");
-    let _ = std::fs::remove_dir_all(&dir);
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    match stdout.trim() {
-        "YES" => true,
-        "NO" => false,
-        other => panic!("unrecognised answer from the shell predicate: {other:?}"),
-    }
-}
-
-#[test]
-fn the_shell_predicate_is_reachable() {
-    // Anti-vacuity guard, asserting BOTH answers: a driver that always printed
-    // NO would otherwise satisfy most of the corpus below by accident.
-    assert!(
-        shell_is_dependency_finding("Blocked by #3"),
-        "the shell predicate did not return its known-good YES; \
-         every differential assertion below would be unreliable"
-    );
-    assert!(
-        !shell_is_dependency_finding("nothing relevant here"),
-        "the shell predicate did not return its known-good NO"
-    );
-}
-
-#[test]
-fn rust_and_shell_agree_on_dependency_classification() {
-    let corpus: &[(&str, &str)] = &[
-        ("immediate phrase+ref", "Blocked by #3"),
-        ("bullet form", "- Depends on acme/widgets#7"),
-        ("lead window", "#3 is blocking this work"),
-        ("lead window qualified", "acme/w#12 blocks the rollout"),
-        ("phrase, no ref", "Blocked by a pending design decision"),
-        ("ref, no phrase", "See #3 for background"),
-        ("upper case phrase", "BLOCKED BY #3"),
-        ("url issue", "Blocked by https://github.com/acme/widgets/issues/42"),
-        ("url pull", "Requires https://github.com/acme/widgets/pull/9"),
-        ("waiting on", "Waiting on #11 before this can start"),
-        ("cannot start until", "cannot start until #12 lands"),
-        ("must wait for", "must wait for #13"),
-        ("dependency on", "has a dependency on #14"),
-        (
-            "#7756 far co-occurrence",
-            "#7430 (which was a prerequisite for any meaningful soak) merged only minutes \
-             before this evaluation, so no soak observation window has started yet and the \
-             result is therefore not yet observable",
-        ),
-        (
-            "#7877 far ref after phrase",
-            "**Technical feasibility**: this issue's own Dependencies section states it is \
-             \"Blocked by the sibling Phase 4 issue (run-job seam contract + host executor)\" \
-             — that issue is #7853, which is currently OPEN",
-        ),
-        ("empty", ""),
-        ("just prose", "The approach is wrong on the merits"),
-    ];
-
-    for (name, bullet) in corpus {
-        let shell = shell_is_dependency_finding(bullet);
-        let rust = is_dependency_finding(bullet);
-        assert_eq!(
-            rust, shell,
-            "port diverges from the shell on {name:?}\n  rust:  {rust}\n  shell: {shell}"
-        );
-    }
-}
+//
+// This port was not translated on trust. Each function above landed in #7943
+// beside a DIFFERENTIAL test that ran it and the shell original over the same
+// fixture corpus and asserted they agreed, character for character, with an
+// anti-vacuity guard so a shell that silently produced nothing could not pass.
+//
+// Those tests are removed here with the shell they compared against: a
+// comparison needs both sides, and keeping a copy of the retired
+// implementation purely to compare with would be keeping the thing this epic
+// retires. The evidence is the merged CI run on #7943, not a fixture that
+// pins a deleted file forever.
+//
+// What still runs both ways is the black-box suite
+// `defaults/scripts/tests/test-classify-dependency-block.sh`, whose assertions
+// were written against the shell and now drive this implementation unchanged
+// through the same CLI.

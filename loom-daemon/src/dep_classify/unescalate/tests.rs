@@ -38,7 +38,8 @@ fn an_unparked_issue_is_not_unescalated() {
     assert_eq!(
         decide_it(&i),
         Decision::NoUnescalate {
-            reason: "not-operator-only"
+            reason: "not-operator-only",
+            still_open: Vec::new(),
         }
     );
 }
@@ -52,7 +53,8 @@ fn a_cycle_escalation_is_never_undone_by_this_path() {
     assert_eq!(
         decide_it(&i),
         Decision::NoUnescalate {
-            reason: "cycle-escalation"
+            reason: "cycle-escalation",
+            still_open: Vec::new(),
         }
     );
 }
@@ -64,7 +66,8 @@ fn a_missing_escalation_record_stops_it() {
     assert_eq!(
         decide_it(&i),
         Decision::NoUnescalate {
-            reason: "no-escalation-record"
+            reason: "no-escalation-record",
+            still_open: Vec::new(),
         }
     );
 }
@@ -76,7 +79,8 @@ fn a_merits_escalation_is_never_undone() {
     assert_eq!(
         decide_it(&i),
         Decision::NoUnescalate {
-            reason: "merits-finding"
+            reason: "merits-finding",
+            still_open: Vec::new(),
         }
     );
 }
@@ -89,7 +93,8 @@ fn an_unreadable_blocker_refuses_to_unescalate() {
     assert_eq!(
         decide_it(&i),
         Decision::NoUnescalate {
-            reason: "unreadable-blocker"
+            reason: "unreadable-blocker",
+            still_open: Vec::new(),
         },
         "releasing a human-parked proposal on blockers nobody could read is the \
          direction that does not recover"
@@ -104,7 +109,8 @@ fn an_unreadable_blocker_refuses_even_when_others_have_cleared() {
     assert_eq!(
         decide_it(&i),
         Decision::NoUnescalate {
-            reason: "unreadable-blocker"
+            reason: "unreadable-blocker",
+            still_open: Vec::new(),
         },
         "a partially-readable set must not be treated as cleared"
     );
@@ -133,7 +139,10 @@ fn a_still_open_blocker_with_no_subset_stops_it() {
     assert_eq!(
         decide_it(&i),
         Decision::NoUnescalate {
-            reason: "blocker-still-open"
+            reason: "blocker-still-open",
+            // Named, not empty: this refusal is reached only after the blocker
+            // was classified, and the shell reports it on the way past.
+            still_open: vec!["o/r#3".to_string()],
         }
     );
 }
@@ -202,7 +211,8 @@ fn an_existing_marker_short_circuits_the_second_attempt() {
     assert_eq!(
         decide_it(&i),
         Decision::NoUnescalate {
-            reason: "already-unescalated"
+            reason: "already-unescalated",
+            still_open: Vec::new(),
         }
     );
 }
@@ -275,9 +285,64 @@ fn a_refusal_exits_one() {
     let (out, code) = render(
         &Decision::NoUnescalate {
             reason: "blocker-still-open",
+            still_open: Vec::new(),
         },
         &[],
     );
     assert_eq!(out, "NO_UNESCALATE\nREASON: blocker-still-open\n");
     assert_eq!(code, 1);
+}
+
+#[test]
+fn a_refusal_that_found_open_blockers_still_reports_them() {
+    // The shell prints STILL_OPEN as soon as it classifies an open blocker —
+    // before it knows whether the verdict will be a refusal or a release. A
+    // caller told only "blocker-still-open" would have to re-read the issue to
+    // learn WHICH blocker.
+    let (out, code) = render(
+        &Decision::NoUnescalate {
+            reason: "blocker-still-open",
+            still_open: vec!["o/r#3".into(), "o/r#4".into()],
+        },
+        &[],
+    );
+    assert_eq!(out, "STILL_OPEN: o/r#3 o/r#4\nNO_UNESCALATE\nREASON: blocker-still-open\n");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn an_already_unescalated_subset_still_reports_what_is_open() {
+    // The second refusal reachable past classification. It and the
+    // cleared-path `already-unescalated` share a reason string but not a
+    // position, which is exactly why the open set rides on the decision.
+    let mut i = parked();
+    i.refs.open = vec!["o/r#3".into()];
+    i.body = "## Startable subset\n- work\n".into();
+    let Decision::Subset {
+        blocker_fingerprint: fp,
+        ..
+    } = decide_it(&i)
+    else {
+        panic!("expected a carve-out");
+    };
+    i.comments = format!("{UNESC_PREFIX}{fp} -->");
+    assert_eq!(
+        decide_it(&i),
+        Decision::NoUnescalate {
+            reason: "already-unescalated",
+            still_open: vec!["o/r#3".to_string()],
+        }
+    );
+}
+
+#[test]
+fn a_refusal_reached_before_classification_reports_nothing_open() {
+    // The other direction: `not-operator-only` is decided before any blocker is
+    // looked at, so claiming an open set there would be an invention.
+    let mut i = parked();
+    i.labels.clear();
+    let Decision::NoUnescalate { still_open, .. } = decide_it(&i) else {
+        panic!("expected a refusal");
+    };
+    assert!(still_open.is_empty());
 }

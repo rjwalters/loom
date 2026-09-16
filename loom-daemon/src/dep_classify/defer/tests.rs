@@ -270,3 +270,88 @@ fn a_subset_without_a_trailing_newline_still_renders_one() {
     );
     assert!(out.ends_with("- work\n"), "got {out:?}");
 }
+
+// ---------------------------------------------------------------------------
+// premise-false (#7904)
+// ---------------------------------------------------------------------------
+
+/// The motivating case: #7657's close gate requires that a MIXED set still
+/// defers through this gate rather than falling through to escalation.
+#[test]
+fn a_premise_false_bullet_does_not_disqualify_an_otherwise_deferrable_set() {
+    let i = with_open(
+        inputs(
+            "**Champion Review: NEEDS REVISION**\n\n\
+             - [premise-false] Criterion 8: the cited path is not on `origin/main`.\n\
+             - Technical Feasibility: depends on #3, still open.\n",
+            "A proposal. Blocked by #3.",
+        ),
+        &["o/r#3"],
+    );
+    assert!(
+        matches!(decide(&i, REPO, SELF), Decision::Defer { .. }),
+        "a premise-false bullet is not dependency-shaped, but it must not make \
+         the whole set read as a merits objection"
+    );
+}
+
+#[test]
+fn an_all_premise_false_set_gets_its_own_reason_not_merits_finding() {
+    // The distinction is what the caller routes on: `merits-finding` means
+    // escalate, `premise-false-only` means run the close gate against the
+    // full, unfiltered set.
+    let i = inputs(
+        "**Champion Review: NEEDS REVISION**\n\n\
+         - [premise-false] Criterion 6: the cited test file does not exist.\n\
+         - [premise-false] Criterion 8: the cited line range does not exist.\n",
+        "A proposal.",
+    );
+    assert_eq!(
+        decide(&i, REPO, SELF),
+        Decision::NoDefer {
+            reason: "premise-false-only"
+        }
+    );
+}
+
+#[test]
+fn a_real_merits_finding_is_never_masked_by_a_co_occurring_premise_false_one() {
+    // The regression guard. Stripping first must not swallow a genuine merits
+    // objection into `premise-false-only`, which would close a proposal a human
+    // rejected on substance.
+    let i = inputs(
+        "**Champion Review: NEEDS REVISION**\n\n\
+         - [premise-false] Criterion 8: the cited path does not exist.\n\
+         - Scope Appropriateness: this is three issues in one.\n",
+        "A proposal.",
+    );
+    assert_eq!(
+        decide(&i, REPO, SELF),
+        Decision::NoDefer {
+            reason: "merits-finding"
+        }
+    );
+}
+
+#[test]
+fn stripping_matches_only_a_tagged_bullet_not_the_tag_anywhere() {
+    // `grep -v '^[[:space:]]*[-*][[:space:]]*\[premise-false\]'` is anchored at
+    // the bullet marker. Prose that merely mentions the tag is kept.
+    assert_eq!(
+        strip_premise_false("- [premise-false] gone\n  * [premise-false] also gone\n- kept"),
+        "- kept"
+    );
+    assert_eq!(
+        strip_premise_false("- the reviewer called it [premise-false] mid-sentence"),
+        "- the reviewer called it [premise-false] mid-sentence"
+    );
+    assert_eq!(strip_premise_false("not a bullet at all"), "not a bullet at all");
+}
+
+#[test]
+fn the_fetch_schedule_agrees_with_the_decision_on_a_premise_false_only_set() {
+    // `blockers_to_classify` and `decide` must strip the same way, or the CLI
+    // pays for forge reads on a set the decision has already refused.
+    let i = inputs("- [premise-false] Criterion 6: the cited file does not exist.\n", "");
+    assert!(blockers_to_classify(&i, REPO, SELF).is_empty());
+}

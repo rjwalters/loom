@@ -256,7 +256,7 @@ these an API change rather than a rewrite.
 | `resync-installed.sh` | ~1,170 | `init/`, `daemon_install_state.rs` | vendored **and** a port candidate; resolve the upstream question first |
 | `lib/forge-helpers.sh` | 1,072 | forge dispatch already in the daemon | none of its own — it evaporates as its callers port, so it follows its consumers |
 | `check-main-clean.sh` | 489 | — (git-state inspection) | the build-gate invocation name, which stays behind as a stub |
-| `classify-dependency-block.sh` | ~470 | — | not pure policy (it does forge reads *and* writes, see #7810), so a complete port is #7810 Phase 3. Called by name from role prompts; the name stays |
+| ~~`classify-dependency-block.sh`~~ | ~470 → 7 | `dep_classify/` (#7952) | **Done.** Ported with its two sourced helpers (`detect-dependency-cycle.sh`, `detect-startable-subset.sh`) — one unit, since `classify` sourced both. All three names stay as thin stubs: role prompts invoke them by path and parse their stdout line-wise |
 | `dep-recheck-fingerprint.sh` | 390 | — | deterministic hashing, #7810 Phase 4 |
 | `claim-staleness.sh` | 280 | — | a pure decision function over forge state |
 

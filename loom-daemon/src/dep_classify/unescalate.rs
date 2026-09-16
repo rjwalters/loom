@@ -48,6 +48,15 @@ pub struct Inputs {
 pub enum Decision {
     NoUnescalate {
         reason: &'static str,
+        /// Blockers still open at the moment of refusal, or empty when the
+        /// refusal happened before any were classified.
+        ///
+        /// Carried on the decision rather than reconstructed at the CLI: the
+        /// shell prints `STILL_OPEN:` as soon as it finds open blockers, on
+        /// **both** the refusal and the release paths, and only two of the
+        /// eight refusal reasons are reachable after that point. A renderer
+        /// given just a reason cannot tell which.
+        still_open: Vec<String>,
     },
     /// Blockers are still open, but the issue declares work independent of
     /// them — release it scoped to that subset.
@@ -71,6 +80,37 @@ pub struct Markers<'a> {
     pub unescalate_prefix: &'a str,
 }
 
+/// The blockers a caller must classify with the forge before [`decide`] can
+/// answer — empty when a gate *before* classification already settles it.
+///
+/// Same seam as [`super::defer::blockers_to_classify`], and same reason: the
+/// gate order decides whether a forge read is warranted at all, and the I/O
+/// boundary should not have to restate it to find that out.
+#[must_use]
+pub fn blockers_to_classify(
+    inputs: &Inputs,
+    repo: &str,
+    self_node: &str,
+    markers: &Markers<'_>,
+) -> Vec<String> {
+    if !inputs
+        .labels
+        .iter()
+        .any(|l| l == markers.operator_only_label)
+        || inputs.comments.contains(markers.cycle_prefix)
+        || inputs.escalation.chars().all(char::is_whitespace)
+    {
+        return Vec::new();
+    }
+    let findings = super::findings::extract_findings(&inputs.escalation);
+    if findings.chars().all(char::is_whitespace)
+        || !super::finding::findings_are_dependency_only(&findings)
+    {
+        return Vec::new();
+    }
+    super::defer::resolve_blockers(&findings, &inputs.body, repo, self_node)
+}
+
 /// Decide whether to un-escalate.
 ///
 /// Order is contract, as in [`super::defer`]. The gates before any forge
@@ -85,6 +125,7 @@ pub fn decide(inputs: &Inputs, repo: &str, self_node: &str, markers: &Markers<'_
     {
         return Decision::NoUnescalate {
             reason: "not-operator-only",
+            still_open: Vec::new(),
         };
     }
 
@@ -93,12 +134,14 @@ pub fn decide(inputs: &Inputs, repo: &str, self_node: &str, markers: &Markers<'_
     if inputs.comments.contains(markers.cycle_prefix) {
         return Decision::NoUnescalate {
             reason: "cycle-escalation",
+            still_open: Vec::new(),
         };
     }
 
     if inputs.escalation.chars().all(char::is_whitespace) {
         return Decision::NoUnescalate {
             reason: "no-escalation-record",
+            still_open: Vec::new(),
         };
     }
 
@@ -106,11 +149,13 @@ pub fn decide(inputs: &Inputs, repo: &str, self_node: &str, markers: &Markers<'_
     if findings.chars().all(char::is_whitespace) {
         return Decision::NoUnescalate {
             reason: "no-findings",
+            still_open: Vec::new(),
         };
     }
     if !super::finding::findings_are_dependency_only(&findings) {
         return Decision::NoUnescalate {
             reason: "merits-finding",
+            still_open: Vec::new(),
         };
     }
 
@@ -118,6 +163,7 @@ pub fn decide(inputs: &Inputs, repo: &str, self_node: &str, markers: &Markers<'_
     if blockers.is_empty() {
         return Decision::NoUnescalate {
             reason: "no-recorded-blocker",
+            still_open: Vec::new(),
         };
     }
 
@@ -127,6 +173,7 @@ pub fn decide(inputs: &Inputs, repo: &str, self_node: &str, markers: &Markers<'_
     if !inputs.refs.unknown.is_empty() {
         return Decision::NoUnescalate {
             reason: "unreadable-blocker",
+            still_open: Vec::new(),
         };
     }
 
@@ -135,6 +182,7 @@ pub fn decide(inputs: &Inputs, repo: &str, self_node: &str, markers: &Markers<'_
         if subset.chars().all(char::is_whitespace) {
             return Decision::NoUnescalate {
                 reason: "blocker-still-open",
+                still_open: inputs.refs.open.clone(),
             };
         }
 
@@ -144,6 +192,7 @@ pub fn decide(inputs: &Inputs, repo: &str, self_node: &str, markers: &Markers<'_
         if already_marked(&inputs.comments, markers.unescalate_prefix, &fp) {
             return Decision::NoUnescalate {
                 reason: "already-unescalated",
+                still_open: inputs.refs.open.clone(),
             };
         }
 
@@ -159,6 +208,7 @@ pub fn decide(inputs: &Inputs, repo: &str, self_node: &str, markers: &Markers<'_
     if already_marked(&inputs.comments, markers.unescalate_prefix, &fp) {
         return Decision::NoUnescalate {
             reason: "already-unescalated",
+            still_open: Vec::new(),
         };
     }
 
@@ -189,9 +239,12 @@ pub fn render(decision: &Decision, unreadable: &[String]) -> (String, i32) {
         out.push_str(&format!("UNREADABLE: {}\n", unreadable.join(" ")));
     }
     match decision {
-        Decision::NoUnescalate { reason } => {
-            // `blocker-still-open` is reached only after STILL_OPEN has already
-            // been printed by the caller; the shell emits it the same way.
+        Decision::NoUnescalate { reason, still_open } => {
+            // The shell prints this as soon as it finds open blockers, before
+            // it knows whether the verdict will be a refusal or a release.
+            if !still_open.is_empty() {
+                out.push_str(&format!("STILL_OPEN: {}\n", still_open.join(" ")));
+            }
             out.push_str("NO_UNESCALATE\n");
             out.push_str(&format!("REASON: {reason}\n"));
             (out, 1)

@@ -33,6 +33,10 @@ use crate::cmd_out::CmdOutcome;
 /// Why an apply did not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyError {
+    /// The issue body could not be revised (fact path only). Nothing else was
+    /// attempted, so a later pass finds the body unrevised and retries the
+    /// whole sequence from the top.
+    BodyEdit(String),
     /// The base label could not be removed. **No comment was posted**, so a
     /// later pass still sees the label, finds no marker, and retries.
     LabelRemoval(String),
@@ -44,6 +48,9 @@ pub enum ApplyError {
 impl std::fmt::Display for ApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ApplyError::BodyEdit(d) => {
+                write!(f, "could not append the revision section ({d}); no label change, no comment, a later pass will retry")
+            }
             ApplyError::LabelRemoval(d) => {
                 write!(f, "could not remove the operator-only label ({d}); no comment posted, a later pass will retry")
             }
@@ -62,6 +69,8 @@ pub trait Writer {
     fn remove_label(&mut self, label: &str) -> CmdOutcome;
     /// Post a comment.
     fn post_comment(&mut self, body: &str) -> CmdOutcome;
+    /// Replace the issue body. Only the fact path writes one.
+    fn edit_body(&mut self, body: &str) -> CmdOutcome;
 }
 
 /// Labels this operation manipulates.
@@ -166,6 +175,130 @@ pub fn subset_body(
          *Automated by Champion role (classify-dependency-block.sh, #5664)*\n\
          {marker}\n"
     )
+}
+
+// ===========================================================================
+// The fact path (#7650)
+// ===========================================================================
+
+/// Labels the **fact** un-escalation manipulates.
+///
+/// Deliberately not [`Labels`]: the two mechanisms drop a *different* sub-kind.
+/// A dependency-timing escalation carries `loom:operator-blocked`; a
+/// fact-checkable one carries `loom:operator-decision`, which is what
+/// `champion-issue-promo.md` selects whenever a recurring finding is not a pure
+/// dependency citation. Sharing one struct would invite passing the wrong one,
+/// which fails silently — removing an absent label is best-effort and succeeds.
+pub struct FactLabels<'a> {
+    pub operator_only: &'a str,
+    /// The #7650 sub-kind label, removed best-effort.
+    pub operator_decision: &'a str,
+}
+
+/// Fold a resolutions file into prose bullets.
+///
+/// Mirrors `sed -E 's/^RESOLVED:[[:space:]]*/- /'`: the tag is stripped only at
+/// line start, and every other line passes through untouched. By the time this
+/// runs every line is `RESOLVED:` — a partial set never reaches the apply path.
+#[must_use]
+pub fn resolutions_summary(resolutions: &str) -> String {
+    resolutions
+        .lines()
+        .map(|line| match line.strip_prefix("RESOLVED:") {
+            Some(rest) => format!("- {}", rest.trim_start_matches([' ', '\t'])),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The issue body with a `## Revision` section appended.
+///
+/// Appending changes the body hash, which is this repo's existing contract for
+/// "revised — evaluate again". The returned string has **no** trailing newline,
+/// matching the shell's `${new_body%$'\n'}`.
+#[must_use]
+pub fn fact_revised_body(
+    body: &str,
+    today: &str,
+    commit: &str,
+    summary: &str,
+    revision_marker: &str,
+) -> String {
+    format!(
+        "{body}\n\n## Revision ({today})\n\nCurator re-verified every objection Champion's escalation cited against\n`{commit}` and found all of them resolved:\n\n{summary}\n\n{revision_marker}"
+    )
+}
+
+/// The confirming comment for a fact un-escalation. No trailing newline,
+/// matching the shell.
+#[must_use]
+pub fn fact_comment_body(
+    operator_only: &str,
+    operator_decision: &str,
+    commit: &str,
+    summary: &str,
+    marker: &str,
+) -> String {
+    format!(
+        "**Curator: De-escalating — every cited objection has resolved on `main`**\n\nChampion escalated this proposal for repeated rejection without revision.\nEvery objection Champion's escalation cited has since been independently\nre-verified against `{commit}`:\n\n{summary}\n\nAppended a `## Revision` section naming the verifying commit (this changes\nthe body hash, the existing contract for \"revised — evaluate again\") and\nremoved `{operator_only}` (and its `{operator_decision}`\nsub-kind label, if present). This proposal returns to Champion's normal\nevaluation queue. Nothing here overrides a human decision — if this proposal\ngenuinely needs one, re-add the label and it will not be de-escalated again\nfor the same finding set.\n\n---\n*Automated by Curator role (classify-dependency-block.sh --check-fact-unescalate, #7650)*\n{marker}"
+    )
+}
+
+/// Apply a fact un-escalation: revise the body, remove the label, post the
+/// comment.
+///
+/// # Write order
+///
+/// The same rule as [`apply_unescalation`], with one extra write in front:
+///
+/// - **body edit fails** → no label change and no comment; a later re-scan
+///   finds the body unrevised and retries from the top.
+/// - **label removal fails** → the body already carries the `## Revision`
+///   section, but the label is still on. A later re-scan re-reads the
+///   already-revised body and computes the *same* fingerprint — it is keyed to
+///   the escalation comment and the commit, not the body — so the label and
+///   comment steps retry. The `revision_marker` guard below is what keeps that
+///   retry from appending the section a second time.
+/// - **comment post fails** → both state changes landed; only the audit trail
+///   is missing.
+///
+/// # Errors
+///
+/// [`ApplyError::BodyEdit`], [`ApplyError::LabelRemoval`] or
+/// [`ApplyError::CommentPost`], per the ordering above.
+pub fn apply_fact_unescalation<W: Writer>(
+    writer: &mut W,
+    labels: &FactLabels<'_>,
+    current_body: &str,
+    revised_body: &str,
+    revision_marker: &str,
+    comment: &str,
+) -> Result<(), ApplyError> {
+    // Idempotent: a retry after a failed label removal must not append the
+    // `## Revision` section again.
+    if !current_body.contains(revision_marker) {
+        let edited = writer.edit_body(revised_body);
+        if !edited.succeeded() {
+            return Err(ApplyError::BodyEdit(edited.failure_reason("gh issue edit --body")));
+        }
+    }
+
+    let removed = writer.remove_label(labels.operator_only);
+    if !removed.succeeded() {
+        return Err(ApplyError::LabelRemoval(
+            removed.failure_reason("gh issue edit --remove-label"),
+        ));
+    }
+
+    let _ = writer.remove_label(labels.operator_decision);
+
+    let posted = writer.post_comment(comment);
+    if !posted.succeeded() {
+        return Err(ApplyError::CommentPost(posted.failure_reason("gh issue comment")));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

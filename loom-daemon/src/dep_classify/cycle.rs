@@ -151,6 +151,15 @@ where
         &self.unreadable
     }
 
+    /// How many nodes were actually fetched — the shell's `SCANNED:`.
+    ///
+    /// Distinct from the number *visited*: a memoised node is visited again
+    /// without being fetched again, and this counts the cost, not the traversal.
+    #[must_use]
+    pub fn fetch_count(&self) -> usize {
+        self.fetch_count
+    }
+
     fn note_truncated(&mut self, why: Truncation) {
         if !self.truncated.contains(&why) {
             self.truncated.push(why);

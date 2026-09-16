@@ -905,6 +905,14 @@ enum Commands {
         action: SweepExperimentAction,
     },
 
+    /// The dependency-classification family (epic #7810 PR 3):
+    /// `classify-dependency-block`, `detect-dependency-cycle`,
+    /// `detect-startable-subset`. Flattened, so each is a top-level subcommand;
+    /// the args and their docs live in `cli::dep_classify` because this file is
+    /// frozen by the file-size ratchet.
+    #[command(flatten)]
+    DepClassify(cli::dep_classify::DepClassifyCommand),
+
     /// Validate a sweep phase contract and attempt mechanical recovery (native
     /// port of `loom_tools.validate_phase`, #4275). Backs `validate-phase.sh`.
     ///
@@ -2567,6 +2575,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
+        Commands::DepClassify(cmd) => cmd.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
             phase,
@@ -2774,21 +2783,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Cancel is handled in main() before handle_cli_command")
         }
-        Commands::Watch { .. } => {
-            // Routed directly in `main()` (it needs the async runtime for the
-            // socket round-trip), never dispatched through this sync handler.
-            unreachable!("Watch is handled in main() before handle_cli_command")
-        }
-        Commands::Restart(..) => {
-            // Routed directly in `main()` (it needs the async runtime for the
-            // socket round-trip), never dispatched through this sync handler.
-            unreachable!("Restart is handled in main() before handle_cli_command")
-        }
-        Commands::Serve { .. } => {
-            // Routed directly in `main()` (it needs the async runtime for the
-            // HTTP listener + socket round-trips), never dispatched through
-            // this sync handler.
-            unreachable!("Serve is handled in main() before handle_cli_command")
+        // Routed directly in `main()`, which has the async runtime these need
+        // (socket round-trips; for `serve`, an HTTP listener too). They never
+        // reach this sync handler.
+        Commands::Watch { .. } | Commands::Restart(..) | Commands::Serve { .. } => {
+            unreachable!("handled in main() before handle_cli_command")
         }
         Commands::Init {
             workspace,
