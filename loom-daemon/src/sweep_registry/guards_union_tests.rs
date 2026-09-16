@@ -178,11 +178,11 @@ fn parked_issue_with_an_active_non_closing_pr_is_refused_without_touching_labels
 ///
 /// `decide` short-circuits to `Keep` on `has_quarantine_comment == false`, and
 /// `kicad-tools#5333` carries no `QUARANTINE_COMMENT_MARKER` comment anywhere
-/// in its 1,316-comment history — so this path provably could not have
-/// unparked it. It is doubly unreachable for the empty-pool death this issue
-/// fixes: the #4122 carve-out means such a death never charges a quarantine
-/// tally, so it can never post the marker that would make an issue eligible
-/// here in the first place.
+/// in its 187-comment history (as of 2026-09-16) — so this path provably could
+/// not have unparked it. It is doubly unreachable for the empty-pool death this
+/// issue fixes: the #4122 carve-out means such a death never charges a
+/// quarantine tally, so it can never post the marker that would make an issue
+/// eligible here in the first place.
 ///
 /// (`quarantine_reconciliation`'s own suite covers the recency rules; this
 /// asserts only the entry condition, from #7860's angle.)
