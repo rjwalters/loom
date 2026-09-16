@@ -91,7 +91,9 @@ Env overrides (each wins over config for that key):
 `.loom/config.json`** (`config_resolver.rs`/`config-resolver.sh`), so the
 committed file must never carry a live room id — like `socket` below, ship only
 a placeholder there and deliver the real value through `LOOM_SAFEHOUSE_ROOM` or
-the gitignored local-config tier (#6650).
+the gitignored local-config tier (#6650) — **not** the private-defaults tier
+(`LOOM_CONFIG_DEFAULTS_FILE`, else `~/.local/share/loom/config/defaults.json`),
+which sits *below* the committed file and is shadowed by the placeholder.
 
 **Socket resolution** (precedence **env > config**, `resolve_socket` in
 `loom-daemon/src/safehouse.rs`; the bash-side worker-injection path

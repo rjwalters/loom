@@ -119,7 +119,7 @@
     }
   },
   "observability": {
-    "enabled": true,
+    "enabled": false,
     "endpoint": "https://dashboard.example.com/ingest",
     "batchSize": 50,
     "flushIntervalSecs": 30,
