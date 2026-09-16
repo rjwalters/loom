@@ -164,12 +164,12 @@ if printf '%s' "$err_out" | grep -q "loom:no-surface-change"; then
 else
     fail "failure output missing marker escape hatch. Got: $err_out"
 fi
-if printf '%s' "$err_out" | grep -q "do NOT run that command yourself"; then
+if grep -q "do NOT run that command yourself" <<<"$err_out"; then
     pass "failure output warns a Builder not to run the bump command itself (#7919)"
 else
     fail "failure output missing the Builder do-not-bump warning. Got: $err_out"
 fi
-if printf '%s' "$err_out" | grep -q -- "--forbid-bump"; then
+if grep -q -- "--forbid-bump" <<<"$err_out"; then
     pass "failure output cross-references --forbid-bump so the two modes stop disagreeing (#7919)"
 else
     fail "failure output missing --forbid-bump cross-reference. Got: $err_out"
