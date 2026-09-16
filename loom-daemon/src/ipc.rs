@@ -2778,55 +2778,7 @@ pub fn build_daemon_status(
             // `resolve_posture`'s, so this is byte-identical to pre-#7691.
             let decision = crate::role_shard::decide(fallback_root);
             let posture = decision.posture;
-            // Roster section (#7690, Phase A of #6704) — read ONLY from the
-            // cache the heartbeat task populates (`role_shard::roster::roster_snapshot`),
-            // never a live forge call: `status` must never itself add a forge
-            // round-trip, and a disabled/never-yet-published roster leaves the
-            // cache `None`, which renders nothing (byte-identical to pre-#7690
-            // status when the roster is off).
-            let roster = crate::role_shard::roster::roster_snapshot().map(|snap| {
-                let view = crate::role_shard::roster::build_roster_status(
-                    &snap.issue,
-                    &snap.comments,
-                    &snap.host,
-                    chrono::Utc::now(),
-                    snap.ttl_secs,
-                );
-                crate::types::RosterStatus {
-                    issue: view.issue,
-                    live_count: view.live_count,
-                    seen_count: view.seen_count,
-                    generation: view.generation,
-                    settled_secs: view.settled_secs,
-                    // The admission fence's verdict for this host (#7691),
-                    // taken from the same `decide` call the header's posture
-                    // came from — so `status` never renders a fence state the
-                    // tick path would not have taken.
-                    fence: Some(match &decision.roster {
-                        crate::role_shard::RosterMode::Ring { generation } => format!(
-                            "admitted — acting under the ring settled at generation {generation}"
-                        ),
-                        crate::role_shard::RosterMode::Yield(reason) => {
-                            format!("YIELDING role ticks — {}", reason.describe())
-                        }
-                        crate::role_shard::RosterMode::Off(off) => format!(
-                            "not consulted for ownership ({}) — the static #6374 ring is in effect",
-                            off.label()
-                        ),
-                    }),
-                    members: view
-                        .members
-                        .into_iter()
-                        .map(|m| crate::types::RosterMemberStatus {
-                            host: m.host,
-                            fresh: m.fresh,
-                            last_beat_secs_ago: m.last_beat_secs_ago,
-                            serves_count: m.serves_count,
-                            is_this_host: m.is_this_host,
-                        })
-                        .collect(),
-                }
-            });
+            let roster = roster_status::roster_status(&decision.roster);
             Some(crate::types::RoleRunnerShardPosture {
                 index: posture.index(),
                 count: posture.count(),
@@ -4970,6 +4922,8 @@ fn handle_remove_watch(id: &str) -> Response {
         },
     }
 }
+
+mod roster_status;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
