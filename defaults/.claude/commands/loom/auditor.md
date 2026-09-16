@@ -456,13 +456,6 @@ fi
 | **Pending** | Run full local validation (CI hasn't finished) |
 | **Unknown** | Run full local validation (can't determine status) |
 
-### Benefits of CI-Aware Validation
-
-- **Avoids duplicate work**: Don't rebuild what CI already validated
-- **Faster iterations**: Focus time on what CI doesn't cover (runtime behavior)
-- **Better resource utilization**: Save compute resources for novel validation
-- **Immediate failure analysis**: When CI fails, Auditor can analyze and create issues
-
 ### Output Analysis
 
 When analyzing command output, look for these patterns:
@@ -601,20 +594,12 @@ Create a capability request when you:
 
 ### Avoiding Duplicate Capability Requests
 
-Before creating a new capability request:
+Capability requests are one application of the MANDATORY gate above — run
+`check-duplicate.sh "$TITLE" "<capability gap>"` with a title shaped like
+`Auditor Capability Request: [specific capability needed]` before filing. If
+the script is unavailable, search the label by hand first:
 
 ```bash
-# Use the duplicate detection script (recommended)
-TITLE="Auditor Capability Request: [specific capability needed]"
-if ./.loom/scripts/check-duplicate.sh "$TITLE" "Description of capability gap"; then
-    # No duplicates found - safe to create
-    ./.loom/scripts/create-issue.sh --title "$TITLE" ...
-else
-    # Potential duplicate found - review similar issues first
-    echo "Similar capability request may already exist. Checking..."
-fi
-
-# Alternative: manual search
 gh issue list --state open --label "loom:auditor-capability-request" --limit 500 --json number,title --jq '.[] | "#\(.number): \(.title)"'
 gh issue list --state open --label "loom:auditor-capability-request" --search "screenshot" --limit 500 --json number,title
 ```
@@ -783,31 +768,19 @@ Each tick, read the Judge rejections that landed since your last pass and watch 
 
 ### Avoiding Duplicate Issues
 
-**Before creating a bug issue, check for potential duplicates:**
+Bug reports are one application of the MANDATORY gate above — run
+`check-duplicate.sh "$TITLE" "<description>"` with a title shaped like
+`Build/runtime failure on main: [specific problem]`, and act on its exit code
+(0 = file it; 1 = comment on the existing issue instead; 2 = skip, let a human
+review). If the script is unavailable, search by hand first:
 
 ```bash
-# Use the duplicate detection script (recommended)
-TITLE="Build/runtime failure on main: [specific problem]"
-if ./.loom/scripts/check-duplicate.sh "$TITLE" "Description of the bug"; then
-    # No duplicates found - safe to create
-    ./.loom/scripts/create-issue.sh --title "$TITLE" ...
-else
-    # Potential duplicate found - review similar issues first
-    echo "Similar issue may already exist. Checking..."
-fi
-
-# Alternative: manual search
 gh issue list --state open --limit 500 --json number,title --jq '.[] | "#\(.number): \(.title)"' | head -20
 gh issue list --state open --search "build failure" --limit 500 --json number,title
 ```
 
-**When duplicates are found:**
-1. Review the similar issues listed in the output
-2. If truly duplicate: Add comment to existing issue instead of creating new one
-3. If related but distinct: Proceed with creation, reference the related issue in the body
-4. If unclear: Skip creation, let human review the existing issue
-
-**Why this matters**: Duplicate issues waste Builder cycles and create confusion. Issues #1981 and #1988 were created for the identical bug - this check prevents that.
+A related-but-distinct issue is still fileable — reference it in the body.
+**Why this matters**: duplicates waste Builder cycles; #1981 and #1988 were both filed for the identical bug.
 
 ## Best Practices
 
