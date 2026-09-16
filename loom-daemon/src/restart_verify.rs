@@ -436,11 +436,27 @@ pub fn resolve_launchd_service() -> String {
 
 /// Run a query-only probe, collapsing every failure mode (absent binary, spawn
 /// failure, hang past [`PROBE_TIMEOUT`]) to `None`.
-fn probe(mut cmd: Command) -> Option<std::process::Output> {
+///
+/// Moved onto the shared bounded executor in epic #7810 PR 1, keeping the same
+/// [`PROBE_TIMEOUT`] budget and the same `Option` contract callers already rely
+/// on. The collapse is retained deliberately: these are *query-only* probes
+/// whose callers act only on a definite affirmative answer, so "could not ask"
+/// and "asked and got no" are equivalent to them.
+///
+/// What changes is that the collapse now happens here, in one readable match,
+/// instead of in a `.ok().flatten()` that silently discarded distinctions the
+/// executor had already computed. Probes also no longer risk reporting a large
+/// result as a hang, and a probe that outlives its budget no longer leaves
+/// descendants running — both properties come from [`crate::proc_exec`].
+fn probe(cmd: Command) -> Option<std::process::Output> {
+    let mut cmd = cmd;
     cmd.stdin(std::process::Stdio::null());
-    crate::sweep_registry::output_with_timeout(cmd, PROBE_TIMEOUT)
-        .ok()
-        .flatten()
+    match crate::proc_exec::run_bounded(cmd, PROBE_TIMEOUT) {
+        Ok(crate::proc_exec::Completion::Exited(o)) => Some(o),
+        // Timed out, or never started. Either way this probe has no answer —
+        // and must not be mistaken for one.
+        Ok(crate::proc_exec::Completion::TimedOut { .. }) | Err(_) => None,
+    }
 }
 
 /// Current uid via `id -u` (same mechanism `daemon_install_state` uses, so no
