@@ -500,36 +500,40 @@ jobs:
         run: bash scripts/check-vendored-private-refs.sh
 
   defaults-version-bump-check:
-    name: defaults/ Changes Require a VERSION Bump
+    name: PRs Must Not Hand-Edit Version-Bearing Files
     # PR-only: needs the PR's base commit to diff against, which only exists
-    # for pull_request events (a push to main has already merged). Every file
-    # under defaults/ is copied into consumers' installed
-    # .loom/{scripts,hooks,roles,docs,bin}/ + .claude/commands/loom/ surfaces
-    # at install time, NOT refreshed by a git pull -- so a PR that changes
-    # defaults/ without bumping VERSION leaves every currency check (fleet
-    # resync dry-run, install.sh's own check, /repo:update-tools) reporting
-    # "current" while installed surfaces silently diverge (#5874, surfaced by
-    # #5846 changing 5 role prompts + a doc with no version bump).
+    # for pull_request events (a push to main has already merged). Version
+    # bumps are now a single automated post-merge step
+    # (.github/workflows/version-bump-on-merge.yml, #7743) rather than
+    # something every defaults/-touching PR carries itself -- a PR that
+    # hand-edits a version-bearing file's value (package.json,
+    # mcp-loom/package.json, Cargo.toml, CLAUDE.md, VERSION) is either
+    # duplicating that workflow's job (harmless but pointless) or racing it
+    # (actively wrong: the PR's hand-picked value goes stale the moment any
+    # other defaults/-touching PR merges first). This inverts the check this
+    # job used to run (which required, rather than forbade, a version bump
+    # alongside a defaults/ change -- #5874, superseded by #7743 after
+    # nine follow-up issues about the per-PR-bump cost in 60 days).
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       # fetch-depth: 0 + an explicit head sha (instead of the default
-      # single-commit fetch of the synthetic refs/pull/<N>/merge ref) are
-      # both required for the script's `git log BASE..HEAD` commit-message
-      # marker check to see the PR's real commits (#6577) -- a shallow
-      # merge-ref checkout lands on a synthetic "Merge <head> into <base>"
-      # commit with no reachable branch history, silently defeating a
-      # marker placed in a real commit message.
+      # single-commit fetch of the synthetic refs/pull/<N>/merge ref) ensure
+      # both the PR's base and head commits are present locally for the
+      # script's `git show <ref>:<path>` value extraction -- and that their
+      # merge-base resolves, which --forbid-bump needs (#7823): base.sha is
+      # the live tip of main at trigger time, so comparing against it raw
+      # would false-FAIL any PR cut before a sibling defaults/-touching merge
+      # bumped the version. The script narrows to merge-base(base, head)
+      # itself; this checkout depth is what makes that resolvable.
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-      - name: Check defaults/ changes carry a VERSION bump or marker (#5874, #6577)
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
+      - name: Check no version-bearing file's value was hand-edited (#7743)
         run: |
-          bash defaults/scripts/check-defaults-version-bump.sh \
+          bash defaults/scripts/check-defaults-version-bump.sh --forbid-bump \
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}"
 

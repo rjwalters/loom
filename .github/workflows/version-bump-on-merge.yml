@@ -1,0 +1,115 @@
+name: Version Bump on Merge
+
+# Single post-merge owner for VERSION (and the other version-bearing files
+# scripts/version.sh manages) -- see #7743.
+#
+# Why this exists: previously every PR touching `defaults/` had to carry a
+# 9(then 7)-file mechanical version-bump diff, which conflicted under any
+# concurrency and produced a steady stream of Doctor/operator rounds re-cut
+# against a moved `main` (nine closed issues about this in 60 days, #7743's
+# own body has the table). Moving the bump here removes the requirement
+# instead of teaching every actor to comply with it better: one workflow,
+# triggered only when a just-merged commit touched `defaults/`, always
+# bumping from the tree it is bumping -- correct by construction, not by
+# review. `defaults/scripts/check-defaults-version-bump.sh --forbid-bump`
+# (wired into ci.yml's `defaults-version-bump-check` job) is the matching
+# gate: it now REJECTS a PR that hand-edits a version-bearing file's value,
+# since that value change should only ever come from this workflow.
+#
+# Self-trigger note: the bump commit this workflow pushes never touches
+# `defaults/` (it only rewrites the version-bearing files themselves --
+# `package.json`, `mcp-loom/package.json`, `Cargo.toml`, `CLAUDE.md`,
+# `VERSION`, `.loom/install-metadata.json` if present, plus the derived
+# `Cargo.lock` / `mcp-loom/package-lock.json`), so the `paths: ['defaults/**']`
+# filter below can never see its own push and re-trigger a loop. Do NOT add
+# an extra guard for that -- a naive one (e.g. skipping when the pusher is
+# this workflow's own bot identity) would also suppress a legitimate human
+# push that happens to share that identity, for no benefit, since the path
+# filter already makes the loop structurally impossible.
+#
+# Activation dependency (not a blocker for merging this workflow itself --
+# see #7743's PR description): the push step below needs this repo's branch
+# ruleset to list this workflow's pushing identity (the default
+# `github-actions[bot]` `GITHUB_TOKEN` actor, unless a dedicated bot identity
+# is provisioned instead) in `bypass_actors`. Until a repo admin adds that
+# entry, the final push step 403s -- everything up to it (checkout, bump,
+# commit) still runs and is harmless to leave enabled while that one-time
+# repo-settings change is pending.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "defaults/**"
+
+# Serialize runs instead of racing them -- deliberately NOT cancel-in-progress:
+# every merge that touched `defaults/` needs its own bump (this is a queue of
+# real work, not redundant re-verification of the same commit; see
+# .loom/docs/ci-principles.md), so back-to-back merges should queue and each
+# run should bump from whatever `main` looks like when it starts (which, for
+# a queued run, already includes every earlier run's own bump commit).
+concurrency:
+  group: version-bump-on-merge
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  bump-version:
+    name: Bump VERSION after a defaults/ merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # No `ref:`/pinned sha here -- always check out the CURRENT tip of
+      # `main` at run start. For a queued run that matters: it must bump from
+      # wherever `main` actually is now, not from the commit that originally
+      # triggered it (which may already be several bumps behind by the time
+      # this run gets to the front of the concurrency group).
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Bump version and push (retries on a racing push to main)
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          attempts=5
+          for attempt in $(seq 1 "$attempts"); do
+            # Re-sync to the current tip every attempt, not just the first --
+            # a losing race means another push landed on main while we were
+            # bumping, so the bump itself (not just the push) must be redone
+            # against the new tip.
+            git fetch origin main
+            git checkout -B main origin/main
+
+            ./scripts/version.sh bump patch
+            new_version="$(./scripts/version.sh show)"
+
+            git add package.json mcp-loom/package.json mcp-loom/package-lock.json \
+                   Cargo.toml Cargo.lock CLAUDE.md VERSION
+            if [ -f .loom/install-metadata.json ]; then
+              git add .loom/install-metadata.json
+            fi
+            git commit -m "chore: bump version to $new_version"
+
+            if git push origin HEAD:main; then
+              echo "Pushed version bump to $new_version"
+              exit 0
+            fi
+
+            echo "Push attempt $attempt/$attempts failed (main moved under us) -- retrying" >&2
+            sleep $((attempt * 3))
+          done
+
+          echo "ERROR: failed to push the version bump after $attempts attempts -- main kept moving faster than we could bump it." >&2
+          exit 1
