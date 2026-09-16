@@ -129,13 +129,13 @@ Edit `config.json` to customize:
   "agents": [
     {
       "id": "1",
-      "name": "Worker 1",
+      "name": "Builder 1",
       "status": "idle",
       "isPrimary": true,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "worker.md",
+        "roleFile": "builder.md",
         "targetInterval": 300000,
         "intervalPrompt": "Continue working on tasks"
       }
