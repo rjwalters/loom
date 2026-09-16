@@ -246,7 +246,8 @@ unset -f gh gitea_api
 # (the installer treats jq as optional — gh ships its own engine).
 TOTAL=$((TOTAL + 1))
 if command -v jq >/dev/null 2>&1; then
-  JQ_EXPR=$(grep -o "\[(\.allow_squash_merge.*@tsv" "$REPO_ROOT/scripts/install/forge-detect.sh" | head -1)
+  JQ_EXPR=""
+  IFS= read -r JQ_EXPR < <(grep -o "\[(\.allow_squash_merge.*@tsv" "$REPO_ROOT/scripts/install/forge-detect.sh") || true
   JQ_OUT=$(printf '%s' \
     '{"allow_squash_merge":false,"allow_merge_commit":true,"allow_rebase_merge":false}' \
     | jq -r "$JQ_EXPR" 2>/dev/null || echo "")
