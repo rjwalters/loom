@@ -6,11 +6,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'ROOT=$(cd \"$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd) && [ -x \"$ROOT/.loom/hooks/guard-destructive.sh\" ] && exec \"$ROOT/.loom/hooks/guard-destructive.sh\" || exit 0'"
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/hooks/hook-wiring.sh; [ -r \"$L\" ] && LOOM_PROJECT_ROOT=$W exec bash \"$L\" PreToolUse guard-destructive.sh; G=$W/.loom/hooks/guard-destructive.sh; [ -x \"$G\" ] && exec \"$G\"; [ -r \"$G\" ] && exec bash \"$G\"; [ -d \"$W/.loom/hooks\" ] || exit 0; echo \"[loom] BROKEN GUARD INSTALL: guard-destructive.sh is not installed in this Loom workspace ($W/.loom/hooks/guard-destructive.sh); re-run scripts/install-loom.sh.\" >&2; [ \"${LOOM_GUARD_WIRING_FAILOPEN:-0}\" = \"1\" ] && exit 0; printf %s \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"permissionDecision\\\":\\\"deny\\\",\\\"permissionDecisionReason\\\":\\\"Loom hook guard-destructive.sh is not installed in this workspace (no .loom/hooks/hook-wiring.sh and no .loom/hooks/guard-destructive.sh), but .loom/hooks/ exists, so this workspace does carry per-repo hook copies and expects this one. A missing guard is a broken install, not an opt-out, and this session runs without permission prompts. Repair: re-run scripts/install-loom.sh (or .loom/scripts/check-guards-installed.sh), then restart Claude Code. Set LOOM_GUARD_WIRING_FAILOPEN=1 in the environment to downgrade this deny to a warning.\\\"}}\"; exit 0'"
           },
           {
             "type": "command",
-            "command": "bash -c 'ROOT=$(cd \"$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd) && [ -x \"$ROOT/.loom/hooks/guard-loom-workflow.sh\" ] && exec \"$ROOT/.loom/hooks/guard-loom-workflow.sh\" || exit 0'"
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/hooks/hook-wiring.sh; [ -r \"$L\" ] && LOOM_PROJECT_ROOT=$W exec bash \"$L\" PreToolUse guard-loom-workflow.sh; G=$W/.loom/hooks/guard-loom-workflow.sh; [ -x \"$G\" ] && exec \"$G\"; [ -r \"$G\" ] && exec bash \"$G\"; [ -d \"$W/.loom/hooks\" ] || exit 0; echo \"[loom] BROKEN GUARD INSTALL: guard-loom-workflow.sh is not installed in this Loom workspace ($W/.loom/hooks/guard-loom-workflow.sh); re-run scripts/install-loom.sh.\" >&2; [ \"${LOOM_GUARD_WIRING_FAILOPEN:-0}\" = \"1\" ] && exit 0; printf %s \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"permissionDecision\\\":\\\"deny\\\",\\\"permissionDecisionReason\\\":\\\"Loom hook guard-loom-workflow.sh is not installed in this workspace (no .loom/hooks/hook-wiring.sh and no .loom/hooks/guard-loom-workflow.sh), but .loom/hooks/ exists, so this workspace does carry per-repo hook copies and expects this one. A missing guard is a broken install, not an opt-out, and this session runs without permission prompts. Repair: re-run scripts/install-loom.sh (or .loom/scripts/check-guards-installed.sh), then restart Claude Code. Set LOOM_GUARD_WIRING_FAILOPEN=1 in the environment to downgrade this deny to a warning.\\\"}}\"; exit 0'"
           }
         ]
       },
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'ROOT=$(cd \"$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd) && [ -x \"$ROOT/.loom/hooks/guard-worktree-paths.sh\" ] && exec \"$ROOT/.loom/hooks/guard-worktree-paths.sh\" || exit 0'"
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/hooks/hook-wiring.sh; [ -r \"$L\" ] && LOOM_PROJECT_ROOT=$W exec bash \"$L\" PreToolUse guard-worktree-paths.sh; G=$W/.loom/hooks/guard-worktree-paths.sh; [ -x \"$G\" ] && exec \"$G\"; [ -r \"$G\" ] && exec bash \"$G\"; [ -d \"$W/.loom/hooks\" ] || exit 0; echo \"[loom] BROKEN GUARD INSTALL: guard-worktree-paths.sh is not installed in this Loom workspace ($W/.loom/hooks/guard-worktree-paths.sh); re-run scripts/install-loom.sh.\" >&2; [ \"${LOOM_GUARD_WIRING_FAILOPEN:-0}\" = \"1\" ] && exit 0; printf %s \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"permissionDecision\\\":\\\"deny\\\",\\\"permissionDecisionReason\\\":\\\"Loom hook guard-worktree-paths.sh is not installed in this workspace (no .loom/hooks/hook-wiring.sh and no .loom/hooks/guard-worktree-paths.sh), but .loom/hooks/ exists, so this workspace does carry per-repo hook copies and expects this one. A missing guard is a broken install, not an opt-out, and this session runs without permission prompts. Repair: re-run scripts/install-loom.sh (or .loom/scripts/check-guards-installed.sh), then restart Claude Code. Set LOOM_GUARD_WIRING_FAILOPEN=1 in the environment to downgrade this deny to a warning.\\\"}}\"; exit 0'"
           }
         ]
       }
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'ROOT=$(cd \"$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd) && [ -x \"$ROOT/.loom/hooks/skill-router.sh\" ] && exec \"$ROOT/.loom/hooks/skill-router.sh\" || exit 0'"
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/hooks/hook-wiring.sh; [ -r \"$L\" ] && LOOM_PROJECT_ROOT=$W exec bash \"$L\" UserPromptSubmit skill-router.sh; G=$W/.loom/hooks/skill-router.sh; [ -x \"$G\" ] && exec \"$G\"; [ -r \"$G\" ] && exec bash \"$G\"; [ -d \"$W/.loom/hooks\" ] || exit 0; echo \"[loom] BROKEN GUARD INSTALL: skill-router.sh is not installed in this Loom workspace ($W/.loom/hooks/skill-router.sh); re-run scripts/install-loom.sh.\" >&2; exit 0'"
           }
         ]
       }
@@ -61,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'ROOT=$(cd \"$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd) && [ -x \"$ROOT/.loom/hooks/guard-background-subagents.sh\" ] && exec \"$ROOT/.loom/hooks/guard-background-subagents.sh\" || exit 0'"
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/hooks/hook-wiring.sh; [ -r \"$L\" ] && LOOM_PROJECT_ROOT=$W exec bash \"$L\" Stop guard-background-subagents.sh; G=$W/.loom/hooks/guard-background-subagents.sh; [ -x \"$G\" ] && exec \"$G\"; [ -r \"$G\" ] && exec bash \"$G\"; [ -d \"$W/.loom/hooks\" ] || exit 0; echo \"[loom] BROKEN GUARD INSTALL: guard-background-subagents.sh is not installed in this Loom workspace ($W/.loom/hooks/guard-background-subagents.sh); re-run scripts/install-loom.sh.\" >&2; exit 0'"
           }
         ]
       }

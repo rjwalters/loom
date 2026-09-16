@@ -17,6 +17,22 @@
 # The TOC lists TOP-LEVEL (`##`) sections only. A full heading dump would
 # recreate the problem it solves.
 #
+# File set (#7753 extends #7739's defaults/docs/*.md to the agent-facing
+# prompt set too — bigger and hotter, and #7724 confirmed these are the files
+# that actually dominate agent context):
+#   - defaults/docs/*.md               (reference docs, #7739's original scope)
+#   - defaults/.claude/commands/loom/*.md, EXCEPT bump.md (a generic,
+#     non-Loom-specific command — #7724's canonical 33-file prompt set is 18
+#     role prompts + 15 command-only files, not 34)
+#
+# defaults/roles/*.md (other than README.md, a docs index) are NOT globbed
+# separately: every one of them is a symlink into
+# defaults/.claude/commands/loom/ (confirmed structurally, not by name list —
+# see check-markdown-token-budget.sh, #7724/#7725), so generating on the
+# commands/loom/ side is automatically visible through the symlink. Writing
+# through defaults/roles/<name>.md instead would replace the symlink with a
+# standalone file via `mv` and desynchronize the pair.
+#
 # Usage:
 #   check-doc-tocs.sh           Fail if any doc's TOC is missing or stale.
 #   check-doc-tocs.sh --fix     Insert/refresh the TOC in place.
@@ -41,7 +57,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --fix)       MODE="fix"; shift ;;
     --threshold) THRESHOLD="${2:?--threshold needs a value}"; shift 2 ;;
-    --help|-h)   sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h)   sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           echo "check-doc-tocs: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -55,12 +71,27 @@ cd "$ROOT"
 # GitHub's heading anchor: lowercase, drop anything that is not alphanumeric,
 # underscore, space or hyphen (backticks, punctuation, emphasis markers) —
 # underscore is kept because GitHub's own slugger preserves it — spaces -> hyphens.
+#
+# ORDER OF OPERATIONS MATTERS (#7753). GitHub's slugger does NOT trim: it strips
+# the disallowed characters and then turns EVERY remaining space into a hyphen,
+# including one that is now leading because the character in front of it was
+# dropped. `## ⛔ STOP! READ THIS FIRST - …` therefore anchors as
+# `#-stop-read-this-first---…`, with a leading hyphen standing in for the
+# stripped emoji's trailing space. Trimming after the strip (which this did
+# until #7753) produced `#stop-read-this-first---…` and generated a TOC full of
+# self-referential dead links in every emoji-headed prompt — the exact class of
+# heading this file set uses for its warnings (⛔, ⚠️, 🚫).
+#
+# The one trim that IS correct happens BEFORE the strip: CommonMark trims the
+# heading text itself, so `##   Foo  ` is the heading "Foo" and never reaches
+# the slugger with its surrounding whitespace attached.
 slugify() {
   printf '%s' "$1" \
     | tr '[:upper:]' '[:lower:]' \
     | sed -e 's/`//g' -e 's/\[\([^]]*\)\](\([^)]*\))/\1/g' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
     | sed -e 's/[^a-z0-9_ -]//g' \
-    | sed -e 's/^ *//' -e 's/ *$//' -e 's/ /-/g'
+    | sed -e 's/ /-/g'
 }
 
 # Emit the TOC body for one file. Duplicate slugs get GitHub's -1, -2 suffixes;
@@ -70,10 +101,42 @@ build_toc() {
   seen=""
   printf '%s\n' "$BEGIN_MARK"
   printf '**Contents**\n\n'
-  # Skip headings inside fenced code blocks.
+  # Skip headings inside fenced code blocks — by CommonMark's fence rules, not
+  # by toggling on every ``` line (#7753). A closing fence carries NO info
+  # string and is at least as long as its opener, so the inner ```bash of a
+  # ```bash block that quotes a shell heredoc does not close anything. Toggling
+  # blind inverts the fence state from that point on: hermit-patterns.md's
+  # proposal templates made the generator emit `## Goal Discovery Scripts` (which
+  # GitHub renders inside a code block, so the anchor does not exist) while
+  # hiding the template headings that GitHub does render.
+  #
+  # Written with substr/while rather than `{n,m}` intervals: old awks (mawk 1.3.3,
+  # the BSD awk on macOS) do not support interval expressions without a flag.
   awk '
-    /^```/ { infence = !infence; next }
-    !infence && /^## / { sub(/^## /, ""); print }
+    {
+      line = $0
+      indent = 0
+      while (indent < length(line) && substr(line, indent + 1, 1) == " ") indent++
+      body = substr(line, indent + 1)
+      fence_char = substr(body, 1, 1)
+      ticks = 0
+      # Up to three leading spaces still opens/closes a fence; four makes it an
+      # indented code block, which cannot contain a heading either way.
+      if (indent <= 3 && (fence_char == "`" || fence_char == "~")) {
+        while (substr(body, ticks + 1, 1) == fence_char) ticks++
+        if (ticks < 3) ticks = 0
+      }
+      if (infence) {
+        if (ticks >= open_len && fence_char == open_char) {
+          rest = substr(body, ticks + 1)
+          gsub(/[ \t]/, "", rest)
+          if (rest == "") infence = 0
+        }
+        next
+      }
+      if (ticks > 0) { infence = 1; open_char = fence_char; open_len = ticks; next }
+      if (indent == 0 && body ~ /^## /) { sub(/^## /, "", body); print body }
+    }
   ' "$file" | while IFS= read -r heading; do
     [ -n "$heading" ] || continue
     base="$(slugify "$heading")"
@@ -126,8 +189,11 @@ stale=""
 fixed=0
 checked=0
 
-for f in defaults/docs/*.md; do
+for f in defaults/docs/*.md defaults/.claude/commands/loom/*.md; do
   [ -f "$f" ] || continue
+  case "$f" in
+    */bump.md) continue ;;  # generic, non-Loom-specific — not part of the prompt set
+  esac
   qualifies "$f" || continue
   checked=$((checked + 1))
   rendered="$(render "$f")"
