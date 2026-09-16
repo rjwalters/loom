@@ -10,6 +10,87 @@ use loom_daemon::types::{Request, Response};
 
 use super::common::{query_daemon, resolve_socket_path};
 
+/// `restart` subcommand args (Issue #4712 split, moved wholesale out of
+/// `main.rs`'s `Commands::Restart` variant by Issue #6969's file-size-ratchet
+/// fix: `main.rs` is already over `.loom/docs/file-size-policy.md`'s
+/// threshold and frozen, so adding the 3 new `--verify-*` fields there could
+/// only land by moving the WHOLE bundle to this already-under-threshold
+/// module instead of leaving a few new fields behind as dispatch debt).
+#[derive(clap::Args)]
+pub(crate) struct RestartArgs {
+    /// Finish all in-flight sweeps before restarting, instead of restarting
+    /// immediately (#4090). New dispatch is paused for the duration.
+    #[arg(long)]
+    pub(crate) drain: bool,
+    /// Max seconds to wait for in-flight sweeps to drain (with `--drain`).
+    /// Defaults to the daemon's built-in timeout (tens of minutes).
+    #[arg(long)]
+    pub(crate) timeout: Option<u64>,
+    /// On drain timeout, cancel the remaining sweeps and restart anyway
+    /// (with `--drain`). Without this, a timeout refuses the restart and
+    /// keeps the daemon running (fail-safe).
+    #[arg(long)]
+    pub(crate) force_after_timeout: bool,
+    /// Abort an in-progress drain and resume normal dispatch (no restart).
+    #[arg(long)]
+    pub(crate) abort_drain: bool,
+    /// With `--drain`, stop (and stay down) instead of restarting once
+    /// drained (Issue #4343). Requires `--drain`; the daemon does not
+    /// require a recognized supervisor for this variant (there is
+    /// nothing to prove supervision for — a `then-exit` drain never
+    /// wants a relaunch).
+    #[arg(long)]
+    pub(crate) then_exit: bool,
+    /// Boot the launchd job out and back in (bounded, EIO-aware bootstrap
+    /// retry) so a hand-edited plist's `EnvironmentVariables` actually
+    /// takes effect (Issue #6682) — see the command doc above. A local
+    /// operation, independent of the running daemon's IPC socket; never
+    /// combine with `--drain`/`--abort-drain`/`--then-exit`. Refuses on a
+    /// non-launchd host.
+    #[arg(long)]
+    pub(crate) reload_supervisor: bool,
+    /// The `--verify-only`/`--verify-supervisor`/`--verify-pre-pid` flags
+    /// (Issue #6969) — internal use only; see `VerifyOnlyArgs`'s doc for
+    /// what they do and why they're grouped.
+    #[command(flatten)]
+    pub(crate) verify: VerifyOnlyArgs,
+}
+
+/// The three `--verify-only`/`--verify-supervisor`/`--verify-pre-pid` flags
+/// (Issue #6969), bundled into one `#[command(flatten)]` argument nested
+/// inside [`RestartArgs`] so `handle_restart_command` stays under clippy's
+/// `too_many_arguments` threshold. They only ever travel together —
+/// `--verify-only` is meaningless without the other two, and
+/// [`restart_verify::spawn_detached_verifier`] always sets all three at
+/// once — so grouping them costs nothing at its one call site.
+#[derive(clap::Args)]
+pub(crate) struct VerifyOnlyArgs {
+    /// **Internal use only** (Issue #6969): run ONLY the post-restart
+    /// relaunch verification + self-heal (`restart_verify::verify_and_heal`)
+    /// against the given `--verify-supervisor` / `--verify-pre-pid`, without
+    /// sending any request to a daemon. This is what
+    /// `restart_verify::spawn_detached_verifier` execs as a DETACHED child
+    /// right before an in-process `DrainAndRestartDaemon` exit (the
+    /// autonomous self-update roll, most notably): a verification poll
+    /// cannot run *inside* the process that is about to exit (see
+    /// `restart_verify.rs`'s module doc), so it runs here instead, in a
+    /// separate process that survives the parent's exit. Requires
+    /// `--verify-supervisor` and `--verify-pre-pid`. Not a stable/documented
+    /// CLI surface — hidden from `--help`.
+    #[arg(long, hide = true)]
+    pub(crate) verify_only: bool,
+    /// Supervisor to verify against with `--verify-only` (`launchd` or
+    /// `systemd`) — the exiting process's own authoritative
+    /// `detect_supervisor()` reading, passed through rather than
+    /// re-detected in the child.
+    #[arg(long, hide = true)]
+    pub(crate) verify_supervisor: Option<String>,
+    /// The exiting process's own pid, so `--verify-only` can tell "a NEW
+    /// pid showed up" apart from "the old process is still mid-teardown".
+    #[arg(long, hide = true)]
+    pub(crate) verify_pre_pid: Option<u32>,
+}
+
 /// Handle the `restart` subcommand (Issue #4054 — the supervised restart
 /// primitive). Connects to the running daemon over its Unix socket and sends a
 /// single `RestartDaemon` request.
@@ -26,14 +107,25 @@ use super::common::{query_daemon, resolve_socket_path};
 /// proved not to be enough on a busy systemd host: a **pre-restart stale-unit
 /// warning**, and a **post-restart relaunch verification with supervisor
 /// self-heal** ([`verify_relaunch`]).
-pub(crate) async fn handle_restart_command(
-    drain: bool,
-    timeout: Option<u64>,
-    force_after_timeout: bool,
-    abort_drain: bool,
-    then_exit: bool,
-    reload_supervisor: bool,
-) -> Result<()> {
+pub(crate) async fn handle_restart_command(args: RestartArgs) -> Result<()> {
+    let RestartArgs {
+        drain,
+        timeout,
+        force_after_timeout,
+        abort_drain,
+        then_exit,
+        reload_supervisor,
+        verify,
+    } = args;
+    // Issue #6969: `--verify-only` never talks to a daemon at all — it is the
+    // detached child `restart_verify::spawn_detached_verifier` execs right
+    // before an in-process `DrainAndRestartDaemon` exit (the auto-update
+    // self-roll, most notably), so it branches out before every other flag
+    // (including `--reload-supervisor`) even looks at its own arguments.
+    if verify.verify_only {
+        return handle_verify_only_command(verify.verify_supervisor, verify.verify_pre_pid);
+    }
+
     // Issue #6682: `--reload-supervisor` is a local, launchctl-shelling CLI
     // operation — it boots the launchd job out and back in so a hand-edited
     // plist's EnvironmentVariables actually takes effect (a plain restart's
@@ -171,6 +263,56 @@ fn handle_reload_supervisor_command(drain: bool, abort_drain: bool, then_exit: b
         Ok(())
     } else {
         std::process::exit(1);
+    }
+}
+
+/// Handle `restart --verify-only` (Issue #6969) — run
+/// [`restart_verify::verify_and_heal`] against an already-known supervisor/pid
+/// with NO daemon request at all, print the verdict, and exit.
+///
+/// This is exactly what [`restart_verify::spawn_detached_verifier`] execs as a
+/// DETACHED child right before an in-process `DrainAndRestartDaemon` exit (the
+/// autonomous self-update loop's own drain-and-restart, most notably — see
+/// `run_drain_supervisor` in `ipc.rs`): a verification poll cannot run *inside*
+/// the process that is about to `std::process::exit`, because that either
+/// delays the very exit the supervisor is waiting on to relaunch, or simply
+/// vanishes along with the rest of the process. Running it here, in a
+/// freshly-spawned sibling process, survives the parent's exit either way.
+///
+/// A missing/unrecognized `--verify-supervisor` is a usage error (this
+/// subcommand only ever has one caller, `spawn_detached_verifier`, so a bad
+/// value means that caller regressed) — exits non-zero rather than silently
+/// doing nothing.
+fn handle_verify_only_command(
+    verify_supervisor: Option<String>,
+    verify_pre_pid: Option<u32>,
+) -> Result<()> {
+    let Some(sup) = verify_supervisor.as_deref().and_then(Supervisor::parse) else {
+        eprintln!(
+            "restart --verify-only requires a recognized --verify-supervisor \
+             (launchd|systemd); got: {verify_supervisor:?}"
+        );
+        std::process::exit(1);
+    };
+    let poll_secs = restart_verify::resolve_secs(
+        std::env::var(restart_verify::POLL_SECS_ENV).ok().as_deref(),
+        restart_verify::DEFAULT_POLL_SECS,
+    );
+    let outcome = restart_verify::verify_and_heal(sup, verify_pre_pid);
+    let rendered = outcome.render(sup.as_str(), poll_secs);
+    match outcome {
+        RelaunchOutcome::Relaunched { healed: false, .. } | RelaunchOutcome::Skipped { .. } => {
+            println!("{rendered}");
+            Ok(())
+        }
+        RelaunchOutcome::Relaunched { healed: true, .. } => {
+            eprintln!("{rendered}");
+            Ok(())
+        }
+        RelaunchOutcome::NotRelaunched { .. } => {
+            eprintln!("{rendered}");
+            std::process::exit(1);
+        }
     }
 }
 

@@ -133,6 +133,8 @@ use crate::event_bus::EventBus;
 use crate::ipc::DrainState;
 use crate::workspace_pool::WorkspacePool;
 
+mod relaunch_verify_note;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -2077,6 +2079,7 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                      reduced priority]"
                 );
             }
+            note = relaunch_verify_note::with_relaunch_verify_note(note, drain_accepted);
             log_roll_outcome(&outcome, &note);
             note
         }
@@ -2114,6 +2117,7 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                      reduced priority]"
                 );
             }
+            note = relaunch_verify_note::with_relaunch_verify_note(note, drain_accepted);
             log_roll_outcome(&outcome, &note);
             note
         }

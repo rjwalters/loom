@@ -1089,18 +1089,21 @@ pub fn drain_exit_code(then_exit: bool) -> i32 {
 /// The two terminal actions **must** produce visibly different lines — a host
 /// log has to say which one fired without the reader guessing. Extracted as a
 /// pure function so that distinctness is a test assertion rather than a
-/// convention. `supervisor` is only interpolated on the relaunch line.
+/// convention. `supervisor` and `verify_poll_secs` are only interpolated on
+/// the relaunch line (`verify_poll_secs` is unused on the `then_exit` branch —
+/// there is no relaunch to verify there).
 #[must_use]
-pub fn drain_complete_log_line(then_exit: bool, supervisor: &str) -> String {
+pub fn drain_complete_log_line(then_exit: bool, supervisor: &str, verify_poll_secs: u64) -> String {
     if then_exit {
         format!(
             "drain complete — 0 in-flight sweeps; exiting {EXIT_SHUTDOWN} and staying down \
              (then_exit — Issue #4343 teardown). No sweep was killed; no orphan left behind."
         )
     } else {
+        let note = crate::restart_verify::relaunch_verify_note(supervisor, verify_poll_secs);
         format!(
             "drain complete — 0 in-flight sweeps; exiting {EXIT_RESTART} for a \
-             {supervisor}-supervised relaunch. No sweep was killed; no orphan left behind."
+             {supervisor}-supervised relaunch. No sweep was killed; no orphan left behind. {note}"
         )
     }
 }
@@ -1209,6 +1212,11 @@ async fn run_drain_supervisor(
     my_generation: u64,
     poll_interval: Duration,
 ) {
+    // Issue #6969: the bound a detached post-exit verifier polls against,
+    // resolved once per supervisor rather than per tick — the same knob
+    // `restart_verify::verify_and_heal` itself resolves, so the log line and
+    // the verifier it describes can never disagree about the bound.
+    let verify_poll_secs = crate::restart_verify::resolve_configured_poll_secs();
     loop {
         // Superseded / aborted: a newer drain or an abort bumped the generation,
         // so this supervisor is stale — stop WITHOUT ending the process. This is
@@ -1243,15 +1251,20 @@ async fn run_drain_supervisor(
                     serde_json::json!({ "in_flight": 0, "then_exit": then_exit }),
                 );
                 if then_exit {
-                    log::warn!("{}", drain_complete_log_line(true, ""));
+                    log::warn!("{}", drain_complete_log_line(true, "", verify_poll_secs));
                     std::process::exit(drain_exit_code(true));
                 }
                 // This path only runs after `handle_drain_request` proved
                 // supervision, so `detect_supervisor()` should still be `Some`
                 // here; fall back to a generic label rather than hardcoding
                 // launchd if the environment somehow changed underneath us.
-                let sup = detect_supervisor().unwrap_or_else(|| "supervisor".to_string());
-                log::warn!("{}", drain_complete_log_line(false, &sup));
+                // Issue #6969: also spawns the detached post-exit verifier
+                // BEFORE exiting — see `restart_verify::spawn_detached_verifier`'s
+                // doc for why it cannot run in-band here. `pre_pid` is this
+                // process's own pid: the supervisor's current record of the
+                // daemon that is about to exit.
+                let sup = crate::restart_verify::detect_and_spawn_verifier(std::process::id());
+                log::warn!("{}", drain_complete_log_line(false, &sup, verify_poll_secs));
                 std::process::exit(drain_exit_code(false));
             }
             DrainTick::TimedOutRefuse => {
@@ -1345,9 +1358,15 @@ async fn run_drain_supervisor(
                     );
                     std::process::exit(drain_exit_code(true));
                 }
+                // Same detection/fallback as the `DrainTick::Complete` relaunch
+                // branch above; this path only reaches here after
+                // `handle_drain_request` already proved supervision. Also
+                // spawns the same detached post-exit verifier (Issue #6969).
+                let sup = crate::restart_verify::detect_and_spawn_verifier(std::process::id());
                 log::warn!(
                     "drain timed out with {in_flight} in-flight; --force-after-timeout cancelled \
-                     {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch"
+                     {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch. {}",
+                    crate::restart_verify::relaunch_verify_note(&sup, verify_poll_secs)
                 );
                 std::process::exit(drain_exit_code(false));
             }

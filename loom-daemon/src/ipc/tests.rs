@@ -5166,15 +5166,28 @@ fn test_supervisor_branch_follows_live_then_exit() {
 /// **distinct**, so a host log tells an operator which terminal action fired
 /// without guessing. Asserted against the exact bodies
 /// `run_drain_supervisor`'s `DrainTick::Complete` arm emits.
+///
+/// Also Issue #6969 AC2 — the relaunch line states BOTH the expected
+/// relaunch path (which supervisor mechanism) and the detached verifier's
+/// bound, so a future gap (the ~4-minute launchd observation this issue
+/// records) is attributable from the log alone; the then_exit branch has no
+/// relaunch to verify, so it must not carry that note even though a bound is
+/// technically passed in.
 #[test]
 fn test_drain_complete_log_lines_remain_distinct() {
-    let then_exit_line = drain_complete_log_line(true, "launchd");
-    let relaunch_line = drain_complete_log_line(false, "launchd");
+    let then_exit_line = drain_complete_log_line(true, "launchd", 45);
+    let relaunch_line = drain_complete_log_line(false, "launchd", 45);
     assert_ne!(then_exit_line, relaunch_line);
     assert!(then_exit_line.contains("staying down"));
     assert!(then_exit_line.contains("143"));
     assert!(relaunch_line.contains("supervised relaunch"));
     assert!(!relaunch_line.contains("staying down"));
+    // "KeepAlive" only appears in the launchd-specific mechanism wording, so
+    // this subsumes a separate `.contains("launchd")` check.
+    assert!(relaunch_line.contains("KeepAlive"));
+    assert!(relaunch_line.contains("45s"));
+    assert!(relaunch_line.contains("verify-only"));
+    assert!(!then_exit_line.contains("verify-only"));
 }
 
 /// Issue #5340 (AC: the `TimedOutRefuse` message names the exact local

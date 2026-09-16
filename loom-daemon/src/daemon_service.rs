@@ -205,24 +205,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // `restart` connects to the running daemon over its Unix socket to
             // trigger the supervised restart primitive (Issue #4054), or a
             // scheduled drain-and-restart (Issue #4090).
-            Commands::Restart {
-                drain,
-                timeout,
-                force_after_timeout,
-                abort_drain,
-                then_exit,
-                reload_supervisor,
-            } => {
-                handle_restart_command(
-                    drain,
-                    timeout,
-                    force_after_timeout,
-                    abort_drain,
-                    then_exit,
-                    reload_supervisor,
-                )
-                .await
-            }
+            Commands::Restart(args) => handle_restart_command(args).await,
             // `fleet status` collects the local host's own status over the
             // daemon's Unix socket (issue #4342), so — unlike `fleet
             // add-worker`, which is pure ssh/filesystem and stays on the sync

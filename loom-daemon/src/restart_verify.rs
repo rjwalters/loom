@@ -43,6 +43,60 @@
 //! operator-invoked restart (an SSH shell, a fleet script) is outside the
 //! cgroup and self-heals in-band.
 //!
+//! # The launchd / auto-update case is a DIFFERENT shape of the same residual
+//! (#6969)
+//!
+//! The systemd-cgroup residual above is about being *killed* before polling
+//! can happen. The in-process `DrainAndRestartDaemon` exit that the autonomous
+//! self-update loop triggers (`run_drain_supervisor` in `ipc.rs`, reached from
+//! `auto_update.rs`'s "drain-and-restart triggered" roll — never through the
+//! CLI's `loom-daemon restart`, which already gets this module's verification
+//! from `cli::restart::verify_relaunch`) has the same residual for a
+//! different reason, on **both** supervisors: the verification would have to
+//! run in the very process that is about to call `std::process::exit`, and
+//! *polling before that exit* would delay the one signal (the exit itself)
+//! that the supervisor is waiting on to relaunch — so it cannot run in-band
+//! either way. A single observed launchd relaunch that took ~4 minutes
+//! (recovered only by `loom-daemon-watchdog.sh`'s ~300s poll, not by anything
+//! faster) motivated closing this gap rather than leaving the watchdog as the
+//! sole bound. [`spawn_detached_verifier`] is the fix: it execs a
+//! `loom-daemon restart --verify-only` **child**, in its own process group
+//! and never `.wait()`'d, right before every in-process drain-and-restart
+//! exit that expects a relaunch. It runs the exact same [`verify_and_heal`]
+//! poll+self-heal this module already gives the CLI path, just from a process
+//! that outlives the one it is verifying.
+//!
+//! ## What this actually closes: launchd only (#7707 review)
+//!
+//! **launchd — closed.** POSIX reparenting alone is *not* enough there:
+//! per `launchd.plist(5)`, "when a job dies, launchd kills any remaining
+//! processes with the same process group ID as the job" unless the job sets
+//! `AbandonProcessGroup`, and `render_launchd_plist`
+//! (`defaults/scripts/cli/loom-daemon-start.sh`) deliberately does not emit
+//! that key. A child left in the daemon's own process group would therefore
+//! be swept milliseconds into its first poll. [`spawn_detached_verifier`]
+//! calls `process_group(0)` precisely so the verifier is in a process group
+//! launchd's sweep does not name; the orphaned child then survives the
+//! parent's exit and polls for the relaunch.
+//!
+//! **systemd — unchanged; still watchdog-bound.** `process_group(0)` moves a
+//! child between process groups, not between cgroups, and the rendered unit
+//! sets `KillMode=mixed` (#4862): per `kill(5)`, mixed SIGTERMs the main
+//! process and SIGKILLs *all remaining processes in the cgroup* as soon as
+//! the main process exits — immediately, without waiting out
+//! `TimeoutStopSec`. The verifier child is in that cgroup, so it is killed at
+//! essentially the same instant as its parent. The spawn is therefore
+//! **best-effort on systemd and expected to lose that race**; it is still
+//! attempted (it costs nothing and its log line is itself attribution), but
+//! the real bound on a systemd relaunch remains
+//! `loom-daemon-watchdog.sh`'s out-of-cgroup poll, exactly as documented in
+//! the residual section above. `KillMode=mixed` must NOT be relaxed to make
+//! the verifier survive — it is load-bearing for the relaunch itself
+//! (control-group mode yields `Result=timeout`, which `Restart=on-success`
+//! does not match, and the daemon then never comes back at all). Escaping the
+//! cgroup properly would need `systemd-run --user --scope`, which is
+//! deliberately out of scope here.
+//!
 //! # Deliberately mirrors the shell implementation
 //!
 //! The poll contract ("a NEW pid that is also *alive*"), the env knobs
@@ -329,6 +383,51 @@ where
 pub fn resolve_secs(raw: Option<&str>, default: u64) -> u64 {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+/// Resolve the configured post-restart verification poll bound from
+/// [`POLL_SECS_ENV`] (or [`DEFAULT_POLL_SECS`]) — the exact knob
+/// [`verify_and_heal`] itself resolves, so every caller describing this bound
+/// in a log line (Issue #6969) can never disagree with the verifier that
+/// actually polls against it.
+#[must_use]
+pub fn resolve_configured_poll_secs() -> u64 {
+    resolve_secs(std::env::var(POLL_SECS_ENV).ok().as_deref(), DEFAULT_POLL_SECS)
+}
+
+/// The shared "here is what confirms this relaunch, and by when" sentence
+/// appended to every in-process drain-and-restart exit that expects a
+/// relaunch (Issue #6969 AC2 — the auto-update roll's own "drain-and-restart
+/// triggered" note states the expected relaunch path and the verifier's
+/// bound, so a future gap like the one this issue observed — a launchd
+/// relaunch that took ~4 minutes — is attributable from the log alone).
+///
+/// Extracted as a pure function so the exact wording is a test assertion.
+#[must_use]
+pub fn relaunch_verify_note(supervisor: &str, verify_poll_secs: u64) -> String {
+    let mechanism = if supervisor.eq_ignore_ascii_case("launchd") {
+        "launchd KeepAlive.SuccessfulExit"
+    } else if supervisor.eq_ignore_ascii_case("systemd") {
+        "systemd Restart=on-success"
+    } else {
+        "the supervisor's own relaunch-on-success policy"
+    };
+    // #7707 review: on systemd the detached verifier lives in the unit's own
+    // cgroup, which `KillMode=mixed` SIGKILLs the instant the main process
+    // exits — so the note must not promise a 30s bound there. See this
+    // module's doc, "What this actually closes".
+    let verifier_caveat = if supervisor.eq_ignore_ascii_case("systemd") {
+        " NOTE: that child is best-effort under systemd (KillMode=mixed kills this unit's cgroup \
+         on main-process exit), so the watchdog is in practice the real bound here."
+    } else {
+        ""
+    };
+    format!(
+        "Expected relaunch path: {mechanism}. A detached `restart --verify-only` child will \
+         confirm a new, live pid within {verify_poll_secs}s or self-heal \
+         (kickstart/reset-failed+start); the unattended watchdog poll (~300s) is the outer bound \
+         if that also fails to confirm.{verifier_caveat}"
+    )
 }
 
 /// Read the poll interval, which the shell implementation allows to be
@@ -805,6 +904,173 @@ fn heal_launchd(pre_pid: Option<u32>, recovery_secs: u64, interval: Duration) ->
 }
 
 // ============================================================================
+// Detached post-exit verifier (Issue #6969)
+// ============================================================================
+
+/// The subcommand + flags a detached verifier child is exec'd with — kept as
+/// one named constant/helper so `spawn_detached_verifier` and any test that
+/// wants to assert on the exact argv stay in lockstep.
+#[must_use]
+fn verify_only_args(supervisor: Supervisor, pre_pid: u32) -> Vec<String> {
+    vec![
+        "restart".to_string(),
+        "--verify-only".to_string(),
+        "--verify-supervisor".to_string(),
+        supervisor.as_str().to_string(),
+        "--verify-pre-pid".to_string(),
+        pre_pid.to_string(),
+    ]
+}
+
+/// Put a to-be-spawned child in its **own** process group (`setpgid(0, 0)` via
+/// `CommandExt::process_group`).
+///
+/// This is load-bearing for [`spawn_detached_verifier`], not cosmetic, and the
+/// reason differs from the `#3800` precedents in `sweep_registry::dispatch` /
+/// `role_runner` (which do it for *teardown control* — so a timeout can kill a
+/// whole subtree). Here it is for **survival**: per `launchd.plist(5)`,
+///
+/// > **AbandonProcessGroup** — When a job dies, launchd kills any remaining
+/// > processes with the same process group ID as the job. Setting this key to
+/// > true disables that behavior.
+///
+/// `render_launchd_plist` (`defaults/scripts/cli/loom-daemon-start.sh`) does
+/// not emit `AbandonProcessGroup`, so launchd's default sweep applies: a
+/// verifier left in the daemon's process group is killed the instant the
+/// daemon exits — i.e. before it can poll anything. Moving it to its own group
+/// is what makes the orphaned child outlive that exit. Do not remove this
+/// without also adding `AbandonProcessGroup` to the rendered plist.
+///
+/// Note this buys nothing under systemd's `KillMode=mixed` cgroup kill — see
+/// the module doc's "What this actually closes" section.
+fn detach_process_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Supervisor-specific honesty clause appended to the "spawned a detached
+/// post-exit verifier" log line.
+///
+/// Under launchd the detachment is sufficient (see [`detach_process_group`]);
+/// under systemd's `KillMode=mixed` the child is in the unit's cgroup and is
+/// SIGKILLed with its parent, so the log must not claim a bound it will not
+/// deliver.
+#[must_use]
+fn detached_verifier_survival_caveat(supervisor: Supervisor) -> &'static str {
+    match supervisor {
+        Supervisor::Launchd => "",
+        Supervisor::Systemd => {
+            " NOTE: best-effort on systemd — KillMode=mixed SIGKILLs this unit's whole cgroup \
+             (including this child) as soon as the main process exits, so this verifier is \
+             expected to lose that race; loom-daemon-watchdog.sh remains the real bound here."
+        }
+    }
+}
+
+/// Spawn a detached, short-lived `loom-daemon restart --verify-only` child to
+/// verify and (if needed) self-heal a relaunch this process itself expects but
+/// cannot wait around to confirm — see the module doc's "The launchd /
+/// auto-update case" section for why the wait cannot happen in-band.
+///
+/// `pre_pid` is this process's OWN pid ([`std::process::id`]) — the pid the
+/// supervisor currently has on record for the daemon that is about to exit, so
+/// the child's [`is_confirmed_relaunch`] check can tell "a genuinely NEW pid
+/// showed up" apart from "the exiting process just hadn't torn down yet".
+///
+/// The child is spawned in its own process group ([`detach_process_group`]),
+/// which is what lets it survive launchd's kill-the-job's-process-group sweep;
+/// under systemd's `KillMode=mixed` cgroup kill it is expected to lose the
+/// race and be SIGKILLed with its parent (still attempted — see the module
+/// doc's "What this actually closes" section).
+///
+/// Best-effort and silent-on-failure by design: a spawn failure here must
+/// never block, delay, or fail the exit it exists to backstop — the
+/// unattended watchdog poll remains the ultimate backstop regardless. One
+/// known benign failure mode: the child is exec'd from
+/// [`std::env::current_exe`], which on the auto-update path is the *newly
+/// installed* binary. If a rollback ever restores an older binary at that path
+/// before the child starts, `restart --verify-only` fails clap parsing and
+/// exits non-zero — a stderr line in the supervisor's log and nothing more,
+/// since nothing waits on the child and the watchdog still bounds the
+/// relaunch. The
+/// child's stdio is deliberately left **inherited** (not redirected to
+/// `/dev/null`): under a supervisor that redirects the daemon's own
+/// stdout/stderr to a persistent log file (launchd's `StandardErrorPath`,
+/// systemd's journal), the child's diagnostics land in that same log, so a
+/// future gap is attributable from the log alone even though the process that
+/// observed it has, by definition, already exited.
+pub fn spawn_detached_verifier(supervisor: Supervisor, pre_pid: u32) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "restart_verify: could not resolve current_exe to spawn a detached post-exit \
+                 verifier ({e}) — the unattended watchdog poll remains the only bound on this \
+                 relaunch."
+            );
+            return;
+        }
+    };
+    let mut cmd = Command::new(&exe);
+    cmd.args(verify_only_args(supervisor, pre_pid));
+    cmd.stdin(std::process::Stdio::null());
+    // MUST outlive the parent's exit: launchd sweeps the job's whole process
+    // group (no `AbandonProcessGroup` in the rendered plist), so reparenting
+    // alone is not enough. See [`detach_process_group`].
+    detach_process_group(&mut cmd);
+    match cmd.spawn() {
+        Ok(child) => {
+            eprintln!(
+                "restart_verify: spawned a detached post-exit verifier (pid {}, `{} restart \
+                 --verify-only --verify-supervisor {} --verify-pre-pid {pre_pid}`) to confirm {} \
+                 relaunches this daemon within the poll bound — its own process group, \
+                 deliberately never awaited, so it outlives this process's own exit.{}",
+                child.id(),
+                exe.display(),
+                supervisor.as_str(),
+                supervisor.as_str(),
+                detached_verifier_survival_caveat(supervisor)
+            );
+            // Deliberately never `.wait()`'d: on Unix, once THIS (the parent)
+            // process calls `std::process::exit`, the child is reparented
+            // (to launchd/init) and keeps running — that orphaning, PLUS the
+            // `process_group(0)` above (which is what keeps launchd's
+            // same-pgid sweep from killing it anyway), is the detachment this
+            // function exists to produce. Dropping the `Child` handle here
+            // does not send it any signal.
+        }
+        Err(e) => {
+            eprintln!(
+                "restart_verify: failed to spawn the detached post-exit verifier ({e}) — the \
+                 unattended watchdog poll remains the only bound on this relaunch."
+            );
+        }
+    }
+}
+
+/// Re-detect the current supervisor label ([`crate::ipc::detect_supervisor`],
+/// falling back to `"supervisor"` the same way every `run_drain_supervisor`
+/// exit point already does) and spawn [`spawn_detached_verifier`] against it
+/// — a no-op on an unrecognized label, since there is nothing to verify
+/// against. Bundles both steps (Issue #6969) so `ipc.rs`'s two
+/// `run_drain_supervisor` exit points share one call instead of each
+/// re-detecting the supervisor and parsing it themselves.
+pub fn detect_and_spawn_verifier(pre_pid: u32) -> String {
+    let sup = crate::ipc::detect_supervisor().unwrap_or_else(|| "supervisor".to_string());
+    if let Some(supervisor) = Supervisor::parse(&sup) {
+        spawn_detached_verifier(supervisor, pre_pid);
+    }
+    sup
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -822,6 +1088,27 @@ mod tests {
         assert_eq!(Supervisor::parse(""), None);
         assert_eq!(Supervisor::Launchd.as_str(), "launchd");
         assert_eq!(Supervisor::Systemd.as_str(), "systemd");
+    }
+
+    /// #7707 review: the systemd note must flag the detached verifier as
+    /// best-effort rather than promising a bound `KillMode=mixed` prevents it
+    /// from delivering; the launchd note carries no such caveat because
+    /// `process_group(0)` really does let the child survive there.
+    #[test]
+    fn relaunch_verify_note_names_path_and_bound() {
+        let note = relaunch_verify_note("systemd", 30);
+        assert!(note.contains("systemd"));
+        assert!(note.contains("30s"));
+        assert!(note.contains("watchdog"));
+        assert!(
+            note.contains("best-effort under systemd"),
+            "expected the KillMode=mixed caveat, got: {note}"
+        );
+        let launchd = relaunch_verify_note("launchd", 30);
+        assert!(
+            !launchd.contains("best-effort"),
+            "launchd's verifier is not best-effort — it survives the pgid sweep: {launchd}"
+        );
     }
 
     #[test]
@@ -1179,5 +1466,152 @@ com.rjwalters.loom-daemon = {
              bare None from the user/<uid> miss alone"
         );
         assert!(alive);
+    }
+
+    // ========================================================================
+    // Detached post-exit verifier — Issue #6969
+    // ========================================================================
+
+    /// AC3: the verifier's DECISION under a fake supervisor that delays its
+    /// relaunch past the poll bound — no live host required. This is the exact
+    /// shape the issue's single observation records: launchd eventually DID
+    /// bring the daemon back, just not inside the window a caller can
+    /// practically poll for, so `poll_until_relaunched` (the decision
+    /// [`verify_and_heal`] falls through to its self-heal branch on) must
+    /// report `None` rather than hang waiting for a relaunch that is,
+    /// relative to the bound, indefinitely delayed.
+    #[test]
+    fn poll_reports_not_relaunched_when_a_fake_supervisor_delays_past_the_bound() {
+        // The fake supervisor never reports anything other than the OLD pid,
+        // still alive — a relaunch that (from this poll's perspective) simply
+        // never arrived inside the bound, exactly like a launchd relaunch that
+        // eventually happens well outside any caller's poll window.
+        let got = poll_until_relaunched(
+            Some(4242),
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            || (Some(4242), true),
+        );
+        assert_eq!(
+            got, None,
+            "a supervisor whose relaunch is delayed past the bound must never be reported as \
+             confirmed — that is precisely what routes `verify_and_heal` into its self-heal branch"
+        );
+    }
+
+    /// The mirror image: a fake supervisor whose relaunch lands WELL inside
+    /// the bound must be confirmed immediately — the decision is not simply
+    /// "always report not-relaunched", it correctly distinguishes the two
+    /// cases.
+    #[test]
+    fn poll_reports_relaunched_when_a_fake_supervisor_relaunches_within_the_bound() {
+        let ticks = std::cell::Cell::new(0u32);
+        let got = poll_until_relaunched(
+            Some(4242),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                ticks.set(ticks.get() + 1);
+                if ticks.get() < 3 {
+                    (Some(4242), true) // not yet
+                } else {
+                    (Some(9999), true) // a genuinely new, live pid
+                }
+            },
+        );
+        assert_eq!(got, Some(9999));
+    }
+
+    /// [`verify_only_args`] is the exact argv [`spawn_detached_verifier`] execs
+    /// its detached child with — pinned so a future refactor of either cannot
+    /// silently drift the two apart (the child parses these with clap, so a
+    /// mismatch would only surface as a runtime usage error on a live host,
+    /// never at compile time).
+    #[test]
+    fn verify_only_args_names_the_exact_argv_the_verify_only_subcommand_expects() {
+        assert_eq!(
+            verify_only_args(Supervisor::Launchd, 4242),
+            vec![
+                "restart".to_string(),
+                "--verify-only".to_string(),
+                "--verify-supervisor".to_string(),
+                "launchd".to_string(),
+                "--verify-pre-pid".to_string(),
+                "4242".to_string(),
+            ]
+        );
+        assert_eq!(
+            verify_only_args(Supervisor::Systemd, 1)[3],
+            "systemd",
+            "the supervisor arg must be Supervisor::as_str(), not Debug output"
+        );
+    }
+    /// The spawn attribute the detached verifier's *survival* depends on
+    /// (#6969 / #7707 review): launchd kills every remaining process sharing
+    /// the dying job's process group unless the plist sets
+    /// `AbandonProcessGroup` — and `render_launchd_plist` deliberately does
+    /// not. So [`spawn_detached_verifier`] must put its child in a NEW process
+    /// group, or the verifier is swept milliseconds into its first poll and
+    /// the whole feature is a silent no-op on the exact host shape that
+    /// motivated it.
+    ///
+    /// Asserted behaviorally rather than by reading the `Command` back (std
+    /// exposes no getter for `process_group`): spawn a real child configured
+    /// by the same [`detach_process_group`] helper `spawn_detached_verifier`
+    /// uses and have it report its own pid and pgid. `process_group(0)` makes
+    /// the child a group leader, i.e. `pgid == pid`. The control case (no
+    /// helper) inherits this test process's pgid, which can never equal the
+    /// freshly allocated child pid.
+    #[cfg(unix)]
+    #[test]
+    fn detach_process_group_puts_the_child_in_its_own_process_group() {
+        fn pid_and_pgid(detach: bool) -> (i32, i32) {
+            let mut cmd = Command::new("/bin/sh");
+            // `$$` is the shell's own pid; `ps -o pgid=` its process group.
+            cmd.arg("-c")
+                .arg("printf '%s %s' \"$$\" \"$(ps -o pgid= -p $$)\"");
+            if detach {
+                detach_process_group(&mut cmd);
+            }
+            let out = cmd.output().expect("spawn /bin/sh");
+            assert!(out.status.success(), "probe shell failed: {out:?}");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut it = text.split_whitespace();
+            let pid: i32 = it.next().expect("pid").parse().expect("pid parses");
+            let pgid: i32 = it.next().expect("pgid").parse().expect("pgid parses");
+            (pid, pgid)
+        }
+
+        let (pid, pgid) = pid_and_pgid(true);
+        assert_eq!(
+            pgid, pid,
+            "a detached verifier child must lead its OWN process group (pgid == pid), otherwise \
+             launchd's kill-the-job's-process-group sweep (no AbandonProcessGroup in the \
+             rendered plist) takes it down with the exiting daemon"
+        );
+
+        let (ctl_pid, ctl_pgid) = pid_and_pgid(false);
+        assert_ne!(
+            ctl_pgid, ctl_pid,
+            "control: without detach_process_group the child inherits this process's group — if \
+             this ever stops holding, the positive assertion above proves nothing"
+        );
+    }
+
+    /// The spawn log line must not promise a bound systemd will not deliver:
+    /// `KillMode=mixed` SIGKILLs the unit's cgroup (verifier included) the
+    /// instant the main process exits, so the systemd case is annotated
+    /// best-effort while launchd — where the process-group detachment IS
+    /// sufficient — carries no caveat.
+    #[test]
+    fn detached_verifier_survival_caveat_is_systemd_only() {
+        assert_eq!(detached_verifier_survival_caveat(Supervisor::Launchd), "");
+        let systemd = detached_verifier_survival_caveat(Supervisor::Systemd);
+        assert!(systemd.contains("best-effort"), "{systemd}");
+        assert!(systemd.contains("KillMode=mixed"), "{systemd}");
+        assert!(
+            systemd.contains("loom-daemon-watchdog.sh"),
+            "the caveat must name the actual bound on systemd: {systemd}"
+        );
     }
 }
