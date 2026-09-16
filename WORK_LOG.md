@@ -7,6 +7,18 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7854** (closed): [Epic #6896] Phase 4: migrate docker-requiring callers onto the run-job seam
+- **PR #7924**: feat(run-job): migrate docker-requiring callers onto the run-job seam
+- **Issue #7844** (closed): create-pr.sh's force-auto-merge path still hardcodes squash (follow-up to #7754 Part 1)
+- **PR #7925**: fix(install): detect the allowed merge method in create-pr.sh's force-auto-merge path
+- **Issue #7926** (closed): Observability: classify normalized URL hosts before loading an ingest key
+- **PR #7928**: fix(observability): classify normalized endpoint hosts before export
+- **Issue #7908** (closed): epic #7810 PR 2: typed forge results over proc_exec — retire GhResult and two more ad-hoc runners
+- **PR #7922**: feat(daemon): typed forge results — retire GhResult + 2 ad-hoc runners, remove every --jq (epic #7810 PR 2)
+- **Issue #7815** (closed): observability: refuse to export to reserved placeholder domains (example.com) instead of shipping the ingest key to them
+- **PR #7918**: fix(observability): refuse to export to reserved placeholder domains
+- **Issue #7795** (closed): Guard ASK tier: which sites steer toward a safe alternative, and which are a bare 'are you sure?' that stalls headless runs
+- **PR #7916**: guard: size the ASK tier to the decision log — 16 sites → 13 (#7795)
 - **Issue #7895** (closed): role-runner roster: generation high-water mark strands a peer when a late PATCH moves an observed expiry boundary into the future (#7691 follow-up)
 - **PR #7914**: fix(roster): release the generation fence when a PATCH moves an observed boundary
 - **Issue #7794** (closed): Eight scripts read their own source for --help: concise usage block for the non-wrappers, interim single-read for the five loom-daemon-*.sh wrappers
