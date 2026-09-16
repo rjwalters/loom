@@ -155,6 +155,59 @@ loom_job_spec_defaults() {
       }' <<<"$spec" 2>/dev/null || return 1
 }
 
+# Canonical (symlink-free) homes of the container-runtime sockets that the
+# refusal patterns in `loom_job_validate_spec` name — on every mainstream Linux
+# `/var/run -> /run` since the /run merge; both spellings are kept so the check
+# still means something on a host where they are separate directories. A bind
+# mount propagates a directory's ENTIRE contents, socket special files
+# included, so a mount whose source is a proper ancestor of one of these
+# (`/run`, `/var`, `/var/run`, `/run/podman`, ...) hands the job container the
+# socket just as surely as naming the socket would (#7875 review finding).
+_RJ_RUNTIME_SOCKET_PATHS=(
+    /run/docker.sock /var/run/docker.sock
+    /run/docker /var/run/docker
+    /run/containerd/containerd.sock /var/run/containerd/containerd.sock
+    /run/podman/podman.sock /var/run/podman/podman.sock
+    /run/crio/crio.sock /var/run/crio/crio.sock
+)
+
+# _rj_socket_ancestor <path>
+#
+# Prints the first known container-runtime socket path that lives BENEATH
+# <path> (i.e. <path> is a proper ancestor of it), or nothing. Pure string
+# work against the canonical list above — no filesystem access — so it holds
+# on the client's pre-flight exactly as it does on the executor host, and does
+# not depend on the socket existing at validation time.
+_rj_socket_ancestor() {
+    local dir="${1%/}" s
+    [[ -n "$dir" ]] || return 0 # "/" is refused outright by the caller
+    for s in "${_RJ_RUNTIME_SOCKET_PATHS[@]}"; do
+        if [[ "$s" == "$dir"/* ]]; then
+            printf '%s' "$s"
+            return 0
+        fi
+    done
+}
+
+# _rj_live_socket_under <path>
+#
+# Prints the first live unix-domain socket found AT or BENEATH <path> on THIS
+# host, or nothing. Best effort by construction: it is meaningful only on the
+# executor host (the client cannot see what the executor's filesystem holds),
+# stops at the first hit, never follows symlinks, and ignores subtrees it
+# cannot read. It is the second layer behind `_rj_socket_ancestor`: whatever a
+# socket is called and wherever a daemon was told to put it, a socket that is
+# live right now is refused.
+_rj_live_socket_under() {
+    local p="$1"
+    if [[ -S "$p" ]]; then
+        printf '%s' "$p"
+        return 0
+    fi
+    [[ -d "$p" ]] || return 0
+    find "$p" -type s -print -quit 2>/dev/null || true
+}
+
 # loom_job_validate_spec <spec-json>
 #
 # Returns 0 when the spec is well-formed and safe to execute; otherwise prints
@@ -226,7 +279,7 @@ loom_job_validate_spec() {
     # src:dst form to get wrong, so docker/worker/MOUNT-CONTRACT.md §1 (path
     # parity) is structurally enforced by the spec shape itself rather than by
     # a rule callers have to follow.
-    local path mode real candidate
+    local path mode real candidate below live
     while IFS=$'\t' read -r path mode; do
         [[ -z "$path$mode" ]] && continue
         if [[ "$path" != /* ]]; then
@@ -272,7 +325,33 @@ loom_job_validate_spec() {
                     errors+=("refusing host kernel-interface mount \"$candidate\" (/proc, /sys and /dev are not mountable through this seam)")
                     ;;
             esac
+
+            # The name patterns above match the socket itself, or a path
+            # inside it — NOT the directory that contains it, and a bind mount
+            # of a directory carries every socket beneath it (#7875 review).
+            # `/run` is docker.sock's real, non-symlink home on essentially
+            # every mainstream distro and matches none of the name patterns,
+            # so without this an innocent-looking `--mount /run` handed the
+            # job container the docker socket.
+            below="$(_rj_socket_ancestor "$candidate")"
+            if [[ -n "$below" ]]; then
+                errors+=("refusing mount \"$candidate\": it is an ancestor of container-runtime socket path \"$below\", and a bind mount of a directory carries every socket beneath it — host-root-equivalent, exactly what this seam exists to avoid (ADR-0017 Decision 3)")
+            fi
         done
+
+        # Second, host-local layer behind the name-based checks: whatever the
+        # path is called, refuse to bind a live unix socket, or a directory
+        # that holds one, on THIS host. This is what catches a runtime socket
+        # the canonical list cannot know about — a daemon started with
+        # `-H unix:///srv/x.sock`, rootless docker under `/run/user/<uid>` —
+        # at the cost of being meaningful only on the executor host, and only
+        # for sockets that exist at validation time (a socket created later
+        # inside an `rw` mount is the residual TOCTOU the seam does not claim
+        # to close; see run-job-seam.md).
+        live="$(_rj_live_socket_under "${real:-$path}")"
+        if [[ -n "$live" ]]; then
+            errors+=("refusing mount \"$path\": it is, or contains, a live unix socket (\"$live\") — this seam binds filesystem paths, never host IPC endpoints, because a socket bound into a job container is host-root-equivalent in the worst case (ADR-0017 Decision 3)")
+        fi
     done < <(jq -r '.mounts[]? | [.path // "", .mode // ""] | @tsv' <<<"$spec")
 
     while IFS= read -r v; do

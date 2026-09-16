@@ -127,13 +127,42 @@ because the seam's mount shape is one path bound at the identical path
 parity guarantee. Pass the resolved path explicitly instead; the error message
 names it.
 
+**The refusal also covers the socket's *ancestors*.** A bind mount propagates
+a directory's entire contents, socket special files included, so `--mount
+/run` — the real, non-symlink home of `docker.sock` on every mainstream
+distro, and a name that matches none of the socket patterns — would carry
+the socket into the job container just as surely as naming it. The validator
+therefore refuses any mount whose source (given or resolved) is a proper
+ancestor of a known container-runtime socket path: `/run`, `/var`,
+`/var/run`, `/run/podman`, `/run/containerd`, and so on. This is a string
+check against a fixed list, so it holds on the client's pre-flight as well as
+on the executor, whether or not the socket exists yet.
+
+**Behind the name-based checks sits a live-socket walk.** Whatever a socket
+is called and wherever a daemon was told to put it (`-H unix:///srv/x.sock`,
+rootless docker under `/run/user/<uid>`), the validator refuses a mount
+source that *is* a live unix socket or a directory that *contains* one on
+the host doing the validation. That layer is best-effort by nature: it is
+only meaningful on the executor host, it sees only sockets that exist at
+validation time, and it skips subtrees it cannot read.
+
 Validation runs **twice, from one implementation**: `run-job.sh` sources
 `loom_job_validate_spec` from the executor program for its client-side
 pre-flight, and the executor runs the same function again on its own host. A
 client that skips its pre-flight, or lies, still cannot talk an executor into
-a privileged container. The executor-side run is also the only one whose path
-resolution is meaningful — it is the host that will do the mounting — which is
-why the re-validation is load-bearing rather than merely belt-and-braces.
+a privileged container *through any input the spec can express*. The
+executor-side run is also the only one whose path resolution and socket walk
+are meaningful — it is the host that will do the mounting — which is why the
+re-validation is load-bearing rather than merely belt-and-braces.
+
+What the seam does **not** claim: the checks are evaluated at validation
+time on the executor's filesystem. A socket created *after* validation
+inside an `rw` mount the job already holds, or a socket the executor host
+cannot see (unreadable subtree, non-standard location that is not live yet),
+is outside what a pre-run validator can refuse; the containment there rests
+on the job container being an ordinary unprivileged docker container (no
+`--privileged`, no added capabilities, no host namespaces — none of which the
+spec can express), not on the mount check alone.
 
 ## Using it
 

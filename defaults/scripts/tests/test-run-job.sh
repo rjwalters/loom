@@ -58,6 +58,12 @@ assert_not_contains() {
 }
 
 TMP_ROOT="$(mktemp -d)"
+# Canonicalized on purpose: the seam refuses a symlinked mount source (it would
+# break path parity), and on macOS `mktemp -d` hands back a `/var/...` path
+# that is a symlink to `/private/var/...` — an uncanonicalized scratch path
+# would make every "a real directory is still accepted" case fail for the
+# wrong reason. Same treatment as docker/worker/test-run-job.sh.
+TMP_ROOT="$(cd "$TMP_ROOT" && pwd -P)"
 cleanup() { rm -rf "$TMP_ROOT"; }
 trap cleanup EXIT
 
@@ -247,6 +253,65 @@ out="$("$RUN_JOB" --dry-run --image alpine --mount /run/podman/podman.sock -- tr
 assert_eq "78" "$?" "refuses a podman socket mount too"
 out="$("$RUN_JOB" --dry-run --image alpine --mount /proc -- true 2>&1)"
 assert_eq "78" "$?" "refuses a /proc mount"
+
+# ...NOR by mounting an ANCESTOR of the socket's directory (#7875 review).
+# `/run` is docker.sock's real, non-symlink home on every mainstream distro and
+# matches none of the socket-name patterns, yet a bind mount of it carries the
+# socket along. This is refused by string against the canonical socket list,
+# so it holds on the client pre-flight too, and whether or not the socket (or
+# even the directory) exists on the host running this test.
+for anc in /run /run/ /var /var/run /run/podman /run/containerd /var/run/crio; do
+    out="$("$RUN_JOB" --dry-run --image alpine --mount "$anc" -- true 2>&1)"
+    assert_eq "78" "$?" "refuses to mount $anc: an ancestor of a container-runtime socket"
+    assert_contains "$out" "is an ancestor of container-runtime socket path" "refusal for $anc says why an innocent-looking directory is refused"
+    assert_contains "$out" "host-root-equivalent" "refusal for $anc cites the security rationale"
+done
+argv="$("$RUN_JOB" --dry-run --image alpine --mount /run -- true 2>/dev/null || true)"
+assert_not_contains "$argv" "/run:/run" "no docker argv is produced for the ancestor-directory mount"
+
+# The executor re-checks the ancestor rule on its own: a client that skipped
+# its pre-flight (or lied) still cannot get `-v /run:/run` past it.
+anc_evil="$(jq -nc '{schema:"loom.run-job/v1", id:"job-ancestor", image:"alpine",
+                     command:["true"], workdir:"", network:"none",
+                     mounts:[{path:"/run", mode:"ro"}],
+                     env:{}, limits:{cpus:"",memory:""}, timeoutSeconds:0}')"
+out="$(bash "$EXEC_LIB" run "$(printf '%s' "$anc_evil" | base64 | tr -d '\n')" 2>&1)"
+assert_eq "78" "$?" "executor independently rejects an ancestor-directory mount spec"
+assert_contains "$out" "is an ancestor of container-runtime socket path" "executor-side ancestor refusal is explicit"
+assert_not_contains "$(cat "$FAKE_DOCKER_LOG")" "/run:/run" "no docker run was issued for the ancestor-directory spec"
+
+# ...NOR by mounting a directory that holds a live socket the canonical list
+# cannot know about (a daemon started on `-H unix:///srv/x.sock`, rootless
+# docker under /run/user/<uid>): the validator walks the source for live
+# sockets on the host that will do the mounting. Needs a real unix socket on
+# disk, which bash cannot make on its own — python3 or perl, whichever is here.
+LIVEDIR="$TMP_ROOT/live"
+mkdir -p "$LIVEDIR/nested"
+make_unix_socket() {
+    python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1" 2>/dev/null \
+        || perl -e 'use Socket; socket(S, PF_UNIX, SOCK_STREAM, 0) or exit 1; bind(S, sockaddr_un($ARGV[0])) or exit 1' "$1" 2>/dev/null
+}
+if make_unix_socket "$LIVEDIR/nested/d.sock" && [[ -S "$LIVEDIR/nested/d.sock" ]]; then
+    out="$("$RUN_JOB" --dry-run --image alpine --mount "$LIVEDIR" -- true 2>&1)"
+    assert_eq "78" "$?" "refuses a directory that contains a live unix socket under an innocent name"
+    assert_contains "$out" "live unix socket" "the live-socket refusal says what it found"
+    assert_contains "$out" "nested/d.sock" "...and names the socket it found"
+    out="$("$RUN_JOB" --dry-run --image alpine --mount "$LIVEDIR/nested/d.sock" -- true 2>&1)"
+    assert_eq "78" "$?" "refuses a live unix socket itself, whatever it is called"
+    live_evil="$(jq -nc --arg p "$LIVEDIR" \
+        '{schema:"loom.run-job/v1", id:"job-livesock", image:"alpine",
+          command:["true"], workdir:"", network:"none",
+          mounts:[{path:$p, mode:"rw"}],
+          env:{}, limits:{cpus:"",memory:""}, timeoutSeconds:0}')"
+    out="$(bash "$EXEC_LIB" run "$(printf '%s' "$live_evil" | base64 | tr -d '\n')" 2>&1)"
+    assert_eq "78" "$?" "executor independently rejects a directory holding a live socket"
+    assert_not_contains "$(cat "$FAKE_DOCKER_LOG")" "$LIVEDIR" "no docker run was issued for the live-socket directory"
+    rm -f "$LIVEDIR/nested/d.sock"
+    out="$("$RUN_JOB" --dry-run --image alpine --mount "$LIVEDIR" -- true 2>&1)"
+    assert_eq "0" "$?" "the same directory is accepted again once the socket is gone (a live walk, not a name check)"
+else
+    echo "  (skip: neither python3 nor perl could create a unix socket here; live-socket walk not exercised)"
+fi
 
 # ...AND the refusal cannot be walked around with a symlink whose own name is
 # innocent (#7875). Docker resolves a bind mount's SOURCE on the executor host

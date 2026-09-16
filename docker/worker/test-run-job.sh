@@ -409,6 +409,45 @@ created="$("${DOCKER[@]}" ps -a --filter "name=loom-job-$JOB_SYM" --format '{{.N
 assert_eq "" "$created" "no container was created for the smuggled socket mount"
 rm -f "$SCRATCH/work/innocent.sock" 2>/dev/null || true
 
+# ...nor by mounting the socket's PARENT directory (#7875 review). `/run` is
+# docker.sock's real home on the host running this test; it is not a symlink,
+# so the parity check never fires, and its name matches no socket pattern. A
+# bind mount of it would carry `/run/docker.sock` straight into the job
+# container — the executor's own re-validation must refuse it regardless of
+# what the client did.
+JOB_ANC="e2e-ancestor-$$"
+JOB_IDS+=("$JOB_ANC")
+rc=0
+anc_out="$("${DOCKER[@]}" "${CLIENT_ARGS[@]}" "$IMAGE" \
+    "$RUN_JOB" --id "$JOB_ANC" --image "$IMAGE" \
+    --mount /run -- true 2>&1)" || rc=$?
+assert_eq "78" "$rc" "a job requesting a mount of /run (the docker socket's parent directory) is rejected (EX_CONFIG)"
+assert_contains "$anc_out" "is an ancestor of container-runtime socket path" "the refusal explains that the directory carries the socket"
+created="$("${DOCKER[@]}" ps -a --filter "name=loom-job-$JOB_ANC" --format '{{.Names}}' 2>/dev/null || true)"
+assert_eq "" "$created" "no container was created for the ancestor-directory mount"
+
+# ...nor by mounting a workspace directory that happens to hold a live socket
+# under a name the canonical list cannot know: the executor walks the source
+# on the host that does the mounting. The socket is planted from the HOST
+# side (it must be a real socket on the executor's filesystem); skipped when
+# neither python3 nor perl is available to create one.
+if python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$SCRATCH/work/x.sock" 2>/dev/null \
+    || perl -e 'use Socket; socket(S, PF_UNIX, SOCK_STREAM, 0) or exit 1; bind(S, sockaddr_un($ARGV[0])) or exit 1' "$SCRATCH/work/x.sock" 2>/dev/null; then
+    JOB_LIVE="e2e-livesock-$$"
+    JOB_IDS+=("$JOB_LIVE")
+    rc=0
+    live_out="$("${DOCKER[@]}" "${CLIENT_ARGS[@]}" "$IMAGE" \
+        "$RUN_JOB" --id "$JOB_LIVE" --image "$IMAGE" \
+        --mount "$SCRATCH/work" -- true 2>&1)" || rc=$?
+    assert_eq "78" "$rc" "a job mounting a directory that holds a live unix socket is rejected (EX_CONFIG)"
+    assert_contains "$live_out" "live unix socket" "the refusal names the live socket it found"
+    created="$("${DOCKER[@]}" ps -a --filter "name=loom-job-$JOB_LIVE" --format '{{.Names}}' 2>/dev/null || true)"
+    assert_eq "" "$created" "no container was created for the live-socket directory mount"
+    rm -f "$SCRATCH/work/x.sock" 2>/dev/null || true
+else
+    echo "  (skip: neither python3 nor perl on the host could create a unix socket; live-socket walk not exercised end-to-end)"
+fi
+
 echo ""
 echo "-- 5. An unreachable executor is EX_UNAVAILABLE, never a fake job result --"
 rc=0
