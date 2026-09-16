@@ -5252,51 +5252,7 @@ fn shrinking_the_ring_reassigns_the_departed_hosts_slice_to_the_survivor() {
     }
 }
 
-/// The idle-edge dispatch surface (#4364) is sharded too. Without this,
-/// an idle-triggered role would duplicate across the fleet exactly as the
-/// interval cadence did, and the invariant would hold on only one of the
-/// two paths that spend tokens.
-#[test]
-#[serial]
-fn the_idle_edge_is_sharded_on_the_same_key_as_the_interval_tick() {
-    let _env = ShardEnvGuard::capture();
-    let workspace = enabled_workspace();
-    let root = workspace.path();
-    let cfg = on_idle_config(Some(true), vec!["champion"]);
-
-    let owner = (0..2)
-        .find(|host| {
-            ShardEnvGuard::become_host(*host, 2);
-            tick_admitted(root)
-        })
-        .expect("exactly one of the two hosts owns this workspace");
-
-    // The owning host fires on the busy -> idle edge...
-    ShardEnvGuard::become_host(owner, 2);
-    let mut t = IdleTrigger::new();
-    let set = new_in_progress_guard();
-    let now = Instant::now();
-    assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
-    assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
-    assert_eq!(
-        plan_idle_runs(&mut t, &set, root, &cfg, true, false, now)
-            .iter()
-            .map(|(s, _)| s.name)
-            .collect::<Vec<_>>(),
-        vec!["champion"]
-    );
-
-    // ...and the peer, observing the same edge, does not.
-    ShardEnvGuard::become_host((owner + 1) % 2, 2);
-    let mut t = IdleTrigger::new();
-    let set = new_in_progress_guard();
-    assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
-    assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
-    assert!(
-        plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty(),
-        "a non-owning host must not fire an idle-triggered role (#6374)"
-    );
-}
+mod roster_fence;
 
 // ===================================================================
 // Role-tick health ring (#4761)

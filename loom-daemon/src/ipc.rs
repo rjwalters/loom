@@ -2770,40 +2770,15 @@ pub fn build_daemon_status(
         // per-root `role_runner_shard` fields above carry the actual
         // per-workspace verdicts.
         role_runner_shard: {
-            let posture = crate::role_shard::resolve_posture(fallback_root);
-            // Roster section (#7690, Phase A of #6704) — read ONLY from the
-            // cache the heartbeat task populates (`role_shard::roster::roster_snapshot`),
-            // never a live forge call: `status` must never itself add a forge
-            // round-trip, and a disabled/never-yet-published roster leaves the
-            // cache `None`, which renders nothing (byte-identical to pre-#7690
-            // status when the roster is off).
-            let roster = crate::role_shard::roster::roster_snapshot().map(|snap| {
-                let view = crate::role_shard::roster::build_roster_status(
-                    &snap.issue,
-                    &snap.comments,
-                    &snap.host,
-                    chrono::Utc::now(),
-                    snap.ttl_secs,
-                );
-                crate::types::RosterStatus {
-                    issue: view.issue,
-                    live_count: view.live_count,
-                    seen_count: view.seen_count,
-                    generation: view.generation,
-                    settled_secs: view.settled_secs,
-                    members: view
-                        .members
-                        .into_iter()
-                        .map(|m| crate::types::RosterMemberStatus {
-                            host: m.host,
-                            fresh: m.fresh,
-                            last_beat_secs_ago: m.last_beat_secs_ago,
-                            serves_count: m.serves_count,
-                            is_this_host: m.is_this_host,
-                        })
-                        .collect(),
-                }
-            });
+            // `decide(...).posture` rather than `resolve_posture(...)` so that
+            // with roster mode on (#7691) the header reports the ring the
+            // fence actually produced — "shard 1 of 3 (index from roster,
+            // count from roster)" — instead of a static posture no tick uses.
+            // With the roster off (the default) `decide`'s posture IS
+            // `resolve_posture`'s, so this is byte-identical to pre-#7691.
+            let decision = crate::role_shard::decide(fallback_root);
+            let posture = decision.posture;
+            let roster = roster_status::roster_status(&decision.roster);
             Some(crate::types::RoleRunnerShardPosture {
                 index: posture.index(),
                 count: posture.count(),
@@ -4947,6 +4922,8 @@ fn handle_remove_watch(id: &str) -> Response {
         },
     }
 }
+
+mod roster_status;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]

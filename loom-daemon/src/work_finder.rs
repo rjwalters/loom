@@ -3402,6 +3402,16 @@ pub fn spawn_multi_work_finder_task(
             // sharding misconfiguration, only reordered. See
             // `defaults/docs/dispatcher-repo-sharding.md`.
             //
+            // Roster mode (#7691) keeps that contract intact: when the
+            // roster's admission fence YIELDS, `ShardDecision::owned` still
+            // carries the pre-roster (#6374) verdict — only the role runner's
+            // `admits_role_tick()` flips. A fence yield therefore never
+            // reaches this line as "owns nothing"; it degrades to exactly the
+            // work-conserving preference this host had before the roster
+            // existed. (When the fence *admits*, `owned` is the roster ring's
+            // own verdict, which is the intended, in-scope change: a
+            // preference reshuffle, never a dropped dispatch.)
+            //
             // Deliberately NOT calling `role_shard::log_decision_once` here:
             // it renders a `role_runner:`-prefixed line and dedups through a
             // process-global per-root map, so calling it from this loop would

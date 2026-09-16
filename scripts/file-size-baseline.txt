@@ -15,7 +15,7 @@
 1185 defaults/scripts/cli/loom-daemon-start.sh
 1770 defaults/scripts/cli/loom-daemon-update.sh
 1072 defaults/scripts/lib/forge-helpers.sh
-1464 defaults/scripts/merge-pr.sh
+1460 defaults/scripts/merge-pr.sh
 2033 defaults/scripts/tests/test-loom-daemon-start.sh
 4385 defaults/scripts/tests/test-loom-daemon-update.sh
 1876 defaults/scripts/tests/test-loom-daemon-watchdog.sh
@@ -30,7 +30,7 @@
 1777 loom-daemon/src/claim_reconciliation.rs
 2606 loom-daemon/src/claim_reconciliation/tests.rs
 1060 loom-daemon/src/cli/status.rs
-3740 loom-daemon/src/cli/status_render.rs
+3668 loom-daemon/src/cli/status_render.rs
 1146 loom-daemon/src/cli/tokens.rs
 1913 loom-daemon/src/credential_preflight.rs
 1840 loom-daemon/src/daemon_install_state.rs
@@ -46,7 +46,7 @@
 2299 loom-daemon/src/init/scaffolding/tests.rs
 1916 loom-daemon/src/init/tests.rs
 1344 loom-daemon/src/install_self_check.rs
-3171 loom-daemon/src/ipc.rs
+3147 loom-daemon/src/ipc.rs
 4414 loom-daemon/src/ipc/tests.rs
 1273 loom-daemon/src/main.rs
 1845 loom-daemon/src/main_health_gate.rs
@@ -55,8 +55,8 @@
 1010 loom-daemon/src/observability/otlp/mapping.rs
 1715 loom-daemon/src/orphan_process_reaper.rs
 1596 loom-daemon/src/peer_claims.rs
-2435 loom-daemon/src/role_runner.rs
-4071 loom-daemon/src/role_runner/tests.rs
+2224 loom-daemon/src/role_runner.rs
+4036 loom-daemon/src/role_runner/tests.rs
 2443 loom-daemon/src/safehouse.rs
 3913 loom-daemon/src/safehouse/tests.rs
 1580 loom-daemon/src/script_helpers/sweep_experiment.rs
@@ -82,11 +82,11 @@
 1180 loom-daemon/src/tokens_pool/monitor.rs
 1423 loom-daemon/src/tokens_pool/select.rs
 1510 loom-daemon/src/tokens_pool/session_lifecycle.rs
-1765 loom-daemon/src/types.rs
+1748 loom-daemon/src/types.rs
 1050 loom-daemon/src/watch_registry.rs
 1922 loom-daemon/src/work_finder.rs
-3473 loom-daemon/src/work_finder/tests.rs
-1164 loom-daemon/src/worktree_ops/aggressive.rs
+3450 loom-daemon/src/work_finder/tests.rs
+1135 loom-daemon/src/worktree_ops/aggressive.rs
 1225 loom-daemon/src/worktree_ops/cargo_target.rs
 2370 loom-daemon/src/worktree_ops/clean.rs
 1702 loom-daemon/src/worktree_ops/clean/tests.rs

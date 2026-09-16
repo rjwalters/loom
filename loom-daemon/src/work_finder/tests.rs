@@ -491,34 +491,7 @@ fn tick_multi_with_sharding_prefers_in_slice_over_higher_priority_out_of_slice()
     assert_eq!(workspaces[1].1.dispatched, vec![2], "in-slice workspace dispatches");
 }
 
-/// #6243 AC: work-conservation — when this host's slice has ZERO
-/// eligible candidates, it must still drain the global (out-of-slice)
-/// queue rather than starve while other repos have ready work.
-#[test]
-fn tick_multi_with_sharding_falls_back_to_out_of_slice_when_slice_is_empty() {
-    let mut workspaces = vec![
-        (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
-        (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
-    ];
-    // Neither workspace is in this host's preferred slice this tick.
-    let preferred_slice = [false, false];
-    let report = tick_multi_with_sharding(
-        &mut workspaces,
-        &[0, 0],
-        10,
-        &[false, false],
-        usize::MAX,
-        false,
-        Some(&preferred_slice),
-    );
-    assert_eq!(report.dispatched, 2, "empty slice must fall back to the full global queue");
-    assert_eq!(
-        report.deferred_out_of_slice, 0,
-        "a fallback dispatch is not a deferral — it went through"
-    );
-    assert_eq!(workspaces[0].1.dispatched, vec![1]);
-    assert_eq!(workspaces[1].1.dispatched, vec![2]);
-}
+mod roster_fence;
 
 /// A `preferred_slice` shorter than `workspaces` (a caller bug, or a
 /// workspace added between slice computation and dispatch) must not
