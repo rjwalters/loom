@@ -221,7 +221,10 @@ The tiers below are the categorical verdicts derived in **#7758** and ruled on
 2026-09-16. [ADR-0018](../../docs/adr/0018-rust-owns-behavior-shell-reaches-it.md)
 (#7777, accepted) is the principle they implement; epic **#7810** owns the
 execution order. A tier here says *what may be ported*, never *when* —
-sequencing belongs to #7810, phase by phase.
+sequencing belongs to #7810, phase by phase. These tiers describe shell that
+already exists; for what language a **new** file may be written in, see
+[`shell-language-policy.md`](shell-language-policy.md) (#7762), whose
+categories are these same #7758 verdicts.
 
 | Tier | Count | Verdict | Why |
 |---|---|---|---|
