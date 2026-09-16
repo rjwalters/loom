@@ -79,10 +79,10 @@ fn is_recommended_actions(line: &str) -> bool {
 fn starts_bullet(line: &str) -> bool {
     let t = line.trim_start();
     let mut chars = t.chars();
-    match (chars.next(), chars.next()) {
-        (Some('-' | '*'), Some(c)) if c.is_whitespace() => true,
-        _ => false,
-    }
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('-' | '*'), Some(c)) if c.is_whitespace()
+    )
 }
 
 /// `/^[[:space:]]+[^[:space:]]/` — starts with whitespace, then has content.
