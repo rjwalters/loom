@@ -22,7 +22,148 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
-use super::{run_gh, run_git, GhResult};
+use super::{run_gh, run_git};
+use crate::cmd_out::{run_command, CmdOutcome, Query, Unavailable, DEFAULT_TIMEOUT};
+
+/// Typed shapes for the `gh --json` queries this module makes (#7810 PR 2).
+///
+/// These replace `--jq` filters that ran a second interpreter inside the `gh`
+/// subprocess and handed back a bare scalar. The scalar could not distinguish
+/// *the command failed*, *the field is absent*, *the value is empty* and *the
+/// query matched nothing* — every one of them arrived as an empty string, and
+/// the `success && !stdout.is_empty()` idiom then read them all as "not found".
+mod gh_shapes {
+    use serde::Deserialize;
+
+    /// `--json labels` → `{"labels":[{"name":"loom:pr"}, ...]}`
+    #[derive(Debug, Deserialize)]
+    pub(super) struct Labelled {
+        #[serde(default)]
+        pub labels: Vec<Label>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub(super) struct Label {
+        pub name: String,
+    }
+
+    /// `--json number` on a LIST → `[{"number":123}, ...]`
+    #[derive(Debug, Deserialize)]
+    pub(super) struct Numbered {
+        pub number: i64,
+    }
+
+    /// `--json files` → `{"files":[{"path":..,"additions":..,"deletions":..}]}`
+    #[derive(Debug, Deserialize)]
+    pub(super) struct Filed {
+        #[serde(default)]
+        pub files: Vec<FileChange>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub(super) struct FileChange {
+        pub path: String,
+        #[serde(default)]
+        pub additions: i64,
+        #[serde(default)]
+        pub deletions: i64,
+    }
+}
+
+/// Label names on an issue or PR, or an empty vec when they cannot be read.
+///
+/// The collapse is explicit and unchanged from the `--jq .labels[].name`
+/// version: every caller treats "no labels" and "could not read labels" the
+/// same way. What changes is that a malformed response is no longer silently
+/// identical to "this PR has no labels".
+fn gh_label_names(entity: &str, number: i64, repo_root: &Path) -> Vec<String> {
+    match gh_labels_query(entity, number, repo_root) {
+        Query::Populated(names) => names,
+        _ => Vec::new(),
+    }
+}
+
+/// Label names, keeping the outcome classification.
+///
+/// Callers that must tell "this has no labels" from "the labels could not be
+/// read" use this directly. Under `--jq .labels[].name` those were the same
+/// thing — both produced no lines — so a forge hiccup read as an unlabelled
+/// issue, which is how a Curator check could silently pass on a PR nobody had
+/// looked at.
+fn gh_labels_query(entity: &str, number: i64, repo_root: &Path) -> Query<Vec<String>> {
+    let n = number.to_string();
+    let q: Query<gh_shapes::Labelled> = super::gh_query(
+        &[entity, "view", &n, "--json", "labels"],
+        repo_root,
+        true,
+        |l: &gh_shapes::Labelled| l.labels.is_empty(),
+    );
+    match q {
+        Query::Populated(l) => Query::Populated(l.labels.into_iter().map(|x| x.name).collect()),
+        Query::Empty => Query::Empty,
+        Query::Malformed { raw, error } => Query::Malformed { raw, error },
+        Query::Failed { status, stderr } => Query::Failed { status, stderr },
+        Query::Unavailable(u) => Query::Unavailable(u),
+    }
+}
+
+/// One string field of an issue/PR via `--json <field>`, classified.
+///
+/// The field name is dynamic, so this decodes to a JSON object and pulls the
+/// named key rather than using a per-field struct. The four-way classification
+/// is what matters here and survives: a missing key or a non-string value is
+/// `Malformed`, an empty string is `Empty`, and a failed command stays `Failed`
+/// — distinctions `--jq .<field>` flattened into one empty string.
+fn gh_string_field(
+    entity: &str,
+    number: i64,
+    field: &str,
+    repo_root: &Path,
+    use_cache: bool,
+) -> Query<String> {
+    let n = number.to_string();
+    let outcome = run_gh(&[entity, "view", &n, "--json", field], repo_root, use_cache);
+    let q: Query<serde_json::Map<String, serde_json::Value>> =
+        crate::cmd_out::decode_json(outcome, |m: &serde_json::Map<String, serde_json::Value>| {
+            m.get(field)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+        });
+    match q {
+        Query::Populated(m) => match m.get(field).and_then(serde_json::Value::as_str) {
+            Some(v) => Query::Populated(v.to_string()),
+            None => Query::Malformed {
+                raw: Vec::new(),
+                error: format!("response had no string field `{field}`"),
+            },
+        },
+        Query::Empty => Query::Empty,
+        Query::Malformed { raw, error } => Query::Malformed { raw, error },
+        Query::Failed { status, stderr } => Query::Failed { status, stderr },
+        Query::Unavailable(u) => Query::Unavailable(u),
+    }
+}
+
+/// The first PR number returned by a `gh pr list` query, if any.
+///
+/// `Query::Empty` here is the genuinely common case — no PR matches the filter
+/// — and is now distinguishable from the query having failed, which is what
+/// `.[0].number` on an empty list could never express.
+fn gh_first_pr_number(args: &[&str], repo_root: &Path) -> Option<i64> {
+    let q: Query<Vec<gh_shapes::Numbered>> =
+        super::gh_query(args, repo_root, true, |v: &Vec<gh_shapes::Numbered>| v.is_empty());
+    match q {
+        Query::Populated(v) => v.first().map(|n| n.number),
+        _ => None,
+    }
+}
+
+/// Ceiling for the fire-and-forget milestone heartbeat (#7810 PR 2).
+///
+/// Short on purpose: nothing downstream waits on its result, so a slow one
+/// should be abandoned rather than allowed to hold up the phase it reports on.
+const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The phases this validator knows how to check.
 pub const VALID_PHASES: [&str; 4] = ["curator", "builder", "judge", "doctor"];
@@ -141,9 +282,13 @@ fn report_milestone(task_id: Option<&str>, repo_root: &Path, action: &str) {
     if !script.is_file() {
         return;
     }
-    let _ = std::process::Command::new(&script)
-        .args(["heartbeat", "--task-id", task_id, "--action", action])
-        .output();
+    // #7810 PR 2: bounded. Fire-and-forget by intent, but an unbounded
+    // `.output()` is not fire-and-forget — it blocks the caller for as long as
+    // the script runs, so a wedged heartbeat stalled the phase it was reporting on.
+    let mut cmd = std::process::Command::new(&script);
+    cmd.args(["heartbeat", "--task-id", task_id, "--action", action])
+        .stdin(std::process::Stdio::null());
+    let _ = crate::cmd_out::run_command(cmd, HEARTBEAT_TIMEOUT);
 }
 
 /// Append a recovery event to `.loom/metrics/recovery-events.json`, keeping only
@@ -266,35 +411,24 @@ fn find_pr_for_issue(
     cached_pr: Option<i64>,
 ) -> Option<(i64, &'static str)> {
     if let Some(cached) = cached_pr {
-        let cached_s = cached.to_string();
-        let r = run_gh(
-            &["pr", "view", &cached_s, "--json", "state", "--jq", ".state"],
-            repo_root,
-            true,
-        );
-        if r.success && r.trimmed_stdout() == "OPEN" {
+        // #7810 PR 2: only a decoded "OPEN" counts. Previously a failed query
+        // produced an empty string that merely failed the `== "OPEN"` compare,
+        // so "the PR is closed" and "we could not check" took the same path.
+        if matches!(
+            gh_string_field("pr", cached, "state", repo_root, true),
+            Query::Populated(ref st) if st == "OPEN"
+        ) {
             return Some((cached, "caller_cached"));
         }
     }
 
     let head = format!("feature/issue-{issue}");
-    let r = run_gh(
+    if let Some(pr) = gh_first_pr_number(
         &[
-            "pr",
-            "list",
-            "--head",
-            &head,
-            "--state",
-            "open",
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number",
+            "pr", "list", "--head", &head, "--state", "open", "--json", "number",
         ],
         repo_root,
-        true,
-    );
-    if let Some(pr) = parse_pr_number(&r.stdout) {
+    ) {
         return Some((pr, "branch_name"));
     }
 
@@ -304,23 +438,12 @@ fn find_pr_for_issue(
         ("Resolves", "resolves_keyword"),
     ] {
         let search = format!("{keyword} #{issue}");
-        let r = run_gh(
+        if let Some(pr) = gh_first_pr_number(
             &[
-                "pr",
-                "list",
-                "--search",
-                &search,
-                "--state",
-                "open",
-                "--json",
-                "number",
-                "--jq",
-                ".[0].number",
+                "pr", "list", "--search", &search, "--state", "open", "--json", "number",
             ],
             repo_root,
-            true,
-        );
-        if let Some(pr) = parse_pr_number(&r.stdout) {
+        ) {
             return Some((pr, found_by));
         }
     }
@@ -330,29 +453,10 @@ fn find_pr_for_issue(
 /// The label names on a PR (one per line from `gh`), or an empty vector on
 /// failure.
 fn pr_labels(repo_root: &Path, pr: i64) -> Vec<String> {
-    let pr_s = pr.to_string();
-    let r = run_gh(
-        &[
-            "pr",
-            "view",
-            &pr_s,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-        repo_root,
-        true,
-    );
-    if !r.success {
-        return Vec::new();
-    }
-    r.stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect()
+    // #7810 PR 2: was `--jq .labels[].name` plus newline-splitting. The filter
+    // produced one name per line, so a PR with no labels, a `gh` that failed,
+    // and a malformed response were all "no lines" — indistinguishable.
+    gh_label_names("pr", pr, repo_root)
 }
 
 /// Closing-keyword references (`Closes|Fixes|Resolves #N`) found in `body`.
@@ -399,11 +503,12 @@ pub fn closing_references(body: &str) -> Vec<(String, i64)> {
 /// may have solved a different issue than the one being validated.
 fn ensure_pr_body_references_issue(repo_root: &Path, pr: i64, issue: i64, task_id: Option<&str>) {
     let pr_s = pr.to_string();
-    let r = run_gh(&["pr", "view", &pr_s, "--json", "body", "--jq", ".body"], repo_root, true);
-    let mut body = if r.success {
-        r.trimmed_stdout().to_string()
-    } else {
-        String::new()
+    // Best-effort: an unreadable body and an empty body are both "nothing to
+    // work from" here, so the collapse is kept — but it is now stated, and a
+    // malformed response can no longer arrive looking like real body text.
+    let mut body = match gh_string_field("pr", pr, "body", repo_root, true) {
+        Query::Populated(b) => b.trim().to_string(),
+        _ => String::new(),
     };
 
     let refs = closing_references(&body);
@@ -446,7 +551,7 @@ fn ensure_pr_body_references_issue(repo_root: &Path, pr: i64, issue: i64, task_i
 
     if needs_edit {
         let r = run_gh(&["pr", "edit", &pr_s, "--body", &body], repo_root, false);
-        if r.success {
+        if r.succeeded() {
             let mut action = format!("recovery: ensured PR #{pr} body references #{issue}");
             if !wrong.is_empty() {
                 let wrong_list = wrong
@@ -499,18 +604,18 @@ pub fn generic_title_reason(title: &str) -> Option<&'static str> {
 /// validation here would disrupt the pipeline. The warning surfaces in logs and
 /// milestones so the pattern can be tracked.
 fn warn_generic_pr_title(repo_root: &Path, pr: i64, task_id: Option<&str>) {
-    let pr_s = pr.to_string();
-    let r = run_gh(&["pr", "view", &pr_s, "--json", "title", "--jq", ".title"], repo_root, true);
-    if !r.success {
+    let Query::Populated(title) = gh_string_field("pr", pr, "title", repo_root, true) else {
+        // No title, or no answer — either way there is nothing to pattern-match,
+        // and this is advisory, so stay silent rather than warn on a guess.
         return;
-    }
-    if let Some(pattern) = generic_title_reason(r.trimmed_stdout()) {
+    };
+    if let Some(pattern) = generic_title_reason(title.trim()) {
         report_milestone(
             task_id,
             repo_root,
             &format!(
                 "warning: PR #{pr} has generic title matching anti-pattern /{pattern}/: {:?}",
-                r.trimmed_stdout()
+                title.trim()
             ),
         );
     }
@@ -551,42 +656,36 @@ fn closing_reference_only_line(line: &str) -> Option<i64> {
 /// Enrich a PR body that carries no meaningful summary.
 fn recover_minimal_pr_body(repo_root: &Path, pr: i64, issue: i64, task_id: Option<&str>) {
     let pr_s = pr.to_string();
-    let r = run_gh(&["pr", "view", &pr_s, "--json", "body", "--jq", ".body"], repo_root, false);
-    if !r.success {
-        return;
-    }
-    let body = {
-        let t = r.trimmed_stdout();
-        if t.is_empty() || t == "null" {
-            String::new()
-        } else {
-            t.to_string()
-        }
+    // Uncached deliberately — this reads a body it is about to rewrite.
+    //
+    // The `t == "null"` guard below is gone: it existed because `--jq .body` on
+    // a PR with no body printed the literal four characters `null`, which then
+    // had to be special-cased back into an empty string. Decoding JSON makes
+    // that a real absent/empty value instead of a magic string.
+    let body = match gh_string_field("pr", pr, "body", repo_root, false) {
+        Query::Populated(b) => b.trim().to_string(),
+        Query::Empty => String::new(),
+        // Unanswered: do not rewrite a body we could not read.
+        _ => return,
     };
     if !is_minimal_pr_body(&body) {
         return;
     }
 
-    let r = run_gh(
-        &[
-            "pr",
-            "view",
-            &pr_s,
-            "--json",
-            "files",
-            "--jq",
-            r#".files[] | "\(.path) (+\(.additions)/-\(.deletions))""#,
-        ],
+    // The only `--jq` here that FORMATTED rather than selected: it interpolated
+    // `"\(.path) (+\(.additions)/-\(.deletions))"` inside the gh subprocess.
+    // That string building now happens in Rust, where the numbers are numbers.
+    let files_q: Query<gh_shapes::Filed> = super::gh_query(
+        &["pr", "view", &pr_s, "--json", "files"],
         repo_root,
         false,
+        |f: &gh_shapes::Filed| f.files.is_empty(),
     );
-    let file_lines: Vec<String> = if r.success {
-        r.stdout
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
+    let file_lines: Vec<String> = if let Query::Populated(f) = files_q {
+        f.files
+            .iter()
             .take(25)
-            .map(|l| format!("- `{l}`"))
+            .map(|c| format!("- `{} (+{}/-{})`", c.path, c.additions, c.deletions))
             .collect()
     } else {
         Vec::new()
@@ -612,7 +711,7 @@ fn recover_minimal_pr_body(repo_root: &Path, pr: i64, issue: i64, task_id: Optio
     let new_body = parts.join("\n");
 
     let r = run_gh(&["pr", "edit", &pr_s, "--body", &new_body], repo_root, false);
-    if r.success {
+    if r.succeeded() {
         report_milestone(
             task_id,
             repo_root,
@@ -798,14 +897,14 @@ fn gather_builder_diagnostics(repo_root: &Path, issue: i64, worktree: &str) -> B
         }
 
         let r = run_git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
-        if r.success {
-            diag.branch = r.trimmed_stdout().to_string();
+        if r.succeeded() {
+            diag.branch = r.stdout_trimmed().to_string();
         }
 
         // Detect the default branch name rather than assuming `main`.
         let r = run_git(&wt, &["symbolic-ref", "refs/remotes/origin/HEAD"]);
-        let main_branch = if r.success {
-            r.trimmed_stdout()
+        let main_branch = if r.succeeded() {
+            r.stdout_trimmed()
                 .replace("refs/remotes/origin/", "")
                 .trim()
                 .to_string()
@@ -815,16 +914,16 @@ fn gather_builder_diagnostics(repo_root: &Path, issue: i64, worktree: &str) -> B
 
         let ahead_range = format!("origin/{main_branch}..HEAD");
         let r = run_git(&wt, &["rev-list", "--count", &ahead_range]);
-        if r.success {
-            diag.commits_ahead = r.trimmed_stdout().to_string();
+        if r.succeeded() {
+            diag.commits_ahead = r.stdout_trimmed().to_string();
         }
         let behind_range = format!("HEAD..origin/{main_branch}");
         let r = run_git(&wt, &["rev-list", "--count", &behind_range]);
-        if r.success {
-            diag.commits_behind = r.trimmed_stdout().to_string();
+        if r.succeeded() {
+            diag.commits_behind = r.stdout_trimmed().to_string();
         }
         diag.has_remote_tracking =
-            run_git(&wt, &["rev-parse", "--abbrev-ref", "@{upstream}"]).success;
+            run_git(&wt, &["rev-parse", "--abbrev-ref", "@{upstream}"]).succeeded();
     }
 
     // Session log (first existing candidate wins).
@@ -850,29 +949,18 @@ fn gather_builder_diagnostics(repo_root: &Path, issue: i64, worktree: &str) -> B
     }
 
     // Issue labels.
-    let issue_s = issue.to_string();
-    let r = run_gh(
-        &[
-            "issue",
-            "view",
-            &issue_s,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-        repo_root,
-        true,
-    );
-    if r.success && !r.trimmed_stdout().is_empty() {
-        diag.issue_labels = r.trimmed_stdout().replace('\n', ", ");
+    // #7810 PR 2: a diagnostic, so an unreadable label set and an unlabelled
+    // issue both leave the field blank — but only `Populated` now fills it, so
+    // a malformed response cannot masquerade as a real label list.
+    if let Query::Populated(names) = gh_labels_query("issue", issue, repo_root) {
+        diag.issue_labels = names.join(", ");
     }
 
     // Uncommitted changes on the main checkout (the workflow-violation signal).
     let r = run_git(repo_root, &["status", "--porcelain"]);
-    if r.success && !r.trimmed_stdout().is_empty() {
+    if r.succeeded() && !r.stdout_trimmed().is_empty() {
         diag.main_uncommitted = r
-            .trimmed_stdout()
+            .stdout_trimmed()
             .lines()
             .take(10)
             .collect::<Vec<_>>()
@@ -963,21 +1051,21 @@ pub fn build_recovery_pr_body(issue: i64, worktree: &str, rate_limited: bool) ->
 
     let stat_range = format!("{default_branch}...HEAD");
     let r = run_git(&wt, &["diff", "--stat", &stat_range]);
-    if r.success && !r.trimmed_stdout().is_empty() {
+    if r.succeeded() && !r.stdout_trimmed().is_empty() {
         lines.push("## Changes".to_string());
         lines.push(String::new());
         lines.push("```".to_string());
-        lines.push(r.trimmed_stdout().to_string());
+        lines.push(r.stdout_trimmed().to_string());
         lines.push("```".to_string());
         lines.push(String::new());
     }
 
     let log_range = format!("{default_branch}..HEAD");
     let r = run_git(&wt, &["log", "--oneline", &log_range]);
-    if r.success && !r.trimmed_stdout().is_empty() {
+    if r.succeeded() && !r.stdout_trimmed().is_empty() {
         lines.push("## Commits".to_string());
         lines.push(String::new());
-        for commit in r.trimmed_stdout().lines() {
+        for commit in r.stdout_trimmed().lines() {
             lines.push(format!("- `{commit}`"));
         }
         lines.push(String::new());
@@ -1003,8 +1091,8 @@ pub fn build_recovery_pr_body(issue: i64, worktree: &str, rate_limited: bool) ->
 /// target when it resolves, else `origin/main`.
 fn resolve_default_branch(wt: &Path) -> String {
     let r = run_git(wt, &["rev-parse", "--abbrev-ref", "origin/HEAD"]);
-    if r.success && !r.trimmed_stdout().is_empty() {
-        r.trimmed_stdout().to_string()
+    if r.succeeded() && !r.stdout_trimmed().is_empty() {
+        r.stdout_trimmed().to_string()
     } else {
         "origin/main".to_string()
     }
@@ -1044,11 +1132,11 @@ pub fn is_substantive_path(path: &str) -> bool {
 fn pushed_branch_is_adoptable(wt: &Path) -> bool {
     let range = format!("{}..HEAD", resolve_default_branch(wt));
     let log = run_git(wt, &["log", "--oneline", &range]);
-    if !log.success || log.trimmed_stdout().is_empty() {
+    if !log.succeeded() || log.stdout_trimmed().is_empty() {
         return false;
     }
     let files = run_git(wt, &["diff", "--name-only", &range]);
-    files.success && files.stdout.lines().any(is_substantive_path)
+    files.succeeded() && files.stdout_lossy().lines().any(is_substantive_path)
 }
 
 /// Open the recovery PR through `.loom/scripts/create-pr.sh` when the repo has
@@ -1059,11 +1147,11 @@ fn pushed_branch_is_adoptable(wt: &Path) -> bool {
 /// then a personal token) — so this recovery path survives the same window the
 /// Builder's own PR creation now survives, instead of re-failing on the very
 /// 403 that sent it here.
-fn create_recovery_pr(repo_root: &Path, branch: &str, title: &str, body: &str) -> GhResult {
+fn create_recovery_pr(repo_root: &Path, branch: &str, title: &str, body: &str) -> CmdOutcome {
     let script = repo_root.join(".loom").join("scripts").join("create-pr.sh");
     if script.is_file() {
-        let spawned = Command::new("bash")
-            .arg(&script)
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
             .args([
                 "--head",
                 branch,
@@ -1075,13 +1163,16 @@ fn create_recovery_pr(repo_root: &Path, branch: &str, title: &str, body: &str) -
                 body,
             ])
             .current_dir(repo_root)
-            .output();
+            .stdin(std::process::Stdio::null());
         // A spawn failure (no bash, unreadable script) is the only case that
         // falls through — a script that RAN and failed has already exhausted
         // the escalation ladder, and a bare `gh pr create` behind it would
-        // only repeat the same rejection.
-        if let Ok(out) = spawned {
-            return GhResult::from_output(&out);
+        // only repeat the same rejection. #7810 PR 2: `Unavailable` now names
+        // that case precisely, where the old `success: false` could not tell it
+        // apart from the script running and rejecting the PR.
+        let spawned = run_command(cmd, DEFAULT_TIMEOUT);
+        if !matches!(spawned, CmdOutcome::Unavailable(Unavailable::Spawn(_))) {
+            return spawned;
         }
     }
     run_gh(
@@ -1158,16 +1249,11 @@ pub fn conventional_pr_title(issue_title: &str, issue: i64) -> String {
 /// A recovery commit message: the issue title as a conventional commit when it
 /// can be fetched, else a file-based summary, else a generic message.
 fn derive_commit_message(repo_root: &Path, issue: i64, staged_files: &[String]) -> String {
-    let issue_s = issue.to_string();
-    let r = run_gh(
-        &[
-            "issue", "view", &issue_s, "--json", "title", "--jq", ".title",
-        ],
-        repo_root,
-        false,
-    );
-    if r.success && !r.trimmed_stdout().is_empty() {
-        return conventional_pr_title(r.trimmed_stdout(), issue);
+    if let Query::Populated(title) = gh_string_field("issue", issue, "title", repo_root, false) {
+        let title = title.trim();
+        if !title.is_empty() {
+            return conventional_pr_title(title, issue);
+        }
     }
     if !staged_files.is_empty() {
         let names: Vec<&str> = staged_files
@@ -1194,28 +1280,26 @@ fn derive_commit_message(repo_root: &Path, issue: i64, staged_files: &[String]) 
 pub fn validate_curator(repo_root: &Path, opts: &ValidateOpts) -> ValidationResult {
     let issue = opts.issue;
     let issue_s = issue.to_string();
-    let r = run_gh(
-        &[
-            "issue",
-            "view",
-            &issue_s,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-        repo_root,
-        true,
-    );
-    if !r.success {
-        return ValidationResult::new(
-            "curator",
-            issue,
-            ValidationStatus::Failed,
-            "Could not fetch issue labels",
-        );
-    }
-    if r.stdout.lines().any(|l| l.trim() == "loom:curated") {
+    // #7810 PR 2: `Empty` (the issue genuinely has no labels) must keep flowing
+    // to the "missing loom:curated" path below, while every way of NOT KNOWING
+    // fails the check. Under `--jq .labels[].name` both produced no lines, so a
+    // forge hiccup was indistinguishable from an uncurated issue — and the old
+    // `!r.succeeded()` guard could not catch it, because `gh` had exited zero.
+    let labels: Vec<String> = match gh_labels_query("issue", issue, repo_root) {
+        Query::Populated(names) => names,
+        Query::Empty => Vec::new(),
+        // Malformed / Failed / Unavailable: we could not read the labels, which
+        // is not the same as the issue having none.
+        _ => {
+            return ValidationResult::new(
+                "curator",
+                issue,
+                ValidationStatus::Failed,
+                "Could not fetch issue labels",
+            );
+        }
+    };
+    if labels.iter().any(|l| l.trim() == "loom:curated") {
         return ValidationResult::new(
             "curator",
             issue,
@@ -1245,7 +1329,7 @@ pub fn validate_curator(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
         repo_root,
         false,
     );
-    if r.success {
+    if r.succeeded() {
         report_milestone(
             opts.task_id.as_deref(),
             repo_root,
@@ -1279,31 +1363,21 @@ pub fn validate_judge(repo_root: &Path, opts: &ValidateOpts) -> ValidationResult
             "PR number required for judge phase validation",
         );
     };
-    let pr_s = pr.to_string();
-    let probe = run_gh(
-        &[
-            "pr",
-            "view",
-            &pr_s,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-        repo_root,
-        true,
-    );
-    if !probe.success {
-        return ValidationResult::new(
-            "judge",
-            issue,
-            ValidationStatus::Failed,
-            "Could not fetch PR labels",
-        );
-    }
-    let labels: Vec<&str> = probe.stdout.lines().map(str::trim).collect();
-
-    if labels.contains(&"loom:pr") {
+    // #7810 PR 2: `Empty` — a PR with no labels at all — is a real answer and
+    // must reach the checks below. Only a genuinely unanswered query fails here.
+    let labels: Vec<String> = match gh_labels_query("pr", pr, repo_root) {
+        Query::Populated(names) => names,
+        Query::Empty => Vec::new(),
+        _ => {
+            return ValidationResult::new(
+                "judge",
+                issue,
+                ValidationStatus::Failed,
+                "Could not fetch PR labels",
+            );
+        }
+    };
+    if labels.iter().any(|l| l.trim() == "loom:pr") {
         return ValidationResult::new(
             "judge",
             issue,
@@ -1311,7 +1385,7 @@ pub fn validate_judge(repo_root: &Path, opts: &ValidateOpts) -> ValidationResult
             format!("PR #{pr} approved (loom:pr)"),
         );
     }
-    if labels.contains(&"loom:changes-requested") {
+    if labels.iter().any(|l| l.trim() == "loom:changes-requested") {
         return ValidationResult::new(
             "judge",
             issue,
@@ -1323,7 +1397,7 @@ pub fn validate_judge(repo_root: &Path, opts: &ValidateOpts) -> ValidationResult
     // Issue #1998: after Doctor applies fixes it removes
     // `loom:changes-requested` and adds `loom:review-requested`. Seeing that
     // here is an expected intermediate state, worth naming distinctly.
-    let msg = if labels.contains(&"loom:review-requested") {
+    let msg = if labels.iter().any(|l| l.trim() == "loom:review-requested") {
         format!(
             "PR #{pr} has loom:review-requested (Doctor applied fixes) but judge did not \
              produce outcome label yet"
@@ -1357,33 +1431,21 @@ pub fn validate_doctor(repo_root: &Path, opts: &ValidateOpts) -> ValidationResul
             "PR number required for doctor phase validation",
         );
     };
-    let pr_s = pr.to_string();
-    let probe = run_gh(
-        &[
-            "pr",
-            "view",
-            &pr_s,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-        repo_root,
-        true,
-    );
-    if !probe.success {
-        return ValidationResult::new(
-            "doctor",
-            issue,
-            ValidationStatus::Failed,
-            "Could not fetch PR labels",
-        );
-    }
-    if probe
-        .stdout
-        .lines()
-        .any(|l| l.trim() == "loom:review-requested")
-    {
+    // #7810 PR 2: `Empty` — a PR with no labels at all — is a real answer and
+    // must reach the checks below. Only a genuinely unanswered query fails here.
+    let labels: Vec<String> = match gh_labels_query("pr", pr, repo_root) {
+        Query::Populated(names) => names,
+        Query::Empty => Vec::new(),
+        _ => {
+            return ValidationResult::new(
+                "doctor",
+                issue,
+                ValidationStatus::Failed,
+                "Could not fetch PR labels",
+            );
+        }
+    };
+    if labels.iter().any(|l| l.trim() == "loom:review-requested") {
         return ValidationResult::new(
             "doctor",
             issue,
@@ -1434,8 +1496,8 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     if let Some(worktree) = opts.worktree.as_deref() {
         if !PathBuf::from(worktree).is_dir() {
             let r = run_git(repo_root, &["status", "--porcelain"]);
-            if r.success && !r.trimmed_stdout().is_empty() {
-                let head: String = r.trimmed_stdout().chars().take(200).collect();
+            if r.succeeded() && !r.stdout_trimmed().is_empty() {
+                let head: String = r.stdout_trimmed().chars().take(200).collect();
                 super::log_warning(&format!(
                     "WORKFLOW VIOLATION: Builder appears to have worked on main instead of \
                      in worktree '{worktree}'. Uncommitted changes on main: {head}"
@@ -1445,14 +1507,11 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     }
 
     // Already-closed issue: a close with no PR means the Builder abandoned it.
-    let state = run_gh(
-        &[
-            "issue", "view", &issue_s, "--json", "state", "--jq", ".state",
-        ],
-        repo_root,
-        true,
-    );
-    if state.success && state.trimmed_stdout() == "CLOSED" {
+    let state = gh_string_field("issue", issue, "state", repo_root, true);
+    // Only a decoded "CLOSED" counts as closed. An unanswered query must not
+    // conclude the issue is closed — that path declares the Builder abandoned
+    // the work, which is not something to infer from a forge hiccup.
+    if matches!(state, Query::Populated(ref st) if st == "CLOSED") {
         if let Some((pr, _)) = find_pr_for_issue(repo_root, issue, opts.pr_number) {
             return ValidationResult::new(
                 "builder",
@@ -1463,23 +1522,13 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
         }
         // Merged PRs do not appear in an open search.
         let head = format!("feature/issue-{issue}");
-        let merged = run_gh(
+        let merged = gh_first_pr_number(
             &[
-                "pr",
-                "list",
-                "--head",
-                &head,
-                "--state",
-                "merged",
-                "--json",
-                "number",
-                "--jq",
-                ".[0].number",
+                "pr", "list", "--head", &head, "--state", "merged", "--json", "number",
             ],
             repo_root,
-            true,
         );
-        if let Some(pr) = parse_pr_number(&merged.stdout) {
+        if let Some(pr) = merged {
             return ValidationResult::new(
                 "builder",
                 issue,
@@ -1561,7 +1610,7 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
             repo_root,
             false,
         );
-        if r.success {
+        if r.succeeded() {
             report_milestone(
                 opts.task_id.as_deref(),
                 repo_root,
@@ -1626,7 +1675,7 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     }
 
     let status = run_git(&wt, &["status", "--porcelain"]);
-    if !status.success {
+    if !status.succeeded() {
         mark_phase_failed(
             repo_root,
             issue,
@@ -1637,13 +1686,13 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
         );
         return fail("Could not check worktree status".to_string());
     }
-    let status_output = status.trimmed_stdout().to_string();
+    let status_output = status.stdout_trimmed().to_string();
     let mut adopted_pushed_branch = false;
 
     if status_output.is_empty() {
         // No uncommitted changes — are there unpushed commits?
         let unpushed = run_git(&wt, &["log", "--oneline", "@{upstream}..HEAD"]);
-        let has_unpushed = unpushed.success && !unpushed.trimmed_stdout().is_empty();
+        let has_unpushed = unpushed.succeeded() && !unpushed.stdout_trimmed().is_empty();
         if !has_unpushed && pushed_branch_is_adoptable(&wt) {
             // Everything is already committed AND pushed; only the PR is
             // missing (the #6074 App-permission window). Adopt the branch —
@@ -1667,9 +1716,9 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
         // There ARE unpushed commits. If they only add the no-changes-needed
         // marker, this is a deliberate "no changes needed", not lost work.
         let committed = run_git(&wt, &["diff", "--name-only", "@{upstream}..HEAD"]);
-        let files: Vec<&str> = if committed.success {
-            committed
-                .stdout
+        let committed_out = committed.stdout_lossy();
+        let files: Vec<&str> = if committed.succeeded() {
+            committed_out
                 .lines()
                 .map(str::trim)
                 .filter(|f| !f.is_empty())
@@ -1726,8 +1775,8 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
             let mut args: Vec<&str> = vec!["add", "--"];
             args.extend(files_to_stage.iter().map(String::as_str));
             let r = run_git(&wt, &args);
-            if !r.success {
-                let head: String = r.stderr.trim().chars().take(200).collect();
+            if !r.succeeded() {
+                let head: String = r.stderr_trimmed().chars().take(200).collect();
                 let diag = gather_builder_diagnostics(repo_root, issue, worktree);
                 mark_phase_failed(
                     repo_root,
@@ -1742,8 +1791,8 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
 
             let commit_msg = derive_commit_message(repo_root, issue, &files_to_stage);
             let r = run_git(&wt, &["commit", "-m", &commit_msg]);
-            if !r.success {
-                let head: String = r.stderr.trim().chars().take(200).collect();
+            if !r.succeeded() {
+                let head: String = r.stderr_trimmed().chars().take(200).collect();
                 let diag = gather_builder_diagnostics(repo_root, issue, worktree);
                 mark_phase_failed(
                     repo_root,
@@ -1759,8 +1808,8 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     }
 
     let r = run_git(&wt, &["push", "-u", "origin", &branch]);
-    if !r.success {
-        let head: String = r.stderr.trim().chars().take(200).collect();
+    if !r.succeeded() {
+        let head: String = r.stderr_trimmed().chars().take(200).collect();
         let diag = gather_builder_diagnostics(repo_root, issue, worktree);
         mark_phase_failed(
             repo_root,
@@ -1774,24 +1823,18 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     }
 
     let rate_limited = is_rate_limited_builder_exit(repo_root, issue);
-    let title_probe = run_gh(
-        &[
-            "issue", "view", &issue_s, "--json", "title", "--jq", ".title",
-        ],
-        repo_root,
-        true,
-    );
-    let raw_title = if title_probe.success {
-        title_probe.trimmed_stdout()
-    } else {
-        ""
+    // An unreadable title falls back to the generic conventional-commit title,
+    // exactly as before — `conventional_pr_title` handles an empty input.
+    let raw_title = match gh_string_field("issue", issue, "title", repo_root, true) {
+        Query::Populated(t) => t.trim().to_string(),
+        _ => String::new(),
     };
-    let pr_title = conventional_pr_title(raw_title, issue);
+    let pr_title = conventional_pr_title(&raw_title, issue);
     let pr_body = build_recovery_pr_body(issue, worktree, rate_limited);
 
     let created = create_recovery_pr(repo_root, &branch, &pr_title, &pr_body);
-    if !created.success {
-        let head: String = created.stderr.trim().chars().take(200).collect();
+    if !created.succeeded() {
+        let head: String = created.stderr_trimmed().chars().take(200).collect();
         let diag = gather_builder_diagnostics(repo_root, issue, worktree);
         mark_phase_failed(
             repo_root,
@@ -1805,8 +1848,8 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     }
 
     // `gh pr create` prints the PR URL; the number is its last path segment.
-    let url = created.trimmed_stdout();
-    let recovered_pr = parse_pr_number(url.rsplit('/').next().unwrap_or(url));
+    let url = created.stdout_trimmed();
+    let recovered_pr = parse_pr_number(url.rsplit('/').next().unwrap_or(&url));
 
     let recovery_reason = if rate_limited {
         "rate_limited"
@@ -1921,9 +1964,6 @@ pub fn run(cwd: &Path, opts: &ValidateOpts) -> i32 {
     }
     i32::from(!result.satisfied())
 }
-
-/// Re-export for callers that want the raw `gh` runner shape.
-pub type GhOutcome = GhResult;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -2361,8 +2401,8 @@ mod tests {
         .unwrap();
 
         let r = create_recovery_pr(dir.path(), "feature/issue-1", "fix: t", "Closes #1");
-        assert!(r.success);
-        assert_eq!(r.trimmed_stdout(), "https://github.test/o/r/pull/9");
+        assert!(r.succeeded());
+        assert_eq!(r.stdout_trimmed(), "https://github.test/o/r/pull/9");
         let argv = std::fs::read_to_string(scripts.join("argv")).unwrap();
         assert!(argv.contains("--head feature/issue-1"), "argv: {argv}");
         assert!(argv.contains("--label loom:review-requested"), "argv: {argv}");

@@ -38,8 +38,15 @@ pub mod sweep_experiment;
 pub mod usage;
 pub mod validate_phase;
 
+use crate::cmd_out::{decode_json, run_command, CmdOutcome, Query, DEFAULT_TIMEOUT};
+
+/// Ceiling for the `gh-cached --version` capability probe.
+///
+/// Deliberately short: the probe delegates straight to `gh --version` with no
+/// API call, so anything slow here is already the breakage it is testing for.
+const GH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 
 /// Repo-root discovery, re-exported from the single-source
 /// [`crate::repo_root`] helper (issue #5140 — this module used to carry its own
@@ -76,10 +83,13 @@ pub fn now_iso() -> String {
 pub fn gh_cmd(repo_root: &Path) -> PathBuf {
     let cached = repo_root.join(".loom").join("scripts").join("gh-cached");
     if is_executable_file(&cached) {
-        let probed = Command::new(&cached)
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success());
+        // #7810 PR 2: bounded. The point of this probe is to catch a wrapper
+        // that is executable but broken (an unaccepted Xcode licence, a missing
+        // interpreter); one that HANGS is the same class of broken, and an
+        // unbounded probe would wait for it forever on every single call.
+        let mut probe = Command::new(&cached);
+        probe.arg("--version").stdin(std::process::Stdio::null());
+        let probed = run_command(probe, GH_PROBE_TIMEOUT).succeeded();
         if probed {
             return cached;
         }
@@ -98,55 +108,53 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Run a `gh` (or `gh-cached`) command inside `repo_root`.
+/// Run a `gh` (or `gh-cached`) command inside `repo_root`, under a deadline.
 ///
-/// Port of `validate_phase._run_gh`: never fails the caller — a spawn error is
-/// reported as a non-zero-status [`GhResult`] with empty output, exactly like
-/// the Python `check=False` + captured-output contract.
-pub fn run_gh(args: &[&str], repo_root: &Path, use_cache: bool) -> GhResult {
+/// Epic #7810 PR 2: returns [`CmdOutcome`] instead of the retired `GhResult`.
+/// That type reported a **spawn failure as `success: false`**, so "gh is not
+/// installed" and "gh ran and exited 1" were the same value; it also decoded
+/// lossily at the boundary and ran unbounded, so a wedged `gh` blocked forever
+/// (the 2026-07-26 incident). All three are now distinguished or bounded.
+pub fn run_gh(args: &[&str], repo_root: &Path, use_cache: bool) -> CmdOutcome {
     let program = if use_cache {
         gh_cmd(repo_root)
     } else {
         PathBuf::from("gh")
     };
-    match Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .current_dir(repo_root)
-        .output()
-    {
-        Ok(out) => GhResult::from_output(&out),
-        Err(e) => GhResult {
-            success: false,
-            stdout: String::new(),
-            stderr: e.to_string(),
-        },
-    }
+        .stdin(std::process::Stdio::null());
+    run_command(cmd, DEFAULT_TIMEOUT)
 }
 
-/// The captured result of a `gh` invocation (stdout/stderr already lossily
-/// decoded, mirroring Python's `text=True`).
-#[derive(Debug, Clone)]
-pub struct GhResult {
-    pub success: bool,
-    pub stdout: String,
-    pub stderr: String,
+/// Run a `gh` JSON query and decode it in-process (epic #7810 PR 2).
+///
+/// Callers pass `--json <fields>` and **no `--jq`**. Flattening JSON to a
+/// scalar inside the subprocess is what made *command failed*, *field absent*,
+/// *valid-but-empty* and *no match* the same empty string.
+pub fn gh_query<T, F>(args: &[&str], repo_root: &Path, use_cache: bool, is_empty: F) -> Query<T>
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce(&T) -> bool,
+{
+    decode_json(run_gh(args, repo_root, use_cache), is_empty)
 }
 
-impl GhResult {
-    fn from_output(out: &Output) -> Self {
-        Self {
-            success: out.status.success(),
-            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-        }
-    }
-
-    /// `stdout` with surrounding whitespace removed — the shape nearly every
-    /// `--jq`-filtered call wants.
-    #[must_use]
-    pub fn trimmed_stdout(&self) -> &str {
-        self.stdout.trim()
-    }
+/// Run `git` in `dir` under a deadline, capturing output.
+///
+/// Output is **not** trimmed here. `main_health_gate` needed a whole separate
+/// `git_status_porcelain` helper because a blanket trim ate the leading space
+/// of a porcelain v1 status line (`" M file"`), changing what it meant; a
+/// shared layer that trimmed by default would spread that bug rather than fix
+/// it. Trim at the call site, where the format is known.
+pub fn run_git(dir: &Path, args: &[&str]) -> CmdOutcome {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null());
+    run_command(cmd, DEFAULT_TIMEOUT)
 }
 
 // --------------------------------------------------------------------------
@@ -226,18 +234,6 @@ pub fn read_json_file(path: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&text).ok()
 }
 
-/// Run `git` with `-C <dir>` and capture its output, never failing the caller.
-pub fn run_git(dir: &Path, args: &[&str]) -> GhResult {
-    match Command::new("git").arg("-C").arg(dir).args(args).output() {
-        Ok(out) => GhResult::from_output(&out),
-        Err(e) => GhResult {
-            success: false,
-            stdout: String::new(),
-            stderr: e.to_string(),
-        },
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -314,7 +310,35 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
         // Not a git repo: git exits non-zero but the helper still returns.
-        assert!(!r.success);
+        assert!(!r.succeeded());
+        // #7810 PR 2 — the distinction the old `GhResult` could not make: git
+        // was found and RAN, it just answered no. That must not look the same
+        // as git being absent, which is what `success: false` used to report
+        // for both.
+        assert!(
+            matches!(r, CmdOutcome::Ran(_)),
+            "git ran and exited non-zero; this is an answer, not an inability to ask"
+        );
+    }
+
+    #[test]
+    fn run_git_reports_a_missing_directory_as_gits_own_answer() {
+        // `run_git` passes the directory as git's `-C` argument rather than as
+        // the process cwd, so a missing path is something GIT rejects — it runs
+        // and exits non-zero. That is an answer, and it must be reported as one.
+        //
+        // Worth pinning because the intuitive reading ("bad directory =>
+        // couldn't run") is wrong here, and a future change to `current_dir`
+        // would silently flip this outcome from `Ran` to `Unavailable` and
+        // change what every caller concludes.
+        let missing = std::path::Path::new("/nonexistent/loom/definitely-not-here");
+        let r = run_git(missing, &["rev-parse", "HEAD"]);
+        assert!(!r.succeeded());
+        assert!(
+            matches!(r, CmdOutcome::Ran(_)),
+            "git itself rejects a bad -C path; that is an answer, got {r:?}"
+        );
+        assert!(!r.stderr_trimmed().is_empty(), "git should say why it refused");
     }
 
     #[test]
