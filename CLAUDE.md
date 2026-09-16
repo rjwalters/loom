@@ -276,10 +276,10 @@ missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
   atomically (#5047). See [`.loom/docs/github-authentication.md`](.loom/docs/github-authentication.md).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [`.loom/docs/forge-authentication.md`](.loom/docs/forge-authentication.md).
-- **Releasing** — `scripts/version.sh` keeps all 6 version-bearing files in sync
-  (including this `CLAUDE.md`'s `**Loom Version**` line and the root `VERSION`
-  file, #5517); releases are driven by
-  `/repo:release` from [rjwalters/repo](https://github.com/rjwalters/repo). The
+- **Releasing** — **a PR must NEVER bump `VERSION`**: a post-merge workflow does
+  it once, and CI fails any PR that hand-edits a version-bearing file (#7743).
+  `scripts/version.sh` keeps all 6 in sync (#5517) and is the *release* path;
+  releases are driven by `/repo:release` from [rjwalters/repo](https://github.com/rjwalters/repo). The
   release workflow triggers on GitHub Release creation, not tag push. The same
   workflow also publishes `ghcr.io/rjwalters/loom-worker:<version>` — a pinned
   sweep-execution-environment base image (daemon stays on the host; see
