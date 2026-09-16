@@ -266,7 +266,10 @@ Local verification:
 # ./.loom/scripts/create-pr.sh. Mirrors the CI job "PRs Must Not Hand-Edit
 # Version-Bearing Files" (.github/workflows/ci.yml) — no PR exists yet at
 # Builder time, so use the merge-base with origin/main as --base instead of
-# a PR base sha.
+# a PR base sha. (`--forbid-bump` also narrows to merge-base(base, head)
+# internally since #7823, so passing one here is idempotent, not redundant
+# belt-and-braces you could drop: it keeps this block correct on an older
+# installed copy of the script too.)
 MERGE_BASE="$(git merge-base origin/main HEAD)"
 
 # Exit 0 = no version-bearing file's VALUE changed anywhere in your diff;

@@ -1477,6 +1477,17 @@ files, that means something violated the new invariant; treat it as a
 **complex conflict** (below), not this now-dead simple case, and flag the
 anomaly rather than reconstructing the old bump-and-continue recipe.
 
+**Scope of that impossibility (#7823):** it covers *git rebase conflicts*, not
+every way a stale branch can surface a version-bearing-file complaint. A
+PR whose branch predates a sibling `defaults/`-touching merge is simply
+*behind* `main`'s automated bump — no conflict, nothing hand-edited. The
+`--forbid-bump` gate compares against `merge-base(base, head)` precisely so
+that drift stays invisible, so if you nonetheless see a
+`PRs Must Not Hand-Edit Version-Bearing Files` failure reporting a *downgrade*
+(`'0.0.N' -> '0.0.M'` with M < N) on a PR whose own commits never touch those
+files, that is a stale branch or a CI checkout with insufficient history — ask
+for a rebase, do **not** treat it as a violation of the new invariant.
+
 ### For Complex Conflicts (Request Changes)
 
 Run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below.

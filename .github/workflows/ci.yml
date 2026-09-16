@@ -521,7 +521,12 @@ jobs:
       # fetch-depth: 0 + an explicit head sha (instead of the default
       # single-commit fetch of the synthetic refs/pull/<N>/merge ref) ensure
       # both the PR's base and head commits are present locally for the
-      # script's `git show <ref>:<path>` value extraction.
+      # script's `git show <ref>:<path>` value extraction -- and that their
+      # merge-base resolves, which --forbid-bump needs (#7823): base.sha is
+      # the live tip of main at trigger time, so comparing against it raw
+      # would false-FAIL any PR cut before a sibling defaults/-touching merge
+      # bumped the version. The script narrows to merge-base(base, head)
+      # itself; this checkout depth is what makes that resolvable.
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}

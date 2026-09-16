@@ -46,8 +46,8 @@
 #                     Also settable via the VERSION_BUMP_WATCH_PATHS
 #                     environment variable (a whitespace-separated list),
 #                     which --paths overrides when both are given.
-#     --forbid-bump   Inverted mode (#7743): FAIL if this diff changes the
-#                     extracted version VALUE of any version-bearing file
+#     --forbid-bump   Inverted mode (#7743): FAIL if this PR's own commits
+#                     change the extracted version VALUE of any version-bearing file
 #                     (package.json, mcp-loom/package.json, Cargo.toml,
 #                     CLAUDE.md, VERSION -- the same set scripts/version.sh
 #                     manages); PASS otherwise, regardless of --paths /
@@ -76,7 +76,9 @@
 # diff and re-cut it whenever `main` moved. --forbid-bump asks a different,
 # decidable-from-the-diff-alone question instead: "does this diff change a
 # version-bearing file's VALUE at all" -- comparing each file's *extracted*
-# version value between --base and --head (not "did the raw file change"),
+# version value between merge-base(--base, --head) and --head (not "did the
+# raw file change", and NOT against --base directly: see the BASE_REF block
+# in that code path for why base-branch drift would otherwise false-FAIL),
 # so an unrelated CLAUDE.md prose edit that never touches the
 # `**Loom Version**:` line still passes even though CLAUDE.md itself is in
 # the diff. This mirrors scripts/version.sh's own get_version_from_file()
@@ -127,8 +129,8 @@
 #   2 - bad usage (missing/invalid --base or --head, or an unknown argument).
 #
 # Exit codes (--forbid-bump mode):
-#   0 - no version-bearing file's extracted value differs between --base and
-#       --head.
+#   0 - no version-bearing file's extracted value differs between
+#       merge-base(--base, --head) and --head.
 #   1 - at least one version-bearing file's extracted value differs.
 #   2 - bad usage (same as above).
 
@@ -176,7 +178,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --help|-h)
-      sed -n '2,133p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,135p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -208,6 +210,34 @@ fi
 # at all", independent of --paths/VERSION_BUMP_WATCH_PATHS) rather than the
 # default mode's ("did a watched path change without VERSION also changing").
 if $FORBID_BUMP; then
+  # Compare against merge-base($BASE, $HEAD), not $BASE itself (#7823 review).
+  # CI wires --base to `github.event.pull_request.base.sha` -- the live tip of
+  # the base branch at trigger time, NOT the point this branch diverged from
+  # it. Those differ the moment ANY sibling PR merges after this branch was
+  # cut, and under #7743 every defaults/-touching merge bumps the version, so
+  # a raw $BASE..$HEAD value comparison reports a version DOWNGRADE (base's
+  # new value -> head's older, untouched one) for a PR whose own commits never
+  # touched a version-bearing file at all. That is a false FAIL caused purely
+  # by base-branch drift -- the same "gate that is unsound" symptom class
+  # #7743 set out to eliminate, and it fired on #7743's own PR (#7823).
+  #
+  # The merge-base is the last commit this branch and the base branch agree
+  # on, so BASE_REF..$HEAD contains exactly this PR's own commits: base drift
+  # becomes invisible, while a genuine hand-edit (which lives inside that
+  # range) still fails. Idempotent when the caller already passes a merge-base
+  # (builder-pr.md's local pre-flight does), since merge-base(mb, head) == mb.
+  #
+  # Falls back to the raw $BASE when no merge-base is resolvable -- a shallow
+  # CI checkout whose two histories do not share enough depth (the same
+  # ancestry caveat the default mode's direct two-ref diff documents below).
+  # Callers that need this narrowing must therefore check out with enough
+  # history (`fetch-depth: 0`), as .github/workflows/ci.yml's
+  # defaults-version-bump-check job does.
+  BASE_REF="$BASE"
+  if MERGE_BASE="$(git merge-base "$BASE" "$HEAD" 2>/dev/null)" && [[ -n "$MERGE_BASE" ]]; then
+    BASE_REF="$MERGE_BASE"
+  fi
+
   # Extracts file:path's version VALUE at git ref:ref, or prints nothing if
   # the file doesn't exist at that ref (so a file added/removed between base
   # and head is treated as "no value" on the missing side, not an error) or
@@ -237,7 +267,7 @@ if $FORBID_BUMP; then
 
   CHANGED_VALUES=""
   for vf in "${FORBID_BUMP_VALUE_FILES[@]}"; do
-    base_val="$(extract_version_value "$BASE" "$vf")"
+    base_val="$(extract_version_value "$BASE_REF" "$vf")"
     head_val="$(extract_version_value "$HEAD" "$vf")"
     if [[ "$base_val" != "$head_val" ]]; then
       CHANGED_VALUES+="  $vf: '$base_val' -> '$head_val'"$'\n'
@@ -245,11 +275,12 @@ if $FORBID_BUMP; then
   done
 
   if [[ -z "$CHANGED_VALUES" ]]; then
-    echo "check-defaults-version-bump: OK — no version-bearing file's value changed in this diff."
+    echo "check-defaults-version-bump: OK — no version-bearing file's value changed in this diff (compared against $BASE_REF)."
     exit 0
   fi
 
-  echo "check-defaults-version-bump: FAIL — this diff hand-edits a version-bearing file's value:" >&2
+  echo "check-defaults-version-bump: FAIL — this diff hand-edits a version-bearing file's value" >&2
+  echo "(comparing $BASE_REF..$HEAD, i.e. this PR's own commits):" >&2
   echo "" >&2
   printf '%s' "$CHANGED_VALUES" >&2
   echo "" >&2

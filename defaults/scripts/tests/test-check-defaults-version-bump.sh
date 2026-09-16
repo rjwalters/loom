@@ -410,6 +410,75 @@ else
     fail "default mode: expected exit 1, got $rc"
 fi
 
+# -------- Tests 22-24: --forbid-bump is immune to base-branch drift (#7823) --------
+#
+# Regression for the false FAIL that #7743's own PR hit: CI wires --base to
+# `github.event.pull_request.base.sha` (the live base-branch tip at trigger
+# time), so any PR whose branch predates a sibling merge that bumped the
+# version saw a raw base-vs-head value MISMATCH -- reported as a hand-edit
+# (in fact a downgrade: base's newer value -> head's older, untouched one)
+# even though the PR's own commits never touch a version-bearing file.
+# --forbid-bump must compare against merge-base(--base, --head) instead.
+#
+# Builds: base -> PR branch (defaults/ only, no version touch), while the
+# base branch independently advances with the automated post-merge bump.
+make_drift_fixture() {
+    make_fixture
+    git -C "$REPO" checkout -q -b pr base
+    echo "changed" >> "$REPO/defaults/scripts/foo.md"
+    git -C "$REPO" commit -q -am "pr work: defaults/ only, no version touch"
+    PR_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+    git -C "$REPO" checkout -q main
+    echo "1.0.1" > "$REPO/VERSION"
+    echo '{"version": "1.0.1"}' > "$REPO/package.json"
+    echo '{"version": "1.0.1"}' > "$REPO/mcp-loom/package.json"
+    printf '[workspace.package]\nversion = "1.0.1"\n' > "$REPO/Cargo.toml"
+    printf '# Test\n\n**Loom Version**: 1.0.1\n\nSome prose.\n' > "$REPO/CLAUDE.md"
+    git -C "$REPO" commit -q -am "automated post-merge version bump (sibling merge)"
+    MAIN_TIP="$(git -C "$REPO" rev-parse HEAD)"
+}
+
+echo "Test 22: --forbid-bump, base branch bumped after the branch diverged, PR touches no version file -> PASS"
+make_drift_fixture
+rc=0
+out="$(cd "$REPO" && "$SCRIPT" --forbid-bump --base "$MAIN_TIP" --head "$PR_HEAD" 2>&1)" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    pass "--forbid-bump: base-branch drift alone does not fail the PR"
+else
+    fail "--forbid-bump: base-branch drift expected exit 0, got $rc. Output: $out"
+fi
+
+echo "Test 23: --forbid-bump, a genuine hand-edit still fails despite base-branch drift"
+make_drift_fixture
+git -C "$REPO" checkout -q pr
+echo "9.9.9" > "$REPO/VERSION"
+git -C "$REPO" commit -q -am "hand-edit VERSION on the PR branch"
+PR_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+rc=0
+err_out="$(cd "$REPO" && "$SCRIPT" --forbid-bump --base "$MAIN_TIP" --head "$PR_HEAD" 2>&1 >/dev/null)" || true
+( cd "$REPO" && "$SCRIPT" --forbid-bump --base "$MAIN_TIP" --head "$PR_HEAD" >/dev/null 2>&1 ) || rc=$?
+if [[ "$rc" -eq 1 ]]; then
+    pass "--forbid-bump: hand-edit inside the PR's own range still exits 1 under drift"
+else
+    fail "--forbid-bump: hand-edit under drift expected exit 1, got $rc. Output: $err_out"
+fi
+if printf '%s' "$err_out" | grep -q "VERSION: '1.0.0' -> '9.9.9'"; then
+    pass "--forbid-bump: drift-narrowed failure reports the merge-base value, not the base tip's"
+else
+    fail "--forbid-bump: expected a 1.0.0 -> 9.9.9 VERSION report. Got: $err_out"
+fi
+
+echo "Test 24: --forbid-bump is idempotent when the caller already passes a merge-base"
+make_drift_fixture
+MB="$(git -C "$REPO" merge-base "$MAIN_TIP" "$PR_HEAD")"
+rc=0
+out="$(cd "$REPO" && "$SCRIPT" --forbid-bump --base "$MB" --head "$PR_HEAD" 2>&1)" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    pass "--forbid-bump: a pre-computed merge-base --base (builder-pr.md's pre-flight) still exits 0"
+else
+    fail "--forbid-bump: pre-computed merge-base expected exit 0, got $rc. Output: $out"
+fi
+
 # -------- Summary --------
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
