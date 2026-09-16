@@ -47,6 +47,49 @@ if ! declare -F print_info >/dev/null 2>&1; then
     print_info() { echo "INFO: $1"; }
 fi
 
+# Does this repository have ANY git remote that could plausibly be a forge?
+#
+# Mirrors `gh`'s own rule ("none of the git remotes configured for this
+# repository point to a known GitHub host") but decided LOCALLY from the
+# remote URLs, with zero forge calls — because `gh` only reports that message
+# once it is authenticated. An UNAUTHENTICATED `gh` bails out first, with a
+# completely different message and exit code:
+#
+#   $ gh pr list ...        # origin = /tmp/xxx/origin.git, no credential
+#   To get started with GitHub CLI, please run:  gh auth login
+#   Alternatively, populate the GH_TOKEN environment variable ...
+#   exit 4
+#
+# That text does not match the "no known GitHub host" signal, so before this
+# helper existed the throwaway-local-clone case was misclassified as
+# `unavailable` and `worktree.sh` REFUSED to create a worktree at all — which
+# broke every hermetic shell suite that builds a synthetic repo with
+# `git remote add origin "$TMP/origin.git"` on an unauthenticated runner
+# (#7863), and would equally break any real offline/sandboxed clone.
+#
+# A URL with a host component (scheme://… or scp-like user@host:path) is
+# treated as "possibly a forge" — deliberately permissive, since the genuine
+# `unavailable` refusal (auth/rate-limit/network failure against a REAL forge
+# remote) must stay a refusal. Only URLs that are unambiguously local
+# filesystem paths (absolute, relative, ~-relative, or file://) count as
+# evidence of no forge relationship. A repo with no remotes at all likewise
+# has nothing to shadow.
+#
+# Returns 0 when at least one remote could be a forge, 1 otherwise.
+_worktree_repo_has_forge_remote() {
+    local remote url
+    while read -r remote; do
+        [[ -n "$remote" ]] || continue
+        url="$(git remote get-url "$remote" 2>/dev/null || true)"
+        case "$url" in
+            ""|file://*|/*|./*|../*|"~"/*) continue ;;
+            *://*) return 0 ;;
+            *@*:*) return 0 ;;
+        esac
+    done < <(git remote 2>/dev/null)
+    return 1
+}
+
 # Look up an OPEN pull request whose head branch matches <branch>, via the
 # forge (same `loom-daemon forge` / `gh` convention as `branch_landed` in
 # lib/branch-landed.sh, the #5657/#7812 sibling check). Unlike that
@@ -63,12 +106,15 @@ fi
 #                       globals below are populated from it
 #     not_found      - the forge was reachable and confirmed no open PR has
 #                       this head branch — safe to create a fresh branch
-#     no_forge_remote - origin isn't a recognized forge remote at all (e.g. a
-#                       throwaway/offline local clone), OR `jq` itself is
-#                       missing (a tooling gap, not a forge-reachability
-#                       signal) — either way there is no PR to shadow, so
-#                       this is treated the same as not_found by callers,
-#                       kept distinct here only for testability
+#     no_forge_remote - no git remote could be a forge at all (every remote
+#                       URL is a local filesystem path, or there are no
+#                       remotes — a throwaway/offline local clone; decided
+#                       locally by _worktree_repo_has_forge_remote, and also
+#                       via gh's own "no known GitHub host" error), OR `jq`
+#                       itself is missing (a tooling gap, not a
+#                       forge-reachability signal) — either way there is no PR
+#                       to shadow, so this is treated the same as not_found by
+#                       callers, kept distinct here only for testability
 #     unavailable    - gh/loom-daemon missing, not authenticated,
 #                       rate-limited, or the query otherwise failed —
 #                       genuinely unknown, distinct from not_found so callers
@@ -98,6 +144,14 @@ _worktree_open_pr_for_branch() {
     # expecting plain worktree creation to keep working) - degrade the same
     # way as "no forge remote" rather than refusing.
     if ! command -v jq >/dev/null 2>&1; then
+        _WT_OPEN_PR_STATUS="no_forge_remote"
+        return 0
+    fi
+    # No remote that could be a forge => there is no PR to shadow, and no
+    # query worth making. Decided from the remote URLs BEFORE spending a forge
+    # round-trip, because an unauthenticated `gh` never gets far enough to tell
+    # us this itself (see _worktree_repo_has_forge_remote above, #7863).
+    if ! _worktree_repo_has_forge_remote; then
         _WT_OPEN_PR_STATUS="no_forge_remote"
         return 0
     fi

@@ -26,11 +26,18 @@
 #   3. Forge query genuinely unavailable (gh present but the query itself
 #      fails, e.g. auth/rate-limit) -> worktree.sh REFUSES rather than
 #      guessing "safe to create fresh".
-#   4. Origin is not a recognized forge remote at all (offline/throwaway
-#      clone — gh's own "no known GitHub host" signal) -> treated as "no PR
-#      to shadow"; worktree.sh still creates the fresh branch as before.
+#   4. gh itself reports that no remote points at a known GitHub host ->
+#      treated as "no PR to shadow"; worktree.sh still creates the fresh
+#      branch as before.
 #   5. No open PR matches this branch name at all (forge reachable, confirmed
 #      clean) -> worktree.sh still creates the fresh branch as before.
+#   6. Every remote is a local filesystem path AND gh is unauthenticated (so
+#      it bails out before it can emit the scenario-4 signal) -> still
+#      classified "no forge remote", worktree still created. This is the
+#      #7863 regression: it was misfiled as scenario 3 and refused, breaking
+#      every hermetic suite that builds a synthetic local-origin repo.
+#   7. Every remote is a local filesystem path -> the forge is not consulted
+#      at all (the decision is made from the remote URLs, with no round-trip).
 #
 # Companion to test-worktree-stale-merged-branch.sh (#5657) and
 # test-worktree-remote-branch-tracking.sh (#4823) — both must keep passing
@@ -66,6 +73,13 @@ setup_repo() {
     local name="$1"
     local with_pull_ref="${2:-false}"
     local pr_number="${3:-}"
+    # Whether this synthetic repo should look like it has a forge relationship
+    # at all. `origin` is always the local bare repo (so fetch/push stay
+    # hermetic — no network), so a repo that is supposed to HAVE a forge gets
+    # a second, never-fetched remote carrying a real GitHub URL. Without it
+    # the repo is a pure local-filesystem clone, which is now (correctly)
+    # classified `no_forge_remote` with no forge call at all — #7863.
+    local with_forge_remote="${4:-true}"
     local tmp
     tmp=$(mktemp -d /tmp/loom-wtforge.XXXXXX)
     git init -q -b main "$tmp/origin.git" --bare
@@ -77,6 +91,9 @@ setup_repo() {
         git commit --allow-empty -q -m init
         git remote add origin "$tmp/origin.git"
         git push -q origin main
+        if [[ "$with_forge_remote" == "true" ]]; then
+            git remote add forge https://github.com/rjwalters/loom.git
+        fi
         mkdir -p .loom/scripts/lib .loom/hooks
         cp "$WORKTREE_SH" .loom/scripts/worktree.sh
         if [[ -d "$SCRIPTS_DIR/lib" ]]; then
@@ -114,6 +131,10 @@ cleanup_repo() {
 #   FAKE_GH_MODE=none        -> no open PR matches (confirmed clean)
 #   FAKE_GH_MODE=no_host     -> gh's own "no known GitHub host" failure
 #                               (origin isn't a real forge remote)
+#   FAKE_GH_MODE=unauth      -> gh's UNAUTHENTICATED bail-out (exit 4), which
+#                               happens before it ever inspects the remotes,
+#                               so its text carries no "known GitHub host"
+#                               signal at all — the #7863 CI shape
 #   FAKE_GH_MODE=unavailable -> a genuine forge failure (e.g. rate limit)
 install_fake_gh() {
     local pr_number="${1:-999}"
@@ -148,6 +169,11 @@ if [[ "\$1" == "pr" && "\$2" == "list" ]]; then
         no_host)
             echo "none of the git remotes configured for this repository point to a known GitHub host. To tell gh about a new GitHub host, please use \`gh auth login\`" >&2
             exit 1
+            ;;
+        unauth)
+            echo "To get started with GitHub CLI, please run:  gh auth login" >&2
+            echo "Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token." >&2
+            exit 4
             ;;
         unavailable)
             echo "gh: API rate limit exceeded for this token" >&2
@@ -238,9 +264,9 @@ cleanup_repo "$REPO"
 rm -rf "$FAKE_BIN"
 rm -f "$OUT_LOG"
 
-# --- Test 4: origin is not a recognized forge remote -> proceed as before ---
+# --- Test 4: gh says no remote points at a known forge host -> proceed ---
 echo ""
-echo "Test 4: origin has no forge relationship at all (offline/throwaway clone) -> still creates the fresh branch"
+echo "Test 4: gh reports no remote points at a known GitHub host -> still creates the fresh branch"
 REPO=$(setup_repo nohost1)
 FAKE_BIN=$(install_fake_gh)
 OUT_LOG="/tmp/wtforge-nohost.$$"
@@ -272,6 +298,65 @@ if [[ -d "$REPO/.loom/worktrees/issue-77" ]]; then
     pass "worktree was created from base (forge confirmed no conflicting PR)"
 else
     fail "worktree.sh refused even though the forge confirmed no open PR matches"
+    cat "$OUT_LOG"
+fi
+cleanup_repo "$REPO"
+rm -rf "$FAKE_BIN"
+rm -f "$OUT_LOG"
+
+# --- Test 6: local-filesystem-only clone + UNAUTHENTICATED gh -> proceed ---
+#
+# The #7863 regression, verbatim: a repo whose only remote is a local bare
+# path (every hermetic suite in defaults/scripts/tests/ builds one this way)
+# on a runner with no GH_TOKEN. gh bails out before it ever looks at the
+# remotes, so its stderr carries none of the "no known GitHub host" signal
+# Test 4 relies on — and the old code misfiled that as `unavailable` and
+# refused to create ANY worktree.
+echo ""
+echo "Test 6: local-filesystem-only origin + unauthenticated gh -> still creates the fresh branch (#7863)"
+REPO=$(setup_repo localonly1 false "" false)
+FAKE_BIN=$(install_fake_gh)
+OUT_LOG="/tmp/wtforge-unauth.$$"
+(
+    cd "$REPO"
+    PATH="$FAKE_BIN:$PATH" FAKE_GH_MODE=unauth ./.loom/scripts/worktree.sh 77 >"$OUT_LOG" 2>&1 || { echo "FAILED"; cat "$OUT_LOG"; }
+)
+if [[ -d "$REPO/.loom/worktrees/issue-77" ]]; then
+    pass "worktree was created (no forge remote -> nothing to shadow, even though gh could not answer)"
+else
+    fail "worktree.sh refused on a local-only clone because gh was unauthenticated (#7863 regression)"
+    cat "$OUT_LOG"
+fi
+if ! grep -qi "refusing to create a same-named branch" "$OUT_LOG"; then
+    pass "no 'could not verify via the forge' refusal was emitted"
+else
+    fail "emitted a forge-unavailable refusal for a repo that has no forge remote"
+    cat "$OUT_LOG"
+fi
+cleanup_repo "$REPO"
+rm -rf "$FAKE_BIN"
+rm -f "$OUT_LOG"
+
+# --- Test 7: local-filesystem-only clone -> the forge is not consulted ---
+#
+# Guards the short-circuit itself: with no forge remote there is no PR that
+# could shadow this branch, so the query is skipped entirely rather than
+# asked and then reinterpreted. Uses the mode that would otherwise REFUSE
+# (cross-repo PR found), so a regression that reintroduces the forge call here
+# fails loudly instead of silently costing a round-trip.
+echo ""
+echo "Test 7: local-filesystem-only origin -> forge is never consulted at all"
+REPO=$(setup_repo localonly2 false "" false)
+FAKE_BIN=$(install_fake_gh 4242)
+OUT_LOG="/tmp/wtforge-skip.$$"
+(
+    cd "$REPO"
+    PATH="$FAKE_BIN:$PATH" FAKE_GH_MODE=cross_repo ./.loom/scripts/worktree.sh 77 >"$OUT_LOG" 2>&1 || { echo "FAILED"; cat "$OUT_LOG"; }
+)
+if [[ -d "$REPO/.loom/worktrees/issue-77" ]] && ! grep -q "4242" "$OUT_LOG"; then
+    pass "worktree was created without consulting the forge (no remote could be one)"
+else
+    fail "the forge was consulted (or creation refused) for a repo with no forge remote"
     cat "$OUT_LOG"
 fi
 cleanup_repo "$REPO"
