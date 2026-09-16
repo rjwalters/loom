@@ -9,7 +9,7 @@ This comprehensive guide walks you through installing and setting up Loom, wheth
 - [Installation Options](#installation-options)
   - [Option 1: Download Binary (Easiest)](#option-1-download-binary-easiest)
   - [Option 2: Build from Source](#option-2-build-from-source)
-  - [Option 3: Interactive Install Script](#option-3-interactive-install-script)
+  - [Option 3: Interactive Install Script](#option-3-interactive-install-script-recommended)
 - [First-Time Setup](#first-time-setup)
 - [Verifying Your Setup](#verifying-your-setup)
 - [Next Steps](#next-steps)

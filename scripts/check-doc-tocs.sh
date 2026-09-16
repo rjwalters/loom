@@ -53,12 +53,13 @@ fi
 cd "$ROOT"
 
 # GitHub's heading anchor: lowercase, drop anything that is not alphanumeric,
-# space or hyphen (backticks, punctuation, emphasis markers), spaces -> hyphens.
+# underscore, space or hyphen (backticks, punctuation, emphasis markers) —
+# underscore is kept because GitHub's own slugger preserves it — spaces -> hyphens.
 slugify() {
   printf '%s' "$1" \
     | tr '[:upper:]' '[:lower:]' \
     | sed -e 's/`//g' -e 's/\[\([^]]*\)\](\([^)]*\))/\1/g' \
-    | sed -e 's/[^a-z0-9 -]//g' \
+    | sed -e 's/[^a-z0-9_ -]//g' \
     | sed -e 's/^ *//' -e 's/ *$//' -e 's/ /-/g'
 }
 

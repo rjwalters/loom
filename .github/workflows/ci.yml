@@ -552,6 +552,24 @@ jobs:
         run: bash scripts/check-dangling-links.sh --self-test
       - name: Check for dangling internal markdown links
         run: bash scripts/check-dangling-links.sh
+      # Anchor fragments are the other half of a link's contract and were never
+      # checked (#7801): "doc.md#section" stayed green after the heading moved.
+      # lychee implements GitHub's slug rule correctly and checks ~1500 links in
+      # under a second, so this rides in THIS job rather than adding a 26th one
+      # — the job is ~9s against a ~350s critical path, so it is free in wall
+      # clock, whereas a new job would cost a whole billable minute (GitHub
+      # rounds every job up) and widen the fan-out.
+      - name: Install lychee (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          VER=v0.24.2
+          SHA=1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a
+          curl -fsSL "https://github.com/lycheeverse/lychee/releases/download/lychee-${VER}/lychee-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/lychee.tgz
+          echo "${SHA}  /tmp/lychee.tgz" | sha256sum -c -
+          tar xzf /tmp/lychee.tgz -C /tmp
+          sudo install -m 0755 /tmp/lychee-x86_64-unknown-linux-gnu/lychee /usr/local/bin/lychee
+      - name: Check markdown anchor fragments resolve
+        run: bash scripts/check-doc-anchors.sh
 
   guard-destructive-drift:
     name: Guard-Destructive Vendored/Canonical Drift Check (advisory)
