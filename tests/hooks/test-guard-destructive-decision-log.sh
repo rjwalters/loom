@@ -186,7 +186,10 @@ fi
 
 # (e) The decision log is a SEPARATE file from hook-errors.log: a clean deny
 # writes to the decision log and does NOT append to the real hook-errors.log.
-_dl_hookerr="$REPO_ROOT/defaults/logs/hook-errors.log"
+# The error log's path follows the same source-vs-installed resolution as the
+# decision log (#7882): running $GUARD from defaults/hooks/ targets the repo's
+# own .loom/logs/, never defaults/logs/ inside the vendored tree.
+_dl_hookerr="$REPO_ROOT/.loom/logs/hook-errors.log"
 _dl_err_before="$( [[ -f "$_dl_hookerr" ]] && wc -l < "$_dl_hookerr" || echo 0 )"
 rm -f "$DL_LOG"
 make_input "rm -rf /" "$REPO_ROOT" | \
@@ -265,6 +268,68 @@ fi
 
 # Clean up the decision-telemetry temp dir.
 [[ -n "$DL_DIR" && "$DL_DIR" != "/" && -d "$DL_DIR" ]] && rm -rf "$DL_DIR"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- Decision-log DEFAULT path: source vs installed layout (#7882) ---${NC}"
+# =========================================================================
+#
+# With no LOOM_GUARD_DECISION_LOG_FILE override, the default log path must land
+# in <root>/.loom/logs/ whether the guard runs from an INSTALLED copy
+# (.loom/hooks/) or directly from its SOURCE location (defaults/hooks/).
+#
+# Before #7882 the path was blindly ${SCRIPT_DIR}/../logs, so a source-location
+# invocation wrote live runtime telemetry into defaults/logs/ — inside the
+# VENDORED tree that is copy-installed into every consumer repo and that
+# scripts/check-vendored-private-refs.sh scans, producing false CI failures on
+# long-lived checkouts.
+#
+# Both fixtures are throwaway copies of the guard laid out in the two shapes.
+# The cwd is a NON-repo dir, so the guard's REPO_ROOT is empty and only the env
+# toggle decides whether logging is on (no config tier involved).
+
+_dl_nonrepo="$(mktemp -d)"
+_dl_resolver="$REPO_ROOT/defaults/scripts/lib/config-resolver.sh"
+
+# (k) SOURCE layout: <root>/defaults/hooks/ logs to <root>/.loom/logs/ and must
+# not create <root>/defaults/logs/ at all.
+_dl_src_root="$(mktemp -d)"
+mkdir -p "$_dl_src_root/defaults/hooks" "$_dl_src_root/defaults/scripts/lib"
+cp "$GUARD" "$_dl_src_root/defaults/hooks/guard-destructive-generic.sh"
+cp "$_dl_resolver" "$_dl_src_root/defaults/scripts/lib/config-resolver.sh" 2>/dev/null || true
+make_input "rm -rf /" "$_dl_nonrepo" | \
+    env LOOM_GUARD_DECISION_LOG=1 \
+        "$_dl_src_root/defaults/hooks/guard-destructive-generic.sh" >/dev/null 2>&1 || true
+_dl_src_rec="$(tail -1 "$_dl_src_root/.loom/logs/guard-decisions.log" 2>/dev/null)" || _dl_src_rec=""
+if [[ ! -e "$_dl_src_root/defaults/logs" ]] && \
+   [[ "$(printf '%s' "$_dl_src_rec" | jq -r '.decision' 2>/dev/null)" == "deny" ]]; then
+    dl_assert "#7882: source layout (defaults/hooks/) logs to .loom/logs/, never defaults/logs/" 0
+else
+    dl_assert "#7882: source layout (defaults/hooks/) logs to .loom/logs/, never defaults/logs/" 1 \
+        "defaults/logs present: $( [[ -e "$_dl_src_root/defaults/logs" ]] && echo yes || echo no ); record: ${_dl_src_rec:-<none>}"
+fi
+
+# (l) INSTALLED layout regression: <root>/.loom/hooks/ still logs to
+# <root>/.loom/logs/ (the long-standing ${SCRIPT_DIR}/../logs behavior).
+_dl_inst_root="$(mktemp -d)"
+mkdir -p "$_dl_inst_root/.loom/hooks" "$_dl_inst_root/.loom/scripts/lib"
+cp "$GUARD" "$_dl_inst_root/.loom/hooks/guard-destructive-generic.sh"
+cp "$_dl_resolver" "$_dl_inst_root/.loom/scripts/lib/config-resolver.sh" 2>/dev/null || true
+make_input "rm -rf /" "$_dl_nonrepo" | \
+    env LOOM_GUARD_DECISION_LOG=1 \
+        "$_dl_inst_root/.loom/hooks/guard-destructive-generic.sh" >/dev/null 2>&1 || true
+_dl_inst_rec="$(tail -1 "$_dl_inst_root/.loom/logs/guard-decisions.log" 2>/dev/null)" || _dl_inst_rec=""
+if [[ "$(printf '%s' "$_dl_inst_rec" | jq -r '.decision' 2>/dev/null)" == "deny" ]]; then
+    dl_assert "#7882: installed layout (.loom/hooks/) still logs to .loom/logs/" 0
+else
+    dl_assert "#7882: installed layout (.loom/hooks/) still logs to .loom/logs/" 1 \
+        "record: ${_dl_inst_rec:-<none>}"
+fi
+
+for _dl_fixture in "$_dl_src_root" "$_dl_inst_root" "$_dl_nonrepo"; do
+    [[ -n "$_dl_fixture" && "$_dl_fixture" != "/" && -d "$_dl_fixture" ]] && rm -rf "$_dl_fixture"
+done
 
 echo ""
 
