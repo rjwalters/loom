@@ -267,17 +267,15 @@ mod tests {
         let driver = r#"
             set -euo pipefail
             SCRIPT="$1"; IGNORE_FILE="$2"; REL="$3"
-            # is_ignored() reads and writes the SEEN_RELS/PIN_HIT associative
-            # arrays that resync-installed.sh declares at module scope (#6515)
-            # so report_dead_pins() can see every call this run made. Extracting
-            # only the function body (below) loses those `declare -A` lines, so
-            # without redeclaring them here the first `SEEN_RELS["$rel"]=1`
-            # crashes under `set -u` (rel contains "/", so bash tries to treat
-            # the un-declared, non-associative SEEN_RELS as an arithmetic-index
-            # array) — a crash this driver's exit-code contract silently reads
-            # as "false" instead of the real answer.
-            declare -A SEEN_RELS=()
-            declare -A PIN_HIT=()
+            # is_ignored() reads and writes the SEEN_RELS/PIN_HIT indexed
+            # arrays (used as sets, #7730/#7749) that resync-installed.sh
+            # declares at module scope so report_dead_pins() can see every
+            # call this run made. Extracting only the function body (below)
+            # loses those top-level `SEEN_RELS=()`/`PIN_HIT=()` lines, but no
+            # preamble is needed here: `SEEN_RELS+=(...)`/`PIN_HIT+=(...)`
+            # auto-vivify an unset name as an indexed array on first use, on
+            # both bash 3.2 and bash 5+, so the extracted function body works
+            # standalone with no redeclaration.
             # Extract only the is_ignored() function body from the real
             # script (first line matching its signature through the next
             # line that is exactly a closing brace) and source it — this
