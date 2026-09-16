@@ -66,29 +66,32 @@ const DEFAULT_SAFEHOUSE_INVITE_EXEC: &str =
 /// so a non-Linux target is refused up front rather than half-provisioned.
 const SUPPORTED_TARGET_UNAME: &str = "Linux";
 
-/// Default fleet-feed ingest endpoint a worker's opt-in `[egress]` block
-/// publishes decrypted `completion-v1` events to (issue #6383). Not secret;
-/// overridable via `--feed-egress-sink-url` for a fork's own feed backend.
-pub const DEFAULT_FEED_EGRESS_SINK_URL: &str = "https://2amlogic.com/api/ingest";
-
 /// Default `delay_seconds` a worker's opt-in `[egress]` block buffers a
-/// decrypted event by before publishing it (issue #6383) — mirrors the one
-/// hand-configured publisher's (`robb-studio`) current value.
+/// decrypted event by before publishing it (issue #6383). A *mechanism*
+/// default (how long to buffer), which is why it still has one — unlike the
+/// two egress knobs that carry operator identity and therefore deliberately
+/// have no default at all (see the note immediately below, #7814).
 pub const DEFAULT_FEED_EGRESS_DELAY_SECONDS: u32 = 300;
 
-/// Default narration-scrub `deny_patterns` for a worker's opt-in `[egress]`
-/// block (issue #6383) — mirrors the fleet's current hand-configured list.
-/// A parameter threaded from [`AddWorkerConfig`] into the rendered template
-/// (not a literal baked into [`render_safehouse_config`]), overridable per
-/// host via repeated `--feed-egress-deny-pattern`.
-#[must_use]
-pub fn default_feed_egress_deny_patterns() -> Vec<String> {
-    vec![
-        "safehouse.2amlogic.com".to_string(),
-        "/Users/rwalters".to_string(),
-        "ip-172-31-".to_string(),
-    ]
-}
+// No `DEFAULT_FEED_EGRESS_SINK_URL` constant and no
+// `default_feed_egress_deny_patterns()` helper exist here, deliberately
+// (#7814, continuing #6650 under the #4990 public/private seam: "public repo
+// = mechanism, operator identity = overlay").
+//
+// The fleet-feed ingest endpoint and the narration-scrub deny list are
+// operator identity, not Loom mechanism. When they carried this fleet's own
+// values as compiled-in defaults, a fork running `fleet add-worker
+// --feed-egress` without the override flags provisioned a worker that
+// published its decrypted narration to an unrelated operator's ingest
+// endpoint, and scrubbed against that operator's hostname, home directory,
+// and VPC prefix rather than its own.
+//
+// Both are now ordinary operator inputs, in the same tier as
+// `--safehouse-homeserver-url` / `--safehouse-room`: the sink URL is
+// *required* when `--feed-egress` is opted in (see [`preflight`]) and the
+// deny list is empty unless repeated `--feed-egress-deny-pattern` flags
+// supply it. An operator's real values live in that operator's own infra
+// repo's invocation, never here.
 
 /// The probe run on the target host — before any plan step — to learn its
 /// platform (#5395). Deliberately the cheapest possible remote command: it
@@ -177,10 +180,15 @@ pub struct AddWorkerConfig {
     /// config template). Required when `feed_egress_enabled`.
     pub feed_egress_ingest_key_file: Option<PathBuf>,
     /// Fleet-feed ingest endpoint the worker's `[egress]` block publishes
-    /// completions to. Not secret.
-    pub feed_egress_sink_url: String,
+    /// completions to. Not secret, but operator identity rather than Loom
+    /// mechanism — so it carries no default and is **required** when
+    /// `feed_egress_enabled`, exactly like `safehouse_room` (#7814).
+    pub feed_egress_sink_url: Option<String>,
     /// Narration-scrub patterns applied before publication — a parameter,
-    /// not a literal baked into the rendered template (issue #6383).
+    /// not a literal baked into the rendered template (issue #6383) — and
+    /// empty unless the operator supplies it: a real scrub list names that
+    /// operator's hostnames, home directory, and VPC prefix, which must not
+    /// ship as a compiled-in default (#7814).
     pub feed_egress_deny_patterns: Vec<String>,
     /// Seconds the worker's `[egress]` block buffers a decrypted event
     /// before publishing it.
@@ -444,8 +452,18 @@ pub fn preflight(config: &AddWorkerConfig) -> Result<Secrets> {
     // could have the remote shell expand it against the secrets already
     // exported into that shell (`SAFEHOUSE_MATRIX_PASSWORD`,
     // `FLEET_FEED_INGEST_KEY`, ...) or execute arbitrary commands.
+    //
+    // The sink URL is also *required* here (#7814): the ingest endpoint is
+    // operator identity, not Loom mechanism, so there is no compiled-in
+    // default to fall back to and an omitted `--feed-egress-sink-url` fails
+    // now rather than rendering an `[egress]` block that publishes this
+    // worker's decrypted narration to somebody else's endpoint.
     if config.feed_egress_enabled {
-        validate_safe_token("feed-egress-sink-url", &config.feed_egress_sink_url, ".:/_-?=&")?;
+        let sink = config.feed_egress_sink_url.as_deref().unwrap_or("").trim();
+        if sink.is_empty() {
+            bail!("--feed-egress requires --feed-egress-sink-url (operator-specific: no default)");
+        }
+        validate_safe_token("feed-egress-sink-url", sink, ".:/_-?=&")?;
         for pattern in &config.feed_egress_deny_patterns {
             validate_safe_token("feed-egress-deny-pattern", pattern, ".:/_-?=&")?;
         }
@@ -819,7 +837,9 @@ fn push_safehouse_steps(
         room,
         deny_patterns: &config.feed_egress_deny_patterns,
         delay_seconds: config.feed_egress_delay_seconds,
-        sink_url: &config.feed_egress_sink_url,
+        // Non-empty whenever egress is opted in — `preflight` requires the
+        // operator to supply it (#7814); there is no default to fall back to.
+        sink_url: config.feed_egress_sink_url.as_deref().unwrap_or(""),
     });
     let config_step_description = if config.feed_egress_enabled {
         "write ~/.loom/safehoused/config.toml (0600): homeserver, account, passphrases, \
@@ -1687,3 +1707,10 @@ systemctl --user restart loom-daemon.service
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+// The fleet-feed egress group lives in its own sibling file rather than in
+// `tests.rs`, which is over the file-size ratchet's threshold (#7814; see
+// `.loom/docs/file-size-policy.md`).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod feed_egress_tests;

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# check-vendored-private-refs.sh — fail if defaults/ names a repository or host
-# that is not a public/placeholder identifier.
+# check-vendored-private-refs.sh — fail if a scanned tree names a repository or
+# host that is not a public/placeholder identifier.
 #
 # Why (#6190): every file under defaults/ is copy-installed into every consumer
 # repo's .loom/{scripts,hooks,roles,docs,bin}/ + .claude/commands/loom/ tree. A
@@ -20,8 +20,18 @@
 # Incident narratives keep their instructional value: genericize the identifiers
 # (example-org/tool-repo#202, dashboard.example.com) and keep the story.
 #
+# Scanned by default (#7814): defaults/ (the copy-installed surface above) AND
+# loom-daemon/src/fleet/ — the module that renders a provisioned host's config
+# from compiled-in defaults. That second tree is the same failure in daemon
+# code rather than vendored prose: `fleet add-worker`'s egress defaults used to
+# bake in this fleet's ingest endpoint and scrub list, so a fork provisioned a
+# worker publishing to an unrelated operator's endpoint. The rest of
+# loom-daemon/src/ is NOT scanned yet — it still carries operator-named test
+# fixtures (token-pool account names and the like), which are test-only data
+# rather than shipped defaults and are a separate scrub.
+#
 # Usage:
-#   check-vendored-private-refs.sh [--root <dir>]
+#   check-vendored-private-refs.sh [--root <dir>]...   # repeatable
 #   check-vendored-private-refs.sh --self-test
 #   check-vendored-private-refs.sh --help
 #
@@ -45,8 +55,8 @@ ALLOWED_OWNERS=(
   my-org some-owner
 )
 
-# Hosts permitted anywhere under defaults/: public services Loom actually talks
-# to or cites, plus the example.* / test.* placeholder families. Matched
+# Hosts permitted anywhere in a scanned tree: public services Loom actually
+# talks to or cites, plus the example.* / test.* placeholder families. Matched
 # case-insensitively, as a suffix (so `api.github.com` is covered by
 # `github.com`). Adding a genuinely public host here is the intended way to
 # extend this list; an operator-owned deployment hostname is not.
@@ -62,18 +72,21 @@ ALLOWED_HOST_SUFFIXES=(
   developercertificate.org
   percy.io
   ghcr.io
+  # Package/source origins the fleet bootstrap plan fetches from (#7814).
+  tailscale.com
+  sf.net
 )
 
 usage() {
-  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-ROOT=""
+ROOTS=()
 SELF_TEST=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --root)      ROOT="${2:-}"; shift 2 ;;
+    --root)      ROOTS+=("${2:-}"); shift 2 ;;
     --self-test) SELF_TEST=1; shift ;;
     --help|-h)   usage; exit 0 ;;
     *)
@@ -248,6 +261,30 @@ EOF
     fails=1
   fi
 
+  # Repeatable --root (#7814): the check now scans several trees in one run
+  # (defaults/ plus the daemon's fleet module), so a violation in ANY scanned
+  # root must fail the whole run, and a clean run must name every root it
+  # actually scanned.
+  if multi_out="$("$0" --root "$tmp/clean" --root "$tmp/dirty" 2>&1)"; then
+    echo "self-test: FAIL — a violation in the SECOND --root did not fail the run" >&2
+    echo "$multi_out" >&2
+    fails=1
+  elif grep -q 'dashboard.privateorg.com' <<<"$multi_out"; then
+    echo "self-test: OK — a violation in any scanned root fails the run"
+  else
+    echo "self-test: FAIL — multi-root run failed without reporting the violation. Got:" >&2
+    echo "$multi_out" >&2
+    fails=1
+  fi
+
+  if multi_clean="$("$0" --root "$tmp/clean" --root "$tmp/clean" 2>&1)"; then
+    echo "self-test: OK — several clean roots pass in one run"
+  else
+    echo "self-test: FAIL — clean roots reported a violation. Got:" >&2
+    echo "$multi_clean" >&2
+    fails=1
+  fi
+
   exit "$fails"
 fi
 
@@ -255,39 +292,56 @@ fi
 # Main
 # ---------------------------------------------------------------------------
 
-if [[ -z "$ROOT" ]]; then
+if [[ ${#ROOTS[@]} -eq 0 ]]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
     :
   else
     REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
   fi
-  ROOT="$REPO_ROOT/defaults"
+  # defaults/ is the copy-installed surface (#6190); loom-daemon/src/fleet/ is
+  # the daemon code that renders a provisioned host's config from compiled-in
+  # defaults (#7814). See this file's header for why the rest of
+  # loom-daemon/src/ is deliberately not scanned yet.
+  ROOTS=("$REPO_ROOT/defaults" "$REPO_ROOT/loom-daemon/src/fleet")
 fi
 
-if [[ ! -d "$ROOT" ]]; then
-  echo "check-vendored-private-refs: no such directory: $ROOT — nothing to check (ok)."
-  exit 0
-fi
+violations=""
+scanned=()
+for root in "${ROOTS[@]}"; do
+  if [[ ! -d "$root" ]]; then
+    echo "check-vendored-private-refs: no such directory: $root — nothing to check (ok)."
+    continue
+  fi
+  scanned+=("$root")
+  if ! out="$(scan_tree "$root")"; then
+    violations+="$out"$'\n'
+  fi
+done
 
-if out="$(scan_tree "$ROOT")"; then
-  echo "check-vendored-private-refs: OK — no non-allowlisted repo/host identifiers under $ROOT."
+if [[ -z "${violations//[$'\n\t ']/}" ]]; then
+  echo "check-vendored-private-refs: OK — no non-allowlisted repo/host identifiers under ${scanned[*]:-<nothing>}."
   exit 0
 fi
 
 {
-  echo "check-vendored-private-refs: FAIL — defaults/ names identifiers that are not public or placeholder:"
+  echo "check-vendored-private-refs: FAIL — a scanned tree names identifiers that are not public or placeholder:"
   echo ""
-  echo "$out"
+  printf '%s' "$violations"
   echo ""
   echo "Everything under defaults/ is copy-installed into every consumer repo, so"
   echo "these identifiers ship to every repo Loom is installed on — and a fix made"
-  echo "downstream reverts on the next resync (#6190)."
+  echo "downstream reverts on the next resync (#6190). Everything under"
+  echo "loom-daemon/src/fleet/ is a compiled-in default a fork inherits when it"
+  echo "provisions a host (#7814)."
   echo ""
   echo "Fix: genericize the identifier, keeping the narrative's instructional value:"
   echo "  private-org/private-repo#56  ->  example-org/tool-repo#202"
   echo "  dashboard.private-org.com    ->  dashboard.example.com"
   echo "  <operator machine name>      ->  studio-host / laptop-host"
+  echo ""
+  echo "For daemon code, an operator-specific value belongs in an operator-supplied"
+  echo "input (a required flag / an overlay), not a compiled-in default."
   echo ""
   echo "If an identifier is genuinely public and belongs here, add it to"
   echo "ALLOWED_OWNERS / ALLOWED_HOST_SUFFIXES at the top of this script."

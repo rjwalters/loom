@@ -580,16 +580,22 @@ jobs:
     # identifier to every repo Loom is installed on — and a downstream fix
     # reverts on the next resync (#6190). This asserts the inverse of a
     # denylist: every cross-repo `owner/repo#N` reference and every hostname
-    # under defaults/ must be a public or placeholder identifier. The
+    # in a scanned tree must be a public or placeholder identifier. The
     # self-test step regression-tests the checker itself against synthetic
     # clean/dirty fixtures.
+    #
+    # Since #7814 the scan also covers loom-daemon/src/fleet/ — the same
+    # failure in daemon code rather than vendored prose: `fleet add-worker`'s
+    # egress defaults baked in this fleet's ingest endpoint and scrub list, so
+    # a fork provisioned a worker publishing to an unrelated operator's
+    # endpoint. The script owns the default root list; this job just runs it.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Self-test the checker against synthetic fixtures
         run: bash scripts/check-vendored-private-refs.sh --self-test
-      - name: Check defaults/ for private repo/host identifiers
+      - name: Check defaults/ and loom-daemon/src/fleet/ for private repo/host identifiers
         run: bash scripts/check-vendored-private-refs.sh
 
   defaults-version-bump-check:
