@@ -36,8 +36,8 @@
 1840 loom-daemon/src/daemon_install_state.rs
 1281 loom-daemon/src/daemon_service.rs
 1575 loom-daemon/src/epic_supervisor.rs
-1110 loom-daemon/src/fleet/add_worker.rs
-1488 loom-daemon/src/fleet/add_worker/tests.rs
+1108 loom-daemon/src/fleet/add_worker.rs
+1362 loom-daemon/src/fleet/add_worker/tests.rs
 1408 loom-daemon/src/fleet/drain.rs
 1118 loom-daemon/src/fleet/status.rs
 1040 loom-daemon/src/forge_listing.rs
@@ -48,7 +48,7 @@
 1344 loom-daemon/src/install_self_check.rs
 3147 loom-daemon/src/ipc.rs
 4414 loom-daemon/src/ipc/tests.rs
-1273 loom-daemon/src/main.rs
+1265 loom-daemon/src/main.rs
 1845 loom-daemon/src/main_health_gate.rs
 2318 loom-daemon/src/main_health_gate/tests.rs
 1379 loom-daemon/src/observability/collector.rs

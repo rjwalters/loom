@@ -1374,7 +1374,7 @@ enum FleetAction {
         /// Opt-in — a consumer of loom with no public feed does not get a
         /// dangling sink. Requires `--safehouse` (egress publishes the same
         /// room safehoused already decrypts) plus
-        /// `--feed-egress-ingest-key-file`.
+        /// `--feed-egress-ingest-key-file` and `--feed-egress-sink-url`.
         #[arg(long)]
         feed_egress: bool,
 
@@ -1389,22 +1389,18 @@ enum FleetAction {
         feed_egress_ingest_key_file: Option<String>,
 
         /// Fleet-feed ingest endpoint the worker's `[egress]` block publishes
-        /// completions to. Not secret.
-        #[arg(
-            long,
-            value_name = "URL",
-            default_value = loom_daemon::fleet::add_worker::DEFAULT_FEED_EGRESS_SINK_URL
-        )]
-        feed_egress_sink_url: String,
+        /// completions to. Not secret, but operator-specific: there is no
+        /// default, so a fork never publishes to another operator's endpoint
+        /// (#7814). Required with `--feed-egress`.
+        #[arg(long, value_name = "URL")]
+        feed_egress_sink_url: Option<String>,
 
         /// A narration-scrub pattern applied before publication (repeat for
-        /// several). Defaults to the fleet's current scrub list — a
-        /// parameter, not a literal baked into the rendered template.
-        #[arg(
-            long = "feed-egress-deny-pattern",
-            value_name = "PATTERN",
-            default_values_t = loom_daemon::fleet::add_worker::default_feed_egress_deny_patterns()
-        )]
+        /// several). Empty unless supplied — a real scrub list names the
+        /// operator's own hostnames, home directory, and VPC prefix, so it
+        /// lives in that operator's infra-repo invocation rather than as a
+        /// compiled-in default (#7814).
+        #[arg(long = "feed-egress-deny-pattern", value_name = "PATTERN")]
         feed_egress_deny_patterns: Vec<String>,
 
         /// Seconds the worker's `[egress]` block buffers a decrypted event
