@@ -20,21 +20,31 @@
 # log`, a bypass push happened from automation, and establishing this was
 # benign took a reflog read.
 #
-# This script replaces that ad hoc recipe with a deterministic, conservative
-# one: it NEVER rebases and NEVER force/bypass-pushes over a commit it did
-# not author.
+# That bypass push was NOT a `--force` push. It was a plain post-rebase
+# `git push` that GitHub ACCEPTED -- because the pushing identity (the
+# operator's own account / the fleet App, admin on the repo) is on the
+# ruleset's bypass list -- and merely reported on stderr as
+# `remote: Bypassed rule violations for refs/heads/main:`. A plain push is
+# therefore only "rejected outright by branch protection" for an identity
+# WITHOUT bypass rights; for one with them it goes straight through, and a
+# script that discards push stderr on success never notices.
 #
-#   1. If the working tree in the primary checkout has no resync-managed dirt,
-#      it is a no-op (exit 0).
+# This script replaces the ad hoc recipe with a deterministic, conservative
+# one: it NEVER rebases, NEVER force/bypass-pushes over a commit it did not
+# author, and treats a bypass push as a failure rather than a success.
+#
+#   1. If the working tree in the primary checkout has no resync-managed dirt
+#      AND the default branch has nothing ahead of origin, it is a no-op
+#      (exit 0).
 #   2. If the dirty set includes anything OUTSIDE the known resync-managed
 #      surfaces (`.loom/hooks|scripts|roles|docs|bin|runtimes/`,
 #      `.claude/commands/loom/`, and the handful of single-file targets
 #      resync-installed.sh itself resyncs), it refuses to commit ANYTHING --
 #      an unrelated (possibly operator) change must never be swept into a
 #      "chore: resync" commit.
-#   3. Otherwise it commits the resync-managed dirt, fetches origin, and
-#      inspects every commit the primary checkout's default branch now has
-#      that origin does not:
+#   3. Otherwise it commits the resync-managed dirt (if any), fetches origin,
+#      and inspects every commit the primary checkout's default branch now
+#      has that origin does not:
 #        - If ANY of those commits was NOT authored by this checkout's own
 #          configured git identity (`git config user.email` -- the Loom
 #          automation identity; see check-git-identity.sh) -- i.e. an
@@ -42,16 +52,34 @@
 #          local, nothing is pushed, nothing is rebased, nothing is forced.
 #          This is the fix for the incident above: an operator's in-flight
 #          commit is never silently rewritten to reconcile with origin.
-#        - Otherwise every commit ahead is this checkout's own automation, so
-#          a plain `git push` is attempted. Ordinary git push semantics make
-#          this fast-forward-only by construction -- it is rejected outright
-#          if origin has advanced with commits this checkout doesn't have, or
-#          if the forge's branch protection requires a PR.
-#   4. If that push is rejected, it does NOT retry with a rebase or a forced
-#      push. It lands the commit via a short-lived branch + PR instead (the
-#      same path already used for other automated commits, via
-#      create-pr.sh), then resets the primary checkout's default branch back
-#      to origin's current tip so it never sits diverged waiting on that PR.
+#        - Otherwise every commit ahead is this checkout's own automation.
+#          A re-run is idempotent here: if an EARLIER run committed the
+#          resync but then failed before landing it (fetch failure, side
+#          branch push failure), the next run finds a clean tree with that
+#          Loom-authored commit still ahead of origin and lands it instead
+#          of reporting "nothing to land" and stranding it.
+#   4. Before attempting a direct push it asks the forge (GitHub only,
+#      fail-open) whether the default branch has an active `pull_request` /
+#      `required_status_checks` rule or legacy branch protection. If it does,
+#      the direct push is SKIPPED regardless of whether this identity could
+#      bypass it -- a plain push from a bypass-capable identity is exactly the
+#      incident shape above. Otherwise a plain `git push` is attempted;
+#      ordinary git push semantics make this fast-forward-only by
+#      construction (rejected if origin has advanced), and its stderr is
+#      inspected even on success: a `Bypassed rule violations` warning is
+#      treated as a failure (exit 4, loudly) so a bypass push can never
+#      happen silently again.
+#   5. If the direct push was skipped or rejected, it does NOT retry with a
+#      rebase or a forced push. It lands the commit via a short-lived branch
+#      + PR instead: the STABLE side branch `chore/resync-installed` (so a
+#      repeated fallback updates the one open PR through create-pr.sh's
+#      adopt-existing check rather than opening a duplicate per run), pushed
+#      with `--force-with-lease` (forcing a throwaway side branch is fine;
+#      only the default branch is sacred), labeled `loom:review-requested`
+#      so it enters the normal Judge queue. It then resets the primary
+#      checkout's default branch back to origin's current tip so it never
+#      sits diverged waiting on that PR. No local side branch is created or
+#      left behind.
 #
 # See `.loom/docs/troubleshooting.md` -> "Landing a resync commit on the
 # primary clone (#6646)" for the full policy, the conditions under which this
@@ -72,11 +100,12 @@
 #
 # Exit codes:
 #   0 - Nothing to land, OR landed successfully (direct push, or via a
-#       branch + PR when a direct push was rejected).
+#       branch + PR when a direct push was skipped or rejected).
 #   1 - Error: not a git repo, no resolvable default branch, wrong branch
 #       checked out, non-resync dirt present, fetch failed, or the branch+PR
 #       fallback itself failed (a PR-less pushed branch is reported so it can
-#       be finished by hand).
+#       be finished by hand). A commit made by this run stays local and is
+#       picked up by the next run (see 3.).
 #   2 - Usage error (bad argument).
 #   3 - STOPPED on purpose: the resync was committed locally but NOT pushed,
 #       because the primary checkout's default branch is ahead of origin by
@@ -84,6 +113,12 @@
 #       (presumed operator work). Nothing was rebased or force-pushed. A
 #       human must reconcile (push, or rebase by hand) before the next
 #       resync commit can land.
+#   4 - BYPASS PUSH DETECTED: the direct push was accepted by the forge only
+#       because this identity bypassed the default branch's protection rules
+#       (the forge said so on stderr). The commit IS on origin -- this script
+#       never force-pushes, so it does not undo it -- but the run is reported
+#       as a failure so the bypass is never silent. Fix the identity/ruleset
+#       (or the forge reachability that made the pre-check fail open).
 
 set -uo pipefail
 
@@ -113,9 +148,16 @@ EXIT_OK=0
 EXIT_ERROR=1
 EXIT_USAGE=2
 EXIT_STOPPED_FOREIGN_AHEAD=3
+EXIT_BYPASS_PUSHED=4
+
+RESYNC_COMMIT_SUBJECT="chore: resync installed Loom surfaces"
+FALLBACK_BRANCH="chore/resync-installed"
 
 usage() {
-    sed -n '2,86p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+    # The header comment block above runs from line 2 to the first blank line;
+    # keying on that blank line (rather than a hard-coded line range) means a
+    # header edit can neither truncate nor overflow the help text.
+    sed -n '2,/^$/p' "${BASH_SOURCE[0]:-$0}" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
 DRY_RUN=0
@@ -267,10 +309,6 @@ pure_copy_surface_source_path() {
 }
 
 STATUS="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)"
-if [[ -z "$STATUS" ]]; then
-    note "land-resync-commit.sh: nothing to land — working tree is clean."
-    exit "$EXIT_OK"
-fi
 
 IS_LOOM_SOURCE_REPO=0
 [[ -d "$REPO_ROOT/defaults/hooks" || -d "$REPO_ROOT/defaults/scripts" ]] && IS_LOOM_SOURCE_REPO=1
@@ -317,34 +355,45 @@ if [[ "${#RETIRED_PATHS[@]}" -gt 0 ]]; then
     warn "  Add it to defaults/.loom-retired.list (or delete it) if it is genuinely retired."
 fi
 
-if [[ "${#RESYNC_PATHS[@]}" -eq 0 ]]; then
-    note "land-resync-commit.sh: nothing to land — no resync-managed surface is dirty."
-    exit "$EXIT_OK"
-fi
+# ---------- git identity (needed to tell Loom's commits from an operator's) ----------
 
-if [[ "$DRY_RUN" -eq 1 ]]; then
-    note "[dry-run] Would commit ${#RESYNC_PATHS[@]} resync-managed path(s) as 'chore: resync installed Loom surfaces',"
-    note "[dry-run] then attempt to land it onto '$DEFAULT_BRANCH' (never rebasing, never force/bypass-pushing)."
-    exit "$EXIT_OK"
-fi
+LOOM_IDENTITY_EMAIL=""
+require_identity() {
+    [[ -n "$LOOM_IDENTITY_EMAIL" ]] && return 0
+    LOOM_IDENTITY_EMAIL="$(git -C "$REPO_ROOT" config user.email 2>/dev/null || true)"
+    if [[ -z "$LOOM_IDENTITY_EMAIL" ]]; then
+        err "git config user.email is not set in $REPO_ROOT — cannot tell a"
+        err "  Loom-authored commit apart from an operator's without a configured"
+        err "  identity. Configure one (see check-git-identity.sh) and re-run."
+        exit "$EXIT_ERROR"
+    fi
+}
 
-LOOM_IDENTITY_EMAIL="$(git -C "$REPO_ROOT" config user.email 2>/dev/null || true)"
-if [[ -z "$LOOM_IDENTITY_EMAIL" ]]; then
-    err "git config user.email is not set in $REPO_ROOT — cannot tell a"
-    err "  Loom-authored commit apart from an operator's without a configured"
-    err "  identity. Configure one (see check-git-identity.sh) and re-run."
-    exit "$EXIT_ERROR"
-fi
+# ---------- commit (only when there is resync-managed dirt) ----------
 
-# ---------- commit ----------
-
-git -C "$REPO_ROOT" add -- "${RESYNC_PATHS[@]}"
-if ! git -C "$REPO_ROOT" commit --quiet -m "chore: resync installed Loom surfaces"; then
-    err "git commit failed."
-    exit "$EXIT_ERROR"
+RESYNC_SHA=""
+if [[ "${#RESYNC_PATHS[@]}" -gt 0 ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        note "[dry-run] Would commit ${#RESYNC_PATHS[@]} resync-managed path(s) as '$RESYNC_COMMIT_SUBJECT',"
+        note "[dry-run] then attempt to land it onto '$DEFAULT_BRANCH' (never rebasing, never force/bypass-pushing)."
+        exit "$EXIT_OK"
+    fi
+    require_identity
+    git -C "$REPO_ROOT" add -- "${RESYNC_PATHS[@]}"
+    if ! git -C "$REPO_ROOT" commit --quiet -m "$RESYNC_COMMIT_SUBJECT"; then
+        err "git commit failed."
+        exit "$EXIT_ERROR"
+    fi
+    RESYNC_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    note "land-resync-commit.sh: committed $RESYNC_SHA (${#RESYNC_PATHS[@]} path(s))."
+else
+    # No resync-managed dirt. That is NOT necessarily "nothing to land": an
+    # earlier run may have committed the resync and then failed before landing
+    # it (fetch failure, side branch push failure) -- the commit is still on
+    # local <default>, ahead of origin. Fall through to the landing phase,
+    # which decides from origin/<default>..HEAD (re-run idempotency).
+    note "land-resync-commit.sh: no resync-managed surface is dirty — checking $DEFAULT_BRANCH for an already-committed resync ahead of origin."
 fi
-RESYNC_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-note "land-resync-commit.sh: committed $RESYNC_SHA (${#RESYNC_PATHS[@]} path(s))."
 
 # ---------- fetch origin, then evaluate what's ahead (never rebase) ----------
 
@@ -353,24 +402,48 @@ PUSH_ERR_FILE="$(mktemp)"
 trap 'rm -f "$FETCH_ERR_FILE" "$PUSH_ERR_FILE"' EXIT
 if ! git -C "$REPO_ROOT" fetch --quiet origin "$DEFAULT_BRANCH" 2>"$FETCH_ERR_FILE"; then
     warn "Could not fetch origin/$DEFAULT_BRANCH: $(cat "$FETCH_ERR_FILE")"
-    warn "  The resync commit ($RESYNC_SHA) stays LOCAL, uncommitted-to-origin."
-    warn "  Retry once network/forge access is restored — nothing was pushed or rebased."
+    if [[ -n "$RESYNC_SHA" ]]; then
+        warn "  The resync commit ($RESYNC_SHA) stays LOCAL, uncommitted-to-origin."
+    fi
+    warn "  Retry once network/forge access is restored — nothing was pushed or rebased;"
+    warn "  the next run lands any Loom-authored commit still ahead of origin."
     exit "$EXIT_ERROR"
 fi
 
 AHEAD_SHAS="$(git -C "$REPO_ROOT" rev-list "origin/$DEFAULT_BRANCH..HEAD" 2>/dev/null || true)"
+if [[ -z "$AHEAD_SHAS" ]]; then
+    # Only reachable on the clean-tree path (after a commit there is always at
+    # least one commit ahead).
+    note "land-resync-commit.sh: nothing to land — origin/$DEFAULT_BRANCH already has everything on $DEFAULT_BRANCH."
+    exit "$EXIT_OK"
+fi
+
+require_identity
 FOREIGN_COMMITS=()
+LOOM_COMMITS=()
 while IFS= read -r sha; do
     [[ -z "$sha" ]] && continue
     author_email="$(git -C "$REPO_ROOT" log -1 --format='%ae' "$sha")"
     if [[ "$author_email" != "$LOOM_IDENTITY_EMAIL" ]]; then
         FOREIGN_COMMITS+=("$sha")
+    else
+        LOOM_COMMITS+=("$sha")
     fi
 done <<< "$AHEAD_SHAS"
 
 if [[ "${#FOREIGN_COMMITS[@]}" -gt 0 ]]; then
+    if [[ "${#LOOM_COMMITS[@]}" -eq 0 ]]; then
+        # Clean tree, and everything ahead is someone else's (an operator's
+        # unpushed work). Nothing of Loom's to land; leave it exactly as is.
+        note "land-resync-commit.sh: nothing to land — the ${#FOREIGN_COMMITS[@]} commit(s) ahead of origin/$DEFAULT_BRANCH are not Loom-authored (operator work); leaving them untouched."
+        exit "$EXIT_OK"
+    fi
     note ""
-    note "land-resync-commit.sh: resync committed, NOT pushed: ${#FOREIGN_COMMITS[@]} operator commit(s) ahead of origin/$DEFAULT_BRANCH:"
+    if [[ -n "$RESYNC_SHA" ]]; then
+        note "land-resync-commit.sh: resync committed, NOT pushed: ${#FOREIGN_COMMITS[@]} operator commit(s) ahead of origin/$DEFAULT_BRANCH:"
+    else
+        note "land-resync-commit.sh: a previously committed resync is still NOT pushed: ${#FOREIGN_COMMITS[@]} operator commit(s) ahead of origin/$DEFAULT_BRANCH:"
+    fi
     for sha in "${FOREIGN_COMMITS[@]}"; do
         note "    $(git -C "$REPO_ROOT" log -1 --format='%h %an <%ae> %s' "$sha")"
     done
@@ -381,50 +454,130 @@ if [[ "${#FOREIGN_COMMITS[@]}" -gt 0 ]]; then
     exit "$EXIT_STOPPED_FOREIGN_AHEAD"
 fi
 
-# ---------- plain push (fast-forward-only by construction; never forced) ----------
-
-if git -C "$REPO_ROOT" push origin "HEAD:$DEFAULT_BRANCH" 2>"$PUSH_ERR_FILE"; then
-    note "land-resync-commit.sh: pushed $RESYNC_SHA to origin/$DEFAULT_BRANCH."
+LAND_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+if [[ -z "$RESYNC_SHA" ]]; then
+    note "land-resync-commit.sh: found ${#LOOM_COMMITS[@]} Loom-authored commit(s) ahead of origin/$DEFAULT_BRANCH from an earlier run — landing them:"
+    for sha in "${LOOM_COMMITS[@]}"; do
+        note "    $(git -C "$REPO_ROOT" log -1 --format='%h %s' "$sha")"
+    done
+fi
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    note "[dry-run] Would land $LAND_SHA onto '$DEFAULT_BRANCH' (direct push if the branch is unprotected, else a '$FALLBACK_BRANCH' branch + PR; never rebasing, never force/bypass-pushing)."
     exit "$EXIT_OK"
 fi
-warn "Direct push to origin/$DEFAULT_BRANCH was rejected:"
-warn "$(cat "$PUSH_ERR_FILE")"
-warn "Never rebasing or force/bypass-pushing to reconcile — landing via a short-lived branch + PR instead."
+
+# ---------- branch-protection pre-check (GitHub only; fail-open) ----------
+#
+# Returns 0 ("protected: do NOT direct-push") when the forge reports an active
+# pull_request / required_status_checks rule (rulesets API) or legacy branch
+# protection with PR reviews / status checks on the default branch. Returns 1
+# otherwise -- INCLUDING on any API error, a non-GitHub forge, or a missing
+# `gh` (fail-open, so a Gitea/offline host still works). A plain push is then
+# attempted, and the post-push bypass check below is the second line of
+# defense. The point of asking at all: for an identity on the ruleset's
+# bypass list, GitHub ACCEPTS a plain push to a protected branch and only
+# warns on stderr -- so "the push was rejected" is not a signal we can rely
+# on to route protected branches to the PR path (#6646).
+PROTECTION_SOURCE=""
+default_branch_requires_pr() {
+    case "$(printf '%s' "${LOOM_FORGE_TYPE:-}" | tr '[:upper:]' '[:lower:]')" in
+        gitea) return 1 ;;
+    esac
+    command -v gh >/dev/null 2>&1 || return 1
+    local rule_types
+    rule_types="$(cd "$REPO_ROOT" && gh api "repos/{owner}/{repo}/rules/branches/$DEFAULT_BRANCH" --jq '.[].type' 2>/dev/null || true)"
+    if grep -qxE 'pull_request|required_status_checks' <<< "$rule_types"; then
+        PROTECTION_SOURCE="ruleset rule(s): $(grep -xE 'pull_request|required_status_checks' <<< "$rule_types" | tr '\n' ' ' | sed 's/ $//')"
+        return 0
+    fi
+    local legacy
+    legacy="$(cd "$REPO_ROOT" && gh api "repos/{owner}/{repo}/branches/$DEFAULT_BRANCH/protection" \
+        --jq '[.required_pull_request_reviews, .required_status_checks] | map(select(. != null)) | length' 2>/dev/null || true)"
+    if [[ "$legacy" =~ ^[0-9]+$ && "$legacy" -gt 0 ]]; then
+        PROTECTION_SOURCE="legacy branch protection (PR reviews / status checks required)"
+        return 0
+    fi
+    return 1
+}
+
+# ---------- plain push (fast-forward-only by construction; never forced) ----------
+
+if default_branch_requires_pr; then
+    note "land-resync-commit.sh: origin/$DEFAULT_BRANCH is protected ($PROTECTION_SOURCE) — skipping the direct push:"
+    note "  a bypass-capable identity would be let straight through with only a stderr warning (#6646)."
+    note "  Landing via a short-lived branch + PR instead."
+else
+    if git -C "$REPO_ROOT" push origin "HEAD:$DEFAULT_BRANCH" 2>"$PUSH_ERR_FILE"; then
+        if grep -qi 'bypass' "$PUSH_ERR_FILE"; then
+            err "BYPASS PUSH DETECTED: the plain push of $LAND_SHA to origin/$DEFAULT_BRANCH was accepted only because"
+            err "  this identity bypassed the branch's protection rules. The forge said:"
+            while IFS= read -r l; do err "    $l"; done < "$PUSH_ERR_FILE"
+            err "  The commit IS on origin/$DEFAULT_BRANCH — this script never force-pushes, so it is not undone here —"
+            err "  but this run is a FAILURE: automation must never bypass-push (#6646). Fix the pushing identity /"
+            err "  ruleset bypass list, or whatever made the branch-protection pre-check fail open (gh missing,"
+            err "  API unreachable), before the next resync lands. See .loom/docs/troubleshooting.md"
+            err "  \"Landing a resync commit on the primary clone (#6646)\"."
+            exit "$EXIT_BYPASS_PUSHED"
+        fi
+        note "land-resync-commit.sh: pushed $LAND_SHA to origin/$DEFAULT_BRANCH."
+        exit "$EXIT_OK"
+    fi
+    warn "Direct push to origin/$DEFAULT_BRANCH was rejected:"
+    warn "$(cat "$PUSH_ERR_FILE")"
+    warn "Never rebasing or force/bypass-pushing to reconcile — landing via a short-lived branch + PR instead."
+fi
 
 # ---------- branch + PR fallback (never a bypass push) ----------
+#
+# The side branch name is STABLE on purpose: after the reset below the next
+# resync-installed.sh re-dirties the tree identically, so a host whose plain
+# push is always refused (a non-bypass identity on a protected branch -- the
+# very population this fallback exists for) would otherwise open a fresh PR
+# per sweep. With one name, create-pr.sh's adopt-existing check converges every
+# re-run on the single open PR, and --force-with-lease just moves that PR's
+# head to the fresh commit. Forcing a throwaway side branch is fine; only the
+# default branch is sacred.
 
-BRANCH_SUFFIX="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%Y%m%d%H%M%S)"
-BRANCH="chore/resync-installed-$BRANCH_SUFFIX"
-if ! git -C "$REPO_ROOT" branch "$BRANCH" HEAD; then
-    err "Could not create fallback branch '$BRANCH'. The resync commit ($RESYNC_SHA) stays local."
-    exit "$EXIT_ERROR"
+BRANCH="$FALLBACK_BRANCH"
+# Refresh the remote-tracking ref so the lease below compares against origin's
+# CURRENT tip of the side branch (not a stale local notion of it). If origin
+# has no such branch the lease must expect "absent", so drop any stale
+# tracking ref too.
+if ! git -C "$REPO_ROOT" fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>/dev/null; then
+    git -C "$REPO_ROOT" update-ref -d "refs/remotes/origin/$BRANCH" 2>/dev/null || true
 fi
-if ! git -C "$REPO_ROOT" push --quiet -u origin "$BRANCH"; then
-    err "Could not push fallback branch '$BRANCH'. The resync commit ($RESYNC_SHA) stays local on '$DEFAULT_BRANCH'."
+LEASE_SHA="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" 2>/dev/null || true)"
+if ! git -C "$REPO_ROOT" push --quiet "--force-with-lease=refs/heads/$BRANCH:$LEASE_SHA" origin "HEAD:refs/heads/$BRANCH" 2>"$PUSH_ERR_FILE"; then
+    err "Could not push fallback branch '$BRANCH': $(cat "$PUSH_ERR_FILE")"
+    err "  The resync commit ($LAND_SHA) stays local on '$DEFAULT_BRANCH'; re-running this script retries the landing."
     exit "$EXIT_ERROR"
 fi
 
 # The commit is now safely on the pushed side branch — reset the primary
 # checkout's default branch back to origin's tip so it never sits diverged,
-# waiting on a PR that may take a while to merge.
+# waiting on a PR that may take a while to merge. This is the ONE place this
+# script writes a `reset: moving to origin/<default>` reflog entry on the
+# default branch (documented in troubleshooting.md's forensic recipe): it
+# always directly follows the `commit: chore: resync installed Loom surfaces`
+# entry, and the commit it moves away from is on origin/<side branch>.
 git -C "$REPO_ROOT" reset --hard "origin/$DEFAULT_BRANCH"
 
 PR_BODY="Automated resync of installed Loom surfaces from \`defaults/\`.
 
-Opened via a PR instead of a direct push because \`origin/$DEFAULT_BRANCH\` had
-already advanced (or requires status checks this push doesn't carry) —
-land-resync-commit.sh never rebases or force/bypass-pushes to reconcile. See
-\`.loom/docs/troubleshooting.md\` -> \"Landing a resync commit on the primary
-clone (#6646)\"."
+Opened via a PR instead of a direct push because \`origin/$DEFAULT_BRANCH\` is
+protected (or had already advanced) — land-resync-commit.sh never rebases or
+force/bypass-pushes to reconcile. See \`.loom/docs/troubleshooting.md\` ->
+\"Landing a resync commit on the primary clone (#6646)\"."
 
 if PR_URL="$("$SCRIPT_DIR/create-pr.sh" \
-    --title "chore: resync installed Loom surfaces" \
+    --title "$RESYNC_COMMIT_SUBJECT" \
     --body "$PR_BODY" \
+    --label "loom:review-requested" \
     --base "$DEFAULT_BRANCH" --head "$BRANCH")"; then
-    note "land-resync-commit.sh: opened $PR_URL (branch $BRANCH) — merge it through the normal review path."
+    note "land-resync-commit.sh: opened $PR_URL (branch $BRANCH, loom:review-requested) — it lands through the normal review path."
     exit "$EXIT_OK"
 fi
 
 err "Pushed '$BRANCH' but could not open a PR for it. Open one by hand:"
-err "  gh pr create --base $DEFAULT_BRANCH --head $BRANCH --title 'chore: resync installed Loom surfaces'"
+err "  gh pr create --base $DEFAULT_BRANCH --head $BRANCH --label loom:review-requested --title '$RESYNC_COMMIT_SUBJECT'"
 exit "$EXIT_ERROR"
