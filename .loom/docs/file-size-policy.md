@@ -9,6 +9,12 @@ repos.
 > stale. The dated measurements that motivated the policy are in #7711. Please
 > do not paste counts back into this file — the first revision did, and two of
 > them were wrong within a day.
+>
+> One deliberate exception: the shell-migration **floor** in
+> ["Shell: port to Rust, tiered"](#shell-port-to-rust-tiered) is stated as a
+> line count, because a ratchet with no floor cannot distinguish progress from
+> stasis (#7758). Those figures are dated and approximate by construction; the
+> baseline file still wins on anything it measures.
 
 ## The rule
 
@@ -94,10 +100,30 @@ Only cases where a violation would be permanently unfixable here:
 2. **Installed mirrors** — `.loom/hooks/`, `.loom/scripts/`, `.loom/docs/` are
    resync copies of `defaults/`, measured at their `defaults/` source.
 
-**Bootstrap scripts are deliberately NOT exempt.** `install.sh`,
-`scripts/install-loom.sh`, `loom-daemon-update.sh` and `loom-daemon-start.sh`
-run before — or manage — the `loom-daemon` binary, so they can never be ported
-into it. But "cannot be ported to Rust" is not "may grow without bound".
+**Bootstrap is a responsibility, not a file-level exemption.** Obtaining a
+runnable `loom-daemon` may require shell; manifest processing, ownership
+decisions and reinstall policy *after* that point do not — that is
+[ADR-0018](../../docs/adr/0018-rust-owns-behavior-shell-reaches-it.md), and
+epic #7810 is the migration that follows from it. The irreducible core is
+therefore not "the big install-ish scripts" but exactly the files that must run
+on a machine where the binary is absent, unbuilt, or being removed:
+
+| script | why it cannot be ported into the binary |
+|---|---|
+| `install.sh` | Runs where no Loom artifact, and possibly no toolchain, exists. |
+| `scripts/install-loom.sh` | Same, plus registering the MCP server at user scope. |
+| `scripts/uninstall-loom.sh` | Must still work once the binary is gone — it must never depend on the thing it removes. |
+| `defaults/scripts/lib/locate-daemon-bin.sh` | Executable discovery: pre-binary by definition. Shared by 30 stubs, and the sanctioned shell job under ADR-0018. |
+
+Together ≈4,214 code lines. **They are ratcheted like everything else** — they
+may shrink, they may not grow. "Cannot be ported to Rust" is not "may grow
+without bound".
+
+The earlier version of this section also named `loom-daemon-update.sh` and
+`loom-daemon-start.sh` as unportable. That was inherited, not derived, and it is
+wrong in both directions: those two are port candidates, and
+`uninstall-loom.sh` and `locate-daemon-bin.sh` — which it did not name — are the
+ones that genuinely must stay shell (#7758).
 
 **Test files are not exempt** in any language.
 
@@ -191,12 +217,65 @@ There is established precedent for porting shell into `loom-daemon` subcommands
 `agent_wait.py`), #4105 / #4108 (`tokens bootstrap` / `check`). The landing zone
 is `loom-daemon/src/cli/` or `loom-daemon/src/script_helpers/`.
 
-| Tier | Action |
+The tiers below are the categorical verdicts derived in **#7758** and ruled on
+2026-09-16. [ADR-0018](../../docs/adr/0018-rust-owns-behavior-shell-reaches-it.md)
+(#7777, accepted) is the principle they implement; epic **#7810** owns the
+execution order. A tier here says *what may be ported*, never *when* —
+sequencing belongs to #7810, phase by phase.
+
+| Tier | Count | Verdict | Why |
+|---|---|---|---|
+| **Vendored** — `guard-destructive*.sh`, `resync-installed.sh`, +2 | 5 | Stays shell, **upstream** | The canonical copy lives in [rjwalters/repo](https://github.com/rjwalters/repo) and is re-vendored at release, so a local split would be reverted by the next re-vendor. Restructuring is an upstream proposal (#7760), not a Loom change. |
+| **Hook entry points** — `guard-destructive.sh`, `guard-loom-workflow.sh`, `guard-worktree-paths.sh`, `skill-router.sh`, `session-start-handoff.sh`, `guard-background-subagents.sh` | 6 | The **stub** stays shell; the logic under it is a port candidate | `PreToolUse` / `SessionStart` need a shell-invocable command. Only the invocation is irreducible — everything below it can move. (These currently fail **open** when absent: #7761.) |
+| **Bootstrap core** — the four files in ["Exemptions"](#exemptions), plus `sync-labels.sh` | 5 | Stays shell, **ratcheted** | Runs before a binary is guaranteed, or after it is gone. `sync-labels.sh` (587) is pure forge CRUD that would be natural Rust, but it runs standalone at install time and that constraint wins. |
+| **Port candidates** | 12 named | Port — see the per-file table below | Real logic, with Rust already adjacent in most cases. |
+| **Already thin stubs** (<40 code lines over `loom-daemon`) | 28 | **Done** | 571 lines total, averaging 20 each. This is the target state, and a large slice of the surface has already reached it. |
+| **Shell tests** | 251 suites | **Follow their subject** | They are shell *because the code under test is shell*. That is a consequence of the implementation language, not an independent argument for keeping either, and must not be cited as one (#7755). Split oversized ones (#7741); they port when their subject ports. |
+
+The ~180 smaller production scripts not named anywhere here are governed by the
+categorical rules above; #7810 deliberately does not wait on a complete
+per-file inventory.
+
+### Port candidates, and the contract each port must retire
+
+A port is not finished when the Rust exists — it is finished when the
+shell-era interface it replaced is gone. The last column is what makes each of
+these an API change rather than a rewrite.
+
+| script | code | Rust today | contract a port must retire |
+|---|---|---|---|
+| `cli/loom-daemon-update.sh` | 1,770 | `auto_update.rs` **schedules and decides**, and delegates release resolution / fetch / verify / provision **to this script** | `--resolve-json` (read-only decision info) and `--no-restart` (the rebuild), both consumed by `auto_update.rs` — an API change on both sides (#7810 Phase 5–6) |
+| `cli/loom-daemon-start.sh` | 1,185 | `daemon_service.rs`, `restart_verify.rs` | launchd/systemd unit management; supervisor handoff |
+| `cli/loom-daemon-watchdog.sh` | ~990 | `main_health_gate.rs`, `health.rs` | poll cadence and restart policy |
+| `claude-wrapper.sh` | 1,675 | none — retry/backoff lives *only* here | the retry policy itself, which is application logic (#7810 Phase 7–8) |
+| `worktree.sh` | ~1,820 | `worktree_ops/`, `worktree_reaper.rs` | the `.loom-managed` sentinel contract; also forge-blind today (#7765) |
+| `merge-pr.sh` | ~1,460 | `forge_cmd.rs` (`loom-daemon forge auto-merge`) | already has a delegation ladder — the most incremental port available |
+| `resync-installed.sh` | ~1,170 | `init/`, `daemon_install_state.rs` | vendored **and** a port candidate; resolve the upstream question first |
+| `lib/forge-helpers.sh` | 1,072 | forge dispatch already in the daemon | none of its own — it evaporates as its callers port, so it follows its consumers |
+| `check-main-clean.sh` | 489 | — (git-state inspection) | the build-gate invocation name, which stays behind as a stub |
+| `classify-dependency-block.sh` | ~470 | — | not pure policy (it does forge reads *and* writes, see #7810), so a complete port is #7810 Phase 3. Called by name from role prompts; the name stays |
+| `dep-recheck-fingerprint.sh` | 390 | — | deterministic hashing, #7810 Phase 4 |
+| `claim-staleness.sh` | 280 | — | a pure decision function over forge state |
+
+Counts are code lines as derived in #7758 on 2026-09-16 and drift within days;
+`scripts/file-size-baseline.txt` is authoritative for anything over threshold.
+
+### The floor the ratchet tracks against
+
+What is expected to still be shell when the migration is complete:
+
+| component | code lines |
 |---|---|
-| Vendored (`guard-destructive*.sh`) | Exempt here — [rjwalters/repo](https://github.com/rjwalters/repo) owns the structure. Rewriting it is an upstream proposal (#7760), not a Loom change. |
-| Bootstrap (`install.sh`, `install-loom.sh`, `loom-daemon-{update,start}.sh`) | Ratchet. **How much must stay shell is unresolved** — `auto_update.rs` already implements fetch/rebuild/restart in Rust, so the earlier "never port, chicken-and-egg" claim is being re-derived in #7758. |
-| Port candidates (`merge-pr.sh`, `worktree.sh`, `claude-wrapper.sh`) | Finish the port — all three already have a `loom-daemon forge` delegation ladder, so this is incremental |
-| Shell tests | Split (#7741). Note these are shell **because the code under test is shell** — that is a consequence of the implementation language, not an independent reason to keep either. |
+| Bootstrap core (4 files) | ≈4,214 |
+| `sync-labels.sh` | 587 |
+| 6 hook entry points | the stub only — tens of lines each, not today's sizes |
+| 5 vendored files | owned upstream; not Loom's to shrink |
+| **floor** | **≈4,800 + stubs** |
+
+Everything else under `defaults/scripts/` is portable in principle. That figure
+is the floor #7711's ratchet has to track against: the shell total should
+approach it and then stop. Without a floor, a shrinking number and a stalled one
+look identical.
 
 Porting also improves hook latency: `PreToolUse` fires on every tool call, and a
 binary exec beats parsing a multi-thousand-line bash script. The vendoring
