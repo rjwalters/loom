@@ -64,42 +64,49 @@
 //! slice unowned) silently stops role rotation entirely, which is strictly
 //! worse and much harder to notice. When in doubt, duplicate; never drop.
 //!
-//! ## What this does NOT do (deferred to Issue #6704)
+//! ## The dynamic half: the roster (Issue #6704)
 //!
-//! The assignment is **static**: it is derived from `(shardIndex, shardCount)`,
-//! not from a live roster. Killing a host does **not** reassign its slice — its
-//! workspaces simply stop rotating until an operator lowers `shardCount` (or
-//! points a survivor at the vacated index). Dynamic roster membership with
-//! bounded reassignment is deliberately deferred to #6704; it needs a liveness
-//! protocol whose failure modes are exactly the zero-or-two-owner races this
-//! static scheme avoids by construction — two hosts with different views of
-//! roster membership disagree about the ring *size*, and therefore about every
-//! workspace's owner, not just the departed host's slice.
+//! By itself the assignment above is **static**: derived from `(shardIndex,
+//! shardCount)`, not from a live roster, so killing a host does **not**
+//! reassign its slice — its workspaces simply stop rotating until an operator
+//! lowers `shardCount` (or points a survivor at the vacated index).
 //!
-//! **The design for #6704 has now been recorded** (but *not* implemented — this
-//! module is still the static ring described above): `defaults/docs/role-runner-roster.md`
-//! selects a forge-backed roster (one marker comment per host, liveness from
-//! the comment's forge-assigned `updated_at`, as with lease records) plus a
-//! generation-fenced ring — a host acts only under the newest membership
-//! generation it has observed, and only once that generation has been settled
-//! for a full role-tick interval, so a membership disagreement yields instead
-//! of duplicating. When it lands it changes only the *source* of
-//! `(index, count)` in [`ShardPosture::Sharded`]; [`hash_key`], [`owns`], and
-//! the static env pair (which stays as the higher-precedence escape hatch) are
-//! untouched.
+//! The [`roster`] submodule closes that gap, behind
+//! `autonomous.roleRunner.roster.enabled` (default **`false`**, so everything
+//! above is unchanged unless a fleet opts in). It is a forge-backed host
+//! roster — one marker comment per host on a designated issue, liveness from
+//! the comment's forge-assigned `updated_at`, exactly as with lease records —
+//! refreshed by a per-daemon heartbeat task ([`crate::role_runner`]'s roster
+//! loop), plus a **generation-fenced ring**: a host acts only under the newest
+//! membership generation it has observed, and only once that generation has
+//! been settled for a full role-tick interval, so a membership disagreement
+//! *yields* instead of duplicating. `defaults/docs/role-runner-roster.md` is
+//! the design record; [`roster::admission`] is its fencing rule verbatim.
+//!
+//! Roster mode changes only the **source** of `(index, count)` in
+//! [`ShardPosture::Sharded`] (a new [`ValueSource::Roster`]) and adds the
+//! [`ShardDecision::admits_role_tick`] gate. [`hash_key`], [`owns`],
+//! [`resolve_shard_key`], the status rendering, and the static env pair — which
+//! stays the *higher-precedence* escape hatch — are untouched.
 //!
 //! [`owns`]: ShardPosture::owns
 //!
-//! ## Roster (Issue #7690, Phase A of #6704) — observational only
+//! ## The fail-safe direction inverts under roster mode — deliberately
 //!
-//! The [`roster`] submodule adds a forge-backed host **roster**: one marker
-//! comment per host on a designated issue, refreshed by a per-daemon
-//! heartbeat task ([`crate::role_runner`]'s roster loop). It is purely
-//! additive in this phase — [`decide`] and [`resolve_posture`] above are
-//! completely unaware of it, and its verdict is provably unchanged whether
-//! the roster is enabled or not (see the `roster_does_not_change_decide`
-//! test). Nothing here feeds [`ShardPosture::Sharded`]'s `(index, count)` yet;
-//! that is Phase B (#6704), gated entirely behind `roster.enabled`.
+//! Above, every ambiguity resolves to "duplicate, never drop", because the
+//! doubt is about *configuration* and the fallback is the pre-#6374 status quo
+//! the fleet already survives. A roster ambiguity is about *liveness*, and the
+//! two errors are not symmetric: a brief gap is one idempotent periodic pass
+//! running an interval later, while a brief duplicate is two `claude` sessions
+//! racing the same forge queue (#6332 / #6352) and is not self-healing. So
+//! every roster-mode ambiguity resolves toward **yield**
+//! ([`roster::RosterYield`]).
+//!
+//! The one case that keeps the #6374 direction is "this host never got a
+//! roster at all" ([`RosterOff::NeverJoined`]): an unreachable or unconfigured
+//! roster at startup falls back to the static posture, because yielding there
+//! would let a typo in `roster.issue` silently stop role rotation fleet-wide.
+//! Only a host that successfully **joined and then lost** the roster yields.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -310,6 +317,12 @@ pub enum ValueSource {
     Env,
     /// From `autonomous.roleRunner.{shardIndex,shardCount}`.
     Config,
+    /// From the **live roster** (Issue #7691, Phase B of #6704): this host's
+    /// ordinal in, and the size of, [`roster::ring`] for this workspace's
+    /// key. Unlike the other two tiers this one is *dynamic* — it changes as
+    /// hosts join and expire — which is why it is only ever reached through
+    /// the generation fence ([`roster::admission`]).
+    Roster,
 }
 
 impl ValueSource {
@@ -319,6 +332,7 @@ impl ValueSource {
         match self {
             Self::Env => "env",
             Self::Config => "config",
+            Self::Roster => "roster",
         }
     }
 }
@@ -668,6 +682,91 @@ fn resolve_posture_from(block: Option<&serde_json::Value>, root: &Path) -> Shard
 // Decision
 // ============================================================================
 
+/// Why roster mode is **not** supplying this decision's `(index, count)` —
+/// every variant means "the #6374 static/unsharded posture decided this
+/// verdict", i.e. the pre-roster behavior, verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosterOff {
+    /// `autonomous.roleRunner.roster.enabled` is `false` — the default.
+    Disabled,
+    /// `roster.enabled` is true but no valid `roster.issue` is configured
+    /// ([`roster::RosterState::MisconfiguredNoIssue`], which the heartbeat
+    /// task already `error!`s about).
+    Misconfigured,
+    /// The static [`SHARD_INDEX_ENV`] + `shardCount` pair resolved to a valid
+    /// [`ShardPosture::Sharded`], which **outranks** the roster (the design
+    /// record's escape-hatch precedence, rung 2): an operator who needs a
+    /// deterministic ring keeps #6374's behavior verbatim by setting them.
+    StaticShardWins,
+    /// Roster mode is enabled and configured, but this host has never
+    /// completed a roster read — the "never got a roster at all" case, which
+    /// per the design record's rung 4 falls back to the #6374 posture rather
+    /// than yielding. Only a host that successfully **joined and then lost**
+    /// the roster yields.
+    NeverJoined,
+    /// A snapshot exists, but it was read from a *different* roster issue
+    /// than the one now configured. Same reasoning as
+    /// [`Self::NeverJoined`]: this host has no observation of the roster it
+    /// is now supposed to be a member of.
+    SnapshotForAnotherIssue,
+}
+
+impl RosterOff {
+    /// A short, stable label for logs and status output.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Misconfigured => "misconfigured",
+            Self::StaticShardWins => "static-shard-wins",
+            Self::NeverJoined => "never-joined",
+            Self::SnapshotForAnotherIssue => "snapshot-for-another-issue",
+        }
+    }
+}
+
+/// How the live roster (Issue #7691, Phase B of #6704) participated in one
+/// [`ShardDecision`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RosterMode {
+    /// It did not — see [`RosterOff`]. `posture`/`owned` are #6374's.
+    Off(RosterOff),
+    /// The fence admitted and the ring supplied `(index, count)`:
+    /// `posture` is [`ShardPosture::Sharded`] with both sources
+    /// [`ValueSource::Roster`], and `owned` is its ordinary `owns(key)`.
+    Ring {
+        /// The settled membership generation the ring was computed under.
+        generation: chrono::DateTime<chrono::Utc>,
+    },
+    /// The fence **denied** the role tick (see [`roster::RosterYield`]).
+    ///
+    /// `posture`/`owned` still carry the pre-roster (#6374) verdict: a yield
+    /// must not reach [`crate::work_finder`]'s preferred-slice consumer as
+    /// "owns nothing", because there the verdict is only a *preference* with
+    /// a work-conserving fallback and turning it off would starve dispatch.
+    /// The role runner reads [`ShardDecision::admits_role_tick`] instead,
+    /// which is the surface this yield actually gates.
+    Yield(roster::RosterYield),
+}
+
+impl RosterMode {
+    /// Whether the roster fence denied a role tick here.
+    #[must_use]
+    pub const fn is_yield(&self) -> bool {
+        matches!(self, Self::Yield(_))
+    }
+
+    /// A short, stable label for logs and status output.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Off(off) => off.label(),
+            Self::Ring { .. } => "ring",
+            Self::Yield(y) => y.label(),
+        }
+    }
+}
+
 /// One workspace's resolved sharding decision: the host posture, the
 /// workspace's key, and whether this host owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -676,32 +775,74 @@ pub struct ShardDecision {
     pub posture: ShardPosture,
     /// The workspace's resolved key.
     pub key: ResolvedKey,
-    /// Whether this host runs role ticks for this workspace.
+    /// Whether this host owns this workspace's slice.
+    ///
+    /// **Two consumers read this with deliberately different strength.** For
+    /// [`crate::work_finder`]'s dispatcher slice (#6243) it is a *preference*
+    /// with a work-conserving fallback, so it keeps the pre-roster semantics
+    /// even when the roster fence yields. The role runner must additionally
+    /// pass the fence — it calls [`Self::admits_role_tick`], never this field
+    /// alone.
     pub owned: bool,
     /// Which shard owns it, or `None` when unsharded.
     pub owning_shard: Option<usize>,
+    /// How the live roster participated (Issue #7691) —
+    /// [`RosterMode::Off`]`(`[`RosterOff::Disabled`]`)` whenever roster mode
+    /// is off, which is the default and is byte-identical to #6374.
+    pub roster: RosterMode,
 }
 
 impl ShardDecision {
+    /// Whether this host may run a **role tick** for this workspace: it owns
+    /// the slice AND the roster fence did not yield.
+    ///
+    /// This is the role runner's gate on both dispatch surfaces
+    /// ([`crate::role_runner::decide_root_tick`] and `plan_idle_runs`). With
+    /// the roster off it is exactly `owned`, i.e. #6374 unchanged.
+    #[must_use]
+    pub const fn admits_role_tick(&self) -> bool {
+        self.owned && !self.roster.is_yield()
+    }
+
     /// A one-line log/status description naming `root`, the key (and its
     /// tier), the owning shard, and this host's verdict.
+    ///
+    /// **This string is also [`log_decision_once`]'s dedup key**, so the
+    /// roster clause carries only values that are *stable between membership
+    /// boundaries* — the fence's label and its generation, never a
+    /// tick-by-tick countdown like "settled 61s of 900s". A changing number
+    /// here would turn the edge-triggered `info!` line into a per-tick,
+    /// per-root, per-role log flood for the whole settle window. The
+    /// countdown lives on the `debug!` line the role runner emits instead
+    /// ([`roster::RosterYield::describe`]).
     #[must_use]
     pub fn describe(&self, root: &Path) -> String {
-        let verdict = if self.owned {
+        let verdict = if self.admits_role_tick() {
             "OWNED here"
         } else {
             "not owned here"
         };
+        let roster = match &self.roster {
+            RosterMode::Off(RosterOff::Disabled) => String::new(),
+            RosterMode::Off(off) => format!(" [roster: {} — static ring in effect]", off.label()),
+            RosterMode::Ring { generation } => {
+                format!(" [roster: ring settled at generation {generation}, #6704]")
+            }
+            RosterMode::Yield(y) => format!(
+                " [roster: YIELDING role ticks — {} (#6704); dispatcher preference unchanged]",
+                y.label()
+            ),
+        };
         match (&self.posture, self.owning_shard) {
             (ShardPosture::Sharded { index, count, .. }, Some(owner)) => format!(
                 "role_runner: shard decision for {} — key={:?} ({}), owner=shard {owner} of \
-                 {count}, this host=shard {index} => {verdict} (#6374)",
+                 {count}, this host=shard {index} => {verdict} (#6374){roster}",
                 root.display(),
                 self.key.key,
                 self.key.source.label(),
             ),
             _ => format!(
-                "role_runner: shard decision for {} — sharding {} => {verdict} (#6374)",
+                "role_runner: shard decision for {} — sharding {} => {verdict} (#6374){roster}",
                 root.display(),
                 self.posture.describe(),
             ),
@@ -715,6 +856,20 @@ impl ShardDecision {
 /// tick, after the [`crate::role_runner::ROLE_RUNNER_ENABLE_ENV`] /
 /// per-root-`enabled` gate — so `LOOM_ROLE_RUNNER=0` still short-circuits
 /// everything before sharding is even consulted (Issue #6374 AC3).
+///
+/// ## Escape-hatch precedence (Issue #7691 / #6704 AC3), highest first
+///
+/// 1. **`LOOM_ROLE_RUNNER=0`** — checked by the caller, *before* this
+///    function; the blunt kill switch is never weakened or second-guessed.
+/// 2. **`LOOM_ROLE_RUNNER_SHARD_INDEX` + `shardCount`** — when the static
+///    pair resolves to a valid [`ShardPosture::Sharded`] it **wins over the
+///    roster** ([`RosterOff::StaticShardWins`]).
+/// 3. **Roster** — only when `roster.enabled` is true, a valid `roster.issue`
+///    is configured, this host has actually joined (a snapshot exists), and
+///    no static index is set.
+/// 4. **Unsharded** — everything else, including an enabled-but-never-read
+///    roster ([`RosterOff::NeverJoined`]), which keeps #6374's
+///    duplicate-biased fallback rather than yielding.
 #[must_use]
 pub fn decide(root: &Path) -> ShardDecision {
     let effective = crate::config_resolver::resolve_effective_config(root);
@@ -724,16 +879,37 @@ pub fn decide(root: &Path) -> ShardDecision {
         .and_then(|b| b.get(SHARD_KEY_KEY))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    decide_with(posture, root, explicit.as_deref())
+    let roster_config =
+        roster::resolve_roster_config_from(block.and_then(|b| b.get(roster::ROSTER_BLOCK_KEY)));
+    decide_with_roster(
+        posture,
+        root,
+        explicit.as_deref(),
+        &roster_config,
+        roster::roster_snapshot().as_ref(),
+        chrono::Utc::now(),
+    )
 }
 
-/// The [`decide`] core with the posture and explicit key already resolved —
-/// the seam tests drive.
+/// The [`decide`] core with the posture and explicit key already resolved and
+/// **the roster deliberately out of the picture** — the pre-#7691 seam, kept
+/// verbatim so every #6374 test still drives exactly the behavior it pinned.
 #[must_use]
 pub fn decide_with(
     posture: ShardPosture,
     root: &Path,
     explicit_key: Option<&str>,
+) -> ShardDecision {
+    static_decision(posture, root, explicit_key, RosterMode::Off(RosterOff::Disabled))
+}
+
+/// Build a decision from the #6374 static posture, tagged with why the roster
+/// did not supply it.
+fn static_decision(
+    posture: ShardPosture,
+    root: &Path,
+    explicit_key: Option<&str>,
+    roster_mode: RosterMode,
 ) -> ShardDecision {
     let key = resolve_shard_key(root, explicit_key);
     let owning_shard = posture
@@ -745,6 +921,85 @@ pub fn decide_with(
         key,
         owned,
         owning_shard,
+        roster: roster_mode,
+    }
+}
+
+/// The full [`decide`] core: the static posture, the roster config, the last
+/// roster snapshot (if any), and `now`, with no I/O of its own — the seam the
+/// split-view / kill-host / self-fence / join-fence tests drive.
+///
+/// Implements the precedence documented on [`decide`].
+#[must_use]
+pub fn decide_with_roster(
+    static_posture: ShardPosture,
+    root: &Path,
+    explicit_key: Option<&str>,
+    roster_config: &roster::RosterConfig,
+    snapshot: Option<&roster::RosterSnapshot>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ShardDecision {
+    // Rung 2: a valid static pair outranks the roster, verbatim #6374.
+    if static_posture.is_sharded() {
+        return static_decision(
+            static_posture,
+            root,
+            explicit_key,
+            RosterMode::Off(RosterOff::StaticShardWins),
+        );
+    }
+    let off = |reason: RosterOff| RosterMode::Off(reason);
+    let Some(issue) = roster_config.issue() else {
+        let reason = match roster_config.state {
+            roster::RosterState::Disabled => RosterOff::Disabled,
+            _ => RosterOff::Misconfigured,
+        };
+        return static_decision(static_posture, root, explicit_key, off(reason));
+    };
+    // Rung 4's "never got a roster at all" case: fall back to the #6374
+    // posture (duplicate-biased), NOT to a yield. Only a host that joined and
+    // then lost the roster yields — and such a host has a snapshot.
+    let Some(snapshot) = snapshot else {
+        return static_decision(static_posture, root, explicit_key, off(RosterOff::NeverJoined));
+    };
+    if snapshot.issue != *issue {
+        return static_decision(
+            static_posture,
+            root,
+            explicit_key,
+            off(RosterOff::SnapshotForAnotherIssue),
+        );
+    }
+
+    // Rung 3: the fence decides.
+    let key = resolve_shard_key(root, explicit_key);
+    match roster::admit(snapshot, hash_key(&key.key), now) {
+        roster::RosterAdmission::Yield(reason) => {
+            // The dispatcher keeps the pre-roster verdict (see
+            // `ShardDecision::owned`); only `admits_role_tick` flips.
+            static_decision(static_posture, root, explicit_key, RosterMode::Yield(reason))
+        }
+        roster::RosterAdmission::Ring {
+            index,
+            count,
+            generation,
+        } => {
+            let posture = ShardPosture::Sharded {
+                index,
+                count,
+                index_source: ValueSource::Roster,
+                count_source: ValueSource::Roster,
+            };
+            let owning_shard = owning_shard(&key.key, count);
+            let owned = posture.owns(&key.key);
+            ShardDecision {
+                posture,
+                key,
+                owned,
+                owning_shard,
+                roster: RosterMode::Ring { generation },
+            }
+        }
     }
 }
 
@@ -1342,8 +1597,9 @@ mod tests {
         );
     }
 
-    // ---- Roster is purely additive (Issue #7690, Phase A of #6704): `decide`
-    // must be byte-identical whether the roster is configured or not ----
+    // ---- The static ring is untouched by an enabled roster (#7690 Phase A's
+    // invariant, which #7691 preserves: the static env pair OUTRANKS the
+    // roster, so a host that sets it keeps #6374 verbatim) ----
 
     #[test]
     #[serial]
@@ -1355,7 +1611,7 @@ mod tests {
         let baseline = decide_with(posture.clone(), root, Some("rjwalters/loom"));
 
         // Enabling the roster (even with a fully valid issue) must not change
-        // `decide`'s verdict at all in Phase A -- nothing here wires it in.
+        // `decide`'s verdict at all when a static shard index is in effect.
         std::env::set_var(roster::ROSTER_ENABLED_ENV, "1");
         std::env::set_var(roster::ROSTER_ISSUE_ENV, "rjwalters/loom#1234");
         let with_roster = decide_with(posture.clone(), root, Some("rjwalters/loom"));
@@ -1370,5 +1626,745 @@ mod tests {
         std::env::remove_var(roster::ROSTER_ENABLED_ENV);
 
         assert_eq!(baseline, with_misconfigured_roster);
+    }
+
+    // ========================================================================
+    // Roster-driven ring (Issue #7691, Phase B of #6704)
+    // ========================================================================
+
+    mod roster_mode {
+        use super::*;
+        use chrono::{DateTime, Duration as ChronoDuration, Utc};
+        use std::collections::BTreeSet;
+
+        const NOW: &str = "2026-01-01T10:00:00Z";
+        const FLEET_CREATED: &str = "2026-01-01T00:00:00Z";
+        const TTL: u64 = 900;
+        const SETTLE: u64 = 900;
+        const KEY: &str = "rjwalters/loom";
+
+        fn dt(s: &str) -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+        }
+
+        fn issue() -> roster::RosterIssueRef {
+            roster::RosterIssueRef::parse("rjwalters/loom#1234").expect("valid ref")
+        }
+
+        fn active_config() -> roster::RosterConfig {
+            roster::RosterConfig {
+                state: roster::RosterState::Active(issue()),
+                heartbeat_secs: 300,
+                ttl_secs: TTL,
+                settle_secs: SETTLE,
+            }
+        }
+
+        fn disabled_config() -> roster::RosterConfig {
+            roster::RosterConfig {
+                state: roster::RosterState::Disabled,
+                heartbeat_secs: 300,
+                ttl_secs: TTL,
+                settle_secs: SETTLE,
+            }
+        }
+
+        /// One live roster record: created at `created`, last beat at `beat`,
+        /// serving every key in `keys`.
+        fn record(
+            id: u64,
+            host: &str,
+            keys: &[&str],
+            created: DateTime<Utc>,
+            beat: DateTime<Utc>,
+        ) -> roster::RosterComment {
+            roster::RosterComment {
+                id,
+                host: host.to_string(),
+                serves: keys.iter().map(|k| hash_key(k)).collect::<BTreeSet<u64>>(),
+                created_at: created,
+                updated_at: beat,
+            }
+        }
+
+        /// A live three-host fleet at `now`: all created long ago, all still
+        /// beating (last beat 60s back), all serving `keys`.
+        fn live_fleet(now: DateTime<Utc>, keys: &[&str]) -> Vec<roster::RosterComment> {
+            ["host-a", "host-b", "host-c"]
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    record(
+                        u64::try_from(i).unwrap() + 1,
+                        h,
+                        keys,
+                        dt(FLEET_CREATED),
+                        now - ChronoDuration::seconds(60),
+                    )
+                })
+                .collect()
+        }
+
+        fn snapshot(
+            host: &str,
+            comments: Vec<roster::RosterComment>,
+            now: DateTime<Utc>,
+        ) -> roster::RosterSnapshot {
+            roster::RosterSnapshot {
+                issue: issue(),
+                host: host.to_string(),
+                comments,
+                ttl_secs: TTL,
+                settle_secs: SETTLE,
+                fetched_at: now,
+            }
+        }
+
+        fn unsharded() -> ShardPosture {
+            ShardPosture::Unsharded(UnshardedReason::NotConfigured)
+        }
+
+        // ---- Rank and size come from the roster, and say so ----
+
+        #[test]
+        #[serial]
+        fn the_ring_rank_and_size_are_derived_from_the_live_roster() {
+            clear_nwo_cache();
+            roster::clear_generation_fence_for_tests();
+            let now = dt(NOW);
+            let root = Path::new("/repos/loom");
+            let snap = snapshot("host-b", live_fleet(now, &[KEY]), now);
+
+            let decision = decide_with_roster(
+                unsharded(),
+                root,
+                Some(KEY),
+                &active_config(),
+                Some(&snap),
+                now,
+            );
+
+            assert_eq!(
+                decision.posture,
+                ShardPosture::Sharded {
+                    // host-b is second in the id-sorted ring of three.
+                    index: 1,
+                    count: 3,
+                    index_source: ValueSource::Roster,
+                    count_source: ValueSource::Roster,
+                },
+                "with no static index and a settled roster, (index, count) must come from the ring"
+            );
+            // `status` must be able to say where the numbers came from (AC).
+            let summary = decision.posture.describe();
+            assert!(summary.contains("index from roster"), "{summary}");
+            assert!(summary.contains("count from roster"), "{summary}");
+            // Ownership is still the ordinary arithmetic over the same hash.
+            assert_eq!(decision.owning_shard, owning_shard(KEY, 3));
+            assert_eq!(decision.owned, decision.owning_shard == Some(1));
+            assert_eq!(decision.owned, decision.admits_role_tick());
+            roster::clear_generation_fence_for_tests();
+        }
+
+        #[test]
+        #[serial]
+        fn exactly_one_live_member_owns_each_key_under_a_settled_ring() {
+            clear_nwo_cache();
+            let now = dt(NOW);
+            let keys: Vec<String> = (0..27).map(|i| format!("2amlogic/repo-{i}")).collect();
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let comments = live_fleet(now, &key_refs);
+            for key in &keys {
+                let owners: Vec<&str> = ["host-a", "host-b", "host-c"]
+                    .into_iter()
+                    .filter(|h| roster_owns(&comments, h, key, now, TTL, SETTLE))
+                    .collect();
+                assert_eq!(owners.len(), 1, "{key} owned by {owners:?} under a settled ring");
+            }
+        }
+
+        // ---- Escape-hatch precedence (AC3) ----
+
+        #[test]
+        #[serial]
+        fn a_static_shard_index_beats_an_enabled_roster() {
+            clear_nwo_cache();
+            let now = dt(NOW);
+            let root = Path::new("/repos/loom");
+            let snap = snapshot("host-b", live_fleet(now, &[KEY]), now);
+
+            let decision = decide_with_roster(
+                sharded(1, 4),
+                root,
+                Some(KEY),
+                &active_config(),
+                Some(&snap),
+                now,
+            );
+
+            assert_eq!(decision.roster, RosterMode::Off(RosterOff::StaticShardWins));
+            assert_eq!(
+                decision.posture,
+                sharded(1, 4),
+                "a resolved static pair must keep #6374's ring verbatim — it is the documented \
+                 escape hatch for a roster outage"
+            );
+            // ...and it is byte-identical to the pre-roster decision.
+            let mut pre_roster = decide_with(sharded(1, 4), root, Some(KEY));
+            pre_roster.roster = RosterMode::Off(RosterOff::StaticShardWins);
+            assert_eq!(decision, pre_roster);
+        }
+
+        #[test]
+        #[serial]
+        fn a_disabled_roster_is_byte_identical_to_the_static_decision() {
+            clear_nwo_cache();
+            let now = dt(NOW);
+            let root = Path::new("/repos/loom");
+            // Even with a live snapshot sitting in the cache, a disabled
+            // roster must not be consulted at all.
+            let snap = snapshot("host-b", live_fleet(now, &[KEY]), now);
+            assert_eq!(
+                decide_with_roster(
+                    unsharded(),
+                    root,
+                    Some(KEY),
+                    &disabled_config(),
+                    Some(&snap),
+                    now
+                ),
+                decide_with(unsharded(), root, Some(KEY)),
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn an_enabled_roster_this_host_has_never_read_falls_back_to_the_static_posture() {
+            // Design record rung 4: "never got a roster at all" keeps #6374's
+            // duplicate-biased fallback. Yielding here would let one typo in
+            // `roster.issue` silently stop role rotation fleet-wide.
+            clear_nwo_cache();
+            let root = Path::new("/repos/loom");
+            let decision =
+                decide_with_roster(unsharded(), root, Some(KEY), &active_config(), None, dt(NOW));
+            assert_eq!(decision.roster, RosterMode::Off(RosterOff::NeverJoined));
+            assert!(decision.owned, "an unreachable roster must not stop role rotation");
+            assert!(decision.admits_role_tick());
+        }
+
+        #[test]
+        #[serial]
+        fn a_snapshot_read_from_a_different_roster_issue_is_not_used() {
+            clear_nwo_cache();
+            let now = dt(NOW);
+            let mut snap = snapshot("host-b", live_fleet(now, &[KEY]), now);
+            snap.issue = roster::RosterIssueRef::parse("someone/else#7").unwrap();
+            let decision = decide_with_roster(
+                unsharded(),
+                Path::new("/repos/loom"),
+                Some(KEY),
+                &active_config(),
+                Some(&snap),
+                now,
+            );
+            assert_eq!(decision.roster, RosterMode::Off(RosterOff::SnapshotForAnotherIssue));
+            assert!(decision.admits_role_tick());
+        }
+
+        #[test]
+        #[serial]
+        fn a_misconfigured_roster_falls_back_to_the_static_posture() {
+            clear_nwo_cache();
+            let config = roster::RosterConfig {
+                state: roster::RosterState::MisconfiguredNoIssue,
+                ..active_config()
+            };
+            let decision = decide_with_roster(
+                unsharded(),
+                Path::new("/repos/loom"),
+                Some(KEY),
+                &config,
+                None,
+                dt(NOW),
+            );
+            assert_eq!(decision.roster, RosterMode::Off(RosterOff::Misconfigured));
+            assert!(decision.admits_role_tick());
+        }
+
+        // ---- The inverted fail-safe, and the dispatcher's exemption from it ----
+
+        #[test]
+        #[serial]
+        fn a_host_that_joined_and_then_lost_the_roster_yields_role_ticks() {
+            clear_nwo_cache();
+            roster::clear_generation_fence_for_tests();
+            let now = dt(NOW);
+            // This host's own heartbeat is 20m stale: it cannot know whether
+            // the fleet has evicted it, so it yields (the inverted fail-safe).
+            let mut comments = live_fleet(now, &[KEY]);
+            comments[1].updated_at = now - ChronoDuration::seconds(1200);
+            let snap = snapshot("host-b", comments, now);
+
+            let decision = decide_with_roster(
+                unsharded(),
+                Path::new("/repos/loom"),
+                Some(KEY),
+                &active_config(),
+                Some(&snap),
+                now,
+            );
+
+            assert!(
+                matches!(decision.roster, RosterMode::Yield(roster::RosterYield::SelfStale { .. })),
+                "got {:?}",
+                decision.roster
+            );
+            assert!(!decision.admits_role_tick(), "a fenced-out host must run NO role ticks");
+            // ...but the DISPATCHER's preferred-slice consumer (#6243) keeps
+            // the pre-roster verdict, or a fence yield would starve dispatch
+            // instead of merely pausing role rotation.
+            assert!(
+                decision.owned,
+                "a roster yield must degrade to work_finder's work-conserving fallback, never to \
+                 `owns nothing`"
+            );
+            assert_eq!(
+                decision.posture,
+                unsharded(),
+                "the dispatcher must see exactly the posture it saw before the roster existed"
+            );
+            roster::clear_generation_fence_for_tests();
+        }
+
+        #[test]
+        #[serial]
+        fn the_describe_line_names_the_fence_state() {
+            clear_nwo_cache();
+            roster::clear_generation_fence_for_tests();
+            let now = dt(NOW);
+            let root = Path::new("/repos/loom");
+            let mut comments = live_fleet(now, &[KEY]);
+            comments[1].updated_at = now - ChronoDuration::seconds(1200);
+            let yielded = decide_with_roster(
+                unsharded(),
+                root,
+                Some(KEY),
+                &active_config(),
+                Some(&snapshot("host-b", comments, now)),
+                now,
+            );
+            let line = yielded.describe(root);
+            assert!(line.contains("YIELDING"), "{line}");
+            assert!(line.contains("not owned here"), "{line}");
+
+            // Fresh process state for the second half: the eviction boundary
+            // the yielding view above carried has already ratcheted this
+            // process's high-water mark, and a host whose record expired
+            // rejoins with a NEW comment id in production (see
+            // `resolve_publish_action`), never by silently re-freshening the
+            // same one.
+            roster::clear_generation_fence_for_tests();
+            let admitted = decide_with_roster(
+                unsharded(),
+                root,
+                Some(KEY),
+                &active_config(),
+                Some(&snapshot("host-b", live_fleet(now, &[KEY]), now)),
+                now,
+            );
+            assert!(admitted.describe(root).contains("roster: ring settled"));
+            roster::clear_generation_fence_for_tests();
+        }
+
+        // ====================================================================
+        // Adversarial scenarios
+        //
+        // These drive `roster::admission` + `ShardPosture::owns` directly
+        // rather than `decide_with_roster`, for one reason: the generation
+        // high-water mark is process-global (one daemon = one process), so two
+        // *simulated* hosts sharing this test process would contaminate each
+        // other's fence. The arithmetic below is exactly what
+        // `decide_with_roster` does with an admitted ring — pinned by
+        // `the_ring_rank_and_size_are_derived_from_the_live_roster` above —
+        // and passing `None` for the high-water mark is the *weaker*
+        // assumption, so a fence that holds here holds a fortiori in
+        // production.
+        // ====================================================================
+
+        fn roster_owns(
+            view: &[roster::RosterComment],
+            host: &str,
+            key: &str,
+            now: DateTime<Utc>,
+            ttl: u64,
+            settle: u64,
+        ) -> bool {
+            match roster::admission(view, host, hash_key(key), now, ttl, settle, None) {
+                roster::RosterAdmission::Ring { index, count, .. } => ShardPosture::Sharded {
+                    index,
+                    count,
+                    index_source: ValueSource::Roster,
+                    count_source: ValueSource::Roster,
+                }
+                .owns(key),
+                roster::RosterAdmission::Yield(_) => false,
+            }
+        }
+
+        /// SPLIT VIEW (AC): two hosts reading the same roster at different
+        /// staleness must never both own the same key at the same instant.
+        ///
+        /// A lagging host is modelled as reading the true comment set as of
+        /// `t - lag` while evaluating at `t` — which is what an ETag-cached or
+        /// replica-lagged read actually looks like, including the fact that
+        /// the host's own record looks `lag` seconds staler to itself.
+        #[test]
+        #[serial]
+        fn a_split_view_never_gives_one_key_two_owners() {
+            let keys: Vec<String> = (0..12).map(|i| format!("2amlogic/repo-{i}")).collect();
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let join = dt("2026-01-01T02:00:00Z");
+
+            // The true, forge-side comment set at instant `t`.
+            let truth = |t: DateTime<Utc>| {
+                let mut c = live_fleet(t, &key_refs);
+                if t >= join {
+                    c.push(record(4, "host-d", &key_refs, join, t - ChronoDuration::seconds(60)));
+                }
+                c
+            };
+
+            // Deliberately divergent read staleness, including one host
+            // lagging far enough that only the SELF-LIVENESS condition can
+            // save the invariant.
+            let hosts = [
+                ("host-a", 0i64),
+                ("host-b", 120),
+                ("host-c", 600),
+                ("host-d", 1500),
+            ];
+
+            let start = join - ChronoDuration::seconds(1800);
+            for step in 0..240 {
+                let t = start + ChronoDuration::seconds(step * 30);
+                for key in &keys {
+                    let owners: Vec<&str> = hosts
+                        .iter()
+                        .filter(|(host, lag)| {
+                            let view = truth(t - ChronoDuration::seconds(*lag));
+                            roster_owns(&view, host, key, t, TTL, SETTLE)
+                        })
+                        .map(|(host, _)| *host)
+                        .collect();
+                    assert!(
+                        owners.len() <= 1,
+                        "{key} owned by {owners:?} at {t} — a membership disagreement must YIELD, \
+                         never duplicate (#6704)"
+                    );
+                }
+            }
+        }
+
+        /// SPLIT VIEW, second half (AC): outside the settle window every key
+        /// still has an owner — the fence trades a bounded gap for the
+        /// duplicate, it does not strand work indefinitely.
+        #[test]
+        #[serial]
+        fn every_key_has_exactly_one_owner_outside_the_settle_window() {
+            let keys: Vec<String> = (0..12).map(|i| format!("2amlogic/repo-{i}")).collect();
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let join = dt("2026-01-01T02:00:00Z");
+            let truth = |t: DateTime<Utc>| {
+                let mut c = live_fleet(t, &key_refs);
+                if t >= join {
+                    c.push(record(4, "host-d", &key_refs, join, t - ChronoDuration::seconds(60)));
+                }
+                c
+            };
+            // Both hosts read within the TTL, as a healthy fleet does.
+            let hosts = [
+                ("host-a", 0i64),
+                ("host-b", 120),
+                ("host-c", 240),
+                ("host-d", 60),
+            ];
+            let settle_window = join..(join + ChronoDuration::seconds(SETTLE as i64 + 240));
+
+            let start = join - ChronoDuration::seconds(1800);
+            for step in 0..240 {
+                let t = start + ChronoDuration::seconds(step * 30);
+                if settle_window.contains(&t) {
+                    continue;
+                }
+                for key in &keys {
+                    let owners: Vec<&str> = hosts
+                        .iter()
+                        .filter(|(host, lag)| {
+                            if t < join && *host == "host-d" {
+                                return false; // not a member yet
+                            }
+                            let view = truth(t - ChronoDuration::seconds(*lag));
+                            roster_owns(&view, host, key, t, TTL, SETTLE)
+                        })
+                        .map(|(host, _)| *host)
+                        .collect();
+                    assert_eq!(
+                        owners.len(),
+                        1,
+                        "{key} owned by {owners:?} at {t} (outside the settle window every key \
+                         must have exactly one owner)"
+                    );
+                }
+            }
+        }
+
+        /// KILL HOST (AC): when a member's record expires, a survivor picks up
+        /// its slice within `ttl + settleSecs` (+ one role interval for tick
+        /// alignment, which is the cadence, not the fence) — and **not
+        /// before**.
+        #[test]
+        #[serial]
+        fn a_dead_hosts_slice_is_reassigned_after_ttl_plus_settle_and_not_before() {
+            let keys: Vec<String> = (0..12).map(|i| format!("2amlogic/repo-{i}")).collect();
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let death = dt("2026-01-01T02:00:00Z");
+            let survivors = ["host-a", "host-b"];
+
+            // host-c's last beat is at `death`; a, b keep beating.
+            let view = |t: DateTime<Utc>| {
+                let mut c = live_fleet(t, &key_refs);
+                c[2].updated_at = death;
+                c
+            };
+
+            // Its slice: the keys host-c owned while it was alive.
+            let just_before_death = death - ChronoDuration::seconds(1);
+            let orphaned: Vec<&String> = keys
+                .iter()
+                .filter(|k| {
+                    roster_owns(
+                        &view(just_before_death),
+                        "host-c",
+                        k,
+                        just_before_death,
+                        TTL,
+                        SETTLE,
+                    )
+                })
+                .collect();
+            assert!(!orphaned.is_empty(), "precondition: host-c must own part of the ring");
+
+            // NOT BEFORE: for the whole `ttl + settle` window, no survivor
+            // touches the orphaned slice.
+            let reassigned_at = death + ChronoDuration::seconds((TTL + SETTLE) as i64);
+            let mut t = death;
+            while t < reassigned_at {
+                for key in &orphaned {
+                    for host in survivors {
+                        assert!(
+                            !roster_owns(&view(t), host, key, t, TTL, SETTLE),
+                            "{host} picked up {key} at {t}, before ttl+settle had elapsed — the \
+                             reassignment window must be bounded BELOW as well as above (#6704)"
+                        );
+                    }
+                }
+                t += ChronoDuration::seconds(30);
+            }
+
+            // AND NOT NEVER: at `death + ttl + settle` every orphaned key has
+            // exactly one live owner again.
+            for key in &orphaned {
+                let owners: Vec<&str> = survivors
+                    .into_iter()
+                    .filter(|h| {
+                        roster_owns(&view(reassigned_at), h, key, reassigned_at, TTL, SETTLE)
+                    })
+                    .collect();
+                assert_eq!(
+                    owners.len(),
+                    1,
+                    "{key} had owners {owners:?} at ttl+settle after its host died; a dead host's \
+                     slice must be reassigned within a bounded window (#6704 AC2)"
+                );
+            }
+            // And the whole ring is covered again, not just the orphans.
+            for key in &keys {
+                let owners: Vec<&str> = survivors
+                    .into_iter()
+                    .filter(|h| {
+                        roster_owns(&view(reassigned_at), h, key, reassigned_at, TTL, SETTLE)
+                    })
+                    .collect();
+                assert_eq!(owners.len(), 1, "{key} owned by {owners:?} after reassignment");
+            }
+        }
+
+        /// SELF-FENCE (AC), at the surface that spends tokens: a host whose
+        /// own heartbeat is stale runs no roster-gated role tick for ANY key.
+        #[test]
+        #[serial]
+        fn a_host_with_a_stale_heartbeat_runs_no_roster_gated_role_ticks() {
+            clear_nwo_cache();
+            roster::clear_generation_fence_for_tests();
+            let now = dt(NOW);
+            let keys: Vec<String> = (0..12).map(|i| format!("2amlogic/repo-{i}")).collect();
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let mut comments = live_fleet(now, &key_refs);
+            comments[0].updated_at = now - ChronoDuration::seconds(1200);
+            let snap = snapshot("host-a", comments, now);
+
+            for key in &keys {
+                let decision = decide_with_roster(
+                    unsharded(),
+                    Path::new("/repos/loom"),
+                    Some(key),
+                    &active_config(),
+                    Some(&snap),
+                    now,
+                );
+                assert!(
+                    !decision.admits_role_tick(),
+                    "{key}: a self-fenced host must run no role ticks at all"
+                );
+                assert!(decision.owned, "{key}: dispatch preference must be unaffected");
+            }
+            roster::clear_generation_fence_for_tests();
+        }
+
+        /// JOIN FENCE (AC) at the same surface: a host that has just joined
+        /// runs nothing until its own record is `ttl` old.
+        #[test]
+        #[serial]
+        fn a_newly_joined_host_runs_nothing_until_its_record_is_ttl_old() {
+            clear_nwo_cache();
+            roster::clear_generation_fence_for_tests();
+            let keys: Vec<String> = (0..12).map(|i| format!("2amlogic/repo-{i}")).collect();
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let join = dt(NOW);
+
+            let view = |t: DateTime<Utc>| {
+                let mut c = live_fleet(t, &key_refs);
+                c.push(record(4, "host-d", &key_refs, join, t - ChronoDuration::seconds(60)));
+                c
+            };
+
+            // Anywhere inside its first ttl, the joiner is fenced out for
+            // every key.
+            let mut t = join;
+            while t < join + ChronoDuration::seconds(TTL as i64) {
+                for key in &keys {
+                    let decision = decide_with_roster(
+                        unsharded(),
+                        Path::new("/repos/loom"),
+                        Some(key),
+                        &active_config(),
+                        Some(&snapshot("host-d", view(t), t)),
+                        t,
+                    );
+                    assert!(
+                        !decision.admits_role_tick(),
+                        "{key}: a joiner must not act until its own record is a full ttl old \
+                         (t={t})"
+                    );
+                }
+                t += ChronoDuration::seconds(120);
+            }
+
+            // Once both the join fence and the settle window have passed, it
+            // takes up its share.
+            let after = join + ChronoDuration::seconds((TTL + SETTLE) as i64);
+            let owned: Vec<&String> = keys
+                .iter()
+                .filter(|key| {
+                    decide_with_roster(
+                        unsharded(),
+                        Path::new("/repos/loom"),
+                        Some(key),
+                        &active_config(),
+                        Some(&snapshot("host-d", view(after), after)),
+                        after,
+                    )
+                    .admits_role_tick()
+                })
+                .collect();
+            assert!(
+                !owned.is_empty(),
+                "a joined, settled host must eventually carry part of the ring"
+            );
+            roster::clear_generation_fence_for_tests();
+        }
+
+        // ---- End-to-end through `decide` (config + snapshot cache) ----
+
+        #[test]
+        #[serial]
+        fn decide_reads_the_roster_from_config_and_the_snapshot_cache() {
+            let _env = EnvGuard::capture();
+            let _roster_env = RosterEnvGuard::capture();
+            clear_nwo_cache();
+            roster::clear_generation_fence_for_tests();
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            std::fs::create_dir_all(root.join(".loom")).expect("mkdir .loom");
+            std::fs::write(
+                root.join(crate::config_resolver::LEGACY_CONFIG_REL),
+                r#"{"autonomous":{"roleRunner":{"enabled":true,"shardKey":"rjwalters/loom",
+                   "roster":{"enabled":true,"issue":"rjwalters/loom#1234"}}}}"#,
+            )
+            .expect("write config");
+
+            // No snapshot yet: the never-joined fallback, NOT a yield.
+            roster::clear_roster_snapshot_for_tests();
+            let before = decide(root);
+            assert_eq!(before.roster, RosterMode::Off(RosterOff::NeverJoined));
+            assert!(before.admits_role_tick());
+
+            // The heartbeat task publishes a snapshot; now the ring is live.
+            let now = chrono::Utc::now();
+            roster::set_roster_snapshot(snapshot("host-c", live_fleet(now, &[KEY]), now));
+            let after = decide(root);
+            assert!(matches!(after.roster, RosterMode::Ring { .. }), "got {:?}", after.roster);
+            assert_eq!(after.posture.count(), Some(3));
+            assert_eq!(after.posture.index(), Some(2), "host-c is third in the ring");
+            assert!(after.posture.describe().contains("from roster"));
+
+            roster::clear_roster_snapshot_for_tests();
+            roster::clear_generation_fence_for_tests();
+        }
+
+        /// Restore the roster env knobs, so a stray `LOOM_ROLE_RUNNER_ROSTER`
+        /// in the ambient environment cannot steer the config-driven test.
+        struct RosterEnvGuard {
+            saved: Vec<(&'static str, Option<String>)>,
+        }
+
+        impl RosterEnvGuard {
+            fn capture() -> Self {
+                let names = [
+                    roster::ROSTER_ENABLED_ENV,
+                    roster::ROSTER_ISSUE_ENV,
+                    roster::ROSTER_HEARTBEAT_SECS_ENV,
+                    roster::ROSTER_TTL_SECS_ENV,
+                    roster::ROSTER_SETTLE_SECS_ENV,
+                ];
+                let saved = names.iter().map(|n| (*n, std::env::var(*n).ok())).collect();
+                for n in names {
+                    std::env::remove_var(n);
+                }
+                Self { saved }
+            }
+        }
+
+        impl Drop for RosterEnvGuard {
+            fn drop(&mut self) {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(v) => std::env::set_var(name, v),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
     }
 }

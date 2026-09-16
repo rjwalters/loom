@@ -365,16 +365,18 @@ pub(crate) fn build_status_json_value(
             "count": s.count,
             "configured": s.configured,
             "summary": s.summary,
-            // Roster section (Issue #7690, Phase A of #6704) — `null` when
-            // the roster is disabled (the default) or has never completed a
-            // heartbeat cycle. Observational only: does not feed `index`/
-            // `count` above in this phase.
+            // Roster section (Issue #7690 / #7691, #6704) — `null` when the
+            // roster is disabled (the default) or has never completed a
+            // heartbeat cycle. With `roster.enabled` it is also the source of
+            // `index`/`count` above (`summary` says so), and `fence` names
+            // the admission verdict.
             "roster": s.roster.as_ref().map(|r| serde_json::json!({
                 "issue": r.issue,
                 "live_count": r.live_count,
                 "seen_count": r.seen_count,
                 "generation": r.generation,
                 "settled_secs": r.settled_secs,
+                "fence": r.fence,
                 "members": r.members.iter().map(|m| serde_json::json!({
                     "host": m.host,
                     "fresh": m.fresh,
@@ -1573,6 +1575,13 @@ fn render_roster_lines(report: &DaemonStatusReport) -> Vec<String> {
         "  Roster: issue {} · {} live / {} seen · gen {gen_str}{settled_str}",
         roster.issue, roster.live_count, roster.seen_count,
     )];
+    // The fence verdict (#7691), directly under the roster header: a host
+    // that is YIELDING runs no role ticks at all, and that must never be
+    // invisible — it is the one state where "nothing is happening" is correct
+    // by design rather than a bug.
+    if let Some(fence) = &roster.fence {
+        lines.push(format!("  Fence: {fence}"));
+    }
     for m in &roster.members {
         let freshness = if m.fresh { "fresh  " } else { "EXPIRED" };
         let this_host = if m.is_this_host {
@@ -5290,6 +5299,7 @@ mod roster_render_tests {
             seen_count: 3,
             generation: None,
             settled_secs: Some(22 * 60),
+            fence: None,
             members: vec![
                 member("host-a3f9c1d2", true, false),
                 member("host-d9142cf3", true, true),
@@ -5318,5 +5328,30 @@ mod roster_render_tests {
                 .any(|l| l.contains("host-d9142cf3") && l.contains("this host")),
             "this host must be marked: {lines:?}"
         );
+    }
+
+    /// Issue #7691: a host that the roster fence is holding back runs **no**
+    /// role ticks at all. That state must be visible — otherwise it is
+    /// indistinguishable in `status` from a healthy host that simply owns no
+    /// slice, which is precisely the invisibility #6374 was filed about.
+    #[test]
+    fn the_fence_verdict_renders_under_the_roster_header_when_present() {
+        let roster = RosterStatus {
+            issue: "rjwalters/loom#1234".to_string(),
+            live_count: 3,
+            seen_count: 3,
+            generation: None,
+            settled_secs: Some(60),
+            fence: Some("YIELDING role ticks — this host's own roster record is stale".to_string()),
+            members: vec![member("host-a3f9c1d2", true, true)],
+        };
+        let report = DaemonStatusReport {
+            role_runner_shard: Some(posture_with_roster(Some(roster))),
+            ..sample_report()
+        };
+        let lines = render_roster_lines(&report);
+        assert_eq!(lines.len(), 3, "header + fence + 1 member: {lines:?}");
+        assert!(lines[1].starts_with("  Fence: "), "{}", lines[1]);
+        assert!(lines[1].contains("YIELDING"), "{}", lines[1]);
     }
 }

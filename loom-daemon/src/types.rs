@@ -2773,10 +2773,12 @@ pub struct RosterMemberStatus {
     pub is_this_host: bool,
 }
 
-/// The role-runner roster section for `status`/`--json` (Issue #7690, Phase A
-/// of #6704) — [`crate::role_shard::roster::RosterStatusView`] flattened for
-/// the wire. Observational only: nothing here feeds [`RoleRunnerShardPosture::index`]/
-/// [`RoleRunnerShardPosture::count`] yet.
+/// The role-runner roster section for `status`/`--json` (Issue #7690 / #7691,
+/// #6704) — [`crate::role_shard::roster::RosterStatusView`] flattened for the
+/// wire. With `roster.enabled` (opt-in) this roster is also what
+/// [`RoleRunnerShardPosture::index`]/[`RoleRunnerShardPosture::count`] are
+/// derived from, and [`Self::fence`] says whether this host is currently
+/// admitted under it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RosterStatus {
     /// `owner/repo#N` of the roster issue.
@@ -2791,6 +2793,15 @@ pub struct RosterStatus {
     /// Seconds since [`Self::generation`], `None` alongside it.
     #[serde(default)]
     pub settled_secs: Option<i64>,
+    /// The roster **admission fence**'s current verdict on this host (Issue
+    /// #7691), as a one-line human string — `None` from a pre-#7691 daemon.
+    ///
+    /// Load-bearing for operators: a host that is *yielding* runs no role
+    /// ticks at all, which is otherwise indistinguishable in `status` from a
+    /// host that simply owns no slice. The design's whole fail-safe direction
+    /// is "yield when in doubt", so the doubt has to be visible.
+    #[serde(default)]
+    pub fence: Option<String>,
     /// Per-member rows, sorted by host id. An expired member stays in this
     /// list (`fresh: false`) rather than being dropped — silence about a dead
     /// host is exactly how the pre-#6374 `LOOM_ROLE_RUNNER=0` mitigation
