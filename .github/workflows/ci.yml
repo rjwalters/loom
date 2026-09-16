@@ -6,9 +6,21 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# Supersede on a PR; NEVER on main (#7779).
+#
+# `github.ref` is `refs/heads/main` for every push to main, so one shared
+# group meant each merge cancelled the previous merge's verification.
+# Measured before this change: of the last 30 main runs, 22 cancelled and 7
+# succeeded. At ~3.3 merges/hour against a run longer than the gap between
+# merges, near-total cancellation is the steady state, and `main` stops being
+# a usable control for "does this fail here too?" -- the first question in any
+# flake triage (#7789).
+#
+# Keyed on the PR number when there is one, and on the commit SHA otherwise,
+# so every main commit gets its own group and has nothing to supersede.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Belt-and-suspenders cancellation (#6683): the native `cancel-in-progress`
@@ -26,6 +38,14 @@ jobs:
   # not gate them — its only side effect is cancelling stale runs elsewhere.
   cancel-superseded:
     name: Cancel Superseded Runs (same ref)
+    # PR events only (#7779). The rationale above is entirely about a
+    # superseded PR push -- "a force-pushed rebase created a new run". On a
+    # push to main there is nothing to supersede: `github.head_ref` is empty,
+    # so REF fell back to `github.ref_name` = `main`, and this job cancelled
+    # every other queued/in_progress main run. That is the dominant cause of
+    # the 22/30 cancellation rate, not the `concurrency:` stanza alone --
+    # each main commit is distinct work that deserves its own verification.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
