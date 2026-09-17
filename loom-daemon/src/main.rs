@@ -1156,6 +1156,13 @@ enum SweepExperimentAction {
         quiet: bool,
     },
 
+    /// Fleet-wide, repo-stratified model A/B: `plan`, `start`, `stop`
+    /// (#8055 phases 1-2). Flattened in from `cli::fleet_experiment` so they
+    /// are direct sub-actions of `sweep-experiment` while `main.rs` — frozen
+    /// by the file-size ratchet — carries one variant for all three.
+    #[command(flatten)]
+    Fleet(cli::fleet_experiment::FleetExperimentAction),
+
     /// Aggregate the stats store into the per-arm #3718 inequality inputs.
     Harvest {
         #[arg(long = "stats-file")]

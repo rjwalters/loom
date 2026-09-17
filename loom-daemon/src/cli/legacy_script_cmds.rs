@@ -355,6 +355,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
             }
             Ok(())
         }
+        SweepExperimentAction::Fleet(action) => action.run(),
         SweepExperimentAction::Harvest {
             stats_file,
             archive_dir,

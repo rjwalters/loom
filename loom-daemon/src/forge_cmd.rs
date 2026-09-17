@@ -659,7 +659,7 @@ fn repo_nwo_in(gh: &str, cwd: Option<&Path>) -> Option<String> {
 /// Extract `owner/repo` from a git remote URL (SSH `git@host:owner/repo.git`
 /// or HTTPS `https://host/owner/repo(.git)` form), mirroring the shell sed in
 /// `forge_get_repo_nwo` (`defaults/scripts/lib/forge-helpers.sh`).
-fn parse_nwo_from_remote_url(url: &str) -> Option<String> {
+pub(crate) fn parse_nwo_from_remote_url(url: &str) -> Option<String> {
     let trimmed = url.strip_suffix(".git").unwrap_or(url);
     let mut parts: Vec<&str> = trimmed.rsplit(['/', ':']).take(2).collect();
     if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
