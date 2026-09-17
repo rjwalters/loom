@@ -41,6 +41,7 @@
 pub mod config;
 pub mod consts;
 pub mod env;
+pub mod escalate;
 pub mod heartbeat;
 pub mod liveness;
 pub mod locate;
