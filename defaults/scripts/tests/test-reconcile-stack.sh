@@ -279,6 +279,65 @@ teardown_sandbox
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
+echo "Scenario H: a STALE pinned ref (reused branch name) is refused, not rebased onto (#8010 item 4)"
+setup_sandbox
+
+# The reachable shape, not a hypothetical: `feature/issue-N` branch names ARE
+# reused in this repo (CLAUDE.md's #5657/#3667 note on a partial-increment
+# slice's name being reused by the next slice), and before #8010 nothing ever
+# reaped refs/loom/parent/<branch>. So a pin left by an EARLIER merge of the
+# same name could be picked up by a later, unrelated child.
+#
+# What makes it dangerous rather than merely wrong: `git rebase --onto <default>
+# <non-ancestor> <child>` does NOT error. It replays the wrong commit range, and
+# the child PR silently gains commits it should never have had.
+git_q -C "$MAIN" branch -D "$PARENT_BR" >/dev/null 2>&1
+git_q -C "$MAIN" update-ref -d "refs/remotes/origin/$PARENT_BR" >/dev/null 2>&1 || true
+
+# A pin pointing at a commit that is NOT an ancestor of the child: main's own
+# squashed parent commit, which the child never had in its history.
+STALE_PIN_SHA="$(git_q -C "$MAIN" rev-parse main)"
+git_q -C "$MAIN" update-ref "refs/loom/parent/$PARENT_BR" "$STALE_PIN_SHA"
+
+CHILD_BEFORE_H="$(git_q -C "$MAIN" rev-parse "$CHILD_BR")"
+run_reconcile "$MAIN"
+
+assert_eq "1" "$RUN_RC" "H: refuses with a non-zero exit rather than rebasing onto a non-ancestor"
+assert_contains "$RUN_OUT" "NOT an ancestor" "H: says plainly why it refused"
+assert_contains "$RUN_OUT" "silently add commits" \
+  "H: names the consequence, so the operator knows this is not a cosmetic refusal"
+assert_contains "$RUN_OUT" "update-ref" "H: offers the exact recovery commands"
+
+CHILD_AFTER_H="$(git_q -C "$MAIN" rev-parse "$CHILD_BR")"
+assert_eq "$CHILD_BEFORE_H" "$CHILD_AFTER_H" \
+  "H: the child branch was not touched at all"
+assert_not_contains "$(cat "$GH_EDIT_LOG")" "pr edit $CHILD_PR" \
+  "H: the child PR was not retargeted either"
+
+teardown_sandbox
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "Scenario I: a consumed pin is reaped, so it cannot become the next run's stale pin (#8010 item 4)"
+setup_sandbox
+
+PARENT_TIP_I="$(git_q -C "$MAIN" rev-parse "$PARENT_BR")"
+git_q -C "$MAIN" branch -D "$PARENT_BR" >/dev/null 2>&1
+git_q -C "$MAIN" update-ref -d "refs/remotes/origin/$PARENT_BR" >/dev/null 2>&1 || true
+git_q -C "$MAIN" update-ref "refs/loom/parent/$PARENT_BR" "$PARENT_TIP_I"
+
+run_reconcile "$MAIN"
+assert_eq "0" "$RUN_RC" "I: reconcile succeeds through the pinned-ref path"
+
+PIN_AFTER_I="$(git_q -C "$MAIN" rev-parse --verify --quiet "refs/loom/parent/$PARENT_BR" 2>/dev/null || echo "gone")"
+assert_eq "gone" "$PIN_AFTER_I" \
+  "I: the consumed pin was deleted after use (left behind, it becomes the next reuse's stale pin)"
+assert_contains "$RUN_OUT" "Reaped the consumed pin" "I: says so, rather than deleting silently"
+
+teardown_sandbox
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
 echo "Scenario B: child branch NOT checked out in any worktree (in-place fallback)"
 setup_sandbox
 

@@ -193,8 +193,32 @@ PARENT_REF="$PARENT_BRANCH"
 if ! "${GIT_C[@]}" rev-parse --verify --quiet "${PARENT_BRANCH}^{commit}" >/dev/null 2>&1; then
     PINNED_PARENT_REF="refs/loom/parent/$PARENT_BRANCH"
     if "${GIT_C[@]}" rev-parse --verify --quiet "${PINNED_PARENT_REF}^{commit}" >/dev/null 2>&1; then
-        warn "Branch '$PARENT_BRANCH' no longer resolves locally (likely deleted by delete_branch_on_merge) — falling back to the pinned ref $PINNED_PARENT_REF."
-        PARENT_REF="$PINNED_PARENT_REF"
+        # ANCESTRY IS CHECKED, NOT ASSUMED (#8010 item 4).
+        #
+        # `git rebase --onto <default> <upstream> <child>` replays
+        # `(upstream..child]`. If <upstream> is not an ancestor of the child,
+        # that command does NOT error — it silently replays the wrong commit
+        # range, and the child PR gains commits it should never have had.
+        #
+        # A stale pin is reachable here, not hypothetical: nothing reaped these
+        # refs before this change, and `feature/issue-N` branch names ARE reused
+        # in this repo (see CLAUDE.md's #5657/#3667 note on a partial-increment
+        # slice's branch name being reused by the next slice). A pin left by an
+        # earlier merge of the SAME name would otherwise be preferred without
+        # complaint.
+        if "${GIT_C[@]}" merge-base --is-ancestor "$PINNED_PARENT_REF" "$CHILD_BRANCH" 2>/dev/null; then
+            warn "Branch '$PARENT_BRANCH' no longer resolves locally (likely deleted by delete_branch_on_merge) — falling back to the pinned ref $PINNED_PARENT_REF."
+            PARENT_REF="$PINNED_PARENT_REF"
+        else
+            err "Branch '$PARENT_BRANCH' no longer resolves locally, and the pinned ref $PINNED_PARENT_REF ($("${GIT_C[@]}" rev-parse --short "$PINNED_PARENT_REF" 2>/dev/null || echo '?')) is NOT an ancestor of '$CHILD_BRANCH'."
+            err ""
+            err "Rebasing onto a non-ancestor would not fail — it would replay the wrong commit range and silently add commits to PR #$CHILD_PR. Refusing."
+            err ""
+            err "This usually means the pin is stale: the branch name was reused by a later issue slice, and an older merge left the ref behind. Verify which parent this child was actually built on, then either:"
+            err "  git update-ref refs/loom/parent/$PARENT_BRANCH <the-correct-tip>"
+            err "  git update-ref -d refs/loom/parent/$PARENT_BRANCH   # then rebase by hand"
+            exit 1
+        fi
     fi
 fi
 
@@ -269,5 +293,22 @@ fi
 if [[ "$DRY_RUN" == "true" ]]; then
     ok "Dry run complete — no changes made. Re-run without --dry-run to reconcile."
 else
+    # Reap the pin once it has been consumed (#8010 item 4). Leaving it is what
+    # makes a stale pin reachable at all: `feature/issue-N` names are reused in
+    # this repo, so a ref left behind by one merge can be picked up by a later,
+    # unrelated child of the same name. The ancestry check above refuses that
+    # case loudly, but not leaving the landmine is better than detecting it.
+    #
+    # Only when the fallback was actually USED — a direct invocation that
+    # resolved the live branch must not delete a pin some other reconcile still
+    # needs. Best-effort: a failure here costs a stale ref, never the reconcile
+    # that already succeeded.
+    if [[ -n "${PINNED_PARENT_REF:-}" && "$PARENT_REF" == "$PINNED_PARENT_REF" ]]; then
+        if "${GIT_C[@]}" update-ref -d "$PINNED_PARENT_REF" 2>/dev/null; then
+            info "Reaped the consumed pin $PINNED_PARENT_REF."
+        else
+            warn "Could not delete the consumed pin $PINNED_PARENT_REF — harmless, but remove it by hand if a later child reuses '$PARENT_BRANCH'."
+        fi
+    fi
     ok "Reconciled: PR #$CHILD_PR now stacks only its own commits on $DEFAULT_BRANCH."
 fi
