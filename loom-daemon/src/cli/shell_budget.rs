@@ -17,6 +17,15 @@ pub(crate) struct ShellBudgetArgs {
     /// Repo root to measure. Defaults to the current directory.
     #[arg(long, value_name = "PATH")]
     pub root: Option<std::path::PathBuf>,
+
+    /// Also enforce the ratchet: exit 1 when the tree is over budget.
+    ///
+    /// This is what CI runs. The report prints either way — a gate that only
+    /// speaks up on failure teaches nobody which way the number is moving,
+    /// which is how the portable pool grew +317 across four merged ports
+    /// without anyone noticing.
+    #[arg(long)]
+    pub check: bool,
 }
 
 impl ShellBudgetArgs {
@@ -50,6 +59,17 @@ impl ShellBudgetArgs {
             );
         } else {
             print!("{}", shell_budget::render_report(&budget, origin));
+        }
+
+        if self.check {
+            let base = shell_budget::read_baseline(&root).map_err(anyhow::Error::msg)?;
+            if let Err(why) = shell_budget::check(&budget, &base) {
+                eprintln!("\nshell-budget: OVER BUDGET\n\n{why}");
+                std::process::exit(1);
+            }
+            if !self.json {
+                println!("\nshell-budget: within budget.");
+            }
         }
         Ok(())
     }

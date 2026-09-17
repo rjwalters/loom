@@ -290,6 +290,35 @@ jobs:
       - name: Check file size budget
         run: bash scripts/check-file-size-budget.sh
 
+  shell-budget-ratchet:
+    name: Shell Budget Ratchet
+    # Always runs, like every other structural ratchet here — deliberately NOT
+    # behind `needs: changes`. The first cut of this gate lived inside `Rust
+    # Unit Tests`, which is gated on the `backend` paths filter; that filter
+    # covers `loom-daemon/**` but not `scripts/**` or `defaults/**`, so a PR
+    # that ADDED a shell script skipped the job entirely and the ratchet first
+    # fired on the push to `main`. A gate skipped on exactly the changes it
+    # targets is not a gate. See .loom/docs/ci-principles.md: path-filtering is
+    # an optimisation, not a correctness tool.
+    #
+    # It measures the pool epic #7810 is retiring — `contract` + `hook-entry`,
+    # whose logic moves into the daemon behind a stub — rather than total
+    # production shell, a quarter of which is `bootstrap`/`vendored` and
+    # correctly permanent. See .loom/docs/shell-language-policy.md.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build loom-daemon
+        run: cargo build --release -p loom-daemon --bin loom-daemon
+      # Prints the report whether or not it passes. A gate that only speaks up
+      # on failure teaches nobody which way the number is moving, which is how
+      # the portable pool grew +317 across four merged ports unnoticed.
+      - name: Shell budget
+        run: ./target/release/loom-daemon shell-budget --check
+
   shell-allowlist:
     name: Shell Allowlist
     # Cheap structural check; always runs. #7762 / ADR-0018: new executable

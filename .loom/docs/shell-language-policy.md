@@ -160,7 +160,7 @@ itself exercised under bash 3.2.
 
 ## The aggregate ratchet (#8084)
 
-The allowlist gates each NEW script. It does not measure total volume, and total
+The allowlist gates each NEW script. It does not measure total volume, and
 volume is where the growth actually was:
 
 | when | files | production shell code lines |
@@ -168,30 +168,79 @@ volume is where the growth actually was:
 | 90 days ago | 93 | 14,958 |
 | 60 days ago | 96 | 15,568 |
 | 30 days ago | 186 | 40,735 |
-| now | 234 | 51,814 |
+| now | 236 | 52,493 |
 
-Epic #7810 deleted roughly 2,200 lines of production shell over that last
-stretch and the total still rose — immediately before its first port commit the
-number was 51,749, against 51,814 now, a net **+65**. Of the 98 files appearing
-between the 60- and 30-day marks, 96 did not exist anywhere in the tree at 60
-days, so this is new code rather than a reorganisation. 29,795 of the added
-lines came in as 148 brand-new scripts, nearly all individually under the
-per-file threshold and each with a defensible allowlist reason.
+Of the lines added since the 60-day mark, 29,795 arrived as 148 brand-new
+scripts — nearly all individually under the per-file threshold, each with a
+defensible allowlist reason.
 
-`loom-daemon/tests/shell_budget_ratchet.rs` freezes the total in
-`scripts/shell-budget-baseline.txt`: it may fall freely and may not rise. Growth
-is still allowed — it just has to be spelled out as a changed number that a
-reviewer can see, instead of arriving invisibly across a hundred files. Tests
-are excluded, because the retained black-box suite method a port runs on
-*requires* test shell to grow as production shell shrinks.
+### It measures the pool being retired, not the total
+
+Total production shell cannot reach zero and was never meant to. A quarter of
+it is shell that must stay shell:
+
+| category | lines | why it is permanent |
+|---|---|---|
+| `bootstrap` | 8,658 | runs before a `loom-daemon` binary exists, or after it is removed; requiring the binary to install itself is circular |
+| `vendored` | 4,999 | owned upstream in rjwalters/repo; its structure is not ours to change |
+
+Ratcheting "what we are retiring" plus "what we are keeping" gives a figure
+with no target, so no run of it says how far along the epic is. What the epic
+retires is the **portable** pool — `contract` + `hook-entry`, whose logic moves
+into the daemon behind a stub ("The name stays; logic ports behind it"):
+
+| category | lines | files |
+|---|---|---|
+| `contract` | 36,296 | 188 |
+| `hook-entry` | 2,395 | 8 |
+| **portable** | **38,691** | **196** |
+
+Its target is the ~145 lines of `stub` glue a ported file leaves behind. That
+is what the ratchet gates. `total` is ratcheted as a secondary signal so floor
+growth is visible rather than free, but the floor is not debt.
+
+### Where it runs, and why that took two attempts
 
 ```bash
-cargo test -p loom-daemon --test shell_budget_ratchet          # the gate CI runs
+loom-daemon shell-budget           # the progress report
+loom-daemon shell-budget --json    # the same, for scripting
+loom-daemon shell-budget --check   # report + exit 1 when over budget (what CI runs)
+```
+
+The `Shell Budget Ratchet` job runs unconditionally, like every other
+structural ratchet. The first cut lived inside `Rust Unit Tests`, which is
+gated on the `backend` paths filter — `loom-daemon/**` but **not**
+`scripts/**` or `defaults/**`. A PR that added a shell script skipped the job
+entirely and the ratchet first fired on the push to `main`. A gate skipped on
+exactly the changes it targets is not a gate; see
+[`ci-principles.md`](ci-principles.md), path-filtering is an optimisation, not
+a correctness tool.
+
+The report prints on every run, pass or fail. A gate that only speaks on
+failure teaches nobody which way the number is moving — which is how the
+portable pool grew **+317 since the epic's first port commit**, across four
+merged ports, with nobody noticing.
+
+It is Rust, not a script, for the obvious reason: a `.sh` enforcing "stop
+adding shell" would have to exempt itself from its own count.
+
+### Regenerating the baseline
+
+```bash
 UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet
 ```
 
-It is Rust, not a script, for the obvious reason: a `.sh` enforcing "stop adding
-shell" would have to exempt itself from its own count.
+Legitimate for recording shrinkage, or for a reviewed decision to admit growth.
+A reviewer should treat an update that RAISES `portable` as the thing to ask
+about. `origin_portable` is never regenerated — it is the denominator, and an
+origin that moves measures nothing. Regeneration refuses to run while any
+production script lacks an allowlist entry, since banking an undercount freezes
+the error in place.
+
+**Rebase before regenerating.** A baseline captured on a branch snapshots that
+branch's tree while `main` moves underneath it — that is how #8073 red-lined
+`main` at its own merge commit, and this file's own baseline went stale twice
+in one day (#8105).
 
 ## Related
 

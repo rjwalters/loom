@@ -40,6 +40,20 @@
 //! number in `scripts/shell-budget-baseline.txt`, visible in the diff, instead
 //! of arriving invisibly across a hundred files.
 //!
+//! # Where this actually gates
+//!
+//! CI runs `loom-daemon shell-budget --check` in its own unconditional job, not
+//! this test. `Rust Unit Tests` is gated on the `backend` paths filter, which
+//! covers `loom-daemon/**` but NOT `scripts/**` or `defaults/**` — so a PR that
+//! adds a shell script would have skipped the job entirely and the ratchet would
+//! have first fired on the push to `main`. A gate that is skipped on exactly the
+//! changes it targets is not a gate. Every sibling structural ratchet (File
+//! Size, Shell Allowlist, Markdown Token, Role Prompt) runs unconditionally for
+//! the same reason.
+//!
+//! This test keeps the same gate honest locally and under `cargo test`; both
+//! call [`shell_budget::check`], so they cannot disagree about what passes.
+//!
 //! # Updating
 //!
 //! ```text
@@ -66,48 +80,6 @@ fn baseline_path() -> PathBuf {
     repo_root().join("scripts/shell-budget-baseline.txt")
 }
 
-/// The ratcheted values, plus the never-regenerated origin.
-struct Baseline {
-    portable: u64,
-    total: u64,
-    files: u64,
-    origin_portable: u64,
-}
-
-fn read_baseline() -> Baseline {
-    let path = baseline_path();
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("baseline not found at {}: {e}", path.display()));
-    let mut vals = std::collections::BTreeMap::<String, u64>::new();
-    for l in text.lines() {
-        let l = l.trim();
-        if l.is_empty() || l.starts_with('#') {
-            continue;
-        }
-        let mut it = l.split_whitespace();
-        match (it.next(), it.next()) {
-            (Some(k), Some(v)) => {
-                let n = v
-                    .parse()
-                    .unwrap_or_else(|_| panic!("baseline key {k} has a non-numeric value {v:?}"));
-                vals.insert(k.to_string(), n);
-            }
-            _ => panic!("unrecognised baseline line: {l:?}"),
-        }
-    }
-    let get = |k: &str| {
-        *vals
-            .get(k)
-            .unwrap_or_else(|| panic!("baseline is missing a `{k} <N>` entry"))
-    };
-    Baseline {
-        portable: get("portable"),
-        total: get("total"),
-        files: get("files"),
-        origin_portable: get("origin_portable"),
-    }
-}
-
 #[test]
 fn portable_shell_does_not_grow() {
     let root = repo_root();
@@ -116,6 +88,20 @@ fn portable_shell_does_not_grow() {
     if std::env::var_os("UPDATE_SHELL_BUDGET").is_some() {
         let origin = shell_budget::read_origin_portable(&root)
             .expect("origin_portable must already exist — it is never regenerated");
+        // Refuse to bank an undercount: an unlisted script makes every figure
+        // below wrong, and writing it as the new baseline would freeze the
+        // error in place.
+        assert!(
+            budget.unlisted.is_empty(),
+            "refusing to regenerate while {} production script(s) have no allowlist entry:\n{}",
+            budget.unlisted.len(),
+            budget
+                .unlisted
+                .iter()
+                .map(|p| format!("  {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         let text = std::fs::read_to_string(baseline_path()).expect("read baseline");
         let header: String = text
             .lines()
@@ -136,80 +122,10 @@ fn portable_shell_does_not_grow() {
         return;
     }
 
-    let base = read_baseline();
-
-    // Always print it. A gate that only speaks up on failure teaches nobody
-    // which way the number is moving, which is how +65 went unnoticed across
-    // four merged ports.
+    let base = shell_budget::read_baseline(&root).expect("read baseline");
     println!("{}", shell_budget::render_report(&budget, base.origin_portable));
 
-    assert!(
-        budget.unlisted.is_empty(),
-        "{} production script(s) carry no allowlist entry, so every figure here is an \
-         undercount — add them to scripts/shell-allowlist.txt:\n{}",
-        budget.unlisted.len(),
-        budget
-            .unlisted
-            .iter()
-            .map(|p| format!("  {}", p.display()))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-
-    assert!(
-        budget.file_count() >= 150,
-        "only {} production shell files were counted — the scope filter is too broad, and a \
-         gate that measures almost nothing passes for the wrong reason",
-        budget.file_count()
-    );
-
-    if budget.portable() > base.portable {
-        let mut largest: Vec<_> = budget
-            .by_category
-            .iter()
-            .filter(|(c, _)| shell_budget::PORTABLE.contains(&c.as_str()))
-            .collect();
-        largest.sort_by(|a, b| b.1.cmp(a.1));
-        panic!(
-            "PORTABLE shell grew by {} code lines ({} -> {}).\n\n\
-             This is the pool epic #7810 is retiring, so adding to it works directly against \
-             the epic. Options, best first:\n\n\
-             \x20 1. Put the new logic in the daemon instead — that is the language policy\n\
-             \x20    (.loom/docs/shell-language-policy.md) and it makes this gate a non-event.\n\
-             \x20 2. Remove portable shell elsewhere to pay for it.\n\
-             \x20 3. If the script genuinely must stay shell forever, it may belong in\n\
-             \x20    `bootstrap` or `vendored` rather than `contract` — but that is a claim\n\
-             \x20    about the script, argued in scripts/shell-allowlist.txt, not a way\n\
-             \x20    around this number.\n\
-             \x20 4. If the growth is genuinely right, record it:\n\
-             \x20      UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet\n\
-             \x20    and say WHY in the commit. A reviewer will see the raised number.\n\n\
-             {}",
-            budget.portable() - base.portable,
-            base.portable,
-            budget.portable(),
-            shell_budget::render_report(&budget, base.origin_portable)
-        );
+    if let Err(why) = shell_budget::check(&budget, &base) {
+        panic!("{why}\n\n{}", shell_budget::render_report(&budget, base.origin_portable));
     }
-
-    assert!(
-        budget.total() <= base.total,
-        "total production shell grew by {} code lines ({} -> {}) without portable growing, so \
-         the growth is in the permanent floor (bootstrap/vendored). That is allowed but not \
-         free — record it deliberately and say why.\n\n{}",
-        budget.total().saturating_sub(base.total),
-        base.total,
-        budget.total(),
-        shell_budget::render_report(&budget, base.origin_portable)
-    );
-
-    // A large drop in file count with no corresponding line drop means the
-    // filter stopped seeing whole directories.
-    assert!(
-        budget.file_count() + 20 >= base.files,
-        "production shell file count fell from {} to {} — verify that is a real removal and \
-         not a scope-filter regression",
-        base.files,
-        budget.file_count()
-    );
 }

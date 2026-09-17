@@ -282,6 +282,120 @@ pub fn read_origin_portable(root: &Path) -> Option<u64> {
         })
 }
 
+/// The ratcheted values plus the never-regenerated origin.
+#[derive(Debug, Clone)]
+pub struct Baseline {
+    pub portable: u64,
+    pub total: u64,
+    pub files: u64,
+    pub origin_portable: u64,
+}
+
+/// Read `scripts/shell-budget-baseline.txt`.
+///
+/// # Errors
+/// When the file is missing, malformed, or lacks a required key.
+pub fn read_baseline(root: &Path) -> Result<Baseline, String> {
+    let path = root.join("scripts/shell-budget-baseline.txt");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("baseline not found at {}: {e}", path.display()))?;
+    let mut vals = BTreeMap::<String, u64>::new();
+    for l in text.lines() {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let mut it = l.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some(k), Some(v)) => {
+                let n = v
+                    .parse()
+                    .map_err(|_| format!("baseline key {k} has a non-numeric value {v:?}"))?;
+                vals.insert(k.to_string(), n);
+            }
+            _ => return Err(format!("unrecognised baseline line: {l:?}")),
+        }
+    }
+    let get = |k: &str| {
+        vals.get(k)
+            .copied()
+            .ok_or_else(|| format!("baseline is missing a `{k} <N>` entry"))
+    };
+    Ok(Baseline {
+        portable: get("portable")?,
+        total: get("total")?,
+        files: get("files")?,
+        origin_portable: get("origin_portable")?,
+    })
+}
+
+/// The gate. Shared by the CI subcommand and the integration test so the two
+/// can never disagree about what passes.
+///
+/// # Errors
+/// Returns the operator-facing explanation when the tree is over budget.
+pub fn check(budget: &Budget, base: &Baseline) -> Result<(), String> {
+    if !budget.unlisted.is_empty() {
+        return Err(format!(
+            "{} production script(s) carry no allowlist entry, so every figure here is an \
+             undercount — add them to scripts/shell-allowlist.txt:\n{}",
+            budget.unlisted.len(),
+            budget
+                .unlisted
+                .iter()
+                .map(|p| format!("  {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if budget.file_count() < 150 {
+        return Err(format!(
+            "only {} production shell files were counted — the scope filter is too broad, and a \
+             gate that measures almost nothing passes for the wrong reason",
+            budget.file_count()
+        ));
+    }
+    if budget.portable() > base.portable {
+        return Err(format!(
+            "PORTABLE shell grew by {} code lines ({} -> {}).\n\n\
+             This is the pool epic #7810 is retiring, so adding to it works directly against the \
+             epic. Options, best first:\n\n\
+             \x20 1. Put the new logic in the daemon instead — that is the language policy\n\
+             \x20    (.loom/docs/shell-language-policy.md) and it makes this gate a non-event.\n\
+             \x20 2. Remove portable shell elsewhere to pay for it.\n\
+             \x20 3. If the script genuinely must stay shell forever, it may belong in\n\
+             \x20    `bootstrap` or `vendored` rather than `contract` — but that is a claim about\n\
+             \x20    the script, argued in scripts/shell-allowlist.txt, not a way around this\n\
+             \x20    number.\n\
+             \x20 4. If the growth is genuinely right, record it:\n\
+             \x20      UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet\n\
+             \x20    and say WHY in the commit. A reviewer will see the raised number.",
+            budget.portable() - base.portable,
+            base.portable,
+            budget.portable()
+        ));
+    }
+    if budget.total() > base.total {
+        return Err(format!(
+            "total production shell grew by {} code lines ({} -> {}) without portable growing, so \
+             the growth is in the permanent floor (bootstrap/vendored). That is allowed but not \
+             free — record it deliberately and say why.",
+            budget.total() - base.total,
+            base.total,
+            budget.total()
+        ));
+    }
+    if budget.file_count() + 20 < base.files {
+        return Err(format!(
+            "production shell file count fell from {} to {} — verify that is a real removal and \
+             not a scope-filter regression",
+            base.files,
+            budget.file_count()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
