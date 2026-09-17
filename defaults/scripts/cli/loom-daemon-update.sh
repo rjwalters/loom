@@ -888,6 +888,17 @@ verify_artifact_signature() {
             fi
             local desc
             desc="$(codesign -dv "$bin_path" 2>&1 || true)"
+            # Recorded regardless of outcome below (used by
+            # verify_destination_artifact() after provisioning, #8008): whether
+            # the VERIFIED download carried a certificate-anchored (Developer
+            # ID) signature, so a post-provision downgrade to an ad-hoc/no
+            # signature can be caught instead of going unnoticed (the #7932
+            # incident this follows up on).
+            if grep -q '^Authority=' <<<"$desc"; then
+                ARTIFACT_SIGNATURE_HAD_AUTHORITY=true
+            else
+                ARTIFACT_SIGNATURE_HAD_AUTHORITY=false
+            fi
             if grep -q 'code object is not signed at all' <<<"$desc"; then
                 warn "Downloaded artifact is unsigned (no Developer ID secrets were configured for this release) -- proceeding without signature verification, per design (checksum is unconditional; signature is optional)."
                 return 0
@@ -1435,6 +1446,39 @@ verify_destination_artifact() {
         exit 5
     fi
     ok "Post-provision verification: destination binary at $dest is the fetched release artifact ($dest_version)."
+
+    # ---- signature-preservation assertion (Darwin only, #8008) ----
+    # The version-string compare above proves the destination IS the fetched
+    # binary; it says nothing about whether provisioning left its SIGNATURE
+    # intact. #7932 fixed a guard in sign_daemon_binary() that had been
+    # silently ad-hoc-resigning every Developer ID-signed release artifact on
+    # provision since #5020 (a `codesign ... | grep -q` pipe form that always
+    # reported 141 under `set -o pipefail`) -- replacing the
+    # certificate-anchored designated requirement with a per-build cdhash and
+    # orphaning TCC grants on every roll. Nothing caught that regression
+    # because nothing compared the destination's signature against the
+    # verified download's. This closes that gap: only runs when the
+    # pre-provision download demonstrably carried an Authority (set by
+    # verify_artifact_signature() before provisioning); skips silently when
+    # that is unknown (Linux target, or codesign unavailable at download time).
+    if [[ "$ARTIFACT_SIGNATURE_HAD_AUTHORITY" == "true" ]]; then
+        if ! command -v codesign >/dev/null 2>&1; then
+            warn "'codesign' not available -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature)."
+        else
+            local dest_sig_desc
+            # Read-then-match (#6662/#7932): NEVER `codesign ... | grep -q`,
+            # which is exactly the pipefail bug this whole check exists to
+            # guard against (grep -q closes the pipe before codesign finishes
+            # writing, reporting 141 under `set -o pipefail`).
+            dest_sig_desc="$(codesign -dvvv "$dest" 2>&1 || true)"
+            if ! grep -q '^Authority=' <<<"$dest_sig_desc"; then
+                err "Post-provision verification FAILED: the fetched release artifact carried a Developer ID (Authority=) signature, but the provisioned destination at $dest does not."
+                err "Provisioning has DOWNGRADED the signature -- this replaces the certificate-anchored designated requirement with a per-build ad-hoc identity and orphans every TCC grant on this host (the #7932 regression class). Refusing to report success."
+                exit 5
+            fi
+            ok "Post-provision verification: destination binary at $dest retains its Developer ID Authority signature."
+        fi
+    fi
 }
 
 # verify_supervisor_matches_provisioned <provisioned_dest> — the #6009
@@ -2232,6 +2276,16 @@ ARTIFACT_TARGET=""
 ARTIFACT_BIN=""
 ARTIFACT_COMMIT=""
 ARTIFACT_VERSION_OUTPUT=""
+# Darwin-only (#8008): whether the VERIFIED download's `codesign -dv` output
+# carried an `Authority=` line, i.e. a certificate-anchored (Developer ID)
+# signature rather than an ad-hoc/unsigned one. Set by verify_artifact_signature()
+# before provisioning; verify_destination_artifact() asserts against it after,
+# so a post-provision downgrade (the #7932 incident: ad-hoc re-signing a
+# Developer ID-signed release artifact) is caught instead of going unnoticed.
+# Left "" (neither true nor false) on Linux targets and when codesign is
+# unavailable -- both cases where the pre-provision state is unknown, so the
+# post-provision check has nothing to assert against and skips.
+ARTIFACT_SIGNATURE_HAD_AUTHORITY=""
 ARTIFACT_FALLBACK_REASON=""
 # Gap-visibility (#6010): true when the newest resolved release is behind the
 # CURRENT source tree's VERSION file — independent of ARTIFACT_MODE, which
