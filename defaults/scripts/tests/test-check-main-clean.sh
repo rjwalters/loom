@@ -1072,7 +1072,8 @@ printf '{"autonomous":{"model":"opus"}}\n' > "$OVERLAY"
 OVERLAY_CONTENT=$(cat "$OVERLAY")
 
 # Sanity: git really does see it as untracked dirt in this fixture.
-if ! git -C "$REPO" status --porcelain | grep -q '\.loom-local'; then
+RAW_STATUS=$(git -C "$REPO" status --porcelain)
+if ! grep -q '\.loom-local' <<<"$RAW_STATUS"; then
     fail "Test 45 setup: expected an untracked .loom-local/ in a stale-gitignore repo"
 fi
 
@@ -1084,7 +1085,7 @@ if [[ "$RC" -eq 0 ]] \
    && [[ -f "$OVERLAY" ]] \
    && [[ "$(cat "$OVERLAY")" == "$OVERLAY_CONTENT" ]] \
    && [[ "$STASH_COUNT" -eq 0 ]] \
-   && ! echo "$out" | grep -q '\.loom-local'; then
+   && ! grep -q '\.loom-local' <<<"$out"; then
     pass "--quarantine reports clean and leaves .loom-local/local.json in place"
 else
     fail "expected rc=0, overlay intact, no stash; got rc=$RC exists=$([[ -f "$OVERLAY" ]] && echo y || echo n) stashes=$STASH_COUNT out=$out"
@@ -1095,15 +1096,15 @@ fi
 if [[ "$RC" -eq 0 && -f "$OVERLAY" ]]; then
     pass "plain detection also treats .loom-local/ as Loom-owned (exit 0)"
 else
-    fail "expected 0 from plain detection with only .loom-local/ present, got $RC"
+    fail "expected 0 from plain detection with the overlay still present, got rc=$RC overlay_exists=$([[ -f "$OVERLAY" ]] && echo y || echo n)"
 fi
 
 # ...and a real stray alongside the overlay is still caught, naming only itself.
 echo "def widget(): return 42" > "$REPO/leaked_module.py"
 out=$( cd "$REPO" && "$SCRIPT" 2>&1 ); RC=$?
 if [[ "$RC" -eq 3 ]] \
-   && echo "$out" | grep -q "leaked_module.py" \
-   && ! echo "$out" | grep -q '\.loom-local'; then
+   && grep -q "leaked_module.py" <<<"$out" \
+   && ! grep -q '\.loom-local' <<<"$out"; then
     pass "a real stray beside the overlay is still flagged, the overlay is not"
 else
     fail "expected 3 naming only leaked_module.py, got rc=$RC; out=$out"
