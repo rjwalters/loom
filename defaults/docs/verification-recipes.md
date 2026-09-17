@@ -239,6 +239,29 @@ against that — see `loom-daemon/tests/differential_extract_refs.rs` and
 `loom-daemon/tests/fixtures/extract_refs_shell_oracle.jsonl`, which pin the
 three accepted divergences and fail on a fourth.
 
+**Recognise each divergence class by its MECHANISM, not by a property of the
+input that correlates with it.** This is the sharpest trap in the whole recipe,
+and the first version of `differential_extract_refs.rs` fell into it. Its
+newline-spanning class was recognised as *"the port found an extra reference and
+the body contains a newline"* — but 88% of the corpus bodies contain a newline,
+so the class absorbed an extra reference from **any** cause. Measured against
+its own proof mutation, the test caught 9 of the 116 cases the mutation actually
+changed; the other 107 were silently classified as expected.
+
+The fix is to compute what the class can *actually* produce and require the
+observed difference to be a subset of exactly that — here, references the
+pattern matches over the whole text but not within any single line. Same corpus,
+same green baseline, 116 of 116 caught instead of 9.
+
+A class whose test is a property of the input is a hole shaped like a class.
+Check every class you write this way: *if the port changed for an unrelated
+reason, would this class still say "expected"?*
+
+**A difference in rendering is not a difference in findings.** If both sides
+report the same set but different text — ordering, separators, padding — no
+class about *which* references were found explains it. Say so rather than
+letting a coincidentally-applicable class absorb it.
+
 **Every surviving divergence gets written down where the code is**, with the
 direction of its risk. "Kept, because missing a genuine declared reference is
 worse than one extra" is a decision; the same behaviour undocumented is a bug

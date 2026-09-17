@@ -142,7 +142,7 @@ pub fn comment_counts(comment: &Comment, bot_login: &str) -> bool {
 /// `defaults/docs/untrusted-external-content.md`).
 ///
 /// Kept deliberately, and note the direction carefully, because it is NOT the
-/// same call as [`super::cli::parse_refs_arg`], which hard-errors on a token it
+/// same call as `parse_refs_arg` (in [`super::cli`]), which hard-errors on a token it
 /// cannot parse (#8011). That flag carries an OPERATOR's explicit list, where
 /// silently computing over fewer references than were asked for is the
 /// "confident wrong answer". This function scans arbitrary issue bodies and

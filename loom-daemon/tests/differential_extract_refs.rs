@@ -35,6 +35,19 @@
 //! The per-class counts are a characterization, not a contract — they change
 //! when `extract()` legitimately changes. The zero-`UNEXPLAINED` assertion is
 //! the real invariant.
+//!
+//! # Each class is recognised by its mechanism
+//!
+//! Review caught the first version of this test recognising the newline class as
+//! "the port found an extra reference and the body contains a newline". That is
+//! a property of the INPUT, and 88% of these bodies contain a newline, so the
+//! class absorbed an extra reference from any cause — measured against the
+//! case-insensitivity mutation below, it caught 9 of the 116 cases the mutation
+//! actually changed. [`newline_only_refs`] now computes what the class can
+//! genuinely produce, and the extras must be a subset of exactly that: same
+//! green baseline, 116 of 116 caught.
+//!
+//! A class whose test is a property of the input is a hole shaped like a class.
 
 use loom_daemon::dep_recheck::extract::{extract, Input};
 
@@ -103,6 +116,31 @@ fn load_oracle() -> Vec<Case> {
     cases
 }
 
+/// References the phrase pattern finds over the WHOLE text but not within any
+/// single line — exactly what the accepted newline-spanning divergence can
+/// account for, and nothing else.
+///
+/// The shell matched with `grep -oE`, which is line-oriented and cannot span a
+/// newline; the port's regex runs over the concatenated text with `\s` (inside
+/// `[*_:\s]*`) matching `\n`. Normalised through `u64` the way the port does,
+/// so a zero-padded token compares equal to its canonical form.
+fn newline_only_refs(body: &str) -> std::collections::BTreeSet<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:\s]*#([0-9]+)")
+            .expect("static dependency-phrase pattern")
+    });
+    let nums = |text: &str| -> std::collections::BTreeSet<String> {
+        re.captures_iter(text)
+            .filter_map(|c| c.get(2)?.as_str().parse::<u64>().ok())
+            .map(|n| n.to_string())
+            .collect()
+    };
+    let whole = nums(body);
+    let per_line: std::collections::BTreeSet<String> = body.lines().flat_map(nums).collect();
+    whole.difference(&per_line).cloned().collect()
+}
+
 /// Explain every token-level difference between the shell's answer and the
 /// port's, or return `Err` describing the part that no known class covers.
 fn classify(body: &str, shell: &str, rust: &str) -> Result<Vec<Divergence>, String> {
@@ -127,17 +165,29 @@ fn classify(body: &str, shell: &str, rust: &str) -> Result<Vec<Divergence>, Stri
 
     let got: Vec<&str> = rust.split_whitespace().collect();
 
-    let extra: Vec<&&str> = got
+    let extra: Vec<String> = got
         .iter()
         .filter(|t| !normalised.contains(&t.to_string()))
+        .map(|t| (*t).to_string())
         .collect();
     if !extra.is_empty() {
-        if body.contains('\n') {
+        // Recognise the class by its MECHANISM, not by a property of the input
+        // that merely correlates with it. Keying this on `body.contains('\n')`
+        // absorbed an extra ref from ANY cause, because 88% of these bodies
+        // contain a newline — so a later change that stopped dropping overflow
+        // refs, say, would have slipped through silently. Compute instead what
+        // the newline divergence can actually produce, and require the extras
+        // to be a subset of exactly that.
+        let explainable = newline_only_refs(body);
+        let unexplained: Vec<&String> =
+            extra.iter().filter(|t| !explainable.contains(*t)).collect();
+        if unexplained.is_empty() {
             classes.push(Divergence::NewlineSpan);
         } else {
             return Err(format!(
-                "port reported {extra:?} which the shell did not, and the input has no newline \
-                 so the accepted newline-spanning divergence cannot explain it"
+                "port reported {unexplained:?} which the shell did not, and the \
+                 newline-spanning divergence cannot produce them: the pattern does not match \
+                 them across a line break in this input either"
             ));
         }
     }
@@ -151,6 +201,21 @@ fn classify(body: &str, shell: &str, rust: &str) -> Result<Vec<Divergence>, Stri
             "port DROPPED {missing:?}, which the shell found and which parse cleanly as u64 — \
              no accepted class explains losing a declared reference"
         ));
+    }
+
+    // Same reference SET, different string. None of the three accepted classes
+    // is about rendering, so ordering/separator/formatting drift must not be
+    // absorbed by a LeadingZero or OverflowDropped class that merely happened
+    // to apply to this input.
+    if extra.is_empty() && missing.is_empty() {
+        let want = normalised.join(" ");
+        if rust != want {
+            return Err(format!(
+                "port and shell agree on WHICH references were found but render them \
+                 differently: expected {want:?}, got {rust:?} — no accepted class is about \
+                 ordering or formatting"
+            ));
+        }
     }
 
     classes.sort_unstable_by_key(|c| format!("{c:?}"));
