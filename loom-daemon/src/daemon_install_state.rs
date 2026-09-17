@@ -1283,6 +1283,18 @@ struct DomainResolution {
 /// for callers that need to cross-check a negative verdict (#4694) — every
 /// caller in this module uses that detail, so there is no separate
 /// domain-only accessor.
+/// The launchd domain to probe in: the explicit override, else `gui/<uid>`
+/// when that domain resolves, else `user/<uid>`.
+///
+/// `pub(crate)` for the watchdog, which needs the same domain the liveness
+/// probe used so its report and its `launchctl print` name the same service
+/// (#4536 — resolving it twice is how the two came to disagree).
+pub(crate) fn launchd_domain(override_value: Option<&str>) -> String {
+    resolve_launchd_domain_detailed(override_value)
+        .domain
+        .unwrap_or_default()
+}
+
 fn resolve_launchd_domain_detailed(override_value: Option<&str>) -> DomainResolution {
     if let Some(explicit) = override_value.filter(|s| !s.is_empty()) {
         return DomainResolution {

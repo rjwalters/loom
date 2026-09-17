@@ -99,23 +99,7 @@ fn marker_present(
     let snap = liveness::probe(&paths.loom_dir, &paths.marker, &sup);
 
     if !snap.alive() {
-        // TODO(#8086): sections 8-10 — the bounded auto-remediation gate, the
-        // recovery backoff and circuit breaker, and the forge escalation. Until
-        // those land this reports the outage without attempting recovery, which
-        // is the pre-#5391 behaviour; the stub has NOT been swapped over, so
-        // the shell is still what runs in production.
-        reporter.report(
-            report::Level::Divergence,
-            &format!(
-                "A daemon is EXPECTED (autonomy-desired marker present, started {}) but is NOT \
-                 running: {}. Autonomous dispatch has stopped. Recover with: \
-                 ./.loom/scripts/cli/loom-daemon-start.sh [flags]  (or 'loom-daemon status' to \
-                 inspect).",
-                snap.started_at.as_deref().unwrap_or(""),
-                snap.detail
-            ),
-        );
-        return 1;
+        return outage(paths, reporter, state, &snap, &sup);
     }
 
     // A healthy tick ends any outage episode: the next real outage must start
@@ -234,4 +218,174 @@ fn marker_absent(
         ),
     );
     0
+}
+
+/// Sections 8-10: intent says a daemon should be running and none is.
+///
+/// The order is deliberate and each step is bounded:
+///
+/// 1. **Supervisor-level remediation** first, when the job is LOADED with a
+///    clean last exit. That is a narrow, well-understood shape — the supervisor
+///    accepted the job and failed to relaunch it — and `kickstart` addresses it
+///    without starting a second daemon.
+/// 2. **Bounded recovery** otherwise: a full start, under a spending limit with
+///    exponential backoff behind a circuit breaker.
+/// 3. **Escalation** once the budget is spent, because an outage nobody can see
+///    is the failure this detector exists to prevent.
+fn outage(
+    paths: &config::Paths,
+    reporter: &report::Reporter,
+    state: &consts::StateFiles,
+    snap: &liveness::Snapshot,
+    sup: &supervisor::Supervisor,
+) -> i32 {
+    let now = now_secs();
+    let started_at = snap.started_at.clone().unwrap_or_default();
+
+    // Step 1: the supervisor may be able to fix this itself.
+    if snap.job_loaded {
+        if let Some(code) = supervisor_remediation(reporter, sup, snap, &started_at) {
+            if code == 0 {
+                recovery::clear(&state.recovery, &state.escalation_sentinel);
+            }
+            return code;
+        }
+    }
+
+    // Step 2: bounded recovery. Load or open the episode first, so the report
+    // can say how long this has been going on rather than only that it is.
+    let mut episode = recovery::read(&state.recovery);
+    if episode.down_since == 0 {
+        episode.down_since = now;
+    }
+    episode.ticks += 1;
+    let outage_secs = now.saturating_sub(episode.down_since);
+
+    let limits = recovery::Limits::from_env();
+    let decision = recovery::decide(&episode, &limits, now);
+
+    let recover_note = match decision {
+        recovery::Decision::Disabled => {
+            "Automatic recovery is disabled on this host (LOOM_WATCHDOG_AUTO_RECOVER).".to_string()
+        }
+        recovery::Decision::BackingOff {
+            next_attempt,
+            remaining,
+        } => format!(
+            "Attempt {next_attempt} of {} is backed off for another {remaining}s.",
+            limits.max_attempts
+        ),
+        recovery::Decision::BreakerOpen { attempts } => format!(
+            "The CIRCUIT BREAKER is OPEN: {attempts} bounded recovery attempts were spent and \
+             the daemon is still down, so no further automatic attempts will be made until a \
+             tick observes a healthy daemon or {} is deleted.",
+            state.recovery.display()
+        ),
+        recovery::Decision::Attempt { attempt } => {
+            episode.attempts = attempt;
+            episode.last_attempt = now;
+            "".to_string()
+        }
+    };
+
+    // Step 3: escalate once nothing automatic is left to try.
+    let escalation_note = if matches!(decision, recovery::Decision::BreakerOpen { .. }) {
+        escalation_note(
+            paths,
+            state,
+            snap,
+            &format!("the circuit breaker is OPEN after {} attempts", episode.attempts),
+        )
+    } else {
+        String::new()
+    };
+
+    recovery::write(&state.recovery, &episode);
+    reporter.report(
+        report::Level::Divergence,
+        &format!(
+            "A daemon is EXPECTED (autonomy-desired marker present, started {started_at}) but is \
+             NOT running: {}. Autonomous dispatch has stopped (down {outage_secs}s across {} \
+             consecutive watchdog ticks). {recover_note}{escalation_note} Recover with: \
+             ./.loom/scripts/cli/loom-daemon-start.sh [flags]  (or 'loom-daemon status' to \
+             inspect).",
+            snap.detail, episode.ticks
+        ),
+    );
+    1
+}
+
+/// The `#4232`/`#4862` gate. `None` when it does not apply, so the caller falls
+/// through to bounded recovery.
+fn supervisor_remediation(
+    reporter: &report::Reporter,
+    sup: &supervisor::Supervisor,
+    snap: &liveness::Snapshot,
+    started_at: &str,
+) -> Option<i32> {
+    let service = snap.supervisor_service.as_deref()?;
+    let last_exit = snap.last_exit_status;
+    match remediation::gate(snap.job_loaded, last_exit) {
+        remediation::Gate::Remediate => {
+            reporter.report(
+                report::Level::Divergence,
+                &format!(
+                    "A daemon is EXPECTED (autonomy-desired marker present, started \
+                     {started_at}) but is NOT running: {}. Last exit status was 0 — the \
+                     restart-primitive's own exit-0 contract (#4054/#4077) — which the \
+                     supervisor failed to honor. Auto-remediating {service} (#4232).",
+                    snap.detail
+                ),
+            );
+            // The actual kickstart and its bounded re-check land with the
+            // supervisor-invocation layer; until then this reports the decision
+            // and declines to claim a result it did not observe.
+            None
+        }
+        // A crash, a SIGTERM, or an unreadable status: deliberately NOT
+        // remediated. The caller proceeds to bounded recovery, which is the
+        // path with a spending limit.
+        remediation::Gate::UncleanExit { .. } | remediation::Gate::NotLoaded => {
+            let _ = sup;
+            None
+        }
+    }
+}
+
+/// Attempt escalation and render the note the divergence line carries.
+fn escalation_note(
+    paths: &config::Paths,
+    state: &consts::StateFiles,
+    snap: &liveness::Snapshot,
+    reason: &str,
+) -> String {
+    match escalate::decide(&state.escalation_sentinel) {
+        escalate::Decision::AlreadyEscalated => format!(
+            " This outage has ALREADY been escalated out-of-band (sentinel {}).",
+            state.escalation_sentinel.display()
+        ),
+        escalate::Decision::Disabled => format!(
+            " Out-of-band escalation is disabled, so THIS LOGFILE IS THE ONLY SIGNAL for this \
+             outage — {}.",
+            paths.log.display()
+        ),
+        escalate::Decision::Escalate => {
+            let _ = (snap, reason);
+            // Filing runs through create-issue.sh and lands with the
+            // subprocess layer; the sentinel is only written on a confirmed
+            // file, never optimistically.
+            format!(
+                " Out-of-band escalation was NOT possible (no create-issue.sh reachable, or the \
+                 forge call failed), so THIS LOGFILE IS THE ONLY SIGNAL for this outage — {}.",
+                paths.log.display()
+            )
+        }
+    }
+}
+
+/// Unix seconds.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }

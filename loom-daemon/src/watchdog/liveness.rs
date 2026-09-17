@@ -48,6 +48,17 @@ pub struct Snapshot {
     pub heartbeat_stale_threshold_secs: Option<u64>,
     pub heartbeat_file: Option<String>,
     pub process_age_secs: Option<u64>,
+    /// The supervisor knows the job but it has no live pid — "LOADED but NOT
+    /// running". The only state the bounded auto-remediation gate may act on.
+    pub job_loaded: bool,
+    /// The supervisor's name for the job (`gui/501/com.x`, or a systemd unit),
+    /// when one applies. `None` on the pid-file path, where there is no
+    /// supervisor to ask.
+    pub supervisor_service: Option<String>,
+    /// The supervisor's report of how the job last exited. `None` when it could
+    /// not be read — treated as unclean by [`super::remediation::gate`], never
+    /// as clean.
+    pub last_exit_status: Option<i64>,
 }
 
 impl Snapshot {
@@ -107,6 +118,9 @@ pub fn probe(
             heartbeat_stale_threshold_secs: None,
             heartbeat_file: None,
             process_age_secs: None,
+            job_loaded: false,
+            supervisor_service: None,
+            last_exit_status: None,
         };
     }
 
@@ -133,6 +147,21 @@ pub fn probe(
     let process_age = liveness
         .pid
         .and_then(daemon_install_state::process_age_secs);
+
+    // The supervisor's own name for the job, used both in the report and for
+    // the last-exit lookup. Resolved ONCE: #4536 is this repo's receipt for
+    // deriving a launchd domain twice and having the two disagree.
+    let service = if supervisor.use_launchd {
+        Some(format!(
+            "{}/{}",
+            daemon_install_state::launchd_domain(super::env::var("LOOM_LAUNCHD_DOMAIN").as_deref()),
+            supervisor.label
+        ))
+    } else if supervisor.use_systemd {
+        Some(supervisor.systemd_unit.clone())
+    } else {
+        None
+    };
 
     let heartbeat_file = m("heartbeat_file")
         .map_or_else(|| loom_dir.join("daemon.heartbeat"), std::path::PathBuf::from);
@@ -166,7 +195,34 @@ pub fn probe(
         heartbeat_stale_threshold_secs: Some(threshold),
         heartbeat_file: Some(heartbeat_file.display().to_string()),
         process_age_secs: process_age,
+        job_loaded: liveness.job_loaded,
+        supervisor_service: service.clone(),
+        // Only asked when the job is loaded and there is a service to ask
+        // about. A supervisor that has no job has no last exit to report, and
+        // inventing one would hand `gate` the value that licenses a restart.
+        last_exit_status: if liveness.job_loaded {
+            service.as_deref().and_then(supervisor_last_exit)
+        } else {
+            None
+        },
     }
+}
+
+/// Ask the supervisor how the job last exited.
+///
+/// launchd only for now: the systemd equivalent reads `ExecMainCode` and
+/// `ExecMainStatus`, which is a different shape and lands with that branch.
+fn supervisor_last_exit(service: &str) -> Option<i64> {
+    // A systemd unit name has no domain prefix; launchd services always do.
+    if !service.contains('/') {
+        return None;
+    }
+    let mut cmd = std::process::Command::new("launchctl");
+    cmd.args(["print", service]);
+    let out = crate::sweep_registry::output_with_timeout(cmd, std::time::Duration::from_secs(5))
+        .ok()
+        .flatten()?;
+    super::remediation::parse_launchd_last_exit(&String::from_utf8_lossy(&out.stdout))
 }
 
 #[cfg(test)]
@@ -184,6 +240,9 @@ mod tests {
             heartbeat_stale_threshold_secs: None,
             heartbeat_file: None,
             process_age_secs: None,
+            job_loaded: false,
+            supervisor_service: None,
+            last_exit_status: None,
         }
     }
 
