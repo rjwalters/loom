@@ -1738,31 +1738,13 @@ fn test_run_tick_fetch_failure_backs_off_without_falling_back_to_a_build() {
     );
 }
 
-// ---- script-root resolution (the no-source-checkout host) -------------
-
-#[tokio::test]
-async fn test_script_root_falls_back_to_the_workspace_root() {
-    // The host shape this issue exists for: no build-time source checkout
-    // resolvable, but the daemon's own workspace root has the script.
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().to_path_buf();
-    std::fs::create_dir_all(root.join(".loom/scripts/cli")).unwrap();
-    std::fs::write(root.join(".loom/scripts/cli/loom-daemon-update.sh"), "#!/bin/sh\n").unwrap();
-    let bus = Arc::new(EventBus::new());
-    let pool = Arc::new(WorkspacePool::new(bus, tokio::runtime::Handle::current()));
-    let mut probe = ScriptAutoUpdateProbe::new(pool, root.clone());
-    probe.source_root = None;
-    assert_eq!(probe.script_root(), Some(root));
-}
-
-#[tokio::test]
-async fn test_script_root_is_none_without_any_script() {
-    let tmp = tempfile::tempdir().unwrap();
-    let bus = Arc::new(EventBus::new());
-    let pool = Arc::new(WorkspacePool::new(bus, tokio::runtime::Handle::current()));
-    let mut probe = ScriptAutoUpdateProbe::new(pool, tmp.path().to_path_buf());
-    probe.source_root = None;
-    assert_eq!(probe.script_root(), None);
-    // …and a probe with no script resolves no artifact rather than erroring.
-    assert!(matches!(probe.resolve_artifact(), ArtifactResolution::Unresolved(_)));
-}
+// ---- script-candidate resolution (the no-source-checkout host) ---------
+//
+// #7964: these tests live in `script_candidates.rs`'s own test module, not
+// here — this file is over the file-size ratchet's threshold
+// (`.loom/docs/file-size-policy.md`), so new tests go to the sibling module
+// they exercise. See `auto_update::script_candidates::tests`:
+//   - `test_script_candidates_fall_back_to_the_workspace_root`
+//   - `test_mirrored_copy_is_the_last_script_candidate`
+//   - `test_a_stale_workspace_copy_falls_back_to_the_mirrored_copy`
+//   - `test_every_tried_script_is_named_when_all_candidates_are_unusable`

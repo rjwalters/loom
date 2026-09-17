@@ -8722,6 +8722,26 @@ anything about whether a newer signed binary exists.
   place of the source commit, so a host that switches paths mid-streak (a
   release appears) restarts its settle window exactly as it would for a new
   commit.
+- **Three candidate copies of the script, tried in order (#7964).** The tick
+  needs *a* `loom-daemon-update.sh` that understands `--resolve-json`, and the
+  nearest copy is not always one: (1) the build-time source checkout, (2) this
+  daemon's workspace root, (3) the per-machine mirrored `defaults/` payload
+  (`$LOOM_DAEMON_DEFAULTS_DIR`, else `~/.local/share/loom-daemon/defaults` —
+  the same mirror `loom update` maintains; set the variable to the empty string
+  to disable this candidate). A candidate that prints **no usable JSON** — a
+  copy too old to know the flag, a spawn failure, a timeout — is stepped past
+  and the next one is tried; the reason it gave is retained, and if every
+  candidate is unusable the "no artifact" log line names each script path, its
+  origin, and its stderr tail rather than only the first one's. A candidate
+  that prints a well-formed object is **authoritative even when it says
+  `ok:false`** — "no release published yet" is an answer, not a broken script,
+  so the walk stops there instead of spending another `gh` round-trip. The
+  mirror candidate supplies the *script* only: it runs with the same working
+  directory the earlier candidates use, since that is what the script resolves
+  its `REPO_ROOT` from. Why this exists: a host running `LOOM_WORKSPACE`
+  pointed at a consumer repo invoked *that* repo's stale copy, got no JSON, and
+  silently degraded to the source path on every tick for weeks — while a
+  current copy of the identical script sat in the mirror on the same machine.
 - **Reported, not just logged.** `loom-daemon status` (human and `--json`) and
   `loom-daemon health` report `artifact_available` (`version`, `published_at`;
   `null` when none resolved) next to the installed version, so fleet-wide

@@ -135,6 +135,7 @@ use crate::workspace_pool::WorkspacePool;
 
 mod relaunch_verify_note;
 mod resolve_json;
+mod script_candidates;
 
 // ============================================================================
 // Constants
@@ -815,6 +816,16 @@ pub struct ScriptAutoUpdateProbe {
     /// there is no checkout — but the loop never rebuilds in that case anyway
     /// (`update_available` is `None`).
     source_root: Option<PathBuf>,
+    /// The per-machine mirrored `defaults/` payload (#7964): the third — and
+    /// last — place to look for a `loom-daemon-update.sh` that still
+    /// understands `--resolve-json`. `None` disables the strategy (an empty
+    /// `LOOM_DAEMON_DEFAULTS_DIR`, or no resolvable home directory).
+    mirror_root: Option<PathBuf>,
+    /// The candidate the last [`AutoUpdateProbe::resolve_artifact`] got its
+    /// answer from, so the `--fetch` that follows in the same tick runs the
+    /// copy that *worked* rather than re-running the stale one the resolution
+    /// already stepped past. `Mutex` because resolution happens behind `&self`.
+    last_answering: Mutex<Option<script_candidates::ScriptCandidate>>,
     timeout: Duration,
 }
 
@@ -825,6 +836,8 @@ impl ScriptAutoUpdateProbe {
             workspace_pool,
             fallback_root,
             source_root: crate::self_update::source_checkout_root(),
+            mirror_root: crate::init::git::machine_level_defaults_path(),
+            last_answering: Mutex::new(None),
             timeout: DEFAULT_REBUILD_TIMEOUT,
         }
     }
@@ -844,67 +857,69 @@ impl ScriptAutoUpdateProbe {
         None
     }
 
-    /// The checkout the update script is *invoked from* on the ARTIFACT path
-    /// (Issue #7609): the build-time source checkout when it is still present,
-    /// else this daemon's own workspace root.
+    /// Every `loom-daemon-update.sh` worth asking on the ARTIFACT path
+    /// (Issue #7609, extended by #7964), in priority order: the build-time
+    /// source checkout, this daemon's own workspace root, then the
+    /// machine-level mirror — see [`script_candidates`] for why the mirror is
+    /// last and why it borrows an earlier candidate's working directory.
     ///
-    /// The fallback matters precisely because of the hosts this issue exists
-    /// for: a daemon provisioned from a release artifact — or one whose
-    /// `CARGO_MANIFEST_DIR` checkout has moved — has NO
+    /// The non-source candidates matter precisely because of the hosts the
+    /// artifact path exists for: a daemon provisioned from a release artifact
+    /// — or one whose `CARGO_MANIFEST_DIR` checkout has moved — has NO
     /// [`crate::self_update::source_checkout_root`], and would otherwise have
     /// no script to run even though fetching a newer artifact needs nothing
-    /// from a source tree but the script itself. It is deliberately NOT used
-    /// for [`Self::rebuild`]: a source build must happen in the checkout the
-    /// binary was built from, never in some other repo that merely happens to
-    /// be registered.
-    fn script_root(&self) -> Option<PathBuf> {
-        if let Some(root) = self.source_root.clone() {
-            if Self::resolve_script(&root).is_some() {
-                return Some(root);
-            }
+    /// from a source tree but the script itself. They are deliberately NOT
+    /// used for [`AutoUpdateProbe::rebuild`]: a source build must happen in
+    /// the checkout the binary was built from, never in some other repo that
+    /// merely happens to be registered.
+    fn artifact_candidates(&self) -> Vec<script_candidates::ScriptCandidate> {
+        script_candidates::candidates(
+            self.source_root.as_deref(),
+            &self.fallback_root,
+            self.mirror_root.as_deref(),
+            Self::resolve_script,
+        )
+    }
+
+    /// The candidate a `--fetch` should run: whichever copy answered the
+    /// resolution that produced this tick's artifact (`resolve_artifact` always
+    /// runs first), else the highest-priority candidate as a cold-start guess.
+    fn fetch_candidate(&self) -> Option<script_candidates::ScriptCandidate> {
+        if let Some(candidate) = self.last_answering.lock().ok().and_then(|c| c.clone()) {
+            return Some(candidate);
         }
-        if Self::resolve_script(&self.fallback_root).is_some() {
-            return Some(self.fallback_root.clone());
-        }
-        None
+        self.artifact_candidates().into_iter().next()
     }
 }
 
 impl AutoUpdateProbe for ScriptAutoUpdateProbe {
     fn resolve_artifact(&self) -> ArtifactResolution {
-        let Some(root) = self.script_root() else {
-            return ArtifactResolution::Unresolved(
-                "no checkout with a loom-daemon-update.sh could be resolved (neither the \
-                 build-time source checkout nor this daemon's workspace root)"
-                    .to_string(),
-            );
-        };
-        let Some(script) = Self::resolve_script(&root) else {
-            return ArtifactResolution::Unresolved(format!(
-                "loom-daemon-update.sh not found under {}",
-                root.display()
-            ));
-        };
-        match resolve_json::run_resolve_json(&script, &root, ARTIFACT_RESOLVE_TIMEOUT) {
-            Ok((stdout, stderr)) => resolve_json::parse_resolve_json(&stdout, &stderr, &script),
-            Err(reason) => ArtifactResolution::Unresolved(reason),
+        let (resolution, answering) =
+            script_candidates::first_answering(&self.artifact_candidates(), |candidate| {
+                resolve_json::resolve_candidate(candidate, ARTIFACT_RESOLVE_TIMEOUT)
+            });
+        if let Ok(mut last) = self.last_answering.lock() {
+            *last = answering;
         }
+        resolution
     }
 
     fn fetch_artifact(&mut self, low_priority: bool) -> RebuildOutcome {
-        let Some(root) = self.script_root() else {
+        let Some(candidate) = self.fetch_candidate() else {
             return RebuildOutcome::Retryable(
-                "no checkout with a loom-daemon-update.sh could be resolved — cannot fetch"
+                "no loom-daemon-update.sh could be resolved (neither the build-time source \
+                 checkout, this daemon's workspace root, nor the machine-level mirror) — cannot \
+                 fetch"
                     .to_string(),
             );
         };
-        let Some(script) = Self::resolve_script(&root) else {
-            return RebuildOutcome::Retryable(format!(
-                "loom-daemon-update.sh not found under {}",
-                root.display()
-            ));
-        };
-        run_update_script_with(&script, &root, self.timeout, low_priority, &["--fetch"])
+        run_update_script_with(
+            &candidate.script,
+            &candidate.cwd,
+            self.timeout,
+            low_priority,
+            &["--fetch"],
+        )
     }
 
     fn check(&self) -> UpdateCheck {

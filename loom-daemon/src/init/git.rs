@@ -534,7 +534,12 @@ const MACHINE_DEFAULTS_REL: &str = ".local/share/loom-daemon/defaults";
 /// `~/` + [`MACHINE_DEFAULTS_REL`]. Returns `None` when the env var is
 /// explicitly set to an empty string (strategy disabled) or when no home
 /// directory can be determined.
-fn machine_level_defaults_path() -> Option<PathBuf> {
+///
+/// `pub(crate)` since #7964: [`crate::auto_update`]'s third
+/// `loom-daemon-update.sh` candidate is the same mirrored payload, and the two
+/// lookups must not drift apart on the env-var override / `None`-disable
+/// semantics — so there is exactly one resolver, not two.
+pub(crate) fn machine_level_defaults_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var(MACHINE_DEFAULTS_ENV) {
         return if p.is_empty() {
             None
