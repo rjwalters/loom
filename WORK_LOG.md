@@ -7,6 +7,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-17
+- **Issue #7982** (closed): merge-pr.sh should pin the parent ref and warn, instead of blocking every stacked-PR merge
+- **PR #7998**: fix(merge-pr): pin the parent ref and warn instead of blocking stacked merges (#7982)
+- **Issue #7893** (closed): [#4196 Phase 3a] Daemon ChatOps command enum + allowlisted senders + confirm-nonce for inbound safehouse steering
+- **PR #7989**: feat(daemon): closed ChatOps command enum + sender allowlist + confirm-nonce for inbound safehouse steering
+- **Issue #7961** (closed): [epic #7810 PR 4] Port dep-recheck-fingerprint.sh; keep its 104 assertions as the equivalence proof
+- **PR #7969**: feat(daemon): port dep-recheck-fingerprint.sh; keep its 104 assertions as the proof (#7961)
+- **Issue #7980** (closed): Stop asking to approve --force-with-lease on feature branches: guards.forceScope=protected (15 of 15 logged ASKs)
+- **PR #7981**: fix(guards): stop asking to approve --force-with-lease on feature branches (#7980)
 - **Issue #7973** (closed): Guide parse_dependencies reads a CHECKED checklist box as a blocking dependency, auto-unblocking issues whose real gate is prose
 - **PR #8007**: fix(guide): checked checklist boxes no longer count as dependencies
 - **Issue #7818** (closed): post_init managed .gitignore omits .loom/gh-config/ — a resync commit swept a live App installation token into a public repo
