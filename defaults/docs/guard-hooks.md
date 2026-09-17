@@ -156,7 +156,16 @@ outside that array for parsing reasons:
   **deny** by the #7795 sizing pass (see "Ask-tier composition" below) — but
   note that neither joined the *floor*: `cargo-clean-scope-outside-repo` is
   still governed by `guards.cargoCleanScope`, and `git-read-tree` is an ungated
-  deny with a carve-out (`GIT_INDEX_FILE=`), not an unconditional block.
+  deny with a carve-out (`GIT_INDEX_FILE=`), not an unconditional block. Since
+  #7923 that carve-out is **scoped to the invocation** — the assignment must be
+  an assignment prefix of the same simple command (or a genuinely persistent
+  earlier `export`), not merely present somewhere in the command string — and
+  the site sees interpreter-wrapped spellings (`bash -c '…'`, `eval '…'`,
+  a pipeline into `sh`) while no longer firing on quoted prose that only
+  mentions the command. A heredoc body counts as prose only when its
+  **delimiter is quoted** (`<<'EOF'` / `<<"EOF"`): a bare `<<EOF` body is
+  expanded by the shell before the sink ever reads it, so any `$( … )` /
+  backtick span inside one is still scanned as executable text.
 - **The toggleable deny categories**: SQL DDL/DML (`guards.sqlDdl`), the
   cloud/docker ask category (`guards.cloudCli`), rm-scope beyond the
   catastrophic targets (`guards.rmScope`), the generic force-op ask
@@ -389,7 +398,7 @@ to a large number:
 | `ask:<printenv reason>` | 0 | **keep ask** | The **precise** printenv check (#6245): command word literally `printenv`, operand name-matched, two documented non-secret vars allowlisted. Zero hits — its existence is exactly what makes retiring the substring backstop above safe rather than a hole. |
 | `cargo-clean-scope-outside-repo` | 0 | **→ DENY** | Already steered toward two named alternatives (`cargo clean -p <pkg>`, `CARGO_TARGET_DIR`), and refusing is **lossless** — nothing is deleted, the caller just reruns scoped. An ask was the worst of both worlds: headless it blocked anyway with no verdict; interactively it invited a reflex "yes" on a host-wide delete. The `guards.cargoCleanScope` opt-out is unchanged and is named in the denial. |
 | `reversible-gh:<pattern>` | 0 | **keep ask** | Only executes when a repo **opts in** (`guards.reversibleGh:true`, default off). A repo that opts into a confirmation wants the confirmation; converting it to a deny would make the toggle meaningless. |
-| `git-read-tree` | 0 | **→ DENY** | #3637's stated reason for the middle tier ("an isolated form is legitimate") argues for the **carve-out**, not the prompt: an isolated `GIT_INDEX_FILE=` form never reaches this check. What reaches it would clobber the real index with no reflog trace; refusing is lossless and both replacements are named. Scripted-merge shapes (`read-tree -m -u`) must now say which index they mean. |
+| `git-read-tree` | 0 | **→ DENY** | #3637's stated reason for the middle tier ("an isolated form is legitimate") argues for the **carve-out**, not the prompt: an isolated `GIT_INDEX_FILE=` form never reaches this check. What reaches it would clobber the real index with no reflog trace; refusing is lossless and both replacements are named. Scripted-merge shapes (`read-tree -m -u`) must now say which index they mean. **Follow-up (#7923)**: promoting the site to a deny made its two context-blind substring tests load-bearing, and both were wrong in both directions — quoted documentation that merely *mentioned* the phrase was hard-denied (blocking `gh issue create --body`/`gh pr comment --body` about this guard), while `bash -c '…'` / `sh -c "…"` / `eval '…'` escaped it entirely and a `GIT_INDEX_FILE=` substring from *anywhere* authorized an unrelated invocation. Both tests were replaced by `index_mutation_unisolated()`, a structural pass over simple commands, interpreter wrappers, substitutions and heredocs. |
 | `stash-scope:main-checkout` | 8 | **keep ask** | **Do not weaken** — #5754's telemetry-backed verdict, reaffirmed here on fresh data. All 8 hits were genuine main-checkout `git stash pop`/`drop`. A deny is wrong in the other direction: `refs/stash` has **no sanctioned reader other than a pop**, so denying converts "ask a human" into "lose the work". The lossless half of this hazard is already a deny (`stash-scope:create-redirect`). |
 | `stash-scope:worktree-collision` | 4 | **keep ask** | Same reasoning, same source verdict (#5754/#4821, reaffirmed by #6785): this is the **recovery** half of the cycle, and the create half is where the lossless block belongs. Two hits are genuine cross-worktree stash recovery; the other two (both 2026-09-07) are a `grep`/`awk` **search pattern** quoting a test-case name, already fixed by the `COMMAND_STASH_SCAN` masking merged 2026-09-08 (#7363/#7366) — no hits since. The curator's first-pass table nominated both stash sites for promotion on the "names an alternative" test; the alternative they name is *preventive*, not a recovery path for WIP already on the shared stack, so the test does not apply. |
 | `stash-scope:cd-unresolved` | 1 | **keep ask** | The ambiguity fail-safe for the two sites above. One hit in 30 days. Dropping it to allow would silently permit a stash pop/drop/clear whose scope could not be determined. |
