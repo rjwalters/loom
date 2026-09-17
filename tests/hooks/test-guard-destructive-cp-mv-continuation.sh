@@ -131,7 +131,7 @@ assert_deny "cp-mv-continuation (h) SAFETY: backslash-newline inside a quoted sp
 # match inside it, so this fix must not alter its verdict either way (still
 # allow: /tmp is outside the main checkout entirely).
 CMD_I="sed -i '' 's/from foo import bar/from foo_v2 import bar/' /tmp/run_test.py
-cat /tmp/run_test.py | head -3"
+head -3 /tmp/run_test.py"
 assert_allow "cp-mv-continuation (i) regression guard: unrelated sed -i /tmp write (no continuation) is unaffected by this fix -> allow" \
     "$CMD_I" "$WT_REPO"
 
