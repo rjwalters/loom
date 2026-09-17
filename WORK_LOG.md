@@ -7,6 +7,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-16
+- **Issue #7874** (closed): flaky: test-rebase-stacked-children.sh source-guard assertions fail under concurrency in run-ci-suites.sh
+- **PR #7963**: fix(tests): make assert_contains fork-free to kill source-guard flake under CI concurrency
+- **Issue #7949** (closed): docs(token-pool): correct the kicad-tools#5333 comment count in the #7860 forensic record (1,316 -> 187)
+- **PR #7958**: docs(token-pool): fix kicad-tools#5333's comment count (1,316 -> 187) in the #7860 record
+- **Issue #7960** (closed): sweep-lease-fence.sh: repo_args[@] unbound variable makes check fail open on every no-repo run
+- **Issue #7929** (closed): epic #7810 PR 3: retire classify-dependency-block.sh + its two sourced helpers (861 code lines) into loom-daemon
+- **Issue #7948** (closed): main is red: sweep_md_doc_lint asserts on sweep.md prose that #7726/#7759 moved into sweep-wave-lifecycle.md
+- **Issue #7927** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
+- **Issue #7911** (closed): [Epic #7810] Phase 1: Lossless subprocess boundary
 - **Issue #7860** (closed): Investigate blocked-label removal and rapid redispatch on kicad-tools#5333
 - **PR #7946**: fix(daemon): stop the pool's own diagnostic from masking a token-selection death as account exhaustion
 - **PR #7943**: feat(daemon): port both dependency-helper scripts' pure logic, with differential proofs against the shell (#7929)
