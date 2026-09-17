@@ -152,3 +152,29 @@ fn a_body_only_document_decodes() {
     let i: Input = serde_json::from_str(r#"{"body":"Blocked by #7"}"#).unwrap();
     assert_eq!(extract(&i, DEFAULT_BOT_LOGIN), "7");
 }
+
+// ---------------------------------------------------------------------------
+// #8011: undisclosed divergences from the pre-port shell
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_phrase_and_its_reference_may_be_split_across_a_newline() {
+    // The pre-port shell's `grep -oE` was line-oriented and could never see
+    // this; kept intentionally (fail-safe direction — see `phrase_re`'s doc).
+    assert_eq!(refs("Blocked by\n#42", vec![]), "42");
+}
+
+#[test]
+fn bot_login_normalises_symmetrically_on_both_sides() {
+    // The shell only normalised the comment AUTHOR's app/[bot] shape, not the
+    // supplied --bot-login itself, so passing the "app/"-prefixed spelling
+    // would never have matched a bare-login author. Both sides go through
+    // `normalise_login` here, so it does (arguably a fix, see its doc).
+    let i = input("clean body", vec![comment("loom-fleet-dispatch", "Depends on #93")]);
+    // Without the flag (default bot login, already bare) the comment is
+    // excluded, as it always was.
+    assert_eq!(extract(&i, DEFAULT_BOT_LOGIN), "");
+    // With the "app/"-prefixed spelling of the SAME identity, it is now also
+    // excluded — the shell's asymmetric normalisation would have missed this.
+    assert_eq!(extract(&i, "app/loom-fleet-dispatch"), "");
+}

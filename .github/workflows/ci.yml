@@ -736,12 +736,16 @@ jobs:
     # over a `loom-daemon` subcommand, so each needs a BUILT binary — which
     # shell-suite-tests deliberately has no Rust toolchain for.
     #
-    # The three original suites' 261 assertions were written against
+    # The original three suites' assertions were written against
     # classify-dependency-block.sh / detect-dependency-cycle.sh /
     # detect-startable-subset.sh; those are now thin stubs over
     # `loom-daemon classify-dependency-block` et al., and the same assertions
-    # run unchanged against the Rust port. That is what makes deleting 861
-    # lines of decision logic checkable rather than asserted.
+    # run unchanged against the Rust port. That is what makes deleting hundreds
+    # of lines of decision logic checkable rather than asserted. Epic #7810's
+    # later phases added more suites the same way: dep-recheck-fingerprint.sh
+    # (PR 4, `loom-daemon/src/dep_recheck/`), the premise-false interaction
+    # suite (#7904), and loom-daemon-update --resolve-json (#7609/#7977). Every
+    # step below is one of these thin-stub-over-native-port suites.
     #
     # They live here rather than in shell-suite-tests because they need a BUILT
     # loom-daemon, and that job deliberately has no Rust toolchain. Each suite
@@ -749,8 +753,8 @@ jobs:
     # by quietly running nothing.
     #
     # Triggered by `backend` as well as `scripts`: a Rust-only change to
-    # loom-daemon/src/dep_classify/ is exactly the change that can break them,
-    # and it touches no shell at all.
+    # loom-daemon/src/dep_classify/ or loom-daemon/src/dep_recheck/ is exactly
+    # the change that can break these suites, and it touches no shell at all.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

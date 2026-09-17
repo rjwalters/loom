@@ -146,8 +146,20 @@ fn a_pr_or_issue_token_before_the_reference_is_tolerated() {
 
 #[test]
 fn both_bullet_markers_and_leading_indentation_are_accepted() {
+    // #8011: the pre-port shell's `_extract_named_deps` matched only a literal
+    // `-` bullet; accepting `*` too (valid GitHub task-list syntax) is kept
+    // intentionally rather than narrowed back — see `item_re`'s doc.
     let body = "## Dependencies\n  - [ ] #3: x\n* [ ] #4: y\n";
     assert_eq!(parse_entries(body), vec![(3, false), (4, false)]);
+}
+
+#[test]
+fn an_asterisk_bullet_alone_still_computes_the_verdict_correctly() {
+    // #8011's own repro: a `*`-only checklist with one still-OPEN reference.
+    let body = "### Dependencies\n* [ ] #123: asterisk bullet\n";
+    assert_eq!(parse_entries(body), vec![(123, false)]);
+    let o = compute(&[dep(123, false, Some("OPEN"))]);
+    assert_eq!(o.verdict, "blocked");
 }
 
 #[test]

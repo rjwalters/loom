@@ -96,6 +96,28 @@ fn a_safe_word_is_left_bare() {
     assert_eq!(shell_quote("7"), "7");
 }
 
+// ---------------------------------------------------------------------------
+// `--refs` token parsing (#8011)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_refs_token_must_parse_as_a_number() {
+    // The shell original iterated `for ref in $REFS_ARG` and `_die`d (exit 1)
+    // the moment a token failed both `gh issue view`/`gh pr view` — which a
+    // non-numeric token always would. Silently dropping it instead (as a bare
+    // `.filter_map(|t| t.parse().ok())` does) computes a fingerprint over
+    // fewer references than the caller asked for: a confident wrong answer.
+    assert!(super::parse_refs_arg("abc").is_err());
+    assert!(super::parse_refs_arg("123 abc").is_err());
+    assert!(super::parse_refs_arg("abc 123").is_err());
+}
+
+#[test]
+fn a_refs_list_of_valid_numbers_parses_in_order() {
+    assert_eq!(super::parse_refs_arg("123 456").unwrap(), vec![123, 456]);
+    assert_eq!(super::parse_refs_arg("").unwrap(), Vec::<i64>::new());
+}
+
 #[test]
 fn a_backslash_in_a_multi_line_value_is_escaped_before_the_newline_is() {
     // Order matters inside the `$'...'` form: escaping the newline first and

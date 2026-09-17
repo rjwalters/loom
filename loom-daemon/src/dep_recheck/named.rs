@@ -37,13 +37,23 @@ pub struct Outcome {
     pub conclusion_hash: String,
 }
 
-/// A checklist item: `- [ ] #123: ...`, with an optional case-insensitive
-/// `PR `/`Issue ` token before the `#N`.
+/// A checklist item: `- [ ] #123: ...` or `* [ ] #123: ...`, with an optional
+/// case-insensitive `PR `/`Issue ` token before the `#N`.
 ///
 /// The optional token is #7501: curator prose naturally varies ("PR #N",
 /// "Issue #N"), and silently dropping such an item produces a false
 /// `VERDICT=clear` — which can unblock a Builder that is genuinely blocked.
 /// Being slightly too permissive is the better failure direction here.
+///
+/// **Divergence from the pre-port shell (#8011, kept intentionally):** the
+/// shell's `_extract_named_deps` matched only a literal `-` bullet;
+/// `[-*]` here also accepts `*`, which is valid GitHub task-list syntax and
+/// shows up in hand-written Curator checklists. Narrowing back to `-`-only
+/// would silently drop a real `* [ ] #N: ...` dependency and manufacture a
+/// false `VERDICT=clear` — the same worse-failure-direction argument as the
+/// `PR `/`Issue ` token above — so the broader match is kept rather than
+/// narrowed. This changes `CONCLUSION_HASH` for any body that happens to use
+/// `*` bullets in its `## Dependencies` section.
 fn item_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
