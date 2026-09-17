@@ -70,6 +70,10 @@ pub(crate) enum ScriptPortCommand {
     /// the predicate holds, 1 when it does not — an answer, not an error.
     #[command(subcommand)]
     RetryClassify(super::retry_classify::RetryClassifyCommand),
+    /// Host-side autonomy-loss detector (#8086), backing
+    /// `loom-daemon-watchdog.sh`. Run by a launchd/systemd timer on a
+    /// `StartInterval` cadence, so it owns no long-lived process.
+    DaemonWatchdog(super::watchdog::WatchdogArgs),
 }
 
 impl ScriptPortCommand {
@@ -86,6 +90,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
+            ScriptPortCommand::DaemonWatchdog(args) => args.run(),
         }
     }
 }
