@@ -4409,7 +4409,7 @@ fi
 # Authority= line for every target, so this is the "signed-to-signed" no-op
 # case the new check must stay silent-success on.
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outN" | grep -q 'retains its Developer ID Authority signature'; then
+if grep -q 'retains its Developer ID Authority signature' <<< "$outN"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} macOS artifact signed: post-provision signature-preservation check ran and confirmed no downgrade"
 else
@@ -4838,8 +4838,8 @@ rcV=$(echo "$outV" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "5" "$rcV" "macOS signature-preservation: Authority pre-provision, ad-hoc post-provision hard-fails (exit 5)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outV" | grep -q 'Post-provision verification FAILED.*Developer ID (Authority=) signature' \
-    && echo "$outV" | grep -q 'DOWNGRADED the signature'; then
+if grep -q 'Post-provision verification FAILED.*Developer ID (Authority=) signature' <<< "$outV" \
+    && grep -q 'DOWNGRADED the signature' <<< "$outV"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} macOS signature-preservation: downgrade reported explicitly, names the #7932 regression class"
 else
