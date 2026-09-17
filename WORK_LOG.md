@@ -6,7 +6,31 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-17
+- **Issue #7954** (closed): version-check-gate.sh still prints Fix: ./scripts/version.sh bump patch, the hand-bump #7743 forbids
+- **PR #7975**: fix(version-check-gate): stop recommending the #7743-forbidden hand-bump
+- **Issue #7957** (closed): bug(sweep-lease-fence): empty repo_args[@] is an unbound variable under bash 3.2, so the pre-push fence fails open whenever --repo is omitted
+- **PR #7976**: fix(sweep-lease-fence): guard empty repo_args[@] against bash 3.2 unbound-variable
+- **Issue #7498** (closed): guard: seven more index() presence checks share the #7495 escaped-vs-live substitution bug
+- **PR #7967**: fix(guard): distinguish escaped from live $(/backtick in guard-destructive-generic.sh masking gates
+
 ### 2026-09-16
+- **Issue #7968** (closed): sweep-lease-fence.sh: "repo_args[@]: unbound variable" on bash 3.2 makes `check` fail open on the default invocation
+- **Issue #7919** (closed): check-defaults-version-bump.sh default mode advises a VERSION bump that CI's --forbid-bump job rejects
+- **PR #7956**: fix(defaults): check-defaults-version-bump.sh default-mode FAIL no longer advises a bump CI's --forbid-bump rejects
+- **Issue #7921** (closed): champion-epic: N=2 escalation has no escape hatch for a same-day operator un-park ruling, re-escalates repeatedly (3x in one day)
+- **Issue #7734** (closed): fix(champion): epic-escalation path re-applies loom:operator-* to an epic already resting on loom:blocked
+- **PR #7962**: fix(champion): stop the epic escalation ladder from re-fighting a human ruling
+- **Issue #7836** (closed): judge.md/doctor.md/CLAUDE.md rebase recipes still bump version-bearing files, now forbidden by #7743
+- **PR #7959**: docs: stop rebase recipes telling agents to run version.sh bump
+- **Issue #7839** (closed): check-doc-anchors.sh (lychee) strips underscores from heading anchors, false-positiving on pre_tool_use / CODEX_HOME
+- **Issue #7776** (closed): merge-pr.sh: pipefail + grep -o no-match silently kills the whole script (champion-hold-state check)
+- **Issue #7657** (closed): Champion: close a proposal whose central premise is verified false instead of escalating it as an operator decision
+- **PR #7904**: feat(champion): close proposals whose central premise is verified false
+- **Issue #7814** (closed): add_worker.rs hard-codes operator identity defaults (feed egress sink URL, deny patterns) outside the #6650 scrub
+- **PR #7917**: fix(fleet): stop shipping this fleet's identity as `add-worker` egress defaults
+- **Issue #7834** (closed): test-loom-daemon-watchdog.sh: #7508 heredoc-body static scan passes vacuously for the read -d '' <<EOF || true bodies
+- **PR #7910**: test(watchdog): detect read -d '' heredoc openers in the #7508 body scan
 - **Issue #7874** (closed): flaky: test-rebase-stacked-children.sh source-guard assertions fail under concurrency in run-ci-suites.sh
 - **PR #7963**: fix(tests): make assert_contains fork-free to kill source-guard flake under CI concurrency
 - **Issue #7949** (closed): docs(token-pool): correct the kicad-tools#5333 comment count in the #7860 forensic record (1,316 -> 187)
