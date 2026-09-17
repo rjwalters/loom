@@ -107,9 +107,14 @@ if grep -q "git add -A" <<< "$OUT"; then
 else
     fail "(#7818) no 'git add -A' suggestion found at all — test fixture/assumptions are stale (out=$OUT)"
 fi
+# Capture the `git add -A` line plus its continuation ONCE into a variable and
+# match against that, rather than piping `grep -A1` into `grep -qF`: a pipe into
+# an early-exit consumer under `pipefail` can SIGPIPE the producer and report a
+# spurious failure (scripts/check-pipefail-early-exit.sh, #7790).
+ADD_LINE_CTX="$(grep -A1 "git add -A" <<< "$OUT")"
 if grep -q "git add -A" <<< "$OUT" && \
-   grep -A1 "git add -A" <<< "$OUT" | grep -qF -- ":!.loom/gh-config" && \
-   grep -A1 "git add -A" <<< "$OUT" | grep -qF -- ":!.loom/gh-config-by-owner"; then
+   grep -qF -- ":!.loom/gh-config" <<< "$ADD_LINE_CTX" && \
+   grep -qF -- ":!.loom/gh-config-by-owner" <<< "$ADD_LINE_CTX"; then
     pass "(#7818) the git add -A line's own pathspec excludes both .loom/gh-config and .loom/gh-config-by-owner"
 else
     fail "(#7818) the git add -A suggestion does not exclude the credential trees (out=$OUT)"
