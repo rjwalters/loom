@@ -65,6 +65,26 @@
 # flag.
 #
 # Exit codes: 0 = within budget; 1 = a file grew or newly crossed; 2 = bad args.
+#
+# --- Correctness-PR exemption decision (#7992) ------------------------------
+#
+# Recorded decision: there is NO exemption from this ratchet for a PR that is a
+# pure correctness fix, even when the fix requires adding explanatory text
+# (e.g. a paragraph documenting why a bug happened, so it does not recur). Such
+# a PR must trim an equal or greater amount from the same file, split the
+# addition into a new sibling doc (the two remediation options already in the
+# FAIL message below), or run --update after a deliberate, reviewed size
+# increase — never silently.
+#
+# Why "no exemption" rather than a carve-out: a "was this PR purely a
+# correctness fix" predicate is not mechanically checkable from a diff, so
+# leaving the question open means every trim-vs-explain tradeoff gets
+# re-litigated from scratch by whichever agent hits it (see #7959, #7962,
+# #7967 for three PRs that each argued this independently before it was
+# written down). A flat "no exemption, trim elsewhere" is mechanically
+# enforceable and consistent across agents. This does not preclude revisiting
+# the decision later — but that revisit should update this comment, not
+# happen silently PR by PR.
 
 set -euo pipefail
 
