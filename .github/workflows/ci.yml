@@ -332,6 +332,29 @@ jobs:
       - name: Check markdown token budget
         run: bash scripts/check-markdown-token-budget.sh
 
+  role-prompt-budget:
+    name: Role Prompt Prefix Ratchet
+    # The aggregate the per-file Markdown Token Ratchet above cannot see
+    # (#8053): the SUM of everything ONE spawned role session injects before it
+    # reads a line of its issue — the role prompt, every sibling that prompt
+    # always loads, and both CLAUDE.md files. Measured over 28 days of
+    # transcripts, ~91% of fleet cost-equivalent is cache writes + cache reads
+    # of exactly that prefix (output is ~9%), at 50-170k fresh tokens/session.
+    # A per-file ratchet is blind to it: split a 3k file into three 1k files and
+    # every per-file number goes DOWN while the role's total goes UP.
+    #
+    # Needs no toolchain, same as the sibling budget jobs: a grep/wc scan over
+    # `git ls-files` with no cargo step and no loom-daemon binary.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Self-test first: a ratchet that silently stops resolving a role's file
+      # set reports OK forever while the prefix it guards keeps growing.
+      - name: Self-test the ratchet
+        run: bash scripts/check-role-prompt-budget.sh --self-test
+      - name: Check per-role prompt prefix budget
+        run: bash scripts/check-role-prompt-budget.sh
+
   conflict-markers:
     name: Conflict Marker Check
     # Cheap structural check; always runs, on every path group. #6499: an
