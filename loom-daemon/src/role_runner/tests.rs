@@ -584,104 +584,6 @@ fn test_invoke_recovers_within_one_tick_once_the_pool_is_readmitted() {
     }
 }
 
-/// Shared fixture for the #5028 end-to-end mismatch tests: a workspace
-/// admitted onto the `codex` runtime for `judge`, with a real per-repo
-/// token pool (so the #4642 preflight does not short-circuit first) and a
-/// fake `spawn-worker.sh` (the actual script `resolve_spawn_bin` resolves
-/// and `invoke` runs — mirrors `mixed_runtime_role_launch_is_admitted_and_pinned_before_spawn`)
-/// that writes a marker file if it is ever actually invoked — proving a
-/// refused launch never reaches the spawn.
-fn setup_codex_judge_fixture(root: &Path, config_extra: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    for sub in [
-        ".loom/roles",
-        ".loom/runtimes",
-        ".loom/scripts",
-        ".loom/tokens",
-    ] {
-        fs::create_dir_all(root.join(sub)).unwrap();
-    }
-    fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
-    write_config(
-        root,
-        &format!(r#"{{"runtimes":{{"roles":{{"judge":"codex"}}}}{}}}"#, config_extra),
-    );
-    fs::write(root.join(".loom/roles/judge.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
-    fs::write(
-        root.join(".loom/runtimes/codex.json"),
-        r#"{"runtime":"codex","capabilities":{}}"#,
-    )
-    .unwrap();
-    // Admission (`resolve_and_admit`) validates that the `codex` adapter
-    // file exists on disk before admitting the runtime at all — it is
-    // never actually exec'd in this fixture (that's `spawn-worker.sh`
-    // below), but its mere absence would itself refuse the launch with a
-    // `RuntimeRejected`, which is not what these tests are exercising.
-    let adapter = root.join(".loom/scripts/spawn-codex.sh");
-    fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let marker = root.join("spawn-ran");
-    let worker = root.join(".loom/scripts/spawn-worker.sh");
-    fs::write(&worker, format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display())).unwrap();
-    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
-    marker
-}
-
-/// Issue #5028 (#5001 AC2/AC3): `runtimes.roles.judge = "codex"` with NO
-/// `autonomous.roleRunner.roleModels.judge` override resolves the
-/// Claude-shaped default model (`sonnet`) for a role admitted onto Codex —
-/// a provable, doomed launch. `invoke` must refuse it as
-/// `ModelRuntimeMismatch` BEFORE the spawn, never create the adapter's
-/// marker file, and increment the dedicated skip counter — never a bare
-/// `Failure`/`RuntimeRejected`.
-#[test]
-#[serial]
-fn test_invoke_refuses_a_provable_model_runtime_mismatch_before_spawning() {
-    let _env_guard = ClearedLoomRuntimeEnv::new();
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let marker = setup_codex_judge_fixture(root, "");
-
-    let before = model_runtime_mismatch_skip_count();
-    let mut runner =
-        ScriptRoleInvocationRunner::new(root.to_path_buf()).with_timeout(Duration::from_secs(5));
-    let outcome = runner.invoke("judge", "/loom:judge");
-
-    let RoleTickOutcome::ModelRuntimeMismatch(mismatch) = outcome else {
-        panic!("expected ModelRuntimeMismatch, got {outcome:?}");
-    };
-    assert_eq!(mismatch.role, "judge");
-    assert_eq!(mismatch.runtime, "codex");
-    assert_eq!(mismatch.model, "sonnet", "the unfixed Claude-shaped default");
-    assert!(!marker.exists(), "a doomed launch must never actually spawn the adapter");
-    assert_eq!(model_runtime_mismatch_skip_count(), before + 1);
-}
-
-/// Issue #5028: the SAME fixture with `roleModels.judge` pointed at a
-/// Codex-valid model spawns successfully — proving the check is a
-/// targeted refusal, not a blanket block on Judge-on-Codex, and that it
-/// self-heals the moment the config is corrected (no restart needed).
-#[test]
-#[serial]
-fn test_invoke_succeeds_once_role_models_supplies_a_matching_model() {
-    let _env_guard = ClearedLoomRuntimeEnv::new();
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let marker = setup_codex_judge_fixture(
-        root,
-        r#","autonomous":{"roleRunner":{"roleModels":{"judge":"gpt-5-codex"}}}"#,
-    );
-
-    let mut runner =
-        ScriptRoleInvocationRunner::new(root.to_path_buf()).with_timeout(Duration::from_secs(5));
-    let outcome = runner.invoke("judge", "/loom:judge");
-
-    assert_eq!(outcome, RoleTickOutcome::Success);
-    assert!(marker.exists(), "a matching model must let the launch actually spawn");
-}
-
 #[test]
 fn test_invoke_success_on_zero_exit() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5252,6 +5154,7 @@ fn shrinking_the_ring_reassigns_the_departed_hosts_slice_to_the_survivor() {
     }
 }
 
+mod model_resolution;
 mod roster_fence;
 
 // ===================================================================
