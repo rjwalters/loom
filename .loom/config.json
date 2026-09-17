@@ -42,6 +42,7 @@
   },
   "guards": {
     "sqlDdl": false,
+    "forceScope": "protected",
     "decisionLog": true
   },
   "terminals": [
