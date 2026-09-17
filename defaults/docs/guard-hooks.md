@@ -379,7 +379,7 @@ to a large number:
 | Site (decision tag) | Hits / 30d | Disposition | Reason |
 |---|---|---|---|
 | `cloud-delete-ask` (`az`/`gcloud … delete`) | 0 | **keep ask** | Irreversible external effect; deliberately ungated so `guards.cloudCli:false` cannot bypass it (#4216 chose this tier on purpose, to preserve an interactive confirm on a *security-positive* operation). Zero friction to remove. |
-| `force-op:all` | 0 | **keep ask** | Only reachable in `guards.forceScope:"all"`. The fleet ships `LOOM_FORCE_SCOPE=protected`, so it never fires here. Flipping the *shipped* default to `"protected"` is a separate, already-documented policy decision (see "Force-Op Branch Scope Guard" below), not a conclusion this data supports. |
+| `force-op:all` | 0 | **keep ask** | Only reachable in `guards.forceScope:"all"`, which this repo no longer runs (#7980). The `0` here is this table's own 30-day window; the separate figure quoted under "Force-Op Branch Scope Guard" below is from a different log and a different window, and the two are not comparable — see that section for which file and dates it names. Flipping the *shipped* default to `"protected"` is a separate, already-documented policy decision (see "Force-Op Branch Scope Guard" below), not a conclusion this data supports. |
 | `force-op:detached` | **25** (all pre-#7533) | **keep ask** | The largest single ask source — and a **precision** bug, not a tier error, that is **already fixed**. 22 of the 25 hits are `git -C "$WORKTREE_ABS" reset --hard origin/feature/issue-N` (a builder resetting its *own* worktree to its *own* branch, where the guard could not resolve the `-C` **variable** and so failed toward asking); the other 3 are the guard's own test harnesses. #7530 / PR #7533 extended the safe-list to a worktree's own branch and merged 2026-09-15; the **last logged hit is 2026-09-12**, so this count is a record of a closed defect, not live friction. What remains is the fail-safe for *ambiguous* branch identity — the one case the floor's literal `origin main`/`origin master` patterns cannot cover — so dropping it to allow would silently permit an unresolvable force op against a protected branch. |
 | `force-op:protected` | 5 | **keep ask** | Fires only on a resolved protected-branch target and names it. Four hits are unambiguously genuine (`git reset --hard origin/main` ×3, `HEAD~1` ×1); the fifth (`origin/feature/issue-6752`, 2026-08-22) is the same pre-#7533 own-branch gap as the row above. A deny would break a legitimate operator resync. |
 | `ask:<pattern>` — `ASK_PATTERNS` loop (11 patterns: `git clean -fd`, `git checkout .`, `git restore .`, `gh release delete`, `aws iam delete`, 3× `kubectl`, 2× `sky`, `cat …/.aws/credentials`) | 0 | **keep ask** | Every member is irreversible or credential-bearing, and the whole array fired zero times. No measured cost to keep. |
@@ -1167,6 +1167,33 @@ rebase/amend/reset workflow. The genuinely dangerous case is a force op against 
 The shipped default is **`"all"`** — a zero-config install sees **no behaviour
 change**. Consumers who want the autonomous-friendly behaviour opt in explicitly
 (`guards.forceScope: "protected"` in `.loom/config.json`).
+
+**This repo runs `"protected"`** (#7980). The fleet already shipped
+`LOOM_FORCE_SCOPE=protected` to *dispatched* agents, but that env var never
+reached an interactive operator session — so every stacked-PR
+`git push --force-with-lease origin feature/issue-N` still stopped and asked,
+and a human answered yes.
+
+The decision log sized that gap. **Which log matters**: the hook writes to
+`<its own checkout>/.loom/logs/guard-decisions.log`, so every worktree keeps a
+separate one and no single file is authoritative for the host. The figure below
+is from the **primary clone's** log
+(`/Users/joseph/dev/loom/.loom/logs/guard-decisions.log`) over
+2026-09-16T03:12Z–2026-09-17T05:12Z: **17 of 18 ASKs were `force-op:all`**,
+every one an own-branch force op. (The 18th is a `force-op:detached` ask —
+which `"protected"` still raises, by design.) A reviewer on another checkout
+will see different counts from their own log; treat this as a measurement of
+this session's traffic, not a host-wide constant.
+
+Setting it in `.loom/config.json` closes the gap for every session shape at
+once. It changes nothing about the protected set: **no protected-branch force
+op moves from deny or ask to allow.** Note the precise tiers, since "still
+denies" would overstate it — only the six literal
+`git push --force|-f|--force-with-lease origin main|master` forms are
+`ALWAYS_BLOCK` hard denies; every other default-branch-targeting form
+(`HEAD:main`, `+main`, a flag after the refspec, `--force-with-lease=…`, and
+`git reset --hard` on `main`) **asks** via `force-op:protected`, in this mode
+as before.
 
 **Protected set & branch resolution**:
 - Protected branches = the repo default branch (detected offline via
