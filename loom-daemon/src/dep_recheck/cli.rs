@@ -185,17 +185,35 @@ fn run_dep_recheck(cwd: &Path, opts: &Opts, stdin_text: Option<&str>) -> Result<
     Ok(0)
 }
 
+/// Parse `--refs`'s whitespace-separated token list into issue/PR numbers.
+///
+/// # Errors
+///
+/// One message per bad token, fail-safe like every live read in this module
+/// (see `forge`'s module doc): a token that is not `[0-9]+` cannot be resolved
+/// via `gh issue view`/`gh pr view` any more than the shell original's could,
+/// so — like the shell's own `_die` on that same failed lookup (#8011) — it
+/// must be a hard error here, not silently dropped from the computed set. A
+/// fingerprint computed over fewer references than the caller actually asked
+/// for is exactly the "confident wrong answer" that doc warns against.
+fn parse_refs_arg(s: &str) -> Result<Vec<i64>, String> {
+    s.split_whitespace()
+        .map(|t| {
+            t.parse::<i64>().map_err(|_| {
+                format!(
+                    "--refs token '{t}' is not a valid issue/PR number \
+                     (neither gh issue view nor gh pr view can resolve it)"
+                )
+            })
+        })
+        .collect()
+}
+
 fn run_operator_premise(cwd: &Path, opts: &Opts, stdin_text: Option<&str>) -> Result<i32, i32> {
     let refs = if opts.stdin {
         decode::<premise::Input>(stdin_text.unwrap_or(""), "a top-level 'refs' array")?.refs
     } else {
-        let numbers: Vec<i64> = opts
-            .refs
-            .as_deref()
-            .unwrap_or("")
-            .split_whitespace()
-            .filter_map(|t| t.parse().ok())
-            .collect();
+        let numbers = parse_refs_arg(opts.refs.as_deref().unwrap_or("")).map_err(|e| die(&e, 1))?;
         forge::fetch_refs(&numbers, opts.repo.as_deref(), cwd)
             .map_err(|e| die(&e.to_string(), 1))?
     };

@@ -54,6 +54,18 @@ pub struct Input {
 /// `detect-dependency-cycle.sh` / `warn-operator-gated.sh` rather than
 /// inventing a second vocabulary. A bare prose mention (a backtick-quoted
 /// `owner/repo#123`, say) deliberately does not count.
+///
+/// **Divergence from the pre-port shell (#8011, kept intentionally):** the
+/// shell matched this pattern with `grep -oE`, which is line-oriented and
+/// cannot span a newline. This regex runs over the whole concatenated
+/// body-plus-comments text with `\s` (inside `[*_:\s]*`) matching `\n`, so a
+/// phrase and its `#N` split across a line break — e.g. `"Blocked by\n#42"` —
+/// now match where the shell found nothing. This is the same
+/// slightly-too-permissive direction as [`super::named`]'s bullet-marker
+/// divergence: missing a genuine declared reference is the worse failure
+/// mode for a check whose whole job is finding one. Kept rather than
+/// narrowed; changes `CONCLUSION_HASH` (via `operator-premise`'s `--refs`)
+/// for any input where the phrase and reference are separated by a newline.
 fn phrase_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -69,6 +81,17 @@ fn phrase_re() -> &'static Regex {
 /// `judge-fallback-guard.sh`'s `app/loom-fleet-dispatch` PR-author check with
 /// the bare `loom-fleet-dispatch` that `gh issue view --json comments` reports.
 /// Matching only one spelling would let the loop back in through the other.
+///
+/// **Divergence from the pre-port shell (#8011, kept — arguably a fix):** the
+/// shell only lower-cased the supplied `--bot-login`; it normalised the
+/// `app/`/`[bot]` shape on the comment **author** only, not on the caller's
+/// own flag. So a shell caller passing `--bot-login "app/loom-fleet-dispatch"`
+/// would never match a plain `loom-fleet-dispatch` comment author — the
+/// asymmetry defeated the very normalisation this function exists for. Here
+/// both sides go through the same [`normalise_login`], so that case now
+/// excludes such a comment as intended. No current caller passes
+/// `--bot-login` (see [`DEFAULT_BOT_LOGIN`], already in normalised form), so
+/// nothing live changes, but a future caller of the flag will observe this.
 #[must_use]
 pub fn normalise_login(login: &str) -> String {
     let lower = login.to_ascii_lowercase();
