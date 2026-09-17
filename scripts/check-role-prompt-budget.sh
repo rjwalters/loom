@@ -180,7 +180,10 @@ is_gated() {
   local referrer="$1" sibling="$2" rows
   rows="$(grep -F -- "$sibling" "$referrer" 2>/dev/null | grep -E '^[[:space:]]*\|' || true)"
   [[ -z "$rows" ]] && return 1
-  printf '%s\n' "$rows" | grep -qE '(^|[^[:alnum:]])Always([^[:alnum:]]|$)' && return 1
+  # Here-string, NOT a pipe: `grep -q` is an early-exit consumer, and under
+  # `set -o pipefail` a producer that takes SIGPIPE fails the whole pipeline
+  # (#7790/#7789, ratcheted by scripts/check-pipefail-early-exit.sh).
+  grep -qE '(^|[^[:alnum:]])Always([^[:alnum:]]|$)' <<< "$rows" && return 1
   return 0
 }
 

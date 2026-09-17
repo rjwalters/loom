@@ -378,10 +378,11 @@ a slash command rather than a terminal role, so it has no `.json` to be found
 by; it is also the largest measured prefix in the fleet). From each role's
 prompt at `defaults/.claude/commands/loom/<role>.md` the resolver then:
 
-- follows **relative markdown links** — `](sibling.md)` — to siblings in the
-  same directory, transitively, with a visited set so a back-link terminates. A
-  markdown link is the "go read this" affordance; a **backticked filename in
-  prose is a citation and is not followed**. That distinction is load-bearing:
+- follows **relative markdown links** to siblings in the same directory
+  (ordinary markdown link syntax whose target is a bare `sibling.md`),
+  transitively, with a visited set so a back-link terminates. A markdown link is
+  the "go read this" affordance; a **backticked filename in prose is a citation
+  and is not followed**. That distinction is load-bearing:
   `judge.md` cites `curator.md`, `doctor.md`, `builder.md` and `sweep.md` in
   prose, and following those would charge judge for four other roles' prompts.
 - **subtracts** any sibling the referring file gates in a load-gate table — a
