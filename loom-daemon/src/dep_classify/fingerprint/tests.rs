@@ -67,78 +67,21 @@ fn a_fact_fingerprint_is_prefixed_and_keyed_on_both_inputs() {
 }
 
 // ---------------------------------------------------------------------------
-// Differential tests against the shell original
+// The differential tests that used to live here (epic #7810, PR 3)
 // ---------------------------------------------------------------------------
-
-fn shell_script() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("defaults/scripts/classify-dependency-block.sh")
-}
-
-fn shell_fingerprint(nodes: &str) -> String {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("loom-fp-diff-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("tmp dir");
-    let nodes_file = dir.join("nodes.txt");
-    std::fs::write(&nodes_file, nodes).expect("write nodes");
-
-    let driver = format!(
-        r#"set -uo pipefail
-source "{script}" --help >/dev/null 2>&1 || true
-nodes="$(cat "{nodes_file}")"
-_fingerprint "$nodes"
-"#,
-        script = shell_script().display(),
-        nodes_file = nodes_file.display(),
-    );
-    let driver_path = dir.join("driver.sh");
-    std::fs::write(&driver_path, driver).expect("write driver");
-
-    let out = std::process::Command::new("bash")
-        .arg(&driver_path)
-        .output()
-        .expect("the shell implementation must be runnable");
-    let _ = std::fs::remove_dir_all(&dir);
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-#[test]
-fn the_shell_fingerprint_is_reachable_and_uses_a_real_sha() {
-    // Anti-vacuity guard. Also pins the environment assumption the port makes:
-    // if this host fell through to `cksum`, the shell's own fingerprints would
-    // be incompatible with every other host's, and comparing against them here
-    // would be meaningless.
-    let probe = shell_fingerprint("o/r#3");
-    assert_eq!(probe.len(), 16, "shell produced {probe:?}");
-    assert!(
-        probe.chars().all(|c| c.is_ascii_hexdigit()),
-        "shell produced {probe:?} — if this is not hex, _sha256 fell through to cksum \
-         and this host's fingerprints never matched any other host's"
-    );
-}
-
-#[test]
-fn rust_and_shell_agree_on_fingerprints() {
-    let corpus = [
-        "o/r#3",
-        "o/r#3 o/r#9",
-        "o/r#9 o/r#3",
-        "o/r#3 o/r#3 o/r#9",
-        "o/r#3\no/r#9",
-        "  o/r#3   o/r#9  ",
-        "acme/widgets#42 other/repo#7 o/r#1",
-        "",
-        "   ",
-    ];
-
-    for nodes in corpus {
-        let shell = shell_fingerprint(nodes);
-        let rust = fingerprint(nodes);
-        assert_eq!(
-            rust, shell,
-            "port diverges from the shell on {nodes:?}\n  rust:  {rust}\n  shell: {shell}"
-        );
-    }
-}
+//
+// This port was not translated on trust. Each function above landed in #7943
+// beside a DIFFERENTIAL test that ran it and the shell original over the same
+// fixture corpus and asserted they agreed, character for character, with an
+// anti-vacuity guard so a shell that silently produced nothing could not pass.
+//
+// Those tests are removed here with the shell they compared against: a
+// comparison needs both sides, and keeping a copy of the retired
+// implementation purely to compare with would be keeping the thing this epic
+// retires. The evidence is the merged CI run on #7943, not a fixture that
+// pins a deleted file forever.
+//
+// What still runs both ways is the black-box suite
+// `defaults/scripts/tests/test-classify-dependency-block.sh`, whose assertions
+// were written against the shell and now drive this implementation unchanged
+// through the same CLI.

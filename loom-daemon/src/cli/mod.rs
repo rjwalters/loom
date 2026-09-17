@@ -10,6 +10,7 @@ pub(crate) mod accounts;
 pub(crate) mod cancel;
 pub(crate) mod cleanup_ops;
 pub(crate) mod common;
+pub(crate) mod dep_classify;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_backoff;
 pub(crate) mod health;

@@ -87,94 +87,86 @@ fn an_empty_body_yields_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// Differential tests against the shell original
+// extract_refs — the UNGATED parser, used on findings
 // ---------------------------------------------------------------------------
 
-fn shell_script() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("defaults/scripts/detect-dependency-cycle.sh")
-}
-
-/// Call the shell's `parse_dependency_refs` directly by sourcing the script.
-///
-/// Sourcing rather than driving the CLI: the CLI walks the dependency graph and
-/// needs a live forge, while this function is pure. `--help` short-circuits the
-/// script's `main` so sourcing does not run it.
-fn shell_parse(body: &str, default_repo: &str) -> Vec<String> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("loom-refs-diff-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("tmp dir");
-    let body_file = dir.join("body.md");
-    std::fs::write(&body_file, body).expect("write body");
-
-    let driver = format!(
-        r#"set -uo pipefail
-# The script runs main() only when executed, not sourced — but it also parses
-# argv at load. Guard by feeding it nothing and ignoring a non-zero exit.
-source "{script}" --help >/dev/null 2>&1 || true
-body="$(cat "{body_file}")"
-parse_dependency_refs "$body" "{repo}"
-"#,
-        script = shell_script().display(),
-        body_file = body_file.display(),
-        repo = default_repo,
-    );
-    let script_path = dir.join("driver.sh");
-    std::fs::write(&script_path, driver).expect("write driver");
-
-    let out = std::process::Command::new("bash")
-        .arg(&script_path)
-        .output()
-        .expect("the shell implementation must be runnable");
-    let _ = std::fs::remove_dir_all(&dir);
-
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 #[test]
-fn the_shell_parser_is_reachable() {
-    // Anti-vacuity guard: without this, an unsourceable script would make every
-    // comparison below empty-vs-empty and pass while testing nothing.
-    let probe = shell_parse("Blocked by #3", REPO);
+fn extract_refs_needs_no_dependency_phrase() {
+    // The whole reason this is a second parser. The text it reads has already
+    // been classified as dependency-only, so every reference on it is a
+    // blocker; there is nothing left to gate on.
     assert_eq!(
-        probe,
-        vec!["o/r#3"],
-        "the shell parse_dependency_refs did not return its known-good answer; \
-         every differential assertion below would be vacuous"
+        extract_refs("- Technical Feasibility: see #9 and #12.", "o/r"),
+        vec!["o/r#12".to_string(), "o/r#9".to_string()]
+    );
+    assert!(
+        parse_dependency_refs("- Technical Feasibility: see #9 and #12.", "o/r").is_empty(),
+        "the gated parser finds nothing here — that is the difference"
     );
 }
 
 #[test]
-fn rust_and_shell_agree_on_reference_parsing() {
-    let corpus: &[(&str, &str)] = &[
-        ("bare ref", "Blocked by #3"),
-        ("qualified ref", "Depends on other/repo#7"),
-        ("url", "Requires https://github.com/acme/widgets/issues/42"),
-        ("bold phrase", "**Blocked by**: #3"),
-        ("underscore phrase", "_Requires_ #4"),
-        ("lower case is ignored", "blocked by #3"),
-        ("two refs on one line", "Blocked by #3 (see also #99)"),
-        ("no phrase", "Mentions #3 in passing"),
-        ("dedup and sort", "Blocked by #9\nDepends on #2\nRequires #9\n"),
-        ("short url dropped", "Blocked by https://example.com/issues/42"),
-        ("mixed lines", "intro\nBlocked by #1\nnoise #55\nRequires acme/w#2\n"),
-        ("trailing punctuation", "Blocked by #3, and Requires #4."),
-        ("empty", ""),
-        ("phrase with no ref", "Blocked by a design decision"),
-    ];
-
-    for (name, body) in corpus {
-        let shell = shell_parse(body, REPO);
-        let rust = parse_dependency_refs(body, REPO);
-        assert_eq!(
-            rust, shell,
-            "port diverges from the shell on {name:?}\n  rust:  {rust:?}\n  shell: {shell:?}"
-        );
-    }
+fn extract_refs_is_case_insensitive_because_it_has_no_phrase_to_match() {
+    // A Champion verdict routinely writes "blocked by #9" in lower case.
+    // parse_dependency_refs drops that line (grep -E, no -i); dropping it here
+    // would silently turn a real blocker into `no-recorded-blocker` and
+    // escalate a proposal that was only waiting.
+    let lower = "- Technical Feasibility: blocked by #9 (the harness PR), still open.";
+    assert_eq!(extract_refs(lower, "o/r"), vec!["o/r#9".to_string()]);
+    assert!(
+        parse_dependency_refs(lower, "o/r").is_empty(),
+        "case-sensitivity is real, which is why the findings side cannot use it"
+    );
 }
+
+#[test]
+fn extract_refs_accepts_a_pull_url_which_the_gated_parser_does_not() {
+    // A verdict cites the PR that will unblock the work, and a MERGED PR
+    // resolves the block as surely as a closed issue.
+    let text = "- blocked on https://github.com/o/x/pull/7";
+    assert_eq!(extract_refs(text, "o/r"), vec!["o/x#7".to_string()]);
+    assert!(parse_dependency_refs(text, "o/r").is_empty());
+}
+
+#[test]
+fn extract_refs_normalises_the_same_three_shapes() {
+    assert_eq!(extract_refs("see #3", "o/r"), vec!["o/r#3".to_string()]);
+    assert_eq!(extract_refs("see a/b#9", "o/r"), vec!["a/b#9".to_string()]);
+    assert_eq!(
+        extract_refs("see https://github.com/o/x/issues/56", "o/r"),
+        vec!["o/x#56".to_string()]
+    );
+}
+
+#[test]
+fn extract_refs_sorts_and_deduplicates() {
+    assert_eq!(
+        extract_refs("#5 then #3 then #5 again", "o/r"),
+        vec!["o/r#3".to_string(), "o/r#5".to_string()]
+    );
+}
+
+#[test]
+fn a_url_too_short_to_name_a_repo_is_dropped_not_guessed() {
+    assert!(extract_refs("https://example.com/issues/5", "o/r").is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The differential tests that used to live here (epic #7810, PR 3)
+// ---------------------------------------------------------------------------
+//
+// This port was not translated on trust. Each function above landed in #7943
+// beside a DIFFERENTIAL test that ran it and the shell original over the same
+// fixture corpus and asserted they agreed, character for character, with an
+// anti-vacuity guard so a shell that silently produced nothing could not pass.
+//
+// Those tests are removed here with the shell they compared against: a
+// comparison needs both sides, and keeping a copy of the retired
+// implementation purely to compare with would be keeping the thing this epic
+// retires. The evidence is the merged CI run on #7943, not a fixture that
+// pins a deleted file forever.
+//
+// What still runs both ways is the black-box suite
+// `defaults/scripts/tests/test-classify-dependency-block.sh`, whose assertions
+// were written against the shell and now drive this implementation unchanged
+// through the same CLI.

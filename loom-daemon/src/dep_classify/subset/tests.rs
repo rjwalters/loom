@@ -122,123 +122,21 @@ fn an_empty_body_is_handled() {
 }
 
 // ---------------------------------------------------------------------------
-// Differential tests against the shell original (epic #7810, PR 3)
+// The differential tests that used to live here (epic #7810, PR 3)
 // ---------------------------------------------------------------------------
 //
-// Unit tests above prove this port is self-consistent. They cannot prove it
-// matches `detect-startable-subset.sh`, which is what the migration actually
-// claims. These run BOTH implementations on the same input and compare.
+// This port was not translated on trust. Each function above landed in #7943
+// beside a DIFFERENTIAL test that ran it and the shell original over the same
+// fixture corpus and asserted they agreed, character for character, with an
+// anti-vacuity guard so a shell that silently produced nothing could not pass.
 //
-// They are deliberately temporary: they exist while both implementations do,
-// and go when the shell one does. Until then they are the strongest evidence
-// available that behaviour was preserved.
-
-/// Locate the shell script from the compiled crate's source tree.
-fn shell_script() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("defaults/scripts/detect-startable-subset.sh")
-}
-
-/// Run the shell implementation on `body` and return its captured section.
-///
-/// The CLI prints a `STARTABLE_SUBSET` / `NO_STARTABLE_SUBSET` marker line
-/// first; the rest is the section.
-fn shell_extract(body: &str) -> String {
-    // Unique per call, not per process: these tests run in parallel, and a
-    // shared fixture path had them overwriting each other's body mid-read —
-    // which surfaced as the anti-vacuity guard failing only under concurrency
-    // and passing in isolation.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("loom-subset-diff-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("tmp dir");
-    let f = dir.join("body.md");
-    std::fs::write(&f, body).expect("write body");
-
-    let out = std::process::Command::new("bash")
-        .arg(shell_script())
-        .args(["--issue", "1", "--repo", "o/r", "--body-file"])
-        .arg(&f)
-        .output()
-        .expect("the shell implementation must be runnable");
-
-    let _ = std::fs::remove_dir_all(&dir);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut lines = stdout.lines();
-    match lines.next() {
-        Some("NO_STARTABLE_SUBSET") | None => String::new(),
-        Some("STARTABLE_SUBSET") => {
-            let rest: Vec<&str> = lines.collect();
-            if rest.is_empty() {
-                String::new()
-            } else {
-                let mut s = rest.join("\n");
-                s.push('\n');
-                s
-            }
-        }
-        Some(other) => panic!("unrecognised marker from the shell CLI: {other:?}"),
-    }
-}
-
-#[test]
-fn the_shell_implementation_is_present_and_runnable() {
-    // Anti-vacuity guard. Without this, a missing or unrunnable script would
-    // make every differential case below compare "" against "" and pass while
-    // proving nothing — a gate reporting green while doing no work.
-    let p = shell_script();
-    assert!(p.is_file(), "shell original not found at {}", p.display());
-    let probe = shell_extract("## Startable subset\nprobe\n");
-    assert_eq!(
-        probe, "probe\n",
-        "the shell implementation did not produce its known-good answer; \
-         every differential assertion below would be vacuous"
-    );
-}
-
-#[test]
-fn rust_and_shell_agree_across_the_edge_cases() {
-    let corpus: &[(&str, &str)] = &[
-        ("plain section", "# Title\n\n## Startable subset\n- do this now\n- and this\n"),
-        (
-            "deeper subsection stays",
-            "## Startable subset\nintro\n### Files\na.rs\n## Dependencies\nout\n",
-        ),
-        ("equal-depth heading closes", "## Startable subset\nin\n## Dependencies\nout\n"),
-        ("shallower heading closes", "### Startable subset\nin\n## Later\nout\n"),
-        (
-            "re-arms on a later heading",
-            "## Startable subset\nfirst\n## Other\nx\n## Startable subset\nsecond\n",
-        ),
-        (
-            "issue ref is not a heading",
-            "## Startable subset\nsee #5664 for context\n##notaheading\nstill in\n",
-        ),
-        ("top-level heading excluded", "# Startable subset\nwork\n"),
-        ("seven hashes excluded", "####### Startable subset\nwork\n"),
-        ("indented heading", "  ## Startable subset\nin\n   ## Next\nout\n"),
-        ("blank section", "## Startable subset\n\n   \n## Dependencies\nout\n"),
-        ("absent", "# Title\n\nJust a description.\n"),
-        ("case and prefix", "## STARTABLE SUBSET (partial)\nwork\n"),
-        ("empty body", ""),
-    ];
-
-    for (name, body) in corpus {
-        let shell = shell_extract(body);
-        // Compare like for like: the shell CLI gates its output on
-        // `has_startable_subset`, printing NO_STARTABLE_SUBSET for a
-        // present-but-blank section. The raw extractor does not, so the gate
-        // has to be applied on this side too — comparing the ungated extractor
-        // against the gated CLI measures the harness, not the port.
-        let rust = if has_startable_subset(body) {
-            extract_startable_subset(body)
-        } else {
-            String::new()
-        };
-        assert_eq!(
-            rust, shell,
-            "port diverges from the shell on {name:?}\n  rust:  {rust:?}\n  shell: {shell:?}"
-        );
-    }
-}
+// Those tests are removed here with the shell they compared against: a
+// comparison needs both sides, and keeping a copy of the retired
+// implementation purely to compare with would be keeping the thing this epic
+// retires. The evidence is the merged CI run on #7943, not a fixture that
+// pins a deleted file forever.
+//
+// What still runs both ways is the black-box suite
+// `defaults/scripts/tests/test-classify-dependency-block.sh`, whose assertions
+// were written against the shell and now drive this implementation unchanged
+// through the same CLI.

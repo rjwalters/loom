@@ -727,6 +727,43 @@ jobs:
       - name: Check .gitignore matches the current EPHEMERAL_PATTERNS set
         run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
 
+  dep-classification-suites:
+    name: Dependency Classification Suites
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
+    # The equivalence evidence for epic #7810 PR 3. These three suites' 261
+    # assertions were written against the SHELL implementations of
+    # classify-dependency-block.sh / detect-dependency-cycle.sh /
+    # detect-startable-subset.sh; those are now thin stubs over
+    # `loom-daemon classify-dependency-block` et al., and the same assertions
+    # run unchanged against the Rust port. That is what makes deleting 861
+    # lines of decision logic checkable rather than asserted.
+    #
+    # They live here rather than in shell-suite-tests because they need a BUILT
+    # loom-daemon, and that job deliberately has no Rust toolchain. Each suite
+    # FAILS (not SKIPs) when no binary resolves, so this job cannot report green
+    # by quietly running nothing.
+    #
+    # Triggered by `backend` as well as `scripts`: a Rust-only change to
+    # loom-daemon/src/dep_classify/ is exactly the change that can break them,
+    # and it touches no shell at all.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build loom-daemon
+        run: cargo build --package loom-daemon
+      - name: classify-dependency-block (#5664, #7650)
+        run: bash defaults/scripts/tests/test-classify-dependency-block.sh
+      - name: classify-dependency-block premise-false interaction (#7904)
+        run: bash defaults/scripts/tests/test-classify-dependency-block-premise-false.sh
+      - name: detect-dependency-cycle (#5671)
+        run: bash defaults/scripts/tests/test-detect-dependency-cycle.sh
+      - name: detect-startable-subset (#5664)
+        run: bash defaults/scripts/tests/test-detect-startable-subset.sh
+
   installer-tests:
     name: Installer Integration Tests
     needs: changes

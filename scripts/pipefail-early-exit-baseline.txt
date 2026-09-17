@@ -32,7 +32,6 @@
 3 defaults/scripts/check-promotion-landed.sh
 1 defaults/scripts/classify-ac-verification.sh
 1 defaults/scripts/classify-capacity-defer.sh
-8 defaults/scripts/classify-dependency-block.sh
 20 defaults/scripts/claude-wrapper.sh
 3 defaults/scripts/cli/loom-daemon-start.sh
 2 defaults/scripts/cli/loom-daemon-update.sh
@@ -78,7 +77,7 @@
 65 defaults/scripts/tests/test-loom-daemon-start.sh
 12 defaults/scripts/tests/test-loom-daemon-stop.sh
 180 defaults/scripts/tests/test-loom-daemon-update.sh
-4 defaults/scripts/tests/test-loom-daemon-watchdog.sh
+2 defaults/scripts/tests/test-loom-daemon-watchdog.sh
 2 defaults/scripts/tests/test-mcp-config.sh
 12 defaults/scripts/tests/test-merge-pr-auto-merge-disabled-fallback.sh
 4 defaults/scripts/tests/test-merge-pr-check-runs-404-fallback.sh
