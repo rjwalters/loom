@@ -125,11 +125,57 @@ echo "Test group 2: the excluding pathspec actually works against a real git add
 # Belt-and-braces: don't just assert the printed string, prove the emitted
 # pathspec really does what it claims against a real `git add -A` invocation,
 # the same way an operator/agent following the suggestion would run it.
+#
+# #8006: run the command the script ACTUALLY emitted -- extracted from
+# $ADD_LINE_CTX above -- never a hand-maintained literal copy of it. A
+# hardcoded copy would only re-prove git's pathspec semantics (never in doubt)
+# and would keep passing after the script's own pathspec regressed: exactly the
+# circular-fixture smell judge.md names, where both sides of the comparison come
+# from the fixture instead of from the subject under test.
+#
+# Strip the ANSI bold/reset codes print_output_mode_next_steps() wraps each
+# recipe line in, then take everything from `git add` to end of line. Both
+# filters read a HERE-STRING, not a pipe: an early-exit consumer (`grep -m1`)
+# at the end of a pipeline can SIGPIPE its producer under `pipefail`
+# (scripts/check-pipefail-early-exit.sh, #7790).
+ADD_LINE_PLAIN="$(sed -e $'s/\033\\[[0-9;]*m//g' <<< "$ADD_LINE_CTX")"
+ADD_CMD="$(grep -m1 -o "git add -A.*" <<< "$ADD_LINE_PLAIN")"
+if [[ -n "$ADD_CMD" ]]; then
+    pass "(#7818) the emitted git add command was extracted verbatim from the script's own output: $ADD_CMD"
+else
+    fail "(#7818) could not extract the emitted git add command to execute (ctx=$ADD_LINE_CTX)"
+fi
 mkdir -p "$STAGE/.loom/gh-config" "$STAGE/.loom/gh-config-by-owner/some-owner"
 printf 'oauth_token: ghs_live_dummy\n' > "$STAGE/.loom/gh-config/hosts.yml"
 printf 'oauth_token: ghs_live_dummy2\n' > "$STAGE/.loom/gh-config-by-owner/some-owner/hosts.yml"
-(cd "$STAGE" && git add -A -- . ':!.loom/gh-config' ':!.loom/gh-config-by-owner')
+# #8006: the pathspec is belt-and-braces FOR A HOST WHOSE .gitignore IS
+# MISSING OR STALE -- and resync-installed.sh refreshes the loom-managed
+# .gitignore block in this very staging worktree, which already lists both
+# credential trees. Leave that block intact and a BARE `git add -A` skips them
+# too, so this group would pass no matter what pathspec the script emitted.
+# Drop those entries so the emitted pathspec is the ONLY thing that can keep a
+# credential out of the index -- the exact host state #7818 defends against.
+if [[ -f "$STAGE/.gitignore" ]]; then
+    grep -v "gh-config" "$STAGE/.gitignore" > "$STAGE/.gitignore.tmp"
+    mv "$STAGE/.gitignore.tmp" "$STAGE/.gitignore"
+fi
+if ! git -C "$STAGE" check-ignore -q .loom/gh-config/hosts.yml && \
+   ! git -C "$STAGE" check-ignore -q .loom/gh-config-by-owner/some-owner/hosts.yml; then
+    pass "(#7818) fixture now models a host whose .gitignore does NOT cover the credential trees (the pathspec is the only guard left)"
+else
+    fail "(#7818) the credential trees are still gitignored — this group would pass regardless of the emitted pathspec"
+fi
+# Run it the way an operator pasting the suggestion into a shell would.
+(cd "$STAGE" && bash -c "$ADD_CMD")
 STAGED="$(git -C "$STAGE" diff --cached --name-only)"
+# Sensitivity guard: an empty stage would make the exclusion assertion below
+# pass for the wrong reason (nothing staged => no credential path staged), so
+# prove the emitted command really added the worktree's non-credential content.
+if [[ -n "$STAGED" ]]; then
+    pass "(#7818) the emitted command really staged the staging worktree's content (the exclusion check below is not vacuous)"
+else
+    fail "(#7818) the emitted command staged nothing at all — the exclusion check below would pass vacuously (cmd=$ADD_CMD)"
+fi
 if ! grep -q "gh-config" <<< "$STAGED"; then
     pass "(#7818) neither credential tree was staged by the printed pathspec"
 else
