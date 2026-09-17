@@ -2392,11 +2392,7 @@ fn exit_78_token_selection_death_is_classified_journaled_and_ladder_exempt() {
     // (b) #7708: a pool-level fault is charged to the POOL, not to whichever
     // issue happened to be dispatched into it.
     assert_eq!(registry.insta_crash_count(4644), 0, "#4386 carve-out preserved");
-    assert_eq!(
-        registry.dispatch_failure_count(4644),
-        0,
-        "the #4485 per-issue ladder must not be charged for a pool-wide fault (#7708)"
-    );
+    assert_eq!(registry.dispatch_failure_count(4644), 0, "pool fault: no per-issue charge");
     assert!(registry
         .dispatch_backoff_remaining(4644, Utc::now())
         .is_none());
