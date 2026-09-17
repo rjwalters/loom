@@ -763,6 +763,8 @@ jobs:
         run: bash defaults/scripts/tests/test-detect-dependency-cycle.sh
       - name: detect-startable-subset (#5664)
         run: bash defaults/scripts/tests/test-detect-startable-subset.sh
+      - name: dep-recheck-fingerprint (#7281, #7314, #7617)
+        run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
 
   installer-tests:
     name: Installer Integration Tests
