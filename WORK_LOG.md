@@ -7,6 +7,20 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-17
+- **Issue #7973** (closed): Guide parse_dependencies reads a CHECKED checklist box as a blocking dependency, auto-unblocking issues whose real gate is prose
+- **PR #8007**: fix(guide): checked checklist boxes no longer count as dependencies
+- **Issue #7818** (closed): post_init managed .gitignore omits .loom/gh-config/ — a resync commit swept a live App installation token into a public repo
+- **PR #7999**: fix(security): stop resync from being able to sweep GH_CONFIG_DIR credentials into a commit
+- **PR #7932**: fix(install): stop ad-hoc downgrading Developer ID-signed release artifacts
+- **Issue #7992** (closed): Write test-authoring rule against prose-existence assertions + record markdown-ratchet exemption decision (split from #7979)
+- **PR #8009**: docs(tests): add test-authoring rule against prose-existence assertions
+- **PR #8002**: fix(work_finder): pre-flight the token pool before dispatch, classify token-selection death as no-usable-account
+- **Issue #7873** (closed): dispatch_sweep refuses any issue lacking loom:issue as a 'cross-host collision' (classify_preflip_labels treats never-labeled as peer-removed)
+- **PR #8000**: fix(sweep_registry): stop treating an unpromoted issue as a cross-host collision
+- **Issue #7952** (closed): epic #7810 PR 3 (final): cycle walk + CLI subcommands + stubs, and delete 861 lines of shell
+- **PR #7953**: feat(daemon): retire classify-dependency-block.sh and its two sourced helpers (#7952)
+- **Issue #7883** (closed): Builder/Doctor guidance: refuse an in-place edit to a Loom-managed file in a fleet repo — upstream it or pin it
+- **PR #7997**: docs(roles): refuse in-place edits to installed Loom files in consumer repos
 - **PR #7988**: fix(worktree_reaper): clear stuck-removal record on every Skip* route
 - **Issue #7939** (closed): worktree_reaper: a stuck-removal record never clears when a Skip* decision makes the worktree ineligible
 - **PR #7985**: fix(champion): make the epic un-park read fail open on both unknown inputs
