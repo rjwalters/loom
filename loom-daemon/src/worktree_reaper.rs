@@ -295,42 +295,12 @@ impl ReapReport {
     }
 }
 
-/// Human-readable reason a decision preserved a worktree. `None` for
-/// [`WorktreeDecision::Remove`].
-#[must_use]
-fn skip_reason(decision: &WorktreeDecision) -> Option<String> {
-    match decision {
-        WorktreeDecision::Remove => None,
-        WorktreeDecision::SkipInUse(reason) => Some(reason.clone()),
-        WorktreeDecision::SkipEditable(pkgs) => Some(format!("editable pip install(s): {pkgs}")),
-        WorktreeDecision::SkipUnmanaged => {
-            Some("no .loom-managed sentinel (user-provisioned)".to_string())
-        }
-        WorktreeDecision::SkipIssueNotClosed(state) => Some(format!("issue is {state}")),
-        WorktreeDecision::SkipGrace(remaining) => {
-            Some(format!("grace period not passed ({remaining}s remaining)"))
-        }
-        WorktreeDecision::SkipClosedNoMergeGrace(remaining) => Some(format!(
-            "PR closed without merge, grace period not passed ({remaining}s remaining)"
-        )),
-        WorktreeDecision::SkipNoPrGrace(remaining) => Some(format!(
-            "no PR found for closed issue, grace period not passed ({remaining}s remaining)"
-        )),
-        WorktreeDecision::SkipUncommitted => Some("uncommitted changes".to_string()),
-        WorktreeDecision::SkipNotMerged(reason) => Some(reason.clone()),
-        WorktreeDecision::SkipPrOpen => Some("PR still open".to_string()),
-        WorktreeDecision::SkipUnknownPrStatus => Some("PR status unknown".to_string()),
-        // Unreachable with the reaper's `safe: true` options, but a
-        // non-`--safe` caller must never be interpreted as "remove it".
-        WorktreeDecision::ConfirmClosedIssue => {
-            Some("needs confirmation (non-safe mode)".to_string())
-        }
-        // #6653: handled specially in the reap loop BEFORE `skip_reason` is
-        // ever consulted for it (quarantine, then treat like `Remove`) — this
-        // arm exists only so the match stays exhaustive; it is never reached.
-        WorktreeDecision::RemoveWithQuarantine => None,
-    }
-}
+// `skip_reason` — the human-readable reason a decision preserved a worktree —
+// moved to the `removal_backoff` sibling module in #7939 (re-exported below as
+// `use removal_backoff::{..., skip_reason}`) purely to make room: this file is
+// over the file-size ratchet's threshold and may not grow, and #7939's fix
+// needs a couple of new lines right at `skip_reason`'s one call site. Its
+// logic and doc comment are unchanged — see `removal_backoff::skip_reason`.
 
 /// Every direct subdirectory of `repo_root`'s worktree root, sorted by path so
 /// a pass's report order is deterministic.
@@ -403,6 +373,11 @@ fn reap_worktrees_generic(
                     );
                 }
                 None => {
+                    // #7939: this worktree is not going to be removed this
+                    // tick — clear any stuck-removal record for it now,
+                    // rather than only on a successful `remove()` call this
+                    // route never reaches.
+                    clear_stuck_record(&worktree_path);
                     report.skipped.push((
                         num,
                         "uncommitted changes (quarantine-stash failed or nothing to stash)"
@@ -412,6 +387,18 @@ fn reap_worktrees_generic(
                 }
             }
         } else if let Some(reason) = skip_reason(&decision) {
+            // #7939: every `Skip*`/`ConfirmClosedIssue` route below makes this
+            // worktree ineligible for removal — via `remove_with_backoff`'s
+            // `Ok(())` arm — for as long as the condition holds. If it was
+            // previously stuck (backed off after repeated failures) and the
+            // condition that made it stuck is what changed (an issue
+            // reopened, new uncommitted work landing, the `.loom-managed`
+            // sentinel removed, …), the reaper is no longer even attempting a
+            // removal here, so `remove_with_backoff` never runs to clear the
+            // old record. Clear it directly so `loom-daemon health` reflects
+            // reality the moment eligibility changes, not at the next daemon
+            // restart.
+            clear_stuck_record(&worktree_path);
             report.skipped.push((num, reason));
             continue;
         }
@@ -729,10 +716,12 @@ pub fn try_enter_reclaim(repo_root: &Path) -> Option<ReclaimGuard> {
 
 mod removal_backoff;
 
+use removal_backoff::{
+    clear_stuck_record, prune_orphaned_removal_records, remove_with_backoff, skip_reason,
+};
 pub use removal_backoff::{
     is_permission_denied_cause, stuck_worktree_removals, REMOVAL_BACKOFF_SECS, REMOVAL_FAILURE_CAP,
 };
-use removal_backoff::{prune_orphaned_removal_records, remove_with_backoff};
 
 /// Which reap pass a tracked removal failure belongs to — threaded through so
 /// a stuck path can be named `issue-<N>` or `pr-<N>` on the health surface,

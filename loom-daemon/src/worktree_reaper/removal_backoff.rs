@@ -26,6 +26,51 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use chrono::{DateTime, Utc};
 
 use super::WorktreeKind;
+use crate::worktree_ops::clean::WorktreeDecision;
+
+/// Human-readable reason a decision preserved a worktree. `None` for
+/// [`WorktreeDecision::Remove`].
+///
+/// Lives here, rather than in [`super`] where every one of its match arms was
+/// introduced, purely to make room (#7939): [`super`] is over the file-size
+/// ratchet's threshold and may not grow, and #7939's fix needs a couple of new
+/// lines right at this function's one call site in
+/// [`super::reap_worktrees_generic`]. Logic and wording are unchanged from
+/// before the move.
+#[must_use]
+pub(crate) fn skip_reason(decision: &WorktreeDecision) -> Option<String> {
+    match decision {
+        WorktreeDecision::Remove => None,
+        WorktreeDecision::SkipInUse(reason) => Some(reason.clone()),
+        WorktreeDecision::SkipEditable(pkgs) => Some(format!("editable pip install(s): {pkgs}")),
+        WorktreeDecision::SkipUnmanaged => {
+            Some("no .loom-managed sentinel (user-provisioned)".to_string())
+        }
+        WorktreeDecision::SkipIssueNotClosed(state) => Some(format!("issue is {state}")),
+        WorktreeDecision::SkipGrace(remaining) => {
+            Some(format!("grace period not passed ({remaining}s remaining)"))
+        }
+        WorktreeDecision::SkipClosedNoMergeGrace(remaining) => Some(format!(
+            "PR closed without merge, grace period not passed ({remaining}s remaining)"
+        )),
+        WorktreeDecision::SkipNoPrGrace(remaining) => Some(format!(
+            "no PR found for closed issue, grace period not passed ({remaining}s remaining)"
+        )),
+        WorktreeDecision::SkipUncommitted => Some("uncommitted changes".to_string()),
+        WorktreeDecision::SkipNotMerged(reason) => Some(reason.clone()),
+        WorktreeDecision::SkipPrOpen => Some("PR still open".to_string()),
+        WorktreeDecision::SkipUnknownPrStatus => Some("PR status unknown".to_string()),
+        // Unreachable with the reaper's `safe: true` options, but a
+        // non-`--safe` caller must never be interpreted as "remove it".
+        WorktreeDecision::ConfirmClosedIssue => {
+            Some("needs confirmation (non-safe mode)".to_string())
+        }
+        // #6653: handled specially in the reap loop BEFORE `skip_reason` is
+        // ever consulted for it (quarantine, then treat like `Remove`) — this
+        // arm exists only so the match stays exhaustive; it is never reached.
+        WorktreeDecision::RemoveWithQuarantine => None,
+    }
+}
 
 /// Per-path removal-failure state, tracked across reaper ticks (#7590). Never
 /// persisted across a daemon restart — an acceptable trade-off given the
@@ -263,6 +308,33 @@ pub(crate) fn remove_with_backoff(
             false
         }
     }
+}
+
+/// Clear a tracked stuck-removal record the moment its worktree becomes
+/// ineligible for removal, not merely absent (#7939).
+///
+/// Before this, the *only* routes that cleared a record were
+/// [`remove_with_backoff`]'s `Ok(())` arm (reached only when the reaper
+/// actually attempts — and succeeds at — a removal) and the confirmed-absence
+/// prune in [`prune_orphaned_removal_records`]/[`stuck_worktree_removals`]
+/// (#7709, reached only when the directory is gone). But
+/// `reap_worktrees_generic` `continue`s on a `Skip*` classify decision (or a
+/// failed quarantine) *before* ever reaching the remover — so a stuck
+/// condition resolved by making the worktree ineligible rather than absent
+/// (an issue reopened, new uncommitted work landing, the `.loom-managed`
+/// sentinel removed, …) never reached either clearing route, and
+/// `loom-daemon health` stayed DEGRADED naming a path the reaper was no
+/// longer even trying to remove, until a daemon restart.
+///
+/// A no-op when `path` has no tracked record — every one of
+/// `reap_worktrees_generic`'s skip routes calls this unconditionally, so it
+/// must tolerate the overwhelmingly common case of a path that was never
+/// stuck in the first place.
+pub(crate) fn clear_stuck_record(path: &Path) {
+    removal_failures()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(path);
 }
 
 /// Snapshot every worktree removal currently backed off (#7590 AC2) — the
@@ -585,6 +657,165 @@ mod tests {
             !failures.contains_key(dead.as_path()),
             "a record whose worktree is confirmed gone must be pruned"
         );
+    }
+
+    // ===================================================================
+    // A Skip* classify decision must clear a stuck record too (#7939)
+    //
+    // Before this fix, `reap_worktrees_generic` `continue`d on a `Skip*`
+    // decision from `classify_worktree`/`classify_pr_worktree` BEFORE ever
+    // reaching `remove_with_backoff` — so a stuck-removal record for a path
+    // that became ineligible for removal (rather than confirmed absent from
+    // disk, #7709's case) never cleared, and `loom-daemon health` stayed
+    // DEGRADED until a daemon restart.
+    // ===================================================================
+
+    /// A real `issue-<n>` directory directly under a fresh repo root's
+    /// `.loom/worktrees`, named so [`crate::worktree_ops::naming::issue_from_worktree`]
+    /// parses it — unlike [`unique_test_path`] above, whose synthetic
+    /// `<label>-<counter>` names are never valid `issue-<N>`/`pr-<N>` names
+    /// and so are never used with [`super::super::reap_worktrees_generic`]
+    /// itself, only with [`remove_with_backoff`] directly.
+    fn issue_worktree_dir(n: u32) -> (tempfile::TempDir, PathBuf) {
+        let repo_root = tempfile::tempdir().unwrap();
+        let path = repo_root
+            .path()
+            .join(".loom/worktrees")
+            .join(format!("issue-{n}"));
+        std::fs::create_dir_all(&path).unwrap();
+        let canonical = path.canonicalize().unwrap();
+        (repo_root, canonical)
+    }
+
+    #[test]
+    fn a_stuck_record_clears_when_the_reaper_skips_the_worktree() {
+        let (repo_root_dir, path) = issue_worktree_dir(101);
+        let repo_root = repo_root_dir.path();
+
+        // Mark the path stuck exactly as a prior reap pass would have,
+        // attempting and failing to remove it.
+        let ok = remove_with_backoff(repo_root, WorktreeKind::Issue, 101, &path, || {
+            Err("Permission denied (os error 13)".to_string())
+        });
+        assert!(!ok);
+        assert!(
+            stuck_worktree_removals().iter().any(|r| r.path == path),
+            "precondition: the path must be tracked as stuck before the pass runs"
+        );
+
+        // The condition that made it stuck is resolved in the OTHER way
+        // #7939 is about: the worktree becomes ineligible (here: the issue
+        // reopened) rather than confirmed absent. `classify` returning a
+        // `Skip*` decision must never let `remove` run at all.
+        let remove_was_called = std::cell::Cell::new(false);
+        let report = super::super::reap_worktrees_generic(
+            repo_root,
+            &crate::worktree_ops::naming::issue_from_worktree,
+            &|_path, _num| {
+                crate::worktree_ops::clean::WorktreeDecision::SkipIssueNotClosed("OPEN".to_string())
+            },
+            &|_path, _num| None,
+            &|_path, _num| {
+                remove_was_called.set(true);
+                true
+            },
+        );
+
+        assert!(!remove_was_called.get(), "a Skip* decision must never invoke the remover");
+        assert_eq!(report.skipped, vec![(101, "issue is OPEN".to_string())]);
+        assert!(
+            !stuck_worktree_removals().iter().any(|r| r.path == path),
+            "the stuck record must clear the moment the reaper decides the worktree is no \
+             longer eligible for removal, not only when it is confirmed absent (#7709) or \
+             actually removed"
+        );
+        assert!(
+            !removal_failures()
+                .lock()
+                .unwrap()
+                .contains_key(path.as_path()),
+            "the record must be DROPPED, not merely filtered out of one stuck_worktree_removals \
+             read"
+        );
+    }
+
+    #[test]
+    fn a_stuck_record_clears_when_a_quarantine_attempt_finds_nothing_to_stash() {
+        // The 13th route named in #7939: `reap_worktrees_generic`'s
+        // `RemoveWithQuarantine` branch, when `quarantine` returns `None`
+        // (stash failed or nothing to stash), also `continue`s before ever
+        // reaching the remover — and must clear a stuck record exactly like
+        // every `Skip*` route does.
+        let (repo_root_dir, path) = issue_worktree_dir(102);
+        let repo_root = repo_root_dir.path();
+
+        let ok = remove_with_backoff(repo_root, WorktreeKind::Issue, 102, &path, || {
+            Err("Permission denied (os error 13)".to_string())
+        });
+        assert!(!ok);
+        assert!(stuck_worktree_removals().iter().any(|r| r.path == path));
+
+        let report = super::super::reap_worktrees_generic(
+            repo_root,
+            &crate::worktree_ops::naming::issue_from_worktree,
+            &|_path, _num| crate::worktree_ops::clean::WorktreeDecision::RemoveWithQuarantine,
+            &|_path, _num| None,
+            &|_path, _num| true,
+        );
+
+        assert_eq!(report.removed, Vec::<u32>::new());
+        assert_eq!(report.failed, Vec::<u32>::new());
+        assert!(!stuck_worktree_removals().iter().any(|r| r.path == path));
+    }
+
+    #[test]
+    fn a_stuck_record_clears_across_several_distinct_skip_decisions() {
+        // Coverage beyond the one named variant above: every `Skip*` (and the
+        // unreachable-in-`--safe`-mode `ConfirmClosedIssue`) route goes
+        // through the same `skip_reason` match in `reap_worktrees_generic`,
+        // so one representative per decision family is enough to show none
+        // of them special-case the clear away.
+        use crate::worktree_ops::clean::WorktreeDecision;
+
+        let decisions = [
+            WorktreeDecision::SkipInUse("live process".to_string()),
+            WorktreeDecision::SkipEditable("loom".to_string()),
+            WorktreeDecision::SkipUnmanaged,
+            WorktreeDecision::SkipGrace(60),
+            WorktreeDecision::SkipClosedNoMergeGrace(60),
+            WorktreeDecision::SkipNoPrGrace(60),
+            WorktreeDecision::SkipUncommitted,
+            WorktreeDecision::SkipNotMerged("branch unreachable".to_string()),
+            WorktreeDecision::SkipPrOpen,
+            WorktreeDecision::SkipUnknownPrStatus,
+            WorktreeDecision::ConfirmClosedIssue,
+        ];
+
+        for (i, decision) in decisions.into_iter().enumerate() {
+            let n = 200 + u32::try_from(i).unwrap();
+            let (repo_root_dir, path) = issue_worktree_dir(n);
+            let repo_root = repo_root_dir.path();
+
+            let ok = remove_with_backoff(repo_root, WorktreeKind::Issue, n, &path, || {
+                Err("Permission denied (os error 13)".to_string())
+            });
+            assert!(!ok);
+            assert!(stuck_worktree_removals().iter().any(|r| r.path == path));
+
+            let decision = decision.clone();
+            let _report = super::super::reap_worktrees_generic(
+                repo_root,
+                &crate::worktree_ops::naming::issue_from_worktree,
+                &move |_path, _num| decision.clone(),
+                &|_path, _num| None,
+                &|_path, _num| true,
+            );
+
+            assert!(
+                !stuck_worktree_removals().iter().any(|r| r.path == path),
+                "decision at index {i} must clear its worktree's stuck record"
+            );
+        }
     }
 
     #[test]
