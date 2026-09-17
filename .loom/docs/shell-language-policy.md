@@ -158,9 +158,45 @@ also self-tested on the macOS leg of the `Shell Syntax` job, which asserts its
 `bash` really is 3.x, so the gate that guards against the bash 3.2 class is
 itself exercised under bash 3.2.
 
+## The aggregate ratchet (#8084)
+
+The allowlist gates each NEW script. It does not measure total volume, and total
+volume is where the growth actually was:
+
+| when | files | production shell code lines |
+|---|---|---|
+| 90 days ago | 93 | 14,958 |
+| 60 days ago | 96 | 15,568 |
+| 30 days ago | 186 | 40,735 |
+| now | 234 | 51,814 |
+
+Epic #7810 deleted roughly 2,200 lines of production shell over that last
+stretch and the total still rose — immediately before its first port commit the
+number was 51,749, against 51,814 now, a net **+65**. Of the 98 files appearing
+between the 60- and 30-day marks, 96 did not exist anywhere in the tree at 60
+days, so this is new code rather than a reorganisation. 29,795 of the added
+lines came in as 148 brand-new scripts, nearly all individually under the
+per-file threshold and each with a defensible allowlist reason.
+
+`loom-daemon/tests/shell_budget_ratchet.rs` freezes the total in
+`scripts/shell-budget-baseline.txt`: it may fall freely and may not rise. Growth
+is still allowed — it just has to be spelled out as a changed number that a
+reviewer can see, instead of arriving invisibly across a hundred files. Tests
+are excluded, because the retained black-box suite method a port runs on
+*requires* test shell to grow as production shell shrinks.
+
+```bash
+cargo test -p loom-daemon --test shell_budget_ratchet          # the gate CI runs
+UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet
+```
+
+It is Rust, not a script, for the obvious reason: a `.sh` enforcing "stop adding
+shell" would have to exempt itself from its own count.
+
 ## Related
 
 - [ADR-0018](https://github.com/rjwalters/loom/blob/main/docs/adr/0018-rust-owns-behavior-shell-reaches-it.md) — the accepted architectural decision this narrows.
 - #7810 — the migration epic for shell that already exists.
 - #7758 — the categorical verdicts used as this taxonomy, and the irreducible bootstrap core.
 - [`file-size-policy.md`](file-size-policy.md) — the #7711 ratchet on existing files, unchanged by this policy.
+- #8084 — the aggregate shell-volume ratchet above, the companion to this per-file allowlist.
