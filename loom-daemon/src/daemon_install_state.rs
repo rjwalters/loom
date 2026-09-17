@@ -841,7 +841,7 @@ fn parse_etime(raw: &str) -> Option<u64> {
 /// so the caller falls through to today's verdicts rather than falsely
 /// reporting "starting" (#4213). Bounded by [`PROBE_TIMEOUT`]: a hung `ps`
 /// takes the same `None` path (#4548).
-fn process_age_secs(pid: u32) -> Option<u64> {
+pub(crate) fn process_age_secs(pid: u32) -> Option<u64> {
     let mut cmd = Command::new("ps");
     cmd.args(["-o", "etime=", "-p", &pid.to_string()]);
     let output = probe_output(cmd, PROBE_TIMEOUT)?;
@@ -888,7 +888,7 @@ fn heartbeat_age_secs(path: &Path) -> Option<u64> {
 /// check. `None` (unparseable `ps` age) makes no prior-boot claim and
 /// degrades to the pre-#4368 Stale/Fresh verdicts, per the module's
 /// degrade-don't-false-report rule.
-fn check_heartbeat(
+pub(crate) fn check_heartbeat(
     heartbeat_file: &Path,
     stale_threshold_secs: u64,
     process_age_secs: Option<u64>,
@@ -912,7 +912,7 @@ fn check_heartbeat(
 
 /// The watchdog's staleness threshold formula: `max(interval * 5, 300)`,
 /// unless `LOOM_DAEMON_HEARTBEAT_STALE_SECS` overrides it.
-fn resolve_stale_threshold(interval_secs: u64, env_override: Option<u64>) -> u64 {
+pub(crate) fn resolve_stale_threshold(interval_secs: u64, env_override: Option<u64>) -> u64 {
     env_override.unwrap_or_else(|| (interval_secs * 5).max(300))
 }
 

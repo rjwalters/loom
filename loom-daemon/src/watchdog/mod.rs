@@ -41,6 +41,7 @@
 pub mod config;
 pub mod consts;
 pub mod env;
+pub mod heartbeat;
 pub mod liveness;
 pub mod locate;
 pub mod marker;
@@ -77,9 +78,67 @@ pub fn tick(verbose: bool) -> i32 {
     if !paths.marker.exists() {
         return marker_absent(&paths, &reporter, &state);
     }
+    marker_present(&paths, &reporter, &state)
+}
 
-    // TODO(#8086): sections 2-22 and the 50-series.
-    0
+/// Sections 2-7: intent is on record, so compare it against reality.
+fn marker_present(
+    paths: &config::Paths,
+    reporter: &report::Reporter,
+    state: &consts::StateFiles,
+) -> i32 {
+    let sup = supervisor::resolve_with_marker(
+        &paths.marker,
+        cfg!(target_os = "macos"),
+        supervisor::systemctl_available(),
+    );
+    let snap = liveness::probe(&paths.loom_dir, &paths.marker, &sup);
+
+    if !snap.alive() {
+        // TODO(#8086): sections 8-10 — the bounded auto-remediation gate, the
+        // recovery backoff and circuit breaker, and the forge escalation. Until
+        // those land this reports the outage without attempting recovery, which
+        // is the pre-#5391 behaviour; the stub has NOT been swapped over, so
+        // the shell is still what runs in production.
+        reporter.report(
+            report::Level::Divergence,
+            &format!(
+                "A daemon is EXPECTED (autonomy-desired marker present, started {}) but is NOT \
+                 running: {}. Autonomous dispatch has stopped. Recover with: \
+                 ./.loom/scripts/cli/loom-daemon-start.sh [flags]  (or 'loom-daemon status' to \
+                 inspect).",
+                snap.started_at.as_deref().unwrap_or(""),
+                snap.detail
+            ),
+        );
+        return 1;
+    }
+
+    // A healthy tick ends any outage episode: the next real outage must start
+    // from a fresh attempt budget rather than inheriting a spent one.
+    let _ = std::fs::remove_file(&state.recovery);
+
+    // TODO(#8086): sections 12-22 (the bounded IPC probe, its consecutive and
+    // windowed signals) set `reporter.probe_diverged`, which is what makes an
+    // OK-shaped heartbeat line render as DEGRADED and owns the exit code. The
+    // 50-series peer-coordination checks run here too.
+
+    let heartbeat_file = snap.heartbeat_file.clone().unwrap_or_else(|| {
+        paths
+            .loom_dir
+            .join("daemon.heartbeat")
+            .display()
+            .to_string()
+    });
+    let verdict = heartbeat::decide(
+        snap.heartbeat,
+        &snap.detail,
+        &heartbeat_file,
+        snap.heartbeat_age_secs,
+        snap.heartbeat_stale_threshold_secs,
+        snap.process_age_secs,
+    );
+    heartbeat::emit(&verdict, reporter)
 }
 
 /// Sections 1 and 1b — there is no operator intent on record.

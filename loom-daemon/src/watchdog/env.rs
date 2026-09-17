@@ -78,7 +78,7 @@ mod tests {
     fn a_value_matching_neither_pattern_leaves_the_default_standing() {
         // The shell's if/elif fell through, keeping the marker's setting. An
         // unrecognised value must therefore be indistinguishable from unset.
-        assert_eq!(super::super::env::is_true("ture"), false);
-        assert_eq!(super::super::env::is_false("ture"), false);
+        assert!(!is_true("ture"));
+        assert!(!is_false("ture"));
     }
 }

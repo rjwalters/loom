@@ -45,6 +45,54 @@ pub fn resolve_without_marker(is_darwin: bool, systemctl_available: bool) -> Sup
     }
 }
 
+/// Resolve for the **marker-present** path (sections 2-22), where the marker
+/// records what the start script actually chose on this host and the
+/// environment may override it.
+///
+/// The rules differ from [`resolve_without_marker`] in two ways that are easy
+/// to miss and are reproduced deliberately:
+///
+/// - `use_launchd` defaults to **true** from the marker's absence, not false.
+///   The marker is written by a start that knew; a marker with no `use_launchd`
+///   predates the field.
+/// - The systemd probe here is **not** gated on `!is_darwin` or on `systemctl`
+///   existing. On the marker-absent path it is, because there is no record of
+///   what the daemon was started under and probing a supervisor the host does
+///   not have reports "not loaded", which reads exactly like a real outage.
+///   With a marker, the record settles it.
+#[must_use]
+pub fn resolve_with_marker(
+    marker: &std::path::Path,
+    is_darwin: bool,
+    _systemctl_available: bool,
+) -> Supervisor {
+    let m = |k: &str| super::marker::get_nonempty(marker, k);
+
+    let mut use_launchd = m("use_launchd").is_none_or(|v| v != "false");
+    if env::var("LOOM_DAEMON_LAUNCHD").is_some_and(|v| env::is_false(&v)) {
+        use_launchd = false;
+    }
+    if !is_darwin {
+        use_launchd = false;
+    }
+
+    let mut use_systemd = m("use_systemd").is_some_and(|v| v == "true");
+    if let Some(v) = env::tri("LOOM_WATCHDOG_SYSTEMD_PROBE") {
+        use_systemd = v;
+    }
+
+    Supervisor {
+        use_launchd,
+        label: env::var("LOOM_LAUNCHD_LABEL")
+            .or_else(|| m("launchd_label"))
+            .unwrap_or_else(|| DEFAULT_LAUNCHD_LABEL.to_string()),
+        use_systemd,
+        systemd_unit: env::var("LOOM_SYSTEMD_UNIT")
+            .or_else(|| m("systemd_unit"))
+            .unwrap_or_else(|| DEFAULT_SYSTEMD_UNIT.to_string()),
+    }
+}
+
 /// Whether `systemctl` is on PATH — the shell's `command -v systemctl`.
 #[must_use]
 pub fn systemctl_available() -> bool {

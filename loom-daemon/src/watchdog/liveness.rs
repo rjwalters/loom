@@ -35,7 +35,7 @@
 
 use std::path::Path;
 
-use crate::daemon_install_state::{self, EnvOverrides, HeartbeatFreshness, InstallState};
+use crate::daemon_install_state::{self, HeartbeatFreshness, InstallState};
 
 /// One tick's view of intent-vs-reality.
 pub struct Snapshot {
@@ -69,20 +69,103 @@ impl Snapshot {
 }
 
 /// Classify this tick.
+///
+/// # Why this calls the primitives rather than [`daemon_install_state::classify`]
+///
+/// `classify` is documented as answering "the states `status` can distinguish
+/// **once a live IPC round-trip has failed**", and it bakes in that framing:
+/// heartbeat freshness is computed only for `AliveButUnresponsive`, because a
+/// process inside the startup-grace window is `AliveStarting` and `status` has
+/// nothing to say about its heartbeat yet.
+///
+/// The watchdog asks a different question in a different order. It wants
+/// heartbeat freshness for **any** live daemon, independently of process age,
+/// and it runs its own bounded probe afterwards rather than before. Calling
+/// `classify` here looked right and silently produced "no heartbeat file" for a
+/// live daemon with a stale heartbeat — a section-3 DIVERGENCE reported as a
+/// section-5 OK. An end-to-end run caught it; no unit test would have, because
+/// each half was individually correct.
+///
+/// So this composes the same primitives `classify` does — `check_liveness`,
+/// `check_heartbeat`, `process_age_secs`, `resolve_stale_threshold` — in the
+/// watchdog's own order. Still one implementation of each; a different
+/// sequence over them.
 #[must_use]
-pub fn probe(loom_dir: &Path, marker: &Path) -> Snapshot {
-    let env = EnvOverrides::from_env();
-    let report = daemon_install_state::classify(loom_dir, marker, &env);
+pub fn probe(
+    loom_dir: &Path,
+    marker: &Path,
+    supervisor: &super::supervisor::Supervisor,
+) -> Snapshot {
+    if !marker.exists() {
+        return Snapshot {
+            state: InstallState::NotExpected,
+            started_at: None,
+            pid: None,
+            detail: String::new(),
+            heartbeat: None,
+            heartbeat_age_secs: None,
+            heartbeat_stale_threshold_secs: None,
+            heartbeat_file: None,
+            process_age_secs: None,
+        };
+    }
+
+    let m = |k: &str| super::marker::get_nonempty(marker, k);
+    let pid_file = super::marker::resolve_pid_file(
+        super::env::var("LOOM_PID_FILE"),
+        m("pid_file"),
+        super::env::var("LOOM_MACHINE_CHECKOUT"),
+        super::env::var("LOOM_WORKSPACE"),
+        m("repo_root"),
+        Some(loom_dir.to_path_buf()),
+    );
+
+    let liveness = daemon_install_state::check_liveness_with_systemd(
+        supervisor.use_launchd,
+        &supervisor.label,
+        pid_file.as_deref(),
+        super::env::var("LOOM_LAUNCHD_DOMAIN").as_deref(),
+        supervisor
+            .use_systemd
+            .then_some(supervisor.systemd_unit.as_str()),
+    );
+
+    let process_age = liveness
+        .pid
+        .and_then(daemon_install_state::process_age_secs);
+
+    let heartbeat_file = m("heartbeat_file")
+        .map_or_else(|| loom_dir.join("daemon.heartbeat"), std::path::PathBuf::from);
+    let interval = m("heartbeat_interval_secs")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+    let threshold = daemon_install_state::resolve_stale_threshold(
+        interval,
+        super::env::var("LOOM_DAEMON_HEARTBEAT_STALE_SECS").and_then(|v| v.parse().ok()),
+    );
+
+    // Heartbeat freshness is only meaningful about a process that exists.
+    let (freshness, age) = if liveness.alive {
+        let (f, a) = daemon_install_state::check_heartbeat(&heartbeat_file, threshold, process_age);
+        (Some(f), a)
+    } else {
+        (None, None)
+    };
+
     Snapshot {
-        state: report.state,
-        started_at: report.started_at,
-        pid: report.pid,
-        detail: report.liveness_detail.unwrap_or_default(),
-        heartbeat: report.heartbeat_freshness,
-        heartbeat_age_secs: report.heartbeat_age_secs,
-        heartbeat_stale_threshold_secs: report.heartbeat_stale_threshold_secs,
-        heartbeat_file: super::marker::get_nonempty(marker, "heartbeat_file"),
-        process_age_secs: report.process_age_secs,
+        state: if liveness.alive {
+            InstallState::AliveButUnresponsive
+        } else {
+            InstallState::ExpectedButDead
+        },
+        started_at: m("started_at"),
+        pid: liveness.pid,
+        detail: liveness.detail,
+        heartbeat: freshness,
+        heartbeat_age_secs: age,
+        heartbeat_stale_threshold_secs: Some(threshold),
+        heartbeat_file: Some(heartbeat_file.display().to_string()),
+        process_age_secs: process_age,
     }
 }
 
