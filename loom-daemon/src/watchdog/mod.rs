@@ -48,6 +48,7 @@ pub mod marker;
 pub mod probe;
 pub mod probe_state;
 pub mod recovery;
+pub mod remediation;
 pub mod report;
 pub mod supervisor;
 
