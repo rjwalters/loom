@@ -1342,6 +1342,8 @@ mod tests {
         let sweep_id = "sweep-issue-404-adopt";
         let owner = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 404,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),

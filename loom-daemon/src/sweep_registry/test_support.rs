@@ -2289,6 +2289,8 @@ pub(crate) fn write_lock_owner(
     std::fs::create_dir_all(&lock).unwrap();
     let owner = LockOwner {
         pgid: None,
+        model: None,
+        effort: None,
         issue,
         owner_pid,
         acquired_at: Utc::now().to_rfc3339(),

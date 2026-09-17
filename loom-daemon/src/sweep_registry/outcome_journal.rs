@@ -36,6 +36,13 @@ pub(crate) const MAX_PHASE_OBSERVATIONS: usize = 32;
 /// `sweep.outcome` record (Issue #4704).
 pub(crate) const MERGE_PHASE_LABEL: &str = "merge";
 
+/// The normalized lifecycle phase name (see [`phase_label`]) for a Doctor
+/// phase — counted per observation into the `sweep.outcome` record's
+/// `doctor_cycles` (Issue #8056). Both `doctor-done` and a (hypothetical)
+/// `doctor-rejected` marker normalize to this, so a cycle is counted by the
+/// phase it belongs to rather than by how it ended.
+pub(crate) const DOCTOR_PHASE_LABEL: &str = "doctor";
+
 /// Normalize a checkpoint phase marker to the lifecycle phase name the
 /// telemetry schema documents (Issue #4704): `"curator-done"` → `"curator"`,
 /// `"judge-rejected"` → `"judge"`, `"merge-done"` → `"merge"`. A marker with
@@ -50,6 +57,28 @@ pub(crate) fn phase_label(checkpoint_phase: &str) -> &str {
         }
     }
     checkpoint_phase
+}
+
+/// The distinct model ids in a `sweep.outcome` record's per-model token
+/// breakdown (Issue #8056), sorted and deduped — the top-level
+/// [`telemetry::SweepOutcomeRecord::models_used`] signal that a sweep ran more
+/// than the one model it was dispatched with (the Doctor escalation ladder's
+/// opus rescue of a sonnet build, which the record's own `model` field reports
+/// as plain `sonnet`).
+///
+/// Derived from [`telemetry::SweepOutcomeRecord::tokens_by_model`] rather than
+/// sampled separately so the two can never disagree, and inherits its
+/// "unknown != zero" contract: `None` — never `Some(vec![])` — when no
+/// attributable transcript was found.
+#[must_use]
+pub(crate) fn models_used_from(
+    tokens_by_model: Option<&[crate::script_helpers::sweep_experiment::ModelUsageTotals]>,
+) -> Option<Vec<String>> {
+    let rows = tokens_by_model?;
+    let mut models: Vec<String> = rows.iter().map(|r| r.model.clone()).collect();
+    models.sort_unstable();
+    models.dedup();
+    (!models.is_empty()).then_some(models)
 }
 
 impl SweepRegistry {
@@ -103,11 +132,27 @@ impl SweepRegistry {
         result: telemetry::SweepResult,
     ) {
         let path = self.config.resolve_outcomes_journal_path();
-        let token_name = self
-            .entries
-            .get(sweep_id)
-            .map(|info| info.token_name.clone())
-            .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string());
+        let token_name = self.resolve_token_account(sweep_id, issue);
+        // Issue #8056: the single most-specific failure label for this
+        // terminal transition, copied into the PAIRED `sweep.outcome`
+        // telemetry record below so "real failure vs. <60s spawn death" is
+        // answerable without joining this journal by `sweep_id`. Computed
+        // before the two `Option`s move into the record below; both survive
+        // separately there, exactly as before.
+        //
+        // Precedence: `death_class` first. It is the pre-flight classifier —
+        // it answers "did this sweep ever start work?", which is the question
+        // behind #8056's measurement that 1,285 of 1,963 `failure` records
+        // were <60s spawn deaths. `crash_classification` fills in for the
+        // deaths the pre-flight classifier deliberately declines to label
+        // (account/credit exhaustion is excluded from it by design), so in
+        // practice the two rarely compete; where they do — a token-selection
+        // death that also resolved an empty pool — the pre-flight label is the
+        // canonical one for that shape.
+        let failure_class = death_class
+            .clone()
+            .or_else(|| crash_classification.clone())
+            .filter(|class| !class.is_empty());
         let record = sweep_outcomes::OutcomeRecord {
             timestamp: Utc::now(),
             repo: self.config.workspace_root.display().to_string(),
@@ -132,7 +177,44 @@ impl SweepRegistry {
         // `sweep_outcomes` module doc for why), carrying model/config/result
         // detail the #4644 journal was never meant to hold. Independent
         // best-effort side effect: never allowed to block reaping.
-        self.append_outcome_telemetry_journal(issue, sweep_id, duration_sec, result);
+        self.append_outcome_telemetry_journal(issue, sweep_id, duration_sec, result, failure_class);
+    }
+
+    /// The OAuth/token account this sweep actually ran on (Issue #8056), for
+    /// both terminal journals' account attribution.
+    ///
+    /// Three sources, strongest first:
+    ///
+    /// 1. the live registry entry's `token_name`, when it holds a real account;
+    /// 2. a re-parse of the sweep's own per-sweep log, anchored to its
+    ///    `sweep_id=<id>` dispatch header — the same parser restart adoption
+    ///    uses ([`recover_adopted_token_name`], #4173);
+    /// 3. [`UNKNOWN_TOKEN_NAME`], for a genuinely unknowable account.
+    ///
+    /// Step 2 is what #8056 measured as missing: `config.token_account` was
+    /// `"unknown"` on every inspected record, from two different causes that
+    /// both leave the on-disk log intact. Either the entry is **gone** (a sweep
+    /// reconstructed after a daemon restart, or one already reaped), or the
+    /// entry is present but its `token_name` is literally `"unknown"` because
+    /// the dispatch-time account-selection poll gave up after
+    /// `TOKEN_NAME_CAPTURE_TIMEOUT` (5s) while `spawn-claude.sh` logged its
+    /// selection a moment later. The log line is durable in both cases, so one
+    /// bounded read at the terminal transition recovers the attribution.
+    ///
+    /// Cost: a single `read_to_string` of the per-sweep log, and only on the
+    /// fallback path — a sweep whose entry already names its account never
+    /// touches the filesystem here. Terminal transitions are rare (once per
+    /// sweep), so this is not a per-tick cost. Never a forge call.
+    pub(crate) fn resolve_token_account(&self, sweep_id: &str, issue: u32) -> String {
+        let info = self.entries.get(sweep_id);
+        if let Some(name) = info
+            .map(|i| i.token_name.clone())
+            .filter(|name| !name.is_empty() && name != UNKNOWN_TOKEN_NAME)
+        {
+            return name;
+        }
+        let log_path = info.map_or_else(|| self.compute_log_path(issue), |i| i.log_path.clone());
+        recover_adopted_token_name(&log_path, sweep_id)
     }
 
     /// Append one `sweep.outcome` telemetry record (Issue #4704, absorbs
@@ -151,20 +233,26 @@ impl SweepRegistry {
     /// `skip_label_flip` is set, matching every other real-forge probe in this
     /// file. A skipped lookup still writes the record, with best-effort
     /// (workspace-path `repo`, private `visibility`) values.
+    ///
+    /// `failure_class` is the caller's already-computed classification for this
+    /// same terminal transition (Issue #8056) — passed in rather than re-derived
+    /// so the telemetry record and the sibling `sweep-outcomes.jsonl` record can
+    /// never disagree about why a sweep died.
     pub(crate) fn append_outcome_telemetry_journal(
         &self,
         issue: u32,
         sweep_id: &str,
         duration_sec: i64,
         result: telemetry::SweepResult,
+        failure_class: Option<String>,
     ) {
         let info = self.entries.get(sweep_id);
         let model = info.and_then(|i| i.model.clone());
         let effort = info.and_then(|i| i.effort.clone());
         let runtime = info.map(|i| i.runtime.clone());
-        let token_name = info
-            .map(|i| i.token_name.clone())
-            .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string());
+        // Issue #8056: survives both a missing entry and an entry whose
+        // dispatch-time account capture timed out — see `resolve_token_account`.
+        let token_name = self.resolve_token_account(sweep_id, issue);
         let latest_phase = info.and_then(|i| i.latest_phase.clone());
         let started_at = info.map(|i| i.started_at);
 
@@ -300,6 +388,30 @@ impl SweepRegistry {
             )
         });
 
+        // Distinct model ids actually observed in this sweep's transcripts
+        // (Issue #8056) — see `models_used_from`.
+        let models_used = models_used_from(tokens_by_model.as_deref());
+
+        // Observed Doctor phases (Issue #8056). Counted from the SAMPLED
+        // transition history, not from `phase_durations` above: the latter
+        // falls back to a synthesized single entry naming `latest_phase` when
+        // no history exists, and counting that would report a fabricated
+        // `doctor_cycles: 1` for a sweep whose lifecycle was never observed.
+        // `None` here means "no history sampled" and `Some(0)` means "observed,
+        // no Doctor phase" — the "unknown != zero" contract the schema
+        // documents. Interim proxy until label-event sourcing lands: a Doctor
+        // phase that opens and closes between two ~30s reaper ticks is missed,
+        // so this is a lower bound.
+        let doctor_cycles = self.phase_history.get(sweep_id).map(|history| {
+            u32::try_from(
+                history
+                    .iter()
+                    .filter(|o| phase_label(&o.phase) == DOCTOR_PHASE_LABEL)
+                    .count(),
+            )
+            .unwrap_or(u32::MAX)
+        });
+
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
             visibility,
@@ -317,6 +429,9 @@ impl SweepRegistry {
             lines_added,
             lines_deleted,
             tokens_by_model,
+            failure_class,
+            models_used,
+            doctor_cycles,
         };
         let envelope = telemetry::TelemetryEnvelope::new(
             host_identity(),
@@ -1437,5 +1552,299 @@ mod tests {
             }
             other => panic!("expected a SweepPhase record on the queue, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // Outcome-journal completeness (Issue #8056): failure_class, models_used,
+    // doctor_cycles, and token-account recovery.
+    // ------------------------------------------------------------------------
+
+    /// Read the raw JSON of the `sweep.outcome` telemetry line for `issue` —
+    /// the only way to tell an **omitted** optional field from a `null` one,
+    /// which the "unknown != zero" contract turns on.
+    fn raw_outcome_record(registry: &SweepRegistry, issue: u32) -> serde_json::Value {
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let contents = std::fs::read_to_string(&path).expect("telemetry journal must exist");
+        let line = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|v| v["record"]["kind"] == "sweep.outcome" && v["record"]["issue"] == issue)
+            .expect("a sweep.outcome line for this issue");
+        line["record"].clone()
+    }
+
+    /// AC: `failure_class` on a spawn-death record equals the sibling
+    /// `sweep-outcomes.jsonl` record's classification for the same `sweep_id`
+    /// — readable off the telemetry record alone, with no external join.
+    #[test]
+    fn telemetry_outcome_failure_class_copies_the_preflight_death_class() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        let issue = 8056;
+
+        insert_dead_running_with_log(
+            &mut registry,
+            issue,
+            0,
+            "agent-1",
+            "==== loom-daemon dispatch: sweep-issue-8056-0 ====\nToken selection failed:\n",
+        );
+        registry.reap_once();
+
+        let siblings = sweep_outcomes::read_all(&registry.config().resolve_outcomes_journal_path());
+        let sibling = siblings.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(
+            sibling.death_class.as_deref(),
+            Some("preflight-token-selection-failed"),
+            "precondition: the sibling journal classifies this as a pre-flight death"
+        );
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(
+            record.failure_class.as_deref(),
+            Some("preflight-token-selection-failed"),
+            "the telemetry record must carry the same class, no sweep_id join required"
+        );
+    }
+
+    /// A credit-exhaustion death carries no `death_class` at all (the
+    /// pre-flight classifier excludes account exhaustion by design), so
+    /// `failure_class` falls through to the sibling's `crash_classification` —
+    /// which is how an `account-exhausted:*` record stays distinguishable from
+    /// a pre-flight one. The sibling journal still carries both fields.
+    #[test]
+    fn telemetry_outcome_failure_class_prefers_the_account_exhaustion_class() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        let issue = 8058;
+
+        insert_dead_running_with_log(
+            &mut registry,
+            issue,
+            0,
+            "agent-1",
+            "==== loom-daemon dispatch: sweep-issue-8058-0 ====\n\
+             # CLAUDE_CLI_START\n\
+             Claude: You're out of usage credits for this model.\n",
+        );
+        registry.reap_once();
+
+        let siblings = sweep_outcomes::read_all(&registry.config().resolve_outcomes_journal_path());
+        let sibling = siblings.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(
+            sibling.crash_classification.as_deref(),
+            Some("account-exhausted:model-credits-exhausted"),
+        );
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(
+            record.failure_class.as_deref(),
+            Some("account-exhausted:model-credits-exhausted"),
+        );
+    }
+
+    /// A clean run carries NO `failure_class` key at all — not `null`, not
+    /// `"unknown"`, not `""`. There is nothing to classify about a success.
+    #[test]
+    fn telemetry_outcome_omits_failure_class_when_there_was_no_classification() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 8059;
+
+        // A log that reached the CLI and shows no exhaustion signature: no
+        // pre-flight class, no crash classification, nothing to copy.
+        insert_dead_running_with_log(
+            &mut registry,
+            issue,
+            0,
+            "agent-2",
+            "==== loom-daemon dispatch: sweep-issue-8059-0 ====\n\
+             # CLAUDE_CLI_START\n\
+             clean run\n",
+        );
+        registry.reap_once();
+
+        let raw = raw_outcome_record(&registry, issue);
+        assert!(
+            raw.get("failure_class").is_none(),
+            "an unclassified terminal transition must omit failure_class entirely: {raw}"
+        );
+    }
+
+    /// AC: a sweep whose lifecycle included two Doctor phases reports
+    /// `doctor_cycles: 2` — the "sonnet passed" vs. "sonnet failed, the Doctor
+    /// fixed it" discriminator, counted per observed phase, not collapsed.
+    #[test]
+    fn telemetry_outcome_counts_doctor_cycles_from_sampled_phases() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 8060;
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-3", "log\n");
+        let started_at = Utc::now() - Duration::from_secs(300);
+        registry.entries.get_mut(&sweep_id).unwrap().started_at = started_at;
+
+        for phase in [
+            "builder-done",
+            "judge-rejected",
+            "doctor-done",
+            "judge-rejected",
+            "doctor-done",
+        ] {
+            write_checkpoint_with_mtime(&registry, issue, phase, SystemTime::now());
+            registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+        }
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(record.doctor_cycles, Some(2));
+    }
+
+    /// "Observed, no Doctor phase" is `0` — a real, load-bearing value, and
+    /// distinct from the omitted case below.
+    #[test]
+    fn telemetry_outcome_reports_zero_doctor_cycles_for_an_observed_clean_lifecycle() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 8061;
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-4", "log\n");
+        let started_at = Utc::now() - Duration::from_secs(120);
+        registry.entries.get_mut(&sweep_id).unwrap().started_at = started_at;
+        write_checkpoint_with_mtime(&registry, issue, "builder-done", SystemTime::now());
+        registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+        registry.reap_once();
+
+        let record = raw_outcome_record(&registry, issue);
+        assert_eq!(
+            record
+                .get("doctor_cycles")
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "an observed lifecycle with no Doctor phase reports 0, not an absent key: {record}"
+        );
+    }
+
+    /// "Not observed" is an ABSENT key — a sweep that died before the first
+    /// reaper tick sampled anything has no lifecycle to count, and reporting
+    /// `0` there would fabricate a "no Doctor phase happened" claim the daemon
+    /// cannot make.
+    #[test]
+    fn telemetry_outcome_omits_doctor_cycles_without_a_sampled_history() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 8062;
+
+        insert_dead_running_with_log(&mut registry, issue, 0, "agent-5", "clean run\n");
+        registry.reap_once();
+
+        let raw = raw_outcome_record(&registry, issue);
+        assert!(
+            raw.get("doctor_cycles").is_none(),
+            "an unobserved lifecycle must omit doctor_cycles, never report 0: {raw}"
+        );
+    }
+
+    /// AC: `config.token_account` carries the account the sweep actually ran
+    /// on even when the dispatch-time capture recorded `unknown` — the log's
+    /// own selection line is durable and is re-read at the terminal
+    /// transition.
+    #[test]
+    fn telemetry_outcome_token_account_recovers_from_the_log_when_the_entry_says_unknown() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 8063;
+
+        let sweep_id =
+            insert_dead_running_with_log(&mut registry, issue, 0, UNKNOWN_TOKEN_NAME, "");
+        // The account-selection line `spawn-claude.sh` logs a moment after the
+        // 5s dispatch-time capture window gave up, anchored to this dispatch.
+        let log_path = registry.entries.get(&sweep_id).unwrap().log_path.clone();
+        std::fs::write(
+            &log_path,
+            format!(
+                "==== loom-daemon dispatch: sweep_id={sweep_id} issue={issue} ====\n\
+                 spawn-claude: using OAuth account 'agent7-2amlogic' (mode=random)\n"
+            ),
+        )
+        .unwrap();
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(record.config.get("token_account").map(String::as_str), Some("agent7-2amlogic"),);
+        // The sibling #4644 journal, written from the same resolution, agrees.
+        let siblings = sweep_outcomes::read_all(&registry.config().resolve_outcomes_journal_path());
+        let sibling = siblings.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(sibling.token_name, "agent7-2amlogic");
+    }
+
+    /// The `unknown` fallback survives for the genuinely-unknowable case: no
+    /// entry attribution AND no selection line in the log. Never invented.
+    #[test]
+    fn telemetry_outcome_token_account_stays_unknown_when_nothing_recorded_it() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 8064;
+
+        insert_dead_running_with_log(
+            &mut registry,
+            issue,
+            0,
+            UNKNOWN_TOKEN_NAME,
+            "no account selection was ever logged\n",
+        );
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(
+            record.config.get("token_account").map(String::as_str),
+            Some(UNKNOWN_TOKEN_NAME),
+        );
+    }
+
+    /// `models_used` lifts the DISTINCT model ids out of the per-model token
+    /// rows, sorted and deduped — so an escalated sweep is visible at the top
+    /// level even though its `model` field names only the dispatched model.
+    #[test]
+    fn models_used_lifts_distinct_models_from_the_token_rows() {
+        let row =
+            |model: &str, speed: &str| crate::script_helpers::sweep_experiment::ModelUsageTotals {
+                model: model.to_string(),
+                speed: speed.to_string(),
+                service_tier: "standard".to_string(),
+                input: 1,
+                cache_read: 0,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                output: 1,
+            };
+        // Same model twice under different speeds must collapse to one id.
+        let rows = vec![
+            row("claude-sonnet-5", "standard"),
+            row("claude-opus-5", "standard"),
+            row("claude-sonnet-5", "fast"),
+        ];
+        assert_eq!(
+            models_used_from(Some(&rows)),
+            Some(vec!["claude-opus-5".to_string(), "claude-sonnet-5".to_string()]),
+        );
+    }
+
+    /// "Unknown != zero": no attributable transcript ⇒ no `models_used` at
+    /// all, never an empty vec that would read as "ran no models".
+    #[test]
+    fn models_used_is_absent_when_no_token_rows_were_found() {
+        assert_eq!(models_used_from(None), None);
+        assert_eq!(models_used_from(Some(&[])), None);
     }
 }

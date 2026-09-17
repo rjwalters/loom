@@ -2209,6 +2209,8 @@ fn reconstruct_discards_a_pgid_the_os_contradicts() {
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: "sweep-stale-pgid".to_string(),
         pgid: Some(pid),
+        model: None,
+        effort: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 

@@ -140,6 +140,26 @@ pub(crate) struct LockOwner {
     /// written before this field existed.
     #[serde(default)]
     pub(crate) pgid: Option<u32>,
+    /// Model this sweep was dispatched with (Issue #8056), stamped by
+    /// [`SweepRegistry::record_child_pid_in_lock`] alongside the child pid.
+    ///
+    /// Added for the same reason as `pgid`, and with the same
+    /// `Option`+`#[serde(default)]` schema-evolution contract: the value is
+    /// known only to the dispatching daemon *instance*, so before this field
+    /// existed a daemon restart erased it — [`SweepRegistry::reconstruct`] had
+    /// nothing to restore from and set `model: None` on every adopted entry,
+    /// which is what nulled `model`/`effort` on the resulting `sweep.outcome`
+    /// telemetry record. `None` on a provisional (pre-spawn) record, on a
+    /// pre-#8056 `owner.json`, and on a dispatch that requested no explicit
+    /// model (the honest "inherited the default" case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    /// Reasoning effort this sweep was dispatched with (Issue #8056), stamped
+    /// and restored exactly like [`model`](Self::model). `None` means no
+    /// explicit `--effort` was requested — the child inherited the session
+    /// default — which is a genuinely unknown level, never a fabricated one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) effort: Option<String>,
 }
 
 /// The pure filesystem-scan half of [`SweepRegistry::unregistered_locked_issues`]
@@ -262,6 +282,8 @@ impl SweepRegistry {
                     // target the daemon itself. `record_child_pid_in_lock`
                     // stamps the real value once the child is running.
                     pgid: None,
+                    model: None,
+                    effort: None,
                 };
                 let owner_json =
                     serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
@@ -297,11 +319,22 @@ impl SweepRegistry {
     /// *live* process's group, so once the wrapper dies its surviving
     /// descendants become unreachable-by-group unless the value was persisted
     /// while it was alive. `None` leaves the field untouched (unknown group).
+    ///
+    /// Issue #8056 additionally stamps the dispatch's `model`/`effort` for the
+    /// same class of reason: they are known only to the dispatching daemon
+    /// *instance*, so a restart used to erase them and every post-restart
+    /// `sweep.outcome` telemetry record for an adopted sweep carried
+    /// `model: null, effort: null` — not because no model was chosen, but
+    /// because the choice was never written down. A `None` argument writes
+    /// nothing (an unset dispatch param is an honest "inherited the default",
+    /// never a fabricated level).
     pub(crate) fn record_child_pid_in_lock(
         &self,
         issue: u32,
         child_pid: u32,
         pgid: Option<u32>,
+        model: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<()> {
         let owner_path = self
             .config
@@ -315,6 +348,12 @@ impl SweepRegistry {
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
+        }
+        if let Some(model) = model.filter(|m| !m.is_empty()) {
+            owner.model = Some(model.to_string());
+        }
+        if let Some(effort) = effort.filter(|e| !e.is_empty()) {
+            owner.effort = Some(effort.to_string());
         }
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
@@ -366,6 +405,8 @@ impl SweepRegistry {
                     acquired_at: Utc::now().to_rfc3339(),
                     sweep_id: sweep_id.to_string(),
                     pgid: None,
+                    model: None,
+                    effort: None,
                 };
                 let owner_json =
                     serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
@@ -651,6 +692,8 @@ impl SweepRegistry {
             // there is no sweep child, and recording OUR OWN group would let a
             // later group-kill target the daemon (#4980).
             pgid: None,
+            model: None,
+            effort: None,
         };
         let takeover = serde_json::to_string_pretty(&owner)
             .context("serialize midbuild-watchdog lock owner")
@@ -876,11 +919,16 @@ impl SweepRegistry {
                         state: SweepState::Running,
                         latest_phase: None,
                         pr_number: None,
-                        // Lock owner.json does not record the model; the
-                        // dispatching daemon instance is gone (#3482).
-                        model: None,
-                        // Effort is likewise unrecoverable from the lock (#3716).
-                        effort: None,
+                        // Issue #8056: restored from the lock, which
+                        // `record_child_pid_in_lock` now stamps at dispatch
+                        // time. Before that the dispatching daemon instance's
+                        // knowledge died with it (#3482/#3716) and every
+                        // adopted sweep's `sweep.outcome` record reported a
+                        // null model/effort. Still `None` for a pre-#8056
+                        // `owner.json` and for a dispatch that requested no
+                        // explicit value — never a fabricated one.
+                        model: owner.model.clone(),
+                        effort: owner.effort.clone(),
                         // depends_on is not recorded in the lock owner (#3729).
                         depends_on: None,
                         // Owning workspace root, stamped for multi-repo
@@ -1135,6 +1183,8 @@ mod tests {
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 77,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),
@@ -1166,6 +1216,8 @@ mod tests {
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 4201,
             owner_pid: std::process::id(), // guaranteed alive
             acquired_at: Utc::now().to_rfc3339(),
@@ -1196,6 +1248,8 @@ mod tests {
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 4202,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),
@@ -1230,6 +1284,8 @@ mod tests {
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 4203,
             owner_pid: 2_147_483_640, // dead
             acquired_at: Utc::now().to_rfc3339(),
@@ -1257,6 +1313,8 @@ mod tests {
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 78,
             owner_pid: 2_147_483_640, // dead
             acquired_at: Utc::now().to_rfc3339(),
@@ -1308,6 +1366,8 @@ mod tests {
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 91,
             owner_pid: 2_147_483_640, // dead
             acquired_at: Utc::now().to_rfc3339(),
@@ -1475,6 +1535,8 @@ mod tests {
         let sweep_id = "sweep-issue-401-adopt";
         let owner = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 401,
             owner_pid: std::process::id(), // alive → admitted as Running
             acquired_at: Utc::now().to_rfc3339(),
@@ -1506,6 +1568,69 @@ mod tests {
         );
     }
 
+    /// Issue #8056: `record_child_pid_in_lock` stamps the dispatched
+    /// model/effort into `owner.json`, and `reconstruct` restores them onto the
+    /// adopted entry — so a sweep that outlives the daemon that dispatched it
+    /// still reports its real model/effort on the `sweep.outcome` telemetry
+    /// record instead of two nulls.
+    #[test]
+    fn reconstruct_restores_model_and_effort_stamped_at_dispatch() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let sweep_id = "sweep-issue-8056-adopt";
+
+        registry.acquire_lock(8056, sweep_id).unwrap();
+        // The dispatch-time stamp: the child's real pid, plus the model and
+        // effort that only this daemon instance knows.
+        registry
+            .record_child_pid_in_lock(
+                8056,
+                std::process::id(), // alive → admitted as Running
+                None,
+                Some("claude-opus-5"),
+                Some("high"),
+            )
+            .unwrap();
+
+        let admitted = registry.reconstruct().unwrap();
+        assert!(admitted >= 1);
+        let info = registry.get(sweep_id).unwrap();
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(info.effort.as_deref(), Some("high"));
+    }
+
+    /// The other half of the contract: an unset dispatch param stamps nothing,
+    /// and a pre-#8056 `owner.json` (no keys at all) still parses — an
+    /// unparseable owner is treated as "no owner" and would drop a LIVE
+    /// sweep's lock, which is far worse than a missing field.
+    #[test]
+    fn reconstruct_leaves_model_and_effort_none_without_a_stamp() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let sweep_id = "sweep-issue-8057-adopt";
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-8057");
+        std::fs::create_dir(&lock).unwrap();
+        // Exactly the pre-#8056 on-disk shape: no `model`/`effort` keys.
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(
+                r#"{{"issue":8057,"owner_pid":{},"acquired_at":"{}","sweep_id":"{sweep_id}"}}"#,
+                std::process::id(),
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        let admitted = registry.reconstruct().unwrap();
+        assert!(admitted >= 1, "a pre-#8056 owner.json must still be parseable and adoptable");
+        let info = registry.get(sweep_id).unwrap();
+        assert_eq!(info.model, None, "never a fabricated model");
+        assert_eq!(info.effort, None, "never a fabricated effort");
+    }
+
     /// Issue #4173: a missing log, or a log without the selection line, degrades
     /// gracefully to `unknown` — adoption never fails on token capture.
     #[test]
@@ -1521,6 +1646,8 @@ mod tests {
         std::fs::create_dir(&lock_a).unwrap();
         let owner_a = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 402,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),
@@ -1538,6 +1665,8 @@ mod tests {
         std::fs::create_dir(&lock_b).unwrap();
         let owner_b = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 403,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),
@@ -1614,6 +1743,8 @@ mod tests {
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
             pgid: None,
+            model: None,
+            effort: None,
             issue: 6262,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),

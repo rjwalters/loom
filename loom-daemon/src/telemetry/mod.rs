@@ -453,6 +453,59 @@ pub struct SweepOutcomeRecord {
     /// rather than re-deriving it from a reconstructed window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
+    /// Terminal failure classification (Issue #8056), copied verbatim at emit
+    /// time from the SAME terminal transition's sibling
+    /// [`crate::sweep_outcomes::OutcomeRecord`] — its `death_class` (the
+    /// pre-flight classifier: `preflight-token-selection-failed`,
+    /// `preflight-no-cli-start`, …) when it derived one, otherwise its
+    /// `crash_classification` (`account-exhausted:model-credits-exhausted`,
+    /// `no-usable-account`, …). The two classifiers are independent and rarely
+    /// compete: account/credit exhaustion is deliberately excluded from the
+    /// pre-flight one. The classification exists on both
+    /// journals so a consumer can tell a real build failure from a <60s spawn
+    /// death **without** joining `sweep-outcomes.jsonl` by `sweep_id` — the
+    /// join #8056 measured as "every success-rate number is wrong until it is
+    /// done". The sibling record still carries BOTH fields separately; this is
+    /// the single most-specific label, not a replacement for them.
+    ///
+    /// Omitted (never `""`, never `"unknown"`) when the terminal transition
+    /// carried no classification at all — including on every success, where
+    /// there is nothing to classify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    /// The distinct model ids observed in [`tokens_by_model`](Self::tokens_by_model),
+    /// sorted and deduped (Issue #8056) — the top-level answer to "did this
+    /// sweep run more than one model?", which the grouped token rows carry
+    /// only implicitly and the top-level [`model`](Self::model) field (the
+    /// *dispatched* model) cannot answer at all. A sweep that escalated to
+    /// `claude-opus-5` through the Doctor ladder has `model: "sonnet"` and
+    /// `models_used: ["claude-opus-5", "claude-sonnet-5"]`.
+    ///
+    /// Derived from `tokens_by_model` rather than sampled independently, so it
+    /// inherits exactly that field's contract: omitted (never an empty vec)
+    /// when no attributable transcript was found. "Not observed" and "observed,
+    /// one model" are therefore distinguishable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_used: Option<Vec<String>>,
+    /// How many times the Doctor phase was observed completing for this sweep
+    /// (Issue #8056) — the "sonnet passed" vs. "sonnet failed, the ladder's
+    /// Doctor fixed it" discriminator.
+    ///
+    /// Counted from the sampled phase-transition history the same
+    /// [`phase_durations`](Self::phase_durations) is built from (one entry per
+    /// observed `doctor-done`/`doctor-rejected` marker), so it is an **interim
+    /// proxy**: the reaper samples the on-disk checkpoint on a ~30s tick, and a
+    /// Doctor phase that opens and closes entirely between two ticks is not
+    /// counted. It is a lower bound, not a certified count, until label-event
+    /// sourcing lands (#8056 Phase 2).
+    ///
+    /// `Some(0)` means "the lifecycle was observed and no Doctor phase
+    /// appeared"; omitted means "no phase history was sampled at all"
+    /// (a sweep that died before the first reaper tick, or one reconstructed
+    /// after a daemon restart). The two are deliberately distinguishable —
+    /// the same "unknown != zero" contract as `tokens_in`/`tokens_by_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctor_cycles: Option<u32>,
 }
 
 /// One account's slice of a `tokens.snapshot` — the per-account usage /
@@ -837,6 +890,9 @@ mod tests {
                 cache_write_1h: 1_500,
                 output: 6_120,
             }]),
+            failure_class: None,
+            models_used: Some(vec!["claude-sonnet-5".to_string()]),
+            doctor_cycles: Some(0),
         })
     }
 
@@ -970,6 +1026,9 @@ mod tests {
             lines_added: None,
             lines_deleted: None,
             tokens_by_model: None,
+            failure_class: None,
+            models_used: None,
+            doctor_cycles: None,
         };
         let value = serde_json::to_value(&record).unwrap();
         for field in [
@@ -1038,6 +1097,124 @@ mod tests {
                 assert_eq!(r.lines_added, None);
                 assert_eq!(r.lines_deleted, None);
                 assert_eq!(r.tokens_by_model, None);
+            }
+            other => panic!("expected SweepOutcome, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Outcome-journal completeness (Issue #8056): failure_class,
+    // models_used, doctor_cycles — all additive and all optional, with the
+    // same "unknown != zero" contract as the #5357/#6384 fields above.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sweep_outcome_round_trips_the_completeness_fields() {
+        let record = SweepOutcomeRecord {
+            repo: "rjwalters/loom".to_string(),
+            visibility: RepoVisibility::Public,
+            issue: 8056,
+            sweep_id: "sweep-issue-8056-0".to_string(),
+            model: Some("sonnet".to_string()),
+            effort: Some("high".to_string()),
+            config: std::collections::BTreeMap::new(),
+            phase_durations: Vec::new(),
+            total_duration_sec: 900,
+            result: SweepResult::Success,
+            pr_number: Some(8100),
+            tokens_in: None,
+            tokens_out: None,
+            lines_added: None,
+            lines_deleted: None,
+            tokens_by_model: None,
+            failure_class: Some("account-exhausted:model-credits-exhausted".to_string()),
+            models_used: Some(vec!["claude-opus-5".to_string(), "claude-sonnet-5".to_string()]),
+            doctor_cycles: Some(2),
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["failure_class"], "account-exhausted:model-credits-exhausted");
+        assert_eq!(value["models_used"][1], "claude-sonnet-5");
+        assert_eq!(value["doctor_cycles"], 2);
+        let decoded: SweepOutcomeRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
+        // The whole point of `Option<u32>`: `Some(0)` is "observed, no Doctor
+        // phase" and must be ON the wire, while `None` is "not observed" and
+        // must be absent. A consumer that cannot tell them apart
+        // (#8057's doctor-phase rate) would silently count the second as the
+        // first.
+        let base = SweepOutcomeRecord {
+            repo: "rjwalters/loom".to_string(),
+            visibility: RepoVisibility::Private,
+            issue: 8056,
+            sweep_id: "sweep-issue-8056-1".to_string(),
+            model: None,
+            effort: None,
+            config: std::collections::BTreeMap::new(),
+            phase_durations: Vec::new(),
+            total_duration_sec: 10,
+            result: SweepResult::Failure,
+            pr_number: None,
+            tokens_in: None,
+            tokens_out: None,
+            lines_added: None,
+            lines_deleted: None,
+            tokens_by_model: None,
+            failure_class: None,
+            models_used: None,
+            doctor_cycles: None,
+        };
+
+        let unobserved = serde_json::to_value(&base).unwrap();
+        for field in ["failure_class", "models_used", "doctor_cycles"] {
+            assert!(
+                unobserved.get(field).is_none(),
+                "unobserved {field:?} must be omitted, not null: {unobserved}"
+            );
+        }
+
+        let observed_zero = serde_json::to_value(SweepOutcomeRecord {
+            doctor_cycles: Some(0),
+            ..base
+        })
+        .unwrap();
+        assert_eq!(
+            observed_zero
+                .get("doctor_cycles")
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "an observed zero must be present on the wire: {observed_zero}"
+        );
+    }
+
+    #[test]
+    fn sweep_outcome_from_a_pre_8056_daemon_still_decodes() {
+        // Backward compatibility (no `schema_version` bump accompanies these
+        // fields): a record emitted by a daemon that predates them must
+        // decode, with each new field reading as "not observed".
+        let json = r#"{
+            "kind": "sweep.outcome",
+            "repo": "rjwalters/loom",
+            "visibility": "public",
+            "issue": 6384,
+            "sweep_id": "sweep-issue-6384-0",
+            "model": "sonnet",
+            "config": { "runtime": "claude", "token_account": "unknown" },
+            "total_duration_sec": 512,
+            "result": "failure",
+            "tokens_in": 100,
+            "tokens_out": 20
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::SweepOutcome(r) => {
+                assert_eq!(r.tokens_in, Some(100));
+                assert_eq!(r.failure_class, None);
+                assert_eq!(r.models_used, None);
+                assert_eq!(r.doctor_cycles, None);
             }
             other => panic!("expected SweepOutcome, got {other:?}"),
         }
