@@ -750,7 +750,7 @@ matched line is captured, not just the first (#4508):
 | Explicit blocker | `Blocked by #123`, `**Blocked by:** #123` |
 | Depends on | `Depends on #123`, `_Depends on_ #123` |
 | Requires | `Requires #123` |
-| Task list | `- [ ] #123: Description` |
+| Task list (unchecked only) | `- [ ] #123: Description` — a **checked** `- [x] #123` box is NOT a dependency (#7973); it records completed prior work, not a live gate |
 
 ```bash
 parse_dependencies() {
@@ -759,9 +759,13 @@ parse_dependencies() {
   # phrase, tolerant of markdown emphasis/colon between the phrase and the
   # first #N (e.g. "**Blocked by:** #1"); stage 2 extracts every #N on those
   # lines, so comma-separated lists ("#1 (reason), #3 (reason)") capture all
-  # refs, not just the first.
+  # refs, not just the first. The checkbox alternative is narrowed to an
+  # UNCHECKED box only (#7973): `\- \[.\]` matched a checked `- [x] #N` box
+  # just as readily as an unchecked one, so a completed checklist item
+  # recording prior work (not a live gate) was wrongly treated as an
+  # unresolved dependency.
   echo "$body" \
-    | grep -E '(Blocked by|Depends on|Requires|\- \[.\])[*_:[:space:]]*#[0-9]+' \
+    | grep -E '(Blocked by|Depends on|Requires|\- \[ \])[*_:[:space:]]*#[0-9]+' \
     | grep -oE '#[0-9]+' | tr -d '#' | sort -u
 }
 ```
