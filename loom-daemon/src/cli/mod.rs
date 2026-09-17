@@ -24,6 +24,7 @@ pub(crate) mod release_resolve;
 pub(crate) mod restart;
 pub(crate) mod script_ports;
 pub(crate) mod serve_cmd;
+mod shell_budget;
 pub(crate) mod stashes;
 pub(crate) mod stats;
 pub(crate) mod status;
