@@ -112,6 +112,10 @@ pub struct WorkspacePool {
     /// coordination task. Read back by [`safehouse_status`](Self::safehouse_status)
     /// for `loom-daemon status` — see `crate::safehouse::SafehouseState`.
     safehouse_state: safehouse::SharedSafehouseState,
+    /// The inbound ChatOps steering task (Issue #7893), kept alive for the
+    /// daemon's lifetime. `None` when no `safehouse.chatops` block is
+    /// configured — the off-by-default contract.
+    chatops_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl WorkspacePool {
@@ -125,6 +129,7 @@ impl WorkspacePool {
             inner: Mutex::new(HashMap::new()),
             peer_coord: Mutex::new(None),
             safehouse_state: safehouse::new_shared_state(),
+            chatops_task: Mutex::new(None),
         }
     }
 
@@ -308,6 +313,41 @@ impl WorkspacePool {
             view,
             _task: task,
         });
+        drop(slot);
+        self.start_safehouse_chatops(repo_root);
+    }
+
+    /// Start the optional **inbound ChatOps steering** task (Issue #7893, Phase
+    /// 3a of #4196): one dedicated safehouse connection that reads room
+    /// messages addressed to the `loom_daemon` persona, routes them through the
+    /// closed command enum + sender allowlist + confirm-nonce gate
+    /// ([`crate::safehouse_chatops`]), and replies.
+    ///
+    /// **Byte-for-byte no-op** unless a `safehouse.chatops` config block (or its
+    /// env override) is present *and* names at least one allowed Matrix ID: no
+    /// socket, no task, no subscription. An install without safehouse — or with
+    /// safehouse but without this block — is unaffected.
+    ///
+    /// Started from [`start_peer_coordination`](Self::start_peer_coordination)
+    /// so inbound steering shares one config resolution and one enablement
+    /// decision with the rest of the daemon's room presence, and so it can never
+    /// come up on a host where safehouse itself did not.
+    fn start_safehouse_chatops(&self, repo_root: &Path) {
+        let Some(chatops) = crate::safehouse_chatops::resolve_chatops_config(repo_root) else {
+            return; // no config block ⇒ inbound steering off, byte-for-byte
+        };
+        let config = safehouse::resolve_config(repo_root);
+        let task = crate::safehouse_chatops::runtime::spawn(
+            config,
+            chatops,
+            Some(self.event_bus.clone()),
+            &self.runtime,
+        );
+        let mut slot = self
+            .chatops_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = task;
     }
 
     /// Inject the peer-claim publisher + view into `registry` when coordination

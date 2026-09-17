@@ -482,8 +482,13 @@ fn parse_by_repo_env(raw: &str) -> std::collections::BTreeMap<String, String> {
 /// `safehouse.socket` (#5457). No built-in `$HOME`-relative default: unlike
 /// `ingestKeyFile`, safehouse is opt-in per-host, so an unconfigured socket
 /// degrades to `None` (warn + skip) rather than guessing a path.
+///
+/// `pub` since #7893: the inbound-steering task in
+/// [`crate::safehouse_chatops::runtime`] resolves the same socket through this
+/// one function rather than re-deriving the env/config precedence, so the two
+/// safehouse consumers can never disagree about which socket they dialed.
 #[must_use]
-fn resolve_socket(cfg: &SafehouseConfig) -> Option<PathBuf> {
+pub fn resolve_socket(cfg: &SafehouseConfig) -> Option<PathBuf> {
     env_nonempty(SOCKET_ENV)
         .or_else(|| env_nonempty(SAFEHOUSED_SOCKET_ENV))
         .map(PathBuf::from)

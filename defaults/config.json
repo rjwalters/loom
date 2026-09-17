@@ -18,7 +18,13 @@
     "persona": "loom_daemon",
     "workerPersonas": [],
     "mcpCommand": "safehouse-mcp",
-    "peerClaimTtlSecs": 120
+    "peerClaimTtlSecs": 120,
+    "chatops": {
+      "enabled": false,
+      "allowedSenders": [],
+      "room": null,
+      "confirmTtlSecs": 120
+    }
   },
   "health_monitoring": {
     "enabled": true,
