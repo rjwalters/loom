@@ -767,8 +767,14 @@ jobs:
     # of lines of decision logic checkable rather than asserted. Epic #7810's
     # later phases added more suites the same way: dep-recheck-fingerprint.sh
     # (PR 4, `loom-daemon/src/dep_recheck/`), the premise-false interaction
-    # suite (#7904), and loom-daemon-update --resolve-json (#7609/#7977). Every
-    # step below is one of these thin-stub-over-native-port suites.
+    # suite (#7904), and loom-daemon-update --resolve-json (#7609/#7977).
+    #
+    # NOT every step below is a thin-stub-over-native-port suite: #8069 added
+    # test-spawn-claude.sh, which CALLS `loom-daemon tokens select` rather than
+    # being a stub over it. It is here for the same operational reason — it
+    # needs a built binary — not because it is equivalence evidence. Keep this
+    # distinction; a universal that quietly stopped being true is what #8069
+    # was filed about.
     #
     # They live here rather than in shell-suite-tests because they need a BUILT
     # loom-daemon, and that job deliberately has no Rust toolchain. Each suite
