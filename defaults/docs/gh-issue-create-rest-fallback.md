@@ -65,6 +65,13 @@ Builders filed the same bug — #7957, #7960, #7968 — inside four minutes. A
 backstop at the single filing call site covers every caller, including roles
 nobody updates.
 
+The prompt-level alternative was also *structurally* unavailable: every file
+under `defaults/.claude/commands/loom/` is frozen at its current size by
+`scripts/check-markdown-token-budget.sh`, so a paragraph added to `builder.md`
+/ `doctor.md` / `judge.md` fails CI unless as much is deleted from the same
+file. Those prompts already link here from their issue-filing sites; this page
+is where the detail belongs.
+
 **It fails OPEN on everything inconclusive**, so it can never become a new way
 for a filing to die:
 
@@ -83,6 +90,31 @@ falls back to the REST POST below, and still returns the new issue's URL. A
 caller that already ran `check-duplicate.sh` for a whole burst (the eight
 prompts above) should export `LOOM_SKIP_DUPLICATE_CHECK=1` rather than pay for
 the same search twice per filing.
+
+**Deliberate multi-filing bursts want the env skip, not `--force` per call.** A
+decomposition or epic-phase burst files several issues that are similar *to each
+other* by construction — `[Parent #812] Part 1` and `[Parent #812] Part 2` share
+most of their keywords, so Part 2 can be blocked by the Part 1 filed seconds
+earlier. (The parent itself never blocks a child: a child citing `#812`
+anywhere in its title or body lands in the cross-reference row above.) Export
+`LOOM_SKIP_DUPLICATE_CHECK=1` once for the burst rather than `--force`-ing each
+call:
+
+```bash
+export LOOM_SKIP_DUPLICATE_CHECK=1   # this decomposition / phase burst only
+```
+
+This is the right move for `builder-complexity.md`'s decomposition loop,
+`epic.md` Phase 5, and `champion-epic.md`'s phase-issue creation loop — each is
+already deduplicated by the design step (or existence check) that precedes it.
+Forgetting it is recoverable, not lossy: the block message names the match and
+the `--force` re-run, and nothing was filed.
+
+**Alerting callers pass `--force` deliberately.** `loom-daemon-watchdog.sh`'s
+outage / peer-coordination escalations and `loom-daemon-start.sh`'s
+unprovisionable-watchdog filing are each already deduplicated by their own
+sentinel file, and a similarity heuristic must never be what silences an
+outage alert — so those three call sites file with `--force`.
 
 ## The five-signature table
 
