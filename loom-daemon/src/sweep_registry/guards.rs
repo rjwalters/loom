@@ -4,6 +4,13 @@
 use super::*;
 use crate::claim_reconciliation::forge::parse_max_timestamp;
 
+/// The pure pre-flip label predicate behind [`CollisionClass`] (Issue #7873).
+/// Declared here rather than in `sweep_registry::mod` because it is this
+/// module's own decision logic, extracted only so it can be exercised without
+/// a `gh` fixture.
+#[path = "preflip_labels.rs"]
+pub(crate) mod preflip_labels;
+
 /// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
 /// Defined in [`crate::worktree_ops::gh`] and re-exported here, where it
@@ -181,16 +188,25 @@ pub const COLLISION_DETECT_ENV: &str = "LOOM_DETECT_COLLISIONS";
 /// ([`SweepRegistry::dispatch_inner`](super::SweepRegistry::dispatch_inner))
 /// backs off the dispatch on a confirmed [`CollisionClass::Collision`] (#5789
 /// — previously detection-only, recording the outcome without changing
-/// dispatch behavior).
+/// dispatch behavior) and proceeds on every other variant.
+///
+/// The predicate that produces these lives in
+/// [`preflip_labels::classify_observed_labels`] — see that module for why
+/// absence of `loom:issue` is NOT evidence of a peer (Issue #7873).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CollisionClass {
-    /// `loom:issue` was still present and `loom:building` absent — this host is
-    /// the first claimant, no collision.
+    /// `loom:issue` was still present and no claim label alongside it — this
+    /// host is the first claimant, no collision.
     Clean,
-    /// `loom:issue` was already gone, or `loom:building` already present, before
-    /// this host flipped the labels — a peer host claimed it first. Carries the
-    /// observed pre-flip label set for the diagnostic log record.
+    /// A claim label ([`preflip_labels::CLAIM_LABELS`]) was already present
+    /// before this host flipped the labels — a peer host claimed it first.
+    /// Carries the observed pre-flip label set for the diagnostic log record.
     Collision { labels: Vec<String> },
+    /// Neither `loom:issue` nor any claim label: the issue was simply never
+    /// promoted (unlabeled, `loom:triage`, `loom:curating`, `loom:curated`).
+    /// **Not a collision** (Issue #7873) — an explicit dispatch proceeds and
+    /// the child sweep curates/promotes it in its own pre-flight.
+    NotYetApproved { labels: Vec<String> },
     /// The label state could not be read (gh timeout / non-zero exit /
     /// unparseable JSON). **Fail-closed**: never counted as a collision, so the
     /// baseline is never inflated by an unverifiable flip.
@@ -277,6 +293,10 @@ impl SweepRegistry {
     /// [`CollisionClass::Unknown`], never `Collision`, so the baseline is never
     /// inflated by an unverifiable read. The `gh issue edit` flip itself is left
     /// byte-for-byte unchanged.
+    ///
+    /// This method owns only the I/O; the verdict is
+    /// [`preflip_labels::classify_observed_labels`]'s (Issue #7873 — a snapshot
+    /// missing `loom:issue` is unpromoted, not peer-claimed).
     pub(crate) fn classify_preflip_labels(&self, issue: u32) -> CollisionClass {
         let gh = self
             .config
@@ -320,13 +340,7 @@ impl SweepRegistry {
             .iter()
             .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect();
-        let has_issue = labels.iter().any(|l| l == "loom:issue");
-        let has_building = labels.iter().any(|l| l == "loom:building");
-        if !has_issue || has_building {
-            CollisionClass::Collision { labels }
-        } else {
-            CollisionClass::Clean
-        }
+        preflip_labels::classify_observed_labels(labels)
     }
 
     // ------------------------------------------------------------------------
@@ -467,11 +481,12 @@ impl SweepRegistry {
                 log::warn!(
                     "sweep_registry: cross-host dispatch collision (#4085/#5789) — issue #{issue} \
                      in {repo} was already claimed by another host before host {host} attempted \
-                     to flip it at {ts}; observed pre-flip labels=[{labels}]; running collision \
-                     count={count}",
+                     to flip it at {ts}; observed claim label(s)=[{claims}] in pre-flip \
+                     labels=[{labels}]; running collision count={count}",
                     repo = self.config.workspace_root.display(),
                     host = host_identity(),
                     ts = Utc::now().to_rfc3339(),
+                    claims = preflip_labels::claim_labels_in(labels).join(", "),
                     labels = labels.join(", "),
                     count = self.collision_count,
                 );
@@ -489,6 +504,17 @@ impl SweepRegistry {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .record_same_issue_collision_at(repo, issue, std::time::Instant::now());
                 }
+            }
+            CollisionClass::NotYetApproved { labels } => {
+                // Issue #7873: an unpromoted issue is NOT a peer claim. Logged
+                // (not counted, not refused) so an explicit dispatch of work
+                // the child sweep will promote itself stays visible.
+                log::info!(
+                    "sweep_registry: issue #{issue} carries no claim label and no `loom:issue` \
+                     (observed pre-flip labels=[{labels}]) — not yet promoted, NOT a cross-host \
+                     collision (#7873); proceeding so the child sweep can curate/promote it",
+                    labels = labels.join(", "),
+                );
             }
             CollisionClass::Unknown => {
                 // Fail-closed: an unverifiable read is never a collision.
@@ -2438,74 +2464,9 @@ mod tests {
         );
     }
 
-    /// A pre-flip read showing `loom:building` already present is a collision.
-    #[test]
-    fn classify_preflip_labels_flags_prior_building_claim() {
-        let dir = tempdir().unwrap();
-        let gh_log = dir.path().join("gh.log");
-        let registry = collision_registry(
-            dir.path(),
-            &gh_log,
-            r#"{"labels":[{"name":"loom:building"},{"name":"loom:curated"}]}"#,
-            0,
-        );
-        match registry.classify_preflip_labels(42) {
-            CollisionClass::Collision { labels } => {
-                assert!(labels.iter().any(|l| l == "loom:building"));
-            }
-            other => panic!("expected Collision, got {other:?}"),
-        }
-    }
-
-    /// A pre-flip read with `loom:issue` already gone is a collision even if
-    /// `loom:building` is not (yet) visible.
-    #[test]
-    fn classify_preflip_labels_flags_missing_issue_label() {
-        let dir = tempdir().unwrap();
-        let gh_log = dir.path().join("gh.log");
-        let registry = collision_registry(
-            dir.path(),
-            &gh_log,
-            r#"{"labels":[{"name":"tier:goal-supporting"}]}"#,
-            0,
-        );
-        assert!(matches!(registry.classify_preflip_labels(42), CollisionClass::Collision { .. }));
-    }
-
-    /// `loom:issue` still present and `loom:building` absent ⇒ this host is the
-    /// first claimant: Clean, not a collision.
-    #[test]
-    fn classify_preflip_labels_clean_when_issue_label_present() {
-        let dir = tempdir().unwrap();
-        let gh_log = dir.path().join("gh.log");
-        let registry = collision_registry(
-            dir.path(),
-            &gh_log,
-            r#"{"labels":[{"name":"loom:issue"},{"name":"loom:curated"}]}"#,
-            0,
-        );
-        assert_eq!(registry.classify_preflip_labels(42), CollisionClass::Clean);
-    }
-
-    /// Fail-closed: a non-zero `gh` exit is `Unknown`, never a collision — an
-    /// unverifiable read must not inflate the baseline.
-    #[test]
-    fn classify_preflip_labels_fail_closed_on_gh_error() {
-        let dir = tempdir().unwrap();
-        let gh_log = dir.path().join("gh.log");
-        let registry = collision_registry(dir.path(), &gh_log, "", 1);
-        assert_eq!(registry.classify_preflip_labels(42), CollisionClass::Unknown);
-    }
-
-    /// Fail-closed: unparseable stdout (exit 0 but not the expected JSON) is
-    /// `Unknown`, never a collision.
-    #[test]
-    fn classify_preflip_labels_fail_closed_on_unparseable() {
-        let dir = tempdir().unwrap();
-        let gh_log = dir.path().join("gh.log");
-        let registry = collision_registry(dir.path(), &gh_log, "not json at all", 0);
-        assert_eq!(registry.classify_preflip_labels(42), CollisionClass::Unknown);
-    }
+    // The `classify_preflip_labels` probe's own cases live in the sibling
+    // `guards_preflip_tests.rs` (registered at the foot of this file), and the
+    // pure label matrix behind them in `preflip_labels.rs` (#7873).
 
     /// With detection enabled, a collision increments the counter once per call;
     /// an Unknown/Clean read does not.
@@ -3907,3 +3868,7 @@ exit 0
 #[cfg(test)]
 #[path = "guards_union_tests.rs"]
 mod union_tests;
+
+#[cfg(test)]
+#[path = "guards_preflip_tests.rs"]
+mod preflip_tests;

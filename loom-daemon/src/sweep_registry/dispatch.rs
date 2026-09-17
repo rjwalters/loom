@@ -317,10 +317,12 @@ pub enum CollisionSource {
     /// round trip, checked before the claim lock is even acquired.
     PeerClaim,
     /// Caught by the opt-in forge-label pre-flip read
-    /// ([`crate::sweep_registry::guards::classify_preflip_labels`]) — the
-    /// peer's `loom:building` flip (or `loom:issue` removal) already landed on
-    /// the forge before this host's own flip. Carries the observed pre-flip
-    /// label set for diagnostics.
+    /// ([`SweepRegistry::classify_preflip_labels`]) — a peer's
+    /// claim label (`loom:building` / `loom:reviewing` / `loom:treating`)
+    /// already landed on the forge before this host's own flip. Carries the
+    /// observed pre-flip label set for diagnostics; the claim label(s) the
+    /// refusal is actually founded on are extracted from it for the message
+    /// (Issue #7873 — the absence of `loom:issue` alone never refuses).
     ForgeLabel { labels: Vec<String> },
 }
 
@@ -331,11 +333,7 @@ impl std::fmt::Display for CollisionSource {
                 write!(f, "a peer host's live soft-claim advertisement")
             }
             CollisionSource::ForgeLabel { labels } => {
-                write!(
-                    f,
-                    "a peer host's forge label flip (observed labels=[{}])",
-                    labels.join(", ")
-                )
+                f.write_str(&preflip_labels::describe_claim_evidence(labels))
             }
         }
     }
