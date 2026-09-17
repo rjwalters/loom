@@ -36,7 +36,7 @@ if kill -0 "$PID" 2>/dev/null; then
   kill "$PID"
 
   # Wait for process to die (up to 5 seconds)
-  for i in {1..50}; do
+  for _ in {1..50}; do
     if ! kill -0 "$PID" 2>/dev/null; then
       break
     fi

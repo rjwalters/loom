@@ -57,7 +57,10 @@ provision_loom_dispatcher() {
 
     # Publish resolved destinations up front so EVERY return path communicates
     # where things live (the caller gates on the return code).
+    # shellcheck disable=SC2034  # output variables: read by install-loom.sh and
+    # asserted by test-loom-dispatcher.sh — see the contract above.
     PROVISIONED_DISPATCHER_BIN="$dest_bin"
+    # shellcheck disable=SC2034  # output variable (see above)
     PROVISIONED_LOOM_CHECKOUT="$checkout_dir"
 
     if [[ -z "$loom_root" || ! -f "$src" ]]; then

@@ -240,7 +240,7 @@ echo -e "${YELLOW}--- Performance check ---${NC}"
 PERF_MAX_MS="${LOOM_GUARD_PERF_MAX_MS:-200}"
 TOTAL=$((TOTAL + 1))
 START=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time()*1e9))")
-for i in $(seq 1 10); do
+for _ in $(seq 1 10); do
     make_input "git status" "$REPO_ROOT" | "$GUARD" >/dev/null 2>&1
 done
 END=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time()*1e9))")

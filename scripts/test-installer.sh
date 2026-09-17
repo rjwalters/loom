@@ -249,8 +249,7 @@ GITIGNORE_EOF
     -not -name '.DS_Store' \
     -not -name '*.log' \
     -not -name '*.sock' \
-    2>/dev/null \
-    -print0 | sort -z)
+    -print0 2>/dev/null | sort -z)
   installed_files_json="${installed_files_json}]"
 
   # Create install metadata with installed_files manifest

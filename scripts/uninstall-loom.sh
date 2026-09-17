@@ -1161,7 +1161,7 @@ done
 # Remove runtime directories
 for dir in "${RUNTIME_DIRS[@]}"; do
   if [[ -d "$WORKTREE_ABS/$dir" ]]; then
-    rm -rf "$WORKTREE_ABS/$dir"
+    rm -rf "${WORKTREE_ABS:?refusing to remove a runtime dir with an empty WORKTREE_ABS}/${dir:?refusing to remove a runtime dir with an empty dir name}"
     REMOVED_LIST+=("$dir/")
     REMOVED_COUNT=$((REMOVED_COUNT + 1))
   fi

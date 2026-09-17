@@ -87,6 +87,7 @@ _reinstall_safe_stash_pop() {
 
   if [[ -n "$wrapper" ]]; then
     REINSTALL_POP_MODE="wrapper"
+    # shellcheck disable=SC2034  # output variable: read by install.sh, asserted by test-install-reinstall-safety.sh (contract at top of file)
     REINSTALL_POP_WRAPPER="$wrapper"
     local wrapper_output wrapper_status
     wrapper_output="$("$wrapper" --repo "$target" --index "$stash_ref" 2>&1)"
@@ -130,6 +131,7 @@ _reinstall_safe_stash_pop() {
   # Fallback: neither copy of safe-stash-pop.sh is available (older install,
   # partial tree, or a curl-piped standalone install predating #6501). Fall
   # back to today's raw pop with a warning rather than failing the install.
+  # shellcheck disable=SC2034  # output variable: read by install.sh, asserted by test-install-reinstall-safety.sh (contract at top of file)
   REINSTALL_POP_MODE="raw"
   local raw_output raw_status
   if raw_output="$(git -C "$target" stash pop --index "$stash_ref" 2>&1)"; then
@@ -137,11 +139,14 @@ _reinstall_safe_stash_pop() {
   else
     raw_status=$?
   fi
+  # shellcheck disable=SC2034  # output variable: read by install.sh, asserted by test-install-reinstall-safety.sh (contract at top of file)
   REINSTALL_POP_OUTPUT="$raw_output"
+  # shellcheck disable=SC2034  # output variable: read by install.sh, asserted by test-install-reinstall-safety.sh (contract at top of file)
   REINSTALL_POP_STATUS="$raw_status"
   if [[ "$raw_status" -eq 0 ]]; then
     REINSTALL_POP_RESULT="clean"
   else
+    # shellcheck disable=SC2034  # output variable: read by install.sh, asserted by test-install-reinstall-safety.sh (contract at top of file)
     REINSTALL_POP_RESULT="raw_conflict"
   fi
   return 0
