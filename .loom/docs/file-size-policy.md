@@ -400,7 +400,11 @@ and pass forever. Same exemption, same reason, as the two gates above.
 
 Because a static file sum cannot distinguish "read on demand" from "always
 inlined", this gate takes each prompt's own documented load contract at its
-word. Whether the runtime honors it is a separate, open question (#8065).
+word. **That trust is now verified, not assumed**: #8065 traced the spawn chain
+and measured 134 real sweep sessions — nothing in Loom's dispatch inlines a
+sibling file, and a sibling gated "Mode C only" loads in 0 of 131 Mode A/B runs
+(and vice versa). Trace, measurements, and the re-measurement recipe:
+[`prompt-prefix-loading.md`](prompt-prefix-loading.md).
 
 **Budget vs. goal.** `scripts/role-prompt-budget.txt` carries two numbers per
 role: `budget`, the enforced ceiling, frozen at the measured total and free to
