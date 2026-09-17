@@ -30,28 +30,55 @@
 //! The lead window exists because the bare forms — `blocker`, `blocking`,
 //! `blocks` — are the ones that naturally follow their subject.
 //!
-//! # Known limitation (#7877), deliberately preserved here
+//! # Why the trailing window is per-family (#7877)
 //!
-//! The windows are a character-distance proxy for "this phrase names this
-//! reference", and 60 characters is too narrow for some real prose:
+//! A single trailing window cannot serve both halves of the phrase list,
+//! because the halves differ in how strongly a phrase *commits* to naming a
+//! blocker.
+//!
+//! **Explicit phrases** ([`explicit_phrase_re`]) are prepositional: their
+//! grammatical object simply *is* the blocker. "Blocked by X", "depends on X",
+//! "waiting on X" have no reading in which X is incidental. Real prose then
+//! routinely interposes a description or a restatement before finally citing
+//! the number — the #7877 case:
 //!
 //! > "Blocked by the sibling Phase 4 issue (run-job seam contract + host
-//! > executor)" … #7853
+//! > executor)" — that issue is #7853
 //!
-//! classifies as a merits finding, which is wrong. That is #7877. It is **not**
-//! fixed in this port: the 252-assertion shell suite pins current behaviour, and
-//! changing the predicate in the same change would make a failing assertion
-//! ambiguous — port bug, or intended change? The fix lands as its own commit
-//! where a diff in the suite is expected and reviewable.
+//! Eighty-four characters separate the phrase from the reference, so the
+//! original 60-character window read a genuine timing finding as a merits one
+//! and risked escalating it to `loom:operator-only` — exactly what #5664
+//! exists to prevent. These phrases get [`DEP_REF_EXPLICIT_WINDOW`].
+//!
+//! **Weak phrases** — `requires`, `prerequisite`, and the bare
+//! `blocker`/`blocking`/`blocks` — are the ones ordinary narration reaches for
+//! without citing anything ("this requires more work", "a prerequisite for any
+//! meaningful soak"). They are precisely the #7756/#7431 false-positive shape,
+//! so they keep the conservative [`DEP_REF_WINDOW`]: near enough to be a
+//! citation, or it does not count.
+//!
+//! Widening only the explicit family makes the change a strict superset of the
+//! old positives — nothing that classified as a dependency before stops doing
+//! so — while leaving the false-positive guard's phrase family untouched.
 
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// How far **after** a phrase a reference may appear and still count.
+/// How far **after** a *weak* phrase a reference may appear and still count.
 ///
-/// See the module docs: known to be too narrow (#7877), preserved verbatim
-/// here so the port is provably behaviour-identical first.
+/// The conservative window, applied to every phrase — including `requires`,
+/// `prerequisite` and the bare `blocker`/`blocking`/`blocks`, which ordinary
+/// narration uses without citing a blocker (#7756/#7431).
 pub const DEP_REF_WINDOW: usize = 60;
+
+/// How far **after** an *explicit* phrase ([`explicit_phrase_re`]) a reference
+/// may appear and still count.
+///
+/// Wider than [`DEP_REF_WINDOW`] because prepositional phrases commit to naming
+/// their blocker, and real prose interposes a parenthetical or a restatement
+/// before the citation (#7877). 120 clears the reproduced 84-character case
+/// with headroom, while still being far short of a whole bullet.
+pub const DEP_REF_EXPLICIT_WINDOW: usize = 120;
 
 /// How far **before** a bare phrase (`blocker`/`blocking`/`blocks`) a reference
 /// may appear and still count.
@@ -65,6 +92,21 @@ fn phrase_re() -> &'static Regex {
             r"(?i)(blocked by|blocker|blocking|blocks|depends on|dependent on|dependenc(y|ies) (on|of)|requires|prerequisite|waiting on|waits on|cannot (start|proceed|begin)( work)? until|not (start|begin)able until|must wait (for|until))",
         )
         .expect("static phrase pattern")
+    })
+}
+
+/// The *explicit* (prepositional) dependency phrases, case-insensitive.
+///
+/// `phrase_re()` minus the weak forms `requires`, `prerequisite`, `blocker`,
+/// `blocking` and `blocks`. These are the ones whose object simply *is* the
+/// blocker, so they earn [`DEP_REF_EXPLICIT_WINDOW`]. See the module docs.
+fn explicit_phrase_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(blocked by|depends on|dependent on|dependenc(y|ies) (on|of)|waiting on|waits on|cannot (start|proceed|begin)( work)? until|not (start|begin)able until|must wait (for|until))",
+        )
+        .expect("static explicit phrase pattern")
     })
 }
 
@@ -94,10 +136,16 @@ pub fn is_dependency_finding(bullet: &str) -> bool {
         return false;
     }
 
-    // Trailing window: a reference shortly AFTER a phrase.
+    // Trailing window: a reference shortly AFTER a phrase. Every phrase gets
+    // the conservative window; the explicit prepositional family additionally
+    // gets the wider one (#7877). Two passes rather than one parameterised
+    // pass, so the fix is visibly a strict superset of the old positives.
     if windows_after(bullet, phrase_re(), DEP_REF_WINDOW)
         .iter()
         .any(|w| ref_re().is_match(w))
+        || windows_after(bullet, explicit_phrase_re(), DEP_REF_EXPLICIT_WINDOW)
+            .iter()
+            .any(|w| ref_re().is_match(w))
     {
         return true;
     }

@@ -22,9 +22,9 @@
 //! `Blocked by #3 (see also #99)` yields *both* `#3` and `#99`. That is
 //! over-capture, but it is the behaviour every existing fixture and every live
 //! issue body has been read against, so the port keeps it. (Contrast
-//! `classify-dependency-block.sh`'s own `is_dependency_finding`, which
-//! deliberately adds a proximity window — a different function with a different
-//! job, and the subject of #7877.)
+//! [`super::finding::is_dependency_finding`], which deliberately adds a
+//! per-phrase-family proximity window — a different function with a different
+//! job. #7877 widened that window; it does not apply here.)
 //!
 //! **The phrase match is case-sensitive.** `grep -E` without `-i`, so
 //! `blocked by #3` in lower case does not register. Preserved deliberately.
