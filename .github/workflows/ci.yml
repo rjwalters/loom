@@ -728,11 +728,15 @@ jobs:
         run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
 
   dep-classification-suites:
-    name: Dependency Classification Suites
+    name: Native Port Suites
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
-    # The equivalence evidence for epic #7810 PR 3. These three suites' 261
-    # assertions were written against the SHELL implementations of
+    # The equivalence evidence for epic #7810. Every suite here carries
+    # assertions written against a SHELL implementation that is now a thin stub
+    # over a `loom-daemon` subcommand, so each needs a BUILT binary — which
+    # shell-suite-tests deliberately has no Rust toolchain for.
+    #
+    # The three original suites' 261 assertions were written against
     # classify-dependency-block.sh / detect-dependency-cycle.sh /
     # detect-startable-subset.sh; those are now thin stubs over
     # `loom-daemon classify-dependency-block` et al., and the same assertions
@@ -765,6 +769,26 @@ jobs:
         run: bash defaults/scripts/tests/test-detect-startable-subset.sh
       - name: dep-recheck-fingerprint (#7281, #7314, #7617)
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
+      # Moved out of shell-suite-tests by #7977: its --resolve-json assertions
+      # now drive `loom-daemon release-resolve` through the stub's delegation,
+      # so they need the binary this job builds.
+      #
+      # It drives the REAL loom-daemon lifecycle scripts, which is why
+      # run-ci-suites.sh listed it in LIVE_DAEMON_GUARDED_SUITES. A GitHub
+      # runner never has a daemon, but the precondition is asserted rather than
+      # assumed — and FATAL, not skipped, so this can never pass by running
+      # nothing.
+      - name: loom-daemon-update (#7609 --resolve-json)
+        run: |
+          source defaults/scripts/lib/live-daemon-guard.sh
+          evidence="$(live_daemon_pidfiles_present)"
+          if [ -n "$evidence" ]; then
+            echo "FATAL: a loom-daemon pid file exists on this host:" >&2
+            echo "$evidence" | sed 's/^/  /' >&2
+            echo "This suite drives the real daemon lifecycle scripts and must not run here." >&2
+            exit 1
+          fi
+          bash defaults/scripts/tests/test-loom-daemon-update.sh
 
   installer-tests:
     name: Installer Integration Tests

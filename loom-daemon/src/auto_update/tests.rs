@@ -1545,7 +1545,6 @@ fn test_artifact_roll_record_round_trips_on_disk() {
     assert_eq!(load_artifact_roll_record(None), None);
 }
 
-
 // ---- run_tick end to end on the artifact path ------------------------
 
 /// A probe that resolves a scripted artifact and records whether the tick
