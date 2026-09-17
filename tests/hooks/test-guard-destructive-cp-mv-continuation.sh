@@ -136,6 +136,67 @@ assert_allow "cp-mv-continuation (i) regression guard: unrelated sed -i /tmp wri
     "$CMD_I" "$WT_REPO"
 
 echo ""
+echo -e "${YELLOW}--- qsplit() BACKSLASH PARITY: \\\\ + newline is NOT a continuation (#7978) ---${NC}"
+# =========================================================================
+#
+# The join above must fire on a backslash the SHELL treats as an escape
+# character -- i.e. one with EVEN backslash parity behind it -- and on no
+# other. `foo\\` + a real newline is an escaped literal backslash followed
+# by an ORDINARY, UNESCAPED line end: two shell statements, not one. Joining
+# them deletes a real statement boundary, which hides the SECOND statement's
+# command word from toks[1] -- and the cp / mv / sed -i / mkdir branches of
+# extract_write_targets() are all keyed on toks[1]. The first port of this
+# fix had no parity tracking and turned three existing DENY verdicts into
+# ALLOW that way; the suite shipped green because no case below existed.
+#
+# Spelled with explicit named variables rather than inline escapes: the
+# whole point of these cases is the exact NUMBER of backslashes, and a
+# miscounted `\\\\` inside a double-quoted bash string is precisely the
+# reading error they exist to catch.
+BS1='\'    # ONE literal backslash   -> a real shell line continuation
+BS2='\\'   # TWO literal backslashes -> escaped literal backslash, then a real line end
+NL=$'\n'
+
+# CWD is the worktree itself here (not $WT_REPO as in (d)-(h) above): these
+# model a Builder acting from inside its own managed worktree and writing
+# out into the main checkout, the exact shape of the reported bypass.
+
+# --- SAFETY (j): cp across a `\\` line end -> the cp is a SECOND statement
+# and its destination escapes the worktree -> must DENY.
+assert_deny "cp-mv-continuation (j) SAFETY: \\\\ + newline is a real statement boundary; escaping cp on the next line -> deny" \
+    "echo foo${BS2}${NL}cp /tmp/src.txt \"$WT_REPO/pwned-j.txt\"" "$WT_DIR"
+
+# --- SAFETY (k): same via mv ------------------------------------------------
+assert_deny "cp-mv-continuation (k) SAFETY: \\\\ + newline, escaping mv on the next line -> deny" \
+    "echo foo${BS2}${NL}mv /tmp/src.txt \"$WT_REPO/pwned-k.txt\"" "$WT_DIR"
+
+# --- SAFETY (l): same via sed -i --------------------------------------------
+assert_deny "cp-mv-continuation (l) SAFETY: \\\\ + newline, escaping sed -i on the next line -> deny" \
+    "echo foo${BS2}${NL}sed -i '' 's/a/b/' \"$WT_REPO/pwned-l.txt\"" "$WT_DIR"
+
+# --- SAFETY (m): FOUR backslashes -- two escaped literal backslashes, then
+# an ordinary line end. Proves the parity rule is a rule, not a special case
+# hard-coded for exactly two.
+assert_deny "cp-mv-continuation (m) SAFETY: \\\\\\\\ (two escaped pairs) + newline is still a statement boundary -> deny" \
+    "echo foo${BS2}${BS2}${NL}cp /tmp/src.txt \"$WT_REPO/pwned-m.txt\"" "$WT_DIR"
+
+# --- PARITY (n): THREE backslashes -- an escaped literal backslash, THEN a
+# genuine continuation. The real shell joins these two physical lines into
+# ONE `echo` command, so no cp is ever invoked and there is no write to
+# confine: allow is the CORRECT verdict, and asserting it is what proves the
+# guard discriminates on parity rather than just denying every backslash run.
+# Verified against a real shell: with 1 or 3 trailing backslashes bash joins
+# the lines (one statement); with 2 or 4 it runs both (two statements).
+assert_allow "cp-mv-continuation (n) PARITY: \\\\\\ (escaped pair + real continuation) still joins -- one echo, no cp invoked -> allow" \
+    "echo foo${BS2}${BS1}${NL}cp /tmp/src.txt \"$WT_REPO/pwned-n.txt\"" "$WT_DIR"
+
+# --- PARITY (o): ONE backslash -- the ordinary continuation this fix exists
+# to honour, on the same text as (j). Completes the 1/2/3/4 ladder and shows
+# (j) denies because of parity, not because of the `cp` token.
+assert_allow "cp-mv-continuation (o) PARITY: single \\ + newline joins as before -- one echo, no cp invoked -> allow" \
+    "echo foo${BS1}${NL}cp /tmp/src.txt \"$WT_REPO/pwned-o.txt\"" "$WT_DIR"
+
+echo ""
 
 # =========================================================================
 

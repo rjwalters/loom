@@ -1608,21 +1608,47 @@ function has_live_subst(str,    i, c, bs) {
 # string is never touched). This exactly mirrors real shell semantics: the
 # backslash and the newline are simply deleted, with nothing inserted in
 # their place (a leading space on the continuation line, if any, is
-# untouched and is what naturally keeps the joined tokens separated). It only
-# ever REDUCES spurious mid-invocation segment boundaries -- it can never
-# manufacture a NEW deny (a joined command is scanned exactly as if the
-# operator had typed it on one line), so it stays on the safe side of "never
-# widen a deny".
+# untouched and is what naturally keeps the joined tokens separated). It
+# never manufactures a NEW deny (a joined command is scanned exactly as if
+# the operator had typed it on one line), so it cannot widen a deny.
 #
-# KNOWN LIMITATION: qsplit() has no general backslash-escape tracking outside
-# quotes (a bare `\` was, and remains, passed through as a literal character
-# in every other position). A doubled `\\` immediately followed by a real
-# newline (an escaped literal backslash, THEN an ordinary unescaped line end
-# -- not a continuation) is misread as a continuation and joined too. This
-# shape is vanishingly rare in real commands and, per the "never widen a
-# deny" contract above, over-joining can only ever suppress a spurious
-# segment split -- never create a new false ALLOW of an otherwise-flagged
-# write.
+# BUT ELIDING IS NOT A FREE ACTION IN THE OTHER DIRECTION (#7978). Deleting a
+# newline deletes a SEGMENT BOUNDARY, and every consumer downstream
+# (`n = split($0, segs, "\n")`) reads one segment as one simple command whose
+# command word is toks[1]. So joining across a boundary that the real shell
+# does NOT join hides the following statement's command word -- and the
+# `cp` / `mv` / `sed -i` / `mkdir` write idioms in extract_write_targets()
+# are all keyed on toks[1]. A wrong elision therefore skips the
+# worktree-write-confinement check entirely: a false ALLOW of a write that
+# would otherwise be denied. Correctness of this branch is a SAFETY
+# property, not a cosmetic one. Getting it wrong is how the original port of
+# this fix turned three existing DENY verdicts (cp, mv, sed -i escaping a
+# managed worktree into the main checkout) into ALLOW.
+#
+# WHAT THIS CODE ACTUALLY GUARANTEES: the elision fires only on a backslash
+# with EVEN backslash parity behind it -- i.e. one the shell really does
+# treat as an escape character -- because the branch directly above the
+# continuation branch consumes each `\\` pair atomically. `foo\\` + newline
+# (escaped literal backslash, then an ordinary line end: two statements) is
+# therefore NOT joined, and `foo\\\` + newline (literal backslash, then a
+# real continuation: one statement) still IS. This is the same even/odd
+# parity rule has_live_subst() (#7498) applies a few dozen lines above.
+#
+# KNOWN LIMITATION (unchanged by #7978, and PRE-EXISTING -- present
+# identically before the continuation branch was introduced): qsplit() still
+# has no escape tracking for characters OTHER than a backslash before a
+# backslash or a newline. Two consequences, in opposite safety directions:
+#   * An escaped separator (`\;`, `\|`, `\&`) is still split on, though the
+#     real shell treats it as a literal character. Over-splitting yields MORE
+#     command words to check -- fail-closed, at worst a false positive.
+#   * An escaped QUOTE (`\"`, `\'`) still enters the quoted-span branch as if
+#     it opened a real span, so separators up to the next same-type quote are
+#     treated as inert. That direction CAN hide a real statement boundary,
+#     and a probe against both this file and its pre-#7945 ancestor confirms
+#     the resulting allow is identical in both -- so it is a standing gap in
+#     this helper, tracked separately, NOT something this branch introduced
+#     or is entitled to claim it closes.
+# Do not restate either of these as "harmless": state the direction.
 #
 # Shared as a single awk source string so the three parsers cannot drift.
 # =============================================================================
@@ -1720,12 +1746,39 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom) {
             i = ci + 1
             continue
         }
+        if (c == "\\" && i < n && substr(s, i + 1, 1) == "\\") {
+            # BACKSLASH PARITY (#7978 -- MUST stay immediately above the
+            # continuation branch below). An escaped literal backslash: emit
+            # BOTH bytes and consume BOTH, so the second one can never be
+            # re-examined on the next iteration as the START of a
+            # continuation. Without this, `foo\\` + a real newline -- an
+            # escaped literal backslash followed by an ordinary UNESCAPED
+            # line end, i.e. two separate shell statements -- had its second
+            # backslash paired with the newline by the branch below and the
+            # statement boundary silently deleted, hiding the command word of
+            # the SECOND statement from every toks[1]-keyed write idiom
+            # (cp / mv / sed -i / mkdir). That was a live worktree-write-
+            # confinement bypass, not a cosmetic over-join.
+            #
+            # Consuming pairs atomically is exactly equivalent to the
+            # even/odd backslash-parity scan has_live_subst() (line ~1539,
+            # #7498) already performs for the same reason: only a backslash
+            # preceded by an EVEN number of backslashes is itself live.
+            out = out c substr(s, i + 1, 1)
+            i += 2
+            continue
+        }
         if (c == "\\" && i < n && substr(s, i + 1, 1) == "\n") {
             # Unquoted line continuation (see header comment above): the real
             # shell deletes BOTH the backslash and the newline and joins the
             # two physical lines into one logical command -- so this emits
             # nothing at all (never a "\n", unlike the separators below,
             # which really do end a statement).
+            #
+            # Reached only with EVEN backslash parity behind it (the branch
+            # directly above consumed every `\\` pair), so this backslash is
+            # genuinely the escape character and the newline is genuinely
+            # elided by the shell.
             i += 2
             continue
         }

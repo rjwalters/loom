@@ -151,6 +151,21 @@ assert_deny "mkdir-confinement (92415b2): mkdir target via a symlinked-ancestor 
 assert_allow "mkdir-confinement (92415b2 sibling): mkdir target inside the worktree, reached via the same symlinked-ancestor repo, still allows" \
     "mkdir -p \"$SYMLINK_ALIAS_REPO/.loom/worktrees/issue-1/src/newdir\"" "$SYMLINK_WT_DIR"
 
+# --- (i) the new mkdir idiom must not be bypassable through qsplit()'s
+# backslash-newline join (#7978). `foo\\` + a real newline is an escaped
+# literal backslash followed by an ORDINARY line end -- two shell
+# statements. When qsplit() lacked backslash-parity tracking it joined them,
+# hiding the second statement's `mkdir` command word from toks[1] so this
+# whole confinement branch never ran: the idiom (a) denies was bypassable on
+# this one shape from the day it was added. The parity rule itself is
+# exercised across cp/mv/sed -i in
+# tests/hooks/test-guard-destructive-cp-mv-continuation.sh (j)-(o); this
+# case pins the mkdir half of it, in the suite that owns mkdir recognition.
+MKDIR_BS2='\\'   # TWO literal backslashes -- see that suite for why this is named, not inlined
+assert_deny "mkdir-confinement (i): escaping mkdir after a \\\\ + newline statement boundary is still caught (not joined away) -> deny" \
+    "echo foo${MKDIR_BS2}
+mkdir -p \"$WT_REPO/pwned-dir-parity\"" "$WT_DIR"
+
 echo ""
 
 # =========================================================================
