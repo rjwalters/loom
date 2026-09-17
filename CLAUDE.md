@@ -101,7 +101,9 @@ label documents its own `Applied by:` owner). State transitions:
 
 `loom:operator` is the first-class "a human is needed" state (engine stops
 acting, re-evaluable, unlike `loom:operator-only`) — wired at Champion's
-merge-risk hold only so far: [`.loom/docs/label-state-machine.md`](.loom/docs/label-state-machine.md).
+merge-risk hold only so far. What is currently waiting on you: the pinned
+merge-risk hold digest (#6877) and the two label queries, both in
+[`.loom/docs/label-state-machine.md`](.loom/docs/label-state-machine.md).
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
 > closed issues or merged PRs (harmless — all agents filter by open state — and it
