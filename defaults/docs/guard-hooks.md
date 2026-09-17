@@ -1011,6 +1011,20 @@ and an unassigned name stays unresolved. Heredoc bodies are masked before the
 scan, so an inert decoy assignment inside one cannot launder a real
 unresolved target (#6549).
 
+**One exception to the two-assignment rule (#7986)**, shared by the mktemp fast
+path above and its write-confinement sibling `wt_write_mktemp_same_command_safe()`
+(#6949): a `NAME=$(mktemp -d)` / `NAME=$(mktemp)` assignment may be followed by
+**exactly one** self-referential canonicalization of the **same** variable,
+whose entire RHS is exactly `$(cd "$NAME" && pwd -P)` or `$(realpath "$NAME")`
+(either optionally double-quoted) — the routine way to resolve a symlinked temp
+root (`/tmp` → `/private/tmp`) before use. That second assignment cannot escape
+the directory the first one already proved safe: `cd`/`realpath` either fails
+(the substitution captures nothing and `NAME` becomes empty) or prints the
+canonical path of that same directory. Everything else still fails closed — a
+third assignment, the reverse order, `pwd` without `-P`, `${NAME}` inside the
+`cd`, a canonicalization of a *different* variable, or any prefix/suffix around
+the admitted form.
+
 Because the literal fast path re-runs the ordinary checks on the *resolved*
 path, it is a false-positive refinement rather than a relaxation:
 `WT=/etc/foo; rm -rf "$WT/.snapshots"` still denies as out-of-scope,
