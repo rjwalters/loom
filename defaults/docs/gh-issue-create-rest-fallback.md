@@ -69,8 +69,9 @@ The prompt-level alternative was also *structurally* unavailable: every file
 under `defaults/.claude/commands/loom/` is frozen at its current size by
 `scripts/check-markdown-token-budget.sh`, so a paragraph added to `builder.md`
 / `doctor.md` / `judge.md` fails CI unless as much is deleted from the same
-file. Those prompts already link here from their issue-filing sites; this page
-is where the detail belongs.
+file. `builder-pr.md`, `builder-complexity.md`, `doctor.md` and `judge.md`
+already link here from their issue-filing sites, so this page is where the
+detail belongs — and the backstop itself needs no prompt text to work.
 
 **It fails OPEN on everything inconclusive**, so it can never become a new way
 for a filing to die:
