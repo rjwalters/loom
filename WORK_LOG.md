@@ -7,6 +7,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-17
+- **Issue #7915** (closed): test-isolation: pr_set_dispatch_exports_no_lease_renewal_marker fails when run from inside a sweep (ambient LOOM_SWEEP_LEASE_RENEW_DISPATCHED leaks into the child)
+- **PR #8023**: fix(dispatch): clear inherited Issue-scoped markers for a PrSet child (#7915)
+- **Issue #7877** (closed): classify-dependency-block.sh: _DEP_REF_WINDOW=60 too narrow, misclassifies a genuine dependency finding as merits-finding
+- **PR #8020**: fix(dep_classify): widen the trailing window for explicit dependency phrases (#7877)
+- **Issue #7708** (closed): work_finder: dispatching into a pool with zero usable accounts produces a 4-host re-dispatch storm — 228 token-selection deaths in 4h, 39 lease comments on one issue; needs a sweep pre-flight + host-level exhaustion hold
 - **Issue #7982** (closed): merge-pr.sh should pin the parent ref and warn, instead of blocking every stacked-PR merge
 - **PR #7998**: fix(merge-pr): pin the parent ref and warn instead of blocking stacked merges (#7982)
 - **Issue #7893** (closed): [#4196 Phase 3a] Daemon ChatOps command enum + allowlisted senders + confirm-nonce for inbound safehouse steering
