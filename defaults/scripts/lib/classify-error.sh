@@ -646,3 +646,53 @@ classification_is_transient() {
             ;;
     esac
 }
+
+# loom_model_class_marker <output> <exit_code> <model> -- echo the
+# ` [model-class:<model>]` suffix to append to a `.bad_tokens` reason when the
+# death is provably scoped to ONE model class, or nothing at all otherwise.
+# Issue #8058.
+#
+# Anthropic's subscription limits are not model-blind: a Max plan carries a
+# per-model-class ceiling alongside the all-models weekly limit. Marking the
+# whole account bad for one of those is what let a mixed-model fleet's Opus arm
+# starve its Sonnet arm out of a shared pool.
+#
+# DELIBERATELY CONSERVATIVE, because the two error directions are not
+# symmetric. A class-scoped mark is NARROWER than an account-wide one, so
+# mis-scoping a genuinely account-wide death leaves a dead account in rotation
+# for every other class; failing to scope a genuinely per-class death merely
+# reproduces the pre-#8058 behaviour. Widening is therefore the safe default,
+# and only two signatures qualify:
+#
+#   1. MODEL_CREDITS_EXHAUSTED (#5687, "You're out of usage credits") -- the
+#      category is per-tier by definition, per its own documentation.
+#   2. The #4501 per-model ceiling ("You've reached your Fable 5 limit") -- but
+#      only when the words it names are not an account-wide qualifier. The same
+#      regex also matches "reached your weekly limit", which is emphatically
+#      NOT per-class.
+#
+# The class itself always comes from <model> -- the resolved model in flight --
+# not from the error text: a ceiling kill means "the class we were running ran
+# out", which is a property of the dispatch, not of the message. The raw value
+# is emitted verbatim; `tokens_pool::bad_tokens` normalizes it through the
+# `model_tiers::task_alias_of` classifier on read, and an unrecognizable marker
+# reads as class-less (blocks everything) rather than as blocking nothing.
+loom_model_class_marker() {
+    local output="$1" exit_code="${2:-1}" model="${3:-}" ceiling
+    [[ -n "$model" ]] || return 0
+
+    if declare -F classify_error >/dev/null 2>&1 \
+        && [[ "$(classify_error "$output" "$exit_code")" == "MODEL_CREDITS_EXHAUSTED" ]]; then
+        printf ' [model-class:%s]' "$model"
+        return 0
+    fi
+
+    # `grep` reading a here-string rather than a pipe: see the pipefail note in
+    # lib/locate-daemon-bin.sh's loom_daemon_model_select_flag.
+    ceiling="$(grep -m1 -ioE "reached your ([^[:space:]]+[[:space:]]+){1,3}limit" <<<"$output" || true)"
+    [[ -n "$ceiling" ]] || return 0
+    if grep -qiE "\b(weekly|monthly|daily|hourly|session|usage|plan|spend|account|api)\b" <<<"$ceiling"; then
+        return 0
+    fi
+    printf ' [model-class:%s]' "$model"
+}

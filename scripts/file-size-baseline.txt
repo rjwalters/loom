@@ -30,7 +30,6 @@
 1777 loom-daemon/src/claim_reconciliation.rs
 2606 loom-daemon/src/claim_reconciliation/tests.rs
 3655 loom-daemon/src/cli/status_render.rs
-1146 loom-daemon/src/cli/tokens.rs
 1913 loom-daemon/src/credential_preflight.rs
 1840 loom-daemon/src/daemon_install_state.rs
 1250 loom-daemon/src/daemon_service.rs
@@ -47,7 +46,7 @@
 1344 loom-daemon/src/install_self_check.rs
 3138 loom-daemon/src/ipc.rs
 4194 loom-daemon/src/ipc/tests.rs
-1224 loom-daemon/src/main.rs
+1226 loom-daemon/src/main.rs
 1815 loom-daemon/src/main_health_gate.rs
 2318 loom-daemon/src/main_health_gate/tests.rs
 1715 loom-daemon/src/orphan_process_reaper.rs
@@ -71,11 +70,9 @@
 1836 loom-daemon/src/sweep_registry/watchdog/tests.rs
 1918 loom-daemon/src/terminal.rs
 1661 loom-daemon/src/tokens_pool/account_lifecycle.rs
-1280 loom-daemon/src/tokens_pool/bad_tokens.rs
 1317 loom-daemon/src/tokens_pool/bootstrap.rs
 1868 loom-daemon/src/tokens_pool/check.rs
 1180 loom-daemon/src/tokens_pool/monitor.rs
-1423 loom-daemon/src/tokens_pool/select.rs
 1510 loom-daemon/src/tokens_pool/session_lifecycle.rs
 1741 loom-daemon/src/types.rs
 1050 loom-daemon/src/watch_registry.rs

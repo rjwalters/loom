@@ -291,3 +291,31 @@ loom_resolve_self_daemon_bin() {
     [[ -n "$candidate" && -x "$candidate" ]] && printf '%s\n' "$candidate"
     return 0
 }
+
+# loom_daemon_model_select_flag <daemon_bin> <model> -- echo `--model <model>`
+# (two words) when per-model-class token selection is BOTH wanted and
+# supported, or nothing at all otherwise. Issue #8058.
+#
+# Lives here, next to the binary resolver, because it answers a question about
+# the RESOLVED BINARY: a daemon mid-roll that predates #8058 has no `--model`
+# on `tokens select`, and clap rejects an unknown argument outright -- which
+# would turn a routine binary/script version skew into a hard spawn failure on
+# every dispatch. Same capability-probe idiom `spawn-claude.sh` already applies
+# to `--auto-unpin` (#4228), and the same reason.
+#
+# Echoes nothing when:
+#   * <model> is empty (session default -- selection stays account-wide), or
+#   * the resolved binary's `tokens select --help` does not advertise `--model`.
+#
+# The caller splits the output on whitespace, so a model containing spaces is
+# not supported -- no Claude model alias or pinned ID has ever contained one.
+loom_daemon_model_select_flag() {
+    local daemon_bin="$1" model="${2:-}" help_text
+    [[ -n "$daemon_bin" && -n "$model" ]] || return 0
+    # Captured into a variable rather than piped into `grep -q`: an early-exit
+    # pipe consumer under `set -o pipefail` can SIGPIPE the producer and report
+    # the whole pipeline as failed (see scripts/check-pipefail-early-exit.sh).
+    help_text="$("$daemon_bin" tokens select --help 2>&1 || true)"
+    [[ "$help_text" == *"--model"* ]] || return 0
+    printf '%s %s' "--model" "$model"
+}
