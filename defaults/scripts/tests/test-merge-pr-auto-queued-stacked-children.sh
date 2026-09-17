@@ -156,7 +156,7 @@ run_degrade() {
     local allowed="$1" pinned="$2"
     (
         set -euo pipefail
-        # shellcheck disable=SC2034  # read only by the eval'd block
+        # shellcheck disable=SC2034  # read only by the evaluated block
         REPO_AUTO_MERGE_ALLOWED="$allowed"
         # shellcheck disable=SC2034
         PR_NUMBER=8048
@@ -245,7 +245,7 @@ run_queued() {
     out="$(
         (
             set -euo pipefail
-            # shellcheck disable=SC2034  # read only by the eval'd block
+            # shellcheck disable=SC2034  # read only by the evaluated block
             POST_AUTO_MERGED=false
             # shellcheck disable=SC2034
             PR_NUMBER=8048
