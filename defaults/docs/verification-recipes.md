@@ -312,6 +312,20 @@ incomplete.** Those are bugs and the suite is right. The distinction is the
 whole point of the exercise: one says "this can never be true again", the other
 says "this is not true yet", and only the first is a retirement. If you cannot
 articulate which one you are looking at, it is the second.
+**Generate the corpus ONCE and feed both sides the same bytes.** The obvious
+shape — a loop on each side generating its own inputs from the same seed — looks
+equivalent and is not. A first attempt at differential-testing the watchdog's
+rolling window reimplemented a seeded PRNG in bash and in Rust; they diverged on
+the second draw, and the run reported a divergence *in the code under test*. The
+inputs differed, so nothing about the code was measured at all. Write the corpus
+to a file, read it from both sides, and the harness cannot lie about which side
+moved.
+
+The same caution applies to anything else the harness re-implements. If the test
+needs its own copy of the pattern, the parser, or the ordering rule, say
+explicitly **which** implementation it models — the retired one or the port —
+because a maintainer who later "syncs" that copy to the wrong side silently
+deletes the check while leaving it green.
 
 **Every surviving divergence gets written down where the code is**, with the
 direction of its risk. "Kept, because missing a genuine declared reference is
