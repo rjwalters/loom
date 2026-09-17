@@ -145,6 +145,12 @@ pub mod daemon_bin_resolve;
 pub mod daemon_heartbeat;
 pub mod daemon_install_state;
 pub mod daemon_pidfile;
+/// Non-blocking wrapper around the startup claim-reconciliation +
+/// stranded-quarantine reconciliation passes (Issue #7974) — a new sibling
+/// module rather than growing `daemon_service.rs`, which the file-size
+/// ratchet freezes at its current line count
+/// (`.loom/docs/file-size-policy.md`).
+pub mod daemon_startup_reconciliation;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
