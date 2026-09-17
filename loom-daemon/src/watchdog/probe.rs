@@ -222,6 +222,159 @@ pub fn classify(
     }
 }
 
+/// The IPC probe's verdict about **responsiveness**.
+///
+/// Deliberately a different type from [`SocketVerdict`], and the two classify
+/// the SAME command output differently on purpose. They answer different
+/// questions:
+///
+/// | output | [`SocketVerdict`] — "is anything there?" | [`IpcVerdict`] — "is it responsive?" |
+/// |---|---|---|
+/// | timed out (124) | `Indeterminate` — a wedged CLI is not evidence of absence | `Unresponsive` — a timeout IS unresponsiveness |
+/// | `alive-but-unresponsive` | `Indeterminate` — alive-vs-gone unknown | `Unresponsive` — that is the answer |
+/// | unrecognised error | `Answered` — it replied, so the socket is served | `Skipped` — no IPC-failure signature, not a hang |
+///
+/// Collapsing them into one classifier would be an easy and invisible mistake.
+/// It is the same shape as #8011, where a port merged two reference parsers
+/// that looked interchangeable and shipped three silent divergences. The tests
+/// below assert the two DISAGREE on exactly these inputs, so a later
+/// simplification cannot quietly unify them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcVerdict {
+    /// A clean round-trip.
+    Healthy,
+    /// The daemon is alive but did not serve the request. Counts toward the
+    /// consecutive-failure streak and the rolling window.
+    Unresponsive,
+    /// Nothing was learned. Explicitly NOT counted as a hang — a watchdog that
+    /// escalates because its own optional probe could not run is worse than one
+    /// that stays quiet about it.
+    Skipped,
+}
+
+/// Startup grace: a process younger than this has not necessarily bound its
+/// socket yet, so a failed probe against it is not evidence of a wedge (#4213).
+pub const DEFAULT_PROBE_GRACE_SECS: u64 = 90;
+
+/// Resolve the grace window through the shell's **two-level** fallback:
+/// `LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS`, else `LOOM_DAEMON_STARTUP_GRACE_SECS`,
+/// else [`DEFAULT_PROBE_GRACE_SECS`].
+///
+/// The second tier matters: an operator who widened the daemon's startup grace
+/// because their host is slow expects the watchdog's probe to respect the same
+/// window. Reading only the first knob would leave the probe firing inside a
+/// grace period the operator had explicitly extended, which is the false
+/// positive #4213 is about.
+#[must_use]
+pub fn probe_grace_secs() -> u64 {
+    if let Some(v) = super::env::var("LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS")
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty())
+        .and_then(|s| s.parse().ok())
+    {
+        return v;
+    }
+    super::env::num("LOOM_DAEMON_STARTUP_GRACE_SECS", DEFAULT_PROBE_GRACE_SECS)
+}
+
+/// Classify an attempt as a responsiveness verdict.
+///
+/// `process_age_secs` gates the whole probe: inside the startup grace window the
+/// answer is `Skipped` without even asking, because a daemon that has just
+/// relaunched may not have bound its socket yet and counting that as a hang
+/// would page on every restart (#4331/#4213).
+#[must_use]
+pub fn classify_ipc(
+    attempt: &Attempt,
+    process_age_secs: Option<u64>,
+    grace_secs: u64,
+    socket_path: &Path,
+    timeout_secs: u64,
+) -> (IpcVerdict, String) {
+    if let Some(age) = process_age_secs {
+        if age < grace_secs {
+            return (
+                IpcVerdict::Skipped,
+                format!(
+                    "process is only {age}s old (< {grace_secs}s startup grace) — socket may \
+                     not be bound yet"
+                ),
+            );
+        }
+    }
+
+    let (rc, output, bin) = match attempt {
+        Attempt::Skipped { reason } => return (IpcVerdict::Skipped, reason.clone()),
+        Attempt::Ran { rc, output, bin } => (*rc, output.as_str(), bin.as_str()),
+    };
+
+    let base = Path::new(bin)
+        .file_name()
+        .map_or_else(|| bin.to_string(), |s| s.to_string_lossy().into_owned());
+    let label = format!("{base} {}", probe_args().join(" "));
+    let socket = socket_path.display();
+
+    match rc {
+        0 => {
+            return (
+                IpcVerdict::Healthy,
+                format!("'{label}' round-tripped over {socket} within {timeout_secs}s"),
+            );
+        }
+        RC_TIMEOUT => {
+            return (
+                IpcVerdict::Unresponsive,
+                format!(
+                    "'{label}' did NOT return within the {timeout_secs}s probe budget (the \
+                     CLI's own 5s connect + 5s round-trip bounds did not even fire)"
+                ),
+            );
+        }
+        2 | 126 | 127 => {
+            return (
+                IpcVerdict::Skipped,
+                format!(
+                    "probe command '{label}' is unsupported by this binary (exit {rc}) — \
+                     skipping the IPC probe"
+                ),
+            );
+        }
+        _ => {}
+    }
+
+    let lower = output.to_lowercase();
+    let first = output.lines().next().unwrap_or("");
+    let has = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
+
+    if has(&["alive-starting", "socket has not bound"]) {
+        (
+            IpcVerdict::Skipped,
+            "probe reports the daemon is still STARTING (socket not bound yet) — not counted \
+             as a hang"
+                .to_string(),
+        )
+    } else if has(&[
+        "could not reach loom-daemon",
+        "round-trip timed out",
+        "connect timed out",
+        "connect failed",
+        "closed the connection without responding",
+        "alive-but-unresponsive",
+    ]) {
+        (
+            IpcVerdict::Unresponsive,
+            format!("'{label}' failed the IPC round-trip (exit {rc}): {first}"),
+        )
+    } else {
+        (
+            IpcVerdict::Skipped,
+            format!(
+                "probe exited {rc} without an IPC-failure signature (the daemon answered) — \
+                 not counted as a hang: {first}"
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +389,88 @@ mod tests {
 
     fn verdict(a: &Attempt) -> SocketVerdict {
         classify(a, Path::new("/tmp/s.sock"), 15).0
+    }
+
+    fn ipc(a: &Attempt) -> IpcVerdict {
+        classify_ipc(a, None, 120, Path::new("/tmp/s.sock"), 15).0
+    }
+
+    #[test]
+    fn the_two_classifiers_deliberately_disagree_on_a_timeout() {
+        // "Is anything there?" vs "is it responsive?". A wedged CLI is not
+        // evidence the daemon is gone, but it IS a failed round-trip.
+        let a = ran(RC_TIMEOUT, "");
+        assert_eq!(verdict(&a), SocketVerdict::Indeterminate);
+        assert_eq!(ipc(&a), IpcVerdict::Unresponsive);
+    }
+
+    #[test]
+    fn the_two_classifiers_deliberately_disagree_on_alive_but_unresponsive() {
+        let a = ran(1, "state: alive-but-unresponsive");
+        assert_eq!(verdict(&a), SocketVerdict::Indeterminate, "alive-vs-gone is unknown");
+        assert_eq!(ipc(&a), IpcVerdict::Unresponsive, "responsiveness is exactly what it reports");
+    }
+
+    #[test]
+    fn the_two_classifiers_deliberately_disagree_on_an_application_error() {
+        // It answered, so the socket is served -- but an unrecognised error is
+        // not an IPC-failure signature, so it is not counted as a hang.
+        let a = ran(1, "error: quarantine is empty");
+        assert_eq!(verdict(&a), SocketVerdict::Answered);
+        assert_eq!(ipc(&a), IpcVerdict::Skipped);
+    }
+
+    #[test]
+    fn the_two_classifiers_agree_on_a_clean_round_trip() {
+        let a = ran(0, "");
+        assert_eq!(verdict(&a), SocketVerdict::Answered);
+        assert_eq!(ipc(&a), IpcVerdict::Healthy);
+    }
+
+    #[test]
+    fn the_grace_window_falls_back_through_two_knobs_to_ninety() {
+        // Shell: ${LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS:-${LOOM_DAEMON_STARTUP_GRACE_SECS:-90}}
+        // The second tier is not decoration: an operator who widened the
+        // daemon's startup grace for a slow host expects the probe to respect
+        // the same window, or it fires inside a grace period they extended.
+        assert_eq!(DEFAULT_PROBE_GRACE_SECS, 90);
+    }
+
+    #[test]
+    fn a_young_process_is_never_counted_as_a_hang() {
+        // #4213/#4331: a daemon that just relaunched may not have bound its
+        // socket. Counting that as a wedge pages on every restart.
+        let a = ran(RC_TIMEOUT, "");
+        let (v, detail) = classify_ipc(&a, Some(5), 120, Path::new("/tmp/s.sock"), 15);
+        assert_eq!(v, IpcVerdict::Skipped);
+        assert!(detail.contains("startup grace"), "{detail}");
+    }
+
+    #[test]
+    fn a_process_past_the_grace_window_is_probed_normally() {
+        let a = ran(RC_TIMEOUT, "");
+        assert_eq!(
+            classify_ipc(&a, Some(500), 120, Path::new("/tmp/s.sock"), 15).0,
+            IpcVerdict::Unresponsive
+        );
+    }
+
+    #[test]
+    fn an_unknown_process_age_does_not_grant_grace() {
+        // A missing age must not be read as "young". The shell's `=~ ^[0-9]+$`
+        // guard fails on an empty value and falls through to the probe.
+        let a = ran(RC_TIMEOUT, "");
+        assert_eq!(
+            classify_ipc(&a, None, 120, Path::new("/tmp/s.sock"), 15).0,
+            IpcVerdict::Unresponsive
+        );
+    }
+
+    #[test]
+    fn a_starting_daemon_is_not_counted_as_a_hang_by_either_classifier() {
+        let a = ran(1, "state: alive-starting (socket has not bound yet)");
+        assert_eq!(verdict(&a), SocketVerdict::Answered, "alive, not gone");
+        assert_eq!(ipc(&a), IpcVerdict::Skipped, "starting is not wedged");
     }
 
     #[test]
