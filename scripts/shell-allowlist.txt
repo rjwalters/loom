@@ -555,6 +555,8 @@ tests/install/test-uninstall-shim-cleanup.sh                                   t
 uninstall.sh                                                                   bootstrap   Pre-binary bootstrap: curl-pipe uninstall entry point; must keep working once the binary it removes is gone.
 
 # @section new
+defaults/hooks/tests/test-guard-installed-file-writes.sh                       test        Tests the installed-file write guard's two PreToolUse hooks and its discriminator library (#7995) — shell because its subject is shell; follows its subject, never an independent reason (#7758).
+defaults/scripts/lib/installed-file-guard.sh                                   hook-entry  Hook logic: the repo-identity discriminator + write-target extraction behind the guard-worktree-paths.sh / guard-loom-workflow.sh PreToolUse entry points (#7995). Extracted rather than inlined so both matchers cannot drift; ports with them (#7758).
 defaults/scripts/tests/lib/heredoc-body-safety.sh                              test        Shell test harness for the watchdog suites — scans shell source for the bash-3.2 heredoc trap, so its subject is shell (#7834).
 defaults/scripts/tests/lib/require-daemon-bin.sh                               test        Shell test harness: pins the loom-daemon binary a stub-driven suite tests against, so it must run inside the suite's own shell (#7952).
 defaults/scripts/tests/test-champion-epic-escalation-respects-human-hold.sh    test        Tests the human-hold and un-park guards in champion-epic.md (#7734/#7921) — shell because its subject is shell; follows its subject, never an independent reason (#7758).
