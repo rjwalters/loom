@@ -785,6 +785,13 @@ jobs:
       # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
       - name: loom-daemon-update --resolve-json (#7609)
         run: bash defaults/scripts/tests/test-loom-daemon-update-resolve-json.sh
+      # #8069: 284 assertions that had never run in ANY CI job. They were
+      # excluded on the reason "wiring it needs a cargo build step or a binary
+      # stub — follow-up"; this job is that cargo build step. The subject is
+      # spawn-claude.sh's token selection — the path behind the 228-instance
+      # crash incident (#7708).
+      - name: spawn-claude token selection (#4228, #7708)
+        run: bash defaults/scripts/tests/test-spawn-claude.sh
 
   installer-tests:
     name: Installer Integration Tests
