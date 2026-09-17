@@ -53,6 +53,59 @@ tests/
 └── README.md            # This file
 ```
 
+## Markdown Doc-Lint Tests: No New Prose-Existence Assertions
+
+Some test files in this directory (`sweep_md_doc_lint.rs`, `bump_md_doc_lint.rs`,
+`sweep_md_stage_minus_one_doc_lint.rs`) read a `.md` file from
+`defaults/.claude/commands/loom/` or `defaults/roles/` and assert
+`content.contains("<literal>")` against it — a **prose-existence assertion**: a
+claim that a specific sentence, table row, or code-fence literal still exists
+verbatim inside a markdown file.
+
+**Do not add new prose-existence assertions.** This pattern has already broken
+`main`:
+
+- #7950 — a *correct* bug fix (#7876) reworded a pinned command-line literal
+  inside `sweep.md`. The assertion failed on the corrected doc and took `main`
+  red for 10 commits, over the same two-string mismatch each time.
+- #7948 — the same failure shape produced a misdiagnosis: the failure message
+  describes what the pinned text *means* ("lease-renewal races"), not the
+  actual failure ("two strings no longer match"), so the next reader chased the
+  wrong cause.
+
+If you're about to add a `content.contains(...)` (or `.find(...)`) call to one
+of these files, use one of the two patterns below instead:
+
+1. **The literal lives inside a code fence** (a shell function, a JSON sample,
+   a script template) — never pin it as a string. Extract the fenced block and
+   **execute it**. This is the pattern already used by the ~20
+   `defaults/scripts/tests/test-guide-*.sh` suites: locate the `.md` file, pull
+   the shell functions defined in its fenced code blocks, and run them. That
+   pattern fails when *behavior* changes; it does not fail when the prose
+   around the fence is reworded or the fence is moved under a different
+   heading.
+2. **Genuine prose guidance with no executable surface** (a sentence, a
+   rationale paragraph, a recommendation) — there is nothing to execute. Rely
+   on human review at PR time, not a brittle string match. A `contains()`
+   assertion over a sentence only ever verifies "this exact wording still
+   exists" — it fails on a correct reword and has nothing to say about whether
+   a subtly wrong rewording is actually wrong.
+
+This rule governs new assertions going forward. It is not a mandate to rewrite
+the doc-lint tests that already exist in this directory on sight — the
+mechanical migration of those is tracked from #7979. Note those files already
+distinguish CONTRACT identifiers (stable tokens like IPC variant names or
+config keys, legitimately pinned exact) from PROSE (asserted structurally,
+e.g. by heading prefix or a tolerant phrasing set) per #3877 — that framework
+predates and is compatible with this rule, but "pin the CONTRACT identifier
+exact" is not license to add a fresh *sentence* pin under a PROSE label.
+
+**Ratchet-exemption decision**: see the "Correctness-PR exemption decision"
+comment block in `scripts/check-markdown-token-budget.sh` for the recorded
+answer to "should a purely-correctness PR be exempt from the per-file markdown
+token ratchet when the fix requires adding explanatory text?" (short version:
+no — trim elsewhere).
+
 ## Test Helpers
 
 ### `TestDaemon`

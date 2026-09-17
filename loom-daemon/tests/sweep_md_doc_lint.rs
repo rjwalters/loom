@@ -30,6 +30,18 @@
 //! If the markdown structure intentionally changes (e.g. a follow-up issue
 //! adds a seventh topic), update this test together with the markdown so
 //! the doc-lint stays in sync with the contract.
+//!
+//! ---------------------------------------------------------------------------
+//! Before adding a NEW `contains()`/`find()` assertion (#7992)
+//! ---------------------------------------------------------------------------
+//! Read "Markdown Doc-Lint Tests: No New Prose-Existence Assertions" in
+//! `tests/README.md` first. Short version: a literal that lives inside a code
+//! fence should be extracted and EXECUTED (see the
+//! `defaults/scripts/tests/test-guide-*.sh` pattern), not pinned as a string;
+//! genuine prose with no executable surface should rely on review, not a new
+//! `contains()` pin. The CONTRACT/PROSE split above (#3877) predates that rule
+//! and stays as-is here — see #7979 for the tracked migration — but it is not
+//! license to add a fresh sentence pin under a PROSE label.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
