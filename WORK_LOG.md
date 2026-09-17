@@ -7,6 +7,28 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-17
+- **Issue #7971** (closed): Builder/Doctor/Judge file side findings with no duplicate check — three agents filed the same bug in four minutes
+- **PR #8014**: fix(create-issue): add a duplicate backstop at the single filing call site
+- **Issue #7993** (closed): Migrate sweep_md_doc_lint.rs off prose-existence assertions to extract-and-execute tests (split from #7979)
+- **PR #8024**: test(loom-daemon): migrate sweep_md_doc_lint.rs off code-fence literal pins
+- **Issue #7994** (closed): Migrate sweep_md_stage_minus_one_doc_lint.rs off prose-existence assertions (split from #7979)
+- **PR #8043**: test(loom-daemon): migrate Stage -1 doc-lint off code-fence literal pins
+- **Issue #7974** (closed): loom-daemon: bind the IPC socket and start the heartbeat before the synchronous startup claim-reconciliation pass
+- **PR #8042**: fix(daemon): bind IPC socket/pidfile/heartbeat before startup reconciliation completes
+- **Issue #8032** (closed): Characterize claude-wrapper.sh's retry policy before porting it: 1,675 lines, 0 dedicated tests
+- **PR #8036**: test: characterize claude-wrapper.sh's retry policy before porting it (#8032)
+- **Issue #8004** (closed): land-resync-commit.sh treats an ALREADY-TRACKED credential path the same as an untracked one — the one state the #7818 incident left behind
+- **PR #8033**: fix(security): hard-stop land-resync-commit.sh on an ALREADY-TRACKED credential path (#8004)
+- **Issue #7996** (closed): Migrate bump_md_doc_lint.rs off prose-existence assertions (split from #7979)
+- **PR #8034**: test(loom-daemon): migrate bump_md_doc_lint.rs off code-fence literal pins
+- **PR #8031**: fix(reconcile-stack): refuse a pinned parent ref that is not an ancestor (#8010 item 4)
+- **Issue #7935** (closed): SweepRegistry entry survives its child's death when the pid is recycled — blocks `restart --drain` and every auto_update roll
+- **PR #8022**: fix(sweep-registry): pair tracked pids with a start-time identity so a recycled pid reads as dead (#7935)
+- **Issue #7977** (closed): [epic #7810 PR 5] Resolve release artifacts natively; auto_update.rs stops shelling out to --resolve-json
+- **PR #8017**: feat(daemon): resolve release artifacts natively; auto_update stops shelling out (#7977)
+- **Issue #8030** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7923** (closed): Index guard: distinguish inert read-tree documentation from executable shell wrappers
+- **PR #8003**: fix(guard): distinguish inert documentation from executable index mutation
 - **Issue #7915** (closed): test-isolation: pr_set_dispatch_exports_no_lease_renewal_marker fails when run from inside a sweep (ambient LOOM_SWEEP_LEASE_RENEW_DISPATCHED leaks into the child)
 - **PR #8023**: fix(dispatch): clear inherited Issue-scoped markers for a PrSet child (#7915)
 - **Issue #7877** (closed): classify-dependency-block.sh: _DEP_REF_WINDOW=60 too narrow, misclassifies a genuine dependency finding as merits-finding
