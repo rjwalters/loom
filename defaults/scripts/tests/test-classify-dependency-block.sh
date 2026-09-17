@@ -364,7 +364,7 @@ reset_state
 issue_fixture 'o/r#5' OPEN 'A proposal.' 'loom:architect' \
     '**Champion Review: NEEDS REVISION**
 
-- Technical feasibility: this issue’s own Dependencies section states it is "Blocked by the sibling Phase 4 issue (run-job seam contract + host executor)" — that issue is #3, which is currently OPEN.
+- Technical feasibility: this issue'\''s own Dependencies section states it is "Blocked by the sibling Phase 4 issue (run-job seam contract + host executor)" — that issue is #3, which is currently OPEN.
 '
 issue_fixture 'o/r#3' OPEN 'The sibling Phase 4 issue.' ''
 run_cdb --issue 5 --repo o/r --check-defer
