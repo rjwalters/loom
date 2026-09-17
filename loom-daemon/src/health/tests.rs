@@ -582,19 +582,6 @@ fn a_host_id_mismatch_is_a_degraded_observability_note() {
     assert_eq!(report.exit_code(), EXIT_DEGRADED);
 }
 
-#[test]
-fn the_observability_section_is_appended_last_and_only_when_present() {
-    let with_mismatch = assess(&mismatched_inputs(60));
-    let keys: Vec<&str> = with_mismatch.sections.iter().map(|s| s.key).collect();
-    assert_eq!(keys.last(), Some(&"observability"));
-    // 11 always-present sections (#6157 added `peer_coordination`; #6201
-    // added `role_liveness`; #7529 added `stale_sweeps`; #7584 added
-    // `auto_update`; #7590 added `worktree_reaper`) + the conditional
-    // trailing `observability` note.
-    assert_eq!(keys.len(), 12);
-    assert_eq!(assess(&healthy_inputs()).sections.len(), 11);
-}
-
 // ===================================================================
 // Observability export liveness (#5083)
 // ===================================================================
@@ -636,10 +623,10 @@ fn a_healthy_exporter_still_renders_no_observability_section() {
     let report = assess(&inputs);
     assert!(report.section("observability").is_none());
     assert_eq!(report.overall, Verdict::Green);
-    // 11 always-present sections: + `peer_coordination` (#6157),
+    // 12 always-present sections: + `peer_coordination` (#6157),
     // `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
-    // (#7584), and `worktree_reaper` (#7590).
-    assert_eq!(report.sections.len(), 11);
+    // (#7584), `worktree_reaper` (#7590), and `pool_hold` (#7990).
+    assert_eq!(report.sections.len(), 12);
 }
 
 #[test]
@@ -778,51 +765,6 @@ fn a_pre_5083_daemon_reporting_no_export_field_renders_nothing() {
     status.observability_export = None;
     status.observability_host_id_mismatch = None;
     assert!(assess_observability(&inputs).is_none());
-}
-
-#[test]
-fn report_always_has_all_seven_sections() {
-    let report = assess(&healthy_inputs());
-    let keys: Vec<&str> = report.sections.iter().map(|s| s.key).collect();
-    assert_eq!(
-        keys,
-        vec![
-            "liveness",
-            "dispatch",
-            "tokens",
-            "roles",
-            "role_liveness",
-            "queues",
-            "throughput",
-            "peer_coordination",
-            "stale_sweeps",
-            "auto_update",
-            "worktree_reaper"
-        ]
-    );
-}
-
-#[test]
-fn render_human_is_one_line_per_section_plus_overall() {
-    let report = assess(&healthy_inputs());
-    let rendered = report.render_human();
-    let lines: Vec<&str> = rendered.lines().collect();
-    // liveness, dispatch, tokens, roles, role_liveness (#6201), queues,
-    // throughput, peer_coordination (#6157), stale_sweeps (#7529),
-    // auto_update (#7584), worktree_reaper (#7590), + overall.
-    assert_eq!(lines.len(), 12);
-    assert!(lines[11].starts_with("overall"));
-}
-
-#[test]
-fn json_serialization_round_trips() {
-    let report = assess(&healthy_inputs());
-    let value = serde_json::to_value(&report).unwrap();
-    assert_eq!(value["overall"], "green");
-    // 11 always-present sections: + `peer_coordination` (#6157),
-    // `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
-    // (#7584), and `worktree_reaper` (#7590).
-    assert_eq!(value["sections"].as_array().unwrap().len(), 11);
 }
 
 // ===================================================================
@@ -3208,3 +3150,5 @@ fn worktree_reaper_is_unknown_without_a_status_round_trip() {
     inputs.ipc_error = Some("connection refused".to_string());
     assert_eq!(assess_worktree_reaper(&inputs).verdict, Verdict::Unknown);
 }
+
+mod section_inventory;

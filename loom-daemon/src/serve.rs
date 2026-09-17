@@ -1189,7 +1189,7 @@ pub async fn run_with_state(listener: TcpListener, state: ServeState) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CapacityReport, DaemonStatusReport};
+    use crate::types::DaemonStatusReport;
     use std::net::Ipv4Addr;
     use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;
@@ -1198,77 +1198,12 @@ mod tests {
     /// the zero-workspaces / zero-in-flight case, matching what a freshly
     /// started daemon with no registered repos reports.
     fn empty_report() -> DaemonStatusReport {
+        // `Default` IS the zero-workspaces / zero-in-flight shape this fixture
+        // wants (see `DaemonStatusReport`'s own doc) — spread it rather than
+        // restating ~50 fields, only naming the one value that differs.
         DaemonStatusReport {
-            journal_adopted_at_startup: 0,
-            in_flight: vec![],
-            unregistered_locked: vec![],
-            stale_sweeps: vec![],
-            token_pool_size: 0,
-            token_pool_dir: None,
-            disk_headroom: 0,
-            ram_headroom: 0,
-            logical_cpus: 0,
-            loadavg_1m: None,
-            cpu_idle_fraction: None,
-            capacity_bound: false,
-            preflight_advisory_active: false,
-            preflight_advisory_message: None,
-            preflight_advisory_changed_at: None,
-            configured_max: 0,
-            dynamic_cap: 0,
-            main_health_gate_halted: false,
-            main_health_gate_not_evaluated: false,
-            main_health_gate_not_evaluated_reason: None,
-            main_health_gate_enabled: None,
-            main_health_gate_verdict_at: None,
-            main_health_gate_deferred: false,
-            main_health_gate_deferred_reason: None,
-            main_health_gate_verdict_tier: None,
-            capacity: CapacityReport {
-                ranking_present: false,
-                total_accounts: 0,
-                healthy_accounts: 0,
-                exhausted_accounts: 0,
-                token_axis_limit: 0,
-                token_bound: false,
-            },
-            per_repo: vec![],
-            role_runner_host_env_override: None,
-            role_runner_shard: None,
-            credential_preflight: None,
-            draining: false,
-            drain_deadline: None,
-            drain_note: None,
-            auto_update_enabled: false,
-            auto_update_last_check: None,
-            auto_update_last_roll: None,
-            auto_update_consecutive_failures: 0,
-            auto_update_backoff_secs: None,
-            auto_update_terminal_reason: None,
-            auto_update_note: None,
-            auto_update_artifact_version: None,
-            auto_update_artifact_published_at: None,
-            host_breaker: None,
-            admission_brake: None,
-            rate_limit_breaker: None,
-            safehouse: None,
-            work_finder_enabled: None,
-            last_work_finder_tick: None,
-            role_tick_records: vec![],
-            role_last_tick: vec![],
-            active_role_agents: 0,
             role_agent_max_concurrent: Some(7),
-            daemon_pid: None,
-            pid_file: None,
-            daemon_build_commit: None,
-            daemon_built_at_raw: None,
-            work_finder_interval_secs: None,
-            observability_host_id_mismatch: None,
-            observability_export: None,
-            peer_claims: None,
-            deep_clean: Vec::new(),
-            idle_exit: None,
-            stuck_worktree_reclaims: Vec::new(),
+            ..DaemonStatusReport::default()
         }
     }
 
@@ -2683,7 +2618,8 @@ mod tests {
                 "peer_coordination",
                 "stale_sweeps",
                 "auto_update",
-                "worktree_reaper"
+                "worktree_reaper",
+                "pool_hold"
             ]
         );
         assert!(json["exit_code"].is_i64(), "payload must carry the 0/1/2 contract");

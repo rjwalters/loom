@@ -2841,22 +2841,9 @@ pub fn build_daemon_status(
         // a real answer, not the silence #4830 alone could offer.
         observability_export: Some(crate::observability::global_export_status()),
         // Per-repo deep-clean state (#5919) — the same process-global snapshot
-        // pattern once more. Reported for EVERY repo the reaper has evaluated,
-        // not only those where a pass fired: "last evaluated 3m ago, 118G free"
-        // is the answer to "is this host reclaiming its own disk?" on a healthy
-        // host, and the absence of any entry is itself the signal that the
-        // reaper (and therefore the deep pass) is not running at all.
-        deep_clean: crate::deep_clean::snapshot()
-            .into_iter()
-            .map(|(root, s)| crate::types::DeepCleanRepoStatus {
-                root,
-                last_evaluated_at: s.last_evaluated_at,
-                last_reason: s.last_reason,
-                last_free_gb: s.last_free_gb,
-                last_fired_at: s.last_fired_at,
-                last_reclaimed: s.last_reclaimed,
-            })
-            .collect(),
+        // pattern once more, projected by the module that owns the state (the
+        // mapping lived here until #7990 moved it beside `snapshot()`).
+        deep_clean: crate::deep_clean::status_snapshot(),
         // Live idle-exit eligibility (#5565) — same process-global snapshot
         // pattern as the auto-update/host-breaker fields above. `enabled:
         // false, eligible: false` when the `autonomous.idleExit` task was
@@ -2886,6 +2873,12 @@ pub fn build_daemon_status(
         // snapshot pattern as `deep_clean`/`idle_exit` above. Empty in the
         // overwhelmingly common case (nothing stuck).
         stuck_worktree_reclaims: crate::worktree_reaper::stuck_worktree_removals(),
+        // Token pools holding ALL sweep dispatch because nothing in them can
+        // spawn (#7708, surfaced by #7990). The hold lives in the daemon
+        // process; `status`/`health` run as a separate CLI process, so the
+        // only way they can name it is to ride this payload. Empty whenever
+        // no pool is held, which is the steady state.
+        pool_exhaustion_holds: crate::work_finder::pool_preflight::active_hold_statuses(),
         // Live safehouse connection state (#4345) — the pool's shared cell is
         // updated by the narration sink / peer-coordination tasks
         // `start_safehouse_narration`/`start_peer_coordination` spawn, and

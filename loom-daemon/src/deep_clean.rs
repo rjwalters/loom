@@ -712,6 +712,31 @@ pub fn snapshot() -> Vec<(PathBuf, DeepCleanState)> {
         .collect()
 }
 
+/// [`snapshot`] projected onto the status wire (Issue #5919; moved here from
+/// `ipc.rs` by #7990 so this module owns its own wire projection, the shape
+/// [`crate::worktree_reaper::stuck_worktree_removals`] and
+/// [`crate::work_finder::pool_preflight::active_hold_statuses`] already use).
+///
+/// Reported for EVERY repo the reaper has evaluated, not only those where a
+/// pass fired: "last evaluated 3m ago, 118G free" is the answer to "is this
+/// host reclaiming its own disk?" on a healthy host, and the absence of any
+/// entry is itself the signal that the reaper (and therefore the deep pass)
+/// is not running at all.
+#[must_use]
+pub fn status_snapshot() -> Vec<crate::types::DeepCleanRepoStatus> {
+    snapshot()
+        .into_iter()
+        .map(|(root, s)| crate::types::DeepCleanRepoStatus {
+            root,
+            last_evaluated_at: s.last_evaluated_at,
+            last_reason: s.last_reason,
+            last_free_gb: s.last_free_gb,
+            last_fired_at: s.last_fired_at,
+            last_reclaimed: s.last_reclaimed,
+        })
+        .collect()
+}
+
 /// Drop all published state. Test-only seam (the process-global would otherwise
 /// leak between `#[serial]` tests in the same binary).
 #[doc(hidden)]

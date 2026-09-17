@@ -3,7 +3,7 @@
 //! the same "misconfiguration must render" principle
 //! `role_runner_shard_render_tests` pins for the sharding header above.
 use super::render_roster_lines;
-use crate::cli::status::status_client_tests::sample_report;
+use crate::cli::status::sample_report::sample_report;
 use loom_daemon::types::{
     DaemonStatusReport, RoleRunnerShardPosture, RosterMemberStatus, RosterStatus,
 };

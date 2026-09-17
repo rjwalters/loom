@@ -30,6 +30,7 @@
 //! | peer_coordination | [`crate::types::DaemonStatusReport::safehouse`] (RPC socket reachability) + [`crate::types::DaemonStatusReport::peer_claims`]`.coordination` (published by [`crate::peer_claims::PeerClaimView::evaluate_coordination`], Issue #6157) |
 //! | auto_update | [`crate::types::DaemonStatusReport::auto_update_*`] (the daemon-side rebuild loop's own state, Issue #4055) + [`crate::self_update::check`] (this CLI process's own source-vs-built-commit staleness magnitude, Issue #6261) — unconditional, mirroring `liveness`/`dispatch` (Issue #7584) |
 //! | worktree_reaper | [`crate::types::DaemonStatusReport::stuck_worktree_reclaims`] (published by [`crate::worktree_reaper::stuck_worktree_removals`], Issue #7590) |
+//! | pool_hold | [`crate::types::DaemonStatusReport::pool_exhaustion_holds`] (published by [`crate::work_finder::pool_preflight::active_hold_statuses`], Issues #7708/#7990) — its own bucket, deliberately NOT folded into `tokens` |
 //! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`] (published by [`crate::observability::HostIdStatus`]) + [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
@@ -2469,68 +2470,16 @@ pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
 }
 
 // ============================================================================
-// Stuck worktree-removal backoff section (Issue #7590)
+// Sections for held/backed-off activity (Issues #7590, #7708)
 // ============================================================================
+//
+// `assess_worktree_reaper` (#7590) and `assess_pool_hold` (#7708) both live in
+// the `holds` sibling module and are re-exported here, so every caller and
+// test keeps addressing them as `health::assess_*` — see that module's doc for
+// why they are grouped and why this file only carries the dispatch line.
 
-/// Assess [`DaemonStatusReport::stuck_worktree_reclaims`]: worktree removals
-/// the periodic reaper has backed off after a permission-class failure (or a
-/// fixed retry-count cap) — see
-/// [`crate::worktree_reaper::stuck_worktree_removals`]'s doc comment for the
-/// exact classification. Before #7590 a worktree in this state retried the
-/// exact same removal, and failed the exact same way, every single reaper
-/// tick forever, with nothing on this surface to notice it — this section
-/// closes that gap.
-///
-/// **Unconditional** (mirrors `stale_sweeps`/`liveness`/`dispatch`), not the
-/// anomaly-only `Option`-returning pattern [`assess_observability`] uses: a
-/// stuck removal is otherwise invisible on every existing surface, so a
-/// section that only appears once an operator already suspects trouble would
-/// defeat the point.
-#[must_use]
-pub fn assess_worktree_reaper(inputs: &HealthInputs) -> HealthSection {
-    let Some(status) = &inputs.status else {
-        return unknown_section("worktree_reaper", &no_status_reason(inputs));
-    };
-
-    if status.stuck_worktree_reclaims.is_empty() {
-        return HealthSection::new(
-            "worktree_reaper",
-            Verdict::Green,
-            "no worktree removals backed off",
-            serde_json::json!({ "count": 0 }),
-        );
-    }
-
-    let summary = status
-        .stuck_worktree_reclaims
-        .iter()
-        .map(|r| {
-            format!(
-                "{}-{} @ {} ({} attempt(s), first failed {}): {}",
-                r.kind,
-                r.number,
-                repo_label(&r.repo_root),
-                r.attempt_count,
-                format_age((inputs.at - r.first_failure_at).num_seconds()),
-                r.cause
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    HealthSection::new(
-        "worktree_reaper",
-        Verdict::Degraded,
-        format!(
-            "{} worktree removal(s) backed off after repeated/permission-class failures \
-             (#7590 — will not self-resolve without operator intervention): {summary}",
-            status.stuck_worktree_reclaims.len()
-        ),
-        serde_json::json!({
-            "count": status.stuck_worktree_reclaims.len(),
-            "stuck": status.stuck_worktree_reclaims,
-        }),
-    )
-}
+pub mod holds;
+pub use holds::{assess_pool_hold, assess_worktree_reaper};
 
 // ============================================================================
 // Observability section (Issue #4830) — conditional
@@ -2817,6 +2766,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_stale_sweeps(inputs),
         assess_auto_update(inputs),
         assess_worktree_reaper(inputs),
+        assess_pool_hold(inputs),
     ];
     sections.extend(assess_observability(inputs));
     sections.extend(assess_codesign_identity(inputs));

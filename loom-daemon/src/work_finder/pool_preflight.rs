@@ -374,5 +374,30 @@ pub fn active_holds() -> Vec<PoolExhaustionHold> {
     PoolHoldState::global().active_holds()
 }
 
+/// [`active_holds`] projected onto the status wire (Issue #7990).
+///
+/// The daemon owns the hold set, but `loom-daemon status` / `health` run in a
+/// *separate CLI process* that only ever sees a
+/// [`crate::types::DaemonStatusReport`] — so the holds have to ride that
+/// payload. This is the projection, kept here (beside the state it reads)
+/// rather than in `ipc.rs`, matching
+/// [`crate::worktree_reaper::stuck_worktree_removals`]'s own shape.
+///
+/// Order is [`PoolHoldState::active_holds`]'s: sorted by pool directory, so
+/// rendering is stable across calls.
+#[must_use]
+pub fn active_hold_statuses() -> Vec<crate::types::PoolExhaustionHoldStatus> {
+    active_holds()
+        .into_iter()
+        .map(|h| crate::types::PoolExhaustionHoldStatus {
+            dir: h.dir,
+            total: h.total,
+            since: h.since,
+            next_clear_at: h.next_clear_at,
+            wrapper_observed: h.wrapper_observed,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;

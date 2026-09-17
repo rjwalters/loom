@@ -1723,38 +1723,23 @@ pub struct DaemonStatusReport {
     /// pre-#7590 wire data / older clients compatible.
     #[serde(default)]
     pub stuck_worktree_reclaims: Vec<StuckWorktreeReclaim>,
+    /// Token pools this host currently holds ALL sweep dispatch for because
+    /// not one account in them is spawnable (Issue #7708, surfaced by
+    /// #7990). Populated from the work finder's own process-global hold set
+    /// via [`crate::work_finder::pool_preflight::active_hold_statuses`], and
+    /// empty in the overwhelmingly common case (no pool held).
+    ///
+    /// Its own field, never folded into [`Self::capacity`]: a host-level
+    /// "this pool can spawn nothing" hold is a different condition from N
+    /// degraded accounts, and merging them would inflate the `tokens`
+    /// section's failure tallies with one fact. `#[serde(default)]` keeps
+    /// pre-#7990 wire data / older clients compatible.
+    #[serde(default)]
+    pub pool_exhaustion_holds: Vec<PoolExhaustionHoldStatus>,
 }
 
-/// One [`DaemonStatusReport::stuck_worktree_reclaims`] entry (Issue #7590) —
-/// a worktree removal the reaper has backed off after either a
-/// permission-class failure or [`crate::worktree_reaper::REMOVAL_FAILURE_CAP`]
-/// consecutive failures of any cause. Surfaced so an operator sees the
-/// specific stuck repo + issue/PR number + cause on `loom-daemon
-/// health`/`status` instead of the removal silently retrying and failing
-/// identically forever.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StuckWorktreeReclaim {
-    /// The owning repo's primary-checkout root.
-    pub repo_root: PathBuf,
-    /// `"issue"` or `"pr"` — which reap pass owns this worktree.
-    pub kind: String,
-    /// The issue or PR number (interpretation depends on [`Self::kind`]).
-    pub number: u32,
-    /// The worktree's on-disk path.
-    pub path: PathBuf,
-    /// The most recent removal failure's cause, verbatim from
-    /// `clean::cleanup_worktree`/`cleanup_pr_worktree`'s `Err`.
-    pub cause: String,
-    /// When the first failed removal attempt for this path was recorded this
-    /// process (removal-failure state is not persisted across a daemon
-    /// restart — see [`crate::worktree_reaper::stuck_worktree_removals`]'s
-    /// doc comment).
-    pub first_failure_at: DateTime<Utc>,
-    /// When the most recent failed removal attempt was recorded.
-    pub last_attempt_at: DateTime<Utc>,
-    /// Total consecutive failed removal attempts recorded for this path.
-    pub attempt_count: u32,
-}
+mod holds;
+pub use holds::{PoolExhaustionHoldStatus, StuckWorktreeReclaim};
 
 /// One registered repo's deep-clean state on the status wire (#5919) — the
 /// serializable projection of [`crate::deep_clean::DeepCleanState`].
