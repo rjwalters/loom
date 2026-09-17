@@ -39,6 +39,51 @@ It tries `gh issue create` first and, only on one of the five documented
 rate-limit signatures below, retries the identical filing as a single REST
 POST.
 
+## The duplicate backstop (#7971): exit 3 means NOT FILED
+
+Before filing, `create-issue.sh` runs the sibling `check-duplicate.sh` against
+**open issues** and **exits 3 without creating anything** when it reports an
+above-threshold match. The block message lists the matches and the `--force`
+re-run:
+
+```
+create-issue.sh: NOT FILED -- this looks like a duplicate of open work:
+  #4242: sweep-lease-fence.sh:392 repo_args unbound under bash 3.2 (similarity: 34%)
+Nothing was created. Either:
+  * comment on the issue above instead of filing a new one, or
+  * re-run with --force if this is genuinely distinct work.
+```
+
+**Why here and not in the role prompts.** Eight role prompts already teach a
+`check-duplicate.sh` step — and they are the roles whose *primary job* is
+filing issues (Architect, Hermit, Auditor, Curator, Guide), the ones most
+likely to remember anyway. The roles that file issues as a **side effect** of
+other work (Builder, Doctor, Judge) had the step in none of their prompts, and
+that is the high-duplication path by construction: every concurrent Builder
+trips over the same broken script and files reflexively. On 2026-09-16 three
+Builders filed the same bug — #7957, #7960, #7968 — inside four minutes. A
+backstop at the single filing call site covers every caller, including roles
+nobody updates.
+
+**It fails OPEN on everything inconclusive**, so it can never become a new way
+for a filing to die:
+
+| Situation | Behaviour |
+|---|---|
+| `check-duplicate.sh` missing / non-executable / exits 2 | warn on stderr, **file anyway** |
+| `NON_DISCRIMINATIVE` (#4409 — the scorer reporting it is not separating anything for this query) | warn, **file anyway** |
+| The match is already cross-referenced by the filing (`Part of #123`) | **file anyway** — an intentional follow-up scores high against the work that spawned it; decomposition is not duplication |
+| `--repo OWNER/REPO` given | check **skipped** — `check-duplicate.sh` searches the working directory's repo and cannot answer for another one |
+| `--force` / `--skip-duplicate-check` / `LOOM_SKIP_DUPLICATE_CHECK=1` | check **skipped** |
+
+**This does not make the REST fallback GraphQL-dependent.** Under GraphQL
+exhaustion `check-duplicate.sh` falls back to REST itself, and a *total*
+failure of it lands in the fail-open row above — the create still runs, still
+falls back to the REST POST below, and still returns the new issue's URL. A
+caller that already ran `check-duplicate.sh` for a whole burst (the eight
+prompts above) should export `LOOM_SKIP_DUPLICATE_CHECK=1` rather than pay for
+the same search twice per filing.
+
 ## The five-signature table
 
 A rejection whose text contains one of these (case-insensitive) is a rate

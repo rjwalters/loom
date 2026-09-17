@@ -75,6 +75,7 @@ test-cleanup-branches-pr-review-branch.sh
 test-config-resolver.sh
 test-config-tiers-cli-migration.sh
 test-cpu-budget.sh
+test-create-issue-duplicate-check.sh
 test-create-pr-superseded-issue.sh
 test-create-pr-version-check.sh
 test-default-branch.sh
