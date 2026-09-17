@@ -61,6 +61,15 @@
 #       alongside a legitimate resync change     staged and never treated as
 #                                                 blocking foreign dirt; the
 #                                                 legitimate change still lands
+#   (o) a TRACKED .loom/gh-config/ path with -> hard stop, exit 1 (#8004): the
+#       local modifications                      one state #7818 left behind;
+#                                                 nothing is committed or
+#                                                 pushed, and the message names
+#                                                 `git rm --cached` + rotating
+#                                                 the credential
+#   (o2) the same path after `git rm --cached` -> back to the (n) behaviour:
+#                                                 excluded, non-blocking, the
+#                                                 legitimate resync change lands
 #
 # Usage:
 #   ./.loom/scripts/tests/test-land-resync-commit.sh
@@ -650,6 +659,70 @@ if [[ -f "$WORKDIR/primary-n/.loom/gh-config/hosts.yml" ]] && \
     pass "the credential files are left on disk, still untracked (never touched by git add)"
 else
     fail "the credential files are left on disk, still untracked (never touched by git add)"
+fi
+
+echo ""
+echo "=== (o) a TRACKED .loom/gh-config/ path is a HARD STOP, not a warning (#8004) ==="
+gh_stub_reset
+make_origin origin-o
+make_primary origin-o primary-o
+# The state the #7818 incident left behind: the credential file is already in
+# the index (and on origin), so no .gitignore entry can ever apply to it.
+mkdir -p "$WORKDIR/primary-o/.loom/gh-config"
+printf 'oauth_token: ghs_live_dummy\n' > "$WORKDIR/primary-o/.loom/gh-config/hosts.yml"
+git -C "$WORKDIR/primary-o" add -f .loom/gh-config/hosts.yml
+git -C "$WORKDIR/primary-o" commit -q -m "oops: committed the GH_CONFIG_DIR tree"
+git -C "$WORKDIR/primary-o" push -q origin main
+# The daemon re-mints the token, so the tracked file goes dirty alongside an
+# ordinary resync change.
+printf 'oauth_token: ghs_live_dummy_rotated\n' > "$WORKDIR/primary-o/.loom/gh-config/hosts.yml"
+printf 'updated\n' > "$WORKDIR/primary-o/.loom/hooks/foo.sh"
+OUT="$(cd "$WORKDIR/primary-o" && "$SCRIPT" 2>&1)"; RC=$?
+if [[ $RC -eq 1 ]] && grep -qi "refusing to land" <<< "$OUT" && grep -q "TRACKED" <<< "$OUT" && \
+   grep -q "\.loom/gh-config/hosts\.yml" <<< "$OUT"; then
+    pass "a tracked credential path stops the run (exit 1) instead of being warned about"
+else
+    fail "a tracked credential path stops the run (exit 1) instead of being warned about (rc=$RC, out=$OUT)"
+fi
+if grep -q "rm --cached" <<< "$OUT" && grep -qi "rotate" <<< "$OUT"; then
+    pass "the refusal names both remediation steps (git rm --cached, rotate the credential)"
+else
+    fail "the refusal names both remediation steps (git rm --cached, rotate the credential) (out=$OUT)"
+fi
+ORIGIN_LOG_O="$(git --git-dir="$WORKDIR/origin-o.git" log --oneline main)"
+if ! grep -q "resync installed Loom surfaces" <<< "$ORIGIN_LOG_O" && \
+   [[ -z "$(git -C "$WORKDIR/primary-o" log --oneline "origin/main..main" 2>/dev/null)" ]]; then
+    pass "nothing was committed or pushed while a tracked credential path is present"
+else
+    fail "nothing was committed or pushed while a tracked credential path is present (origin_log=$ORIGIN_LOG_O)"
+fi
+if [[ "$(< "$WORKDIR/primary-o/.loom/gh-config/hosts.yml")" == "oauth_token: ghs_live_dummy_rotated" ]]; then
+    pass "the credential file itself is left untouched on disk (the script only refuses)"
+else
+    fail "the credential file itself is left untouched on disk (the script only refuses)"
+fi
+
+echo ""
+echo "=== (o2) after 'git rm --cached' the same path is back to the untracked, non-blocking case (#8004) ==="
+gh_stub_reset
+# Remediation step 1 from the refusal message, applied to the (o) fixture.
+git -C "$WORKDIR/primary-o" rm -q --cached -r -- .loom/gh-config
+OUT="$(cd "$WORKDIR/primary-o" && "$SCRIPT" 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Excluded from the commit" <<< "$OUT" && ! grep -qi "refusing to land" <<< "$OUT"; then
+    pass "an untracked-again credential path is excluded, not blocking"
+else
+    fail "an untracked-again credential path is excluded, not blocking (rc=$RC, out=$OUT)"
+fi
+ORIGIN_TREE_O="$(git --git-dir="$WORKDIR/origin-o.git" log -1 --format='%H' main | xargs -I{} git --git-dir="$WORKDIR/origin-o.git" ls-tree -r --name-only {})"
+if grep -q "\.loom/hooks/foo\.sh" <<< "$ORIGIN_TREE_O" && ! grep -q "gh-config" <<< "$ORIGIN_TREE_O"; then
+    pass "the legitimate resync change landed and the credential path is no longer tracked on origin"
+else
+    fail "the legitimate resync change landed and the credential path is no longer tracked on origin (tree=$ORIGIN_TREE_O)"
+fi
+if [[ -f "$WORKDIR/primary-o/.loom/gh-config/hosts.yml" ]]; then
+    pass "the credential file is still on disk after the untracking (git rm --cached keeps it)"
+else
+    fail "the credential file is still on disk after the untracking (git rm --cached keeps it)"
 fi
 
 echo ""
