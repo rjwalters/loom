@@ -95,6 +95,8 @@ Thumbs.db
 .loom/.install.lock
 .loom/logs/
 .loom/.resync-in-progress
+.loom/gh-config/
+.loom/gh-config-by-owner/
 # <<< loom-managed <<<
 .loom-test-failure-context.json
 .loom/.daemon.flags
@@ -109,15 +111,13 @@ Thumbs.db
 # removed (see loom_tools.semantic_search.guard_index_dest_not_tracked).
 .loom/search-index/
 
-# Daemon-owned GH_CONFIG_DIR for GitHub App installation-token delivery
-# (#4458) — host-local hosts.yml/config.yml, rewritten atomically by the
-# credential refresh tick. Never committed (mirrors `.loom/tokens/` above).
-.loom/gh-config/
-
-# Per-owner GH_CONFIG_DIR subtree for cross-owner GitHub App installation
-# tokens (#5401) — same host-local, never-committed contract as
-# .loom/gh-config/ above, one subdirectory per non-root managed-repo owner.
-.loom/gh-config-by-owner/
+# NOTE (#7818): `.loom/gh-config/` and `.loom/gh-config-by-owner/` — the
+# daemon-owned GH_CONFIG_DIR trees holding live GitHub App installation
+# tokens (#4458/#5401) — used to be declared here by hand, which protected
+# THIS repo only. They now live in EPHEMERAL_PATTERNS
+# (loom-daemon/src/init/post_init.rs) and are emitted into the loom-managed
+# block above, so every managed repo gets the rule. Do not re-add them here:
+# one declaration site, enforced by scripts/check-gitignore-convergence.sh.
 
 # Loom workspace config (DO commit for team sharing)
 # - config.json: Persistent terminal configurations (roles, themes, intervals)

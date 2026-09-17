@@ -56,6 +56,11 @@
 #       exit), bare origin would accept the     closed): direct push SKIPPED,
 #       plain push                              branch + PR instead; origin/
 #                                               <default> untouched
+#   (n) untracked .loom/gh-config/ +        -> both excluded from the commit
+#       .loom/gh-config-by-owner/ dirt          UNCONDITIONALLY (#7818), never
+#       alongside a legitimate resync change     staged and never treated as
+#                                                 blocking foreign dirt; the
+#                                                 legitimate change still lands
 #
 # Usage:
 #   ./.loom/scripts/tests/test-land-resync-commit.sh
@@ -608,6 +613,43 @@ if grep -q "rules/branches/main" "$GH_CALLS_LOG" && ! grep -q "branches/main/pro
     pass "the rules endpoint was consulted and its failure short-circuited (no legacy /protection lookup could downgrade it to 'unprotected')"
 else
     fail "the rules endpoint was consulted and its failure short-circuited (calls=$(cat "$GH_CALLS_LOG"))"
+fi
+
+echo ""
+echo "=== (n) untracked .loom/gh-config/ + .loom/gh-config-by-owner/ dirt is excluded, unconditionally (#7818) ==="
+gh_stub_reset
+make_origin origin-n
+make_primary origin-n primary-n
+printf 'updated\n' > "$WORKDIR/primary-n/.loom/hooks/foo.sh"
+# Simulate a host whose .gitignore is missing the corresponding entries: both
+# credential trees show up as ordinary untracked dirt.
+mkdir -p "$WORKDIR/primary-n/.loom/gh-config" "$WORKDIR/primary-n/.loom/gh-config-by-owner/some-owner"
+printf 'oauth_token: ghs_live_dummy\n' > "$WORKDIR/primary-n/.loom/gh-config/hosts.yml"
+printf 'oauth_token: ghs_live_dummy2\n' > "$WORKDIR/primary-n/.loom/gh-config-by-owner/some-owner/hosts.yml"
+OUT="$(cd "$WORKDIR/primary-n" && "$SCRIPT" 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Excluded from the commit" <<< "$OUT" && \
+   grep -q "gh-config" <<< "$OUT" && ! grep -qi "refusing to land" <<< "$OUT"; then
+    pass "credential dirt is reported as excluded, not as blocking foreign dirt"
+else
+    fail "credential dirt is reported as excluded, not as blocking foreign dirt (rc=$RC, out=$OUT)"
+fi
+ORIGIN_TREE_N="$(git --git-dir="$WORKDIR/origin-n.git" log -1 --format='%H' main | xargs -I{} git --git-dir="$WORKDIR/origin-n.git" ls-tree -r --name-only {})"
+if ! grep -q "gh-config" <<< "$ORIGIN_TREE_N"; then
+    pass "neither credential tree was ever committed to origin"
+else
+    fail "neither credential tree was ever committed to origin (tree=$ORIGIN_TREE_N)"
+fi
+if grep -q "\.loom/hooks/foo\.sh" <<< "$ORIGIN_TREE_N"; then
+    pass "the legitimate resync-managed change still landed"
+else
+    fail "the legitimate resync-managed change still landed"
+fi
+if [[ -f "$WORKDIR/primary-n/.loom/gh-config/hosts.yml" ]] && \
+   [[ -f "$WORKDIR/primary-n/.loom/gh-config-by-owner/some-owner/hosts.yml" ]] && \
+   [[ -n "$(git -C "$WORKDIR/primary-n" status --porcelain -- .loom/gh-config .loom/gh-config-by-owner)" ]]; then
+    pass "the credential files are left on disk, still untracked (never touched by git add)"
+else
+    fail "the credential files are left on disk, still untracked (never touched by git add)"
 fi
 
 echo ""

@@ -1545,65 +1545,9 @@ fn test_artifact_roll_record_round_trips_on_disk() {
     assert_eq!(load_artifact_roll_record(None), None);
 }
 
-// ---- --resolve-json parsing -----------------------------------------
-
-#[test]
-fn test_parse_resolve_json_happy_path() {
-    let stdout = r#"{"ok":true,"reason":null,"repo":"rjwalters/loom","target":"aarch64-apple-darwin","tag":"v0.19.24","version":"0.19.24","published_at":"2026-09-13T12:00:00Z","asset_sha256":"abc123","installed_bin":"/x/loom-daemon","installed_version":"0.19.21","installed_commit":"deadbee","installed_sha256":"def456","source_version":"0.19.25","source_commit":"88116c7"}"#;
-    match parse_resolve_json(stdout) {
-        ArtifactResolution::Resolved(info) => {
-            assert_eq!(info.version, "0.19.24");
-            assert_eq!(info.tag, "v0.19.24");
-            assert_eq!(info.published_at.as_deref(), Some("2026-09-13T12:00:00Z"));
-            assert_eq!(info.asset_sha256.as_deref(), Some("abc123"));
-            assert_eq!(info.installed_version.as_deref(), Some("0.19.21"));
-            assert_eq!(info.installed_sha256.as_deref(), Some("def456"));
-            assert_eq!(info.target.as_deref(), Some("aarch64-apple-darwin"));
-        }
-        other => panic!("expected Resolved, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_parse_resolve_json_not_ok_carries_the_reason() {
-    let stdout =
-        r#"{"ok":false,"reason":"'gh release view' found no latest release","version":null}"#;
-    match parse_resolve_json(stdout) {
-        ArtifactResolution::Unresolved(reason) => {
-            assert!(reason.contains("no latest release"), "reason: {reason}");
-        }
-        other => panic!("expected Unresolved, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_parse_resolve_json_garbage_is_unresolved_not_a_panic() {
-    assert!(matches!(parse_resolve_json(""), ArtifactResolution::Unresolved(_)));
-    assert!(matches!(
-        parse_resolve_json("not json at all"),
-        ArtifactResolution::Unresolved(_)
-    ));
-    assert!(matches!(parse_resolve_json("{oops"), ArtifactResolution::Unresolved(_)));
-    // ok:true but no version — a shape surprise must degrade, not fetch.
-    assert!(matches!(
-        parse_resolve_json(r#"{"ok":true,"version":null}"#),
-        ArtifactResolution::Unresolved(_)
-    ));
-    // The script's "unknown" installed-commit sentinel must not become a
-    // plausible-looking installed VERSION.
-    match parse_resolve_json(r#"{"ok":true,"version":"0.19.24","installed_version":"unknown"}"#) {
-        ArtifactResolution::Resolved(info) => assert_eq!(info.installed_version, None),
-        other => panic!("expected Resolved, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_parse_resolve_json_ignores_leading_noise_lines() {
-    // Defensive: a shell that leaks a line onto stdout before the JSON
-    // must not break resolution.
-    let stdout = "warning: something\n{\"ok\":true,\"version\":\"0.19.24\"}\n";
-    assert!(matches!(parse_resolve_json(stdout), ArtifactResolution::Resolved(_)));
-}
+// ---- --resolve-json parsing: see resolve_json.rs's own `#[cfg(test)] mod
+// tests` (split out alongside the code it tests when both crossed the
+// file-size ratchet, #7818) ---------------------------------------------
 
 // ---- run_tick end to end on the artifact path ------------------------
 
