@@ -32,7 +32,23 @@
 
 use super::{apply, consts, cycle, defer, fact, forge, state, subset, unescalate};
 use crate::script_helpers::run_git;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The directory forge calls are made from.
+///
+/// The enclosing repository root when there is one, else `cwd` unchanged.
+///
+/// This is not cosmetic. `script_helpers::gh_cmd` looks for the read cache at
+/// `<dir>/.loom/scripts/gh-cached`, and the shell resolved that relative to the
+/// SCRIPT's own directory — always right, wherever it was invoked from. Passing
+/// the process cwd instead silently loses the cache for any caller that runs
+/// from a subdirectory: still correct, but one uncached `gh` call per blocker
+/// per pass, against a module whose header promises "one cached read of the
+/// issue, one cached read per DISTINCT referenced blocker".
+#[must_use]
+fn forge_dir(cwd: &Path) -> PathBuf {
+    crate::repo_root::find_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
 
 /// Which question is being asked. Defaults to [`Mode::Defer`], as the shell did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -183,6 +199,7 @@ pub fn run_classify(cwd: &Path, opts: &ClassifyOpts) -> i32 {
 }
 
 fn classify(cwd: &Path, opts: &ClassifyOpts) -> Result<i32, i32> {
+    let cwd = &forge_dir(cwd);
     check_issue(opts.issue)?;
 
     // `--apply` on `--check-defer` would be a silent no-op: that mode only
@@ -495,6 +512,7 @@ pub fn run_cycle(cwd: &Path, opts: &CycleOpts) -> i32 {
 }
 
 fn detect_cycle(cwd: &Path, opts: &CycleOpts) -> Result<i32, i32> {
+    let cwd = &forge_dir(cwd);
     check_issue(opts.issue)?;
     let repo = repo_or_exit(opts.repo.as_ref(), cwd)?;
     let use_cache = !opts.no_cache;
@@ -623,6 +641,7 @@ pub fn run_subset(cwd: &Path, opts: &SubsetOpts) -> i32 {
 }
 
 fn detect_subset(cwd: &Path, opts: &SubsetOpts) -> Result<i32, i32> {
+    let cwd = &forge_dir(cwd);
     check_issue(opts.issue)?;
 
     let body = match opts.body_file.as_deref() {
