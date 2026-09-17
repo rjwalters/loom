@@ -31,6 +31,12 @@
 #   - --dry-run prints every command without executing.
 #   - Refuses to run with a dirty working tree (a rebase would fail confusingly).
 #
+# Parent-ref fallback (#7982): if <parent-branch> no longer resolves locally
+# (delete_branch_on_merge removed it once the parent PR merged), this script
+# falls back to refs/loom/parent/<parent-branch> — a ref merge-pr.sh's
+# merge-ordering guard pins to the parent's pre-merge tip before merging a
+# stacked parent. That ref is shared across every worktree of the same repo.
+#
 # Options:
 #   --dry-run   Print the commands that would run without executing them.
 #   --help,-h   Show this help.
@@ -172,6 +178,26 @@ if [[ -n "$("${GIT_C[@]}" status --porcelain 2>/dev/null)" ]]; then
     exit 1
 fi
 
+# Resolve the parent ref to rebase --onto FROM (#7982). By the time this
+# script runs, the parent branch's remote (and, once merge-pr.sh's own
+# worktree/branch cleanup has run, local) copy is often already gone —
+# delete_branch_on_merge removes it the instant the parent PR merges — so the
+# literal branch name may no longer resolve as a ref at all. merge-pr.sh's
+# merge-ordering guard pins the parent's pre-merge tip to
+# refs/loom/parent/<branch> before merging a stacked parent; that ref is a
+# plain (non-per-worktree) ref, so it is visible from every worktree of the
+# SAME repository regardless of which worktree wrote it. Prefer the literal
+# branch name when it still resolves (keeps direct/legacy invocations
+# unchanged); fall back to the pinned ref only when it doesn't.
+PARENT_REF="$PARENT_BRANCH"
+if ! "${GIT_C[@]}" rev-parse --verify --quiet "${PARENT_BRANCH}^{commit}" >/dev/null 2>&1; then
+    PINNED_PARENT_REF="refs/loom/parent/$PARENT_BRANCH"
+    if "${GIT_C[@]}" rev-parse --verify --quiet "${PINNED_PARENT_REF}^{commit}" >/dev/null 2>&1; then
+        warn "Branch '$PARENT_BRANCH' no longer resolves locally (likely deleted by delete_branch_on_merge) — falling back to the pinned ref $PINNED_PARENT_REF."
+        PARENT_REF="$PINNED_PARENT_REF"
+    fi
+fi
+
 run() {
     echo -e "${YELLOW}\$ $*${NC}" >&2
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -183,8 +209,8 @@ run() {
 # 1. Replay ONLY the child's own commits onto the default branch, stripping the
 #    parent's now-squashed pre-merge commits. Runs inside the child worktree when
 #    one holds the branch (so git does not reject the checked-out branch).
-info "Step 1/3: rebase --onto $DEFAULT_BRANCH $PARENT_BRANCH $CHILD_BRANCH"
-if ! run "${GIT_C[@]}" rebase --onto "$DEFAULT_BRANCH" "$PARENT_BRANCH" "$CHILD_BRANCH"; then
+info "Step 1/3: rebase --onto $DEFAULT_BRANCH $PARENT_REF $CHILD_BRANCH"
+if ! run "${GIT_C[@]}" rebase --onto "$DEFAULT_BRANCH" "$PARENT_REF" "$CHILD_BRANCH"; then
     err "Rebase failed (likely a conflict). Resolve it, then re-run this script or finish manually:"
     echo "    git rebase --continue   # after resolving" >&2
     echo "    git push --force-with-lease" >&2

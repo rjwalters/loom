@@ -407,6 +407,52 @@ assert_contains "$RUN_OUT" "Dry run complete" "F: dry-run still reports its own 
 teardown_sandbox
 
 # ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "Scenario G: parent branch gone everywhere (remote AND local) -- falls back to the pinned ref (#7982)"
+setup_sandbox
+
+# Simulate the REAL post-merge state this fix targets: delete_branch_on_merge
+# already removed the parent on the remote (setup_sandbox does this), and
+# merge-pr.sh's own worktree/branch cleanup has ALSO removed the parent's
+# local branch in $MAIN -- unlike every scenario above, where $PARENT_BR
+# survives as a local branch in $MAIN and the rebase resolves it that way
+# without ever needing the fallback. Deleting it here forces
+# reconcile-stack.sh through the refs/loom/parent/<branch> path.
+PARENT_TIP_SHA="$(git_q -C "$MAIN" rev-parse "$PARENT_BR")"
+git_q -C "$MAIN" branch -D "$PARENT_BR" >/dev/null 2>&1
+git_q -C "$MAIN" update-ref -d "refs/remotes/origin/$PARENT_BR" >/dev/null 2>&1 || true
+
+# Sanity: the branch really is gone in $MAIN now (both forms).
+if git_q -C "$MAIN" rev-parse --verify --quiet "${PARENT_BR}^{commit}" >/dev/null 2>&1; then
+    echo -e "  ${RED}FATAL${NC}: test setup expected '$PARENT_BR' to no longer resolve in \$MAIN" >&2
+    exit 2
+fi
+
+# Pin the parent's pre-merge tip exactly as merge-pr.sh's merge-ordering guard
+# does before merging a stacked parent (#7982's _pin_parent_tip).
+git_q -C "$MAIN" update-ref "refs/loom/parent/$PARENT_BR" "$PARENT_TIP_SHA"
+
+run_reconcile "$MAIN"
+
+assert_eq "0" "$RUN_RC" "G: reconcile exits 0 even though the parent branch resolves nowhere but the pinned ref"
+assert_contains "$RUN_OUT" "no longer resolves locally" \
+  "G: script reports the branch-name fallback explicitly"
+assert_contains "$RUN_OUT" "refs/loom/parent/$PARENT_BR" \
+  "G: script names the pinned ref it fell back to"
+assert_contains "$RUN_OUT" "rebase --onto main refs/loom/parent/$PARENT_BR $CHILD_BR" \
+  "G: the rebase step itself is run against the pinned ref, not the (gone) branch name"
+
+CHILD_LOG_G="$(git_q -C "$MAIN" log --format=%s main.."$CHILD_BR")"
+assert_eq "C-own-commit" "$CHILD_LOG_G" "G: child branch carries ONLY its own commit above main"
+FULL_LOG_G="$(git_q -C "$MAIN" log --format=%s)"
+assert_not_contains "$FULL_LOG_G" "P-original" "G: parent's pre-squash commit was stripped by the rebase"
+assert_contains "$FULL_LOG_G" "P-squash" "G: child now sits on main's squashed parent commit"
+assert_contains "$(cat "$GH_EDIT_LOG")" "pr edit $CHILD_PR --base main" \
+  "G: child PR base retargeted to the default branch via the pinned-ref fallback"
+
+teardown_sandbox
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Source guards: fail loudly if a refactor drops either fix.
 echo ""
 echo "Source guards on reconcile-stack.sh"
@@ -425,6 +471,8 @@ assert_contains "$src" '"$SCRIPT_DIR/version-check-gate.sh"' \
   "reconcile-stack.sh runs the shared version-check-gate.sh after rebase, before push (#7168, #7341)"
 assert_contains "$src" 'DRY_RUN' \
   "reconcile-stack.sh's version-check-gate call is itself skipped under --dry-run"
+assert_contains "$src" 'refs/loom/parent/' \
+  "reconcile-stack.sh falls back to the refs/loom/parent/<branch> pinned ref (#7982)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
