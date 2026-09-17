@@ -376,11 +376,18 @@ pub fn resolved_arm_model(arm: &str, config: &Value) -> String {
     }
 }
 
-/// Normalize a model alias or pinned ID to its family (mirrors
-/// [`model_pricing`]). Matching is generation-agnostic — it keys off the family
-/// stem so a future `claude-sonnet-6` classifies correctly with no code change
-/// (#3981). Legacy `claude-3-5-sonnet` / `claude-3-opus` / `claude-3-haiku` IDs
-/// predate the `-<generation>-` scheme and are matched explicitly.
+/// Normalize a model alias or pinned ID to its family.
+///
+/// Matching is generation-agnostic — it keys off the family stem so a future
+/// `claude-sonnet-6` classifies correctly with no code change (#3981). Legacy
+/// `claude-3-5-sonnet` / `claude-3-opus` / `claude-3-haiku` IDs predate the
+/// `-<generation>-` scheme and are matched explicitly.
+///
+/// This is an **arm-inference** helper ([`infer_arm_from_model`]), not a
+/// pricing helper: family is the right granularity for "which arm was this?"
+/// and the wrong granularity for "what did it cost?". [`model_pricing`] used
+/// to route through here and inherited exactly that confusion (#8060) — it no
+/// longer does.
 #[must_use]
 pub fn model_family(model: Option<&str>) -> Option<&'static str> {
     let m = model.unwrap_or("").to_lowercase();
@@ -521,23 +528,21 @@ pub fn build_record(f: &RecordFields<'_>, ts: &str) -> Value {
 ///
 /// Delegates to [`crate::activity::resource_usage::ModelPricing`] so this port
 /// does not recreate the Python/Rust mirror pair it was meant to collapse:
-/// there is now exactly ONE pricing table in the tree. `claude-fable-*` has no
-/// published per-token rate (it is an escalation-ladder rung above Opus,
-/// #3702), so it is conservatively priced at the Opus rate rather than falling
-/// through to the cheaper Sonnet default and under-reporting cost.
+/// there is now exactly ONE pricing table in the tree.
+///
+/// The model string is passed through **verbatim** (#8060). It used to be
+/// collapsed to a family stem first — `Some("opus" | "fable") =>
+/// "claude-opus-"` — which did two kinds of damage now that the shared table
+/// is generation-keyed: it threw away the generation of every pinned ID (so
+/// an `claude-opus-4-8` arm and a retired `claude-opus-4` arm priced
+/// identically), and it charged Fable at the Opus rate even though Fable is on
+/// the published card at 2x Opus. `for_model` resolves bare arm aliases
+/// (`opus`, `sonnet`, `haiku`, `fable`) to the newest generation of their
+/// family itself, so no normalization is needed here. `model_family` remains
+/// for arm inference, which genuinely is a family question.
 #[must_use]
 pub fn model_pricing(model: Option<&str>) -> (f64, f64, f64, f64) {
-    // The Python original also matched the bare aliases `opus`/`fable`/`haiku`
-    // (its input can be an unresolved arm alias). Normalize through the family
-    // classifier first so the shared Rust table — which keys off pinned-ID
-    // stems — sees a value it recognizes.
-    let normalized = match model_family(model) {
-        Some("sonnet") => "claude-sonnet-",
-        Some("opus" | "fable") => "claude-opus-",
-        Some("haiku") => "claude-haiku-",
-        _ => "",
-    };
-    let p = crate::activity::resource_usage::ModelPricing::for_model(normalized);
+    let p = crate::activity::resource_usage::ModelPricing::for_model(model.unwrap_or(""));
     (
         p.input_cost_per_1k,
         p.output_cost_per_1k,
@@ -1554,25 +1559,13 @@ mod tests {
 
     // ===== pricing =====
 
-    /// The pricing table is now shared with `resource_usage.rs` — one
-    /// implementation, so the old "keep both in sync" mirror pair is gone.
-    #[test]
-    fn pricing_matches_the_shared_daemon_table() {
-        assert_eq!(model_pricing(Some("sonnet")), (0.003, 0.015, 0.0003, 0.00375));
-        assert_eq!(model_pricing(Some("claude-opus-5")), (0.015, 0.075, 0.0015, 0.01875));
-        assert_eq!(model_pricing(Some("fable")), (0.015, 0.075, 0.0015, 0.01875));
-        assert_eq!(model_pricing(Some("claude-fable-5")), (0.015, 0.075, 0.0015, 0.01875));
-        assert_eq!(model_pricing(Some("haiku")), (0.00025, 0.00125, 0.00003, 0.0003));
-        // Unknown → Sonnet default (matches the Rust table's fallback).
-        assert_eq!(model_pricing(Some("mystery")), (0.003, 0.015, 0.0003, 0.00375));
-        assert_eq!(model_pricing(None), (0.003, 0.015, 0.0003, 0.00375));
-    }
-
     #[test]
     fn cost_arithmetic_is_cache_aware() {
-        // The exact figure `test-sweep-experiment.sh` asserts.
+        // The exact figure `test-sweep-experiment.sh` asserts. Opus 4.8 at the
+        // #8060-verified rate: 10 in @ $5/MTok + 5 out @ $25/MTok
+        // + 2000 cache read @ 0.1x + 1000 cache write @ 1.25x.
         let cost = calc_cost(10, 5, 2000, 1000, Some("claude-opus-4-8"));
-        assert!((cost - 0.022_275).abs() < 1e-12, "got {cost}");
+        assert!((cost - 0.007_425).abs() < 1e-12, "got {cost}");
     }
 
     // ===== records =====
@@ -1710,8 +1703,8 @@ mod tests {
         assert_eq!(arm_a["first_attempt_pass_rate"], json!(1.0));
         assert_eq!(arm_a["merge_rate"], json!(1.0));
         assert_eq!(arm_a["mean_doctor_cycles"], json!(0.0));
-        assert_eq!(arm_a["total_cost_usd"], json!(0.022_275));
-        assert_eq!(arm_a["mean_cost_per_issue_usd"], json!(0.022_275));
+        assert_eq!(arm_a["total_cost_usd"], json!(0.007_425));
+        assert_eq!(arm_a["mean_cost_per_issue_usd"], json!(0.007_425));
     }
 
     /// The shell harness asserts the literal substrings `"transcript": 1` and
@@ -1725,7 +1718,7 @@ mod tests {
         assert!(text.contains("\"transcript\": 1"), "{text}");
         assert!(text.contains("\"first_attempt_pass_rate\": 1.0"), "{text}");
         assert!(text.contains("\"merge_rate\": 1.0"), "{text}");
-        assert!(text.contains("0.022275"), "{text}");
+        assert!(text.contains("0.007425"), "{text}");
     }
 
     #[test]
@@ -1814,7 +1807,7 @@ mod tests {
         .unwrap();
         let report = harvest(Some(&stats), None);
         assert_eq!(report["token_fidelity_counts"]["sweep-aggregate-log"], json!(1));
-        assert_eq!(report["arms"][0]["total_cost_usd"], json!(0.018));
+        assert_eq!(report["arms"][0]["total_cost_usd"], json!(0.012));
     }
 
     #[test]

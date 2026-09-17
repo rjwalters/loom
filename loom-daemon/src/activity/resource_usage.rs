@@ -35,98 +35,267 @@ pub struct ResourceUsage {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Model pricing configuration (cost per 1000 tokens)
+/// Cache-rate multipliers, applied to a row's **own** base input price.
+///
+/// The vendor publishes cache rates as multiples of base input, not as
+/// independent numbers, so deriving them keeps every row internally consistent
+/// by construction. Hand-typing them is exactly how the pre-#8060 Haiku row
+/// drifted to 0.12x / 1.2x of its own base instead of 0.1x / 1.25x.
+const CACHE_WRITE_5M_MULTIPLIER: f64 = 1.25;
+
+/// 1-hour-TTL cache writes cost 2x base input (vs. 1.25x for the 5m TTL).
+const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
+
+/// Standard cache hit / refresh multiplier.
+const CACHE_READ_MULTIPLIER: f64 = 0.1;
+
+/// Cache hits and refreshes on Claude Fable 5.1 and Claude Mythos 5.1 are
+/// priced at 0.025x base input; every other model uses the standard 0.1x.
+const CACHE_READ_MULTIPLIER_REDUCED: f64 = 0.025;
+
+/// Model pricing configuration (cost per 1000 tokens).
+///
+/// `cache_write_cost_per_1k` is the **5-minute-TTL** write rate, which is what
+/// [`Self::calculate_cost`] charges: the token counters Loom parses out of
+/// terminal output and transcripts report a single
+/// `cache_creation_input_tokens` figure with no TTL breakdown, so there is
+/// nothing to attribute to the 1h tier. `cache_write_1h_cost_per_1k` carries
+/// the published 1h rate so a future caller that *can* distinguish the two
+/// (e.g. a provider API that splits the counter) does not have to re-derive
+/// it, and so the 1.6x under-count of a 1h-TTL write is visible in the type
+/// rather than buried in a comment.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_field_names)]
 pub struct ModelPricing {
     pub input_cost_per_1k: f64,
     pub output_cost_per_1k: f64,
     pub cache_read_cost_per_1k: f64,
+    /// 5-minute-TTL cache write (1.25x base input).
     pub cache_write_cost_per_1k: f64,
+    /// 1-hour-TTL cache write (2x base input). Not charged by
+    /// [`Self::calculate_cost`] — see the struct doc.
+    pub cache_write_1h_cost_per_1k: f64,
 }
 
 impl ModelPricing {
-    /// Get pricing for a given model.
-    ///
-    /// Matching is **generation-agnostic**: it keys off the family stem
-    /// (`claude-sonnet-`, `claude-opus-`, `claude-haiku-`, `claude-fable-`)
-    /// rather than a pinned generation number, so a future generation (e.g.
-    /// `claude-sonnet-6`) prices correctly with no code change (#3981). The
-    /// legacy `claude-3-5-sonnet` / `claude-3-opus` / `claude-3-haiku` IDs
-    /// predate the `-<generation>-` naming scheme and are matched explicitly.
-    /// This used to be one half of a hand-synced Python/Rust mirror pair with
-    /// `loom_tools.sweep_experiment.model_pricing`. Issue #4275 (epic #4081
-    /// Phase 3 family 5) deleted that Python module, and its native replacement
-    /// — [`crate::script_helpers::sweep_experiment::model_pricing`] — carries
-    /// the same rate card for the experiment harvest. Both live in Rust now, so
-    /// there is no cross-language sync obligation left; if a rate changes,
-    /// update both Rust sites (their tests assert the fable-priced-as-opus and
-    /// unknown-priced-as-sonnet rules independently).
-    pub fn for_model(model: &str) -> Self {
-        // Normalize model name for matching
-        let model_lower = model.to_lowercase();
+    /// Build a row from its published base input/output rates, deriving the
+    /// three cache rates from `cache_read_multiplier` and the two cache-write
+    /// multipliers so a row cannot silently desynchronize from its own base.
+    fn from_base(
+        input_cost_per_1k: f64,
+        output_cost_per_1k: f64,
+        cache_read_multiplier: f64,
+    ) -> Self {
+        Self {
+            input_cost_per_1k,
+            output_cost_per_1k,
+            cache_read_cost_per_1k: input_cost_per_1k * cache_read_multiplier,
+            cache_write_cost_per_1k: input_cost_per_1k * CACHE_WRITE_5M_MULTIPLIER,
+            cache_write_1h_cost_per_1k: input_cost_per_1k * CACHE_WRITE_1H_MULTIPLIER,
+        }
+    }
 
-        // Anthropic models (prices as of Jan 2025)
-        if model_lower.contains("claude-3-5-sonnet") || model_lower.contains("claude-sonnet-") {
-            Self {
-                input_cost_per_1k: 0.003,
-                output_cost_per_1k: 0.015,
-                cache_read_cost_per_1k: 0.0003,
-                cache_write_cost_per_1k: 0.00375,
-            }
-        } else if model_lower.contains("claude-3-opus")
-            || model_lower.contains("claude-opus-")
-            || model_lower.contains("claude-fable-")
+    /// Look up a model in the published rate card.
+    ///
+    /// Returns `None` only for an ID that matches no row at all — the caller
+    /// decides what to do about that (see [`Self::for_model`]).
+    ///
+    /// # Anthropic rate card
+    ///
+    /// Prices verified against
+    /// <https://platform.claude.com/docs/en/about-claude/pricing> on
+    /// **2026-09-17**. USD per 1k tokens (= the published $/MTok / 1000):
+    ///
+    /// | Row | Input | Output |
+    /// |---|---|---|
+    /// | Fable 5.1 / Mythos 5.1 | 0.010 | 0.050 |
+    /// | Fable 5 / Mythos 5 | 0.010 | 0.050 |
+    /// | Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 | 0.005 | 0.025 |
+    /// | Opus 4.1 / 4 / 3 *(retired)* | 0.015 | 0.075 |
+    /// | Sonnet 5 | 0.002 | 0.010 |
+    /// | Sonnet 4.6 / 4.5 / 4 / 3.5 / 3 | 0.003 | 0.015 |
+    /// | Haiku 4.5 | 0.001 | 0.005 |
+    /// | Haiku 3.5 *(retired)* | 0.0008 | 0.004 |
+    /// | Haiku 3 *(retired)* | 0.00025 | 0.00125 |
+    ///
+    /// Sonnet 5's $2/$10 is the **standard** price, not a lapsing promo: the
+    /// same page records that the increase to $3/$15 scheduled for
+    /// 2026-09-01 will not occur.
+    ///
+    /// # Matching
+    ///
+    /// Matching is keyed by **generation**, not by family stem (#8060). The
+    /// old family-stem table was not generation-agnostic in any useful sense
+    /// — it froze one generation's rates per family and applied them to every
+    /// other, which is how `claude-opus-*` ended up billed at the retired Opus
+    /// 4.1 rate (3x over) and `claude-haiku-*` at the Haiku 3 rate (4x under).
+    ///
+    /// An ID whose family is recognized but whose generation is not (a future
+    /// `claude-opus-6`) pins to the **newest** generation of that family, never
+    /// the oldest: an unrecognized ID is far more likely to be newer than the
+    /// card than to be a resurrected retired model, and the old behaviour of
+    /// inheriting a retired price is the specific defect #8060 was filed over.
+    /// Legacy `claude-3-5-sonnet` / `claude-3-opus` / `claude-3-haiku` IDs
+    /// predate the `-<generation>-` naming scheme and are matched explicitly.
+    ///
+    /// Bare tier aliases (`opus`, `sonnet`, `haiku`, `fable`, `mythos`) can
+    /// reach here unresolved from the experiment harvest
+    /// ([`crate::script_helpers::sweep_experiment::model_pricing`]), so they
+    /// resolve to the newest generation of that family too. That harvest is
+    /// the only other pricing entry point in the tree and it delegates here —
+    /// there is exactly ONE pricing table, and `sweep_experiment`'s
+    /// `model_pricing_agrees_with_the_shared_daemon_table` test holds the two
+    /// entry points together.
+    fn lookup(model: &str) -> Option<Self> {
+        let lowered = model.to_lowercase();
+        let m: &str = match lowered.as_str() {
+            "sonnet" => "claude-sonnet-5",
+            "opus" => "claude-opus-5",
+            "haiku" => "claude-haiku-4-5",
+            "fable" => "claude-fable-5-1",
+            "mythos" => "claude-mythos-5-1",
+            other => other,
+        };
+
+        // ---- Fable / Mythos: $10 / $50 per MTok ----------------------------
+        // #3702's "fable has no published per-token rate, so price it as Opus"
+        // premise expired: Fable 5 and 5.1 are on the published card, and at
+        // 2x Opus, so the Opus fallback over-reported rather than erring
+        // conservatively upward as its comment claimed.
+        if m.contains("claude-fable-5-1") || m.contains("claude-mythos-5-1") {
+            return Some(Self::from_base(0.010, 0.050, CACHE_READ_MULTIPLIER_REDUCED));
+        }
+        if m.contains("claude-fable-5") || m.contains("claude-mythos-5") {
+            return Some(Self::from_base(0.010, 0.050, CACHE_READ_MULTIPLIER));
+        }
+        if m.contains("claude-fable-") || m.contains("claude-mythos-") {
+            // Unknown generation -> newest published row (5.1).
+            return Some(Self::from_base(0.010, 0.050, CACHE_READ_MULTIPLIER_REDUCED));
+        }
+
+        // ---- Opus ----------------------------------------------------------
+        if m.contains("claude-opus-5")
+            || m.contains("claude-opus-4-8")
+            || m.contains("claude-opus-4-7")
+            || m.contains("claude-opus-4-6")
+            || m.contains("claude-opus-4-5")
         {
-            // `claude-fable-*` (the #3702 escalation-ladder rung above Opus)
-            // has no published per-token rate, so it is conservatively priced
-            // at the Opus rate rather than falling through to the cheaper
-            // default and under-reporting cost.
-            Self {
-                input_cost_per_1k: 0.015,
-                output_cost_per_1k: 0.075,
-                cache_read_cost_per_1k: 0.0015,
-                cache_write_cost_per_1k: 0.01875,
-            }
-        } else if model_lower.contains("claude-3-haiku") || model_lower.contains("claude-haiku-") {
-            Self {
-                input_cost_per_1k: 0.00025,
-                output_cost_per_1k: 0.00125,
-                cache_read_cost_per_1k: 0.00003,
-                cache_write_cost_per_1k: 0.0003,
-            }
-        } else if model_lower.contains("gpt-4o") {
-            // OpenAI GPT-4o pricing
-            Self {
+            return Some(Self::from_base(0.005, 0.025, CACHE_READ_MULTIPLIER));
+        }
+        if m.contains("claude-opus-4-1")
+            || m.contains("claude-opus-4")
+            || m.contains("claude-3-opus")
+        {
+            // Retired: Opus 4.1 / 4 / 3 at $15 / $75.
+            return Some(Self::from_base(0.015, 0.075, CACHE_READ_MULTIPLIER));
+        }
+        if m.contains("claude-opus-") {
+            // Unknown generation -> newest published row (Opus 5).
+            return Some(Self::from_base(0.005, 0.025, CACHE_READ_MULTIPLIER));
+        }
+
+        // ---- Sonnet --------------------------------------------------------
+        if m.contains("claude-sonnet-5") {
+            return Some(Self::from_base(0.002, 0.010, CACHE_READ_MULTIPLIER));
+        }
+        if m.contains("claude-sonnet-4")
+            || m.contains("claude-3-5-sonnet")
+            || m.contains("claude-3-sonnet")
+        {
+            return Some(Self::from_base(0.003, 0.015, CACHE_READ_MULTIPLIER));
+        }
+        if m.contains("claude-sonnet-") {
+            // Unknown generation -> newest published row (Sonnet 5).
+            return Some(Self::from_base(0.002, 0.010, CACHE_READ_MULTIPLIER));
+        }
+
+        // ---- Haiku ---------------------------------------------------------
+        if m.contains("claude-haiku-4-5") {
+            return Some(Self::from_base(0.001, 0.005, CACHE_READ_MULTIPLIER));
+        }
+        if m.contains("claude-haiku-3-5") || m.contains("claude-3-5-haiku") {
+            return Some(Self::from_base(0.0008, 0.004, CACHE_READ_MULTIPLIER));
+        }
+        if m.contains("claude-3-haiku") {
+            return Some(Self::from_base(0.00025, 0.00125, CACHE_READ_MULTIPLIER));
+        }
+        if m.contains("claude-haiku-") {
+            // Unknown generation -> newest published row (Haiku 4.5).
+            return Some(Self::from_base(0.001, 0.005, CACHE_READ_MULTIPLIER));
+        }
+
+        // ---- OpenAI --------------------------------------------------------
+        // Not generation-keyed and not re-verified by #8060; these rows are
+        // unchanged and are reached only if some future caller records a GPT
+        // model, which Loom does not dispatch today.
+        if m.contains("gpt-4o") {
+            return Some(Self {
                 input_cost_per_1k: 0.005,
                 output_cost_per_1k: 0.015,
                 cache_read_cost_per_1k: 0.0025, // 50% discount for cached
                 cache_write_cost_per_1k: 0.005,
-            }
-        } else if model_lower.contains("gpt-4-turbo") {
-            Self {
+                cache_write_1h_cost_per_1k: 0.005,
+            });
+        }
+        if m.contains("gpt-4-turbo") {
+            return Some(Self {
                 input_cost_per_1k: 0.01,
                 output_cost_per_1k: 0.03,
                 cache_read_cost_per_1k: 0.005,
                 cache_write_cost_per_1k: 0.01,
-            }
-        } else if model_lower.contains("gpt-3.5") {
-            Self {
+                cache_write_1h_cost_per_1k: 0.01,
+            });
+        }
+        if m.contains("gpt-3.5") {
+            return Some(Self {
                 input_cost_per_1k: 0.0005,
                 output_cost_per_1k: 0.0015,
                 cache_read_cost_per_1k: 0.00025,
                 cache_write_cost_per_1k: 0.0005,
-            }
-        } else {
-            // Default to Claude Sonnet pricing as reasonable middle ground
-            log::debug!("Unknown model '{model}', using default Sonnet pricing");
-            Self {
-                input_cost_per_1k: 0.003,
-                output_cost_per_1k: 0.015,
-                cache_read_cost_per_1k: 0.0003,
-                cache_write_cost_per_1k: 0.00375,
-            }
+                cache_write_1h_cost_per_1k: 0.0005,
+            });
         }
+
+        None
+    }
+
+    /// Whether `model` matches a row in the published rate card rather than
+    /// falling through to the unknown-model default.
+    ///
+    /// Exposed so a test can assert the card still knows every model ID the
+    /// fleet can dispatch — a fall-through is silent in production by design
+    /// (the cost record still gets *a* number), so only a test can catch it.
+    #[must_use]
+    pub fn is_known_model(model: &str) -> bool {
+        Self::lookup(model).is_some()
+    }
+
+    /// Get pricing for a given model.
+    ///
+    /// See [`Self::lookup`] for the rate card, its verification date and
+    /// source, and the generation-matching rules.
+    ///
+    /// An ID that matches no family at all is logged at **warn** level and
+    /// priced at the newest Sonnet row. It is warn rather than debug because
+    /// the failure is otherwise invisible: a Mythos-class ID silently priced
+    /// as Sonnet under-reports ~3.3x on input and 5x on output, and the only
+    /// evidence would be a debug line nobody has enabled. An empty model
+    /// string is the one exception — "no model was recorded" is a parse gap,
+    /// not an unknown model, and is logged at debug.
+    #[must_use]
+    pub fn for_model(model: &str) -> Self {
+        if let Some(pricing) = Self::lookup(model) {
+            return pricing;
+        }
+        if model.is_empty() {
+            log::debug!("No model recorded; using default Sonnet pricing");
+        } else {
+            log::warn!(
+                "Unknown model '{model}' is not on the pricing card (checked 2026-09-17); \
+                 cost is being estimated at the newest Sonnet rate and may be badly wrong"
+            );
+        }
+        Self::from_base(0.002, 0.010, CACHE_READ_MULTIPLIER)
     }
 
     /// Calculate total cost for given token counts
@@ -241,11 +410,14 @@ pub fn parse_resource_usage(output: &str, duration_ms: Option<i64>) -> Option<Re
         .and_then(|c| c.get(1))
         .and_then(|m| parse_token_count(m.as_str()));
 
-    // Extract model name
+    // Extract model name. When the output carries none, fall back to the
+    // current default tier rather than to a retired generation: before #8060
+    // this named `claude-sonnet-4`, so every model-less record was costed at a
+    // superseded rate forever.
     let model = MODEL_PATTERN
         .captures(output)
         .and_then(|c| c.get(1))
-        .map_or_else(|| "claude-sonnet-4".to_string(), |m| m.as_str().to_string());
+        .map_or_else(|| "claude-sonnet-5".to_string(), |m| m.as_str().to_string());
 
     // Extract or use provided duration
     let duration = duration_ms.or_else(|| extract_duration(output));
@@ -376,42 +548,222 @@ mod tests {
         assert!((cost - 0.010_837_5).abs() < 0.0001);
     }
 
-    // Regression tests for #3981: model-family/pricing matching was
-    // generation-locked to literal `-4` substrings, so gen-5 model IDs
-    // (`claude-sonnet-5`, `claude-opus-5`, `claude-fable-5`) fell through to
-    // the Sonnet-priced default — a 5x cost under-report for Opus 5.
+    // ---- #8060: generation-keyed rate card -------------------------------
+    //
+    // Supersedes the #3981 regression tests that asserted the *family-stem*
+    // behaviour (one frozen generation's rates applied to every generation of
+    // a family). #3981's actual invariant — a gen-5 ID must not fall through
+    // to the unknown-model default — is preserved below; what changed is that
+    // each generation now carries its own published rate.
+
+    /// Every model ID the fleet can dispatch, or that appears as a pinned ID
+    /// anywhere in the tree, plus the bare tier aliases. A fall-through to the
+    /// unknown-model default is silent in production (the record still gets a
+    /// number), so this list is the only thing that can catch one.
+    const KNOWN_MODEL_IDS: &[&str] = &[
+        "sonnet",
+        "opus",
+        "haiku",
+        "fable",
+        "mythos",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-opus-4-5",
+        "claude-opus-4-1",
+        "claude-opus-4",
+        "claude-fable-5-1",
+        "claude-fable-5",
+        "claude-mythos-5-1",
+        "claude-mythos-5",
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251001",
+        "claude-haiku-3-5",
+        "claude-3-5-sonnet",
+        "claude-3-opus",
+        "claude-3-haiku",
+    ];
 
     #[test]
-    fn test_pricing_matches_gen5_sonnet() {
-        let gen5 = ModelPricing::for_model("claude-sonnet-5");
-        let gen4 = ModelPricing::for_model("claude-sonnet-4");
-        assert!((gen5.input_cost_per_1k - gen4.input_cost_per_1k).abs() < f64::EPSILON);
-        assert!((gen5.input_cost_per_1k - 0.003).abs() < f64::EPSILON);
+    fn pricing_card_knows_every_dispatchable_model_id() {
+        for id in KNOWN_MODEL_IDS {
+            assert!(
+                ModelPricing::is_known_model(id),
+                "'{id}' is not on the pricing card — it would be costed at the \
+                 unknown-model default. Add its row (rates verified against \
+                 https://platform.claude.com/docs/en/about-claude/pricing)."
+            );
+        }
+        // Control: the detector is not vacuously true.
+        assert!(!ModelPricing::is_known_model("totally-not-a-model"));
     }
 
     #[test]
-    fn test_pricing_matches_gen5_opus_not_sonnet() {
+    fn pricing_rows_carry_their_published_rates() {
+        // USD per 1k tokens, verified 2026-09-17 against
+        // https://platform.claude.com/docs/en/about-claude/pricing
+        let expected: &[(&str, f64, f64)] = &[
+            ("claude-sonnet-5", 0.002, 0.010),
+            ("claude-sonnet-4-6", 0.003, 0.015),
+            ("claude-sonnet-4-5", 0.003, 0.015),
+            ("claude-sonnet-4", 0.003, 0.015),
+            ("claude-3-5-sonnet", 0.003, 0.015),
+            ("claude-opus-5", 0.005, 0.025),
+            ("claude-opus-4-8", 0.005, 0.025),
+            ("claude-opus-4-7", 0.005, 0.025),
+            ("claude-opus-4-6", 0.005, 0.025),
+            ("claude-opus-4-5", 0.005, 0.025),
+            ("claude-opus-4-1", 0.015, 0.075),
+            ("claude-opus-4", 0.015, 0.075),
+            ("claude-3-opus", 0.015, 0.075),
+            ("claude-fable-5-1", 0.010, 0.050),
+            ("claude-fable-5", 0.010, 0.050),
+            ("claude-mythos-5-1", 0.010, 0.050),
+            ("claude-mythos-5", 0.010, 0.050),
+            ("claude-haiku-4-5", 0.001, 0.005),
+            ("claude-haiku-4-5-20251001", 0.001, 0.005),
+            ("claude-haiku-3-5", 0.0008, 0.004),
+            ("claude-3-haiku", 0.00025, 0.00125),
+        ];
+        for (id, input, output) in expected {
+            let p = ModelPricing::for_model(id);
+            assert!(
+                (p.input_cost_per_1k - input).abs() < f64::EPSILON,
+                "{id}: input {} != {input}",
+                p.input_cost_per_1k
+            );
+            assert!(
+                (p.output_cost_per_1k - output).abs() < f64::EPSILON,
+                "{id}: output {} != {output}",
+                p.output_cost_per_1k
+            );
+        }
+    }
+
+    #[test]
+    fn cache_rates_are_derived_from_each_row_own_base() {
+        // The defect this test exists to prevent: before #8060 the Haiku row's
+        // hand-typed cache rates were 0.12x / 1.2x of its own base instead of
+        // 0.1x / 1.25x — internally inconsistent, and invisible without this.
+        for id in KNOWN_MODEL_IDS {
+            let p = ModelPricing::for_model(id);
+            let reduced = id.contains("fable") || id.contains("mythos");
+            let expected_read_multiplier = if reduced && !id.ends_with("-5") {
+                // Fable/Mythos 5.1 (and the bare `fable`/`mythos` aliases,
+                // which resolve to 5.1) price cache hits at 0.025x.
+                CACHE_READ_MULTIPLIER_REDUCED
+            } else {
+                CACHE_READ_MULTIPLIER
+            };
+            let base = p.input_cost_per_1k;
+            assert!(
+                (p.cache_read_cost_per_1k - base * expected_read_multiplier).abs() < f64::EPSILON,
+                "{id}: cache read {} is not {expected_read_multiplier}x of base {base}",
+                p.cache_read_cost_per_1k
+            );
+            assert!(
+                (p.cache_write_cost_per_1k - base * CACHE_WRITE_5M_MULTIPLIER).abs() < f64::EPSILON,
+                "{id}: 5m cache write {} is not 1.25x of base {base}",
+                p.cache_write_cost_per_1k
+            );
+            assert!(
+                (p.cache_write_1h_cost_per_1k - base * CACHE_WRITE_1H_MULTIPLIER).abs()
+                    < f64::EPSILON,
+                "{id}: 1h cache write {} is not 2x of base {base}",
+                p.cache_write_1h_cost_per_1k
+            );
+        }
+    }
+
+    #[test]
+    fn fable_5_1_cache_hits_use_the_reduced_multiplier() {
+        // The published footnote: Fable 5.1 and Mythos 5.1 price cache hits at
+        // 0.025x base input; everything else uses 0.1x.
+        let f51 = ModelPricing::for_model("claude-fable-5-1");
+        assert!((f51.cache_read_cost_per_1k - 0.000_25).abs() < f64::EPSILON);
+        let f5 = ModelPricing::for_model("claude-fable-5");
+        assert!((f5.cache_read_cost_per_1k - 0.001).abs() < f64::EPSILON);
+        let m51 = ModelPricing::for_model("claude-mythos-5-1");
+        assert!((m51.cache_read_cost_per_1k - 0.000_25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fable_is_not_priced_as_opus() {
+        // #3702's "no published per-token rate, so price it as Opus" premise
+        // expired: Fable is on the published card at 2x Opus, so the old
+        // fallback over-reported rather than erring conservatively upward.
+        let fable = ModelPricing::for_model("claude-fable-5-1");
+        let opus = ModelPricing::for_model("claude-opus-5");
+        assert!((fable.input_cost_per_1k - 0.010).abs() < f64::EPSILON);
+        assert!((fable.input_cost_per_1k - opus.input_cost_per_1k).abs() > f64::EPSILON);
+        assert!(fable.input_cost_per_1k > opus.input_cost_per_1k);
+    }
+
+    #[test]
+    fn gen5_ids_do_not_fall_through_to_the_default() {
+        // The #3981 invariant, preserved: a gen-5 ID must be recognized, not
+        // silently priced at the unknown-model default.
+        for id in ["claude-sonnet-5", "claude-opus-5", "claude-fable-5"] {
+            assert!(ModelPricing::is_known_model(id), "{id} fell through");
+        }
         let opus5 = ModelPricing::for_model("claude-opus-5");
-        // Opus-5 must NOT silently fall through to the Sonnet default.
-        assert!((opus5.input_cost_per_1k - 0.015).abs() < f64::EPSILON);
-        assert!((opus5.output_cost_per_1k - 0.075).abs() < f64::EPSILON);
+        assert!((opus5.input_cost_per_1k - 0.005).abs() < f64::EPSILON);
+        assert!((opus5.output_cost_per_1k - 0.025).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_pricing_matches_gen5_fable() {
-        // `claude-fable-5` has no published rate; it is conservatively priced
-        // at the Opus rate rather than defaulting to (cheaper) Sonnet.
-        let fable5 = ModelPricing::for_model("claude-fable-5");
-        let opus = ModelPricing::for_model("claude-opus-4");
-        assert!((fable5.input_cost_per_1k - opus.input_cost_per_1k).abs() < f64::EPSILON);
+    fn unknown_generation_pins_to_the_newest_row_not_the_oldest() {
+        // The specific #8060 defect: the family row was frozen at a RETIRED
+        // generation, so every unrecognized ID inherited a retired price.
+        let opus6 = ModelPricing::for_model("claude-opus-6");
+        assert!(
+            (opus6.input_cost_per_1k - 0.005).abs() < f64::EPSILON,
+            "opus fallback is retired"
+        );
+        let sonnet99 = ModelPricing::for_model("claude-sonnet-99");
+        assert!((sonnet99.input_cost_per_1k - 0.002).abs() < f64::EPSILON);
+        let haiku9 = ModelPricing::for_model("claude-haiku-9");
+        assert!((haiku9.input_cost_per_1k - 0.001).abs() < f64::EPSILON);
+        let fable9 = ModelPricing::for_model("claude-fable-9");
+        assert!((fable9.input_cost_per_1k - 0.010).abs() < f64::EPSILON);
+        assert!((fable9.cache_read_cost_per_1k - 0.000_25).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_pricing_future_generation_still_matches_family_stem() {
-        // A hypothetical future generation must still classify correctly via
-        // the family-stem match, not require a code change.
-        let gen6_opus = ModelPricing::for_model("claude-opus-6");
-        assert!((gen6_opus.input_cost_per_1k - 0.015).abs() < f64::EPSILON);
+    fn bare_tier_aliases_resolve_to_the_newest_generation() {
+        assert!((ModelPricing::for_model("sonnet").input_cost_per_1k - 0.002).abs() < f64::EPSILON);
+        assert!((ModelPricing::for_model("opus").input_cost_per_1k - 0.005).abs() < f64::EPSILON);
+        assert!((ModelPricing::for_model("haiku").input_cost_per_1k - 0.001).abs() < f64::EPSILON);
+        assert!((ModelPricing::for_model("fable").input_cost_per_1k - 0.010).abs() < f64::EPSILON);
+        // Case-insensitively, too.
+        assert!((ModelPricing::for_model("OPUS").input_cost_per_1k - 0.005).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn unknown_model_falls_back_to_the_newest_sonnet_row() {
+        let p = ModelPricing::for_model("totally-unknown");
+        assert!(!ModelPricing::is_known_model("totally-unknown"));
+        assert!((p.input_cost_per_1k - 0.002).abs() < f64::EPSILON);
+        assert!((p.output_cost_per_1k - 0.010).abs() < f64::EPSILON);
+        // An absent model string takes the same default.
+        let empty = ModelPricing::for_model("");
+        assert!((empty.input_cost_per_1k - 0.002).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn opus_is_two_and_a_half_times_sonnet() {
+        // The figure the issue body asks to be re-derivable: Opus 5 $5/$25 vs
+        // Sonnet 5 $2/$10 is 2.5x on both axes, not the 5x the retired-Opus
+        // row produced.
+        let opus = ModelPricing::for_model("claude-opus-5");
+        let sonnet = ModelPricing::for_model("claude-sonnet-5");
+        assert!((opus.input_cost_per_1k / sonnet.input_cost_per_1k - 2.5).abs() < 1e-9);
+        assert!((opus.output_cost_per_1k / sonnet.output_cost_per_1k - 2.5).abs() < 1e-9);
     }
 
     #[test]
