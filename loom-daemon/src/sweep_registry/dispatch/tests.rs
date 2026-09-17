@@ -2331,14 +2331,28 @@ fn preflight_death_arms_backoff_even_though_quarantine_is_carved_out() {
 /// AC: a child that dies at `spawn-claude.sh`'s token-selection step
 /// (exit 78, `EX_CONFIG`) is (a) classified with the specific
 /// `preflight-token-selection-failed` death_class rather than the generic
-/// `preflight-no-cli-start` fallback, (b) still arms the #4485 dispatch
-/// backoff exactly like any other pre-flight death (confirming the
-/// existing backoff machinery already covers this shape — no extension
-/// needed), and (c) is written to the durable outcomes journal with the
-/// exit code, death_class, token_name, and duration a post-hoc reader
-/// needs, all without reading log prose.
+/// `preflight-no-cli-start` fallback, (b) exempt from the #4485 per-issue
+/// dispatch-backoff ladder, and (c) is written to the durable outcomes
+/// journal with the exit code, death_class, token_name, and duration a
+/// post-hoc reader needs, all without reading log prose.
+///
+/// **(b) reversed in #7708, deliberately.** This test originally asserted
+/// the opposite — that the ladder "still counts it" — on the reasoning that
+/// the existing backoff machinery already covered this shape and needed no
+/// extension. Production disproved that: the ladder is keyed **per issue**
+/// and capped at 900 s, so ~10 ready issues each behaving perfectly still
+/// aggregate to ~40 doomed spawns an hour. Across four hosts on 2026-09-15
+/// that produced 228 token-selection deaths in 4.3 h. A pool-wide fault
+/// needs a pool-wide hold, and charging the ladder also *misreports* the
+/// fault as the issue's dispatch having failed, when this death says
+/// nothing about the issue at all.
+///
+/// The brake that replaces it is `work_finder::pool_preflight`'s
+/// pool-keyed host hold, which this death arms instead (asserted in
+/// `quarantine_empty_pool_tests.rs`). (a) and (c) — #4644's own surface —
+/// are unchanged.
 #[test]
-fn exit_78_token_selection_death_is_classified_backed_off_and_journaled() {
+fn exit_78_token_selection_death_is_classified_journaled_and_ladder_exempt() {
     let dir = tempdir().unwrap();
     let mut registry = backoff_registry(dir.path(), 60, 900);
 
@@ -2375,13 +2389,17 @@ fn exit_78_token_selection_death_is_classified_backed_off_and_journaled() {
     assert!(record.duration_sec >= 0);
     assert_eq!(record.sweep_id, "sweep-issue-4644-0");
 
-    // (b) #4485 backoff already covers this shape — confirmed, not
-    // re-implemented.
+    // (b) #7708: a pool-level fault is charged to the POOL, not to whichever
+    // issue happened to be dispatched into it.
     assert_eq!(registry.insta_crash_count(4644), 0, "#4386 carve-out preserved");
-    assert_eq!(registry.dispatch_failure_count(4644), 1, "backoff still counts it");
+    assert_eq!(
+        registry.dispatch_failure_count(4644),
+        0,
+        "the #4485 per-issue ladder must not be charged for a pool-wide fault (#7708)"
+    );
     assert!(registry
         .dispatch_backoff_remaining(4644, Utc::now())
-        .is_some());
+        .is_none());
 }
 
 /// Issue #5697 (daemon-path half of #5687): a sweep killed by per-model
