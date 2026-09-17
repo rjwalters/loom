@@ -400,6 +400,101 @@ printf "%s\n" "$HELD"'
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #7970: NAME= heredoc-capture masking needs a \$NAME/\${NAME} read check ---${NC}"
+# =========================================================================
+#
+# #7355 widened mask_unquoted_cat_heredoc_bodies()'s capre allowlist to admit
+# a plain shell-variable-assignment capture (`R=$(cat <<EOF ... EOF)`) on the
+# reasoning that a capture into a variable is as confined as a capture into a
+# flag value. True of the capture itself, but unlike a flag value the
+# VARIABLE can be re-read later in the SAME command and RE-PARSED as shell
+# code (`eval "$R"`, `sh -c "$R"`, `"$R" | bash`) -- and nothing checked for
+# that. This closes exactly that gap: when condition 2 matched via the NAME=
+# alternative, _heredoc_var_reparsed() now fails closed against the TRUE
+# original command whenever the variable is fed to one of those re-parsing
+# consumers. Deliberately narrower than mask_catastrophic_var_assignment()'s
+# own blanket "$NAME appears anywhere" check -- see that function's mirror,
+# _heredoc_var_reparsed(), for why: a blanket check would re-open the #7355
+# false positive the tests directly above this section exist to lock in
+# (every one of them reads the captured variable via `echo`/`printf`, never
+# via a re-parsing consumer).
+
+ST7970_PHRASE='git reset --hard origin/main'
+
+# --- Genuinely dead capture (never read at all) stays masked/allowed -------
+assert_allow "#7970: a NAME= heredoc capture that is NEVER read afterward stays masked (allow)" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+EOF
+)
+echo done"
+
+# --- Display-only read (the #7355 shape) stays masked/allowed --------------
+assert_allow "#7970: a NAME= heredoc capture read only via 'echo \"\$NAME\"' (display, not re-parsed) stays masked (allow) -- must not regress #7355" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+EOF
+)
+echo \"\$R\""
+
+assert_allow "#7970: same shape read via 'printf' (display, not re-parsed) stays masked (allow)" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+EOF
+)
+printf '%s\n' \"\$R\""
+
+# --- The gap itself: a capture later RE-PARSED as shell code must NOT be
+#     masked -- COMMAND_ASK_SCAN needs to see the phrase and ask ------------
+assert_ask "#7970: a NAME= heredoc capture later fed to 'eval \"\$NAME\"' is NOT masked -- still asks (the reported gap)" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+EOF
+)
+eval \"\$R\""
+
+assert_ask "#7970: a NAME= heredoc capture later fed to 'sh -c \"\$NAME\"' is NOT masked -- still asks" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+EOF
+)
+sh -c \"\$R\""
+
+assert_ask "#7970: a NAME= heredoc capture later piped to bash ('\$NAME | bash') is NOT masked -- still asks" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+EOF
+)
+echo \"\$R\" | bash"
+
+assert_ask "#7970: the \${NAME} brace form fed to 'eval' is NOT masked -- still asks" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+EOF
+)
+eval \"\${R}\""
+
+# --- Catastrophic tier is untouched: mask_unquoted_cat_heredoc_bodies() only
+#     feeds COMMAND_ASK_SCAN, never the catastrophic-tier scan, so a
+#     catastrophic phrase in the SAME shape denies regardless of this fix ---
+assert_deny "#7970: the equivalent catastrophic-tier phrase (aws s3 rb) fed to 'eval \"\$NAME\"' still denies, unaffected by the ask-tier fix" \
+    "R=\$(cat <<EOF
+${_S3RB_CAT}
+EOF
+)
+eval \"\$R\""
+
+# --- Flag-value branch (#6056's original shape) is untouched: a flag value
+#     can never be eval'd, so it needs no read check and stays masked -------
+assert_allow "#7970: the sibling flag-value capture ('gh pr comment --body \"\$(cat <<EOF...)\"') is UNCHANGED -- no read check applies, stays masked" \
+    "gh pr comment 123 --body \"\$(cat <<EOF
+$ST7970_PHRASE
+EOF
+)\""
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #6252: COMMAND_NO_COMMENT quote-awareness (ADR-0016 sed test matrix) ---${NC}"
 # =========================================================================
 #
