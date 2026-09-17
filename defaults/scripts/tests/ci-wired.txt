@@ -252,6 +252,7 @@ tests/hooks/test-guard-destructive-heredoc-subst.sh
 tests/hooks/test-guard-destructive-masking.sh
 tests/hooks/test-guard-destructive-matching-precision.sh
 tests/hooks/test-guard-destructive-mkdir-confinement.sh
+tests/hooks/test-guard-destructive-mktemp-canon.sh
 tests/hooks/test-guard-destructive-readonly-fastpath.sh
 tests/hooks/test-guard-destructive-rm-scope.sh
 tests/hooks/test-guard-destructive-stash-scope.sh
