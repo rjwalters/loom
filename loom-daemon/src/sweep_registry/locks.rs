@@ -186,9 +186,11 @@ pub(crate) fn scan_unregistered_locked_issues(
             // against — `reconstruct()`'s stale-lock cleanup owns this case.
             continue;
         };
-        if !is_pid_alive(owner.owner_pid) {
+        if !pid_identity::owner_pid_alive_since(owner.owner_pid, &owner.acquired_at) {
             // Stale lock (dead owner): the sweep has actually finished or
-            // crashed, not "unregistered" — do not report it as alive.
+            // crashed, not "unregistered" — do not report it as alive. The
+            // probe is identity-paired (#7935) so a recycled pid number does
+            // not resurrect a long-dead owner as a phantom live lock.
             continue;
         }
         if !is_tracked(issue) {
@@ -787,7 +789,7 @@ impl SweepRegistry {
                     let _ = std::fs::remove_dir_all(&path);
                     continue;
                 };
-                if !is_pid_alive(owner.owner_pid) {
+                if !pid_identity::owner_pid_alive_since(owner.owner_pid, &owner.acquired_at) {
                     // Stale lock: the daemon-dispatched child's PID (recorded
                     // by `record_child_pid_in_lock`, #3808) is dead. This lock
                     // is the daemon's own crash-surviving evidence that it
@@ -804,6 +806,18 @@ impl SweepRegistry {
                     // remaining handle on those survivors (the OS cannot report
                     // a dead pid's group), so reap the group before dropping the
                     // lock that records it.
+                    //
+                    // Issue #7935: "dead" here now means *identity-paired*
+                    // dead — the pid is gone, OR it is alive but belongs to a
+                    // process that started long after this lock was acquired,
+                    // i.e. an unrelated process that recycled the pid number
+                    // while no daemon was running. Admitting that phantom as
+                    // `Running` (the pre-#7935 behavior) wedged the entry
+                    // non-terminal forever, blocking `restart --drain` and
+                    // every `auto_update` roll on the host. In THAT case the
+                    // recorded `pgid` (always the leader's own pid) names a
+                    // number a stranger now owns, so `reap_orphaned_group`
+                    // refuses it — see its own #7935 guard.
                     if let Some(pgid) = owner.pgid {
                         self.reap_orphaned_group(&owner.sweep_id, Some(issue), pgid);
                     }
@@ -1020,7 +1034,11 @@ impl SweepRegistry {
             if self.has_tracked_sweep_for(entry.issue) {
                 continue;
             }
-            if !is_pid_alive(entry.pid) {
+            // Identity-paired (#7935): a journal record whose pid number has
+            // been recycled onto an unrelated process must not be adopted as
+            // a live sweep — that phantom is un-reapable, since nothing this
+            // daemon does can make the stranger exit.
+            if !pid_identity::pid_alive_since(entry.pid, entry.started_at) {
                 continue;
             }
             let sweep_id = format!("journal-adopted-issue-{}-{}", entry.issue, entry.pid);
