@@ -1545,10 +1545,6 @@ fn test_artifact_roll_record_round_trips_on_disk() {
     assert_eq!(load_artifact_roll_record(None), None);
 }
 
-// ---- --resolve-json parsing: see resolve_json.rs's own `#[cfg(test)] mod
-// tests` (split out alongside the code it tests when both crossed the
-// file-size ratchet, #7818) ---------------------------------------------
-
 // ---- run_tick end to end on the artifact path ------------------------
 
 /// A probe that resolves a scripted artifact and records whether the tick

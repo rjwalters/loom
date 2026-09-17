@@ -37,7 +37,6 @@
 2 defaults/scripts/cli/loom-daemon-update.sh
 6 defaults/scripts/cli/loom-daemon-watchdog.sh
 2 defaults/scripts/cli/loom-status.sh
-2 defaults/scripts/dep-recheck-fingerprint.sh
 1 defaults/scripts/lib/body-repo-affinity.sh
 14 defaults/scripts/merge-pr.sh
 1 defaults/scripts/rebase-stacked-children.sh
@@ -76,7 +75,7 @@
 6 defaults/scripts/tests/test-loom-daemon-quiesce.sh
 65 defaults/scripts/tests/test-loom-daemon-start.sh
 12 defaults/scripts/tests/test-loom-daemon-stop.sh
-180 defaults/scripts/tests/test-loom-daemon-update.sh
+175 defaults/scripts/tests/test-loom-daemon-update.sh
 2 defaults/scripts/tests/test-loom-daemon-watchdog.sh
 2 defaults/scripts/tests/test-mcp-config.sh
 12 defaults/scripts/tests/test-merge-pr-auto-merge-disabled-fallback.sh

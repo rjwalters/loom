@@ -728,11 +728,15 @@ jobs:
         run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
 
   dep-classification-suites:
-    name: Dependency Classification Suites
+    name: Native Port Suites
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
-    # The equivalence evidence for epic #7810 PR 3. These three suites' 261
-    # assertions were written against the SHELL implementations of
+    # The equivalence evidence for epic #7810. Every suite here carries
+    # assertions written against a SHELL implementation that is now a thin stub
+    # over a `loom-daemon` subcommand, so each needs a BUILT binary — which
+    # shell-suite-tests deliberately has no Rust toolchain for.
+    #
+    # The three original suites' 261 assertions were written against
     # classify-dependency-block.sh / detect-dependency-cycle.sh /
     # detect-startable-subset.sh; those are now thin stubs over
     # `loom-daemon classify-dependency-block` et al., and the same assertions
@@ -753,6 +757,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Configure git identity for suite fixtures
+        # These suites create fixture commits; a fresh runner has no global
+        # identity. Same step shell-suite-tests carries, for the same reason.
+        run: |
+          git config --global user.email "ci@loom.test"
+          git config --global user.name "Loom CI"
       - name: Build loom-daemon
         run: cargo build --package loom-daemon
       - name: classify-dependency-block (#5664, #7650)
@@ -765,6 +775,12 @@ jobs:
         run: bash defaults/scripts/tests/test-detect-startable-subset.sh
       - name: dep-recheck-fingerprint (#7281, #7314, #7617)
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
+      # Split out of test-loom-daemon-update.sh by #7977: these assertions
+      # now drive `loom-daemon release-resolve` through the stub's delegation,
+      # so they need the binary this job builds. The parent suite stays in
+      # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
+      - name: loom-daemon-update --resolve-json (#7609)
+        run: bash defaults/scripts/tests/test-loom-daemon-update-resolve-json.sh
 
   installer-tests:
     name: Installer Integration Tests

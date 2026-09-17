@@ -905,19 +905,11 @@ enum Commands {
         action: SweepExperimentAction,
     },
 
-    /// The dependency-classification family (epic #7810 PR 3):
-    /// `classify-dependency-block`, `detect-dependency-cycle`,
-    /// `detect-startable-subset`. Flattened, so each is a top-level subcommand;
-    /// the args and their docs live in `cli::dep_classify` because this file is
-    /// frozen by the file-size ratchet.
+    /// Subcommands backing a retired shell script (epic #7810). Flattened, so
+    /// each is top-level; the args and their docs live in `cli::script_ports`
+    /// because this file is frozen by the file-size ratchet.
     #[command(flatten)]
-    DepClassify(cli::dep_classify::DepClassifyCommand),
-
-    /// Curator's re-check fingerprints (epic #7810 PR 4): the
-    /// `dep-recheck-fingerprint` subcommand family. Args and docs live in
-    /// `cli::dep_recheck` because this file is frozen by the file-size ratchet.
-    #[command(subcommand)]
-    DepRecheckFingerprint(cli::dep_recheck::DepRecheckCommand),
+    ScriptPorts(cli::script_ports::ScriptPortCommand),
 
     /// Validate a sweep phase contract and attempt mechanical recovery (native
     /// port of `loom_tools.validate_phase`, #4275). Backs `validate-phase.sh`.
@@ -2581,8 +2573,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
-        Commands::DepClassify(cmd) => cmd.run(),
-        Commands::DepRecheckFingerprint(cmd) => cmd.run(),
+        Commands::ScriptPorts(cmd) => cmd.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
             phase,
