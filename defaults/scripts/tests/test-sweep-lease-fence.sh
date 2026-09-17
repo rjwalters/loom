@@ -396,8 +396,11 @@ else
 fi
 
 LEGACY_BASH=""
-if [[ -x /bin/bash ]] && /bin/bash --version 2> /dev/null | head -n1 | grep -q 'version 3\.'; then
-    LEGACY_BASH=/bin/bash
+if [[ -x /bin/bash ]]; then
+    bash_version_output="$(/bin/bash --version 2>/dev/null)"
+    if [[ "$bash_version_output" == *"version 3."* ]]; then
+        LEGACY_BASH=/bin/bash
+    fi
 fi
 if [[ -n "$LEGACY_BASH" ]]; then
     OUT="$("$LEGACY_BASH" "$SCRIPT" check 6309 --host studio-host 2>"$STUB_DIR/stderr-legacy.log")"
