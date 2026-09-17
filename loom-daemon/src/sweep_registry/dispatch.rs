@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod child_env_markers;
+
 /// Issue #3943: print-mode background-task wait ceiling (milliseconds). A
 /// daemon-spawned sweep child is a headless `claude -p` session; in print mode
 /// the harness reaps still-running background tasks (the sweep's Builder/Judge
@@ -3009,44 +3011,12 @@ impl SweepRegistry {
             cmd.arg("--use-wrapper");
         }
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"));
-        // Claim-ownership marker (issue #3823): `dispatch()` flips
-        // loom:issue -> loom:building on the forge BEFORE this child is
-        // spawned (step 4, for immediate external visibility of the claim).
-        // Without a signal, the child's own `/loom:sweep` pre-flight would
-        // read that label and skip issue N as "already being built by
-        // someone else" — self-skipping the daemon's OWN claim, so no
-        // worktree, no build, no PR. Export the issue number this sweep
-        // owns so the child's pre-flight recognises an existing
-        // loom:building as ITS OWN daemon claim and proceeds to build.
-        // Scoped to daemon-dispatched children only: an operator-run
-        // `/loom:sweep N` never sets this env var, so the manual-terminal
-        // skip rule (honor any loom:building) is unchanged.
-        //
-        // Issue #4111: this env var alone was proven insufficient — a
-        // daemon-dispatched child reliably reasoned about loom:building
-        // label timing / PID tables / `loom-daemon status` and
-        // self-skipped its own claim without ever consulting it. The
-        // `--claim-owned <N>` argv flag appended above is now the PRIMARY
-        // signal (positional, in the model's context by construction);
-        // this env var is kept for backward compatibility only —
-        // spawn-claude.sh still logs it, and it is still asserted by the
-        // producer-side tests below plus `work_finder.rs` / `ipc.rs`.
-        //
-        // Issue #5342: `PrSet` claims no single issue, so this marker is
-        // Issue-only — a `PrSet` child's `/loom:sweep --prs ...` pre-flight
-        // has no per-issue `loom:building` self-claim to recognise.
-        //
-        // Issue #7672: the same `Issue`-only scoping applies to the
-        // lease-renewal capability marker — it tells this child's Step 1a that
-        // the dispatch which spawned it will start the renewal loop for the
-        // one issue it claims, so the session must not start a second one. A
-        // `PrSet` child claims no issue and has no lease to renew. See
-        // [`LEASE_RENEW_STARTED_ENV`] for why this is a marker rather than an
-        // unconditional prose withdrawal in `sweep.md`.
-        if let SweepKind::Issue(issue) = kind {
-            cmd.env("LOOM_SWEEP_CLAIM_OWNED", issue.to_string());
-            cmd.env(LEASE_RENEW_STARTED_ENV, issue.to_string());
-        }
+        // The two `Issue`-scoped child markers — `LOOM_SWEEP_CLAIM_OWNED`
+        // (#3823/#4111/#5342) and the lease-renewal capability marker
+        // (#7672) — are set for an `Issue` dispatch and *cleared* for a
+        // `PrSet` one. Both the rationale and the clearing (#7915) live in
+        // [`child_env_markers::apply_issue_scoped_markers`].
+        child_env_markers::apply_issue_scoped_markers(&mut cmd, kind);
         cmd
             // Always pin LOOM_WORKSPACE to the registry's configured root so
             // spawn-claude.sh resolves `.loom/tokens/` from the same place
