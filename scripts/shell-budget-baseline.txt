@@ -1,15 +1,28 @@
-# shell-budget-baseline.txt — the aggregate production-shell ratchet.
+# shell-budget-baseline.txt — the aggregate production-shell ratchet for epic #7810.
 #
-# Regenerate deliberately:
+#   loom-daemon shell-budget          the progress report a human reads
+#   loom-daemon shell-budget --json   the same, for scripting
+#
+# Regenerate the ratchet lines deliberately:
 #   UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet
 #
-# `lines` may go DOWN freely and must not go UP. See
-# loom-daemon/tests/shell_budget_ratchet.rs for the scope rule (what counts
-# as production shell) and for why raising this number is the thing a
-# reviewer should ask about.
+# `portable` is the number the epic is retiring — `contract` + `hook-entry`,
+# whose logic moves into the daemon behind a stub. It may go DOWN freely and
+# must not go UP. A reviewer should treat a raised `portable` as the thing to
+# ask about; that is the ratchet slipping, and it is the whole point of the gate.
 #
-# `files` is a companion sanity value, not a second ratchet: it exists so a
-# filter regression that silently stops counting whole directories shows up
-# as a suspicious drop rather than as a free win.
-lines 51814
+# `total` is ratcheted too, so growth in the permanent floor (`bootstrap` +
+# `vendored`) is visible rather than free — but the floor is NOT debt, and
+# driving it down is not a goal.
+#
+# `files` is a companion sanity value, not a third ratchet: it exists so a
+# filter regression that silently stops counting whole directories shows up as
+# a suspicious drop rather than as a win.
+#
+# `origin_portable` is the portable figure immediately before this epic's first
+# port commit (143fe332^, PR #7953). It is the DENOMINATOR progress is measured
+# against and must never be regenerated — an origin that moves measures nothing.
+portable 38439
+total 51814
 files 234
+origin_portable 38374

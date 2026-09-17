@@ -1,61 +1,60 @@
-//! Aggregate ratchet on production shell volume (#8084, epic #7810).
+//! Aggregate ratchet on the shell epic #7810 is actually retiring (#8084).
 //!
 //! # Why
 //!
-//! Epic #7810 ported four scripts and deleted roughly 2,200 lines of production
-//! shell. Over the same window the repo's total production shell went UP:
+//! Four scripts have been ported and roughly 2,200 lines of production shell
+//! deleted. Over the same window the pool those ports are draining went **up**:
+//! 38,374 lines immediately before the epic's first port commit, 38,439 now.
+//! A net **+65**. More portable shell arrived than left, and nothing measured
+//! it, so four merged ports read as progress.
 //!
-//! | when | files | production shell code lines |
-//! |---|---|---|
-//! | 90 days ago | 93 | 14,958 |
-//! | 60 days ago | 96 | 15,568 |
-//! | 30 days ago | 186 | 40,735 |
-//! | now | 234 | 51,814 |
+//! # Why `portable` and not the total
 //!
-//! Immediately before the epic's first port commit the number was 51,749. It is
-//! now 51,814 — the epic is a net **+65**. Of the 98 files appearing between the
-//! 60- and 30-day marks, 96 did not exist anywhere in the tree at 60 days, so
-//! this is new code, not a relocation.
+//! The first cut of this gate ratcheted total production shell — 51,814 lines.
+//! That number cannot reach zero and was never meant to: `bootstrap` (runs
+//! before a `loom-daemon` binary exists, so requiring the binary to install
+//! itself is circular) and `vendored` (owned upstream in rjwalters/repo) are
+//! 13,230 lines of correctly permanent shell. Ratcheting "what we are retiring"
+//! plus "what we are keeping" yields a figure with no target, so no run of it
+//! ever says how far along the epic is.
 //!
-//! Neither existing gate sees it. `check-file-size-budget.sh` ratchets
-//! INDIVIDUAL files already over 1,000 lines; `check-shell-allowlist.sh` wants a
-//! category and reason for each NEW script. But 29,795 of those lines arrived as
-//! 148 brand-new scripts, nearly all under the per-file threshold and each with
-//! a defensible reason. `check-file-size-budget.sh`'s own header names the
-//! failure mode: "every individual addition is defensible while the aggregate is
-//! the problem." That is true of shell volume, and nothing measured it.
+//! `portable` — `contract` + `hook-entry`, whose logic moves into the daemon
+//! behind a stub — has a target: the ~145 lines of `stub` glue a ported file
+//! leaves behind. `total` stays ratcheted so floor growth is visible rather
+//! than free, but the floor is not debt.
+//!
+//! # Why the existing gates miss all of this
+//!
+//! `check-file-size-budget.sh` ratchets INDIVIDUAL files already over 1,000
+//! lines; `check-shell-allowlist.sh` wants a category and reason per NEW
+//! script. Neither constrains aggregate volume, and the aggregate is where the
+//! growth is: 29,795 of the lines added since the 60-day mark arrived as 148
+//! brand-new scripts, nearly all under the per-file threshold and each with a
+//! defensible reason. `check-file-size-budget.sh`'s own header names the
+//! failure mode — *"every individual addition is defensible while the aggregate
+//! is the problem."*
 //!
 //! # What this is not
 //!
-//! Not a ban, and not a per-file limit. Growth stays possible — it just has to
-//! be spelled out as a changed number in `scripts/shell-budget-baseline.txt`,
-//! visible in the diff, instead of arriving invisibly across 148 files. Same
-//! bargain the file-size ratchet strikes.
+//! Not a ban. Growth stays possible; it just has to be spelled out as a changed
+//! number in `scripts/shell-budget-baseline.txt`, visible in the diff, instead
+//! of arriving invisibly across a hundred files.
 //!
-//! # Why this is Rust and not a shell script
-//!
-//! A `.sh` enforcing "stop adding shell" would have to exempt itself from its
-//! own count, and the language policy (`.loom/docs/shell-language-policy.md`)
-//! already says new executable logic belongs in the daemon. It lives as an
-//! integration test so it runs under the existing `cargo nextest run
-//! --workspace` with no new CI job.
-//!
-//! # Updating the baseline
+//! # Updating
 //!
 //! ```text
 //! UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet
 //! ```
 //!
-//! Legitimate for recording shrinkage (the ratchet tightens) or for a reviewed
-//! decision to admit growth. A reviewer should treat an update that RAISES the
-//! number as the thing to ask about — that is the ratchet slipping, which is the
-//! whole point of the gate.
+//! Legitimate for recording shrinkage, or for a reviewed decision to admit
+//! growth. A reviewer should treat an update that RAISES `portable` as the
+//! thing to ask about. `origin_portable` is never regenerated — an origin that
+//! moves measures nothing.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
-/// Repo root: this crate's manifest dir is `<root>/loom-daemon`.
+use loom_daemon::shell_budget;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -67,253 +66,150 @@ fn baseline_path() -> PathBuf {
     repo_root().join("scripts/shell-budget-baseline.txt")
 }
 
-/// Whether a tracked `.sh` path counts as PRODUCTION shell.
-///
-/// Three exclusions, each with a reason:
-///
-/// - **`tests/` path segments and `test-*.sh` basenames.** The retained
-///   black-box suite method this epic runs on *requires* test shell to grow as
-///   production shell shrinks — a port keeps the old suite and runs its
-///   assertions against the Rust. Counting tests here would make the correct
-///   move look like a regression and the gate would be gamed or deleted.
-/// - **`.loom/`.** Installed mirrors of `defaults/`. Counting both double-counts
-///   the same source, most visibly the 3,808-line vendored guard.
-/// - Nothing else. Vendored shell still counts: it is shell we ship and it is
-///   part of the volume an agent has to work around, whoever wrote it.
-fn is_production_shell(path: &str) -> bool {
-    if path.starts_with(".loom/") {
-        return false;
-    }
-    if path.split('/').any(|seg| seg == "tests" || seg == "test") {
-        return false;
-    }
-    let basename = path.rsplit('/').next().unwrap_or(path);
-    if basename.starts_with("test-") {
-        return false;
-    }
-    true
+/// The ratcheted values, plus the never-regenerated origin.
+struct Baseline {
+    portable: u64,
+    total: u64,
+    files: u64,
+    origin_portable: u64,
 }
 
-/// Code lines: leading whitespace stripped, blanks skipped, `#`-leading lines
-/// skipped. Byte-for-byte the rule `check-file-size-budget.sh` applies to `.sh`
-/// (its `measure_all` awk pass), so the two gates never disagree about a file.
-fn code_lines(text: &str) -> usize {
-    text.lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            !t.is_empty() && !t.starts_with('#')
-        })
-        .count()
-}
-
-fn tracked_shell_files(root: &Path) -> Vec<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "-z", "--", "*.sh"])
-        .output()
-        .unwrap_or_else(|e| panic!("could not run `git ls-files` in {}: {e}", root.display()));
-
-    assert!(
-        out.status.success(),
-        "`git ls-files` failed in {}: {}",
-        root.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    String::from_utf8_lossy(&out.stdout)
-        .split('\0')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-struct Measurement {
-    total: usize,
-    files: usize,
-    per_file: BTreeMap<String, usize>,
-}
-
-fn measure() -> Measurement {
-    let root = repo_root();
-    let tracked = tracked_shell_files(&root);
-
-    // A discovery failure must not read as "no shell left". Without this, a
-    // broken pathspec or a non-git checkout silently passes the gate at 0.
-    assert!(
-        tracked.len() >= 400,
-        "expected 400+ tracked .sh files, found {} — shell discovery is broken, and a gate \
-         that measures nothing passes for the wrong reason",
-        tracked.len()
-    );
-
-    let mut per_file = BTreeMap::new();
-    let mut total = 0usize;
-    for rel in tracked.iter().filter(|p| is_production_shell(p)) {
-        let full = root.join(rel);
-        let Ok(text) = std::fs::read_to_string(&full) else {
-            // A tracked path that will not read as UTF-8 text is not something
-            // to skip quietly; say so and keep it out of the count explicitly.
-            panic!("tracked shell file {rel} could not be read as text");
-        };
-        let n = code_lines(&text);
-        total += n;
-        per_file.insert(rel.clone(), n);
-    }
-
-    assert!(
-        per_file.len() >= 150,
-        "only {} production shell files survived the filter — the exclusion rule is too broad",
-        per_file.len()
-    );
-
-    Measurement {
-        total,
-        files: per_file.len(),
-        per_file,
-    }
-}
-
-fn read_baseline() -> (usize, usize) {
+fn read_baseline() -> Baseline {
     let path = baseline_path();
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("baseline not found at {}: {e}", path.display()));
-    let mut lines = None;
-    let mut files = None;
+    let mut vals = std::collections::BTreeMap::<String, u64>::new();
     for l in text.lines() {
         let l = l.trim();
         if l.is_empty() || l.starts_with('#') {
             continue;
         }
-        let mut parts = l.split_whitespace();
-        match (parts.next(), parts.next()) {
-            (Some("lines"), Some(v)) => lines = v.parse().ok(),
-            (Some("files"), Some(v)) => files = v.parse().ok(),
+        let mut it = l.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some(k), Some(v)) => {
+                let n = v
+                    .parse()
+                    .unwrap_or_else(|_| panic!("baseline key {k} has a non-numeric value {v:?}"));
+                vals.insert(k.to_string(), n);
+            }
             _ => panic!("unrecognised baseline line: {l:?}"),
         }
     }
-    (
-        lines.expect("baseline is missing a `lines <N>` entry"),
-        files.expect("baseline is missing a `files <N>` entry"),
-    )
-}
-
-fn write_baseline(m: &Measurement) {
-    let body = format!(
-        "# shell-budget-baseline.txt — the aggregate production-shell ratchet.\n\
-         #\n\
-         # Regenerate deliberately:\n\
-         #   UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet\n\
-         #\n\
-         # `lines` may go DOWN freely and must not go UP. See\n\
-         # loom-daemon/tests/shell_budget_ratchet.rs for the scope rule (what counts\n\
-         # as production shell) and for why raising this number is the thing a\n\
-         # reviewer should ask about.\n\
-         #\n\
-         # `files` is a companion sanity value, not a second ratchet: it exists so a\n\
-         # filter regression that silently stops counting whole directories shows up\n\
-         # as a suspicious drop rather than as a free win.\n\
-         lines {}\n\
-         files {}\n",
-        m.total, m.files
-    );
-    std::fs::write(baseline_path(), body).expect("could not write baseline");
+    let get = |k: &str| {
+        *vals
+            .get(k)
+            .unwrap_or_else(|| panic!("baseline is missing a `{k} <N>` entry"))
+    };
+    Baseline {
+        portable: get("portable"),
+        total: get("total"),
+        files: get("files"),
+        origin_portable: get("origin_portable"),
+    }
 }
 
 #[test]
-fn production_shell_does_not_grow() {
-    let m = measure();
+fn portable_shell_does_not_grow() {
+    let root = repo_root();
+    let budget = shell_budget::measure(&root).expect("measure");
 
     if std::env::var_os("UPDATE_SHELL_BUDGET").is_some() {
-        write_baseline(&m);
-        eprintln!("shell-budget-baseline.txt updated: lines {} files {}", m.total, m.files);
+        let origin = shell_budget::read_origin_portable(&root)
+            .expect("origin_portable must already exist — it is never regenerated");
+        let text = std::fs::read_to_string(baseline_path()).expect("read baseline");
+        let header: String = text
+            .lines()
+            .take_while(|l| l.trim_start().starts_with('#') || l.trim().is_empty())
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(
+            baseline_path(),
+            format!(
+                "{header}portable {}\ntotal {}\nfiles {}\norigin_portable {origin}\n",
+                budget.portable(),
+                budget.total(),
+                budget.file_count()
+            ),
+        )
+        .expect("write baseline");
+        eprintln!("{}", shell_budget::render_report(&budget, origin));
         return;
     }
 
-    let (baseline_lines, baseline_files) = read_baseline();
+    let base = read_baseline();
 
-    println!(
-        "production shell: {} code lines across {} files (baseline {} / {})",
-        m.total, m.files, baseline_lines, baseline_files
+    // Always print it. A gate that only speaks up on failure teaches nobody
+    // which way the number is moving, which is how +65 went unnoticed across
+    // four merged ports.
+    println!("{}", shell_budget::render_report(&budget, base.origin_portable));
+
+    assert!(
+        budget.unlisted.is_empty(),
+        "{} production script(s) carry no allowlist entry, so every figure here is an \
+         undercount — add them to scripts/shell-allowlist.txt:\n{}",
+        budget.unlisted.len(),
+        budget
+            .unlisted
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 
-    if m.total > baseline_lines {
-        let mut largest: Vec<_> = m.per_file.iter().collect();
-        largest.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-        let top = largest
-            .iter()
-            .take(10)
-            .map(|(p, n)| format!("  {n:>6}  {p}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+    assert!(
+        budget.file_count() >= 150,
+        "only {} production shell files were counted — the scope filter is too broad, and a \
+         gate that measures almost nothing passes for the wrong reason",
+        budget.file_count()
+    );
 
+    if budget.portable() > base.portable {
+        let mut largest: Vec<_> = budget
+            .by_category
+            .iter()
+            .filter(|(c, _)| shell_budget::PORTABLE.contains(&c.as_str()))
+            .collect();
+        largest.sort_by(|a, b| b.1.cmp(a.1));
         panic!(
-            "production shell grew by {} code lines ({} -> {}), across {} files (baseline {}).\n\
-             \n\
-             Epic #7810 is retiring shell. Adding to the aggregate works against that, so the\n\
-             gate asks for the growth to be deliberate rather than invisible. Options, best\n\
-             first:\n\
-             \n\
-               1. Put the new logic in the daemon instead — that is the language policy\n\
-                  (.loom/docs/shell-language-policy.md) and it makes this gate a non-event.\n\
-               2. Remove shell elsewhere to pay for it.\n\
-               3. If the growth is genuinely right, record it:\n\
-                    UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet\n\
-                  and say WHY in the commit. A reviewer will see the raised number.\n\
-             \n\
-             Largest production scripts right now:\n{}",
-            m.total - baseline_lines,
-            baseline_lines,
-            m.total,
-            m.files,
-            baseline_files,
-            top
+            "PORTABLE shell grew by {} code lines ({} -> {}).\n\n\
+             This is the pool epic #7810 is retiring, so adding to it works directly against \
+             the epic. Options, best first:\n\n\
+             \x20 1. Put the new logic in the daemon instead — that is the language policy\n\
+             \x20    (.loom/docs/shell-language-policy.md) and it makes this gate a non-event.\n\
+             \x20 2. Remove portable shell elsewhere to pay for it.\n\
+             \x20 3. If the script genuinely must stay shell forever, it may belong in\n\
+             \x20    `bootstrap` or `vendored` rather than `contract` — but that is a claim\n\
+             \x20    about the script, argued in scripts/shell-allowlist.txt, not a way\n\
+             \x20    around this number.\n\
+             \x20 4. If the growth is genuinely right, record it:\n\
+             \x20      UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet\n\
+             \x20    and say WHY in the commit. A reviewer will see the raised number.\n\n\
+             {}",
+            budget.portable() - base.portable,
+            base.portable,
+            budget.portable(),
+            shell_budget::render_report(&budget, base.origin_portable)
         );
     }
-}
 
-/// The counting rule itself, so a refactor of `code_lines` cannot drift from
-/// `check-file-size-budget.sh` unnoticed.
-#[test]
-fn code_lines_counts_what_the_file_size_ratchet_counts() {
-    assert_eq!(code_lines(""), 0);
-    assert_eq!(code_lines("\n\n   \n\t\n"), 0, "blank lines never count");
-    assert_eq!(
-        code_lines("#!/usr/bin/env bash\n# a comment\n"),
-        0,
-        "comment-only lines never count"
-    );
-    assert_eq!(code_lines("   # indented comment\n"), 0, "leading whitespace is stripped first");
-    assert_eq!(code_lines("echo hi\n"), 1);
-    assert_eq!(code_lines("  echo hi   # trailing comment\n"), 1, "a trailing comment is code");
-    assert_eq!(
-        code_lines("#!/usr/bin/env bash\n\nset -e\n# note\nfoo() {\n  bar\n}\n"),
-        4,
-        "shebang and comment excluded; the four body lines counted"
-    );
-}
-
-/// The scope rule, stated as assertions rather than left to a glob.
-#[test]
-fn production_scope_rule_is_explicit() {
-    assert!(is_production_shell("defaults/scripts/merge-pr.sh"));
-    assert!(is_production_shell("scripts/install-loom.sh"));
-    assert!(is_production_shell("install.sh"));
     assert!(
-        is_production_shell("defaults/hooks/guard-destructive-generic.sh"),
-        "vendored shell still ships and still counts"
+        budget.total() <= base.total,
+        "total production shell grew by {} code lines ({} -> {}) without portable growing, so \
+         the growth is in the permanent floor (bootstrap/vendored). That is allowed but not \
+         free — record it deliberately and say why.\n\n{}",
+        budget.total().saturating_sub(base.total),
+        base.total,
+        budget.total(),
+        shell_budget::render_report(&budget, base.origin_portable)
     );
 
-    assert!(!is_production_shell("defaults/scripts/tests/test-merge-pr.sh"));
-    assert!(!is_production_shell("tests/install/test-provision-daemon.sh"));
-    assert!(!is_production_shell("scripts/test-installer.sh"), "test-* basename anywhere");
+    // A large drop in file count with no corresponding line drop means the
+    // filter stopped seeing whole directories.
     assert!(
-        !is_production_shell(".loom/hooks/guard-destructive-generic.sh"),
-        "installed mirror"
+        budget.file_count() + 20 >= base.files,
+        "production shell file count fell from {} to {} — verify that is a real removal and \
+         not a scope-filter regression",
+        base.files,
+        budget.file_count()
     );
-
-    // Not fooled by a substring: `latest/` is not `tests/`, `testable.sh` is
-    // not `test-*.sh`.
-    assert!(is_production_shell("defaults/scripts/latest/thing.sh"));
-    assert!(is_production_shell("defaults/scripts/testable.sh"));
 }

@@ -1,4 +1,5 @@
-//! Subcommands that back a retired shell script (epic #7810).
+//! Epic #7810's subcommands: those that back a retired shell script, plus the
+//! epic's own instrumentation (`shell-budget`).
 //!
 //! Every variant here is the implementation behind a `defaults/scripts/*.sh`
 //! entry point that is now a thin stub. The stubs' names, flags, stdout and
@@ -32,6 +33,12 @@ pub(crate) enum ScriptPortCommand {
     /// Backs `loom-daemon-update.sh --resolve-json`. Exit 0 when one resolved,
     /// 1 when none did — data, not an error.
     ReleaseResolve(super::release_resolve::ReleaseResolveArgs),
+
+    /// How far the epic actually is: portable shell remaining, the permanent
+    /// floor, and the net change since the first port. Not a port itself — it
+    /// lives here because `main.rs` is frozen by the file-size ratchet and this
+    /// flattened enum is what keeps a new top-level subcommand free.
+    ShellBudget(super::shell_budget::ShellBudgetArgs),
 }
 
 impl ScriptPortCommand {
@@ -42,6 +49,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DepClassify(cmd) => cmd.run(),
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
+            ScriptPortCommand::ShellBudget(args) => args.run(),
         }
     }
 }
