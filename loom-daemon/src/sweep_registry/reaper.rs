@@ -1210,6 +1210,11 @@ impl SweepRegistry {
                             // pre-flight-classified without re-borrowing the
                             // (by-then-moved) `Option<String>`.
                             let is_preflight_death = death_class.is_some();
+                            // #7708: likewise captured before `classification`
+                            // is moved. A `no-usable-account` death is a
+                            // POOL-level fault — see this branch's use below.
+                            let pool_dead =
+                                classification.as_deref() == Some(NO_USABLE_ACCOUNT_CLASS);
                             // Captured before `checkpoint_phase` moves into the
                             // `SweepCrashed` event below — needed for the
                             // reaper-driven resume check further down (#4256).
@@ -1307,6 +1312,24 @@ impl SweepRegistry {
                                 // consecutive tally must not carry forward
                                 // into a spurious threshold WARN.
                                 self.clear_decline_cooldown(issue);
+                            } else if pool_dead {
+                                // #7708: the pool held no usable account, so
+                                // this dispatch never got far enough to say
+                                // ANYTHING about the issue. Charging the
+                                // #4485 per-issue ladder would be attributing
+                                // a pool-wide fault to whichever issue
+                                // happened to be dispatched into it — and a
+                                // per-issue ladder structurally cannot damp a
+                                // pool-wide fault anyway: with N ready issues
+                                // each capped at 900s, the aggregate rate is
+                                // still ~N doomed spawns per 15 minutes,
+                                // which is exactly the 228-in-4.3h shape that
+                                // filed this issue. Neither arm nor clear it;
+                                // arm the HOST-level pool hold instead, which
+                                // holds every issue at once.
+                                crate::work_finder::pool_preflight::note_pool_dead(
+                                    &self.config.workspace_root,
+                                );
                             } else if insta_crash {
                                 self.record_dispatch_failure(issue);
                             }
@@ -1816,6 +1839,14 @@ impl SweepRegistry {
                                 .and_then(|p| tail_lines(&p, EXHAUSTION_LOG_TAIL_LINES).ok())
                                 .map(|lines| lines.join("\n"))
                                 .and_then(|tail| classify_crash(&tail, exit_code));
+                            // #7708: captured before `classification` moves
+                            // into the outcome journal below — see this
+                            // branch's use further down. The exit-78
+                            // token-selection death lands HERE (no checkpoint
+                            // was ever written) at least as often as in the
+                            // crashed branch above, so both need the carve-out.
+                            let pool_dead =
+                                classification.as_deref() == Some(NO_USABLE_ACCOUNT_CLASS);
                             // Telemetry `result` classification (#4704),
                             // strongest signal first:
                             //   1. An observed `merge-done` means the sweep
@@ -1879,7 +1910,20 @@ impl SweepRegistry {
                             // purposes, so it arms the same window without
                             // joining the quarantine tally below. Only a
                             // genuinely productive exit clears the window.
-                            if insta_crash || no_progress || yielded_open_pr {
+                            //
+                            // #7708: a `no-usable-account` death is exempt
+                            // from BOTH arms — it neither arms the ladder (a
+                            // pool-wide fault is not the issue's fault, and a
+                            // per-issue ladder cannot damp it) nor clears it
+                            // (this dispatch proved nothing about the issue,
+                            // so an already-armed window must survive). The
+                            // host-level pool hold is armed instead; see the
+                            // sibling carve-out in the crashed branch above.
+                            if pool_dead {
+                                crate::work_finder::pool_preflight::note_pool_dead(
+                                    &self.config.workspace_root,
+                                );
+                            } else if insta_crash || no_progress || yielded_open_pr {
                                 self.record_dispatch_failure(issue);
                             } else {
                                 self.clear_dispatch_backoff(issue);
