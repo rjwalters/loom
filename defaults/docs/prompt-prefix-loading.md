@@ -202,7 +202,7 @@ from the A/B counter, and `loom:sweep-wave-lifecycle` absent from the C one.
 
 ## 7. Regression guard
 
-`loom-daemon/src/sweep_registry/dispatch/tests.rs` →
+`loom-daemon/src/sweep_registry/dispatch/prompt_shape_tests.rs` →
 `dispatch_prompt_is_a_bare_slash_command_reference` pins the finding on the
 Loom side: the `-p` argv token must be exactly
 `/loom:sweep <N> --claim-owned <N>` (or `/loom:sweep --prs …`), short, and
