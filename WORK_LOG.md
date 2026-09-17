@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-17
+- **PR #7988**: fix(worktree_reaper): clear stuck-removal record on every Skip* route
+- **Issue #7939** (closed): worktree_reaper: a stuck-removal record never clears when a Skip* decision makes the worktree ineligible
+- **PR #7985**: fix(champion): make the epic un-park read fail open on both unknown inputs
+- **Issue #7965** (closed): champion-epic: OPERATOR_RULED's actor-blind read depends on an unwritten cross-file invariant
+- **PR #7984**: fix(role_runner): admit an unpinned codex role via a CLI-default model pass-through
+- **Issue #7894** (closed): role_runner: an unpinned codex `runtimes.roles` binding resolves the default `sonnet` and skips forever (ModelRuntimeMismatch) — resolve a runtime-appropriate default or support a 'CLI default' pin
 - **Issue #7954** (closed): version-check-gate.sh still prints Fix: ./scripts/version.sh bump patch, the hand-bump #7743 forbids
 - **PR #7975**: fix(version-check-gate): stop recommending the #7743-forbidden hand-bump
 - **Issue #7957** (closed): bug(sweep-lease-fence): empty repo_args[@] is an unbound variable under bash 3.2, so the pre-push fence fails open whenever --repo is omitted
