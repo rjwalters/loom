@@ -157,6 +157,66 @@ pub struct StatsSummary {
     pub quality_data_available: bool,
 }
 
+/// Detect and repair a stale pre-#6150 `agent_effectiveness` view shape.
+///
+/// `resource_rows`/`quality_rows` were added to the `agent_effectiveness`
+/// view's `SELECT` list in #6150, but the view is (re)created with `CREATE
+/// VIEW IF NOT EXISTS` below — a no-op when a view of that name already
+/// exists. Unlike the `ALTER TABLE ADD COLUMN` migration pattern used for
+/// tables elsewhere (`schema.rs`'s `migrate_token_usage_table` /
+/// `migrate_quality_metrics_table`), SQLite has no `ALTER VIEW`, so any
+/// `activity.db` created before #6150 keeps the old view shape forever and
+/// `query_agent_effectiveness` crashes with "no such column: resource_rows"
+/// (#8061).
+///
+/// This mirrors that table-migration pattern for views: detect the stale
+/// shape via `PRAGMA table_info` (works for views too) and `DROP VIEW` so the
+/// `CREATE VIEW IF NOT EXISTS` immediately below can recreate it with the
+/// current columns. Idempotent — a view already on the current shape (or a
+/// database where the view doesn't exist yet) is left untouched, so this
+/// does not re-migrate on every startup.
+fn migrate_agent_effectiveness_view(conn: &Connection) {
+    let columns: Vec<String> = match conn.prepare("PRAGMA table_info(agent_effectiveness)") {
+        Ok(mut stmt) => {
+            let result = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .and_then(Iterator::collect);
+            match result {
+                Ok(cols) => cols,
+                Err(e) => {
+                    log::debug!(
+                        "Could not inspect agent_effectiveness view columns: {e} (may be expected)"
+                    );
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            log::debug!("Could not prepare PRAGMA table_info(agent_effectiveness): {e}");
+            return;
+        }
+    };
+
+    if columns.is_empty() {
+        // View doesn't exist yet (fresh database) — the CREATE VIEW IF NOT
+        // EXISTS below will create it with the current shape. Nothing to
+        // migrate.
+        return;
+    }
+
+    if columns.iter().any(|c| c == "resource_rows") {
+        // Already the current shape — idempotent no-op.
+        return;
+    }
+
+    log::info!(
+        "Detected stale pre-#6150 agent_effectiveness view shape (missing resource_rows); dropping so it can be recreated"
+    );
+    if let Err(e) = conn.execute_batch("DROP VIEW IF EXISTS agent_effectiveness;") {
+        log::warn!("Could not drop stale agent_effectiveness view: {e}");
+    }
+}
+
 /// Create the SQL views for agent effectiveness metrics.
 ///
 /// This function creates the following views:
@@ -167,6 +227,10 @@ pub struct StatsSummary {
 /// Views use LEFT JOINs to handle cases where correlation tables
 /// may not have data for all prompts (e.g., prompts without GitHub links).
 pub fn create_stats_views(conn: &Connection) -> rusqlite::Result<()> {
+    // Migrate a stale pre-#6150 agent_effectiveness view shape before
+    // (re)creating it below — see `migrate_agent_effectiveness_view` (#8061).
+    migrate_agent_effectiveness_view(conn);
+
     // Agent effectiveness view
     // Joins agent_inputs with quality_metrics and resource_usage to compute
     // success rates, average costs, and durations per agent role.
@@ -915,6 +979,109 @@ mod tests {
         let _: Vec<AgentEffectiveness> = query_agent_effectiveness(&conn, None)?;
         let _: Vec<CostPerIssue> = query_cost_per_issue(&conn, None)?;
         let _: Vec<DailyVelocity> = query_daily_velocity(&conn, None, None)?;
+
+        Ok(())
+    }
+
+    /// Regression test for #8061: `loom-daemon stats` crashed with "no such
+    /// column: resource_rows" against any `activity.db` created before
+    /// #6150, because `CREATE VIEW IF NOT EXISTS` is a no-op when a view of
+    /// that name already exists and never migrates its shape.
+    ///
+    /// This builds a fixture with the exact pre-#6150 `agent_effectiveness`
+    /// view SQL (see `git show 8e2f3010^:loom-daemon/src/activity/stats.rs`),
+    /// then exercises the migration path via `query_agent_effectiveness` and
+    /// confirms it succeeds and returns the same shape as a freshly created
+    /// database would.
+    #[test]
+    fn test_migrate_stale_agent_effectiveness_view() -> rusqlite::Result<()> {
+        let (conn, _temp_dir) = setup_test_db()?;
+
+        // Simulate a pre-#6150 database: create the OLD view shape (no
+        // resource_rows/quality_rows columns) directly, bypassing
+        // create_stats_views entirely.
+        conn.execute_batch(
+            r"
+            CREATE VIEW agent_effectiveness AS
+            SELECT
+                COALESCE(i.agent_role, 'unknown') as agent_role,
+                COUNT(*) as total_prompts,
+                SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) as successful_prompts,
+                ROUND(100.0 * SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) as success_rate,
+                ROUND(COALESCE(AVG(r.cost_usd), 0.0), 4) as avg_cost,
+                ROUND(COALESCE(AVG(r.duration_ms / 1000.0), 0.0), 1) as avg_duration_sec
+            FROM agent_inputs i
+            LEFT JOIN quality_metrics q ON i.id = q.input_id
+            LEFT JOIN resource_usage r ON i.id = r.input_id
+            GROUP BY COALESCE(i.agent_role, 'unknown');
+            ",
+        )?;
+
+        // Sanity check: the fixture really does reproduce the pre-fix crash
+        // shape (missing resource_rows).
+        let has_resource_rows_before = conn
+            .prepare("SELECT resource_rows FROM agent_effectiveness LIMIT 0")
+            .is_ok();
+        assert!(
+            !has_resource_rows_before,
+            "fixture should start with the stale pre-#6150 view shape"
+        );
+
+        // Insert a row so the query has something to aggregate.
+        conn.execute(
+            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
+              VALUES ('t1', datetime('now'), 'manual', 'test', 'builder', '{}')",
+            [],
+        )?;
+
+        // This must NOT error — it was the crash scenario in #8061.
+        let effectiveness = query_agent_effectiveness(&conn, None)?;
+        assert_eq!(effectiveness.len(), 1);
+        assert_eq!(effectiveness[0].agent_role, "builder");
+        assert_eq!(effectiveness[0].total_prompts, 1);
+        // No resource_usage/quality_metrics rows were inserted, so both
+        // availability flags should be false — same shape a freshly created
+        // database would report for this data.
+        assert!(!effectiveness[0].cost_data_available);
+        assert!(!effectiveness[0].quality_data_available);
+
+        // The view should now have been migrated to the current shape.
+        let has_resource_rows_after = conn
+            .prepare("SELECT resource_rows, quality_rows FROM agent_effectiveness LIMIT 0")
+            .is_ok();
+        assert!(
+            has_resource_rows_after,
+            "view should be migrated to the current shape after querying"
+        );
+
+        Ok(())
+    }
+
+    /// Edge case from #8061's acceptance criteria: a view already on the
+    /// current shape must not be re-migrated (dropped/recreated) on every
+    /// call — `migrate_agent_effectiveness_view` must be idempotent.
+    #[test]
+    fn test_migrate_agent_effectiveness_view_idempotent() -> rusqlite::Result<()> {
+        let (conn, _temp_dir) = setup_test_db()?;
+        create_stats_views(&conn)?;
+
+        // Record the view's rowid in sqlite_master before a second call —
+        // if the view were dropped and recreated, this identity would still
+        // hold (SQLite doesn't version rowids meaningfully here), so instead
+        // assert on behavior: calling create_stats_views (which internally
+        // calls the migration check) repeatedly must not error and must
+        // preserve the current shape.
+        migrate_agent_effectiveness_view(&conn);
+        migrate_agent_effectiveness_view(&conn);
+        create_stats_views(&conn)?;
+
+        let has_resource_rows = conn
+            .prepare("SELECT resource_rows, quality_rows FROM agent_effectiveness LIMIT 0")
+            .is_ok();
+        assert!(has_resource_rows, "view should remain on the current shape");
+
+        // Querying should still succeed after repeated migration checks.
+        let _: Vec<AgentEffectiveness> = query_agent_effectiveness(&conn, None)?;
 
         Ok(())
     }
