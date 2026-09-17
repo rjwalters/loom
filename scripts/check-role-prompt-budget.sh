@@ -111,6 +111,19 @@
 # baseline. Goal values are preserved across --update; only budgets are
 # recomputed.
 #
+# A UNIFORM delta across every role means a SHARED file moved, not a prompt.
+# Unlike its per-file siblings (check-file-size-budget.sh,
+# check-markdown-token-budget.sh), this budget is a whole-tree measurement:
+# it sums both CLAUDE.md files and every always-loaded sibling, which a given
+# PR does not necessarily own. A baseline recorded on a branch is therefore
+# invalidated by ANY concurrent merge touching one of those shared files, even
+# though the branch's own CI run was honest about the tree it measured. That
+# is what took `main` red at 304cccb7 (#8095): the baseline was generated on a
+# branch whose CLAUDE.md was 111 bytes smaller than the one it squash-merged
+# onto, so all 12 roles read exactly +28. When the reported delta is identical
+# for every role, re-run --update against current `main` and say so in the PR
+# description; do not hunt for a per-role cause, there isn't one.
+#
 # Exit codes: 0 = every role within budget; 1 = a role is over budget, or
 # coverage is broken; 2 = bad args.
 
@@ -129,7 +142,7 @@ while [[ $# -gt 0 ]]; do
     --self-test) MODE="self-test"; shift ;;
     --role)      ONLY_ROLE="${2:?--role needs a value}"; shift 2 ;;
     --threshold) THRESHOLD="${2:?--threshold needs a value}"; shift 2 ;;
-    --help|-h)   sed -n '2,115p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h)   sed -n '2,129p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           echo "check-role-prompt-budget: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -303,9 +316,9 @@ write_budgets() {
 # estimator against check-markdown-token-budget.sh on the REAL tree, so the
 # two gates cannot drift onto different estimators.
 self_test() {
-  local tmp rc=0 out S
+  local tmp rc=0 out S real=""
   tmp="$(mktemp -d)"
-  trap 'cleanup_self_test "$tmp"' RETURN
+  trap 'cleanup_self_test "$tmp"; cleanup_self_test "$real"' RETURN
 
   mkdir -p "$tmp/scripts" "$tmp/defaults/.claude/commands/loom" \
     "$tmp/defaults/roles" "$tmp/defaults/.loom"
@@ -470,6 +483,56 @@ self_test() {
     echo "  skip check-markdown-token-budget.sh parity (peer script not present)"
   fi
 
+  # --- Real-tree round trip (#8095) -------------------------------------
+  # Everything above runs on three synthetic roles. This runs the SAME
+  # generator and checker over the REAL tree's roles and resolved file sets:
+  # --update, then check, must exit 0. Generator and checker share
+  # role_total(), so this cannot drift today -- it is the tripwire for a
+  # future refactor that splits them, which is the mechanism #8095 was first
+  # hypothesised to be before the cause was measured.
+  #
+  # It operates on a MIRROR under mktemp, never on the repo: --update rewrites
+  # scripts/role-prompt-budget.txt, and a self-test must not dirty the tree
+  # (nor compare against the committed baseline, which a concurrent merge can
+  # legitimately stale -- see the header).
+  real="$(mktemp -d)"
+  mkdir -p "$real/scripts" "$real/$CMD_DIR" "$real/defaults/roles" "$real/defaults/.loom"
+  cp "$ROOT/CLAUDE.md" "$real/CLAUDE.md"
+  cp "$ROOT/defaults/.loom/CLAUDE.md" "$real/defaults/.loom/CLAUDE.md"
+  cp "$ROOT/$CMD_DIR"/*.md "$real/$CMD_DIR/"
+  cp "$ROOT"/defaults/roles/*.json "$real/defaults/roles/"
+  cp "${BASH_SOURCE[0]}" "$real/scripts/check-role-prompt-budget.sh"
+  chmod +x "$real/scripts/check-role-prompt-budget.sh"
+  git -C "$real" init -q
+  git -C "$real" config user.email t@t.test
+  git -C "$real" config user.name t
+  git -C "$real" add -A >/dev/null
+
+  local R nreal failout
+  R="$real/scripts/check-role-prompt-budget.sh"
+  failout="$real/fail.txt"
+  nreal="$(discover_roles | wc -l | tr -d '[:space:]')"
+
+  out="$( (cd "$real" && $R --list) | awk 'NR > 1 && NF' | wc -l | tr -d '[:space:]')"
+  _expect "mirror resolves the same role set as the real tree" "$nreal" "$out"
+
+  (cd "$real" && $R --update >/dev/null)
+  (cd "$real" && $R >/dev/null 2>&1) && out=0 || out=$?
+  _expect "real tree passes the budget it just generated (round trip)" "0" "$out"
+
+  # A SHARED_PREFIX file is charged to every role identically. 120 bytes on
+  # CLAUDE.md is exactly 30 estimated tokens (120/4, no rounding slack), so
+  # every discovered role must report +30 -- the mechanism behind #8095's
+  # uniform +28. Pinned here so that dropping CLAUDE.md from SHARED_PREFIX, or
+  # charging it to only some roles, has to be a deliberate, visible change.
+  head -c 120 /dev/zero | tr '\0' 'x' >> "$real/CLAUDE.md"
+  (cd "$real" && $R >/dev/null 2>"$failout") && out=0 || out=$?
+  _expect "shared-prefix growth fails the check" "1" "$out"
+  out="$(sed -n 's/.*(+\([0-9]\{1,\}\))$/\1/p' "$failout" | LC_ALL=C sort -u | tr '\n' ',')"
+  _expect "every over-budget role reports the SAME delta" "30," "$out"
+  out="$(grep -c '(+30)' "$failout" || true)"
+  _expect "shared-prefix growth is charged to ALL roles, not some" "$nreal" "$out"
+
   if [[ $rc -eq 0 ]]; then
     echo "check-role-prompt-budget --self-test: all checks passed."
   else
@@ -480,6 +543,7 @@ self_test() {
 
 # Separated so the trap above never expands a bare variable into a delete.
 cleanup_self_test() {
+  [[ -n "${1:-}" ]] || return 0
   case "$1" in
     /tmp/*|/var/folders/*|/private/var/folders/*) rm -rf -- "$1" ;;
     *) echo "self-test: refusing to clean unexpected temp path '$1'" >&2 ;;
