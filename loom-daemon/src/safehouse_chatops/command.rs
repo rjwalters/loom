@@ -99,6 +99,33 @@ impl Command {
     /// `cancel` is the one verb that destroys in-flight work that cannot be
     /// recovered by re-running it. Adding a second gated verb later is a single
     /// arm here — deliberately the only place destructiveness is decided.
+    ///
+    /// # Re-affirmed for `dispatch` (#8021)
+    ///
+    /// `dispatch` is the only forge-mutating verb and the only one that spends
+    /// (tokens, shared forge API budget, label churn on a real issue), so
+    /// "gate the money verb too" was reconsidered explicitly and **declined**:
+    ///
+    /// - The nonce is **not a second authentication factor.** It is minted by
+    ///   the daemon and delivered into the same room, to the same sender, over
+    ///   the same channel — whoever can send as an allowlisted sender can also
+    ///   read the reply and echo it back. It defends against *accident and
+    ///   replay*, never against a compromised sender. Spend protection is not
+    ///   something it can provide.
+    /// - Gating the *common* verb is what breaks the gate on the *dangerous*
+    ///   one. A confirm round-trip on every routine `dispatch` trains a reflex,
+    ///   and a reflexive `confirm` is worse than no confirm at all for `cancel`.
+    /// - A spurious dispatch is bounded and reversible: never `force`, subject
+    ///   to the daemon's ordinary concurrency caps / noop cooldown / dispatch
+    ///   backoff, narrated into the room, and cancellable (with a nonce).
+    /// - ChatOps rides the daemon's own IPC, so it grants **reach, not
+    ///   capability** — `dispatch` is ungated over IPC too. A second factor at
+    ///   only one of two surfaces advertises a protection that does not exist.
+    ///
+    /// Revisit if `dispatch` ever gains `force`, or if a verb arrives whose
+    /// spend is unbounded per message (e.g. a multi-issue dispatch). Rationale
+    /// of record: `defaults/docs/safehouse.md` § "Why `dispatch` is not
+    /// nonce-gated".
     #[must_use]
     pub const fn requires_confirmation(&self) -> bool {
         matches!(self, Self::Cancel { .. })

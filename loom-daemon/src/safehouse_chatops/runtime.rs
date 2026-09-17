@@ -342,7 +342,11 @@ pub async fn run(
                 continue;
             }
             let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-                continue; // malformed line — fail open, skip
+                // Malformed line — dropped, which is fail *closed*: a line we
+                // cannot parse never reaches the router, so it can never be
+                // executed. The connection stays up (one bad line is not a
+                // reason to stop reading the room).
+                continue;
             };
             if value.get("event").is_none() {
                 continue; // a reply echo to one of our own sends

@@ -13,8 +13,8 @@ use super::command::{Command, ParseError};
 use super::nonce::{ConfirmOutcome, PendingConfirmations};
 use super::runtime::{command_to_request, render_response};
 use super::{
-    config_from_value, inbound_command, ChatOpsConfig, ChatOpsRouter, Decision, Refusal,
-    DEFAULT_CONFIRM_TTL,
+    apply_env_overrides, config_from_value, inbound_command, ChatOpsConfig, ChatOpsRouter,
+    Decision, Refusal, DEFAULT_CONFIRM_TTL,
 };
 use crate::event_bus::EventBus;
 use crate::types::{Event, Request, Response, SweepKind};
@@ -549,6 +549,182 @@ fn malformed_allowlist_entries_are_dropped() {
     let resolved = config_from_value(Some(&block)).expect("one good entry remains");
     assert_eq!(resolved.allowed_senders.len(), 1);
     assert!(resolved.allows(ROBB));
+    // NOTE: this test leaves one *good* entry, so it never reaches the
+    // empty-allowlist path. The fail-closed gate on that path is covered by
+    // the two tests below (#8021) — do not read this one as covering it.
+}
+
+// ============================================================================
+// Config: an empty allowlist is deny-all (fail-closed gate, #8021)
+// ============================================================================
+//
+// The gate is `apply_env_overrides`'s `allowed_senders.is_empty() ⇒ None`.
+// Before #8021 it was deletable with zero test failures: `config_from_value`
+// (the only function the config tests called) is the *inner* layer and happily
+// returns an empty allowlist, while the outer resolution is what refuses to
+// produce a config at all. These tests fail if that early return is removed.
+
+/// Clear every `LOOM_SAFEHOUSE_CHATOPS_*` override and disable the
+/// machine-level private-defaults config tier, so a resolution assertion sees
+/// only the fixture.
+///
+/// Per `lib.rs` § "Do not depend on a var being *absent*": any agent session
+/// spawned by a running daemon exports a pile of `LOOM_*` vars, so an
+/// env-sensitive test must clear them itself rather than assume they are unset.
+fn clear_chatops_env() {
+    for key in [
+        super::CHATOPS_ENABLED_ENV,
+        super::CHATOPS_SENDERS_ENV,
+        super::CHATOPS_ROOM_ENV,
+        super::CHATOPS_CONFIRM_TTL_ENV,
+    ] {
+        std::env::remove_var(key);
+    }
+    // An ambient `LOOM_CONFIG_DEFAULTS_FILE` would merge a real host's
+    // `safehouse` block underneath the fixture; empty disables the tier.
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+}
+
+fn restore_chatops_env() {
+    std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+}
+
+#[test]
+#[serial_test::serial]
+fn an_empty_allowlist_resolves_to_no_config_at_all() {
+    clear_chatops_env();
+    // The inner layer does produce a config with an empty allowlist — which is
+    // exactly why the outer gate has to exist.
+    let enabled_but_empty = json!({ "enabled": true, "allowedSenders": [] });
+    let inner = config_from_value(Some(&enabled_but_empty)).expect("inner layer yields a config");
+    assert!(inner.allowed_senders.is_empty());
+
+    // The resolution the daemon actually runs refuses it: no config ⇒ no
+    // router, no task, no socket, no subscription.
+    assert!(
+        apply_env_overrides(Some(inner)).is_none(),
+        "an enabled block with an empty allowedSenders must resolve to None (deny-all), \
+         not to an accepts-nobody config that reports as enabled"
+    );
+
+    // Same for a list whose every entry is unusable — an allowlist that can
+    // never match is not an allowlist.
+    let all_malformed = json!({
+        "enabled": true,
+        "allowedSenders": ["loom_daemon", "robb", "", "  "]
+    });
+    assert!(
+        apply_env_overrides(config_from_value(Some(&all_malformed))).is_none(),
+        "a block whose every allowedSenders entry is malformed must resolve to None"
+    );
+    restore_chatops_env();
+}
+
+#[test]
+#[serial_test::serial]
+fn an_empty_allowlist_survives_the_whole_resolution_path() {
+    // End-to-end through the public entry point the runtime calls, so the gate
+    // is verified where the spawn decision is actually made.
+    fn write_chatops_config(root: &std::path::Path, chatops: &serde_json::Value) {
+        let dir = root.join(".loom");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = json!({ "safehouse": { "enabled": true, "chatops": chatops } });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    }
+
+    clear_chatops_env();
+    let empty = tempfile::tempdir().unwrap();
+    write_chatops_config(empty.path(), &json!({ "enabled": true, "allowedSenders": [] }));
+    assert!(
+        super::resolve_chatops_config(empty.path()).is_none(),
+        "enabled: true with an empty allowedSenders must spawn nothing"
+    );
+
+    // Positive control: the same fixture with one usable sender *does* resolve,
+    // so the `None` above is the gate and not a broken fixture.
+    let ok = tempfile::tempdir().unwrap();
+    write_chatops_config(ok.path(), &json!({ "enabled": true, "allowedSenders": [ROBB] }));
+    let resolved = super::resolve_chatops_config(ok.path()).expect("one usable sender ⇒ on");
+    assert!(resolved.allows(ROBB));
+    restore_chatops_env();
+}
+
+#[test]
+fn a_router_built_with_an_empty_allowlist_accepts_nobody() {
+    // The second, independent layer: even if a config with an empty allowlist
+    // were ever constructed (it cannot be, per the test above), every sender is
+    // refused — `BTreeSet::contains` on an empty set is always false, and the
+    // allowlist is never treated as "empty means unrestricted".
+    let router = ChatOpsRouter::new(
+        ChatOpsConfig {
+            allowed_senders: std::collections::BTreeSet::new(),
+            room: None,
+            confirm_ttl: DEFAULT_CONFIRM_TTL,
+        },
+        PERSONA.to_owned(),
+        None,
+    );
+    for sender in [ROBB, MALLORY, "@anyone:example.org"] {
+        match router.handle(sender, "status") {
+            Decision::Refuse {
+                refusal: Refusal::NotAllowlisted { .. },
+            } => {}
+            other => panic!("empty allowlist accepted {sender}: {other:?}"),
+        }
+    }
+}
+
+// ============================================================================
+// Config: `enabled` is parsed strictly (#8021)
+// ============================================================================
+
+#[test]
+fn a_non_boolean_enabled_fails_closed() {
+    // `"enabled": "false"` (the JSON string, not the literal) is a realistic
+    // hand-edit typo. Reading it as "not a bool ⇒ use the default" would
+    // silently switch an inbound control channel ON.
+    for bad in [
+        json!("false"),
+        json!("true"),
+        json!("yes"),
+        json!(1),
+        json!(0),
+        json!(null),
+        json!([true]),
+        json!({ "enabled": true }),
+    ] {
+        let block = json!({ "enabled": bad, "allowedSenders": [ROBB] });
+        assert!(
+            config_from_value(Some(&block)).is_none(),
+            "a non-boolean `enabled` ({bad}) must fail closed"
+        );
+    }
+    // The literal still means what it says, and an omitted key is still the
+    // block-presence opt-in.
+    assert!(config_from_value(Some(&json!({
+        "enabled": true,
+        "allowedSenders": [ROBB]
+    })))
+    .is_some());
+    assert!(config_from_value(Some(&json!({ "allowedSenders": [ROBB] }))).is_some());
+}
+
+#[test]
+#[serial_test::serial]
+fn a_non_boolean_enabled_env_override_fails_closed() {
+    // Same knob, env layer: a typo'd override must not leave an operator who
+    // tried to switch steering off with it still on.
+    clear_chatops_env();
+    let block = json!({ "enabled": true, "allowedSenders": [ROBB] });
+    std::env::set_var(super::CHATOPS_ENABLED_ENV, "flase");
+    let resolved = apply_env_overrides(config_from_value(Some(&block)));
+    std::env::remove_var(super::CHATOPS_ENABLED_ENV);
+    restore_chatops_env();
+    assert!(
+        resolved.is_none(),
+        "an unparseable {} must be read as false, not as unset",
+        super::CHATOPS_ENABLED_ENV
+    );
 }
 
 #[test]

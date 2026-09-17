@@ -146,14 +146,26 @@ pub fn resolve_chatops_config(repo_root: &Path) -> Option<ChatOpsConfig> {
 #[must_use]
 fn config_from_value(block: Option<&Value>) -> Option<ChatOpsConfig> {
     let block = block.and_then(Value::as_object)?;
-    if !block
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-    {
+    // `enabled` is parsed **strictly** (#8021): absent ⇒ on (the block's
+    // presence is the opt-in), literal `true` ⇒ on, literal `false` ⇒ off, and
+    // anything that is not a JSON boolean ⇒ **off, with a warning**. A
+    // hand-edited `"enabled": "false"` — the JSON *string*, not the literal —
+    // is a realistic typo, and reading it as "not a bool, so use the default"
+    // would silently switch an inbound control channel on. A value this
+    // function cannot understand is never taken as consent.
+    match block.get("enabled") {
+        None | Some(Value::Bool(true)) => {}
         // Present but explicitly disabled — off, and deliberately not a warning:
         // an operator who wrote `"enabled": false` knows.
-        return None;
+        Some(Value::Bool(false)) => return None,
+        Some(other) => {
+            log::warn!(
+                "safehouse chatops: `enabled` must be a JSON boolean, got {} — \
+                 treating it as false; inbound steering stays OFF",
+                value_kind(other)
+            );
+            return None;
+        }
     }
     let allowed_senders = block
         .get("allowedSenders")
@@ -191,7 +203,7 @@ fn config_from_value(block: Option<&Value>) -> Option<ChatOpsConfig> {
 #[must_use]
 fn apply_env_overrides(config: Option<ChatOpsConfig>) -> Option<ChatOpsConfig> {
     let env_senders = env_nonempty(CHATOPS_SENDERS_ENV);
-    let env_enabled = env_bool(CHATOPS_ENABLED_ENV);
+    let env_enabled = env_enabled_override();
     let mut config = match config {
         Some(config) => config,
         // No config block: only an explicit env opt-in brings it into existence.
@@ -219,6 +231,16 @@ fn apply_env_overrides(config: Option<ChatOpsConfig>) -> Option<ChatOpsConfig> {
     {
         config.confirm_ttl = clamp_ttl(secs);
     }
+    // **Load-bearing, not defensive.** An empty allowlist is deny-all, and this
+    // early return is the layer that makes it *structurally* so: with no config
+    // there is no router, no task, no socket and no subscription. Deleting it
+    // would leave only `BTreeSet::contains` (always false on an empty set)
+    // standing between an enabled block and an accept-nobody config that still
+    // reports as enabled in `status` — i.e. one refactor away from the classic
+    // empty-list-means-permissive bug. Covered by
+    // `tests::an_empty_allowlist_resolves_to_no_config_at_all` and
+    // `tests::an_empty_allowlist_survives_the_whole_resolution_path` (#8021);
+    // both fail if this returns `Some`.
     if config.allowed_senders.is_empty() {
         log::warn!(
             "safehouse chatops: configured but no usable entry in allowedSenders \
@@ -268,11 +290,43 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn env_bool(key: &str) -> Option<bool> {
-    match env_nonempty(key)?.to_ascii_lowercase().as_str() {
+/// The `LOOM_SAFEHOUSE_CHATOPS_ENABLED` override, parsed with the same strict
+/// rule [`config_from_value`] applies to the config key: `None` ⇒ unset (defer
+/// to the config layer), and a value present but not a recognized boolean word
+/// ⇒ `Some(false)`, **not** "unset" (#8021). Ignoring a typo'd `off` would leave
+/// an operator who tried to switch inbound steering off with it still on.
+fn env_enabled_override() -> Option<bool> {
+    let raw = env_nonempty(CHATOPS_ENABLED_ENV)?;
+    Some(parse_bool_word(&raw).unwrap_or_else(|| {
+        log::warn!(
+            "safehouse chatops: {CHATOPS_ENABLED_ENV} is not a boolean \
+             (expected one of 1/true/yes/on/0/false/no/off) — treating it as false; \
+             inbound steering stays OFF"
+        );
+        false
+    }))
+}
+
+/// `None` ⇒ not a recognized boolean word. Pure, so the strict/lenient decision
+/// lives at the call site rather than inside the parse.
+fn parse_bool_word(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+/// The JSON type of `value`, for a warning that must not echo a config blob
+/// (or an unbounded string) into the log.
+const fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
