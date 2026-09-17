@@ -3,6 +3,8 @@
 
 use super::*;
 
+pub(crate) mod pid_identity;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -623,7 +625,9 @@ impl SweepRegistry {
     /// [`reap_once`](Self::reap_once) tick, so no caller ever blocks on a grace
     /// window while holding the registry mutex. A no-op (returning `false`) when
     /// the group is already empty — the overwhelmingly common case, where the
-    /// leader's death took its whole tree with it.
+    /// leader's death took its whole tree with it — and, since #7935, when the
+    /// group id has demonstrably been recycled onto a stranger (see
+    /// [`pid_identity::pgid_number_was_recycled`]).
     pub(crate) fn reap_orphaned_group(
         &mut self,
         sweep_id: &str,
@@ -634,6 +638,21 @@ impl SweepRegistry {
             log::error!(
                 "reap_orphaned_group: refusing to signal process group {pgid} for sweep \
                  {sweep_id} — it is zero or THIS process's own group (#4980)"
+            );
+            return false;
+        }
+        // Issue #7935. The recorded pgid is always the dead leader's own pid, so
+        // a LIVE process wearing that number means the kernel reallocated it —
+        // which it can only do once the group had no members left. The group
+        // that answers to this number now is somebody else's, and signalling it
+        // would kill an innocent tree. This became reachable the moment
+        // `poll_liveness` started reporting recycled pids as dead.
+        if pid_identity::pgid_number_was_recycled(pgid) {
+            log::error!(
+                "reap_orphaned_group: refusing to signal process group {pgid} for sweep \
+                 {sweep_id} — a live process currently OWNS pid {pgid}, so this group id was \
+                 recycled after the sweep's own group drained. The members it names today are \
+                 an unrelated process tree (#7935)."
             );
             return false;
         }
@@ -694,13 +713,28 @@ impl SweepRegistry {
     /// Determine whether a sweep's child has terminated, reaping it when it
     /// has. Prefers the retained `Child` handle: `try_wait()` reaps an exited
     /// child (no zombie) and yields the real exit status. Falls back to the
-    /// `kill(pid, 0)` liveness probe for reconstructed entries with no handle.
+    /// **identity-paired** liveness probe ([`pid_identity::tracked_pid_alive`])
+    /// for reconstructed entries with no handle.
+    ///
+    /// Issue #7935: that fallback used to be a bare `kill(pid, 0)`, which knows
+    /// nothing about *which* process wears the pid number today. A leader that
+    /// died while no daemon was running — a crash, a restart, an `auto_update`
+    /// roll — can have its pid recycled onto an unrelated process before the
+    /// next daemon starts, and the bare probe then reports "alive" forever:
+    /// the entry never goes terminal, `restart --drain` never drains, and
+    /// [`reap_orphaned_group`](Self::reap_orphaned_group) (which only ever
+    /// fires at the terminal transition) never runs for the real leader.
+    /// Pairing the pid with the tracked process's start time — compared against
+    /// this entry's own `started_at` — makes a recycled pid read as dead. The
+    /// probe is fail-safe in the #4691 direction: an underivable start time
+    /// leaves the pre-#7935 verdict untouched.
     ///
     /// Returns `(is_dead, exit_code)`. On a handle-observed exit the handle is
     /// removed from `self.children`; `exit_code` is `None` when the child was
     /// terminated by a signal (no clean code) or when liveness came from the
     /// fallback probe.
     pub(crate) fn poll_liveness(&mut self, sweep_id: &str, pid: u32) -> (bool, Option<i32>) {
+        let started_at = self.entries.get(sweep_id).map(|info| info.started_at);
         if let Some(child) = self.children.get_mut(sweep_id) {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -711,7 +745,7 @@ impl SweepRegistry {
                 Ok(None) => (false, None),
                 Err(e) => {
                     log::warn!("sweep_registry: try_wait for {sweep_id} (pid {pid}) failed: {e}");
-                    let dead = !is_pid_alive(pid);
+                    let dead = !pid_identity::tracked_pid_alive(pid, started_at);
                     if dead {
                         self.children.remove(sweep_id);
                     }
@@ -719,7 +753,7 @@ impl SweepRegistry {
                 }
             }
         } else {
-            (!is_pid_alive(pid), None)
+            (!pid_identity::tracked_pid_alive(pid, started_at), None)
         }
     }
 

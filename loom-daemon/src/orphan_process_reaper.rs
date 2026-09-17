@@ -286,7 +286,7 @@ fn uptime_secs() -> Option<f64> {
 /// `sysconf(_SC_CLK_TCK)` — the `starttime` unit. Falls back to the near-universal
 /// Linux value of 100 if the query fails.
 #[cfg(target_os = "linux")]
-fn clock_ticks_per_sec() -> f64 {
+pub(crate) fn clock_ticks_per_sec() -> f64 {
     // SAFETY: `sysconf` is a read-only query with no memory arguments.
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if ticks > 0 {
