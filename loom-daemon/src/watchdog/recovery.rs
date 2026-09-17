@@ -184,6 +184,81 @@ pub fn decide(state: &State, limits: &Limits, now: u64) -> Decision {
     Decision::Attempt { attempt: next }
 }
 
+/// The only flags a recovery restart will carry over from `.daemon.flags`.
+///
+/// **This allowlist is a security boundary, not tidiness.** The flags file
+/// lives on disk beside the pid file and records what the last start was
+/// invoked with, so a recovery restart preserves the operator's autonomy
+/// choices. Anything able to write that file could otherwise inject arbitrary
+/// arguments into a restart the watchdog performs unattended, on a timer, with
+/// the operator's privileges. Unrecognised lines are dropped silently and
+/// deliberately: refusing to recover because the file has an unexpected line
+/// would turn a stray write into a denial of service, and echoing the rejected
+/// token into the log would help an attacker tune it.
+pub const RECOVER_FLAG_ALLOWLIST: &[&str] = &[
+    "--from-config",
+    "--work-finder",
+    "--health-gate",
+    "--no-work-finder",
+    "--no-health-gate",
+];
+
+/// How a recovery restart will be invoked.
+pub enum Argv {
+    /// The command to run, plus the operator-facing rendering of it.
+    Run { argv: Vec<String>, detail: String },
+    /// Nothing to recover with. Carries the reason, which is reported.
+    Unavailable { detail: String },
+}
+
+/// Build the recovery command.
+///
+/// `cli_dir` is this script's own directory, and the sibling start script is
+/// invoked from there rather than found on `PATH`: the watchdog runs from a
+/// launchd/systemd timer with a minimal, non-login environment, and the
+/// recovery must relaunch the daemon from the SAME installed tree that
+/// provisioned this watchdog, not whatever happens to be first on a stray PATH.
+#[must_use]
+pub fn resolve_argv(override_cmd: Option<&str>, cli_dir: &Path, pid_file: Option<&Path>) -> Argv {
+    if let Some(raw) = override_cmd {
+        let argv: Vec<String> = raw.split_whitespace().map(str::to_string).collect();
+        if argv.is_empty() {
+            return Argv::Unavailable {
+                detail: "LOOM_WATCHDOG_RECOVER_CMD is set but contains no command".to_string(),
+            };
+        }
+        let detail = format!("LOOM_WATCHDOG_RECOVER_CMD override: {}", argv.join(" "));
+        return Argv::Run { argv, detail };
+    }
+
+    let start_script = cli_dir.join("loom-daemon-start.sh");
+    if !start_script.is_file() {
+        return Argv::Unavailable {
+            detail: format!(
+                "no readable loom-daemon-start.sh beside this watchdog ({}) — nothing to \
+                 recover with",
+                start_script.display()
+            ),
+        };
+    }
+
+    let mut argv = vec!["bash".to_string(), start_script.display().to_string()];
+    if let Some(flags_file) = pid_file
+        .and_then(Path::parent)
+        .map(|d| d.join(".daemon.flags"))
+    {
+        if let Ok(text) = std::fs::read_to_string(&flags_file) {
+            for line in text.lines() {
+                if RECOVER_FLAG_ALLOWLIST.contains(&line) {
+                    argv.push(line.to_string());
+                }
+            }
+        }
+    }
+    let detail = argv.join(" ");
+    Argv::Run { argv, detail }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +270,105 @@ mod tests {
             backoff_secs: 60,
             backoff_cap_secs: 1800,
         }
+    }
+
+    fn start_script_in(dir: &Path) {
+        std::fs::write(dir.join("loom-daemon-start.sh"), "#!/bin/sh\n").expect("script");
+    }
+
+    fn write_flags(dir: &Path, body: &str) -> std::path::PathBuf {
+        std::fs::write(dir.join(".daemon.flags"), body).expect("write flags");
+        dir.join(".daemon.pid")
+    }
+
+    fn argv_of(a: &Argv) -> Vec<String> {
+        match a {
+            Argv::Run { argv, .. } => argv.clone(),
+            Argv::Unavailable { detail } => panic!("expected Run, got Unavailable: {detail}"),
+        }
+    }
+
+    #[test]
+    fn only_allowlisted_flags_survive_the_flags_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        start_script_in(dir.path());
+        let pid = write_flags(dir.path(), "--from-config\n--work-finder\n--no-health-gate\n");
+        let got = argv_of(&resolve_argv(None, dir.path(), Some(&pid)));
+        assert_eq!(&got[2..], ["--from-config", "--work-finder", "--no-health-gate"]);
+    }
+
+    #[test]
+    fn an_injected_argument_is_dropped_silently() {
+        // The flags file sits on disk beside the pid file. Anything able to
+        // write it must not thereby be able to inject arguments into a restart
+        // the watchdog runs unattended, on a timer, with operator privileges.
+        let dir = tempfile::tempdir().expect("tempdir");
+        start_script_in(dir.path());
+        let injected = ["--exec=/bin/sh", "-c", "id"].join("\n");
+        let pid = write_flags(dir.path(), &format!("--from-config\n{injected}\n--work-finder\n"));
+        let got = argv_of(&resolve_argv(None, dir.path(), Some(&pid)));
+        assert_eq!(
+            &got[2..],
+            ["--from-config", "--work-finder"],
+            "only allowlisted flags may survive"
+        );
+        assert!(!got.iter().any(|a| a.contains("/bin/sh")), "{got:?}");
+    }
+
+    #[test]
+    fn an_embedded_literal_backslash_n_does_not_split_a_line() {
+        // Found by a broken test fixture: writing `a\\nb` as ONE line must not
+        // be read as two. If it were, an attacker could smuggle an allowlisted
+        // flag onto the same physical line as a payload and have both accepted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        start_script_in(dir.path());
+        let pid = write_flags(dir.path(), "--from-config\\n--work-finder\n");
+        let got = argv_of(&resolve_argv(None, dir.path(), Some(&pid)));
+        assert_eq!(got.len(), 2, "the whole line is one unrecognised token: {got:?}");
+    }
+
+    #[test]
+    fn a_flag_is_matched_whole_not_by_prefix() {
+        // `--from-config=<path>` must NOT pass merely because `--from-config`
+        // does; an `=`-suffixed variant is a different argument entirely.
+        let dir = tempfile::tempdir().expect("tempdir");
+        start_script_in(dir.path());
+        let pid = write_flags(dir.path(), "--from-config=/tmp/elsewhere\n--work-finderX\n");
+        let got = argv_of(&resolve_argv(None, dir.path(), Some(&pid)));
+        assert_eq!(got.len(), 2, "no flag should have survived: {got:?}");
+    }
+
+    #[test]
+    fn a_missing_start_script_means_nothing_to_recover_with() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        match resolve_argv(None, dir.path(), None) {
+            Argv::Unavailable { detail } => {
+                assert!(detail.contains("nothing to recover with"), "{detail}");
+            }
+            Argv::Run { argv, .. } => panic!("expected Unavailable, got {argv:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_override_is_unavailable_not_an_empty_command() {
+        match resolve_argv(Some("   "), Path::new("/nonexistent"), None) {
+            Argv::Unavailable { detail } => assert!(detail.contains("no command"), "{detail}"),
+            Argv::Run { argv, .. } => panic!("expected Unavailable, got {argv:?}"),
+        }
+    }
+
+    #[test]
+    fn the_override_bypasses_the_start_script_entirely() {
+        let a = resolve_argv(Some("systemctl --user restart loom"), Path::new("/nope"), None);
+        assert_eq!(argv_of(&a), ["systemctl", "--user", "restart", "loom"]);
+    }
+
+    #[test]
+    fn a_missing_flags_file_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        start_script_in(dir.path());
+        let got = argv_of(&resolve_argv(None, dir.path(), Some(&dir.path().join(".daemon.pid"))));
+        assert_eq!(got.len(), 2, "bash + the script, no flags");
     }
 
     #[test]

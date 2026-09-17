@@ -46,6 +46,7 @@ pub mod liveness;
 pub mod locate;
 pub mod marker;
 pub mod probe;
+pub mod probe_state;
 pub mod recovery;
 pub mod report;
 pub mod supervisor;
