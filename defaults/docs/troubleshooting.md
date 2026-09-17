@@ -2329,6 +2329,24 @@ explicit allowlist of resync-surface pathspecs (never `-A`), refuses to land if
 any unrelated dirt is present, and unconditionally excludes the two credential
 trees above even on a host whose `.gitignore` is stale.
 
+**If a credential path is already git-TRACKED, that same script stops instead
+(#8004).** Excluding it from one commit fixes nothing in that state: git applies
+no `.gitignore` rule to a path already in the index, so the credential stays
+committed and every other `git add -A` / `git add .loom` in the checkout keeps
+staging each freshly-minted token. The refusal names the remediation, which is
+the same by hand:
+
+```bash
+git rm --cached -r -- .loom/gh-config .loom/gh-config-by-owner   # untrack; files stay on disk
+loom-daemon update-gitignore                                     # restore the managed ignore block
+git commit -m 'chore: untrack GH_CONFIG_DIR credential trees'
+# then ROTATE the credential — it is in the repository's history and must be
+# assumed compromised (revoke/regenerate the GitHub App installation token).
+```
+
+To audit a host for the condition before it bites: `git ls-files | grep
+gh-config` in each managed checkout — any output at all is the tracked state.
+
 The staging worktree is a real, independent git checkout at the primary's current
 `HEAD` — not a bare file copy — so once the sync completes it is immediately a
 normal place to `git add`/`commit`/`push` from. `--dry-run` combined with
