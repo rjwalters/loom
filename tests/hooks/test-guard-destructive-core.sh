@@ -832,6 +832,100 @@ assert_deny_reason_matches "git read-tree deny states nothing was run (lossless 
     "git read-tree HEAD" \
     "Nothing has been run"
 
+# --- #7923: executable shell wrappers must NOT escape the index deny ---
+# Before #7923 the matcher was `(^|[;&|(`]|[[:space:]])git[[:space:]]+read-tree`
+# over COMMAND_NO_COMMENT. A single/double quote is not in that boundary class,
+# so every interpreter-wrapped form below ALLOWED a real index mutation. They
+# are now resolved structurally (index_mutation_unisolated()): the quoted
+# payload of an interpreter is shell SOURCE, not inert data.
+assert_deny "#7923: Deny bash -c wrapped git read-tree (single-quoted payload)" \
+    "bash -c 'git read-tree HEAD'"
+assert_deny "#7923: Deny sh -c wrapped git read-tree (double-quoted payload)" \
+    'sh -c "git read-tree HEAD"'
+assert_deny "#7923: Deny eval wrapped git read-tree" \
+    "eval 'git read-tree HEAD'"
+assert_deny "#7923: Deny zsh -c wrapped git read-tree" \
+    "zsh -c 'git read-tree HEAD'"
+assert_deny "#7923: Deny unquoted eval git read-tree (no wrapper quotes at all)" \
+    "eval git read-tree HEAD"
+assert_deny "#7923: Deny a wrapper chained after an inert issue-filing command" \
+    "gh issue create --body 'x' ; bash -c 'git read-tree HEAD'"
+assert_deny "#7923: Deny bash -c whose payload chains cd before the mutation" \
+    'bash -c "cd /tmp && git read-tree HEAD"'
+assert_deny "#7923: Deny a quoted payload piped into a stdin-reading shell" \
+    "echo 'git read-tree HEAD' | sh"
+assert_deny "#7923: Deny an interpreter-fed heredoc body (body executes)" \
+    "$(printf "bash <<'EOF'\ngit read-tree HEAD\nEOF\n")"
+
+# --- #7923: the GIT_INDEX_FILE carve-out must be SCOPED to the invocation ---
+# The old isolation test was `grep -qE 'GIT_INDEX_FILE='` over the WHOLE string,
+# so any occurrence anywhere — quoted prose, or an assignment prefixed onto a
+# DIFFERENT simple command — authorized an unrelated real-index mutation. The
+# assignment must now actually be in force for the invocation being judged.
+assert_deny "#7923: Deny when GIT_INDEX_FILE= only appears as quoted echo data" \
+    "echo 'GIT_INDEX_FILE=' ; git read-tree HEAD"
+assert_deny "#7923: Deny when GIT_INDEX_FILE= prefixes a DIFFERENT simple command" \
+    "GIT_INDEX_FILE=/tmp/i git status; git read-tree HEAD"
+assert_deny "#7923: Deny when GIT_INDEX_FILE= is only mentioned inside a --body" \
+    "gh issue create --title x --body 'use GIT_INDEX_FILE=\$(mktemp)' && git read-tree HEAD"
+assert_deny "#7923: Deny the SECOND, unisolated invocation after an isolated one" \
+    "GIT_INDEX_FILE=/tmp/i git read-tree HEAD && git read-tree HEAD"
+
+# --- #7923: git accepts -c/-C config overrides BEFORE the subcommand ---
+# `git[[:space:]]+read-tree` required the two words to be ADJACENT, so a global
+# option between them made a real mutation invisible. Pre-existing gap, folded
+# into this fix rather than deferred.
+assert_deny "#7923: Deny git -c <cfg> read-tree (non-adjacent subcommand)" \
+    "git -c core.quotepath=false read-tree HEAD"
+assert_deny "#7923: Deny git -C <dir> read-tree (non-adjacent subcommand)" \
+    "git -C /tmp/repo read-tree HEAD"
+
+# --- #7923: prefixes the structural pass does not model still deny ---
+# The "lenient net" re-expresses the OLD regex per segment, so the deny set on
+# executable text stays a superset of the pre-#7923 one.
+assert_deny "#7923: Deny env-prefixed git read-tree" \
+    "env git read-tree HEAD"
+assert_deny "#7923: Deny sudo-prefixed git read-tree" \
+    "sudo git read-tree HEAD"
+assert_deny "#7923: Deny timeout-prefixed git read-tree (unmodelled prefix)" \
+    "timeout 5 git read-tree HEAD"
+assert_deny "#7923: Deny git read-tree on its own line of a multi-line command" \
+    "$(printf 'git status\ngit read-tree HEAD\n')"
+assert_deny "#7923: Deny git read-tree in a subshell" \
+    '( git read-tree HEAD )'
+assert_deny "#7923: Deny git read-tree in a brace group" \
+    '{ git read-tree HEAD; }'
+assert_deny "#7923: Deny git read-tree in a for-loop body" \
+    'for f in a; do git read-tree; done'
+assert_deny "#7923: Deny git read-tree in an if-then body" \
+    'if true; then git read-tree; fi'
+assert_deny "#7923: Deny xargs-driven git read-tree" \
+    'echo HEAD | xargs git read-tree'
+assert_deny "#7923: Deny a backslash-newline continuation between git and read-tree" \
+    "$(printf 'git \\\n    read-tree HEAD\n')"
+assert_deny "#7923: Deny a quoted git SUBCOMMAND (git \"read-tree\")" \
+    'git "read-tree" HEAD'
+assert_deny "#7923: Deny git --git-dir=<dir> read-tree" \
+    "git --git-dir=/tmp/x read-tree HEAD"
+assert_deny "#7923: Deny an UNTERMINATED wrapper quote (fail closed)" \
+    "bash -c 'git read-tree HEAD"
+assert_deny "#7923: Deny a heredoc body piped into a shell" \
+    "$(printf "cat <<'EOF' | sh\ngit read-tree HEAD\nEOF\n")"
+assert_deny "#7923: Deny a bash -s heredoc body" \
+    "$(printf "bash -s <<'EOF'\ngit read-tree HEAD\nEOF\n")"
+assert_deny "#7923: Deny a heredoc owned by an UNKNOWN command (not a known inert sink)" \
+    "$(printf "mycmd <<'EOF'\ngit read-tree HEAD\nEOF\n")"
+assert_deny "#7923: Deny a non-shell interpreter heredoc body (legacy treatment preserved)" \
+    "$(printf "python - <<'EOF'\nrun git read-tree HEAD\nEOF\n")"
+assert_deny "#7923: Deny a bash heredoc body inside a command substitution" \
+    "$(printf "x=\$(bash <<'EOF'\ngit read-tree HEAD\nEOF\n)\n")"
+assert_deny "#7923: Deny nested interpreter wrappers (bash -c \"sh -c '…'\")" \
+    "bash -c \"sh -c 'cd /x; git read-tree HEAD'\""
+assert_deny "#7923: Deny when the assignment prefixes the UPSTREAM pipeline stage" \
+    "GIT_INDEX_FILE=/tmp/i echo x | git read-tree HEAD"
+assert_deny "#7923: Deny a QUOTED assignment look-alike (the shell reads it as a command word)" \
+    '"GIT_INDEX_FILE=/tmp/i" git read-tree HEAD'
+
 # --- #3757: reversible GitHub state changes no longer ask by default ---
 # gh pr close / gh issue close / gh label delete are trivially reversible
 # (gh pr reopen / gh issue reopen / recreate the label), so they are NOT in the
@@ -1186,6 +1280,62 @@ assert_allow "Allow git merge-tree --write-tree (safe merge preview, #3637)" \
 # --- git commit-tree does not mutate the index and is not guarded (#3637) ---
 assert_allow "Allow git commit-tree (does not touch the index, #3637)" \
     "git commit-tree abc123 -m 'msg'"
+
+# --- #7923: INERT text that merely MENTIONS the index command is not a mutation ---
+# COMMAND_NO_COMMENT strips only `#` comments, so before #7923 a quoted --body
+# value or a `cat > file <<QUOTED` heredoc body matched the phrase and was
+# HARD-DENIED — which blocked filing or commenting on any issue about this very
+# guard (including #7923). Nothing in these commands is ever executed as shell.
+assert_allow "#7923: Allow gh issue create --body quoting the index command" \
+    "gh issue create --title example --body 'The git read-tree guard rejects inert text.'"
+assert_allow "#7923: Allow gh pr comment --body quoting the index command" \
+    'gh pr comment 1 --body "the git read-tree deny floor"'
+assert_allow "#7923: Allow a literal heredoc written to a FILE (cat is not an interpreter)" \
+    "$(printf "cat > /tmp/example.md <<'EOF'\nThe git read-tree guard rejects inert text.\nEOF\n")"
+assert_allow "#7923: Allow a quoted positional of a non-executing command (printf to a file)" \
+    "printf '%s\\n' 'git read-tree HEAD' > /tmp/notes.txt"
+assert_allow "#7923: Allow grep searching for the phrase" \
+    "grep -n 'git read-tree' file"
+assert_allow "#7923: Allow echo of prose mentioning the phrase" \
+    "echo 'docs mention git read-tree here'"
+assert_allow "#7923: Allow jq --arg carrying the phrase as data" \
+    "jq -n --arg t 'run git read-tree HEAD' '\$t'"
+
+# --- #7923: genuinely-scoped isolation keeps passing through ---
+assert_allow "#7923: Allow an exported GIT_INDEX_FILE reaching a later segment" \
+    "export GIT_INDEX_FILE=/tmp/i; git read-tree HEAD"
+assert_allow "#7923: Allow a standalone GIT_INDEX_FILE= assignment segment" \
+    "GIT_INDEX_FILE=/tmp/i; git read-tree HEAD"
+assert_allow "#7923: Allow an isolated read-tree -m -u scripted merge" \
+    "GIT_INDEX_FILE=\$(mktemp) git read-tree -m -u HEAD"
+assert_allow "#7923: Allow an isolated invocation inside a bash -c payload" \
+    "bash -c 'GIT_INDEX_FILE=/tmp/i git read-tree HEAD'"
+assert_allow "#7923: Allow env-carried GIT_INDEX_FILE isolation" \
+    "env GIT_INDEX_FILE=/tmp/i git read-tree HEAD"
+
+# --- #7923: a heredoc owned by a known INERT SINK is file content, not code ---
+# The sink allowlist is deliberately narrow (im_is_inert_sink): anything NOT on
+# it keeps the pre-#7923 regex treatment, asserted on the deny side above.
+assert_allow "#7923: Allow an unquoted-delimiter heredoc redirected to a file" \
+    "$(printf "cat <<EOF > /tmp/f\ngit read-tree HEAD\nEOF\n")"
+assert_allow "#7923: Allow a tee heredoc writing the phrase to a file" \
+    "$(printf "tee /tmp/f <<'EOF'\ngit read-tree HEAD\nEOF\n")"
+assert_allow "#7923: Allow a git commit -F - heredoc message mentioning the phrase" \
+    "$(printf "git commit -F - <<'EOF'\nmentions git read-tree here\nEOF\n")"
+assert_allow "#7923: Allow the --body \"\$(cat <<'EOF' … )\" issue-filing idiom" \
+    "$(printf "gh issue create --body \"\$(cat <<'EOF'\nsee git read-tree docs\nEOF\n)\"\n")"
+assert_allow "#7923: Allow two chained inert --body values in one command" \
+    "gh issue create --body 'a git read-tree b' && gh pr comment 2 --body 'c git read-tree d'"
+assert_allow "#7923: Allow gh api -f body= carrying the phrase" \
+    "gh api repos/x/y/issues -f body='git read-tree is guarded'"
+assert_allow "#7923: Allow a sed script mentioning the phrase" \
+    "sed -n 's/git read-tree/x/p' file"
+
+# --- #7923: neighbouring git subcommands are not the index command ---
+assert_allow "#7923: Allow git log --grep mentioning the phrase as a pattern" \
+    "git log --grep read-tree"
+assert_allow "#7923: Allow reading a file whose NAME contains the phrase" \
+    "cat docs/read-tree.md"
 
 echo ""
 
