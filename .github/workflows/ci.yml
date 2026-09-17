@@ -757,6 +757,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Configure git identity for suite fixtures
+        # These suites create fixture commits; a fresh runner has no global
+        # identity. Same step shell-suite-tests carries, for the same reason.
+        run: |
+          git config --global user.email "ci@loom.test"
+          git config --global user.name "Loom CI"
       - name: Build loom-daemon
         run: cargo build --package loom-daemon
       - name: classify-dependency-block (#5664, #7650)
@@ -769,26 +775,12 @@ jobs:
         run: bash defaults/scripts/tests/test-detect-startable-subset.sh
       - name: dep-recheck-fingerprint (#7281, #7314, #7617)
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
-      # Moved out of shell-suite-tests by #7977: its --resolve-json assertions
+      # Split out of test-loom-daemon-update.sh by #7977: these assertions
       # now drive `loom-daemon release-resolve` through the stub's delegation,
-      # so they need the binary this job builds.
-      #
-      # It drives the REAL loom-daemon lifecycle scripts, which is why
-      # run-ci-suites.sh listed it in LIVE_DAEMON_GUARDED_SUITES. A GitHub
-      # runner never has a daemon, but the precondition is asserted rather than
-      # assumed — and FATAL, not skipped, so this can never pass by running
-      # nothing.
-      - name: loom-daemon-update (#7609 --resolve-json)
-        run: |
-          source defaults/scripts/lib/live-daemon-guard.sh
-          evidence="$(live_daemon_pidfiles_present)"
-          if [ -n "$evidence" ]; then
-            echo "FATAL: a loom-daemon pid file exists on this host:" >&2
-            echo "$evidence" | sed 's/^/  /' >&2
-            echo "This suite drives the real daemon lifecycle scripts and must not run here." >&2
-            exit 1
-          fi
-          bash defaults/scripts/tests/test-loom-daemon-update.sh
+      # so they need the binary this job builds. The parent suite stays in
+      # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
+      - name: loom-daemon-update --resolve-json (#7609)
+        run: bash defaults/scripts/tests/test-loom-daemon-update-resolve-json.sh
 
   installer-tests:
     name: Installer Integration Tests
