@@ -571,10 +571,16 @@ fn launchctl_pid(domain: &str, label: &str) -> Option<u32> {
 /// One liveness check result: whether the expected daemon is alive, a
 /// human-readable detail string (mirrors the watchdog's `liveness_detail`),
 /// and the live pid when alive.
-struct Liveness {
-    alive: bool,
-    detail: String,
-    pid: Option<u32>,
+pub(crate) struct Liveness {
+    pub(crate) alive: bool,
+    pub(crate) detail: String,
+    pub(crate) pid: Option<u32>,
+    /// The supervisor knows the job but it has no live pid — "LOADED but NOT
+    /// running". Distinct from both alive and simply-absent, because it is the
+    /// only state the watchdog's bounded auto-remediation may act on
+    /// (#4232/#6388): a job the supervisor still owns can be kickstarted,
+    /// whereas an unloaded one needs a full start.
+    pub(crate) job_loaded: bool,
     /// #4774: an advisory note when the pid file disagrees with the *authoritative*
     /// liveness signal this probe used (launchd's own pid). `None` when the file
     /// agrees, is absent, or was the signal itself — see [`pid_file_stale_note`].
@@ -589,6 +595,7 @@ impl Liveness {
             alive,
             detail,
             pid,
+            job_loaded: false,
             pid_file_stale_note: None,
         }
     }
@@ -633,12 +640,35 @@ fn pid_file_alive_pid(pid_file: &Path) -> Option<u32> {
     read_pid_file(pid_file).filter(|pid| pid_alive(*pid))
 }
 
-fn check_liveness(
+pub(crate) fn check_liveness(
     use_launchd: bool,
     label: &str,
     pid_file: Option<&Path>,
     domain_override: Option<&str>,
 ) -> Liveness {
+    check_liveness_with_systemd(use_launchd, label, pid_file, domain_override, None)
+}
+
+/// [`check_liveness`] plus the systemd tier the watchdog needs (#4862).
+///
+/// `systemd_unit` is `Some` only when the caller has opted in — `loom-daemon
+/// status` passes `None`, so its behaviour is unchanged. Before #8086 the
+/// systemd branch existed ONLY in `loom-daemon-watchdog.sh`, so on a
+/// systemd host the watchdog probed the unit while `status` probed the pid
+/// file: the two ends disagreeing about which signal is authoritative, which
+/// is the failure shape `resolve_pid_file`'s own comment describes for paths.
+pub(crate) fn check_liveness_with_systemd(
+    use_launchd: bool,
+    label: &str,
+    pid_file: Option<&Path>,
+    domain_override: Option<&str>,
+    systemd_unit: Option<&str>,
+) -> Liveness {
+    if !use_launchd {
+        if let Some(unit) = systemd_unit {
+            return check_systemd_liveness(unit);
+        }
+    }
     if use_launchd {
         // Same domain-resolution rule the reachable-path protection probe
         // uses (#4354/#4533): explicit `LOOM_LAUNCHD_DOMAIN` override, else
@@ -657,6 +687,7 @@ fn check_liveness(
                     alive: true,
                     detail: format!("launchd job {service} alive (pid {pid})"),
                     pid: Some(pid),
+                    job_loaded: false,
                     // launchd's pid is established independently of the file, so
                     // it can arbitrate against it (#4774).
                     pid_file_stale_note: pid_file_stale_note(pid_file, pid),
@@ -681,6 +712,7 @@ fn check_liveness(
                         alive: true,
                         detail: format!("launchd job {check_domain}/{label} alive (pid {pid})"),
                         pid: Some(pid),
+                        job_loaded: false,
                         pid_file_stale_note: pid_file_stale_note(pid_file, pid),
                     };
                 }
@@ -743,6 +775,46 @@ fn check_liveness(
 /// this accepts `ss`, `mm:ss`, `hh:mm:ss`, and `dd-hh:mm:ss`. Any unexpected
 /// shape or non-numeric field yields `None` — the caller treats an unparseable
 /// age as *unknown* and makes no grace claim, never a false "starting" verdict.
+/// systemd --user liveness (#4862) — the Linux sibling of the launchd branch,
+/// so the watchdog's auto-remediation gate has an equivalent signal there.
+///
+/// `show -p X --value` against an unknown unit answers cleanly
+/// (`LoadState=not-found`) rather than erroring, so no separate return-code
+/// check is needed the way launchd's `print` exit code is used.
+fn check_systemd_liveness(unit: &str) -> Liveness {
+    let value = |prop: &str| -> Option<String> {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["--user", "show", "-p", prop, "--value", unit]);
+        probe_output(cmd, Duration::from_secs(5)).and_then(|o| {
+            let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            (!v.is_empty()).then_some(v)
+        })
+    };
+
+    let main_pid = value("MainPID")
+        .filter(|p| p != "0")
+        .and_then(|p| p.parse::<u32>().ok());
+    if let Some(pid) = main_pid {
+        if pid_alive(pid) {
+            return Liveness::plain(
+                true,
+                format!("systemd unit {unit} alive (pid {pid})"),
+                Some(pid),
+            );
+        }
+    }
+    if value("LoadState").as_deref() == Some("loaded") {
+        let mut l = Liveness::plain(
+            false,
+            format!("systemd unit {unit} is LOADED but NOT running (no live MainPID)"),
+            None,
+        );
+        l.job_loaded = true;
+        return l;
+    }
+    Liveness::plain(false, format!("systemd unit {unit} is not loaded/alive"), None)
+}
+
 fn parse_etime(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     if raw.is_empty() {
