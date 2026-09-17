@@ -34,8 +34,14 @@ jobs:
           set -euo pipefail
 
           # EVERY tracked `.sh`, not just defaults/scripts/ (#8072). Until this
-          # change 129 tracked `.sh` files were never linted at all, including
-          # defaults/hooks/ (the guard layer) and scripts/ (the CI ratchets).
+          # change everything outside defaults/scripts/ was unlinted -- roughly
+          # a quarter of the repo's shell, including defaults/hooks/ (the guard
+          # layer) and scripts/ (the CI ratchets themselves).
+          #
+          # Deliberately no exact count here. The first version of this comment
+          # froze one, and it was wrong within a day as `main` moved -- in the
+          # file whose whole subject is measuring shell coverage. The step
+          # prints the real number every run; that is the number to trust.
           #
           # Scope is `.sh` by extension, matching check-shell-syntax.sh's own
           # documented choice. Five tracked shell scripts have no `.sh`
