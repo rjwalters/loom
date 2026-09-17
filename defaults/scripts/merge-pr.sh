@@ -373,6 +373,14 @@ fi
 # than silently degrade a destructive decision to a guess.
 # shellcheck source=lib/branch-landed.sh
 source "$SCRIPT_DIR/lib/branch-landed.sh"
+# Verdict-label contradiction check (#8112) — same lib Curator/Builder/Judge
+# already share for label operations; the decision logic itself lives there
+# (label-preflight.sh is well under the file-size threshold, merge-pr.sh is
+# not), so this file only needs the source line plus the two-line guard below.
+# Required, not defensive: a missing lib must fail loudly rather than silently
+# skip a safety guard, mirroring branch-landed.sh's own reasoning above.
+# shellcheck source=lib/label-preflight.sh
+source "$SCRIPT_DIR/lib/label-preflight.sh"
 # Default-branch resolver (#4100) — the local-branch delete guard must never
 # target the repo's default branch. Sourced defensively: a repo where this
 # fails to resolve (e.g. no network + no origin/HEAD symref) still falls back
@@ -488,11 +496,11 @@ fi
 PR_JSON=$(forge_get_pr "$REPO_NWO" "$PR_NUMBER" "$GH") || \
   error "Could not fetch PR #$PR_NUMBER"
 
-PR_STATE=$(echo "$PR_JSON" | jq -r '.state')
-PR_MERGED=$(echo "$PR_JSON" | jq -r '.merged')
-PR_BRANCH=$(echo "$PR_JSON" | jq -r '.head.ref')
-PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
-PR_MERGEABLE=$(echo "$PR_JSON" | jq -r '.mergeable')
+# Combined onto two lines (net code-line offset for the #8112 guard added
+# below — file-size-policy.md's "remove at least as much as you added"; a
+# verbatim, behavior-preserving chain, not a reformat of anything else).
+PR_STATE=$(echo "$PR_JSON" | jq -r '.state'); PR_MERGED=$(echo "$PR_JSON" | jq -r '.merged'); PR_BRANCH=$(echo "$PR_JSON" | jq -r '.head.ref')
+PR_TITLE=$(echo "$PR_JSON" | jq -r '.title'); PR_MERGEABLE=$(echo "$PR_JSON" | jq -r '.mergeable')
 # Head SHA (#4100): the safety criterion for local-branch deletion. A local
 # branch whose tip equals this SHA carries no commits absent from the merged
 # PR, so it is safe to force-delete even though it will never satisfy
@@ -854,6 +862,31 @@ _check_loom_pr_label
 #
 # Verifying in isolation, as the original fix did, tested the function and not
 # the call shape. This is the call shape.
+
+# ---------------------------------------------------------------------------
+# Pre-merge verdict-label contradiction guard (#8112).
+#
+# A PR can carry BOTH `loom:pr` (approved) and a blocking verdict/hold label
+# simultaneously — two concurrent Judge passes reaching different verdicts on
+# the same head ~45s apart is a real, observed incident (PR #8076), not a
+# hypothetical. `_check_loom_pr_label` above only checks loom:pr's ABSENCE; it
+# has no way to see a contradicting label standing beside a PRESENT loom:pr.
+#
+# Judge/Doctor's Verdict-Time CAS Recheck (judge.md / doctor.md) and
+# Champion's Verdict-State Janitor Part 1 (champion-pr-merge.md) already exist
+# to prevent and auto-resolve exactly this contradiction — but both live in
+# markdown-orchestrated agent steps, not in this script, so a human or agent
+# invoking merge-pr.sh directly (the documented, canonical way to merge —
+# never `gh pr merge`, see CLAUDE.md) bypasses them entirely. This guard is
+# the backstop at the one point every merge path actually funnels through.
+#
+# Deliberately no bypass flag: --allow-unapproved overrides "nobody reviewed
+# this head" (an absence of signal); this guard blocks "a reviewer explicitly
+# said no" (a present, contradicting signal). Those are different acts, and
+# only the first has a documented override. The fix for a real block here is
+# a fresh Judge verdict, not a flag.
+_check_verdict_label_contradiction() { local msg; msg="$(loom_verdict_label_contradiction_message "$PR_NUMBER" "$PR_LABELS" "$PR_HEAD_SHA")" || return 0; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; error "$msg"; }
+_check_verdict_label_contradiction
 
 # ---------------------------------------------------------------------------
 # Partial-increment closing-keyword conflict detection (#4569, extended by
