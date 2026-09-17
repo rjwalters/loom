@@ -40,10 +40,38 @@
 //! `defaults/scripts/tests/test-guide-*.sh` pattern), not pinned as a string;
 //! genuine prose with no executable surface should rely on review, not a new
 //! `contains()` pin. The CONTRACT/PROSE split above (#3877) predates that rule
-//! and stays as-is here — see #7979 for the tracked migration — but it is not
-//! license to add a fresh sentence pin under a PROSE label.
+//! and stays as-is here — but it is not license to add a fresh sentence pin
+//! under a PROSE label.
+//!
+//! ---------------------------------------------------------------------------
+//! Extract-and-execute migration (#7993, split from #7979)
+//! ---------------------------------------------------------------------------
+//! Every assertion that used to pin a literal living **inside a code fence**
+//! (a shell snippet or a JSON wire-frame sample) has been converted to an
+//! extract-and-execute test: locate the fence via
+//! [`doc_lint_support::first_fenced_block_after`], pull its body out, and
+//! either run it (`sweep_md_step_1a_*`,
+//! `sweep_md_step_1b_*`, `sweep_md_pins_rest_fallback_endpoints_and_pagination`)
+//! or deserialize it through the real wire types
+//! (`sweep_md_documents_publish_event_ipc_contract`,
+//! `sweep_md_includes_sample_wire_payloads`) rather than string-matching it.
+//! `sweep_md_pins_rate_limit_signature_table` and
+//! `sweep_md_topic_taxonomy_table_lists_six_topics` cross-check their table
+//! rows against the real `loom_daemon::rate_limit_breaker::indicates_rate_limit`
+//! / `Event::topic()` implementations instead of only the markdown text. This
+//! is the incident #7950/#7948 exists to prevent: a behavior-preserving reword
+//! of the fenced/tabled text (e.g. positional `$1`/`$2` renamed to
+//! `$LEASE_HOST`/`$LEASE_SWEEP`) no longer fails these tests — only an actual
+//! behavior change does. See the PR that introduced this migration for the
+//! full enumeration of what was migrated vs. kept as review-only prose.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+// Extract-and-execute helpers + the bodies of the heavier migrated checks
+// live in a sibling module, not inline here, purely to keep this file under
+// the file-size ratchet (`.loom/docs/file-size-policy.md`) — see that
+// module's own doc comment.
+mod doc_lint_support;
 
 use std::fs;
 use std::path::PathBuf;
@@ -131,74 +159,32 @@ fn sweep_md_has_daemon_event_bus_section() {
     );
 }
 
-/// AC #3: assert all six initial topics are present in the markdown.
-///
-/// If a topic is renamed in Rust without updating sweep.md, this test
-/// catches the drift. If sweep.md is renamed without updating this
-/// test, the test panics with a missing-file message above.
+/// AC #3 (#7993 migration — table/structure assertion, executable surface
+/// exists): assert all six initial topics are present in the markdown AND
+/// that the REAL `Event::topic()` implementation actually produces each
+/// documented pattern. Body: [`doc_lint_support::check_topic_taxonomy`].
 #[test]
 fn sweep_md_topic_taxonomy_table_lists_six_topics() {
-    let content = read_sweep_md();
-    // CONTRACT: frozen topic strings (see REQUIRED_TOPICS). Keep EXACT.
-    for topic in REQUIRED_TOPICS {
-        assert!(
-            content.contains(topic),
-            "sweep.md is missing topic `{topic}` from the Phase B taxonomy; \
-             update sweep.md or this test if the change is intentional"
-        );
-    }
+    doc_lint_support::check_topic_taxonomy(&read_sweep_md(), REQUIRED_TOPICS);
 }
 
-/// AC #3: assert the `PublishEvent` IPC contract is documented (i.e.,
-/// the markdown has the Request::PublishEvent wire-format reference).
-/// This catches accidental section removals during future refactors.
+/// AC #3 (#7993 migration — code-fence literal, converted to extract +
+/// deserialize): the "Sample wire frame" request/response pair is
+/// deserialized through the REAL wire types. Body:
+/// [`doc_lint_support::check_publish_event_ipc_contract`].
 #[test]
 fn sweep_md_documents_publish_event_ipc_contract() {
-    let content = read_sweep_md();
-    // CONTRACT: IPC request/variant identifiers are wire-protocol names. Keep
-    // EXACT — a rename here is a real contract break.
-    assert!(
-        content.contains("Request::PublishEvent"),
-        "sweep.md should reference `Request::PublishEvent` — the IPC contract \
-         is required by #3453 AC #3"
-    );
-    assert!(
-        content.contains("PublishEvent"),
-        "sweep.md should reference `PublishEvent` IPC variant"
-    );
-    assert!(
-        content.contains("SubscribeEvents"),
-        "sweep.md should reference `SubscribeEvents` IPC variant"
-    );
+    doc_lint_support::check_publish_event_ipc_contract(&read_sweep_md());
 }
 
-/// AC #3: assert at least one sample JSON payload for each topic type.
-/// Looks for the structural markers (the wire-frame examples), not
-/// every payload field — payload fields may evolve while the topic
-/// remains stable.
+/// AC #3 (#7993 migration — code-fence literal, converted to extract +
+/// deserialize): the six sample payloads and the daemon-side events fence are
+/// deserialized through the real wire types, calling the REAL
+/// `Event::topic()` on the daemon-emitted ones. Body:
+/// [`doc_lint_support::check_sample_wire_payloads`].
 #[test]
 fn sweep_md_includes_sample_wire_payloads() {
-    let content = read_sweep_md();
-
-    // CONTRACT: each sample pins a wire-frame topic string or a Rust event
-    // variant name — both are stable wire identifiers. We deliberately do NOT
-    // pin every payload field (those may evolve); the topic/variant name is the
-    // contract. Keep these EXACT.
-    let samples: &[&str] = &[
-        r#""topic": "sweep.issue.123.phase""#,
-        r#""topic": "sweep.issue.123.blocker""#,
-        r#""SweepExited""#,
-        r#""SweepCrashed""#,
-        r#""SweepGlobalDispatch""#,
-        r#""SweepGlobalCompleted""#,
-    ];
-    for sample in samples {
-        assert!(
-            content.contains(sample),
-            "sweep.md is missing a sample wire-frame for `{sample}` — \
-             #3453 AC #3 requires sample payloads for each topic"
-        );
-    }
+    doc_lint_support::check_sample_wire_payloads(&read_sweep_md());
 }
 
 // ---------------------------------------------------------------------------
@@ -541,62 +527,28 @@ fn sweep_md_step_1a_self_claim_check_precedes_loom_building_skip_bullet() {
 ///
 /// This lint is the mechanical guard against a future edit "simplifying" the
 /// gate away.
+///
+/// #7993 migration (this is the exact fence #7876/#7950/#7948 broke on): the
+/// old assertion pinned `content.contains("sweep-lease-renew.sh start \"$N\"")`
+/// — a literal inside the Step 1a code fence. Body (extracts and RUNS the
+/// fence against a stub instead):
+/// [`doc_lint_support::check_step_1a_lease_renewal_fallback`].
 #[test]
 fn sweep_md_step_1a_keeps_a_marker_gated_lease_renewal_fallback() {
-    let content = read_sweep_md();
-
-    // CONTRACT: the env var name is a shared identifier with
-    // `LEASE_RENEW_STARTED_ENV` in `loom-daemon/src/sweep_registry/dispatch.rs`.
-    // Renaming one side without the other silently disables the fallback (the
-    // marker never matches ⇒ every healthy dispatch forks a duplicate loop) or
-    // the skip (the marker always mismatches). Keep EXACT.
-    assert!(
-        content.contains("LOOM_SWEEP_LEASE_RENEW_DISPATCHED"),
-        "sweep.md's Step 1a must gate its lease-renewal fallback on the \
-         `LOOM_SWEEP_LEASE_RENEW_DISPATCHED` capability marker the dispatch \
-         exports (#7672) — without the gate, a new prompt running against a \
-         pre-#7672 daemon binary starts no renewal loop at all and its lease \
-         ages into a peer's reclamation gate (#6286)"
-    );
-
-    // CONTRACT: the fallback must still actually invoke `start`. A doc that
-    // merely *mentions* the marker while having dropped the command is the
-    // same failure with better prose.
-    assert!(
-        content.contains("sweep-lease-renew.sh start \"$N\""),
-        "sweep.md's Step 1a must retain the `./.loom/scripts/sweep-lease-renew.sh \
-         start \"$N\"` fallback invocation (#6180/#7672) for the pre-#7672-daemon \
-         case — naming the marker without the command it guards leaves the skew \
-         window with no renewal loop"
-    );
-
-    // CONTRACT: the fallback must be CONDITIONAL on the marker, not
-    // unconditional — an unguarded `start` under a #7672 daemon forks a second
-    // loop PATCHing the same comment on every healthy dispatch.
-    let marker_pos = content.find("LOOM_SWEEP_LEASE_RENEW_DISPATCHED").unwrap();
-    let start_pos = content
-        .find("sweep-lease-renew.sh start \"$N\"")
-        .expect("asserted present above");
-    assert!(
-        marker_pos < start_pos,
-        "the `LOOM_SWEEP_LEASE_RENEW_DISPATCHED` test (byte offset {marker_pos}) must \
-         precede Step 1a's `sweep-lease-renew.sh start` fallback (byte offset \
-         {start_pos}) — the `start` is the guarded branch, not the default (#7672)"
-    );
+    doc_lint_support::check_step_1a_lease_renewal_fallback(&read_sweep_md());
 }
 
 /// #3725: the canary guardrail and the exact-per-role-cost harvest are pinned.
 #[test]
 fn sweep_md_documents_experiment_guardrail_and_harvest() {
     let content = read_sweep_md();
-    // CONTRACT: the canary env-var+value, the harvest flag, and the cache
-    // token-usage field names are stable identifiers. `canary-only` and
-    // `cache-aware` are distinctive hyphenated terms naming the guardrail /
-    // costing property. Keep EXACT.
+    // CONTRACT: the canary env-var+value and the cache token-usage field
+    // names are stable identifiers, all mentioned in prose (not fenced).
+    // `canary-only` and `cache-aware` are distinctive hyphenated terms naming
+    // the guardrail / costing property. Keep EXACT.
     let contract_needles: &[&str] = &[
         "canary-only",                    // guardrail term
         "LOOM_MODEL_EXPERIMENT_CANARY=1", // canary env var + value
-        "--model-experiment",             // harvest CLI flag
         "cache-aware",                    // costing property term
         "cache_read_input_tokens",        // usage-block field name
         "token_fidelity",                 // record field name
@@ -608,6 +560,33 @@ fn sweep_md_documents_experiment_guardrail_and_harvest() {
              `{needle}` — update sweep.md or this test if the change is intentional"
         );
     }
+
+    // #7993 migration: `--model-experiment` appears in sweep.md ONLY inside a
+    // fenced example command (`./.loom/scripts/agent-metrics.sh
+    // --model-experiment ...`) — its only other historical anchor. Rather
+    // than pin that fenced literal, cross-check against the REAL script's own
+    // argument parser: the flag must actually exist as a real, recognized
+    // flag on the harvest script the doc names, not merely as text in the doc.
+    assert!(
+        content.contains("agent-metrics.sh"),
+        "sweep.md must name `agent-metrics.sh` as the harvest script for the \
+         #3725 model-cost experiment"
+    );
+    let scripts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts");
+    let agent_metrics_sh = scripts_dir.join("agent-metrics.sh");
+    let script_source = fs::read_to_string(&agent_metrics_sh).unwrap_or_else(|e| {
+        panic!(
+            "expected {} to exist (sweep.md's #3725 harvest script): {e}",
+            agent_metrics_sh.display()
+        )
+    });
+    assert!(
+        script_source.contains("--model-experiment"),
+        "sweep.md documents `--model-experiment` as agent-metrics.sh's harvest \
+         flag (#3725), but the REAL script at {} no longer recognizes it — the \
+         doc and the script have drifted",
+        agent_metrics_sh.display()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -731,69 +710,23 @@ fn sweep_md_documents_graphql_exhaustion_fallback_in_both_mode_b_and_mode_c() {
     );
 }
 
-/// #4670: the exhaustion-detection signature table is pinned EXACT. It mirrors
-/// `defaults/scripts/check-duplicate.sh`'s `is_rate_limit_error()` (itself
-/// mirrored from `loom-daemon/src/rate_limit_breaker.rs`'s
-/// `RATE_LIMIT_SIGNATURES`) — deriving a new, subtly different signature set is
-/// exactly the drift this pins against. Note that `api rate limit exceeded` and
-/// `api rate limit already exceeded` are NOT substrings of each other (the word
-/// "already" breaks the contiguous match), so both must be present.
+/// #4670 (#7993 migration — table/structure assertion, executable surface
+/// exists): the five signatures the doc's table lists are cross-checked
+/// against the REAL `loom_daemon::rate_limit_breaker::indicates_rate_limit`
+/// function, not just matched as text. Body:
+/// [`doc_lint_support::check_rate_limit_signature_table`].
 #[test]
 fn sweep_md_pins_rate_limit_signature_table() {
-    let content = read_sweep_md();
-
-    // CONTRACT: the five signature strings. Keep EXACT.
-    let signatures: &[&str] = &[
-        "api rate limit exceeded",
-        "api rate limit already exceeded",
-        "secondary rate limit",
-        "abuse detection mechanism",
-        "was submitted too quickly",
-    ];
-    for signature in signatures {
-        assert!(
-            content.contains(signature),
-            "sweep.md's GraphQL-exhaustion detection is missing the rate-limit \
-             signature `{signature}` (#4670) — the table must mirror \
-             check-duplicate.sh's is_rate_limit_error() / \
-             rate_limit_breaker.rs's RATE_LIMIT_SIGNATURES, not a new one"
-        );
-    }
-
-    // CONTRACT: the provenance pointers keep future editors on the shared
-    // table instead of re-deriving one. Keep EXACT (file/symbol names).
-    for needle in ["is_rate_limit_error()", "RATE_LIMIT_SIGNATURES"] {
-        assert!(
-            content.contains(needle),
-            "sweep.md must cite `{needle}` as the source of the rate-limit \
-             signature table (#4670)"
-        );
-    }
+    doc_lint_support::check_rate_limit_signature_table(&read_sweep_md());
 }
 
-/// #4670: the REST endpoints, pagination parameters, and the PR-exclusion jq
-/// filter that make the fallback actually executable.
+/// #4670 (#7993 migration — code-fence literal, converted to extract +
+/// execute): the Mode B / Mode C REST-fallback `gh api --paginate ...` one-
+/// liners are extracted from their fences and actually RUN against a stub
+/// `$GH_READ`. Body: [`doc_lint_support::check_rest_fallback_endpoints_and_pagination`].
 #[test]
 fn sweep_md_pins_rest_fallback_endpoints_and_pagination() {
-    let content = read_sweep_md();
-
-    // CONTRACT: REST paths, pagination flags/params, and the jq filter are
-    // literal strings the orchestrator reproduces. Keep EXACT.
-    let contract_needles: &[&str] = &[
-        "repos/{owner}/{repo}/issues",   // Mode B REST listing
-        "repos/{owner}/{repo}/pulls",    // Mode C REST listing
-        "repos/{owner}/{repo}/labels",   // unknown-label guard REST rung
-        "--paginate",                    // paginated listing
-        "per_page=100",                  // explicit limit (never REST's 30)
-        "select(.pull_request == null)", // /issues returns PRs too
-    ];
-    for needle in contract_needles {
-        assert!(
-            content.contains(needle),
-            "sweep.md's REST fallback is missing contract token `{needle}` \
-             (#4670) — update sweep.md or this test if the change is intentional"
-        );
-    }
+    doc_lint_support::check_rest_fallback_endpoints_and_pagination(&read_sweep_md());
 }
 
 /// #4670 (AC: no second GraphQL call to resolve the repo): owner/repo must be
@@ -990,85 +923,15 @@ fn sweep_md_documents_orphan_recovery_gate_warning() {
 /// #6320: "Step 1b" must exist, must invoke `sweep-lease-publish.sh`, must
 /// come AFTER Step 1a (which covers the daemon-claimed case and must not be
 /// duplicated by it), and must document the peer-lease skip.
+///
+/// #7993 migration (this is the exact incident site of #7876/#7950/#7948):
+/// the fenced `sweep-lease-publish.sh` / `sweep-lease-renew.sh start`
+/// invocation is now extracted and RUN against stub scripts, asserting the
+/// actual flag/value threading behavior instead of one pinned literal
+/// spelling of it. Body: [`doc_lint_support::check_step_1b_lease_publish`].
 #[test]
 fn sweep_md_step_1b_publishes_an_in_session_lease_after_step_1a() {
-    let content = read_sweep_md();
-
-    // Anchor on the section headings themselves, not on the first mention of
-    // "Step 1a"/"Step 1b" anywhere in the file — both are legitimately
-    // forward-referenced from the flag documentation far above pre-flight.
-    let step_1a_pos = content
-        .find("Step 1a — daemon self-claim check")
-        .expect("sweep.md must retain the `Step 1a — daemon self-claim check` anchor (#4111)");
-    let step_1b_pos = content
-        .find("Step 1b — publish this sweep's OWN lease record")
-        .unwrap_or_else(|| {
-            panic!(
-                "sweep.md is missing the `Step 1b — publish this sweep's OWN lease \
-                 record` pre-flight step (#6320) — without it the in-session dispatch \
-                 path publishes no lease record and every in-session claim stays \
-                 reclaimable by any host"
-            )
-        });
-    assert!(
-        step_1a_pos < step_1b_pos,
-        "Step 1a (daemon-claimed: lease already written at dispatch) must precede \
-         Step 1b (in-session: publish our own) — Step 1b is defined as the branch \
-         Step 1a did NOT take, so stating it first inverts the decision"
-    );
-
-    assert!(
-        content.contains("sweep-lease-publish.sh"),
-        "sweep.md's Step 1b must invoke `./.loom/scripts/sweep-lease-publish.sh` — \
-         the in-session writer that closes #6179's daemon-only hole"
-    );
-    assert!(
-        content.contains("--sweep-id \"$RUN_ID\""),
-        "Step 1b must key the lease on Step 0a's stable `$RUN_ID`, so the lease, \
-         the run registry, and the checkpoints all name one identity"
-    );
-    // #7950: assert the REQUIREMENT, not one spelling of it.
-    //
-    // This used to pin the literal `--host "$1" --sweep-id "$2"`. #7876 then
-    // fixed a real bug — `set -- $LEASE_IDENT` does not word-split under zsh —
-    // by switching to named variables, and this assertion failed on the
-    // CORRECTED doc, taking `main` red for ten commits. The failure message
-    // talked about lease-renewal races while the actual problem was that two
-    // strings no longer matched, so the next reader was pointed away from the
-    // cause.
-    //
-    // What must hold is that the `start` invocation is threaded with the host
-    // and sweep-id that `publish` returned, rather than letting renewal fall
-    // back to "newest lease wins". Any variable names satisfy that; dropping
-    // either flag does not.
-    // Anchored at Step 1b, not the first match in the file: Step 1a ALSO calls
-    // `sweep-lease-renew.sh start`, and legitimately without these flags — the
-    // daemon already wrote that lease at dispatch. Searching from position zero
-    // finds 1a's call and fails on a correct document.
-    let step_1b = &content[step_1b_pos..];
-    let start_invocation = step_1b
-        .find("sweep-lease-renew.sh start")
-        .map(|i| &step_1b[i..(i + 400).min(step_1b.len())])
-        .expect("Step 1b must invoke `sweep-lease-renew.sh start`");
-    for flag in ["--host", "--sweep-id"] {
-        assert!(
-            start_invocation.contains(flag),
-            "Step 1b's `sweep-lease-renew.sh start` must pass `{flag}`, carrying the \
-             identity `sweep-lease-publish.sh publish` returned — under renewal's \
-             default 'newest lease wins' a peer's later lease comment would be the \
-             one this sweep keeps alive while its own expired (#6320). Found: \
-             {start_invocation:?}"
-        );
-    }
-
-    // The peer-lease skip is the safety half: exit 4 means a LIVE peer holds
-    // the claim, and publishing over it would hide that worker from every
-    // freshest-wins reader.
-    assert!(
-        content.contains("Exit `4`") || content.contains("exit `4`"),
-        "Step 1b must document `sweep-lease-publish.sh`'s exit 4 (a different \
-         host holds a fresh lease) as a pre-flight SKIP for that issue"
-    );
+    doc_lint_support::check_step_1b_lease_publish(&read_sweep_md());
 }
 
 /// #6320's second point: `--no-daemon` names dispatch, not isolation. The
