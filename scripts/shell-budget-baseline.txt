@@ -22,7 +22,7 @@
 # `origin_portable` is the portable figure immediately before this epic's first
 # port commit (143fe332^, PR #7953). It is the DENOMINATOR progress is measured
 # against and must never be regenerated — an origin that moves measures nothing.
-portable 38439
-total 51814
-files 234
+portable 38691
+total 52464
+files 236
 origin_portable 38374
