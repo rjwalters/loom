@@ -1,28 +1,22 @@
-# shell-budget-baseline.txt — the aggregate production-shell ratchet for epic #7810.
+# shell-budget-baseline.txt — the epic #7810 progress DENOMINATOR.
 #
-#   loom-daemon shell-budget          the progress report a human reads
-#   loom-daemon shell-budget --json   the same, for scripting
+#   loom-daemon shell-budget           the progress report
+#   loom-daemon shell-budget --json    the same, for scripting
+#   loom-daemon shell-budget --check   report + exit 1 if THIS change grows the
+#                                      portable pool (what CI runs)
 #
-# Regenerate the ratchet lines deliberately:
-#   UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet
+# This file no longer holds a ratchet number. It used to, and that was the
+# defect: a committed number is a snapshot of one tree, so every other tree
+# disagrees with it, and the standing instruction it produced — "regenerate the
+# baseline on every merge" — teaches people to regenerate without looking, which
+# is the exact reflex a ratchet exists to prevent. It went stale twice in one
+# day, and the same design red-lined `main` for 8 commits via #8073.
 #
-# `portable` is the number the epic is retiring — `contract` + `hook-entry`,
-# whose logic moves into the daemon behind a stub. It may go DOWN freely and
-# must not go UP. A reviewer should treat a raised `portable` as the thing to
-# ask about; that is the ratchet slipping, and it is the whole point of the gate.
+# The gate now compares against the MERGE-BASE, which asks the only question it
+# cares about: does THIS change add portable shell? Whatever `main` did
+# meanwhile is not this change's doing. Nothing here needs updating, ever.
 #
-# `total` is ratcheted too, so growth in the permanent floor (`bootstrap` +
-# `vendored`) is visible rather than free — but the floor is NOT debt, and
-# driving it down is not a goal.
-#
-# `files` is a companion sanity value, not a third ratchet: it exists so a
-# filter regression that silently stops counting whole directories shows up as
-# a suspicious drop rather than as a win.
-#
-# `origin_portable` is the portable figure immediately before this epic's first
-# port commit (143fe332^, PR #7953). It is the DENOMINATOR progress is measured
-# against and must never be regenerated — an origin that moves measures nothing.
-portable 38691
-total 52493
-files 236
+# `origin_portable` is the portable figure immediately before epic #7810's first
+# port commit (143fe332^, PR #7953). It is the denominator progress is measured
+# against and must NEVER be regenerated — an origin that moves measures nothing.
 origin_portable 38374

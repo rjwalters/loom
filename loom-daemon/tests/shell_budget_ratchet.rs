@@ -54,7 +54,25 @@
 //! This test keeps the same gate honest locally and under `cargo test`; both
 //! call [`shell_budget::check`], so they cannot disagree about what passes.
 //!
-//! # Updating
+//! # There is nothing to update any more
+//!
+//! This used to compare against a committed number, and that number had to be
+//! regenerated every time `main` moved. That chore was the defect, not the
+//! upkeep cost of it: a standing instruction to regenerate teaches people to
+//! regenerate without looking, which is the reflex a ratchet exists to prevent.
+//! It went stale twice in one day, and the same design red-lined `main` for 8
+//! commits via #8073.
+//!
+//! The growth decision now lives in `loom-daemon shell-budget --check`, which
+//! compares against the MERGE-BASE — "does THIS change add portable shell?" —
+//! and consults no committed number at all.
+//!
+//! What remains here are the invariants that hold of any single tree and need
+//! no `before` to judge: every production script is accounted for in the
+//! allowlist, and the scope filter still sees the tree. Those cannot be checked
+//! by a delta, and they are how a gate comes to pass for the wrong reason.
+//!
+//! # Historical
 //!
 //! ```text
 //! UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet
@@ -76,56 +94,34 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn baseline_path() -> PathBuf {
-    repo_root().join("scripts/shell-budget-baseline.txt")
-}
-
 #[test]
-fn portable_shell_does_not_grow() {
+fn every_production_script_is_accounted_for() {
     let root = repo_root();
     let budget = shell_budget::measure(&root).expect("measure");
+    let origin = shell_budget::read_origin_portable(&root)
+        .expect("scripts/shell-budget-baseline.txt must carry origin_portable");
 
-    if std::env::var_os("UPDATE_SHELL_BUDGET").is_some() {
-        let origin = shell_budget::read_origin_portable(&root)
-            .expect("origin_portable must already exist — it is never regenerated");
-        // Refuse to bank an undercount: an unlisted script makes every figure
-        // below wrong, and writing it as the new baseline would freeze the
-        // error in place.
-        assert!(
-            budget.unlisted.is_empty(),
-            "refusing to regenerate while {} production script(s) have no allowlist entry:\n{}",
-            budget.unlisted.len(),
-            budget
-                .unlisted
-                .iter()
-                .map(|p| format!("  {}", p.display()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        let text = std::fs::read_to_string(baseline_path()).expect("read baseline");
-        let header: String = text
-            .lines()
-            .take_while(|l| l.trim_start().starts_with('#') || l.trim().is_empty())
-            .map(|l| format!("{l}\n"))
-            .collect();
-        std::fs::write(
-            baseline_path(),
-            format!(
-                "{header}portable {}\ntotal {}\nfiles {}\norigin_portable {origin}\n",
-                budget.portable(),
-                budget.total(),
-                budget.file_count()
-            ),
-        )
-        .expect("write baseline");
-        eprintln!("{}", shell_budget::render_report(&budget, origin));
-        return;
+    // Always print it. A gate that only speaks up on failure teaches nobody
+    // which way the number is moving, which is how the portable pool grew +317
+    // across four merged ports unnoticed.
+    println!("{}", shell_budget::render_report(&budget, origin));
+
+    if let Err(why) = shell_budget::check_invariants(&budget) {
+        panic!("{why}\n\n{}", shell_budget::render_report(&budget, origin));
     }
+}
 
-    let base = shell_budget::read_baseline(&root).expect("read baseline");
-    println!("{}", shell_budget::render_report(&budget, base.origin_portable));
-
-    if let Err(why) = shell_budget::check(&budget, &base) {
-        panic!("{why}\n\n{}", shell_budget::render_report(&budget, base.origin_portable));
-    }
+/// The denominator must never be regenerated. A moving origin measures nothing,
+/// so this pins the one value in that file against a silent edit.
+#[test]
+fn the_progress_denominator_is_the_pre_epic_figure() {
+    let root = repo_root();
+    assert_eq!(
+        shell_budget::read_origin_portable(&root),
+        Some(38_374),
+        "origin_portable is the portable-shell figure immediately before epic #7810's first \
+         port commit (143fe332^). Changing it re-bases every progress number ever reported \
+         and is almost certainly a mistake — if the epic's start really is being redefined, \
+         say so in the commit."
+    );
 }

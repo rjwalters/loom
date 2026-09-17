@@ -18,14 +18,24 @@ pub(crate) struct ShellBudgetArgs {
     #[arg(long, value_name = "PATH")]
     pub root: Option<std::path::PathBuf>,
 
-    /// Also enforce the ratchet: exit 1 when the tree is over budget.
+    /// Enforce the ratchet: exit 1 when THIS change grows the portable pool.
     ///
-    /// This is what CI runs. The report prints either way — a gate that only
-    /// speaks up on failure teaches nobody which way the number is moving,
-    /// which is how the portable pool grew +317 across four merged ports
-    /// without anyone noticing.
+    /// Compares against the merge-base with `--base` (default `origin/main`),
+    /// so it measures what your change did and needs no committed number to
+    /// stay in sync. A baseline file goes stale every time `main` moves; this
+    /// cannot.
+    ///
+    /// The report prints either way — a gate that only speaks up on failure
+    /// teaches nobody which way the number is moving, which is how the portable
+    /// pool grew +317 across four merged ports without anyone noticing.
     #[arg(long)]
     pub check: bool,
+
+    /// The ref `--check` compares against. Its merge-base with `HEAD` is used,
+    /// so an un-rebased branch is measured on its own contribution rather than
+    /// being blamed for everything that landed while it was open.
+    #[arg(long, value_name = "REF", default_value = "origin/main")]
+    pub base: String,
 }
 
 impl ShellBudgetArgs {
@@ -62,13 +72,38 @@ impl ShellBudgetArgs {
         }
 
         if self.check {
-            let base = shell_budget::read_baseline(&root).map_err(anyhow::Error::msg)?;
-            if let Err(why) = shell_budget::check(&budget, &base) {
-                eprintln!("\nshell-budget: OVER BUDGET\n\n{why}");
+            // The unlisted check does not depend on a comparison: a production
+            // script with no allowlist entry makes every figure an undercount,
+            // whichever revision you measure.
+            if !budget.unlisted.is_empty() {
+                eprintln!(
+                    "\nshell-budget: {} production script(s) carry no allowlist entry, so every \
+                     figure above is an undercount — add them to scripts/shell-allowlist.txt:\n{}",
+                    budget.unlisted.len(),
+                    budget
+                        .unlisted
+                        .iter()
+                        .map(|p| format!("  {}", p.display()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                std::process::exit(1);
+            }
+
+            let cmp = shell_budget::comparison(&root, &self.base).map_err(anyhow::Error::msg)?;
+            let before =
+                shell_budget::measure_at_rev(&root, &cmp.rev).map_err(anyhow::Error::msg)?;
+            let desc = cmp.desc;
+
+            if let Err(why) = shell_budget::check_against_rev(&budget, &before, &desc) {
+                eprintln!("\nshell-budget: PORTABLE SHELL GREW\n\n{why}");
                 std::process::exit(1);
             }
             if !self.json {
-                println!("\nshell-budget: within budget.");
+                let delta = i128::from(budget.portable()) - i128::from(before.portable());
+                println!(
+                    "\nshell-budget: this change moves portable shell by {delta:+} vs {desc}."
+                );
             }
         }
         Ok(())

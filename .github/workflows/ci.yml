@@ -308,7 +308,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # fetch-depth: 0 because the gate compares against the MERGE-BASE, and the
+      # default depth-1 checkout has no history to find one in. Without this the
+      # comparison degrades to "no merge-base found" and measures the wrong tree.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build loom-daemon
@@ -316,6 +321,11 @@ jobs:
       # Prints the report whether or not it passes. A gate that only speaks up
       # on failure teaches nobody which way the number is moving, which is how
       # the portable pool grew +317 across four merged ports unnoticed.
+      #
+      # No committed baseline: this asks "does THIS change add portable shell?"
+      # against the merge-base, so `main` moving is not this gate's business and
+      # there is nothing to regenerate. The previous design required a baseline
+      # refresh on every merge and red-lined `main` when one was missed (#8073).
       - name: Shell budget
         run: ./target/release/loom-daemon shell-budget --check
 

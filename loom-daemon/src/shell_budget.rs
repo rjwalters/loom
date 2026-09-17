@@ -282,62 +282,18 @@ pub fn read_origin_portable(root: &Path) -> Option<u64> {
         })
 }
 
-/// The ratcheted values plus the never-regenerated origin.
-#[derive(Debug, Clone)]
-pub struct Baseline {
-    pub portable: u64,
-    pub total: u64,
-    pub files: u64,
-    pub origin_portable: u64,
-}
-
-/// Read `scripts/shell-budget-baseline.txt`.
+/// The invariants that hold of any single tree, independent of comparison.
+///
+/// An unlisted production script makes every figure an undercount whichever
+/// revision you measure, and a scope filter that stops seeing whole directories
+/// makes the gate pass for the wrong reason. Neither needs a `before` to judge.
 ///
 /// # Errors
-/// When the file is missing, malformed, or lacks a required key.
-pub fn read_baseline(root: &Path) -> Result<Baseline, String> {
-    let path = root.join("scripts/shell-budget-baseline.txt");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("baseline not found at {}: {e}", path.display()))?;
-    let mut vals = BTreeMap::<String, u64>::new();
-    for l in text.lines() {
-        let l = l.trim();
-        if l.is_empty() || l.starts_with('#') {
-            continue;
-        }
-        let mut it = l.split_whitespace();
-        match (it.next(), it.next()) {
-            (Some(k), Some(v)) => {
-                let n = v
-                    .parse()
-                    .map_err(|_| format!("baseline key {k} has a non-numeric value {v:?}"))?;
-                vals.insert(k.to_string(), n);
-            }
-            _ => return Err(format!("unrecognised baseline line: {l:?}")),
-        }
-    }
-    let get = |k: &str| {
-        vals.get(k)
-            .copied()
-            .ok_or_else(|| format!("baseline is missing a `{k} <N>` entry"))
-    };
-    Ok(Baseline {
-        portable: get("portable")?,
-        total: get("total")?,
-        files: get("files")?,
-        origin_portable: get("origin_portable")?,
-    })
-}
-
-/// The gate. Shared by the CI subcommand and the integration test so the two
-/// can never disagree about what passes.
-///
-/// # Errors
-/// Returns the operator-facing explanation when the tree is over budget.
-pub fn check(budget: &Budget, base: &Baseline) -> Result<(), String> {
+/// Returns the operator-facing explanation when the tree is malformed.
+pub fn check_invariants(budget: &Budget) -> Result<(), String> {
     if !budget.unlisted.is_empty() {
         return Err(format!(
-            "{} production script(s) carry no allowlist entry, so every figure here is an \
+            "{} production script(s) carry no allowlist entry, so every figure is an \
              undercount — add them to scripts/shell-allowlist.txt:\n{}",
             budget.unlisted.len(),
             budget
@@ -355,45 +311,195 @@ pub fn check(budget: &Budget, base: &Baseline) -> Result<(), String> {
             budget.file_count()
         ));
     }
-    if budget.portable() > base.portable {
-        return Err(format!(
-            "PORTABLE shell grew by {} code lines ({} -> {}).\n\n\
-             This is the pool epic #7810 is retiring, so adding to it works directly against the \
-             epic. Options, best first:\n\n\
-             \x20 1. Put the new logic in the daemon instead — that is the language policy\n\
-             \x20    (.loom/docs/shell-language-policy.md) and it makes this gate a non-event.\n\
-             \x20 2. Remove portable shell elsewhere to pay for it.\n\
-             \x20 3. If the script genuinely must stay shell forever, it may belong in\n\
-             \x20    `bootstrap` or `vendored` rather than `contract` — but that is a claim about\n\
-             \x20    the script, argued in scripts/shell-allowlist.txt, not a way around this\n\
-             \x20    number.\n\
-             \x20 4. If the growth is genuinely right, record it:\n\
-             \x20      UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet\n\
-             \x20    and say WHY in the commit. A reviewer will see the raised number.",
-            budget.portable() - base.portable,
-            base.portable,
-            budget.portable()
-        ));
-    }
-    if budget.total() > base.total {
-        return Err(format!(
-            "total production shell grew by {} code lines ({} -> {}) without portable growing, so \
-             the growth is in the permanent floor (bootstrap/vendored). That is allowed but not \
-             free — record it deliberately and say why.",
-            budget.total() - base.total,
-            base.total,
-            budget.total()
-        ));
-    }
-    if budget.file_count() + 20 < base.files {
-        return Err(format!(
-            "production shell file count fell from {} to {} — verify that is a real removal and \
-             not a scope-filter regression",
-            base.files,
-            budget.file_count()
-        ));
-    }
     Ok(())
+}
+
+/// Measure the tree at a git revision rather than the working copy.
+///
+/// # Why this exists
+///
+/// A ratchet that compares against a committed baseline number breaks every
+/// time `main` moves: the number is a snapshot of one tree, and any other tree
+/// disagrees with it. That is not a theoretical cost — this baseline went stale
+/// twice in one day, the role-prompt ratchet red-lined `main` at its own merge
+/// commit for the same reason (#8105), and the standing instruction it produces
+/// is "regenerate the baseline on every merge", which is a chore that teaches
+/// people to regenerate without looking.
+///
+/// Comparing against the **merge-base** instead asks the only question the gate
+/// actually cares about: *does this change add portable shell?* Whatever `main`
+/// did in the meantime is not this change's doing and not this gate's business.
+/// It needs no committed number, so it cannot go stale.
+///
+/// # Errors
+/// When git cannot be run, or the revision does not resolve.
+pub fn measure_at_rev(root: &Path, rev: &str) -> Result<Budget, String> {
+    let git = |args: &[&str]| -> Result<String, String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run git {args:?}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+
+    let allowlist_text = git(&["show", &format!("{rev}:scripts/shell-allowlist.txt")])?;
+    let categories = parse_allowlist(&allowlist_text);
+
+    let listing = git(&["ls-tree", "-r", "--name-only", "-z", rev])?;
+    let tracked: Vec<&str> = listing.split('\0').filter(|s| !s.is_empty()).collect();
+    let shell: Vec<&str> = tracked
+        .iter()
+        .copied()
+        .filter(|p| p.ends_with(".sh") && is_production_shell(p))
+        .collect();
+
+    // Same floor as the working-tree path: a revision that yields almost no
+    // shell means the query broke, and a measurement of nothing must not read
+    // as a clean comparison.
+    if shell.len() < 100 {
+        return Err(format!(
+            "only {} production shell files found at {rev} — the revision query is broken, and \
+             an empty comparison must not read as no growth",
+            shell.len()
+        ));
+    }
+
+    let mut budget = Budget::default();
+    for rel in shell {
+        let text = git(&["show", &format!("{rev}:{rel}")])?;
+        let n = code_lines(&text) as u64;
+        match categories.get(rel) {
+            Some(cat) => {
+                *budget.by_category.entry(cat.clone()).or_default() += n;
+                *budget.files_by_category.entry(cat.clone()).or_default() += 1;
+            }
+            None => budget.unlisted.push(PathBuf::from(rel)),
+        }
+    }
+    Ok(budget)
+}
+
+/// What this change should be measured against.
+pub struct Comparison {
+    /// The revision to measure `before` at.
+    pub rev: String,
+    /// How to describe it to a human.
+    pub desc: String,
+}
+
+/// Resolve the revision to compare against.
+///
+/// Normally the merge-base of `HEAD` and `base_ref` — which is precisely "the
+/// tree this change started from", so the comparison measures the change and
+/// nothing else.
+///
+/// **On the base branch itself** (a push to `main`, where the merge-base of
+/// `HEAD` and `origin/main` is `HEAD`) that would compare a tree against
+/// itself and pass vacuously. There, the analogous question is what the most
+/// recent commit did, so it falls back to `HEAD~1`. Without this the gate
+/// would be a no-op on every direct push, which is exactly where nobody is
+/// reviewing.
+///
+/// # Errors
+/// When git cannot be run at all, or `HEAD` has no parent to compare against.
+pub fn comparison(root: &Path, base_ref: &str) -> Result<Comparison, String> {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    let head = git(&["rev-parse", "HEAD"]).ok_or_else(|| "could not resolve HEAD".to_string())?;
+
+    // No common ancestor (a shallow clone, or an unrelated base) — compare
+    // against the base ref directly rather than silently skipping the check.
+    let Some(base) = git(&["merge-base", "HEAD", base_ref]) else {
+        return Ok(Comparison {
+            rev: base_ref.to_string(),
+            desc: format!("{base_ref} (no merge-base found)"),
+        });
+    };
+
+    if base == head {
+        // We are ON the base branch. Measure what the tip commit did.
+        let parent = git(&["rev-parse", "HEAD~1"]).ok_or_else(|| {
+            format!(
+                "HEAD is {base_ref} and has no parent to compare against — refusing to compare \
+                 a tree with itself, which would pass without measuring anything"
+            )
+        })?;
+        return Ok(Comparison {
+            rev: parent.clone(),
+            desc: format!(
+                "HEAD~1 ({}) — on {base_ref}, so this measures the tip commit",
+                &parent[..parent.len().min(8)]
+            ),
+        });
+    }
+
+    Ok(Comparison {
+        rev: base.clone(),
+        desc: format!("{base_ref} ({})", &base[..base.len().min(8)]),
+    })
+}
+
+/// Compare this tree against a base revision. `Ok` when the change does not
+/// grow the portable pool.
+///
+/// # Errors
+/// Returns the operator-facing explanation when it does.
+pub fn check_against_rev(now: &Budget, before: &Budget, base_desc: &str) -> Result<(), String> {
+    if now.portable() <= before.portable() {
+        return Ok(());
+    }
+    let mut grew: Vec<(&String, u64, u64)> = Vec::new();
+    for (cat, lines) in &now.by_category {
+        if !PORTABLE.contains(&cat.as_str()) {
+            continue;
+        }
+        let was = before.by_category.get(cat).copied().unwrap_or(0);
+        if *lines > was {
+            grew.push((cat, was, *lines));
+        }
+    }
+    let detail = grew
+        .iter()
+        .map(|(c, was, now)| format!("    {c:<12} {was} -> {now}  (+{})", now - was))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Err(format!(
+        "This change adds {} code lines of PORTABLE shell (vs {base_desc}: {} -> {}).\n\n{detail}\n\n\
+         Portable shell is what epic #7810 is retiring — `contract` + `hook-entry`, whose logic \
+         moves into the daemon behind a stub. Adding to it works directly against the epic.\n\n\
+         Options, best first:\n\n\
+         \x20 1. Put the new logic in the daemon instead. That is the language policy\n\
+         \x20    (.loom/docs/shell-language-policy.md) and it makes this gate a non-event.\n\
+         \x20 2. Remove portable shell elsewhere in the same change to pay for it.\n\
+         \x20 3. If the script must stay shell forever, it may belong in `bootstrap` or\n\
+         \x20    `vendored` rather than `contract` — but that is a claim about the script,\n\
+         \x20    argued in scripts/shell-allowlist.txt, not a way around this number.\n\n\
+         Note this compares against the MERGE-BASE, so it is measuring what YOUR change did.\n\
+         Whatever main did meanwhile is not your problem and not this gate's business.",
+        now.portable() - before.portable(),
+        before.portable(),
+        now.portable()
+    ))
 }
 
 #[cfg(test)]
