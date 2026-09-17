@@ -4,12 +4,12 @@ on:
   push:
     branches: [main]
     paths:
-      - 'defaults/scripts/**/*.sh'
+      - '**/*.sh'
       - '.shellcheckrc'
       - '.github/workflows/shell-lint.yml'
   pull_request:
     paths:
-      - 'defaults/scripts/**/*.sh'
+      - '**/*.sh'
       - '.shellcheckrc'
       - '.github/workflows/shell-lint.yml'
 
@@ -31,7 +31,48 @@ jobs:
 
       - name: Run shellcheck
         run: |
-          echo "Linting all shell scripts in defaults/scripts/..."
-          find defaults/scripts -type f -name "*.sh" -print0 | \
-            xargs -0 shellcheck --severity=warning --format=gcc
-          echo "All shell scripts passed shellcheck."
+          set -euo pipefail
+
+          # EVERY tracked .sh, not just defaults/scripts/ (#8072). Until this
+          # change 119 files / 61,393 lines were never linted at all, including
+          # defaults/hooks/ (the guard layer) and scripts/ (the CI ratchets) --
+          # which is how three unguarded `rm -rf "$A/$B"` expansions (SC2115)
+          # survived in the installer and uninstaller.
+          # Portable read loop rather than `mapfile -d ''` (bash 4.4+) so this
+          # exact block can be pasted into a dev shell on macOS, where /bin/bash
+          # is still 3.2. A gate nobody can reproduce locally gets worked around.
+          ALL=()
+          while IFS= read -r -d '' f; do ALL+=("$f"); done < <(git ls-files -z '*.sh')
+
+          # An empty or implausibly small file list means discovery broke, not
+          # that the repo stopped having shell. Without this, a bad glob makes
+          # the job pass while linting nothing.
+          if (( ${#ALL[@]} < 400 )); then
+            echo "ERROR: expected 400+ tracked .sh files, found ${#ALL[@]}." >&2
+            echo "Shell discovery is broken -- refusing to pass on an empty lint." >&2
+            exit 1
+          fi
+
+          # The vendored copy of Repo Skills' generic destructive guard (and its
+          # installed .loom/hooks/ mirror) is upstream's file -- its own header
+          # says DO NOT hand-edit, fixes go to rjwalters/repo (#4041). SC1078
+          # false-positives on apostrophes inside its prose comments, so that ONE
+          # check is dropped for those two paths; all other checks still apply.
+          VENDORED=()
+          GENERAL=()
+          for f in "${ALL[@]}"; do
+            case "$f" in
+              */hooks/guard-destructive-generic.sh) VENDORED+=("$f") ;;
+              *)                                    GENERAL+=("$f") ;;
+            esac
+          done
+
+          echo "Linting ${#GENERAL[@]} tracked shell scripts (all checks)..."
+          shellcheck --severity=warning --format=gcc "${GENERAL[@]}"
+
+          if (( ${#VENDORED[@]} > 0 )); then
+            echo "Linting ${#VENDORED[@]} vendored guard copies (SC1078 excluded)..."
+            shellcheck --severity=warning --format=gcc --exclude=SC1078 "${VENDORED[@]}"
+          fi
+
+          echo "All ${#ALL[@]} tracked shell scripts passed shellcheck."

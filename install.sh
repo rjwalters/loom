@@ -1719,7 +1719,6 @@ if is_loom_source_repo "$TARGET_PATH"; then
     exit 0
   fi
   FORCE_FLAG=""
-  SELF_INSTALL=true
 elif [[ -d "$TARGET_PATH/.loom" ]]; then
   warning "Loom appears to be already installed in this repository"
   echo ""
@@ -1979,6 +1978,8 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # has the same generated-at-install shape but is gitignored → untracked → no
     # staged deletion, so it needs no reconcile; `.loom/config/skill-routes.json`
     # ships in defaults/config and is already covered by RECONCILE_PATHS.)
+    # shellcheck disable=SC2043  # deliberate list-of-one: an extension point
+    # for the next generated-but-tracked path (see the comment above).
     for _generated_tracked in ".loom/install-metadata.json"; do
       if git -C "$TARGET_PATH" diff --staged --name-only -- "$_generated_tracked" 2>/dev/null \
            | grep -qxF "$_generated_tracked"; then
@@ -2268,7 +2269,6 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
   exec "$LOOM_ROOT/scripts/install-loom.sh" ${INSTALL_FLAGS[@]+"${INSTALL_FLAGS[@]}"} ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH"
 else
   FORCE_FLAG=""
-  SELF_INSTALL=false
 fi
 
 echo ""

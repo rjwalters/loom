@@ -105,6 +105,7 @@ eval "$_FN_SRC"
 
 # Real Loom source checkout -- defaults/ must exist for the manifest walk to
 # produce a non-empty list.
+# shellcheck disable=SC2034  # read by the install-loom.sh functions eval'd above
 LOOM_ROOT="$REPO_ROOT"
 
 # ============================================================================

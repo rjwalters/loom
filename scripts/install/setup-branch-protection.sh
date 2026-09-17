@@ -263,10 +263,9 @@ setup_gitea_branch_protection() {
   fi
 
   # Check admin permissions via repo info
-  local repo_response http_code body
+  local repo_response http_code
   repo_response=$(gitea_api GET "/repos/${owner}/${repo}")
   http_code=$(echo "$repo_response" | tail -1)
-  body=$(echo "$repo_response" | sed '$d')
 
   if [[ "$http_code" != "200" ]]; then
     warning "Could not verify permissions on ${owner}/${repo} (HTTP ${http_code})"
