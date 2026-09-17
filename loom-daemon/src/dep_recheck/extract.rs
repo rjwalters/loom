@@ -116,6 +116,44 @@ pub fn comment_counts(comment: &Comment, bot_login: &str) -> bool {
 /// `sort -un` — **numeric**, unlike the line sorts elsewhere in this port.
 /// This list is an argument passed on to `operator-premise`, not a hashed
 /// rendering, so its ordering is the shell's own and worth keeping exact.
+///
+/// # Two further divergences from the pre-port shell (#8072, both kept)
+///
+/// Found by differential-testing this function against the retired shell over
+/// 700 generated inputs — see `tests/differential_extract_refs.rs`. Neither was
+/// visible to the retained black-box suite that was 104/104 green at port time,
+/// for the reason #8011 already recorded: a retained suite proves only what its
+/// author thought to write down.
+///
+/// **Zero-padded references normalise.** The shell's `sort -un` sorts
+/// numerically but prints the ORIGINAL token, so `Blocked by #007` came out as
+/// `007`. The `u64` round-trip here prints `7`. GitHub resolves `#007` to issue
+/// 7, so this spelling is the more correct one, and it makes `#7` and `#007`
+/// deduplicate to a single reference where the shell also collapsed them (both
+/// compare equal under `sort -n`). Kept. It does change `CONCLUSION_HASH` for
+/// any text that zero-pads, which is a one-time change at the port boundary,
+/// not an ongoing divergence — the shell is retired.
+///
+/// **A reference above `u64::MAX` is dropped, not kept.** `.parse().ok()`
+/// below discards it; the shell kept the literal token. The boundary is exact:
+/// `#18446744073709551615` survives, `#18446744073709551616` does not. No real
+/// issue number is twenty digits, so this is reachable only from adversarial
+/// forge text — and forge text IS untrusted input (see
+/// `defaults/docs/untrusted-external-content.md`).
+///
+/// Kept deliberately, and note the direction carefully, because it is NOT the
+/// same call as [`super::cli::parse_refs_arg`], which hard-errors on a token it
+/// cannot parse (#8011). That flag carries an OPERATOR's explicit list, where
+/// silently computing over fewer references than were asked for is the
+/// "confident wrong answer". This function scans arbitrary issue bodies and
+/// comments, where a hard error would let any commenter halt the Curator's
+/// re-check by typing a twenty-digit `#N`. Dropping is the right failure here;
+/// erroring is the right failure there.
+///
+/// Downstream the drop is usually fail-SAFE — losing every reference yields
+/// `verdict: open`, i.e. still blocked. The one case worth knowing is a MIXED
+/// set: one merged reference plus one dropped gives `stale-premise`, where the
+/// shell would instead have hard-errored trying to fetch the unfetchable token.
 #[must_use]
 pub fn extract(input: &Input, bot_login: &str) -> String {
     let mut text = input.body.clone();

@@ -1,0 +1,224 @@
+//! Differential test: the ported `extract-refs` against a frozen oracle of the
+//! **pre-port shell's** answers (epic #7810, filed from #8072).
+//!
+//! # Why this exists
+//!
+//! The port method for epic #7810 is "keep the shell's test suite and run its
+//! assertions unchanged against the Rust" — a retained black-box suite as the
+//! equivalence proof. #8011 showed the limit of that method: the `dep_recheck`
+//! port shipped **three** silent behavioural divergences while its retained
+//! suite was 104/104 green. A retained suite proves only what its author
+//! thought to write down, and nobody writes down the input they did not
+//! imagine. All three escapees were inputs nobody imagined.
+//!
+//! Differential testing closes exactly that gap, because the corpus is
+//! *generated* from the grammar the implementation parses rather than
+//! hand-picked. This test replays 700 such inputs and asserts the port differs
+//! from the shell in only the ways we have deliberately accepted.
+//!
+//! # Why an oracle file rather than running the shell
+//!
+//! The pre-port shell is gone from the tree (that was the point). Running it
+//! here would mean either a `git show` against a pinned rev — which breaks
+//! under CI's default shallow checkout — or vendoring 821 lines of dead shell
+//! plus a runtime `bash` **and** `jq` dependency into `cargo test`. Instead the
+//! shell's answers are frozen into a fixture once, by the documented command in
+//! its `_meta` record, and this test needs no shell at all.
+//!
+//! # What a failure here means
+//!
+//! `UNEXPLAINED` means the port now differs from the retired shell in a way
+//! nobody has classified. That is the #8011 shape recurring: read the reported
+//! case, decide whether the new behaviour is right, then either fix it or add
+//! the class here **with** its reasoning. Do not silence it by widening a class.
+//!
+//! The per-class counts are a characterization, not a contract — they change
+//! when `extract()` legitimately changes. The zero-`UNEXPLAINED` assertion is
+//! the real invariant.
+
+use loom_daemon::dep_recheck::extract::{extract, Input};
+
+/// Frozen answers from the pre-port shell. See the `_meta` first line.
+const ORACLE: &str = include_str!("fixtures/extract_refs_shell_oracle.jsonl");
+
+/// The bot login the oracle was generated with. Must match `_meta.bot_login`.
+const BOT_LOGIN: &str = "loom-bot";
+
+/// The three accepted ways the port differs from the shell it replaced.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+enum Divergence {
+    /// The shell matched with `grep -oE`, which is line-oriented and cannot
+    /// span a newline; the Rust regex runs over the whole text with `\s`
+    /// inside `[*_:\s]*` matching `\n`. So `"Blocked by\n#42"` matches here and
+    /// did not there. Documented and kept in `extract.rs` (#8011): missing a
+    /// genuine declared reference is the worse failure for a check whose whole
+    /// job is finding one.
+    NewlineSpan,
+    /// `#007`. The shell's `sort -un` sorts numerically but prints the ORIGINAL
+    /// token, so it emitted `007`; the Rust parses to `u64` and prints `7`.
+    /// Both denote issue 7, and GitHub resolves `#007` to issue 7, so the Rust
+    /// spelling is the more correct one — but it does change `CONCLUSION_HASH`
+    /// for any text using a zero-padded reference.
+    LeadingZero,
+    /// A `#N` above `u64::MAX` (boundary confirmed exactly at
+    /// 18446744073709551615 vs ...616). `extract()` drops it via
+    /// `.parse().ok()`; the shell kept the literal token. No real issue number
+    /// is 20 digits, so this is reachable only from adversarial forge text.
+    /// Downstream a dropped ref is usually fail-SAFE (zero refs yields
+    /// `verdict: open`, i.e. still blocked), but in a MIXED set — one merged
+    /// ref plus one dropped — the verdict becomes `stale-premise` where the
+    /// shell would instead have hard-errored on the unfetchable token.
+    OverflowDropped,
+}
+
+/// One frozen case.
+struct Case {
+    body: String,
+    shell_refs: String,
+}
+
+fn load_oracle() -> Vec<Case> {
+    let mut cases = Vec::new();
+    for (i, line) in ORACLE.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("oracle line {}: {e}", i + 1));
+        if v.get("_meta").is_some() {
+            // Provenance record; assert it still describes this test's setup.
+            let meta = &v["_meta"];
+            assert_eq!(
+                meta["bot_login"].as_str(),
+                Some(BOT_LOGIN),
+                "oracle was generated with a different --bot-login than this test uses"
+            );
+            continue;
+        }
+        cases.push(Case {
+            body: v["body"].as_str().expect("body").to_string(),
+            shell_refs: v["shell_refs"].as_str().expect("shell_refs").to_string(),
+        });
+    }
+    cases
+}
+
+/// Explain every token-level difference between the shell's answer and the
+/// port's, or return `Err` describing the part that no known class covers.
+fn classify(body: &str, shell: &str, rust: &str) -> Result<Vec<Divergence>, String> {
+    let mut classes = Vec::new();
+
+    // Re-derive what the shell's tokens become under the port's own rules:
+    // parse as u64, dropping anything that overflows.
+    let mut normalised: Vec<String> = Vec::new();
+    for tok in shell.split_whitespace() {
+        match tok.parse::<u64>() {
+            Ok(v) => {
+                if tok != v.to_string() {
+                    classes.push(Divergence::LeadingZero);
+                }
+                normalised.push(v.to_string());
+            }
+            Err(_) => classes.push(Divergence::OverflowDropped),
+        }
+    }
+    normalised.sort_unstable_by_key(|s| s.parse::<u64>().unwrap_or(u64::MAX));
+    normalised.dedup();
+
+    let got: Vec<&str> = rust.split_whitespace().collect();
+
+    let extra: Vec<&&str> = got
+        .iter()
+        .filter(|t| !normalised.contains(&t.to_string()))
+        .collect();
+    if !extra.is_empty() {
+        if body.contains('\n') {
+            classes.push(Divergence::NewlineSpan);
+        } else {
+            return Err(format!(
+                "port reported {extra:?} which the shell did not, and the input has no newline \
+                 so the accepted newline-spanning divergence cannot explain it"
+            ));
+        }
+    }
+
+    let missing: Vec<&String> = normalised
+        .iter()
+        .filter(|t| !got.contains(&t.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "port DROPPED {missing:?}, which the shell found and which parse cleanly as u64 — \
+             no accepted class explains losing a declared reference"
+        ));
+    }
+
+    classes.sort_unstable_by_key(|c| format!("{c:?}"));
+    classes.dedup();
+    Ok(classes)
+}
+
+#[test]
+fn ported_extract_refs_diverges_from_the_retired_shell_only_in_known_ways() {
+    let cases = load_oracle();
+    assert!(
+        cases.len() >= 600,
+        "oracle shrank to {} cases — a differential test that runs almost nothing passes for \
+         the wrong reason",
+        cases.len()
+    );
+
+    let mut agreed = 0usize;
+    let mut per_class = std::collections::BTreeMap::<String, usize>::new();
+    let mut unexplained = Vec::new();
+
+    for case in &cases {
+        let input = Input {
+            body: case.body.clone(),
+            comments: Vec::new(),
+        };
+        let rust = extract(&input, BOT_LOGIN);
+
+        if rust == case.shell_refs {
+            agreed += 1;
+            continue;
+        }
+        match classify(&case.body, &case.shell_refs, &rust) {
+            Ok(classes) if classes.is_empty() => unexplained.push(format!(
+                "body={:?}\n    shell=[{}]  port=[{}]\n    outputs differ but no class applies",
+                case.body, case.shell_refs, rust
+            )),
+            Ok(classes) => {
+                for c in classes {
+                    *per_class.entry(format!("{c:?}")).or_default() += 1;
+                }
+            }
+            Err(why) => unexplained.push(format!(
+                "body={:?}\n    shell=[{}]  port=[{}]\n    {why}",
+                case.body, case.shell_refs, rust
+            )),
+        }
+    }
+
+    assert!(
+        unexplained.is_empty(),
+        "{} of {} generated inputs diverge from the retired shell in UNCLASSIFIED ways.\n\
+         This is the #8011 shape: a divergence that a retained black-box suite would not \
+         have noticed.\n\n{}",
+        unexplained.len(),
+        cases.len(),
+        unexplained
+            .iter()
+            .take(10)
+            .map(|s| format!("  - {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Characterization. Update deliberately when `extract()` changes; a shift
+    // here is a real behaviour change and should be explained in the commit.
+    assert_eq!(agreed, 436, "cases where the port and the shell agree exactly");
+    assert_eq!(per_class.get("NewlineSpan").copied().unwrap_or(0), 94);
+    assert_eq!(per_class.get("LeadingZero").copied().unwrap_or(0), 91);
+    assert_eq!(per_class.get("OverflowDropped").copied().unwrap_or(0), 105);
+}
