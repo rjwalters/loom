@@ -134,6 +134,15 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// up: a resync commit on `rjwalters/anvil` (2026-08-23) swept a live
 /// installation token into a public repo via `git add .loom`. Security-
 /// relevant — never remove without an equivalent replacement.
+///
+/// #8075: added `.loom-local/` — the host-local config overlay tier
+/// (`config_resolver.rs`, #4039 / Epic #3835 Phase 2). Same shape of gap as
+/// #7818: it was ignored in this source repo's own `.gitignore` but missing
+/// from this installer-managed list, so in every consumer repo the overlay
+/// surfaced as `?? .loom-local/` — unignored, un-Loom-owned untracked dirt
+/// that `check-main-clean.sh --quarantine` is entitled to stash away between
+/// sweep waves, silently reverting a per-repo model override with no signal
+/// anywhere.
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
     // Per-worktree builder progress checkpoint. Its WRITER moved from Python to
@@ -267,6 +276,19 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // commit's `git add .loom` swept a live installation token into a
     // public repo.
     ".loom/gh-config-by-owner/",
+    // Host-local config overlay tier (#4039, Epic #3835 Phase 2) — the
+    // highest-precedence tier `config_resolver.rs` merges over the committed
+    // config. Untracked and per-host on purpose: this is where a genuinely
+    // host-specific value (e.g. `observability.ingestKeyFile` on a non-default
+    // path, or a per-repo model override) belongs, so it never gets committed
+    // and copied verbatim onto a different host's `$HOME` the way #5336's
+    // incident did. Ignoring it is load-bearing, not cosmetic: unignored it is
+    // untracked dirt, and untracked dirt is exactly what `check-main-clean.sh
+    // --quarantine` stashes away mid-sweep (#8075). `LOOM_OWNED_PREFIXES` in
+    // `defaults/scripts/check-main-clean.sh` lists it for the same reason —
+    // the two defenses are independent, since this one only reaches a consumer
+    // repo after a resync while that one holds immediately.
+    ".loom-local/",
 ];
 
 /// Build the Loom-managed `.gitignore` block (marker lines + header + patterns),
@@ -719,6 +741,11 @@ mod tests {
         assert!(contents.contains(".loom/gh-config/"));
         assert!(contents.contains(".loom/gh-config-by-owner/"));
 
+        // #8075: the host-local config overlay must be ignored in consumer
+        // repos, else `check-main-clean.sh --quarantine` can stash it away
+        // mid-sweep and silently revert a per-repo model override.
+        assert!(contents.contains(".loom-local/"));
+
         // Retired daemon-brain patterns must NOT be emitted (Phase 3.5, #3402)
         assert!(!contents.contains(".loom/daemon-state.json"));
         assert!(!contents.contains(".loom/[0-9][0-9]-daemon-state.json"));
@@ -787,6 +814,8 @@ mod tests {
         // runs either.
         assert_eq!(contents.matches(".loom/gh-config/").count(), 1);
         assert_eq!(contents.matches(".loom/gh-config-by-owner/").count(), 1);
+        // #8075: the host-local config overlay must not duplicate across runs.
+        assert_eq!(contents.matches(".loom-local/").count(), 1);
     }
 
     #[test]
@@ -860,6 +889,11 @@ mod tests {
             // GitHub App installation token into the tree.
             ".loom/gh-config/",
             ".loom/gh-config-by-owner/",
+            // #8075: host-local config overlay tier (`.loom-local/local.json`).
+            // Ignored in loom's own source .gitignore long before it reached
+            // this list, which is exactly the drift that left every consumer
+            // repo's overlay eligible for a quarantine stash.
+            ".loom-local/",
         ];
 
         for pattern in &expected {
