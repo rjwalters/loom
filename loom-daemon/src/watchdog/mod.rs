@@ -46,6 +46,7 @@ pub mod liveness;
 pub mod locate;
 pub mod marker;
 pub mod probe;
+pub mod recovery;
 pub mod report;
 pub mod supervisor;
 
@@ -115,8 +116,9 @@ fn marker_present(
     }
 
     // A healthy tick ends any outage episode: the next real outage must start
-    // from a fresh attempt budget rather than inheriting a spent one.
-    let _ = std::fs::remove_file(&state.recovery);
+    // from a fresh attempt budget rather than inheriting a spent one, and from
+    // no escalation sentinel.
+    recovery::clear(&state.recovery, &state.escalation_sentinel);
 
     // TODO(#8086): sections 12-22 (the bounded IPC probe, its consecutive and
     // windowed signals) set `reporter.probe_diverged`, which is what makes an
@@ -216,8 +218,10 @@ fn marker_absent(
     }
 
     // A deliberate stop ends any outage episode: the next real start must begin
-    // from a clean slate rather than inheriting a spent attempt budget.
-    let _ = std::fs::remove_file(&state.recovery);
+    // from a clean slate rather than inheriting a spent attempt budget -- and
+    // the escalation sentinel goes with it, or the next outage reads as
+    // already-reported and is never escalated.
+    recovery::clear(&state.recovery, &state.escalation_sentinel);
     reporter.report(
         report::Level::Ok,
         &format!(
