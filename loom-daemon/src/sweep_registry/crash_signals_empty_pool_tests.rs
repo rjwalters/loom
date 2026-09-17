@@ -116,3 +116,91 @@ fn genuine_exhaustion_still_wins_over_other_preflight_shapes() {
     // An unreadable log is still Unknown.
     assert_eq!(classify_preflight_outcome(None), PreflightOutcome::Unknown);
 }
+
+// ===========================================================================
+// `no-usable-account` crash classification (Issue #7708)
+// ===========================================================================
+
+/// Issue #7708 (regression, FAILS before the fix): the crash *classification*
+/// carried on the `sweep.issue.N.crashed` event and persisted into the #4644
+/// outcome journal must name the POOL, not an account.
+///
+/// Before this, every one of the incident's 228 insta-crashes was journaled
+/// as `account-exhausted:rate-limited` with `token=unknown` — a label that
+/// asserts "a named account hit a limit" about a death in which no account
+/// was ever selected. That is what sent two separate investigations (#6917,
+/// #7860) down a per-account theory while the actual fault was pool-wide.
+#[test]
+fn a_token_selection_death_classifies_as_no_usable_account_not_account_exhausted() {
+    let tail = empty_pool_token_selection_tail();
+    assert!(is_no_usable_account_death(&tail));
+    assert_eq!(
+        classify_crash(&tail, Some(78)).as_deref(),
+        Some(NO_USABLE_ACCOUNT_CLASS),
+        "the pool's own per-account diagnostic must not be read as this sweep's death cause"
+    );
+}
+
+/// Issue #7708: the #4122 contract is UNCHANGED. A genuine mid-run
+/// exhaustion — the CLI started, ran, and then hit a limit — still
+/// classifies as `account-exhausted:*`, which is what keeps the spawn
+/// account getting marked bad and the pool self-healing.
+///
+/// This is the specific way the #7708 fix could have silently broken account
+/// rotation while passing every other test, so it is asserted directly.
+#[test]
+fn a_mid_run_exhaustion_still_classifies_as_account_exhaustion() {
+    let tail = "==== loom-daemon dispatch: 2026-09-16T16:29:10Z sweep_id=s issue=1 ====\n\
+                spawn-claude: using OAuth account 'agent4-2amlogic' (mode=ranking)\n\
+                # CLAUDE_CLI_START\n\
+                Claude: You've hit your weekly limit — try again later\n";
+    assert!(
+        !is_no_usable_account_death(tail),
+        "reaching the CLI proves an account WAS selected — this is an account death"
+    );
+    assert_eq!(classify_crash(tail, Some(1)).as_deref(), Some("account-exhausted:rate-limited"),);
+}
+
+/// Issue #7708: the "never reached the CLI" half of the predicate is
+/// load-bearing on its own. A dispatch that logged a token-selection failure
+/// and then went on to start the CLI (a wrapper retry that eventually
+/// succeeded, dying mid-run later) is an ACCOUNT death, not a pool death —
+/// without this guard it would be misrouted, silently disabling the bad-mark
+/// that lets the pool heal itself.
+#[test]
+fn a_token_selection_line_followed_by_a_cli_start_is_not_a_pool_death() {
+    let tail = "==== loom-daemon dispatch: 2026-09-16T16:29:10Z sweep_id=s issue=1 ====\n\
+                ERROR Token selection failed:\n\
+                spawn-claude: retrying token selection\n\
+                spawn-claude: using OAuth account 'agent7' (mode=random)\n\
+                # CLAUDE_CLI_START\n\
+                Claude: You've hit your weekly limit — try again later\n";
+    assert!(!is_no_usable_account_death(tail));
+    assert_eq!(classify_crash(tail, Some(1)).as_deref(), Some("account-exhausted:rate-limited"),);
+}
+
+/// Issue #7708: per-issue logs are append-only, so a token-selection death
+/// recorded by a PREVIOUS dispatch must never classify the current one. The
+/// dispatch-header scoping that `classify_preflight_death` already applies
+/// carries through to this predicate.
+#[test]
+fn a_previous_dispatchs_token_selection_death_does_not_classify_this_one() {
+    let tail = "==== loom-daemon dispatch: 2026-09-16T10:00:00Z sweep_id=old issue=1 ====\n\
+                ERROR Token selection failed:\n\
+                ==== loom-daemon dispatch: 2026-09-16T16:29:10Z sweep_id=new issue=1 ====\n\
+                spawn-claude: using OAuth account 'agent7' (mode=random)\n\
+                # CLAUDE_CLI_START\n\
+                Claude: Execution error\n";
+    assert!(!is_no_usable_account_death(tail));
+}
+
+/// Issue #7708: the other pre-flight shapes are untouched. A broken
+/// `.mcp.json` is a WORKSPACE fault, not a pool fault, and must keep its own
+/// classification path (it has no exhaustion signature, so `classify_crash`
+/// falls through to the bare exit code exactly as before).
+#[test]
+fn an_mcp_preflight_failure_is_not_a_pool_death() {
+    let tail = "==== loom-daemon dispatch: now ====\n# MCP_PREFLIGHT_FAILED\n";
+    assert!(!is_no_usable_account_death(tail));
+    assert_eq!(classify_crash(tail, Some(1)).as_deref(), Some("exit-1"));
+}

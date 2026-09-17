@@ -132,8 +132,7 @@ use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 use crate::sweep_registry::{
     DispatchBackoffError, LeaseOrderDispatchError, LiveClaimDispatchError, OpenPrDispatchError,
-    ParkedIssueDispatchError, PreflightDispatchGate, TokenSelectionDispatchError,
-    WorkspaceCommandsMissingDispatchError,
+    ParkedIssueDispatchError, TokenSelectionDispatchError, WorkspaceCommandsMissingDispatchError,
 };
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::{Event, WorkFinderTickSummary};
@@ -2976,9 +2975,16 @@ where
                 in_flight_sweeps,
                 crate::role_runner::global_active_run_count(),
             );
+            // Host-level token-pool exhaustion hold (#7708) — the
+            // single-workspace analogue of the per-root fold the production
+            // multi-workspace loop below performs via
+            // `pool_preflight::preflight_held_per_root`. Re-derived from the
+            // live pool every tick, so it self-heals within one tick of a
+            // readmission.
             let halted = health_state.is_halted()
                 || (suppress_dispatch_during_gate && health_state.is_gate_in_flight())
-                || crate::host_breaker::global_is_suppressed();
+                || crate::host_breaker::global_is_suppressed()
+                || pool_preflight::observe_root(&workspace_root, chrono::Utc::now());
             // Recompute the dynamic cap from live inputs every tick (Phase B),
             // now with token-capacity backpressure (#3902): the token axis is the
             // count of *healthy* accounts from the ranking, not the flat pool.
@@ -3493,25 +3499,19 @@ pub fn spawn_multi_work_finder_task(
             // clears the advisory automatically on success — no operator
             // action). Strictly per root: a broken workspace never holds a
             // healthy sibling (the #3930 isolation contract).
+            //
+            // #7708: the same slice now also carries the host-level token-pool
+            // exhaustion hold — a pool with accounts but zero SPAWNABLE ones
+            // (every account bad-marked or `.ranking`-hard-excluded) is
+            // guaranteed to kill every sweep dispatched into it at token
+            // selection, ~30s in, after the claim label flip and the lease
+            // comment have already landed on a real issue. See
+            // `pool_preflight::preflight_held_per_root` for why the two holds
+            // are computed together and why a pool hold outranks a #5030
+            // recovery probe.
             let now_tick = chrono::Utc::now();
-            let mut preflight_probe_roots: Vec<std::path::PathBuf> = Vec::new();
-            let preflight_held: Vec<bool> = roots
-                .iter()
-                .map(|root| {
-                    let registry = pool.get_or_provision(root);
-                    let mut registry = registry
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match registry.preflight_dispatch_gate(now_tick) {
-                        PreflightDispatchGate::Open => false,
-                        PreflightDispatchGate::Held => true,
-                        PreflightDispatchGate::Probe => {
-                            preflight_probe_roots.push(root.clone());
-                            false
-                        }
-                    }
-                })
-                .collect();
+            let (preflight_held, preflight_probe_roots) =
+                pool_preflight::preflight_held_per_root(&pool, &roots, now_tick);
             let halted: Vec<bool> = dispatch_held_per_root_with_preflight(
                 &health_states,
                 &roots,
@@ -3525,19 +3525,23 @@ pub fn spawn_multi_work_finder_task(
             // Distinguish a pre-flight-advisory hold from the main-health /
             // gate-in-flight holds (#5030 AC4) so an operator can tell "held
             // because pre-flight is broken" apart from "held because CI is red."
+            // #7708 folded a second cause into this same slice, so this edge
+            // line names both and defers the specifics to whichever hold
+            // logged its own edge line (`pool_preflight` logs the pool one).
             if preflight_held_count != was_preflight_held_count {
                 if preflight_held_count > 0 {
                     log::warn!(
                         "work_finder: {preflight_held_count} of {} repo(s) held — \
-                         claude-wrapper pre-flight advisory tripped (broken .mcp.json / dead token \
-                         pool); dispatch is suppressed except one probe per cooldown until a \
-                         dispatch reaches CLI start (#5030)",
+                         claude-wrapper pre-flight advisory tripped (broken .mcp.json, #5030) or \
+                         the resolved token pool has zero spawnable accounts (#7708); dispatch is \
+                         suppressed (an advisory hold still allows one probe per cooldown, a pool \
+                         hold allows none)",
                         roots.len()
                     );
                 } else {
                     log::info!(
-                        "work_finder: pre-flight advisory cleared for all repos — dispatch \
-                         resuming (#5030)"
+                        "work_finder: pre-flight + token-pool holds cleared for all repos — \
+                         dispatch resuming (#5030/#7708)"
                     );
                 }
                 was_preflight_held_count = preflight_held_count;
@@ -4265,6 +4269,8 @@ pub mod forge {
 
 // Re-export the concrete adapters at the module root for ergonomic wiring.
 pub use forge::{GhWorkSource, RegistryDispatcher};
+
+pub mod pool_preflight;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

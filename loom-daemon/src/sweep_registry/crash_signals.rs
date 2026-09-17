@@ -681,6 +681,42 @@ pub(crate) enum PreflightOutcome {
 /// `token-selection` branch for why.
 pub(crate) const TOKEN_SELECTION_PREFLIGHT_LABEL: &str = "preflight-token-selection-failed";
 
+/// The [`classify_crash`] label for a sweep that died in `spawn-claude.sh`'s
+/// token-selection step because the pool it resolved held **no usable
+/// account** (Issue #7708).
+///
+/// Deliberately NOT an `account-exhausted:*` label: no account was ever
+/// selected, so none can be named, charged, or marked bad. This is a
+/// **pool-level** fault, and every consumer should treat it as one — see
+/// `work_finder::pool_preflight` for the host-level hold it arms and
+/// `sweep_registry::reaper` for the carve-out that keeps it off the #4485
+/// per-issue dispatch-backoff ladder.
+pub(crate) const NO_USABLE_ACCOUNT_CLASS: &str = "no-usable-account";
+
+/// Whether `log_tail`'s newest dispatch is the [`NO_USABLE_ACCOUNT_CLASS`]
+/// shape (Issue #7708): the explicit
+/// [`TOKEN_SELECTION_PREFLIGHT_LABEL`] signature matched **and** the child
+/// never reached the CLI.
+///
+/// The second condition is what protects the #4122 contract. A genuine
+/// *mid-run* exhaustion — the CLI started, ran, and then hit a limit — must
+/// keep classifying as `account-exhausted:*` so the spawn account is still
+/// marked bad and the pool keeps self-healing. Without the CLI-start check, a
+/// single dispatch that logged a token-selection retry before succeeding and
+/// later dying mid-run would be misrouted to the pool-level class, silently
+/// disabling account rotation. Requiring "never reached the CLI" makes that
+/// impossible: no account line, no account death.
+pub(crate) fn is_no_usable_account_death(log_tail: &str) -> bool {
+    if classify_preflight_death(log_tail) != Some(TOKEN_SELECTION_PREFLIGHT_LABEL) {
+        return false;
+    }
+    let current_dispatch = log_tail
+        .rfind(DISPATCH_HEADER_MARKER)
+        .map_or(log_tail, |start| &log_tail[start..]);
+    !current_dispatch.contains(CLAUDE_CLI_START_MARKER)
+        && !current_dispatch.contains(CLI_START_MARKER)
+}
+
 /// The operator-facing warning for an insta-crash that matched an exhaustion
 /// `signature` but whose spawn account was never captured (`token=unknown`) —
 /// see `SweepRegistry::insta_crash_is_account_exhaustion`.
@@ -812,6 +848,20 @@ pub(crate) fn background_wait_signature() -> &'static Regex {
 ///    signature. `None` when the exit was clean/unknown with no signature, so
 ///    the field is omitted from the wire form rather than carrying noise.
 pub(crate) fn classify_crash(log_tail: &str, exit_code: Option<i32>) -> Option<String> {
+    // Issue #7708: a death in `spawn-claude.sh`'s TOKEN SELECTION step
+    // outranks the account-exhaustion row below, for the same reason #7860
+    // gave it precedence in `classify_preflight_outcome` — the prose that
+    // matches `classify_account_exhaustion` here is the pool's own
+    // per-account `.bad_tokens` diagnostic, not this sweep's death cause. No
+    // account was selected, so there is no account to attribute the death to,
+    // and `account-exhausted:rate-limited` names one anyway. All 228
+    // insta-crashes in the incident that filed #7708 carried that label with
+    // `token=unknown`, which is precisely why the exhaustion-shaped label was
+    // useless for diagnosis: it says "an account hit a limit" about a death
+    // in which the pool, not any account, was the fault.
+    if is_no_usable_account_death(log_tail) {
+        return Some(NO_USABLE_ACCOUNT_CLASS.to_string());
+    }
     if let Some(sig) = classify_account_exhaustion(log_tail) {
         return Some(format!("account-exhausted:{sig}"));
     }
