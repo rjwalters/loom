@@ -3233,6 +3233,14 @@ pub fn spawn_multi_work_finder_task(
     event_bus: Arc<EventBus>,
     drain: Arc<std::sync::atomic::AtomicBool>,
     role_in_progress: crate::role_runner::InProgressGuard,
+    // Reconcile-before-dispatch (Issue #6615/#7974): flips to `true` once the
+    // daemon's startup claim-reconciliation pass
+    // (`crate::daemon_startup_reconciliation::spawn_startup_passes`) has
+    // actually finished. That pass now runs on a blocking thread rather than
+    // blocking `run_daemon` itself, so this is what still guarantees no sweep
+    // is admitted before a startup reclaim of a stale `loom:building` claim
+    // has landed.
+    mut startup_reconciliation_ready: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
@@ -3246,6 +3254,12 @@ pub fn spawn_multi_work_finder_task(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;
+        // Block the loop's first REAL tick body until the startup
+        // reconciliation pass has finished (#6615/#7974). Already-`true`
+        // resolves instantly (the common case: the pass is almost always
+        // faster than one tick interval), so this never adds latency once the
+        // pass has completed — including on every tick after the first.
+        let _ = startup_reconciliation_ready.wait_for(|ready| *ready).await;
         let mut was_halted = false;
         let mut was_pressured = false;
         // Pre-flight-advisory hold transition state (#5030): log the distinct

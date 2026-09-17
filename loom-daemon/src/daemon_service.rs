@@ -13,6 +13,7 @@ use loom_daemon::claim_reconciliation;
 use loom_daemon::config_resolver;
 use loom_daemon::credential_preflight;
 use loom_daemon::daemon_heartbeat;
+use loom_daemon::daemon_startup_reconciliation;
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
@@ -25,7 +26,6 @@ use loom_daemon::metrics_collector;
 use loom_daemon::observability;
 use loom_daemon::orphan_process_reaper;
 use loom_daemon::primary_checkout_reaper;
-use loom_daemon::quarantine_reconciliation;
 use loom_daemon::quarantine_stash_status;
 use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_collision;
@@ -855,6 +855,41 @@ pub(crate) async fn run_daemon() -> Result<()> {
         });
     }
 
+    // Declared-cadence liveness heartbeat (Issue #4011): the daemon touches
+    // `<loom_dir>/daemon.heartbeat` on a fixed cadence so a host-side watchdog
+    // (`loom-daemon-watchdog.sh`, a second StartInterval launchd job) can detect
+    // "a daemon should be running but isn't" WITHOUT talking to the daemon — a
+    // dead daemon cannot report its own death, so the reporter must live outside
+    // this process. Default-ON like the token-ranking refresh / watch-monitor
+    // loops (it only writes a small bookkeeping file with no dispatch side
+    // effect); opt out with `LOOM_DAEMON_HEARTBEAT=0` /
+    // `autonomous.heartbeat.enabled=false`. We deliberately do NOT reuse the
+    // token-ranking `.ranking` mtime as an accidental heartbeat: that is a
+    // config-disableable side effect, so a detector keyed to it would silently
+    // stop working when that loop is turned off.
+    //
+    // Spawned here — BEFORE the rate-limit breaker registration and the
+    // startup reconciliation passes just below, rather than after them like
+    // pre-#7974 — so a slow reconciliation pass (unbounded `gh` fan-out under
+    // rate limiting, #7974) never delays the first heartbeat write. The IPC
+    // socket bind / pidfile claim further below get the same treatment for
+    // the same reason.
+    let heartbeat_config = daemon_heartbeat::read_heartbeat_config(&sweep_workspace);
+    // Resolved once here so the healing marker below (#4331) and the running
+    // heartbeat loop agree on the cadence the watchdog derives its staleness
+    // threshold from — even if the loop itself is disabled.
+    let heartbeat_interval = daemon_heartbeat::resolve_interval(&heartbeat_config);
+    let _heartbeat_handle = if daemon_heartbeat::resolve_enabled(&heartbeat_config) {
+        log::info!("daemon_heartbeat: enabled (interval={}s)", heartbeat_interval.as_secs());
+        daemon_heartbeat::spawn_heartbeat_task(heartbeat_interval)
+    } else {
+        log::debug!(
+            "daemon_heartbeat: disabled (set LOOM_DAEMON_HEARTBEAT=1 or \
+             autonomous.heartbeat.enabled=true to opt in)"
+        );
+        None
+    };
+
     // GitHub rate-limit circuit breaker (#4429). Registered here — before the
     // startup reconciliation passes just below — because *every* gh-polling
     // consumer (reconciliation, work-finder, epic supervisor, role runner)
@@ -923,66 +958,33 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // the journal entry above, but its checkpoint's `task_id` joined against
     // `.loom/sweep-run/<task_id>.json` gives `claim_reconciliation` the same
     // provable-death answer — see that module's doc comment for the full
-    // evidence-source precedence. `run_reconciliation_pass` (this call) and
-    // the periodic task spawned just below share one implementation, so the
-    // startup and periodic behavior are identical EXCEPT for the
-    // `is_startup` flag (Issue #6615): only this call passes `true`, which
-    // lets a `loom:building` claim with zero liveness evidence (no journal
-    // entry, no run-registry pid) be reclaimed immediately instead of
-    // waiting out the multi-hour age gate — total absence of evidence right
-    // after a restart is much stronger evidence of a claim orphaned by a
-    // crash between `begin_issue_dispatch`'s label flip and
-    // `finish_issue_dispatch`'s journal write than the identical absence is
-    // during steady-state operation (where the periodic pass below, passing
-    // `false`, still protects a manually-spawned `/loom:sweep` with no
-    // journal entry yet).
-    claim_reconciliation::run_reconciliation_pass(&sweep_workspace, true);
+    // evidence-source precedence. The startup pass and the periodic task
+    // spawned just below share one implementation, so the startup and
+    // periodic behavior are identical EXCEPT for the `is_startup` flag (Issue
+    // #6615): only the startup pass passes `true`, which lets a
+    // `loom:building` claim with zero liveness evidence (no journal entry, no
+    // run-registry pid) be reclaimed immediately instead of waiting out the
+    // multi-hour age gate — total absence of evidence right after a restart
+    // is much stronger evidence of a claim orphaned by a crash between
+    // `begin_issue_dispatch`'s label flip and `finish_issue_dispatch`'s
+    // journal write than the identical absence is during steady-state
+    // operation (where the periodic pass below, passing `false`, still
+    // protects a manually-spawned `/loom:sweep` with no journal entry yet).
+    //
+    // Issue #7974: the startup pass (and the co-located stranded-quarantine
+    // pass below it) used to run as a plain blocking call right here — before
+    // the IPC socket was bound or the heartbeat started. Both now run on a
+    // blocking thread via `spawn_startup_passes`, which returns a
+    // `watch::Receiver<bool>` that flips to `true` once they finish. Nothing
+    // in `run_daemon` itself awaits it — the socket bind / pidfile claim
+    // further below proceed immediately regardless of pass duration — but the
+    // work finder (spawned further below still) DOES await it before its
+    // first admission, which is what keeps the reconcile-before-dispatch
+    // invariant (#6615) intact despite the passes no longer blocking startup.
+    let startup_reconciliation_ready =
+        daemon_startup_reconciliation::spawn_startup_passes(sweep_workspace.clone());
     let _claim_reconciliation_handle =
         claim_reconciliation::spawn_periodic_reconciliation_task(sweep_workspace.clone());
-
-    // Stranded-quarantine reconciliation across every managed workspace
-    // (Issue #4110). The insta-crash quarantine (#3939) is memory-only, so a
-    // restart drops the in-memory pause while the `loom:blocked` label it
-    // applied survives on the forge — with nothing left to release it, the
-    // issue is permanently invisible to the work finder. This pass scans
-    // every registered workspace's open `loom:blocked` issues and releases
-    // the ones carrying a daemon-authored quarantine comment back to
-    // `loom:issue`; a human's manual `loom:blocked` (no such comment) is
-    // never touched. Reuses the same `workspace_registry` roots resolved
-    // above for claim reconciliation.
-    if quarantine_reconciliation::reconciliation_enabled() {
-        let workspace_registry =
-            loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
-        let roots = workspace_registry.effective_roots(&sweep_workspace);
-        let gh_bin = std::path::PathBuf::from("gh");
-        let mut total_checked = 0usize;
-        let mut total_released = 0usize;
-        for root in &roots {
-            let (checked, released) =
-                quarantine_reconciliation::forge::reconcile_workspace(&gh_bin, root);
-            total_checked += checked;
-            total_released += released;
-        }
-        if total_released > 0 {
-            log::info!(
-                "quarantine_reconciliation: startup pass checked {total_checked} loom:blocked \
-                 issue(s) across {} workspace(s), released {total_released} stranded \
-                 quarantine(s) (#4110)",
-                roots.len()
-            );
-        } else {
-            log::debug!(
-                "quarantine_reconciliation: startup pass checked {total_checked} loom:blocked \
-                 issue(s) across {} workspace(s), nothing to release",
-                roots.len()
-            );
-        }
-    } else {
-        log::info!(
-            "quarantine_reconciliation: startup pass disabled ({}=0)",
-            quarantine_reconciliation::RECONCILE_ENABLED_ENV
-        );
-    }
 
     // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the
     // watchdog knobs from `.loom/config.json → autonomous` with env override
@@ -1425,6 +1427,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // Multi-workspace fan-out (#3928): re-reads `effective_roots()` each tick
         // and dispatches into each registered repo's own working tree via the
         // shared `workspace_pool`. Empty registry ⇒ the single `sweep_workspace`.
+        //
+        // `startup_reconciliation_ready` (Issue #7974) is awaited internally
+        // before the loop's first real tick — see `spawn_startup_passes`'s doc
+        // comment above for why this is what still keeps the
+        // reconcile-before-dispatch invariant (#6615) intact now that the
+        // startup pass no longer blocks `run_daemon` itself.
         Some(work_finder::spawn_multi_work_finder_task(
             workspace_pool.clone(),
             sweep_workspace.clone(),
@@ -1436,6 +1444,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
             event_bus.clone(),
             drain_flag.clone(),
             role_in_progress.clone(),
+            startup_reconciliation_ready,
         ))
     } else {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
@@ -1659,33 +1668,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
             None
         };
 
-    // Declared-cadence liveness heartbeat (Issue #4011): the daemon touches
-    // `<loom_dir>/daemon.heartbeat` on a fixed cadence so a host-side watchdog
-    // (`loom-daemon-watchdog.sh`, a second StartInterval launchd job) can detect
-    // "a daemon should be running but isn't" WITHOUT talking to the daemon — a
-    // dead daemon cannot report its own death, so the reporter must live outside
-    // this process. Default-ON like the token-ranking refresh / watch-monitor
-    // loops (it only writes a small bookkeeping file with no dispatch side
-    // effect); opt out with `LOOM_DAEMON_HEARTBEAT=0` /
-    // `autonomous.heartbeat.enabled=false`. We deliberately do NOT reuse the
-    // token-ranking `.ranking` mtime as an accidental heartbeat: that is a
-    // config-disableable side effect, so a detector keyed to it would silently
-    // stop working when that loop is turned off.
-    let heartbeat_config = daemon_heartbeat::read_heartbeat_config(&sweep_workspace);
-    // Resolved once here so the healing marker below (#4331) and the running
-    // heartbeat loop agree on the cadence the watchdog derives its staleness
-    // threshold from — even if the loop itself is disabled.
-    let heartbeat_interval = daemon_heartbeat::resolve_interval(&heartbeat_config);
-    let _heartbeat_handle = if daemon_heartbeat::resolve_enabled(&heartbeat_config) {
-        log::info!("daemon_heartbeat: enabled (interval={}s)", heartbeat_interval.as_secs());
-        daemon_heartbeat::spawn_heartbeat_task(heartbeat_interval)
-    } else {
-        log::debug!(
-            "daemon_heartbeat: disabled (set LOOM_DAEMON_HEARTBEAT=1 or \
-             autonomous.heartbeat.enabled=true to opt in)"
-        );
-        None
-    };
+    // The declared-cadence liveness heartbeat (Issue #4011) used to be spawned
+    // here. It now starts much earlier — immediately after credential
+    // preflight, above the rate-limit breaker registration and the startup
+    // reconciliation passes — so it (and the pidfile / IPC socket bind
+    // further below) are never delayed by a slow reconciliation pass (Issue
+    // #7974). `heartbeat_interval` (still needed below, by the marker
+    // healing) is bound there.
 
     // Startup autonomy-desired marker healing (Issue #4331). The marker is the
     // durable "a daemon is EXPECTED on this host" signal the watchdog + status
