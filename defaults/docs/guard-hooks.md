@@ -162,7 +162,10 @@ outside that array for parsing reasons:
   earlier `export`), not merely present somewhere in the command string — and
   the site sees interpreter-wrapped spellings (`bash -c '…'`, `eval '…'`,
   a pipeline into `sh`) while no longer firing on quoted prose that only
-  mentions the command.
+  mentions the command. A heredoc body counts as prose only when its
+  **delimiter is quoted** (`<<'EOF'` / `<<"EOF"`): a bare `<<EOF` body is
+  expanded by the shell before the sink ever reads it, so any `$( … )` /
+  backtick span inside one is still scanned as executable text.
 - **The toggleable deny categories**: SQL DDL/DML (`guards.sqlDdl`), the
   cloud/docker ask category (`guards.cloudCli`), rm-scope beyond the
   catastrophic targets (`guards.rmScope`), the generic force-op ask

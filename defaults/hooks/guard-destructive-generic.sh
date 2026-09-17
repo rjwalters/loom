@@ -8763,18 +8763,38 @@ done
 #     it to the later segment).
 # The ONLY direction it narrows is the intended one: a `git read-tree` phrase
 # that no shell would ever execute — quoted data handed to a non-executing
-# command, or a heredoc body fed to something that is not an interpreter.
+# command, or a LITERAL heredoc body fed to something that is not an
+# interpreter. "Literal" is load-bearing there: only a QUOTED delimiter
+# (`<<'EOF'` / `<<"EOF"`) makes a body literal. A bare `<<EOF` body is
+# expanded BY THE SHELL before the sink reads a byte of it, so its `$( … )` /
+# backtick spans are scanned as executable text (im_hd_expand()) even when the
+# owning command is a known inert sink.
 #
 # Fail-closed by construction: an unterminated quote, an unbalanced `$(`, an
 # unclosed heredoc and a recursion beyond the depth bound all leave the text
 # VISIBLE/treated as executable rather than inert, and index_mutation_unisolated()
 # falls back to the legacy regex pair if awk itself fails.
 #
-# Measured against `origin/main` over a 70-shape table (both directions), the
-# ONLY verdicts that moved from deny to allow are inert-data shapes: a quoted
-# `--body`/`--comment` value, a heredoc body owned by a known inert sink
-# (`cat > file`, `tee`, `git commit -F -`, the `--body "$(cat <<QUOTED … )"`
-# filing idiom). Thirteen executable shapes moved the other way.
+# MEASURED, not asserted. A differential sweep of a 148-shape corpus against
+# the merge-base hook (`origin/main` at 44e9ab48), each version built into its
+# OWN isolated tree and fed PreToolUse JSON exactly as
+# tests/hooks/lib/guard-destructive-harness.sh make_input() builds it (throwaway
+# git cwd, no .loom/config.json, every LOOM_* unset):
+#
+#     36 shapes  allow -> deny    wrapper escapes, both isolation-scoping
+#                                 holes, git -c/-C/--git-dir/--work-tree
+#     27 shapes  deny  -> allow
+#     85 shapes  unchanged
+#
+# Of the 27 deny -> allow, 22 are PROVABLY inert: each was probed by replacing
+# the index subcommand with a marker program and RUNNING the shape — the marker
+# never fired, so no shell ever executed that text. They are quoted
+# `--body`/`--comment` values and heredoc bodies owned by a known inert sink
+# (`cat > file`, `tee`, `git commit -F -`, `grep`, `jq`, the
+# `--body "$(cat <<QUOTED … )"` filing idiom), either with a QUOTED delimiter or
+# with no substitution in the body at all. The other 5 are the write-then-execute
+# shapes recorded as limitation 4 below: their marker DOES fire, and they are
+# accepted with reasons, not claimed inert.
 #
 # KNOWN LIMITATIONS (unchanged from the old matcher — recorded, not introduced)
 #
@@ -8790,6 +8810,29 @@ done
 #   3. `git` reached through an alias/variable command word (`$G read-tree`) is
 #      not resolved, matching every other command-word-anchored check in this
 #      file (see the printenv/systemctl/ssh-cat segment parsers).
+#
+# ACCEPTED LIMITATIONS INTRODUCED BY THIS PASS (measured, with reasons)
+#
+#   4. WRITE-THEN-EXECUTE inside ONE command string —
+#      `cat > /tmp/x.sh <<QUOTED … EOF` followed by `bash /tmp/x.sh` (also the
+#      `tee`, `source` and `cat <<QUOTED > file && bash file` variants). The
+#      heredoc body genuinely IS literal to `cat`, so this pass treats it as
+#      file content; the same string then executes the file it just wrote. The
+#      old regex denied these only by accident — it matched the raw bytes
+#      wherever they sat — and the shape was never actually covered: no guard
+#      can follow a file across `bash /tmp/x.sh`, and splitting the write and
+#      the run into two tool calls escaped the old matcher exactly as it escapes
+#      this one. 5 shapes in the sweep; accepted as out of remit, recorded here
+#      rather than omitted from the deny -> allow table.
+#   5. PROCESS SUBSTITUTION as an interpreter payload —
+#      `source <(echo 'git read-tree HEAD')`, `. <(…)`, `bash <(…)`.
+#      ALLOW on both sides (no regression, so not a deny -> allow move), but it
+#      is the same class of escape this pass set out to close: the phrase is a
+#      quoted argument of a non-executing producer whose output the interpreter
+#      then runs through a /dev/fd path. Recorded so this inventory stays
+#      honest rather than silently short. (A process substitution whose own
+#      text is unquoted — `diff <(git read-tree HEAD) f` — is still denied by
+#      the lenient net, which sees the adjacent word pair.)
 #
 # Hot path: gated behind a `read-tree` substring test at the call site, so the
 # awk fork only happens for a command that mentions the phrase at all.
@@ -8919,7 +8962,7 @@ function im_unquote(tok,   out, i, n, c, q) {
 # content, and anything else keeps the pre-#7923 regex treatment.
 # An UNCLOSED heredoc is left untouched (body stays visible => fail-closed).
 function im_mask_heredocs(s,   lines, nl, i, j, line, delim, closeat, trimmed,
-                          dashform, k, out, skip, rs, rl, body, any) {
+                          dashform, k, out, skip, rs, rl, body, any, hdquoted) {
     if (index(s, "<<") == 0) return s
     nl = split(s, lines, "\n")
     for (i = 1; i <= nl; i++) skip[i] = 0
@@ -8932,7 +8975,14 @@ function im_mask_heredocs(s,   lines, nl, i, j, line, delim, closeat, trimmed,
         delim = substr(line, rs, rl)
         dashform = (substr(delim, 3, 1) == "-")
         sub(/^<<-?[ \t]*/, "", delim)
-        if (substr(delim, 1, 1) == SQ || substr(delim, 1, 1) == DQ) {
+        # QUOTEDNESS of the delimiter is security-relevant, so it is RECORDED
+        # here, not merely stripped: a quoted delimiter makes the body literal,
+        # but a bare `<<EOF` does NOT -- the shell performs parameter expansion
+        # and command substitution on such a body BEFORE the owning command
+        # reads a single byte of it. See im_hd_expand().
+        # (No apostrophes in this awk program: it is a single-quoted string.)
+        hdquoted = (substr(delim, 1, 1) == SQ || substr(delim, 1, 1) == DQ)
+        if (hdquoted) {
             delim = substr(delim, 2, length(delim) - 2)
         }
         if (delim == "") continue
@@ -8954,6 +9004,7 @@ function im_mask_heredocs(s,   lines, nl, i, j, line, delim, closeat, trimmed,
         }
         skip[closeat] = 1
         IMHD[k] = body
+        IMHDQ[k] = hdquoted
         lines[i] = substr(line, 1, rs - 1) " IMHD" k "IM " substr(line, rs + rl)
     }
     if (!any) return s
@@ -9011,6 +9062,51 @@ function im_extract_subst(s, depth,   out, n, i, c, q, dep, j, inner) {
         out = out c; i++
     }
     return out
+}
+
+# LIVE expansions inside an UNQUOTED-delimiter heredoc body.
+#
+# `cat > f <<QUOTED` is genuinely literal, but a bare `cat > f <<EOF` is NOT:
+# the SHELL performs parameter expansion and command substitution on the body
+# and hands the RESULT to the sink, so a `$( ... )` / backtick span in such a
+# body executes against the real index even though cat/tee/gh/jq/grep never run
+# a byte of it as code. Only the SPANS are live -- the surrounding text really
+# is data -- so this scans the spans and nothing else, which is why a plain
+# `cat > f <<EOF` body naming the index command stays allow.
+#
+# DELIBERATELY QUOTE-BLIND, unlike im_extract_subst(): quote characters carry
+# no quoting meaning inside a heredoc body, so a span wrapped in single quotes
+# there is expanded exactly like a bare one. A BACKSLASH is the one suppressor
+# the shell honours, so it is honoured here too. An unbalanced/unterminated
+# span is not resolvable -- fail closed by handing the whole body to the
+# pre-#7923 regex rather than ignoring it.
+function im_hd_expand(s, depth,   n, i, c, j, dep) {
+    n = length(s); i = 1
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == "\\") { i += 2; continue }
+        if (c == "$" && substr(s, i + 1, 1) == "(") {
+            dep = 1; j = i + 2
+            while (j <= n) {
+                if (substr(s, j, 1) == "(") dep++
+                else if (substr(s, j, 1) == ")") { dep--; if (dep == 0) break }
+                j++
+            }
+            if (dep != 0) { im_legacy(s); return }
+            im_scan(substr(s, i + 2, j - i - 2), depth + 1)
+            i = j + 1
+            continue
+        }
+        if (c == "`") {
+            j = i + 1
+            while (j <= n && substr(s, j, 1) != "`") j++
+            if (j > n) { im_legacy(s); return }
+            im_scan(substr(s, i + 1, j - i - 1), depth + 1)
+            i = j + 1
+            continue
+        }
+        i++
+    }
 }
 
 # Quote-aware lexer. tok[]/typ[] hold words ("w", quote characters PRESERVED so
@@ -9139,6 +9235,7 @@ function im_segments(tok, typ, n, depth,
             if (hdk == 0) continue
             if (im_is_interp(b) || feeds[k]) im_scan(IMHD[hdk], depth + 1)
             else if (!im_is_inert_sink(b)) im_legacy(IMHD[hdk])
+            else if (!IMHDQ[hdk]) im_hd_expand(IMHD[hdk], depth)
         }
 
         if (b == "export") {

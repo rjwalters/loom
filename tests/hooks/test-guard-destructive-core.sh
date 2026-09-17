@@ -926,6 +926,36 @@ assert_deny "#7923: Deny when the assignment prefixes the UPSTREAM pipeline stag
 assert_deny "#7923: Deny a QUOTED assignment look-alike (the shell reads it as a command word)" \
     '"GIT_INDEX_FILE=/tmp/i" git read-tree HEAD'
 
+# --- #7923: an UNQUOTED heredoc delimiter is NOT literal (#8003 follow-up) ---
+# A quoted delimiter (<<'EOF' / <<"EOF") makes the body literal, but a BARE
+# <<EOF does not: bash performs command substitution on the body BEFORE the
+# owning sink (cat/tee/gh/jq/grep) reads a single byte, so a `$( … )` or
+# backtick span there executes against the REAL index. Nothing paired an
+# unquoted delimiter with a substitution before, which is why the hole shipped
+# green. The matching allow-side controls -- same bodies, QUOTED delimiter --
+# live in the inert-sink block further down, so the pair discriminates on the
+# delimiter and nothing else.
+assert_deny "#7923: Deny an unquoted-delimiter heredoc body carrying a substitution" \
+    "$(printf "cat > /tmp/f <<EOF\n\$(git read-tree HEAD)\nEOF\n")"
+assert_deny "#7923: Deny an unquoted-delimiter heredoc body using the BACKTICK form" \
+    "$(printf "cat > /tmp/f <<EOF\n\`git read-tree HEAD\`\nEOF\n")"
+assert_deny "#7923: Deny an unquoted-delimiter tee heredoc body carrying a substitution" \
+    "$(printf "tee /tmp/f <<EOF\n\$(git read-tree HEAD)\nEOF\n")"
+assert_deny "#7923: Deny an unquoted-delimiter gh --body-file heredoc carrying a substitution" \
+    "$(printf "gh issue create --body-file - <<EOF\n\$(git read-tree HEAD)\nEOF\n")"
+assert_deny "#7923: Deny a grep heredoc body carrying a substitution (unquoted delimiter)" \
+    "$(printf "grep x <<EOF\n\$(git read-tree HEAD)\nEOF\n")"
+assert_deny "#7923: Deny a substitution inside QUOTES in an unquoted-delimiter body (heredoc quoting is literal text)" \
+    "$(printf "cat > /tmp/f <<EOF\nprose '\$(git read-tree HEAD)' more\nEOF\n")"
+assert_deny "#7923: Deny an unquoted-delimiter dash-form (<<-) heredoc body carrying a substitution" \
+    "$(printf "cat >> /tmp/f <<-EOF\n\t\$(git read-tree HEAD)\n\tEOF\n")"
+assert_deny "#7923: Deny an unquoted-delimiter heredoc nested in a jq --arg substitution" \
+    "$(printf "jq -n --arg x \"\$(cat <<EOF\n\$(git read-tree HEAD)\nEOF\n)\" .\n")"
+assert_deny "#7923: Deny a wrapper INSIDE an unquoted-delimiter heredoc substitution" \
+    "$(printf "cat > /tmp/f <<EOF\n\$(bash -c 'git read-tree HEAD')\nEOF\n")"
+assert_deny "#7923: Deny an UNBALANCED substitution in an unquoted-delimiter body (fail closed)" \
+    "$(printf "cat > /tmp/f <<EOF\n\$(git read-tree HEAD\nEOF\n")"
+
 # --- #3757: reversible GitHub state changes no longer ask by default ---
 # gh pr close / gh issue close / gh label delete are trivially reversible
 # (gh pr reopen / gh issue reopen / recreate the label), so they are NOT in the
@@ -1318,6 +1348,22 @@ assert_allow "#7923: Allow env-carried GIT_INDEX_FILE isolation" \
 # it keeps the pre-#7923 regex treatment, asserted on the deny side above.
 assert_allow "#7923: Allow an unquoted-delimiter heredoc redirected to a file" \
     "$(printf "cat <<EOF > /tmp/f\ngit read-tree HEAD\nEOF\n")"
+# ...and the paired controls for the deny-side unquoted-delimiter block above:
+# a QUOTED delimiter really does make the body literal, so the SAME body that
+# denies with `<<EOF` must still allow with `<<'EOF'` / `<<"EOF"`, and a
+# backslash-escaped span in an unquoted body is literal too.
+assert_allow "#7923: Allow a single-quoted-delimiter heredoc body carrying a substitution" \
+    "$(printf "cat > /tmp/f <<'EOF'\n\$(git read-tree HEAD)\nEOF\n")"
+assert_allow "#7923: Allow a double-quoted-delimiter heredoc body carrying a substitution" \
+    "$(printf "cat > /tmp/f <<\"EOF\"\n\$(git read-tree HEAD)\nEOF\n")"
+assert_allow "#7923: Allow a quoted-delimiter tee heredoc body using the BACKTICK form" \
+    "$(printf "tee /tmp/f <<'EOF'\n\`git read-tree HEAD\`\nEOF\n")"
+assert_allow "#7923: Allow a quoted-delimiter gh --body-file heredoc body carrying a substitution" \
+    "$(printf "gh issue create --body-file - <<'EOF'\n\$(git read-tree HEAD)\nEOF\n")"
+assert_allow "#7923: Allow a BACKSLASH-escaped substitution in an unquoted-delimiter body" \
+    "$(printf "cat > /tmp/f <<EOF\n\\\\\$(git read-tree HEAD)\nEOF\n")"
+assert_allow "#7923: Allow an unquoted-delimiter body whose substitution is UNRELATED to the index" \
+    "$(printf "gh issue create --body-file - <<EOF\ngenerated \$(date)\nprose about git read-tree here\nEOF\n")"
 assert_allow "#7923: Allow a tee heredoc writing the phrase to a file" \
     "$(printf "tee /tmp/f <<'EOF'\ngit read-tree HEAD\nEOF\n")"
 assert_allow "#7923: Allow a git commit -F - heredoc message mentioning the phrase" \
