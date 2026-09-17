@@ -2203,15 +2203,8 @@ fn reconstruct_discards_a_pgid_the_os_contradicts() {
     // test harness's group — never `pid` itself. Claim otherwise on disk.
     let lock = registry.config.locks_dir().join("issue-4978");
     std::fs::create_dir_all(&lock).unwrap();
-    let owner = LockOwner {
-        issue: 4978,
-        owner_pid: pid,
-        acquired_at: Utc::now().to_rfc3339(),
-        sweep_id: "sweep-stale-pgid".to_string(),
-        pgid: Some(pid),
-        model: None,
-        effort: None,
-    };
+    let mut owner = LockOwner::new(4978, pid, "sweep-stale-pgid");
+    owner.pgid = Some(pid);
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 
     registry.reconstruct().expect("reconstruct should succeed");

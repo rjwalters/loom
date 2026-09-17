@@ -2287,15 +2287,7 @@ pub(crate) fn write_lock_owner(
     std::fs::create_dir_all(&locks).unwrap();
     let lock = locks.join(format!("issue-{issue}"));
     std::fs::create_dir_all(&lock).unwrap();
-    let owner = LockOwner {
-        pgid: None,
-        model: None,
-        effort: None,
-        issue,
-        owner_pid,
-        acquired_at: Utc::now().to_rfc3339(),
-        sweep_id: sweep_id.to_string(),
-    };
+    let owner = LockOwner::new(issue, owner_pid, sweep_id);
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
     lock
 }
