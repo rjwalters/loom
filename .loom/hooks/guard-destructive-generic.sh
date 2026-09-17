@@ -1578,6 +1578,52 @@ function has_live_subst(str,    i, c, bs) {
 # strip_literal_text(): backslash-escaped quotes and an unterminated quote fall
 # back to the old separator-active behaviour, never widening a deny into an allow.
 #
+# UNQUOTED BACKSLASH-NEWLINE LINE CONTINUATION (ported from sky130-modexp
+# fdced41, #7945): every caller downstream of qsplit() ultimately does
+# `n = split($0, segs, "\n")` and treats each resulting piece as ONE simple
+# command (extract_write_targets(), extract_rm_targets(),
+# lifecycle_or_cloud_reason(), parse_force_ops(), ...). Without this branch,
+# qsplit() copies an embedded `\n` through unchanged for any reason OTHER than
+# the ;/&/| separators above -- including the newline half of a real shell
+# line-continuation (`cmd arg1 \` + newline + `arg2`), which is not a
+# statement boundary at all: the real shell deletes the backslash and the
+# newline and joins the two physical lines into one logical command. Leaving
+# it unjoined splits a single multi-line invocation into N bogus "commands",
+# one per physical line -- for a `cp`/`mv` whose ARGUMENTS spill across a
+# `\`-continued line, this strands the real destination argument in its own
+# line-only segment (never reaching the cp/mv branch's "last argument" check
+# at all) while the trailing "\" on an EARLIER line becomes a phantom extra
+# argument on the `cp <source> \` segment, which the cp/mv branch then
+# misreads as the write target -- resolving it relative to curcwd and denying
+# a legitimate multi-source `cp`/`mv` that reads from outside the worktree
+# into an in-worktree destination.
+#
+# The fix: qsplit() elides a `\` immediately followed by `\n` -- but ONLY when
+# reached OUTSIDE any quoted span, i.e. only in the per-character default
+# path below, never inside the DQ/SQ branch above (an inert quoted span is
+# copied VERBATIM as one `substr()`, backslash-newline and all, before this
+# check ever sees its bytes; a command-substitution-carrying span is walked
+# by its own separator-only loop, which likewise never elides -- so a
+# continuation-looking sequence that is really literal DATA inside a quoted
+# string is never touched). This exactly mirrors real shell semantics: the
+# backslash and the newline are simply deleted, with nothing inserted in
+# their place (a leading space on the continuation line, if any, is
+# untouched and is what naturally keeps the joined tokens separated). It only
+# ever REDUCES spurious mid-invocation segment boundaries -- it can never
+# manufacture a NEW deny (a joined command is scanned exactly as if the
+# operator had typed it on one line), so it stays on the safe side of "never
+# widen a deny".
+#
+# KNOWN LIMITATION: qsplit() has no general backslash-escape tracking outside
+# quotes (a bare `\` was, and remains, passed through as a literal character
+# in every other position). A doubled `\\` immediately followed by a real
+# newline (an escaped literal backslash, THEN an ordinary unescaped line end
+# -- not a continuation) is misread as a continuation and joined too. This
+# shape is vanishingly rare in real commands and, per the "never widen a
+# deny" contract above, over-joining can only ever suppress a spurious
+# segment split -- never create a new false ALLOW of an otherwise-flagged
+# write.
+#
 # Shared as a single awk source string so the three parsers cannot drift.
 # =============================================================================
 _QSPLIT_AWK="$_HASLIVESUBST_AWK"'
@@ -1672,6 +1718,15 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom) {
             }
             out = out qc   # the real closing quote -- emitted literally, never re-opened
             i = ci + 1
+            continue
+        }
+        if (c == "\\" && i < n && substr(s, i + 1, 1) == "\n") {
+            # Unquoted line continuation (see header comment above): the real
+            # shell deletes BOTH the backslash and the newline and joins the
+            # two physical lines into one logical command -- so this emits
+            # nothing at all (never a "\n", unlike the separators below,
+            # which really do end a statement).
+            i += 2
             continue
         }
         if (c == ";") { out = out "\n"; i++; continue }
@@ -1854,25 +1909,80 @@ function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
 # and parse_force_ops() both do this per-segment, in their own main loops.
 # =============================================================================
 _VARRESOLVE_AWK='
-function resolve_var(tok,   vname, rest, vv) {
-    if (substr(tok, 1, 1) != "$") return tok
-    if (match(tok, /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
-        vname = substr(tok, RSTART + 2, RLENGTH - 3)
-        rest = substr(tok, RSTART + RLENGTH)
-    } else if (match(tok, /^\$[A-Za-z_][A-Za-z0-9_]*/)) {
-        vname = substr(tok, RSTART + 1, RLENGTH - 1)
-        rest = substr(tok, RSTART + RLENGTH)
+function resolve_var(tok,   vname, rest, vv, dpos, prefix, varpart) {
+    if (substr(tok, 1, 1) == "$") {
+        if (match(tok, /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
+            vname = substr(tok, RSTART + 2, RLENGTH - 3)
+            rest = substr(tok, RSTART + RLENGTH)
+        } else if (match(tok, /^\$[A-Za-z_][A-Za-z0-9_]*/)) {
+            vname = substr(tok, RSTART + 1, RLENGTH - 1)
+            rest = substr(tok, RSTART + RLENGTH)
+        } else {
+            # `$(...)`, `${VAR:-x}`, `$1`, … — not a bare variable reference.
+            return tok
+        }
+        if (!(vname in varmap)) return tok
+        vv = varmap[vname]
+        # A value that itself still starts with an unresolved "$" (chained
+        # assignment this single-pass resolver does not follow) stays
+        # unresolved rather than being guessed.
+        if (vv == "" || substr(vv, 1, 1) == "$") return tok
+        return vv rest
+    }
+    # MID-TOKEN embedded reference (ported from sky130-modexp fdced41, #7945):
+    # a `$NAME`/`${NAME}` reference appearing AFTER literal path text in the
+    # same token, e.g. `"artifacts/$REC/sub"`. The leading-`$`-only branch
+    # above never even looked at this shape -- a same-command literal
+    # assignment (`REC=<literal>`) was already fully known, but the resolver
+    # bailed on the very first `substr(tok, 1, 1) != "$"` check and left the
+    # whole token, and thus the whole write target, unresolved (denied at the
+    # catastrophic tier for an unresolvable `$`, or -- for the mkdir idiom
+    # this fix enables -- simply never matched as safe).
+    #
+    # Only attempted when `tok` is ENTIRELY free of quote characters. By the
+    # time resolve_var() runs, resolve_var_q() has already peeled at most one
+    # matching pair of surrounding double quotes (the common, safe
+    # `"prefix/$NAME/suffix"` idiom), so the ordinary case reaches here
+    # quote-free. A quote character STILL present anywhere in `tok` means
+    # either a literal quote byte or a PARTIALLY-quoted token (e.g.
+    # `prefix"$VAR"/rest`, where only part of the token is inside a quoted
+    # span) -- naively splicing `prefix vv rest` there would fabricate a
+    # resolved string containing quote bytes the real shell never produces
+    # (a quoted mid-token span is unwrapped by the shell, not left literal).
+    # Bail out and return `tok` unchanged rather than risk that -- fail
+    # closed, byte-identical to this function'"'"'s pre-fix behavior for any
+    # such token.
+    if (index(tok, DQ) > 0 || index(tok, SQ) > 0) return tok
+    if (index(tok, sprintf("%c", 92)) > 0) return tok   # backslash: `\$NAME` is
+                                                        # literal at the shell but
+                                                        # would be substituted here
+    dpos = index(tok, "$")
+    if (dpos == 0) return tok
+    prefix = substr(tok, 1, dpos - 1)
+    varpart = substr(tok, dpos)
+    if (match(varpart, /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
+        vname = substr(varpart, RSTART + 2, RLENGTH - 3)
+        rest = substr(varpart, RSTART + RLENGTH)
+    } else if (match(varpart, /^\$[A-Za-z_][A-Za-z0-9_]*/)) {
+        vname = substr(varpart, RSTART + 1, RLENGTH - 1)
+        rest = substr(varpart, RSTART + RLENGTH)
     } else {
-        # `$(...)`, `${VAR:-x}`, `$1`, … — not a bare variable reference.
+        # `$(...)`, `${VAR:-x}`, `$1`, … at this position -- not a bare
+        # variable reference. Leave unresolved (fail closed).
         return tok
     }
     if (!(vname in varmap)) return tok
     vv = varmap[vname]
-    # A value that itself still starts with an unresolved "$" (chained
-    # assignment this single-pass resolver does not follow) stays
-    # unresolved rather than being guessed.
     if (vv == "" || substr(vv, 1, 1) == "$") return tok
-    return vv rest
+    # `rest` is returned verbatim (unchanged substring of the original
+    # token). If it still contains a SECOND, distinct `$NAME` reference (the
+    # chained/multi-var shape this resolver deliberately does not try to
+    # prove), the spliced-together result still contains a literal `$` byte
+    # -- the caller'"'"'s downstream write-confinement check already fails
+    # closed on ANY unresolved `$` surviving in a write target, so a
+    # multi-var token is never silently over-resolved here even though only
+    # a single substitution pass runs.
+    return prefix vv rest
 }
 function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
     eqpos = index(word, "=")
@@ -6127,8 +6237,16 @@ rm_scope_literal_same_command_resolve() {
 #     rather than guessed — allow on uncertainty, never deny on uncertainty.
 #   - `cp` / `mv ... <dest>`     — the LAST non-flag argument (the common
 #     `cp/mv src... dest` shape).
+#   - `mkdir <dir>...`            — EVERY non-flag argument is a target
+#     (ported from sky130-modexp fdced41, #7945), mirroring `tee`: unlike
+#     `cp`/`mv`, `mkdir -p dir1 dir2` genuinely creates all of them, so each
+#     one is scanned rather than just the last. `-m MODE` / `--mode MODE` in
+#     the separate-argument spelling consumes its mode value, not a directory
+#     target (mirrors the `sed -i` BSD-separate-argument handling, #5674);
+#     the attached `-m0755` / `--mode=0755` forms are already excluded by the
+#     leading-`-` flag test itself.
 #
-# In the three idiom scans above (NOT the `>`/`>>` scan, which has its own
+# In the four idiom scans above (NOT the `>`/`>>` scan, which has its own
 # operator detection), a `<` stdin redirection is recognized and EXCLUDED
 # (#5369): neither the operator token (`<`, `0<`, `</path`) nor the file a
 # bare `<` reads FROM is a write target. Skipping it fixes both a false DENY
@@ -6773,6 +6891,53 @@ extract_write_targets() {
                     nfargs[nf] = toks[j]
                 }
                 if (nf >= 2) print curcwd SEP resolve_var_q(nfargs[nf])
+            } else if (toks[1] == "mkdir") {
+                # `mkdir` (with or without `-p`, and other common flags such
+                # as `-m`) is a write idiom -- it creates a directory -- but
+                # was never recognized here at all (ported from sky130-modexp
+                # fdced41, #7945), so `mkdir -p "../../../pwned-dir"` from
+                # inside a Loom-managed worktree silently ALLOWed directory
+                # creation outside the worktree into the main repo checkout,
+                # with zero ask/deny/telemetry, even though the equivalent
+                # cp/mv/>/tee/sed -i idioms are correctly confined. Every
+                # non-flag argument is a DIRECTORY TARGET (unlike cp/mv,
+                # which take exactly one destination): `mkdir -p dir1 dir2`
+                # really does create BOTH, so every one of them is scanned
+                # and printed here, not just the first or the last -- each
+                # flows through the identical curcwd-join + resolve_var_q()
+                # same-command variable resolution path every other write
+                # idiom uses, then the same worktree-write-confinement check
+                # downstream.
+                delete mkdir_skip
+                for (j = 2; j <= m; j++) {
+                    if (j in stdin_redir) continue
+                    if (j in numfd_redir) continue
+                    if (toks[j] == "") continue
+                    if (j in mkdir_skip) continue
+                    # Same heredoc/herestring exclusion as the `tee`/`cp`/`mv`
+                    # branches above (#5232) -- a trailing `<<EOF` (or
+                    # `<<< word`) after the real mkdir operands must not be
+                    # misread as an extra directory target.
+                    if (toks[j] ~ /^<<-?/) {
+                        if (toks[j] == "<<" || toks[j] == "<<-" || toks[j] == "<<<") j++
+                        continue
+                    }
+                    if (toks[j] ~ /^-/) {
+                        # `-m MODE` / `--mode MODE` (SEPARATE-argument form,
+                        # e.g. `mkdir -m 0755 dir`) consumes the NEXT token
+                        # as the mode value, not a directory target --
+                        # mirrors the `sed -i` BSD-separate-argument handling
+                        # above (#5674). The far more common ATTACHED forms
+                        # (`-m0755`, `--mode=0755`) are already excluded by
+                        # the leading `-` test itself and consume nothing
+                        # extra.
+                        if (toks[j] == "-m" || toks[j] == "--mode") {
+                            if (j + 1 <= m) mkdir_skip[j + 1] = 1
+                        }
+                        continue
+                    }
+                    print curcwd SEP resolve_var_q(toks[j])
+                }
             }
 
             # >/>>  redirection — token-boundary detection only (never a
@@ -7329,7 +7494,7 @@ _wt_dist_scratch_path() {
 if worktree_isolation_guard_enabled && \
    { [[ "$COMMAND_ASK_SCAN" == *">"* ]] || [[ "$COMMAND_ASK_SCAN" == *"tee"* ]] || \
      [[ "$COMMAND_ASK_SCAN" == *"sed"* ]] || [[ "$COMMAND_ASK_SCAN" == *"cp "* ]] || \
-     [[ "$COMMAND_ASK_SCAN" == *"mv "* ]]; }; then
+     [[ "$COMMAND_ASK_SCAN" == *"mv "* ]] || [[ "$COMMAND_ASK_SCAN" == *"mkdir"* ]]; }; then
     _WT_WRITE_BASE=""
     _WT_WRITE_BASE_DONE=""
 
@@ -7851,7 +8016,32 @@ if worktree_isolation_guard_enabled && \
         case "$_wabs" in
             "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) : ;;
             "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) : ;;
-            *) continue ;;
+            *)
+                # Neither main-checkout spelling matched LEXICALLY. Before
+                # concluding this write target is unrelated to the main
+                # checkout, retry with $_wabs resolved through the SAME
+                # physical-symlink pass (`pwd -P`, via physical_abs_path())
+                # that produced $_WT_MAIN_ROOT — $_wabs itself only ever went
+                # through normalize_abs_path(), which is deliberately
+                # lexical-only (see its header) and so never resolves a
+                # symlinked ancestor. On macOS this bites every mkdir(1)/
+                # write-idiom target built from a $TMPDIR path: `mktemp -d`
+                # yields `/var/folders/...` while `pwd -P` resolves the
+                # identical directory to `/private/var/folders/...` (the same
+                # divergence documented at physical_abs_path()'s own header
+                # and at the `/tmp` -> `/private/tmp` note where
+                # $_WT_MAIN_ROOT is computed above). Without this fallback,
+                # EVERY escaping target under such a path silently fell
+                # through to the `continue` (allow) below (ported from
+                # sky130-modexp 92415b2, #7945). Only widens what this block
+                # treats as "inside the main checkout"; never narrows the
+                # existing lexical match above.
+                _wabs_phys=$(physical_abs_path "$_wabs")
+                case "$_wabs_phys" in
+                    "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) : ;;
+                    *) continue ;;
+                esac
+                ;;
         esac
 
         # CARVE-OUT (#6021): a read-only-by-role session (no Write/Edit tool
@@ -7886,7 +8076,7 @@ if worktree_isolation_guard_enabled && \
         # base is resolved off the same main-checkout root so the "a managed
         # worktree exists" gate stays consistent with the containment test.
         if _wt_isolation_in_play; then
-            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree ($(_wt_worktree_hint)) and write there instead. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_WT_MKTEMP_SCAN
+            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv/mkdir — do NOT retry the write through Bash. cd into your issue worktree ($(_wt_worktree_hint)) and write there instead. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_WT_MKTEMP_SCAN
         fi
     done <<< "$WRITE_TARGETS"
 fi
