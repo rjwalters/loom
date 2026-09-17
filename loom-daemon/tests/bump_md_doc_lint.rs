@@ -49,11 +49,37 @@
 //! `contains()` pin. The CONTRACT/PROSE split above (#3877) predates that rule
 //! and stays as-is here — see #7979 for the tracked migration — but it is not
 //! license to add a fresh sentence pin under a PROSE label.
+//!
+//! ---------------------------------------------------------------------------
+//! #7996 migration status (split from #7979)
+//! ---------------------------------------------------------------------------
+//! Of this file's `contains()`/`starts_with()` needles, only the ten in the
+//! old `bump_md_includes_version_sh_template` (`VERSION_FILES=`,
+//! `get_version()`, `get_version_from_file()`, `check_versions()`,
+//! `bump_version()`, `set_version()`, `do_tag()`,
+//! `bump <major|minor|patch>`, `set <version>`, `--tag`) lived EXCLUSIVELY
+//! inside a markdown code fence (verified by a fence-position scan of the
+//! whole doc). That test is now `extract_fenced_block_after` + a real `bash
+//! -n` syntax check + end-to-end execution (`show`/`check`/`bump
+//! patch`/`set <version> --tag` against a real git fixture) of the fenced
+//! `scripts/version.sh` template — see its doc comment below. There are no
+//! table/structure assertions in this file (bump.md has no markdown tables).
+//! Every remaining needle in this file also has at least one occurrence
+//! OUTSIDE a code fence (in the surrounding prose itself), so per the rule
+//! above it is not a fence-literal pin requiring migration — these stay
+//! review-only, unchanged by #7996: `bump_md_documents_all_eight_phases`,
+//! `bump_md_lists_seven_detection_sources`,
+//! `bump_md_documents_changelog_handling`,
+//! `bump_md_gates_push_and_release_on_confirmation`,
+//! `bump_md_distinguishes_itself_from_repo_release`,
+//! `bump_md_is_not_in_loom_internal_skip_list`, and
+//! `bump_md_exists_and_has_title`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 const BUMP_MD_RELATIVE: &str = "../defaults/.claude/commands/loom/bump.md";
 
@@ -66,6 +92,36 @@ fn read_bump_md() -> String {
             BUMP_MD_RELATIVE,
         );
     })
+}
+
+/// Extracts the body of the first fenced code block (```` ```lang\n...\n``` ````)
+/// that appears at or after the given `anchor` substring in `content`.
+///
+/// This is the extract-and-execute primitive (#7979/#7993 precedent,
+/// `doc_lint_support::first_fenced_block_after`): rather than pinning the
+/// fence's literal contents as a `contains()` string, the caller extracts the
+/// fence body and RUNS it, so a behavior-preserving reword/relocation of the
+/// surrounding prose (or the fence's own comments) does not break the build —
+/// only an actual functional change does. Panics naming `anchor` if no fence
+/// is found or it is never closed — exactly the "someone deleted/broke the
+/// example" case this lint exists to catch.
+fn extract_fenced_block_after<'a>(content: &'a str, anchor: &str) -> &'a str {
+    let from = content
+        .find(anchor)
+        .unwrap_or_else(|| panic!("expected to find anchor `{anchor}` in bump.md"));
+    let rest = &content[from..];
+    let open = rest
+        .find("```")
+        .unwrap_or_else(|| panic!("expected a fenced code block after `{anchor}`, found none"));
+    let after_open = &rest[open + 3..];
+    let nl = after_open.find('\n').unwrap_or_else(|| {
+        panic!("malformed fence after `{anchor}`: no newline following the opening ```")
+    });
+    let body = &after_open[nl + 1..];
+    let close = body.find("```").unwrap_or_else(|| {
+        panic!("unterminated fence after `{anchor}` — the code block never closes")
+    });
+    &body[..close]
 }
 
 /// AC: skill file exists with the expected title.
@@ -179,37 +235,228 @@ fn bump_md_lists_seven_detection_sources() {
     );
 }
 
-/// AC6: the skill must ship a templated `scripts/version.sh` body. We
-/// assert the marker structural pieces of the template (function names,
-/// subcommand wiring) so a future refactor that drops the template by
-/// accident lights up CI.
+/// AC6: the skill must ship a templated `scripts/version.sh` body.
+///
+/// Migrated from a `contains()` pin over `VERSION_FILES=`, `get_version()`,
+/// `get_version_from_file()`, `check_versions()`, `bump_version()`,
+/// `set_version()`, `do_tag()`, `bump <major|minor|patch>`, `set <version>`,
+/// and `--tag` (#7996 — split from #7979): every one of those markers lives
+/// EXCLUSIVELY inside the fenced `scripts/version.sh` template (verified by a
+/// fence-position scan of the whole doc at authoring time), so a correct
+/// rename/reword inside the fence would previously break the build with a
+/// message about "AC6 requires a template" instead of "two strings no longer
+/// match" — the exact #7950/#7948 failure shape.
+///
+/// This test now EXTRACTS the fenced template verbatim, `bash -n` syntax-
+/// checks the whole thing (including its commented-out per-shape
+/// placeholders), then fills in the npm shape using the template's OWN
+/// commented-out npm-shape example lines (what a runtime LLM following this
+/// skill would uncomment for a real npm project) and RUNS the generated
+/// script end-to-end — `show`, `check`, `bump patch`, and `set <version>
+/// --tag` — against a real git fixture. It fails on an actual behavior
+/// break (a function renamed, a subcommand's argument grammar changed, the
+/// git add/commit/tag sequence broken), not on a wording change.
 #[test]
 fn bump_md_includes_version_sh_template() {
     let content = read_bump_md();
-    // CONTRACT: template markers are function names, variable names, and
-    // subcommand grammar mirrored from Loom's own scripts/version.sh. A rename
-    // means the shipped template drifted — keep EXACT.
-    let required_template_markers: &[&str] = &[
-        "scripts/version.sh",
-        "VERSION_FILES=",
-        "get_version()",
-        "get_version_from_file()",
-        "check_versions()",
-        "bump_version()",
-        "set_version()",
-        "do_tag()",
-        // The subcommand surface mirrored from Loom's own scripts/version.sh.
-        "bump <major|minor|patch>",
-        "set <version>",
-        "--tag",
-    ];
-    for marker in required_template_markers {
-        assert!(
-            content.contains(marker),
-            "bump.md is missing template marker `{marker}` — \
-             #3468 AC6 requires a parameterized scripts/version.sh template"
-        );
+
+    // PROSE (structural anchors, not fenced-literal pins — both also appear
+    // in the surrounding prose, e.g. Phase 5's heading and Phase 1 item 1):
+    // kept as simple presence checks so the extraction anchor below has a
+    // named failure mode if the heading disappears.
+    assert!(
+        content.contains("scripts/version.sh"),
+        "bump.md must reference `scripts/version.sh` — #3468 AC6"
+    );
+    let anchor = "#### Template (adapt to detected sources)";
+    assert!(
+        content.contains(anchor),
+        "bump.md must retain the '{anchor}' heading anchoring the extracted \
+         scripts/version.sh template"
+    );
+
+    let fence = extract_fenced_block_after(&content, anchor);
+
+    // Syntax check: the WHOLE template (including its commented-out
+    // per-shape placeholder sections) must parse as valid bash.
+    let syntax = Command::new("bash")
+        .arg("-n")
+        .arg("-c")
+        .arg(fence)
+        .output()
+        .expect("run `bash -n` on the extracted scripts/version.sh template");
+    assert!(
+        syntax.status.success(),
+        "the scripts/version.sh template fenced in bump.md is not valid bash: {}",
+        String::from_utf8_lossy(&syntax.stderr)
+    );
+
+    // Fill in the npm shape using the template's own commented-out npm-shape
+    // example lines. If either of these substrings disappears (the template
+    // dropped its npm-shape example), fail with a clear message rather than
+    // silently running an unfilled (non-functional) template.
+    let version_files_placeholder = "  # \"package.json\"            # npm shape";
+    assert!(
+        fence.contains(version_files_placeholder),
+        "scripts/version.sh template must retain its commented-out npm-shape \
+         VERSION_FILES example (`{version_files_placeholder}`) — this test \
+         fills it in to exercise the template end-to-end"
+    );
+    let get_version_placeholder = "  # jq -r '.version' \"$REPO_ROOT/package.json\"\n  echo \"REPLACE_WITH_CANONICAL_SOURCE_READER\"";
+    assert!(
+        fence.contains(get_version_placeholder),
+        "scripts/version.sh template must retain its commented-out npm-shape \
+         get_version() example — this test fills it in to exercise the \
+         template end-to-end"
+    );
+    // The `set_version()` per-shape writer for JSON files (the actual code
+    // that mutates package.json). Same treatment: uncomment the template's
+    // own npm-shape example, restricted to the single fixture file.
+    let json_writer_placeholder = "  # JSON files (npm / npm-workspace):\n  \
+         # for file in package.json mcp-loom/package.json; do\n  \
+         #   local tmp; tmp=$(mktemp)\n  \
+         #   jq --arg v \"$new_version\" '.version = $v' \"$REPO_ROOT/$file\" > \"$tmp\"\n  \
+         #   mv \"$tmp\" \"$REPO_ROOT/$file\"\n  \
+         #   echo \"  Updated $file\"\n  \
+         # done";
+    assert!(
+        fence.contains(json_writer_placeholder),
+        "scripts/version.sh template must retain its commented-out npm-shape \
+         JSON writer example in set_version() — this test fills it in to \
+         exercise the template end-to-end"
+    );
+    let json_writer_filled = "  # JSON files (npm / npm-workspace):\n  \
+         for file in package.json; do\n    \
+         local tmp; tmp=$(mktemp)\n    \
+         jq --arg v \"$new_version\" '.version = $v' \"$REPO_ROOT/$file\" > \"$tmp\"\n    \
+         mv \"$tmp\" \"$REPO_ROOT/$file\"\n    \
+         echo \"  Updated $file\"\n  \
+         done";
+    let filled = fence
+        .replace(version_files_placeholder, "  \"package.json\"")
+        .replace(get_version_placeholder, "  jq -r '.version' \"$REPO_ROOT/package.json\"")
+        .replace(json_writer_placeholder, json_writer_filled);
+
+    // Write the filled-in script into a real git fixture and run it.
+    let sandbox = tempfile::tempdir().expect("create sandbox dir");
+    let scripts_dir = sandbox.path().join("scripts");
+    fs::create_dir_all(&scripts_dir).expect("create scripts/ dir");
+    let script_path = scripts_dir.join("version.sh");
+    fs::write(&script_path, &filled).expect("write filled version.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod version.sh");
     }
+    fs::write(
+        sandbox.path().join("package.json"),
+        "{\n  \"name\": \"bump-md-doc-lint-fixture\",\n  \"version\": \"1.0.0\"\n}\n",
+    )
+    .expect("write fixture package.json");
+
+    let git = |args: &[&str]| -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(sandbox.path())
+            .output()
+            .unwrap_or_else(|e| panic!("run `git {args:?}`: {e}"))
+    };
+    assert!(git(&["init", "-q"]).status.success(), "git init failed");
+    assert!(
+        git(&["config", "user.email", "bump-md-doc-lint@example.com"])
+            .status
+            .success(),
+        "git config user.email failed"
+    );
+    assert!(
+        git(&["config", "user.name", "bump-md-doc-lint"])
+            .status
+            .success(),
+        "git config user.name failed"
+    );
+
+    let run = |args: &[&str]| -> std::process::Output {
+        Command::new("bash")
+            .arg(&script_path)
+            .args(args)
+            .current_dir(sandbox.path())
+            .output()
+            .unwrap_or_else(|e| panic!("run extracted version.sh {args:?}: {e}"))
+    };
+
+    // `show` (and bare invocation): prints the current version.
+    let out = run(&[]);
+    assert!(
+        out.status.success(),
+        "version.sh (bare) failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "1.0.0",
+        "version.sh (bare/show) must print the current version read via get_version()"
+    );
+
+    // `check`: all files agree with get_version().
+    let out = run(&["check"]);
+    assert!(
+        out.status.success(),
+        "version.sh check failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("All versions in sync: 1.0.0"),
+        "version.sh check must report all versions in sync — got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // `bump patch`: X.Y.Z -> X.Y.(Z+1), rewriting package.json in place.
+    let out = run(&["bump", "patch"]);
+    assert!(
+        out.status.success(),
+        "version.sh bump patch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Version set to 1.0.1"),
+        "version.sh bump patch must compute 1.0.1 from 1.0.0 — got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let package_json = fs::read_to_string(sandbox.path().join("package.json"))
+        .expect("read package.json after bump");
+    assert!(
+        package_json.contains("\"1.0.1\""),
+        "version.sh bump patch must rewrite package.json's version field — got: {package_json}"
+    );
+
+    // `set <version> --tag`: rewrites, stages the VERSION_FILES entries,
+    // commits, and creates an annotated tag — the subcommand grammar AC6
+    // documents.
+    let out = run(&["set", "2.0.0", "--tag"]);
+    assert!(
+        out.status.success(),
+        "version.sh set 2.0.0 --tag failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Created commit and tag v2.0.0"),
+        "version.sh set <version> --tag must report the created commit and tag — got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let tags = git(&["tag", "--list", "v2.0.0"]);
+    assert_eq!(
+        String::from_utf8_lossy(&tags.stdout).trim(),
+        "v2.0.0",
+        "version.sh set --tag must create annotated tag v2.0.0 via do_tag()"
+    );
+    let log = git(&["log", "-1", "--oneline"]);
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("bump version to 2.0.0"),
+        "version.sh set --tag's do_tag() must commit with message \
+         `chore: bump version to <version>` — got: {}",
+        String::from_utf8_lossy(&log.stdout)
+    );
 }
 
 /// AC7: CHANGELOG handling must ensure `## [Unreleased]` and offer to
