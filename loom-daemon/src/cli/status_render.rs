@@ -8,6 +8,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
+mod holds;
+
 use loom_daemon::daemon_install_state;
 use loom_daemon::self_update;
 use loom_daemon::types::{DaemonStatusReport, SweepKind};
@@ -233,6 +235,12 @@ pub(crate) fn build_status_json_value(
         // without operator intervention (typically a manual `sudo rm -rf`).
         "stuck_worktree_reclaims_count": report.stuck_worktree_reclaims.len(),
         "stuck_worktree_reclaims": report.stuck_worktree_reclaims,
+        // Token pools holding ALL sweep dispatch because not one account in
+        // them can spawn (#7708, surfaced by #7990). Non-empty here is the
+        // machine-readable form of the "pool exhausted hold until T" lines
+        // the human renderer prints; `loom-daemon health --json` carries the
+        // same facts in its own `pool_hold` section.
+        "pool_exhaustion_holds": report.pool_exhaustion_holds,
         // "Currently binding" vs "smallest ceiling" (#4031): the cap only binds
         // once in-flight reaches it. `false` ⇒ the limiter is work availability,
         // not any resource term, so scripted consumers don't misread the
@@ -1786,29 +1794,13 @@ pub(crate) fn print_status_human(
         }
     }
 
-    // Backed-off worktree removals (Issue #7590): a removal that failed with
-    // a permission-class cause (root-owned build-cache directories are the
-    // motivating case), or that failed `REMOVAL_FAILURE_CAP` consecutive
-    // times of any cause, is no longer retried every reap tick — see
-    // `assess_worktree_reaper` in `loom-daemon health` for the same signal
-    // rolled up into a verdict.
-    if !report.stuck_worktree_reclaims.is_empty() {
-        println!(
-            "\nWARNING: {} worktree removal(s) backed off after repeated/permission-class \
-             failures (#7590) — will not self-resolve without operator intervention:",
-            report.stuck_worktree_reclaims.len()
-        );
-        for r in &report.stuck_worktree_reclaims {
-            println!(
-                "  {}-{} ({} attempt(s) since {}) in {}: {}",
-                r.kind,
-                r.number,
-                r.attempt_count,
-                r.first_failure_at,
-                r.repo_root.display(),
-                r.cause
-            );
-        }
+    // Stalled activity the daemon has stopped retrying on its own: backed-off
+    // worktree removals (#7590) and held token pools (#7708). Both are built
+    // in `holds`, which `loom-daemon health`'s own `health::holds` module
+    // mirrors — see there for why a pool hold is never folded into the token
+    // capacity figures printed further below.
+    for line in holds::render_lines(report) {
+        println!("{line}");
     }
 
     // Claude-wrapper pre-flight-death tripwire (#4386): printed prominently,
@@ -3115,7 +3107,7 @@ mod token_starvation_render_tests {
     //! `token_bound` meaning genuine starvation (zero healthy accounts), not
     //! "tokens bind the cap."
     use super::{ranking_diverges_from_starvation, resolve_capacity};
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
     use loom_daemon::types::CapacityReport;
 
     #[test]
@@ -3231,7 +3223,7 @@ mod in_flight_repo_column_tests {
     //! them from `loom-daemon status` output alone, even though `SweepInfo`
     //! already carried the owning workspace root (`repo`, Issue #3929).
     use super::{format_repo_column, render_in_flight_table};
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
     use chrono::Utc;
     use loom_daemon::types::{SweepInfo, SweepKind, SweepState};
     use std::path::PathBuf;
@@ -3342,7 +3334,7 @@ mod containment_column_tests {
     //! temp log files (not just the parser's own unit tests) to prove the
     //! render path actually wires `log_path`/`sweep_id` through correctly.
     use super::{format_containment_column, render_in_flight_table};
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
     use chrono::Utc;
     use loom_daemon::types::{SweepInfo, SweepKind, SweepState};
     use std::path::PathBuf;
@@ -3465,7 +3457,7 @@ mod status_protection_tests {
         build_is_stale, build_status_json_value, deep_clean_lines, render_build_status_line,
         render_observability_line,
     };
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
     use chrono::{DateTime, Utc};
     use loom_daemon::daemon_install_state::{ProtectionReport, ProtectionState, WatchdogJob};
     use std::path::PathBuf;
@@ -4128,7 +4120,7 @@ mod admission_brake_render_tests {
     //! *says so*, on both the human and `--json` surfaces, and that a healthy
     //! host's output is unchanged.
     use super::{build_status_json_value, render_admission_brake_line, saturation_hold_note};
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
     use chrono::Utc;
     use loom_daemon::self_update::SelfUpdateStatus;
     use loom_daemon::types::{AdmissionBrakeStatus, DaemonStatusReport};
@@ -4361,7 +4353,7 @@ mod role_agent_render_tests {
     //! human and `--json` surfaces, and that the wire field is
     //! backward-compatible.
     use super::{build_status_json_value, render_role_agent_line};
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
     use loom_daemon::self_update::SelfUpdateStatus;
     use loom_daemon::types::DaemonStatusReport;
 
@@ -4564,7 +4556,7 @@ mod preflight_advisory_render_tests {
     //! `--json` surface, and forward/backward wire compatibility — without
     //! touching the trip/clear decision logic itself.
     use super::{build_status_json_value, render_preflight_advisory_line};
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
     use chrono::Utc;
     use loom_daemon::self_update::SelfUpdateStatus;
     use loom_daemon::types::DaemonStatusReport;
@@ -4690,7 +4682,7 @@ mod stash_status_render_tests {
     //! `per_repo[].stash` `--json` contract and the compact human-age
     //! formatter that renders alongside it.
     use super::{build_status_json_value, format_stash_age};
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
 
     fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
         loom_daemon::self_update::SelfUpdateStatus {
@@ -4814,7 +4806,7 @@ mod worktree_footprint_render_tests {
     //! `[WorktreeDiskSummary]`, so nothing here touches a real filesystem —
     //! `worktree_disk_status`'s own tests cover the collection side.
     use super::{build_status_json_value, worktree_disk_lines};
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
     use loom_daemon::worktree_disk_status::WorktreeDiskSummary;
     use std::path::PathBuf;
 
@@ -4960,7 +4952,7 @@ mod role_runner_diagnostic_source_render_tests {
     //! tests pin the message-selection logic for both the host-level header
     //! line and the per-root diagnostic line.
     use super::{render_role_runner_disabled_line, render_role_runner_host_header_line};
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
     use loom_daemon::types::{DaemonStatusReport, RepoStatus};
 
     /// `pub(super)` so the sibling #6374 shard-render tests can build a
@@ -5102,7 +5094,7 @@ mod role_runner_shard_render_tests {
     //! nothing rendered; these tests pin that its first-class replacement is
     //! never silent about a configuration the operator asked for.
     use super::{render_role_runner_shard_header_line, render_role_runner_shard_repo_line};
-    use crate::cli::status::status_client_tests::sample_report;
+    use crate::cli::status::sample_report::sample_report;
     use loom_daemon::types::{
         DaemonStatusReport, RepoStatus, RoleRunnerShardPosture, RoleRunnerShardStatus,
     };
