@@ -804,23 +804,26 @@ ASSETS_DIR="$assets_dir"
 TAG_VAL="$tag"
 FAKEGH
     cat >> "$path" <<'FAKEGH'
+# Real `gh --json <fields>` emits an OBJECT, and `--jq` then filters it. This
+# stub used to skip to the post-`--jq` scalar, indistinguishable only because
+# every caller passed `--jq`. #7810 PR 5 has one that does not (the #7922
+# pattern: a bare scalar cannot distinguish "absent" from "empty"), so the stub
+# now does what gh does -- emit the object, filter only when asked.
 if [[ "${1:-}" == "release" && "${2:-}" == "view" ]]; then
     shift 2
-    fields=""
+    fields=""; jqx=""
     while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --json) fields="$2"; shift 2 ;;
-            *) shift ;;
-        esac
+        case "$1" in --json) fields="$2"; shift 2 ;; --jq|-q) jqx="$2"; shift 2 ;; *) shift ;; esac
     done
     case "$fields" in
-        tagName) echo "$TAG_VAL"; exit 0 ;;
-        assets)  ls "$ASSETS_DIR" 2>/dev/null; exit 0 ;;
+        tagName) obj="$(jq -n --arg t "$TAG_VAL" '{tagName:$t}')" ;;
+        assets)  obj="$(ls "$ASSETS_DIR" 2>/dev/null | jq -R -s -c 'split("\n")|map(select(length>0)|{name:.})|{assets:.}')" ;;
         # --resolve-json (#7609) asks for the release's publish timestamp so
         # the daemon can surface `artifact_available.published_at`.
-        publishedAt) echo "2026-09-13T12:00:00Z"; exit 0 ;;
+        publishedAt) obj="$(jq -n '{publishedAt:"2026-09-13T12:00:00Z"}')" ;;
         *) exit 1 ;;
     esac
+    [[ -n "$jqx" ]] && { printf '%s' "$obj" | jq -r "$jqx"; exit 0; }; printf '%s\n' "$obj"; exit 0
 fi
 if [[ "${1:-}" == "release" && "${2:-}" == "download" ]]; then
     shift 2

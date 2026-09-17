@@ -133,8 +133,8 @@ use crate::event_bus::EventBus;
 use crate::ipc::DrainState;
 use crate::workspace_pool::WorkspacePool;
 
+mod native_probe;
 mod relaunch_verify_note;
-mod resolve_json;
 
 // ============================================================================
 // Constants
@@ -210,13 +210,6 @@ const DEFAULT_REBUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Poll granularity while waiting for the rebuild subprocess.
 const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// How long to wait for the read-only `--resolve-json` artifact query (Issue
-/// #7609) before killing it. It makes two or three `gh` calls and downloads a
-/// ~65-byte checksum asset, so a minute is generous; the point of the bound is
-/// that a hung/rate-limited forge call must degrade to "no artifact resolved"
-/// (⇒ source path) instead of parking the tick indefinitely.
-const ARTIFACT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Max bytes of captured script output retained in a failure/roll log line.
 const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
@@ -885,10 +878,11 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
                 root.display()
             ));
         };
-        match resolve_json::run_resolve_json(&script, &root, ARTIFACT_RESOLVE_TIMEOUT) {
-            Ok((stdout, stderr)) => resolve_json::parse_resolve_json(&stdout, &stderr, &script),
-            Err(reason) => ArtifactResolution::Unresolved(reason),
-        }
+        // #7810 PR 5: resolution is native. The script is still located above
+        // because `fetch_artifact` below genuinely needs one; resolution only
+        // needed it to borrow the checkout's git remote, which `root` supplies.
+        let _ = script;
+        native_probe::native_resolution(&root)
     }
 
     fn fetch_artifact(&mut self, low_priority: bool) -> RebuildOutcome {
