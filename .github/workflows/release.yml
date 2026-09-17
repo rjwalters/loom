@@ -469,24 +469,131 @@ jobs:
           fi
           ls -la
 
+      # Upload this platform's assets under a verify -> upload-missing ->
+      # re-verify loop (#8071).
+      #
+      # This step used to be a bare `softprops/action-gh-release@v3`, which does
+      # not retry: ONE transient "Error saving asset" from GitHub's asset API
+      # failed the job with the Release left partially uploaded, and nothing in
+      # CI noticed — every occurrence was found later by an Auditor pass. It was
+      # not a one-off: v0.19.118 (aarch64-linux binary), v0.19.119/120/121
+      # (x86_64-linux binary and sidecars) and v0.19.123 (aarch64-darwin, all of
+      # it) each shipped an incomplete asset set. The gaps hit 96-byte `.sig`
+      # files as readily as the ~26MB binary, so this is API flakiness rather
+      # than a size/timeout effect — per-file retry is the right shape, and a
+      # whole-step retry wrapper would not be.
+      #
+      # The completeness check IS the retry loop's condition, so "retry" and
+      # "verify every expected file landed" are one mechanism that cannot
+      # disagree with itself: the step succeeds only once the Release actually
+      # carries every expected file in GitHub's terminal `uploaded` state, and
+      # otherwise fails loudly naming exactly what is missing.
       - name: Upload release assets
         if: needs.resolve.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.resolve.outputs.tag }}
-          # The `*.sig` glob matches the detached Linux signature when cosign
-          # signing ran and matches nothing otherwise (skipped, not an error) —
-          # so the same block covers signed and unsigned releases. `*.pem`
-          # likewise matches only for a KEYLESS-signed artifact; its presence
-          # (or absence) is the signal Phase 3's verifier uses to pick keyless
-          # vs. key verification, so it must be uploaded alongside the `.sig`.
-          files: |
-            dist/loom-daemon-${{ matrix.target }}
-            dist/loom-daemon-${{ matrix.target }}.sha256
-            dist/loom-daemon-${{ matrix.target }}*.sig
-            dist/loom-daemon-${{ matrix.target }}*.pem
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cd dist
+
+          # The expected set is whatever these four patterns match ON DISK —
+          # the same list the old `files:` block used. Deriving it from disk
+          # rather than from a hardcoded per-target table keeps every skip path
+          # correct with no branching: a darwin build has no `.sig`/`.pem`, an
+          # unsigned build has neither, and a key-mode (non-keyless) signature
+          # has a `.sig` but no `.pem`. Whatever the signing steps produced is
+          # exactly what must arrive on the Release.
+          expected=()
+          for candidate in \
+            "loom-daemon-${TARGET}" \
+            "loom-daemon-${TARGET}.sha256" \
+            "loom-daemon-${TARGET}"*.sig \
+            "loom-daemon-${TARGET}"*.pem
+          do
+            # An unmatched glob stays literal (nullglob is off), so the -f test
+            # is what filters the "this target produced no signature" case.
+            if [ -f "$candidate" ]; then
+              expected+=("$candidate")
+            fi
+          done
+
+          # Floor: the binary and its checksum are unconditional for every
+          # target. If either is absent HERE, an earlier step silently produced
+          # nothing and retrying the upload would only mask that.
+          for required in "loom-daemon-${TARGET}" "loom-daemon-${TARGET}.sha256"; do
+            if [ ! -f "$required" ]; then
+              echo "::error::expected artifact '$required' was never produced in dist/ — refusing to upload a partial asset set for ${TARGET}." >&2
+              exit 1
+            fi
+          done
+
+          MAX_ATTEMPTS=4
+
+          list_uploaded() {
+            # Only assets GitHub reports in the terminal `uploaded` state count.
+            # An asset left `open`/`starting` is a half-written upload: it shows
+            # up in the Release's asset list but is not fetchable — precisely
+            # the partial state this step exists to catch.
+            gh api "repos/${REPO}/releases/tags/${TAG}" \
+              --jq '.assets[] | select(.state == "uploaded") | .name'
+          }
+
+          attempt=1
+          while :; do
+            if ! uploaded="$(list_uploaded)"; then
+              echo "::warning::could not read ${TAG}'s asset list (attempt ${attempt}/${MAX_ATTEMPTS}) — treating every expected asset as unconfirmed" >&2
+              uploaded=""
+            fi
+
+            missing=()
+            for f in "${expected[@]}"; do
+              if ! printf '%s\n' "$uploaded" | grep -qxF -- "$f"; then
+                missing+=("$f")
+              fi
+            done
+
+            if [ "${#missing[@]}" -eq 0 ]; then
+              echo "All ${#expected[@]} expected asset(s) for ${TARGET} are present on ${TAG}."
+              {
+                echo "### Release assets (${TARGET})"
+                for f in "${expected[@]}"; do
+                  echo "- uploaded: \`$f\`"
+                done
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
+            if [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then
+              echo "::error::Release ${TAG} is still missing ${#missing[@]} asset(s) for ${TARGET} after ${MAX_ATTEMPTS} upload attempts: ${missing[*]}" >&2
+              {
+                echo "### Release assets (${TARGET}) — INCOMPLETE"
+                for f in "${missing[@]}"; do
+                  echo "- MISSING: \`$f\`"
+                done
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+
+            echo "Attempt ${attempt}/${MAX_ATTEMPTS}: uploading ${#missing[@]} asset(s) to ${TAG}: ${missing[*]}"
+            for f in "${missing[@]}"; do
+              # --clobber makes each retry idempotent: an asset a previous
+              # attempt half-created is replaced rather than colliding. A
+              # per-file failure is deliberately NOT fatal here — the loop's
+              # next completeness read is the only thing that decides, so one
+              # flaky file never abandons the others that would have succeeded.
+              if ! gh release upload "$TAG" "$f" --repo "$REPO" --clobber; then
+                echo "::warning::upload of '$f' failed on attempt ${attempt}/${MAX_ATTEMPTS} — will retry" >&2
+              fi
+            done
+
+            # Linear backoff, which doubles as the settle window the asset list
+            # needs before the next completeness read.
+            sleep "$((attempt * 5))"
+            attempt="$((attempt + 1))"
+          done
 
       - name: Upload artifacts (for manual runs)
         if: needs.resolve.outputs.publish == 'false'
