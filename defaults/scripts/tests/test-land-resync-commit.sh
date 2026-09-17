@@ -648,10 +648,19 @@ if ! grep -q "gh-config" <<< "$ORIGIN_TREE_N"; then
 else
     fail "neither credential tree was ever committed to origin (tree=$ORIGIN_TREE_N)"
 fi
-if grep -q "\.loom/hooks/foo\.sh" <<< "$ORIGIN_TREE_N"; then
-    pass "the legitimate resync-managed change still landed"
+# #8006: assert on CONTENT and HISTORY, never on path presence. make_primary
+# commits .loom/hooks/foo.sh (as `initial`) and pushes it BEFORE this case
+# modifies it, so the path is in origin's tree whether or not this run landed
+# anything -- a presence grep here passed even against the pre-#7818 script,
+# which treated the credential dirt as blocking foreign dirt and committed
+# nothing at all.
+ORIGIN_SUBJECT_N="$(git --git-dir="$WORKDIR/origin-n.git" log -1 --format='%s' main)"
+ORIGIN_FOO_N="$(git --git-dir="$WORKDIR/origin-n.git" show "main:.loom/hooks/foo.sh" 2>/dev/null)"
+if [[ "$ORIGIN_SUBJECT_N" == "chore: resync installed Loom surfaces" ]] && \
+   [[ "$ORIGIN_FOO_N" == "updated" ]]; then
+    pass "the legitimate resync-managed change still landed (origin's tip IS the resync commit and carries the updated content)"
 else
-    fail "the legitimate resync-managed change still landed"
+    fail "the legitimate resync-managed change still landed (origin tip subject=$ORIGIN_SUBJECT_N, foo.sh=$ORIGIN_FOO_N)"
 fi
 if [[ -f "$WORKDIR/primary-n/.loom/gh-config/hosts.yml" ]] && \
    [[ -f "$WORKDIR/primary-n/.loom/gh-config-by-owner/some-owner/hosts.yml" ]] && \
