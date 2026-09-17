@@ -196,8 +196,10 @@ into the daemon behind a stub ("The name stays; logic ports behind it"):
 | **portable** | **38,691** | **196** |
 
 Its target is the ~145 lines of `stub` glue a ported file leaves behind. That
-is what the ratchet gates. `total` is ratcheted as a secondary signal so floor
-growth is visible rather than free, but the floor is not debt.
+is what the gate measures. `total` is checked too — as a **delta against the
+merge-base**, not an absolute — so growth in the permanent floor is deliberate
+rather than free. The floor is not debt, but adding to it raises the finish
+line.
 
 ### Where it runs, and why that took two attempts
 

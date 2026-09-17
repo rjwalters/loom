@@ -388,6 +388,7 @@ pub fn measure_at_rev(root: &Path, rev: &str) -> Result<Budget, String> {
 }
 
 /// What this change should be measured against.
+#[derive(Debug, Clone)]
 pub struct Comparison {
     /// The revision to measure `before` at.
     pub rev: String,
@@ -426,13 +427,19 @@ pub fn comparison(root: &Path, base_ref: &str) -> Result<Comparison, String> {
 
     let head = git(&["rev-parse", "HEAD"]).ok_or_else(|| "could not resolve HEAD".to_string())?;
 
-    // No common ancestor (a shallow clone, or an unrelated base) — compare
-    // against the base ref directly rather than silently skipping the check.
+    // No common ancestor — a shallow clone, or an unrelated base. Falling back
+    // to `base_ref` itself looks harmless and is not: it measures a DIFFERENT
+    // tree, so a branch that adds shell can report a NEGATIVE delta and pass.
+    // Reproduced in review: a depth-1 clone of a branch adding +300 portable
+    // lines exited 0 with `-100`. Refuse instead — a comparison that cannot be
+    // made must not read as "no growth".
     let Some(base) = git(&["merge-base", "HEAD", base_ref]) else {
-        return Ok(Comparison {
-            rev: base_ref.to_string(),
-            desc: format!("{base_ref} (no merge-base found)"),
-        });
+        return Err(format!(
+            "no merge-base between HEAD and {base_ref} — this is usually a shallow clone \
+             (CI needs `fetch-depth: 0`) or an unrelated base ref. Refusing to compare against \
+             {base_ref} directly: that measures a different tree, so a change that ADDS shell \
+             can report a negative delta and pass."
+        ));
     };
 
     if base == head {
@@ -464,9 +471,38 @@ pub fn comparison(root: &Path, base_ref: &str) -> Result<Comparison, String> {
 /// # Errors
 /// Returns the operator-facing explanation when it does.
 pub fn check_against_rev(now: &Budget, before: &Budget, base_desc: &str) -> Result<(), String> {
-    if now.portable() <= before.portable() {
-        return Ok(());
+    if now.portable() > before.portable() {
+        return Err(portable_growth_message(now, before, base_desc));
     }
+
+    // Total is checked too, as a delta. Dropping it entirely (as the first cut
+    // of this redesign did) opened two holes review reproduced: a 500-line
+    // `bootstrap` script passed, and recategorising a 639-line file
+    // `contract` -> `bootstrap` while ADDING 200 portable lines passed while
+    // reporting -439. Portable is what the epic retires, but growth in the
+    // permanent floor is still growth and should be deliberate.
+    if now.total() > before.total() {
+        return Err(format!(
+            "This change adds {} code lines of production shell without growing the portable \
+             pool (vs {base_desc}: {} -> {}), so the growth is in the permanent floor \
+             (`bootstrap` / `vendored`).\n\n\
+             That is allowed, and it is not free. The floor is what will still be shell when \
+             the epic is done, so adding to it raises the finish line. If that is right, say \
+             why in the commit; if the script could be a daemon subcommand instead, it should \
+             be.\n\n\
+             Note this compares against the MERGE-BASE, so it is measuring what YOUR change \
+             did.",
+            now.total() - before.total(),
+            before.total(),
+            now.total()
+        ));
+    }
+
+    Ok(())
+}
+
+/// The portable-growth explanation, split out so both callers read the same.
+fn portable_growth_message(now: &Budget, before: &Budget, base_desc: &str) -> String {
     let mut grew: Vec<(&String, u64, u64)> = Vec::new();
     for (cat, lines) in &now.by_category {
         if !PORTABLE.contains(&cat.as_str()) {
@@ -483,7 +519,7 @@ pub fn check_against_rev(now: &Budget, before: &Budget, base_desc: &str) -> Resu
         .collect::<Vec<_>>()
         .join("\n");
 
-    Err(format!(
+    format!(
         "This change adds {} code lines of PORTABLE shell (vs {base_desc}: {} -> {}).\n\n{detail}\n\n\
          Portable shell is what epic #7810 is retiring — `contract` + `hook-entry`, whose logic \
          moves into the daemon behind a stub. Adding to it works directly against the epic.\n\n\
@@ -499,7 +535,7 @@ pub fn check_against_rev(now: &Budget, before: &Budget, base_desc: &str) -> Resu
         now.portable() - before.portable(),
         before.portable(),
         now.portable()
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -513,6 +549,156 @@ mod tests {
             b.files_by_category.insert((*c).to_string(), 1);
         }
         b
+    }
+
+    fn budget_with(pairs: &[(&str, u64, u64)]) -> Budget {
+        let mut b = Budget::default();
+        for (c, lines, files) in pairs {
+            b.by_category.insert((*c).to_string(), *lines);
+            b.files_by_category.insert((*c).to_string(), *files);
+        }
+        b
+    }
+
+    #[test]
+    fn adding_portable_shell_fails_and_names_the_category() {
+        let before = budget_with(&[("contract", 100, 2), ("bootstrap", 50, 1)]);
+        let now = budget_with(&[("contract", 130, 3), ("bootstrap", 50, 1)]);
+        let err = check_against_rev(&now, &before, "origin/main (abc)").expect_err("must fail");
+        assert!(err.contains("adds 30 code lines of PORTABLE"), "{err}");
+        assert!(err.contains("contract     100 -> 130"), "{err}");
+        assert!(err.contains("MERGE-BASE"), "must say what it compared against: {err}");
+    }
+
+    #[test]
+    fn growth_in_the_permanent_floor_is_caught_too() {
+        // Regression: the first cut of the merge-base redesign dropped the
+        // total check entirely, so a 500-line `bootstrap` script passed where
+        // it used to fail. Portable is what the epic retires, but floor growth
+        // raises the finish line and must be deliberate.
+        let before = budget_with(&[("contract", 100, 2), ("bootstrap", 50, 1)]);
+        let now = budget_with(&[("contract", 100, 2), ("bootstrap", 550, 2)]);
+        let err = check_against_rev(&now, &before, "origin/main (abc)").expect_err("must fail");
+        assert!(err.contains("adds 500 code lines of production shell"), "{err}");
+        assert!(err.contains("permanent floor"), "{err}");
+    }
+
+    #[test]
+    fn recategorising_to_hide_an_addition_is_caught() {
+        // Regression: moving a 639-line file `contract` -> `bootstrap` while
+        // ADDING 200 portable lines reported -439 and passed. Portable falls,
+        // but total rises, so the total leg catches it.
+        let before = budget_with(&[("contract", 1000, 10), ("bootstrap", 50, 1)]);
+        let now = budget_with(&[("contract", 561, 9), ("bootstrap", 889, 2)]);
+        assert!(now.portable() < before.portable(), "portable falls, as in the report");
+        let err = check_against_rev(&now, &before, "origin/main (abc)").expect_err("must fail");
+        assert!(err.contains("production shell"), "{err}");
+    }
+
+    #[test]
+    fn a_change_that_removes_shell_passes() {
+        let before = budget_with(&[("contract", 100, 2), ("bootstrap", 50, 1)]);
+        let now = budget_with(&[("contract", 40, 1), ("bootstrap", 50, 1)]);
+        assert!(check_against_rev(&now, &before, "base").is_ok());
+    }
+
+    #[test]
+    fn a_change_that_moves_shell_sideways_passes() {
+        // Add and remove an equal amount: net zero, allowed by design — it is
+        // option 2 in the failure message.
+        let before = budget_with(&[("contract", 100, 2), ("hook-entry", 20, 1)]);
+        let now = budget_with(&[("contract", 80, 2), ("hook-entry", 40, 2)]);
+        assert_eq!(now.portable(), before.portable());
+        assert!(check_against_rev(&now, &before, "base").is_ok());
+    }
+
+    #[test]
+    fn an_unchanged_tree_passes() {
+        let b = budget_with(&[("contract", 100, 2)]);
+        assert!(check_against_rev(&b, &b, "base").is_ok());
+    }
+
+    // --- git-backed: comparison() resolution ---
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().expect("tempdir");
+        git(d.path(), &["init", "-q", "-b", "main"]);
+        git(d.path(), &["config", "user.email", "t@example.com"]);
+        git(d.path(), &["config", "user.name", "t"]);
+        std::fs::write(d.path().join("a.txt"), "1\n").expect("write");
+        git(d.path(), &["add", "-A"]);
+        git(d.path(), &["commit", "-q", "-m", "c1"]);
+        d
+    }
+
+    #[test]
+    fn on_the_base_branch_it_compares_against_the_parent_not_itself() {
+        let d = init_repo();
+        std::fs::write(d.path().join("b.txt"), "2\n").expect("write");
+        git(d.path(), &["add", "-A"]);
+        git(d.path(), &["commit", "-q", "-m", "c2"]);
+        let c = comparison(d.path(), "main").expect("comparison");
+        assert!(c.desc.contains("HEAD~1"), "{}", c.desc);
+    }
+
+    #[test]
+    fn a_root_commit_with_no_parent_errors_rather_than_comparing_with_itself() {
+        // Comparing a tree with itself passes without measuring anything. On a
+        // direct push that is a gate nobody is reviewing AND nothing is
+        // checking, which is worse than the chore it replaced.
+        let d = init_repo();
+        let err = comparison(d.path(), "main").expect_err("must refuse");
+        assert!(err.contains("no parent"), "{err}");
+    }
+
+    #[test]
+    fn a_branch_compares_against_the_merge_base_not_the_advanced_tip() {
+        let d = init_repo();
+        git(d.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(d.path().join("f.txt"), "f\n").expect("write");
+        git(d.path(), &["add", "-A"]);
+        git(d.path(), &["commit", "-q", "-m", "feature work"]);
+        // main advances independently.
+        git(d.path(), &["checkout", "-q", "main"]);
+        std::fs::write(d.path().join("m.txt"), "m\n").expect("write");
+        git(d.path(), &["add", "-A"]);
+        git(d.path(), &["commit", "-q", "-m", "main advances"]);
+        let base_sha = String::from_utf8_lossy(
+            &Command::new("git")
+                .arg("-C")
+                .arg(d.path())
+                .args(["rev-parse", "HEAD~1"])
+                .output()
+                .expect("git")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        git(d.path(), &["checkout", "-q", "feature"]);
+
+        let c = comparison(d.path(), "main").expect("comparison");
+        assert_eq!(c.rev, base_sha, "must pick the common ancestor, not main's tip");
+    }
+
+    #[test]
+    fn an_unresolvable_base_errors_rather_than_measuring_a_different_tree() {
+        // Falling back to the base ref looks harmless and is not: it measures a
+        // DIFFERENT tree, so a branch that adds shell can report a negative
+        // delta and pass. Reproduced in review on a depth-1 clone.
+        let d = init_repo();
+        let err = comparison(d.path(), "origin/nonexistent").expect_err("must refuse");
+        assert!(err.contains("no merge-base"), "{err}");
+        assert!(err.contains("fetch-depth"), "must name the usual cause: {err}");
     }
 
     #[test]

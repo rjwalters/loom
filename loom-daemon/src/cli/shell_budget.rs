@@ -72,21 +72,18 @@ impl ShellBudgetArgs {
         }
 
         if self.check {
-            // The unlisted check does not depend on a comparison: a production
-            // script with no allowlist entry makes every figure an undercount,
-            // whichever revision you measure.
-            if !budget.unlisted.is_empty() {
-                eprintln!(
-                    "\nshell-budget: {} production script(s) carry no allowlist entry, so every \
-                     figure above is an undercount — add them to scripts/shell-allowlist.txt:\n{}",
-                    budget.unlisted.len(),
-                    budget
-                        .unlisted
-                        .iter()
-                        .map(|p| format!("  {}", p.display()))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
+            // The tree invariants need no comparison: an unlisted production
+            // script makes every figure an undercount whichever revision you
+            // measure, and a scope filter that stops seeing the tree makes the
+            // gate pass for the wrong reason.
+            //
+            // Call the shared function rather than inlining part of it. The
+            // first cut inlined only the `unlisted` half, which left the
+            // scope-filter floor running solely in the path-filtered Rust test
+            // job — exactly the gating mistake this job's own comment exists to
+            // warn about.
+            if let Err(why) = shell_budget::check_invariants(&budget) {
+                eprintln!("\nshell-budget: {why}");
                 std::process::exit(1);
             }
 
