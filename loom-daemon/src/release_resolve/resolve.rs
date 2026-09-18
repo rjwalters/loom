@@ -90,6 +90,29 @@ struct PublishedAt {
     published_at: String,
 }
 
+/// Every asset name a release publishes, per the release's own metadata:
+/// `tag`'s assets, or the repo's LATEST release when `tag` is `None`.
+///
+/// `None` means the question could not be answered (the query failed, timed
+/// out, or decoded to something unusable) and is never the same as
+/// `Some(vec![])`, "this release publishes nothing". Keeping those two apart is
+/// the point: [`crate::release_fetch`] uses this to tell an unsigned release
+/// from one whose `.sig` merely would not download (#8197), and folding
+/// *unknown* into *absent* there is exactly the fail-open that issue closes.
+#[must_use]
+pub fn asset_names(root: &Path, repo: &str, tag: Option<&str>) -> Option<Vec<String>> {
+    let mut args: Vec<&str> = vec!["release", "view"];
+    if let Some(t) = tag {
+        args.push(t);
+    }
+    args.extend_from_slice(&["--json", "assets", "-R", repo]);
+    let q: Query<Assets> = gh_query(&args, root, false, |_: &Assets| false);
+    match q {
+        Query::Populated(a) => Some(a.assets.into_iter().map(|a| a.name).collect()),
+        _ => None,
+    }
+}
+
 /// Resolve the latest release artifact for this host.
 ///
 /// Read-only: the only download is the release's ~65-byte `.sha256` asset.
@@ -158,16 +181,10 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
     // upgrade this host cannot actually verify.
     let bin_name = format!("loom-daemon-{target}");
     let sha_name = format!("{bin_name}.sha256");
-    let q: Query<Assets> = gh_query(
-        &["release", "view", "--json", "assets", "-R", &repo],
-        root,
-        false,
-        |_: &Assets| false,
-    );
-    let names: Vec<String> = match q {
-        Query::Populated(a) => a.assets.into_iter().map(|a| a.name).collect(),
-        _ => Vec::new(),
-    };
+    // An unreadable asset list is `None` here and resolves to the same empty
+    // list it always did: unresolved, fall back to source. (The fetch path
+    // treats that `None` differently -- see `asset_names`.)
+    let names: Vec<String> = asset_names(root, &repo, None).unwrap_or_default();
     if !names.contains(&bin_name) || !names.contains(&sha_name) {
         return Resolution::Unresolved(format!(
             "release {tag} has no artifact for target {target} \

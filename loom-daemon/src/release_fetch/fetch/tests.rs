@@ -64,16 +64,50 @@ fn with_tmp_dir<F: FnOnce()>(dir: &Path, f: F) {
     }
 }
 
-/// A fake `gh` understanding exactly `gh release download <tag> -R <slug>
-/// -p <name> [-p <name> ...] -D <dir> --clobber` -- copies matching files
-/// out of `assets_dir`, exiting 1 if NONE of the `-p` patterns matched
-/// anything (mirrors real `gh`'s "no assets match" failure).
-fn write_fake_gh(dir: &Path, assets_dir: &Path) -> PathBuf {
+/// A fake `gh` understanding exactly the two invocations this module makes:
+///
+/// * `gh release download <tag> -R <slug> -p <name> [-p <name> ...] -D <dir>
+///   --clobber` -- copies matching files out of `assets_dir`, exiting 1 if
+///   NONE of the `-p` patterns matched anything (mirrors real `gh`'s "no
+///   assets match" failure).
+/// * `gh release view <tag> --json assets -R <slug>` -- emits the release's
+///   own asset list as the `{{"assets":[{{"name":…}}]}}` object real `gh`
+///   emits for `--json assets` with no `--jq` (#8197).
+///
+/// The listing is `ls assets_dir` PLUS `extra_listed`, which is what lets a
+/// test express the case this fixture exists for: an asset the release
+/// **publishes** but that cannot be **downloaded**. `listing_fails` instead
+/// makes every `release view` exit non-zero -- the "could not read the asset
+/// list at all" case.
+fn write_fake_gh_full(
+    dir: &Path,
+    assets_dir: &Path,
+    extra_listed: &[&str],
+    listing_fails: bool,
+) -> PathBuf {
     write_script(
         dir,
         "gh",
         &format!(
             r#"ASSETS_DIR="{assets}"
+EXTRA_LISTED="{extra}"
+LISTING_FAILS="{fails}"
+if [[ "$1" == "release" && "$2" == "view" ]]; then
+    if [[ "$LISTING_FAILS" == "1" ]]; then
+        echo "gh: could not read release metadata" >&2
+        exit 1
+    fi
+    out='{{"assets":['
+    first=1
+    for n in $(ls "$ASSETS_DIR" 2>/dev/null) $EXTRA_LISTED; do
+        [[ "$first" -eq 1 ]] || out+=','
+        out+="{{\"name\":\"$n\"}}"
+        first=0
+    done
+    out+=']}}'
+    printf '%s\n' "$out"
+    exit 0
+fi
 if [[ "$1" == "release" && "$2" == "download" ]]; then
     shift 2; shift
     dest="."
@@ -100,9 +134,16 @@ if [[ "$1" == "release" && "$2" == "download" ]]; then
 fi
 exit 1
 "#,
-            assets = assets_dir.display()
+            assets = assets_dir.display(),
+            extra = extra_listed.join(" "),
+            fails = if listing_fails { "1" } else { "0" },
         ),
     )
+}
+
+/// The ordinary fixture: the release lists exactly what it can serve.
+fn write_fake_gh(dir: &Path, assets_dir: &Path) -> PathBuf {
+    write_fake_gh_full(dir, assets_dir, &[], false)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -277,5 +318,234 @@ fn missing_release_asset_is_a_download_failure_not_a_verification_failure() {
         FetchOutcome::VerificationFailed { lines } => {
             panic!("expected DownloadFailed, got VerificationFailed: {lines:?}")
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #8197: absent vs. unavailable signature material
+//
+// Both directions, deliberately: a fix in one direction alone would either
+// break every unsigned (pre-signing) release or leave the downgrade open.
+// ---------------------------------------------------------------------------
+
+/// The binary + its `.sha256`, checksum-consistent, under `dir/assets`.
+fn write_checksummed_assets(dir: &Path, bin_name: &str) -> PathBuf {
+    let assets = dir.join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let bin_bytes = b"fake artifact bytes";
+    std::fs::write(assets.join(bin_name), bin_bytes).unwrap();
+    std::fs::write(
+        assets.join(format!("{bin_name}.sha256")),
+        format!("{}  {bin_name}\n", sha256_hex(bin_bytes)),
+    )
+    .unwrap();
+    assets
+}
+
+fn linux_inputs<'a>(dir: &'a Path) -> FetchInputs<'a> {
+    FetchInputs {
+        repo_root: dir,
+        target: "x86_64-unknown-linux-gnu",
+        repo_slug: "test-owner/test-repo",
+        tag: "v0.16.0",
+        cosign_pubkey_env: None,
+        cosign_identity_env: None,
+        cosign_oidc_issuer_env: None,
+    }
+}
+
+/// The bug this issue exists for: a release that DOES publish a `.sig` whose
+/// download fails must be refused, not silently downgraded to checksum-only
+/// verification. The publisher signed deliberately; dropping that signature
+/// because a transfer failed is the one place "best effort" is the wrong
+/// default.
+#[test]
+#[serial]
+fn listed_but_unfetchable_sig_is_refused_not_downgraded_to_checksum_only() {
+    let dir = tempdir();
+    let bin_name = "loom-daemon-x86_64-unknown-linux-gnu";
+    // The `.sig` is LISTED by the release but absent from the servable
+    // assets, so every download attempt for it fails -- a 500, a timeout, a
+    // truncated transfer, all indistinguishable from here.
+    let assets = write_checksummed_assets(&dir, bin_name);
+    let fakebin = tempdir();
+    write_fake_gh_full(&fakebin, &assets, &[&format!("{bin_name}.sig")], false);
+
+    let inputs = linux_inputs(&dir);
+    let mut outcome = None;
+    with_fake_bin(&fakebin, || {
+        outcome = Some(fetch_and_verify(&inputs));
+    });
+
+    match outcome.unwrap() {
+        FetchOutcome::VerificationFailed { lines } => {
+            assert!(lines.iter().any(|l| l.contains("UNAVAILABLE, not absent")), "{lines:?}");
+            assert!(lines.iter().any(|l| l.contains(&format!("{bin_name}.sig"))), "{lines:?}");
+            assert!(lines.iter().any(|l| l.contains("left untouched")), "{lines:?}");
+        }
+        FetchOutcome::Verified { .. } => {
+            panic!("a listed-but-unfetchable .sig must NOT verify checksum-only")
+        }
+        FetchOutcome::DownloadFailed(msg) => {
+            panic!("expected VerificationFailed, got DownloadFailed: {msg}")
+        }
+    }
+}
+
+/// The other direction (#5054): a genuinely UNSIGNED release -- no `.sig`
+/// listed at all -- still succeeds on the checksum alone, exactly as before.
+/// Over-correcting here would break the update path for every pre-signing
+/// release.
+#[test]
+#[serial]
+fn unsigned_release_with_no_sig_listed_still_succeeds_checksum_only() {
+    let dir = tempdir();
+    let bin_name = "loom-daemon-x86_64-unknown-linux-gnu";
+    let assets = write_checksummed_assets(&dir, bin_name);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets); // lists exactly what it serves: no `.sig`
+
+    let inputs = linux_inputs(&dir);
+    let mut outcome = None;
+    with_fake_bin(&fakebin, || {
+        outcome = Some(fetch_and_verify(&inputs));
+    });
+
+    match outcome.unwrap() {
+        FetchOutcome::Verified {
+            artifact,
+            signature_state,
+            ..
+        } => {
+            assert_eq!(signature_state, signature::SignatureState::Skipped);
+            let _ = std::fs::remove_dir_all(&artifact.tmp_dir);
+        }
+        FetchOutcome::VerificationFailed { lines } => {
+            panic!("an unsigned release must still fetch on its checksum alone: {lines:?}")
+        }
+        FetchOutcome::DownloadFailed(msg) => panic!("expected Verified, got DownloadFailed: {msg}"),
+    }
+}
+
+/// When the asset list itself cannot be read, "unsigned" and "signature
+/// download failed" stay indistinguishable -- so the artifact is refused
+/// rather than accepted on an assumption. This costs one skipped update tick
+/// (the running daemon keeps running and retries later); the opposite choice
+/// would silently reinstate the downgrade under exactly the conditions an
+/// attacker would arrange.
+#[test]
+#[serial]
+fn unreadable_asset_list_with_unfetchable_sig_is_refused() {
+    let dir = tempdir();
+    let bin_name = "loom-daemon-x86_64-unknown-linux-gnu";
+    let assets = write_checksummed_assets(&dir, bin_name);
+    let fakebin = tempdir();
+    write_fake_gh_full(&fakebin, &assets, &[], true); // `release view` always fails
+
+    let inputs = linux_inputs(&dir);
+    let mut outcome = None;
+    with_fake_bin(&fakebin, || {
+        outcome = Some(fetch_and_verify(&inputs));
+    });
+
+    match outcome.unwrap() {
+        FetchOutcome::VerificationFailed { lines } => {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("asset list could not be read")),
+                "{lines:?}"
+            );
+        }
+        FetchOutcome::Verified { .. } => {
+            panic!("an unreadable asset list must not be read as 'unsigned'")
+        }
+        FetchOutcome::DownloadFailed(msg) => {
+            panic!("expected VerificationFailed, got DownloadFailed: {msg}")
+        }
+    }
+}
+
+/// The `.pem` signing certificate gets the same treatment as the `.sig`: a
+/// keyless release whose certificate is listed but unfetchable would
+/// otherwise fall through to key mode and end as a loud skip -- the same
+/// downgrade by a different door. A key-signed release (no `.pem` listed at
+/// all) is untouched; that is the `unsigned_release_...` case's sibling and
+/// is exercised by `linux_key_mode_*` in the signature suite.
+#[test]
+#[serial]
+fn listed_but_unfetchable_cert_is_refused() {
+    let dir = tempdir();
+    let bin_name = "loom-daemon-x86_64-unknown-linux-gnu";
+    let assets = write_checksummed_assets(&dir, bin_name);
+    // The `.sig` IS servable; only its `.pem` sibling is listed-but-missing.
+    std::fs::write(assets.join(format!("{bin_name}.sig")), b"sig").unwrap();
+    let fakebin = tempdir();
+    write_fake_gh_full(&fakebin, &assets, &[&format!("{bin_name}.pem")], false);
+
+    let inputs = linux_inputs(&dir);
+    let mut outcome = None;
+    with_fake_bin(&fakebin, || {
+        outcome = Some(fetch_and_verify(&inputs));
+    });
+
+    match outcome.unwrap() {
+        FetchOutcome::VerificationFailed { lines } => {
+            assert!(lines.iter().any(|l| l.contains(&format!("{bin_name}.pem"))), "{lines:?}");
+        }
+        FetchOutcome::Verified { .. } => {
+            panic!("a listed-but-unfetchable .pem must not fall through to key mode")
+        }
+        FetchOutcome::DownloadFailed(msg) => {
+            panic!("expected VerificationFailed, got DownloadFailed: {msg}")
+        }
+    }
+}
+
+/// A release whose signature material is both published AND fetchable, with
+/// `cosign` present, reports `SIGNATURE=verified` -- the value that tells the
+/// caller a verification actually ran, which no stdout key carried before
+/// (#8197 AC3).
+#[test]
+#[serial]
+fn fetched_and_verified_signature_reports_the_verified_state() {
+    let dir = tempdir();
+    let bin_name = "loom-daemon-x86_64-unknown-linux-gnu";
+    let assets = write_checksummed_assets(&dir, bin_name);
+    std::fs::write(assets.join(format!("{bin_name}.sig")), b"sig").unwrap();
+    std::fs::write(assets.join(format!("{bin_name}.pem")), b"cert").unwrap();
+
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    write_script(
+        &fakebin,
+        "cosign",
+        "if [[ \"$1\" == version ]]; then exit 0; fi\nif [[ \"$1\" == verify-blob ]]; then exit 0; fi\nexit 1\n",
+    );
+
+    let inputs = linux_inputs(&dir);
+    let mut outcome = None;
+    with_fake_bin(&fakebin, || {
+        outcome = Some(fetch_and_verify(&inputs));
+    });
+
+    match outcome.unwrap() {
+        FetchOutcome::Verified {
+            artifact,
+            signature_state,
+            signature_line,
+            ..
+        } => {
+            assert_eq!(signature_state, signature::SignatureState::Verified);
+            assert!(
+                signature_line.contains("keyless signature verification passed"),
+                "{signature_line}"
+            );
+            let _ = std::fs::remove_dir_all(&artifact.tmp_dir);
+        }
+        FetchOutcome::VerificationFailed { lines } => {
+            panic!("expected Verified, got VerificationFailed: {lines:?}")
+        }
+        FetchOutcome::DownloadFailed(msg) => panic!("expected Verified, got DownloadFailed: {msg}"),
     }
 }

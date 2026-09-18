@@ -182,12 +182,19 @@ EOF
 #       -> copies each matching file from $3 into <dir>; exits 1 if NONE of
 #          the -p patterns matched anything under $3 (mirrors real gh's
 #          "no assets match" failure for a required download).
+#
+# Optional $4 (#8197): extra asset names the release LISTS but cannot SERVE,
+# space-separated. They are appended to the `--json assets` listing only, so a
+# scenario can express a published-but-undownloadable `.sig` -- the case that
+# must refuse the artifact instead of degrading to checksum-only verification.
+# Omitted (the default) means the listing reports exactly what $3 can serve.
 write_fake_gh() {
-    local path="$1" tag="$2" assets_dir="$3"
+    local path="$1" tag="$2" assets_dir="$3" extra_listed="${4:-}"
     cat > "$path" <<FAKEGH
 #!/usr/bin/env bash
 ASSETS_DIR="$assets_dir"
 TAG_VAL="$tag"
+EXTRA_LISTED="$extra_listed"
 FAKEGH
     cat >> "$path" <<'FAKEGH'
 # Real `gh --json <fields>` emits an OBJECT, and `--jq` then filters it. This
@@ -203,7 +210,7 @@ if [[ "${1:-}" == "release" && "${2:-}" == "view" ]]; then
     done
     case "$fields" in
         tagName) obj="$(jq -n --arg t "$TAG_VAL" '{tagName:$t}')" ;;
-        assets)  obj="$(ls "$ASSETS_DIR" 2>/dev/null | jq -R -s -c 'split("\n")|map(select(length>0)|{name:.})|{assets:.}')" ;;
+        assets)  obj="$({ ls "$ASSETS_DIR" 2>/dev/null; printf '%s\n' $EXTRA_LISTED; } | jq -R -s -c 'split("\n")|map(select(length>0)|{name:.})|{assets:.}')" ;;
         # --resolve-json (#7609) asks for the release's publish timestamp so
         # the daemon can surface `artifact_available.published_at`.
         publishedAt) obj="$(jq -n '{publishedAt:"2026-09-13T12:00:00Z"}')" ;;

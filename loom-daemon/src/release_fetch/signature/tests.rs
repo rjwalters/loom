@@ -79,6 +79,9 @@ fn linux_no_sig_asset_is_a_silent_skip() {
     assert_eq!(result.outcome, Outcome::Skipped);
     assert!(result.message.is_empty());
     assert_eq!(result.had_authority, None);
+    // #8197: nothing was published, so nothing went unchecked -- the value
+    // the `SIGNATURE=` stdout key reports for a genuinely unsigned release.
+    assert_eq!(result.state, Some(SignatureState::Skipped));
 }
 
 /// An unrecognized target verifies nothing rather than failing -- the
@@ -101,6 +104,9 @@ fn unrecognized_target_is_a_silent_pass() {
     });
     assert_eq!(result.outcome, Outcome::Verified);
     assert!(result.message.is_empty());
+    // `Outcome::Verified` here means "nothing to verify", NOT "verification
+    // passed" -- so the reported state is `Skipped`, never `Verified` (#8197).
+    assert_eq!(result.state, Some(SignatureState::Skipped));
 }
 
 /// `cosign` not installed: a detached signature IS present, but the tool to
@@ -139,6 +145,9 @@ fn linux_cosign_absent_is_a_loud_skip_not_a_failure() {
     assert_eq!(result.outcome, Outcome::Skipped);
     assert!(result.message.contains("'cosign' is not installed"), "{}", result.message);
     assert!(result.message.contains("SKIPPING verification"), "{}", result.message);
+    // #8197: a signature IS present and went unchecked -- distinct from the
+    // silent no-`.sig` skip above, which `Outcome` alone cannot express.
+    assert_eq!(result.state, Some(SignatureState::Unavailable));
 }
 
 /// Key mode, signature present, no resolvable public key -- AC3's loud skip:
@@ -178,6 +187,7 @@ fn linux_key_mode_no_pubkey_is_a_loud_skip() {
         result.message
     );
     assert!(result.message.contains("SKIPPING verification"), "{}", result.message);
+    assert_eq!(result.state, Some(SignatureState::Unavailable));
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +234,7 @@ fn linux_key_mode_valid_signature_verifies() {
         "{}",
         result.message
     );
+    assert_eq!(result.state, Some(SignatureState::Verified));
 }
 
 /// A present-but-invalid signature is tamper evidence, never a soft skip --
@@ -491,6 +502,7 @@ fn macos_unsigned_is_a_soft_skip_not_tamper_evidence() {
     assert_eq!(result.outcome, Outcome::Skipped);
     assert!(result.message.contains("unsigned"), "{}", result.message);
     assert_eq!(result.had_authority, Some(false));
+    assert_eq!(result.state, Some(SignatureState::Skipped));
 }
 
 #[test]
@@ -561,6 +573,9 @@ fn macos_signed_but_invalid_fails_closed() {
     assert_eq!(result.outcome, Outcome::Failed);
     assert!(result.message.contains("codesign verification FAILED"), "{}", result.message);
     assert!(result.message.contains("NOT the 'unsigned' case"), "{}", result.message);
+    // A blocked artifact is never reported at all -- the process exits before
+    // any `SIGNATURE=` line is printed (#8197).
+    assert_eq!(result.state, None);
     // Authority WAS present (a real, invalid signature) -- distinct from the
     // unsigned case's `Some(false)` above.
     assert_eq!(result.had_authority, Some(true));

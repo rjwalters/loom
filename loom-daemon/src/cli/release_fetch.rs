@@ -18,12 +18,27 @@
 //!   VERSION_OUTPUT=<the verified binary's full `--version` output>
 //!   COMMIT=<its embedded commit, or empty>
 //!   HAD_AUTHORITY=<true|false|empty -- see release_fetch::signature>
+//!   SIGNATURE=<verified|skipped|unavailable -- see
+//!              release_fetch::signature::SignatureState>
+//!
+//! Keys are ADDITIVE ONLY. `SIGNATURE=` (#8197) was appended after
+//! `HAD_AUTHORITY=`, and every existing consumer of `BIN_PATH`/`TMP_DIR`/
+//! `VERSION_OUTPUT`/`COMMIT` reads keys by name from a `while IFS='='` loop
+//! that ignores what it does not recognize -- so an older wrapper is
+//! unaffected. Never remove or rename one of these.
+//!
+//! `SIGNATURE=` answers what nothing on stdout could before: whether the
+//! artifact's signature was actually CHECKED. Note there is deliberately no
+//! `SIGNATURE=` value for "the release published a signature that would not
+//! download" -- that case exits 1 below rather than reporting anything,
+//! because accepting it is the checksum-only downgrade #8197 closes.
 //!
 //! Exit codes (distinct from a plain 0/1 verdict, because the shell wrapper
 //! reacts differently to each):
 //!   0  verified. stdout carries the KEY=value lines above.
-//!   1  verification FAILED (checksum mismatch or an invalid signature) --
-//!      tamper evidence, never a soft fallback (AC2/AC3). The shell wrapper
+//!   1  verification FAILED (a checksum mismatch, an invalid signature, or a
+//!      published signature asset that would not download) -- refuse the
+//!      artifact, never a soft fallback (AC2/AC3). The shell wrapper
 //!      exits the whole script on this code immediately, matching the
 //!      pre-port shell calling `exit 1` directly from inside
 //!      `fetch_and_verify_artifact` rather than returning to its caller.
@@ -83,6 +98,7 @@ impl ReleaseFetchArgs {
                 artifact,
                 checksum_line,
                 signature_line,
+                signature_state,
             } => {
                 eprintln!("{checksum_line}");
                 if !signature_line.is_empty() {
@@ -99,6 +115,7 @@ impl ReleaseFetchArgs {
                         .map(|b| b.to_string())
                         .unwrap_or_default()
                 );
+                println!("SIGNATURE={}", signature_state.as_str());
                 std::process::exit(0);
             }
             FetchOutcome::VerificationFailed { lines } => {
