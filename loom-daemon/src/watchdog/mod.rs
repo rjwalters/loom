@@ -690,7 +690,14 @@ fn escalation_note(
 /// `loom-daemon daemon-watchdog` invocation working, where there is no stub
 /// and therefore no sibling scripts to find anyway.
 fn cli_dir() -> PathBuf {
-    if let Some(d) = env::var("LOOM_WATCHDOG_CLI_DIR").map(PathBuf::from) {
+    cli_dir_from(env::var("LOOM_WATCHDOG_CLI_DIR").as_deref())
+}
+
+/// The decision half of [`cli_dir`], split out so it can be tested without
+/// mutating process environment — which is shared across threads and makes an
+/// env-setting test order-dependent against every other test in the binary.
+fn cli_dir_from(exported: Option<&str>) -> PathBuf {
+    if let Some(d) = exported.filter(|v| !v.is_empty()).map(PathBuf::from) {
         if d.is_dir() {
             return d;
         }
@@ -699,6 +706,48 @@ fn cli_dir() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod high_fix_tests {
+    use super::*;
+
+    /// HIGH-2. `cli_dir` must prefer the ENTRY POINT's directory: sibling
+    /// scripts (loom-daemon-start.sh for bounded recovery, create-issue.sh for
+    /// the tier-3 escalation fallback) live beside the SCRIPT and never beside
+    /// `~/.local/bin/loom-daemon`.
+    ///
+    /// Deriving it from `current_exe()` made bounded recovery REPORT-ONLY on
+    /// every default install — "no readable loom-daemon-start.sh beside this
+    /// watchdog" — while the real sibling sat next to the stub that had just
+    /// invoked it. The retained suite cannot see this: it always pins
+    /// LOOM_WATCHDOG_RECOVER_CMD.
+    #[test]
+    fn an_exported_entry_point_directory_wins() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let got = cli_dir_from(d.path().to_str());
+        assert_eq!(got, d.path(), "an exported, existing dir must win");
+    }
+
+    #[test]
+    fn a_value_that_cannot_hold_siblings_is_ignored() {
+        // A stale or mistyped export must not send sibling resolution somewhere
+        // that cannot contain siblings. Falling back is safer than trusting it,
+        // and matches a direct `loom-daemon daemon-watchdog` invocation, where
+        // there is no stub and no siblings to find.
+        let d = tempfile::tempdir().expect("tempdir");
+        let f = d.path().join("not-a-dir");
+        std::fs::write(&f, "x").expect("write");
+
+        let fallback = cli_dir_from(None);
+        assert_eq!(cli_dir_from(f.to_str()), fallback, "a file is not a cli dir");
+        assert_eq!(cli_dir_from(Some("")), fallback, "empty is not a cli dir");
+        assert_eq!(
+            cli_dir_from(Some("/nonexistent/loom/cli")),
+            fallback,
+            "a missing dir is not a cli dir"
+        );
+    }
 }
 
 /// Unix seconds.

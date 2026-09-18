@@ -110,7 +110,21 @@ pub fn cooldown_secs() -> u64 {
 pub fn cooldown_remaining(state: &std::path::Path, now: u64, window: u64) -> Option<u64> {
     let text = std::fs::read_to_string(state).ok()?;
     let recovered_at: u64 = text.split_whitespace().next()?.parse().ok()?;
-    let elapsed = now.saturating_sub(recovered_at);
+    // The shell's guard is `elapsed >= 0 && elapsed < COOLDOWN`, and the `>= 0`
+    // half is load-bearing: a record stamped in the FUTURE (clock skew, an NTP
+    // step, a restored snapshot) makes elapsed negative, the condition false,
+    // and the shell FILES FRESH. Its own comment says so — "a record whose
+    // stored timestamp is in the future, e.g. clock skew, FAILS OPEN".
+    //
+    // `saturating_sub` silently inverted that: it clamps to 0, which reads as
+    // "just recovered" and suppresses for the whole window. On a host whose
+    // clock jumped forward, a real coordination outage would go unreported for
+    // six hours. Fail-open is the deliberate choice here — a duplicate issue
+    // is noise, a missing one is an outage nobody hears about.
+    if recovered_at > now {
+        return None;
+    }
+    let elapsed = now - recovered_at;
     (elapsed < window).then(|| window - elapsed)
 }
 
@@ -171,7 +185,11 @@ pub fn repeat_action(cooldown: Option<&Cooldown>, now: u64, window: u64) -> Repe
     if c.issue_ref.is_empty() {
         return Repeat::FileFresh;
     }
-    if now.saturating_sub(c.recovered_at) >= window {
+    // Same clock-skew rule as `cooldown_remaining`: a record stamped in the
+    // FUTURE is not evidence of a recent episode, so it cannot hold the dedup
+    // window open either. `saturating_sub` would clamp to 0 and keep commenting
+    // on a stale issue instead of filing the fresh one the operator needs.
+    if c.recovered_at > now || now - c.recovered_at >= window {
         return Repeat::FileFresh;
     }
     Repeat::CommentOn {
@@ -484,12 +502,17 @@ mod tests {
     }
 
     #[test]
-    fn a_clock_that_went_backwards_stays_inside_the_window() {
-        // saturating_sub keeps elapsed at 0 rather than wrapping to a huge
-        // number, which would look like "long outside the window" and file a
-        // duplicate.
+    fn a_record_stamped_in_the_future_files_fresh_rather_than_commenting() {
+        // Renamed and inverted, for the same reason as its twin in
+        // `cooldown_remaining`. The old version argued that clamping avoided
+        // "filing a duplicate" — but a record stamped in the FUTURE is not
+        // evidence of a recent episode at all, and treating it as one keeps
+        // commenting on a stale issue instead of filing the fresh one an
+        // operator needs. The shell files fresh here.
+        assert_eq!(repeat_action(Some(&cd(5000, "1234", 1)), 1000, 86_400), Repeat::FileFresh);
+        // The ordinary in-window case is unchanged.
         assert_eq!(
-            repeat_action(Some(&cd(5000, "1234", 1)), 1000, 86_400),
+            repeat_action(Some(&cd(1000, "1234", 1)), 5000, 86_400),
             Repeat::CommentOn {
                 issue_ref: "1234".into(),
                 flap: 2
@@ -602,13 +625,27 @@ mod tests {
     }
 
     #[test]
-    fn a_clock_that_went_backwards_does_not_underflow() {
+    fn a_record_stamped_in_the_future_fails_OPEN_like_the_shell() {
+        // Renamed and inverted. The old version asserted that a future-stamped
+        // record suppresses for the FULL window, and called that "not
+        // underflowing" — it does not underflow, but it is the wrong
+        // direction, and the test enshrined it.
+        //
+        // The shell's guard is `elapsed >= 0 && elapsed < COOLDOWN`, whose own
+        // comment says a timestamp in the future (clock skew) FAILS OPEN. A
+        // host whose clock jumped forward would otherwise go six hours without
+        // reporting a real coordination outage. A duplicate issue is noise; a
+        // missing one is an outage nobody hears about.
         let d = tempfile::tempdir().expect("tempdir");
         let p = d.path().join("cooldown");
         std::fs::write(&p, "5000 issue-42 1\n").expect("write");
-        // `now` before the recorded recovery: saturating_sub keeps elapsed at 0,
-        // so the full window remains rather than wrapping to a huge number.
-        assert_eq!(cooldown_remaining(&p, 1000, 3600), Some(3600));
+        assert_eq!(
+            cooldown_remaining(&p, 1000, 3600),
+            None,
+            "a future-stamped record must NOT suppress"
+        );
+        // And the ordinary case still behaves.
+        assert_eq!(cooldown_remaining(&p, 6000, 3600), Some(2600));
     }
 }
 
