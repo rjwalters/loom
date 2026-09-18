@@ -215,7 +215,13 @@ Differential testing raises the ceiling because the corpus comes from the
 grammar rather than from imagination. Replaying 700 generated inputs through
 both implementations of `extract-refs` reproduced the newline divergence and
 found two more that #8011 had not caught (zero-padded `#007`, and `#N` above
-`u64::MAX` being dropped by `.parse().ok()`).
+`u64::MAX` being dropped by `.parse().ok()`). That first corpus covered only
+two of the seven separator characters it claimed to, had no committed
+generator, and ran every case with zero comments — three gaps #8097 closed by
+committing `loom-daemon/examples/generate_extract_refs_oracle.rs` and
+regenerating against the full grammar; the corpus is larger now (see the
+fixture's own `_meta.corpus` for the current count and coverage) but the
+method below is unchanged.
 
 ```bash
 # 1. Recover the reference implementation — the commit BEFORE the port.

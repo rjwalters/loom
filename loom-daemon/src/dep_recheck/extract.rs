@@ -58,18 +58,41 @@ pub struct Input {
 /// **Divergence from the pre-port shell (#8011, kept intentionally):** the
 /// shell matched this pattern with `grep -oE`, which is line-oriented and
 /// cannot span a newline. This regex runs over the whole concatenated
-/// body-plus-comments text with `\s` (inside `[*_:\s]*`) matching `\n`, so a
-/// phrase and its `#N` split across a line break — e.g. `"Blocked by\n#42"` —
-/// now match where the shell found nothing. This is the same
-/// slightly-too-permissive direction as [`super::named`]'s bullet-marker
-/// divergence: missing a genuine declared reference is the worse failure
-/// mode for a check whose whole job is finding one. Kept rather than
-/// narrowed; changes `CONCLUSION_HASH` (via `operator-premise`'s `--refs`)
-/// for any input where the phrase and reference are separated by a newline.
+/// body-plus-comments text with `[[:space:]]` (inside `[*_:[[:space:]]]*`)
+/// matching `\n`, so a phrase and its `#N` split across a line break — e.g.
+/// `"Blocked by\n#42"` — now match where the shell found nothing. This is
+/// the same slightly-too-permissive direction as [`super::named`]'s
+/// bullet-marker divergence: missing a genuine declared reference is the
+/// worse failure mode for a check whose whole job is finding one. Kept
+/// rather than narrowed; changes `CONCLUSION_HASH` (via
+/// `operator-premise`'s `--refs`) for any input where the phrase and
+/// reference are separated by a newline.
+///
+/// **Resolved divergence (#8097): NBSP (U+00A0) is deliberately NOT in the
+/// separator class.** The shell's `[[:space:]]` is a POSIX bracket
+/// expression, and this regex used to spell the equivalent separator run as
+/// `\s` — but the `regex` crate's `\s` is Unicode-aware by default and
+/// matches the whole `White_Space` property, which includes U+00A0. That
+/// made the port accept `"Requires\u{a0}#42"` (a bare NBSP as the only
+/// separator) where the retired shell's `grep -oE '[[:space:]]'` did not —
+/// and, worse, *which* shell disagreed depended on the platform: GNU grep
+/// (Linux, what CI and the fleet run) excludes NBSP from `[[:space:]]`
+/// under any locale tested; BSD grep (macOS) and the crate's default `\s`
+/// both include it. A caller developing locally on macOS and one running in
+/// CI could therefore have silently observed different `--refs` output for
+/// byte-identical input. Spelling the class as the nested POSIX class
+/// `[[:space:]]` (a fixed, locale-independent ASCII set: space, `\t`, `\n`,
+/// `\r`, `\x0b`, `\x0c` — never Unicode `White_Space`) makes the Rust
+/// separator alphabet match the GNU-grep behaviour the frozen oracle in
+/// `tests/fixtures/extract_refs_shell_oracle.jsonl` was captured against,
+/// on every platform this binary runs on. See
+/// `tests/differential_extract_refs.rs`, whose corpus now exercises all
+/// seven ASCII/NBSP-adjacent separators including NBSP itself, confirming
+/// the two sides agree (both find nothing) rather than diverging.
 fn phrase_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:\s]*#([0-9]+)")
+        Regex::new(r"(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:[[:space:]]]*#([0-9]+)")
             .expect("static dependency-phrase pattern")
     })
 }
