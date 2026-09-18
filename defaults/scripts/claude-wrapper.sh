@@ -1509,7 +1509,7 @@ check_api_reachable() {
     return 0  # Don't fail on network check - let Claude CLI handle it
 }
 
-# --- Retry / rotation classification (ported to Rust in #8037) --------------
+# --- Retry / rotation classification (ported to Rust in #8037, #8138) -------
 #
 # Six predicates decide whether a sweep retries, rotates to another account,
 # marks a credential dead, or dies, and how long it waits between attempts:
@@ -1529,6 +1529,13 @@ check_api_reachable() {
 # independent verdict systems printing contradictory conclusions about one
 # failure. So the shell still answers WHAT this failure is; the port owns WHAT
 # THE WRAPPER DOES about it.
+#
+# #8138 moved a seventh across the same boundary, for the same reason: the
+# `[model-class:...]` scoping decision (#8058) that rotate_exhausted_account
+# applies to its own .bad_tokens mark. It does not choose BETWEEN remedies, it
+# narrows the one is_account_exhaustion already chose, which is squarely "what
+# the wrapper does about it" — and it consults `classify_error` exactly as the
+# six above do, through the same --classification flag.
 #
 # Both of the library's modes moved together (#8032): when classify-error.sh
 # was sourced the category travels with the question, and when it was not,
@@ -1558,7 +1565,7 @@ _retry_classify_bin() {
     [[ -n "${_RETRY_CLASSIFY_BIN}" ]]
 }
 
-# _retry_classify <subcommand> <output> <exit_code>
+# _retry_classify <subcommand> <output> <exit_code> [extra_args...]
 #
 # Asks the delegate one question. Sets _RETRY_CLASSIFY_OUT to its stdout and
 # returns its verdict:
@@ -1579,16 +1586,25 @@ _retry_classify_bin() {
 # spelled as an empty value; and the library counts as available only when BOTH
 # functions are defined, since they come from the same file and a half-sourced
 # library is not a state that occurs.
+#
+# Anything after <exit_code> is passed through to the subcommand verbatim, for
+# the one flag that is NOT part of the shared shape: `model-class --model`
+# (#8138). It is deliberately not hoisted into the uniform argv above — a
+# `retry-classify` binary predating #8138 rejects an unknown argument outright
+# (clap exits 2), so sending `--model` to all seven subcommands would turn a
+# routine version skew into a fail-safe verdict for the OTHER six. Attached only
+# to the subcommand that such a binary does not have either, it costs nothing:
+# the whole invocation already falls to rc 3.
 _RETRY_CLASSIFY_OUT=""
 _retry_classify() {
-    local subcommand="$1" output="$2" exit_code="$3" rc=0 args=()
+    local subcommand="$1" output="$2" exit_code="$3" rc=0 args=("${@:4}")
     _RETRY_CLASSIFY_OUT=""
     _retry_classify_bin || return 3
     if declare -F classify_error >/dev/null 2>&1 \
        && declare -F classification_is_transient >/dev/null 2>&1; then
         local category
         category="$(classify_error "${output}" "${exit_code}")"
-        args=(--classification "${category}")
+        args+=(--classification "${category}")
         # The deny-list verdict travels WITH the category: classify-error.sh
         # owns it (#4501), the port consumes it.
         if classification_is_transient "${category}"; then args+=(--classification-transient); fi
@@ -1809,7 +1825,7 @@ reselect_account_no_mark() {
     # wrapper's own args: the daemon path sets both (spawn-claude.sh exports
     # LOOM_MODEL and appends the flag), and on the rare path where they
     # disagree a mismatch costs at most one extra rotation -- never a wrong
-    # mark, since marking is gated separately by loom_model_class_marker.
+    # mark, since marking is gated separately by `retry-classify model-class`.
     # shellcheck disable=SC2046
     sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
     _sel_rc=$?
@@ -1897,11 +1913,11 @@ _derive_token_name() {
 #
 # `$2` / `$3` (optional, issue #8058) are the captured child output and its exit
 # code. They are read positionally at the mark-bad call below rather than copied
-# into locals, so this function gains no lines: `loom_model_class_marker` needs
-# them to decide whether the death was scoped to ONE model class, and if so the
-# `.bad_tokens` entry is scoped to `$LOOM_MODEL`'s class instead of blocking the
-# account outright. Omitted, or unscopable, yields the pre-#8058 account-wide
-# mark unchanged.
+# into locals, so this function gains no lines: `retry-classify model-class`
+# needs them to decide whether the death was scoped to ONE model class, and if
+# so the `.bad_tokens` entry is scoped to `$LOOM_MODEL`'s class instead of
+# blocking the account outright. Omitted, or unscopable, yields the pre-#8058
+# account-wide mark unchanged.
 rotate_exhausted_account() {
     local reason="$1"
     local ws daemon_bin
@@ -1918,14 +1934,18 @@ rotate_exhausted_account() {
     fi
 
     if [[ -n "${ACTIVE_TOKEN_NAME}" ]]; then
-        # The `[model-class:...]` suffix (#8058) rides inside the existing
-        # free-form reason field -- no new CLI flag, so this works against any
-        # daemon vintage. `$2`/`$3` are this function's optional output /
-        # exit-code arguments; see the header. A missing helper (older
-        # lib/classify-error.sh mid-resync) yields no suffix, i.e. today's
-        # account-wide mark.
+        # The `[model-class:...]` suffix (#8058) still rides inside the existing
+        # free-form reason field, so `tokens mark-bad` needs no new flag and
+        # ${daemon_bin} -- the INSTALLED daemon, possibly an old release -- is
+        # unaffected by this. What computes the suffix is the SELF daemon
+        # (#8138, `retry-classify model-class`), reached through the same
+        # _retry_classify bridge as every other rotation predicate: rc 3 (no
+        # implementation resolved, or one predating the subcommand) leaves
+        # _RETRY_CLASSIFY_OUT empty, which is the pre-#8058 account-wide mark.
+        # `$2`/`$3` are this function's optional output / exit-code arguments;
+        # see the header.
         if "${daemon_bin}" tokens mark-bad "${ACTIVE_TOKEN_NAME}" \
-            --reason "exhausted: ${reason}$(declare -F loom_model_class_marker >/dev/null 2>&1 && loom_model_class_marker "${2:-}" "${3:-1}" "${LOOM_MODEL:-}" || true)" --workspace "${ws}" >/dev/null 2>&1; then
+            --reason "exhausted: ${reason}$(_retry_classify model-class "${2:-}" "${3:-1}" --model "${LOOM_MODEL:-}" && printf '%s' "${_RETRY_CLASSIFY_OUT}" || true)" --workspace "${ws}" >/dev/null 2>&1; then
             log_info "Marked account '${ACTIVE_TOKEN_NAME}' exhausted in .bad_tokens (${reason})"
         else
             log_warn "Could not record '${ACTIVE_TOKEN_NAME}' in .bad_tokens (continuing to re-select)"
@@ -1946,7 +1966,7 @@ rotate_exhausted_account() {
     # wrapper's own args: the daemon path sets both (spawn-claude.sh exports
     # LOOM_MODEL and appends the flag), and on the rare path where they
     # disagree a mismatch costs at most one extra rotation -- never a wrong
-    # mark, since marking is gated separately by loom_model_class_marker.
+    # mark, since marking is gated separately by `retry-classify model-class`.
     # shellcheck disable=SC2046
     sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
     _sel_rc=$?
@@ -2014,7 +2034,7 @@ rotate_auth_dead_account() {
     # wrapper's own args: the daemon path sets both (spawn-claude.sh exports
     # LOOM_MODEL and appends the flag), and on the rare path where they
     # disagree a mismatch costs at most one extra rotation -- never a wrong
-    # mark, since marking is gated separately by loom_model_class_marker.
+    # mark, since marking is gated separately by `retry-classify model-class`.
     # shellcheck disable=SC2046
     sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
     _sel_rc=$?

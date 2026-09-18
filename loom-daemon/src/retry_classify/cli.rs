@@ -13,7 +13,8 @@
 //!   never look like "not exhausted".
 //! - **stdout**: `transient` prints the category the verdict was derived from
 //!   (`_LAST_ERROR_CLASSIFICATION`, #4501); `wait-time` prints the number of
-//!   seconds; every other subcommand prints nothing.
+//!   seconds; `model-class` prints the ` [model-class:<model>]` reason suffix
+//!   when its verdict is TRUE (#8138); every other subcommand prints nothing.
 //! - **stdin**: the child's captured output arrives on stdin, never in argv. It
 //!   is routinely megabytes of CLI transcript, which argv cannot hold.
 //!
@@ -26,7 +27,8 @@
 mod tests;
 
 use super::{calculate_wait_time, is_account_auth_dead, is_account_exhaustion};
-use super::{is_account_session_limit, is_mcp_error, is_transient, Backoff, Input};
+use super::{is_account_session_limit, is_mcp_error, is_transient, model_class_marker};
+use super::{Backoff, Input};
 
 /// Exit code for a usage error — deliberately distinct from the FALSE verdict.
 pub const EX_USAGE: i32 = 2;
@@ -40,6 +42,7 @@ pub enum Sub {
     SessionLimit,
     McpError,
     WaitTime,
+    ModelClass,
 }
 
 /// The parsed argv.
@@ -59,6 +62,10 @@ pub struct Opts {
     pub initial_wait: i64,
     pub multiplier: i64,
     pub max_wait: i64,
+    /// `model-class`: the resolved model in flight (`$LOOM_MODEL`). Empty is a
+    /// real answer — "the session default", which keeps the mark account-wide —
+    /// so unlike `classification` this is not an `Option`.
+    pub model: String,
 }
 
 /// Runs one predicate and returns the process exit code.
@@ -96,6 +103,21 @@ pub fn run(sub: Sub, opts: &Opts, output: &str) -> i32 {
         Sub::AuthDead => is_account_auth_dead(&input),
         Sub::SessionLimit => is_account_session_limit(&input),
         Sub::McpError => is_mcp_error(output),
+        Sub::ModelClass => match model_class_marker(&input, &opts.model) {
+            // Printed before the exit code is chosen, exactly as `transient`
+            // does: the caller splices this straight into the `tokens mark-bad
+            // --reason` string, and reads the status only to know whether to.
+            //
+            // `println!`, not `print!`, even though the marker is a SUFFIX: the
+            // caller reads it through `$(...)`, which strips trailing newlines
+            // but not the marker's leading space, and the newline is what
+            // flushes the line-buffered stdout before `std::process::exit`.
+            Some(marker) => {
+                println!("{marker}");
+                true
+            }
+            None => false,
+        },
         Sub::WaitTime => unreachable!("handled above"),
     };
 

@@ -1,6 +1,8 @@
 //! The `retry-classify` subcommand (epic #7810, #8037).
 //!
-//! Backs the six classifiers in `claude-wrapper.sh`, which now delegate to it.
+//! Backs the six classifiers in `claude-wrapper.sh` that #8037 ported, plus the
+//! `model-class` mark-scoping decision #8138 added, all of which now delegate
+//! to it.
 //! What each answers is documented on [`loom_daemon::retry_classify`]; the
 //! frozen argv / stdout / exit-code contract is on
 //! [`loom_daemon::retry_classify::cli`].
@@ -80,6 +82,25 @@ pub(crate) enum RetryClassifyCommand {
         predicate: PredicateArgs,
     },
 
+    /// How narrow the `.bad_tokens` mark for this death may be
+    /// (`loom_model_class_marker`, #8058/#8138). Prints the
+    /// ` [model-class:<model>]` reason suffix and exits 0 when the death is
+    /// provably scoped to ONE model class; prints nothing and exits 1 when the
+    /// mark must stay account-wide.
+    ModelClass {
+        #[command(flatten)]
+        predicate: PredicateArgs,
+
+        /// The resolved model in flight (`$LOOM_MODEL`) — the class a scoped
+        /// mark would name. Empty (the default) is an ANSWER, not a missing
+        /// value: it means the spawn took the session default, so there is no
+        /// class to scope to and the mark stays account-wide. That is why this
+        /// is not spelled like `--classification`, whose absence selects a
+        /// different code path rather than a different verdict.
+        #[arg(long, value_name = "MODEL", default_value = "")]
+        model: String,
+    },
+
     /// The backoff curve (`calculate_wait_time`): prints
     /// `INITIAL_WAIT * MULTIPLIER^(attempt-1)`, capped at `MAX_WAIT`.
     WaitTime {
@@ -121,6 +142,14 @@ impl RetryClassifyCommand {
             RetryClassifyCommand::McpError { predicate } => {
                 (cli::Sub::McpError, Some(predicate), cli::Opts::default())
             }
+            RetryClassifyCommand::ModelClass { predicate, model } => (
+                cli::Sub::ModelClass,
+                Some(predicate),
+                cli::Opts {
+                    model,
+                    ..Default::default()
+                },
+            ),
             RetryClassifyCommand::WaitTime {
                 attempt,
                 initial_wait,
