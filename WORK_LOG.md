@@ -7,6 +7,21 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8064** (closed): Trim narrative/reference bloat from champion-*/judge-reference/watch skills and .loom/CLAUDE.md
+- **PR #8139**: docs(prompt-budget): trim narrative bloat from champion-reference/judge-reference/watch/.loom-CLAUDE.md
+- **Issue #8140** (closed): A retained suite's assertions about the SHELL's source text cannot survive the port, and the recipe is silent on them
+- **PR #8141**: docs(recipe): what to do with a retained assertion that cannot survive the port (#8140)
+- **Issue #8113** (closed): Differential test's pattern literal models the retired SHELL, and nothing says so
+- **PR #8126**: test(differential_extract_refs): document the frozen oracle pattern, run rendering invariant on every case
+- **Issue #8093** (closed): Test 12C in test-champion-held-pr-health-pass.sh is non-discriminating: it passes with the pin line deleted AND with its own || true removed
+- **PR #8118**: test(champion): make Test 12C discriminate by executing the shipped pin line
+- **Issue #8048** (closed): merge-pr.sh --auto exits before reconciling stacked children when the server-side merge is only queued (#8010 item 1)
+- **PR #8117**: fix(merge-pr): reconcile stacked children when --auto only queues the merge
+- **Issue #7945** (closed): Port sky130-modexp's mkdir/qsplit-continuation guard-hook fail-open fixes (#116/#121) to defaults/
+- **PR #7978**: fix(guards): port sky130-modexp mkdir/qsplit-continuation guard-hook fail-open fixes
+- **PR #8089**: fix(pricing): key the model rate card by generation, not family stem
+- **Issue #8066** (closed): Reorder role spawn prefix so stable content precedes volatile content for cross-session cache hits
+- **PR #8149**: docs(cache): measure and falsify the prefix-ordering hypothesis (#8066)
 - **Issue #8054** (closed): cost mode for the role-runner path: machine-level roleModels/effort defaults, honour sweep.optimization, emit --effort on role ticks
 - **PR #8145**: feat(role-runner): resolve and emit --effort on scheduled role ticks (#8054)
 - **Issue #8091** (closed): feat(daemon): surface operator-attention counts in loom-daemon health and the dashboard pipeline
