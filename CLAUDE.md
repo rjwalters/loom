@@ -2,7 +2,6 @@
 
 This repository uses **Loom** for AI-powered development orchestration.
 
-**Loom Version**: 0.19.168
 **Installation Date**: 2026-04-21
 
 > **This file is the operating core** — only what an agent must know to act
@@ -272,7 +271,8 @@ missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
   [`.loom/docs/forge-authentication.md`](.loom/docs/forge-authentication.md).
 - **Releasing** — **a PR must NEVER bump `VERSION`**: a post-merge workflow does
   it once, and CI fails any PR that hand-edits a version-bearing file (#7743).
-  `scripts/version.sh` keeps all 6 in sync (#5517) and is the *release* path;
+  `scripts/version.sh` keeps all 5 in sync (`version.sh list` names them; #5517,
+  #8147) and is the *release* path;
   releases are driven by `/repo:release` from [rjwalters/repo](https://github.com/rjwalters/repo). The
   release workflow triggers on GitHub Release creation, not tag push. The same
   workflow also publishes `ghcr.io/rjwalters/loom-worker:<version>` — a pinned

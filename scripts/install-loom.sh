@@ -1133,10 +1133,16 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
   echo ""
 
   # Check 1: Is Loom already installed with the same version?
-  # Layered version detection — prefer .loom/install-metadata.json (deterministic
-  # JSON written at install time), fall back to .loom/CLAUDE.md (substituted
-  # template), then root CLAUDE.md (legacy). Reject `{{...}}` placeholder leaks
-  # from stale/corrupted installs.
+  # Layered version detection — .loom/install-metadata.json (deterministic JSON
+  # written at install time) is the authoritative source; the two CLAUDE.md
+  # sources below are LEGACY-ONLY fallbacks kept for repos installed before
+  # #8147, which removed the `**Loom Version**:` header from both guides (a
+  # per-release token in a file injected into every session's prompt prefix
+  # invalidated every agent's cached prefix on each bump). On a post-#8147
+  # install their `grep` matches nothing and detection falls through cleanly to
+  # an empty INSTALLED_VERSION, i.e. "treat as a fresh install" — the same
+  # behavior as a repo with no metadata file at all. Reject `{{...}}`
+  # placeholder leaks from stale/corrupted installs.
   INSTALLED_VERSION=""
 
   # Source 1: .loom/install-metadata.json (preferred — deterministic JSON)
@@ -1149,12 +1155,12 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
     fi
   fi
 
-  # Source 2: .loom/CLAUDE.md (substituted template)
+  # Source 2: .loom/CLAUDE.md (legacy, pre-#8147 installs only)
   if [[ -z "$INSTALLED_VERSION" ]] && [[ -f "$TARGET_PATH/.loom/CLAUDE.md" ]]; then
     INSTALLED_VERSION=$(grep 'Loom Version' "$TARGET_PATH/.loom/CLAUDE.md" 2>/dev/null | head -1 | sed 's/.*Loom Version.*: //' | sed 's/\*//g' | tr -d '[:space:]' || true)
   fi
 
-  # Source 3: root CLAUDE.md (legacy fallback)
+  # Source 3: root CLAUDE.md (legacy, pre-#8147/pre-#3000 installs only)
   if [[ -z "$INSTALLED_VERSION" ]] && [[ -f "$TARGET_PATH/CLAUDE.md" ]]; then
     INSTALLED_VERSION=$(grep 'Loom Version' "$TARGET_PATH/CLAUDE.md" 2>/dev/null | head -1 | sed 's/.*Loom Version.*: //' | sed 's/\*//g' | tr -d '[:space:]' || true)
   fi
