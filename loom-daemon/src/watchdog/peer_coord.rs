@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_stamped_in_the_future_fails_OPEN_like_the_shell() {
+    fn a_record_stamped_in_the_future_fails_open_like_the_shell() {
         // Renamed and inverted. The old version asserted that a future-stamped
         // record suppresses for the FULL window, and called that "not
         // underflowing" — it does not underflow, but it is the wrong
