@@ -106,11 +106,13 @@ fn marker_present(
     // #5118: the out-of-band signals can only ever be a hint. Before declaring
     // an outage, ask the socket — a served socket is authoritative and an
     // absent pid file is no evidence at all.
+    let mut socket_proved_healthy = false;
     if !snap.alive() {
-        match socket_corroboration(paths, reporter, &mut snap) {
-            Some(code) => return code,
-            None => {}
+        let corroboration = socket_corroboration(paths, reporter, &mut snap);
+        if let Some(code) = corroboration.exit {
+            return code;
         }
+        socket_proved_healthy = corroboration.healthy;
     }
 
     if !snap.alive() {
@@ -123,14 +125,20 @@ fn marker_present(
     recovery::clear(&state.recovery, &state.escalation_sentinel);
 
     // Sections 12-22: the bounded in-band probe and its two signals.
-    if let Some(code) = ipc_probe(paths, reporter, state, &snap) {
+    let probe_outcome = ipc_probe(paths, reporter, state, &snap);
+    if let Some(code) = probe_outcome.exit {
         return code;
     }
 
     // The 50-series: only on a tick whose probe came back healthy. Asking a
     // daemon that is not answering produces no information, and a "could not
     // determine" reported alongside a confirmed hang is noise on a real signal.
-    if !reporter.diverged() {
+    // `probe_outcome.healthy`, NOT `!reporter.diverged()`. A probe that was
+    // disabled or skipped also fails to diverge, and this check must never
+    // become a new hang surface for a tick that deliberately spent no
+    // round-trip — `LOOM_WATCHDOG_IPC_PROBE=0` against a never-returning
+    // binary took 15s here before this distinction existed.
+    if probe_outcome.healthy || socket_proved_healthy {
         peer_coordination(paths, reporter, state, &snap);
     }
 
@@ -631,13 +639,34 @@ fn now_secs() -> u64 {
 ///   probe — fail, succeed, fail, succeed — never reaches 3 consecutive, so the
 ///   first signal never fires for it, yet failing half your ticks is not a
 ///   clean bill of health either.
+/// What the bounded in-band probe concluded.
+///
+/// `healthy` is NOT `exit.is_none()`. A probe that was disabled, skipped, or
+/// never ran (no pid to ask about) also produces no exit code, and treating
+/// that as healthy is what let the 50-series peer-coordination check spend a
+/// SECOND round-trip on a tick that had deliberately spent none — turning
+/// `LOOM_WATCHDOG_IPC_PROBE=0` into a 15-second hang against a mock that never
+/// returns. The shell gates that check on `probe_verdict == healthy`; this is
+/// that value, carried explicitly rather than inferred.
+struct ProbeOutcome {
+    /// An exit code the tick must return immediately.
+    exit: Option<i32>,
+    /// The round-trip actually succeeded this tick.
+    healthy: bool,
+}
+
 fn ipc_probe(
     paths: &config::Paths,
     reporter: &report::Reporter,
     state: &consts::StateFiles,
     snap: &liveness::Snapshot,
-) -> Option<i32> {
-    let pid = snap.pid?;
+) -> ProbeOutcome {
+    let Some(pid) = snap.pid else {
+        return ProbeOutcome {
+            exit: None,
+            healthy: false,
+        };
+    };
 
     let repo_root = marker::get_nonempty(&paths.marker, "repo_root").map(PathBuf::from);
     let bin = locate::daemon_bin(repo_root.as_deref());
@@ -691,7 +720,10 @@ fn ipc_probe(
             } else {
                 reporter.report(report::Level::Ok, &format!("IPC probe OK: {detail}."));
             }
-            None
+            ProbeOutcome {
+                exit: None,
+                healthy: true,
+            }
         }
 
         probe::IpcVerdict::Unresponsive => {
@@ -725,7 +757,10 @@ fn ipc_probe(
                         probe::probe_timeout_secs()
                     ),
                 );
-                return Some(1);
+                return ProbeOutcome {
+                    exit: Some(1),
+                    healthy: false,
+                };
             }
 
             reporter.report(
@@ -740,7 +775,10 @@ fn ipc_probe(
                 ),
             );
             reporter.mark_diverged();
-            None
+            ProbeOutcome {
+                exit: None,
+                healthy: false,
+            }
         }
 
         // Nothing was learned. Explicitly not counted as a hang, and the window
@@ -748,7 +786,10 @@ fn ipc_probe(
         // recording it as either would bias the rate signal.
         probe::IpcVerdict::Skipped => {
             reporter.report(report::Level::Ok, &format!("IPC probe skipped: {detail}."));
-            None
+            ProbeOutcome {
+                exit: None,
+                healthy: false,
+            }
         }
     }
 }
@@ -917,13 +958,19 @@ fn peer_coordination(
 /// thing from evidence of absence, and conflating them paged for a daemon that
 /// was serving traffic the whole time.
 ///
-/// Returns `Some(exit_code)` when this tick's answer is settled here; `None`
-/// when the caller should continue to the outage path. May flip `snap` to alive.
+/// Returns `exit: Some(code)` when this tick's answer is settled here; `None`
+/// when the caller should continue to the outage path. May flip `snap` to
+/// alive.
+///
+/// `healthy` reports that THIS round-trip answered — the shell's
+/// SOCKET_ONLY_LIVENESS path, which sets `probe_verdict=healthy` directly.
+/// The later in-band probe cannot re-derive it, because on this path there is
+/// no pid to ask about and it returns before probing at all.
 fn socket_corroboration(
     paths: &config::Paths,
     reporter: &report::Reporter,
     snap: &mut liveness::Snapshot,
-) -> Option<i32> {
+) -> ProbeOutcome {
     let repo_root = marker::get_nonempty(&paths.marker, "repo_root").map(PathBuf::from);
     let bin = locate::daemon_bin(repo_root.as_deref());
     let attempt = probe::attempt(&paths.socket_path, bin.as_deref());
@@ -947,7 +994,10 @@ fn socket_corroboration(
                     report::Level::Ok,
                     &format!("daemon healthy via the in-band socket round-trip: {}.", snap.detail),
                 );
-                None
+                ProbeOutcome {
+                    exit: None,
+                    healthy: true,
+                }
             } else {
                 // A supervisor says the job is gone, yet something serves the
                 // socket. Dispatch is running, so this is NOT an outage — but
@@ -967,7 +1017,10 @@ fn socket_corroboration(
                         snap.detail
                     ),
                 );
-                Some(1)
+                ProbeOutcome {
+                    exit: Some(1),
+                    healthy: false,
+                }
             }
         }
 
@@ -975,7 +1028,10 @@ fn socket_corroboration(
             // Two independent signals agree. That is a real outage.
             snap.detail =
                 format!("{}; and the in-band probe confirms it: {socket_detail}", snap.detail);
-            None
+            ProbeOutcome {
+                exit: None,
+                healthy: false,
+            }
         }
 
         probe::SocketVerdict::Indeterminate => {
@@ -1001,13 +1057,19 @@ fn socket_corroboration(
                         snap.detail
                     ),
                 );
-                return Some(3);
+                return ProbeOutcome {
+                    exit: Some(3),
+                    healthy: false,
+                };
             }
             snap.detail = format!(
                 "{}; the in-band probe could not corroborate: {socket_detail}",
                 snap.detail
             );
-            None
+            ProbeOutcome {
+                exit: None,
+                healthy: false,
+            }
         }
     }
 }
