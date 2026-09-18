@@ -35,6 +35,9 @@ fn record(
         lines_added: None,
         lines_deleted: None,
         tokens_by_model: None,
+        failure_class: None,
+        models_used: None,
+        doctor_cycles: None,
     }
 }
 
