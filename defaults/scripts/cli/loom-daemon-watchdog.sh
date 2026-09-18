@@ -59,6 +59,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC2034  # read by loom_exec_script_helper, sourced below
 LOOM_SCRIPT_HELPER_MISSING_RC=3
 
+# The implementation resolves sibling scripts — loom-daemon-start.sh for
+# bounded recovery, create-issue.sh for escalation — RELATIVE TO THIS FILE, not
+# to the binary. The shell knew its own directory as $_LOOM_WATCHDOG_CLI_DIR;
+# the binary cannot derive it, because `current_exe()` points at
+# ~/.local/bin/loom-daemon on every normal install, where no sibling scripts
+# live. Export it so the port keeps the shell's meaning.
+export LOOM_WATCHDOG_CLI_DIR="$SCRIPT_DIR"
+
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/../lib/script-helper.sh"
 

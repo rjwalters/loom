@@ -296,10 +296,7 @@ fn outage(
     // Resolve what a recovery would RUN before deciding whether to run it: a
     // host with nothing runnable is report-only, and the report should say so
     // rather than implying an attempt was made and failed.
-    let cli_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let cli_dir = cli_dir();
     let pid_file = marker::get_nonempty(&paths.marker, "pid_file").map(PathBuf::from);
     let argv = recovery::resolve_argv(
         env::var("LOOM_WATCHDOG_RECOVER_CMD").as_deref(),
@@ -420,8 +417,22 @@ fn outage(
                  REPORT-ONLY on this host — an installed watchdog job here means DETECTION, not \
                  self-healing — until that is fixed."
             ),
+            // The shell has TWO distinct messages here, not one
+            // (loom-daemon-watchdog.sh:2158 and :2161), and both say
+            // REPORT-ONLY. The port had paraphrased this one down to
+            // "Automatic recovery is disabled on this host", dropping the
+            // "nothing will bring the daemon back but you" the header promises
+            // is stated explicitly.
+            //
+            // The retained assertion for it passed anyway, because `cli_dir`
+            // pointed at the binary's directory where no start script exists,
+            // so argv was ALWAYS Unavailable and the other branch answered.
+            // Fixing that bug is what exposed this one.
             recovery::Argv::Run { .. } => {
-                "Automatic recovery is disabled on this host (LOOM_WATCHDOG_AUTO_RECOVER)."
+                "NO auto-recovery was attempted: it is DISABLED on this host \
+                 (LOOM_WATCHDOG_AUTO_RECOVER=0). This watchdog is REPORT-ONLY for this outage — \
+                 an installed watchdog job here means DETECTION, not self-healing, and nothing \
+                 will bring the daemon back but you."
                     .to_string()
             }
         },
@@ -446,12 +457,51 @@ fn outage(
     };
 
     // Step 3: escalate once nothing automatic is left to try.
+    //
+    // TWO conditions, not one. The shell (loom-daemon-watchdog.sh:2224-2228)
+    // escalates when the breaker has tripped OR when no attempt is even
+    // POSSIBLE on this host and the outage has persisted for the same number
+    // of consecutive ticks. Porting only the first left the second silent:
+    // with auto-recovery disabled, or no runnable recovery command, a
+    // confirmed outage filed no forge issue at all — just a log line every
+    // tick, forever. That is the 2026-07-26 shape the watchdog exists to
+    // prevent, and `help.txt` still promised the behaviour.
+    //
+    // No retained assertion covers it: the harness pins AUTO_RECOVER=0 with
+    // ESCALATE=0, so no case ever enables escalation while recovery is
+    // impossible.
+    //
+    // The reason strings are the shell's verbatim — they are posted into a
+    // forge issue body, and a paraphrase is a silent divergence in text an
+    // operator reads during an outage.
+    // `Disabled` covers both of the shell's `recover_possible != true` cases:
+    // recovery switched off, and no runnable recovery argv — the call site
+    // maps `Argv::Unavailable` onto it.
+    let recovery_impossible =
+        matches!(decision, recovery::Decision::Disabled) && episode.ticks >= limits.max_attempts;
+
     let escalation_note = if matches!(decision, recovery::Decision::BreakerOpen { .. }) {
         escalation_note(
             paths,
             state,
             snap,
-            &format!("the circuit breaker is OPEN after {} attempts", episode.attempts),
+            &format!(
+                "the circuit breaker is OPEN — {} bounded recovery attempts were spent and the \
+                 daemon is still down",
+                episode.attempts
+            ),
+            None,
+        )
+    } else if recovery_impossible {
+        escalation_note(
+            paths,
+            state,
+            snap,
+            &format!(
+                "automatic recovery is not possible on this host, and the outage has persisted \
+                 for {} consecutive watchdog ticks ({outage_secs}s)",
+                episode.ticks
+            ),
             None,
         )
     } else {
@@ -577,10 +627,7 @@ fn escalation_note(
         ),
         escalate::Decision::Escalate => {
             let repo_root = marker::get_nonempty(&paths.marker, "repo_root").map(PathBuf::from);
-            let cli_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf))
-                .unwrap_or_else(|| PathBuf::from("."));
+            let cli_dir = cli_dir();
             let fallback = env::var("LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR").map(PathBuf::from);
 
             let script =
@@ -614,6 +661,34 @@ fn escalation_note(
             }
         }
     }
+}
+
+/// The directory the ENTRY POINT lives in — not the binary's.
+///
+/// Sibling scripts (`loom-daemon-start.sh` for bounded recovery,
+/// `create-issue.sh` for the tier-3 escalation fallback) are resolved relative
+/// to the script, which is what `$_LOOM_WATCHDOG_CLI_DIR` meant in the shell.
+///
+/// `current_exe()` is the wrong answer and was silently wrong on every normal
+/// install: it points at `~/.local/bin/loom-daemon`, where no sibling scripts
+/// exist, so bounded recovery degraded to REPORT-ONLY — "no readable
+/// loom-daemon-start.sh beside this watchdog" — while the real sibling sat
+/// next to the stub that invoked it. The retained suite never caught it
+/// because it always pins `LOOM_WATCHDOG_RECOVER_CMD`.
+///
+/// The stub exports `LOOM_WATCHDOG_CLI_DIR`; the fallback keeps a direct
+/// `loom-daemon daemon-watchdog` invocation working, where there is no stub
+/// and therefore no sibling scripts to find anyway.
+fn cli_dir() -> PathBuf {
+    if let Some(d) = env::var("LOOM_WATCHDOG_CLI_DIR").map(PathBuf::from) {
+        if d.is_dir() {
+            return d;
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Unix seconds.
@@ -906,10 +981,7 @@ fn peer_coordination(
             } else {
                 // #6222: file a forge tracking issue so the degradation is not
                 // confined to a logfile nobody tails.
-                let cli_dir = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(Path::to_path_buf))
-                    .unwrap_or_else(|| PathBuf::from("."));
+                let cli_dir = cli_dir();
                 let fallback =
                     env::var("LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR").map(PathBuf::from);
                 let script = escalate::resolve_issue_script(
@@ -1018,6 +1090,32 @@ fn socket_corroboration(
                 // socket wins: it is in-band evidence of the thing actually
                 // being asked about.
                 snap.state = crate::daemon_install_state::InstallState::AliveButUnresponsive;
+
+                // Recompute heartbeat freshness now that liveness is
+                // established. `liveness.rs` computes it only when the process
+                // was ALREADY known alive — reasonable on its own, since
+                // freshness is meaningless about a process that does not exist
+                // — but this path flips the snapshot to alive afterwards, and
+                // nothing re-asked.
+                //
+                // The result was a fail-OPEN: no pid file, socket answers,
+                // heartbeat file 1000s old against a 300s threshold, and the
+                // tick reported "no heartbeat file … (heartbeat disabled or
+                // not yet written) — liveness-only OK" and exited 0, while the
+                // file existed and was stale. The shell's section 4 ran on
+                // HEARTBEAT_FILE regardless of how liveness was established.
+                if let Some(hb) = snap.heartbeat_file.clone() {
+                    if let Some(threshold) = snap.heartbeat_stale_threshold_secs {
+                        let (f, a) = crate::daemon_install_state::check_heartbeat(
+                            std::path::Path::new(&hb),
+                            threshold,
+                            snap.process_age_secs,
+                        );
+                        snap.heartbeat = Some(f);
+                        snap.heartbeat_age_secs = a;
+                    }
+                }
+
                 snap.detail = format!(
                     "daemon ANSWERS on {socket} ({socket_detail}) — authoritative; the pid-file \
                      hint was unusable ({}), which is NOT evidence of an outage (#5118)",
