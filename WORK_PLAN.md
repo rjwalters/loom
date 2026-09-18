@@ -9,17 +9,14 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#8090**: feat(tokens): per-model-class exhaustion marks and `tokens select --model` (#8058)
-- **#8190**: fix(cache): stop stamping the running version into CLAUDE.md (#8147)
-- **#8199**: feat(merge-pr): port the closing-reference analysis to Rust (#8191 slice 1)
-- **#8212**: fix(guard): qsplit() closing-quote scan honours backslash parity (#8166)
-- **#8218**: fix(guard): scan an unquoted heredoc body's substitution spans for write targets
+- **#8179**: fix(tests): stop sweep test runs leaking into the live host (#8077)
+- **#8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#8077**: Builder test runs leak into the live host: test daemons log to ~/.loom/daemon.log and reload the production user systemd manager (#7873 sweep on loom-worker-2)
+- **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
 - **#8086**: Port loom-daemon-watchdog.sh to a daemon subcommand (994 lines, 233 retained assertions)
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 
@@ -27,55 +24,45 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
-- **#6544**: provision-hooks.sh emits unquoted ${CLAUDE_PROJECT_DIR} — every hook breaks when the project path contains a space
 - **#7986**: Guard: same-command mktemp safe-path denies the routine `VAR=$(cd "$VAR" && pwd -P)` realpath-canonicalization reassignment
 - **#8013**: test-guard-destructive-rm-scope.sh:338 '../ escaping the repo' assertion fails when the suite runs from a linked worktree (passes from the primary checkout)
-- **#8077**: Builder test runs leak into the live host: test daemons log to ~/.loom/daemon.log and reload the production user systemd manager (#7873 sweep on loom-worker-2)
 - **#8086**: Port loom-daemon-watchdog.sh to a daemon subcommand (994 lines, 233 retained assertions)
 - **#8097**: Differential corpus covers 2 of 7 separator chars, omits comments entirely, and its generator is not committed
-- **#8112**: Two Judges raced on one head: a PR can carry loom:pr and loom:changes-requested at once, and merge-pr.sh only reads the first
 - **#8136**: Reconcile PR #8097's differential-corpus gaps with #8125's BotLoginNormalisation work
-- **#8138**: Port PR #8058's model-class-marker logic to loom-daemon (Shell Budget Ratchet)
-- **#8146**: Token selection: prefer the account that last warmed this (repo, role) prompt cache (65% vs 1.4% hit rate)
 - **#8170**: sweep_registry::watchdog midbuild_* tests fail under the full parallel suite, pass 90/90 in isolation
 - **#8173**: test-loom-daemon-start.sh's #6568 control cases fail when the suite runs inside a Loom agent session (si_run does not strip LOOM_SWEEP_*/LOOM_TERMINAL_ID/LOOM_ROLE)
 - **#8177**: pricing: deliver the model rate card as a resync-updatable defaults/pricing.json asset (ask 2 of #8060)
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
-- **#8193**: Builder: in-session Task-tool builders publish no loom:lease, so claim_reconciliation reclaims them mid-build
 - **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes)
-- **#8197**: release-fetch: a .sig download failure is indistinguishable from an unsigned release, silently downgrading to checksum-only
-- **#8211**: guard mask_ws(): a quote inside an unquoted backtick substitution masks away a live statement boundary
 - **#8221**: Guard: same-command mktemp fast paths count only bare `NAME=` assignments — `export`/`declare`/`read`/`printf -v` rebinding slips the ambiguity rule
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#8062**: add 'loom-daemon usage report' command: token/cost breakdown by role, model, repo, day
-- **#8163**: health: status build exceeds the 10 s IPC probe budget on many-workspace hosts, so `health` returns exit 3 on an idle daemon
+- **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
+- **#6544**: provision-hooks.sh emits unquoted ${CLAUDE_PROJECT_DIR} — every hook breaks when the project path contains a space
+- **#8146**: Token selection: prefer the account that last warmed this (repo, role) prompt cache (65% vs 1.4% hit rate)
+- **#8211**: guard mask_ws(): a quote inside an unquoted backtick substitution masks away a live statement boundary
+- **#8217**: guard: an unquoted heredoc body's $( ) substitution bypasses rm-scope (extract_rm_targets analogue of #8035)
 - **#8222**: telemetry: source judge_verdicts and doctor_cycles from the forge label timeline, not the sampled phase history
+- **#8224**: health: extend #8163's root-scaled IPC budget to cli::status and the dashboard's serve.rs FETCH_TIMEOUT
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#8184**: feat(watchdog): retire loom-daemon-watchdog.sh (2436 lines) — the epic goes net-negative
+- **#8016**: fix(guard): admit the exact mktemp-then-canonicalize chain in both same-command fast paths
 - **#8207**: feat(pricing): deliver the model rate card as a resync-updatable defaults/pricing.json asset
-- **#8226**: feat(worktree): port the worktree-add lock to Rust (#8195 slice 1)
-- **#8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
-- **#8228**: fix(builder): publish a lease from worktree.sh so in-session builders survive reclamation
+- **#8220**: feat(tokens): prefer the account that last warmed this (repo, role) prompt cache (#8146)
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#8078**: fix(install): ignore .loom-local/ in consumer repos and treat it as Loom-owned
-- **#8090**: feat(tokens): per-model-class exhaustion marks and `tokens select --model` (#8058)
-- **#8190**: fix(cache): stop stamping the running version into CLAUDE.md (#8147)
-- **#8199**: feat(merge-pr): port the closing-reference analysis to Rust (#8191 slice 1)
-- **#8212**: fix(guard): qsplit() closing-quote scan honours backslash parity (#8166)
-- **#8218**: fix(guard): scan an unquoted heredoc body's substitution spans for write targets
+- **#8179**: fix(tests): stop sweep test runs leaking into the live host (#8077)
+- **#8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
+- **#8236**: feat(shell-budget): report fix-weighted progress, not just lines (#8233)
 
 ## Proposed
 
@@ -90,39 +77,31 @@ Issues carrying `loom:curated`.
 - **#8001**: [Part of #7708] Broadcast the pool-exhaustion hold to peers via the peer-claim room *(curated)*
 - **#8005**: Generalise #7818's credential-staging guard from two hardcoded gh-config paths to the credential-bearing class (.loom/tokens/, accounts.env, claude-config/) *(curated)*
 - **#8013**: test-guard-destructive-rm-scope.sh:338 '../ escaping the repo' assertion fails when the suite runs from a linked worktree (passes from the primary checkout) *(curated)*
-- **#8015**: Add doc-comment pointer to prose-existence rule in sweep_md_stage_minus_one_doc_lint.rs *(curated)*
 - **#8026**: peer_coordination DEGRADED can be a false positive during a fleet-wide dispatch lull (advertise is dispatch-gated, not periodic) *(curated)*
-- **#8035**: guard: an unquoted heredoc body's $( ) substitution bypasses worktree write confinement (write-path analogue of #8003) *(curated)*
 - **#8052**: telemetry: per-role × model token consumption report + weekly-limit calibration (activity.db token tables are empty, `loom-daemon stats` crashes) *(curated)*
 - **#8055**: experiment: fleet-wide repo-stratified model A/B — assign arms, write/remove overlays, cover role-runner ticks, stamp the arm explicitly in outcome records *(curated)*
 - **#8056**: telemetry: outcome journal lacks judge verdicts, doctor cycles, failure class, effort, token account — and role-runner ticks emit no record at all *(curated)*
 - **#8058**: token pool: per-model-class exhaustion state — an Opus ceiling bad-marks the whole account and starves Sonnet work *(curated)*
-- **#8062**: add 'loom-daemon usage report' command: token/cost breakdown by role, model, repo, day *(curated)*
-- **#8075**: install/hygiene: .loom-local/ overlay is not gitignored in consumer repos and not Loom-owned — quarantine stashes it, silently reverting model overrides *(curated)*
 - **#8077**: Builder test runs leak into the live host: test daemons log to ~/.loom/daemon.log and reload the production user systemd manager (#7873 sweep on loom-worker-2) *(curated)*
 - **#8086**: Port loom-daemon-watchdog.sh to a daemon subcommand (994 lines, 233 retained assertions) *(curated)*
 - **#8087**: Port loom-daemon-start.sh to a daemon subcommand (1,184 lines; preserve the FLAGS-OFF contract across start) *(curated)*
 - **#8088**: Port loom-daemon-update.sh to a daemon subcommand (1,733 lines; the binary must replace itself) *(curated)*
 - **#8097**: Differential corpus covers 2 of 7 separator chars, omits comments entirely, and its generator is not committed *(curated)*
 - **#8103**: Repo settings: main has no required status checks, so CI cannot block a merge (and stale branches never re-run) *(curated)*
-- **#8112**: Two Judges raced on one head: a PR can carry loom:pr and loom:changes-requested at once, and merge-pr.sh only reads the first *(curated)*
-- **#8122**: Destructive-write guard denies redirects/heredocs targeting paths outside every repo when cwd is a repo with live worktrees *(curated)*
 - **#8136**: Reconcile PR #8097's differential-corpus gaps with #8125's BotLoginNormalisation work *(curated)*
-- **#8138**: Port PR #8058's model-class-marker logic to loom-daemon (Shell Budget Ratchet) *(curated)*
 - **#8146**: Token selection: prefer the account that last warmed this (repo, role) prompt cache (65% vs 1.4% hit rate) *(curated)*
-- **#8147**: CLAUDE.md's **Loom Version** stamp invalidates every session's cached prefix on each bump *(curated)*
-- **#8163**: health: status build exceeds the 10 s IPC probe budget on many-workspace hosts, so `health` returns exit 3 on an idle daemon *(curated)*
-- **#8166**: guard qsplit(): the closing-quote scan matches an escaped quote, ending a double-quoted span early *(curated)*
 - **#8170**: sweep_registry::watchdog midbuild_* tests fail under the full parallel suite, pass 90/90 in isolation *(curated)*
 - **#8173**: test-loom-daemon-start.sh's #6568 control cases fail when the suite runs inside a Loom agent session (si_run does not strip LOOM_SWEEP_*/LOOM_TERMINAL_ID/LOOM_ROLE) *(curated)*
 - **#8177**: pricing: deliver the model rate card as a resync-updatable defaults/pricing.json asset (ask 2 of #8060) *(curated)*
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it) *(curated)*
-- **#8193**: Builder: in-session Task-tool builders publish no loom:lease, so claim_reconciliation reclaims them mid-build *(curated)*
 - **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes) *(curated)*
 - **#8197**: release-fetch: a .sig download failure is indistinguishable from an unsigned release, silently downgrading to checksum-only *(curated)*
 - **#8211**: guard mask_ws(): a quote inside an unquoted backtick substitution masks away a live statement boundary *(curated)*
+- **#8217**: guard: an unquoted heredoc body's $( ) substitution bypasses rm-scope (extract_rm_targets analogue of #8035) *(curated)*
 - **#8221**: Guard: same-command mktemp fast paths count only bare `NAME=` assignments — `export`/`declare`/`read`/`printf -v` rebinding slips the ambiguity rule *(curated)*
 - **#8222**: telemetry: source judge_verdicts and doctor_cycles from the forge label timeline, not the sampled phase history *(curated)*
+- **#8224**: health: extend #8163's root-scaled IPC budget to cli::status and the dashboard's serve.rs FETCH_TIMEOUT *(curated)*
+- **#8233**: shell-budget reports lines, not fragility — add a fix-weighted progress figure *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -140,13 +119,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 5 |
+| Operator merge-risk holds | 2 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 20 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 5 |
-| Approved PRs awaiting merge | 6 |
-| Curated | 42 |
+| Ready (`loom:issue`) | 11 |
+| In Progress (`loom:building`) | 7 |
+| PRs awaiting review | 3 |
+| Approved PRs awaiting merge | 3 |
+| Curated | 34 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
