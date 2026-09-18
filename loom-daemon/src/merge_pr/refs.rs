@@ -74,7 +74,14 @@ pub fn strip_fenced_code_blocks(text: &str) -> String {
     let mut out = String::new();
     let mut in_fence = false;
     for line in text.lines() {
-        if line.trim_start().starts_with("```") {
+        // ASCII horizontal whitespace only. `trim_start()` is Unicode-aware,
+        // so a NBSP before the fence marker made the port see a fence where
+        // `awk`'s `[[:space:]]` did not — inverting fence sense for the whole
+        // rest of the body.
+        if line
+            .trim_start_matches([' ', '\t', '\x0B', '\x0C', '\r'])
+            .starts_with("```")
+        {
             in_fence = !in_fence;
             continue;
         }
@@ -92,9 +99,27 @@ pub fn strip_fenced_code_blocks(text: &str) -> String {
 /// is left alone rather than consuming to end of text.
 fn blank_inline_code(text: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"`[^`]*`").expect("static inline-code pattern"))
-        .replace_all(text, "")
-        .into_owned()
+    // `[^`\n]*`, NOT `[^`]*` — `sed` is per-line, so its span can never cross
+    // a newline. The unrestricted class does, which is the SAME
+    // shell-is-line-oriented divergence documented above for `[[:space:]]`,
+    // one function away, and it produces errors in both directions:
+    //
+    //   "Use the `foo command\n\nPart of #5\n\nsee `bar`"  shell [5], Rust []
+    //   "`a\nb` Part of #5"                                  shell [],  Rust [5]
+    //
+    // The trigger is an odd backtick count on an earlier line plus any later
+    // backtick — a stray triple-backtick not at line start, or a typo. The
+    // first shape makes a declaration invisible, which closes an issue that is
+    // only partly done.
+    RE.get_or_init(|| {
+        Regex::new(
+            r"`[^`
+]*`",
+        )
+        .expect("static inline-code pattern")
+    })
+    .replace_all(text, "")
+    .into_owned()
 }
 
 /// Issue numbers declared with a NON-closing partial-increment keyword

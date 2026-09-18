@@ -839,6 +839,22 @@ If you are deliberately merging without that review signal and take responsibili
 # call — same reasoning as the two guards above.
 _check_loom_pr_label
 
+# #8191: prove the closing-reference analysis can actually RUN, here, while
+# `set -e` is live and before anything has been mutated.
+#
+# _mp_refs()'s own `error` exit cannot do this. Every consumer calls it inside
+# `$(...)` inside _check_partial_increment_close_conflict /
+# _reset_partial_increment_labels, and both of those are invoked as `... ||
+# true`. Bash suppresses `set -e` in that context, so the exit only kills the
+# subshell: the caller receives an EMPTY string and reads it as "no references
+# found" — the reading that closes an unfinished issue or reopens a correctly
+# closed one. Review reproduced all five skew shapes reaching the merge that
+# way, including the default rollout state (a resynced script against an
+# installed binary that predates this subcommand and answers exit 2).
+#
+# Verifying in isolation, as the original fix did, tested the function and not
+# the call shape. This is the call shape.
+
 # ---------------------------------------------------------------------------
 # Partial-increment closing-keyword conflict detection (#4569, extended by
 # #4595 to cover commit messages).
@@ -921,19 +937,26 @@ _strip_fenced_code_blocks() {
 # found" -- it is "no answer", which would silently close an unfinished issue
 # or reopen a correctly closed one. Failing loudly is the safe direction.
 _mp_refs() {
-  # Resolution is inline, not via lib/locate-daemon-bin.sh: the retained suites
-  # extract these functions and source them alone, with no libs present, so a
-  # sourcing dependency would make the port untestable by its own evidence.
-  local bin out rc
-  bin="${LOOM_DAEMON_BIN:-}"
-  [[ -n "$bin" && -x "$bin" ]] || bin="$(command -v loom-daemon 2>/dev/null || printf '%s' "$HOME/.local/bin/loom-daemon")"
-  [[ -x "$bin" ]] || error "merge-pr.sh needs loom-daemon for its closing-reference analysis (#8191) and could not resolve one. Refusing rather than proceeding with no answer: an empty result here is indistinguishable from 'no references', which would close an unfinished issue or reopen a correctly closed one."
-  # Fail CLOSED on ANY non-zero exit, not just a missing binary. An installed
-  # loom-daemon predating #8191 answers with clap's exit 2 and empty stdout --
-  # and empty stdout means "no references found", the reading that closes an
-  # unfinished issue. Version skew must never look like a clean answer.
-  out="$("$bin" merge-pr-refs "$@" 2>/dev/null)"; rc=$?
-  [[ "$rc" -eq 0 ]] || error "merge-pr.sh's closing-reference analysis failed: '$bin merge-pr-refs $*' exited $rc. If this binary predates #8191 it has no such subcommand -- update loom-daemon. Refusing rather than treating an empty result as 'no references'."
+  # Resolved inline, not via lib/locate-daemon-bin.sh: the retained suites
+  # extract these functions and source them alone, with no libs present.
+  # LOOM_DAEMON_SELF_BIN first, per #8134 — it means "the binary that
+  # IMPLEMENTS this entry point", which is exactly what this is.
+  local bin out rc=0
+  bin="${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-}}"
+  if [[ -n "$bin" ]]; then
+    # A PINNED path that is unusable must refuse, not quietly resolve a
+    # different binary off PATH — that substitutes an unknown version for the
+    # one an operator deliberately selected.
+    [[ -x "$bin" ]] || error "merge-pr.sh: LOOM_DAEMON_SELF_BIN/LOOM_DAEMON_BIN is set to '$bin', which is not executable. Refusing rather than silently falling back to a different loom-daemon."
+  else
+    bin="$(command -v loom-daemon 2>/dev/null || printf '%s' "$HOME/.local/bin/loom-daemon")"
+    [[ -x "$bin" ]] || error "merge-pr.sh needs loom-daemon for its closing-reference analysis (#8191) and could not resolve one. Refusing rather than proceeding with no answer: an empty result is indistinguishable from 'no references', which would close an unfinished issue or reopen a correctly closed one."
+  fi
+  # `|| rc=$?`, not `; rc=$?`: under `set -e` a failing command substitution in
+  # a bare assignment aborts the script AT THAT LINE, so the check below never
+  # ran and the refusal was silent — fail-closed, but with nothing said.
+  out="$("$bin" merge-pr-refs "$@" 2>/dev/null)" || rc=$?
+  [[ "$rc" -eq 0 ]] || error "merge-pr.sh's closing-reference analysis failed: '$bin merge-pr-refs $*' exited $rc. A loom-daemon predating #8191 has no such subcommand -- update it, or pin LOOM_DAEMON_BIN to a build that has it. Refusing rather than treating an empty result as 'no references'."
   printf '%s' "$out"
 }
 
@@ -1117,6 +1140,14 @@ _check_partial_increment_close_conflict() {
 
 # Runs before either merge path so the operator sees the conflict BEFORE the
 # close happens, and so --dry-run reports it without merging. Best-effort.
+# #8191 preflight. One call, at top level: NOT inside `$(...)`, NOT behind
+# `|| true`, and AFTER the definitions (_mp_refs lives inside the span the
+# retained suite extracts, so it cannot be defined any earlier). _mp_refs's own
+# `error` therefore exits the script here, which it cannot do from inside a
+# command substitution in a `|| true` caller — the shape review proved lets all
+# five version-skew cases reach the merge with an empty "no references" answer.
+_mp_refs closing-refs </dev/null >/dev/null
+
 _check_partial_increment_close_conflict || true
 
 info "Merging PR #$PR_NUMBER: $PR_TITLE"
