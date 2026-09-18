@@ -222,6 +222,12 @@ pub mod shell_budget;
 pub mod short_hash;
 pub mod startup_adoption;
 pub mod stash_retirement;
+/// Root-count-aware cost model for `build_daemon_status` and the `status`/
+/// `health` IPC probes that wait on it (#8163). A sibling module rather than
+/// code inside `ipc.rs`/`cli/health.rs`: `ipc.rs` is an over-threshold file
+/// frozen by the file-size ratchet, and stating the model once is what keeps
+/// the daemon-side budget and the client-side probe budget from drifting.
+pub mod status_budget;
 pub mod sweep_journal;
 pub mod sweep_outcome_summary;
 pub mod sweep_outcomes;

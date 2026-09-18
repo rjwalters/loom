@@ -608,9 +608,8 @@ async fn handle_health(
     // working), so this mostly guards a `gh` that has gone missing since —
     // but the check is symmetric with the CLI collector so this route's
     // `queues`/`throughput` never regress to the pre-#5061 per-repo noise.
-    let gh_unavailable =
-        pipeline_snapshot::probe_gh_availability(Path::new(pipeline_snapshot::DEFAULT_GH_BIN))
-            .err();
+    let gh_bin = Path::new(pipeline_snapshot::DEFAULT_GH_BIN);
+    let gh_unavailable = pipeline_snapshot::probe_gh_availability(gh_bin).err();
     let pipeline = match (&report, &gh_unavailable) {
         (Some(r), None) => {
             let roots: Vec<PathBuf> = r.per_repo.iter().map(|repo| repo.root.clone()).collect();
@@ -681,6 +680,11 @@ async fn handle_health(
         // `loom-daemon health` (the CLI path, `cli/health.rs`) is the one
         // place this actually runs.
         codesign_preflight: None,
+        // #8163: corroborates (or refutes) an `indeterminate-busy` roll-up.
+        // A `/proc/loadavg`-class read — cheap enough for this route's poll
+        // cadence, and taken here rather than daemon-side-over-IPC precisely
+        // because the verdict it guards is the one reported when IPC failed.
+        load_per_core: crate::cpu_headroom::load_per_core(),
     });
 
     let mut body = serde_json::to_value(&health)?;

@@ -118,6 +118,29 @@
 //!    undiagnosable liveness probe) still falls through to the ordinary
 //!    `Unknown`/exit `1` — this distinction is deliberately narrow, not a
 //!    general amnesty for "could not determine".
+//!
+//! # "Busy" has to actually mean busy (#8163)
+//!
+//! #6191's two mechanisms above were both keyed on a *fixed* budget, and the
+//! daemon-side work they wait on ([`crate::ipc::build_daemon_status`]) is
+//! `O(registered workspace roots)`. On a host with several dozen registered
+//! workspaces the build measured `13.1s`/`14.3s` against a `10s` escalated
+//! retry, so **every** `health` call on an idle, demonstrably healthy daemon
+//! reported `indeterminate-busy` (exit `3`) with every section downstream of
+//! liveness `unknown` — the consolidated probe was useless on exactly the
+//! hosts that most need it, and the reported reason (host load) was false.
+//! Reconciled on both sides:
+//!
+//! 1. The budget is derived from the registered root count instead of being
+//!    a constant — one shared cost model in [`crate::status_budget`], used by
+//!    the daemon to judge its own builds and by `cli::health` to size the
+//!    escalated retry.
+//! 2. The verdict now requires the host load to *corroborate* the busy story
+//!    ([`busy::load_corroborates_busy`]). A timeout that survives a
+//!    root-scaled budget on an idle host is not "busy"; it is unexplained,
+//!    and the honest roll-up for unexplained is the ordinary `Unknown`. An
+//!    unreadable load average cannot refute anything, so it preserves the
+//!    pre-#8163 verdict exactly.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -479,6 +502,19 @@ pub struct HealthInputs {
     /// also reads as `None`, matching every other optional collector fact
     /// here.
     pub codesign_preflight: Option<CodesignPreflightResult>,
+    /// This host's observed 1-minute load average **per logical core**
+    /// ([`crate::cpu_headroom::load_per_core`]), read by the collector
+    /// without any IPC (Issue #8163).
+    ///
+    /// A **corroborating** signal only, in the same spirit as
+    /// [`Self::pid_file`] and [`Self::work_finder_log_tick_age_secs`]: no
+    /// section derives its verdict from it. Its one job is to stop
+    /// [`Verdict::IndeterminateBusy`] — literally "the host was too busy to
+    /// answer in time" — from being asserted about an idle host whose probe
+    /// merely outran a budget. `None` means "no reading available", which
+    /// can neither support nor refute the busy story and therefore preserves
+    /// the pre-#8163 verdict exactly; see [`busy::load_corroborates_busy`].
+    pub load_per_core: Option<f64>,
 }
 
 // ============================================================================
@@ -2715,33 +2751,9 @@ pub fn assess_codesign_identity(inputs: &HealthInputs) -> Option<HealthSection> 
 // Roll-up
 // ============================================================================
 
-/// Whether this report's non-green state is entirely attributable to the
-/// collector's own IPC probe budget having been exhausted against a daemon
-/// local, no-IPC evidence already corroborates as running (Issue #6191) —
-/// the roll-up counterpart of [`alive_with_fresh_heartbeat`]. Both of the
-/// following must hold:
-///
-/// - `inputs.status` is `None` (the IPC round-trip never produced a report),
-///   and the recorded `ipc_error` classifies as a *timeout*
-///   ([`ipc_error_is_probe_timeout`]) rather than a harder failure.
-/// - [`alive_with_fresh_heartbeat`] corroborates the process as alive with a
-///   fresh heartbeat.
-///
-/// Deliberately narrow: this says nothing about *why* any individual section
-/// is non-green, only whether the specific "busy" story is consistent with
-/// the evidence. [`assess`] additionally requires no section to be
-/// [`Verdict::Degraded`] before consulting this at all — a genuine
-/// degradation (a stale pid file, a hard IPC failure, a real dispatch fault)
-/// always takes precedence, so this can never mask one.
-#[must_use]
-fn probe_budget_busy(inputs: &HealthInputs) -> bool {
-    inputs.status.is_none()
-        && inputs
-            .ipc_error
-            .as_deref()
-            .is_some_and(ipc_error_is_probe_timeout)
-        && alive_with_fresh_heartbeat(inputs.install_state.as_ref())
-}
+/// The `indeterminate-busy` verdict's corroboration rules (#6191, #8163) —
+/// `probe_budget_busy` and the host-load reading it now requires.
+mod busy;
 
 /// Assemble the full report from already-collected inputs (pure).
 ///
@@ -2754,12 +2766,13 @@ fn probe_budget_busy(inputs: &HealthInputs) -> bool {
 /// appended only when there is a mismatch to report — see
 /// [`assess_observability`].
 ///
-/// # `IndeterminateBusy` (#6191)
+/// # `IndeterminateBusy` (#6191, #8163)
 ///
 /// When no section is [`Verdict::Degraded`] (so this is not, and cannot mask,
-/// a genuine fault) and [`probe_budget_busy`] says the entire non-green state
-/// traces back to an exhausted IPC probe budget against a daemon already
-/// corroborated as alive with a fresh heartbeat, `overall` is
+/// a genuine fault) and [`busy::probe_budget_busy`] says the entire non-green
+/// state traces back to an exhausted IPC probe budget against a daemon already
+/// corroborated as alive with a fresh heartbeat **on a host whose load
+/// corroborates the busy story** (#8163), `overall` is
 /// [`Verdict::IndeterminateBusy`] rather than the ordinary
 /// [`Verdict::Unknown`] — its own exit code ([`EXIT_INDETERMINATE_BUSY`])
 /// distinct from [`EXIT_DEGRADED`]. See the module-level "Busy vs degraded"
@@ -2791,7 +2804,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         Verdict::Green
     } else if sections.iter().any(|s| s.verdict == Verdict::Degraded) {
         Verdict::Degraded
-    } else if probe_budget_busy(inputs) {
+    } else if busy::probe_budget_busy(inputs) {
         Verdict::IndeterminateBusy
     } else {
         Verdict::Unknown

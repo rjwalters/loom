@@ -2318,22 +2318,24 @@ fn describe_panic(panic: &(dyn std::any::Any + Send)) -> String {
 /// saw a silent EOF. Recovering the guard keeps `status` answerable after any such
 /// fault.
 ///
-/// # Phase timing (#7513)
+/// # Phase timing (#7513) and the budget it is judged against (#8163)
 ///
-/// Fleet reports showed `status`/`health` IPC round-trips exceeding the 5s
+/// Fleet reports showed `status`/`health` IPC round-trips exceeding the
 /// client budget on hosts with a large registered-workspace count, with the
 /// per-workspace work in the loop below (registry lock/list, per-root config
 /// reads, the `role_shard::decide` walk, token-pool/ranking file reads, and a
 /// `git stash list` shell-out per root) as the prime suspect — but no
 /// daemon-internal timing existed to confirm *which* of those actually
-/// dominates on a given host. This function now accumulates wall-clock time
-/// per named phase, summed across every root, and logs a `warn`-level
-/// breakdown whenever the whole build exceeds
-/// [`STATUS_BUILD_SLOW_LOG_THRESHOLD`] — so the next report can name the slow
-/// phase (and, if it is dominated by one repo rather than being spread
-/// evenly, the single slowest root) instead of guessing.
-const STATUS_BUILD_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
-
+/// dominates on a given host. This function accumulates wall-clock time per
+/// named phase, summed across every root, and hands the whole breakdown to
+/// [`crate::status_budget::record_status_build`] — so the next report can
+/// name the slow phase (and, if it is dominated by one repo rather than being
+/// spread evenly, the single slowest root) instead of guessing.
+///
+/// #8163: the budget that breakdown is compared against is no longer a
+/// constant. This build is `O(roots)`, so both the daemon-side target and the
+/// `health` client's probe budget derive from the registered root count —
+/// see [`crate::status_budget`] for the one shared cost model.
 pub fn build_daemon_status(
     workspace_pool: &Arc<WorkspacePool>,
     health_states: &WorkspaceHealthStates,
@@ -2957,29 +2959,27 @@ pub fn build_daemon_status(
         ),
     };
 
-    // #7513: log a phase breakdown when the whole build crosses the slow
-    // threshold — never on a fast build, so this costs nothing beyond the
-    // (nanosecond-scale) `Instant::now()` calls above on the common path.
+    // #7513/#8163: hand the phase breakdown to the shared cost model, which
+    // owns both the one-time per-root INFO line and the slow-build WARN (and
+    // names the root-scaled budget each is judged against). Logging policy
+    // lives there, not here — see `crate::status_budget`.
     let phase_tail = phase_start.elapsed();
-    let total_elapsed = build_started.elapsed();
-    if total_elapsed >= STATUS_BUILD_SLOW_LOG_THRESHOLD {
-        let root_count = roots.len();
-        let slowest_root_desc = slowest_root
-            .as_ref()
-            .map(|(root, d)| format!("{} ({d:?})", root.display()))
-            .unwrap_or_else(|| "n/a".to_string());
-        log::warn!(
-            "build_daemon_status: slow build took {total_elapsed:?} across {root_count} roots \
-             (budget-relevant: status/health IPC round-trips are expected to stay well under the \
-             client's 5s timeout) — phase breakdown: registry_load={phase_registry_load:?}, \
-             per_repo_loop_total={phase_per_repo_loop_total:?} [registry_lock/list=\
-             {phase_registry_lock:?}, role_runner_config={phase_role_runner_config:?}, \
-             role_shard={phase_role_shard:?}, token_pool={phase_token_pool:?}, \
-             stash_git_shellout={phase_stash_git_shellout:?}, \
-             sweep_command_check={phase_sweep_command_check:?}], tail={phase_tail:?}; \
-             slowest single root: {slowest_root_desc}"
-        );
-    }
+    crate::status_budget::record_status_build(
+        build_started.elapsed(),
+        roots.len(),
+        &crate::status_budget::StatusBuildPhases {
+            registry_load: phase_registry_load,
+            per_repo_loop_total: phase_per_repo_loop_total,
+            registry_lock: phase_registry_lock,
+            role_runner_config: phase_role_runner_config,
+            role_shard: phase_role_shard,
+            token_pool: phase_token_pool,
+            stash_git_shellout: phase_stash_git_shellout,
+            sweep_command_check: phase_sweep_command_check,
+            tail: phase_tail,
+            slowest_root,
+        },
+    );
 
     report
 }

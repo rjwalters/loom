@@ -111,17 +111,45 @@ use super::common::{query_daemon_bounded, resolve_socket_path};
 ///    `Verdict::Unknown`, at its own exit code
 ///    ([`loom_daemon::health::EXIT_INDETERMINATE_BUSY`]) — so a watch loop can
 ///    tell "try again shortly" apart from "alert" without parsing `--json`.
+///
+/// # The budget has to fit the work (#8163)
+///
+/// Both #6103's load scaling and #6191's escalation are keyed on **host
+/// load**; neither accounts for the fact that the daemon-side work being
+/// waited on ([`loom_daemon::ipc::build_daemon_status`]) is `O(registered
+/// workspace roots)`. On a many-workspace host that build outran even the
+/// escalated `10s` budget on every call, so `health` reported
+/// `indeterminate-busy` on an idle daemon and every section downstream of
+/// liveness came back `unknown`:
+///
+/// 6. [`resolve_retry_timeout`] takes the **larger** of #6191's fixed floor
+///    and [`loom_daemon::status_budget::client_probe_budget`], derived from
+///    the registered root count read locally before the round-trip. The
+///    *first* attempt is deliberately left short (this function's own
+///    load-scaled base): a fast miss against a genuinely wedged daemon is
+///    still reported fast, and the wider budget is only spent once local
+///    evidence says the daemon is alive and worth waiting for.
 const BASE_IPC_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The escalated per-attempt budget [`query_status`] retries at when local,
-/// no-IPC evidence already corroborates the daemon as alive with a fresh
-/// heartbeat (Issue #6191) — worth waiting longer for rather than repeating
-/// [`resolve_ipc_timeout`]'s short budget a second time. `10s` matches the
-/// issue's own worked example (`2s -> 10s`) and sits comfortably below both
-/// `status`'s own load-scaled ceiling (30s, see
-/// [`super::status::scale_timeout_for_load`]) and the watchdog's per-tick
-/// budget (15s) — an escalated `health` invocation never ends up waiting
-/// *longer* than either of those for the same evidence.
+/// The **floor** under the escalated per-attempt budget [`query_status`]
+/// retries at when local, no-IPC evidence already corroborates the daemon as
+/// alive with a fresh heartbeat (Issue #6191) — worth waiting longer for
+/// rather than repeating [`resolve_ipc_timeout`]'s short budget a second
+/// time. `10s` matches #6191's own worked example (`2s -> 10s`).
+///
+/// # A floor, not the budget (#8163)
+///
+/// This was the whole escalated budget until #8163, which is exactly why
+/// `health` broke on many-workspace hosts: the daemon's
+/// [`loom_daemon::ipc::build_daemon_status`] is `O(registered roots)` and
+/// measured `13.1s`/`14.3s` on a host with several dozen of them, so both
+/// attempts timed out and `health` reported `indeterminate-busy` (exit `3`)
+/// on an idle, healthy daemon. [`resolve_retry_timeout`] now takes the
+/// **larger** of this floor and
+/// [`loom_daemon::status_budget::client_probe_budget`], which is derived from
+/// the registered root count — so a single-workspace host keeps this exact
+/// `10s` behaviour and a many-workspace host gets a budget that can actually
+/// cover the build it is waiting on.
 const ESCALATED_IPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolve the effective per-attempt IPC timeout for this invocation (#6103
@@ -188,6 +216,11 @@ async fn collect(window: Duration) -> HealthReport {
     let install_state = daemon_install_state::probe();
     let pgrep_pids = daemon_install_state::pgrep_daemon_pids();
     let escalate_on_timeout = health::alive_with_fresh_heartbeat(install_state.as_ref());
+    // #8163: read the host load BEFORE the IPC attempt, so the reading
+    // describes the host the probe actually ran against rather than whatever
+    // it settled to afterwards. Corroborates (or refutes) the
+    // `indeterminate-busy` roll-up — see `health::busy`.
+    let load_per_core = loom_daemon::cpu_headroom::load_per_core();
 
     // 2. The IPC round-trip — the only source for the dispatch/tokens/roles
     //    sections, and the strongest liveness signal there is.
@@ -302,6 +335,7 @@ async fn collect(window: Duration) -> HealthReport {
         work_finder_log_tick_age_secs,
         self_update: Some(self_update),
         codesign_preflight,
+        load_per_core,
     })
 }
 
@@ -518,7 +552,11 @@ async fn query_status(escalate: bool) -> (Option<DaemonStatusReport>, Option<Str
     match query_status_once(&socket_path, timeout).await {
         Ok(report) => (Some(report), None),
         Err(first_err) if health::ipc_error_is_probe_timeout(&first_err) => {
-            let retry_timeout = resolve_retry_timeout(timeout, escalate);
+            // #8163: the root count is read from the LOCAL workspace registry
+            // (a cheap JSON read), not from the daemon — the client cannot
+            // learn it from a round-trip it has not managed to complete.
+            let root_count = loom_daemon::status_budget::registered_root_count();
+            let retry_timeout = resolve_retry_timeout(timeout, escalate, root_count);
             match query_status_once(&socket_path, retry_timeout).await {
                 Ok(report) => (Some(report), None),
                 Err(second_err) => (None, Some(second_err)),
@@ -529,18 +567,32 @@ async fn query_status(escalate: bool) -> (Option<DaemonStatusReport>, Option<Str
 }
 
 /// The retry budget [`query_status`] uses on a bounded-timeout-classified
-/// first miss (#6191): [`ESCALATED_IPC_TIMEOUT`] when `escalate` is set (local
-/// evidence already corroborates the daemon as alive with a fresh heartbeat —
-/// see [`health::alive_with_fresh_heartbeat`]), else `base` unchanged — the
-/// exact pre-#6191 "retry once, same budget" behavior. `.max(...)`, never a
-/// bare assignment, so an already-wider `base` (e.g. from a heavily
-/// load-scaled [`resolve_ipc_timeout`], or an operator's own
-/// `LOOM_DAEMON_IPC_TIMEOUT_MS` override) is never *narrowed* by escalation.
+/// first miss (#6191, root-scaled by #8163).
+///
+/// When `escalate` is set (local evidence already corroborates the daemon as
+/// alive with a fresh heartbeat — see [`health::alive_with_fresh_heartbeat`]),
+/// the budget is the largest of:
+///
+/// 1. `base` — so an already-wider first-attempt budget (a heavily
+///    load-scaled [`resolve_ipc_timeout`], or an operator's own
+///    `LOOM_DAEMON_IPC_TIMEOUT_MS` override) is never *narrowed*;
+/// 2. [`ESCALATED_IPC_TIMEOUT`] — #6191's fixed floor;
+/// 3. [`loom_daemon::status_budget::client_probe_budget`] over `root_count` —
+///    #8163's root-scaled term, which is what makes the escalated retry
+///    actually able to cover an `O(roots)` `build_daemon_status` on a
+///    many-workspace host. At `root_count == 1` it is well under the `10s`
+///    floor, so a single-workspace host is bit-for-bit unchanged.
+///
+/// `escalate = false` (no corroboration) still preserves the exact pre-#6191
+/// behavior: retry once, same budget — a host with many workspaces but no
+/// evidence its daemon is alive gets no extra patience.
+///
 /// Split out of [`query_status`] purely so this decision is unit-testable
 /// without a socket.
-fn resolve_retry_timeout(base: Duration, escalate: bool) -> Duration {
+fn resolve_retry_timeout(base: Duration, escalate: bool, root_count: usize) -> Duration {
     if escalate {
         base.max(ESCALATED_IPC_TIMEOUT)
+            .max(loom_daemon::status_budget::client_probe_budget(root_count))
     } else {
         base
     }
@@ -594,6 +646,7 @@ fn ranking_state(dir: &Path) -> (bool, Option<u64>) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use loom_daemon::status_budget;
 
     #[test]
     fn ranking_state_reports_absent_when_there_is_no_file() {
@@ -670,27 +723,56 @@ mod tests {
 
     /// Issue #6191: with no corroborating alive-with-fresh-heartbeat evidence
     /// the retry budget is unchanged from the first attempt's — the exact
-    /// pre-#6191 "retry once, same budget" behavior.
+    /// pre-#6191 "retry once, same budget" behavior. #8163: a large root
+    /// count buys no extra patience here either, because the corroboration
+    /// that the daemon is even alive is what is missing.
     #[test]
     fn resolve_retry_timeout_is_unchanged_without_escalation() {
-        assert_eq!(resolve_retry_timeout(BASE_IPC_TIMEOUT, false), BASE_IPC_TIMEOUT);
+        assert_eq!(resolve_retry_timeout(BASE_IPC_TIMEOUT, false, 1), BASE_IPC_TIMEOUT);
+        assert_eq!(
+            resolve_retry_timeout(BASE_IPC_TIMEOUT, false, status_budget::DOCUMENTED_MAX_ROOTS),
+            BASE_IPC_TIMEOUT
+        );
     }
 
     /// Issue #6191 AC1: corroborated evidence escalates the retry to
     /// [`ESCALATED_IPC_TIMEOUT`] rather than repeating a short first-attempt
-    /// budget.
+    /// budget. On a single-workspace host #8163's root term is well under
+    /// that floor, so this pins the pre-#8163 behavior as unchanged.
     #[test]
     fn resolve_retry_timeout_escalates_when_corroborated() {
-        assert_eq!(resolve_retry_timeout(BASE_IPC_TIMEOUT, true), ESCALATED_IPC_TIMEOUT);
+        assert_eq!(resolve_retry_timeout(BASE_IPC_TIMEOUT, true, 1), ESCALATED_IPC_TIMEOUT);
+    }
+
+    /// **Issue #8163 AC1.** A many-workspace host must get a retry budget
+    /// derived from its registered root count, not the fixed `10s` floor that
+    /// the `13.1s`/`14.3s` `build_daemon_status` builds in the issue report
+    /// outran on every single call.
+    #[test]
+    fn resolve_retry_timeout_scales_with_the_registered_root_count() {
+        let many = resolve_retry_timeout(BASE_IPC_TIMEOUT, true, 36);
+        assert!(
+            many > ESCALATED_IPC_TIMEOUT,
+            "a 36-root host must be budgeted above the fixed #6191 floor, got {many:?}"
+        );
+        assert!(
+            many > Duration::from_millis(14_300),
+            "and above the worst build #8163 measured, got {many:?}"
+        );
+        assert_eq!(many, status_budget::client_probe_budget(36));
+        // Monotonic: registering another workspace never shrinks the budget.
+        assert!(resolve_retry_timeout(BASE_IPC_TIMEOUT, true, 37) >= many);
     }
 
     /// An already-wider base (a heavily load-scaled first attempt, or an
     /// operator's own `LOOM_DAEMON_IPC_TIMEOUT_MS` floor) must never be
-    /// *narrowed* by escalation.
+    /// *narrowed* by escalation — nor by #8163's root term, which is combined
+    /// with `max` for exactly this reason.
     #[test]
     fn resolve_retry_timeout_never_narrows_an_already_wider_base() {
-        let wide = ESCALATED_IPC_TIMEOUT + Duration::from_secs(5);
-        assert_eq!(resolve_retry_timeout(wide, true), wide);
+        let wide = status_budget::MAX_ROOT_SCALED_PROBE_TIMEOUT + Duration::from_secs(5);
+        assert_eq!(resolve_retry_timeout(wide, true, 1), wide);
+        assert_eq!(resolve_retry_timeout(wide, true, status_budget::DOCUMENTED_MAX_ROOTS), wide);
     }
 
     // ===================================================================
