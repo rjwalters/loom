@@ -42,3 +42,4 @@ pub(crate) mod transcript_ingest_cli;
 pub(crate) mod usage_report_cli;
 pub(crate) mod watch;
 pub(crate) mod workspace_fleet;
+pub(crate) mod worktree_lock;
