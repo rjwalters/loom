@@ -56,24 +56,8 @@ Spawn and manage a background pool of autonomous agents (tmux sessions) from
 ./.loom/bin/loom stop     # Graceful shutdown of the pool
 ```
 
-| Command | Purpose |
-|---------|---------|
-| `./.loom/bin/loom start` | Start all configured agents (`--only <role>` to filter, `--dry-run` to preview) |
-| `./.loom/bin/loom status` | List running `loom-*` tmux sessions with id / name / role, plus any configured agent that is not running (`--json` for machine-readable output) |
-| `./.loom/bin/loom stop` | Graceful shutdown (`--force` to kill immediately, `<agent>` to stop one) |
-| `./.loom/bin/loom attach <id>` | Attach to a running agent's tmux session |
-| `./.loom/bin/loom logs <id>` | Tail an agent's output |
-| `./.loom/bin/loom health` / `scale <role> <n>` | Diagnostic daemon health check / dynamic agent scaling |
-| `./.loom/bin/loom help` | Full command list; `./.loom/bin/loom <cmd> --help` for per-command help |
-
-The legacy `./loom.sh` wrapper (and `.loom/scripts/start-daemon.sh` /
-`stop-daemon.sh`) are thin shims that now delegate to these `.loom/bin/loom`
-subcommands, kept only for backwards compatibility.
-
-**Safe to run from inside a Claude Code session.** `.loom/bin/loom start` spawns
-each agent with `tmux new-session -d` on a dedicated `-L loom` socket, so an
-agent started from within a Claude Code session is never a descendant of that
-session and survives its exit.
+Full command reference (including `attach`/`logs`/`health`/`scale`) and the
+legacy-wrapper/session-safety notes: [`.loom/docs/agent-pool-cli.md`](.loom/docs/agent-pool-cli.md).
 
 > For single-issue lifecycle orchestration prefer `/loom:sweep <issue>` (Tier 1),
 > and for multi-account autonomous dispatch use the Rust `loom-daemon` binary via
@@ -346,7 +330,7 @@ plus `loom-daemon tokens check --ranking` to rank accounts by remaining capacity
 Agents spawn through `.loom/scripts/spawn-claude.sh` (never `claude` directly),
 which selects a token (ranking → allowlist → random); a missing/exhausted pool
 exits `78` (`EX_CONFIG`). Full reference:
-[`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md#token-pool-provisioning-for-managed-repos-3938).
+[`.loom/docs/token-pool.md`](.loom/docs/token-pool.md).
 
 ## Forge Authentication
 
