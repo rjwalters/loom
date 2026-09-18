@@ -908,6 +908,14 @@ enum Commands {
     #[command(flatten)]
     ScriptPorts(cli::script_ports::ScriptPortCommand),
 
+    /// Lease the liveness of a `loom:building` claim (#8193). The args and
+    /// their docs live in `cli::lease_ensure` because this file is frozen by
+    /// the file-size ratchet.
+    Lease {
+        #[command(subcommand)]
+        action: cli::lease_ensure::LeaseCommand,
+    },
+
     /// Validate a sweep phase contract and attempt mechanical recovery (native
     /// port of `loom_tools.validate_phase`, #4275). Backs `validate-phase.sh`.
     ///
@@ -2417,6 +2425,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
         Commands::ScriptPorts(cmd) => cmd.run(),
+        Commands::Lease { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
             phase,
