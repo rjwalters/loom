@@ -7,6 +7,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8060** (closed): models: pricing table is one to two generations stale (opus 3× over, haiku 4× under, fable priced as opus); dormant workflows pin gen-4 IDs
+- **PR #8178**: fix(pricing): close the last #8060 gaps — retune doc, gate scope, schedule rationale
+- **Issue #8150** (closed): docs(config_resolver): drop the stale "tier 1 is not yet shipped" framing from two doc comments
+- **PR #8175**: docs(config_resolver): drop the stale "tier 1 is not yet shipped" framing from three doc comments
+- **Issue #8134** (closed): A stub and its retained suite both mean LOOM_DAEMON_BIN, and they mean different things
+- **PR #8167**: fix(scripts): give a stub's own implementation its own knob, LOOM_DAEMON_SELF_BIN
+- **PR #8158**: test(role-runner): extract the #8066 prompt-cache guard; tighten the ledger (-7752, zero raises)
 - **Issue #8157** (closed): main is red on the File Size Ratchet — the third baseline-staleness incident today
 - **Issue #8153** (closed): File Size Ratchet fails on main: role_runner/tests.rs grew past its frozen baseline (4036 -> 4043)
 - **PR #8159**: test(role-runner): extract role-tick health ring tests to a sibling module
