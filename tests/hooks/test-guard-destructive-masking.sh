@@ -495,6 +495,79 @@ EOF
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #7970 x #8003: unquoted-heredoc expansion x NAME= capture read check ---${NC}"
+# =========================================================================
+#
+# #8003 (merged as 5b62d478) reworked how an UNQUOTED heredoc delimiter is
+# handled: the shell expands such a body BEFORE the sink reads a byte of it,
+# and a BACKSLASH is the only suppressor that survives inside a heredoc body
+# -- quote characters carry no quoting meaning there, which is why
+# im_hd_expand() is deliberately quote-blind. This PR's condition-2b read
+# check (_heredoc_var_reparsed()) lives in the sibling ask-tier masking path,
+# and the two had never been exercised TOGETHER. These assertions pin that
+# intersection: a #7355-shaped variable-capture heredoc whose body ALSO
+# carries expansion syntax, later re-parsed via `eval`.
+#
+# Differential re-run against `main` INCLUDING #8003 and #7978: every case
+# below is ALLOW->ASK or unchanged. No ASK->ALLOW anywhere -- the change is
+# monotone toward fail-closed.
+
+# The one case the intersection actually MOVES: the body's only substitution
+# is BACKSLASH-escaped, so it is inert per #8003's backslash rule and
+# _heredoc_body_expansion_free() lets condition 4 pass -- the capture IS
+# masked, so before this PR the later `eval` was a silent ALLOW.
+assert_ask "#7970x#8003: unquoted-delimiter capture whose body's only subst is backslash-escaped (inert per #8003), fed to 'eval', is NOT masked -- asks (ALLOW on main)" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+literal \\\$(date)
+EOF
+)
+eval \"\$R\""
+
+# ...and the SAME body read only for DISPLAY stays masked -- the #7355 ALLOW
+# this fix must not reopen, now confirmed against the #8003 expansion path.
+assert_allow "#7970x#8003: the same backslash-inert body read only via 'echo \"\$NAME\"' stays masked (allow) -- #7355 not reopened" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+literal \\\$(date)
+EOF
+)
+echo \"\$R\""
+
+# A body carrying a LIVE substitution is not expansion-free, so condition 4
+# already refuses to mask it and it asked before this PR too. Pinned so that a
+# later widening of _heredoc_body_expansion_free() cannot turn this shape into
+# an ALLOW without a test noticing.
+assert_ask "#7970x#8003: unquoted-delimiter capture whose body carries a LIVE \$( ) substitution, fed to 'eval', asks" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+generated \$(date)
+EOF
+)
+eval \"\$R\""
+
+# #8003's quote-blindness finding: a substitution wrapped in SINGLE quotes
+# inside a heredoc body is still live, so the body is still not inert.
+assert_ask "#7970x#8003: same shape with the substitution wrapped in single quotes (quote-blind per #8003) still asks" \
+    "R=\$(cat <<EOF
+$ST7970_PHRASE
+marker '\$(date)' here
+EOF
+)
+eval \"\$R\""
+
+# `<<-EOF` tab-stripping form of the same intersection.
+assert_ask "#7970x#8003: the <<-EOF dash form of the capture-plus-substitution shape fed to 'eval' asks" \
+    "R=\$(cat <<-EOF
+	$ST7970_PHRASE
+	generated \$(date)
+	EOF
+)
+eval \"\$R\""
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #6252: COMMAND_NO_COMMENT quote-awareness (ADR-0016 sed test matrix) ---${NC}"
 # =========================================================================
 #
