@@ -93,6 +93,33 @@ pub enum PidfileEvidence {
 }
 
 impl Snapshot {
+    /// The "no marker, nothing to check" snapshot: no daemon is expected here,
+    /// so every field is the absence of evidence rather than a claim.
+    ///
+    /// Named rather than `Default`, because most of these fields are contract
+    /// and a derived `Default` invites constructing a snapshot that asserts
+    /// things nobody measured.
+    #[must_use]
+    pub fn not_expected() -> Self {
+        Self {
+            state: InstallState::NotExpected,
+            started_at: None,
+            pid: None,
+            detail: String::new(),
+            heartbeat: None,
+            heartbeat_age_secs: None,
+            heartbeat_stale_threshold_secs: None,
+            heartbeat_file: None,
+            process_age_secs: None,
+            job_loaded: false,
+            supervisor_service: None,
+            last_exit_status: None,
+            exit_signal_detail: None,
+            source: Source::PidFile,
+            pidfile_evidence: PidfileEvidence::Absent,
+        }
+    }
+
     /// `true` when a daemon process is running, whatever its IPC state.
     ///
     /// `classify` distinguishes `AliveStarting` from `AliveButUnresponsive`
@@ -139,23 +166,7 @@ pub fn probe(
     supervisor: &super::supervisor::Supervisor,
 ) -> Snapshot {
     if !marker.exists() {
-        return Snapshot {
-            state: InstallState::NotExpected,
-            started_at: None,
-            pid: None,
-            detail: String::new(),
-            heartbeat: None,
-            heartbeat_age_secs: None,
-            heartbeat_stale_threshold_secs: None,
-            heartbeat_file: None,
-            process_age_secs: None,
-            job_loaded: false,
-            supervisor_service: None,
-            last_exit_status: None,
-            exit_signal_detail: None,
-            source: Source::PidFile,
-            pidfile_evidence: PidfileEvidence::Absent,
-        };
+        return Snapshot::not_expected();
     }
 
     let m = |k: &str| super::marker::get_nonempty(marker, k);

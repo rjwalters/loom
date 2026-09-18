@@ -487,11 +487,10 @@ fn outage(
     // `Disabled` covers both of the shell's `recover_possible != true` cases:
     // recovery switched off, and no runnable recovery argv — the call site
     // maps `Argv::Unavailable` onto it.
-    let recovery_impossible =
-        matches!(decision, recovery::Decision::Disabled) && episode.ticks >= limits.max_attempts;
+    let escalate_for = escalation_trigger(&decision, episode.ticks, limits.max_attempts);
 
-    let escalation_note = if matches!(decision, recovery::Decision::BreakerOpen { .. }) {
-        escalation_note(
+    let escalation_note = match escalate_for {
+        Some(EscalationTrigger::BreakerOpen) => escalation_note(
             paths,
             state,
             snap,
@@ -501,9 +500,8 @@ fn outage(
                 episode.attempts
             ),
             None,
-        )
-    } else if recovery_impossible {
-        escalation_note(
+        ),
+        Some(EscalationTrigger::RecoveryImpossible) => escalation_note(
             paths,
             state,
             snap,
@@ -513,9 +511,8 @@ fn outage(
                 episode.ticks
             ),
             None,
-        )
-    } else {
-        String::new()
+        ),
+        None => String::new(),
     };
 
     recovery::write(&state.recovery, &episode);
@@ -673,6 +670,71 @@ fn escalation_note(
     }
 }
 
+/// Recompute heartbeat freshness for a snapshot that has just been flipped to
+/// alive.
+///
+/// `liveness.rs` computes freshness only when the process was ALREADY known
+/// alive — reasonable on its own, since freshness is meaningless about a
+/// process that does not exist. But `socket_corroboration` flips the snapshot
+/// to alive AFTERWARDS, and nothing re-asked.
+///
+/// The result was a fail-OPEN: no pid file, the socket answers, a heartbeat
+/// file 1000s old against a 300s threshold — and the tick reported "no
+/// heartbeat file … (heartbeat disabled or not yet written) — liveness-only
+/// OK" and exited 0, while the file existed and was stale. The shell's section
+/// 4 ran on HEARTBEAT_FILE regardless of how liveness was established.
+fn refresh_heartbeat(snap: &mut liveness::Snapshot) {
+    let Some(hb) = snap.heartbeat_file.clone() else {
+        return;
+    };
+    let Some(threshold) = snap.heartbeat_stale_threshold_secs else {
+        return;
+    };
+    let (freshness, age) = crate::daemon_install_state::check_heartbeat(
+        std::path::Path::new(&hb),
+        threshold,
+        snap.process_age_secs,
+    );
+    snap.heartbeat = Some(freshness);
+    snap.heartbeat_age_secs = age;
+}
+
+/// Why this tick escalates out-of-band, if it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscalationTrigger {
+    /// The bounded recovery budget is spent and the daemon is still down.
+    BreakerOpen,
+    /// No attempt is even possible on this host, and the outage has persisted
+    /// for as many ticks as the budget would have allowed attempts.
+    RecoveryImpossible,
+}
+
+/// The shell escalates on TWO conditions (loom-daemon-watchdog.sh:2224-2228),
+/// and porting only the first left the second silent: with auto-recovery
+/// disabled, or no runnable recovery command, a confirmed outage filed no
+/// forge issue at all — just a log line every tick, forever. That is the
+/// 2026-07-26 shape this watchdog exists to prevent.
+///
+/// Extracted as a predicate because the retained suite cannot reach it: the
+/// harness pins `AUTO_RECOVER=0` together with `ESCALATE=0`, so no case ever
+/// enables escalation while recovery is impossible.
+fn escalation_trigger(
+    decision: &recovery::Decision,
+    ticks: u64,
+    max_attempts: u64,
+) -> Option<EscalationTrigger> {
+    match decision {
+        recovery::Decision::BreakerOpen { .. } => Some(EscalationTrigger::BreakerOpen),
+        // `Disabled` covers both of the shell's `recover_possible != true`
+        // cases — recovery switched off, and no runnable argv — because the
+        // caller maps `Argv::Unavailable` onto it.
+        recovery::Decision::Disabled if ticks >= max_attempts => {
+            Some(EscalationTrigger::RecoveryImpossible)
+        }
+        _ => None,
+    }
+}
+
 /// The directory the ENTRY POINT lives in — not the binary's.
 ///
 /// Sibling scripts (`loom-daemon-start.sh` for bounded recovery,
@@ -709,46 +771,7 @@ fn cli_dir_from(exported: Option<&str>) -> PathBuf {
 }
 
 #[cfg(test)]
-mod high_fix_tests {
-    use super::*;
-
-    /// HIGH-2. `cli_dir` must prefer the ENTRY POINT's directory: sibling
-    /// scripts (loom-daemon-start.sh for bounded recovery, create-issue.sh for
-    /// the tier-3 escalation fallback) live beside the SCRIPT and never beside
-    /// `~/.local/bin/loom-daemon`.
-    ///
-    /// Deriving it from `current_exe()` made bounded recovery REPORT-ONLY on
-    /// every default install — "no readable loom-daemon-start.sh beside this
-    /// watchdog" — while the real sibling sat next to the stub that had just
-    /// invoked it. The retained suite cannot see this: it always pins
-    /// LOOM_WATCHDOG_RECOVER_CMD.
-    #[test]
-    fn an_exported_entry_point_directory_wins() {
-        let d = tempfile::tempdir().expect("tempdir");
-        let got = cli_dir_from(d.path().to_str());
-        assert_eq!(got, d.path(), "an exported, existing dir must win");
-    }
-
-    #[test]
-    fn a_value_that_cannot_hold_siblings_is_ignored() {
-        // A stale or mistyped export must not send sibling resolution somewhere
-        // that cannot contain siblings. Falling back is safer than trusting it,
-        // and matches a direct `loom-daemon daemon-watchdog` invocation, where
-        // there is no stub and no siblings to find.
-        let d = tempfile::tempdir().expect("tempdir");
-        let f = d.path().join("not-a-dir");
-        std::fs::write(&f, "x").expect("write");
-
-        let fallback = cli_dir_from(None);
-        assert_eq!(cli_dir_from(f.to_str()), fallback, "a file is not a cli dir");
-        assert_eq!(cli_dir_from(Some("")), fallback, "empty is not a cli dir");
-        assert_eq!(
-            cli_dir_from(Some("/nonexistent/loom/cli")),
-            fallback,
-            "a missing dir is not a cli dir"
-        );
-    }
-}
+mod high_fix_tests;
 
 /// Unix seconds.
 fn now_secs() -> u64 {
@@ -1163,17 +1186,7 @@ fn socket_corroboration(
                 // not yet written) — liveness-only OK" and exited 0, while the
                 // file existed and was stale. The shell's section 4 ran on
                 // HEARTBEAT_FILE regardless of how liveness was established.
-                if let Some(hb) = snap.heartbeat_file.clone() {
-                    if let Some(threshold) = snap.heartbeat_stale_threshold_secs {
-                        let (f, a) = crate::daemon_install_state::check_heartbeat(
-                            std::path::Path::new(&hb),
-                            threshold,
-                            snap.process_age_secs,
-                        );
-                        snap.heartbeat = Some(f);
-                        snap.heartbeat_age_secs = a;
-                    }
-                }
+                refresh_heartbeat(snap);
 
                 snap.detail = format!(
                     "daemon ANSWERS on {socket} ({socket_detail}) — authoritative; the pid-file \
