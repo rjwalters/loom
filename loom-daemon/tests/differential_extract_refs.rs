@@ -281,11 +281,25 @@ fn parse_only(text: &str) -> String {
 /// newline; the port's regex runs over the concatenated text with `\s` (inside
 /// `[*_:\s]*`) matching `\n`. Normalised through `u64` the way the port does,
 /// so a zero-padded token compares equal to its canonical form.
+///
+/// **This regex is the ORACLE's pattern, not the port's.** It is a literal
+/// transliteration of the pre-port shell's ERE —
+/// `grep -oE '(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:[:space:]]*#[0-9]+'`
+/// — at the oracle's frozen rev `b1968d2a` (see `reference_impl` in the `_meta`
+/// records of `fixtures/extract_refs_shell_oracle.jsonl`). It happens to read
+/// the same as `phrase_re()` in `extract.rs` today, but the two must stay
+/// independently frozen: this one models what the retired shell actually
+/// matched, and `phrase_re()` is free to evolve. **Do NOT "fix" a failure here
+/// by syncing this literal to a `phrase_re()` change** — that would silently
+/// reopen the hole this test exists to catch (a legitimate port change going
+/// unclassified, the #8011 shape). If `phrase_re()` changes, this test going
+/// red is the point; update the fixture's classification reasoning, not this
+/// pattern.
 fn newline_only_refs(text: &str) -> std::collections::BTreeSet<String> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(r"(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:\s]*#([0-9]+)")
-            .expect("static dependency-phrase pattern")
+            .expect("static dependency-phrase pattern (the ORACLE's, frozen — see doc comment)")
     });
     let nums = |text: &str| -> std::collections::BTreeSet<String> {
         re.captures_iter(text)
@@ -371,6 +385,37 @@ fn classify(text: &str, shell: &str, rust: &str) -> Result<Vec<Divergence>, Stri
 
     let got: Vec<&str> = rust.split_whitespace().collect();
 
+    // The port's own output must always be ascending, deduplicated numbers
+    // joined by a single space, independent of which references were found.
+    // That is a self-consistency property of `rust` alone, so it is checked
+    // here unconditionally — on every case that reaches this function, not only
+    // the ones where the SET also happens to match the shell's. An earlier
+    // version gated an equivalent check behind `extra.is_empty()`, which meant
+    // an ordering- or duplicate-emitting regression went unreported on exactly
+    // the NewlineSpan cases (195 of 1050), since those always have a non-empty
+    // `extra`.
+    let mut own_sorted: Vec<u64> = Vec::with_capacity(got.len());
+    for tok in got.iter() {
+        match tok.parse::<u64>() {
+            Ok(v) => own_sorted.push(v),
+            Err(_) => return Err(format!("port emitted a non-numeric token {tok:?} in {rust:?}")),
+        }
+    }
+    own_sorted.sort_unstable();
+    own_sorted.dedup();
+    let want_self = own_sorted
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if rust != want_self {
+        return Err(format!(
+            "port's own output is not ascending/deduplicated/single-space-joined: got \
+             {rust:?}, canonical form is {want_self:?} — no accepted class is about ordering \
+             or formatting"
+        ));
+    }
+
     let extra: Vec<String> = got
         .iter()
         .filter(|t| !normalised.contains(&t.to_string()))
@@ -380,10 +425,12 @@ fn classify(text: &str, shell: &str, rust: &str) -> Result<Vec<Divergence>, Stri
         // Recognise the class by its MECHANISM, not by a property of the input
         // that merely correlates with it. Keying this on `text.contains('\n')`
         // absorbed an extra ref from ANY cause, because 88% of these bodies
-        // contain a newline — so a later change that stopped dropping overflow
-        // refs, say, would have slipped through silently. Compute instead what
-        // the newline divergence can actually produce, and require the extras
-        // to be a subset of exactly that.
+        // contain a newline. Modelled against a hypothetical later change that
+        // stopped dropping overflow refs, that version of the classifier
+        // reported 2 of 130 changed cases on the then-700-case corpus — red,
+        // barely, rather than silent, but not a signal anyone would act on.
+        // Compute instead what the newline divergence can actually produce, and
+        // require the extras to be a subset of exactly that.
         let explainable = newline_only_refs(text);
         let unexplained: Vec<&String> =
             extra.iter().filter(|t| !explainable.contains(*t)).collect();
@@ -407,21 +454,6 @@ fn classify(text: &str, shell: &str, rust: &str) -> Result<Vec<Divergence>, Stri
             "port DROPPED {missing:?}, which the shell found and which parse cleanly as u64 — \
              no accepted class explains losing a declared reference"
         ));
-    }
-
-    // Same reference SET, different string. None of the accepted classes is
-    // about rendering, so ordering/separator/formatting drift must not be
-    // absorbed by a LeadingZero or OverflowDropped class that merely happened
-    // to apply to this input.
-    if extra.is_empty() && missing.is_empty() {
-        let want = normalised.join(" ");
-        if rust != want {
-            return Err(format!(
-                "port and shell agree on WHICH references were found but render them \
-                 differently: expected {want:?}, got {rust:?} — no accepted class is about \
-                 ordering or formatting"
-            ));
-        }
     }
 
     classes.sort_unstable_by_key(|c| format!("{c:?}"));
