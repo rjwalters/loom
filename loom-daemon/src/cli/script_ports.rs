@@ -29,6 +29,12 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     DepRecheckFingerprint(super::dep_recheck::DepRecheckCommand),
 
+    /// Download + verify one release artifact (PR 6a). Backs
+    /// `loom-daemon-update.sh`'s `fetch_and_verify_artifact`. Exit 0 verified,
+    /// 1 verification failed (tamper evidence), 2 could not even download —
+    /// see `cli/release_fetch.rs` for the full contract.
+    ReleaseFetch(super::release_fetch::ReleaseFetchArgs),
+
     /// Resolve the latest release artifact for this host, read-only (PR 5).
     /// Backs `loom-daemon-update.sh --resolve-json`. Exit 0 when one resolved,
     /// 1 when none did — data, not an error.
@@ -54,6 +60,7 @@ impl ScriptPortCommand {
         match self {
             ScriptPortCommand::DepClassify(cmd) => cmd.run(),
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
+            ScriptPortCommand::ReleaseFetch(args) => args.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),

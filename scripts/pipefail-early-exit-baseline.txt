@@ -75,7 +75,7 @@
 6 defaults/scripts/tests/test-loom-daemon-quiesce.sh
 65 defaults/scripts/tests/test-loom-daemon-start.sh
 12 defaults/scripts/tests/test-loom-daemon-stop.sh
-175 defaults/scripts/tests/test-loom-daemon-update.sh
+136 defaults/scripts/tests/test-loom-daemon-update.sh
 2 defaults/scripts/tests/test-loom-daemon-watchdog.sh
 2 defaults/scripts/tests/test-mcp-config.sh
 12 defaults/scripts/tests/test-merge-pr-auto-merge-disabled-fallback.sh

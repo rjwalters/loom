@@ -20,6 +20,7 @@ pub(crate) mod misc_cmds;
 pub(crate) mod noop_cooldown;
 pub(crate) mod peer_claims_cmd;
 pub(crate) mod quarantine;
+pub(crate) mod release_fetch;
 pub(crate) mod release_resolve;
 pub(crate) mod restart;
 pub(crate) mod retry_classify;

@@ -974,6 +974,13 @@ jobs:
       # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
       - name: loom-daemon-update --resolve-json (#7609)
         run: bash defaults/scripts/tests/test-loom-daemon-update-resolve-json.sh
+      # Split out of test-loom-daemon-update.sh by #8028 (epic #7810 PR 6a):
+      # fetch_and_verify_artifact() now drives `loom-daemon release-fetch`
+      # through the stub's delegation, so these 64 assertions (tests A-V) need
+      # the binary this job builds. The parent suite stays in
+      # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
+      - name: loom-daemon-update artifact fetch + verify (#8028)
+        run: bash defaults/scripts/tests/test-loom-daemon-update-fetch.sh
       # #8069: 284 assertions that had never run in ANY CI job. They were
       # excluded on the reason "wiring it needs a cargo build step or a binary
       # stub — follow-up"; this job is that cargo build step. The subject is
