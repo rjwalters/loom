@@ -20,7 +20,7 @@ use super::models::{
     PromptChanges, PromptForgeEvent, RunwayProjection,
 };
 use super::schema::init_schema;
-use super::{claims, cost_analytics, prompts, quality};
+use super::{claims, cost_analytics, prompts, quality, usage_report};
 
 /// Activity database for tracking agent inputs and results
 pub struct ActivityDb {
@@ -298,6 +298,18 @@ impl ActivityDb {
         lookback_days: i32,
     ) -> Result<Option<RunwayProjection>> {
         cost_analytics::project_runway(&self.conn, period, lookback_days)
+    }
+
+    /// Token/cost usage report (Issue #8062): every `resource_usage` row at
+    /// or after `since`, grouped by `group_by`. See
+    /// [`super::usage_report`] for the aggregation and why the cost column
+    /// is summed rather than recomputed.
+    pub fn get_usage_report(
+        &self,
+        since: DateTime<Utc>,
+        group_by: usage_report::UsageReportGroupBy,
+    ) -> Result<Vec<usage_report::UsageReportRow>> {
+        usage_report::get_usage_report(&self.conn, since, group_by)
     }
 
     // ========================================================================

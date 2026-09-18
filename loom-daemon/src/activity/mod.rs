@@ -53,6 +53,7 @@ pub mod test_parser;
 pub mod transcript_ingest;
 pub mod transcript_parse;
 pub mod tuning;
+mod usage_report;
 
 // Re-export public types from models
 // Only export types that are used by other modules
@@ -111,3 +112,6 @@ pub use tuning::{
 // Issue claim registry types (Issue #1159)
 // Used for reliable work distribution and crash recovery
 pub use models::{ClaimResult, ClaimType, ClaimsSummary, IssueClaim};
+
+// Token/cost usage report types (Issue #8062) — `loom-daemon usage-report`.
+pub use usage_report::{UsageReportGroupBy, UsageReportRow};
