@@ -221,6 +221,22 @@ pub fn initialize_workspace(
     // configuration (contrast `merge_config_file` above).
     copy_single_file(&defaults, &loom_path, ".loom/biome.jsonc", ".loom/biome.jsonc", &mut report)?;
 
+    // `.loom/pricing.json` (#8177): the model rate card
+    // `activity::pricing_card` loads at runtime, so a vendor price change can
+    // reach the fleet on a resync rather than on a Loom release.
+    //
+    // Loom PAYLOAD, not consumer configuration: overwritten wholesale here and
+    // on every resync (contrast `merge_config_file` above). The manifest
+    // generator (scripts/install/manifest.sh) translates `defaults/pricing.json`
+    // to `.loom/pricing.json` and registers it as Loom-installed, so this copy
+    // must exist or the installer's post-install metadata-vs-disk check fails
+    // with "MISSING: .loom/pricing.json" and rolls the install back.
+    //
+    // A repo that somehow ends up without it is not broken: loom-daemon falls
+    // back to the rate card compiled into the binary and logs the fallback at
+    // warn level.
+    copy_single_file(&defaults, &loom_path, "pricing.json", ".loom/pricing.json", &mut report)?;
+
     // Ownership evidence for the reinstall clean sweep (issue #5971). Read
     // BEFORE any sync, because `write_install_metadata` below overwrites
     // `.loom/install-metadata.json` with a stub whose `installed_files` is

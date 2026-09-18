@@ -62,6 +62,7 @@ _read_loom_internal_skip_list() {
 # Path translations (defaults-relative → target-relative):
 #   .loom-README.md       → .loom/README.md
 #   config.json           → .loom/config.json
+#   pricing.json          → .loom/pricing.json
 #   config/X              → .loom/config/X
 #   roles/X               → .loom/roles/X
 #   scripts/X             → .loom/scripts/X
@@ -187,6 +188,12 @@ _emit_installed_files_manifest() {
         ;;
       config.json)
         target_path=".loom/config.json"
+        ;;
+      pricing.json)
+        # #8177: the model rate card. Loom payload (overwritten wholesale on
+        # reinstall and on every resync), not consumer configuration — contrast
+        # config.json directly above, which is merge-aware.
+        target_path=".loom/pricing.json"
         ;;
       config/*)
         target_path=".loom/${rel_path}"

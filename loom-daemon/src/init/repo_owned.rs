@@ -383,12 +383,12 @@ mod tests {
                 expect_ignored: false,
             },
             Case {
-                // `.loom/CLAUDE.md` and `.loom/biome.jsonc` are the two
-                // surfaces `resync-installed.sh` itself passes to
-                // `is_ignored()` WITH the `.loom/` prefix already baked into
-                // `rel` (see the `sync_one` call sites at the `.loom/CLAUDE.md`
-                // restamp and the `.loom/biome.jsonc` single-file sync) — so a
-                // pin written with that same prefix is the documented,
+                // `.loom/CLAUDE.md`, `.loom/biome.jsonc` and (since #8177)
+                // `.loom/pricing.json` are the surfaces `resync-installed.sh`
+                // itself passes to `is_ignored()` WITH the `.loom/` prefix
+                // already baked into `rel` (see the `sync_one` call sites at
+                // the `.loom/CLAUDE.md` restamp and the two single-file syncs)
+                // — so a pin written with that same prefix is the documented,
                 // already-agreeing case, not the drifted one below.
                 label:
                     "a prefixed pin matches the two shell call sites that also pass a prefixed rel",
