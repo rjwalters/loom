@@ -246,6 +246,11 @@ assert_deny_env "rmScope repo (#6520): tmpdir reassigned after mktemp still deni
 # per #6520's own scope note.
 assert_deny_env "rmScope repo (#6520): mktemp -d with a custom template excluded from fast path, still denies" \
     "LOOM_RM_SCOPE=repo" 'tmpdir=$(mktemp -d /opt/other/XXXXXX) && rm -rf "$tmpdir"' "$REPO_ROOT"
+# The ONE chained exception to the ambiguity rule asserted just above — a
+# second assignment of the exact `NAME=$(cd "$NAME" && pwd -P)` /
+# `NAME=$(realpath "$NAME")` canonicalization form (#7986) — is covered in its
+# own suite alongside the identical write-confinement half:
+# tests/hooks/test-guard-destructive-mktemp-canon.sh.
 
 # ---- Same-command LITERAL-path resolution (#6676) — a SIBLING fast path to
 # ---- the mktemp one above: a same-command `NAME=<literal absolute path>`
