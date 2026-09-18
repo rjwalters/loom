@@ -978,47 +978,16 @@ enum Commands {
     ///
     /// With no filters, prints the "success rate and median duration by
     /// model" summary #4137 asked for. `--records` instead lists individual
-    /// outcome records (still respecting `--model`/`--result`/`--limit`).
-    SweepOutcomes {
-        /// Repo root whose `.loom/logs/sweep-outcome-telemetry.jsonl` to
-        /// read (plain path, default `.` — no upward `.git` walk).
-        #[arg(long, value_name = "PATH", default_value = ".")]
-        workspace: String,
-
-        /// Only include records for this dispatched model (matches the
-        /// `"default"` group for records with no explicit model).
-        #[arg(long)]
-        model: Option<String>,
-
-        /// Only include records with this terminal result: success, failure,
-        /// cancelled, blocked.
-        #[arg(long)]
-        result: Option<String>,
-
-        /// List individual records (newest first) instead of the
-        /// summary-by-model table.
-        #[arg(long)]
-        records: bool,
-
-        /// Cap the number of records considered (after filtering), newest
-        /// first. Applies to both the summary and `--records` listing.
-        #[arg(long, value_name = "N")]
-        limit: Option<usize>,
-
-        /// Print how many locally-journaled records the observability
-        /// exporter has not yet attempted to send to the backend (Issue
-        /// #5084) instead of the summary/records output — every other flag
-        /// except `--json`/`--workspace` is ignored in this mode. This is the
-        /// AC's "N local outcomes not yet in the backend" measurability
-        /// gauge: `0` means the backfill drain (see
-        /// `.loom/docs/observability.md`) is caught up.
-        #[arg(long = "pending-export")]
-        pending_export: bool,
-
-        /// Emit machine-readable JSON instead of the human-readable table.
-        #[arg(long)]
-        json: bool,
-    },
+    /// outcome records (still respecting `--model`/`--result`/`--limit`), and
+    /// the `summary` sub-verb (Issue #8057) prints the fleet-wide grouped
+    /// SUPERSET of that summary.
+    //
+    // The flag set and the `summary` sub-verb live in
+    // `cli::sweep_outcomes_cli`, not here: `main.rs` is over the file-size
+    // ratchet's threshold (`scripts/check-file-size-budget.sh`), so new CLI
+    // surface goes in a sibling module behind a one-line dispatch arm. A
+    // `#[derive(Args)]` struct parses identically to an inline variant body.
+    SweepOutcomes(cli::sweep_outcomes_cli::SweepOutcomesArgs),
 }
 
 /// Sub-actions for `loom-daemon checkpoint` (issue #4275).
@@ -2534,9 +2503,7 @@ use cli::legacy_script_cmds::{
     handle_checkpoint_command, handle_resolve_model_command, handle_strip_ansi_command,
     handle_sweep_experiment_command,
 };
-use cli::misc_cmds::{
-    handle_sweep_outcomes_command, handle_update_gitignore_command, handle_validate_command,
-};
+use cli::misc_cmds::{handle_update_gitignore_command, handle_validate_command};
 use cli::stats::{handle_agent_metrics_command, handle_stats_command};
 use cli::tokens::{handle_claude_config_command, handle_forge_command, handle_tokens_command};
 use cli::workspace_fleet::{
@@ -2604,23 +2571,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             strict,
             verbose,
         } => handle_validate_command(&workspace, &format, strict, verbose),
-        Commands::SweepOutcomes {
-            workspace,
-            model,
-            result,
-            records,
-            limit,
-            pending_export,
-            json,
-        } => handle_sweep_outcomes_command(
-            &workspace,
-            model.as_deref(),
-            result.as_deref(),
-            records,
-            limit,
-            pending_export,
-            json,
-        ),
+        Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::Stats {
             command,
             role,

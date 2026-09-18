@@ -219,6 +219,7 @@ pub mod short_hash;
 pub mod startup_adoption;
 pub mod stash_retirement;
 pub mod sweep_journal;
+pub mod sweep_outcome_summary;
 pub mod sweep_outcomes;
 pub mod sweep_registry;
 pub mod telemetry;

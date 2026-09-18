@@ -579,4 +579,70 @@ loom-daemon sweep-outcomes --json
 Purely file-based (like `loom-daemon calibrate`) — no running daemon required.
 `--workspace PATH` selects a different repo root (default `.`).
 
+### Fleet-wide: `loom-daemon sweep-outcomes summary`
+
+The `summary` sub-verb (Issue #8057) is a **documented superset** of the
+by-model summary above. The bare command is *not* superseded and its output is
+unchanged — the two deliberately use different names for different things:
+
+| | bare `sweep-outcomes` | `sweep-outcomes summary` |
+|---|---|---|
+| scope | one workspace | every workspace in `~/.loom/workspaces.json` (see below) |
+| grouping | model only | `arm` \| `model` \| `repo` \| `host` \| `day` |
+| failure metric | `success_rate` over every record | `real_failure_rate`, spawn deaths discounted |
+
+Do not compare the two numbers directly.
+
+```bash
+# The arm-vs-arm question, fleet-wide, spawn deaths removed:
+loom-daemon sweep-outcomes summary --since 7d --group-by arm --exclude-spawn-deaths
+
+# Machine-readable, with the rate card and arm provenance named:
+loom-daemon sweep-outcomes summary --since 7d --group-by model --json
+
+# Skip the forge merge join (merged counts then report as unavailable, not 0):
+loom-daemon sweep-outcomes summary --since 7d --no-merge-join
+```
+
+Per group: sweeps; success/failure/cancelled/blocked; real failure rate;
+median and p75 duration **of successes only**; doctor-phase rate; merged PRs;
+cost-weighted tokens; merges per weighted token; and lines added/deleted per
+merged PR.
+
+Four properties worth knowing before reading the numbers:
+
+- **The all-workspaces default is scoped to this sub-verb.** Run from a
+  registered workspace, `summary` reads every registered workspace;
+  `--this-workspace` restores the single-workspace read. The pre-existing
+  `sweep-outcomes` paths always read exactly one workspace, unchanged.
+- **`--group-by host` is degenerate on a local read.** [`TelemetryEnvelope`]
+  stamps the *emitting* host, so every journal this host wrote carries one
+  `host_id` — one bucket. The grouping is meaningful only over a
+  pooled/exported corpus. The report says so in its notes.
+- **`--group-by arm` is inferred until #8055.** The only arm on a record today
+  is derived from the dispatched model, which conflates "arm A" with "arm B
+  escalated to Opus via the ladder" and with an explicit `--model` pin. Every
+  row carries `arm_source` (`explicit` | `inferred` | `unknown`); unstamped
+  records land in an `unknown` bucket rather than being dropped, so the group
+  counts always sum to `records_grouped`.
+- **Weighted tokens price through a named, known-stale rate card.**
+  `ModelPricing::for_model`'s rates are the Jan-2025 set (#8060 tracks the
+  refresh), and `claude-fable-*` is deliberately priced at the Opus rate. Both
+  the human header and the JSON name the card and its as-of date. "Merges per
+  weighted-token" is exactly as trustworthy as that card.
+
+`--exclude-spawn-deaths` drops runs that died before doing any work: a
+classified `preflight-token-selection-failed` / `account-exhausted:*` (joined
+by `sweep_id` to the sibling `sweep-outcomes.jsonl` until #8056 puts
+`failure_class` on the telemetry record), or — with no class available — a
+sub-60-second non-success. The number dropped is always reported, never
+silently applied.
+
+The merged-PR join (`pr_number` -> `gh pr view --json mergedAt`) is cached at
+`~/.loom/cache/pr-merge-state.json`; a merged answer never expires, a
+not-yet-merged one is re-checked after 6h. **A forge failure reports the
+affected groups' merged counts as unavailable (`null` / `n/a`), never as `0`**
+— the same "unknown != zero" contract `tokens_in`/`tokens_by_model` use — and
+one failure latches, so a dead forge costs one subprocess, not one per PR.
+
 [`TelemetryEnvelope`]: #envelope
