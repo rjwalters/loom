@@ -269,16 +269,25 @@ Shell-Budget-Growth: 59 lines — guards against a silent revert of a local fix 
 
 Rules the gate enforces:
 
-- It must be a **real git trailer** — in the commit's trailing paragraph, at
-  column 0, exactly as `Co-Authored-By` and `Signed-off-by` are. The check uses
-  git's own parser (`git log --format='%(trailers:key=…,valueonly)'`) rather
-  than scanning lines, so an indented example, a fenced code block, a folded
-  continuation, and a trailer written as the commit *subject* all correctly do
-  nothing.
+- It goes on a line of its own **in a commit body**: column 0, outside any
+  ``` fence, and not the subject. Anywhere in the body works — it does not have
+  to be the last paragraph.
 
-  That is not hypothetical: the PR adding this parser contained an indented
-  example of its own trailer, and the hand-rolled scan granted the PR 59 lines
-  attributed to an unmerged issue.
+  An indented or fenced occurrence is prose showing the format, not a
+  declaration using it. That is not hypothetical: the PR adding this check
+  contained an indented example of its own trailer and granted itself 59 lines
+  attributed to an unmerged issue. A near-miss is **reported as malformed**,
+  never ignored — otherwise the build fails with a message about growth while
+  the real problem is placement, and the author re-reads the wrong thing.
+
+  This deliberately does **not** use `git interpret-trailers`, which reads only
+  the message's final paragraph. Two reproduced reasons: the repo's own commit
+  shape puts `Closes #N` and `Co-Authored-By:` after the declaration, which
+  takes it out of that paragraph; and GitHub's squash of a multi-commit PR
+  concatenates each commit as `* subject` + body, so every declaration lands
+  mid-message. Keying on git's rule would accept a PR and then red-line `main`
+  on the very commit it just approved — the #8073/#8105 failure the merge-base
+  design exists to avoid.
 - The declared count must **cover** the measured growth. Declaring 10 and
   growing 500 fails, and the message names the shortfall.
 - The reason must cite an issue (`#<n>`).

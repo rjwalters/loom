@@ -614,27 +614,78 @@ pub fn parse_growth_declarations(
 ) -> (Vec<GrowthDeclaration>, Vec<MalformedDeclaration>) {
     let mut ok = Vec::new();
     let mut bad = Vec::new();
+    let mut fenced = false;
+    let lines: Vec<&str> = text.lines().collect();
 
-    for raw in text.lines() {
-        // Column 0 only. Git trailers are unindented by convention, and an
-        // INDENTED line in a commit body is prose showing the format, not a
-        // declaration using it.
-        //
-        // This is not hypothetical: the commit that introduced this parser
-        // contained an indented example of its own trailer, and an earlier cut
-        // of this function trimmed first — so the PR granted itself 59 lines
-        // of growth attributed to an unmerged issue, and a squash-merge would
-        // have written that into `main`'s cumulative figure permanently. The
-        // fix for "text that looks like documentation is read as enforcement"
-        // cannot itself have that bug.
-        if raw.starts_with([' ', '\t']) {
+    for (i, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim();
+
+        // ``` or ~~~ toggles a fenced block. A declaration inside one is an
+        // example being quoted, which is how commit bodies in this repo show
+        // the format.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
             continue;
         }
+
+        let looks_like = strip_trailer_prefix(trimmed).is_some();
+        if !looks_like {
+            continue;
+        }
+
+        // The subject line is never a declaration. git would not treat it as a
+        // trailer, and a squash rewrites it to `* Shell-Budget-Growth: …`,
+        // where it would silently stop counting.
+        if i == 0 {
+            bad.push(MalformedDeclaration {
+                line: trimmed.to_string(),
+                why: "a declaration cannot be the commit SUBJECT — put it in the body",
+            });
+            continue;
+        }
+
+        // Indented or fenced: prose showing the format, not a declaration
+        // using it. Reported rather than ignored — a near-miss that silently
+        // means "no override" fails the build with a message about growth
+        // while the real problem is placement, and the author then re-reads
+        // the wrong thing. That is the defect this whole change exists to fix,
+        // so it must not be reproduced one level down.
+        if fenced || raw.starts_with([' ', '\t']) {
+            bad.push(MalformedDeclaration {
+                line: trimmed.to_string(),
+                why: if fenced {
+                    "inside a fenced block, so it reads as an example — move it to column 0 \
+                     outside the fence"
+                } else {
+                    "indented, so it reads as an example — move it to column 0"
+                },
+            });
+            continue;
+        }
+
         let line = raw.trim_end();
         let Some(rest) = strip_trailer_prefix(line) else {
             continue;
         };
-        match parse_declaration_value(rest, line) {
+
+        // Fold a continuation: git unfolds a trailer value wrapped onto an
+        // indented following line, and an author who wraps a long reason
+        // should not silently lose half of it.
+        let mut value = rest.to_string();
+        let mut j = i + 1;
+        while let Some(next) = lines.get(j) {
+            if !next.starts_with([' ', '\t']) || next.trim().is_empty() {
+                break;
+            }
+            if strip_trailer_prefix(next.trim()).is_some() {
+                break;
+            }
+            value.push(' ');
+            value.push_str(next.trim());
+            j += 1;
+        }
+
+        match parse_declaration_value(&value, line) {
             Ok(d) => ok.push(d),
             Err(m) => bad.push(m),
         }
@@ -722,16 +773,36 @@ fn first_issue_reference(text: &str) -> Option<u64> {
     None
 }
 
-/// Read the `Shell-Budget-Growth:` trailers from every commit in
-/// `base_rev..HEAD`, using **git's own** trailer parser.
+/// Read the `Shell-Budget-Growth:` declarations from every commit in
+/// `base_rev..HEAD`.
 ///
-/// Not a hand-rolled line scan. Review defeated the first one three ways —
-/// a trailer inside a fenced code block at column 0, a folded continuation
-/// line, and a trailer used as a commit SUBJECT (which git would never treat
-/// as a trailer, and which a squash rewrites into `* Shell-Budget-Growth: …`
-/// and drops). `git interpret-trailers`' semantics get all three right for
-/// free, and they are the semantics an author already expects from
-/// `Co-Authored-By` and `Signed-off-by`.
+/// # Why not `git interpret-trailers`
+///
+/// git only parses the message's FINAL paragraph, and that is the wrong rule
+/// here for two reproduced reasons:
+///
+///  1. The repo's own commit shape breaks it. A declaration paragraph followed
+///     by `Closes #N` and `Co-Authored-By:` puts the declaration outside the
+///     final paragraph, so git returns nothing — and the build then fails with
+///     a message about growth while the real problem is placement. That is the
+///     "a typo degrades to no override" failure this whole change exists to
+///     prevent.
+///  2. It disagrees with itself across a merge. GitHub's squash of a
+///     multi-commit PR concatenates each commit as `* subject` + body, so every
+///     body trailer ends up mid-message. The gate would accept a PR and then
+///     red-line `main` on the very commit it just approved — the #8073/#8105
+///     failure mode the merge-base design was built to avoid.
+///
+/// So the rule is positional in a different way: **column 0, not inside a
+/// fenced block, and never the subject line**. That keeps the protections git
+/// was adopted for — an indented example does not declare (the defect that
+/// made this PR grant itself 59 lines), a fenced example does not declare, and
+/// a trailer written as a subject does not declare — while surviving both
+/// shapes above.
+///
+/// Anything that looks like a declaration but sits in a position this does not
+/// read is reported as MALFORMED rather than ignored, so it can never fail
+/// silently.
 ///
 /// # Errors
 /// Returns a message when `git log` cannot be run.
@@ -739,18 +810,9 @@ pub fn collect_growth_declarations(
     root: &Path,
     base_rev: &str,
 ) -> Result<(Vec<GrowthDeclaration>, Vec<MalformedDeclaration>), String> {
-    // A per-commit record separator, because a trailer value may itself span
-    // lines and commits may carry more than one.
     let out = Command::new("git")
         .current_dir(root)
-        .args([
-            "log",
-            &format!(
-                "--format=%x00%(trailers:key={},valueonly)",
-                GROWTH_TRAILER.trim_end_matches(':')
-            ),
-            &format!("{base_rev}..HEAD"),
-        ])
+        .args(["log", "--format=%x00%B", &format!("{base_rev}..HEAD")])
         .output()
         .map_err(|e| format!("could not run git log: {e}"))?;
     if !out.status.success() {
@@ -763,16 +825,10 @@ pub fn collect_growth_declarations(
     let text = String::from_utf8_lossy(&out.stdout);
     let mut ok = Vec::new();
     let mut bad = Vec::new();
-    for value in text
-        .split('\0')
-        .flat_map(str::lines)
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-    {
-        match parse_declaration_value(value, &format!("{GROWTH_TRAILER} {value}")) {
-            Ok(d) => ok.push(d),
-            Err(m) => bad.push(m),
-        }
+    for message in text.split('\0').filter(|m| !m.trim().is_empty()) {
+        let (mut o, mut b) = parse_growth_declarations(message);
+        ok.append(&mut o);
+        bad.append(&mut b);
     }
     Ok((ok, bad))
 }
@@ -855,7 +911,17 @@ pub fn check_against_rev(
             if !PORTABLE.contains(&cat.as_str()) {
                 continue;
             }
-            let now_lines = now.by_file.get(path).map_or(0, |(_, n)| *n);
+            // The file's category NOW matters as much as its line count. A
+            // `contract` file relisted as `bootstrap` with identical lines has
+            // lost every portable line it had — review reproduced exactly that
+            // to launder 20 new portable lines past a declaration after the
+            // first per-file cut shipped. Reading only the count re-opened the
+            // hole the deleted `recategorised_since` used to cover.
+            let now_lines = now
+                .by_file
+                .get(path)
+                .filter(|(c, _)| PORTABLE.contains(&c.as_str()))
+                .map_or(0, |(_, n)| *n);
             if now_lines < *before_lines {
                 lost.push((path, *before_lines, now_lines));
             }
@@ -912,10 +978,12 @@ pub fn check_against_rev(
              That is allowed, and it is not free. The floor is what will still be shell when \
              the epic is done, so adding to it raises the finish line. If the script could be a \
              daemon subcommand instead, it should be.\n\n\
-             If the growth is right, declare it with a commit trailer naming the amount and the \
-             issue that argues it. It must start at column 0 — an indented line is prose \
-             showing the format, not a declaration using it:\n\n\
+             If the growth is right, declare it on a line of its own in a commit BODY:\n\n\
              {GROWTH_TRAILER} {growth} lines — <why this must stay shell> (#<issue>)\n\n\
+             It must start at column 0, outside any ``` fence, and must not be the commit \
+             subject — an indented or fenced line is prose showing the format, not a \
+             declaration using it. Anywhere in the body is fine; it does not have to be the \
+             last paragraph. A near-miss is reported as malformed rather than ignored.\n\n\
              The declared count must cover the measured growth, and the reason must cite an \
              issue. Declared growth is not hidden: it stays in the running total and \
              `shell-budget` prints it.{declared_note}\n\n\
@@ -1051,11 +1119,18 @@ mod tests {
 
     // --- #8154: declared floor growth ---
 
+    /// A realistic commit message, because position is now part of the rule:
+    /// a subject line, a blank, then the declaration.
     fn decl(lines: u64) -> Vec<GrowthDeclaration> {
         parse_growth_declarations(&format!(
-            "Shell-Budget-Growth: {lines} lines — must stay shell, see (#7870)"
+            "fix: add a guard\n\nShell-Budget-Growth: {lines} lines — must stay shell, see (#7870)"
         ))
         .0
+    }
+
+    /// Wrap a body so its first line is a subject, not a declaration.
+    fn msg(body: &str) -> String {
+        format!("subject line\n\n{body}")
     }
 
     #[test]
@@ -1159,7 +1234,7 @@ mod tests {
         let concrete = line
             .replace("<why this must stay shell>", "cannot be ported yet")
             .replace("<issue>", "8154");
-        let (ok, bad) = parse_growth_declarations(&concrete);
+        let (ok, bad) = parse_growth_declarations(&msg(&concrete));
         assert!(bad.is_empty(), "the message's own template must parse: {bad:?}");
         assert_eq!(ok.len(), 1, "from {concrete:?}");
         assert_eq!(ok[0].lines, 500, "must carry the measured growth");
@@ -1183,7 +1258,7 @@ mod tests {
         // Ask #1: the reason must reference an issue, so the override cannot be
         // a bare escape hatch a Builder grants itself in passing.
         let (ok, bad) =
-            parse_growth_declarations("Shell-Budget-Growth: 59 lines — because I said so");
+            parse_growth_declarations(&msg("Shell-Budget-Growth: 59 lines — because I said so"));
         assert!(ok.is_empty(), "{ok:?}");
         assert_eq!(bad.len(), 1);
         assert!(bad[0].why.contains("cites no issue"), "{:?}", bad[0]);
@@ -1191,9 +1266,9 @@ mod tests {
 
     #[test]
     fn a_declaration_without_a_count_or_reason_is_malformed() {
-        let (ok, bad) = parse_growth_declarations(
+        let (ok, bad) = parse_growth_declarations(&msg(
             "Shell-Budget-Growth: lines — no count (#1)\nShell-Budget-Growth: 12 lines\n",
-        );
+        ));
         assert!(ok.is_empty(), "{ok:?}");
         assert_eq!(bad.len(), 2, "{bad:?}");
         assert!(bad[0].why.contains("no leading line count"), "{:?}", bad[0]);
@@ -1214,7 +1289,7 @@ mod tests {
             "shell-budget-growth: 59 lines — why (#7870)",
             "Shell-Budget-Growth: 1 line — why (#7870)",
         ] {
-            let (ok, bad) = parse_growth_declarations(body);
+            let (ok, bad) = parse_growth_declarations(&msg(body));
             assert!(bad.is_empty(), "{body:?} -> {bad:?}");
             assert_eq!(ok.len(), 1, "{body:?}");
             assert_eq!(ok[0].issue, 7870, "{body:?}");
@@ -1234,18 +1309,110 @@ mod tests {
                     That is all.\n";
         let (ok, bad) = parse_growth_declarations(body);
         assert!(ok.is_empty(), "an indented example must not declare: {ok:?}");
-        assert!(bad.is_empty(), "nor should it be reported as malformed: {bad:?}");
+        // It IS reported. Silently ignoring a near-miss is how the author ends
+        // up reading a message about growth when the real problem is
+        // placement — the defect this change exists to fix.
+        assert_eq!(bad.len(), 1, "a near-miss must be reported: {bad:?}");
+        assert!(bad[0].why.contains("indented"), "{:?}", bad[0]);
 
         // The same text at column 0 IS a declaration — otherwise this test
         // would pass simply because the parser stopped working.
-        let real = "Shell-Budget-Growth: 59 lines — an example (#7870)\n";
-        assert_eq!(parse_growth_declarations(real).0.len(), 1);
+        let real = msg("Shell-Budget-Growth: 59 lines — an example (#7870)\n");
+        assert_eq!(parse_growth_declarations(&real).0.len(), 1);
+    }
+
+    #[test]
+    fn a_fenced_declaration_is_an_example_and_is_reported() {
+        // Review got a column-0 trailer past the first cut by putting it in a
+        // fenced block, which is how commit bodies in this repo quote things.
+        let body = msg("Here is the format:\n\n```\nShell-Budget-Growth: 5 lines — x (#1)\n```\n");
+        let (ok, bad) = parse_growth_declarations(&body);
+        assert!(ok.is_empty(), "{ok:?}");
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].why.contains("fenced"), "{:?}", bad[0]);
+    }
+
+    #[test]
+    fn a_declaration_as_the_subject_is_rejected_and_reported() {
+        // git would never treat a subject as a trailer, and a squash rewrites
+        // it to `* Shell-Budget-Growth: …`, where it would stop counting —
+        // green on the PR, red on main.
+        let (ok, bad) = parse_growth_declarations("Shell-Budget-Growth: 5 lines — x (#1)\n\nbody");
+        assert!(ok.is_empty(), "{ok:?}");
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].why.contains("SUBJECT"), "{:?}", bad[0]);
+    }
+
+    #[test]
+    fn a_declaration_survives_the_repos_own_commit_shape() {
+        // The shape a Builder actually writes: declaration, then `Closes #N`,
+        // then `Co-Authored-By:`. git's trailer parser reads only the FINAL
+        // paragraph and returns nothing here, so the build would have failed
+        // with a message about growth while the real problem was placement.
+        let body = "fix: add a guard\n\n\
+                    Some prose about why.\n\n\
+                    Shell-Budget-Growth: 59 lines — cannot be ported yet (#7758)\n\n\
+                    Closes #8154\n\n\
+                    Co-Authored-By: Someone <x@y.z>\n";
+        let (ok, bad) = parse_growth_declarations(body);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(ok.len(), 1, "{ok:?}");
+        assert_eq!(ok[0].lines, 59);
+    }
+
+    #[test]
+    fn a_declaration_survives_a_multi_commit_squash() {
+        // GitHub's squash of a multi-commit PR concatenates each commit as
+        // `* subject` + body, so every declaration lands mid-message. Keying
+        // on git's final-paragraph rule would accept the PR and then red-line
+        // `main` on the very commit it just approved (#8073/#8105).
+        let squashed = "feat: the PR title (#9999)\n\n\
+                        * fix: first commit\n\n\
+                        Shell-Budget-Growth: 30 lines — part one (#7758)\n\n\
+                        * fix: second commit\n\n\
+                        Shell-Budget-Growth: 29 lines — part two (#7758)\n\n\
+                        ---------\n\n\
+                        Co-authored-by: Someone <x@y.z>\n";
+        let (ok, bad) = parse_growth_declarations(squashed);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(ok.len(), 2, "both halves must survive the squash: {ok:?}");
+        assert_eq!(ok.iter().map(|d| d.lines).sum::<u64>(), 59);
+    }
+
+    #[test]
+    fn a_folded_declaration_value_is_rejoined() {
+        let body = msg("Shell-Budget-Growth: 12 lines — a reason long enough to\n  wrap (#1)\n");
+        let (ok, bad) = parse_growth_declarations(&body);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(ok.len(), 1);
+        assert!(ok[0].reason.contains("wrap"), "{:?}", ok[0]);
+        assert_eq!(ok[0].issue, 1);
+    }
+
+    #[test]
+    fn an_in_place_recategorisation_cannot_launder_portable_growth() {
+        // Review's P1: `c.sh` relisted contract -> bootstrap with IDENTICAL
+        // line counts, plus 20 brand-new contract lines. The first per-file cut
+        // read only the line count, so it saw no loss and admitted it.
+        let before = budget_files(&[("c.sh", "contract", 30), ("a.sh", "contract", 0)]);
+        let now = budget_files(&[("c.sh", "bootstrap", 30), ("a.sh", "contract", 20)]);
+        assert_eq!(
+            now.by_file["c.sh"].1, before.by_file["c.sh"].1,
+            "the line count is unchanged — only the category moved"
+        );
+        let d = decl(9999);
+        let err = check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
+            .expect_err("a relisted portable file must count as a total loss");
+        assert!(err.contains("c.sh  30 -> gone"), "{err}");
     }
 
     #[test]
     fn a_tab_indented_trailer_is_also_prose() {
-        let (ok, bad) = parse_growth_declarations("\tShell-Budget-Growth: 9 lines — x (#1)\n");
-        assert!(ok.is_empty() && bad.is_empty(), "{ok:?} {bad:?}");
+        let (ok, bad) =
+            parse_growth_declarations(&msg("\tShell-Budget-Growth: 9 lines — x (#1)\n"));
+        assert!(ok.is_empty(), "{ok:?}");
+        assert_eq!(bad.len(), 1, "a near-miss must be REPORTED, never ignored");
+        assert!(bad[0].why.contains("indented"), "{:?}", bad[0]);
     }
 
     /// A budget with per-file detail, which the laundering rule needs.
@@ -1337,7 +1504,7 @@ mod tests {
                       — leading em-dash\n\
                       日本語のコミットメッセージです\n\
                       Shell-Budget-Growth: 9 lines — naïve café (#8154)\n";
-        let (ok, bad) = parse_growth_declarations(corpus);
+        let (ok, bad) = parse_growth_declarations(&msg(corpus));
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!(ok.len(), 1, "{ok:?}");
         assert_eq!(ok[0].lines, 9);
