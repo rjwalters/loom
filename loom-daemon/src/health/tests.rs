@@ -7,7 +7,11 @@ fn now() -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-fn install_report(state: InstallState) -> InstallStateReport {
+// `pub(crate)` (Issue #8163): the `busy` sibling module's own test suite
+// builds probe-timeout fixtures from the same install-state report, reused
+// rather than re-derived so the two suites cannot drift about what
+// "alive with a fresh heartbeat" looks like.
+pub(crate) fn install_report(state: InstallState) -> InstallStateReport {
     InstallStateReport {
         state,
         started_at: Some("2026-07-30T00:00:00Z".to_string()),
@@ -88,6 +92,10 @@ pub(crate) fn healthy_inputs() -> HealthInputs {
         // overwhelmingly common case) -- nothing for `codesign_identity`
         // to report.
         codesign_preflight: None,
+        // Healthy baseline: no host-load reading (#8163). `None` cannot
+        // refute an `indeterminate-busy` story, so every pre-#8163 fixture
+        // built from this one keeps its exact pre-#8163 verdict.
+        load_per_core: None,
     }
 }
 
@@ -319,9 +327,9 @@ fn alive_but_unresponsive_is_degraded_not_dead() {
 /// verbatim. `overall` now carries the distinct `IndeterminateBusy`
 /// verdict at its own exit code, rather than the same `EXIT_DEGRADED` a
 /// genuine degradation uses — see
-/// `a_probe_timeout_with_a_stale_heartbeat_is_not_reported_as_busy` below
-/// for the negative case (no heartbeat corroboration ⇒ stays ordinary
-/// `Unknown`/exit 1).
+/// `health::busy`'s own suite (#8163) for the negative cases: no heartbeat
+/// corroboration, a hard non-timeout failure, and an idle host whose load
+/// average refutes the busy story all stay ordinary `Unknown`/exit 1.
 #[test]
 fn a_single_probe_timeout_against_a_confirmed_alive_daemon_is_unknown_not_degraded() {
     let mut inputs = healthy_inputs();
@@ -355,42 +363,10 @@ fn a_single_probe_timeout_against_a_confirmed_alive_daemon_is_unknown_not_degrad
     assert_eq!(report.exit_code(), EXIT_INDETERMINATE_BUSY);
 }
 
-/// The negative case for the test above: a probe-budget timeout against a
-/// daemon whose heartbeat is STALE (not fresh) gets no benefit of the
-/// doubt. `overall` stays the ordinary `Unknown`/exit `1` — a stale
-/// heartbeat is itself grounds for suspicion, and must not silently
-/// downgrade to "just busy" (#6191).
-#[test]
-fn a_probe_timeout_with_a_stale_heartbeat_is_not_reported_as_busy() {
-    let mut inputs = healthy_inputs();
-    inputs.status = None;
-    inputs.ipc_error = Some("round-trip timed out after 2s".to_string());
-    inputs.pgrep_pids = vec![];
-    let mut install = install_report(InstallState::AliveButUnresponsive);
-    install.heartbeat_freshness = Some(HeartbeatFreshness::Stale);
-    inputs.install_state = Some(install);
-
-    let report = assess(&inputs);
-    assert_eq!(report.overall, Verdict::Unknown, "{}", report.render_human());
-    assert_eq!(report.exit_code(), EXIT_DEGRADED);
-}
-
-/// A HARD IPC failure (not a timeout) against an alive+fresh-heartbeat
-/// daemon must still resolve to `Degraded`/exit 1 — `probe_budget_busy`
-/// requires the timeout classification specifically, so this must never
-/// slip into the busy verdict just because the heartbeat looks fine.
-#[test]
-fn a_hard_ipc_failure_with_a_fresh_heartbeat_still_reports_degraded() {
-    let mut inputs = healthy_inputs();
-    inputs.status = None;
-    inputs.ipc_error = Some("connect failed: No such file or directory (os error 2)".to_string());
-    inputs.pgrep_pids = vec![];
-    // healthy_inputs()'s default install_state is already
-    // AliveButUnresponsive with a fresh heartbeat.
-    let report = assess(&inputs);
-    assert_eq!(report.overall, Verdict::Degraded, "{}", report.render_human());
-    assert_eq!(report.exit_code(), EXIT_DEGRADED);
-}
+// The two negative cases for the test above — a STALE heartbeat, and a HARD
+// (non-timeout) IPC failure — moved to `health::busy`'s own suite in #8163,
+// alongside the `probe_budget_busy` logic they pin and the new load-average
+// corroboration that joined it.
 
 /// Pure classification pin for [`alive_with_fresh_heartbeat`]: both
 /// signals — a live pid AND a fresh heartbeat — are required; either

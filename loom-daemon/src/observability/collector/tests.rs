@@ -873,6 +873,11 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         // here since this fixture is not about the `codesign_identity`
         // axis.
         codesign_preflight: None,
+        // `HealthInputs` gained this field in #8163 after this fixture was
+        // added — `None` (no host-load reading) is fine here since this
+        // fixture's IPC round-trip succeeds, so the `indeterminate-busy`
+        // corroboration this field feeds never comes into play.
+        load_per_core: None,
     }
 }
 
