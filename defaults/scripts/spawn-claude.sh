@@ -1046,6 +1046,15 @@ if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; th
     # shellcheck disable=SC2206,SC2207
     _select_args+=($(loom_daemon_model_select_flag "$_daemon_bin" "$_resolved_model"))
 
+    # Prompt-cache affinity key (issue #8146): the account that last ran this
+    # (repo, role) is the one holding a warm prompt cache for it — a 65% full
+    # prefix-hit rate on same-account ticks vs 1.4% on cross-account ones.
+    # No shell-side passing needed — `tokens select`'s `--role` arg reads
+    # `LOOM_ROLE` straight from the environment (clap `env =`), which is
+    # already present here, so an older daemon binary that predates the
+    # field simply never reads it. No role set, or affinity unconfigured,
+    # selects exactly as before.
+
     # Capture stdout (shell-evalable export lines) and stderr (errors /
     # advisories, e.g. a firing "[auto-unpin] ..." line) separately so log
     # output never contaminates what we're about to `eval`.
