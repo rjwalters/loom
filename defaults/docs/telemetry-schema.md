@@ -282,14 +282,17 @@ processed and lines changed. (A distinct type from the daemon's internal
       "cache_write_1h": 1500,
       "output": 6120
     }
-  ]
+  ],
+  "models_used": ["claude-sonnet-5"],
+  "doctor_cycles": 0
 }
 ```
 
 `config` (free-form string map), `phase_durations`, `model`, `effort`,
-`pr_number`, `tokens_in`, `tokens_out`, `lines_added`, `lines_deleted`, and
-`tokens_by_model` are omitted when empty/unset. `config` is a map — not fixed
-fields — so operator-tunable knobs can be captured without a schema bump.
+`pr_number`, `tokens_in`, `tokens_out`, `lines_added`, `lines_deleted`,
+`tokens_by_model`, `failure_class`, `models_used`, and `doctor_cycles` are
+omitted when empty/unset. `config` is a map — not fixed fields — so
+operator-tunable knobs can be captured without a schema bump.
 
 `tokens_by_model` (Issue #6384) is the same per-model breakdown documented
 under `sweep.completed` above — the same aggregation
@@ -317,6 +320,44 @@ Neither pair is added to the public (unauthenticated, private-repo) redaction
 allowlist — like `pr_number`, they are workload detail about a private repo
 and stay behind the same authenticated-only boundary (see
 `dashboard/src/redaction.ts`).
+
+#### Completeness fields (Issue #8056)
+
+Three more **independently optional** fields, added additively (no
+`schema_version` bump — none of them is a new record kind). Each answers a
+question that previously required joining the sibling `sweep-outcomes.jsonl`
+by `sweep_id`, or could not be answered at all.
+
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `failure_class` | string | The paired `sweep_outcomes::OutcomeRecord`'s own classification for the same terminal transition: `death_class` when the pre-flight classifier derived one (`preflight-token-selection-failed`, `preflight-no-cli-start`, …), otherwise `crash_classification` (`account-exhausted:model-credits-exhausted`, `no-usable-account`, …). | Copied at emit time in the same function that writes the sibling record — never a post-hoc joiner. Lets a consumer separate real build failures from sub-60s spawn deaths from this journal alone. The sibling record still carries both classifier fields separately; this is the single most canonical label, not a replacement. Omitted entirely when nothing classified the transition — including on every success. |
+| `models_used` | string array | The distinct `model` ids in `tokens_by_model`, sorted and deduped. | The top-level "did this sweep run more than one model?" signal. `model` names the **dispatched** model, so a sweep that escalated to `claude-opus-5` through the Doctor ladder still reports `model: "sonnet"`; `models_used` is what makes the escalation visible. Inherits `tokens_by_model`'s contract exactly: omitted (never `[]`) when no attributable transcript was found. |
+| `doctor_cycles` | integer | Count of Doctor phases in the sampled phase-transition history — the same history `phase_durations` is built from. | **Interim proxy.** The reaper samples the on-disk checkpoint on a ~30s tick, so a Doctor phase that opens and closes between two ticks is not counted: treat this as a lower bound until label-event sourcing lands. `0` means "the lifecycle was observed and no Doctor phase appeared"; an **absent** key means no phase history was sampled at all (a sweep that died before the first tick). |
+
+All three follow the established "unknown != zero" contract: `0` / a
+one-element array is an observation, an absent key is not. A consumer that
+coerces a missing `doctor_cycles` to `0` reports "no Doctor phase happened"
+about a sweep nobody watched.
+
+None of the three is added to the public redaction allowlist, for the same
+reason as the work-output fields above.
+
+`config.token_account` (Issue #8056) is now resolved from three sources at
+emit time rather than one: the live registry entry, then a re-parse of the
+sweep's own per-sweep log for the account-selection line `spawn-claude.sh`
+wrote (the same parser restart adoption uses), then `"unknown"`. The middle
+step is what makes the value real: the entry is absent for a sweep
+reconstructed after a daemon restart, and carries a literal `"unknown"` when
+the 5s dispatch-time capture window closed before the wrapper logged its
+selection. `"unknown"` now means genuinely unknowable — no attribution
+anywhere — not "nobody looked twice".
+
+`model` / `effort` likewise survive a daemon restart: the dispatch stamps both
+into the claim lock's `owner.json` (alongside the child pid and process
+group), and `reconstruct` restores them onto the adopted entry. A pre-#8056
+`owner.json` has neither key and still parses; a dispatch that requested no
+explicit model/effort still reports `null` — the honest "inherited the
+session default", never a fabricated value.
 
 ### `tokens.snapshot`
 
