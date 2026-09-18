@@ -1799,7 +1799,19 @@ reselect_account_no_mark() {
 
     local sel_output _sel_rc
     set +e
-    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export 2>/dev/null)"
+    # #8058: scope selection to the model class this wrapper is running, so an
+    # account bad-marked only for another class stays eligible. The helper
+    # emits nothing when LOOM_MODEL is unset or the resolved daemon binary
+    # predates `--model`, which is why the expansion is deliberately unquoted
+    # (it is either two words or none) and why a missing helper -- an older
+    # lib/locate-daemon-bin.sh mid-resync -- degrades to plain selection.
+    # The class comes from LOOM_MODEL, not from an explicit `--model` in this
+    # wrapper's own args: the daemon path sets both (spawn-claude.sh exports
+    # LOOM_MODEL and appends the flag), and on the rare path where they
+    # disagree a mismatch costs at most one extra rotation -- never a wrong
+    # mark, since marking is gated separately by loom_model_class_marker.
+    # shellcheck disable=SC2046
+    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
     _sel_rc=$?
     set -e
     if [[ ${_sel_rc} -ne 0 || -z "${sel_output}" ]]; then
@@ -1882,6 +1894,14 @@ _derive_token_name() {
 # issue #4228) rather than reimplementing lean-genius's raw file-glob.
 # Returns 0 on success (a new account is exported), 1 when the pool has no
 # eligible account left (or no loom-daemon binary resolves).
+#
+# `$2` / `$3` (optional, issue #8058) are the captured child output and its exit
+# code. They are read positionally at the mark-bad call below rather than copied
+# into locals, so this function gains no lines: `loom_model_class_marker` needs
+# them to decide whether the death was scoped to ONE model class, and if so the
+# `.bad_tokens` entry is scoped to `$LOOM_MODEL`'s class instead of blocking the
+# account outright. Omitted, or unscopable, yields the pre-#8058 account-wide
+# mark unchanged.
 rotate_exhausted_account() {
     local reason="$1"
     local ws daemon_bin
@@ -1898,8 +1918,14 @@ rotate_exhausted_account() {
     fi
 
     if [[ -n "${ACTIVE_TOKEN_NAME}" ]]; then
+        # The `[model-class:...]` suffix (#8058) rides inside the existing
+        # free-form reason field -- no new CLI flag, so this works against any
+        # daemon vintage. `$2`/`$3` are this function's optional output /
+        # exit-code arguments; see the header. A missing helper (older
+        # lib/classify-error.sh mid-resync) yields no suffix, i.e. today's
+        # account-wide mark.
         if "${daemon_bin}" tokens mark-bad "${ACTIVE_TOKEN_NAME}" \
-            --reason "exhausted: ${reason}" --workspace "${ws}" >/dev/null 2>&1; then
+            --reason "exhausted: ${reason}$(declare -F loom_model_class_marker >/dev/null 2>&1 && loom_model_class_marker "${2:-}" "${3:-1}" "${LOOM_MODEL:-}" || true)" --workspace "${ws}" >/dev/null 2>&1; then
             log_info "Marked account '${ACTIVE_TOKEN_NAME}' exhausted in .bad_tokens (${reason})"
         else
             log_warn "Could not record '${ACTIVE_TOKEN_NAME}' in .bad_tokens (continuing to re-select)"
@@ -1910,7 +1936,19 @@ rotate_exhausted_account() {
 
     local sel_output _sel_rc
     set +e
-    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export 2>/dev/null)"
+    # #8058: scope selection to the model class this wrapper is running, so an
+    # account bad-marked only for another class stays eligible. The helper
+    # emits nothing when LOOM_MODEL is unset or the resolved daemon binary
+    # predates `--model`, which is why the expansion is deliberately unquoted
+    # (it is either two words or none) and why a missing helper -- an older
+    # lib/locate-daemon-bin.sh mid-resync -- degrades to plain selection.
+    # The class comes from LOOM_MODEL, not from an explicit `--model` in this
+    # wrapper's own args: the daemon path sets both (spawn-claude.sh exports
+    # LOOM_MODEL and appends the flag), and on the rare path where they
+    # disagree a mismatch costs at most one extra rotation -- never a wrong
+    # mark, since marking is gated separately by loom_model_class_marker.
+    # shellcheck disable=SC2046
+    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
     _sel_rc=$?
     set -e
     if [[ ${_sel_rc} -ne 0 || -z "${sel_output}" ]]; then
@@ -1966,7 +2004,19 @@ rotate_auth_dead_account() {
 
     local sel_output _sel_rc
     set +e
-    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export 2>/dev/null)"
+    # #8058: scope selection to the model class this wrapper is running, so an
+    # account bad-marked only for another class stays eligible. The helper
+    # emits nothing when LOOM_MODEL is unset or the resolved daemon binary
+    # predates `--model`, which is why the expansion is deliberately unquoted
+    # (it is either two words or none) and why a missing helper -- an older
+    # lib/locate-daemon-bin.sh mid-resync -- degrades to plain selection.
+    # The class comes from LOOM_MODEL, not from an explicit `--model` in this
+    # wrapper's own args: the daemon path sets both (spawn-claude.sh exports
+    # LOOM_MODEL and appends the flag), and on the rare path where they
+    # disagree a mismatch costs at most one extra rotation -- never a wrong
+    # mark, since marking is gated separately by loom_model_class_marker.
+    # shellcheck disable=SC2046
+    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
     _sel_rc=$?
     set -e
     if [[ ${_sel_rc} -ne 0 || -z "${sel_output}" ]]; then
@@ -2684,7 +2734,7 @@ run_with_retry() {
             local _exh_phrase
             _exh_phrase="$(_exhaustion_phrase "${output}")"
             log_warn "Account exhaustion detected (${_exh_phrase}) — rotating account (attempt ${attempt}/${MAX_RETRIES} NOT consumed)"
-            if rotate_exhausted_account "${_exh_phrase}"; then
+            if rotate_exhausted_account "${_exh_phrase}" "${output}" "${exit_code}"; then
                 write_retry_state "running" "${attempt}"
                 # Retry the SAME attempt number on the fresh account.
                 continue

@@ -550,7 +550,9 @@ document.
 ## Bad-token tracking (`loom-daemon tokens mark-bad`)
 
 When a token returns `TOKEN_EXPIRED`, `TOKEN_EXHAUSTED`, or
-`MODEL_CREDITS_EXHAUSTED` (#5687 — treated exactly like `TOKEN_EXHAUSTED` here),
+`MODEL_CREDITS_EXHAUSTED` (#5687 — the same rotation and the same cooldown, but
+since #8058 a **model-class-scoped** entry rather than an account-wide one; see
+[Model-class-scoped entries](#model-class-scoped-entries-8058) below),
 callers append an entry
 to `.loom/tokens/.bad_tokens` via `loom-daemon tokens mark-bad <name> --reason
 <text>` (native Rust, `loom-daemon/src/tokens_pool/bad_tokens.rs`, exposed as a
@@ -569,6 +571,70 @@ long it survives on disk (24h / 30d) are two different clocks — see
 [Permanence: auth vs exhaustion](#permanence-auth-vs-exhaustion-at-read-time-and-on-disk)
 below.
 
+### Model-class-scoped entries (#8058)
+
+Anthropic's subscription limits are not model-blind: a Max plan carries a
+per-model-class ceiling alongside the all-models weekly limit. Before #8058 an
+Opus ceiling bad-marked the **whole account**, so a fleet running Opus and
+Sonnet arms against one shared pool had the Opus arm starve the Sonnet arm out
+of accounts it could still have used.
+
+An exhaustion that is *provably* scoped to one model class now records that
+class in the entry:
+
+```text
+2026-09-17T04:05:06Z agent-1 exhausted: out of usage credits [model-class:opus]
+```
+
+**The line format is unchanged.** The marker rides inside the existing
+free-form reason field, so the `<ISO8601> <name> <reason words...>` shape every
+reader already parses is untouched, and a reader that knows nothing about
+classes sees an ordinary reason string.
+
+The rule, in both directions:
+
+| Entry | `tokens select` (no `--model`) | `tokens select --model <opus>` | `--model <sonnet>` |
+|---|---|---|---|
+| class-less (every pre-#8058 line, every weekly/plan limit, every auth line) | blocks | blocks | blocks |
+| `[model-class:opus]` | blocks | blocks | **does not block** |
+
+So a class-scoped mark is **strictly narrower** than an account-wide one and
+never wider. `bad_tokens::is_bad` / `blocking_entry` keep their account-wide
+meaning verbatim — callers outside the pool (`sweep_registry::quarantine`,
+`sweep_registry::crash_signals`) ask "is this account unusable at all", and
+narrowing them would readmit genuinely dead accounts. The class-aware question
+is a separate sibling read, `is_bad_for_class` / `blocking_entry_for_class`.
+
+Each class-scoped mark is its own line with its own timestamp, so it ages out
+on its own schedule (the ordinary 6h exhaustion TTL) independently of any
+account-wide line for the same account. Auth reasons always win: a revoked
+credential blocks every class whatever marker the line carries.
+
+**Who writes a class-scoped mark.** Only `claude-wrapper.sh`'s rotation path,
+and only when the death is provably per-class — a `MODEL_CREDITS_EXHAUSTED`
+classification (definitionally per-tier) or a #4501 per-model ceiling
+("reached your `<model>` limit") whose named words are not an account-wide
+qualifier (`weekly`/`monthly`/`session`/`plan`/…). The class itself comes from
+the **resolved model in flight** (`$LOOM_MODEL`, or an explicit `--model` arg
+that beat it), mapped through `script_helpers::model_tiers::task_alias_of` —
+the same classifier the sweep orchestrator's cost ladder uses. Anything
+ambiguous, any unrecognized model, and the daemon-side reaper
+(`sweep_registry::quarantine`, which has no model in hand) all write the
+ordinary account-wide entry. Widening is the fail-safe direction.
+
+**Who reads it.** `spawn-claude.sh` and `claude-wrapper.sh` pass the resolved
+model to `loom-daemon tokens select --model <alias|id>`, each behind the same
+`tokens select --help | grep -q -- '--model'` capability probe the `--auto-unpin`
+flag already uses, so a daemon binary mid-roll degrades to account-wide
+selection instead of hard-failing on an unknown argument. An unrecognized
+`--model` value is likewise not an error: it warns on stderr and falls back to
+class-less selection. Selection must never fail closed on a model name the
+classifier does not know.
+
+Scope note: `.ranking`-sourced exclusions (`exhausted`/`blocked` statuses) stay
+account-wide, because `.ranking` carries no per-class state yet — that, and the
+per-class `health`/`status` counts, are #8058's Phases 2-3.
+
 ## Error classification (`.loom/scripts/lib/classify-error.sh`)
 
 The `classify_error <output> <exit_code>` function returns one of `SUCCESS`,
@@ -580,13 +646,17 @@ matching — clean exits (`exit_code == 0`) always return `SUCCESS` regardless o
 stdout content.
 
 `MODEL_CREDITS_EXHAUSTED` (#5687, "You're out of usage credits") is a
-per-model-**tier** credit exhaustion, not an account death. **Every pool
-mechanism treats it exactly like `TOKEN_EXHAUSTED`** — same rotation, same
-`.bad_tokens` entry, same cooldown, same retryability — because the pool tracks
-account health, not per-model account state. The distinct name exists for the
-in-session `/loom:sweep` orchestrator, which has no pool to rotate through and
-instead re-dispatches one model rung down (`sweep.md` → "Credit-exhaustion
-fallback").
+per-model-**tier** credit exhaustion, not an account death. The Claude pool
+treats it like `TOKEN_EXHAUSTED` in every respect but one: same rotation, same
+cooldown, same retryability, but since #8058 the `.bad_tokens` entry it writes
+is **scoped to the model class that was in flight** rather than blocking the
+whole account (see
+[Model-class-scoped entries](#model-class-scoped-entries-8058)). The distinct
+name also still matters for the in-session `/loom:sweep` orchestrator, which
+has no pool to rotate through and instead re-dispatches one model rung down
+(`sweep.md` → "Credit-exhaustion fallback"). On the **Codex/other-provider**
+health surface (`tokens_pool/health.rs`) the two categories remain fused —
+splitting those is #8058 Phase 2.
 
 A **monthly spend-limit kill** ("You've hit your monthly spend limit", issue
 #5631/#6518) classifies as plain `TOKEN_EXHAUSTED` — it is not, and does not

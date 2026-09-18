@@ -1804,6 +1804,16 @@ enum TokensAction {
         /// firing auto-unpin logs an `[auto-unpin] ...` advisory to stderr.
         #[arg(long)]
         auto_unpin: bool,
+
+        /// Model alias or pinned ID the spawn will actually run (issue #8058)
+        /// — typically `$LOOM_MODEL`. Accounts bad-marked *only* for a
+        /// different model class (an Opus ceiling, say) stay eligible; every
+        /// class-less `.bad_tokens` entry still blocks, exactly as without
+        /// this flag. An unrecognized value is NOT an error: it degrades to
+        /// class-less selection, because selection must never fail closed on
+        /// a model name the classifier does not know.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
     },
 
     /// Materialize `.loom/tokens/` from `ACCOUNT_*_N` triples, merging by email
@@ -2031,6 +2041,14 @@ enum TokensAction {
         workspace: String,
 
         /// Emit a JSON status instead of a human message.
+        ///
+        /// To scope a mark to one model class (issue #8058), append the
+        /// `[model-class:<model>]` marker to `--reason` — see
+        /// `defaults/docs/token-pool.md` § "Model-class-scoped entries". There
+        /// is deliberately no separate flag: the marker travels inside the
+        /// existing free-form reason field, so a caller can write one against
+        /// any daemon vintage (an older binary stores it verbatim, and a
+        /// reader that does not understand it keeps blocking account-wide).
         #[arg(long)]
         json: bool,
     },

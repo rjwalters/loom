@@ -895,14 +895,21 @@ for _arg in ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}; do
     esac
 done
 
+# The model this spawn will actually run, after the precedence above — reused
+# by token selection below (`tokens select --model`, issue #8058) so the pool
+# can skip accounts bad-marked for THIS model class only. Empty means "session
+# default": nothing is passed, and selection stays account-wide.
+_resolved_model=""
 if [[ "$_has_model_arg" == "true" ]]; then
     if [[ -n "${LOOM_MODEL:-}" ]]; then
         log_info "spawn-claude: explicit --model in args wins over LOOM_MODEL='$LOOM_MODEL'"
     fi
     log_info "spawn-claude: model=${_explicit_model:-default} (from --model arg)"
+    _resolved_model="$_explicit_model"
 elif [[ -n "${LOOM_MODEL:-}" ]]; then
     PASSTHROUGH_ARGS+=(--model "$LOOM_MODEL")
     log_info "spawn-claude: model=$LOOM_MODEL (from LOOM_MODEL)"
+    _resolved_model="$LOOM_MODEL"
 else
     log_info "spawn-claude: model=default"
 fi
@@ -1025,6 +1032,19 @@ if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; th
     if "$_daemon_bin" tokens select --help 2>&1 | grep -q -- '--auto-unpin'; then
         _select_args+=(--auto-unpin)
     fi
+    # Per-model-class selection (issue #8058): an account that hit its Opus
+    # ceiling is still fully usable for Sonnet work, so tell the selector which
+    # class this spawn will actually run and let it skip only the accounts
+    # bad-marked for THAT class. `loom_daemon_model_select_flag` applies the
+    # same capability probe as --auto-unpin above, for the same reason: a daemon
+    # binary mid-roll that predates `--model` must degrade to account-wide
+    # selection, not hard-fail on an unknown argument. With no resolved model
+    # (session default) it emits nothing and behaviour is byte-identical to
+    # pre-#8058.
+    # Deliberate word splitting: the helper emits either the two words
+    # `--model <value>` or nothing at all.
+    # shellcheck disable=SC2206,SC2207
+    _select_args+=($(loom_daemon_model_select_flag "$_daemon_bin" "$_resolved_model"))
 
     # Capture stdout (shell-evalable export lines) and stderr (errors /
     # advisories, e.g. a firing "[auto-unpin] ..." line) separately so log

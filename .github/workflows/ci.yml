@@ -996,6 +996,12 @@ jobs:
       # fail loudly rather than the suite reporting green on nothing.
       - name: claude-wrapper retry classifiers (#8032, #8037)
         run: bash defaults/scripts/tests/test-claude-wrapper-retry.sh
+      # Split out of the suite above (#8058), same operational need — it
+      # drives spawn-claude.sh / claude-wrapper.sh against a real
+      # `loom-daemon tokens select|mark-bad`, so it needs the binary this job
+      # builds. Wired alongside its parent rather than left excluded.
+      - name: token model-class selection (#8058)
+        run: bash defaults/scripts/tests/test-token-model-class.sh
 
   installer-tests:
     name: Installer Integration Tests
