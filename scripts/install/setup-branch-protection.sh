@@ -10,11 +10,24 @@
 #   LOOM_NON_INTERACTIVE=true  Skip prompts; on overlap conflict, default to
 #                              "skip" (preserves existing protection, avoids
 #                              creating duplicate rulesets — issue #3216).
+#   LOOM_DRY_RUN=true          Print the exact ruleset payload that WOULD be
+#                              applied and exit without any API call (#8103).
+#   LOOM_REQUIRED_STATUS_CHECKS
+#                              Comma- or newline-separated check-run names to
+#                              require. Overrides the target repo's
+#                              .loom/config.json -> branchProtection
+#                              .requiredStatusChecks (#8103).
+#   LOOM_REQUIRED_STATUS_CHECKS_STRICT=true
+#                              Also require branches to be up to date before
+#                              merging. Overrides branchProtection
+#                              .strictRequiredStatusChecks; default false —
+#                              see the rationale at the rule itself.
 #
 # For GitHub, creates or updates a ruleset with recommended rules:
 #   - Prevent branch deletion and force pushes
 #   - Require linear history (squash merges only)
 #   - Require pull requests (0 approvals for solo dev/Loom workflows)
+#   - Require status checks, when the target repo names any (#8103)
 #
 # For Gitea, creates or updates branch protection with equivalent settings:
 #   - Prevent force pushes
@@ -132,6 +145,61 @@ setup_github_branch_protection() {
     ]
   }'
 
+  # --- Required status checks (#8103) ---------------------------------------
+  #
+  # Until #8103 this payload had no `required_status_checks` rule, so on every
+  # repo it configured, CI was purely advisory: a red check could not block a
+  # merge, and no rule could force a stale branch to re-run against the current
+  # base before landing. The incident that made this concrete is rjwalters/loom
+  # #8095 — a PR's only CI run measured a tree that `main` had since moved off,
+  # the squash-merge tree was never measured by anything, and the first signal
+  # was `main` going red after the fact.
+  #
+  # The contexts are NOT hardcoded here, because this script installs into any
+  # repository and a required check that never reports blocks every merge in
+  # that repo indefinitely. They come from the TARGET repo, in precedence order:
+  #
+  #   1. $LOOM_REQUIRED_STATUS_CHECKS — comma- or newline-separated context
+  #      names (matches the env > config > default precedence Loom uses
+  #      elsewhere).
+  #   2. `.loom/config.json` -> `.branchProtection.requiredStatusChecks`, a JSON
+  #      array of context names.
+  #   3. Neither present -> no rule is emitted and behavior is exactly as before.
+  #
+  # A "context" is the check-run NAME GitHub posts to the Checks tab (a job's
+  # `name:`, with the matrix values substituted), not the workflow job id.
+  #
+  # Only name checks that ALWAYS run. A path-filtered job (`needs: changes` and
+  # friends) that is skipped never reports a conclusion, and a required check
+  # with no conclusion blocks the merge forever.
+  #
+  # `strict_required_status_checks_policy` is GitHub's "require branches to be
+  # up to date before merging". It defaults to FALSE here and is opt-in via
+  # `.branchProtection.strictRequiredStatusChecks` /
+  # $LOOM_REQUIRED_STATUS_CHECKS_STRICT. Reasoning: strict forces a
+  # rebase-and-full-re-run immediately before every merge, so its cost scales
+  # with merge rate. On a repo merging ~3.3 PRs/hour with CI runs longer than
+  # the gap between merges (loom's own measured rate, `ci.yml`'s concurrency
+  # comment), every merge would invalidate the branch its successors just
+  # re-ran, and the queue serializes behind CI wall-clock. Non-strict still
+  # blocks the case that actually motivates this — a PR landing with its OWN
+  # required check red — which is the larger and cheaper half. Repos that merge
+  # rarely, or whose ratchets compare absolute numbers against a moving base,
+  # should turn it on deliberately.
+  local rsc_contexts rsc_strict
+  rsc_contexts="${LOOM_REQUIRED_STATUS_CHECKS:-$(jq -r '(.branchProtection.requiredStatusChecks // []) | join(",")' .loom/config.json 2>/dev/null || true)}"
+  rsc_strict="${LOOM_REQUIRED_STATUS_CHECKS_STRICT:-$(jq -r '(.branchProtection.strictRequiredStatusChecks // false) | tostring' .loom/config.json 2>/dev/null || true)}"
+  [[ "$rsc_strict" == "true" ]] || rsc_strict=false
+  if [[ -n "${rsc_contexts//[[:space:],]/}" ]]; then
+    ruleset_payload="$(printf '%s' "$ruleset_payload" | jq --arg c "$rsc_contexts" --argjson s "$rsc_strict" '.rules += [{"type": "required_status_checks", "parameters": {"strict_required_status_checks_policy": $s, "do_not_enforce_on_create": false, "required_status_checks": ($c | [splits("[,\n]+")] | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | map({"context": .}))}}]')"
+  fi
+
+  # Preview the exact payload without touching the repository. This is the
+  # supported way to review a ruleset change before applying it to a live repo:
+  # it makes no API call at all, so it is also how the test suite asserts the
+  # payload's shape.
+  if [[ "${LOOM_DRY_RUN:-false}" == "true" ]]; then printf '%s\n' "$ruleset_payload" | jq .; return 0; fi
+
   # Detect cross-name overlapping rulesets BEFORE the same-name update path,
   # so we don't silently POST a second ruleset overlapping a differently-named
   # pre-existing one. See issue #3216 for the bug this fixes.
@@ -228,6 +296,7 @@ setup_github_branch_protection() {
     echo "  - Require linear history (squash merges only)"
     echo "  - Require pull requests (0 approvals required)"
     echo "  - Dismiss stale reviews on new commits"
+    [[ -n "${rsc_contexts//[[:space:],]/}" ]] && echo "  - Required status checks (up-to-date branch required: ${rsc_strict}): ${rsc_contexts}"
     echo "  - Admin bypass: repository admins can push directly without a PR"
     echo ""
     echo "Note: 0 approvals required supports solo development and Loom's label-based review system."

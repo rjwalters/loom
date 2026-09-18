@@ -76,37 +76,66 @@ FORGE_TYPE="github"
 STUB_DIR=$(mktemp -d)
 trap 'rm -rf "$STUB_DIR"' EXIT
 
-# Stub gh that recognizes the GraphQL query for required status check contexts.
-# We inspect $* for the GraphQL ref argument shape and pick the response from
-# canned files keyed by `ref=refs/heads/<branch>`.
+# Stub gh that recognizes BOTH sources the GitHub path queries (#8103):
+#   - the Rulesets effective-rules REST endpoint, and
+#   - the classic branch-protection GraphQL query,
+# picking each response from canned files keyed by branch name.
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 # Stub gh used by test-merge-pr-unstable-fallback.sh.
 #
 # Recognizes:
-#   gh api graphql -f query=... -F owner=... -F name=... -F ref=refs/heads/<b>
-#                  --jq '.data.repository.ref.branchProtectionRule.requiredStatusCheckContexts // [] | .[]'
 #
-# It pulls the branch from the ref=... arg and looks up a canned response in
-# $STUB_DIR/required-checks-<branch>.txt (one context per line). If the file
-# doesn't exist, emits nothing (simulates absent branchProtectionRule).
+#   1. Rulesets (#8103):
+#        gh api repos/<owner>/<repo>/rules/branches/<b> --jq '<filter>'
+#      Canned body: $STUB_DIR/ruleset-rules-<branch>.json — a VERBATIM-SHAPED
+#      GitHub effective-rules response. The stub runs the REAL `--jq` filter the
+#      helper passed against it, so the fixture exercises the helper's own
+#      parsing of the documented API shape rather than a pre-digested answer.
+#      A `$STUB_DIR/ruleset-fail-<branch>` marker makes the call exit nonzero
+#      (network failure / 403), to test the fail-closed and partial-failure
+#      paths. No canned file at all = a 200 with an empty rules array.
+#
+#   2. Classic branch protection:
+#        gh api graphql -f query=... -F owner=... -F name=... -F ref=refs/heads/<b>
+#                       --jq '.data.repository.ref.branchProtectionRule.requiredStatusCheckContexts // [] | .[]'
+#      Canned response: $STUB_DIR/required-checks-<branch>.txt (one context per
+#      line, post-jq). Missing file = absent branchProtectionRule (empty).
+#      A `$STUB_DIR/graphql-fail-<branch>` marker makes the call exit nonzero.
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:-}"
 if [[ -z "$STUB_DIR_FROM_ENV" ]]; then
   echo "stub gh: LOOM_TEST_STUB_DIR not set" >&2
   exit 2
 fi
 
-# Find the ref=... arg
+# Find the ref=... arg (GraphQL), the rules-endpoint path (REST), and the --jq
+# filter (used verbatim for the REST fixture).
 ref=""
+rules_branch=""
+jq_filter=""
+prev=""
 for a in "$@"; do
   case "$a" in
     ref=refs/heads/*) ref="${a#ref=refs/heads/}" ;;
+    repos/*/rules/branches/*) rules_branch="${a##*/rules/branches/}" ;;
   esac
+  [[ "$prev" == "--jq" ]] && jq_filter="$a"
+  prev="$a"
 done
+
+if [[ -n "$rules_branch" ]]; then
+  [[ -f "$STUB_DIR_FROM_ENV/ruleset-fail-$rules_branch" ]] && exit 1
+  canned="$STUB_DIR_FROM_ENV/ruleset-rules-$rules_branch.json"
+  [[ -f "$canned" ]] || exit 0
+  jq -r "$jq_filter" "$canned"
+  exit 0
+fi
 
 if [[ -z "$ref" ]]; then
   exit 0
 fi
+
+[[ -f "$STUB_DIR_FROM_ENV/graphql-fail-$ref" ]] && exit 1
 
 # Canned response file lookup
 canned="$STUB_DIR_FROM_ENV/required-checks-$ref.txt"
@@ -140,6 +169,114 @@ assert_eq "" "$result" "GitHub: empty requiredStatusCheckContexts yields empty o
 echo "Code Ownership" > "$STUB_DIR/required-checks-single.txt"
 result=$(forge_get_required_status_check_contexts "owner/repo" "single" "$STUB_DIR/gh" | tr '\n' '|' | sed 's/|$//')
 assert_eq "Code Ownership" "$result" "GitHub: single required context returned correctly"
+
+# --- Ruleset-sourced required checks (#8103) ---
+#
+# GitHub has TWO backing systems for branch protection and the classic
+# GraphQL `branchProtectionRule` field reports ONLY the legacy one. Verified
+# live on rjwalters/loom (2026-09-17): `main` is governed by an ACTIVE
+# ruleset, and the GraphQL query still returns `branchProtectionRule: null`
+# while `GET /repos/{owner}/{repo}/rules/branches/main` returns every rule.
+# Before this fix the helper queried GraphQL only, so on a ruleset-governed
+# repo it reported "no required checks" no matter what the ruleset said —
+# which would have let merge-pr.sh's #3720 fallback merge straight over a
+# failing required check, silently.
+#
+# The fixtures below are shaped exactly like real effective-rules responses
+# (including the non-`required_status_checks` rules that accompany them) and
+# the stub applies the helper's real `--jq` filter to them.
+echo ""
+echo "Testing forge_get_required_status_check_contexts (ruleset source, #8103)..."
+
+# Subtest 1.5: ruleset-only required checks, no classic protection at all —
+# this is rjwalters/loom's exact configuration.
+cat > "$STUB_DIR/ruleset-rules-ruleset-only.json" <<'EOF'
+[
+  {"type": "deletion", "ruleset_source_type": "Repository", "ruleset_id": 8809610},
+  {"type": "non_fast_forward", "ruleset_source_type": "Repository", "ruleset_id": 8809610},
+  {"type": "required_linear_history", "ruleset_source_type": "Repository", "ruleset_id": 8809610},
+  {"type": "pull_request",
+   "parameters": {"required_approving_review_count": 0, "allowed_merge_methods": ["squash"]},
+   "ruleset_source_type": "Repository", "ruleset_id": 8809610},
+  {"type": "required_status_checks",
+   "parameters": {
+     "strict_required_status_checks_policy": false,
+     "do_not_enforce_on_create": false,
+     "required_status_checks": [
+       {"context": "Role Prompt Prefix Ratchet", "integration_id": 15368},
+       {"context": "CLAUDE.md Line Budget", "integration_id": 15368}
+     ]},
+   "ruleset_source_type": "Repository", "ruleset_id": 8809610}
+]
+EOF
+result=$(forge_get_required_status_check_contexts "owner/repo" "ruleset-only" "$STUB_DIR/gh" | tr '\n' '|' | sed 's/|$//')
+assert_eq "Role Prompt Prefix Ratchet|CLAUDE.md Line Budget" "$result" \
+  "#8103: ruleset-sourced required checks are detected with NO classic branch protection"
+
+# Subtest 1.6: an active ruleset carrying no required_status_checks rule (the
+# pre-#8103 state of rjwalters/loom) still means "no required checks".
+cat > "$STUB_DIR/ruleset-rules-ruleset-no-checks.json" <<'EOF'
+[
+  {"type": "deletion", "ruleset_source_type": "Repository", "ruleset_id": 8809610},
+  {"type": "required_linear_history", "ruleset_source_type": "Repository", "ruleset_id": 8809610}
+]
+EOF
+result=$(forge_get_required_status_check_contexts "owner/repo" "ruleset-no-checks" "$STUB_DIR/gh" | tr '\n' '|' | sed 's/|$//')
+assert_eq "" "$result" "#8103: ruleset without a required_status_checks rule yields empty output"
+
+# Subtest 1.7: both sources configured — union, de-duplicated, each name once
+# (the callers' comm set-difference needs unique names).
+cat > "$STUB_DIR/ruleset-rules-both.json" <<'EOF'
+[
+  {"type": "required_status_checks",
+   "parameters": {
+     "strict_required_status_checks_policy": true,
+     "required_status_checks": [
+       {"context": "Shared Check"},
+       {"context": "Ruleset Only Check"}
+     ]}}
+]
+EOF
+cat > "$STUB_DIR/required-checks-both.txt" <<'EOF'
+Shared Check
+Classic Only Check
+EOF
+result=$(forge_get_required_status_check_contexts "owner/repo" "both" "$STUB_DIR/gh" | tr '\n' '|' | sed 's/|$//')
+assert_eq "Shared Check|Ruleset Only Check|Classic Only Check" "$result" \
+  "#8103: ruleset + classic contexts are unioned and de-duplicated"
+
+# Subtest 1.8: partial lookup failure — the rules endpoint errors but classic
+# protection answers. One system erroring is not evidence the other's rules do
+# not exist, so the surviving source's answer is reported (exit 0).
+: > "$STUB_DIR/ruleset-fail-partial"
+cat > "$STUB_DIR/required-checks-partial.txt" <<'EOF'
+Classic Survivor
+EOF
+rc=0
+result=$(forge_get_required_status_check_contexts "owner/repo" "partial" "$STUB_DIR/gh" | tr '\n' '|' | sed 's/|$//') || rc=$?
+assert_eq "0" "$rc" "#8103: one failing source does not fail the lookup"
+assert_eq "Classic Survivor" "$result" "#8103: partial failure still reports the surviving source's contexts"
+
+# Subtest 1.9: BOTH sources error -> fail closed (nonzero exit, empty stdout),
+# matching the Gitea path and the callers' documented fail-closed contract.
+: > "$STUB_DIR/ruleset-fail-dead"
+: > "$STUB_DIR/graphql-fail-dead"
+rc=0
+result=$(forge_get_required_status_check_contexts "owner/repo" "dead" "$STUB_DIR/gh" 2>/dev/null | tr '\n' '|' | sed 's/|$//') || rc=$?
+assert_eq "1" "$rc" "#8103: both sources failing -> nonzero exit (fail closed)"
+assert_eq "" "$result" "#8103: both sources failing -> empty stdout"
+
+# Subtest 1.10: the helper must actually QUERY the rulesets endpoint. A
+# refactor that drops the REST call and goes back to GraphQL-only would pass
+# every assertion above except this one (the fixtures would simply go unread),
+# so anchor on the call itself.
+if grep -q 'rules/branches/' "$HELPERS_DIR/lib/forge-helpers.sh"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: #8103: forge-helpers queries the Rulesets effective-rules endpoint"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: #8103: forge-helpers no longer queries /rules/branches/ (ruleset-based required checks would be invisible)"
+fi
 
 # --- Test the set-difference policy ---
 # These replicate the comm/sort/diff logic used inside merge-pr.sh so that the
