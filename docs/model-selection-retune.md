@@ -86,6 +86,39 @@ strategy that merges materially less often is not a win. If either condition fai
 This inequality is per role. Demonstrating it for Builder says nothing about any
 other role; each candidate is evaluated independently.
 
+### The list-price ratio the inequality is evaluated against is 2.5x, not 5x (#8060)
+
+`cost_sonnet_attempt` and `cost_opus_attempt` are produced by the daemon's rate
+card (`loom-daemon/src/activity/resource_usage.rs`), so the **ratio** between the
+two arms is a property of that table, not of the sample. Until #8060 the table
+was generation-stale and the ratio it produced was wrong:
+
+| | Opus (per 1k) | Sonnet (per 1k) | `cost_opus_attempt / cost_sonnet_attempt` |
+|---|---|---|---|
+| Pre-#8060 table | 0.015 in / 0.075 out *(retired Opus 4.1/4)* | 0.003 / 0.015 *(Sonnet 4.6)* | **5x** |
+| Post-#8060 table | 0.005 / 0.025 *(Opus 5)* | 0.002 / 0.010 *(Sonnet 5)* | **2.5x** |
+
+**2.5x is exact, not an average over a token mix**: Opus 5 is 2.5x Sonnet 5 on
+each of the four token classes independently — base input (0.005 / 0.002), output
+(0.025 / 0.010), 5m cache write (0.00625 / 0.0025), cache hit (0.0005 / 0.0002) —
+because every cache rate is derived from that row's own base input by a shared
+multiplier. The ratio therefore holds whatever a sweep's in/out/cache mix is.
+
+**This tightens condition (1).** Rewriting (1) in units of one Sonnet attempt,
+with `k = cost_opus_attempt / cost_sonnet_attempt` and
+`d = cost_doctor_cycle(escalated) / cost_sonnet_attempt`:
+
+```
+P(judge_reject | sonnet) · d  <  k − 1
+```
+
+The error budget for Sonnet's rejections is `k − 1`, which the correction cuts
+from **4** Sonnet-attempts' worth to **1.5** — a 62.5% reduction. A sonnet-first
+strategy that cleared (1) on pre-#8060 numbers can fail it on real prices, so
+**do not carry a pre-#8060 cost verdict forward**; re-derive it. Condition (2)
+is unaffected — it contains no cost term. This corrects the *scale factor* only:
+the gate still needs a measured sample per Section 3 before any default moves.
+
 ---
 
 ## 3. The gating procedure (how to collect the data)
@@ -401,6 +434,42 @@ here changes a default** unless it also cites a qualifying sample per Section 3.
   **Decision:** `defaults/roles/builder.json` `suggestedModel` remains `opus` (the
   alias, now resolving to Opus 5). No default flipped. Arm B and
   `DEFAULT_DISPATCH_MODEL` (`sonnet`) are unchanged — Sonnet remains the workhorse.
+
+- **2026-09-18 (#8060) — the rate card was wrong; every pre-#8060 `cost$` figure
+  is unusable, and the Opus:Sonnet ratio is 2.5x, not 5x.** `ModelPricing::for_model`
+  keyed its rates by *family stem*, which froze one generation's prices per family
+  and applied them to every other: `claude-opus-*` billed at the **retired** Opus
+  4.1/4 rate (3x over), `claude-haiku-*` at the Haiku 3 rate (4x under), and
+  `claude-fable-*` at the Opus rate (2x under its own published $10/$50). #8060
+  re-keys the card by generation and derives every cache rate from that row's own
+  base input; rates re-verified against the live vendor page on 2026-09-18,
+  unchanged from the 2026-09-17 card. §2 now carries the re-derivation.
+
+  **Consequence for the gate — a second, independent non-comparability cutoff.**
+  The 2026-07-27 entry established a *collection-date* cutoff because Arm A
+  changed model. This one is different in kind: the models did not change, the
+  **prices attributed to them** did. Any `cost$` / `$/issue` column harvested
+  before #8060 merged — `agent-metrics.sh costs --by-model`,
+  `sweep-experiment.sh harvest`, the §3 runbook's accrual log — was computed on
+  the stale card and must **not** be pooled with or compared against post-#8060
+  output. Re-harvest from the activity DB rather than reusing a saved table: raw
+  token counts are unaffected, so a re-run reprices the same sample correctly
+  and nothing has to be re-accrued.
+
+  **Related caveat, not fixed here.** The same vendor page records that Claude 4.7
+  and later use a newer tokenizer producing ~30% more tokens for the same text,
+  so a *cross-generation* $/task comparison on raw token counts is not
+  apples-to-apples. Harmless for the §2 Arm A vs Arm B comparison as currently
+  run (Opus 5 and Sonnet 5 are both post-4.7); it does bear on pooling any
+  pre-4.7 sample. Tracked with the cost-telemetry work (#8052 / #8055 / #8057).
+
+  **Representative sample?** No — this entry corrects the price constants and
+  cites no measured sample. The §2 inequality stays unevaluable.
+
+  **Decision:** `defaults/roles/builder.json` `suggestedModel` remains `opus`. No
+  default changed. The correction makes the cheap-first case *weaker*, not
+  stronger: the error budget in condition (1) shrinks from 4 to 1.5 Sonnet
+  attempts.
 
 ---
 

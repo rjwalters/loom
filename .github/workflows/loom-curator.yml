@@ -16,6 +16,7 @@ name: Loom Curator
 # This is Phase 2a of the shepherd/daemon deprecation epic (#3372 / #3375).
 
 on:
+  # Not dead code: this commented block IS the fork opt-in the header describes (#8060).
   # schedule:
   #   # Uncomment and set CLAUDE_API_KEY secret to enable.
   #   - cron: "*/5 * * * *"

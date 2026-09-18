@@ -615,8 +615,9 @@ jobs:
   stale-model-pins:
     name: Stale Model Pin Check
     # Cheap structural check; always runs, and deliberately NOT path-filtered:
-    # the thing it guards is a workflow file, so a filter keyed on anything
-    # else would skip it on exactly the PR that reintroduces a pin.
+    # the things it guards are workflow files and dispatching scripts, so a
+    # filter keyed on anything else would skip it on exactly the PR that
+    # reintroduces a pin.
     #
     # #8060: the five `loom-*.yml` role workflows pinned `--model
     # claude-opus-4-8` / `--model claude-sonnet-4-6` and sat two generations
@@ -624,58 +625,113 @@ jobs:
     # relied on a human bumping and nobody did. They now pass bare aliases,
     # which the CLI resolves at dispatch. This keeps a pin from creeping back.
     #
-    # SCOPE IS THE POINT: `.github/workflows/` only, and only a `--model`
-    # argument. The tree-wide grep the issue originally proposed matches 29
-    # files on main — test fixtures, doc-comment examples, CHANGELOG history —
-    # and would red-flag `tokens_pool/check.rs`'s `claude-haiku-4-5-20251001`,
-    # the one model ID in the repo that is genuinely current. A gate that is
-    # red on day one for 28 legitimate reasons gets disabled, not obeyed.
+    # SCOPE IS THE POINT: the two surfaces that actually dispatch a model —
+    # `.github/workflows/*.yml` and the top-level `defaults/scripts/*.sh` — and
+    # only a `--model` argument on a non-comment line. The tree-wide grep the
+    # issue originally proposed matches 29 files on main — test fixtures,
+    # doc-comment examples, CHANGELOG history — and would red-flag
+    # `tokens_pool/check.rs`'s `claude-haiku-4-5-20251001`, the one model ID in
+    # the repo that is genuinely current. A gate that is red on day one for 28
+    # legitimate reasons gets disabled, not obeyed.
     #
-    # Known over-match, accepted: the pattern would also fire on a HYPOTHETICAL
-    # `--model claude-haiku-4-5`, which is current. No workflow pins Haiku, and
-    # the fix if one ever wants to is the same as everywhere else — pass the
-    # `haiku` alias.
+    # Deliberately NOT scanned, and each exclusion is load-bearing:
+    #   ci.yml                    carries the pattern and a known-stale fixture
+    #                             as DATA for the self-test below; it dispatches
+    #                             no role model of its own.
+    #   defaults/scripts/tests/   `test-spawn-claude.sh` and
+    #                             `test-sweep-checkpoint.sh` pass
+    #                             `--model claude-opus-4-8` to a STUB binary on
+    #                             purpose — the pinned ID is the fixture. A
+    #                             pathname-aware `:(glob)` pathspec keeps `*`
+    #                             from crossing the `/`, which a bare
+    #                             `defaults/scripts/*.sh` pathspec would do.
+    #   comment lines             `resolve-model.sh:18,31` and
+    #                             `sweep-checkpoint.sh:41,166` name a pinned ID
+    #                             in prose explaining what a pinned ID is. Prose
+    #                             is not a dispatch.
+    #   everything outside the    Rust, TS, docs, CHANGELOG/WORK_LOG. In
+    #   two globs                 particular `tokens_pool/check.rs`'s probe model
+    #                             and `scripts/test-migrate-consumer.sh`'s
+    #                             migration fixture are both out of scope by
+    #                             construction, not by an allow-list that can
+    #                             drift out of date.
+    #
+    # The pattern is generation-aware rather than "any -3 or -4": Haiku 4.5 is
+    # the CURRENT Haiku, so `claude-haiku-4-5` (and the dated
+    # `claude-haiku-4-5-20251001` the token probe uses) must never be flagged,
+    # while the retired `claude-haiku-3-5` must be. Opus and Sonnet are both on
+    # generation 5, so any `-3`/`-4` pin in those families is stale.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       # Self-test first: a gate that silently stops matching reports OK forever
-      # while stale pins keep landing. Both controls run before the real scan.
+      # while stale pins keep landing. Every control runs before the real scan.
       - name: Self-test the detector
         run: |
           set -euo pipefail
-          PATTERN='--model[ =]claude-(opus|sonnet|haiku)-[34]'
-          if ! printf '%s\n' 'run: claude -p "/loom:judge" --model claude-opus-4-8 --dangerously-skip-permissions' \
-               | grep -qE -e "$PATTERN"; then
-            echo "::error::self-test failed: the detector no longer matches a known-stale pin"
-            exit 1
-          fi
-          if printf '%s\n' 'run: claude -p "/loom:judge" --model opus --dangerously-skip-permissions' \
-               | grep -qE -e "$PATTERN"; then
-            echo "::error::self-test failed: the detector matches a bare alias, which is the fixed state"
+          PATTERN='--model[ =]claude-((opus|sonnet)-[34]|haiku-3)'
+          fail=0
+          # expect <stale|ok> <line>: `stale` MUST match the detector, `ok` must not.
+          expect() {
+            want="$1"; line="$2"; got=ok
+            if printf '%s\n' "$line" | grep -qE -e "$PATTERN"; then got=stale; fi
+            if [ "$got" != "$want" ]; then
+              echo "::error::self-test failed: expected '$want', got '$got', for: $line"
+              fail=1
+            fi
+          }
+          # Positive controls — the pins this gate exists to catch.
+          expect stale 'run: claude -p "/loom:judge" --model claude-opus-4-8 --dangerously-skip-permissions'
+          expect stale 'run: claude -p "/loom:curator" --model claude-sonnet-4-6 --dangerously-skip-permissions'
+          expect stale 'claude --model=claude-opus-4-1 -p ping'
+          expect stale 'claude --model claude-haiku-3-5 -p ping'
+          # Negative controls — the fixed state, and the IDs that are CURRENT.
+          # `claude-haiku-4-5-20251001` is the token-pool probe model: current
+          # and correct, and the reason the pattern is not a bare `-[34]`.
+          expect ok 'run: claude -p "/loom:judge" --model opus --dangerously-skip-permissions'
+          expect ok 'run: claude -p "/loom:curator" --model sonnet --dangerously-skip-permissions'
+          expect ok 'claude --model claude-haiku-4-5-20251001 -p ping'
+          expect ok 'claude --model claude-opus-5 -p ping'
+          # A variable dispatch is not a pin. The single quotes are deliberate:
+          # the control needs the literal text, not an expansion.
+          # shellcheck disable=SC2016
+          expect ok 'claude --model "$RESOLVED_MODEL" -p ping'
+          [ "$fail" -eq 0 ] || exit 1
+          # The comment filter is part of the detector, so control it too: a
+          # doc-comment example must survive the pattern and be dropped by the
+          # filter, not the other way round.
+          if printf '%s\n' 'resolve-model.sh:31:#   claude --model claude-sonnet-4-6' \
+               | grep -E -e "$PATTERN" | grep -vE ':[0-9]+:[[:space:]]*#' | grep -q .; then
+            echo "::error::self-test failed: a doc-comment example survived the comment filter"
             exit 1
           fi
           echo "detector self-test OK"
-      - name: No stale pinned model ID in a dispatching workflow
+      - name: No stale pinned model ID in a dispatching workflow or script
         run: |
           set -euo pipefail
-          PATTERN='--model[ =]claude-(opus|sonnet|haiku)-[34]'
-          # Two exclusions, both about the gate not tripping over itself:
-          #   --exclude=ci.yml  this file carries the pattern and a known-stale
-          #                     fixture as DATA for the self-test above, and
-          #                     dispatches no role model of its own.
-          #   the `grep -v`     a YAML comment explaining a past pin is prose,
-          #                     not a dispatch.
-          if hits="$(grep -rnE -e "$PATTERN" --exclude=ci.yml .github/workflows/ \
+          PATTERN='--model[ =]claude-((opus|sonnet)-[34]|haiku-3)'
+          # `:(glob)` makes `*` pathname-aware so `defaults/scripts/*.sh` does
+          # NOT reach `defaults/scripts/tests/` — see the job comment above.
+          mapfile -t TARGETS < <(
+            git ls-files -- ':(glob).github/workflows/*.yml' ':(glob)defaults/scripts/*.sh' \
+              | grep -vx '.github/workflows/ci.yml'
+          )
+          if [ "${#TARGETS[@]}" -eq 0 ]; then
+            echo "::error::scan found no files to check — the pathspecs are wrong, not the tree"
+            exit 1
+          fi
+          echo "Scanning ${#TARGETS[@]} dispatching workflow/script files."
+          if hits="$(grep -HnE -e "$PATTERN" "${TARGETS[@]}" \
                      | grep -vE ':[0-9]+:[[:space:]]*#')"; then
-            echo "::error::A workflow dispatches a pinned model ID that is at least one generation stale."
-            echo "The invariant: no workflow dispatches a pinned model older than the current"
-            echo "generation. Pass a bare alias (--model sonnet / --model opus) and let the CLI"
-            echo "resolve it, as the daemon dispatch path already does (#8060)."
+            echo "::error::A workflow or script dispatches a pinned model ID that is at least one generation stale."
+            echo "The invariant: no workflow or script dispatches a pinned model older than the"
+            echo "current generation. Pass a bare alias (--model sonnet / --model opus / --model"
+            echo "haiku) and let the CLI resolve it, as the daemon dispatch path already does (#8060)."
             printf '%s\n' "$hits"
             exit 1
           fi
-          echo "No stale pinned model IDs in .github/workflows/"
+          echo "No stale pinned model IDs in .github/workflows/ or defaults/scripts/"
 
   hooks-defaults-parity:
     name: Hooks/Scripts Defaults Parity Check
