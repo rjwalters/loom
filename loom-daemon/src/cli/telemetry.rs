@@ -1,9 +1,10 @@
 //! Token-cost telemetry subcommands: what a fleet's agents actually spent.
 //!
-//! Two members today — `usage` (what the Anthropic OAuth API reports for the
-//! current credential, live) and `ingest-transcripts` (Issue #8059: persist
-//! what the local transcripts record into `activity.db`) — and one expected
-//! (#8062's report over the rows ingestion writes).
+//! Three members: `usage` (what the Anthropic OAuth API reports for the
+//! current credential, live), `ingest-transcripts` (Issue #8059: persist
+//! what the local transcripts record into `activity.db`), and `usage-report`
+//! (Issue #8062: the role/model/repo/day cost breakdown over the rows
+//! ingestion writes).
 //!
 //! They are gathered into one **flattened** enum, exactly as
 //! [`super::script_ports`] is and for the same second reason: `main.rs` is over
@@ -44,6 +45,18 @@ pub(crate) enum TelemetryCommand {
     /// Safe to re-run: an unchanged transcript is skipped, and a transcript
     /// that has grown has its rows replaced rather than appended to.
     IngestTranscripts(super::transcript_ingest_cli::IngestTranscriptsArgs),
+
+    /// Token/cost usage report, grouped by role, model, repo, or day
+    /// (Issue #8062).
+    ///
+    /// Reads only the already-ingested `resource_usage` table — the same
+    /// data `ingest-transcripts` populates — and sums each row's
+    /// already-priced `cost_usd` rather than re-deriving a second pricing
+    /// table. `loom-daemon usage-report --since 7d --by role`, not
+    /// `loom-daemon usage report`: `usage` stays a leaf command (its
+    /// `--status` flag, unchanged) so `check-usage.sh`'s contract is never at
+    /// risk of a parse ambiguity — see `usage_report_cli`'s module doc.
+    UsageReport(super::usage_report_cli::UsageReportArgs),
 }
 
 impl TelemetryCommand {
@@ -57,6 +70,7 @@ impl TelemetryCommand {
         match self {
             TelemetryCommand::Usage(args) => args.run(),
             TelemetryCommand::IngestTranscripts(args) => args.run(),
+            TelemetryCommand::UsageReport(args) => args.run(),
         }
     }
 }
