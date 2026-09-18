@@ -3172,6 +3172,15 @@ function _heredoc_mark_live_lines(lines, from, to,   j, line, n, k, c, BTC) {
 #   2. the text before that `cat` ends with a text-data flag whose value is an
 #      opening `$(`/backtick capture (`capre`) -- so cat stdout is provably
 #      confined to inert message text and can never reach a shell,
+#   2b. (#7970) IF condition 2 matched via the `NAME=` variable-assignment
+#      alternative (#7355) rather than a known text-data flag, the captured
+#      text is NOT as confined as a flag value: it can be RE-READ later in
+#      the same command via `$NAME`/`${NAME}` and fed to something that
+#      re-parses it as shell code (`eval "$NAME"`, `sh -c "$NAME"`,
+#      `"$NAME" | bash`, ...). _heredoc_var_reparsed() (below) checks for
+#      exactly that, against the TRUE original command buffer -- see its own
+#      header for why this is narrower than mask_catastrophic_var_
+#      assignment()'"'"'s blanket "$NAME appears anywhere" check.
 #   3. the opener line ENDS after the delimiter -- anything trailing it (`| bash`,
 #      `> file`) routes cat stdout elsewhere and is left visible,
 #   4. the body is expansion-free per _heredoc_body_expansion_free().
@@ -3180,7 +3189,52 @@ function _heredoc_mark_live_lines(lines, from, to,   j, line, n, k, c, BTC) {
 # heredocs are skipped here entirely -- mask_heredoc_bodies_selective() already
 # handles those (with its interpreter carve-out), and re-handling them here
 # would bypass that carve-out.
-function mask_unquoted_cat_heredoc_bodies(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, start, wordend, qc, rest, pre, before_cat, capre, MASKC, SQ, DQ, BT) {
+#
+# True when a captured variable NAME (matched via the #7355 `NAME=$(cat
+# <<EOF ... EOF)` capre alternative) is fed to something that RE-PARSES its
+# text as shell code -- `eval`, `source`/`.`, an `sh -c`/`bash -c`/...
+# wrapper, or a pipeline into a bare shell interpreter (`$NAME | bash`) --
+# on any SINGLE line of the TRUE original command buffer `orig` (never the
+# in-progress masked buffer this file'"'"'s other passes work on -- same
+# #6068-regression-avoidance rule mask_catastrophic_var_assignment()
+# documents: an earlier masking pass must never be able to hide a live
+# reference from this check).
+#
+# Deliberately narrower than that sibling'"'"'s own blanket "$NAME appears
+# anywhere" check: a plain DISPLAY/consumption read (`echo "$NAME"`,
+# `--search "$NAME"`) does NOT disqualify masking here -- #7355'"'"'s own
+# regression tests (e.g. `REPORT=$(cat <<EOF ... EOF); echo "$REPORT"`)
+# already establish that exact shape as the intended ALLOW, and a blanket
+# check would silently reopen that false positive. Only a reference
+# immediately adjacent to one of the known re-parsing consumers counts.
+# Scanned per PHYSICAL LINE (not the whole multi-line buffer at once) so this
+# needs no assumption about whether `.` matches a newline in the awk
+# implementation in use (portable across gawk/mawk/BSD awk, unlike a
+# whole-buffer `.*` scan would be) -- sufficient for the concrete shapes this
+# closes (`eval "$NAME"`, `sh -c "$NAME"`, `"$NAME" | bash`, all single-line
+# idioms in every real occurrence seen).
+#
+# KNOWN ACCEPTED GAP (same posture as every other textual approximation in
+# this file, see mask_catastrophic_var_assignment()'"'"'s header): a consumer
+# that re-parses the text WITHOUT spelling one of these tokens adjacent to
+# the reference (`CMD="$NAME"; $CMD`, `xargs -I{} sh -c '"'"'{}'"'"' -- "$NAME"`, a
+# reparse split across multiple lines) is not detected and so is not caught
+# -- fail-closed by omission, not a claim of completeness.
+function _heredoc_var_reparsed(orig, name,   nl2, olines2, k, oln, ref, SQ, DQ, execarg, execpipe) {
+    SQ = sprintf("%c", 39)
+    DQ = sprintf("%c", 34)
+    ref = "[$][{]?" name "[}]?([^A-Za-z0-9_]|$)"
+    execarg = "(^|[ \t;&|`(])(eval|source|\\.|sh|bash|zsh|dash|ksh)([ \t]+-c)?[ \t]+(" DQ "|" SQ ")?[$][{]?" name "[}]?([^A-Za-z0-9_]|$)"
+    execpipe = "[$][{]?" name "[}]?.*[|][ \t]*(bash|sh|zsh|dash|ksh)([ \t]|$)"
+    nl2 = split(orig, olines2, "\n")
+    for (k = 1; k <= nl2; k++) {
+        oln = olines2[k]
+        if (oln !~ ref) continue
+        if (oln ~ execarg || oln ~ execpipe) return 1
+    }
+    return 0
+}
+function mask_unquoted_cat_heredoc_bodies(s, orig,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, start, wordend, qc, rest, pre, before_cat, capre, flagre, namere, name, MASKC, SQ, DQ, BT) {
     MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
     SQ = sprintf("%c", 39)
     DQ = sprintf("%c", 34)
@@ -3201,6 +3255,14 @@ function mask_unquoted_cat_heredoc_bodies(s,   out, lines, nl, i, j, line, trimm
     # assignment), so it does not also match e.g. a `[ "$x" = "$(cat ...` test
     # (space before `=` there breaks the adjacency this alternative requires).
     capre = "(^|[ \t])((-m|--message|--body|--notes|--title|--comment|--search)[ \t]*=?|-f[ \t]+(body|message|comment|title|notes|search)=|[A-Za-z_][A-Za-z0-9_]*=)[ \t]*(" DQ "|" SQ ")?[ \t]*([$][(]|" BT ")[ \t]*$"
+    # flagre is capre with ONLY the known-flag alternatives (no `NAME=`) --
+    # since capre'"'"'s alternation is exactly "flag alternatives OR NAME=",
+    # before_cat matching capre but NOT flagre means it matched via `NAME=`
+    # (#7970 condition 2b, checked below). namere then pulls just that
+    # matched `NAME=...opener` tail back out so the variable name can be
+    # extracted for the _heredoc_var_reparsed() read check.
+    flagre = "(^|[ \t])((-m|--message|--body|--notes|--title|--comment|--search)[ \t]*=?|-f[ \t]+(body|message|comment|title|notes|search)=)[ \t]*(" DQ "|" SQ ")?[ \t]*([$][(]|" BT ")[ \t]*$"
+    namere = "[A-Za-z_][A-Za-z0-9_]*=[ \t]*(" DQ "|" SQ ")?[ \t]*([$][(]|" BT ")[ \t]*$"
     nl = split(s, lines, "\n")
     if (nl == 0) return ""
     for (i = 1; i <= nl; i++) {
@@ -3218,6 +3280,17 @@ function mask_unquoted_cat_heredoc_bodies(s,   out, lines, nl, i, j, line, trimm
             before_cat = pre
             sub(/cat[ \t]*$/, "", before_cat)
             if (before_cat !~ capre) continue
+            # (2b, #7970) NAME= capture (rather than a known text-data flag)
+            # -- fail closed if the variable is re-parsed as shell code
+            # anywhere in the true original command (see _heredoc_var_
+            # reparsed()'"'"'s header above for exactly what counts).
+            if (before_cat !~ flagre) {
+                if (match(before_cat, namere)) {
+                    name = substr(before_cat, RSTART, RLENGTH)
+                    sub(/=.*/, "", name)
+                    if (_heredoc_var_reparsed(orig, name)) continue
+                }
+            }
             start = p + 2
             if (substr(line, start, 1) == "<") continue    # `<<<` herestring
             if (substr(line, start, 1) == "-") start++
@@ -5634,10 +5707,19 @@ COMMAND_ASK_SCAN="$COMMAND_NO_COMMENT"  # scan-contract: COMMAND_ASK_SCAN=deny-s
 # expansion, so a body that could actually execute something stays visible and
 # still asks. Runs SECOND so the quoted-delimiter pass (and its interpreter
 # carve-out) keeps full authority over the shapes it already handles.
+#
+# ORIG_COMMAND_FOR_READ_CHECK (#7970): the TRUE original $COMMAND, passed
+# through so mask_unquoted_cat_heredoc_bodies()'s condition-2b `$NAME`/
+# `${NAME}` re-parse check (_heredoc_var_reparsed()) can fail closed on a
+# capture that is later `eval`'d/`sh -c`'d/piped-to-`bash` -- never against
+# COMMAND_ASK_SCAN itself (an earlier masking pass's own working buffer),
+# mirroring the #6068-regression-avoidance rule mask_catastrophic_var_
+# assignment() already documents for its own sibling read check.
 if [[ "$COMMAND_ASK_SCAN" == *"<<"* ]]; then
-    COMMAND_ASK_SCAN=$(printf '%s' "$COMMAND_ASK_SCAN" | awk "$_MASKHEREDOC_AWK"'
+    COMMAND_ASK_SCAN=$(printf '%s' "$COMMAND_ASK_SCAN" | ORIG_COMMAND_FOR_READ_CHECK="$COMMAND" awk "$_MASKHEREDOC_AWK"'
+    BEGIN { origcmd = ENVIRON["ORIG_COMMAND_FOR_READ_CHECK"] }
     { buf = buf (NR > 1 ? "\n" : "") $0 }
-    END { printf "%s", mask_unquoted_cat_heredoc_bodies(mask_heredoc_bodies_selective(buf)) }')
+    END { printf "%s", mask_unquoted_cat_heredoc_bodies(mask_heredoc_bodies_selective(buf), origcmd) }')
 fi
 
 # COMMAND_CLOUD_ASK_SCAN (#6002): a SEPARATE, further-redacted copy branched
