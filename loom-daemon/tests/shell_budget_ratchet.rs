@@ -82,6 +82,64 @@ fn every_production_script_is_accounted_for() {
     }
 }
 
+/// `origin_rev` is the same fixed point as a revision (#8154). Review found the
+/// docs claiming "neither may be regenerated … A test pins it" while only
+/// `origin_portable` was actually pinned — the "a comment describes a check
+/// nobody wrote" defect this gate keeps producing. This is that check.
+#[test]
+fn the_progress_denominator_pins_its_revision_too() {
+    let root = repo_root();
+    assert_eq!(
+        shell_budget::read_origin_rev(&root).as_deref(),
+        Some("143fe332^"),
+        "origin_rev anchors the scan for declared floor growth to the epic's start. Moving it \
+         silently re-scopes every cumulative figure the report prints."
+    );
+}
+
+/// It must also still RESOLVE. A pinned string that no longer names a reachable
+/// commit makes the cumulative figure silently read zero.
+#[test]
+fn the_pinned_origin_rev_resolves_in_this_checkout() {
+    let root = repo_root();
+    let rev = shell_budget::read_origin_rev(&root).expect("origin_rev must be present");
+
+    // A shallow clone genuinely cannot reach the epic's first commit, and the
+    // report is built to degrade to omitting the figure there. I wrote that
+    // caveat into this assertion's own failure message and then asserted
+    // anyway; CI clones shallow, so it failed on the first run. Honour it.
+    let shallow = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false);
+    if shallow {
+        eprintln!(
+            "skipped: a shallow clone cannot reach {rev}, which the report handles by omitting \
+             the cumulative figure"
+        );
+        return;
+    }
+
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .output()
+        .expect("git rev-parse must run");
+    assert!(
+        out.status.success(),
+        "origin_rev {rev:?} does not resolve in this FULL checkout, so the anchor is wrong."
+    );
+}
+
 /// The denominator must never be regenerated. A moving origin measures nothing,
 /// so this pins the one value in that file against a silent edit.
 #[test]

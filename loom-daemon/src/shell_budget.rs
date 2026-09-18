@@ -61,6 +61,14 @@ pub struct Budget {
     pub by_category: BTreeMap<String, u64>,
     /// Files per allowlist category.
     pub files_by_category: BTreeMap<String, u64>,
+    /// Per-file `(category, code lines)`, keyed by repo-relative path.
+    ///
+    /// Needed because the per-CATEGORY totals cannot distinguish "added 20
+    /// lines to a bootstrap script" from "retired 20 portable lines and added
+    /// 20 bootstrap ones" — the two produce identical category figures, and
+    /// review used exactly that to launder new portable shell past a
+    /// declaration (#8154).
+    pub by_file: BTreeMap<String, (String, u64)>,
     /// Production scripts carrying no allowlist entry at all. Non-zero means
     /// the allowlist and the tree have drifted, which makes every other number
     /// here an undercount — so it is surfaced rather than folded in silently.
@@ -226,6 +234,7 @@ pub fn measure(root: &Path) -> Result<Budget, String> {
             Some(cat) => {
                 *budget.by_category.entry(cat.clone()).or_default() += n;
                 *budget.files_by_category.entry(cat.clone()).or_default() += 1;
+                budget.by_file.insert(rel.clone(), (cat.clone(), n));
             }
             None => budget.unlisted.push(PathBuf::from(rel)),
         }
@@ -295,6 +304,23 @@ pub fn render_report(budget: &Budget, origin_portable: u64) -> String {
         }
     }
     s
+}
+
+/// The revision immediately before epic #7810's first port commit, as recorded
+/// in `scripts/shell-budget-baseline.txt`.
+///
+/// Returns `None` when the key is absent, which is not an error — the report
+/// simply omits the cumulative figure rather than failing.
+#[must_use]
+pub fn read_origin_rev(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("scripts/shell-budget-baseline.txt")).ok()?;
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .find_map(|l| {
+            let mut it = l.split_whitespace();
+            (it.next()? == "origin_rev").then(|| it.next().map(str::to_string))?
+        })
 }
 
 /// The portable-shell figure at epic #7810's first port commit, read from the
@@ -451,6 +477,7 @@ pub fn measure_at_rev(root: &Path, rev: &str) -> Result<Budget, String> {
             Some(cat) => {
                 *budget.by_category.entry(cat.clone()).or_default() += n;
                 *budget.files_by_category.entry(cat.clone()).or_default() += 1;
+                budget.by_file.insert((*rel).to_string(), (cat.clone(), n));
             }
             None => budget.unlisted.push(PathBuf::from(rel)),
         }
@@ -536,12 +563,104 @@ pub fn comparison(root: &Path, base_ref: &str) -> Result<Comparison, String> {
     })
 }
 
+mod declaration;
+
+pub use declaration::{
+    parse_growth_declarations, GrowthDeclaration, MalformedDeclaration, GROWTH_TRAILER,
+};
+
+/// Read the `Shell-Budget-Growth:` declarations from every commit in
+/// `base_rev..HEAD`.
+///
+/// # Why not `git interpret-trailers`
+///
+/// git only parses the message's FINAL paragraph, and that is the wrong rule
+/// here for two reproduced reasons:
+///
+///  1. The repo's own commit shape breaks it. A declaration paragraph followed
+///     by `Closes #N` and `Co-Authored-By:` puts the declaration outside the
+///     final paragraph, so git returns nothing — and the build then fails with
+///     a message about growth while the real problem is placement. That is the
+///     "a typo degrades to no override" failure this whole change exists to
+///     prevent.
+///  2. It disagrees with itself across a merge. GitHub's squash of a
+///     multi-commit PR concatenates each commit as `* subject` + body, so every
+///     body trailer ends up mid-message. The gate would accept a PR and then
+///     red-line `main` on the very commit it just approved — the #8073/#8105
+///     failure mode the merge-base design was built to avoid.
+///
+/// So the rule is positional in a different way: **column 0, not inside a
+/// fenced block, and never the subject line**. That keeps the protections git
+/// was adopted for — an indented example does not declare (the defect that
+/// made this PR grant itself 59 lines), a fenced example does not declare, and
+/// a trailer written as a subject does not declare — while surviving both
+/// shapes above.
+///
+/// Anything that looks like a declaration but sits in a position this does not
+/// read is reported as MALFORMED rather than ignored, so it can never fail
+/// silently.
+///
+/// # Errors
+/// Returns a message when `git log` cannot be run.
+pub fn collect_growth_declarations(
+    root: &Path,
+    base_rev: &str,
+) -> Result<(Vec<GrowthDeclaration>, Vec<MalformedDeclaration>), String> {
+    let out = Command::new("git")
+        .current_dir(root)
+        .args(["log", "--format=%x00%B", &format!("{base_rev}..HEAD")])
+        .output()
+        .map_err(|e| format!("could not run git log: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git log {base_rev}..HEAD failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut ok = Vec::new();
+    let mut bad = Vec::new();
+    for message in text.split('\0').filter(|m| !m.trim().is_empty()) {
+        let (mut o, mut b) = parse_growth_declarations(message);
+        ok.append(&mut o);
+        bad.append(&mut b);
+    }
+    Ok((ok, bad))
+}
+
+/// Everything `check_against_rev` needs beyond the two measurements.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GrowthContext<'a> {
+    /// `Shell-Budget-Growth:` trailers found in the compared commit range.
+    pub declared: &'a [GrowthDeclaration],
+}
+
+impl<'a> GrowthContext<'a> {
+    /// A context with no declarations and no recategorisation — the shape
+    /// every pre-#8154 caller had.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { declared: &[] }
+    }
+}
+
 /// Compare this tree against a base revision. `Ok` when the change does not
 /// grow the portable pool.
 ///
 /// # Errors
 /// Returns the operator-facing explanation when it does.
-pub fn check_against_rev(now: &Budget, before: &Budget, base_desc: &str) -> Result<(), String> {
+pub fn check_against_rev(
+    now: &Budget,
+    before: &Budget,
+    base_desc: &str,
+    ctx: &GrowthContext<'_>,
+) -> Result<(), String> {
+    let declared = ctx.declared;
+    // Portable growth is NOT overridable, deliberately. The trailer buys a
+    // larger permanent floor, which is a cost the epic can price; it does not
+    // buy more of the thing the epic exists to retire. #8154 asked only for the
+    // floor and this keeps it there.
     if now.portable() > before.portable() {
         return Err(portable_growth_message(now, before, base_desc));
     }
@@ -553,17 +672,119 @@ pub fn check_against_rev(now: &Budget, before: &Budget, base_desc: &str) -> Resu
     // reporting -439. Portable is what the epic retires, but growth in the
     // permanent floor is still growth and should be deliberate.
     if now.total() > before.total() {
+        let growth = now.total() - before.total();
+        // Saturating: two `u64::MAX` declarations overflow. Debug panics
+        // (fail-closed but ugly); release wraps to a small number and would
+        // then REFUSE growth it should allow, which is the wrong failure.
+        let allowed: u64 = declared
+            .iter()
+            .fold(0u64, |acc, d| acc.saturating_add(d.lines));
+
+        // A declaration must not launder PORTABLE growth into the floor.
+        //
+        // The first cut of this vetoed a change that RECATEGORISED a script.
+        // Review defeated that three ways without ever recategorising: `git mv`
+        // the portable file and list the new path as `bootstrap`; delete it and
+        // add an equivalent; or leave the allowlist untouched and simply move
+        // the lines from a `contract` file into a `bootstrap` one. All three
+        // produce category totals byte-identical to the legitimate "add 20
+        // lines to a bootstrap script" case, so no rule over the two
+        // category-level `Budget`s can tell them apart.
+        //
+        // The rule that actually closes it is per-FILE: a declaration applies
+        // only when no file that was PORTABLE at the base lost code lines. A
+        // file that shrank, or that vanished, is portable shell being retired —
+        // and retiring portable shell in the same change that grows the floor
+        // is exactly what makes the totals ambiguous. Once no portable file may
+        // shrink, any new portable line necessarily raises `now.portable()`,
+        // and the portable leg above fires.
+        //
+        // The cost is that "retire portable shell AND grow the floor" must be
+        // two PRs. That is the same "split the change" this already asks for,
+        // and each half is then reviewable on its own terms.
+        let mut lost: Vec<(&String, u64, u64)> = Vec::new();
+        for (path, (cat, before_lines)) in &before.by_file {
+            if !PORTABLE.contains(&cat.as_str()) {
+                continue;
+            }
+            // The file's category NOW matters as much as its line count. A
+            // `contract` file relisted as `bootstrap` with identical lines has
+            // lost every portable line it had — review reproduced exactly that
+            // to launder 20 new portable lines past a declaration after the
+            // first per-file cut shipped. Reading only the count re-opened the
+            // hole the deleted `recategorised_since` used to cover.
+            let now_lines = now
+                .by_file
+                .get(path)
+                .filter(|(c, _)| PORTABLE.contains(&c.as_str()))
+                .map_or(0, |(_, n)| *n);
+            if now_lines < *before_lines {
+                lost.push((path, *before_lines, now_lines));
+            }
+        }
+        if !lost.is_empty() {
+            let detail = lost
+                .iter()
+                .map(|(p, was, is)| {
+                    if *is == 0 {
+                        format!("    {p}  {was} -> gone")
+                    } else {
+                        format!("    {p}  {was} -> {is}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(format!(
+                "This change adds {growth} code lines of production shell (vs {base_desc}: {} -> \
+                 {}) while PORTABLE shell shrank or disappeared:\n\n{detail}\n\n\
+                 A `{GROWTH_TRAILER}` declaration does not apply to a change that does both. \
+                 Retiring portable lines while adding floor lines makes the two \
+                 indistinguishable from simply moving them, so the declaration could buy new \
+                 portable shell without the portable leg ever seeing it.\n\n\
+                 Split the change: retire portable shell in one PR, grow the floor in another. \
+                 Each is then reviewable on its own terms.",
+                before.total(),
+                now.total()
+            ));
+        }
+
+        if allowed >= growth {
+            return Ok(());
+        }
+
+        let declared_note = if declared.is_empty() {
+            String::new()
+        } else {
+            let each = declared
+                .iter()
+                .map(|d| format!("    {} lines — {}", d.lines, d.reason))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n\nYou declared {allowed} line(s), which is {} short:\n\n{each}\n\n\
+                 Raise the declared count to cover the measured growth, or shrink the change.",
+                growth - allowed
+            )
+        };
+
         return Err(format!(
-            "This change adds {} code lines of production shell without growing the portable \
-             pool (vs {base_desc}: {} -> {}), so the growth is in the permanent floor \
+            "This change adds {growth} code lines of production shell without growing the \
+             portable pool (vs {base_desc}: {} -> {}), so the growth is in the permanent floor \
              (`bootstrap` / `vendored`).\n\n\
              That is allowed, and it is not free. The floor is what will still be shell when \
-             the epic is done, so adding to it raises the finish line. If that is right, say \
-             why in the commit; if the script could be a daemon subcommand instead, it should \
-             be.\n\n\
+             the epic is done, so adding to it raises the finish line. If the script could be a \
+             daemon subcommand instead, it should be.\n\n\
+             If the growth is right, declare it on a line of its own in a commit BODY:\n\n\
+             {GROWTH_TRAILER} {growth} lines — <why this must stay shell> (#<issue>)\n\n\
+             It must start at column 0, outside any ``` fence, and must not be the commit \
+             subject — an indented or fenced line is prose showing the format, not a \
+             declaration using it. Anywhere in the body is fine; it does not have to be the \
+             last paragraph. A near-miss is reported as malformed rather than ignored.\n\n\
+             The declared count must cover the measured growth, and the reason must cite an \
+             issue. Declared growth is not hidden: it stays in the running total and \
+             `shell-budget` prints it.{declared_note}\n\n\
              Note this compares against the MERGE-BASE, so it is measuring what YOUR change \
              did.",
-            now.total() - before.total(),
             before.total(),
             now.total()
         ));
@@ -610,278 +831,4 @@ fn portable_growth_message(now: &Budget, before: &Budget, base_desc: &str) -> St
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn budget_of(pairs: &[(&str, u64)]) -> Budget {
-        let mut b = Budget::default();
-        for (c, n) in pairs {
-            b.by_category.insert((*c).to_string(), *n);
-            b.files_by_category.insert((*c).to_string(), 1);
-        }
-        b
-    }
-
-    fn budget_with(pairs: &[(&str, u64, u64)]) -> Budget {
-        let mut b = Budget::default();
-        for (c, lines, files) in pairs {
-            b.by_category.insert((*c).to_string(), *lines);
-            b.files_by_category.insert((*c).to_string(), *files);
-        }
-        b
-    }
-
-    #[test]
-    fn adding_portable_shell_fails_and_names_the_category() {
-        let before = budget_with(&[("contract", 100, 2), ("bootstrap", 50, 1)]);
-        let now = budget_with(&[("contract", 130, 3), ("bootstrap", 50, 1)]);
-        let err = check_against_rev(&now, &before, "origin/main (abc)").expect_err("must fail");
-        assert!(err.contains("adds 30 code lines of PORTABLE"), "{err}");
-        assert!(err.contains("contract     100 -> 130"), "{err}");
-        assert!(err.contains("MERGE-BASE"), "must say what it compared against: {err}");
-    }
-
-    #[test]
-    fn growth_in_the_permanent_floor_is_caught_too() {
-        // Regression: the first cut of the merge-base redesign dropped the
-        // total check entirely, so a 500-line `bootstrap` script passed where
-        // it used to fail. Portable is what the epic retires, but floor growth
-        // raises the finish line and must be deliberate.
-        let before = budget_with(&[("contract", 100, 2), ("bootstrap", 50, 1)]);
-        let now = budget_with(&[("contract", 100, 2), ("bootstrap", 550, 2)]);
-        let err = check_against_rev(&now, &before, "origin/main (abc)").expect_err("must fail");
-        assert!(err.contains("adds 500 code lines of production shell"), "{err}");
-        assert!(err.contains("permanent floor"), "{err}");
-    }
-
-    #[test]
-    fn recategorising_to_hide_an_addition_is_caught() {
-        // Regression: moving a 639-line file `contract` -> `bootstrap` while
-        // ADDING 200 portable lines reported -439 and passed. Portable falls,
-        // but total rises, so the total leg catches it.
-        let before = budget_with(&[("contract", 1000, 10), ("bootstrap", 50, 1)]);
-        let now = budget_with(&[("contract", 561, 9), ("bootstrap", 889, 2)]);
-        assert!(now.portable() < before.portable(), "portable falls, as in the report");
-        let err = check_against_rev(&now, &before, "origin/main (abc)").expect_err("must fail");
-        assert!(err.contains("production shell"), "{err}");
-    }
-
-    #[test]
-    fn a_change_that_removes_shell_passes() {
-        let before = budget_with(&[("contract", 100, 2), ("bootstrap", 50, 1)]);
-        let now = budget_with(&[("contract", 40, 1), ("bootstrap", 50, 1)]);
-        assert!(check_against_rev(&now, &before, "base").is_ok());
-    }
-
-    #[test]
-    fn a_change_that_moves_shell_sideways_passes() {
-        // Add and remove an equal amount: net zero, allowed by design — it is
-        // option 2 in the failure message.
-        let before = budget_with(&[("contract", 100, 2), ("hook-entry", 20, 1)]);
-        let now = budget_with(&[("contract", 80, 2), ("hook-entry", 40, 2)]);
-        assert_eq!(now.portable(), before.portable());
-        assert!(check_against_rev(&now, &before, "base").is_ok());
-    }
-
-    #[test]
-    fn an_unchanged_tree_passes() {
-        let b = budget_with(&[("contract", 100, 2)]);
-        assert!(check_against_rev(&b, &b, "base").is_ok());
-    }
-
-    // --- git-backed: comparison() resolution ---
-
-    fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .expect("git");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    }
-
-    fn init_repo() -> tempfile::TempDir {
-        let d = tempfile::tempdir().expect("tempdir");
-        git(d.path(), &["init", "-q", "-b", "main"]);
-        git(d.path(), &["config", "user.email", "t@example.com"]);
-        git(d.path(), &["config", "user.name", "t"]);
-        std::fs::write(d.path().join("a.txt"), "1\n").expect("write");
-        git(d.path(), &["add", "-A"]);
-        git(d.path(), &["commit", "-q", "-m", "c1"]);
-        d
-    }
-
-    #[test]
-    fn on_the_base_branch_it_compares_against_the_parent_not_itself() {
-        let d = init_repo();
-        std::fs::write(d.path().join("b.txt"), "2\n").expect("write");
-        git(d.path(), &["add", "-A"]);
-        git(d.path(), &["commit", "-q", "-m", "c2"]);
-        let c = comparison(d.path(), "main").expect("comparison");
-        assert!(c.desc.contains("HEAD~1"), "{}", c.desc);
-    }
-
-    #[test]
-    fn a_root_commit_with_no_parent_errors_rather_than_comparing_with_itself() {
-        // Comparing a tree with itself passes without measuring anything. On a
-        // direct push that is a gate nobody is reviewing AND nothing is
-        // checking, which is worse than the chore it replaced.
-        let d = init_repo();
-        let err = comparison(d.path(), "main").expect_err("must refuse");
-        assert!(err.contains("no parent"), "{err}");
-    }
-
-    #[test]
-    fn a_branch_compares_against_the_merge_base_not_the_advanced_tip() {
-        let d = init_repo();
-        git(d.path(), &["checkout", "-q", "-b", "feature"]);
-        std::fs::write(d.path().join("f.txt"), "f\n").expect("write");
-        git(d.path(), &["add", "-A"]);
-        git(d.path(), &["commit", "-q", "-m", "feature work"]);
-        // main advances independently.
-        git(d.path(), &["checkout", "-q", "main"]);
-        std::fs::write(d.path().join("m.txt"), "m\n").expect("write");
-        git(d.path(), &["add", "-A"]);
-        git(d.path(), &["commit", "-q", "-m", "main advances"]);
-        let base_sha = String::from_utf8_lossy(
-            &Command::new("git")
-                .arg("-C")
-                .arg(d.path())
-                .args(["rev-parse", "HEAD~1"])
-                .output()
-                .expect("git")
-                .stdout,
-        )
-        .trim()
-        .to_string();
-        git(d.path(), &["checkout", "-q", "feature"]);
-
-        let c = comparison(d.path(), "main").expect("comparison");
-        assert_eq!(c.rev, base_sha, "must pick the common ancestor, not main's tip");
-    }
-
-    #[test]
-    fn an_unresolvable_base_errors_rather_than_measuring_a_different_tree() {
-        // Falling back to the base ref looks harmless and is not: it measures a
-        // DIFFERENT tree, so a branch that adds shell can report a negative
-        // delta and pass. Reproduced in review on a depth-1 clone.
-        let d = init_repo();
-        let err = comparison(d.path(), "origin/nonexistent").expect_err("must refuse");
-        assert!(err.contains("no merge-base"), "{err}");
-        assert!(err.contains("fetch-depth"), "must name the usual cause: {err}");
-    }
-
-    #[test]
-    fn the_production_floor_uses_the_typed_category_not_the_filter_it_guards() {
-        // The floor exists to catch `is_production_shell` being wrong, so it
-        // must not be computed with it. Review reproduced what happens when it
-        // is: narrowing the filter to drop `defaults/` made every gate pass
-        // while the report announced "net vs epic start -34222 — retired since
-        // the epic began". A fabricated 34,000-line win, green.
-        let mut cats = BTreeMap::new();
-        cats.insert("defaults/scripts/a.sh".to_string(), "contract".to_string());
-        cats.insert("defaults/scripts/b.sh".to_string(), "bootstrap".to_string());
-        cats.insert("defaults/scripts/tests/test-a.sh".to_string(), "test".to_string());
-        assert_eq!(
-            production_entry_count(&cats),
-            2,
-            "counts the two non-test entries, regardless of what the path filter thinks"
-        );
-    }
-
-    #[test]
-    fn a_narrowed_scope_filter_is_reported_as_a_filter_bug_not_as_progress() {
-        let msg = production_filter_error(236, 64);
-        assert!(msg.contains("too narrow"), "{msg}");
-        assert!(
-            msg.contains("manufactures progress that did not happen"),
-            "the message must name the consequence, not just the mismatch: {msg}"
-        );
-    }
-
-    #[test]
-    fn the_typed_category_and_the_path_filter_agree_on_the_real_allowlist() {
-        // If these ever disagree, one of them is wrong and the floor becomes
-        // either slack or a false alarm. Pinning the agreement makes that
-        // visible the day it happens rather than the day it matters.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root");
-        let text =
-            std::fs::read_to_string(root.join("scripts/shell-allowlist.txt")).expect("allowlist");
-        let cats = parse_allowlist(&text);
-        let by_category = production_entry_count(&cats);
-        let by_path = cats.keys().filter(|p| is_production_shell(p)).count();
-        assert_eq!(
-            by_category, by_path,
-            "the allowlist's typed categories and is_production_shell disagree about which \
-             scripts are production — one of them is wrong"
-        );
-    }
-
-    #[test]
-    fn portable_excludes_the_permanent_floor() {
-        let b = budget_of(&[
-            ("contract", 100),
-            ("hook-entry", 10),
-            ("bootstrap", 999),
-            ("vendored", 999),
-            ("stub", 5),
-        ]);
-        assert_eq!(b.portable(), 110, "only contract + hook-entry are retirable");
-        assert_eq!(b.floor(), 1998);
-        assert_eq!(b.total(), 2113);
-    }
-
-    #[test]
-    fn the_report_says_plainly_when_the_pool_grew() {
-        let b = budget_of(&[("contract", 38439), ("bootstrap", 100), ("stub", 145)]);
-        let out = render_report(&b, 38374);
-        assert!(out.contains("+65"), "{out}");
-        assert!(out.contains("has GROWN"), "the direction must not be buried: {out}");
-    }
-
-    #[test]
-    fn the_report_says_plainly_when_the_pool_shrank() {
-        let b = budget_of(&[("contract", 30000), ("stub", 145)]);
-        let out = render_report(&b, 38374);
-        assert!(out.contains("-8374"), "{out}");
-        assert!(out.contains("retired since"), "{out}");
-    }
-
-    #[test]
-    fn unlisted_scripts_are_surfaced_because_they_make_the_count_wrong() {
-        let mut b = budget_of(&[("contract", 10)]);
-        b.unlisted
-            .push(PathBuf::from("defaults/scripts/mystery.sh"));
-        let out = render_report(&b, 10);
-        assert!(out.contains("WARNING"), "{out}");
-        assert!(out.contains("undercount"), "{out}");
-        assert!(out.contains("mystery.sh"), "{out}");
-    }
-
-    #[test]
-    fn code_lines_matches_the_file_size_ratchets_rule() {
-        assert_eq!(code_lines("#!/usr/bin/env bash\n\nset -e\n# note\nfoo\n"), 2);
-        assert_eq!(code_lines("   # indented comment\n"), 0);
-        assert_eq!(code_lines("  echo hi   # trailing comment\n"), 1);
-    }
-
-    #[test]
-    fn the_scope_rule_is_not_fooled_by_substrings() {
-        assert!(is_production_shell("defaults/scripts/latest/thing.sh"));
-        assert!(is_production_shell("defaults/scripts/testable.sh"));
-        assert!(!is_production_shell("defaults/scripts/tests/test-x.sh"));
-        assert!(!is_production_shell("scripts/test-installer.sh"));
-        assert!(!is_production_shell(".loom/hooks/guard.sh"));
-    }
-
-    #[test]
-    fn an_allowlist_line_needs_both_a_path_and_a_category() {
-        let m = parse_allowlist("a.sh contract reason here\n# comment\n\nb.sh\nc.sh bootstrap\n");
-        assert_eq!(m.get("a.sh").map(String::as_str), Some("contract"));
-        assert_eq!(m.get("c.sh").map(String::as_str), Some("bootstrap"));
-        assert!(!m.contains_key("b.sh"), "a path with no category is not an entry");
-    }
-}
+mod tests;

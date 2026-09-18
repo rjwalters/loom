@@ -245,9 +245,109 @@ every merge" teaches people to regenerate without looking — which is exactly t
 reflex a ratchet exists to prevent. The gate was training the behaviour it was
 built to stop.
 
-`scripts/shell-budget-baseline.txt` now holds one value, `origin_portable`, and
-it is the progress **denominator**, not a gate input. It must never be
-regenerated: an origin that moves measures nothing. A test pins it.
+`scripts/shell-budget-baseline.txt` holds two immovable values —
+`origin_portable`, the progress **denominator**, and `origin_rev`, the same
+fixed point as a revision so tooling can scan the epic's history. Neither is a
+gate input and neither may be regenerated: an origin that moves measures
+nothing. A test pins it.
+
+### Declaring growth in the permanent floor (#8154)
+
+Portable growth (`contract`, `hook-entry`) is what the epic retires, and there
+is **no** override for it. Floor growth (`bootstrap`, `vendored`) is different:
+the floor is what will still be shell when the epic is done, and some of it
+cannot be ported at all — `resync-installed.sh` is `vendored`, owned upstream,
+and blocked by #7758. Refusing a safety fix to such a script does not advance
+the epic; it just makes the script worse.
+
+So floor growth is default-deny with a declared exception. Declare it with a
+commit trailer:
+
+```
+Shell-Budget-Growth: 59 lines — guards against a silent revert of a local fix (#7870)
+```
+
+Rules the gate enforces:
+
+- It goes on a line of its own **in a commit body**: column 0, outside any
+  ``` fence, and not the subject. Anywhere in the body works — it does not have
+  to be the last paragraph.
+
+  An indented or fenced occurrence is prose showing the format, not a
+  declaration using it. That is not hypothetical: the PR adding this check
+  contained an indented example of its own trailer and granted itself 59 lines
+  attributed to an unmerged issue. A near-miss is **reported as malformed**,
+  never ignored — otherwise the build fails with a message about growth while
+  the real problem is placement, and the author re-reads the wrong thing.
+
+  This deliberately does **not** use `git interpret-trailers`, which reads only
+  the message's final paragraph. Two reproduced reasons: the repo's own commit
+  shape puts `Closes #N` and `Co-Authored-By:` after the declaration, which
+  takes it out of that paragraph; and GitHub's squash of a multi-commit PR
+  concatenates each commit as `* subject` + body, so every declaration lands
+  mid-message. Keying on git's rule would accept a PR and then red-line `main`
+  on the very commit it just approved — the #8073/#8105 failure the merge-base
+  design exists to avoid.
+- The declared count must **cover** the measured growth. Declaring 10 and
+  growing 500 fails, and the message names the shortfall.
+- The reason must cite an issue (`#<n>`).
+- Trailers **accumulate** across the commits in the range, so a multi-commit PR
+  can declare its growth in pieces.
+- Undeclared growth still fails exactly as before.
+- A malformed trailer is reported as malformed. It is not silently treated as
+  absent — otherwise the build fails with a message about growth while the real
+  problem is a typo, and the author re-reads the wrong thing.
+- A change that **retires portable shell** cannot be bought with a trailer at
+  all. If any file that was `contract`/`hook-entry` at the base lost code lines
+  (or vanished), the declaration does not apply.
+
+  This is the rule, rather than the narrower "does not recategorise" one, because
+  review defeated that three ways without recategorising anything: `git mv` the
+  portable file and list the new path as `bootstrap`; delete it and add an
+  equivalent; or leave the allowlist untouched and move the lines from a
+  `contract` file into a `bootstrap` one. All three produce category totals
+  byte-identical to an honest "add 20 lines to a bootstrap script", so no rule
+  over the category figures can tell them apart — only a per-file one can.
+
+  Once no portable file may shrink, any new portable line necessarily raises the
+  portable total, and the portable leg fires. The cost is that "retire portable
+  shell **and** grow the floor" must be two PRs, which is the same split this
+  already asks for, and each half is then reviewable on its own terms.
+
+### What this override does NOT do
+
+It does not verify that a human wrote it. #8154 asked that the override not be
+"a bare escape hatch a Builder grants itself", and the check that ships is
+syntactic: the trailer must name an amount and cite some issue number. `#1`
+satisfies it. An agent can write one.
+
+What it actually buys is **attribution and visibility**, not authorisation:
+the growth is named, priced, tied to an issue, printed in CI output, and
+carried in the cumulative figure forever. Undeclared growth remains impossible.
+Whether the cited issue genuinely argues the cost is a **review** judgement, and
+it is one a reviewer can now make, because the claim is written down where the
+diff is.
+
+Stating that plainly is the point. A gate that advertises an authorisation it
+does not perform is the exact defect this section exists to correct.
+
+Declared growth is not absorbed or forgiven. It stays in the running total, and
+`loom-daemon shell-budget` prints the cumulative accepted figure since the epic
+began (`accepted_floor_growth` in `--json`), so the floor rising is visible
+rather than inferred.
+
+This exists because the gate's failure message used to end *"if that is right,
+say why in the commit"* while `check_against_rev` returned an error
+unconditionally. It promised an escape hatch that was never implemented, and
+three Judge-approved safety PRs sat red against it with no in-repo remedy. A
+test now lifts the trailer template out of the failure message, substitutes the
+placeholders, and asserts it parses **and** then admits the growth it was
+printed for — so the message and the enforcement cannot drift apart again.
+
+That test earned its keep immediately: when the parser was tightened to reject
+indented trailers, it failed, because the failure message's own template was
+indented. The message would have told every author to write something the
+parser rejected.
 
 ## Related
 
