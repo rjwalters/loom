@@ -582,6 +582,19 @@ pub struct TranscriptUsage {
 /// Sum every `usage` block in a subagent transcript.
 ///
 /// Best-effort: unreadable lines are skipped, a missing file yields zeros.
+///
+/// **Not deduped on `message.id`** — a streamed assistant message is written
+/// to the transcript once per chunk, and every chunk repeats the same
+/// `message.id` carrying that message's **cumulative** usage, not a delta.
+/// Summing every block therefore counts a streamed message once per chunk.
+/// Measured 2026-09-18 (24h window, 2,330 transcripts): 51% of usage blocks
+/// are repeats, so this (and [`sum_transcript_usage_by_model`]) run roughly
+/// 2x high versus a per-`message.id`-deduped total. That is long-standing
+/// behaviour the existing consumers (the safehouse completion feed's
+/// `tokens`, `sweep.outcome`) are calibrated against (issue #8186), so it is
+/// left as-is here — for a deduped total use
+/// [`crate::activity::transcript_parse`], the `activity.db` ingestion path
+/// issue #8059 added.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn sum_transcript_usage(path: &Path) -> TranscriptUsage {
@@ -677,10 +690,13 @@ pub struct ModelUsageTotals {
 ///
 /// **Not deduped on `message.id`** — a streamed message's chunks each repeat
 /// the id carrying cumulative usage, so a streamed message is counted once per
-/// chunk here. That is long-standing behaviour the existing consumers (the
-/// safehouse completion feed, `sweep.outcome`) are calibrated against, so
-/// #8059 left it alone and deduped in its own `activity.db` ingestion fold
-/// instead.
+/// chunk here. Measured 2026-09-18 (24h window, 2,330 transcripts): 51% of
+/// usage blocks are repeats, so this runs roughly 2x high versus a
+/// per-`message.id`-deduped total (issue #8186). That is long-standing
+/// behaviour the existing consumers (the safehouse completion feed,
+/// `sweep.outcome`) are calibrated against, so #8059 left it alone and
+/// deduped in its own `activity.db` ingestion fold instead — see
+/// [`crate::activity::transcript_parse`] for the deduped alternative.
 ///
 /// Returned in a deterministic order (sorted by the grouping tuple), not
 /// insertion order, so callers get stable output for tests/snapshots.
