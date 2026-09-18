@@ -407,6 +407,111 @@ assert_allow "cp-mv-continuation (ak) PIN: \"…\\\" with no unescaped closer --
     "echo ${DQC}foo${BS1}${DQC}bar; cp /tmp/src.txt $WT_REPO/pwned-ak.txt" "$WT_DIR"
 
 echo ""
+echo -e "${YELLOW}--- mask_ws()/mask_gt() BACKTICK SPAN: a quote inside \`…\` is data (#8211) ---${NC}"
+# =========================================================================
+#
+# Third sibling of the (p)-(y) / (aa)-(ak) blocks, and the one that is NOT in
+# qsplit() at all. qsplit() segments every input below correctly -- its
+# has_live_subst() check sees the backtick and keeps the separators live -- so
+# the statement boundary reaches mask_ws() intact. mask_ws()/mask_gt() then
+# lost it: they modelled three quote states (unquoted / single / double) and
+# had NO branch for a backtick, so the `"` inside an unquoted `…` span opened
+# a span of its own running to the next `"` in the command -- the opening
+# quote of the `cp` destination -- and every space between them was masked.
+# The `cp` segment then split into ONE token, `toks[1]` was never `cp`, and
+# every cp / mv / sed -i / mkdir branch of extract_write_targets() was
+# skipped. Fail-OPEN, measured: a worktree-write-confinement DENY became a
+# silent ALLOW while real bash ran the write (the substitution itself errors,
+# but the `;` after it is a live separator and the second statement still
+# executes).
+#
+# DIRECTION (why these cases are not optional): suppressing a quote toggle
+# changes WHICH whitespace is masked, and it is reachable in BOTH directions
+# -- masking less splits more tokens (fail-closed), masking more merges them
+# and can hide a command word (fail-open). (as)-(aw) pin both edges.
+BTC='`'    # one literal backtick character
+
+# CWD is the worktree itself, as in (j)-(ak): a Builder acting from inside its
+# own managed worktree and writing out into the main checkout.
+
+# --- SAFETY (al): the issue's first fixture. The `"` is DATA inside the
+# backtick span, so the `;` is live and the `cp` is its own statement writing
+# outside the worktree -> must DENY. Allowed before #8211.
+assert_deny "cp-mv-continuation (al) SAFETY: \" inside a \`…\` span does not open one; escaping cp after the ; -> deny" \
+    "echo ${BTC}${DQC}${BTC}; cp /tmp/src.txt ${DQC}$WT_REPO/pwned-al.txt${DQC}" "$WT_DIR"
+
+# --- SAFETY (am): the issue's second fixture, single quote inside the span --
+assert_deny "cp-mv-continuation (am) SAFETY: ' inside a \`…\` span does not open one -> deny" \
+    "echo ${BTC}${SQC}${BTC}; cp /tmp/src.txt ${DQC}$WT_REPO/pwned-am.txt${DQC}" "$WT_DIR"
+
+# --- SAFETY (an): the issue's third fixture -- the span does not have to
+# start the word for the mask to go wrong.
+assert_deny "cp-mv-continuation (an) SAFETY: a\`\"\` (span mid-word) -> deny" \
+    "echo a${BTC}${DQC}${BTC}; cp /tmp/src.txt ${DQC}$WT_REPO/pwned-an.txt${DQC}" "$WT_DIR"
+
+# --- CONTROL (ao): the identical command with no backtick anywhere. It denied
+# before #8211 and must keep denying after -- the row that proves (al)-(an)
+# are about the backtick span and nothing else. (The issue's own control row.)
+assert_deny "cp-mv-continuation (ao) CONTROL: no backtick at all -> deny (unchanged baseline)" \
+    "echo foobar; cp /tmp/src.txt ${DQC}$WT_REPO/pwned-ao.txt${DQC}" "$WT_DIR"
+
+# --- SAFETY (ap)/(aq)/(ar): the same span ahead of the other three toks[1]-
+# keyed write idioms, so the fix is proven at the gate they all share.
+assert_deny "cp-mv-continuation (ap) SAFETY: \`\"\` span, escaping mv after the ; -> deny" \
+    "echo ${BTC}${DQC}${BTC}; mv /tmp/src.txt ${DQC}$WT_REPO/pwned-ap.txt${DQC}" "$WT_DIR"
+
+assert_deny "cp-mv-continuation (aq) SAFETY: \`\"\` span, escaping mkdir after the ; -> deny" \
+    "echo ${BTC}${DQC}${BTC}; mkdir -p ${DQC}$WT_REPO/pwned-aq-dir${DQC}" "$WT_DIR"
+
+assert_deny "cp-mv-continuation (ar) SAFETY: \`\"\` span, escaping sed -i after the ; -> deny" \
+    "echo ${BTC}${DQC}${BTC}; sed -i ${SQC}${SQC} ${SQC}s/a/b/${SQC} ${DQC}$WT_REPO/pwned-ar.txt${DQC}" "$WT_DIR"
+
+# --- PARITY (as): an ESCAPED backtick opens no span. mask_ws()'s pre-existing
+# `esc` flag (#8025) consumes it before the new branch is reached, which is the
+# same even/odd parity rule has_live_subst() (#7498) applies to the same
+# question. The destination is a QUOTED path containing a literal space on
+# purpose: that is the #4934 contract the escape has to preserve -- if the
+# escaped backtick wrongly opened a span, the destination's `"` would not open
+# one either, the space would split the token, and the surviving fragment
+# (`as.txt"`) would resolve as a RELATIVE path inside the acting worktree and
+# silently ALLOW. Real bash prints a literal backtick and runs the cp -> deny.
+assert_deny "cp-mv-continuation (as) PARITY: \\\` opens no span; quoted dest with a space still masked -> deny" \
+    "echo ${BS1}${BTC}x; cp /tmp/src.txt ${DQC}$WT_REPO/pwned as.txt${DQC}" "$WT_DIR"
+
+# --- PARITY (at): the ladder partner of (as) -- the SAME text with an
+# UNESCAPED backtick. The span is unterminated, so `btick` stays set to the end
+# of the buffer, no later quote opens a span, and LESS whitespace is masked:
+# the fail-CLOSED direction. ALLOW is the correct answer and is not a
+# suppressed deny -- `bash -n` rejects this input outright ("unexpected EOF
+# while looking for matching \`"), so nothing runs and there is no write to
+# confine. It DENIED before #8211; this is a false positive the fix removes,
+# and asserting it is what proves the branch discriminates on the escape.
+assert_allow "cp-mv-continuation (at) PARITY: unterminated \`…\` span -- unrunnable by bash -> allow" \
+    "echo ${BTC}x; cp /tmp/src.txt ${DQC}$WT_REPO/pwned at.txt${DQC}" "$WT_DIR"
+
+# --- SAFETY (au): the same backtick span followed by a write that is
+# legitimately INSIDE the worktree must not be denied. The fix changes which
+# whitespace is masked, not whether in-worktree writes are allowed -- guards
+# against it manufacturing a phantom write target.
+assert_allow "cp-mv-continuation (au) SAFETY: \`\"\` span followed by an IN-worktree cp -> allow" \
+    "echo ${BTC}${DQC}${BTC}; cp /tmp/src.txt $WT_DIR/src/" "$WT_DIR"
+
+# --- PIN (av): mask_ws() must still mask whitespace inside an ORDINARY quoted
+# span -- the #4934 contract this whole helper exists for. Without it the
+# target splits at the space, the fragment `file.sh"` resolves relative to the
+# worktree and the write into the main checkout is allowed. No backtick is
+# involved, so the new branch must leave it completely alone -> deny.
+assert_deny "cp-mv-continuation (av) PIN: quoted write target containing a space is still masked (#4934) -> deny" \
+    "echo x > ${DQC}$WT_REPO/evil file.sh${DQC}" "$WT_DIR"
+
+# --- PIN (aw): mask_gt() gets the same span state, and a `>` INSIDE the span
+# stays LIVE -- it really is a redirection for the substituted command, and
+# real bash writes the file. Masking it would drop a genuine write target, so
+# this pins the one thing the mask_gt() half must NOT do -> deny.
+assert_deny "cp-mv-continuation (aw) PIN: a > inside a \`…\` span is still a live redirect -> deny" \
+    "echo ${BTC}cat /tmp/a > $WT_REPO/pwned-aw.txt${BTC}" "$WT_DIR"
+
+echo ""
 
 # =========================================================================
 

@@ -2401,6 +2401,15 @@ BEGIN {
 # never treated as entering a span, matching how such a string's `>` is
 # already unconditionally masked as quoted data regardless of context.
 #
+# A QUOTE INSIDE AN UNQUOTED BACKTICK SUBSTITUTION (#8211): mask_gt() carries
+# the same `btick` span state mask_ws() does -- see mask_ws()'"'"'s header below
+# for the measured fail-OPEN behind it. Not a courtesy: mask_gt() runs ON
+# mask_ws()'"'"'s output and the two are required to reach the SAME quote-state
+# conclusion at every byte, so only one of them modelling the span is exactly
+# the desync this file already fixed twice (#6472/#8025, #8166). A `>` inside
+# such a span stays LIVE exactly as before -- it really is a redirection for
+# the substituted command, so masking it would drop a real write target.
+#
 # BACKSLASH-ESCAPED QUOTES (#6472): a bare `"`/`'"'"'` byte toggles `mode` above
 # UNCONDITIONALLY -- including one that is backslash-escaped and therefore, in
 # real shell semantics, still just literal DATA inside the CURRENTLY open span
@@ -2459,7 +2468,7 @@ BEGIN {
 # (a masked-away `>` can only DROP a write target, never invent a new deny).
 # =============================================================================
 _MASKGT_AWK='
-function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc) {
+function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc, btick) {
     SQ = sprintf("%c", 39)    # single quote
     DQ = sprintf("%c", 34)    # double quote
     MASK = sprintf("%c", 1)   # SOH -- placeholder for a quoted/arith-context ">"/"<" (never a real char)
@@ -2470,6 +2479,7 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc) {
     adepth = 0   # `((...))` arithmetic-context nesting depth (unquoted only)
     tdepth = 0   # `[[...]]` test-context nesting depth (unquoted only)
     esc = 0      # previous byte was an unescaped backslash (mode 0/2 only, #6472)
+    btick = 0    # inside an unquoted `...` command substitution (#8211)
     while (i <= n) {
         c = substr(s, i, 1)
         if (esc) {
@@ -2494,8 +2504,11 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc) {
             continue
         }
         if (mode == 0) {
-            if (c == SQ) { mode = 1; out = out c; i++; continue }
-            if (c == DQ) { mode = 2; out = out c; i++; continue }
+            # An unquoted backtick span makes the quote characters inside it
+            # literal data (#8211 -- lockstep with mask_ws(), see above).
+            if (c == "`") { btick = 1 - btick; out = out c; i++; continue }
+            if (c == SQ && !btick) { mode = 1; out = out c; i++; continue }
+            if (c == DQ && !btick) { mode = 2; out = out c; i++; continue }
             if (c == "(" && i < n && substr(s, i + 1, 1) == "(") {
                 adepth++
                 out = out "(("
@@ -2611,6 +2624,47 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc) {
 # a token that should have been split — it never merges tokens, never hides a
 # command word, and so never widens a deny into an allow.
 #
+# A QUOTE INSIDE AN UNQUOTED BACKTICK SUBSTITUTION IS NOT A QUOTE (#8211).
+# mask_ws() modelled three states (unquoted / single / double) and had no
+# branch for a backtick at ALL, so the `"` in `echo BT"BT; cp …` (BT = a
+# backtick) opened a span that ran to the NEXT `"` in the command — the
+# opening quote of the `cp` destination — masking every space between them.
+# The `cp` segment then split into ONE token, `toks[1]` was never `cp`, and
+# every cp/mv/sed -i/mkdir branch of extract_write_targets() was skipped: a
+# measured worktree-write-confinement DENY silently became an ALLOW. qsplit()
+# parses those inputs correctly (its has_live_subst() check keeps the
+# separators live), so the statement boundary reached mask_ws() intact and was
+# lost HERE, by masking away the whitespace that separates the next
+# statement's command word from its arguments.
+#
+# `btick` tracks an unquoted backtick span: a backtick toggles it, and while
+# it is set a quote character is literal DATA that cannot toggle `mode`. Only
+# in mode == 0 — inside an already-open quoted span a backtick is left exactly
+# as before, the same narrowing mask_gt()'s `((`/`[[` tracking already takes.
+# An ESCAPED backtick never reaches the branch: the `esc` flag above consumes
+# it first, which is the same even/odd parity rule has_live_subst() (#7498)
+# applies to decide the same question. An UNTERMINATED span runs to the end of
+# the string with `btick` set, so no later quote opens a span and LESS
+# whitespace is masked — the fail-closed direction, same as every other
+# best-effort fallback here.
+#
+# DIRECTION, STATED (this one is NOT automatically safe): suppressing a quote
+# toggle changes WHICH whitespace is masked, and it is reachable in both
+# directions — masking less splits more tokens (fail-closed), masking more
+# merges them and can hide a command word (fail-open). Measured over the #8166
+# differential corpus rather than asserted; see the (al)-(aw) cases in
+# tests/hooks/test-guard-destructive-cp-mv-continuation.sh.
+#
+# SCOPED TO BACKTICKS ON PURPOSE — `$( … )` is deliberately NOT given the same
+# treatment here. bash parses a `$( … )` body at PARSE time, so an unbalanced
+# quote inside one is a syntax error and the command never runs at all (the
+# whole input is rejected, nothing to confine); a backtick body is parsed
+# LAZILY at expansion time, which is exactly why `echo BT"BT; cp …` is a
+# runnable command whose second statement really executes. Extending `btick`
+# to `$(` would therefore buy no denial and would widen the blast radius of a
+# change whose direction has to be measured. The separate `$( … )` gap inside
+# a heredoc BODY is #8035, still open, and is a different mechanism.
+#
 # Still deliberately NOT modelled: look-ahead for a terminating quote — same
 # simplification qsplit()/mask_gt() accept (see mask_gt()'s comment above for
 # the accepted-risk rationale). An unterminated quote just runs to the end of
@@ -2626,7 +2680,7 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc) {
 # calls the other.
 # =============================================================================
 _MASKWS_AWK='
-function mask_ws(s,   out, n, i, c, mode, SQ, DQ, SPMASK, TABMASK, esc) {
+function mask_ws(s,   out, n, i, c, mode, SQ, DQ, SPMASK, TABMASK, esc, btick) {
     SQ = sprintf("%c", 39)    # single quote
     DQ = sprintf("%c", 34)    # double quote
     SPMASK = sprintf("%c", 2)    # STX -- placeholder for a quoted space
@@ -2636,6 +2690,7 @@ function mask_ws(s,   out, n, i, c, mode, SQ, DQ, SPMASK, TABMASK, esc) {
     i = 1
     mode = 0   # 0 = unquoted, 1 = single-quoted, 2 = double-quoted
     esc = 0    # previous byte was an unescaped backslash (mode 0/2 only, #8025)
+    btick = 0  # inside an unquoted `...` command substitution (#8211)
     while (i <= n) {
         c = substr(s, i, 1)
         if (esc) {
@@ -2672,8 +2727,12 @@ function mask_ws(s,   out, n, i, c, mode, SQ, DQ, SPMASK, TABMASK, esc) {
             continue
         }
         if (mode == 0) {
-            if (c == SQ) { mode = 1; out = out c; i++; continue }
-            if (c == DQ) { mode = 2; out = out c; i++; continue }
+            # An unquoted backtick span makes the quote characters inside it
+            # literal data (#8211 -- see the header above for the measured
+            # fail-OPEN and for why the direction is not free).
+            if (c == "`") { btick = 1 - btick; out = out c; i++; continue }
+            if (c == SQ && !btick) { mode = 1; out = out c; i++; continue }
+            if (c == DQ && !btick) { mode = 2; out = out c; i++; continue }
             out = out c
             i++
             continue
