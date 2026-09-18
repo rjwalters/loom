@@ -7,6 +7,17 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8112** (closed): Two Judges raced on one head: a PR can carry loom:pr and loom:changes-requested at once, and merge-pr.sh only reads the first
+- **PR #8226**: feat(worktree): port the worktree-add lock to Rust (#8195 slice 1)
+- **Issue #8138** (closed): Port PR #8058's model-class-marker logic to loom-daemon (Shell Budget Ratchet)
+- **PR #8249**: refactor(tokens): port the model-class mark-scoping decision to loom-daemon (#8138)
+- **Issue #8243** (closed): main is red: File Size Ratchet fails since #8078 grew a frozen file by one line
+- **PR #8247**: fix(health-gate): move the path-classification table to a sibling module (#8243)
+- **Issue #8147** (closed): CLAUDE.md's **Loom Version** stamp invalidates every session's cached prefix on each bump
+- **Issue #8015** (closed): Add doc-comment pointer to prose-existence rule in sweep_md_stage_minus_one_doc_lint.rs
+- **Issue #8075** (closed): install/hygiene: .loom-local/ overlay is not gitignored in consumer repos and not Loom-owned — quarantine stashes it, silently reverting model overrides
+- **Issue #8035** (closed): guard: an unquoted heredoc body's $( ) substitution bypasses worktree write confinement (write-path analogue of #8003)
+- **Issue #8062** (closed): add 'loom-daemon usage report' command: token/cost breakdown by role, model, repo, day
 - **Issue #8122** (closed): Destructive-write guard denies redirects/heredocs targeting paths outside every repo when cwd is a repo with live worktrees
 - **PR #8218**: fix(guard): scan an unquoted heredoc body's substitution spans for write targets
 - **Issue #8166** (closed): guard qsplit(): the closing-quote scan matches an escaped quote, ending a double-quoted span early
