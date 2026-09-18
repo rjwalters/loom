@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8176** (closed): Shell suites can silently test a stale or foreign loom-daemon when CARGO_TARGET_DIR is shared (false T15-style regressions)
+- **PR #8205**: fix(tests): pin the freshest repo build and snapshot it in require-daemon-bin
+- **Issue #8098** (closed): resync local-divergence gate (#7864): three shapes the gate does not cover — uncommitted fixes, pure-deletion fixes, and the unanchored legacy-install subject
+- **PR #8215**: fix(resync): anchor the legacy install-commit regex alternative (#8098)
 - **Issue #8156** (closed): guard: quoted-delimiter heredoc capture fed to eval/sh -c is still a silent ALLOW (the <<'EOF' sibling of #7970)
 - **PR #8209**: fix(guard): gate quoted-delimiter heredoc capture masking on the #7970 re-parse check (#8156)
 - **Issue #8206** (closed): Auditor role prompt describes a nonexistent CI 'full-stack check' job for root npm run check:all
