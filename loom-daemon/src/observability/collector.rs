@@ -401,6 +401,7 @@ fn terminal_records(
             failure_class: None,
             models_used: None,
             doctor_cycles: None,
+            judge_verdicts: None,
         }),
     ]
 }

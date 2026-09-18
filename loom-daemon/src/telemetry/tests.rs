@@ -104,6 +104,10 @@ fn sweep_outcome() -> TelemetryRecord {
         failure_class: None,
         models_used: Some(vec!["claude-sonnet-5".to_string()]),
         doctor_cycles: Some(0),
+        judge_verdicts: Some(vec![JudgeVerdict {
+            attempt: 1,
+            verdict: "pass".to_string(),
+        }]),
     })
 }
 
@@ -241,6 +245,7 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         failure_class: None,
         models_used: None,
         doctor_cycles: None,
+        judge_verdicts: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for field in [
@@ -342,11 +347,27 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         failure_class: Some("account-exhausted:model-credits-exhausted".to_string()),
         models_used: Some(vec!["claude-opus-5".to_string(), "claude-sonnet-5".to_string()]),
         doctor_cycles: Some(2),
+        judge_verdicts: Some(vec![
+            JudgeVerdict {
+                attempt: 1,
+                verdict: "fail".to_string(),
+            },
+            JudgeVerdict {
+                attempt: 2,
+                verdict: "pass".to_string(),
+            },
+        ]),
     };
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(value["failure_class"], "account-exhausted:model-credits-exhausted");
     assert_eq!(value["models_used"][1], "claude-sonnet-5");
     assert_eq!(value["doctor_cycles"], 2);
+    // Issue #8222: the first-pass approval rate a consumer computes is
+    // `judge_verdicts[0].verdict == "pass"` — this record's first pass was a
+    // rejection, so it counts against that rate.
+    assert_eq!(value["judge_verdicts"][0]["attempt"], 1);
+    assert_eq!(value["judge_verdicts"][0]["verdict"], "fail");
+    assert_eq!(value["judge_verdicts"][1]["verdict"], "pass");
     let decoded: SweepOutcomeRecord = serde_json::from_value(value).unwrap();
     assert_eq!(decoded, record);
 }
@@ -378,10 +399,16 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         failure_class: None,
         models_used: None,
         doctor_cycles: None,
+        judge_verdicts: None,
     };
 
     let unobserved = serde_json::to_value(&base).unwrap();
-    for field in ["failure_class", "models_used", "doctor_cycles"] {
+    for field in [
+        "failure_class",
+        "models_used",
+        "doctor_cycles",
+        "judge_verdicts",
+    ] {
         assert!(
             unobserved.get(field).is_none(),
             "unobserved {field:?} must be omitted, not null: {unobserved}"
@@ -390,6 +417,7 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
 
     let observed_zero = serde_json::to_value(SweepOutcomeRecord {
         doctor_cycles: Some(0),
+        judge_verdicts: Some(Vec::new()),
         ..base
     })
     .unwrap();
@@ -399,6 +427,15 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
             .and_then(serde_json::Value::as_u64),
         Some(0),
         "an observed zero must be present on the wire: {observed_zero}"
+    );
+    // Issue #8222's twin of the same contract: a timeline that WAS read and
+    // carried no verdict is an empty array on the wire, not an absent key.
+    assert_eq!(
+        observed_zero
+            .get("judge_verdicts")
+            .and_then(serde_json::Value::as_array),
+        Some(&vec![]),
+        "an observed-but-unjudged PR must be an empty list on the wire: {observed_zero}"
     );
 }
 
@@ -427,6 +464,7 @@ fn sweep_outcome_from_a_pre_8056_daemon_still_decodes() {
             assert_eq!(r.failure_class, None);
             assert_eq!(r.models_used, None);
             assert_eq!(r.doctor_cycles, None);
+            assert_eq!(r.judge_verdicts, None);
         }
         other => panic!("expected SweepOutcome, got {other:?}"),
     }
