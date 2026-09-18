@@ -262,9 +262,25 @@ pub fn probe(
         // Asked whenever a service is known, independent of `job_loaded`: a
         // unit can be gone from the supervisor entirely and still have a
         // recorded signal death worth naming.
-        exit_signal_detail: service.as_deref().and_then(|svc| {
-            supervisor_exit_signal_detail(svc, Some(supervisor.systemd_unit.as_str()))
-        }),
+        // Computed ONLY when the daemon is not alive. The shell reaches
+        // detect_supervisor_exit_signal() deep in the outage path
+        // (loom-daemon-watchdog.sh:2155) — never on a healthy tick — and it is
+        // purely informational there: it NAMES a signal-shaped death in the
+        // report, and by #6388 never blocks recovery.
+        //
+        // Computing it unconditionally cost two `systemctl show` calls per
+        // snapshot, each with a 10s budget, on every healthy tick. That turned
+        // the hermetic shell-suite CI job from ~7.6 minutes into a 30-minute
+        // timeout, six runs running, because the systemd-touching suites drive
+        // the watchdog many times over. A probe whose answer is only ever read
+        // on the outage path must not be paid for on the common one.
+        exit_signal_detail: if liveness.alive {
+            None
+        } else {
+            service.as_deref().and_then(|svc| {
+                supervisor_exit_signal_detail(svc, Some(supervisor.systemd_unit.as_str()))
+            })
+        },
     }
 }
 
