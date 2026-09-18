@@ -103,9 +103,188 @@ pub fn cooldown_remaining(state: &std::path::Path, now: u64, window: u64) -> Opt
     (elapsed < window).then(|| window - elapsed)
 }
 
+/// The cooldown state file's three fields: when the last episode recovered,
+/// which issue tracked it, and how many times it has flapped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cooldown {
+    pub recovered_at: u64,
+    pub issue_ref: String,
+    pub flap_count: u64,
+}
+
+/// Read the cooldown record, or `None` when there is no usable one.
+#[must_use]
+pub fn read_cooldown(state: &std::path::Path) -> Option<Cooldown> {
+    let text = std::fs::read_to_string(state).ok()?;
+    let mut it = text.split_whitespace();
+    let recovered_at = it.next()?.parse().ok()?;
+    let issue_ref = it.next()?.to_string();
+    // A missing or malformed count reads as 1, not 0: this record only exists
+    // because an episode happened, so "no flaps yet" is one.
+    let flap_count = it.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+    Some(Cooldown {
+        recovered_at,
+        issue_ref,
+        flap_count,
+    })
+}
+
+/// The #7664 dedup window: how long after a recovery a repeat degradation is
+/// treated as the SAME episode flapping rather than a new one.
+///
+/// A day by default, and much longer than the #7258 cooldown on purpose. The
+/// cooldown asks "is this too soon to be worth reporting at all"; this asks "is
+/// this the same problem coming back". A path that degrades, recovers and
+/// re-degrades three times in an afternoon is one operator problem, and three
+/// issues bury it under itself.
+#[must_use]
+pub fn dedup_window_secs() -> u64 {
+    super::env::num("LOOM_WATCHDOG_PEER_COORD_DEDUP_WINDOW_SECS", 86_400)
+}
+
+/// What to do about a repeat degradation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Repeat {
+    /// Comment on the existing issue and reopen it, as flap number `flap`.
+    CommentOn { issue_ref: String, flap: u64 },
+    /// Outside the window, or no issue on record — file fresh.
+    FileFresh,
+}
+
+/// Decide, given the cooldown record and the current time.
+#[must_use]
+pub fn repeat_action(cooldown: Option<&Cooldown>, now: u64, window: u64) -> Repeat {
+    let Some(c) = cooldown else {
+        return Repeat::FileFresh;
+    };
+    if c.issue_ref.is_empty() {
+        return Repeat::FileFresh;
+    }
+    if now.saturating_sub(c.recovered_at) >= window {
+        return Repeat::FileFresh;
+    }
+    Repeat::CommentOn {
+        issue_ref: c.issue_ref.clone(),
+        flap: c.flap_count + 1,
+    }
+}
+
+/// The comment left on an existing tracking issue for a repeat flap.
+#[must_use]
+pub fn flap_comment(hostname: &str, summary: &str, flap: u64, window: u64) -> String {
+    format!(
+        "peer-claim coordination has gone DEGRADED again on `{hostname}` ({summary}).\n\
+         This is flap #{flap} since this tracking issue was first filed, landing within the \
+         {window}s dedup window (#7664) since the last recovery — commenting here instead of \
+         filing a fresh issue.\n\
+         **Suspected cause** (unverified, per anvil#1270): `advertised` only moves at dispatch \
+         time, so a RAM/disk-throttled host with cap 0 never advertises and cannot reach the \
+         sustained-receive recovery threshold.\n\
+         Filed automatically by the loom-daemon-watchdog.sh peer-coordination escalation \
+         (#6222, dedup by #7664).\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cd(recovered_at: u64, issue: &str, flap: u64) -> Cooldown {
+        Cooldown {
+            recovered_at,
+            issue_ref: issue.to_string(),
+            flap_count: flap,
+        }
+    }
+
+    #[test]
+    fn a_repeat_inside_the_window_comments_rather_than_files() {
+        let c = cd(1000, "1234", 1);
+        assert_eq!(
+            repeat_action(Some(&c), 1500, 86_400),
+            Repeat::CommentOn {
+                issue_ref: "1234".into(),
+                flap: 2
+            }
+        );
+    }
+
+    #[test]
+    fn the_flap_count_increments_across_episodes() {
+        let c = cd(1000, "1234", 4);
+        assert_eq!(
+            repeat_action(Some(&c), 1001, 86_400),
+            Repeat::CommentOn {
+                issue_ref: "1234".into(),
+                flap: 5
+            }
+        );
+    }
+
+    #[test]
+    fn outside_the_window_it_files_fresh() {
+        assert_eq!(
+            repeat_action(Some(&cd(1000, "1234", 1)), 1000 + 86_400, 86_400),
+            Repeat::FileFresh
+        );
+    }
+
+    #[test]
+    fn no_issue_on_record_means_there_is_nothing_to_comment_on() {
+        // Commenting needs somewhere to comment: an empty ref must never
+        // become `gh issue comment ""`.
+        assert_eq!(repeat_action(Some(&cd(1000, "", 1)), 1001, 86_400), Repeat::FileFresh);
+        assert_eq!(repeat_action(None, 1001, 86_400), Repeat::FileFresh);
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_stays_inside_the_window() {
+        // saturating_sub keeps elapsed at 0 rather than wrapping to a huge
+        // number, which would look like "long outside the window" and file a
+        // duplicate.
+        assert_eq!(
+            repeat_action(Some(&cd(5000, "1234", 1)), 1000, 86_400),
+            Repeat::CommentOn {
+                issue_ref: "1234".into(),
+                flap: 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_cooldown_record_round_trips_and_defaults_its_count_to_one() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let p = d.path().join("cd");
+        std::fs::write(&p, "1700000000 4242 3\n").expect("write");
+        assert_eq!(read_cooldown(&p), Some(cd(1_700_000_000, "4242", 3)));
+        std::fs::write(&p, "1700000000 4242\n").expect("write");
+        assert_eq!(read_cooldown(&p).map(|c| c.flap_count), Some(1));
+    }
+
+    #[test]
+    fn a_corrupt_cooldown_record_is_no_record() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let p = d.path().join("cd");
+        std::fs::write(&p, "notanumber 4242 1\n").expect("write");
+        assert_eq!(read_cooldown(&p), None);
+        std::fs::write(&p, "\n").expect("write");
+        assert_eq!(read_cooldown(&p), None);
+    }
+
+    #[test]
+    fn the_flap_comment_names_the_flap_number_and_the_window() {
+        let c = flap_comment("build-01", "3 received / 9 advertised", 4, 86_400);
+        for needle in [
+            "flap #4",
+            "86400s dedup window",
+            "build-01",
+            "3 received / 9 advertised",
+        ] {
+            assert!(c.contains(needle), "missing {needle:?}: {c}");
+        }
+        // The suspected cause is marked unverified, because it is.
+        assert!(c.contains("(unverified, per anvil#1270)"), "{c}");
+    }
 
     #[test]
     fn a_degraded_report_summarises_the_recovery_progress() {
