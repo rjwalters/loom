@@ -387,6 +387,58 @@ fn start_then_stop_restores_every_overlay_byte_for_byte() {
 }
 
 #[test]
+fn start_twice_on_a_workspace_it_already_owns_preserves_the_true_prior() {
+    let f = fleet(1);
+    // An operator pin exists before the experiment ever starts.
+    let touched = overlay_path(&f.roots[0]);
+    let hand_written = json!({"autonomous": {"model": "haiku"}});
+    std::fs::create_dir_all(touched.parent().unwrap()).unwrap();
+    std::fs::write(&touched, serde_json::to_string_pretty(&hand_written).unwrap()).unwrap();
+
+    start(start_opts(&f, false, never_held)).unwrap();
+    let after_first = read_marker(&read(&touched)).unwrap();
+    assert_eq!(
+        after_first.prior.get(DISPATCH_MODEL_POINTER).unwrap().value,
+        Some(json!("haiku")),
+        "first start must record the operator's true pre-experiment pin"
+    );
+    assert!(
+        !after_first
+            .prior
+            .get(ROLE_RUNNER_MODEL_POINTER)
+            .unwrap()
+            .present,
+        "the role-runner pointer never existed before start"
+    );
+
+    // Retry/resume: re-run `start` against the same fixture and experiment id
+    // without an intervening `stop` (e.g. recovering from a crash partway
+    // through a fleet-wide start).
+    start(start_opts(&f, false, never_held)).unwrap();
+    let after_second = read_marker(&read(&touched)).unwrap();
+    assert_eq!(
+        after_second.prior.get(DISPATCH_MODEL_POINTER).unwrap().value,
+        Some(json!("haiku")),
+        "a second start must not overwrite the recorded prior with the arm value the first start wrote"
+    );
+    assert!(
+        !after_second
+            .prior
+            .get(ROLE_RUNNER_MODEL_POINTER)
+            .unwrap()
+            .present
+    );
+
+    let (report, _) = stop(f.state.path(), &f.plan.experiment_id, false, now()).unwrap();
+    assert_eq!(report.reverted.len(), 1, "{report:?}");
+    assert_eq!(
+        read(&touched)["autonomous"]["model"],
+        json!("haiku"),
+        "stop must restore the operator's true pin, not the arm value start wrote"
+    );
+}
+
+#[test]
 fn start_refuses_when_another_experiment_already_owns_a_workspace_and_writes_nothing() {
     let f = fleet(3);
     let squatted = overlay_path(&f.roots[2]);

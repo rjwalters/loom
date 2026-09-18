@@ -171,6 +171,14 @@ fn remove_segments(doc: &mut Value, segs: &[&str]) {
 /// Errors when `doc` is not a JSON object: a `.loom-local/local.json` holding
 /// an array or a scalar contributes nothing to the resolver today, and merging
 /// into it would destroy whatever the operator meant by it.
+///
+/// When `doc` already carries a marker for this same `id` (a resumed/retried
+/// `start` on a workspace this experiment already owns — see `start`'s
+/// same-id fall-through), each pointer's `prior` is taken from that existing
+/// marker rather than recomputed from `doc`. Recomputing it here would read
+/// the arm value `start` itself wrote the first time, not the operator's true
+/// pre-experiment value, permanently losing it once the marker is
+/// overwritten.
 pub fn plan_overlay_edit(
     doc: &Value,
     id: &str,
@@ -181,18 +189,26 @@ pub fn plan_overlay_edit(
     if !doc.is_object() {
         bail!("overlay is not a JSON object");
     }
+    let existing_prior = if marker_id(doc).as_deref() == Some(id) {
+        read_marker(doc).map(|m| m.prior)
+    } else {
+        None
+    };
     let mut prior = BTreeMap::new();
     let mut wrote = BTreeMap::new();
     let mut next = doc.clone();
     for pointer in EXPERIMENT_POINTERS {
-        let before = get_pointer(doc, pointer);
-        prior.insert(
-            pointer.to_string(),
-            Prior {
-                present: before.is_some(),
-                value: before,
-            },
-        );
+        let this_prior = match existing_prior.as_ref().and_then(|p| p.get(pointer)) {
+            Some(carried) => carried.clone(),
+            None => {
+                let before = get_pointer(doc, pointer);
+                Prior {
+                    present: before.is_some(),
+                    value: before,
+                }
+            }
+        };
+        prior.insert(pointer.to_string(), this_prior);
         let value = Value::String(arm.to_string());
         wrote.insert(pointer.to_string(), value.clone());
         next = deep_merge(&next, &pointer_overlay(pointer, value));
