@@ -274,12 +274,133 @@ fn outage(
     let outage_secs = now.saturating_sub(episode.down_since);
 
     let limits = recovery::Limits::from_env();
-    let decision = recovery::decide(&episode, &limits, now);
+
+    // Resolve what a recovery would RUN before deciding whether to run it: a
+    // host with nothing runnable is report-only, and the report should say so
+    // rather than implying an attempt was made and failed.
+    let cli_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let pid_file = marker::get_nonempty(&paths.marker, "pid_file").map(PathBuf::from);
+    let argv = recovery::resolve_argv(
+        env::var("LOOM_WATCHDOG_RECOVER_CMD").as_deref(),
+        &cli_dir,
+        pid_file.as_deref(),
+    );
+
+    // #6388: a signal-shaped exit is NAMED, never used to refuse. Only marker
+    // absence means a deliberate stop, and the marker is present here.
+    let signal_note = remediation::launchd_exit_signal_detail(snap.last_exit_status)
+        .map(|d| remediation::signal_rule_note(&d))
+        .unwrap_or_default();
+
+    let decision = match &argv {
+        recovery::Argv::Unavailable { .. } => recovery::Decision::Disabled,
+        recovery::Argv::Run { .. } => recovery::decide(&episode, &limits, now),
+    };
+
+    // An attempt actually runs here, rather than being reported and skipped.
+    if let (recovery::Decision::Attempt { attempt }, recovery::Argv::Run { argv, detail }) =
+        (&decision, &argv)
+    {
+        episode.attempts = *attempt;
+        episode.last_attempt = now;
+        recovery::write(&state.recovery, &episode);
+
+        reporter.report(
+            report::Level::Divergence,
+            &format!(
+                "A daemon is EXPECTED (autonomy-desired marker present, started {started_at}) \
+                 but is NOT running: {}. Autonomous dispatch has stopped (down {outage_secs}s \
+                 across {} consecutive watchdog ticks).{signal_note} AUTO-RECOVERING now — \
+                 bounded attempt {attempt} of {} (#5391), running: {detail}",
+                snap.detail, episode.ticks, limits.max_attempts
+            ),
+        );
+
+        let timeout =
+            std::time::Duration::from_secs(env::num("LOOM_WATCHDOG_RECOVER_TIMEOUT_SECS", 120));
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        let recover_rc = crate::sweep_registry::output_with_timeout(cmd, timeout)
+            .ok()
+            .flatten()
+            .and_then(|o| o.status.code());
+
+        // Confirm with the SAME liveness question the outage was declared on.
+        let recheck = supervisor_cmd::Recheck::from_env();
+        let back = supervisor_cmd::recheck_alive(&recheck, || {
+            let l = liveness::probe(&paths.loom_dir, &paths.marker, sup);
+            l.alive().then_some(l.pid).flatten()
+        });
+
+        if back.is_some() {
+            reporter.report(
+                report::Level::Ok,
+                &format!(
+                    "auto-recovery SUCCEEDED on attempt {attempt} of {} after a {outage_secs}s \
+                     outage: {}. Recovery command exited {} (#5391).",
+                    limits.max_attempts,
+                    snap.detail,
+                    recover_rc.map_or_else(|| "?".to_string(), |c| c.to_string())
+                ),
+            );
+            recovery::clear(&state.recovery, &state.escalation_sentinel);
+            return 0;
+        }
+
+        let next = attempt + 1;
+        let tail = if *attempt < limits.max_attempts {
+            format!(
+                " The next attempt is backed off by {}s.",
+                recovery::backoff_for(next, limits.backoff_secs, limits.backoff_cap_secs)
+            )
+        } else {
+            format!(
+                " The CIRCUIT BREAKER is now OPEN: the attempt budget is spent, so no further \
+                 automatic attempts will be made until a tick observes a healthy daemon or {} \
+                 is deleted.",
+                state.recovery.display()
+            )
+        };
+        let escalation = if *attempt >= limits.max_attempts {
+            escalation_note(
+                paths,
+                state,
+                snap,
+                &format!("the circuit breaker is OPEN after {attempt} attempts"),
+                Some(detail),
+            )
+        } else {
+            String::new()
+        };
+        reporter.report(
+            report::Level::Divergence,
+            &format!(
+                "Bounded recovery attempt {attempt} of {} RAN ('{detail}', exit {}) and the \
+                 daemon is STILL not confirmed running.{tail}{escalation} Recover with: \
+                 ./.loom/scripts/cli/loom-daemon-start.sh [flags]  (or 'loom-daemon status' to \
+                 inspect).",
+                limits.max_attempts,
+                recover_rc.map_or_else(|| "?".to_string(), |c| c.to_string())
+            ),
+        );
+        return 1;
+    }
 
     let recover_note = match decision {
-        recovery::Decision::Disabled => {
-            "Automatic recovery is disabled on this host (LOOM_WATCHDOG_AUTO_RECOVER).".to_string()
-        }
+        recovery::Decision::Disabled => match &argv {
+            recovery::Argv::Unavailable { detail } => format!(
+                "NO auto-recovery was attempted: {detail}. This watchdog is therefore \
+                 REPORT-ONLY on this host — an installed watchdog job here means DETECTION, not \
+                 self-healing — until that is fixed."
+            ),
+            recovery::Argv::Run { .. } => {
+                "Automatic recovery is disabled on this host (LOOM_WATCHDOG_AUTO_RECOVER)."
+                    .to_string()
+            }
+        },
         recovery::Decision::BackingOff {
             next_attempt,
             remaining,
@@ -293,11 +414,8 @@ fn outage(
              tick observes a healthy daemon or {} is deleted.",
             state.recovery.display()
         ),
-        recovery::Decision::Attempt { attempt } => {
-            episode.attempts = attempt;
-            episode.last_attempt = now;
-            "".to_string()
-        }
+        // Unreachable: an Attempt is handled above, where it actually runs.
+        recovery::Decision::Attempt { .. } => String::new(),
     };
 
     // Step 3: escalate once nothing automatic is left to try.
@@ -319,7 +437,8 @@ fn outage(
         &format!(
             "A daemon is EXPECTED (autonomy-desired marker present, started {started_at}) but is \
              NOT running: {}. Autonomous dispatch has stopped (down {outage_secs}s across {} \
-             consecutive watchdog ticks). {recover_note}{escalation_note} Recover with: \
+             consecutive watchdog ticks).{signal_note} {recover_note}{escalation_note} Recover \
+             with: \
              ./.loom/scripts/cli/loom-daemon-start.sh [flags]  (or 'loom-daemon status' to \
              inspect).",
             snap.detail, episode.ticks

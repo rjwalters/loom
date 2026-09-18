@@ -90,9 +90,114 @@ pub fn gate(job_loaded: bool, last_exit: Option<i64>) -> Gate {
     }
 }
 
+/// Signal-shaped exit codes: a job killed or interrupted rather than failing.
+///
+/// `143` = 128+15 (SIGTERM), `130` = 128+2 (SIGINT). The negative forms are
+/// what launchd reports on some macOS versions for the same thing.
+const SIGNAL_SHAPED_EXITS: &[i64] = &[143, 130, -15, -2];
+
+/// Whether the supervisor's recorded exit looks like a signal, and the
+/// operator-facing detail naming it.
+///
+/// # Why this is NOT a reason to refuse recovery (#6388)
+///
+/// Before #6388 a signal-shaped exit was read as "the operator stopped it" and
+/// recovery was skipped. That was wrong, and the resulting report was
+/// self-contradictory: it said a daemon was expected (marker present) and in
+/// the same breath refused to revive it because of an exit code.
+///
+/// **Only marker ABSENCE means a deliberate stop.** The marker is operator
+/// intent; an exit code is not. A stray SIGTERM — an OOM killer, a careless
+/// `kill`, a host going down — leaves the marker in place, and a daemon that is
+/// still expected should come back. So this detail exists to be NAMED in the
+/// report, never to block the attempt.
+#[must_use]
+pub fn launchd_exit_signal_detail(last_exit: Option<i64>) -> Option<String> {
+    let status = last_exit?;
+    SIGNAL_SHAPED_EXITS
+        .contains(&status)
+        .then(|| format!("launchd records the job's last exit status as {status} (SIGTERM/SIGINT)"))
+}
+
+/// The systemd equivalent, from `ExecMainCode` and `ExecMainStatus`.
+#[must_use]
+pub fn systemd_exit_signal_detail(exec_code: &str, exec_status: &str) -> Option<String> {
+    match exec_code {
+        "killed" if matches!(exec_status, "TERM" | "INT" | "15" | "2") => {
+            Some(format!("systemd records the unit's main process as killed by SIG{exec_status}"))
+        }
+        "exited" if matches!(exec_status, "143" | "130") => Some(format!(
+            "systemd records the unit's main process as exiting {exec_status} (SIGTERM/SIGINT)"
+        )),
+        _ => None,
+    }
+}
+
+/// The note the outage report carries when a signal-shaped exit is on record.
+#[must_use]
+pub fn signal_rule_note(detail: &str) -> String {
+    format!(
+        " RULE: marker present, {detail} -> stray signal, recovering (NOT a deliberate operator \
+         stop — only marker ABSENCE means that, #6388)."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_shaped_exits_are_recognised_in_both_spellings() {
+        for status in [143, 130, -15, -2] {
+            assert!(
+                launchd_exit_signal_detail(Some(status)).is_some(),
+                "{status} is signal-shaped"
+            );
+        }
+        for status in [0, 1, 2, 70, 15] {
+            assert!(
+                launchd_exit_signal_detail(Some(status)).is_none(),
+                "{status} is not signal-shaped"
+            );
+        }
+        assert!(launchd_exit_signal_detail(None).is_none());
+    }
+
+    #[test]
+    fn a_signal_shaped_exit_still_falls_through_to_bounded_recovery() {
+        // #6388: only marker ABSENCE means a deliberate stop. A stray SIGTERM
+        // -- an OOM kill, a careless `kill`, a host going down -- leaves the
+        // marker in place, and a daemon that is still expected should come
+        // back. The gate refuses SUPERVISOR remediation (that path needs a
+        // clean exit) but must not block the attempt entirely.
+        assert_eq!(gate(true, Some(143)), Gate::UncleanExit { status: Some(143) });
+        assert!(launchd_exit_signal_detail(Some(143)).is_some(), "and it is nameable");
+    }
+
+    #[test]
+    fn the_rule_note_says_recovering_not_refusing() {
+        // The pre-#6388 report was self-contradictory: a daemon was expected,
+        // and in the same breath it refused to revive it because of an exit
+        // code. The note exists so that never reads that way again.
+        let n =
+            signal_rule_note("launchd records the job's last exit status as 143 (SIGTERM/SIGINT)");
+        assert!(n.contains("stray signal, recovering"), "{n}");
+        assert!(n.contains("only marker ABSENCE means that"), "{n}");
+        assert!(n.contains("#6388"), "{n}");
+    }
+
+    #[test]
+    fn systemd_reports_signals_two_different_ways() {
+        // `killed` carries a signal NAME or number; `exited` carries 128+n.
+        assert!(systemd_exit_signal_detail("killed", "TERM").is_some());
+        assert!(systemd_exit_signal_detail("killed", "15").is_some());
+        assert!(systemd_exit_signal_detail("exited", "143").is_some());
+        assert!(systemd_exit_signal_detail("exited", "130").is_some());
+        // A clean exit is not a signal, and neither is a plain failure.
+        assert!(systemd_exit_signal_detail("exited", "0").is_none());
+        assert!(systemd_exit_signal_detail("exited", "1").is_none());
+        assert!(systemd_exit_signal_detail("killed", "KILL").is_none(), "SIGKILL is not a stop");
+    }
 
     // --- regressions from differential testing against the retired shell ---
 
