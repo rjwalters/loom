@@ -1647,28 +1647,65 @@ function has_live_subst(str,    i, c, bs) {
 # real continuation: one statement) still IS. This is the same even/odd
 # parity rule has_live_subst() (#7498) applies a few dozen lines above.
 #
-# KNOWN LIMITATION (narrowed by #8025): qsplit() has escape tracking for a
-# backslash before a backslash (#7978), a newline (#7945) and a quote
-# character (#8025) -- and for nothing else. Two consequences remain, in
-# opposite safety directions:
+# ESCAPED CLOSING QUOTE INSIDE A DOUBLE-QUOTED SPAN (#8166). Sibling of #8025,
+# same helper, different branch: #8025 taught the top-level loop that an
+# UNQUOTED `\"` / `\'` opens no span; this is the other half -- the forward
+# scan that LOOKS FOR the closing quote once a span is already open. That scan
+# used to match on the quote CHARACTER alone, with no backslash-parity
+# question, so `"foo\"bar"` ended its span at the ESCAPED quote rather than the
+# real one. The trailing `bar"` then re-entered the top-level loop as unquoted
+# text, and that stray quote opened a span of its own running to the next
+# same-type quote anywhere later in the command -- suppressing every separator
+# in between, deleting a real statement boundary, and hiding the following
+# statement's command word from toks[1] (the gate for every cp / mv / sed -i /
+# mkdir branch of extract_write_targets()). Measured fail-OPEN: with cwd inside
+# a managed worktree, `echo "foo\"bar"; cp /tmp/src.txt "<main>/pwned.txt"` and
+# the `mkdir -p` variant both ALLOWED while their no-escaped-quote controls
+# DENIED.
+#
+# The scan now asks the same even/odd backslash-parity question the rest of
+# this file already asks (has_live_subst() #7498, the `\\`-pair branch #7978,
+# mask_ws()/mask_gt()'s `esc` flag #6472/#8025): a candidate closing quote
+# preceded by an ODD run of backslashes is escaped DATA, so the scan keeps
+# going to the real closer.
+#
+# ONLY for `qc == DQ`. Inside single quotes a backslash has no escaping power
+# in real bash, so a `'` really does end the span there -- applying parity to
+# SQ would over-extend a span past its real end and make live text inert. (The
+# #6968 embedded-apostrophe idiom is a separate, explicitly matched case just
+# below.)
+#
+# DIRECTION, STATED (this one is NOT automatically safe): extending a span to
+# its real closer makes MORE text inert, which is the fail-OPEN direction --
+# the opposite of #8025's branch, which could only ever ADD boundaries. It
+# happens to be the CORRECT parse (real bash reads `"foo\"bar"` as one word),
+# and the flips measured on the corpus all went allow -> deny, but the risk
+# direction is real and the differential sweep behind it is not optional. See
+# the (aa)-(ak) cases in
+# tests/hooks/test-guard-destructive-cp-mv-continuation.sh.
+#
+# LOCKSTEP, not divergence: mask_ws() (#8025) and mask_gt() (#6472) already
+# model this exact case -- their `esc` flag suppresses the quote toggle for a
+# backslash-escaped quote in double-quoted mode, so both have always kept the
+# span open across a `\"`. qsplit() was the odd one out. This fix therefore
+# brings the three quote-state scans back INTO agreement (mask_gt()'s own
+# header requires mask_ws() and mask_gt() to reach the same quote-state
+# conclusion at every byte; qsplit() feeding a different one is how the
+# boundary went missing) rather than introducing a new asymmetry.
+#
+# KNOWN LIMITATION (narrowed by #8025, narrowed again by #8166): qsplit() has
+# escape tracking for a backslash before a backslash (#7978), a newline
+# (#7945), an unquoted quote character (#8025) and a double-quoted span's
+# closing quote (#8166) -- and for nothing else. One consequence remains:
 #   * An escaped separator (`\;`, `\|`, `\&`) is still split on, though the
 #     real shell treats it as a literal character. Over-splitting yields MORE
 #     command words to check -- fail-closed, at worst a false positive.
-#   * INSIDE a quoted span, the forward scan for the closing quote still
-#     matches on the quote character alone: a `"foo\"bar"` ends its span at
-#     the ESCAPED quote rather than the real one, so the trailing `bar"`
-#     re-enters the loop as unquoted text. That direction over-splits at the
-#     escaped quote (fail-closed there) but the stray trailing quote can then
-#     open a span of its own, which can suppress a later separator -- a
-#     standing gap in this helper, tracked in #8166, NOT something the #8025
-#     branch (which only ever fires OUTSIDE a span) introduced or is entitled
-#     to claim it closes.
-# Do not restate either of these as "harmless": state the direction.
+# Do not restate this as "harmless": state the direction.
 #
 # Shared as a single awk source string so the three parsers cannot drift.
 # =============================================================================
 _QSPLIT_AWK="$_HASLIVESUBST_AWK"'
-function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom) {
+function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs, bk) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     out = ""
@@ -1683,7 +1720,37 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom) {
             while (1) {
                 ci = 0
                 for (j = scanfrom; j <= n; j++) {
-                    if (substr(s, j, 1) == qc) { ci = j; break }
+                    if (substr(s, j, 1) != qc) continue
+                    if (qc == DQ) {
+                        # ESCAPED CLOSING QUOTE (#8166 -- see the header
+                        # comment above for the measured fail-OPEN this
+                        # closes and for why the direction is not free).
+                        # Count the CONTIGUOUS backslash run immediately
+                        # behind this candidate, stopping at the opening
+                        # quote (bk > i, never walking outside the span --
+                        # the opening quote itself is already known to be
+                        # unescaped, since the #8025 branch consumed any
+                        # escaped one before the DQ/SQ branch could see it).
+                        # An ODD run means this quote is backslash-escaped
+                        # literal data, not the closer: keep scanning.
+                        #
+                        # Contiguity makes the backward count exactly
+                        # equivalent to a forward even/odd parity walk from
+                        # the start of the span -- the same rule
+                        # has_live_subst() (#7498) applies -- because any
+                        # non-backslash byte resets parity to even.
+                        #
+                        # DQ only: inside SINGLE quotes a backslash has no
+                        # escaping power in real bash, so a `'"'"'` really does
+                        # close the span and applying parity there would
+                        # over-extend it (making live text inert -- the
+                        # fail-open direction, for no correctness gain).
+                        bs = 0
+                        bk = j - 1
+                        while (bk > i && substr(s, bk, 1) == "\\") { bs++; bk-- }
+                        if (bs % 2 == 1) continue
+                    }
+                    ci = j; break
                 }
                 if (ci == 0) break
                 # Single-quote embedded-apostrophe idiom (#6968): closing
@@ -1708,6 +1775,11 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom) {
             if (ci == 0) {
                 # Unterminated quote: fall back to separator-active processing so
                 # a stray quote never suppresses a real split (never widen a deny).
+                # Since #8166 this also covers a double-quoted span in which
+                # EVERY remaining same-type quote is backslash-escaped -- which
+                # really is unterminated to the shell too (it would prompt for
+                # more input), so the same fail-closed fallback is the right
+                # answer and the separators after it stay live.
                 out = out c
                 i++
                 continue
@@ -2355,9 +2427,12 @@ BEGIN {
 # extract_write_targets() depends on (masked text is byte-for-byte
 # length-identical to the original) is untouched.
 #
-# Deliberately does NOT extend escape-awareness to qsplit() or
-# strip_literal_text() -- same simplification those two accept for their own
-# quote-tracking scans, and still correct here for a specific reason: the text
+# Deliberately does NOT extend escape-awareness to strip_literal_text() --
+# same simplification that scan accepts for its own quote tracking. (qsplit()
+# was in this sentence too until #8166, which gave its closing-quote scan the
+# same even/odd parity rule; that fix is confined to qsplit() and changes
+# nothing about the text mask_gt() receives.) Still correct here for a
+# specific reason: the text
 # mask_gt() receives (COMMAND_ASK_SCAN, see extract_write_targets() below) has,
 # for the specific commands that trigger it (only ones naming --body/--message/
 # --title/--notes/--comment/-m/--search/--arg), typically already been through

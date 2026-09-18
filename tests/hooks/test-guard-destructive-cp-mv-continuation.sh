@@ -292,6 +292,121 @@ assert_allow "cp-mv-continuation (y) SAFETY: escaped quote in a source path, in-
     "cp /tmp/a${BS1}${DQC}b.txt $WT_DIR/src/" "$WT_DIR"
 
 echo ""
+echo -e "${YELLOW}--- qsplit() ESCAPED CLOSING QUOTE: \\\" INSIDE a \"…\" span (#8166) ---${NC}"
+# =========================================================================
+#
+# Sibling of the (p)-(y) block above, SAME helper, DIFFERENT branch, and NOT
+# fixed by #8025. #8025 taught the top-level loop that an UNQUOTED `\"` opens
+# no span. This is the other half: the forward scan that looks for the
+# CLOSING quote once a span is already open. That scan matched on the quote
+# CHARACTER alone, with no backslash-parity question, so `"foo\"bar"` ended
+# its span at the ESCAPED quote instead of the real one. The leftover `bar"`
+# re-entered the top-level loop as unquoted text and that stray quote opened
+# a span of ITS own, running to the next same-type quote anywhere later in
+# the command -- swallowing every separator in between. Same fail-OPEN
+# outcome as (p)-(t): a worktree-write-confinement DENY became a silent
+# ALLOW, no ask, no telemetry.
+#
+# DIRECTION (why these cases are not optional): unlike #8025's branch, which
+# could only ever ADD segment boundaries, this fix EXTENDS a span to its real
+# closer -- which makes MORE text inert, the fail-OPEN direction. It is the
+# correct parse (real bash reads `"foo\"bar"` as one word), but "correct
+# parse" is a claim about the corpus, not a licence: (ac)-(ak) below pin both
+# the flips it is allowed to make and the verdicts it must NOT touch.
+
+# CWD is the worktree itself, as in (j)-(y): a Builder acting from inside its
+# own managed worktree and writing out into the main checkout.
+
+# --- SAFETY (aa): the reported shape. The escaped `"` is DATA inside the
+# span; the span's real closer is the quote after `bar`, so the `;` after it
+# is a LIVE separator and the `cp` is its own statement writing outside the
+# worktree -> must DENY. Allowed before #8166.
+assert_deny "cp-mv-continuation (aa) SAFETY: \\\" inside a \"…\" span does not end it; escaping cp after the ; -> deny" \
+    "echo ${DQC}foo${BS1}${DQC}bar${DQC}; cp /tmp/src.txt ${DQC}$WT_REPO/pwned-aa.txt${DQC}" "$WT_DIR"
+
+# --- SAFETY (ab): the mkdir variant from the issue's evidence table --------
+assert_deny "cp-mv-continuation (ab) SAFETY: \\\" inside a \"…\" span, escaping mkdir after the ; -> deny" \
+    "echo ${DQC}foo${BS1}${DQC}bar${DQC}; mkdir -p ${DQC}$WT_REPO/pwned-ab-dir${DQC}" "$WT_DIR"
+
+# --- SAFETY (ac): same via mv ----------------------------------------------
+assert_deny "cp-mv-continuation (ac) SAFETY: \\\" inside a \"…\" span, escaping mv after the ; -> deny" \
+    "echo ${DQC}foo${BS1}${DQC}bar${DQC}; mv /tmp/src.txt ${DQC}$WT_REPO/pwned-ac.txt${DQC}" "$WT_DIR"
+
+# --- SAFETY (ad): same via sed -i ------------------------------------------
+assert_deny "cp-mv-continuation (ad) SAFETY: \\\" inside a \"…\" span, escaping sed -i after the ; -> deny" \
+    "echo ${DQC}foo${BS1}${DQC}bar${DQC}; sed -i ${SQC}${SQC} ${SQC}s/a/b/${SQC} ${DQC}$WT_REPO/pwned-ad.txt${DQC}" "$WT_DIR"
+
+# --- CONTROL (ae): the identical command with NO escaped quote anywhere. It
+# denied before #8166 and must keep denying after -- the row that proves
+# (aa)-(ad) are about the escaped CLOSING quote and nothing else. (This is
+# the issue's own control row.)
+assert_deny "cp-mv-continuation (ae) CONTROL: no escaped quote at all -> deny (unchanged baseline)" \
+    "echo foobar; cp /tmp/src.txt ${DQC}$WT_REPO/pwned-ae.txt${DQC}" "$WT_DIR"
+
+# --- SAFETY (af): a plain, escape-free double-quoted span must still be
+# INERT. The `;` and the `cp` here are data inside one echo argument -- real
+# bash runs no cp at all -> allow. Proves the parity scan did not turn every
+# quoted span into live text.
+assert_allow "cp-mv-continuation (af) SAFETY: an ordinary escape-free \"…\" span stays inert -> allow" \
+    "echo ${DQC}a; cp /tmp/src.txt $WT_REPO/pwned-af.txt${DQC}" "$WT_DIR"
+
+# --- PARITY (ag): TWO backslashes before the candidate closer. The first
+# escapes the second (a literal backslash), so the quote has EVEN parity
+# behind it and really IS the closer: real bash reads `echo "foo\\"` as one
+# complete word and then runs the `cp` as a second statement, writing outside
+# the worktree -> deny. The ladder partner of (aa); asserting it is what
+# proves the scan discriminates on parity rather than skipping every quote
+# that happens to follow a backslash.
+assert_deny "cp-mv-continuation (ag) PARITY: \\\\\" (escaped backslash, then the REAL closer) ends the span -> deny" \
+    "echo ${DQC}foo${BS2}${DQC}; cp /tmp/src.txt ${DQC}$WT_REPO/pwned-ag.txt${DQC}" "$WT_DIR"
+
+# --- PARITY (ah): THREE backslashes -- escaped literal backslash, then an
+# escaped literal quote. Odd parity again, so the span does NOT close there
+# and runs on to the quote after `bar`; the `;` after THAT is live -> deny.
+# Completes the 1/2/3 ladder.
+assert_deny "cp-mv-continuation (ah) PARITY: \\\\\\\" inside the span is still escaped data -> deny" \
+    "echo ${DQC}foo${BS2}${BS1}${DQC}bar${DQC}; cp /tmp/src.txt ${DQC}$WT_REPO/pwned-ah.txt${DQC}" "$WT_DIR"
+
+# --- SAFETY (ai): SINGLE quotes are deliberately NOT given parity treatment
+# -- a backslash has no escaping power inside '…' in real bash, so the quote
+# after it genuinely closes the span. Real bash runs
+# `echo 'foo\'` then `bar; cp … pwned-ai.txt` -- the cp IS a live statement
+# writing outside the worktree -> must still deny. If the parity rule were
+# (wrongly) applied to SQ too, the span would run past its real end and
+# swallow this `;`.
+assert_deny "cp-mv-continuation (ai) SAFETY: \\' inside a '…' span DOES close it (no parity for SQ) -> deny" \
+    "echo ${SQC}foo${BS1}${SQC}bar; cp /tmp/src.txt ${DQC}$WT_REPO/pwned-ai.txt${DQC}" "$WT_DIR"
+
+# --- SAFETY (aj): a span with an escaped quote in it whose FOLLOWING
+# statement writes legitimately INSIDE the worktree must not be denied. The
+# extended span changes where the boundary is, not whether in-worktree writes
+# are allowed -- guards against the fix manufacturing a phantom write target.
+assert_allow "cp-mv-continuation (aj) SAFETY: \\\" span followed by an IN-worktree cp -> allow" \
+    "echo ${DQC}foo${BS1}${DQC}bar${DQC}; cp /tmp/src.txt $WT_DIR/src/" "$WT_DIR"
+
+# --- (ak) UNCHANGED-VERDICT PIN: a double-quoted span in which the ONLY
+# remaining same-type quote is escaped. The parity scan finds no unescaped
+# closer, so it newly routes this input into qsplit()'s pre-existing `ci == 0`
+# fallback (emit the stray opening quote, keep the separators live) instead of
+# closing the span at the escaped quote. That re-route must not change the
+# end-to-end verdict, and it does not: allow before #8166, allow after.
+#
+# ALLOW is the correct answer here and is NOT a suppressed deny: the input is
+# unterminated to the real shell too -- `bash -n` reports "unexpected EOF
+# while looking for matching \"" and runs NOTHING, so there is no write to
+# confine. (The allow is produced downstream of qsplit anyway: mask_ws() sees
+# the unterminated span and masks every following space, so the `cp` never
+# splits into tokens. That is mask_ws()'s own unterminated-quote behaviour,
+# untouched by this fix -- qsplit() itself does split this input correctly,
+# verified directly on the helper.)
+#
+# Note there is deliberately no quoting on the cp destination: a quote there
+# would be an unescaped closer and this would stop being the unterminated
+# case it exists to pin.
+assert_allow "cp-mv-continuation (ak) PIN: \"…\\\" with no unescaped closer -- unrunnable by bash, verdict unchanged -> allow" \
+    "echo ${DQC}foo${BS1}${DQC}bar; cp /tmp/src.txt $WT_REPO/pwned-ak.txt" "$WT_DIR"
+
+echo ""
 
 # =========================================================================
 
