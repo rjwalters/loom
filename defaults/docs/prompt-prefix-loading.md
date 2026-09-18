@@ -209,6 +209,13 @@ from the A/B counter, and `loom:sweep-wave-lifecycle` absent from the C one.
 - The `~49k` post-split floor is not decomposed. #8066 (prefix ordering for
   cross-session cache hits) and #8064 (trimming `champion-*` /
   `judge-reference.md` / `watch.md`) own that.
+  **#8066 is answered** — see
+  [`prompt-prefix-cache-ordering.md`](prompt-prefix-cache-ordering.md): the
+  ordering hypothesis is falsified (Loom's injected prefix is already last and
+  contiguous, and cache matching is block-granular so intra-block reordering is
+  a no-op), and the real determinant of a hit is which OAuth account the spawn
+  selected — 65% full-hit rate on a same-account repeat within the hour vs 1.4%
+  otherwise.
 
 ## 7. Regression guard
 
