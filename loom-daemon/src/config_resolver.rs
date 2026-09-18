@@ -33,16 +33,17 @@ pub const LOCAL_CONFIG_REL: &str = ".loom-local/local.json";
 
 /// Env var overriding the private/shared defaults file location. Set to a
 /// non-empty path to point at an alternate file; set to the empty string to
-/// disable this tier entirely (it is already a no-op on any host that
-/// hasn't run the Phase 3 machine-level installer, so disabling it has no
-/// practical effect today — the toggle exists for forward compatibility and
-/// test isolation).
+/// disable this tier entirely. This tier is live today (see
+/// [`resolve_effective_config`] and `docs/design/config-resolution-tiers.md`)
+/// — the empty-string form is load-bearing in tests across this crate, which
+/// set it to `""` so a real host defaults file never leaks into assertions.
 pub const PRIVATE_DEFAULTS_ENV: &str = "LOOM_CONFIG_DEFAULTS_FILE";
 
-/// Home-relative default location of the private/shared defaults file. Epic
-/// #3835 Phase 3 introduces the machine-level checkout this lives in; until
-/// that phase ships the file simply does not exist on any host, so this
-/// tier resolves to "contributes nothing" everywhere today.
+/// Home-relative default location of the private/shared defaults file. This
+/// tier is live (see [`resolve_effective_config`]); what's typically absent
+/// is just this file — see `docs/design/config-resolution-tiers.md` and
+/// `defaults/docs/daemon-reference.md` ("One file, fleet-wide: the
+/// machine-level defaults tier") for the write-it-once recipe.
 const DEFAULT_PRIVATE_DEFAULTS_REL: &str = ".local/share/loom/config/defaults.json";
 
 /// Resolve the path to the private/shared defaults file, honoring
@@ -175,8 +176,9 @@ pub fn deep_merge(base: &Value, overlay: &Value) -> Value {
 /// Resolve the full effective config tree for `repo_root` by deep-merging,
 /// lowest to highest precedence:
 ///
-/// 1. Private/shared defaults ([`private_defaults_path`]) — a no-op tier on
-///    every host until Epic #3835 Phase 3 ships.
+/// 1. Private/shared defaults ([`private_defaults_path`]) — live on every
+///    host, and typically a no-op only because the file itself hasn't been
+///    written yet (see `docs/design/config-resolution-tiers.md`).
 /// 2. Legacy `.loom/config.json` — the sole tier every existing repo has.
 /// 3. Tracked `.loom-project/project.json` — new in #4039; empty until a
 ///    repo migrates (Phase 6).
