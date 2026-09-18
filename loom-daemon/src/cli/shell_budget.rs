@@ -45,6 +45,14 @@ impl ShellBudgetArgs {
             None => std::env::current_dir().context("could not resolve the current directory")?,
         };
         let budget = shell_budget::measure(&root).map_err(anyhow::Error::msg)?;
+
+        // #8233: the benefit side. Fail-soft — a shallow clone has no
+        // six-month window, and omitting a section beats refusing to report.
+        let churn = std::fs::read_to_string(root.join("scripts/shell-allowlist.txt"))
+            .ok()
+            .map(|t| shell_budget::parse_allowlist(&t))
+            .and_then(|cats| shell_budget::churn::measure(&root, &cats).ok())
+            .unwrap_or_default();
         let origin = shell_budget::read_origin_portable(&root).unwrap_or(0);
 
         // Floor growth that has been declared and accepted since the epic began
@@ -73,6 +81,14 @@ impl ShellBudgetArgs {
                     "files": budget.file_count(),
                     "origin_portable": origin,
                     "net_vs_epic_start": i128::from(budget.portable()) - i128::from(origin),
+                    "churn_retired": churn.retired,
+                    "churn_remaining": churn.remaining,
+                    "churn_retired_pct": churn.retired_pct(),
+                    "churn_delegating": churn.delegating,
+                    "churn_window": churn.window,
+                    "churn_worst": churn.worst.iter().take(shell_budget::churn::JSON_WORST).map(|(p, l, f)| serde_json::json!({
+                        "path": p, "code_lines": l, "fixes": f,
+                    })).collect::<Vec<_>>(),
                     "declared_floor_growth": accepted_total,
                     "declared_floor_growth_declarations": accepted.iter().map(|d| serde_json::json!({
                         "lines": d.lines,
@@ -85,6 +101,7 @@ impl ShellBudgetArgs {
             );
         } else {
             print!("{}", shell_budget::render_report(&budget, origin));
+            print!("{}", shell_budget::churn::render(&churn));
             if !accepted.is_empty() {
                 println!(
                     "\n  declared floor growth  {accepted_total:>6}   declared across {} commit(s) since the epic began",
