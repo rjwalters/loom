@@ -172,20 +172,50 @@ pub fn measure(root: &Path) -> Result<Budget, String> {
         .map(str::to_string)
         .collect();
 
-    // A discovery failure must not read as "no shell left". Without this, a
-    // broken pathspec or a non-git checkout reports a budget of zero, which
-    // every downstream check would happily accept as a win.
-    if tracked.len() < 400 {
+    let allowlist_text = std::fs::read_to_string(root.join("scripts/shell-allowlist.txt"))
+        .map_err(|e| format!("could not read scripts/shell-allowlist.txt: {e}"))?;
+    let categories = parse_allowlist(&allowlist_text);
+
+    // A discovery failure must not read as "no shell left": a broken pathspec
+    // or a non-git checkout reports a budget of zero, which every downstream
+    // check would happily accept as a win.
+    //
+    // The floor is DERIVED from the allowlist rather than hard-coded. A fixed
+    // number encodes an assumption about how much shell this repo contains,
+    // and this epic exists to invalidate that assumption — a constant chosen
+    // today eventually fails on a healthy tree while blaming "broken
+    // discovery". The allowlist enumerates every in-scope script and is
+    // CI-enforced to stay in sync, so it tracks the real figure by
+    // construction (#8120).
+    if tracked.len() < categories.len() {
         return Err(format!(
-            "expected 400+ tracked .sh files, found {} — shell discovery is broken, and a \
-             measurement of nothing must not read as progress",
+            "scripts/shell-allowlist.txt enumerates {} scripts but discovery found only {} — \
+             that is a discovery failure, not a smaller repo, and a measurement of nothing must \
+             not read as progress",
+            categories.len(),
             tracked.len()
         ));
     }
 
-    let allowlist_text = std::fs::read_to_string(root.join("scripts/shell-allowlist.txt"))
-        .map_err(|e| format!("could not read scripts/shell-allowlist.txt: {e}"))?;
-    let categories = parse_allowlist(&allowlist_text);
+    // The PRODUCTION count needs its own floor, from a signal INDEPENDENT of
+    // the filter being checked. The allowlist types every script, and a
+    // non-`test` category is that signal: it is maintained by a human argument
+    // in the allowlist, not derived from `is_production_shell`.
+    //
+    // Without it a too-narrow filter is invisible. Review proved it: adding
+    // `if path.starts_with("defaults/") { return false }` made every gate pass
+    // while the report announced
+    //
+    //     net vs epic start   -34222 — retired since the epic began
+    //
+    // A fabricated 34,000-line win, green. The floor above cannot catch that,
+    // because `tracked` is the PRE-filter list — only a bound on the
+    // post-filter count can.
+    let expected = production_entry_count(&categories);
+    let counted = tracked.iter().filter(|p| is_production_shell(p)).count();
+    if counted < expected {
+        return Err(production_filter_error(expected, counted));
+    }
 
     let mut budget = Budget::default();
     for rel in tracked.iter().filter(|p| is_production_shell(p)) {
@@ -304,14 +334,46 @@ pub fn check_invariants(budget: &Budget) -> Result<(), String> {
                 .join("\n")
         ));
     }
-    if budget.file_count() < 150 {
-        return Err(format!(
-            "only {} production shell files were counted — the scope filter is too broad, and a \
-             gate that measures almost nothing passes for the wrong reason",
-            budget.file_count()
-        ));
+    // Deliberately NOT a fixed floor: a constant would fail on a healthy tree
+    // once the epic has retired enough shell, and blame the scope filter for
+    // the success.
+    //
+    // The real bound on the production count lives in `measure`, against the
+    // allowlist's non-`test` entries. An earlier version of THIS comment
+    // claimed that bound already existed when nobody had written it, which left
+    // a too-narrow filter free to manufacture a 34,000-line win with every gate
+    // green. The comment was the bug.
+    if budget.file_count() == 0 {
+        return Err(
+            "no production shell files were counted at all — the scope filter matched nothing, \
+             and a gate that measures nothing passes for the wrong reason"
+                .to_string(),
+        );
     }
     Ok(())
+}
+
+/// How many allowlist entries are typed as production, i.e. not `test`.
+///
+/// Deliberately reads the TYPED category rather than applying
+/// [`is_production_shell`]: the floor exists to catch that predicate being
+/// wrong, so it cannot be computed with it. The category is an independent
+/// signal — a human argues it in `scripts/shell-allowlist.txt` and CI enforces
+/// that every script has one.
+///
+/// Verified to agree with [`is_production_shell`] on all 514 current entries
+/// (236 vs 236, zero disagreements), so the floor is tight rather than slack.
+fn production_entry_count(categories: &BTreeMap<String, String>) -> usize {
+    categories.values().filter(|c| *c != "test").count()
+}
+
+/// The shared explanation, so both floors say the same thing.
+fn production_filter_error(expected: usize, counted: usize) -> String {
+    format!(
+        "the allowlist types {expected} scripts as production (non-`test`) but the scope filter \
+         counted only {counted} — `is_production_shell` is too narrow, and a filter that \
+         silently drops production shell manufactures progress that did not happen"
+    )
 }
 
 /// Measure the tree at a git revision rather than the working copy.
@@ -361,12 +423,21 @@ pub fn measure_at_rev(root: &Path, rev: &str) -> Result<Budget, String> {
         .filter(|p| p.ends_with(".sh") && is_production_shell(p))
         .collect();
 
-    // Same floor as the working-tree path: a revision that yields almost no
-    // shell means the query broke, and a measurement of nothing must not read
-    // as a clean comparison.
-    if shell.len() < 100 {
+    // Same reasoning as the working-tree path, against THAT revision's own
+    // allowlist — which is the only figure that can be right for a tree from
+    // an arbitrary point in the epic's history.
+    // Compare like with like: `shell` is the PRODUCTION subset, so the floor is
+    // the production subset of that revision's allowlist, not its whole count.
+    // (The first version of this compared against the full allowlist, which
+    // includes every test script, and refused a perfectly good revision.)
+    // Typed category, NOT is_production_shell. An earlier version filtered both
+    // sides through the same predicate, so a bug in it cancelled out and the
+    // floor could not see the thing it exists to see.
+    let expected = production_entry_count(&categories);
+    if shell.len() < expected {
         return Err(format!(
-            "only {} production shell files found at {rev} — the revision query is broken, and \
+            "{rev}'s allowlist types {expected} scripts as production but only {} were found \
+             there — either the revision query is broken or the scope filter is too narrow, and \
              an empty comparison must not read as no growth",
             shell.len()
         ));
@@ -699,6 +770,54 @@ mod tests {
         let err = comparison(d.path(), "origin/nonexistent").expect_err("must refuse");
         assert!(err.contains("no merge-base"), "{err}");
         assert!(err.contains("fetch-depth"), "must name the usual cause: {err}");
+    }
+
+    #[test]
+    fn the_production_floor_uses_the_typed_category_not_the_filter_it_guards() {
+        // The floor exists to catch `is_production_shell` being wrong, so it
+        // must not be computed with it. Review reproduced what happens when it
+        // is: narrowing the filter to drop `defaults/` made every gate pass
+        // while the report announced "net vs epic start -34222 — retired since
+        // the epic began". A fabricated 34,000-line win, green.
+        let mut cats = BTreeMap::new();
+        cats.insert("defaults/scripts/a.sh".to_string(), "contract".to_string());
+        cats.insert("defaults/scripts/b.sh".to_string(), "bootstrap".to_string());
+        cats.insert("defaults/scripts/tests/test-a.sh".to_string(), "test".to_string());
+        assert_eq!(
+            production_entry_count(&cats),
+            2,
+            "counts the two non-test entries, regardless of what the path filter thinks"
+        );
+    }
+
+    #[test]
+    fn a_narrowed_scope_filter_is_reported_as_a_filter_bug_not_as_progress() {
+        let msg = production_filter_error(236, 64);
+        assert!(msg.contains("too narrow"), "{msg}");
+        assert!(
+            msg.contains("manufactures progress that did not happen"),
+            "the message must name the consequence, not just the mismatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_typed_category_and_the_path_filter_agree_on_the_real_allowlist() {
+        // If these ever disagree, one of them is wrong and the floor becomes
+        // either slack or a false alarm. Pinning the agreement makes that
+        // visible the day it happens rather than the day it matters.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let text =
+            std::fs::read_to_string(root.join("scripts/shell-allowlist.txt")).expect("allowlist");
+        let cats = parse_allowlist(&text);
+        let by_category = production_entry_count(&cats);
+        let by_path = cats.keys().filter(|p| is_production_shell(p)).count();
+        assert_eq!(
+            by_category, by_path,
+            "the allowlist's typed categories and is_production_shell disagree about which \
+             scripts are production — one of them is wrong"
+        );
     }
 
     #[test]

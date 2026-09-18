@@ -13,8 +13,10 @@
 //! - **Every production script is accounted for** in `scripts/shell-allowlist.txt`.
 //!   An unlisted one makes every figure an undercount, whichever revision you
 //!   measure.
-//! - **The scope filter still sees the tree.** A filter that silently stops
-//!   counting whole directories makes the gate pass for the wrong reason.
+//! - **Something was counted at all.** The real bound on the production count
+//!   lives in `shell_budget::measure`, against the allowlist's non-`test`
+//!   entries — an independent signal, because a floor that used
+//!   `is_production_shell` could not catch that predicate being wrong.
 //! - **The progress denominator is pinned.** `origin_portable` is the portable
 //!   figure immediately before the epic's first port commit. An origin that
 //!   moves measures nothing, so a silent edit to it must fail here.
