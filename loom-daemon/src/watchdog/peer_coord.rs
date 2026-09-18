@@ -10,6 +10,8 @@
 //! that is not answering produces no information, and a "could not determine"
 //! reported alongside a confirmed hang is noise on top of a real signal.
 
+use std::path::Path;
+
 /// The daemon's own verdict about its coordination path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -22,6 +24,12 @@ pub enum Verdict {
 pub struct Health {
     pub verdict: Verdict,
     pub summary: String,
+    /// How long the receive path has been degraded, when the daemon said.
+    pub degraded_for_secs: Option<u64>,
+    /// Sustained receives accumulated toward recovery.
+    pub consecutive: Option<u64>,
+    /// How many are needed.
+    pub recovery_threshold: Option<u64>,
 }
 
 /// Parse `loom-daemon peer-claims --json`.
@@ -73,6 +81,9 @@ pub fn parse(json: &str) -> Option<Health> {
             Verdict::Green
         },
         summary,
+        degraded_for_secs: num("degraded_for_secs"),
+        consecutive: num("consecutive_receives_toward_recovery"),
+        recovery_threshold: num("recovery_threshold"),
     })
 }
 
@@ -90,7 +101,7 @@ pub fn enabled() -> bool {
 /// under duplicates.
 #[must_use]
 pub fn cooldown_secs() -> u64 {
-    super::env::num("LOOM_WATCHDOG_PEER_COORD_COOLDOWN_SECS", 3600)
+    super::env::num("LOOM_WATCHDOG_PEER_COORD_COOLDOWN_SECS", 21600)
 }
 
 /// Seconds remaining in the cooldown, or `None` when it has expired or no
@@ -183,6 +194,179 @@ pub fn flap_comment(hostname: &str, summary: &str, flap: u64, window: u64) -> St
          Filed automatically by the loom-daemon-watchdog.sh peer-coordination escalation \
          (#6222, dedup by #7664).\n"
     )
+}
+
+/// Seconds since the epoch. Mirrors `mod.rs`'s helper rather than making that
+/// one public, so the cooldown stamp and the cooldown read agree on a clock.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The escalation issue's title (#6222).
+#[must_use]
+pub fn title(hostname: &str) -> String {
+    format!("peer-claim coordination is DEGRADED on {hostname} (#6157 Layer 3)")
+}
+
+/// The escalation issue's body.
+///
+/// In the shell this was built with `read -d ''` rather than `$(cat <<EOF)`,
+/// because wrapping a heredoc in command substitution trips a real bash 3.2
+/// lexer bug: a bare apostrophe in the prose (here, "host's") was misread as
+/// opening a quote region it could never close, and the escalation body was
+/// silently dropped — 1099 times from 2026-08-16 (#7508). Here it is a string
+/// literal, so the entire bug class is gone rather than worked around, and the
+/// prose no longer has to avoid apostrophes to stay correct.
+#[must_use]
+pub fn body(hostname: &str, health: &Health, watchdog_log: &Path, sentinel: &Path) -> String {
+    let q = |o: Option<u64>| o.map_or_else(|| "?".to_string(), |n| n.to_string());
+    format!(
+        "The `peer_coordination` section of `loom-daemon health` has gone DEGRADED on host\n\
+         `{hostname}`. This host's one-way peer-claim RECEIVE path (Safehouse, #6157)\n\
+         can no longer be trusted to prove another host has already claimed an issue.\n\
+         This is diagnostic only since Epic #6165 Phase 4 (#6317): it no longer freezes\n\
+         stale-claim reclamation, which now gates solely on the lease record (#6286)\n\
+         (see `.loom/docs/safehouse.md` -> \"Peer-claim coordination: cross-host soft\n\
+         claim (#4028)\").\n\n\
+         - **Host**: `{hostname}`\n\
+         - **Verdict**: {summary}\n\
+         - **Degraded for**: {degraded_for}s\n\
+         - **Recovery progress**: {consecutive}/{threshold} consecutive sustained receive(s) \
+         toward recovery\n\
+         - **Watchdog log**: `{log}`\n\n\
+         **To recover by hand**: run `loom-daemon peer-claims` (or `loom-daemon health`)\n\
+         on `{hostname}` to confirm the live `peer_coordination` state, and check\n\
+         Safehouse connectivity to peer hosts (`.loom/docs/safehouse.md`).\n\n\
+         **This alert clears itself** — no manual close needed. Filed automatically by\n\
+         the loom-daemon-watchdog peer-coordination escalation (#6222, Layer 3 of\n\
+         #6157). Deduped by a sentinel at `{sentinel}`, which is cleared\n\
+         automatically (and this issue commented on + closed) once a later watchdog\n\
+         tick observes `peer_coordination` back to healthy.\n",
+        summary = health.summary,
+        degraded_for = health
+            .degraded_for_secs
+            .map_or_else(|| "unknown".to_string(), |n| n.to_string()),
+        consecutive = health.consecutive.unwrap_or(0),
+        threshold = q(health.recovery_threshold),
+        log = watchdog_log.display(),
+        sentinel = sentinel.display(),
+    )
+}
+
+/// File the tracking issue. Returns the issue reference `create-issue.sh`
+/// printed, which the sentinel records so recovery can close that exact issue.
+///
+/// `--force` because the sentinel already dedupes this path.
+pub fn file(
+    script: &Path,
+    hostname: &str,
+    health: &Health,
+    watchdog_log: &Path,
+    sentinel: &Path,
+) -> Option<String> {
+    let mut cmd = std::process::Command::new(script);
+    cmd.arg("--title")
+        .arg(title(hostname))
+        .arg("--body")
+        .arg(body(hostname, health, watchdog_log, sentinel))
+        .arg("--label")
+        .arg("loom:triage")
+        .arg("--force");
+
+    let out = crate::sweep_registry::output_with_timeout(cmd, std::time::Duration::from_secs(60))
+        .ok()
+        .flatten()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() {
+        // The shell requires BOTH rc 0 and a non-empty url. A sentinel with no
+        // issue reference is worse than none: recovery would have nothing to
+        // close and would keep retrying against a filing that may not exist.
+        return None;
+    }
+    Some(url)
+}
+
+/// Record the filing so a later tick dedupes against it and recovery can close
+/// the exact issue: `<iso8601> <issue-ref>`, the shell's format.
+pub fn write_sentinel(sentinel: &Path, issue_ref: &str) {
+    if let Some(dir) = sentinel.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(
+        sentinel,
+        format!("{} {issue_ref}\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")),
+    );
+}
+
+/// The issue reference a previous escalation recorded, if any.
+#[must_use]
+pub fn sentinel_issue_ref(sentinel: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(sentinel).ok()?;
+    let mut it = text.split_whitespace();
+    let _ts = it.next()?;
+    it.next().map(str::to_string)
+}
+
+/// The recovery counterpart: comment on and close the exact issue that was
+/// filed, clear the sentinel, and stamp the cooldown.
+///
+/// Best-effort throughout. A missing `gh`, no forge auth, or a failed close
+/// leaves the sentinel in place so a LATER healthy tick simply retries, rather
+/// than silently losing track of an open tracking issue.
+///
+/// Returns `true` only when the issue was actually closed.
+pub fn recover(sentinel: &Path, cooldown_state: &Path, hostname: &str, summary: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(sentinel) else {
+        return false;
+    };
+    let issue_ref = {
+        let mut it = text.split_whitespace();
+        let _ts = it.next();
+        it.next().map(str::to_string)
+    };
+    let Some(issue_ref) = issue_ref.filter(|r| !r.is_empty()) else {
+        // A malformed or legacy sentinel with no recorded reference: there is
+        // nothing to close, so clear it rather than retrying forever.
+        let _ = std::fs::remove_file(sentinel);
+        return true;
+    };
+
+    let gh = std::time::Duration::from_secs(60);
+    let mut comment = std::process::Command::new("gh");
+    comment.args(["issue", "comment", &issue_ref, "--body"]).arg(format!(
+        "peer-claim coordination has RECOVERED on `{hostname}` ({summary}). Closing          automatically — filed by the loom-daemon-watchdog peer-coordination escalation (#6222)."
+    ));
+    // The comment is advisory: a failure must not stop the close.
+    let _ = crate::sweep_registry::output_with_timeout(comment, gh);
+
+    let mut close = std::process::Command::new("gh");
+    close.args(["issue", "close", &issue_ref, "--reason", "completed"]);
+    let closed = crate::sweep_registry::output_with_timeout(close, gh)
+        .ok()
+        .flatten()
+        .is_some_and(|o| o.status.success());
+    if !closed {
+        return false;
+    }
+
+    let _ = std::fs::remove_file(sentinel);
+
+    // #7664: carry this issue's running flap count forward, so a dedup-comment
+    // escalation's bumped count survives recovery instead of resetting to 1 on
+    // every episode.
+    let flap = read_cooldown(cooldown_state)
+        .filter(|c| c.issue_ref == issue_ref)
+        .map_or(1, |c| c.flap_count);
+    if let Some(dir) = cooldown_state.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(cooldown_state, format!("{} {issue_ref} {flap}\n", now_secs()));
+    true
 }
 
 #[cfg(test)]

@@ -817,13 +817,43 @@ fn peer_coordination(
                     peer_coord::cooldown_secs(),
                     paths.log.display()
                 )
-            } else {
+            } else if env::var("LOOM_WATCHDOG_ESCALATE").is_some_and(|v| env::is_false(&v)) {
                 format!(
-                    "Out-of-band escalation was NOT possible (disabled, no create-issue.sh \
-                     reachable, or the forge call failed) — THIS LOGFILE IS THE ONLY SIGNAL for \
+                    "Out-of-band escalation is disabled — THIS LOGFILE IS THE ONLY SIGNAL for \
                      this degradation, {}.",
                     paths.log.display()
                 )
+            } else {
+                // #6222: file a forge tracking issue so the degradation is not
+                // confined to a logfile nobody tails.
+                let cli_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(Path::to_path_buf))
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let fallback =
+                    env::var("LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR").map(PathBuf::from);
+                let script = escalate::resolve_issue_script(
+                    repo_root.as_deref(),
+                    &cli_dir,
+                    fallback.as_deref(),
+                );
+                let hostname = escalate::hostname();
+                match script.as_deref().and_then(|s| {
+                    peer_coord::file(s, &hostname, &health, &paths.log, &state.peer_coord_sentinel)
+                }) {
+                    Some(issue_ref) => {
+                        peer_coord::write_sentinel(&state.peer_coord_sentinel, &issue_ref);
+                        "ESCALATED out-of-band: filed a forge tracking issue so this degradation \
+                         is not confined to a logfile nobody tails (#6222)."
+                            .to_string()
+                    }
+                    None => format!(
+                        "Out-of-band escalation was NOT possible (no create-issue.sh reachable, \
+                         or the forge call failed) — THIS LOGFILE IS THE ONLY SIGNAL for this \
+                         degradation, {}.",
+                        paths.log.display()
+                    ),
+                }
             };
             reporter.report(
                 report::Level::Divergence,
@@ -833,15 +863,36 @@ fn peer_coordination(
         peer_coord::Verdict::Green => {
             // Only worth a line when there was something to recover FROM.
             if state.peer_coord_sentinel.exists() {
-                reporter.report(
-                    report::Level::Warn,
-                    &format!(
-                        "peer-claim coordination has RECOVERED ({}) but closing the tracking \
-                         issue is not wired yet — the sentinel is left in place so a later \
-                         healthy tick retries (#6222).",
-                        health.summary
-                    ),
-                );
+                let hostname = escalate::hostname();
+                if peer_coord::recover(
+                    &state.peer_coord_sentinel,
+                    &state.peer_coord_cooldown,
+                    &hostname,
+                    &health.summary,
+                ) {
+                    reporter.report(
+                        report::Level::Warn,
+                        &format!(
+                            "peer-claim coordination has RECOVERED ({}): commented on and closed \
+                             the tracking issue, cleared the sentinel, and stamped the \
+                             post-recovery cooldown (#6222/#7258).",
+                            health.summary
+                        ),
+                    );
+                } else {
+                    // Best-effort by design: a missing `gh`, no forge auth, or
+                    // a failed close leaves the sentinel so a LATER healthy
+                    // tick retries, rather than losing track of an open issue.
+                    reporter.report(
+                        report::Level::Warn,
+                        &format!(
+                            "peer-claim coordination has RECOVERED ({}) but the tracking issue \
+                             could not be closed — the sentinel is left in place so a later \
+                             healthy tick retries (#6222).",
+                            health.summary
+                        ),
+                    );
+                }
             }
         }
     }
