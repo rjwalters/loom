@@ -49,6 +49,7 @@ pub mod liveness;
 pub mod load_avg;
 pub mod locate;
 pub mod marker;
+pub mod peer_coord;
 pub mod probe;
 pub mod probe_state;
 pub mod recovery;
@@ -116,7 +117,12 @@ fn marker_present(
         return code;
     }
 
-    // TODO(#8086): the 50-series peer-coordination checks run here.
+    // The 50-series: only on a tick whose probe came back healthy. Asking a
+    // daemon that is not answering produces no information, and a "could not
+    // determine" reported alongside a confirmed hang is noise on a real signal.
+    if !reporter.diverged() {
+        peer_coordination(paths, reporter, state, &snap);
+    }
 
     let heartbeat_file = snap.heartbeat_file.clone().unwrap_or_else(|| {
         paths
@@ -607,4 +613,108 @@ fn ipc_probe(
             None
         }
     }
+}
+
+/// The 50-series: peer-claim coordination health (#6222/#7258/#7664).
+///
+/// A degraded receive path is silent by construction — each host still believes
+/// it is coordinating while actually working alone, so two can claim the same
+/// issue and neither notices. That is why this is asked explicitly rather than
+/// waited for.
+///
+/// Reports only; it never exits. Coordination degradation is a fleet-level
+/// concern, and failing this tick would conflate it with the daemon-liveness
+/// question the exit code answers.
+fn peer_coordination(
+    paths: &config::Paths,
+    reporter: &report::Reporter,
+    state: &consts::StateFiles,
+    snap: &liveness::Snapshot,
+) {
+    if !peer_coord::enabled() {
+        return;
+    }
+    let repo_root = marker::get_nonempty(&paths.marker, "repo_root").map(PathBuf::from);
+    let Some(bin) = locate::daemon_bin(repo_root.as_deref()) else {
+        return;
+    };
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(["peer-claims", "--json"])
+        .env("LOOM_SOCKET_PATH", &paths.socket_path);
+    let timeout =
+        std::time::Duration::from_secs(env::num("LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS", 15));
+    let Some(out) = crate::sweep_registry::output_with_timeout(cmd, timeout)
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    // `None` is "could not determine", which is deliberately NOT reported.
+    // Saying nothing is correct here; saying "healthy" would be a claim, and
+    // saying "unknown" every tick on a host without peers is noise.
+    let Some(health) = peer_coord::parse(&String::from_utf8_lossy(&out.stdout)) else {
+        return;
+    };
+
+    match health.verdict {
+        peer_coord::Verdict::Degraded => {
+            let note = if state.peer_coord_sentinel.exists() {
+                reporter.report(
+                    report::Level::Ok,
+                    &format!(
+                        "peer-coordination degradation already escalated out-of-band (sentinel \
+                         {}).",
+                        state.peer_coord_sentinel.display()
+                    ),
+                );
+                return;
+            } else if let Some(remaining) = peer_coord::cooldown_remaining(
+                &state.peer_coord_cooldown,
+                now_secs(),
+                peer_coord::cooldown_secs(),
+            ) {
+                // #7258: a path that recovers and re-degrades within minutes is
+                // ONE episode to an operator, not two. Filing per flap buries
+                // the signal under duplicates of itself.
+                format!(
+                    "Suppressing a duplicate tracking issue: a previous episode on this host \
+                     recovered within the last {}s cooldown window (#7258) — {remaining}s \
+                     remaining before a repeat degradation would file fresh again. {} is the \
+                     signal for this flap.",
+                    peer_coord::cooldown_secs(),
+                    paths.log.display()
+                )
+            } else {
+                format!(
+                    "Out-of-band escalation was NOT possible (disabled, no create-issue.sh \
+                     reachable, or the forge call failed) — THIS LOGFILE IS THE ONLY SIGNAL for \
+                     this degradation, {}.",
+                    paths.log.display()
+                )
+            };
+            reporter.report(
+                report::Level::Divergence,
+                &format!("peer-claim coordination is DEGRADED: {}. {note}", health.summary),
+            );
+        }
+        peer_coord::Verdict::Green => {
+            // Only worth a line when there was something to recover FROM.
+            if state.peer_coord_sentinel.exists() {
+                reporter.report(
+                    report::Level::Warn,
+                    &format!(
+                        "peer-claim coordination has RECOVERED ({}) but closing the tracking \
+                         issue is not wired yet — the sentinel is left in place so a later \
+                         healthy tick retries (#6222).",
+                        health.summary
+                    ),
+                );
+            }
+        }
+    }
+    let _ = snap;
 }
