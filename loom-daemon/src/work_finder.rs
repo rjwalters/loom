@@ -137,7 +137,6 @@ use crate::sweep_registry::{
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::{Event, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
-use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
 
 // ============================================================================
 // Constants
@@ -3185,12 +3184,19 @@ where
 /// This is the multi-repo replacement for [`spawn_work_finder_task`]. Every
 /// tick it:
 ///
-/// 1. Re-reads the machine-level [`WorkspaceRegistry`] and resolves
-///    [`effective_roots`](WorkspaceRegistry::effective_roots) against
+/// 1. Re-reads the machine-level
+///    [`WorkspaceRegistry`](crate::workspace_registry::WorkspaceRegistry) and
+///    resolves
+///    [`effective_roots`](crate::workspace_registry::WorkspaceRegistry::effective_roots)
+///    against
 ///    `fallback_root` — an **empty** registry yields `vec![fallback_root]`
 ///    (today's single-workspace behavior); a populated one yields the registered
-///    roots. Re-reading each tick means `loom-daemon workspace add|remove` is
-///    hot-applied without a daemon restart.
+///    roots. Re-reading each tick — and provisioning any new root — happens in
+///    `registry_refresh::refresh_local_workspace_state`, called BEFORE the
+///    rate-limit breaker
+///    check (#8121), so `loom-daemon workspace add|remove|set-priority` is
+///    hot-applied without a daemon restart even while gh polling is
+///    suppressed.
 /// 2. Builds one `(GhWorkSource, RegistryDispatcher)` pair per root — the source
 ///    scoped to that repo via [`GhWorkSource::for_root`], the dispatcher over
 ///    that root's own [`SweepRegistry`](crate::sweep_registry::SweepRegistry)
@@ -3295,12 +3301,29 @@ pub fn spawn_multi_work_finder_task(
         loop {
             ticker.tick().await;
 
+            // #8121: reload the registry and provision any newly-registered
+            // root's `SweepRegistry` BEFORE the rate-limit breaker check
+            // below — see `registry_refresh`'s module doc comment for
+            // why this purely-local, no-GitHub-API work must never be gated
+            // behind the breaker (`loom-daemon workspace add|remove
+            // |set-priority` must hot-apply even while gh polling is
+            // suppressed).
+            let (registry, roots) = registry_refresh::refresh_local_workspace_state(
+                &pool,
+                &fallback_root,
+                &mut missing_roots_warned,
+            );
+
             // GitHub rate-limit circuit breaker (#4429): when the shared API
             // budget is exhausted every workspace's candidate list is a doomed
-            // gh call, so skip the ENTIRE tick body — no listing, no dispatch,
-            // no idle-edge role firing (a spawned role would hit the same
-            // wall). The breaker lazily releases itself once the probed reset
-            // epoch passes; the edge is logged once each way, never per-tick.
+            // gh call, so skip the REST of the tick body — no listing, no
+            // dispatch, no idle-edge role firing (a spawned role would hit the
+            // same wall). The breaker lazily releases itself once the probed
+            // reset epoch passes; the edge is logged once each way, never
+            // per-tick. The registry reload + provisioning above already ran
+            // unconditionally (#8121), so a workspace registered mid-
+            // suppression is still hot-applied even though dispatch itself
+            // stays paused.
             if let Some(rl) = crate::rate_limit_breaker::global() {
                 let now = chrono::Utc::now();
                 if let Some(transition) = rl.observe_tick(now) {
@@ -3322,15 +3345,6 @@ pub fn spawn_multi_work_finder_task(
                 }
                 was_rate_limited = false;
             }
-
-            // Resolve the current set of workspaces fresh each tick so registry
-            // edits (add / remove / set-priority) are hot-applied. Loaded before
-            // the token-pool probe below so both can share the same read
-            // (issue #4292, trip-wire 1: registry-aware anchoring needs it too).
-            let registry = WorkspaceRegistry::load_default().unwrap_or_else(|e| {
-                log::warn!("work_finder: could not load workspace registry ({e}); using cwd");
-                WorkspaceRegistry::default()
-            });
 
             // Dynamic cap from live *machine-level* inputs (one token pool, one
             // scratch volume) probed from the daemon's primary workspace.
@@ -3382,13 +3396,9 @@ pub fn spawn_multi_work_finder_task(
             let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
             let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_max);
 
-            let roots = registry.effective_roots(&fallback_root);
-            // Skip registered roots whose directory no longer exists on disk
-            // (#4326 — e.g. a leaked/stale registry entry) so a dangling entry
-            // cannot occupy top dispatch priority or burn the tick. This is
-            // warn-and-skip, never auto-remove: the entry stays registered
-            // (`loom-daemon status` flags it, `workspace remove` clears it).
-            let roots = filter_missing_roots(roots, &mut missing_roots_warned);
+            // `roots` was already resolved (registry reload + missing-root
+            // filtering) by `refresh_local_workspace_state` above, before the
+            // rate-limit breaker check (#8121).
             // Issue #7527: the single `token_limit` probe above reflects only
             // `fallback_root`'s resolved pool — this is the per-workspace
             // minimum across every root's OWN resolved pool, reported
@@ -4285,6 +4295,11 @@ pub mod forge {
 pub use forge::{GhWorkSource, RegistryDispatcher};
 
 pub mod pool_preflight;
+
+// Purely-local registry reload + workspace provisioning for the tick loop
+// (#8121). Lives in its own file because this one is over the file-size
+// ratchet threshold (.loom/docs/file-size-policy.md) and may not grow.
+mod registry_refresh;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
