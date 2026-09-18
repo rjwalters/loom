@@ -237,8 +237,12 @@ assert_not_contains "$src" '"$1" == "--allow-verdict-contradiction"' \
 
 # Assert the guard is invoked BEFORE the auto-merge path (line ordering),
 # same convention as test-merge-pr-loom-pr-label-guard.sh.
-guard_line="$(grep -n '^_check_verdict_label_contradiction$' "$MERGE_PR_SRC" | head -1 | cut -d: -f1)"
-automerge_line="$(grep -n '^# Handle auto-merge mode' "$MERGE_PR_SRC" | head -1 | cut -d: -f1)"
+guard_match="$(grep -n '^_check_verdict_label_contradiction$' "$MERGE_PR_SRC" || true)"
+guard_line="${guard_match%%$'\n'*}"
+guard_line="${guard_line%%:*}"
+automerge_match="$(grep -n '^# Handle auto-merge mode' "$MERGE_PR_SRC" || true)"
+automerge_line="${automerge_match%%$'\n'*}"
+automerge_line="${automerge_line%%:*}"
 if [[ -n "$guard_line" && -n "$automerge_line" && "$guard_line" -lt "$automerge_line" ]]; then
     ordered="yes"
 else
