@@ -58,9 +58,23 @@ jobs:
           # An empty or implausibly small file list means discovery broke, not
           # that the repo stopped having shell. Without this, a bad glob makes
           # the job pass while linting nothing.
-          if (( ${#ALL[@]} < 400 )); then
-            echo "ERROR: expected 400+ tracked .sh files, found ${#ALL[@]}." >&2
-            echo "Shell discovery is broken -- refusing to pass on an empty lint." >&2
+          #
+          # The floor is DERIVED from scripts/shell-allowlist.txt rather than
+          # hard-coded. A fixed number encodes an assumption about how much
+          # shell this repo contains -- and epic #7810 exists to invalidate that
+          # assumption, so a constant chosen today eventually fails on a
+          # perfectly healthy tree while blaming "broken shell discovery".
+          #
+          # The allowlist enumerates every in-scope script and is CI-enforced to
+          # stay in sync, so it tracks the real figure by construction. It
+          # excludes the .loom/ installed mirrors, which discovery does see, so
+          # the count found is always >= the entry count.
+          EXPECTED=$(grep -cvE '^[[:space:]]*(#|$)' scripts/shell-allowlist.txt)
+          if (( ${#ALL[@]} < EXPECTED )); then
+            echo "ERROR: scripts/shell-allowlist.txt enumerates $EXPECTED scripts but discovery" >&2
+            echo "found only ${#ALL[@]}. That is a discovery failure, not a smaller repo --" >&2
+            echo "check-shell-allowlist.sh keeps the two in sync, so they cannot diverge this" >&2
+            echo "way legitimately. Refusing to pass on a lint that sees less than it should." >&2
             exit 1
           fi
 

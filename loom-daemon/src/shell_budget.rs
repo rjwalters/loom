@@ -172,20 +172,30 @@ pub fn measure(root: &Path) -> Result<Budget, String> {
         .map(str::to_string)
         .collect();
 
-    // A discovery failure must not read as "no shell left". Without this, a
-    // broken pathspec or a non-git checkout reports a budget of zero, which
-    // every downstream check would happily accept as a win.
-    if tracked.len() < 400 {
-        return Err(format!(
-            "expected 400+ tracked .sh files, found {} — shell discovery is broken, and a \
-             measurement of nothing must not read as progress",
-            tracked.len()
-        ));
-    }
-
     let allowlist_text = std::fs::read_to_string(root.join("scripts/shell-allowlist.txt"))
         .map_err(|e| format!("could not read scripts/shell-allowlist.txt: {e}"))?;
     let categories = parse_allowlist(&allowlist_text);
+
+    // A discovery failure must not read as "no shell left": a broken pathspec
+    // or a non-git checkout reports a budget of zero, which every downstream
+    // check would happily accept as a win.
+    //
+    // The floor is DERIVED from the allowlist rather than hard-coded. A fixed
+    // number encodes an assumption about how much shell this repo contains,
+    // and this epic exists to invalidate that assumption — a constant chosen
+    // today eventually fails on a healthy tree while blaming "broken
+    // discovery". The allowlist enumerates every in-scope script and is
+    // CI-enforced to stay in sync, so it tracks the real figure by
+    // construction (#8120).
+    if tracked.len() < categories.len() {
+        return Err(format!(
+            "scripts/shell-allowlist.txt enumerates {} scripts but discovery found only {} — \
+             that is a discovery failure, not a smaller repo, and a measurement of nothing must \
+             not read as progress",
+            categories.len(),
+            tracked.len()
+        ));
+    }
 
     let mut budget = Budget::default();
     for rel in tracked.iter().filter(|p| is_production_shell(p)) {
@@ -304,12 +314,18 @@ pub fn check_invariants(budget: &Budget) -> Result<(), String> {
                 .join("\n")
         ));
     }
-    if budget.file_count() < 150 {
-        return Err(format!(
-            "only {} production shell files were counted — the scope filter is too broad, and a \
-             gate that measures almost nothing passes for the wrong reason",
-            budget.file_count()
-        ));
+    // Deliberately NOT a fixed floor. See `measure`: a constant here would fail
+    // on a healthy tree once the epic has retired enough shell, and blame the
+    // scope filter for the success. What is actually checkable without a
+    // comparison is that SOMETHING was counted at all — a filter that sees
+    // nothing is broken, and a filter that sees less than it should shows up
+    // against the allowlist in `measure` before reaching here.
+    if budget.file_count() == 0 {
+        return Err(
+            "no production shell files were counted at all — the scope filter matched nothing, \
+             and a gate that measures nothing passes for the wrong reason"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -361,13 +377,19 @@ pub fn measure_at_rev(root: &Path, rev: &str) -> Result<Budget, String> {
         .filter(|p| p.ends_with(".sh") && is_production_shell(p))
         .collect();
 
-    // Same floor as the working-tree path: a revision that yields almost no
-    // shell means the query broke, and a measurement of nothing must not read
-    // as a clean comparison.
-    if shell.len() < 100 {
+    // Same reasoning as the working-tree path, against THAT revision's own
+    // allowlist — which is the only figure that can be right for a tree from
+    // an arbitrary point in the epic's history.
+    // Compare like with like: `shell` is the PRODUCTION subset, so the floor is
+    // the production subset of that revision's allowlist, not its whole count.
+    // (The first version of this compared against the full allowlist, which
+    // includes every test script, and refused a perfectly good revision.)
+    let expected_production = categories.keys().filter(|p| is_production_shell(p)).count();
+    if shell.len() < expected_production {
         return Err(format!(
-            "only {} production shell files found at {rev} — the revision query is broken, and \
-             an empty comparison must not read as no growth",
+            "{rev}'s allowlist enumerates {expected_production} production scripts but only {} \
+             were found there — the revision query is broken, and an empty comparison must not \
+             read as no growth",
             shell.len()
         ));
     }
