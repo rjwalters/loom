@@ -1112,7 +1112,6 @@ fn select_inner(
     model_class: Option<&str>,
     affinity: &Affinity,
 ) -> Result<SelectedToken, EmptyTokenPoolError> {
-
     if !tokens_dir.is_dir() {
         return Err(EmptyTokenPoolError(format!(
             "Token directory does not exist: {}{}. Run `loom-daemon tokens bootstrap` to populate it \
@@ -1122,7 +1121,7 @@ fn select_inner(
         )));
     }
 
-    let all_tokens = list_token_files(&tokens_dir);
+    let all_tokens = list_token_files(tokens_dir);
     if all_tokens.is_empty() {
         return Err(EmptyTokenPoolError(format!(
             "No .token files in {}{}. Run `loom-daemon tokens bootstrap` \
@@ -1147,10 +1146,10 @@ fn select_inner(
     // #5609 (design D8/D9): `index.json` rows keyed by name, consulted below
     // both to skip a non-Claude account and to carry `upstream_id` through to
     // the caller. A pool with no manifest is an empty map — fail-open, D6/D8.
-    let manifest = read_manifest_index(&tokens_dir);
+    let manifest = read_manifest_index(tokens_dir);
 
     if let Some(selected) =
-        try_ranking(&tokens_dir, &ranking_file, workspace, rng, &manifest, model_class, affinity)
+        try_ranking(tokens_dir, &ranking_file, workspace, rng, &manifest, model_class, affinity)
     {
         return Ok(selected);
     }
@@ -1165,7 +1164,7 @@ fn select_inner(
     //   advisory   — other non-healthy statuses from a *stale* ranking
     //                (#3894); readmitted by the fail-safe if they would empty
     //                the pool.
-    let hard_map = ranking_hard_exclusions(&tokens_dir, &ranking_file);
+    let hard_map = ranking_hard_exclusions(tokens_dir, &ranking_file);
     let mut hard: HashSet<String> = hard_map.keys().cloned().collect();
     let non_claude: HashSet<String> = manifest
         .iter()
@@ -1177,12 +1176,14 @@ fn select_inner(
     exclude.extend(hard.iter().cloned());
 
     if let Some(mut selected) =
-        try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &exclude, model_class, affinity)
+        try_allowlist(tokens_dir, &allowlist_file, workspace, rng, &exclude, model_class, affinity)
     {
         selected.upstream_id = upstream_id_for(&manifest, &selected.name);
         return Ok(selected);
     }
-    if let Some(mut selected) = try_random(&tokens_dir, workspace, rng, &exclude, model_class, affinity) {
+    if let Some(mut selected) =
+        try_random(tokens_dir, workspace, rng, &exclude, model_class, affinity)
+    {
         selected.upstream_id = upstream_id_for(&manifest, &selected.name);
         return Ok(selected);
     }
@@ -1194,12 +1195,14 @@ fn select_inner(
     // non-Claude provider, is still never handed out.
     if exclude.len() > hard.len() {
         if let Some(mut selected) =
-            try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &hard, model_class, affinity)
+            try_allowlist(tokens_dir, &allowlist_file, workspace, rng, &hard, model_class, affinity)
         {
             selected.upstream_id = upstream_id_for(&manifest, &selected.name);
             return Ok(selected);
         }
-        if let Some(mut selected) = try_random(&tokens_dir, workspace, rng, &hard, model_class, affinity) {
+        if let Some(mut selected) =
+            try_random(tokens_dir, workspace, rng, &hard, model_class, affinity)
+        {
             selected.upstream_id = upstream_id_for(&manifest, &selected.name);
             return Ok(selected);
         }
@@ -1233,7 +1236,7 @@ fn select_inner(
         tokens_dir.display(),
         deciding_binary_identity(),
         exhaustion_cooldown_secs(),
-        shadowed_shared_pool_hint(&tokens_dir),
+        shadowed_shared_pool_hint(tokens_dir),
     )))
 }
 

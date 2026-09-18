@@ -495,9 +495,20 @@ The key is populated from `LOOM_ROLE`, which `tokens select`'s `--role` arg
 reads straight from the environment (`spawn-claude.sh` passes nothing extra on
 the command line — the env var is already present in its own environment, and
 a daemon binary predating the `--role` field simply never reads it, no
-shell-side capability probe required). `claude-wrapper.sh`'s post-failure
-account rotation deliberately runs with `LOOM_ROLE` unset — that path exists
-to land on a *different* account.
+shell-side capability probe required).
+
+That env pickup is exactly why `claude-wrapper.sh`'s three post-failure
+rotation `tokens select` calls are each invoked as `env -u LOOM_ROLE
+"${daemon_bin}" tokens select …`: LOOM_ROLE *is* inherited all the way into the
+wrapper, so without the explicit unset the affinity key would be live on those
+paths too. `reselect_account_no_mark()` is the load-bearing one — it handles a
+concurrent-session-limit fault and deliberately does **not** bad-mark, so the
+saturated account is still a candidate and an active affinity key would name it
+as the preferred one, re-picking the account the retry exists to move away from.
+The other two bad-mark first, so the affine account is already excluded there;
+they unset it anyway, so the invariant holds end-to-end and a rotation never
+re-records the affinity key. `test-token-cache-affinity.sh` is the regression
+guard for all three.
 
 ### `.ranking` status exclusions reach every tier (issue #5629)
 
