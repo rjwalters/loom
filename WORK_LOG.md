@@ -7,6 +7,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8122** (closed): Destructive-write guard denies redirects/heredocs targeting paths outside every repo when cwd is a repo with live worktrees
+- **PR #8218**: fix(guard): scan an unquoted heredoc body's substitution spans for write targets
+- **Issue #8166** (closed): guard qsplit(): the closing-quote scan matches an escaped quote, ending a double-quoted span early
+- **PR #8212**: fix(guard): qsplit() closing-quote scan honours backslash parity (#8166)
+- **PR #8238**: feat(daemon): add loom-daemon usage-report token/cost breakdown (#8062)
+- **Issue #8163** (closed): health: status build exceeds the 10 s IPC probe budget on many-workspace hosts, so `health` returns exit 3 on an idle daemon
+- **PR #8235**: fix(health): size the IPC probe budget from the registered root count
+- **Issue #8193** (closed): Builder: in-session Task-tool builders publish no loom:lease, so claim_reconciliation reclaims them mid-build
+- **PR #8228**: fix(builder): publish a lease from worktree.sh so in-session builders survive reclamation
 - **Issue #8230** (closed): curator.md's _epoch() bash helper misparses UTC timestamps as local time on macOS, corrupting dep-recheck staleness window
 - **PR #8231**: fix(curator): treat BSD date -j -f timestamps as UTC in _epoch()
 - **Issue #8165** (closed): resync-installed.sh: comm locale, unanchored install-subject regex alternative, misplaced fixture comment (nits from #7870 review)
