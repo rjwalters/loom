@@ -183,6 +183,7 @@ pub mod launchd_env_drift;
 pub mod launchd_reload;
 pub mod live_claim;
 pub mod main_health_gate;
+pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;
 pub mod orphan_process_reaper;

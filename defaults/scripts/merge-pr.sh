@@ -839,6 +839,22 @@ If you are deliberately merging without that review signal and take responsibili
 # call — same reasoning as the two guards above.
 _check_loom_pr_label
 
+# #8191: prove the closing-reference analysis can actually RUN, here, while
+# `set -e` is live and before anything has been mutated.
+#
+# _mp_refs()'s own `error` exit cannot do this. Every consumer calls it inside
+# `$(...)` inside _check_partial_increment_close_conflict /
+# _reset_partial_increment_labels, and both of those are invoked as `... ||
+# true`. Bash suppresses `set -e` in that context, so the exit only kills the
+# subshell: the caller receives an EMPTY string and reads it as "no references
+# found" — the reading that closes an unfinished issue or reopens a correctly
+# closed one. Review reproduced all five skew shapes reaching the merge that
+# way, including the default rollout state (a resynced script against an
+# installed binary that predates this subcommand and answers exit 2).
+#
+# Verifying in isolation, as the original fix did, tested the function and not
+# the call shape. This is the call shape.
+
 # ---------------------------------------------------------------------------
 # Partial-increment closing-keyword conflict detection (#4569, extended by
 # #4595 to cover commit messages).
@@ -896,10 +912,52 @@ PARTIAL_CONFLICT_ISSUES=""
 # example/quoted text inside a fenced block reads as documentation, never a
 # live declaration (#5234).
 _strip_fenced_code_blocks() {
+  # Retained only for any out-of-tree caller; the analysis below no longer
+  # uses it (loom-daemon strips fences itself, identically).
   awk '
     /^[[:space:]]*```/ { infence = !infence; next }
     !infence { print }
   '
+}
+
+# Closing-reference / partial-increment analysis, ported to Rust (#8191).
+#
+# These five predicates decide whether merging would close an issue this PR
+# only declared itself a PART OF. Their whole bug history is about what a
+# stacked grep/sed/awk pipeline accidentally matched -- #5234 (a backticked
+# hypothetical mention read as a declaration, reopening a correctly closed
+# issue) and the numbered-list ordinal trap (`3. Part of #789` read as
+# referencing both 3 and 789). Both are ordering bugs inside a pipeline.
+#
+# The body goes over STDIN, never argv: it is untrusted external content and
+# routinely tens of kilobytes.
+#
+# A missing binary is FATAL here rather than degrading. Every one of these
+# feeds a merge-or-refuse decision, and an empty answer is not "no references
+# found" -- it is "no answer", which would silently close an unfinished issue
+# or reopen a correctly closed one. Failing loudly is the safe direction.
+_mp_refs() {
+  # Resolved inline, not via lib/locate-daemon-bin.sh: the retained suites
+  # extract these functions and source them alone, with no libs present.
+  # LOOM_DAEMON_SELF_BIN first, per #8134 — it means "the binary that
+  # IMPLEMENTS this entry point", which is exactly what this is.
+  local bin out rc=0
+  bin="${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-}}"
+  if [[ -n "$bin" ]]; then
+    # A PINNED path that is unusable must refuse, not quietly resolve a
+    # different binary off PATH — that substitutes an unknown version for the
+    # one an operator deliberately selected.
+    [[ -x "$bin" ]] || error "merge-pr.sh: LOOM_DAEMON_SELF_BIN/LOOM_DAEMON_BIN is set to '$bin', which is not executable. Refusing rather than silently falling back to a different loom-daemon."
+  else
+    bin="$(command -v loom-daemon 2>/dev/null || printf '%s' "$HOME/.local/bin/loom-daemon")"
+    [[ -x "$bin" ]] || error "merge-pr.sh needs loom-daemon for its closing-reference analysis (#8191) and could not resolve one. Refusing rather than proceeding with no answer: an empty result is indistinguishable from 'no references', which would close an unfinished issue or reopen a correctly closed one."
+  fi
+  # `|| rc=$?`, not `; rc=$?`: under `set -e` a failing command substitution in
+  # a bare assignment aborts the script AT THAT LINE, so the check below never
+  # ran and the refusal was silent — fail-closed, but with nothing said.
+  out="$("$bin" merge-pr-refs "$@" 2>/dev/null)" || rc=$?
+  [[ "$rc" -eq 0 ]] || error "merge-pr.sh's closing-reference analysis failed: '$bin merge-pr-refs $*' exited $rc. A loom-daemon predating #8191 has no such subcommand -- update it, or pin LOOM_DAEMON_BIN to a build that has it. Refusing rather than treating an empty result as 'no references'."
+  printf '%s' "$out"
 }
 
 # Issue numbers referenced with a NON-closing partial-increment keyword
@@ -930,13 +988,7 @@ _strip_fenced_code_blocks() {
 # would see #3 registered as a declared partial increment AND a closing
 # reference, and get reopened right after a correct close.
 _partial_increment_refs() {
-  { printf '%s\n' "$1" \
-      | _strip_fenced_code_blocks \
-      | sed -E 's/`[^`]*`//g' \
-      | grep -oiE '^[[:space:]]*([-*+>]|[0-9]+\.)?[[:space:]]*(Part of|Contributes to)[[:space:]]+#[0-9]+' \
-      | grep -oE '#[0-9]+' \
-      | tr -d '#' \
-      | sort -un; } || true
+  printf '%s\n' "$1" | _mp_refs partial-increment-refs
 }
 
 # Issue numbers referenced with a GitHub CLOSING keyword anywhere in the text
@@ -950,14 +1002,12 @@ _partial_increment_refs() {
 # created via raw REST for that reason). A quota-free text signal is the one that
 # still works in exactly the conditions where this bug bites.
 _closing_refs_stdin() {
-  { grep -oiE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#[0-9]+' \
-      | grep -oE '[0-9]+' \
-      | sort -un; } || true
+  _mp_refs closing-refs
 }
 
 # Same, for text passed as $1 (the PR body, historically the only source).
 _body_closing_refs() {
-  { printf '%s\n' "$1" | _closing_refs_stdin; } || true
+  printf '%s\n' "$1" | _mp_refs closing-refs
 }
 
 # The literal offending snippets ("close #N", "Fixes #N", …) that reference
@@ -965,9 +1015,7 @@ _body_closing_refs() {
 # `snippet", "snippet`. Empty when the text carries no such reference — which is
 # how the caller tells WHICH source (body vs. commit messages) is at fault.
 _closing_ref_snippets() {
-  { printf '%s\n' "$1" \
-      | grep -oiE "\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\b[[:space:]]+#$2\\b" \
-      | sort -u | tr '\n' '|' | sed 's/|$//; s/|/", "/g'; } || true
+  printf '%s\n' "$1" | _mp_refs closing-ref-snippets --issue "$2"
 }
 
 # The literal declaration text (`Part of #N` / `Contributes to #N`) that
@@ -979,12 +1027,7 @@ _closing_ref_snippets() {
 # stripping as _partial_increment_refs so the quoted snippet always matches
 # what was actually matched, never a code-block artifact.
 _partial_increment_ref_snippets() {
-  { printf '%s\n' "$1" \
-      | _strip_fenced_code_blocks \
-      | sed -E 's/`[^`]*`//g' \
-      | grep -oiE "^[[:space:]]*([-*+>]|[0-9]+\\.)?[[:space:]]*(Part of|Contributes to)[[:space:]]+#$2\\b" \
-      | sed -E 's/^[[:space:]]+//' \
-      | sort -u | tr '\n' '|' | sed 's/|$//; s/|/", "/g'; } || true
+  printf '%s\n' "$1" | _mp_refs partial-increment-ref-snippets --issue "$2"
 }
 
 # Every commit message of this PR, concatenated (#4595). merge-pr.sh squash-
@@ -1097,6 +1140,14 @@ _check_partial_increment_close_conflict() {
 
 # Runs before either merge path so the operator sees the conflict BEFORE the
 # close happens, and so --dry-run reports it without merging. Best-effort.
+# #8191 preflight. One call, at top level: NOT inside `$(...)`, NOT behind
+# `|| true`, and AFTER the definitions (_mp_refs lives inside the span the
+# retained suite extracts, so it cannot be defined any earlier). _mp_refs's own
+# `error` therefore exits the script here, which it cannot do from inside a
+# command substitution in a `|| true` caller — the shape review proved lets all
+# five version-skew cases reach the merge with an empty "no references" answer.
+_mp_refs closing-refs </dev/null >/dev/null
+
 _check_partial_increment_close_conflict || true
 
 info "Merging PR #$PR_NUMBER: $PR_TITLE"
