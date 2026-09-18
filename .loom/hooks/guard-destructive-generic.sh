@@ -2880,6 +2880,72 @@ function unmask_ws(s) {
 #      fix belongs in its own issue, scoped against that coupling risk, not
 #      folded in here.
 # =============================================================================
+
+# =============================================================================
+# UNQUOTED-DELIMITER HEREDOC BODY -> LIVE SUBSTITUTION SPANS AS EXECUTABLE TEXT
+# (#8035 -- the write-confinement analogue of the index-mutation-side fix #8003
+# shipped as im_mask_heredocs()/IMHDQ[]/im_hd_expand(), far below in this file.)
+#
+# THE GAP THIS CLOSES. mask_heredoc_bodies_selective() (in the awk program
+# below) already asks the
+# right question about quotedness: an UNQUOTED (`<<EOF`) body keeps every LIVE
+# `$( … )`/backtick span VISIBLE (_heredoc_mark_live_lines(), #7421). But
+# visible is not the same as SCANNED. extract_write_targets() recognizes a
+# write idiom by the COMMAND WORD of a `;`/`&`/`|`-delimited segment (toks[1]
+# == "cp"/"mv"/"mkdir"/"tee"/"sed"), and qsplit() does not treat `$(` / `)` as
+# segment boundaries -- so the whole
+#     cat > /tmp/x <<EOF
+#     $( cp /tmp/s <main-checkout>/pwned )
+#     EOF
+# invocation is ONE segment whose toks[1] is `cat`. The `cp` inside the live
+# span never reaches toks[1], and the span carries no bare `>` for the
+# redirect scan either, so a write bash really does execute (the outer shell
+# expands the body BEFORE `cat` reads a byte of it -- measured: the file lands)
+# was silently ALLOWED by the worktree-write-confinement check.
+#
+# WHAT THIS DOES. heredoc_unquoted_subst_spans() walks the raw command, finds
+# every CLOSED heredoc block whose delimiter was BARE, and returns the INNER
+# text of each live substitution span in those bodies, one per line. The caller
+# (extract_write_targets(), see its own call site) runs that text through the
+# SAME write-idiom scan as a SECOND, INDEPENDENT pass -- so `cp` above becomes
+# toks[1] of its own segment and denies exactly as the bare `cp …` control does.
+#
+# WHY A SECOND PASS AND NOT AN APPEND. Concatenating the span text onto the
+# scanned buffer would share qsplit()'s quote state with the original command:
+# an unbalanced quote in the original would scan forward into the appended copy
+# and find a closing quote there, swallowing every `;`/`&`/`|` in between as
+# inert quoted data -- deleting a real segment boundary and hiding a command
+# word from toks[1]. That is precisely the fail-OPEN direction #7978/#8025 were
+# filed for. A separate pass cannot do that: the two buffers never share lexer
+# state, and the span pass can only ever PRINT MORE write targets, never fewer.
+#
+# DELIBERATELY QUOTE-BLIND AT THE BODY LEVEL, exactly like im_hd_expand()
+# (#8003): quote characters carry no quoting meaning inside a heredoc body, so
+# a span wrapped in quotes there is expanded exactly like a bare one. A
+# BACKSLASH is the one suppressor the shell honours in an unquoted body, so
+# `\$( … )` and an escaped backtick stay inert here too (AC3), with `\\`
+# consumed as a pair so backslash PARITY matches has_live_subst()'s (#7498).
+# INSIDE a span the text is ordinary shell, so the recursion is quote-AWARE --
+# the same split im_hd_expand() (blind) -> im_scan()/im_extract_subst() (aware)
+# already draws. A QUOTED delimiter is skipped entirely: that body IS literal,
+# which is the whole reason the masker is allowed to blank it.
+#
+# DIRECTION / LIMITS, stated rather than claimed away:
+#   * Purely ADDITIVE. Nothing here changes what the primary scan sees; it only
+#     adds a second text to scan. It can convert an ALLOW into a DENY, never a
+#     DENY into an ALLOW.
+#   * An UNBALANCED `$(` / unterminated backtick in the body yields NO span
+#     (not "the rest of the buffer"): the pre-#8035 behaviour for that body was
+#     to scan none of it, so skipping is not a widening -- and a stray `$(` in
+#     ordinary prose is exactly the shape that made #5181/#6056/#7247 false
+#     positives. Recorded as not-covered, not as safe.
+#   * Recursion is bounded at depth 5 (the same bound im_scan() uses). Past it
+#     spans stop being collected -- again not-covered rather than newly allowed.
+#   * The second pass starts from the ORIGINAL cwd: a `cd` earlier in the same
+#     command is not threaded into it. A relative escape (`../../pwned`) still
+#     resolves out of the worktree from that cwd, so the confinement verdict is
+#     unchanged for every shape reachable without a prior `cd`.
+# =============================================================================
 _MASKHEREDOC_AWK='
 # Return the heredoc delimiter opened by the `<<` at byte offset p in line,
 # or "" when that `<<` is not a recognized heredoc opener. As a side effect,
@@ -3598,6 +3664,121 @@ function mask_unquoted_cat_heredoc_bodies(s, orig,   out, lines, nl, i, j, line,
     return out
 }
 '
+
+# =============================================================================
+# _HDSUBST_AWK -- the #8035 unquoted-heredoc-body substitution-span collector.
+#
+# Held as its OWN awk snippet rather than folded into _MASKHEREDOC_AWK above,
+# even though it calls that snippet's heredoc_delim_at() and must therefore be
+# concatenated AFTER it. _MASKHEREDOC_AWK is re-parsed by awk on every fork at
+# six call sites, several of them on the guard's hot path; exactly ONE of those
+# sites (the span pass inside extract_write_targets()) needs these two
+# functions, so the rest should not pay to parse them. Behaviourally identical
+# either way -- this is purely about where the parse cost lands.
+#
+# Full rationale, direction and limits: the shell-comment block titled
+# "UNQUOTED-DELIMITER HEREDOC BODY -> LIVE SUBSTITUTION SPANS" above.
+# =============================================================================
+_HDSUBST_AWK='
+function _hd_collect_subst_spans(s, depth, qaware,   n, i, c, j, dep, q, inner, SQ, DQ, BTC) {
+    if (depth > 5) return
+    SQ = sprintf("%c", 39)
+    DQ = sprintf("%c", 34)
+    BTC = sprintf("%c", 96)
+    n = length(s); i = 1; q = ""
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (qaware) {
+            # Ordinary shell quoting, only INSIDE an already-live span.
+            if (q == SQ) { if (c == SQ) q = ""; i++; continue }
+            if (q == DQ) {
+                if (c == "\\") { i += 2; continue }
+                if (c == DQ) { q = ""; i++; continue }
+                # a `$(`/backtick inside double quotes IS live -- fall through
+            } else {
+                if (c == SQ) { q = SQ; i++; continue }
+                if (c == DQ) { q = DQ; i++; continue }
+                if (c == "\\") { i += 2; continue }
+            }
+        } else if (c == "\\") {
+            # Heredoc-body level: quote-blind, backslash-honouring. Consuming
+            # BOTH bytes keeps `\\` a pair (so a following `$(` is still live)
+            # and keeps `\$(` / an escaped backtick inert.
+            i += 2
+            continue
+        }
+        if (c == "$" && substr(s, i + 1, 1) == "(") {
+            # Count every paren pair, not just `$(`-prefixed opens -- the same
+            # rule _heredoc_mark_live_lines() applies (#7425). `$(( … ))`
+            # arithmetic balances here too; its inner text carries no command
+            # word, so scanning it is inert noise rather than a false positive.
+            dep = 1; j = i + 2
+            while (j <= n) {
+                if (substr(s, j, 1) == "(") dep++
+                else if (substr(s, j, 1) == ")") { dep--; if (dep == 0) break }
+                j++
+            }
+            if (dep != 0) { i++; continue }   # unbalanced: not covered (above)
+            inner = substr(s, i + 2, j - i - 2)
+            _HDSPANS = _HDSPANS "\n" inner
+            _hd_collect_subst_spans(inner, depth + 1, 1)
+            i = j + 1
+            continue
+        }
+        if (c == BTC) {
+            j = i + 1
+            while (j <= n && substr(s, j, 1) != BTC) j++
+            if (j > n) { i++; continue }       # unterminated: not covered
+            inner = substr(s, i + 1, j - i - 1)
+            _HDSPANS = _HDSPANS "\n" inner
+            _hd_collect_subst_spans(inner, depth + 1, 1)
+            i = j + 1
+            continue
+        }
+        i++
+    }
+}
+# Block detection here is deliberately byte-identical to
+# mask_heredoc_bodies_selective() above (same heredoc_delim_at(), same PASS-1
+# close search including the `<<-` tab strip, same `i = closeat` resume), so
+# the two passes can never disagree about WHICH text is a heredoc body.
+function heredoc_unquoted_subst_spans(s,   lines, nl, i, j, line, trimmed, delim, delim_quoted, closeat, p, off, body) {
+    _HDSPANS = ""
+    if (index(s, "<<") == 0) return ""
+    nl = split(s, lines, "\n")
+    if (nl == 0) return ""
+    for (i = 1; i <= nl; i++) {
+        line = lines[i]
+        off = 1
+        while (1) {
+            p = index(substr(line, off), "<<")
+            if (p == 0) break
+            p = off + p - 1
+            off = p + 2
+            delim = heredoc_delim_at(line, p)
+            delim_quoted = HEREDOC_DELIM_QUOTED
+            if (delim == "") continue
+            closeat = 0
+            for (j = i + 1; j <= nl; j++) {
+                trimmed = lines[j]
+                sub(/^\t+/, "", trimmed)
+                if (trimmed == delim) { closeat = j; break }
+            }
+            if (closeat == 0) continue
+            if (!delim_quoted) {
+                body = ""
+                for (j = i + 1; j < closeat; j++)
+                    body = body (body == "" ? "" : "\n") lines[j]
+                if (body != "") _hd_collect_subst_spans(body, 0, 0)
+            }
+            i = closeat
+            break
+        }
+    }
+    return _HDSPANS
+}
+'
+
 
 # =============================================================================
 # QUOTE-AWARE COMMENT STRIPPING (#6252) -- mask_comment()
@@ -6795,8 +6976,48 @@ rm_scope_literal_same_command_resolve() {
 # lands outside the repo — it never flips the default for anything else. (The
 # file's broader "ambiguity never widens a deny" contract is about not
 # inventing NEW denies; preserving an EXISTING one is the conservative side.)
+# UNQUOTED-HEREDOC-BODY SUBSTITUTION SPANS ARE SCANNED AS A SECOND PASS (#8035)
+#
+# extract_write_targets() is the public entry point and is now TWO scans of the
+# same scanner over two texts: the command itself, then the inner text of every
+# live `$( … )`/backtick span found in an UNQUOTED-delimiter heredoc body
+# (heredoc_unquoted_subst_spans(), see its full header beside
+# _hd_collect_subst_spans() above for why bash executes that text, why a quoted
+# delimiter is excluded, and why this is a separate pass rather than a buffer
+# append). The two passes never share awk process state, so the second one can
+# only ever ADD write targets to the caller's list; every pre-#8035 verdict
+# reachable without such a span is byte-for-byte unchanged.
+#
+# HOT PATH: the extra awk forks are gated behind a pure-bash substring test for
+# a `<<` AND a `$(`/backtick in the same command — the same "only fork when the
+# command mentions the construct at all" gating _INDEXMUT_AWK uses at its own
+# call site. A command with no heredoc, or a plain prose heredoc with no
+# substitution anywhere in it (the overwhelmingly common Loom shape), pays
+# nothing at all; the guard's average-execution-time budget
+# (tests/hooks/test-guard-destructive-cargo-and-perf.sh) is measured on those.
+# The test is deliberately whole-COMMAND and not body-scoped: it is a cheap
+# necessary condition, and heredoc_unquoted_subst_spans() does the real,
+# body-scoped, backslash-aware decision.
 # =============================================================================
 extract_write_targets() {
+    _extract_write_targets_scan "$1" "$2"
+    case "$1" in
+        *'<<'*)
+            case "$1" in
+                *'$('*|*'`'*) ;;
+                *) return 0 ;;
+            esac
+            local _hd_spans
+            _hd_spans=$(printf '%s' "$1" | awk "$_MASKHEREDOC_AWK""$_HDSUBST_AWK"'
+                { buf = buf (NR > 1 ? "\n" : "") $0 }
+                END { printf "%s", heredoc_unquoted_subst_spans(buf) }')
+            [[ -n "$_hd_spans" ]] && _extract_write_targets_scan "$_hd_spans" "$2"
+            ;;
+    esac
+    return 0
+}
+
+_extract_write_targets_scan() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_VARRESOLVE_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
     # resolve_var()/record_assign() (same-command $VAR resolution, #4881) and
     # the DQ/SQ/AMBIG constants they use now come from the shared
