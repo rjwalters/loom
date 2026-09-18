@@ -297,6 +297,23 @@ pub fn render_report(budget: &Budget, origin_portable: u64) -> String {
     s
 }
 
+/// The revision immediately before epic #7810's first port commit, as recorded
+/// in `scripts/shell-budget-baseline.txt`.
+///
+/// Returns `None` when the key is absent, which is not an error — the report
+/// simply omits the cumulative figure rather than failing.
+#[must_use]
+pub fn read_origin_rev(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("scripts/shell-budget-baseline.txt")).ok()?;
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .find_map(|l| {
+            let mut it = l.split_whitespace();
+            (it.next()? == "origin_rev").then(|| it.next().map(str::to_string))?
+        })
+}
+
 /// The portable-shell figure at epic #7810's first port commit, read from the
 /// baseline file. It is the denominator progress is measured against and is
 /// never regenerated — an origin that moves measures nothing.
@@ -536,12 +553,188 @@ pub fn comparison(root: &Path, base_ref: &str) -> Result<Comparison, String> {
     })
 }
 
+/// The commit-message trailer that declares deliberate growth in the permanent
+/// floor (`bootstrap` / `vendored`).
+///
+/// The gate's failure message used to end "if that is right, say why in the
+/// commit" while `check_against_rev` returned `Err` unconditionally — it
+/// promised an escape hatch that did not exist, and three Judge-approved
+/// safety PRs sat red against it with no in-repo remedy (#8154). This is that
+/// hatch, made real and made narrow.
+pub const GROWTH_TRAILER: &str = "Shell-Budget-Growth:";
+
+/// A parsed `Shell-Budget-Growth:` trailer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrowthDeclaration {
+    /// Lines of floor growth the author is declaring.
+    pub lines: u64,
+    /// The stated reason, verbatim after the line count.
+    pub reason: String,
+    /// The issue the reason references. Required — an override that cites no
+    /// issue is a bare escape hatch, which is the thing this must not become.
+    pub issue: u64,
+}
+
+/// Why a `Shell-Budget-Growth:` line was not accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MalformedDeclaration {
+    /// The offending line, trimmed.
+    pub line: String,
+    /// What was wrong with it.
+    pub why: &'static str,
+}
+
+/// Parse every `Shell-Budget-Growth:` trailer out of a block of commit
+/// messages.
+///
+/// Returns the accepted declarations and, separately, the lines that look like
+/// an attempt but are not usable. Malformed lines are reported rather than
+/// ignored: a typo'd override that silently degrades to "no override" fails the
+/// build with a message about growth, never about the typo, and the author
+/// re-reads the wrong thing.
+///
+/// Accepted shape, liberal about the separator:
+///
+/// ```text
+/// Shell-Budget-Growth: 59 lines — guard against silent revert of a local fix (#7870)
+/// ```
+#[must_use]
+pub fn parse_growth_declarations(
+    text: &str,
+) -> (Vec<GrowthDeclaration>, Vec<MalformedDeclaration>) {
+    let mut ok = Vec::new();
+    let mut bad = Vec::new();
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some(rest) = strip_trailer_prefix(line) else {
+            continue;
+        };
+        let rest = rest.trim();
+
+        // Leading integer: the declared line count.
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            bad.push(MalformedDeclaration {
+                line: line.to_string(),
+                why: "no leading line count — expected `<n> lines — <reason> (#issue)`",
+            });
+            continue;
+        }
+        let Ok(lines) = digits.parse::<u64>() else {
+            bad.push(MalformedDeclaration {
+                line: line.to_string(),
+                why: "line count does not fit in a u64",
+            });
+            continue;
+        };
+
+        let reason = rest[digits.len()..].trim_start();
+        let reason = reason
+            .strip_prefix("lines")
+            .or_else(|| reason.strip_prefix("line"))
+            .unwrap_or(reason);
+        let reason = reason
+            .trim_start()
+            .trim_start_matches(['-', '\u{2014}', '\u{2013}', ':'])
+            .trim();
+
+        if reason.is_empty() {
+            bad.push(MalformedDeclaration {
+                line: line.to_string(),
+                why: "no reason given after the line count",
+            });
+            continue;
+        }
+
+        let Some(issue) = first_issue_reference(reason) else {
+            bad.push(MalformedDeclaration {
+                line: line.to_string(),
+                why: "reason cites no issue — an override must reference `#<issue>`",
+            });
+            continue;
+        };
+
+        ok.push(GrowthDeclaration {
+            lines,
+            reason: reason.to_string(),
+            issue,
+        });
+    }
+
+    (ok, bad)
+}
+
+/// Case-insensitive match on the trailer key, so `shell-budget-growth:` works.
+fn strip_trailer_prefix(line: &str) -> Option<&str> {
+    let key = GROWTH_TRAILER;
+    // `get` rather than a slice: real commit messages are not ASCII, and
+    // `line[..20]` panics outright when byte 20 lands inside a multi-byte
+    // character. Scanning the epic's own history hit exactly that on an
+    // em-dash — the unit tests were all ASCII and never saw it.
+    let head = line.get(..key.len())?;
+    if head.eq_ignore_ascii_case(key) {
+        Some(&line[key.len()..])
+    } else {
+        None
+    }
+}
+
+/// The first `#<digits>` in the text.
+fn first_issue_reference(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b != b'#' {
+            continue;
+        }
+        let digits: String = text[i + 1..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if !digits.is_empty() {
+            return digits.parse().ok();
+        }
+    }
+    None
+}
+
+/// Read every commit message in `base_rev..HEAD` and parse its trailers.
+///
+/// # Errors
+/// Returns a message when `git log` cannot be run.
+pub fn collect_growth_declarations(
+    root: &Path,
+    base_rev: &str,
+) -> Result<(Vec<GrowthDeclaration>, Vec<MalformedDeclaration>), String> {
+    let out = Command::new("git")
+        .current_dir(root)
+        .args(["log", "--format=%B", &format!("{base_rev}..HEAD")])
+        .output()
+        .map_err(|e| format!("could not run git log: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git log {base_rev}..HEAD failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_growth_declarations(&String::from_utf8_lossy(&out.stdout)))
+}
+
 /// Compare this tree against a base revision. `Ok` when the change does not
 /// grow the portable pool.
 ///
 /// # Errors
 /// Returns the operator-facing explanation when it does.
-pub fn check_against_rev(now: &Budget, before: &Budget, base_desc: &str) -> Result<(), String> {
+pub fn check_against_rev(
+    now: &Budget,
+    before: &Budget,
+    base_desc: &str,
+    declared: &[GrowthDeclaration],
+) -> Result<(), String> {
+    // Portable growth is NOT overridable, deliberately. The trailer buys a
+    // larger permanent floor, which is a cost the epic can price; it does not
+    // buy more of the thing the epic exists to retire. #8154 asked only for the
+    // floor and this keeps it there.
     if now.portable() > before.portable() {
         return Err(portable_growth_message(now, before, base_desc));
     }
@@ -553,17 +746,43 @@ pub fn check_against_rev(now: &Budget, before: &Budget, base_desc: &str) -> Resu
     // reporting -439. Portable is what the epic retires, but growth in the
     // permanent floor is still growth and should be deliberate.
     if now.total() > before.total() {
+        let growth = now.total() - before.total();
+        let allowed: u64 = declared.iter().map(|d| d.lines).sum();
+
+        if allowed >= growth {
+            return Ok(());
+        }
+
+        let declared_note = if declared.is_empty() {
+            String::new()
+        } else {
+            let each = declared
+                .iter()
+                .map(|d| format!("    {} lines — {}", d.lines, d.reason))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n\nYou declared {allowed} line(s), which is {} short:\n\n{each}\n\n\
+                 Raise the declared count to cover the measured growth, or shrink the change.",
+                growth - allowed
+            )
+        };
+
         return Err(format!(
-            "This change adds {} code lines of production shell without growing the portable \
-             pool (vs {base_desc}: {} -> {}), so the growth is in the permanent floor \
+            "This change adds {growth} code lines of production shell without growing the \
+             portable pool (vs {base_desc}: {} -> {}), so the growth is in the permanent floor \
              (`bootstrap` / `vendored`).\n\n\
              That is allowed, and it is not free. The floor is what will still be shell when \
-             the epic is done, so adding to it raises the finish line. If that is right, say \
-             why in the commit; if the script could be a daemon subcommand instead, it should \
-             be.\n\n\
+             the epic is done, so adding to it raises the finish line. If the script could be a \
+             daemon subcommand instead, it should be.\n\n\
+             If the growth is right, declare it with a commit trailer naming the amount and the \
+             issue that argues it:\n\n\
+             \x20   {GROWTH_TRAILER} {growth} lines — <why this must stay shell> (#<issue>)\n\n\
+             The declared count must cover the measured growth, and the reason must cite an \
+             issue. Declared growth is not hidden: it stays in the running total and \
+             `shell-budget` prints it.{declared_note}\n\n\
              Note this compares against the MERGE-BASE, so it is measuring what YOUR change \
              did.",
-            now.total() - before.total(),
             before.total(),
             now.total()
         ));
@@ -635,7 +854,8 @@ mod tests {
     fn adding_portable_shell_fails_and_names_the_category() {
         let before = budget_with(&[("contract", 100, 2), ("bootstrap", 50, 1)]);
         let now = budget_with(&[("contract", 130, 3), ("bootstrap", 50, 1)]);
-        let err = check_against_rev(&now, &before, "origin/main (abc)").expect_err("must fail");
+        let err =
+            check_against_rev(&now, &before, "origin/main (abc)", &[]).expect_err("must fail");
         assert!(err.contains("adds 30 code lines of PORTABLE"), "{err}");
         assert!(err.contains("contract     100 -> 130"), "{err}");
         assert!(err.contains("MERGE-BASE"), "must say what it compared against: {err}");
@@ -649,7 +869,8 @@ mod tests {
         // raises the finish line and must be deliberate.
         let before = budget_with(&[("contract", 100, 2), ("bootstrap", 50, 1)]);
         let now = budget_with(&[("contract", 100, 2), ("bootstrap", 550, 2)]);
-        let err = check_against_rev(&now, &before, "origin/main (abc)").expect_err("must fail");
+        let err =
+            check_against_rev(&now, &before, "origin/main (abc)", &[]).expect_err("must fail");
         assert!(err.contains("adds 500 code lines of production shell"), "{err}");
         assert!(err.contains("permanent floor"), "{err}");
     }
@@ -662,7 +883,8 @@ mod tests {
         let before = budget_with(&[("contract", 1000, 10), ("bootstrap", 50, 1)]);
         let now = budget_with(&[("contract", 561, 9), ("bootstrap", 889, 2)]);
         assert!(now.portable() < before.portable(), "portable falls, as in the report");
-        let err = check_against_rev(&now, &before, "origin/main (abc)").expect_err("must fail");
+        let err =
+            check_against_rev(&now, &before, "origin/main (abc)", &[]).expect_err("must fail");
         assert!(err.contains("production shell"), "{err}");
     }
 
@@ -670,7 +892,7 @@ mod tests {
     fn a_change_that_removes_shell_passes() {
         let before = budget_with(&[("contract", 100, 2), ("bootstrap", 50, 1)]);
         let now = budget_with(&[("contract", 40, 1), ("bootstrap", 50, 1)]);
-        assert!(check_against_rev(&now, &before, "base").is_ok());
+        assert!(check_against_rev(&now, &before, "base", &[]).is_ok());
     }
 
     #[test]
@@ -680,13 +902,178 @@ mod tests {
         let before = budget_with(&[("contract", 100, 2), ("hook-entry", 20, 1)]);
         let now = budget_with(&[("contract", 80, 2), ("hook-entry", 40, 2)]);
         assert_eq!(now.portable(), before.portable());
-        assert!(check_against_rev(&now, &before, "base").is_ok());
+        assert!(check_against_rev(&now, &before, "base", &[]).is_ok());
     }
 
     #[test]
     fn an_unchanged_tree_passes() {
         let b = budget_with(&[("contract", 100, 2)]);
-        assert!(check_against_rev(&b, &b, "base").is_ok());
+        assert!(check_against_rev(&b, &b, "base", &[]).is_ok());
+    }
+
+    // --- #8154: declared floor growth ---
+
+    fn decl(lines: u64) -> Vec<GrowthDeclaration> {
+        parse_growth_declarations(&format!(
+            "Shell-Budget-Growth: {lines} lines — must stay shell, see (#7870)"
+        ))
+        .0
+    }
+
+    #[test]
+    fn a_declaration_covering_the_growth_admits_floor_growth() {
+        // The case #8154 was filed for: #7870 adds 59 lines to a `vendored`
+        // script it cannot port (blocked upstream by #7758), and the only
+        // alternative the gate offered was deleting the guard it was adding.
+        let before = budget_with(&[("contract", 100, 2), ("vendored", 500, 1)]);
+        let now = budget_with(&[("contract", 100, 2), ("vendored", 559, 1)]);
+        assert!(check_against_rev(&now, &before, "base", &decl(59)).is_ok());
+    }
+
+    #[test]
+    fn a_declaration_larger_than_the_growth_also_admits_it() {
+        // Declaring a ceiling and coming in under it is honest, not a defect.
+        let before = budget_with(&[("bootstrap", 500, 1)]);
+        let now = budget_with(&[("bootstrap", 520, 1)]);
+        assert!(check_against_rev(&now, &before, "base", &decl(59)).is_ok());
+    }
+
+    #[test]
+    fn a_declaration_short_of_the_growth_still_fails_and_says_by_how_much() {
+        // The override is a declared amount, not a blanket pass. Declaring 10
+        // and growing 500 must not buy the other 490.
+        let before = budget_with(&[("bootstrap", 50, 1)]);
+        let now = budget_with(&[("bootstrap", 550, 2)]);
+        let err = check_against_rev(&now, &before, "base", &decl(10)).expect_err("must fail");
+        assert!(err.contains("You declared 10 line(s)"), "{err}");
+        assert!(err.contains("490 short"), "must name the shortfall: {err}");
+    }
+
+    #[test]
+    fn undeclared_growth_remains_default_deny() {
+        let before = budget_with(&[("bootstrap", 50, 1)]);
+        let now = budget_with(&[("bootstrap", 550, 2)]);
+        assert!(check_against_rev(&now, &before, "base", &[]).is_err());
+    }
+
+    #[test]
+    fn a_declaration_never_admits_portable_growth() {
+        // The trailer buys a bigger permanent floor. It must not buy more of
+        // the thing the epic exists to retire, or the gate is decorative.
+        let before = budget_with(&[("contract", 100, 2)]);
+        let now = budget_with(&[("contract", 130, 3)]);
+        let err = check_against_rev(&now, &before, "base", &decl(9999)).expect_err("must fail");
+        assert!(err.contains("PORTABLE"), "{err}");
+    }
+
+    #[test]
+    fn the_failure_message_describes_the_format_the_code_accepts() {
+        // The whole bug in #8154 was a message promising something the code did
+        // not implement. Pin them together: the shape the message prints must
+        // parse, and must then admit the growth it was printed for.
+        let before = budget_with(&[("bootstrap", 50, 1)]);
+        let now = budget_with(&[("bootstrap", 550, 2)]);
+        let err = check_against_rev(&now, &before, "base", &[]).expect_err("must fail");
+
+        assert!(err.contains(GROWTH_TRAILER), "message must name the trailer: {err}");
+
+        // Lift the literal template out of the message and make it real.
+        let line = err
+            .lines()
+            .find(|l| l.contains(GROWTH_TRAILER))
+            .expect("message must show the trailer line");
+        let concrete = line
+            .replace("<why this must stay shell>", "cannot be ported yet")
+            .replace("<issue>", "8154");
+        let (ok, bad) = parse_growth_declarations(&concrete);
+        assert!(bad.is_empty(), "the message's own template must parse: {bad:?}");
+        assert_eq!(ok.len(), 1, "from {concrete:?}");
+        assert_eq!(ok[0].lines, 500, "must carry the measured growth");
+        assert!(check_against_rev(&now, &before, "base", &ok).is_ok());
+    }
+
+    #[test]
+    fn declarations_accumulate_across_commits_in_the_range() {
+        let (ok, bad) = parse_growth_declarations(
+            "feat: one\n\nShell-Budget-Growth: 30 lines — first half (#8154)\n\n             feat: two\n\nShell-Budget-Growth: 29 lines — second half (#8154)\n",
+        );
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(ok.len(), 2);
+        let before = budget_with(&[("vendored", 500, 1)]);
+        let now = budget_with(&[("vendored", 559, 1)]);
+        assert!(check_against_rev(&now, &before, "base", &ok).is_ok());
+    }
+
+    #[test]
+    fn a_declaration_without_an_issue_is_malformed_not_accepted() {
+        // Ask #1: the reason must reference an issue, so the override cannot be
+        // a bare escape hatch a Builder grants itself in passing.
+        let (ok, bad) =
+            parse_growth_declarations("Shell-Budget-Growth: 59 lines — because I said so");
+        assert!(ok.is_empty(), "{ok:?}");
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].why.contains("cites no issue"), "{:?}", bad[0]);
+    }
+
+    #[test]
+    fn a_declaration_without_a_count_or_reason_is_malformed() {
+        let (ok, bad) = parse_growth_declarations(
+            "Shell-Budget-Growth: lines — no count (#1)\nShell-Budget-Growth: 12 lines\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        assert_eq!(bad.len(), 2, "{bad:?}");
+        assert!(bad[0].why.contains("no leading line count"), "{:?}", bad[0]);
+        assert!(bad[1].why.contains("no reason"), "{:?}", bad[1]);
+    }
+
+    #[test]
+    fn the_trailer_parses_across_plausible_separators_and_casing() {
+        // Authors type what the message shows, but not byte-for-byte. An
+        // em-dash, a hyphen, a colon and a lowercase key all mean the same
+        // thing, and a near-miss that silently means "no override" is the
+        // failure mode this whole issue is about.
+        for body in [
+            "Shell-Budget-Growth: 59 lines — why (#7870)",
+            "Shell-Budget-Growth: 59 lines - why (#7870)",
+            "Shell-Budget-Growth: 59 lines: why (#7870)",
+            "Shell-Budget-Growth: 59 why (#7870)",
+            "shell-budget-growth: 59 lines — why (#7870)",
+            "    Shell-Budget-Growth: 59 lines — why (#7870)",
+            "Shell-Budget-Growth: 1 line — why (#7870)",
+        ] {
+            let (ok, bad) = parse_growth_declarations(body);
+            assert!(bad.is_empty(), "{body:?} -> {bad:?}");
+            assert_eq!(ok.len(), 1, "{body:?}");
+            assert_eq!(ok[0].issue, 7870, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_multibyte_char_at_the_key_boundary_does_not_panic() {
+        // Regression: `strip_trailer_prefix` sliced `line[..20]`, and 20 bytes
+        // into "docs(cache): measure — …" is the middle of an em-dash, so
+        // scanning real history panicked. Every line here has a multi-byte
+        // character straddling or near the key's byte length.
+        let corpus = "docs(cache): measure — falsify the hypothesis\n\
+                      fix: résumé the loop after a rollback — see #1\n\
+                      — leading em-dash\n\
+                      日本語のコミットメッセージです\n\
+                      Shell-Budget-Growth: 9 lines — naïve café (#8154)\n";
+        let (ok, bad) = parse_growth_declarations(corpus);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(ok.len(), 1, "{ok:?}");
+        assert_eq!(ok[0].lines, 9);
+        assert_eq!(ok[0].issue, 8154);
+    }
+
+    #[test]
+    fn unrelated_prose_is_not_mistaken_for_a_declaration() {
+        let (ok, bad) = parse_growth_declarations(
+            "fix: mention Shell-Budget-Growth: in the docs\n\n             This commit talks about the trailer but does not declare one.\n",
+        );
+        // The mention is mid-line, so it is not a trailer at all.
+        assert!(ok.is_empty(), "{ok:?}");
+        assert!(bad.is_empty(), "{bad:?}");
     }
 
     // --- git-backed: comparison() resolution ---

@@ -47,6 +47,16 @@ impl ShellBudgetArgs {
         let budget = shell_budget::measure(&root).map_err(anyhow::Error::msg)?;
         let origin = shell_budget::read_origin_portable(&root).unwrap_or(0);
 
+        // Floor growth that has been declared and accepted since the epic began
+        // (#8154 ask 2). Fail-soft: a shallow clone cannot reach the epic-start
+        // rev, and a report that refuses to print because of that is worse than
+        // one that omits a line.
+        let accepted: Vec<shell_budget::GrowthDeclaration> = shell_budget::read_origin_rev(&root)
+            .and_then(|rev| shell_budget::collect_growth_declarations(&root, &rev).ok())
+            .map(|(ok, _)| ok)
+            .unwrap_or_default();
+        let accepted_total: u64 = accepted.iter().map(|d| d.lines).sum();
+
         if self.json {
             let by_cat: serde_json::Map<String, serde_json::Value> = budget
                 .by_category
@@ -63,12 +73,27 @@ impl ShellBudgetArgs {
                     "files": budget.file_count(),
                     "origin_portable": origin,
                     "net_vs_epic_start": i128::from(budget.portable()) - i128::from(origin),
+                    "accepted_floor_growth": accepted_total,
+                    "accepted_floor_growth_declarations": accepted.iter().map(|d| serde_json::json!({
+                        "lines": d.lines,
+                        "reason": d.reason,
+                        "issue": d.issue,
+                    })).collect::<Vec<_>>(),
                     "by_category": by_cat,
                     "unlisted": budget.unlisted.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 })
             );
         } else {
             print!("{}", shell_budget::render_report(&budget, origin));
+            if !accepted.is_empty() {
+                println!(
+                    "\n  declared floor growth  {accepted_total:>6}   accepted across {} commit(s) since the epic began",
+                    accepted.len()
+                );
+                for d in &accepted {
+                    println!("    {:>4} — {}", d.lines, d.reason);
+                }
+            }
         }
 
         if self.check {
@@ -92,9 +117,40 @@ impl ShellBudgetArgs {
                 shell_budget::measure_at_rev(&root, &cmp.rev).map_err(anyhow::Error::msg)?;
             let desc = cmp.desc;
 
-            if let Err(why) = shell_budget::check_against_rev(&budget, &before, &desc) {
+            // Declared floor growth (#8154). The gate's own message told
+            // authors to "say why in the commit" while nothing read the
+            // commit; these two lines are what make that true.
+            let (declared, malformed) = shell_budget::collect_growth_declarations(&root, &cmp.rev)
+                .map_err(anyhow::Error::msg)?;
+
+            // A typo'd override degrades to "no override", and then the build
+            // fails with a message about growth rather than about the typo —
+            // so say it plainly before anything else is printed.
+            for m in &malformed {
+                eprintln!(
+                    "\nshell-budget: ignoring a malformed {} trailer — {}\n  {}",
+                    shell_budget::GROWTH_TRAILER,
+                    m.why,
+                    m.line
+                );
+            }
+
+            if let Err(why) = shell_budget::check_against_rev(&budget, &before, &desc, &declared) {
                 eprintln!("\nshell-budget: PORTABLE SHELL GREW\n\n{why}");
                 std::process::exit(1);
+            }
+
+            // Accepted growth stays visible. #8154 ask 3: the point is that
+            // growth remains a conscious act, so it must not vanish into a
+            // silently-passing build.
+            if !declared.is_empty() && !self.json {
+                let total: u64 = declared.iter().map(|d| d.lines).sum();
+                println!("\nshell-budget: {total} line(s) of floor growth declared and accepted:");
+                // The reason carries its own `#<issue>` by construction — the
+                // parser rejects one that does not — so do not print it twice.
+                for d in &declared {
+                    println!("  {} lines — {}", d.lines, d.reason);
+                }
             }
             if !self.json {
                 let delta = i128::from(budget.portable()) - i128::from(before.portable());

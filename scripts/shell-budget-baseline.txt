@@ -20,3 +20,10 @@
 # port commit (143fe332^, PR #7953). It is the denominator progress is measured
 # against and must NEVER be regenerated — an origin that moves measures nothing.
 origin_portable 38374
+
+# `origin_rev` is that same fixed point as a revision, so tooling can scan the
+# epic's whole history rather than re-deriving it from the comment above. It
+# pairs with `origin_portable` and is equally immovable. Used by the report to
+# total the floor growth that has been deliberately declared and accepted
+# (`Shell-Budget-Growth:` trailers, #8154) since the epic began.
+origin_rev 143fe332^

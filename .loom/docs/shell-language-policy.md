@@ -245,9 +245,52 @@ every merge" teaches people to regenerate without looking — which is exactly t
 reflex a ratchet exists to prevent. The gate was training the behaviour it was
 built to stop.
 
-`scripts/shell-budget-baseline.txt` now holds one value, `origin_portable`, and
-it is the progress **denominator**, not a gate input. It must never be
-regenerated: an origin that moves measures nothing. A test pins it.
+`scripts/shell-budget-baseline.txt` holds two immovable values —
+`origin_portable`, the progress **denominator**, and `origin_rev`, the same
+fixed point as a revision so tooling can scan the epic's history. Neither is a
+gate input and neither may be regenerated: an origin that moves measures
+nothing. A test pins it.
+
+### Declaring growth in the permanent floor (#8154)
+
+Portable growth (`contract`, `hook-entry`) is what the epic retires, and there
+is **no** override for it. Floor growth (`bootstrap`, `vendored`) is different:
+the floor is what will still be shell when the epic is done, and some of it
+cannot be ported at all — `resync-installed.sh` is `vendored`, owned upstream,
+and blocked by #7758. Refusing a safety fix to such a script does not advance
+the epic; it just makes the script worse.
+
+So floor growth is default-deny with a declared exception. Declare it with a
+commit trailer:
+
+```
+Shell-Budget-Growth: 59 lines — guards against a silent revert of a local fix (#7870)
+```
+
+Rules the gate enforces:
+
+- The declared count must **cover** the measured growth. Declaring 10 and
+  growing 500 fails, and the message names the shortfall.
+- The reason must cite an issue (`#<n>`). An override that argues for itself in
+  passing is a bare escape hatch, which is what this must not become.
+- Trailers **accumulate** across the commits in the range, so a multi-commit PR
+  can declare its growth in pieces.
+- Undeclared growth still fails exactly as before.
+- A malformed trailer is reported as malformed. It is not silently treated as
+  absent — otherwise the build fails with a message about growth while the real
+  problem is a typo, and the author re-reads the wrong thing.
+
+Declared growth is not absorbed or forgiven. It stays in the running total, and
+`loom-daemon shell-budget` prints the cumulative accepted figure since the epic
+began (`accepted_floor_growth` in `--json`), so the floor rising is visible
+rather than inferred.
+
+This exists because the gate's failure message used to end *"if that is right,
+say why in the commit"* while `check_against_rev` returned an error
+unconditionally. It promised an escape hatch that was never implemented, and
+three Judge-approved safety PRs sat red against it with no in-repo remedy. A
+test now lifts the trailer template out of the failure message and asserts it
+parses, so the message and the enforcement cannot drift apart again.
 
 ## Related
 
