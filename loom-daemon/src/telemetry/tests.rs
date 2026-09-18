@@ -5,11 +5,14 @@
 
 use super::*;
 
+mod role_tick;
+use role_tick::role_tick_outcome;
+
 // ------------------------------------------------------------------
 // Test fixtures — one freshly-constructed record per kind.
 // ------------------------------------------------------------------
 
-fn ts() -> DateTime<Utc> {
+pub(super) fn ts() -> DateTime<Utc> {
     // A fixed instant keeps round-trip equality deterministic.
     DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
         .unwrap()
@@ -177,6 +180,7 @@ fn every_record() -> Vec<TelemetryRecord> {
         sweep_outcome(),
         tokens_snapshot(),
         host_health(),
+        role_tick_outcome(),
     ]
 }
 

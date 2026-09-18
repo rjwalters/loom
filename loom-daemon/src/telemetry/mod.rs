@@ -60,7 +60,17 @@ pub mod visibility;
 /// Current telemetry wire-schema version. Bump on any breaking change to the
 /// record shapes below so a Phase-2 backend ingesting a mixed-version fleet can
 /// gate on a simple numeric compare (no semver parsing). See the module docs.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+///
+/// **`2` since Issue #8056**: [`TelemetryRecord`] gained a seventh variant,
+/// `role_tick.outcome` ([`RoleTickOutcomeRecord`]). A new *record kind* — not a
+/// new optional field — is exactly the change a mixed-version backend has to
+/// gate on: a `1`-era ingester pattern-matching exhaustively on `kind` has no
+/// arm for it. Every pre-existing record shape is byte-identical to the `1`
+/// wire format, so a `2` envelope carrying any of the original six kinds is
+/// still parseable by a `1`-era reader, and a `1` envelope is still parseable
+/// here (the `schema_version` field is read, never validated, on the read
+/// path — see `sweep_outcomes::read_all_outcome_telemetry`).
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 // ============================================================================
 // Repository visibility — private-safe by construction
@@ -273,6 +283,11 @@ pub enum TelemetryRecord {
     /// Host health: CPU/disk headroom, daemon version, uptime.
     #[serde(rename = "host.health")]
     HostHealth(HostHealthRecord),
+    /// One role-runner tick's outcome (Issue #8056) — the per-`(root, role)`
+    /// counterpart of [`SweepOutcome`](Self::SweepOutcome). The seventh
+    /// variant, and the reason [`CURRENT_SCHEMA_VERSION`] is `2`.
+    #[serde(rename = "role_tick.outcome")]
+    RoleTickOutcome(RoleTickOutcomeRecord),
 }
 
 /// A sweep's terminal result. `#[serde(default)]`-friendly variants are not
@@ -506,6 +521,155 @@ pub struct SweepOutcomeRecord {
     /// the same "unknown != zero" contract as `tokens_in`/`tokens_by_model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doctor_cycles: Option<u32>,
+}
+
+/// How one role-runner tick ended (Issue #8056).
+///
+/// Deliberately **not** [`SweepResult`]: a sweep either finished or did not,
+/// but a role tick has a third class the fleet cares about — the pre-spawn
+/// *skips* (`crate::role_runner::RoleTickOutcome`'s `NoTokenPool`,
+/// `PoolExhausted`, `ModelRuntimeMismatch`, and the post-spawn `LoadSkipped`)
+/// that consumed no tokens and are not role failures. Folding those into
+/// `failure` is exactly the mis-read #7607 documents for the in-memory ring:
+/// hundreds of identical exit-78s from one fleet-wide exhausted pool must not
+/// read as hundreds of broken roles. One variant per
+/// `crate::role_runner::RoleTickOutcome` variant, so the mapping is total and
+/// no outcome is silently reclassified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleTickResult {
+    /// The invocation ran to completion with a zero exit code.
+    Success,
+    /// The invocation ran (or failed to start) and reported failure.
+    Failure,
+    /// Fail-closed runtime-admission rejection — never spawned.
+    RuntimeRejected,
+    /// Skipped pre-spawn: no token pool is provisioned for this workspace.
+    SkippedNoTokenPool,
+    /// Skipped pre-spawn: a pool exists but has zero spawnable accounts.
+    SkippedPoolExhausted,
+    /// Skipped pre-spawn: the resolved model provably conflicts with the
+    /// admitted runtime.
+    SkippedModelRuntimeMismatch,
+    /// Terminated at the wall-clock ceiling while the host was measurably
+    /// saturated — a starved tick, not a broken role.
+    SkippedLoad,
+}
+
+impl RoleTickResult {
+    /// Whether this tick actually launched a child session, and therefore
+    /// *could* have consumed tokens. `false` for every pre-spawn skip — the
+    /// discriminator a consumer needs before reading an absent
+    /// [`RoleTickOutcomeRecord::tokens_by_model`] as anything at all.
+    #[must_use]
+    pub fn spawned(self) -> bool {
+        matches!(self, Self::Success | Self::Failure | Self::SkippedLoad)
+    }
+}
+
+/// Forge-mutating work one role-runner tick was observed doing (Issue #8056),
+/// counted from the tick's own Claude Code transcripts.
+///
+/// **A lower bound, by construction.** The counts come from scanning the
+/// transcript's `tool_use` blocks for the shell commands that perform each
+/// action (`gh issue edit --add-label`, `gh pr comment`, `merge-pr.sh`, …), so
+/// an action taken through a path this scanner does not recognize is not
+/// counted. That is why the whole struct is optional on the record rather than
+/// the individual counts: an absent `actions` means "no transcript was
+/// attributable to this tick", while a present `actions` with a `0` means
+/// "the transcript was read and no such command appeared in it". Never
+/// synthesize the former from the latter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleTickActions {
+    /// `gh issue edit … --add-label/--remove-label` invocations — the label
+    /// transitions that drive Loom's whole state machine.
+    pub issues_labeled: u32,
+    /// PR merges (`merge-pr.sh`, `gh pr merge`, `gh api … /merge`).
+    pub prs_merged: u32,
+    /// Comments posted on an issue or PR (`gh issue comment`, `gh pr comment`,
+    /// `gh api … /comments`).
+    pub comments_posted: u32,
+}
+
+/// `role_tick.outcome` — one role-runner tick's outcome (Issue #8056).
+///
+/// The per-tick counterpart of [`SweepOutcomeRecord`]. Role ticks were, by
+/// measurement, ~60% of fleet token spend and emitted **no** durable record at
+/// all: `crate::types::RoleTickRecord` holds `{root, role, at, ok, detail,
+/// pool_exhausted}` in a process-global 2048-entry ring that is lost on daemon
+/// restart and carries no model, effort, duration, or token counts. This
+/// record is the durable, experiment-gradeable version.
+///
+/// Every field that is *measured* rather than *decided* is optional and follows
+/// the same "unknown != zero" contract [`SweepOutcomeRecord::tokens_in`]
+/// establishes: omitted when not observed, never coerced to `0`/`[]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoleTickOutcomeRecord {
+    /// Repository this tick ran for, `owner/repo` form. Falls back to the
+    /// workspace root's path when the slug cannot be resolved from the
+    /// checkout's `origin` remote — same best-effort fallback
+    /// `sweep.outcome` uses.
+    pub repo: String,
+    /// Public/private tag for `repo`. Missing/unknown ⇒ [`RepoVisibility::Private`].
+    #[serde(default)]
+    pub visibility: RepoVisibility,
+    /// The role name (`champion`, `curator`, `judge`, …) — the `/loom:<role>`
+    /// slash command this tick invoked.
+    pub role: String,
+    /// When the tick started (the instant the runner began the invocation,
+    /// not the interval boundary that scheduled it).
+    pub started_at: DateTime<Utc>,
+    /// Wall-clock seconds from invocation start to outcome, including the
+    /// pre-spawn preflights. A skip is typically sub-second; the value is
+    /// still real, so it is not optional.
+    pub duration_sec: i64,
+    /// How the tick ended — see [`RoleTickResult`].
+    pub result: RoleTickResult,
+    /// The model the runner actually resolved for this tick, when it got far
+    /// enough to resolve one. Omitted for a skip that bailed out *before*
+    /// model resolution (`no_token_pool`, `pool_exhausted`,
+    /// `runtime_rejected`) — "not resolved", never a guessed default. This is
+    /// the resolved value including #7894's unpinned-model reconciliation, not
+    /// a re-read of config, so it can never disagree with what was launched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The reasoning-effort level resolved for this tick (#8054), when one was
+    /// configured. Unconfigured resolves to no `--effort` argument at all, and
+    /// is reported here as an absent key — the honest "inherited the runtime
+    /// default", never a fabricated `"medium"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Short failure/skip detail — the same string
+    /// `crate::types::RoleTickRecord::detail` carries (the failure reason, the
+    /// runtime rejection, the mismatch description, the `no-token-pool`
+    /// sentinel). Always absent for [`RoleTickResult::Success`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Per-`(model, speed, service_tier)` token totals for this tick, summed
+    /// from the `/loom:<role>` Claude Code transcripts whose mtime falls in
+    /// this tick's own window — the same grouped shape, and the same raw
+    /// (not cost-weighted) counts, as
+    /// [`SweepOutcomeRecord::tokens_by_model`].
+    ///
+    /// Omitted (never an empty vec, never a fabricated zero) when nothing was
+    /// attributable — which is *always* the case for a pre-spawn skip, since
+    /// no session existed to produce a transcript. A consumer must read an
+    /// absent value together with [`RoleTickResult::spawned`]: absent on a
+    /// skip means "correctly nothing", absent on a `success` means "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
+    /// The distinct model ids in [`tokens_by_model`](Self::tokens_by_model),
+    /// sorted and deduped — the same derivation, and the same contract, as
+    /// [`SweepOutcomeRecord::models_used`]. Answers "did this tick's session
+    /// escalate past the model it was launched with?" without the consumer
+    /// re-folding the grouped rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_used: Option<Vec<String>>,
+    /// Forge-mutating work observed in this tick's transcripts — see
+    /// [`RoleTickActions`], including why the struct (not each count) is the
+    /// optional unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions: Option<RoleTickActions>,
 }
 
 /// One account's slice of a `tokens.snapshot` — the per-account usage /
