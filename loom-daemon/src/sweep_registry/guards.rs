@@ -972,6 +972,14 @@ impl SweepRegistry {
     /// Same fail-open contract as the GraphQL probe: anything short of a
     /// verified answer (spawn/timeout error, non-zero exit, unparseable
     /// output) is [`OpenPrProbe::ProbeFailed`].
+    ///
+    /// The query and its classification live in
+    /// [`crate::worktree_ops::gh::open_linked_pr_timeline_args`] /
+    /// [`crate::worktree_ops::gh::parse_open_linked_pr_timeline`] (#8116), for
+    /// the same reason the GraphQL half already shared
+    /// [`crate::worktree_ops::gh::open_linked_pr_args`]: the `worktree_ops`
+    /// probe needs the identical union, and a second hand-written copy of the
+    /// `--jq` filter is exactly how the two drifted apart in the first place.
     fn probe_open_linked_pr_rest(&self, issue: u32) -> OpenPrProbe {
         let Some((owner, repo)) = self.resolve_owner_repo() else {
             return OpenPrProbe::ProbeFailed;
@@ -982,18 +990,7 @@ impl SweepRegistry {
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
         let mut cmd = Command::new(&gh);
-        let filter = format!(
-            "[.[] | select(.event == \"cross-referenced\" \
-             and .source.issue.pull_request != null \
-             and .source.issue.state == \"open\" \
-             and .source.issue.repository.full_name == \"{owner}/{repo}\") \
-             | .source.issue.number] | unique | .[0] // empty"
-        );
-        cmd.arg("api")
-            .arg(format!("repos/{owner}/{repo}/issues/{issue}/timeline"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(filter);
+        cmd.args(crate::worktree_ops::gh::open_linked_pr_timeline_args(&owner, &repo, issue));
         cmd.current_dir(&self.config.workspace_root);
         crate::credential_preflight::apply_gh_config_for_root(
             &mut cmd,
@@ -1005,15 +1002,9 @@ impl SweepRegistry {
         if !output.status.success() {
             return OpenPrProbe::ProbeFailed;
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let trimmed = stdout.trim();
-        if trimmed.is_empty() {
-            return OpenPrProbe::NoneOpen;
-        }
-        match trimmed.lines().next().unwrap_or("").trim().parse::<u32>() {
-            Ok(pr) => OpenPrProbe::Open(pr),
-            Err(_) => OpenPrProbe::ProbeFailed,
-        }
+        crate::worktree_ops::gh::parse_open_linked_pr_timeline(&String::from_utf8_lossy(
+            &output.stdout,
+        ))
     }
 
     /// Best-effort probe for whether `issue` resolves to a pull request in ANY

@@ -2037,7 +2037,7 @@ pub mod forge {
     /// manufacturing a false failure — consistent with this module's
     /// existing best-effort convention (mirrors `reclaim_pr`'s own
     /// best-effort label re-fetch).
-    fn reclaim(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
+    pub(crate) fn reclaim(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
         reclaim_edit(gh_bin, root, issue)?;
         verify_reclaim_labels(gh_bin, root, issue)
     }
@@ -2439,7 +2439,7 @@ pub mod forge {
                 );
                 continue;
             }
-            match reclaim(gh_bin, root, issue_number) {
+            match crate::reclaim_pr_warning::reclaim_and_warn(gh_bin, root, issue_number) {
                 Ok(()) => {
                     reclaimed += 1;
                     // #4348 acceptance criterion: WARN-level, with the
