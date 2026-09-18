@@ -59,6 +59,10 @@ pub struct Snapshot {
     /// not be read — treated as unclean by [`super::remediation::gate`], never
     /// as clean.
     pub last_exit_status: Option<i64>,
+    /// A signal-shaped death, NAMED (#6388). Computed for both supervisors —
+    /// the launchd form reads the exit status, the systemd form reads
+    /// `ExecMainCode`/`ExecMainStatus`, and the report must not care which.
+    pub exit_signal_detail: Option<String>,
     /// Which signal answered the liveness question. `#5118` turns on this:
     /// the pid file is the WEAKEST source, and a negative answer from it alone
     /// must never declare an outage.
@@ -148,6 +152,7 @@ pub fn probe(
             job_loaded: false,
             supervisor_service: None,
             last_exit_status: None,
+            exit_signal_detail: None,
             source: Source::PidFile,
             pidfile_evidence: PidfileEvidence::Absent,
         };
@@ -254,17 +259,69 @@ pub fn probe(
         } else {
             None
         },
+        // Asked whenever a service is known, independent of `job_loaded`: a
+        // unit can be gone from the supervisor entirely and still have a
+        // recorded signal death worth naming.
+        exit_signal_detail: service.as_deref().and_then(|svc| {
+            supervisor_exit_signal_detail(svc, Some(supervisor.systemd_unit.as_str()))
+        }),
     }
 }
 
-/// Ask the supervisor how the job last exited.
+/// Wall-clock budget for a single supervisor query. The watchdog runs on a
+/// timer and must never be the thing that hangs.
+const SUPERVISOR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `systemctl --user show -p <prop> --value <unit>`, trimmed.
 ///
-/// launchd only for now: the systemd equivalent reads `ExecMainCode` and
-/// `ExecMainStatus`, which is a different shape and lands with that branch.
+/// `show` answers cleanly for an unknown unit (`LoadState=not-found`) rather
+/// than erroring, so there is no separate return-code path to handle.
+fn systemd_show(unit: &str, prop: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args(["--user", "show", "-p", prop, "--value", unit]);
+    let out = crate::sweep_registry::output_with_timeout(cmd, SUPERVISOR_PROBE_TIMEOUT)
+        .ok()
+        .flatten()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A systemd unit's `(ExecMainCode, ExecMainStatus)`.
+fn systemd_exec_result(unit: &str) -> Option<(String, String)> {
+    Some((systemd_show(unit, "ExecMainCode")?, systemd_show(unit, "ExecMainStatus")?))
+}
+
+/// How the supervisor says the job last exited, as a signal-shaped detail
+/// string when it was one (#6388).
+///
+/// Separate from [`supervisor_last_exit`] because the two answer different
+/// questions off the same data: whether a restart is licensed (exit 0), and
+/// whether the death should be NAMED as a stray signal in the report.
+fn supervisor_exit_signal_detail(service: &str, systemd_unit: Option<&str>) -> Option<String> {
+    if service.contains('/') {
+        return super::remediation::launchd_exit_signal_detail(supervisor_last_exit(service));
+    }
+    let unit = systemd_unit.unwrap_or(service);
+    let (code, status) = systemd_exec_result(unit)?;
+    super::remediation::systemd_exit_signal_detail(&code, &status)
+}
+
+/// Ask the supervisor how the job last exited.
 fn supervisor_last_exit(service: &str) -> Option<i64> {
     // A systemd unit name has no domain prefix; launchd services always do.
     if !service.contains('/') {
-        return None;
+        // systemd's shape: a CLEAN exit is `ExecMainCode=exited` with a
+        // numeric `ExecMainStatus`. Anything else — `killed`, `dumped`, an
+        // unparseable status — is deliberately NOT reported as an exit code,
+        // because `remediation::gate` licenses a restart on `Some(0)` and a
+        // killed unit must not be handed that.
+        let (code, status) = systemd_exec_result(service)?;
+        if code != "exited" {
+            return None;
+        }
+        return status.parse::<i64>().ok();
     }
     let mut cmd = std::process::Command::new("launchctl");
     cmd.args(["print", service]);
@@ -292,6 +349,7 @@ mod tests {
             job_loaded: false,
             supervisor_service: None,
             last_exit_status: None,
+            exit_signal_detail: None,
             source: Source::PidFile,
             pidfile_evidence: PidfileEvidence::Absent,
         }

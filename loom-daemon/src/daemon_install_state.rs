@@ -547,25 +547,56 @@ fn current_uid() -> Option<String> {
 /// Bounded by [`PROBE_TIMEOUT`]: a `launchctl print` that stalls on XPC
 /// degrades to `None` — "no live pid" — exactly like an absent `launchctl`
 /// (#4548).
-fn launchctl_pid(domain: &str, label: &str) -> Option<u32> {
+/// What `launchctl print <service>` said.
+///
+/// `loaded` and `pid` are SEPARATE answers and must stay that way. A job that
+/// launchd knows about but is not running prints successfully with no `pid =`
+/// line — "LOADED but NOT running" — and that is the ONLY state the #4232
+/// bounded auto-remediation gate may act on. Collapsing both into
+/// `Option<u32>` (as the first cut of this did) makes it indistinguishable
+/// from "launchd has never heard of this job", so the gate never fires, the
+/// report says "not loaded/alive", and `last_exit_status` is never even asked
+/// for — because it is gated on `job_loaded`.
+struct LaunchctlProbe {
+    /// `launchctl print` exited 0: launchd knows this job.
+    loaded: bool,
+    /// Its `pid = ` line, when it had one.
+    pid: Option<u32>,
+}
+
+fn launchctl_probe(domain: &str, label: &str) -> LaunchctlProbe {
     let service = format!("{domain}/{label}");
     let mut cmd = Command::new("launchctl");
     cmd.args(["print", &service]);
-    let output = probe_output(cmd, PROBE_TIMEOUT)?;
+    let Some(output) = probe_output(cmd, PROBE_TIMEOUT) else {
+        return LaunchctlProbe {
+            loaded: false,
+            pid: None,
+        };
+    };
     if !output.status.success() {
-        return None;
+        return LaunchctlProbe {
+            loaded: false,
+            pid: None,
+        };
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut pid = None;
     for line in stdout.lines() {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("pid = ") {
             let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(pid) = digits.parse::<u32>() {
-                return Some(pid);
+            if let Ok(p) = digits.parse::<u32>() {
+                pid = Some(p);
+                break;
             }
         }
     }
-    None
+    LaunchctlProbe { loaded: true, pid }
+}
+
+fn launchctl_pid(domain: &str, label: &str) -> Option<u32> {
+    launchctl_probe(domain, label).pid
 }
 
 /// One liveness check result: whether the expected daemon is alive, a
@@ -743,6 +774,22 @@ pub(crate) fn check_liveness_with_systemd(
             }
         }
 
+        // The job may be LOADED but not running — launchd prints it happily
+        // with no `pid =` line. That is the one state the #4232 bounded
+        // auto-remediation gate acts on, and the systemd branch below has
+        // always had its equivalent (`LoadState=loaded`). Without it the
+        // launchd half of the gate could never fire.
+        if let Some(d) = domain.as_deref() {
+            if launchctl_probe(d, label).loaded {
+                let mut l = Liveness::plain(
+                    false,
+                    format!("launchd job {service} is LOADED but NOT running (no live pid)"),
+                    None,
+                );
+                l.job_loaded = true;
+                return l;
+            }
+        }
         return Liveness::plain(false, format!("launchd job {service} is not loaded/alive"), None);
     }
 

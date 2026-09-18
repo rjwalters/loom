@@ -301,8 +301,10 @@ fn outage(
 
     // #6388: a signal-shaped exit is NAMED, never used to refuse. Only marker
     // absence means a deliberate stop, and the marker is present here.
-    let signal_note = remediation::launchd_exit_signal_detail(snap.last_exit_status)
-        .map(|d| remediation::signal_rule_note(&d))
+    let signal_note = snap
+        .exit_signal_detail
+        .as_deref()
+        .map(remediation::signal_rule_note)
         .unwrap_or_default();
 
     let decision = match &argv {
@@ -368,9 +370,13 @@ fn outage(
             )
         } else {
             format!(
-                " The CIRCUIT BREAKER is now OPEN: the attempt budget is spent, so no further \
-                 automatic attempts will be made until a tick observes a healthy daemon or {} \
-                 is deleted.",
+                // Wording is contract: the retained suite greps for the
+                // literal phrase "CIRCUIT BREAKER OPEN" (#5391). A paraphrase
+                // ("is now OPEN") reads the same to a human and silently fails
+                // the assertion, which is the whole reason the suite is run
+                // unchanged against the port.
+                " CIRCUIT BREAKER OPEN: the attempt budget is spent, so no further automatic \
+                 attempts will be made until a tick observes a healthy daemon or {} is deleted.",
                 state.recovery.display()
             )
         };
@@ -419,9 +425,12 @@ fn outage(
             limits.max_attempts
         ),
         recovery::Decision::BreakerOpen { attempts } => format!(
-            "The CIRCUIT BREAKER is OPEN: {attempts} bounded recovery attempts were spent and \
-             the daemon is still down, so no further automatic attempts will be made until a \
-             tick observes a healthy daemon or {} is deleted.",
+            "CIRCUIT BREAKER OPEN: {attempts} bounded recovery attempts (budget {}) have \
+             already been spent on this outage and none restored the daemon. NO further \
+             automatic attempts will be made until a tick observes a healthy daemon or {} is \
+             deleted — deliberately, so a genuinely broken binary is restarted a bounded number \
+             of times instead of forever.",
+            limits.max_attempts,
             state.recovery.display()
         ),
         // Unreachable: an Attempt is handled above, where it actually runs.
