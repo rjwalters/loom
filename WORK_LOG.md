@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8156** (closed): guard: quoted-delimiter heredoc capture fed to eval/sh -c is still a silent ALLOW (the <<'EOF' sibling of #7970)
+- **PR #8209**: fix(guard): gate quoted-delimiter heredoc capture masking on the #7970 re-parse check (#8156)
+- **Issue #8206** (closed): Auditor role prompt describes a nonexistent CI 'full-stack check' job for root npm run check:all
+- **PR #8210**: fix(auditor): correct nonexistent CI 'full-stack check' job reference
 - **Issue #8187** (closed): chore(ratchet): file-size baseline entry for role_runner/tests.rs is stale-high (4006 recorded, 3893 actual)
 - **PR #8204**: chore(ratchet): tighten file-size baseline for genuine stale-high entries
 - **Issue #8186** (closed): telemetry: sum_transcript_usage_by_model does not dedupe on message.id, so the safehouse completion feed over-counts tokens ~2x
