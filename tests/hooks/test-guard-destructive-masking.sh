@@ -568,6 +568,191 @@ eval \"\$R\""
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #8156: the QUOTED-delimiter sibling of the #7970 capture read check ---${NC}"
+# =========================================================================
+#
+# #7970/PR #8019 gave mask_unquoted_cat_heredoc_bodies()'s NAME= capture
+# branch a `$NAME`/`${NAME}` re-parse check, so an UNQUOTED-delimiter capture
+# later fed to `eval`/`sh -c`/a pipe into a shell is no longer masked. Its
+# sibling mask_heredoc_bodies_selective() -- which owns the QUOTED-delimiter
+# heredocs (`<<'EOF'`, `<<"EOF"`) -- had no equivalent check, so the SAME
+# capture-then-re-parse shape stayed a silent ALLOW through the other, and
+# more idiomatic, delimiter spelling:
+#
+#     R=$(cat <<'EOF'
+#     git reset --hard origin/main
+#     EOF
+#     )
+#     eval "$R"
+#
+# A quoted delimiter makes the BODY literal -- which is the entire reason
+# that function may mask it -- but says NOTHING about the captured VARIABLE:
+# `eval "$R"` re-parses that text as shell code exactly as it does in the
+# unquoted case. #8156 gates the quoted-delimiter masking branch on the same
+# _heredoc_var_reparsed() primitive, against the same TRUE original command
+# buffer (#6068's rule), with the same deliberate narrowness (a DISPLAY-only
+# read does not count -- #7355's intended ALLOW is exactly that shape).
+#
+# These assertions are the quoted-delimiter mirror of the two blocks directly
+# above, plus the `<<"EOF"` double-quoted-delimiter form.
+
+ST8156_PHRASE='git reset --hard origin/main'
+
+# --- Genuinely dead capture (never read at all) stays masked/allowed -------
+assert_allow "#8156: a quoted-delimiter NAME= capture that is NEVER read afterward stays masked (allow)" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+EOF
+)
+echo done"
+
+# --- Display-only reads (the #7355 shape) stay masked/allowed -------------
+assert_allow "#8156: a quoted-delimiter NAME= capture read only via 'echo \"\$NAME\"' (display, not re-parsed) stays masked (allow)" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+EOF
+)
+echo \"\$R\""
+
+assert_allow "#8156: the same quoted-delimiter shape read via 'printf' (display, not re-parsed) stays masked (allow)" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+EOF
+)
+printf '%s\n' \"\$R\""
+
+assert_allow "#8156: a <<\"EOF\" (double-quoted delimiter) capture read only via 'echo' stays masked (allow)" \
+    "R=\$(cat <<\"EOF\"
+$ST8156_PHRASE
+EOF
+)
+echo \"\$R\""
+
+# --- A DIFFERENT variable being eval'd must not disqualify this capture ----
+assert_allow "#8156: a quoted-delimiter capture stays masked when the eval'd variable is a DIFFERENT name (no blanket 'eval appears anywhere' test)" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+EOF
+)
+eval \"\$OTHER\""
+
+# --- The gap itself: a quoted-delimiter capture later RE-PARSED as shell
+#     code must NOT be masked -- COMMAND_ASK_SCAN sees the phrase and asks ---
+assert_ask "#8156: a <<'EOF' capture later fed to 'eval \"\$NAME\"' is NOT masked -- asks (silent ALLOW before this fix)" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+EOF
+)
+eval \"\$R\""
+
+assert_ask "#8156: the <<\"EOF\" double-quoted-delimiter form fed to 'eval \"\$NAME\"' is NOT masked -- asks (silent ALLOW before this fix)" \
+    "R=\$(cat <<\"EOF\"
+$ST8156_PHRASE
+EOF
+)
+eval \"\$R\""
+
+assert_ask "#8156: a <<'EOF' capture later fed to 'sh -c \"\$NAME\"' is NOT masked -- asks" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+EOF
+)
+sh -c \"\$R\""
+
+assert_ask "#8156: a <<'EOF' capture later piped to bash ('\$NAME | bash') is NOT masked -- asks" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+EOF
+)
+echo \"\$R\" | bash"
+
+assert_ask "#8156: the \${NAME} brace form of a <<'EOF' capture fed to 'eval' is NOT masked -- asks" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+EOF
+)
+eval \"\${R}\""
+
+assert_ask "#8156: the quoted-delimiter capture fed to 'source \"\$NAME\"' is NOT masked -- asks" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+EOF
+)
+source \"\$R\""
+
+# --- `<<-'EOF'` tab-stripping form of the same shape -----------------------
+assert_ask "#8156: the <<-'EOF' dash form of the quoted-delimiter capture fed to 'eval' asks" \
+    "R=\$(cat <<-'EOF'
+	$ST8156_PHRASE
+	EOF
+)
+eval \"\$R\""
+
+assert_allow "#8156: the <<-'EOF' dash form read only via 'echo' stays masked (allow)" \
+    "R=\$(cat <<-'EOF'
+	$ST8156_PHRASE
+	EOF
+)
+echo \"\$R\""
+
+# --- A quoted body is inert REGARDLESS of what expansion syntax it spells
+#     (the quoted-delimiter mirror of the #7970x#8003 intersection): the body
+#     is masked either way, so only the read check decides ask vs allow ------
+assert_ask "#8156x#8003: quoted-delimiter capture whose body ALSO spells a \$( ) substitution (inert under a quoted delimiter), fed to 'eval', asks" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+generated \$(date)
+EOF
+)
+eval \"\$R\""
+
+assert_allow "#8156x#8003: the same body read only via 'echo \"\$NAME\"' stays masked (allow) -- #7355/#5779 not reopened" \
+    "R=\$(cat <<'EOF'
+$ST8156_PHRASE
+generated \$(date)
+EOF
+)
+echo \"\$R\""
+
+# --- Flag-value branch is untouched: a flag value can never be eval'd, so it
+#     needs no read check and keeps masking (the #5181/#6056 fixes) ---------
+assert_allow "#8156: the quoted-delimiter flag-value capture ('gh pr comment --body \"\$(cat <<'EOF'...)\"') is UNCHANGED -- stays masked" \
+    "gh pr comment 123 --body \"\$(cat <<'EOF'
+$ST8156_PHRASE
+EOF
+)\""
+
+# --- #5779's own plain file-sink shape (no capture at all) is untouched ----
+assert_allow "#8156: a quoted heredoc body written to a FILE sink (no capture, no re-parse) stays masked (allow) -- #5779 not reopened" \
+    "cat > /tmp/report-8156-a.md <<'EOF'
+Never run $ST8156_PHRASE from a worktree.
+EOF"
+
+assert_allow "#8156: a quoted heredoc body written to a file sink stays masked even when an UNRELATED eval appears later in the same command" \
+    "cat > /tmp/report-8156-b.md <<'EOF'
+Never run $ST8156_PHRASE from a worktree.
+EOF
+eval \"\$SOMETHING_ELSE\""
+
+# --- The interpreter carve-out is a DIFFERENT mechanism and is untouched ---
+assert_ask "#8156: the interpreter carve-out is unchanged -- a live phrase inside 'bash <<'EOF' ... EOF' still asks" \
+    "bash <<'EOF'
+$ST8156_PHRASE
+EOF"
+
+# --- Catastrophic tier is unaffected: it calls mask_heredoc_bodies_
+#     selective() WITHOUT the true original, so `orig` is "" there and its
+#     behavior is bit-for-bit what it was ------------------------------------
+assert_deny "#8156: the equivalent catastrophic-tier phrase (aws s3 rb) in a <<'EOF' capture fed to 'eval' still denies" \
+    "R=\$(cat <<'EOF'
+${_S3RB_CAT}
+EOF
+)
+eval \"\$R\""
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #6252: COMMAND_NO_COMMENT quote-awareness (ADR-0016 sed test matrix) ---${NC}"
 # =========================================================================
 #
