@@ -85,6 +85,34 @@ const CORPUS: &[&str] = &[
     "Closes #1\r\nPart of #2\r\n",
 ];
 
+/// Inputs where the port DELIBERATELY differs from the retired shell, with the
+/// reason. Per `verification-recipes.md` §6 a surviving divergence is written
+/// down rather than normalised away — the previous harness parsed both sides
+/// through `u64` and made this one invisible.
+///
+/// Keyed by corpus index. The value is the shell's answer; the port's is
+/// asserted to differ from it, so this table cannot rot into a list of things
+/// that silently started agreeing again.
+const KNOWN_DIVERGENCES: &[(usize, &[&str])] = &[
+    // `Closes #99999999999999999999999999` — the shell is text-only and emits
+    // the digit run verbatim; the port parses to u64 and drops what cannot fit.
+    //
+    // Kept rather than matched: every consumer of this list compares against a
+    // real issue number, so a value no issue can have is noise either way, and
+    // carrying it as a string would push u64 parsing onto callers that all
+    // need integers. The shell's behaviour here is an artifact of grep, not a
+    // decision anyone made.
+    (27, &["99999999999999999999999999"]),
+];
+
+/// The shell's answer for `i`, if this is a recorded divergence.
+fn known_divergence(i: usize) -> Option<&'static [&'static str]> {
+    KNOWN_DIVERGENCES
+        .iter()
+        .find(|(idx, _)| *idx == i)
+        .map(|(_, v)| *v)
+}
+
 /// The frozen copy of the retired shell functions.
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/merge-pr-refs-retired.sh")
@@ -122,6 +150,13 @@ source "$2"
     );
 
     let out = Command::new("bash")
+        // F5: POSIX classes are LOCALE-DEPENDENT. Under a UTF-8 locale the
+        // shell's `[[:space:]]` also matches U+2003 EM SPACE (and U+00A0 on
+        // BSD), which the Rust port's ASCII class does not — so an unpinned
+        // harness compares against whatever locale the developer happens to
+        // run, and silently differs between a Mac and CI. `C` is the locale
+        // the port models, and saying so here is the point.
+        .env("LC_ALL", "C")
         .arg("-c")
         .arg(&prog)
         .arg("bash")
@@ -135,14 +170,28 @@ source "$2"
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn shell_numbers(script: &Path, func: &str, input: &str) -> Option<Vec<u64>> {
+/// The shell's answer as RAW LINES, not parsed integers.
+///
+/// F6: parsing through `parse::<u64>().ok()` silently discarded any line the
+/// port and the shell genuinely disagreed about. Corpus entry 27
+/// (`Closes #99999999999999999999999999`) is exactly that: the shell emits the
+/// digit string, the port emits nothing, and the parsing harness compared
+/// `[]` with `[]` and called it agreement. A differential that normalises its
+/// inputs is measuring its own normaliser.
+fn shell_lines(script: &Path, func: &str, input: &str) -> Option<Vec<String>> {
     let raw = shell_fn(script, func, input, None)?;
     Some(
         raw.lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| l.trim().parse::<u64>().ok())
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
             .collect(),
     )
+}
+
+/// The port's answer in the same shape, so the comparison is string-to-string.
+fn rust_lines(v: &[u64]) -> Vec<String> {
+    v.iter().map(u64::to_string).collect()
 }
 
 #[test]
@@ -152,10 +201,10 @@ fn partial_increment_refs_agrees_with_the_shell_on_every_corpus_entry() {
 
     let mut compared = 0usize;
     for (i, input) in CORPUS.iter().enumerate() {
-        let Some(want) = shell_numbers(&script, "_partial_increment_refs", input) else {
+        let Some(want) = shell_lines(&script, "_partial_increment_refs", input) else {
             continue;
         };
-        let got = refs::partial_increment_refs(input);
+        let got = rust_lines(&refs::partial_increment_refs(input));
         assert_eq!(
             got, want,
             "entry {i} diverged.\n  input: {input:?}\n  shell: {want:?}\n  rust:  {got:?}"
@@ -165,7 +214,7 @@ fn partial_increment_refs_agrees_with_the_shell_on_every_corpus_entry() {
     // A differential that silently compared nothing is the failure mode this
     // whole file exists to avoid.
     assert!(
-        compared >= CORPUS.len() - 2,
+        compared == CORPUS.len(),
         "only {compared}/{} entries were actually compared — the shell harness is not running",
         CORPUS.len()
     );
@@ -176,18 +225,27 @@ fn closing_refs_agrees_with_the_shell_on_every_corpus_entry() {
     let script = fixture();
     let mut compared = 0usize;
     for (i, input) in CORPUS.iter().enumerate() {
-        let Some(want) = shell_numbers(&script, "_body_closing_refs", input) else {
+        let Some(want) = shell_lines(&script, "_body_closing_refs", input) else {
             continue;
         };
-        let got = refs::closing_refs(input);
-        assert_eq!(
-            got, want,
-            "entry {i} diverged.\n  input: {input:?}\n  shell: {want:?}\n  rust:  {got:?}"
-        );
+        let got = rust_lines(&refs::closing_refs(input));
+        if let Some(shell_said) = known_divergence(i) {
+            assert_eq!(want, shell_said, "entry {i}: the recorded shell answer changed");
+            assert_ne!(
+                got, want,
+                "entry {i} is recorded as a KNOWN divergence but the two now agree — \
+                 remove it from KNOWN_DIVERGENCES rather than leaving a stale exemption"
+            );
+        } else {
+            assert_eq!(
+                got, want,
+                "entry {i} diverged.\n  input: {input:?}\n  shell: {want:?}\n  rust:  {got:?}"
+            );
+        }
         compared += 1;
     }
     assert!(
-        compared >= CORPUS.len() - 2,
+        compared == CORPUS.len(),
         "only {compared}/{} entries were actually compared",
         CORPUS.len()
     );

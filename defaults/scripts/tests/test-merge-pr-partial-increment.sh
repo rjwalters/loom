@@ -835,9 +835,9 @@ assert_contains "$src" '--paginate' \
 assert_contains "$src" '_strip_fenced_code_blocks' \
   "merge-pr.sh strips fenced code blocks before matching a partial-increment declaration (#5234)"
 retired "merge-pr.sh's source contains the inline-code-span strip" \
-    "a backticked mention must be blanked before the line-leading anchor is applied, or a hypothetical 'Part of #N' in prose reads as a live declaration -- the #5234 incident, which reopened a correctly closed issue" \
+    "inline code spans are blanked before the line-leading anchor runs, so the anchor sees the text a reader sees rather than the raw markup. (The #5234 incident itself is caught by the ANCHOR, not by this strip: its mention is mid-sentence. On a single line the strip only ever ADDS matches -- measured, 0 of 29 corpus entries change without it.)" \
     "the strip is now blank_inline_code() in Rust; this file no longer runs sed" \
-    "merge_pr::refs::tests::a_backticked_hypothetical_mention_is_not_a_declaration replays the literal #5234 body and asserts it yields no declaration, and the differential covers three further backtick shapes including an unbalanced one."
+    "merge_pr::refs::tests::the_inline_code_strip_changes_the_answer_and_this_pins_which_way, which asserts the one single-line shape where the strip is load-bearing (\"\`x\` Part of #5\" -> [5]) and would fail if the strip were removed -- the property the original successor did NOT pin."
 assert_contains "$src" '_partial_increment_ref_snippets' \
   "merge-pr.sh quotes the matched partial-increment declaration text in the pre-merge warning (#5234 AC #4)"
 

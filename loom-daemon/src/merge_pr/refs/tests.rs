@@ -47,6 +47,31 @@ fn a_line_leading_declaration_is_still_read() {
     }
 }
 
+#[test]
+fn the_inline_code_strip_changes_the_answer_and_this_pins_which_way() {
+    // The strip's real single-line effect is to REMOVE a code span so what
+    // follows becomes eligible for the line-leading anchor — i.e. it ADDS a
+    // match. Verified against the frozen shell, which agrees.
+    //
+    // This case exists because the retirement record for the strip originally
+    // named `a_backticked_hypothetical_mention_is_not_a_declaration` as its
+    // successor, and that test would pass with the strip DELETED: its #5234
+    // body has the mention mid-sentence, where the line-leading anchor rejects
+    // it regardless. Review measured it — removing the strip changes the
+    // answer for 0 of 29 corpus entries — so the retirement was leaning on a
+    // test that did not exercise it.
+    assert_eq!(
+        partial_increment_refs("subject\n\n`x` Part of #5\n"),
+        vec![5],
+        "the strip blanks the span, and `Part of` then satisfies the line-leading anchor"
+    );
+
+    // And the shape where it genuinely prevents nothing: a declaration wholly
+    // inside a code span is rejected by the anchor whether or not the strip
+    // runs, because the line begins with a backtick.
+    assert_eq!(partial_increment_refs("subject\n\n`Part of #4574`\n"), Vec::<u64>::new());
+}
+
 // --- the numbered-list ordinal trap ---
 
 #[test]
