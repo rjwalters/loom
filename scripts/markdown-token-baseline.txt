@@ -46,7 +46,7 @@
 786 defaults/.claude/commands/loom/probe-protocol.md
 19194 defaults/.claude/commands/loom/sweep-arguments.md
 11546 defaults/.claude/commands/loom/sweep-backend-detection.md
-5066 defaults/.claude/commands/loom/sweep-dry-run.md
+5065 defaults/.claude/commands/loom/sweep-dry-run.md
 1642 defaults/.claude/commands/loom/sweep-examples.md
 18403 defaults/.claude/commands/loom/sweep-execution-model.md
 5176 defaults/.claude/commands/loom/sweep-mode-c-lifecycle.md
