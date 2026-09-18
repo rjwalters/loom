@@ -27,6 +27,7 @@
 //! | roles | [`crate::role_runner::role_tick_records`] |
 //! | queues | [`crate::pipeline_snapshot`] (`queued`) |
 //! | throughput | [`crate::pipeline_snapshot`] (`merged_24h`, over the requested window) |
+//! | operator_attention | [`crate::pipeline_snapshot`] (`operator_held`, `operator_held_conflicting`, `operator_held_oldest_days`, `operator_only_issues`) — **always [`Verdict::Green`]**, deliberately (Issue #8091, see [`assess_operator_attention`]) |
 //! | peer_coordination | [`crate::types::DaemonStatusReport::safehouse`] (RPC socket reachability) + [`crate::types::DaemonStatusReport::peer_claims`]`.coordination` (published by [`crate::peer_claims::PeerClaimView::evaluate_coordination`], Issue #6157) |
 //! | auto_update | [`crate::types::DaemonStatusReport::auto_update_*`] (the daemon-side rebuild loop's own state, Issue #4055) + [`crate::self_update::check`] (this CLI process's own source-vs-built-commit staleness magnitude, Issue #6261) — unconditional, mirroring `liveness`/`dispatch` (Issue #7584) |
 //! | worktree_reaper | [`crate::types::DaemonStatusReport::stuck_worktree_reclaims`] (published by [`crate::worktree_reaper::stuck_worktree_removals`], Issue #7590) |
@@ -2150,6 +2151,19 @@ pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
 }
 
 // ============================================================================
+// Operator-attention section (Issue #8091) — sibling module
+// ============================================================================
+//
+// `assess_operator_attention` lives in the `operator_attention` sibling
+// module and is re-exported here, mirroring `holds` (#7990) just above: this
+// file sits at its `.loom/docs/file-size-policy.md` ratchet, so new
+// assessment logic goes in a sibling module and this file only carries the
+// dispatch line.
+
+pub mod operator_attention;
+pub use operator_attention::assess_operator_attention;
+
+// ============================================================================
 // Peer-coordination section (Issue #6157)
 // ============================================================================
 
@@ -2762,6 +2776,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_role_liveness(inputs),
         assess_queues(inputs),
         assess_throughput(inputs),
+        assess_operator_attention(inputs),
         assess_peer_coordination(inputs),
         assess_stale_sweeps(inputs),
         assess_auto_update(inputs),

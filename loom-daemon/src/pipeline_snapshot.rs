@@ -11,7 +11,11 @@
 //! counts open dispatchable `loom:issue` rows (queued — park-labeled rows
 //! excluded, see [`RepoPipelineSnapshot::queued`]), open `loom:building`
 //! (claimed), open PRs by `loom:review-requested` / `loom:changes-requested`
-//! / `loom:pr`, and PRs merged in the last 24h.
+//! / `loom:pr`, PRs merged in the last 24h, and — since Issue #8091 — the
+//! operator-attention state: open PRs labeled `loom:operator` (the
+//! first-class "engine stopped, a human is needed" hold, #5502) plus their
+//! `mergeable`/age breakdown, and open issues labeled `loom:operator-only`
+//! (the hard park).
 //!
 //! # Resilience
 //!
@@ -73,6 +77,28 @@ pub struct RepoPipelineSnapshot {
     pub approved: Option<usize>,
     /// PRs merged in the last 24h (a throughput signal, not a queue depth).
     pub merged_24h: Option<usize>,
+    /// Open PRs labeled `loom:operator` (Issue #8091) — the first-class
+    /// "the engine has stopped acting on this artifact, a human is needed"
+    /// hold (#5502), distinct from the hard-park `loom:operator-only`
+    /// tracked in [`Self::operator_only_issues`]. A fleet carrying several of
+    /// these is normal steady state, not a fault — see
+    /// `crate::health::assess_operator_attention`.
+    pub operator_held: Option<usize>,
+    /// The subset of [`Self::operator_held`] PRs whose `mergeable` state is
+    /// `CONFLICTING` against the base branch — the same signal Champion's
+    /// held-PR health pass (`champion-pr-merge.md`) already computes per PR,
+    /// rolled up fleet-wide here. `None` whenever [`Self::operator_held`] is
+    /// also `None` (the read failed); `Some(0)` when it succeeded and found
+    /// no conflicting rows.
+    pub operator_held_conflicting: Option<usize>,
+    /// Age in whole days of the oldest [`Self::operator_held`] PR, by
+    /// `createdAt`. `None` when there are no held PRs (not a failure — see
+    /// [`Self::operator_held`]) or the read failed.
+    pub operator_held_oldest_days: Option<i64>,
+    /// Open issues labeled `loom:operator-only` (Issue #8091) — the hard
+    /// park every dispatch route refuses (`crate::capability`,
+    /// `crate::work_finder::PARK_LABELS`).
+    pub operator_only_issues: Option<usize>,
     /// The first forge-query failure encountered for this repo, if any. A
     /// repo can have `Some(error)` and still carry partial `Some(..)` counts
     /// for the metrics that *did* succeed.
@@ -108,12 +134,27 @@ struct NumberRow {
     number: u64,
 }
 
-/// Which of the seven counted metrics a [`GhPipelineSource`] fetches (Issue
-/// #4761; widened to seven by Issue #5272).
+/// One `loom:operator`-held PR row (Issue #8091) — richer than [`NumberRow`]
+/// because [`RepoPipelineSnapshot::operator_held_conflicting`] and
+/// [`RepoPipelineSnapshot::operator_held_oldest_days`] need the `mergeable`
+/// state and creation time of every held row, not just a count.
+#[derive(Debug, Deserialize)]
+struct OperatorHeldRow {
+    #[allow(dead_code)]
+    number: u64,
+    /// `"CONFLICTING"`, `"MERGEABLE"`, `"UNKNOWN"`, or absent when GitHub has
+    /// not yet computed the mergeability check.
+    mergeable: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Which of the nine counted metrics a [`GhPipelineSource`] fetches (Issue
+/// #4761; widened to seven by Issue #5272, to nine by Issue #8091).
 ///
 /// Each metric costs one `gh` invocation, and they run *sequentially* within a
 /// repo, so the mask is what keeps a consumer that needs two of them from
-/// paying for all seven. A metric that is masked off is left `None` — a caller
+/// paying for all nine. A metric that is masked off is left `None` — a caller
 /// that masks a metric off must simply not read it (every existing caller uses
 /// [`Self::ALL`], for which `None` keeps its original "this query failed"
 /// meaning).
@@ -135,6 +176,12 @@ pub struct PipelineMetrics {
     pub approved: bool,
     /// PRs merged inside the configured window.
     pub merged: bool,
+    /// Open PRs labeled `loom:operator`, plus their `mergeable`/age
+    /// breakdown — see [`RepoPipelineSnapshot::operator_held`] (Issue #8091).
+    pub operator_held: bool,
+    /// Open issues labeled `loom:operator-only` — see
+    /// [`RepoPipelineSnapshot::operator_only_issues`] (Issue #8091).
+    pub operator_only_issues: bool,
 }
 
 impl PipelineMetrics {
@@ -147,13 +194,17 @@ impl PipelineMetrics {
         changes_requested_unclaimed: true,
         approved: true,
         merged: true,
+        operator_held: true,
+        operator_only_issues: true,
     };
 
     /// The metrics `loom-daemon health` needs: queue depth, the review-side
-    /// axes (including the #5272 no-owner count), and merge throughput.
+    /// axes (including the #5272 no-owner count), merge throughput, and —
+    /// since Issue #8091 — the operator-attention counts the
+    /// `operator_attention` section reads.
     ///
     /// `building` stays masked off — no health section reads it — so this is
-    /// six `gh` calls per repo rather than seven. The three review axes were
+    /// eight `gh` calls per repo rather than nine. The three review axes were
     /// masked off too until Issue #5021, which is *why* the `queues` section
     /// could not see a Judge outage: the fields it needed were never fetched
     /// on the CLI path. The extra calls are the cost of that visibility, and
@@ -168,6 +219,8 @@ impl PipelineMetrics {
         changes_requested_unclaimed: true,
         approved: true,
         merged: true,
+        operator_held: true,
+        operator_only_issues: true,
     };
 }
 
@@ -404,6 +457,39 @@ impl GhPipelineSource {
         Ok(rows.len())
     }
 
+    /// Fetch every open `loom:operator`-held PR's `mergeable` state and
+    /// `createdAt`, for the `operator_held`/`operator_held_conflicting`/
+    /// `operator_held_oldest_days` metrics (Issue #8091). One `gh` call, like
+    /// [`Self::count`] — richer per-row shape because those three fields are
+    /// all derived from the same row set.
+    fn operator_held_rows(&self, root: &Path) -> Result<Vec<OperatorHeldRow>> {
+        let mut cmd = Command::new(&self.gh_bin);
+        cmd.args([
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--label",
+            "loom:operator",
+            "--json",
+            "number,mergeable,createdAt",
+            "--limit",
+            "500",
+        ])
+        .current_dir(root);
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+        let out = cmd
+            .output()
+            .with_context(|| format!("failed to invoke {}", self.gh_bin.display()))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "gh pr list --label loom:operator failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        serde_json::from_slice(&out.stdout).context("parse gh JSON output")
+    }
+
     /// The `merged:>=<RFC3339>` search qualifier for "merged inside `window`",
     /// computed from `now`. A separate function so tests can pin the clock.
     fn merged_since_query(now: chrono::DateTime<chrono::Utc>, window: chrono::Duration) -> String {
@@ -559,6 +645,51 @@ impl PipelineSource for GhPipelineSource {
                 &[
                     "pr", "list", "--state", "merged", "--search", &search, "--json", "number",
                     "--limit", "500",
+                ],
+            ));
+        }
+
+        // Issue #8091: `operator_held`/`operator_held_conflicting`/
+        // `operator_held_oldest_days` are all derived from the same row set,
+        // so — unlike every metric above — this is not a `record(self.count(..))`
+        // call; a failure here leaves all three `None` rather than a
+        // fabricated 0 (the "must not render 0 held on a failed read" rule).
+        // The error path still routes through `record` (discarding its
+        // `Option<usize>` return) so `first_err` keeps exactly one owner.
+        if self.metrics.operator_held {
+            match self.operator_held_rows(root) {
+                Ok(rows) => {
+                    snap.operator_held = Some(rows.len());
+                    snap.operator_held_conflicting = Some(
+                        rows.iter()
+                            .filter(|r| r.mergeable.as_deref() == Some("CONFLICTING"))
+                            .count(),
+                    );
+                    snap.operator_held_oldest_days = rows
+                        .iter()
+                        .map(|r| r.created_at)
+                        .min()
+                        .map(|oldest| (chrono::Utc::now() - oldest).num_days().max(0));
+                }
+                Err(e) => {
+                    record(Err(e));
+                }
+            }
+        }
+        if self.metrics.operator_only_issues {
+            snap.operator_only_issues = record(self.count(
+                root,
+                &[
+                    "issue",
+                    "list",
+                    "--state",
+                    "open",
+                    "--label",
+                    "loom:operator-only",
+                    "--json",
+                    "number",
+                    "--limit",
+                    "500",
                 ],
             ));
         }
@@ -903,6 +1034,12 @@ case "$*" in
   *"--state merged"*)
     echo '[{"number":8},{"number":9},{"number":10},{"number":11}]'
     ;;
+  *"mergeable,createdAt"*)
+    echo '[{"number":13,"mergeable":"CONFLICTING","createdAt":"2026-07-01T00:00:00Z"},{"number":14,"mergeable":"MERGEABLE","createdAt":"2026-08-01T00:00:00Z"}]'
+    ;;
+  *"loom:operator-only"*)
+    echo '[{"number":15}]'
+    ;;
   *)
     echo '[]'
     ;;
@@ -922,6 +1059,17 @@ esac
         assert_eq!(snap.changes_requested_unclaimed, Some(1));
         assert_eq!(snap.approved, Some(1));
         assert_eq!(snap.merged_24h, Some(4));
+        assert_eq!(snap.operator_held, Some(2), "#8091: two held PRs");
+        assert_eq!(
+            snap.operator_held_conflicting,
+            Some(1),
+            "#8091: only one of the two is CONFLICTING"
+        );
+        // The oldest of 2026-07-01 / 2026-08-01 is 2026-07-01 — older than
+        // 2026-08-01, so its age (measured against the real wall clock) must
+        // be the larger of the two.
+        assert!(snap.operator_held_oldest_days.is_some_and(|d| d > 0));
+        assert_eq!(snap.operator_only_issues, Some(1), "#8091");
         assert!(snap.is_complete());
     }
 
@@ -980,6 +1128,10 @@ esac
         assert_eq!(snap.changes_requested_unclaimed, None);
         assert_eq!(snap.approved, None);
         assert_eq!(snap.merged_24h, None);
+        assert_eq!(snap.operator_held, None, "#8091: must not render 0 held on a failed read");
+        assert_eq!(snap.operator_held_conflicting, None);
+        assert_eq!(snap.operator_held_oldest_days, None);
+        assert_eq!(snap.operator_only_issues, None);
     }
 
     #[test]
@@ -1008,10 +1160,11 @@ esac
         assert_eq!(source.merge_window, chrono::Duration::hours(24));
     }
 
-    /// The #4761 cost control, as widened by #5021 and #5272: the HEALTH mask
-    /// must issue exactly the six `gh` calls the health sections read — queue
-    /// depth, the four review-side axes (including the #5272 no-owner count),
-    /// and merge throughput — and must still skip `building`, which no
+    /// The #4761 cost control, as widened by #5021, #5272, and #8091: the
+    /// HEALTH mask must issue exactly the eight `gh` calls the health
+    /// sections read — queue depth, the four review-side axes (including the
+    /// #5272 no-owner count), merge throughput, and the two #8091
+    /// operator-attention axes — and must still skip `building`, which no
     /// section consumes. The mask exists to keep the one-shot command off the
     /// metrics nothing reads, not to be `ALL`.
     #[test]
@@ -1021,7 +1174,20 @@ esac
         let calls = tmp.path().join("calls.log");
         let gh = write_fake_gh(
             tmp.path(),
-            &format!("echo \"$*\" >> {}\necho '[{{\"number\":1}}]'", calls.display()),
+            &format!(
+                r#"
+echo "$*" >> {}
+case "$*" in
+  *"mergeable,createdAt"*)
+    echo '[{{"number":1,"mergeable":"CONFLICTING","createdAt":"2026-07-01T00:00:00Z"}}]'
+    ;;
+  *)
+    echo '[{{"number":1}}]'
+    ;;
+esac
+"#,
+                calls.display()
+            ),
         );
 
         let source = GhPipelineSource::new()
@@ -1040,10 +1206,18 @@ esac
         );
         assert_eq!(snap.approved, Some(1));
         assert_eq!(snap.building, None, "no health section reads `building`");
+        assert_eq!(snap.operator_held, Some(1), "#8091: the operator-held axis must be fetched");
+        assert_eq!(snap.operator_held_conflicting, Some(1));
+        assert!(snap.operator_held_oldest_days.is_some_and(|d| d >= 0));
+        assert_eq!(
+            snap.operator_only_issues,
+            Some(1),
+            "#8091: the operator-only-issues axis must be fetched"
+        );
         assert!(snap.is_complete());
 
         let log = std::fs::read_to_string(&calls).unwrap();
-        assert_eq!(log.lines().count(), 6, "exactly six gh calls, got:\n{log}");
+        assert_eq!(log.lines().count(), 8, "exactly eight gh calls, got:\n{log}");
         assert!(log.contains("loom:issue"));
         assert!(log.contains("loom:review-requested"));
         assert!(log.contains("loom:changes-requested"));
@@ -1053,6 +1227,11 @@ esac
         );
         assert!(log.contains("--state merged"));
         assert!(!log.contains("loom:building"));
+        assert!(
+            log.contains("--label loom:operator "),
+            "#8091: the held-PR query must fetch by loom:operator, not loom:operator-only: {log}"
+        );
+        assert!(log.contains("loom:operator-only"), "#8091: {log}");
     }
 
     #[test]

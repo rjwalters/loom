@@ -30,17 +30,20 @@
 //!   process table/filesystem, never a forge call made by this CLI process.
 //!   A verdict here reflects the daemon's own state, not this caller's
 //!   environment, so it is trustworthy the same way over SSH as locally.
-//! - **`queues`, `throughput`** execute `gh` calls **in this CLI process**
-//!   ([`pipeline_snapshot::GhPipelineSource`]), scoped to whatever `gh`
-//!   resolves to and however it is authenticated *here* — which can differ
-//!   from the daemon's own (already-verified, see `credential_preflight` in
-//!   `status`/`--json`) forge credential. A missing/non-executable `gh` in
-//!   *this* process (the common case: a non-login SSH shell whose `PATH`
-//!   lacks `~/.local/bin` / `/opt/homebrew/bin`, #4875's failure class) is
-//!   reported as a single distinct fact rather than a per-repo forge-query
-//!   failure, and cross-references the daemon's own `credential_preflight`
-//!   verdict when it is available — see `health::assess_queues` /
-//!   `assess_throughput` / `gh_unavailable_section`.
+//! - **`queues`, `throughput`, `operator_attention`** execute `gh` calls **in
+//!   this CLI process** ([`pipeline_snapshot::GhPipelineSource`]), scoped to
+//!   whatever `gh` resolves to and however it is authenticated *here* — which
+//!   can differ from the daemon's own (already-verified, see
+//!   `credential_preflight` in `status`/`--json`) forge credential. A
+//!   missing/non-executable `gh` in *this* process (the common case: a
+//!   non-login SSH shell whose `PATH` lacks `~/.local/bin` /
+//!   `/opt/homebrew/bin`, #4875's failure class) is reported as a single
+//!   distinct fact rather than a per-repo forge-query failure, and
+//!   cross-references the daemon's own `credential_preflight` verdict when it
+//!   is available — see `health::assess_queues` / `assess_throughput` /
+//!   `gh_unavailable_section`. `operator_attention` (#8091) is always
+//!   `Verdict::Green` regardless, so a missing `gh` there changes the
+//!   rendered text but never the exit code.
 
 use anyhow::Result;
 use std::path::Path;

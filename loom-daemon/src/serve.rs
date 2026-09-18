@@ -2442,6 +2442,13 @@ mod tests {
                 changes_requested_unclaimed: Some(0),
                 approved: Some(1),
                 merged_24h: Some(5),
+                // Issue #8091: the operator-attention bucket must reach
+                // `/api/pipeline` alongside every other queue count, reusing
+                // this same per-repo row rather than a second endpoint.
+                operator_held: Some(2),
+                operator_held_conflicting: Some(1),
+                operator_held_oldest_days: Some(4),
+                operator_only_issues: Some(6),
                 error: None,
             },
         )]);
@@ -2458,6 +2465,12 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
         assert_eq!(value[0]["queued"], serde_json::json!(3));
         assert_eq!(value[0]["merged_24h"], serde_json::json!(5));
+        // #8091: the operator-held bucket, served from the same TTL cache —
+        // no second `gh` subprocess batch for this endpoint.
+        assert_eq!(value[0]["operator_held"], serde_json::json!(2));
+        assert_eq!(value[0]["operator_held_conflicting"], serde_json::json!(1));
+        assert_eq!(value[0]["operator_held_oldest_days"], serde_json::json!(4));
+        assert_eq!(value[0]["operator_only_issues"], serde_json::json!(6));
         // `/repos/loom` is not a real git checkout, so the URL derivation is
         // expected to fail gracefully rather than fabricate a link.
         assert_eq!(value[0]["forge_url"], serde_json::Value::Null);
@@ -2574,7 +2587,7 @@ mod tests {
     // ========================================================================
 
     /// AC4: the dashboard must reuse the collector, so its payload has exactly
-    /// the shape (and the seven sections) `loom-daemon health --json` renders.
+    /// the same shape (and section set) `loom-daemon health --json` renders.
     #[tokio::test]
     async fn health_route_serves_the_shared_collector_report() {
         let mut report = empty_report();
@@ -2615,6 +2628,7 @@ mod tests {
                 "role_liveness",
                 "queues",
                 "throughput",
+                "operator_attention",
                 "peer_coordination",
                 "stale_sweeps",
                 "auto_update",
