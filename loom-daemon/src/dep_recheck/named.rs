@@ -6,6 +6,7 @@
 //! #6333, which carries no `Closes #6335`, so it never appeared in
 //! `closedByPullRequestsReferences` at all.
 
+use super::extract::DEPENDENCY_PHRASES;
 use crate::short_hash::short_sha16;
 use regex::Regex;
 use serde::Deserialize;
@@ -38,12 +39,32 @@ pub struct Outcome {
 }
 
 /// A checklist item: `- [ ] #123: ...` or `* [ ] #123: ...`, with an optional
-/// case-insensitive `PR `/`Issue ` token before the `#N`.
+/// dependency phrase (`Blocked by`, `Depends on`, `Requires`, `**Epic**`)
+/// and/or a `PR `/`Issue ` token before the `#N`, in that order. All of the
+/// optional parts are case-insensitive, and either may appear without the
+/// other (`- [ ] Blocked by PR #3` matches both).
 ///
 /// The optional token is #7501: curator prose naturally varies ("PR #N",
 /// "Issue #N"), and silently dropping such an item produces a false
 /// `VERDICT=clear` — which can unblock a Builder that is genuinely blocked.
 /// Being slightly too permissive is the better failure direction here.
+///
+/// The optional phrase is #8119, and exists for exactly the same reason one
+/// step further out: `- [ ] Blocked by #6333: prerequisite` is the single most
+/// natural way to write a prerequisite, [`super::extract`] already reads it as
+/// a reference, and this matcher used to drop it — so the two subcommands
+/// disagreed about what counts as a dependency and the more permissive one was
+/// not the one deciding the verdict. The vocabulary is
+/// [`super::extract::DEPENDENCY_PHRASES`], shared rather than re-spelled, per
+/// that module's own "reused verbatim … rather than inventing a second
+/// vocabulary" precedent.
+///
+/// Two deliberate narrowings relative to [`super::extract`]'s `phrase_re`:
+/// the separator between phrase and `#N` is `[*_: \t]*` rather than
+/// `[*_:\s]*`, so a match can never span a newline (a checklist *item* is a
+/// line), and the phrase must sit directly after the checkbox rather than
+/// anywhere in the item's prose — `- [ ] #3: blocked by #99` still yields only
+/// `#3`, not `#99`.
 ///
 /// **Divergence from the pre-port shell (#8011, kept intentionally):** the
 /// shell's `_extract_named_deps` matched only a literal `-` bullet;
@@ -57,8 +78,14 @@ pub struct Outcome {
 fn item_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?im)^[ \t]*[-*][ \t]*\[([ xX])\][ \t]*(?:(?:pr|issue)[ \t]+)?#([0-9]+)")
-            .expect("static checklist pattern")
+        // The bullet and its box, then an optional dependency phrase (#8119),
+        // then an optional `PR `/`Issue ` token (#7501), then the reference.
+        // Kept on one line: the phrases themselves contain literal spaces, so
+        // `(?x)` free-spacing mode would silently mangle the shared vocabulary.
+        let pattern = format!(
+            r"(?im)^[ \t]*[-*][ \t]*\[([ xX])\][ \t]*(?:(?:{DEPENDENCY_PHRASES})[*_: \t]*)?(?:(?:pr|issue)[ \t]+)?#([0-9]+)"
+        );
+        Regex::new(&pattern).expect("static checklist pattern")
     })
 }
 
