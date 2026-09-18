@@ -38,6 +38,8 @@
 //! what its author thought to write down. See
 //! `defaults/docs/verification-recipes.md` §6 for the differential step.
 
+use std::path::{Path, PathBuf};
+
 pub mod config;
 pub mod consts;
 pub mod env;
@@ -52,6 +54,7 @@ pub mod recovery;
 pub mod remediation;
 pub mod report;
 pub mod supervisor;
+pub mod supervisor_cmd;
 
 /// The `--help` banner, kept verbatim from the shell's head-comment block.
 ///
@@ -244,7 +247,7 @@ fn outage(
 
     // Step 1: the supervisor may be able to fix this itself.
     if snap.job_loaded {
-        if let Some(code) = supervisor_remediation(reporter, sup, snap, &started_at) {
+        if let Some(code) = supervisor_remediation(paths, reporter, sup, snap, &started_at) {
             if code == 0 {
                 recovery::clear(&state.recovery, &state.escalation_sentinel);
             }
@@ -295,6 +298,7 @@ fn outage(
             state,
             snap,
             &format!("the circuit breaker is OPEN after {} attempts", episode.attempts),
+            None,
         )
     } else {
         String::new()
@@ -318,46 +322,93 @@ fn outage(
 /// The `#4232`/`#4862` gate. `None` when it does not apply, so the caller falls
 /// through to bounded recovery.
 fn supervisor_remediation(
+    paths: &config::Paths,
     reporter: &report::Reporter,
     sup: &supervisor::Supervisor,
     snap: &liveness::Snapshot,
     started_at: &str,
 ) -> Option<i32> {
     let service = snap.supervisor_service.as_deref()?;
-    let last_exit = snap.last_exit_status;
-    match remediation::gate(snap.job_loaded, last_exit) {
-        remediation::Gate::Remediate => {
+    if !matches!(
+        remediation::gate(snap.job_loaded, snap.last_exit_status),
+        remediation::Gate::Remediate
+    ) {
+        // A crash, a SIGTERM, or an unreadable status. Deliberately not
+        // remediated here; the caller proceeds to bounded recovery, which is
+        // the path that has a spending limit.
+        return None;
+    }
+
+    reporter.report(
+        report::Level::Divergence,
+        &format!(
+            "A daemon is EXPECTED (autonomy-desired marker present, started {started_at}) but is \
+             NOT running: {}. Last exit status was 0 — the restart-primitive's own exit-0 \
+             contract (#4054/#4077) — which the supervisor failed to honor. Auto-remediating \
+             {service} (PLAIN kickstart, never -k, so a daemon that is mid-relaunch is never \
+             killed) (#4232).",
+            snap.detail
+        ),
+    );
+
+    if sup.use_launchd {
+        let _ = supervisor_cmd::run_bounded(&supervisor_cmd::launchd_kickstart_argv(service));
+    } else if sup.use_systemd {
+        for argv in supervisor_cmd::systemd_restart_argvs(service) {
+            let _ = supervisor_cmd::run_bounded(&argv);
+        }
+    } else {
+        return None;
+    }
+
+    // Ask the SAME liveness question the outage was declared on, so a
+    // relaunch is confirmed by the same evidence that declared it missing.
+    let recheck = supervisor_cmd::Recheck::from_env();
+    let alive = supervisor_cmd::recheck_alive(&recheck, || {
+        let l = crate::daemon_install_state::check_liveness_with_systemd(
+            sup.use_launchd,
+            &sup.label,
+            None,
+            env::var("LOOM_LAUNCHD_DOMAIN").as_deref(),
+            sup.use_systemd.then_some(sup.systemd_unit.as_str()),
+        );
+        l.alive.then_some(l.pid).flatten()
+    });
+
+    match alive {
+        Some(pid) => {
+            reporter.report(
+                report::Level::Ok,
+                &format!("auto-remediation succeeded: relaunched {service} (new pid {pid})."),
+            );
+            Some(0)
+        }
+        None => {
             reporter.report(
                 report::Level::Divergence,
                 &format!(
-                    "A daemon is EXPECTED (autonomy-desired marker present, started \
-                     {started_at}) but is NOT running: {}. Last exit status was 0 — the \
-                     restart-primitive's own exit-0 contract (#4054/#4077) — which the \
-                     supervisor failed to honor. Auto-remediating {service} (#4232).",
-                    snap.detail
+                    "Auto-remediation attempted on {service} but the daemon is STILL not \
+                     confirmed running. Escalate manually: inspect the supervisor, or run \
+                     ./.loom/scripts/cli/loom-daemon-start.sh [flags]. Watchdog log: {}.",
+                    paths.log.display()
                 ),
             );
-            // The actual kickstart and its bounded re-check land with the
-            // supervisor-invocation layer; until then this reports the decision
-            // and declines to claim a result it did not observe.
-            None
-        }
-        // A crash, a SIGTERM, or an unreadable status: deliberately NOT
-        // remediated. The caller proceeds to bounded recovery, which is the
-        // path with a spending limit.
-        remediation::Gate::UncleanExit { .. } | remediation::Gate::NotLoaded => {
-            let _ = sup;
-            None
+            Some(1)
         }
     }
 }
 
 /// Attempt escalation and render the note the divergence line carries.
+///
+/// The note is written from what was OBSERVED, never from what was intended. An
+/// escalation that says an issue was filed when none was is worse than silence:
+/// it tells the reader to go look somewhere nothing exists.
 fn escalation_note(
     paths: &config::Paths,
     state: &consts::StateFiles,
     snap: &liveness::Snapshot,
     reason: &str,
+    recovery_detail: Option<&str>,
 ) -> String {
     match escalate::decide(&state.escalation_sentinel) {
         escalate::Decision::AlreadyEscalated => format!(
@@ -370,15 +421,42 @@ fn escalation_note(
             paths.log.display()
         ),
         escalate::Decision::Escalate => {
-            let _ = (snap, reason);
-            // Filing runs through create-issue.sh and lands with the
-            // subprocess layer; the sentinel is only written on a confirmed
-            // file, never optimistically.
-            format!(
-                " Out-of-band escalation was NOT possible (no create-issue.sh reachable, or the \
-                 forge call failed), so THIS LOGFILE IS THE ONLY SIGNAL for this outage — {}.",
-                paths.log.display()
-            )
+            let repo_root = marker::get_nonempty(&paths.marker, "repo_root").map(PathBuf::from);
+            let cli_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from("."));
+            let fallback = env::var("LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR").map(PathBuf::from);
+
+            let script =
+                escalate::resolve_issue_script(repo_root.as_deref(), &cli_dir, fallback.as_deref());
+
+            let hostname = escalate::hostname();
+            let ctx = escalate::Context {
+                hostname: &hostname,
+                socket_path: &paths.socket_path,
+                marker: &paths.marker,
+                liveness_detail: &snap.detail,
+                reason,
+                recovery_argv_detail: recovery_detail,
+                watchdog_log: &paths.log,
+                recovery_state: &state.recovery,
+                sentinel: &state.escalation_sentinel,
+            };
+
+            match script {
+                Some(s) if escalate::file_issue(&s, &ctx, &state.escalation_sentinel) => {
+                    " ESCALATED out-of-band: filed a forge tracking issue so this outage is not \
+                     confined to a logfile nobody tails (#5391)."
+                        .to_string()
+                }
+                _ => format!(
+                    " Out-of-band escalation was NOT possible (no create-issue.sh reachable, or \
+                     the forge call failed), so THIS LOGFILE IS THE ONLY SIGNAL for this outage \
+                     — {}.",
+                    paths.log.display()
+                ),
+            }
         }
     }
 }

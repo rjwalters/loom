@@ -149,6 +149,63 @@ pub fn write_sentinel(sentinel: &Path) {
         std::fs::write(sentinel, format!("{}\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")));
 }
 
+/// This host's name for the issue title and body.
+///
+/// Reads `/proc/sys/kernel/hostname` first and falls back to the `hostname`
+/// command, matching [`crate::script_helpers`]'s existing resolution rather
+/// than adding a third way to answer the same question. The shell's final
+/// fallback was `unknown-host`; that is kept, because an issue titled for
+/// `localhost` in a fleet is worse than one that admits it does not know.
+#[must_use]
+pub fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "unknown-host".to_string())
+}
+
+/// File the issue. `true` only when `create-issue.sh` reported success.
+///
+/// The sentinel is written **only** on a confirmed file, never optimistically.
+/// A sentinel written for an issue that was not filed suppresses every future
+/// escalation on this host until someone deletes it by hand — the outage would
+/// be invisible in both places at once.
+///
+/// `--force` is passed because the duplicate-detection in `create-issue.sh`
+/// compares against open issues by similarity, and a recurring outage on the
+/// same host is *supposed* to file again once the sentinel has been cleared by
+/// a recovery. The sentinel is this path's dedup, not the forge's.
+#[must_use]
+pub fn file_issue(script: &Path, ctx: &Context, sentinel: &Path) -> bool {
+    let mut cmd = std::process::Command::new(script);
+    cmd.arg("--title")
+        .arg(title(ctx.hostname))
+        .arg("--body")
+        .arg(body(ctx))
+        .arg("--label")
+        .arg("loom:triage")
+        .arg("--force");
+
+    let filed = crate::sweep_registry::output_with_timeout(cmd, std::time::Duration::from_secs(60))
+        .ok()
+        .flatten()
+        .is_some_and(|o| o.status.success());
+
+    if filed {
+        write_sentinel(sentinel);
+    }
+    filed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
