@@ -21,7 +21,6 @@ TOTAL=0
 # Colors (if terminal supports them)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # Run the AST detection script against a single directory
@@ -83,7 +82,7 @@ for root, dirs, files in os.walk('${target_dir}'):
 
 # Assert that a class name appears in detector output (should be flagged)
 assert_flagged() {
-    local fixture="$1"
+    local _fixture="$1"   # documents which fixture the assertion targets
     local class_name="$2"
     local description="$3"
     TOTAL=$((TOTAL + 1))
@@ -104,7 +103,7 @@ assert_flagged() {
 
 # Assert that a class name does NOT appear in detector output (should be excluded)
 assert_not_flagged() {
-    local fixture="$1"
+    local _fixture="$1"   # documents which fixture the assertion targets
     local class_name="$2"
     local description="$3"
     TOTAL=$((TOTAL + 1))

@@ -23,7 +23,7 @@
 //! - [`repo_owned`]: Ownership boundary for the reinstall clean sweep (#5971)
 
 mod file_ops;
-mod git;
+pub(crate) mod git;
 mod post_init;
 mod repo_owned;
 mod retired;

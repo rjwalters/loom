@@ -605,6 +605,8 @@ provision_machine_daemon() {
   # path below (including the short-circuit) communicates where the binary
   # lives — even the early soft-failure returns (the caller gates on the return
   # code, so a set-but-unprovisioned value there is harmless).
+  # shellcheck disable=SC2034  # output variable: read by the sourcing caller
+  # (loom-daemon-update.sh) — see the contract at the top of this file.
   PROVISIONED_DAEMON_BIN="$dest_bin"
 
   if [[ -z "$src_bin" || ! -x "$src_bin" ]]; then

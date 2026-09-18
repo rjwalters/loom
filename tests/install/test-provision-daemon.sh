@@ -370,7 +370,7 @@ SRC11="$WORKDIR/src11/loom-daemon"
 mkdir -p "$WORKDIR/src11"
 make_fake_bin "$SRC11" "0.15.5"
 DEST11="$WORKDIR/dest11"
-out11=$(PATH="$FAKE_IDENTITY_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST11" \
+_out11=$(PATH="$FAKE_IDENTITY_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST11" \
   LOOM_CODESIGN_IDENTITY="Loom Local Signing" provision_machine_daemon "$SRC11" 2>&1)
 rc11=$?
 assert_eq "LOOM_CODESIGN_IDENTITY set + found: provision returns 0" "0" "$rc11"
@@ -451,7 +451,7 @@ echo "\$@" > "$CODESIGN_ARGS_UNSET_FILE"
 exit 0
 EOF
 chmod +x "$FAKE_UNSET_DIR/codesign"
-out13=$(cd "$WORKDIR" && PATH="$FAKE_UNSET_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST13" \
+_out13=$(cd "$WORKDIR" && PATH="$FAKE_UNSET_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST13" \
   env -u LOOM_CODESIGN_IDENTITY -u LOOM_ROOT \
   bash -c 'source "'"$REPO_ROOT"'/scripts/install/provision-daemon.sh"; provision_machine_daemon "'"$SRC13"'"' 2>&1)
 rc13=$?
@@ -487,7 +487,7 @@ mkdir -p "$WORKDIR/src15"
 cp "$(command -v cat)" "$SRC15"
 chmod +x "$SRC15"
 DEST15="$WORKDIR/dest15"
-out15=$( ( unset LOOM_PROVISION_ALLOW_SCRIPT
+_out15=$( ( unset LOOM_PROVISION_ALLOW_SCRIPT
   PATH="$FAKE_FILE_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST15" \
     provision_machine_daemon "$SRC15" ) 2>&1 )
 rc15=$?
@@ -637,7 +637,7 @@ mkdir -p "$WORKDIR/src22"
 make_fake_bin "$SRC22" "0.19.0"
 DEST22="$WORKDIR/dest22"
 DEFAULTS_DEST22="$WORKDIR/machine-defaults-22/defaults"
-out22=$(LOOM_DAEMON_DEFAULTS_DIR="$DEFAULTS_DEST22" provision_machine_daemon "$SRC22" "$DEST22" 2>&1)
+_out22=$(LOOM_DAEMON_DEFAULTS_DIR="$DEFAULTS_DEST22" provision_machine_daemon "$SRC22" "$DEST22" 2>&1)
 rc22=$?
 assert_eq "no defaults_src_dir: provision still returns 0" "0" "$rc22"
 assert_eq "no defaults_src_dir: no machine-level defaults dir created" "0" \
@@ -686,7 +686,7 @@ mkdir -p "$WORKDIR/src25"
 make_fake_bin "$SRC25" "0.19.2"
 DEST25="$WORKDIR/dest25"
 DEFAULTS_DEST25="$WORKDIR/machine-defaults-25/defaults"
-out25=$(LOOM_DAEMON_DEFAULTS_DIR="$DEFAULTS_DEST25" \
+_out25=$(LOOM_DAEMON_DEFAULTS_DIR="$DEFAULTS_DEST25" \
   provision_machine_daemon "$SRC25" "$DEST25" "$WORKDIR/does-not-exist-defaults" 2>&1)
 rc25=$?
 assert_eq "missing defaults_src_dir: provision still returns 0" "0" "$rc25"

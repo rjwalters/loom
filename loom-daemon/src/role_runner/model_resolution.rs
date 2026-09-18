@@ -2,12 +2,15 @@
 //! (#7894), split out of `role_runner.rs` so the over-threshold parent file
 //! shrinks rather than grows (`.loom/docs/file-size-policy.md`).
 //!
-//! Two questions live here, and only here:
+//! Three questions live here, and only here:
 //!
 //! 1. **Which model does a scheduled role tick run with?** —
 //!    [`resolve_role_runner_model`], the per-role/global/shared precedence
 //!    chain, including the `"default"` CLI pass-through sentinel.
-//! 2. **Is that answer still right once the runtime is known?** —
+//! 2. **Which reasoning effort does it run with?** —
+//!    [`resolve_role_runner_effort`] (#8054), the same per-role-over-global
+//!    shape, but with no shipped default: unconfigured means "emit no flag".
+//! 3. **Is that answer still right once the runtime is known?** —
 //!    [`reconcile_unpinned_model_with_runtime`], which degrades an *unpinned*
 //!    cross-family conflict to the runtime CLI's own default instead of letting
 //!    `ScriptRoleInvocationRunner::invoke`'s #5028 preflight skip the tick
@@ -149,6 +152,144 @@ pub fn resolve_role_runner_model(repo_root: &Path, role: &str) -> (String, Strin
     };
     (model, label)
 }
+
+/// Issue #8054: resolve the reasoning effort a role-runner child must run with —
+/// the role-runner counterpart of the sweep dispatch path's `--effort` param
+/// (#3716), which until now was the *only* path that could emit the flag at all.
+///
+/// **`autonomous.roleRunner.roleEfforts.<role>` >
+/// `autonomous.roleRunner.effort` > unset**
+///
+/// Deliberately **no** shipped default and no fall-through to
+/// `autonomous.effort` (no such key exists): an unconfigured workspace resolves
+/// to the empty string, which [`run_role_with_timeout`] renders as **no
+/// `--effort` argument at all**, so the runtime CLI's own session-default effort
+/// survives end-to-end and the spawned argv is byte-identical to the pre-#8054
+/// argv. That is the opposite of [`resolve_role_runner_model`]'s contract, and
+/// the asymmetry is the point: an inherited *model* was a live incident (#4501 —
+/// every role child silently ran the account's most constrained quota tier),
+/// whereas an inherited *effort* is exactly the behaviour every one of today's
+/// workspaces already has and must keep.
+///
+/// Returns the effort plus a label naming the tier that supplied it (for the
+/// per-role log header), mirroring [`resolve_role_runner_model`]'s return shape;
+/// the unset case is labelled [`UNSET_EFFORT_SOURCE`].
+///
+/// Blank values never reach here — they are dropped at parse time in
+/// [`read_role_runner_config`] at *both* tiers, so a blank per-role entry falls
+/// through to the global tier and a blank global value falls through to unset,
+/// exactly as the model chain treats blanks.
+#[must_use]
+pub fn resolve_role_runner_effort(repo_root: &Path, role: &str) -> (String, String) {
+    let config = read_role_runner_config(repo_root);
+    let role_key = role.trim().to_ascii_lowercase();
+    if let Some(e) = config.role_efforts.get(&role_key) {
+        return (e.clone(), format!("autonomous.roleRunner.roleEfforts.{role_key}"));
+    }
+    match config.effort {
+        Some(e) => (e, "autonomous.roleRunner.effort".to_string()),
+        None => (String::new(), UNSET_EFFORT_SOURCE.to_string()),
+    }
+}
+
+/// Issue #8054: parse the two effort keys out of an already-resolved
+/// `autonomous.roleRunner` config block, returning
+/// `(effort, role_efforts)` for [`RoleRunnerConfig`]'s
+/// [`effort`](RoleRunnerConfig::effort) /
+/// [`role_efforts`](RoleRunnerConfig::role_efforts) fields. Called by
+/// [`read_role_runner_config`]; it lives here rather than inline in the parser
+/// so the module that *resolves* these keys also owns their parse contract (and
+/// so the over-threshold `role_runner.rs` shrinks rather than grows —
+/// `.loom/docs/file-size-policy.md`).
+///
+/// The contract is `roleModels`'s, verbatim:
+///
+/// - **`effort`** — a blank / whitespace-only / non-string / absent value
+///   soft-fails to `None`, i.e. *unset* (emit no flag), never a default.
+/// - **`roleEfforts`** — keys trimmed + lower-cased (so a `"Judge"` key matches
+///   the `judge` role the runner dispatches under); a blank key or a blank /
+///   non-string value drops **that entry only**, so one typo never disables the
+///   rest of the object; an absent / non-object value soft-fails to an empty map.
+/// - Values are trimmed but **not** lower-cased and **not** validated against a
+///   level vocabulary — the runtime owns that list (the sweep-dispatch path
+///   forwards `effort` opaquely too), so a bad level must fail the tick loudly
+///   at the CLI rather than be silently dropped here.
+#[must_use]
+pub(super) fn parse_effort_config(
+    block: &serde_json::Value,
+) -> (Option<String>, BTreeMap<String, String>) {
+    let effort = block
+        .get("effort")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(String::from);
+    let role_efforts = block
+        .get("roleEfforts")
+        .and_then(serde_json::Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    let key = k.trim().to_ascii_lowercase();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    let val = v.as_str().map(str::trim).filter(|e| !e.is_empty())?;
+                    Some((key, val.to_string()))
+                })
+                .collect::<BTreeMap<String, String>>()
+        })
+        .unwrap_or_default();
+    (effort, role_efforts)
+}
+
+/// The `==== loom-daemon role_runner: … ====` header line
+/// [`run_role_with_timeout`] appends to `role-<role>.log` at the start of every
+/// real invocation — the ONE artifact an operator inspects to confirm which
+/// model *and*, since #8054, which reasoning effort a scheduled child actually
+/// ran with, and which config tier supplied each (#4501 / #8054). The
+/// transcript-side cost telemetry (#8052/#8059) attributes a tick's spend to
+/// this line.
+///
+/// An empty `model` is the deliberate CLI-default pass-through (#7894) and an
+/// empty `effort` is the (overwhelmingly common) unconfigured case; both render
+/// as the [`RUNTIME_CLI_DEFAULT_PLACECARD`] name rather than as `model=` /
+/// `effort=` followed by nothing, which reads like a bug in the header itself.
+#[must_use]
+pub(super) fn role_log_header(
+    timestamp: &str,
+    role: &str,
+    model: &str,
+    model_source: &str,
+    effort: &str,
+    effort_source: &str,
+) -> String {
+    let model_display = if model.is_empty() {
+        RUNTIME_CLI_DEFAULT_PLACECARD
+    } else {
+        model
+    };
+    let effort_display = if effort.is_empty() {
+        RUNTIME_CLI_DEFAULT_PLACECARD
+    } else {
+        effort
+    };
+    format!(
+        "==== loom-daemon role_runner: {timestamp} role={role} model={model_display} \
+         (source={model_source}) effort={effort_display} (source={effort_source}) ===="
+    )
+}
+
+/// How [`role_log_header`] names a value that was never pinned, so the runtime
+/// CLI's own default applies (#7894 for the model, #8054 for the effort).
+pub(super) const RUNTIME_CLI_DEFAULT_PLACECARD: &str = "<runtime CLI default>";
+
+/// Issue #8054: the source label [`resolve_role_runner_effort`] attributes to
+/// "no effort was configured at any tier". Distinct from the model chain's
+/// [`SHIPPED_DEFAULT_MODEL_SOURCE`] (`"default"`) on purpose — there is no
+/// shipped default effort to name, and the header line must not imply Loom
+/// chose one.
+pub const UNSET_EFFORT_SOURCE: &str = "unset";
 
 /// Issue #7894: the model-source label [`resolve_role_runner_model`] attributes
 /// to the shipped [`sweep_registry::DEFAULT_DISPATCH_MODEL`] tier — i.e. "no

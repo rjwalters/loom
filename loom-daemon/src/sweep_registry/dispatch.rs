@@ -2529,7 +2529,18 @@ impl SweepRegistry {
         // post-restart `reconstruct()` — and a fresh `loom-daemon cancel`
         // process, which never held the spawn-time `Child` handle — can still
         // tear down the WHOLE tree instead of orphaning it.
-        if let Err(e) = self.record_child_pid_in_lock(issue_number, pid, pgid) {
+        //
+        // The same write persists the dispatched model/effort (#8056) so a
+        // post-restart `reconstruct()` can restore them onto the adopted entry
+        // — otherwise every `sweep.outcome` telemetry record written after a
+        // restart reports a null model and effort for a sweep that had both.
+        if let Err(e) = self.record_child_pid_in_lock(
+            issue_number,
+            pid,
+            pgid,
+            model.as_deref(),
+            effort.as_deref(),
+        ) {
             log::warn!(
                 "failed to record child pid {pid} (pgid {pgid:?}) in lock for issue \
                  #{issue_number} (reconstruct may treat it as stale after a daemon restart, \

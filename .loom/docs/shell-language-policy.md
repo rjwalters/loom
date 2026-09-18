@@ -196,8 +196,10 @@ into the daemon behind a stub ("The name stays; logic ports behind it"):
 | **portable** | **38,691** | **196** |
 
 Its target is the ~145 lines of `stub` glue a ported file leaves behind. That
-is what the ratchet gates. `total` is ratcheted as a secondary signal so floor
-growth is visible rather than free, but the floor is not debt.
+is what the gate measures. `total` is checked too — as a **delta against the
+merge-base**, not an absolute — so growth in the permanent floor is deliberate
+rather than free. The floor is not debt, but adding to it raises the finish
+line.
 
 ### Where it runs, and why that took two attempts
 
@@ -224,23 +226,28 @@ merged ports, with nobody noticing.
 It is Rust, not a script, for the obvious reason: a `.sh` enforcing "stop
 adding shell" would have to exempt itself from its own count.
 
-### Regenerating the baseline
+### There is no baseline to regenerate
 
-```bash
-UPDATE_SHELL_BUDGET=1 cargo test -p loom-daemon --test shell_budget_ratchet
-```
+The gate compares against the **merge-base**, not a committed number. It asks
+the only question it cares about — *does this change add portable shell?* —
+so whatever `main` did meanwhile is not this change's doing and not the gate's
+business.
 
-Legitimate for recording shrinkage, or for a reviewed decision to admit growth.
-A reviewer should treat an update that RAISES `portable` as the thing to ask
-about. `origin_portable` is never regenerated — it is the denominator, and an
-origin that moves measures nothing. Regeneration refuses to run while any
-production script lacks an allowlist entry, since banking an undercount freezes
-the error in place.
+That is a deliberate correction. The first version committed an absolute number
+and required regenerating it whenever `main` moved. A number in the tree is a
+snapshot of one tree, so every other tree disagrees with it: this file's own
+baseline went stale twice in a single day, and the identically-shaped role-prompt
+ratchet **failed at its own merge commit** and red-lined `main` for 8 consecutive
+commits (#8073, #8105).
 
-**Rebase before regenerating.** A baseline captured on a branch snapshots that
-branch's tree while `main` moves underneath it — that is how #8073 red-lined
-`main` at its own merge commit, and this file's own baseline went stale twice
-in one day (#8105).
+The deeper problem was the instruction it produced. "Regenerate the baseline on
+every merge" teaches people to regenerate without looking — which is exactly the
+reflex a ratchet exists to prevent. The gate was training the behaviour it was
+built to stop.
+
+`scripts/shell-budget-baseline.txt` now holds one value, `origin_portable`, and
+it is the progress **denominator**, not a gate input. It must never be
+regenerated: an origin that moves measures nothing. A test pins it.
 
 ## Related
 

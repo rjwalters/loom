@@ -1736,29 +1736,98 @@ fn test_run_tick_fetch_failure_backs_off_without_falling_back_to_a_build() {
 
 // ---- script-root resolution (the no-source-checkout host) -------------
 
-#[tokio::test]
-async fn test_script_root_falls_back_to_the_workspace_root() {
-    // The host shape this issue exists for: no build-time source checkout
-    // resolvable, but the daemon's own workspace root has the script.
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().to_path_buf();
-    std::fs::create_dir_all(root.join(".loom/scripts/cli")).unwrap();
-    std::fs::write(root.join(".loom/scripts/cli/loom-daemon-update.sh"), "#!/bin/sh\n").unwrap();
-    let bus = Arc::new(EventBus::new());
-    let pool = Arc::new(WorkspacePool::new(bus, tokio::runtime::Handle::current()));
-    let mut probe = ScriptAutoUpdateProbe::new(pool, root.clone());
-    probe.source_root = None;
-    assert_eq!(probe.script_root(), Some(root));
+/// Run `f` with `LOOM_DAEMON_DEFAULTS_DIR` set to `value` (or unset if
+/// `None`), restoring the prior value afterward. A copy of
+/// `init::git::tests::with_machine_defaults_env` (that module's test helpers
+/// are private) touching the same env var
+/// [`crate::init::git::MACHINE_DEFAULTS_ENV`] that
+/// `ScriptAutoUpdateProbe::candidate_roots`'s third fallback reads (Issue
+/// #7964) — every caller below carries the matching
+/// `#[serial(loom_daemon_defaults_dir)]` key so the two test modules'
+/// mutations of this process-global var cannot interleave.
+fn with_machine_defaults_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let prev = std::env::var(crate::init::git::MACHINE_DEFAULTS_ENV).ok();
+    match value {
+        Some(v) => std::env::set_var(crate::init::git::MACHINE_DEFAULTS_ENV, v),
+        None => std::env::remove_var(crate::init::git::MACHINE_DEFAULTS_ENV),
+    }
+    let result = f();
+    match prev {
+        Some(p) => std::env::set_var(crate::init::git::MACHINE_DEFAULTS_ENV, p),
+        None => std::env::remove_var(crate::init::git::MACHINE_DEFAULTS_ENV),
+    }
+    result
 }
 
 #[tokio::test]
+#[serial(loom_daemon_defaults_dir)]
+async fn test_script_root_falls_back_to_the_workspace_root() {
+    // The host shape this issue exists for: no build-time source checkout
+    // resolvable, but the daemon's own workspace root has the script. The
+    // machine-level mirror candidate is disabled so a host with a real
+    // `~/.local/share/loom-daemon/defaults` mirror cannot mask the assertion.
+    with_machine_defaults_env(Some(""), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".loom/scripts/cli")).unwrap();
+        std::fs::write(root.join(".loom/scripts/cli/loom-daemon-update.sh"), "#!/bin/sh\n")
+            .unwrap();
+        let bus = Arc::new(EventBus::new());
+        let pool = Arc::new(WorkspacePool::new(bus, tokio::runtime::Handle::current()));
+        let mut probe = ScriptAutoUpdateProbe::new(pool, root.clone());
+        probe.source_root = None;
+        assert_eq!(probe.script_root(), Some(root));
+    });
+}
+
+#[tokio::test]
+#[serial(loom_daemon_defaults_dir)]
 async fn test_script_root_is_none_without_any_script() {
-    let tmp = tempfile::tempdir().unwrap();
-    let bus = Arc::new(EventBus::new());
-    let pool = Arc::new(WorkspacePool::new(bus, tokio::runtime::Handle::current()));
-    let mut probe = ScriptAutoUpdateProbe::new(pool, tmp.path().to_path_buf());
-    probe.source_root = None;
-    assert_eq!(probe.script_root(), None);
-    // …and a probe with no script resolves no artifact rather than erroring.
-    assert!(matches!(probe.resolve_artifact(), ArtifactResolution::Unresolved(_)));
+    // Disable the mirror candidate too, else a host that actually has one
+    // provisioned (e.g. any dev machine running `loom update`) would make
+    // this "nothing resolves" assertion flaky.
+    with_machine_defaults_env(Some(""), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = Arc::new(EventBus::new());
+        let pool = Arc::new(WorkspacePool::new(bus, tokio::runtime::Handle::current()));
+        let mut probe = ScriptAutoUpdateProbe::new(pool, tmp.path().to_path_buf());
+        probe.source_root = None;
+        assert_eq!(probe.script_root(), None);
+        // …and a probe with no script resolves no artifact rather than
+        // erroring, naming every candidate root tried.
+        match probe.resolve_artifact() {
+            ArtifactResolution::Unresolved(reason) => {
+                assert!(reason.contains(&tmp.path().display().to_string()));
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+    });
+}
+
+#[tokio::test]
+#[serial(loom_daemon_defaults_dir)]
+async fn test_script_root_falls_back_to_the_machine_level_mirror() {
+    // Neither the source checkout nor the workspace root has the script, but
+    // the machine-level mirror (Issue #7964's third candidate) does — the
+    // exact host shape this issue exists for: a stale in-repo script copy
+    // that predates `--resolve-json` sitting alongside an up-to-date mirror
+    // maintained by `scripts/install-loom.sh` / `loom update`.
+    let mirror = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(mirror.path().join(".loom/scripts/cli")).unwrap();
+    std::fs::write(
+        mirror
+            .path()
+            .join(".loom/scripts/cli/loom-daemon-update.sh"),
+        "#!/bin/sh\n",
+    )
+    .unwrap();
+
+    with_machine_defaults_env(Some(mirror.path().to_str().unwrap()), || {
+        let no_script = tempfile::tempdir().unwrap();
+        let bus = Arc::new(EventBus::new());
+        let pool = Arc::new(WorkspacePool::new(bus, tokio::runtime::Handle::current()));
+        let mut probe = ScriptAutoUpdateProbe::new(pool, no_script.path().to_path_buf());
+        probe.source_root = None;
+        assert_eq!(probe.script_root(), Some(mirror.path().to_path_buf()));
+    });
 }

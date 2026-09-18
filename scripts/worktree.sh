@@ -50,7 +50,6 @@ check_if_in_worktree() {
 # Function to get current worktree info
 get_worktree_info() {
     if check_if_in_worktree; then
-        local current_dir=$(pwd)
         local worktree_path=$(git rev-parse --show-toplevel)
         local branch=$(git rev-parse --abbrev-ref HEAD)
 

@@ -38,7 +38,7 @@ including an explicit `null` written to override a real value):
 
 | # | Tier | Path (repo-root-relative unless noted) | Tracked? | Introduced |
 |---|------|------------------------------------------|----------|------------|
-| 1 | **Private/shared defaults** | `$LOOM_CONFIG_DEFAULTS_FILE`, else `~/.local/share/loom/config/defaults.json` | N/A (machine-level, outside any repo) | Epic #3835 Phase 3 (not yet shipped — this tier is a no-op today; the file does not exist on any host) |
+| 1 | **Private/shared defaults** | `$LOOM_CONFIG_DEFAULTS_FILE`, else `~/.local/share/loom/config/defaults.json` | N/A (machine-level, outside any repo) | **Live** — merged by `config_resolver::resolve_effective_config` like every other tier; only the *file* is absent by default (see the note below) |
 | 2 | **Legacy config** | `.loom/config.json` | Tracked (today's status quo) | Pre-existing |
 | 3 | **Project config** | `.loom-project/project.json` | Tracked | This issue (schema only; no repo has this file yet) |
 | 4 | **Local config** | `.loom-local/local.json` | Ignored (gitignored) | This issue (schema only; no repo has this file yet) |
@@ -64,10 +64,23 @@ env var  >  (private defaults ⊕ legacy .loom/config.json ⊕ .loom-project/pro
                                                      this is "config" — the resolver's output
 ```
 
-Because tier 2 alone holds every existing repo's real content and tiers 1, 3,
-4 are empty everywhere until later epic phases ship, a repo with only
+Because tier 2 alone holds every existing repo's real content, a repo with only
 `.loom/config.json` merges to **exactly that file's parsed content** — the
 resolver is byte-for-byte behavior-preserving for the status quo.
+
+> **Tier 1 is live, not a placeholder.** `resolve_effective_config`
+> (`loom-daemon/src/config_resolver.rs`) reads and deep-merges the
+> machine-level defaults file on every call, exactly as it does tiers 2–4. What
+> is absent by default is the **file**, not the tier: nothing creates
+> `~/.local/share/loom/config/defaults.json` (or whatever
+> `$LOOM_CONFIG_DEFAULTS_FILE` points at), so on a host that has not written one
+> the tier contributes an empty object and is invisible. Write that one file and
+> every workspace the daemon manages on that host picks up the keys immediately,
+> with each repo's own `.loom/config.json` still layering on top — no per-repo
+> edit and no code change required. See
+> [`defaults/docs/daemon-reference.md`](../../defaults/docs/daemon-reference.md)
+> § "One file, fleet-wide: the machine-level defaults tier" for a worked
+> `autonomous.roleRunner` example (#8054).
 
 ## 3. `.loom-project/project.json` schema
 

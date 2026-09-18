@@ -403,6 +403,11 @@ function renderPipeline(rows) {
       el("th", { text: "repo" }), el("th", { text: "queued" }), el("th", { text: "building" }),
       el("th", { text: "review" }), el("th", { text: "changes" }), el("th", { text: "approved" }),
       el("th", { text: "merged 24h" }),
+      // Issue #8091: the operator-attention bucket, reusing this same row —
+      // "held" is open PRs labeled loom:operator (a first-class, re-evaluable
+      // hold, not a fault), "op-only" is open issues labeled
+      // loom:operator-only (the hard park).
+      el("th", { text: "held" }), el("th", { text: "op-only" }),
     ])]),
   ]);
   var tbody = el("tbody");
@@ -414,6 +419,11 @@ function renderPipeline(rows) {
     } else {
       nameCell = el("td", { text: label });
     }
+    var heldAttrs = { text: fmtCount(row.operator_held) };
+    var heldTitle = fmtHeldBreakdown(row);
+    if (heldTitle) {
+      heldAttrs.title = heldTitle;
+    }
     tbody.appendChild(el("tr", {}, [
       nameCell,
       el("td", { text: fmtCount(row.queued) }),
@@ -422,16 +432,35 @@ function renderPipeline(rows) {
       el("td", { text: fmtCount(row.changes_requested) }),
       el("td", { text: fmtCount(row.approved) }),
       el("td", { text: fmtCount(row.merged_24h) }),
+      el("td", heldAttrs),
+      el("td", { text: fmtCount(row.operator_only_issues) }),
     ]));
     if (row.error) {
       var tr = el("tr");
-      var td = el("td", { colspan: "7", "class": "err", text: "error: " + row.error });
+      var td = el("td", { colspan: "9", "class": "err", text: "error: " + row.error });
       tr.appendChild(td);
       tbody.appendChild(tr);
     }
   });
   table.appendChild(tbody);
   body.appendChild(table);
+}
+
+// A hover tooltip for the "held" column: "1 conflicting, oldest 5d" when
+// there is a breakdown worth showing, else "" (no tooltip) — mirrors
+// `loom-daemon health`'s own `operator_attention` summary line (#8091).
+function fmtHeldBreakdown(row) {
+  if (!row.operator_held) {
+    return "";
+  }
+  var bits = [];
+  if (row.operator_held_conflicting) {
+    bits.push(row.operator_held_conflicting + " conflicting");
+  }
+  if (row.operator_held_oldest_days !== null && row.operator_held_oldest_days !== undefined) {
+    bits.push("oldest " + row.operator_held_oldest_days + "d");
+  }
+  return bits.join(", ");
 }
 
 // ---------------------------------------------------------------------

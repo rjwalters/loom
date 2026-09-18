@@ -1291,6 +1291,12 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 return RoleTickOutcome::ModelRuntimeMismatch(mismatch);
             }
         }
+        // Issue #8054: the reasoning-effort axis, resolved independently of the
+        // model (no shipped default — unconfigured resolves to the empty string,
+        // which the emission site renders as no `--effort` argument at all).
+        // Resolved AFTER the mismatch preflight above so a refused launch does
+        // not pay for a second config read.
+        let (effort, effort_source) = resolve_role_runner_effort(&self.workspace_root, role);
         run_role_with_timeout(
             &script,
             &self.workspace_root,
@@ -1300,6 +1306,8 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             self.timeout,
             &model,
             &model_source,
+            &effort,
+            &effort_source,
             admission.as_ref(),
             self.load_per_core_override,
         )
@@ -1364,7 +1372,7 @@ fn note_pre_spawn_skip(logs_dir: &Path, role: &str, reason: &str) {
     }
 }
 
-/// Run `spawn-claude.sh -p "<prompt>" --model <model>
+/// Run `spawn-claude.sh -p "<prompt>" --model <model> [--effort <level>]
 /// --dangerously-skip-permissions` in `workspace_root`, appending combined
 /// output to `<logs_dir>/role-<role>.log` (never a pipe — avoids the pipe-buffer
 /// deadlock pattern documented in [`crate::main_health_gate`] /
@@ -1379,6 +1387,8 @@ fn run_role_with_timeout(
     timeout: Duration,
     model: &str,
     model_source: &str,
+    effort: &str,
+    effort_source: &str,
     admission: Option<&crate::runtime_admission::ResolvedRuntime>,
     load_per_core_override: Option<f64>,
 ) -> RoleTickOutcome {
@@ -1397,23 +1407,19 @@ fn run_role_with_timeout(
             .append(true)
             .open(&log_path)
         {
-            // The resolved model + the tier that supplied it are recorded in the
-            // per-role log header (#4501) so an operator can confirm from
-            // `role-<role>.log` alone which model a scheduled child ran with —
-            // the manual verification this fix needs on a live host. An empty
-            // model is the deliberate CLI-default pass-through (#7894) — render
-            // it as a name rather than as `model=` followed by nothing, which
-            // reads like a bug in the header itself.
-            let model_display = if model.is_empty() {
-                "<runtime CLI default>"
-            } else {
-                model
-            };
+            // Rendered by `model_resolution::role_log_header` (#4501/#8054) —
+            // the module that resolved the pair owns how it is reported.
             let _ = writeln!(
                 f,
-                "\n==== loom-daemon role_runner: {} role={role} model={model_display} \
-                 (source={model_source}) ====",
-                chrono::Utc::now().to_rfc3339()
+                "\n{}",
+                model_resolution::role_log_header(
+                    &chrono::Utc::now().to_rfc3339(),
+                    role,
+                    model,
+                    model_source,
+                    effort,
+                    effort_source,
+                )
             );
         }
     }
@@ -1447,6 +1453,17 @@ fn run_role_with_timeout(
     // already filters blanks at every tier, so this is belt-and-braces.
     if !model.is_empty() {
         cmd.arg("--model").arg(model);
+    }
+    // Reasoning-effort pin (issue #8054): appended immediately after `--model`,
+    // exactly as `sweep_registry::dispatch`'s spawn does (#3716), so the two
+    // dispatch surfaces share one positional argv contract
+    // (`-p`, `--model`, `--effort`, `--dangerously-skip-permissions`). An empty
+    // value is treated as unset — `--effort ""` must NEVER be emitted: it would
+    // clobber the session-default effort with nothing. Unconfigured is the
+    // normal case, and it must leave the argv byte-identical to the pre-#8054
+    // argv, which is why there is no shipped default effort to fall back on.
+    if !effort.is_empty() {
+        cmd.arg("--effort").arg(effort);
     }
     cmd.arg("--dangerously-skip-permissions");
     // Transient-error recovery (issue #4255): scheduled role spawns are the
@@ -1761,6 +1778,29 @@ pub struct RoleRunnerConfig {
     /// map (every role falls through to the global chain). Resolved by
     /// [`resolve_role_runner_model`].
     pub role_models: BTreeMap<String, String>,
+    /// `autonomous.roleRunner.effort` — the reasoning effort every role child is
+    /// pinned to (issue #8054), the role-runner counterpart of the sweep
+    /// dispatch path's `--effort` param (#3716). `None` (key absent, blank, or
+    /// non-string) means **unset**: [`run_role_with_timeout`] then emits no
+    /// `--effort` argument at all and the runtime CLI's own session-default
+    /// effort survives end-to-end. Deliberately **no** shipped default — unlike
+    /// [`model`](Self::model), which must never fall through to an inherited CLI
+    /// default, an inherited effort is exactly the pre-#8054 behaviour every
+    /// unconfigured workspace must keep. Resolved by
+    /// [`resolve_role_runner_effort`].
+    pub effort: Option<String>,
+    /// `autonomous.roleRunner.roleEfforts` — per-role effort overrides keyed by
+    /// role name (issue #8054), each occupying a tier **above** the global
+    /// [`effort`](Self::effort), exactly as
+    /// [`role_models`](Self::role_models) sits above
+    /// [`model`](Self::model). This is the config axis that lets a repo run the
+    /// cheap bookkeeping roles (curator, guide) at a low effort while leaving
+    /// the merge-gate roles (judge, doctor) alone. Keys are lower-cased and
+    /// trimmed; blank keys and blank/non-string values are dropped **per
+    /// entry**, so an entry never emits `--effort ""`. Absent / malformed /
+    /// non-object soft-fails to an empty map (every role falls through to the
+    /// global tier). Resolved by [`resolve_role_runner_effort`].
+    pub role_efforts: BTreeMap<String, String>,
     /// `autonomous.roleRunner.architectMaxProposals` — the **per-invocation**
     /// cap on how many proposal issues one architect dispatch may file
     /// (#5656). `None` (key absent, zero, or non-integer) falls through to
@@ -1920,6 +1960,11 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
         })
         .unwrap_or_default();
 
+    // `effort` / `roleEfforts` (#8054) — parsed by the module that resolves
+    // them (`role_runner/model_resolution.rs`), with the identical
+    // trim/blank-is-unset/per-entry-soft-fail contract `roleModels` uses above.
+    let (effort, role_efforts) = model_resolution::parse_effort_config(block);
+
     RoleRunnerConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
         roles,
@@ -1931,6 +1976,8 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
         on_idle_max_wait,
         model,
         role_models,
+        effort,
+        role_efforts,
         // `architectMaxProposals` (#5656): a zero / negative / non-integer
         // value soft-fails to `None` — a cap of 0 would mean "dispatch
         // architect, forbid it from filing anything", which is a pure waste of
@@ -4324,8 +4371,8 @@ pub use roster::spawn_roster_heartbeat_task;
 mod model_resolution;
 use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
-    is_cli_default_model_sentinel, resolve_role_runner_model, ModelRuntimeMismatch,
-    CLI_DEFAULT_MODEL_SENTINEL,
+    is_cli_default_model_sentinel, resolve_role_runner_effort, resolve_role_runner_model,
+    ModelRuntimeMismatch, CLI_DEFAULT_MODEL_SENTINEL, UNSET_EFFORT_SOURCE,
 };
 
 #[cfg(test)]

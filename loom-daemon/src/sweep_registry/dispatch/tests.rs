@@ -831,33 +831,6 @@ fn dispatch_and_reap_wire_the_sweep_journal() {
     );
 }
 
-/// Issue #3824: `spawn_child` unconditionally appends
-/// `--dangerously-skip-permissions` to the child argv so a detached,
-/// non-interactive `claude -p` sweep never stalls on a permission prompt.
-/// With no model/effort/depends-on the flag directly follows the
-/// `--claim-owned <N>` marker (#4111, always emitted for a daemon
-/// dispatch), appended AFTER it (verified by the exact positional form).
-#[test]
-#[serial]
-fn dispatch_appends_dangerously_skip_permissions() {
-    let dir = tempdir().unwrap();
-    let (mut registry, record_log) = fixture_registry(dir.path());
-
-    let outcome = registry
-        .dispatch(&SweepKind::Issue(4242), None, None, None, None)
-        .expect("dispatch should succeed");
-
-    let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-    let recorded = assert_child_wrote(&record_log, &needle);
-    assert!(
-        recorded.contains(
-            "argv: -p /loom:sweep 4242 --claim-owned 4242 --dangerously-skip-permissions"
-        ),
-        "expected --claim-owned then --dangerously-skip-permissions appended after the \
-             prompt; got: {recorded}"
-    );
-}
-
 /// Issue #4255: a daemon dispatch routes the child through
 /// `claude-wrapper.sh` by appending `--use-wrapper` immediately AFTER
 /// `--dangerously-skip-permissions`, so a transient API death (rate-limit /
@@ -4725,3 +4698,11 @@ fn a_slow_lease_renew_start_never_holds_the_registry_lock() {
     assert_eq!(loop_pid, Some(4242), "the off-lock handshake must still be performed");
     assert!(renew_log.exists(), "the helper was invoked");
 }
+
+// The #8065 prompt-shape invariant lives in its own sibling file rather than
+// being appended here: this module is over the 1000-line ratchet threshold and
+// frozen at its current size (`.loom/docs/file-size-policy.md` — "put the new
+// code in a NEW sibling module"). Registered from here, the same shape
+// `guards.rs` uses for `guards_union_tests.rs` / `guards_preflip_tests.rs`.
+#[path = "prompt_shape_tests.rs"]
+mod prompt_shape_tests;

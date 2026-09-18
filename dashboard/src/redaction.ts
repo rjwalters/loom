@@ -105,7 +105,10 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // token/LOC counts are "workload detail" for a private repo (how much was
   // spent/changed on it), the same category of detail `pr_number` is held
   // back for, so they stay behind the same allowlist boundary rather than
-  // getting a bespoke exception.
+  // getting a bespoke exception. Issue #8056's three additions —
+  // `failure_class`, `models_used`, `doctor_cycles` — are absent for the same
+  // reason: why a private repo's sweep died, and which models it burned, is
+  // workload detail about that repo.
   // Host-level kinds: no repo/issue/branch/PR reference exists on either —
   // see the module doc's "tokens.snapshot / host.health" section. Every
   // field the schema defines today is listed explicitly (not "pass

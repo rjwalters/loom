@@ -325,6 +325,9 @@ mod tests {
                 lines_added: None,
                 lines_deleted: None,
                 tokens_by_model: None,
+                failure_class: None,
+                models_used: None,
+                doctor_cycles: None,
             }),
         )
     }
@@ -361,6 +364,9 @@ mod tests {
             lines_added: None,
             lines_deleted: None,
             tokens_by_model: Some(rows.clone()),
+            failure_class: None,
+            models_used: None,
+            doctor_cycles: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));
@@ -399,6 +405,9 @@ mod tests {
             lines_added: None,
             lines_deleted: None,
             tokens_by_model: None,
+            failure_class: None,
+            models_used: None,
+            doctor_cycles: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));
