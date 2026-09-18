@@ -156,6 +156,62 @@ fn an_unsignalable_pid_is_treated_as_alive() {
     assert!(!pid_alive(0x7fff_fffe), "a genuinely absent pid is dead");
 }
 
+#[test]
+fn a_partial_owner_json_still_yields_its_pid() {
+    // The retained suite writes an owner.json with no `token` (so did every
+    // lock taken before #6014). All-or-nothing deserialisation made the port
+    // stricter than the shell's field-at-a-time `awk`: the file failed to
+    // parse, `owner_pid` was never read, and BOTH the holder-PID diagnostic
+    // and stale-lock recovery stopped working — so a dead owner's lock was
+    // never reclaimed and every acquisition timed out.
+    let d = repo();
+    std::fs::create_dir_all(lock_path(d.path())).unwrap();
+    std::fs::write(
+        lock_path(d.path()).join("owner.json"),
+        r#"{
+  "issue": 97,
+  "owner_pid": 2147483646,
+  "script": "worktree.sh",
+  "acquired_at": "1970-01-01T00:00:00Z"
+}"#,
+    )
+    .unwrap();
+
+    let got = recorded(&lock_path(d.path())).expect("a token-less owner.json must still parse");
+    assert_eq!(got.owner_pid, 0x7fff_fffe);
+    assert_eq!(got.token, "", "the absent field defaults, it does not fail the parse");
+
+    // And the behaviour that depended on it: this owner is dead, so the lock
+    // must be reclaimable rather than timing out.
+    let token = acquire(d.path(), 97, std::process::id(), FAST, POLL)
+        .expect("a dead owner's token-less lock is still reclaimable");
+    release(d.path(), &token);
+}
+
+#[test]
+fn a_timeout_names_the_holder_from_a_partial_record() {
+    // The diagnostic half: --json output carries holderPid so an operator can
+    // find the process. A token-less record must not blank it.
+    let d = repo();
+    std::fs::create_dir_all(lock_path(d.path())).unwrap();
+    // A LIVE pid, so the lock is not reclaimed and we reach the timeout path.
+    std::fs::write(
+        lock_path(d.path()).join("owner.json"),
+        format!(
+            r#"{{ "issue": 97, "owner_pid": {}, "script": "worktree.sh" }}"#,
+            std::process::id()
+        ),
+    )
+    .unwrap();
+
+    match acquire(d.path(), 97, std::process::id(), Duration::from_millis(60), POLL) {
+        Err(AcquireError::Timeout { holder_pid }) => {
+            assert_eq!(holder_pid, Some(std::process::id()));
+        }
+        other => panic!("expected a Timeout naming the holder, got {other:?}"),
+    }
+}
+
 // --- lock location ---
 
 #[test]
