@@ -49,6 +49,21 @@ WORKDIR="$(mktemp -d)"
 trap 'bg_proc_reap; rm -rf "$WORKDIR"' EXIT
 trap 'bg_proc_reap; rm -rf "$WORKDIR"; exit 1' INT TERM
 
+# Pin the binary that IMPLEMENTS the stub (#8134) — the same pin, for the same
+# reason, as its sibling test-loom-daemon-watchdog.sh; see that file's longer
+# note. --self-only leaves $LOOM_DAEMON_BIN alone because every case below
+# pins it to a make_peer_coord_stub mock (the "daemon this caller probes"
+# meaning). Without the pin lib/script-helper.sh would resolve the
+# IMPLEMENTATION through that same mock and exec it as the watchdog, which is
+# what made 16 of this suite's 27 assertions fail on this branch — masked in
+# CI only because the sibling suite's hang mocks blew the job's 30-minute
+# budget before any report was printed.
+#
+# Called after the traps so the harness leaves this suite's EXIT trap intact.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin --self-only "$(cd "$SCRIPT_DIR/.." && pwd)" daemon-watchdog
+
 MARKER="$WORKDIR/autonomy-desired"
 HEARTBEAT="$WORKDIR/daemon.heartbeat"
 WDLOG="$WORKDIR/watchdog.log"      # the watchdog's own report log (LOOM_WATCHDOG_LOG)

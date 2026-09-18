@@ -82,6 +82,37 @@ WORKDIR="$(mktemp -d)"
 trap 'bg_proc_reap; rm -rf "$WORKDIR"' EXIT
 trap 'bg_proc_reap; rm -rf "$WORKDIR"; exit 1' INT TERM
 
+# Pin the binary that IMPLEMENTS the stub (#8134). $WATCHDOG is now a 77-line
+# stub over `loom-daemon daemon-watchdog`, so every case below only tests the
+# port if that stub execs the binary built from THIS working tree.
+#
+# --self-only is mandatory here, and this suite is the case that flag was built
+# for (see lib/require-daemon-bin.sh's header): it exports LOOM_DAEMON_SELF_BIN
+# and leaves $LOOM_DAEMON_BIN alone. Dozens of cases below pin $LOOM_DAEMON_BIN
+# to a make_daemon_stub mock to drive the #4398 IPC probe -- that is the
+# "daemon this caller probes" meaning, and it has to survive untouched.
+#
+# Without this pin lib/script-helper.sh resolves the IMPLEMENTATION through
+# $LOOM_DAEMON_BIN as well, so cases 13/13b/14/14b/14c/14d/15/20/21 exec the
+# `hang` mock (`while true; do sleep 1; done`) AS THE WATCHDOG and never
+# return. That wedges the suite until run-ci-suites.sh's 1200s per-suite
+# timeout -- twice, counting the #7791 retry -- which is exactly how the
+# 30-minute "Shell Test Suites (hermetic)" job budget was blown with zero
+# suite output. Every remaining case would have exec'd its own (non-hanging)
+# mock as the watchdog instead, which is no better, just louder.
+#
+# Called AFTER the traps above so the harness sees this suite's own EXIT trap
+# and declines to clobber it; its snapshots are bounded by the pid-keyed
+# reaper instead.
+#
+# It is FATAL, not a skip, when no binary resolves: these assertions are the
+# equivalence evidence for the port, and a suite that skipped itself would
+# report green while proving nothing. That is why this suite moved out of
+# ci-wired.txt into the "Native Port Suites" CI job, which builds one first.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin --self-only "$(cd "$SCRIPT_DIR/.." && pwd)" daemon-watchdog
+
 MARKER="$WORKDIR/autonomy-desired"
 HEARTBEAT="$WORKDIR/daemon.heartbeat"
 WDLOG="$WORKDIR/watchdog.log"      # the watchdog's own report log (LOOM_WATCHDOG_LOG)
