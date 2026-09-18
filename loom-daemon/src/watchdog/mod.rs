@@ -623,22 +623,6 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Sections 12-22: the bounded in-band IPC probe.
-///
-/// Returns `Some(code)` only for a CONFIRMED hang, which exits immediately.
-/// Every other outcome falls through to the heartbeat section, possibly having
-/// set [`report::Reporter::probe_diverged`] — which is what makes an OK-shaped
-/// heartbeat line render as `DEGRADED` and owns the tick's exit code (#5790).
-///
-/// Two signals, deliberately distinct:
-///
-/// - **Consecutive** (#4398): N failures in a row against the same pid is a
-///   confirmed hang. Resets on any clean round-trip, because a transient
-///   failure under concurrent-sweep load is the common case (#4279).
-/// - **Windowed** (#5944): N failures among the last M ticks. An intermittent
-///   probe — fail, succeed, fail, succeed — never reaches 3 consecutive, so the
-///   first signal never fires for it, yet failing half your ticks is not a
-///   clean bill of health either.
 /// What the bounded in-band probe concluded.
 ///
 /// `healthy` is NOT `exit.is_none()`. A probe that was disabled, skipped, or
@@ -655,6 +639,22 @@ struct ProbeOutcome {
     healthy: bool,
 }
 
+/// Sections 12-22: the bounded in-band IPC probe.
+///
+/// Returns `Some(code)` only for a CONFIRMED hang, which exits immediately.
+/// Every other outcome falls through to the heartbeat section, possibly having
+/// set [`report::Reporter::probe_diverged`] — which is what makes an OK-shaped
+/// heartbeat line render as `DEGRADED` and owns the tick's exit code (#5790).
+///
+/// Two signals, deliberately distinct:
+///
+/// - **Consecutive** (#4398): N failures in a row against the same pid is a
+///   confirmed hang. Resets on any clean round-trip, because a transient
+///   failure under concurrent-sweep load is the common case (#4279).
+/// - **Windowed** (#5944): N failures among the last M ticks. An intermittent
+///   probe — fail, succeed, fail, succeed — never reaches 3 consecutive, so the
+///   first signal never fires for it, yet failing half your ticks is not a
+///   clean bill of health either.
 fn ipc_probe(
     paths: &config::Paths,
     reporter: &report::Reporter,
