@@ -27,4 +27,4 @@ guide          50050        -
 hermit         16170        -
 judge          55800    30000
 loom           18901        -
-sweep          63077    60000
+sweep          63161    60000
