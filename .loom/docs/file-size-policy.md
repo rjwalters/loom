@@ -250,7 +250,7 @@ these an API change rather than a rewrite.
 | `cli/loom-daemon-update.sh` | 1,770 | `auto_update.rs` **schedules and decides**, and delegates release resolution / fetch / verify / provision **to this script** | `--resolve-json` (read-only decision info) and `--no-restart` (the rebuild), both consumed by `auto_update.rs` — an API change on both sides (#7810 Phase 5–6) |
 | `cli/loom-daemon-start.sh` | 1,185 | `daemon_service.rs`, `restart_verify.rs` | launchd/systemd unit management; supervisor handoff |
 | `cli/loom-daemon-watchdog.sh` | ~990 | `main_health_gate.rs`, `health.rs` | poll cadence and restart policy |
-| `claude-wrapper.sh` | 1,675 | none — retry/backoff lives *only* here | the retry policy itself, which is application logic (#7810 Phase 7–8) |
+| `claude-wrapper.sh` | 1,675 → 1,657 | `retry_classify/` (#8037) owns the six classifiers; preflight, MCP repair, output monitoring and process plumbing are still shell | **Classification done.** Retry vs give up, the three rotation predicates and the backoff curve now delegate to `loom-daemon retry-classify`, with #8032's 44 assertions as the equivalence proof. What remains to retire is `run_with_retry`'s loop and the monitors (#7810 Phase 7–8) |
 | `worktree.sh` | ~1,820 | `worktree_ops/`, `worktree_reaper.rs` | the `.loom-managed` sentinel contract; also forge-blind today (#7765) |
 | `merge-pr.sh` | ~1,460 | `forge_cmd.rs` (`loom-daemon forge auto-merge`) | already has a delegation ladder — the most incremental port available |
 | `resync-installed.sh` | ~1,170 | `init/`, `daemon_install_state.rs` | vendored **and** a port candidate; resolve the upstream question first |

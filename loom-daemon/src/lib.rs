@@ -198,6 +198,7 @@ pub mod rate_limit_breaker;
 pub mod release_resolve;
 pub mod repo_root;
 pub mod restart_verify;
+pub mod retry_classify;
 pub mod role_collision;
 pub mod role_runner;
 pub mod role_shard;

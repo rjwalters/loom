@@ -39,6 +39,12 @@ pub(crate) enum ScriptPortCommand {
     /// lives here because `main.rs` is frozen by the file-size ratchet and this
     /// flattened enum is what keeps a new top-level subcommand free.
     ShellBudget(super::shell_budget::ShellBudgetArgs),
+
+    /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
+    /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
+    /// the predicate holds, 1 when it does not — an answer, not an error.
+    #[command(subcommand)]
+    RetryClassify(super::retry_classify::RetryClassifyCommand),
 }
 
 impl ScriptPortCommand {
@@ -50,6 +56,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
+            ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
         }
     }
 }
