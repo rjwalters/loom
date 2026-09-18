@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8230** (closed): curator.md's _epoch() bash helper misparses UTC timestamps as local time on macOS, corrupting dep-recheck staleness window
+- **PR #8231**: fix(curator): treat BSD date -j -f timestamps as UTC in _epoch()
 - **Issue #8165** (closed): resync-installed.sh: comm locale, unanchored install-subject regex alternative, misplaced fixture comment (nits from #7870 review)
 - **PR #8225**: fix(resync): pin comm to LC_ALL=C in removed_line_count()
 - **PR #8223**: feat(telemetry): add role_tick.outcome record for role-runner ticks
