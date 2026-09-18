@@ -22,6 +22,7 @@ pub(crate) mod peer_claims_cmd;
 pub(crate) mod quarantine;
 pub(crate) mod release_resolve;
 pub(crate) mod restart;
+pub(crate) mod retry_classify;
 pub(crate) mod script_ports;
 pub(crate) mod serve_cmd;
 mod shell_budget;

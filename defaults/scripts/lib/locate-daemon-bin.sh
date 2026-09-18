@@ -205,3 +205,55 @@ loom_daemon_bin_search_paths() {
         [[ -n "$repo_candidate" ]] && echo "$repo_candidate"
     done < <(_loom_daemon_repo_candidates "$root")
 }
+
+# loom_resolve_self_daemon_bin -- the loom-daemon that IMPLEMENTS a caller's
+# ported logic, which is NOT the same binary loom_locate_daemon_bin names.
+#
+# The distinction is the whole point and it is easy to get wrong (#7977 caught
+# it in a test fixture): loom_locate_daemon_bin / $LOOM_DAEMON_BIN name the
+# INSTALLED daemon a script MANAGES -- the one whose version is compared, which
+# may be an old release with no `retry-classify` / `release-resolve`
+# subcommand at all, and which during a test is a deliberately fake binary.
+# Exec'ing a ported subcommand on that is a category error.
+#
+# Resolution order, most explicit first:
+#   1. $LOOM_DAEMON_SELF_BIN -- must be executable. The seam a test or an
+#      operator uses to name the implementation directly.
+#   2. A build in THIS checkout ($CARGO_TARGET_DIR honored, release then debug).
+#      Script-relative first: this library lives at <checkout>/defaults/scripts/lib/
+#      (or <consumer>/.loom/scripts/lib/), so the build that implements the
+#      logic THIS COPY delegates to is the one in the checkout this copy came
+#      from -- not whatever $REPO_ROOT happens to be (in a test fixture,
+#      $REPO_ROOT is the fixture, which has no build at all). $REPO_ROOT is
+#      still probed after it, for the caller that has one.
+#   3. `loom-daemon` on PATH.
+# Echoes "" when none resolves; the caller then answers in its own contract
+# (a fail-safe verdict, not a crash) rather than failing silently.
+#
+# Lives here, beside loom_locate_daemon_bin, so the two resolutions sit next to
+# each other and the distinction above is unmissable. Extracted from
+# cli/loom-daemon-update.sh by #8037, when claude-wrapper.sh became the second
+# caller that needs the IMPLEMENTATION rather than the managed install.
+loom_resolve_self_daemon_bin() {
+    if [[ -n "${LOOM_DAEMON_SELF_BIN:-}" && -x "${LOOM_DAEMON_SELF_BIN}" ]]; then
+        printf '%s\n' "$LOOM_DAEMON_SELF_BIN"
+        return 0
+    fi
+    local self_root
+    self_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." 2>/dev/null && pwd)" || self_root=""
+    local base candidate
+    for base in "${CARGO_TARGET_DIR:-}" "${self_root:+$self_root/target}" \
+                "${REPO_ROOT:+$REPO_ROOT/target}" \
+                "${REPO_ROOT:+$REPO_ROOT/loom-daemon/target}"; do
+        [[ -n "$base" ]] || continue
+        for candidate in "$base/release/loom-daemon" "$base/debug/loom-daemon"; do
+            if [[ -x "$candidate" ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+    done
+    candidate="$(command -v loom-daemon 2>/dev/null || true)"
+    [[ -n "$candidate" && -x "$candidate" ]] && printf '%s\n' "$candidate"
+    return 0
+}

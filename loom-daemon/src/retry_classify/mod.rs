@@ -1,0 +1,307 @@
+//! `claude-wrapper.sh`'s retry/rotation classifiers (epic #7810, #8037).
+//!
+//! Six predicates — 79 code lines of the wrapper's 1,675 — decide whether a
+//! sweep **retries**, **rotates to another account**, **marks a credential
+//! dead**, or **dies**, and how long it waits between attempts. Everything else
+//! in that script is preflight, MCP repair, output monitoring and process
+//! plumbing, and stays where it is.
+//!
+//! `defaults/scripts/tests/test-claude-wrapper-retry.sh` (#8032) pinned all six
+//! against the shell *before* this port and runs unchanged against it. That
+//! suite, not review, is the equivalence evidence.
+//!
+//! # Every classifier has two modes, and both are ported
+//!
+//! `claude-wrapper.sh` sources `lib/classify-error.sh` **optionally**
+//! (`if [[ -f ... ]]`). With the library present the classifiers delegate to
+//! `classify_error`; without it each falls back to its own hand-rolled regex —
+//! a second implementation that had no coverage at all before #8032. Porting
+//! only the library path would have silently changed behaviour on exactly the
+//! hosts with the least evidence, so both paths live here:
+//! [`Input::classification`] is `Some` in library mode and `None` in degraded
+//! mode, and the degraded arm carries the regexes verbatim.
+//!
+//! # Why the deny-list is NOT reimplemented here
+//!
+//! [`Input::classification_is_transient`] is supplied by the caller rather than
+//! recomputed. `classification_is_transient` lives in `lib/classify-error.sh`
+//! and is, per #4501, *the* single source of truth for every retry decision in
+//! the fleet — it is not one of the six functions being ported, and other
+//! scripts still source it. A second copy of that deny-list in Rust would
+//! recreate the precise defect #4501 fixed: two independent verdict systems
+//! that can disagree about the same failure, which on a live host printed
+//!
+//! ```text
+//! [ERROR] Non-transient error detected - not retrying
+//! [ERROR] exit_code=1 classification=RECOVERABLE
+//! ```
+//!
+//! So the boundary is: the shell says what category this failure is and whether
+//! that category is retryable; this module owns what the wrapper *does* with
+//! that answer — which is the part that was duplicated, untested, and only
+//! reachable through the script.
+
+pub mod cli;
+
+#[cfg(test)]
+mod tests;
+
+use regex::Regex;
+use std::sync::LazyLock;
+
+/// The wrapper's own sentinel, emitted by its output/startup monitors when the
+/// CLI showed an interactive usage/plan-limit modal or the 100%-weekly banner.
+///
+/// Not a CLI phrasing, which is why both [`is_transient`] and
+/// [`is_account_exhaustion`] check it *before* consulting any classification.
+pub const RATE_LIMIT_ABORT: &str = "RATE_LIMIT_ABORT";
+
+/// Reported when no classification was available — the degraded path's category.
+pub const UNCLASSIFIED: &str = "UNCLASSIFIED";
+
+/// What the caller knows about one failed invocation.
+///
+/// `classification` being `None` is the degraded path and is a *state*, not a
+/// missing value: it means `lib/classify-error.sh` was not sourced, which each
+/// predicate answers with its own fallback regex.
+#[derive(Debug, Clone, Default)]
+pub struct Input<'a> {
+    /// The child's captured stdout+stderr.
+    pub output: &'a str,
+    /// The child's exit code.
+    pub exit_code: i32,
+    /// `classify_error`'s category, when the library was available.
+    pub classification: Option<&'a str>,
+    /// `classification_is_transient`'s verdict for that category. Meaningful
+    /// only alongside `classification`; see the module doc for why this is
+    /// passed in rather than recomputed.
+    pub classification_is_transient: bool,
+}
+
+/// [`is_transient`]'s answer: the retry verdict plus the category it was
+/// derived from.
+///
+/// The two travel together because the wrapper logs the category it *acted on*
+/// (`_LAST_ERROR_CLASSIFICATION`, #4501). Returning the verdict alone would let
+/// the printed classification drift from the decision again — notably for
+/// [`RATE_LIMIT_ABORT`], which `classify_error` would report as the generic
+/// `RECOVERABLE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransientVerdict {
+    /// Whether the retry loop should try the same invocation again.
+    pub retry: bool,
+    /// The category the verdict was derived from.
+    pub classification: String,
+}
+
+/// Does `output` contain a line matching `re`?
+///
+/// Line-by-line on purpose: the shell spells every one of these as
+/// `echo "$output" | grep -qE ...`, and `grep` matches within a line. A
+/// whole-string search would let `.` / `[[:space:]]` straddle a newline and
+/// match text the shell never would — a silent widening of every pattern below.
+fn any_line_matches(output: &str, re: &Regex) -> bool {
+    output.lines().any(|line| re.is_match(line))
+}
+
+/// `is_transient_error` — retry, or give up.
+///
+/// Order is load-bearing:
+/// 1. [`RATE_LIMIT_ABORT`] is **not** transient. The CLI hit a usage/plan limit
+///    and is showing an interactive prompt, so retrying hits the same limit.
+///    Rotation consumes this sentinel first; reaching here means rotation was
+///    capped or the pool was empty.
+/// 2. No classification available → **retry-by-default** on any non-zero exit,
+///    bounded by the caller's `MAX_RETRIES`. This is the fail-safe direction of
+///    the same deny-list policy, not an oversight: an allow-list of known
+///    transient phrasings has twice turned a new CLI wording into an instant
+///    permanent death (#4255, #4501).
+/// 3. Otherwise the library's verdict for the category stands.
+#[must_use]
+pub fn is_transient(input: &Input<'_>) -> TransientVerdict {
+    if input.output.contains(RATE_LIMIT_ABORT) {
+        return TransientVerdict {
+            retry: false,
+            classification: RATE_LIMIT_ABORT.to_string(),
+        };
+    }
+
+    match input.classification {
+        None => TransientVerdict {
+            retry: input.exit_code != 0,
+            classification: UNCLASSIFIED.to_string(),
+        },
+        Some(category) => TransientVerdict {
+            retry: input.classification_is_transient,
+            classification: category.to_string(),
+        },
+    }
+}
+
+/// The degraded-path exhaustion regex, verbatim from `claude-wrapper.sh`.
+///
+/// Kept in lockstep with `lib/classify-error.sh`'s `TOKEN_EXHAUSTED` +
+/// `MODEL_CREDITS_EXHAUSTED` patterns (#4501's per-model ceiling and #5687's
+/// credits family are both here).
+static EXHAUSTION_FALLBACK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)",
+        r"hit your ([^[:space:]]+[[:space:]]+){0,3}limit",
+        r"|hit\.your\.limit",
+        r"|monthly usage limit",
+        r"|out of extra usage",
+        r"|reached your ([^[:space:]]+[[:space:]]+){0,3}limit",
+        r"|(ran |run )?out of (usage |extra |plan )?credits",
+        r"|no (usage |extra |plan )?credits (remaining|left)",
+        r"|insufficient (usage |plan )?credits",
+    ))
+    .expect("exhaustion fallback pattern is a compile-time constant")
+});
+
+/// The degraded-path auth-death regex, verbatim from `claude-wrapper.sh`.
+///
+/// Kept in lockstep with `lib/classify-error.sh`'s `TOKEN_EXPIRED` pattern,
+/// including #6614's JSON-envelope and revoked-token phrasings.
+static AUTH_DEAD_FALLBACK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)",
+        r"401[^a-z]*authentication_error",
+        "|\"type\"[[:space:]]*:[[:space:]]*\"?authentication_error",
+        r"|token (has been|was) revoked",
+        r"|invalid bearer token",
+        r"|OAuth token has expired",
+        r"|token has expired",
+    ))
+    .expect("auth-dead fallback pattern is a compile-time constant")
+});
+
+/// The degraded-path concurrent-session regex, verbatim from
+/// `claude-wrapper.sh`.
+static SESSION_LIMIT_FALLBACK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)",
+        r"concurrent (session|sessions|request)",
+        r"|maximum number of concurrent",
+        r"|too many concurrent",
+        r"|simultaneous session",
+        r"|another session is (already )?(active|running)",
+    ))
+    .expect("session-limit fallback pattern is a compile-time constant")
+});
+
+/// `is_mcp_error`'s patterns, verbatim from `claude-wrapper.sh` — four
+/// `grep -qi` passes, joined into one alternation because `grep -q` over a list
+/// is exactly an alternation.
+static MCP_PATTERNS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)MCP server failed|MCP.*failed|plugins failed|plugin.*failed to install")
+        .expect("MCP pattern is a compile-time constant")
+});
+
+/// `is_account_exhaustion` — rotate to another account.
+///
+/// [`RATE_LIMIT_ABORT`] is exhaustion regardless of what any classifier makes
+/// of the text: it is the mirror of that sentinel not being transient. Rotating
+/// is the only response that can succeed, because the limit belongs to the
+/// account, not to the attempt.
+///
+/// `MODEL_CREDITS_EXHAUSTED` (#5687) is accepted alongside `TOKEN_EXHAUSTED`.
+/// It is a distinct category so the in-session sweep orchestrator can name the
+/// signature it downgrades models on, but on this subprocess-supervision path
+/// there is no per-call model knob, so the correct response is byte-identical:
+/// rotate, and mark this account exhausted.
+#[must_use]
+pub fn is_account_exhaustion(input: &Input<'_>) -> bool {
+    if input.output.contains(RATE_LIMIT_ABORT) {
+        return true;
+    }
+    match input.classification {
+        Some(category) => matches!(category, "TOKEN_EXHAUSTED" | "MODEL_CREDITS_EXHAUSTED"),
+        // The exit code is conjoined with the regex, never dropped: a limit
+        // phrase on a ZERO exit is a sweep quoting its own logs, not an
+        // exhausted account.
+        None => input.exit_code != 0 && any_line_matches(input.output, &EXHAUSTION_FALLBACK),
+    }
+}
+
+/// `is_account_auth_dead` — rotate **and** mark the credential dead.
+///
+/// A different failure class from [`is_account_exhaustion`] (#6030): an
+/// exhausted account recovers on its own when its quota window resets, an
+/// auth-dead one fails every dispatch forever until a human re-authenticates
+/// it. Collapsing the two either burns healthy accounts on a cooldown that will
+/// never help, or keeps re-selecting a credential that cannot work.
+#[must_use]
+pub fn is_account_auth_dead(input: &Input<'_>) -> bool {
+    match input.classification {
+        Some(category) => category == "TOKEN_EXPIRED",
+        None => input.exit_code != 0 && any_line_matches(input.output, &AUTH_DEAD_FALLBACK),
+    }
+}
+
+/// `is_account_session_limit` — re-select a sibling account, mark nothing bad.
+///
+/// A capacity signal from per-token session stacking (#3947): the account is
+/// healthy, it just cannot start another *simultaneous* session right now.
+/// Poisoning `.bad_tokens` for it would shrink the healthy pool over a
+/// condition that clears in minutes.
+#[must_use]
+pub fn is_account_session_limit(input: &Input<'_>) -> bool {
+    match input.classification {
+        Some(category) => category == "SESSION_LIMIT",
+        None => input.exit_code != 0 && any_line_matches(input.output, &SESSION_LIMIT_FALLBACK),
+    }
+}
+
+/// `is_mcp_error` — attempt an MCP rebuild, and map an exhausted-retry exit to
+/// code 7 so the caller can recognise an MCP failure (#2746).
+///
+/// **Ignores the exit code by construction.** It has no `classify_error` path
+/// and never had an exit-code conjunction, unlike the three account predicates
+/// above. `input.exit_code` is deliberately unread here.
+#[must_use]
+pub fn is_mcp_error(output: &str) -> bool {
+    any_line_matches(output, &MCP_PATTERNS)
+}
+
+/// `calculate_wait_time`'s inputs — the wrapper's `INITIAL_WAIT`, `MULTIPLIER`
+/// and `MAX_WAIT` globals (`LOOM_INITIAL_WAIT` / `LOOM_BACKOFF_MULTIPLIER` /
+/// `LOOM_MAX_WAIT`).
+#[derive(Debug, Clone, Copy)]
+pub struct Backoff {
+    pub initial_wait: i64,
+    pub multiplier: i64,
+    pub max_wait: i64,
+}
+
+/// `calculate_wait_time` — `INITIAL_WAIT * MULTIPLIER^(attempt-1)`, capped at
+/// `MAX_WAIT`.
+///
+/// With the fleet defaults (60s, ×2, 1800s ceiling) that is 60, 120, 240, 480,
+/// 960, 1800, 1800, … — the curve that decides how hard a rate-limited fleet
+/// hammers the API, which is why it is pinned to the second rather than
+/// "improved".
+///
+/// The one deliberate divergence: overflow saturates instead of wrapping. Bash
+/// arithmetic is a wrapping `i64`, so a large enough `attempt` makes the shell
+/// produce a *negative* wait that then compares below `MAX_WAIT` and is handed
+/// to `sleep`. Saturating pins that case at the ceiling. It is unreachable in
+/// practice (`attempt` is bounded by `MAX_RETRIES`), and the alternative is
+/// reproducing an arithmetic bug for its own sake. An `attempt` below 1 — which
+/// the shell answers with a raw `exponent less than 0` arithmetic error — lands
+/// in the same place, at the ceiling: nonsense in, the most conservative wait
+/// out.
+#[must_use]
+pub fn calculate_wait_time(attempt: i64, backoff: &Backoff) -> i64 {
+    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let wait = backoff
+        .multiplier
+        .checked_pow(exponent)
+        .and_then(|factor| backoff.initial_wait.checked_mul(factor))
+        .unwrap_or(i64::MAX);
+
+    if wait > backoff.max_wait {
+        backoff.max_wait
+    } else {
+        wait
+    }
+}

@@ -925,6 +925,14 @@ jobs:
       # crash incident (#7708).
       - name: spawn-claude token selection (#4228, #7708)
         run: bash defaults/scripts/tests/test-spawn-claude.sh
+      # Moved out of shell-suite-tests by #8037: claude-wrapper.sh's six retry
+      # classifiers now delegate to `loom-daemon retry-classify`, so these 44
+      # assertions — written against the pre-port shell in #8032 and unchanged
+      # since — need the binary this job builds. Without one the wrapper's
+      # documented fail-safes answer instead, and the backoff-curve assertions
+      # fail loudly rather than the suite reporting green on nothing.
+      - name: claude-wrapper retry classifiers (#8032, #8037)
+        run: bash defaults/scripts/tests/test-claude-wrapper-retry.sh
 
   installer-tests:
     name: Installer Integration Tests
