@@ -254,8 +254,16 @@ impl SweepRegistry {
             &mut cmd,
             &self.config.workspace_root,
         );
+        // A machine-global `LOOM_REPO` override is applied as the `GH_REPO`
+        // ENV VAR, not as a `--repo` flag: `gh api` has no `--repo` flag (it is
+        // `gh issue`/`gh pr` that do), and rejects one with `unknown flag:
+        // --repo` before issuing any request. `GH_REPO` is the documented input
+        // `gh api` resolves the `{owner}`/`{repo}` placeholders from when the
+        // cwd's remote is not the intended repo. Five sibling `gh api` call
+        // sites still pass the flag and therefore no-op under `LOOM_REPO`;
+        // fixing them is tracked in #8263 rather than scoped into #8222.
         if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
+            cmd.env("GH_REPO", repo);
         }
         let output = match output_with_timeout(cmd, reap_gh_timeout()) {
             Ok(Some(o)) if o.status.success() => o,

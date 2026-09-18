@@ -83,6 +83,33 @@ fn gh_timeline_failing() -> String {
         .to_string()
 }
 
+/// A fake `gh` that behaves like the REAL `gh api` does about repo selection:
+/// it REJECTS a `--repo` flag (`gh api` has none — only `gh issue`/`gh pr` do)
+/// and resolves the repo from the `GH_REPO` env var instead. Answers `rows`
+/// only when `GH_REPO` matches `want_repo`, so a caller that passed the repo
+/// the wrong way produces an unreadable timeline rather than a silent pass.
+fn gh_timeline_requiring_gh_repo_env(rows: &str, want_repo: &str) -> String {
+    format!(
+        "#!/usr/bin/env bash\n\
+         for a in \"$@\"; do\n\
+         if [[ \"$a\" == \"--repo\" ]]; then\n\
+         printf 'unknown flag: --repo\\n' >&2\n\
+         exit 1\n\
+         fi\n\
+         done\n\
+         if [[ \"$1\" == \"api\" && \"$2\" == */timeline ]]; then\n\
+         if [[ \"${{GH_REPO:-}}\" != '{want_repo}' ]]; then\n\
+         printf 'gh: could not determine the repository\\n' >&2\n\
+         exit 1\n\
+         fi\n\
+         printf '%s' '{rows}'\n\
+         exit 0\n\
+         fi\n\
+         exit 0\n",
+        rows = rows.replace('\'', "'\\''"),
+    )
+}
+
 /// Insert a dead `Running` entry for `issue` that has already recorded
 /// `pr_number` on its checkpoint, so the terminal record resolves a PR to read
 /// the timeline of. Returns the sweep id.
@@ -280,6 +307,46 @@ fn an_observed_timeline_with_no_verdict_reports_empty_not_absent() {
         raw.get("doctor_cycles").and_then(serde_json::Value::as_u64),
         Some(0),
         "an observed timeline with no completed Doctor cycle reports 0: {raw}"
+    );
+}
+
+/// A machine-global `LOOM_REPO` override reaches `gh api` as the `GH_REPO`
+/// ENV VAR, never as a `--repo` flag: `gh api` has no such flag and exits
+/// `unknown flag: --repo` before issuing a request, which would silently omit
+/// both fields on every `LOOM_REPO`-configured host. The fake `gh` here
+/// enforces both halves of that contract.
+#[test]
+#[serial]
+fn a_loom_repo_override_is_passed_as_the_gh_repo_env_var() {
+    let dir = tempdir().unwrap();
+    let rows = "2026-09-18T12:00:00Z\tloom:review-requested\n\
+                2026-09-18T12:30:00Z\tloom:pr\n";
+    let mut registry =
+        timeline_registry(dir.path(), &gh_timeline_requiring_gh_repo_env(rows, "rjwalters/loom"));
+    let issue = 8228;
+    let sweep_id = insert_sweep_with_pr(&mut registry, issue, 8304);
+
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    registry.append_outcome_telemetry_journal(
+        issue,
+        &sweep_id,
+        120,
+        telemetry::SweepResult::Success,
+        None,
+    );
+    std::env::remove_var("LOOM_REPO");
+
+    let path = registry.config().resolve_outcome_telemetry_path();
+    let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+    let record = records.iter().find(|r| r.issue == issue).unwrap();
+    assert_eq!(
+        record.judge_verdicts,
+        Some(vec![telemetry::JudgeVerdict {
+            attempt: 1,
+            verdict: "pass".to_string(),
+        }]),
+        "a LOOM_REPO-configured host must still read the timeline — a `--repo` \
+         flag would have made `gh api` exit before the request"
     );
 }
 
