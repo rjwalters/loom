@@ -559,6 +559,34 @@ count deadlocks Champion (no agent can satisfy it; GitHub's API blocks
 self-review). Keep a non-zero count if your repo needs a person on every merge,
 and drive merges by hand with `./.loom/scripts/merge-pr.sh <PR>`.
 
+**Required status checks are opt-in, and your repo names them** (#8103). Without
+them CI is advisory: a red check cannot stop a merge. Add the check-run names to
+the target repo's `.loom/config.json` and re-run the script:
+
+```json
+"branchProtection": {
+  "requiredStatusChecks": ["Lint", "Unit Tests (ubuntu-latest)"],
+  "strictRequiredStatusChecks": false
+}
+```
+
+- A **context** is the name GitHub posts to the Checks tab — a job's `name:`
+  with matrix values substituted, not the workflow job id.
+- **Only name checks that always run.** A job skipped by a *path filter on the
+  workflow* never reports a conclusion, and a required check with no conclusion
+  blocks that merge forever. (A job skipped by its own `if:` does report, as
+  `skipped`, which counts as passing.)
+- `strictRequiredStatusChecks` is GitHub's "require branches to be up to date
+  before merging". It defaults to `false` because it forces a
+  rebase-and-full-re-run immediately before *every* merge: on a repo merging
+  several PRs an hour with CI runs longer than the gap between them, each merge
+  invalidates the branch its successors just re-ran. Turn it on deliberately —
+  it is what stops a stale branch landing green against a base it never
+  measured.
+- `LOOM_REQUIRED_STATUS_CHECKS` / `LOOM_REQUIRED_STATUS_CHECKS_STRICT` override
+  the config for one run, and `LOOM_DRY_RUN=true` prints the exact ruleset
+  payload without touching the repository.
+
 ### 3. Your First Sweep
 
 `/loom:sweep` is the main entry point: it runs the whole
