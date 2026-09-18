@@ -73,6 +73,29 @@ EOF
     ( cd "$root" && git init -q && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m init )
 }
 
+# new_fixture_with_origin <root> <bare_dir> (#4330) — builds on new_fixture(),
+# adding a local BARE repo as `origin` so the ff-first sync path (which
+# resolves the default branch via refs/remotes/origin/HEAD, then fetches and
+# compares against origin/<branch>) has a real remote to talk to — entirely
+# offline (a plain filesystem path, no network). Forces the branch name to
+# `main` (deterministic regardless of the test host's init.defaultBranch) and
+# sets refs/remotes/origin/HEAD via `git remote set-head origin -a` so
+# loom_default_branch() resolves it the same way a real clone would.
+#
+# Shared with the fetch sibling (#8028): the local-checkout-divergence
+# scenario needs a real origin remote exactly like the parent suite's own
+# ff-sync tests do, and this repo's convention is one definition, not two
+# copies that can drift (see the module docs above).
+new_fixture_with_origin() {
+    local root="$1" bare="$2"
+    new_fixture "$root"
+    ( cd "$root" && git branch -q -M main )
+    git init -q --bare "$bare"
+    ( cd "$root" && git remote add origin "$bare" && git push -q origin HEAD:refs/heads/main )
+    git -C "$bare" symbolic-ref HEAD refs/heads/main
+    ( cd "$root" && git remote set-head origin -a >/dev/null 2>&1 )
+}
+
 # Writes a fake "release artifact" binary at $1 reporting version $2 / commit
 # $3 on --version, otherwise behaving like write_fake_daemon (rejects unknown
 # subcommands, loops forever on a normal run) — standing in for a downloaded

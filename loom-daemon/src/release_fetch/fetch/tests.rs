@@ -44,6 +44,26 @@ fn with_fake_bin<F: FnOnce()>(bindir: &Path, f: F) {
     std::env::set_var("PATH", old);
 }
 
+/// Point `std::env::temp_dir()` at `dir` for the duration of `f`, restoring
+/// the prior value after. nextest runs each test in its own process (see
+/// `.config/nextest.toml`), but every one of those processes still shares the
+/// real OS temp dir -- so a test that scans it for leaked entries can be
+/// fooled by an unrelated sibling test process (e.g.
+/// `successful_fetch_verifies_and_reports_the_artifact`, which legitimately
+/// creates and holds its own `loom-daemon-fetch.*` scratch dir) creating
+/// something there at the same moment. Overriding `TMPDIR` gives
+/// [`ScratchDir::create`] a private root so the leak check only ever sees
+/// this test's own directories.
+fn with_tmp_dir<F: FnOnce()>(dir: &Path, f: F) {
+    let old = std::env::var_os("TMPDIR");
+    std::env::set_var("TMPDIR", dir);
+    f();
+    match old {
+        Some(v) => std::env::set_var("TMPDIR", v),
+        None => std::env::remove_var("TMPDIR"),
+    }
+}
+
 /// A fake `gh` understanding exactly `gh release download <tag> -R <slug>
 /// -p <name> [-p <name> ...] -D <dir> --clobber` -- copies matching files
 /// out of `assets_dir`, exiting 1 if NONE of the `-p` patterns matched
@@ -180,12 +200,18 @@ fn checksum_mismatch_fails_closed_and_removes_its_scratch_dir() {
         cosign_oidc_issuer_env: None,
     };
 
+    // A private temp root, isolated via TMPDIR (see `with_tmp_dir`), so the
+    // leak check below only ever sees scratch dirs this test itself created.
+    let tmp_root = tempdir();
+
     let mut outcome = None;
-    let before_entries: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+    let before_entries: Vec<_> = std::fs::read_dir(&tmp_root)
         .map(|it| it.filter_map(|e| e.ok().map(|e| e.path())).collect())
         .unwrap_or_default();
     with_fake_bin(&fakebin, || {
-        outcome = Some(fetch_and_verify(&inputs));
+        with_tmp_dir(&tmp_root, || {
+            outcome = Some(fetch_and_verify(&inputs));
+        });
     });
 
     match outcome.unwrap() {
@@ -205,7 +231,7 @@ fn checksum_mismatch_fails_closed_and_removes_its_scratch_dir() {
     }
 
     // No NEW loom-daemon-fetch.* scratch dir survived the failure.
-    let after_entries: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+    let after_entries: Vec<_> = std::fs::read_dir(&tmp_root)
         .map(|it| it.filter_map(|e| e.ok().map(|e| e.path())).collect())
         .unwrap_or_default();
     let leaked = after_entries.iter().any(|p| {

@@ -130,7 +130,7 @@ rcA=$(echo "$outA" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcA" "artifact-fetch: successful update exits 0"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outA" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+if grep -q 'Rebuilding loom-daemon (cargo build' <<<"$outA"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} artifact-fetch: successful update never invokes 'cargo build' (AC1)"
     echo "  output: $outA"
@@ -141,7 +141,7 @@ fi
 
 installedA_version="$("$WA/installed-loom-daemon" --version 2>/dev/null)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$installedA_version" | grep -q 'commit artifac1'; then
+if grep -q 'commit artifac1' <<<"$installedA_version"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} artifact-fetch: the fetched+verified artifact was provisioned to the destination"
 else
@@ -180,7 +180,7 @@ rcB=$(echo "$outB" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "1" "$rcB" "artifact-fetch: checksum mismatch aborts the update (exit 1)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outB" | grep -q 'Checksum verification FAILED'; then
+if grep -q 'Checksum verification FAILED' <<<"$outB"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} artifact-fetch: checksum-mismatch failure is reported explicitly"
 else
@@ -227,7 +227,7 @@ rcC=$(echo "$outC" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcC" "artifact-fetch: missing-artifact fallback still completes the update (exit 0)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outC" | grep -q 'Artifact-fetch:.*falling back to the local source-build path'; then
+if grep -q 'Artifact-fetch:.*falling back to the local source-build path' <<<"$outC"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} artifact-fetch: a resolution failure is reported as a soft fallback"
 else
@@ -237,7 +237,7 @@ else
 fi
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outC" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+if grep -q 'Rebuilding loom-daemon (cargo build' <<<"$outC"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} artifact-fetch: missing-artifact fallback actually rebuilds from source"
 else
@@ -248,7 +248,7 @@ fi
 
 installedC_version="$("$WC/installed-loom-daemon" --version 2>/dev/null)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$installedC_version" | grep -q "commit ${HEADC}"; then
+if grep -q "commit ${HEADC}" <<<"$installedC_version"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} artifact-fetch: the source-build fallback provisioned the freshly-built binary"
 else
@@ -291,7 +291,7 @@ assert_eq "0" "$rcD" "--no-fetch: update still completes (exit 0)"
 
 installedD_version="$("$WD/installed-loom-daemon" --version 2>/dev/null)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$installedD_version" | grep -q "commit ${HEADD}"; then
+if grep -q "commit ${HEADD}" <<<"$installedD_version"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} --no-fetch: rebuilds from source even though a release artifact was available"
 else
@@ -326,7 +326,7 @@ rcE=$(echo "$outE" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "1" "$rcE" "--fetch: refuses to silently fall back to a source build (exit 1)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outE" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+if grep -q 'Rebuilding loom-daemon (cargo build' <<<"$outE"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} --fetch: never falls back to 'cargo build' on a forced-fetch failure"
     echo "  output: $outE"
@@ -362,7 +362,7 @@ rcF=$(echo "$outF" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcF" "artifact-fetch: an unreachable GitHub API falls back to the source build (exit 0)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outF" | grep -q 'Artifact-fetch:.*falling back to the local source-build path'; then
+if grep -q 'Artifact-fetch:.*falling back to the local source-build path' <<<"$outF"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} artifact-fetch: an unreachable GitHub API is reported as a soft fallback"
 else
@@ -373,7 +373,7 @@ fi
 
 installedF_version="$("$WF/installed-loom-daemon" --version 2>/dev/null)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$installedF_version" | grep -q "commit ${HEADF}"; then
+if grep -q "commit ${HEADF}" <<<"$installedF_version"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} artifact-fetch: the API-failure fallback still provisioned a freshly-built binary"
 else
@@ -413,7 +413,7 @@ rcG=$(echo "$outG" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcG" "artifact-fetch: already at the latest release is a no-op (exit 0)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outG" | grep -q 'is not newer than the installed version'; then
+if grep -q 'is not newer than the installed version' <<<"$outG"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} artifact-fetch: an equal-version release is reported as nothing to fetch"
 else
@@ -424,7 +424,7 @@ fi
 
 installedG_version="$("$WG/installed-loom-daemon" --version 2>/dev/null)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$installedG_version" | grep -q "commit ${HEADG}" && ! echo "$outG" | grep -q 'Downloading '; then
+if grep -q "commit ${HEADG}" <<<"$installedG_version" && ! grep -q 'Downloading ' <<<"$outG"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} artifact-fetch: the up-to-date no-op downloads nothing and leaves the binary untouched"
 else
@@ -461,7 +461,7 @@ rcH=$(echo "$outH" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "3" "$rcH" "--check: an available release artifact still reports 'update available' (exit 3)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outH" | grep -q 'Update available via release artifact v0.16.0'; then
+if grep -q 'Update available via release artifact v0.16.0' <<<"$outH"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} --check: names the release artifact it would fetch"
 else
@@ -501,8 +501,8 @@ rcI=$(echo "$outI" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcI" "--dry-run: exits 0 with an artifact available"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outI" | grep -q '\[dry-run\] Would fetch + verify release artifact v0.16.0' \
-    && ! echo "$outI" | grep -q '\[dry-run\] Would run: (cd .* cargo build'; then
+if grep -q '\[dry-run\] Would fetch + verify release artifact v0.16.0' <<<"$outI" \
+    && ! grep -q '\[dry-run\] Would run: (cd .* cargo build' <<<"$outI"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} --dry-run: describes the artifact fetch instead of a cargo build"
 else
@@ -545,7 +545,7 @@ rcJ=$(echo "$outJ" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcJ" "signature present + cosign verifies: update proceeds (exit 0)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outJ" | grep -q 'cosign signature verification passed'; then
+if grep -q 'cosign signature verification passed' <<<"$outJ"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} signature present: cosign verification actually ran and passed"
 else
@@ -556,7 +556,7 @@ fi
 
 installedJ_version="$("$WJ/installed-loom-daemon" --version 2>/dev/null)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$installedJ_version" | grep -q 'commit sigokc0'; then
+if grep -q 'commit sigokc0' <<<"$installedJ_version"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} signature present + verified: the artifact was provisioned"
 else
@@ -599,8 +599,8 @@ rcK=$(echo "$outK" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "1" "$rcK" "signature present but INVALID: aborts the update (exit 1)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outK" | grep -q 'cosign signature verification FAILED' \
-    && ! echo "$outK" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+if grep -q 'cosign signature verification FAILED' <<<"$outK" \
+    && ! grep -q 'Rebuilding loom-daemon (cargo build' <<<"$outK"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} signature present but INVALID: never degrades to a source-build fallback"
 else
@@ -642,7 +642,7 @@ rcL=$(echo "$outL" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcL" "signature present, no public key: loud skip, update still proceeds (exit 0)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outL" | grep -q 'no cosign public key is resolvable.*SKIPPING verification'; then
+if grep -q 'no cosign public key is resolvable.*SKIPPING verification' <<<"$outL"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} signature present, no public key: the skip is LOUD, not silent"
 else
@@ -653,7 +653,7 @@ fi
 
 installedL_version="$("$WL/installed-loom-daemon" --version 2>/dev/null)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$installedL_version" | grep -q 'commit nokeyc0'; then
+if grep -q 'commit nokeyc0' <<<"$installedL_version"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} signature present, no public key: the artifact was still provisioned"
 else
@@ -691,7 +691,7 @@ rcM=$(echo "$outM" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcM" "macOS artifact unsigned: soft-skip, update proceeds (exit 0)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outM" | grep -q 'Downloaded artifact is unsigned'; then
+if grep -q 'Downloaded artifact is unsigned' <<<"$outM"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} macOS artifact unsigned: reported as 'unsigned', not as a verification failure"
 else
@@ -702,7 +702,7 @@ fi
 
 installedM_version="$("$WM/installed-loom-daemon" --version 2>/dev/null)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$installedM_version" | grep -q 'commit unsignd'; then
+if grep -q 'commit unsignd' <<<"$installedM_version"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} macOS artifact unsigned: still provisioned (absence never blocks)"
 else
@@ -739,7 +739,7 @@ rcN=$(echo "$outN" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcN" "macOS artifact signed + verified: update proceeds (exit 0)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outN" | grep -q 'macOS codesign verification passed'; then
+if grep -q 'macOS codesign verification passed' <<<"$outN"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} macOS artifact signed: codesign verification actually ran and passed"
 else
@@ -793,8 +793,8 @@ rcO=$(echo "$outO" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "1" "$rcO" "macOS artifact signed but INVALID: aborts the update (exit 1)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outO" | grep -q 'codesign verification FAILED' \
-    && ! echo "$outO" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+if grep -q 'codesign verification FAILED' <<<"$outO" \
+    && ! grep -q 'Rebuilding loom-daemon (cargo build' <<<"$outO"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} macOS signed-but-invalid: treated as tamper evidence, no source-build fallback"
 else
@@ -846,8 +846,8 @@ rcP=$(echo "$outP" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcP" "keyless (sig + cert, no env override): update proceeds (exit 0)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outP" | grep -q 'cosign keyless signature verification passed' \
-    && ! echo "$outP" | grep -q 'SKIPPING verification'; then
+if grep -q 'cosign keyless signature verification passed' <<<"$outP" \
+    && ! grep -q 'SKIPPING verification' <<<"$outP"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} keyless: real verification runs on a STOCK install (no loud skip, no env override)"
 else
@@ -871,7 +871,7 @@ fi
 
 installedP_version="$("$WP/installed-loom-daemon" --version 2>/dev/null)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$installedP_version" | grep -q 'commit keyles0'; then
+if grep -q 'commit keyles0' <<<"$installedP_version"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} keyless verified: the artifact was provisioned"
 else
@@ -914,8 +914,8 @@ rcQ=$(echo "$outQ" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "1" "$rcQ" "keyless verification failure: aborts the update (exit 1)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outQ" | grep -q 'cosign keyless signature verification FAILED' \
-    && ! echo "$outQ" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+if grep -q 'cosign keyless signature verification FAILED' <<<"$outQ" \
+    && ! grep -q 'Rebuilding loom-daemon (cargo build' <<<"$outQ"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} keyless failure: treated as tamper evidence, never a source-build fallback"
 else
@@ -961,7 +961,7 @@ rcR=$(echo "$outR" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcR" "key mode via checked-in .loom/cosign.pub (no env override): update proceeds (exit 0)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outR" | grep -q 'cosign signature verification passed' \
+if grep -q 'cosign signature verification passed' <<<"$outR" \
     && grep -qF -- "--key $WR/.loom/cosign.pub" "$WR_COSIGN_ARGS" 2>/dev/null; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} key mode: the checked-in .loom/cosign.pub resolves with no env override"
@@ -1008,7 +1008,7 @@ rcS=$(echo "$outS" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcS" "keyless release + stale pubkey env: still verifies keylessly (exit 0)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outS" | grep -q 'cosign keyless signature verification passed' \
+if grep -q 'cosign keyless signature verification passed' <<<"$outS" \
     && ! grep -qF -- '--key ' "$WS_COSIGN_ARGS" 2>/dev/null; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} artifact shape (not local config) selects the verification mode"
@@ -1053,8 +1053,8 @@ rcT=$(echo "$outT" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "0" "$rcT" "release-gap: a still-usable (newer-than-installed) artifact update still exits 0"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outT" | grep -q 'Artifact path cannot reach current source' \
-    && echo "$outT" | grep -q '0.20.0' && echo "$outT" | grep -q 'v0.16.0'; then
+if grep -q 'Artifact path cannot reach current source' <<<"$outT" \
+    && grep -q '0.20.0' <<<"$outT" && grep -q 'v0.16.0' <<<"$outT"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} release-gap: plain run warns when the resolved release is behind source VERSION"
 else
@@ -1084,7 +1084,7 @@ rcT2=$(echo "$outT2" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "3" "$rcT2" "release-gap: --check still reports the available artifact update (exit 3)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outT2" | grep -q 'Release gap: installed 0.15.0, newest release 0.16.0, source 0.20.0'; then
+if grep -q 'Release gap: installed 0.15.0, newest release 0.16.0, source 0.20.0' <<<"$outT2"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} release-gap: --check summarizes installed/release/source together"
 else
@@ -1125,8 +1125,8 @@ rcU=$(echo "$outU" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 assert_eq "1" "$rcU" "release-gap: forced --fetch behind BOTH installed and source still hard-fails (exit 1)"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outU" | grep -q 'no usable release artifact was resolved' \
-    && echo "$outU" | grep -q 'Cause: the newest release (0.18.0) is behind this source tree'"'"'s VERSION (0.18.13)'; then
+if grep -q 'no usable release artifact was resolved' <<<"$outU" \
+    && grep -q 'Cause: the newest release (0.18.0) is behind this source tree'"'"'s VERSION (0.18.13)' <<<"$outU"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} release-gap: forced --fetch hard-fail names the source-gap cause"
 else
@@ -1136,7 +1136,7 @@ else
 fi
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$outU" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+if grep -q 'Rebuilding loom-daemon (cargo build' <<<"$outU"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} release-gap: forced --fetch hard-fail never falls back to 'cargo build'"
     echo "  output: $outU"
@@ -1191,6 +1191,97 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} macOS signature-preservation: downgrade reported explicitly, names the #7932 regression class"
     echo "  output: $outV"
+fi
+
+
+# ------------------------------------------------------------
+# W. (#7609) A forced --fetch is NOT blocked by local-checkout state. The
+#    parent suite's test 38 proves the default (source-build) path hard-aborts
+#    exit 1 on a diverged local commit. --fetch installs a published artifact
+#    and never compiles anything, so the same checkout must NOT block it: this
+#    is the mode the daemon's artifact-first auto_update tick rolls with, and
+#    letting a dirty/diverged/behind checkout veto it would reintroduce
+#    exactly the fleet-wide stall #7609 exists to end, one level down.
+#
+#    Moved here from test-loom-daemon-update.sh by #8028, the same move
+#    #7977 made for --resolve-json above: fetch_and_verify_artifact() now
+#    delegates to `loom-daemon release-fetch`, so this scenario needs the
+#    binary this job builds, which the parent hermetic suite must not require.
+# ------------------------------------------------------------
+WW="$BASE_WORKDIR/w-fetch-w"
+BAREW="$BASE_WORKDIR/w-fetch-w-origin.git"
+new_fixture_with_origin "$WW" "$BAREW"
+# Advance origin/main with real content...
+TMPCLONEW="$(mktemp -d)"
+git clone -q "$BAREW" "$TMPCLONEW"
+echo "origin-value" > "$TMPCLONEW/origin-only-file.txt"
+( cd "$TMPCLONEW" && git add origin-only-file.txt \
+    && git -c user.email=test@test -c user.name=test commit -q -m "origin real change" \
+    && git push -q origin HEAD:refs/heads/main )
+rm -rf "$TMPCLONEW"
+# ...and diverge locally with DIFFERENT real content, so `git merge --ff-only`
+# genuinely refuses (the test-38 hard-abort shape), plus an untracked stray of
+# the kind that shut the gate on two fleet hosts.
+echo "local-value" > "$WW/local-only-file.txt"
+( cd "$WW" && git add local-only-file.txt \
+    && git -c user.email=test@test -c user.name=test commit -q -m "local diverged commit (real content)" )
+echo "" > "$WW/pnpm-lock.yaml"
+HEAD_BEFOREW="$(cd "$WW" && git rev-parse --short HEAD)"
+
+INSTALLEDW="$WW/installed-loom-daemon"
+write_fake_artifact_daemon "$INSTALLEDW" "0.19.21" "deadbee"
+WW_ASSETS="$WW/gh-assets"
+mkdir -p "$WW_ASSETS"
+WW_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WW_ASSETS/$WW_BIN_NAME" "0.19.24" "cafe123"
+sha256_of "$WW_ASSETS/$WW_BIN_NAME" > "$WW_ASSETS/$WW_BIN_NAME.sha256"
+
+WW_FAKEBIN="$WW/fakebin"
+mkdir -p "$WW_FAKEBIN"
+write_fake_gh "$WW_FAKEBIN/gh" "v0.19.24" "$WW_ASSETS"
+write_fake_cargo "$WW_FAKEBIN/cargo"
+
+outW=$( cd "$WW" && PATH="$WW_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$INSTALLEDW" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart --fetch 2>&1; echo "EXIT=$?" )
+rcW=$(echo "$outW" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcW" "--fetch (#7609): a diverged/dirty/behind checkout does NOT block an artifact roll (exit 0)"
+
+installedW_version="$("$INSTALLEDW" --version 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "0.19.24" <<<"$installedW_version"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --fetch (#7609): the release artifact was actually provisioned over the stale binary"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --fetch (#7609): the release artifact was actually provisioned over the stale binary"
+    echo "  --version: $installedW_version"
+    echo "  output: $outW"
+fi
+
+HEAD_AFTERW="$(cd "$WW" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFOREW" "$HEAD_AFTERW" "--fetch (#7609): leaves the local checkout's HEAD completely untouched (no ff-sync side effect)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'never builds from this checkout' <<<"$outW"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --fetch (#7609): says why the behind-origin checkout was not fast-forwarded"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --fetch (#7609): says why the behind-origin checkout was not fast-forwarded"
+    echo "  output: $outW"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'Rebuilding loom-daemon (cargo build' <<<"$outW"; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --fetch (#7609): never compiles on the artifact path"
+    echo "  output: $outW"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --fetch (#7609): never compiles on the artifact path"
 fi
 
 

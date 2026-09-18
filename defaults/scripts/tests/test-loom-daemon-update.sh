@@ -191,23 +191,9 @@ install_update_script_into() {
     cp "$CLI_DIR/../lib/"*.sh "$root/.loom/scripts/lib/"
 }
 
-# new_fixture_with_origin <root> <bare_dir> (#4330) — builds on new_fixture(),
-# adding a local BARE repo as `origin` so the ff-first sync path (which
-# resolves the default branch via refs/remotes/origin/HEAD, then fetches and
-# compares against origin/<branch>) has a real remote to talk to — entirely
-# offline (a plain filesystem path, no network). Forces the branch name to
-# `main` (deterministic regardless of the test host's init.defaultBranch) and
-# sets refs/remotes/origin/HEAD via `git remote set-head origin -a` so
-# loom_default_branch() resolves it the same way a real clone would.
-new_fixture_with_origin() {
-    local root="$1" bare="$2"
-    new_fixture "$root"
-    ( cd "$root" && git branch -q -M main )
-    git init -q --bare "$bare"
-    ( cd "$root" && git remote add origin "$bare" && git push -q origin HEAD:refs/heads/main )
-    git -C "$bare" symbolic-ref HEAD refs/heads/main
-    ( cd "$root" && git remote set-head origin -a >/dev/null 2>&1 )
-}
+# new_fixture_with_origin moved to lib/daemon-update-fixtures.sh (#8028): the
+# fetch sibling's local-checkout-divergence scenario needs it too, and this
+# repo's convention is one shared definition rather than a copy that can drift.
 
 # push_extra_commits_to_origin <bare_dir> <n> — advances the bare `origin`
 # repo `n` commits ahead of whatever a fixture repo's `main` currently is, by
@@ -4593,93 +4579,14 @@ fi
 # host-mutating suites run-ci-suites.sh guards via LIVE_DAEMON_GUARDED_SUITES
 # (#6386), and that membership is pinned as an explicit literal in
 # test-run-ci-suites-daemon-guard.sh.
+#
+# Test 84 ((#7609) "a forced --fetch is NOT blocked by local-checkout state")
+# moved for the identical reason, to the fetch sibling
+# test-loom-daemon-update-fetch.sh (scenario W): as of #8028
+# fetch_and_verify_artifact() also delegates to `loom-daemon release-fetch`,
+# so it too needs a BUILT binary this suite must not require.
 # ============================================================
 
-
-# ============================================================
-# 84. (#7609) A forced --fetch is NOT blocked by local-checkout state. Test 38
-#     above proves the default (source-build) path hard-aborts exit 1 on a
-#     diverged local commit. --fetch installs a published artifact and never
-#     compiles anything, so the same checkout must NOT block it: this is the
-#     mode the daemon's artifact-first auto_update tick rolls with, and letting
-#     a dirty/diverged/behind checkout veto it would reintroduce exactly the
-#     fleet-wide stall #7609 exists to end, one level down.
-# ============================================================
-W84="$BASE_WORKDIR/w84"
-BARE84="$BASE_WORKDIR/w84-origin.git"
-new_fixture_with_origin "$W84" "$BARE84"
-# Advance origin/main with real content...
-TMPCLONE84="$(mktemp -d)"
-git clone -q "$BARE84" "$TMPCLONE84"
-echo "origin-value" > "$TMPCLONE84/origin-only-file.txt"
-( cd "$TMPCLONE84" && git add origin-only-file.txt \
-    && git -c user.email=test@test -c user.name=test commit -q -m "origin real change" \
-    && git push -q origin HEAD:refs/heads/main )
-rm -rf "$TMPCLONE84"
-# ...and diverge locally with DIFFERENT real content, so `git merge --ff-only`
-# genuinely refuses (the test-38 hard-abort shape), plus an untracked stray of
-# the kind that shut the gate on two fleet hosts.
-echo "local-value" > "$W84/local-only-file.txt"
-( cd "$W84" && git add local-only-file.txt \
-    && git -c user.email=test@test -c user.name=test commit -q -m "local diverged commit (real content)" )
-echo "" > "$W84/pnpm-lock.yaml"
-HEAD_BEFORE84="$(cd "$W84" && git rev-parse --short HEAD)"
-
-INSTALLED84="$W84/installed-loom-daemon"
-write_fake_artifact_daemon "$INSTALLED84" "0.19.21" "deadbee"
-W84_ASSETS="$W84/gh-assets"
-mkdir -p "$W84_ASSETS"
-W84_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
-write_fake_artifact_daemon "$W84_ASSETS/$W84_BIN_NAME" "0.19.24" "cafe123"
-sha256_of "$W84_ASSETS/$W84_BIN_NAME" > "$W84_ASSETS/$W84_BIN_NAME.sha256"
-
-W84_FAKEBIN="$W84/fakebin"
-mkdir -p "$W84_FAKEBIN"
-write_fake_gh "$W84_FAKEBIN/gh" "v0.19.24" "$W84_ASSETS"
-write_fake_cargo "$W84_FAKEBIN/cargo"
-
-out84=$( cd "$W84" && PATH="$W84_FAKEBIN:$TEST_PATH" \
-    LOOM_DAEMON_BIN="$INSTALLED84" \
-    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
-    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
-    bash "$UPDATE_SCRIPT" --no-restart --fetch 2>&1; echo "EXIT=$?" )
-rc84=$(echo "$out84" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
-assert_eq "0" "$rc84" "--fetch (#7609): a diverged/dirty/behind checkout does NOT block an artifact roll (exit 0)"
-
-installed84_version="$("$INSTALLED84" --version 2>/dev/null)"
-TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$installed84_version" | grep -q "0.19.24"; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} --fetch (#7609): the release artifact was actually provisioned over the stale binary"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} --fetch (#7609): the release artifact was actually provisioned over the stale binary"
-    echo "  --version: $installed84_version"
-    echo "  output: $out84"
-fi
-
-HEAD_AFTER84="$(cd "$W84" && git rev-parse --short HEAD)"
-assert_eq "$HEAD_BEFORE84" "$HEAD_AFTER84" "--fetch (#7609): leaves the local checkout's HEAD completely untouched (no ff-sync side effect)"
-
-TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$out84" | grep -q 'never builds from this checkout'; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} --fetch (#7609): says why the behind-origin checkout was not fast-forwarded"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} --fetch (#7609): says why the behind-origin checkout was not fast-forwarded"
-    echo "  output: $out84"
-fi
-
-TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$out84" | grep -q 'Rebuilding loom-daemon (cargo build'; then
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} --fetch (#7609): never compiles on the artifact path"
-    echo "  output: $out84"
-else
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} --fetch (#7609): never compiles on the artifact path"
-fi
 
 # ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
