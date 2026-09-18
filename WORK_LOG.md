@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8054** (closed): cost mode for the role-runner path: machine-level roleModels/effort defaults, honour sweep.optimization, emit --effort on role ticks
+- **PR #8145**: feat(role-runner): resolve and emit --effort on scheduled role ticks (#8054)
+- **Issue #8091** (closed): feat(daemon): surface operator-attention counts in loom-daemon health and the dashboard pipeline
+- **PR #8133**: feat(daemon): surface operator-attention counts in health and pipeline
 - **Issue #8110** (closed): sweep-summary-output.md loads in only 12 of 123 finished Mode A/B sweeps — the settle step is being skipped
 - **PR #8132**: fix(sweep): make the settle step reachable, not recognised (#8110)
 - **Issue #7964** (closed): auto_update: fall back to the mirrored ~/.local/share/loom-daemon/defaults copy when --resolve-json produces no JSON
