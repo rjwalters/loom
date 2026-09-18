@@ -13,7 +13,9 @@ use std::fs;
 // `SHARED_TOKENS_DIR_ENV` mutations in `paths.rs`.
 use serial_test::serial;
 
-fn make_pool(names: &[&str]) -> tempfile::TempDir {
+// `pub(super)` so the sibling `select_affinity_tests` module (#8146) can
+// reuse these two fixtures instead of duplicating them.
+pub(super) fn make_pool(names: &[&str]) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join(".loom").join("tokens");
     fs::create_dir_all(&dir).unwrap();
@@ -23,7 +25,7 @@ fn make_pool(names: &[&str]) -> tempfile::TempDir {
     tmp
 }
 
-fn pool_dir(ws: &Path) -> PathBuf {
+pub(super) fn pool_dir(ws: &Path) -> PathBuf {
     ws.join(".loom").join("tokens")
 }
 
