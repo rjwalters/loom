@@ -55,8 +55,12 @@ fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo 
 # deleted: a reader of this suite must be able to see that something was
 # removed, why, and what proves the property now. Counted as run so the totals
 # stay honest about how many assertions this file still carries.
+TESTS_RETIRED=0
 retired() { # <what> <property> <why-structural> <successor>
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    # Counted in its OWN bucket, not as a pass. A retirement is a record that
+    # an assertion was removed and why — calling it a pass inflates the figure
+    # a reader uses to judge how much this suite still proves.
+    TESTS_RETIRED=$((TESTS_RETIRED + 1))
     echo -e "${YELLOW}⊘${NC} RETIRED: $1"
     echo "      property:   $2"
     echo "      structural: $3"
@@ -2636,5 +2640,5 @@ retired "#7508/#7834: the scan locates each heredoc body rather than passing vac
 
 
 echo
-echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
+echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed, $TESTS_RETIRED retired"
 [[ "$TESTS_FAILED" -eq 0 ]]

@@ -393,9 +393,16 @@ pub fn recover(sentinel: &Path, cooldown_state: &Path, hostname: &str, summary: 
 
     let gh = std::time::Duration::from_secs(60);
     let mut comment = std::process::Command::new("gh");
-    comment.args(["issue", "comment", &issue_ref, "--body"]).arg(format!(
-        "peer-claim coordination has RECOVERED on `{hostname}` ({summary}). Closing          automatically — filed by the loom-daemon-watchdog peer-coordination escalation (#6222)."
-    ));
+    comment
+        .args(["issue", "comment", &issue_ref, "--body"])
+        .arg(format!(
+            // Verbatim from the shell (loom-daemon-watchdog.sh:1820). This is
+            // posted to the forge, so a stray run of spaces and a dropped `.sh`
+            // are both visible to an operator reading the issue.
+            "peer-claim coordination has RECOVERED on `{hostname}` ({summary}). Closing \
+         automatically — filed by the loom-daemon-watchdog.sh peer-coordination escalation \
+         (#6222)."
+        ));
     // The comment is advisory: a failure must not stop the close.
     let _ = crate::sweep_registry::output_with_timeout(comment, gh);
 

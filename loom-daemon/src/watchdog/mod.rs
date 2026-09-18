@@ -29,10 +29,20 @@
 //!
 //! # The equivalence proof
 //!
-//! `defaults/scripts/tests/test-loom-daemon-watchdog.sh` (206 assertions) and
-//! `test-loom-daemon-watchdog-dedup.sh` (27) are retained black-box suites:
-//! they invoke the stub **by path** with environment overrides and assert on
-//! stdout, the log file and exit codes. They run unchanged against this code.
+//! `defaults/scripts/tests/test-loom-daemon-watchdog.sh` (188 assertions, plus
+//! 4 retired records) and `test-loom-daemon-watchdog-dedup.sh` (27) are
+//! retained black-box suites: they invoke the stub **by path** with
+//! environment overrides and assert on stdout, the log file and exit codes.
+//!
+//! They run against this code with two harness changes and no altered
+//! expectations: `LOOM_DAEMON_SELF_BIN` pins the binary that implements the
+//! stub (#8134), and four assertions about the SHELL's source text are retired
+//! under §6's three-part test, recorded in the suite rather than deleted.
+//!
+//! "206" was the count before the stub existed — i.e. the suite measuring the
+//! shell it was supposed to be replacing. That number is the reason §6 now
+//! opens by saying a green figure must be made red on purpose before it is
+//! believed.
 //!
 //! Per #8011 a retained suite is necessary and not sufficient — it proves only
 //! what its author thought to write down. See
