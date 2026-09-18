@@ -11,6 +11,61 @@ use loom_daemon::activity::transcript_ingest::{ingest, IngestOptions, IngestStat
 use loom_daemon::activity::ActivityDb;
 use loom_daemon::transcript_tokens::claude_projects_dir;
 
+/// `loom-daemon ingest-transcripts` — reached through
+/// [`super::telemetry::TelemetryCommand`], which is flattened, so this is a
+/// top-level subcommand with no `telemetry` prefix. The args live here rather
+/// than in `main.rs` because that file is frozen by the file-size ratchet.
+#[derive(clap::Args)]
+pub(crate) struct IngestTranscriptsArgs {
+    /// Only transcripts modified since: `7d`, `12h`, `90m`, an RFC-3339
+    /// instant, or `all` (default: all).
+    #[arg(long)]
+    pub since: Option<String>,
+
+    /// Claude projects directory (default: `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`).
+    #[arg(long = "projects-dir")]
+    pub projects_dir: Option<String>,
+
+    /// Restrict to one workspace's transcripts (default: every project).
+    #[arg(long)]
+    pub workspace: Option<String>,
+
+    /// Activity database path (default: `~/.loom/activity.db`).
+    #[arg(long)]
+    pub db: Option<String>,
+
+    /// Re-ingest transcripts the ledger records as unchanged.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Report what would be ingested without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format: table (default), json
+    #[arg(long, default_value = "table")]
+    pub format: String,
+}
+
+impl IngestTranscriptsArgs {
+    /// Run one ingestion pass and print what it did.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the activity database cannot be opened or a write fails.
+    pub(crate) fn run(self) -> Result<()> {
+        handle_ingest_transcripts_command(
+            self.since.as_deref(),
+            self.projects_dir.as_deref(),
+            self.workspace.as_deref(),
+            self.db.as_deref(),
+            self.force,
+            self.dry_run,
+            &self.format,
+        )
+    }
+}
+
 /// Parse a `--since` value: `7d`, `12h`, `90m`, `all`, or an RFC-3339 instant.
 ///
 /// # Errors

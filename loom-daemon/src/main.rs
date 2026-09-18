@@ -89,49 +89,6 @@ enum Commands {
         workspace: String,
     },
 
-    /// Ingest Claude Code transcript token usage into `activity.db` (#8059).
-    ///
-    /// `resource_usage` had one writer — the managed-terminal IPC path — which
-    /// a dispatched `claude -p` sweep never traverses, so on a dispatch-driven
-    /// host the cost tables and every view over them were permanently empty.
-    /// This reads the transcripts those sweeps already wrote, dedupes each
-    /// message's streamed chunks on `message.id`, skips `<synthetic>` models,
-    /// attributes a role from the session's first user message, and writes one
-    /// `resource_usage` row per (model, UTC day) per transcript.
-    ///
-    /// Safe to re-run: an unchanged transcript is skipped, and a transcript
-    /// that has grown has its rows replaced rather than appended to.
-    IngestTranscripts {
-        /// Only transcripts modified since: `7d`, `12h`, `90m`, an RFC-3339
-        /// instant, or `all` (default: all).
-        #[arg(long)]
-        since: Option<String>,
-
-        /// Claude projects directory (default: `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`).
-        #[arg(long = "projects-dir")]
-        projects_dir: Option<String>,
-
-        /// Restrict to one workspace's transcripts (default: every project).
-        #[arg(long)]
-        workspace: Option<String>,
-
-        /// Activity database path (default: `~/.loom/activity.db`).
-        #[arg(long)]
-        db: Option<String>,
-
-        /// Re-ingest transcripts the ledger records as unchanged.
-        #[arg(long)]
-        force: bool,
-
-        /// Report what would be ingested without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Output format: table (default), json
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-
     /// Display agent effectiveness and activity metrics.
     ///
     /// With no positional `command`, prints the original interactive
@@ -907,16 +864,13 @@ enum Commands {
         runtime: String,
     },
 
-    /// Query Claude API usage via the Anthropic OAuth API (native port of
-    /// `loom_tools.common.usage`, #4275). Backs `check-usage.sh`.
-    ///
-    /// Exits 1 when the payload carries an `error` key (no Keychain token, API
-    /// failure, or not inside a Loom repo) — the historical contract.
-    Usage {
-        /// Print a human-readable status block instead of JSON.
-        #[arg(long)]
-        status: bool,
-    },
+    /// Token-cost telemetry: `usage` (live, from the Anthropic OAuth API) and
+    /// `ingest-transcripts` (#8059 — persist transcript token usage into
+    /// `activity.db`). Flattened, so each stays top-level; the args and their
+    /// docs live in `cli::telemetry` because this file is frozen by the
+    /// file-size ratchet.
+    #[command(flatten)]
+    Telemetry(cli::telemetry::TelemetryCommand),
 
     /// Manage builder checkpoints for progress tracking (native port of
     /// `loom_tools.checkpoints`, #4275). Backs `checkpoint.sh`.
@@ -2574,10 +2528,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             tier.as_deref(),
             &runtime,
         ),
-        Commands::Usage { status } => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            std::process::exit(script_helpers::usage::run(status, &cwd));
-        }
+        Commands::Telemetry(cmd) => cmd.run(),
         Commands::Checkpoint { action } => handle_checkpoint_command(action),
         Commands::Claim { command, args } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -2615,23 +2566,6 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             verbose,
         } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
-        Commands::IngestTranscripts {
-            since,
-            projects_dir,
-            workspace,
-            db,
-            force,
-            dry_run,
-            format,
-        } => cli::transcript_ingest_cli::handle_ingest_transcripts_command(
-            since.as_deref(),
-            projects_dir.as_deref(),
-            workspace.as_deref(),
-            db.as_deref(),
-            force,
-            dry_run,
-            &format,
-        ),
         Commands::Stats {
             command,
             role,

@@ -493,9 +493,9 @@ pub fn run_once(db_path: &Path, window_hours: i64) -> Result<IngestStats> {
 /// Mirrors `metrics_collector::try_init_metrics_collector`: returns the
 /// `JoinHandle` (whose thread keeps running when the handle is dropped) or
 /// `None` when the feature is off.
-pub fn try_init_transcript_ingest(db_path: &str) -> Option<std::thread::JoinHandle<()>> {
+pub fn try_init_transcript_ingest(db_path: &Path) -> Option<std::thread::JoinHandle<()>> {
     let (interval, window_hours) = check_env_enabled()?;
-    let db_path = PathBuf::from(db_path);
+    let db_path = db_path.to_path_buf();
     log::info!(
         "📥 Transcript token ingestion enabled (every {}min, {} window)",
         interval / 60,

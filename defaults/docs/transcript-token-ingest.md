@@ -71,9 +71,9 @@ ingested transcript.
 - **Dedupe on `message.id`.** A streamed assistant message is written once per
   chunk, and every chunk repeats the id carrying the **cumulative** usage.
   Summing blocks over-counts: measured on a live fleet host (2026-09-18, a 24h
-  window over 2,368 transcripts) 64,625 non-synthetic usage blocks collapsed to
-  31,560 distinct messages — **51% of blocks were repeats**, so a naive sum
-  would have roughly doubled the fleet's reported spend. Folding by id and
+  window over 2,330 ingested transcripts) 62,643 non-synthetic usage blocks
+  collapsed to 30,579 distinct messages — **51% of blocks were repeats**, so a
+  naive sum would have roughly doubled the fleet's reported spend. Folding by id and
   taking the per-counter maximum is correct for identical repeats and for
   genuinely growing cumulative chunks.
 - **Skip `model == "<synthetic>"`** — Claude Code's marker for internal/tool-echo
