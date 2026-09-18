@@ -837,40 +837,72 @@ impl ScriptAutoUpdateProbe {
         None
     }
 
-    /// The checkout the update script is *invoked from* on the ARTIFACT path
-    /// (Issue #7609): the build-time source checkout when it is still present,
-    /// else this daemon's own workspace root.
+    /// The candidate checkout roots the update script is searched under, in
+    /// fallback order, on the ARTIFACT path (Issue #7609 + #7964):
+    ///
+    /// 1. The build-time source checkout, when still present.
+    /// 2. This daemon's own workspace root.
+    /// 3. The machine-level mirrored `defaults/` payload
+    ///    ([`crate::init::git::machine_level_defaults_path`],
+    ///    `~/.local/share/loom-daemon/defaults` by default,
+    ///    `LOOM_DAEMON_DEFAULTS_DIR`-overridable) that `scripts/install-loom.sh`
+    ///    / `loom update` keep current on every host.
     ///
     /// The fallback matters precisely because of the hosts this issue exists
     /// for: a daemon provisioned from a release artifact — or one whose
     /// `CARGO_MANIFEST_DIR` checkout has moved — has NO
     /// [`crate::self_update::source_checkout_root`], and would otherwise have
     /// no script to run even though fetching a newer artifact needs nothing
-    /// from a source tree but the script itself. It is deliberately NOT used
-    /// for [`Self::rebuild`]: a source build must happen in the checkout the
-    /// binary was built from, never in some other repo that merely happens to
-    /// be registered.
-    fn script_root(&self) -> Option<PathBuf> {
+    /// from a source tree but the script itself. Candidate 3 additionally
+    /// covers a host whose candidate-1/2 copy of `loom-daemon-update.sh` is
+    /// simply stale (predates a script flag this daemon relies on) even
+    /// though the file itself resolves — the per-machine mirror is kept
+    /// current independent of any one workspace's checkout age.
+    fn candidate_roots(&self) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
         if let Some(root) = self.source_root.clone() {
-            if Self::resolve_script(&root).is_some() {
-                return Some(root);
-            }
+            candidates.push(root);
         }
-        if Self::resolve_script(&self.fallback_root).is_some() {
-            return Some(self.fallback_root.clone());
+        candidates.push(self.fallback_root.clone());
+        if let Some(mirror) = crate::init::git::machine_level_defaults_path() {
+            candidates.push(mirror);
         }
-        None
+        candidates
+    }
+
+    /// The checkout the update script is *invoked from*: the first of
+    /// [`Self::candidate_roots`] whose `loom-daemon-update.sh` actually
+    /// resolves. It is deliberately NOT used for [`Self::rebuild`]: a source
+    /// build must happen in the checkout the binary was built from, never in
+    /// some other repo (or the mirrored defaults payload, which has no
+    /// buildable source at all) that merely happens to be registered.
+    fn script_root(&self) -> Option<PathBuf> {
+        self.candidate_roots()
+            .into_iter()
+            .find(|root| Self::resolve_script(root).is_some())
+    }
+
+    /// The "no artifact resolved" reason when [`Self::script_root`] finds
+    /// nothing under ANY candidate — names every path tried so the log can
+    /// distinguish "no checkout at all" from "checkouts exist but none carry
+    /// the script" (Issue #7964).
+    fn no_script_root_reason(&self) -> String {
+        let tried: Vec<String> = self
+            .candidate_roots()
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect();
+        format!(
+            "no checkout with a loom-daemon-update.sh could be resolved (tried: {})",
+            tried.join(", ")
+        )
     }
 }
 
 impl AutoUpdateProbe for ScriptAutoUpdateProbe {
     fn resolve_artifact(&self) -> ArtifactResolution {
         let Some(root) = self.script_root() else {
-            return ArtifactResolution::Unresolved(
-                "no checkout with a loom-daemon-update.sh could be resolved (neither the \
-                 build-time source checkout nor this daemon's workspace root)"
-                    .to_string(),
-            );
+            return ArtifactResolution::Unresolved(self.no_script_root_reason());
         };
         let Some(script) = Self::resolve_script(&root) else {
             return ArtifactResolution::Unresolved(format!(
@@ -887,10 +919,10 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
 
     fn fetch_artifact(&mut self, low_priority: bool) -> RebuildOutcome {
         let Some(root) = self.script_root() else {
-            return RebuildOutcome::Retryable(
-                "no checkout with a loom-daemon-update.sh could be resolved — cannot fetch"
-                    .to_string(),
-            );
+            return RebuildOutcome::Retryable(format!(
+                "{} — cannot fetch",
+                self.no_script_root_reason()
+            ));
         };
         let Some(script) = Self::resolve_script(&root) else {
             return RebuildOutcome::Retryable(format!(
