@@ -65,7 +65,7 @@ impl WorktreeLockCommand {
                 poll,
                 repo,
             } => {
-                let repo = repo.map_or_else(|| PathBuf::from("."), |r| r);
+                let repo = repo.unwrap_or_else(|| PathBuf::from("."));
                 // A non-numeric poll degrades to the default rather than
                 // failing: the shell passes whatever
                 // LOOM_WORKTREE_LOCK_POLL_INTERVAL holds, and a malformed knob
@@ -95,7 +95,7 @@ impl WorktreeLockCommand {
                 }
             }
             WorktreeLockCommand::Release { token, repo } => {
-                let repo = repo.map_or_else(|| PathBuf::from("."), |r| r);
+                let repo = repo.unwrap_or_else(|| PathBuf::from("."));
                 lock::release(&repo, &token);
                 std::process::exit(0);
             }
