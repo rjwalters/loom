@@ -551,16 +551,16 @@ digest_aggregate_line() {
 #     only, so none of those may abort the merge pass.
 #
 # #8093: the previous shape MIRRORED the line into this file and ran the
-# copy under the suite's own `set -uo pipefail` (note: no `set -e`). That
-# made Test 12C non-discriminating in two independent, reproducible ways:
-# deleting the pin line from champion-pr-merge.md outright left the suite
-# green (nothing here ever read the shipped file), and deleting `|| true`
-# from the mirror left it green too (with no `set -e`, a failing stub can
-# never abort anything, so `echo "pass-continued"` ran unconditionally and
-# sub-assertions (b)/(c)/(d) were vacuous). Both holes are closed below:
-# the real line is extracted from the prompt and run under `set -e` in a
-# subshell, so a non-zero pin that the line does NOT tolerate itself skips
-# everything after it.
+# copy, then echoed unconditionally. That made Test 12C non-discriminating
+# in two independent, reproducible ways: deleting the pin line from
+# champion-pr-merge.md outright left the suite green (nothing here ever
+# read the shipped file), and deleting `|| true` from the mirror left it
+# green too (a failing stub could not stop the following `echo
+# "pass-continued"`, so sub-assertions (b)/(c)/(d) were vacuous). Both
+# holes are closed below: the real line is extracted from the prompt and
+# executed, and the echo standing in for "the pass continued" is gated on
+# that line's own exit status with `&&`, so a non-zero pin that the line
+# does NOT tolerate itself skips everything after it.
 #
 # This is the extract-and-execute shape #7979 asks for — the same one the
 # ~20 `test-guide-*.sh` suites already use — NOT a prose-existence
@@ -573,12 +573,14 @@ DIGEST_PIN_LINE="$(grep -m1 -F 'gh issue pin "$DIGEST_ISSUE"' "$CHAMPION_MD" || 
 
 # `gh_pin` stands in for the real `gh issue pin`; its exit status is the
 # only thing the extracted line observes. The trailing echo represents the
-# pass carrying on to the steps that follow the pin — under `set -e` it is
-# reached only when the extracted line tolerates the failure on its own.
+# pass carrying on to the steps that follow the pin — it is `&&`-gated on
+# the extracted line's own exit status, so it is reached only when that
+# line tolerates the failure itself. (Deliberately no `set -e` anywhere:
+# an `errexit` in this file trips scripts/check-pipefail-early-exit.sh's
+# file-global scan and un-suppresses unrelated pre-existing pipelines.)
 digest_pin() {
     local issue="$1"
     (
-        set -e
         # Route `gh issue pin <n>` to the stub; anything else is a sign the
         # extraction picked up the wrong line, so fail loudly rather than
         # silently passing.
@@ -589,9 +591,9 @@ digest_pin() {
             fi
             gh_pin "${3:-}"
         }
+        # shellcheck disable=SC2034  # consumed by the `eval "$DIGEST_PIN_LINE"` below
         DIGEST_ISSUE="$issue"
-        eval "$DIGEST_PIN_LINE"
-        echo "pass-continued"
+        eval "$DIGEST_PIN_LINE" && echo "pass-continued"
     )
 }
 
@@ -1158,8 +1160,9 @@ assert_eq "pass-continued" "$(digest_pin 6877)" \
 # — otherwise they assert an echo the harness guarantees regardless, which
 # is precisely the defect #8093 was filed for. Run the SAME extracted line
 # with its failure tolerance stripped and confirm the pass does not
-# continue. If someone later drops the `set -e` subshell (or the extracted
-# line stops being the thing that is run), this goes red and says so.
+# continue. If someone later un-gates the trailing echo (making it run
+# regardless of the extracted line's exit status), or the extracted line
+# stops being the thing that is run, this goes red and says so.
 DIGEST_PIN_LINE_REAL="$DIGEST_PIN_LINE"
 DIGEST_PIN_LINE="${DIGEST_PIN_LINE_REAL/|| true/}"
 assert_eq "" "$(digest_pin 6877)" \
