@@ -344,12 +344,25 @@ direction of its risk. "Kept, because missing a genuine declared reference is
 worse than one extra" is a decision; the same behaviour undocumented is a bug
 waiting to be re-litigated.
 
-### Three root causes, from 11 defects across two ports
+### Four root causes, from 17 defects across three ports
 
-The watchdog (#8086) and `merge-pr.sh` (#8191) produced eleven defects that
-review caught and building did not. They are not eleven unrelated mistakes;
-they are three causes wearing different clothes. Each has a cheap
-counter-check, and the counter-check is the point of writing this down.
+The watchdog (#8086), `merge-pr.sh` (#8191) and `worktree.sh` (#8195) produced
+seventeen defects that building did not catch. They are not seventeen
+unrelated mistakes; they are four causes wearing different clothes. Each has a
+cheap counter-check, and the counter-check is the point of writing this down.
+
+**Who caught them is the more useful statistic.** Review found fourteen of the
+seventeen. The three I found myself were all in the smallest slice — 135 shell
+lines — and all three were caught by three specific practices, not by care:
+baselining the retained suites against the UNMODIFIED shell before touching
+anything, mutation-testing my own new guard, and driving the real binary as a
+real caller would. The two larger slices (2,436 and ~95 lines) had none of
+those, and review found every defect in both.
+
+The lesson is not "review works". It is that **review has been doing the
+proving**, and the artifacts the reviewers keep producing — a fail-open
+enumeration, a side-by-side run against the retired implementation, a
+call-shape test — are the artifacts the PR should arrive with.
 
 #### Cause 1: nothing proved the harness could go RED
 
@@ -427,6 +440,30 @@ and pin it.** Pin `LC_ALL=C` in any differential harness that shells out, and
 say so in the module doc. The first of these was found, documented at length,
 and then reproduced **one function away** in the same file — the lesson does
 not generalise itself.
+
+#### Cause 4: the shell was TOLERANT by construction; Rust idioms are strict
+
+A fourth cause showed up porting `worktree.sh`'s lock, three times in ~135
+lines. Each time the idiomatic Rust was stricter than the shell in a way that
+read as more correct and silently removed a behaviour:
+
+| the shell | the port | what it cost |
+|---|---|---|
+| `$$` — a holder process alive for the whole critical section | `std::process::id()` in a CLI that exits immediately | the lock recorded an already-dead pid, the next acquire reclaimed it as stale, and **mutual exclusion was gone** |
+| `git rev-parse --git-common-dir` with no `-C` (i.e. the CWD) | an explicit `--repo "$VAR"` | the variable is not assigned until 700 lines later, so every acquisition resolved a lock relative to nothing |
+| `awk`, reading one field at a time | `serde`, all-or-nothing | a record missing one field failed to parse, so the pid was never read — killing both the holder diagnostic **and** stale-lock recovery |
+
+None of these is a bug in the Rust. Each is correct in isolation. What they
+share is that the shell's version was *accidentally tolerant* — of partial
+input, of an unset variable, of a process boundary that did not exist — and
+nothing in the port's design recorded that the tolerance was load-bearing.
+
+**The counter-check: before porting a function, write down what it tolerates
+BY CONSTRUCTION, and keep a test for each.** Ask specifically: what does this
+do with a partial record? an unset variable? a path relative to something? a
+process that outlives the call? Then check whether the Rust still does it.
+Shell tolerance is rarely deliberate, which is exactly why nobody writes it
+down and everybody removes it.
 
 #### The one that is not a cause, but a habit: verify the CALL SHAPE
 
