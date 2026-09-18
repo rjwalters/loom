@@ -101,7 +101,17 @@ fn marker_present(
         cfg!(target_os = "macos"),
         supervisor::systemctl_available(),
     );
-    let snap = liveness::probe(&paths.loom_dir, &paths.marker, &sup);
+    let mut snap = liveness::probe(&paths.loom_dir, &paths.marker, &sup);
+
+    // #5118: the out-of-band signals can only ever be a hint. Before declaring
+    // an outage, ask the socket — a served socket is authoritative and an
+    // absent pid file is no evidence at all.
+    if !snap.alive() {
+        match socket_corroboration(paths, reporter, &mut snap) {
+            Some(code) => return code,
+            None => {}
+        }
+    }
 
     if !snap.alive() {
         return outage(paths, reporter, state, &snap, &sup);
@@ -836,4 +846,108 @@ fn peer_coordination(
         }
     }
     let _ = snap;
+}
+
+/// #5118: ask the socket before concluding a daemon is gone.
+///
+/// The incident this closes: the pid file alone was treated as sufficient to
+/// declare an outage, and it is the WEAKEST of the three signals — a path
+/// disagreement between the writer and the reader made an absent file look like
+/// a dead daemon. An absent file is **no evidence at all**, which is a different
+/// thing from evidence of absence, and conflating them paged for a daemon that
+/// was serving traffic the whole time.
+///
+/// Returns `Some(exit_code)` when this tick's answer is settled here; `None`
+/// when the caller should continue to the outage path. May flip `snap` to alive.
+fn socket_corroboration(
+    paths: &config::Paths,
+    reporter: &report::Reporter,
+    snap: &mut liveness::Snapshot,
+) -> Option<i32> {
+    let repo_root = marker::get_nonempty(&paths.marker, "repo_root").map(PathBuf::from);
+    let bin = locate::daemon_bin(repo_root.as_deref());
+    let attempt = probe::attempt(&paths.socket_path, bin.as_deref());
+    let (verdict, socket_detail) =
+        probe::classify(&attempt, &paths.socket_path, probe::probe_timeout_secs());
+    let socket = paths.socket_path.display();
+
+    match verdict {
+        probe::SocketVerdict::Answered => {
+            if snap.source == liveness::Source::PidFile {
+                // The pid-file hint was unusable and the socket answers. The
+                // socket wins: it is in-band evidence of the thing actually
+                // being asked about.
+                snap.state = crate::daemon_install_state::InstallState::AliveButUnresponsive;
+                snap.detail = format!(
+                    "daemon ANSWERS on {socket} ({socket_detail}) — authoritative; the pid-file \
+                     hint was unusable ({}), which is NOT evidence of an outage (#5118)",
+                    snap.detail
+                );
+                reporter.report(
+                    report::Level::Ok,
+                    &format!("daemon healthy via the in-band socket round-trip: {}.", snap.detail),
+                );
+                None
+            } else {
+                // A supervisor says the job is gone, yet something serves the
+                // socket. Dispatch is running, so this is NOT an outage — but
+                // nothing will relaunch it when it dies, and relaunching into a
+                // served socket would only be refused by the singleton guard.
+                reporter.report(
+                    report::Level::Warn,
+                    &format!(
+                        "STATE MISMATCH: {}, yet a daemon ANSWERS on {socket} ({socket_detail}). \
+                         Dispatch is still running, so this is NOT an autonomy outage — but the \
+                         daemon is UNSUPERVISED: nothing will relaunch it if it dies, and no \
+                         auto-remediation is attempted here (relaunching into a served socket \
+                         would only be refused by the singleton guard). Heal it by rolling the \
+                         daemon through ./.loom/scripts/cli/loom-daemon-stop.sh && \
+                         ./.loom/scripts/cli/loom-daemon-start.sh [flags] so the supervisor owns \
+                         it again.",
+                        snap.detail
+                    ),
+                );
+                Some(1)
+            }
+        }
+
+        probe::SocketVerdict::Unreachable => {
+            // Two independent signals agree. That is a real outage.
+            snap.detail =
+                format!("{}; and the in-band probe confirms it: {socket_detail}", snap.detail);
+            None
+        }
+
+        probe::SocketVerdict::Indeterminate => {
+            if snap.source == liveness::Source::PidFile
+                && snap.pidfile_evidence == liveness::PidfileEvidence::Absent
+            {
+                // No evidence either way, from the weakest signal. Exit 3 is a
+                // distinct code precisely so this is not counted as an outage:
+                // "we could not tell" and "it is down" call for different
+                // responses, and #5118 is what happens when they share one.
+                reporter.report(
+                    report::Level::Unknown,
+                    &format!(
+                        "LIVENESS UNDETERMINED: a daemon is EXPECTED (autonomy-desired marker \
+                         present, started {}) but this tick found NO evidence either way — {}, \
+                         and the in-band socket probe could not answer: {socket_detail}. This is \
+                         deliberately NOT reported as an outage (#5118): the pid file alone is \
+                         too weak a signal to declare one. Restore the in-band probe (make a \
+                         loom-daemon binary resolvable — LOOM_DAEMON_BIN / PATH / ~/.local/bin — \
+                         and leave LOOM_WATCHDOG_IPC_PROBE enabled), then re-check with \
+                         'loom-daemon health'.",
+                        snap.started_at.as_deref().unwrap_or(""),
+                        snap.detail
+                    ),
+                );
+                return Some(3);
+            }
+            snap.detail = format!(
+                "{}; the in-band probe could not corroborate: {socket_detail}",
+                snap.detail
+            );
+            None
+        }
+    }
 }

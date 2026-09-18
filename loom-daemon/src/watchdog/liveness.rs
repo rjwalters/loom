@@ -59,6 +59,33 @@ pub struct Snapshot {
     /// not be read — treated as unclean by [`super::remediation::gate`], never
     /// as clean.
     pub last_exit_status: Option<i64>,
+    /// Which signal answered the liveness question. `#5118` turns on this:
+    /// the pid file is the WEAKEST source, and a negative answer from it alone
+    /// must never declare an outage.
+    pub source: Source,
+    /// What the pid file said, when it was the source.
+    pub pidfile_evidence: PidfileEvidence,
+}
+
+/// Which out-of-band signal answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Launchd,
+    Systemd,
+    /// The weakest signal, and the only one #5118 refuses to draw an outage
+    /// from on its own.
+    PidFile,
+}
+
+/// What the pid file showed. Distinct from "not alive", because **absent** and
+/// **dead** call for different conclusions: a dead pid is evidence the process
+/// went away, while an absent file is no evidence at all — and #5118 is the
+/// incident where the second was mistaken for the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidfileEvidence {
+    Alive,
+    Dead,
+    Absent,
 }
 
 impl Snapshot {
@@ -121,6 +148,8 @@ pub fn probe(
             job_loaded: false,
             supervisor_service: None,
             last_exit_status: None,
+            source: Source::PidFile,
+            pidfile_evidence: PidfileEvidence::Absent,
         };
     }
 
@@ -196,6 +225,26 @@ pub fn probe(
         heartbeat_file: Some(heartbeat_file.display().to_string()),
         process_age_secs: process_age,
         job_loaded: liveness.job_loaded,
+        source: if supervisor.use_launchd {
+            Source::Launchd
+        } else if supervisor.use_systemd {
+            Source::Systemd
+        } else {
+            Source::PidFile
+        },
+        pidfile_evidence: match pid_file.as_deref() {
+            Some(p) => {
+                let o = crate::daemon_pidfile::observe(p);
+                if o.recorded_pid_alive {
+                    PidfileEvidence::Alive
+                } else if o.present {
+                    PidfileEvidence::Dead
+                } else {
+                    PidfileEvidence::Absent
+                }
+            }
+            None => PidfileEvidence::Absent,
+        },
         supervisor_service: service.clone(),
         // Only asked when the job is loaded and there is a service to ask
         // about. A supervisor that has no job has no last exit to report, and
@@ -243,6 +292,8 @@ mod tests {
             job_loaded: false,
             supervisor_service: None,
             last_exit_status: None,
+            source: Source::PidFile,
+            pidfile_evidence: PidfileEvidence::Absent,
         }
     }
 
