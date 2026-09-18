@@ -284,6 +284,35 @@ report the same set but different text — ordering, separators, padding — no
 class about *which* references were found explains it. Say so rather than
 letting a coincidentally-applicable class absorb it.
 
+**Some assertions cannot survive, and that is different from failing.** A
+retained suite may assert things about the OLD implementation's *source text*,
+not its behaviour — that a function builds a string with a particular heredoc
+idiom, say. Those greps cannot pass once the file they read is gone, and making
+them pass would mean asserting something about a file the port deletes.
+
+The instinct to delete them is right and the execution is where it goes wrong:
+an assertion protects a property, and removing one without naming what now
+protects that property is how a suite quietly stops proving what it claims.
+
+Retire such an assertion only when all three hold, and say so **in the suite**,
+not only in a commit message:
+
+1. **The property it protected is stated.** For the watchdog's `#7508` scans it
+   was: an unescaped backtick in a heredoc is command-substituted into the body
+   of an issue filed automatically, unattended, during an outage.
+2. **The reason it cannot occur in the port is structural, not incidental.**
+   There is no shell and no heredoc — the body is a string literal. "We were
+   careful" is not structural; "the construct does not exist" is.
+3. **The successor proof is named and is at least as strong.** A static scan
+   checks the body was *built* safely. The differential test checks the body
+   *is the same body*, byte for byte. The second subsumes the first.
+
+**Do not confuse this with an assertion that fails because the port is
+incomplete.** Those are bugs and the suite is right. The distinction is the
+whole point of the exercise: one says "this can never be true again", the other
+says "this is not true yet", and only the first is a retirement. If you cannot
+articulate which one you are looking at, it is the second.
+
 **Every surviving divergence gets written down where the code is**, with the
 direction of its risk. "Kept, because missing a genuine declared reference is
 worse than one extra" is a decision; the same behaviour undocumented is a bug
