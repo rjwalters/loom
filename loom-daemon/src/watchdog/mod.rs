@@ -920,12 +920,15 @@ fn peer_coordination(
                     &hostname,
                     &health.summary,
                 ) {
+                    // Level and wording are contract: the shell reports OK
+                    // here (not WARN) and the retained assertion greps for
+                    // "cleared the escalation sentinel". A paraphrase reads
+                    // the same to a human and silently fails the assertion.
                     reporter.report(
-                        report::Level::Warn,
+                        report::Level::Ok,
                         &format!(
-                            "peer-claim coordination has RECOVERED ({}): commented on and closed \
-                             the tracking issue, cleared the sentinel, and stamped the \
-                             post-recovery cooldown (#6222/#7258).",
+                            "peer-claim coordination has RECOVERED ({}) — closed the tracking \
+                             issue and cleared the escalation sentinel (#6222).",
                             health.summary
                         ),
                     );
@@ -936,9 +939,9 @@ fn peer_coordination(
                     reporter.report(
                         report::Level::Warn,
                         &format!(
-                            "peer-claim coordination has RECOVERED ({}) but the tracking issue \
-                             could not be closed — the sentinel is left in place so a later \
-                             healthy tick retries (#6222).",
+                            "peer-claim coordination has RECOVERED ({}) but closing/commenting \
+                             the tracking issue failed — the sentinel is left in place so a \
+                             later healthy tick retries (#6222).",
                             health.summary
                         ),
                     );

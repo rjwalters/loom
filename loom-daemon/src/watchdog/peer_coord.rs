@@ -240,7 +240,7 @@ pub fn body(hostname: &str, health: &Health, watchdog_log: &Path, sentinel: &Pat
          on `{hostname}` to confirm the live `peer_coordination` state, and check\n\
          Safehouse connectivity to peer hosts (`.loom/docs/safehouse.md`).\n\n\
          **This alert clears itself** — no manual close needed. Filed automatically by\n\
-         the loom-daemon-watchdog peer-coordination escalation (#6222, Layer 3 of\n\
+         the loom-daemon-watchdog.sh peer-coordination escalation (#6222, Layer 3 of\n\
          #6157). Deduped by a sentinel at `{sentinel}`, which is cleared\n\
          automatically (and this issue commented on + closed) once a later watchdog\n\
          tick observes `peer_coordination` back to healthy.\n",
@@ -547,5 +547,90 @@ mod tests {
         // `now` before the recorded recovery: saturating_sub keeps elapsed at 0,
         // so the full window remains rather than wrapping to a huge number.
         assert_eq!(cooldown_remaining(&p, 1000, 3600), Some(3600));
+    }
+}
+
+#[cfg(test)]
+mod shell_differential {
+    use super::*;
+
+    /// The #6222 issue body, rendered by the RETIRED shell implementation at
+    /// `143fe332^:defaults/scripts/cli/loom-daemon-watchdog.sh`, for the
+    /// fixture below. Captured by running its own heredoc under bash — not
+    /// retyped, which would only prove the two agree with my typing.
+    ///
+    /// This is the successor proof that lets the three `#7508` static scans be
+    /// retired (`defaults/docs/verification-recipes.md` §6). Those scans
+    /// checked the body was BUILT safely — `read -d \'\'` rather than
+    /// `$(cat <<EOF)`, because wrapping a heredoc in command substitution
+    /// trips a bash 3.2 lexer bug that silently dropped the body 1099 times
+    /// from 2026-08-16. This checks the body IS the same body, byte for byte,
+    /// which subsumes it: a construction defect cannot survive an exact match.
+    const SHELL_RENDERED_BODY: &str = "The `peer_coordination` section of `loom-daemon health` has gone DEGRADED on host\n\
+         `build-01`. This host's one-way peer-claim RECEIVE path (Safehouse, #6157)\n\
+         can no longer be trusted to prove another host has already claimed an issue.\n\
+         This is diagnostic only since Epic #6165 Phase 4 (#6317): it no longer freezes\n\
+         stale-claim reclamation, which now gates solely on the lease record (#6286)\n\
+         (see `.loom/docs/safehouse.md` -> \"Peer-claim coordination: cross-host soft\n\
+         claim (#4028)\").\n\
+         \n\
+         - **Host**: `build-01`\n\
+         - **Verdict**: peer-claim receive path DEGRADED (7 received / 10 advertised), degraded for 300s - 1/3 sustained receive(s) toward recovery\n\
+         - **Degraded for**: 300s\n\
+         - **Recovery progress**: 1/3 consecutive sustained receive(s) toward recovery\n\
+         - **Watchdog log**: `/home/u/.loom/logs/daemon-watchdog.log`\n\
+         \n\
+         **To recover by hand**: run `loom-daemon peer-claims` (or `loom-daemon health`)\n\
+         on `build-01` to confirm the live `peer_coordination` state, and check\n\
+         Safehouse connectivity to peer hosts (`.loom/docs/safehouse.md`).\n\
+         \n\
+         **This alert clears itself** — no manual close needed. Filed automatically by\n\
+         the loom-daemon-watchdog.sh peer-coordination escalation (#6222, Layer 3 of\n\
+         #6157). Deduped by a sentinel at `/home/u/.loom/.watchdog-peer-coordination-escalated`, which is cleared\n\
+         automatically (and this issue commented on + closed) once a later watchdog\n\
+         tick observes `peer_coordination` back to healthy.\n\
+         ";
+
+    fn fixture() -> Health {
+        Health {
+            verdict: Verdict::Degraded,
+            summary: "peer-claim receive path DEGRADED (7 received / 10 advertised), degraded \
+                      for 300s - 1/3 sustained receive(s) toward recovery"
+                .to_string(),
+            degraded_for_secs: Some(300),
+            consecutive: Some(1),
+            recovery_threshold: Some(3),
+        }
+    }
+
+    #[test]
+    fn the_issue_body_is_byte_identical_to_the_shell_it_replaced() {
+        let ours = body(
+            "build-01",
+            &fixture(),
+            Path::new("/home/u/.loom/logs/daemon-watchdog.log"),
+            Path::new("/home/u/.loom/.watchdog-peer-coordination-escalated"),
+        );
+        assert_eq!(
+            ours, SHELL_RENDERED_BODY,
+            "the ported issue body diverged from the shell's. If this is deliberate, say so and \
+             re-capture the constant; if it is not, it is a port defect in text that gets filed \
+             unattended during an outage."
+        );
+        assert_eq!(ours.len(), 1415, "byte count is part of the claim");
+        assert_eq!(ours.lines().count(), 23, "line count is part of the claim");
+    }
+
+    #[test]
+    fn the_body_carries_no_construct_that_could_substitute_a_command() {
+        // What the #7508 scans protected, restated as a property of the port:
+        // there is no shell, no heredoc and no command substitution here, so a
+        // backtick in the prose is inert. Asserting the backticks are PRESENT
+        // is the point — the shell had to escape every one of them, and this
+        // proves the port carries them literally rather than having dodged the
+        // hazard by rewording.
+        let ours = body("build-01", &fixture(), Path::new("/l"), Path::new("/s"));
+        assert!(ours.contains("`peer_coordination`"), "backticks are carried literally");
+        assert!(ours.contains("host's"), "and so is the apostrophe that broke bash 3.2");
     }
 }

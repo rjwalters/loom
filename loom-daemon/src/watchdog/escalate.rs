@@ -112,7 +112,7 @@ pub fn body(ctx: &Context) -> String {
         "`loom-daemon-watchdog.sh` has been unable to restore the loom-daemon on host\n\
          `{host}`. Autonomous dispatch is DOWN and the watchdog bounded-recovery loop\n\
          has stopped trying — this issue is the escalation of last resort (#5391), filed so the\n\
-         outage does not sit unnoticed in a logfile.\n\
+         outage does not sit unnoticed in a logfile.\n\n\
          - **Host**: `{host}`\n\
          - **Socket**: `{socket}`\n\
          - **Intent marker**: `{marker}` (present — a daemon IS expected here)\n\
@@ -120,14 +120,14 @@ pub fn body(ctx: &Context) -> String {
          - **Why recovery stopped**: {reason}\n\
          - **Recovery command**: `{recovery}`\n\
          - **Watchdog log**: `{log}`\n\
-         - **Episode state**: `{state}`\n\
+         - **Episode state**: `{state}`\n\n\
          **To recover by hand**: run `./.loom/scripts/cli/loom-daemon-start.sh [flags]` on that\n\
          host and inspect `loom-daemon status`. The watchdog resumes automatic recovery (with a\n\
          fresh attempt budget) as soon as any tick observes a healthy daemon; deleting\n\
-         `{state}` resets the circuit breaker immediately.\n\
+         `{state}` resets the circuit breaker immediately.\n\n\
          Filed automatically by the loom-daemon-watchdog.sh outage escalation (#5391). Deduped by a\n\
          sentinel at `{sentinel}`, which is cleared automatically once the daemon is\n\
-         healthy again.\n",
+         healthy again.",
         host = ctx.hostname,
         socket = ctx.socket_path.display(),
         marker = ctx.marker.display(),
@@ -305,5 +305,74 @@ mod tests {
     #[test]
     fn no_resolvable_script_yields_none_rather_than_a_guess() {
         assert_eq!(resolve_issue_script(None, Path::new("/nope"), None), None);
+    }
+}
+
+#[cfg(test)]
+mod shell_differential {
+    use super::*;
+
+    /// The #5391 outage-escalation body, rendered by the RETIRED shell at
+    /// `143fe332^:defaults/scripts/cli/loom-daemon-watchdog.sh` for the
+    /// fixture below — captured by running its own heredoc under bash, not
+    /// retyped.
+    ///
+    /// Successor proof for the `#7508` static scans
+    /// (`defaults/docs/verification-recipes.md` §6): those checked the body
+    /// was BUILT safely; this checks it IS the same body, which subsumes them.
+    ///
+    /// It earned that immediately. The port had silently dropped all three
+    /// blank lines between paragraphs, so in Markdown the bullet list would
+    /// have rendered glued to the paragraph above it — in an issue filed
+    /// unattended, during an outage, that nobody reviews before it is posted.
+    /// Every behavioural assertion in the retained suite passed throughout.
+    const SHELL_RENDERED_BODY: &str = "`loom-daemon-watchdog.sh` has been unable to restore the loom-daemon on host\n\
+         `build-01`. Autonomous dispatch is DOWN and the watchdog bounded-recovery loop\n\
+         has stopped trying — this issue is the escalation of last resort (#5391), filed so the\n\
+         outage does not sit unnoticed in a logfile.\n\
+         \n\
+         - **Host**: `build-01`\n\
+         - **Socket**: `/home/u/.loom/loom-daemon.sock`\n\
+         - **Intent marker**: `/home/u/.loom/autonomy-desired` (present — a daemon IS expected here)\n\
+         - **Observed**: launchd job gui/501/com.x is not loaded/alive\n\
+         - **Why recovery stopped**: the circuit breaker is OPEN\n\
+         - **Recovery command**: `/home/u/.loom/scripts/cli/loom-daemon-start.sh`\n\
+         - **Watchdog log**: `/home/u/.loom/logs/daemon-watchdog.log`\n\
+         - **Episode state**: `/home/u/.loom/.watchdog-recovery-state`\n\
+         \n\
+         **To recover by hand**: run `./.loom/scripts/cli/loom-daemon-start.sh [flags]` on that\n\
+         host and inspect `loom-daemon status`. The watchdog resumes automatic recovery (with a\n\
+         fresh attempt budget) as soon as any tick observes a healthy daemon; deleting\n\
+         `/home/u/.loom/.watchdog-recovery-state` resets the circuit breaker immediately.\n\
+         \n\
+         Filed automatically by the loom-daemon-watchdog.sh outage escalation (#5391). Deduped by a\n\
+         sentinel at `/home/u/.loom/.watchdog-outage-escalated`, which is cleared automatically once the daemon is\n\
+         healthy again.";
+
+    #[test]
+    fn the_outage_issue_body_is_byte_identical_to_the_shell_it_replaced() {
+        let ctx = Context {
+            hostname: "build-01",
+            socket_path: Path::new("/home/u/.loom/loom-daemon.sock"),
+            marker: Path::new("/home/u/.loom/autonomy-desired"),
+            liveness_detail: "launchd job gui/501/com.x is not loaded/alive",
+            reason: "the circuit breaker is OPEN",
+            recovery_argv_detail: Some("/home/u/.loom/scripts/cli/loom-daemon-start.sh"),
+            watchdog_log: Path::new("/home/u/.loom/logs/daemon-watchdog.log"),
+            recovery_state: Path::new("/home/u/.loom/.watchdog-recovery-state"),
+            sentinel: Path::new("/home/u/.loom/.watchdog-outage-escalated"),
+        };
+        let ours = body(&ctx);
+        assert_eq!(
+            ours, SHELL_RENDERED_BODY,
+            "the ported outage body diverged from the shell's. If deliberate, say so and \
+             re-capture the constant; if not, it is a port defect in text filed unattended \
+             during an outage."
+        );
+        assert_eq!(ours.len(), 1314, "byte count is part of the claim");
+        // 22, not the 21 `wc -l` reports: this body deliberately ends WITHOUT
+        // a trailing newline (the shell's `$(...)` strips it), and `wc -l`
+        // counts newlines rather than lines.
+        assert_eq!(ours.lines().count(), 22, "line count is part of the claim");
     }
 }
