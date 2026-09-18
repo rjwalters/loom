@@ -6659,11 +6659,11 @@ _extract_rm_targets_scan() {
 #      ambiguity must never resolve to an allow. The ONE exception is the
 #      exact, self-referential canonicalization chain described in
 #      _mktemp_canon_mask()'s own doc comment below (#7986) — a SECOND
-#      assignment whose entire RHS is the exact `$(cd "$NAME" && pwd -P)` /
-#      `$(realpath "$NAME")` form (optionally double-quoted) naming the SAME
-#      variable the first, mktemp-shaped assignment already proved safe.
-#      Every other second-assignment shape, any THIRD assignment, and any
-#      ordering other than mktemp-then-canonicalization still fail closed.
+#      assignment whose entire RHS is the exact `$(realpath "$NAME")` form
+#      (optionally double-quoted) naming the SAME variable the first,
+#      mktemp-shaped assignment already proved safe. Every other
+#      second-assignment shape, any THIRD assignment, and any ordering other
+#      than mktemp-then-canonicalization still fail closed.
 #
 # On success, the caller treats the target as a proven /tmp-or-$TMPDIR-rooted
 # path and skips BOTH the unresolved-var deny AND the string-prefix scope
@@ -6717,30 +6717,41 @@ _rm_scope_bare_var_name() {
 # The ambiguity rule above (point 3) is correct in general but also fails
 # closed on the routine realpath-canonicalization idiom that resolves a
 # symlinked temp root (macOS /tmp -> /private/tmp) before use:
-#   TMPROOT=$(mktemp -d); TMPROOT=$(cd "$TMPROOT" && pwd -P); rm -rf "$TMPROOT"
+#   TMPROOT=$(mktemp -d); TMPROOT=$(realpath "$TMPROOT"); rm -rf "$TMPROOT"
 # The second assignment cannot produce a value outside the directory the FIRST
-# assignment already proved mktemp-safe: `cd` either fails — the `$(...)`
+# assignment already proved mktemp-safe: `realpath` either fails — the `$(...)`
 # captures nothing and NAME becomes EMPTY, which no consumer of these two fast
-# paths can turn into a destructive path — or it succeeds and `pwd -P` prints
-# the canonical absolute path of that SAME directory. The same holds for
-# `realpath "$NAME"` (prints the canonical path of the same object, or
-# nothing when it fails).
+# paths can turn into a destructive path — or it succeeds and prints the
+# canonical absolute path of that SAME directory.
+#
+# ONLY `realpath "$NAME"` is admitted — a `$(cd "$NAME" && pwd -P)` RHS is
+# deliberately NOT masked (PR #8016 review): `cd ""` is a documented no-op
+# SUCCESS, not a failure, on bash 3.2 (macOS stock `/bin/bash`), zsh and
+# `/bin/sh` — so when `mktemp` fails and NAME is empty, `$(cd "$NAME" &&
+# pwd -P)` on those shells prints the CALLER's cwd rather than staying empty,
+# and a `;`/newline-joined chain still runs that assignment even though the
+# first one failed. That turns a benign `mktemp`-failure no-op into
+# `rm -rf <cwd>` / a write into <cwd> — exactly the catastrophic-tier mistake
+# this fast path exists to prevent. `realpath ""` has no such failure mode: it
+# is a plain external command with no shell-builtin "empty path = cwd" special
+# case, so it fails (and prints nothing) on every join style.
 #
 # This is deliberately NOT a general "a safe-looking reassignment is fine"
-# rule. _mktemp_canon_mask() rewrites ONLY these two EXACT strings, built
-# around the variable's OWN name (a canonicalization of any OTHER variable
-# never matches, and neither does any prefix/suffix/spacing variation), into
-# one opaque token carrying no shell separator:
-#   $(cd "$NAME" && pwd -P)      $(realpath "$NAME")
+# rule. _mktemp_canon_mask() rewrites ONLY this ONE EXACT string, built around
+# the variable's OWN name (a canonicalization of any OTHER variable never
+# matches, and neither does any prefix/suffix/spacing variation), into one
+# opaque token carrying no shell separator:
+#   $(realpath "$NAME")
 # Masking is what makes the chain VISIBLE to the segment scan at all: qsplit()
-# is a quote-aware splitter with no `$( )` nesting awareness, so the `&&`
-# inside `$(cd "$NAME" && pwd -P)` would otherwise split that one assignment
-# into two phantom segments. Masking happens on a LOCAL working copy, before
-# the scan, and the scan then treats a segment whose ENTIRE RHS is the token
-# (optionally double-quoted, for the `NAME="$(cd "$NAME" && pwd -P)"` form) as
-# the canonicalization assignment. A RHS that merely CONTAINS the token
-# (`NAME=/etc$(cd "$NAME" && pwd -P)`) is not an exact match, so it stays
-# counted as an ordinary ambiguous reassignment and still fails closed.
+# is a quote-aware splitter with no `$( )` nesting awareness — a future
+# admitted form containing its own `&&`/`;` inside the `$( )` would otherwise
+# be split into phantom segments by qsplit() before the scan ever sees it, so
+# masking happens on a LOCAL working copy, before the scan. The scan then
+# treats a segment whose ENTIRE RHS is the token (optionally double-quoted,
+# for the `NAME="$(realpath "$NAME")"` form) as the canonicalization
+# assignment. A RHS that merely CONTAINS the token (`NAME=/etc$(realpath
+# "$NAME")`) is not an exact match, so it stays counted as an ordinary
+# ambiguous reassignment and still fails closed.
 #
 # Fail-closed detail: if the token's own bytes are already present in the
 # command text (they cannot be typed by accident — the token is delimited by
@@ -6755,21 +6766,19 @@ _rm_scope_bare_var_name() {
 _MKTEMP_CANON_TOKEN=$'\001LOOM_MKTEMP_CANON\001'
 _MKTEMP_CANON_MASKED=""
 _mktemp_canon_mask() {
-    local varname="$1" cmdtext="$2" needle_cd needle_rp masked
+    local varname="$1" cmdtext="$2" needle_rp masked
     _MKTEMP_CANON_MASKED=""
     case "$cmdtext" in
         *"$_MKTEMP_CANON_TOKEN"*) return 1 ;;
     esac
-    needle_cd='$(cd "$'"$varname"'" && pwd -P)'
     needle_rp='$(realpath "$'"$varname"'")'
     masked="$cmdtext"
-    # Both needles are pattern-METACHARACTER-FREE by construction (varname is
-    # [A-Za-z_][A-Za-z0-9_]*, and neither literal contains *, ?, [ or \), so
-    # they are spelled UNQUOTED in the pattern position on purpose: a
-    # metachar-free pattern means the same thing to bash 3.2 (macOS stock) and
-    # to bash 5, with no version-dependent question about how the quote
-    # characters inside a QUOTED pattern are handled.
-    masked="${masked//$needle_cd/$_MKTEMP_CANON_TOKEN}"
+    # The needle is pattern-METACHARACTER-FREE by construction (varname is
+    # [A-Za-z_][A-Za-z0-9_]*, and the literal contains no *, ?, [ or \), so it
+    # is spelled UNQUOTED in the pattern position on purpose: a metachar-free
+    # pattern means the same thing to bash 3.2 (macOS stock) and to bash 5,
+    # with no version-dependent question about how the quote characters
+    # inside a QUOTED pattern are handled.
     masked="${masked//$needle_rp/$_MKTEMP_CANON_TOKEN}"
     _MKTEMP_CANON_MASKED="$masked"
     return 0
@@ -6855,10 +6864,10 @@ rm_scope_mktemp_same_command_safe() {
 #      to NAME anywhere in the command poison the resolution and fail closed),
 #      INCLUDING that rule's one exception: the exact self-referential
 #      canonicalization chain of #7986 (`NAME=$(mktemp -d)` followed by
-#      exactly one `NAME=$(cd "$NAME" && pwd -P)` / `NAME=$(realpath "$NAME")`
-#      assignment). Both fast paths share _mktemp_canon_mask() and apply the
-#      identical two-assignment END rule, so they cannot drift apart on the
-#      shape they admit — see that function's doc comment above.
+#      exactly one `NAME=$(realpath "$NAME")` assignment). Both fast paths
+#      share _mktemp_canon_mask() and apply the identical two-assignment END
+#      rule, so they cannot drift apart on the shape they admit — see that
+#      function's doc comment above.
 #   2. A NEW safety condition the rm-scope original does not need, precisely
 #      because it never allows a suffix at all: any `..` path-traversal
 #      component in the suffix (`/../`, or a suffix that IS or ends in `/..`)
