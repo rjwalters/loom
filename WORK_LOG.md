@@ -7,6 +7,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8110** (closed): sweep-summary-output.md loads in only 12 of 123 finished Mode A/B sweeps — the settle step is being skipped
+- **PR #8132**: fix(sweep): make the settle step reachable, not recognised (#8110)
+- **Issue #7964** (closed): auto_update: fall back to the mirrored ~/.local/share/loom-daemon/defaults copy when --resolve-json produces no JSON
+- **PR #8128**: fix(auto_update): fall back to the machine-level mirror when fetching the update script
+- **Issue #8129** (closed): main is broken: SweepOutcomeRecord missing doctor_cycles/failure_class/models_used in sweep_outcome_summary/tests.rs
+- **PR #8130**: fix(daemon): add missing SweepOutcomeRecord fields in sweep_outcome_summary tests
+- **Issue #8094** (closed): differential_extract_refs corpus has zero comments: the comment-filter half of extract-refs is not differentially covered
+- **PR #8125**: test(dep_recheck): differentially cover extract-refs' comment half
 - **Issue #8057** (closed): sweep-outcomes summary: fleet-wide, grouped by arm/model/repo/day, spawn-death exclusion, merge join, merges per weighted token
 - **PR #8082**: feat(daemon): sweep-outcomes summary — fleet-wide grouped outcome report
 - **PR #8096**: feat(telemetry): failure_class, models_used, doctor_cycles on sweep.outcome; real token_account/effort (#8056 Phase 1)
