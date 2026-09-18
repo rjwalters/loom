@@ -50,6 +50,8 @@ pub mod resource_usage;
 mod schema;
 pub mod stats;
 pub mod test_parser;
+pub mod transcript_ingest;
+pub mod transcript_parse;
 pub mod tuning;
 
 // Re-export public types from models
@@ -77,6 +79,11 @@ pub use db::ActivityDb;
 // (e.g. the GitHub metrics collector) can self-initialize the activity DB schema
 // without routing through `ActivityDb`.
 pub use schema::init_schema;
+
+// Transcript token-usage ingestion (Issue #8059) — the dispatch-path writer
+// for `resource_usage`, which the managed-terminal-only IPC path never reached.
+pub use transcript_ingest::{ingest, IngestOptions, IngestStats};
+pub use transcript_parse::{attribute_role, parse_transcript, ParsedTranscript, UsageBucket};
 
 // Re-export resource usage parsing and cost calculation
 // Used internally by db.rs for terminal output parsing

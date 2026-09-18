@@ -630,12 +630,11 @@ pub fn sum_transcript_usage(path: &Path) -> TranscriptUsage {
     out
 }
 
-/// Bucket for a usage block whose `model` is absent, or is the literal
-/// `"<synthetic>"` Claude Code stamps on certain internal/tool-echo messages
-/// (issue #5740). Grouped explicitly rather than dropped, so the sum across
-/// every [`sum_transcript_usage_by_model`] entry still reconciles against the
-/// flat total [`sum_transcript_usage`] reports for the same file.
-pub const UNATTRIBUTED_MODEL: &str = "<unattributed>";
+/// Re-exported from [`super::transcript_usage`], which owns the per-record
+/// decoding this module folds (issue #8059 moved it there so the `activity.db`
+/// ingestion path reads records identically). Kept re-exported here because
+/// existing callers import it from this module.
+pub use super::transcript_usage::UNATTRIBUTED_MODEL;
 
 /// Per-`(model, speed, service_tier)` totals — the raw counts a `tokens_by_model`
 /// consumer needs to price a sweep, since a single summed `tokens` number
@@ -671,22 +670,21 @@ pub struct ModelUsageTotals {
 /// [`sum_transcript_usage`]: unreadable lines are skipped, a missing file
 /// yields an empty result.
 ///
-/// The 5-minute/1-hour cache-write split reads
-/// `cache_creation.ephemeral_5m_input_tokens`/`ephemeral_1h_input_tokens`
-/// from each usage block. When that nested object is absent (an older
-/// transcript format that only ever wrote the flat
-/// `cache_creation_input_tokens`), the whole flat value is attributed to the
-/// 1-hour bucket — this host's own transcripts show the 1-hour bucket
-/// outweighing the 5-minute one 212x, so that is the safer default and it
-/// keeps every entry's counters reconciling against
-/// [`sum_transcript_usage`]'s flat total rather than silently under-counting.
-/// `speed`/`service_tier` default to `"standard"` when absent, matching both
-/// this host's observed values and the pricing table's own default.
+/// Per-record decoding (the model bucketing, the `speed`/`service_tier`
+/// defaults, the 5-minute/1-hour cache-write split and its flat-only
+/// fallback) is [`super::transcript_usage::usage_from_record`]; this function
+/// only folds those records into per-tuple totals.
+///
+/// **Not deduped on `message.id`** — a streamed message's chunks each repeat
+/// the id carrying cumulative usage, so a streamed message is counted once per
+/// chunk here. That is long-standing behaviour the existing consumers (the
+/// safehouse completion feed, `sweep.outcome`) are calibrated against, so
+/// #8059 left it alone and deduped in its own `activity.db` ingestion fold
+/// instead.
 ///
 /// Returned in a deterministic order (sorted by the grouping tuple), not
 /// insertion order, so callers get stable output for tests/snapshots.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
 pub fn sum_transcript_usage_by_model(path: &Path) -> Vec<ModelUsageTotals> {
     let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -700,56 +698,21 @@ pub fn sum_transcript_usage_by_model(path: &Path) -> Vec<ModelUsageTotals> {
         let Ok(obj) = serde_json::from_str::<Value>(raw) else {
             continue;
         };
-        let container = obj.get("message").filter(|m| m.is_object()).unwrap_or(&obj);
-        let Some(container) = container.as_object() else {
+        let Some(rec) = super::transcript_usage::usage_from_record(&obj) else {
             continue;
         };
-        let Some(usage) = container.get("usage").and_then(Value::as_object) else {
-            continue;
-        };
-        let model = container
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty() && *s != "<synthetic>")
-            .unwrap_or(UNATTRIBUTED_MODEL)
-            .to_string();
-        let speed = usage
-            .get("speed")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("standard")
-            .to_string();
-        let service_tier = usage
-            .get("service_tier")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("standard")
-            .to_string();
-
-        let get = |k: &str| usage.get(k).and_then(Value::as_f64).unwrap_or(0.0) as i64;
-        let cache_creation = usage.get("cache_creation").and_then(Value::as_object);
-        let (cache_write_5m, cache_write_1h) = match cache_creation {
-            Some(c) => {
-                let field = |k: &str| c.get(k).and_then(Value::as_f64).unwrap_or(0.0) as i64;
-                (field("ephemeral_5m_input_tokens"), field("ephemeral_1h_input_tokens"))
-            }
-            // No split available — attribute the flat total to the 1-hour
-            // bucket (see doc comment above) so nothing is silently dropped.
-            None => (0, get("cache_creation_input_tokens")),
-        };
-
-        let key = (model.clone(), speed.clone(), service_tier.clone());
+        let key = (rec.model.clone(), rec.speed.clone(), rec.service_tier.clone());
         let entry = totals.entry(key).or_insert_with(|| ModelUsageTotals {
-            model,
-            speed,
-            service_tier,
+            model: rec.model,
+            speed: rec.speed,
+            service_tier: rec.service_tier,
             ..ModelUsageTotals::default()
         });
-        entry.input += get("input_tokens");
-        entry.cache_read += get("cache_read_input_tokens");
-        entry.cache_write_5m += cache_write_5m;
-        entry.cache_write_1h += cache_write_1h;
-        entry.output += get("output_tokens");
+        entry.input += rec.input;
+        entry.cache_read += rec.cache_read;
+        entry.cache_write_5m += rec.cache_write_5m;
+        entry.cache_write_1h += rec.cache_write_1h;
+        entry.output += rec.output;
     }
     totals.into_values().collect()
 }

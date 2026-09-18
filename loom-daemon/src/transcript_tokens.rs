@@ -184,7 +184,12 @@ fn mtime_in_window(path: &Path, window: Option<(DateTime<Utc>, DateTime<Utc>)>) 
 /// `<uuid>/subagents/*.jsonl`. Subagent records are not duplicated into the
 /// parent file (the parent carries no `isSidechain` records), so summing both
 /// does not double-count.
-fn session_transcripts(session_jsonl: &Path) -> Vec<PathBuf> {
+///
+/// Public since #8059: `activity::transcript_ingest` enumerates exactly the
+/// same set of files when ingesting token usage into `activity.db`, and a
+/// second private copy of this walk would be free to drift from this one.
+#[must_use]
+pub fn session_transcripts(session_jsonl: &Path) -> Vec<PathBuf> {
     let mut out = vec![session_jsonl.to_path_buf()];
     let subagents = session_jsonl.with_extension("").join("subagents");
     if let Ok(entries) = std::fs::read_dir(&subagents) {
