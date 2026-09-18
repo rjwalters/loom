@@ -31,6 +31,8 @@ pub(crate) mod stats;
 pub(crate) mod status;
 pub(crate) mod status_render;
 pub(crate) mod sweep_outcomes_cli;
+pub(crate) mod telemetry;
 pub(crate) mod tokens;
+pub(crate) mod transcript_ingest_cli;
 pub(crate) mod watch;
 pub(crate) mod workspace_fleet;

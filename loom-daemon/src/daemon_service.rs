@@ -5,7 +5,7 @@
 //! resolution, every autonomous subsystem's startup wiring, and the IPC
 //! accept loop that only returns on a startup failure.
 
-use loom_daemon::activity::ActivityDb;
+use loom_daemon::activity::{self, ActivityDb};
 use loom_daemon::admission_brake;
 use loom_daemon::auto_update;
 use loom_daemon::autonomy_marker;
@@ -315,13 +315,20 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     // Start GitHub metrics collection (if workspace is set)
     // Workspace can be set via LOOM_WORKSPACE environment variable (reuse variable from above)
-    let db_path_str = db_path.to_str().map(std::string::ToString::to_string);
+    let db_str = db_path.to_str().map(std::string::ToString::to_string);
 
-    if let (Some(workspace), Some(db_path_string)) = (workspace_from_env.as_deref(), db_path_str) {
-        let _metrics_handle =
-            metrics_collector::try_init_metrics_collector(Some(workspace), &db_path_string);
+    if let (Some(workspace), Some(db)) = (workspace_from_env.as_deref(), db_str) {
+        let _metrics_handle = metrics_collector::try_init_metrics_collector(Some(workspace), &db);
         // Note: metrics_handle is dropped here, but the thread keeps running if enabled
     }
+
+    // Start transcript token ingestion (Issue #8059, opt-in via
+    // LOOM_TRANSCRIPT_INGEST=1). This is the only writer `resource_usage` has
+    // on a dispatch-driven host — the IPC `GetTerminalOutput` path a
+    // `claude -p` sweep never traverses is the other one. Independent of the
+    // workspace: it reads every project's transcripts under
+    // `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`. Handle dropped, thread runs on.
+    let _ingest_handle = activity::transcript_ingest::try_init_transcript_ingest(&db_path);
 
     // Initialize the sweep registry (Issue #3452 — Phase A of #3449).
     // The registry tracks `/loom:sweep` children dispatched via the

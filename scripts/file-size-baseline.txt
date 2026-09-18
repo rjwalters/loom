@@ -47,7 +47,7 @@
 1344 loom-daemon/src/install_self_check.rs
 3138 loom-daemon/src/ipc.rs
 4194 loom-daemon/src/ipc/tests.rs
-1229 loom-daemon/src/main.rs
+1224 loom-daemon/src/main.rs
 1815 loom-daemon/src/main_health_gate.rs
 2318 loom-daemon/src/main_health_gate/tests.rs
 1715 loom-daemon/src/orphan_process_reaper.rs
@@ -56,7 +56,7 @@
 3850 loom-daemon/src/role_runner/tests.rs
 2443 loom-daemon/src/safehouse.rs
 3913 loom-daemon/src/safehouse/tests.rs
-1564 loom-daemon/src/script_helpers/sweep_experiment.rs
+1532 loom-daemon/src/script_helpers/sweep_experiment.rs
 1946 loom-daemon/src/script_helpers/validate_phase.rs
 1839 loom-daemon/src/serve.rs
 1132 loom-daemon/src/stash_retirement.rs

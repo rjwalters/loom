@@ -864,16 +864,13 @@ enum Commands {
         runtime: String,
     },
 
-    /// Query Claude API usage via the Anthropic OAuth API (native port of
-    /// `loom_tools.common.usage`, #4275). Backs `check-usage.sh`.
-    ///
-    /// Exits 1 when the payload carries an `error` key (no Keychain token, API
-    /// failure, or not inside a Loom repo) — the historical contract.
-    Usage {
-        /// Print a human-readable status block instead of JSON.
-        #[arg(long)]
-        status: bool,
-    },
+    /// Token-cost telemetry: `usage` (live, from the Anthropic OAuth API) and
+    /// `ingest-transcripts` (#8059 — persist transcript token usage into
+    /// `activity.db`). Flattened, so each stays top-level; the args and their
+    /// docs live in `cli::telemetry` because this file is frozen by the
+    /// file-size ratchet.
+    #[command(flatten)]
+    Telemetry(cli::telemetry::TelemetryCommand),
 
     /// Manage builder checkpoints for progress tracking (native port of
     /// `loom_tools.checkpoints`, #4275). Backs `checkpoint.sh`.
@@ -2531,10 +2528,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             tier.as_deref(),
             &runtime,
         ),
-        Commands::Usage { status } => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            std::process::exit(script_helpers::usage::run(status, &cwd));
-        }
+        Commands::Telemetry(cmd) => cmd.run(),
         Commands::Checkpoint { action } => handle_checkpoint_command(action),
         Commands::Claim { command, args } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

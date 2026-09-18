@@ -119,6 +119,14 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_metrics_status ON agent_metrics(status);
 
             -- Token usage per API request (enhanced for LLM resource tracking)
+            --
+            -- SUPERSEDED (Issue #8059): this table has never had a writer, and
+            -- transcript ingestion deliberately does not add one — it writes to
+            -- `resource_usage` instead, which every cost analytics view already
+            -- reads and which carries the same counters. Writing both would
+            -- double-book the same tokens in one database. Kept (not dropped)
+            -- because older databases may contain rows and nothing depends on
+            -- removing it; do not add a writer without retiring one side first.
             CREATE TABLE IF NOT EXISTS token_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 input_id INTEGER REFERENCES agent_inputs(id),
@@ -252,6 +260,26 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_resource_usage_timestamp ON resource_usage(timestamp);
             CREATE INDEX IF NOT EXISTS idx_resource_usage_model ON resource_usage(model);
             CREATE INDEX IF NOT EXISTS idx_resource_usage_provider ON resource_usage(provider);
+
+            -- Transcript ingestion ledger (Issue #8059)
+            -- One row per Claude Code transcript whose token usage has been
+            -- ingested into resource_usage. `file_size`/`file_mtime` make an
+            -- unchanged transcript a cheap skip; `input_id` is the agent_inputs
+            -- anchor whose resource_usage rows are REPLACED (not appended to)
+            -- when a still-growing transcript is re-read, so repeated passes
+            -- can neither double-count nor miss a live session's tail.
+            CREATE TABLE IF NOT EXISTS transcript_ingest (
+                transcript_path TEXT PRIMARY KEY,
+                session_id TEXT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                file_size INTEGER NOT NULL,
+                file_mtime INTEGER NOT NULL,
+                rows_written INTEGER NOT NULL DEFAULT 0,
+                ingested_at DATETIME NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transcript_ingest_session ON transcript_ingest(session_id);
+            CREATE INDEX IF NOT EXISTS idx_transcript_ingest_input_id ON transcript_ingest(input_id);
 
             -- Budget configuration for cost tracking (Issue #1064)
             -- Allows setting budget limits per period with alert thresholds
