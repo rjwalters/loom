@@ -7,6 +7,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8165** (closed): resync-installed.sh: comm locale, unanchored install-subject regex alternative, misplaced fixture comment (nits from #7870 review)
+- **PR #8225**: fix(resync): pin comm to LC_ALL=C in removed_line_count()
+- **PR #8223**: feat(telemetry): add role_tick.outcome record for role-runner ticks
+- **Issue #8121** (closed): workspace add reports 'Registered' but silently skips the hot-apply when run outside the daemon's workspace directory
+- **PR #8216**: fix(daemon): hot-apply workspace registry edits during rate-limit suppression
+- **Issue #8116** (closed): claim_reconciliation + worktree_reaper undo in-session builders: no lease record, so loom:building is flipped back and target/ is reaped mid-build
+- **PR #8081**: feat(sweep-experiment): fleet-wide repo-stratified model A/B — plan, start, stop (#8055 phases 1-2)
 - **Issue #8176** (closed): Shell suites can silently test a stale or foreign loom-daemon when CARGO_TARGET_DIR is shared (false T15-style regressions)
 - **PR #8205**: fix(tests): pin the freshest repo build and snapshot it in require-daemon-bin
 - **Issue #8098** (closed): resync local-divergence gate (#7864): three shapes the gate does not cover — uncommitted fixes, pure-deletion fixes, and the unanchored legacy-install subject
