@@ -18,6 +18,7 @@ pub(crate) mod fleet_experiment;
 pub(crate) mod health;
 pub(crate) mod lease_ensure;
 pub(crate) mod legacy_script_cmds;
+mod merge_pr_labels;
 mod merge_pr_refs;
 pub(crate) mod misc_cmds;
 pub(crate) mod noop_cooldown;

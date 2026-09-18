@@ -488,11 +488,11 @@ fi
 PR_JSON=$(forge_get_pr "$REPO_NWO" "$PR_NUMBER" "$GH") || \
   error "Could not fetch PR #$PR_NUMBER"
 
-PR_STATE=$(echo "$PR_JSON" | jq -r '.state')
-PR_MERGED=$(echo "$PR_JSON" | jq -r '.merged')
-PR_BRANCH=$(echo "$PR_JSON" | jq -r '.head.ref')
-PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
-PR_MERGEABLE=$(echo "$PR_JSON" | jq -r '.mergeable')
+# Combined onto two lines (net code-line offset for the #8112 guard added
+# below — file-size-policy.md's "remove at least as much as you added"; a
+# verbatim, behavior-preserving chain, not a reformat of anything else).
+PR_STATE=$(echo "$PR_JSON" | jq -r '.state'); PR_MERGED=$(echo "$PR_JSON" | jq -r '.merged'); PR_BRANCH=$(echo "$PR_JSON" | jq -r '.head.ref')
+PR_TITLE=$(echo "$PR_JSON" | jq -r '.title'); PR_MERGEABLE=$(echo "$PR_JSON" | jq -r '.mergeable')
 # Head SHA (#4100): the safety criterion for local-branch deletion. A local
 # branch whose tip equals this SHA carries no commits absent from the merged
 # PR, so it is safe to force-delete even though it will never satisfy
@@ -854,6 +854,31 @@ _check_loom_pr_label
 #
 # Verifying in isolation, as the original fix did, tested the function and not
 # the call shape. This is the call shape.
+
+# ---------------------------------------------------------------------------
+# Pre-merge verdict-label contradiction guard (#8112).
+#
+# A PR can carry BOTH `loom:pr` (approved) and a blocking verdict/hold label
+# simultaneously — two concurrent Judge passes reaching different verdicts on
+# the same head ~45s apart is a real, observed incident (PR #8076), not a
+# hypothetical. `_check_loom_pr_label` above only checks loom:pr's ABSENCE; it
+# has no way to see a contradicting label standing beside a PRESENT loom:pr.
+#
+# Judge/Doctor's Verdict-Time CAS Recheck (judge.md / doctor.md) and
+# Champion's Verdict-State Janitor Part 1 (champion-pr-merge.md) already exist
+# to prevent and auto-resolve exactly this contradiction — but both live in
+# markdown-orchestrated agent steps, not in this script, so a human or agent
+# invoking merge-pr.sh directly (the documented, canonical way to merge —
+# never `gh pr merge`, see CLAUDE.md) bypasses them entirely. This guard is
+# the backstop at the one point every merge path actually funnels through.
+#
+# Deliberately no bypass flag: --allow-unapproved overrides "nobody reviewed
+# this head" (an absence of signal); this guard blocks "a reviewer explicitly
+# said no" (a present, contradicting signal). Those are different acts, and
+# only the first has a documented override. The fix for a real block here is
+# a fresh Judge verdict, not a flag.
+_check_verdict_label_contradiction() { local msg rc=0; msg="$(printf '%s\n' "$PR_LABELS" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr verdict-contradiction --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" 2>/dev/null)" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-VERDICT-CLEAN" ]] && return 0; [[ $rc -eq 1 && "$msg" == "Merge blocked:"* ]] || msg="Merge blocked: PR #$PR_NUMBER's verdict-label contradiction guard (#8112) could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr verdict-contradiction' exited $rc without the LOOM-VERDICT-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'found nothing' from 'never ran', so only a positive clean signal is accepted. Build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; error "$msg"; }
+_check_verdict_label_contradiction
 
 # ---------------------------------------------------------------------------
 # Partial-increment closing-keyword conflict detection (#4569, extended by
