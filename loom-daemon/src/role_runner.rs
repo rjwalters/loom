@@ -258,53 +258,6 @@ fn clean_and_cap_detail(text: &str) -> String {
     format!("{capped}… [truncated]")
 }
 
-/// The exact stderr sentinel lines `defaults/scripts/claude-wrapper.sh`
-/// writes immediately before aborting a child WITHOUT ever exec'ing the CLI —
-/// `AUTH_PREFLIGHT_FAILED` at `claude-wrapper.sh:2603`, `MCP_PREFLIGHT_FAILED`
-/// at `:2614` (issue #6757). Matched literally (not a regex — these are
-/// fixed, purpose-built markers, not free-form prose).
-const PREFLIGHT_SENTINELS: &[&str] = &["# AUTH_PREFLIGHT_FAILED", "# MCP_PREFLIGHT_FAILED"];
-
-/// Search `full_log` — the ENTIRE contents of a role's own `role-<role>.log`,
-/// not just the retained [`MAX_OUTPUT_TAIL_BYTES`] tail — for a pre-flight
-/// rejection sentinel (issue #6757). Returns the matched sentinel text.
-///
-/// Full-file search is deliberate and free: every caller already has the
-/// whole file in memory (`tail_of_file`/`read_role_log` read it all via
-/// `std::fs::read_to_string` before truncating to a tail), and the sentinel
-/// can land earlier in the file than the retained tail window if the child
-/// wrote enough unrelated output afterward — the exact scenario the issue
-/// reports (an `INFO` line from `lib/locate-daemon-bin.sh`'s ordinary
-/// resolution logging pushing the sentinel out of the tail window).
-#[must_use]
-fn find_preflight_sentinel(full_log: &str) -> Option<&'static str> {
-    PREFLIGHT_SENTINELS
-        .iter()
-        .copied()
-        .find(|sentinel| full_log.contains(sentinel))
-}
-
-/// Build the `RoleTickOutcome::Failure` detail for a role invocation that
-/// exited non-zero (issue #6757). `full_log` is the role's own log file's
-/// complete contents; `log_path` is that file's path.
-///
-/// When `full_log` carries a [`find_preflight_sentinel`] match, the detail
-/// names the sentinel and points directly at `log_path` — where the full
-/// pre-flight block lives — instead of an arbitrary tail-window fragment of
-/// stderr that varies run to run and frequently has nothing to do with the
-/// real cause. Otherwise falls back to the pre-existing cleaned/capped byte
-/// tail.
-#[must_use]
-fn describe_role_failure(full_log: &str, log_path: &Path) -> String {
-    match find_preflight_sentinel(full_log) {
-        Some(sentinel) => format!(
-            "pre-flight rejected the session ({sentinel}) — see the full pre-flight block in {}",
-            log_path.display()
-        ),
-        None => clean_and_cap_detail(&truncate_tail(full_log)),
-    }
-}
-
 /// A `Success` outcome faster than this is implausible for a real
 /// `claude -p "/<role>"` session — starting the process, authenticating, and
 /// making at least one forge round-trip (list/enrich/label an issue, review a
@@ -1542,7 +1495,7 @@ fn run_role_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return RoleTickOutcome::Success,
             Ok(Some(status)) => {
-                // Issue #6757: prefer a purpose-built pre-flight sentinel
+                // Issues #6757/#8123: prefer a purpose-built failure sentinel
                 // (naming the real cause and the role's own log path) over an
                 // arbitrary tail-window fragment of stderr, when one is
                 // present — see `describe_role_failure`.
@@ -1666,7 +1619,7 @@ extern "C" {
 
 /// Read the full contents of `path` (a role's own log file), for failure-
 /// detail construction that needs more than the retained tail — e.g.
-/// [`find_preflight_sentinel`]'s full-file search (issue #6757). Empty string
+/// [`find_failure_sentinel`]'s full-file search (issues #6757, #8123). Empty string
 /// if unreadable, never panics — mirrors [`tail_of_file`]'s existing
 /// fail-safe read (the same underlying read this function factors out of).
 #[must_use]
@@ -4360,6 +4313,11 @@ fn log_outcome_for_root_deduped(
     pool_exhausted.insert(root.to_path_buf(), action.is_pool_exhausted());
     model_mismatch.insert(root.to_path_buf(), action.is_model_mismatch());
 }
+
+// Failure-sentinel classification for a role's `role-<role>.log` (issues
+// #6757, #8123) — see `role_runner/failure_sentinel.rs`.
+mod failure_sentinel;
+use failure_sentinel::describe_role_failure;
 
 // Roster heartbeat task (Issue #7690 Phase A + #7691 Phase B of #6704) —
 // see `role_runner/roster.rs`.

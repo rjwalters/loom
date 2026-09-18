@@ -98,63 +98,10 @@ fn truncate_tail_falls_back_to_byte_cut_for_a_single_giant_token() {
     assert!(tail.chars().all(|c| c == 'x'));
 }
 
-// -- find_preflight_sentinel / describe_role_failure (#6757 AC1/AC2) ---
-
-#[test]
-fn find_preflight_sentinel_detects_auth_failure() {
-    let log = "some INFO noise\n# AUTH_PREFLIGHT_FAILED\nmore noise after\n";
-    assert_eq!(find_preflight_sentinel(log), Some("# AUTH_PREFLIGHT_FAILED"));
-}
-
-#[test]
-fn find_preflight_sentinel_detects_mcp_failure() {
-    let log = "some INFO noise\n# MCP_PREFLIGHT_FAILED\nmore noise after\n";
-    assert_eq!(find_preflight_sentinel(log), Some("# MCP_PREFLIGHT_FAILED"));
-}
-
-#[test]
-fn find_preflight_sentinel_absent_returns_none() {
-    let log = "just ordinary output, no sentinel here\n";
-    assert_eq!(find_preflight_sentinel(log), None);
-}
-
-#[test]
-fn find_preflight_sentinel_found_even_outside_retained_tail_window() {
-    // Reproduces the issue's exact scenario: the sentinel occurs early
-    // in the log, followed by enough unrelated INFO noise to push it
-    // outside the MAX_OUTPUT_TAIL_BYTES tail window that `tail_of_file`
-    // alone would retain.
-    let noise =
-        "resolved /path/to/loom-daemon via $PATH (mtime: 2026-01-01T00:00:00Z)\n".repeat(100);
-    let log = format!("# MCP_PREFLIGHT_FAILED\n{noise}");
-    assert!(log.len() > MAX_OUTPUT_TAIL_BYTES);
-    // The raw tail window alone no longer contains the sentinel...
-    assert!(!truncate_tail(&log).contains("MCP_PREFLIGHT_FAILED"));
-    // ...but full-file detection still finds it.
-    assert_eq!(find_preflight_sentinel(&log), Some("# MCP_PREFLIGHT_FAILED"));
-}
-
-#[test]
-fn describe_role_failure_names_sentinel_and_log_path_when_present() {
-    let log = "INFO: starting up\n# AUTH_PREFLIGHT_FAILED\nINFO: resolved something unrelated\n";
-    let log_path = Path::new("/tmp/some-workspace/.loom/logs/role-champion.log");
-    let detail = describe_role_failure(log, log_path);
-    assert!(detail.contains("AUTH_PREFLIGHT_FAILED"), "{detail:?}");
-    assert!(
-        detail.contains("/tmp/some-workspace/.loom/logs/role-champion.log"),
-        "{detail:?}"
-    );
-    // Must NOT be the raw trailing noise line.
-    assert!(!detail.contains("resolved something unrelated"), "{detail:?}");
-}
-
-#[test]
-fn describe_role_failure_falls_back_to_tail_when_no_sentinel() {
-    let log = "ordinary error: connection refused\n";
-    let log_path = Path::new("/tmp/some-workspace/.loom/logs/role-judge.log");
-    let detail = describe_role_failure(log, log_path);
-    assert_eq!(detail, "ordinary error: connection refused");
-}
+// `find_failure_sentinel` / `describe_role_failure` (#6757 AC1/AC2, #8123)
+// tests live with their implementation in `role_runner/failure_sentinel.rs`
+// (`.loom/docs/file-size-policy.md` — new code for an over-threshold parent
+// goes to a new sibling module, not inline here).
 
 // -- had_ever_succeeded / failure_history_note (#6757 AC4) --------------
 
