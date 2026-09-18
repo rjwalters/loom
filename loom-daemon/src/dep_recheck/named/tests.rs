@@ -163,6 +163,61 @@ fn an_asterisk_bullet_alone_still_computes_the_verdict_correctly() {
 }
 
 #[test]
+fn a_dependency_phrase_before_the_reference_is_recognised() {
+    // #8119. `extract`'s `phrase_re` already reads every one of these as a
+    // reference; this matcher used to drop them, so the two subcommands
+    // disagreed and the one deciding the verdict was the blind one.
+    for phrase in ["Blocked by", "Depends on", "Requires", "**Epic**"] {
+        let body = format!("## Dependencies\n- [ ] {phrase} #6333: prerequisite feature\n");
+        assert_eq!(parse_entries(&body), vec![(6333, false)], "{phrase}");
+    }
+}
+
+#[test]
+fn a_phrased_item_pointing_at_an_open_reference_blocks() {
+    // The whole point: the phrasing must reach a verdict, not just parse.
+    let body = "## Dependencies\n- [ ] Blocked by #6333: prerequisite feature\n";
+    assert_eq!(parse_entries(body), vec![(6333, false)]);
+    assert_eq!(compute(&[dep(6333, false, Some("OPEN"))]).verdict, "blocked");
+}
+
+#[test]
+fn a_phrased_item_pointing_at_a_finished_reference_is_clear() {
+    // The other direction, so the fix cannot be "always blocked": once the
+    // named reference is done, the same body reports clear.
+    let body = "## Dependencies\n- [ ] Blocked by #6333: prerequisite feature\n";
+    assert_eq!(parse_entries(body), vec![(6333, false)]);
+    for state in ["CLOSED", "MERGED"] {
+        assert_eq!(compute(&[dep(6333, false, Some(state))]).verdict, "clear", "{state}");
+    }
+}
+
+#[test]
+fn a_phrase_and_a_pr_token_may_both_precede_the_reference() {
+    // The #7501 token and the #8119 phrase are independent optional parts:
+    // either, both, or neither. Case is irrelevant to both.
+    let body = "## Dependencies\n- [ ] Blocked by PR #3: x\n- [ ] depends on issue #4: y\n";
+    assert_eq!(parse_entries(body), vec![(3, false), (4, false)]);
+}
+
+#[test]
+fn a_phrase_checklist_item_still_honours_its_checkbox() {
+    // A phrase does not make an item unconditionally blocking — a ticked box
+    // is still the human saying "resolved".
+    let body = "## Dependencies\n- [x] Blocked by #3: done\n- [ ] Requires #4: pending\n";
+    assert_eq!(parse_entries(body), vec![(3, true), (4, false)]);
+}
+
+#[test]
+fn a_phrase_later_in_an_items_prose_does_not_add_a_second_reference() {
+    // The phrase is only read where a reference token would be — directly
+    // after the checkbox. Otherwise `- [ ] #3: blocked by #99` would park work
+    // on #99, a number nobody declared as a prerequisite.
+    let body = "## Dependencies\n- [ ] #3: blocked by #99 in the original design\n";
+    assert_eq!(parse_entries(body), vec![(3, false)]);
+}
+
+#[test]
 fn prose_naming_a_reference_without_a_checkbox_is_not_an_entry() {
     let body = "## Dependencies\n\nThis depends on #3 in spirit.\n";
     assert_eq!(parse_entries(body), vec![]);

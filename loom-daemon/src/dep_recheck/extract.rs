@@ -50,10 +50,19 @@ pub struct Input {
     pub comments: Vec<Comment>,
 }
 
-/// The fixed machine-readable phrasings, reused verbatim from
-/// `detect-dependency-cycle.sh` / `warn-operator-gated.sh` rather than
-/// inventing a second vocabulary. A bare prose mention (a backtick-quoted
-/// `owner/repo#123`, say) deliberately does not count.
+/// The fixed machine-readable dependency phrasings, as a bare regex
+/// alternation — reused verbatim from `detect-dependency-cycle.sh` /
+/// `warn-operator-gated.sh` rather than inventing a second vocabulary.
+///
+/// Shared with [`super::named`]'s checklist-item matcher (#8119) for the same
+/// reason: two subcommands of one crate disagreeing about what counts as a
+/// dependency reference is exactly how `- [ ] Blocked by #N` came to be a
+/// reference here and invisible there.
+pub const DEPENDENCY_PHRASES: &str = r"Blocked by|Depends on|Requires|\*\*Epic\*\*";
+
+/// The fixed machine-readable phrasings ([`DEPENDENCY_PHRASES`]) followed by a
+/// `#N`. A bare prose mention (a backtick-quoted `owner/repo#123`, say)
+/// deliberately does not count.
 ///
 /// **Divergence from the pre-port shell (#8011, kept intentionally):** the
 /// shell matched this pattern with `grep -oE`, which is line-oriented and
@@ -69,7 +78,7 @@ pub struct Input {
 fn phrase_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:\s]*#([0-9]+)")
+        Regex::new(&format!(r"({DEPENDENCY_PHRASES})[*_:\s]*#([0-9]+)"))
             .expect("static dependency-phrase pattern")
     })
 }
