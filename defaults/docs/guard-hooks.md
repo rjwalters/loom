@@ -872,6 +872,33 @@ This does not touch `guard-worktree-paths.sh` (the `Edit|Write` matcher):
 every role on the allowlist above structurally has no Write/Edit tool to
 begin with, so that guard was never reachable for them.
 
+**An unquoted heredoc body is not literal (issue #8035).** `cat > /tmp/x
+<<EOF` does **not** make its body inert: the shell performs command
+substitution on an *unquoted*-delimiter body *before* the sink reads a byte,
+so a `cp` / `mv` / `mkdir` / `sed -i` hidden in a `$( … )` or backtick span
+there really executes. The masker already knew this (`<<EOF` bodies keep
+their live spans visible, #7421), but nothing downstream did: every write
+idiom is keyed on the **command word** of a `;`/`&`/`|`-delimited segment,
+and `$(`/`)` is not a segment boundary — the whole heredoc invocation is one
+segment whose command word is `cat`, so the escaping write was never scored
+as a write target at all. `extract_write_targets()` now runs a **second,
+independent pass** over the inner text of each such span
+(`heredoc_unquoted_subst_spans()`), which makes that `cp` the command word of
+its own segment and denies exactly as the bare `cp …` control does. Same
+shape, same discriminator, and the same deliberate quote-blindness as the
+index-mutation side's `im_hd_expand()` (#8003): quote characters carry no
+quoting meaning inside a heredoc body, so a span wrapped in quotes expands
+like a bare one, and only a **backslash** suppresses it (`\$( … )` stays
+inert). A **quoted** delimiter (`<<'EOF'` / `<<"EOF"`) is skipped entirely —
+that body genuinely is literal, which is the whole reason the masker may
+blank it. The pass is purely additive (a separate awk process, never sharing
+lexer state with the primary scan), so it can turn an allow into a deny and
+never the reverse; an unbalanced `$(`, an unterminated backtick, or
+recursion past depth 5 yields **no** span, i.e. the pre-#8035 not-covered
+behaviour rather than a new false positive on prose. The sibling
+`extract_rm_targets()` scan has the same structural blind spot and is
+**not** covered here (tracked separately).
+
 The guard is **on by default**. It is resolved in this order (highest precedence first):
 
 1. **`LOOM_GUARD_WORKTREE_ISOLATION` env var** — `0`/`false`/`no` disables the guard; `1`/`true`/`yes` forces it on. Overrides the config value.
