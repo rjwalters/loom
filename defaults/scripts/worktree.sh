@@ -273,61 +273,48 @@ _worktree_lock_path() {
 WORKTREE_LOCK_HOLDER_PID=""
 WORKTREE_LOCK_TOKEN=""
 
-acquire_worktree_lock() {
-    local issue="$1"
-    local lock
-    lock="$(_worktree_lock_path "$issue")"
-    local locks_dir
-    locks_dir="$(_worktree_locks_dir)"
-
-    mkdir -p "$locks_dir" 2>/dev/null || true
-
-    local deadline=$(( $(date +%s) + LOOM_WORKTREE_LOCK_TIMEOUT ))
-    local stale_retry_done=0
-
-    while true; do
-        if mkdir "$lock" 2>/dev/null; then
-            # Lock acquired; record owner metadata for debugging plus a
-            # one-shot token so release can verify it still owns this lock
-            # (issue #6014 — see "Ownership verification" above).
-            local token
-            token="$$-$(date -u +%s%N 2>/dev/null || date -u +%s)-$RANDOM"
-            cat > "$lock/owner.json" <<EOF
-{
-  "issue": $issue,
-  "owner_pid": $$,
-  "token": "$token",
-  "script": "worktree.sh",
-  "acquired_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# The worktree-add lock, ported to Rust (#8195 slice 1). It is the lock every
+# destructive path in this script stands behind, and #6014/#6017 showed it
+# could be released by a holder that no longer owned it.
+#
+# A missing binary is FATAL for acquire: proceeding without the lock is exactly
+# the concurrent-`git worktree add` race it exists to prevent. Release stays
+# best-effort — failing to release is recoverable (the next acquire reclaims a
+# dead owner's lock), while failing to ACQUIRE and continuing is not.
+_wt_lock() {
+    local bin
+    bin="${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-}}"
+    if [[ -n "$bin" ]]; then
+        [[ -x "$bin" ]] || { print_error "LOOM_DAEMON_SELF_BIN/LOOM_DAEMON_BIN is set to '$bin', which is not executable"; return 2; }
+    else
+        bin="$(command -v loom-daemon 2>/dev/null || printf '%s' "$HOME/.local/bin/loom-daemon")"
+        [[ -x "$bin" ]] || { print_error "worktree.sh needs loom-daemon for the worktree-add lock (#8195) and could not resolve one"; return 2; }
+    fi
+    "$bin" worktree-lock "$@"
 }
-EOF
-            WORKTREE_LOCK_TOKEN="$token"
-            return 0
-        fi
 
-        # Lock exists. Check whether the owner is still alive; if not, clear
-        # it once and retry (stale-lock recovery).
-        local owner_pid=""
-        if [[ -f "$lock/owner.json" ]]; then
-            owner_pid=$(awk -F'[ ,]+' '/owner_pid/ {gsub(/[^0-9]/,"",$3); print $3; exit}' "$lock/owner.json" 2>/dev/null)
-        fi
-
-        if [[ -n "$owner_pid" ]] && [[ "$stale_retry_done" -eq 0 ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Stale worktree lock from dead PID $owner_pid — cleaning up"
-            fi
-            rm -rf "$lock" 2>/dev/null || true
-            stale_retry_done=1
-            continue
-        fi
-
-        if [[ $(date +%s) -ge $deadline ]]; then
-            WORKTREE_LOCK_HOLDER_PID="$owner_pid"
-            return 1
-        fi
-
-        sleep "$LOOM_WORKTREE_LOCK_POLL_INTERVAL"
-    done
+acquire_worktree_lock() {
+    local issue="$1" out rc=0
+    WORKTREE_LOCK_TOKEN=""
+    WORKTREE_LOCK_HOLDER_PID=""
+    # No --repo: the lock resolves from the CWD, exactly as the shell's
+    # `git rev-parse --git-common-dir` did (it ran with no -C). REPO_ROOT is
+    # not assigned until long after this call, so passing it sent an empty
+    # path and every acquisition silently used a different lock.
+    #
+    # --owner-pid "$$" is load-bearing: the CLI exits as soon as it prints the
+    # token, so a lock recording ITS pid is owned by a dead process and the
+    # next acquire reclaims it as stale. The holder is THIS script, for as long
+    # as it runs. See loom-daemon/tests/worktree_lock_subprocess.rs.
+    out="$(_wt_lock acquire --issue "$issue" --owner-pid "$$" \
+            --timeout "$LOOM_WORKTREE_LOCK_TIMEOUT" \
+            --poll "$LOOM_WORKTREE_LOCK_POLL_INTERVAL" 2>/dev/null)" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        WORKTREE_LOCK_TOKEN="${out#TOKEN=}"
+        return 0
+    fi
+    WORKTREE_LOCK_HOLDER_PID="$(printf '%s' "$out" | sed -n 's/^HOLDER_PID=//p')"
+    return 1
 }
 
 # release_worktree_lock <issue> <token>
@@ -340,29 +327,10 @@ EOF
 # owns, so removing anything would risk deleting a different, live holder's
 # lock (the exact race described in issue #6014).
 release_worktree_lock() {
-    local issue="$1"
-    local token="$2"
-    [[ -z "$issue" ]] && return 0
-    # No token means we never held the lock (or already released it) — never
-    # remove a lock directory we cannot prove is ours.
-    [[ -z "$token" ]] && return 0
-
-    local lock
-    lock="$(_worktree_lock_path "$issue")"
-    [[ -d "$lock" ]] || return 0
-
-    local current_token=""
-    if [[ -f "$lock/owner.json" ]]; then
-        current_token=$(awk -F'"' '/"token"[[:space:]]*:/ {print $4; exit}' "$lock/owner.json" 2>/dev/null)
-    fi
-
-    if [[ "$current_token" != "$token" ]]; then
-        # The lock directory belongs to a different acquisition (ours was
-        # already cleared and reassigned) — do NOT touch it.
-        return 0
-    fi
-
-    rm -rf "$lock" 2>/dev/null || true
+    local issue="$1" token="$2"
+    [[ -z "$issue" || -z "$token" ]] && return 0
+    _wt_lock release --token "$token" >/dev/null 2>&1 || true
+    return 0
 }
 
 # cleanup_partial_worktree_state <issue>

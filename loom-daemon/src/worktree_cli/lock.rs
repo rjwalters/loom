@@ -37,10 +37,24 @@ use serde::{Deserialize, Serialize};
 /// `merge-pr.sh`'s diagnostics both read this file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Owner {
+    // Every field defaults. The shell read this file with `awk`, one field at
+    // a time, so a partial or older-format owner.json still yielded whatever
+    // it did contain. Serde's all-or-nothing default made the port STRICTER in
+    // a way that silently lost function: a lock written without a `token`
+    // (the retained suite writes exactly that, and so did every lock taken
+    // before #6014) failed to deserialise, so `owner_pid` was never read —
+    // which killed BOTH the holder-PID diagnostic and stale-lock recovery. A
+    // lock whose owner is dead then never got reclaimed and every acquisition
+    // timed out.
+    #[serde(default)]
     pub issue: u32,
+    #[serde(default)]
     pub owner_pid: u32,
+    #[serde(default)]
     pub token: String,
+    #[serde(default)]
     pub script: String,
+    #[serde(default)]
     pub acquired_at: String,
 }
 
@@ -207,7 +221,8 @@ pub fn acquire(
         }
 
         let holder = recorded(&lock);
-        let holder_pid = holder.as_ref().map(|o| o.owner_pid);
+        // 0 is serde's default, i.e. "the file did not say" — not a pid.
+        let holder_pid = holder.as_ref().map(|o| o.owner_pid).filter(|p| *p != 0);
 
         // Stale-lock recovery, ONCE. Two processes racing to break the same
         // dead lock must not livelock breaking each other's fresh one.
