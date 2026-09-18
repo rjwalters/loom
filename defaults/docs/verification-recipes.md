@@ -332,6 +332,107 @@ direction of its risk. "Kept, because missing a genuine declared reference is
 worse than one extra" is a decision; the same behaviour undocumented is a bug
 waiting to be re-litigated.
 
+### Three root causes, from 11 defects across two ports
+
+The watchdog (#8086) and `merge-pr.sh` (#8191) produced eleven defects that
+review caught and building did not. They are not eleven unrelated mistakes;
+they are three causes wearing different clothes. Each has a cheap
+counter-check, and the counter-check is the point of writing this down.
+
+#### Cause 1: nothing proved the harness could go RED
+
+Five of the eleven were a green number that measured nothing:
+
+- The retained watchdog suite reported **206/206** before the stub existed —
+  it was running against the *shell*. The first honest measurement, once the
+  stub was in place, was 168/202.
+- `retired()` was **called four times and never defined**. Bash printed
+  `command not found` to stderr, `TESTS_RUN` never incremented, and the suite
+  reported a green 188/188 that silently excluded the four records the commit
+  existed to add.
+- A sibling CI-wired suite, `test-loom-daemon-watchdog-dedup.sh`, listed one
+  line above the one being run in `ci-wired.txt`, **was never run at all**. It
+  was 17/27.
+- The `merge-pr` differential parsed the shell's output through
+  `parse::<u64>().ok()`, which **normalised away a real divergence** on a
+  reference too large for `u64`: shell emitted the digits, Rust emitted
+  nothing, the harness compared `[]` with `[]`.
+- A `diff | head` in a shell probe masked `diff`'s exit code and printed
+  `BYTE-IDENTICAL` for two files that differed.
+
+**The counter-check: before believing a green number, make it red on
+purpose.** Break the thing the number depends on — point the harness at a
+missing binary, mutate one byte of the expected output, delete the fixture —
+and confirm the number moves. A suite that cannot be made to fail is not
+evidence. Two cheap habits fall out of this: assert *how many* comparisons ran
+(`assert!(compared == CORPUS.len())`), and grep `ci-wired.txt` for **every**
+suite naming your subject, not the one you already know about.
+
+#### Cause 2: retained suites assert VERDICTS, not MECHANISM
+
+Four were invisible to a suite that checks *what was reported* rather than
+*how the answer was produced*:
+
+- A remediation gate that **could never fire** (the launchd half), because
+  `launchctl_pid` collapsed "job unknown" and "job loaded but not running"
+  into one `None`.
+- A systemd last-exit path whose comment said it "lands with that branch". It
+  never did; the gate read `None` as an unclean exit and refused to remediate.
+- The 50-series gate: the comment said "only on a tick whose probe came back
+  healthy", the code said `if !reporter.diverged()`. A **disabled** probe also
+  fails to diverge, so `LOOM_WATCHDOG_IPC_PROBE=0` still spent a round-trip —
+  15 seconds against a mock that never returns.
+- `#6388`'s signal detail, hoisted out of the outage path onto **every**
+  liveness snapshot: two `systemctl show` calls at a 10s budget per healthy
+  tick, turning a 7.6-minute CI job into a 30-minute timeout.
+
+Note the shape of the last two: **hoisting a conditional probe out of its
+conditional**. It reads as a simplification, changes no verdict, and is
+therefore invisible to every assertion in the suite. It happened twice.
+
+**The counter-check: when a port moves a call, ask what it now costs on the
+path where the answer is never read.** If a probe's result is only consumed
+inside a branch, compute it inside that branch. And when a comment states a
+precondition, verify the code tests *that* precondition rather than a weaker
+one that usually coincides with it.
+
+#### Cause 3: a `grep -E` pattern is not a regex
+
+Copying pattern text across the port boundary keeps the pattern and drops
+everything the *tool* contributed. Five divergences, all from the same root:
+
+| the shell's | what it also meant | what the naive port did |
+|---|---|---|
+| `grep -oiE '…[[:space:]]+#…'` | `grep` is **line-oriented**; the class cannot span `\n` | matched across a line break, reading `Closes\n#3` as a reference |
+| `sed -E 's/`[^`]*`//g'` | `sed` is **per-line**; the span cannot cross `\n` | swallowed whole paragraphs, or invented matches |
+| `awk '/^[[:space:]]*```/'` | POSIX class, **ASCII** | Rust's `trim_start()` is Unicode; an NBSP inverted fence sense |
+| `\b`, case-insensitivity | **ASCII** under `LC_ALL=C` | Rust's are Unicode; `Cloſes #1` matched |
+| any POSIX class | **locale-dependent** | the harness never pinned `LC_ALL`, so the shell side differed by host |
+
+**The counter-check: for every pattern you carry across, write down which of
+{line-orientation, locale, ASCII-vs-Unicode, greediness} the old tool supplied,
+and pin it.** Pin `LC_ALL=C` in any differential harness that shells out, and
+say so in the module doc. The first of these was found, documented at length,
+and then reproduced **one function away** in the same file — the lesson does
+not generalise itself.
+
+#### The one that is not a cause, but a habit: verify the CALL SHAPE
+
+Two defects were "proved" in isolation and false in situ:
+
+- `_mp_refs` was shown to refuse with `rc=1 out=[REFUSED]` when run directly.
+  Every real caller wraps it in `$(...)` inside a function invoked as
+  `… || true`, where bash suppresses `set -e`: the exit killed a subshell and
+  the caller read the empty string as "no references found". All five
+  version-skew shapes reached a completed merge.
+- The watchdog stub's exit-3-on-missing-binary was verified by hand, while the
+  one Rust integration test that drives the stub had no binary pinned — so it
+  failed in CI for exactly the contract that had just been "verified".
+
+**The counter-check: exercise the guard through its real caller, with the real
+`set -e` state, before claiming it holds.** A unit test of a refusal proves the
+function refuses. It does not prove anything refuses.
+
 ### A port can make one env var mean two things — split it, don't edit the suite
 
 **When**: the script being ported *itself invokes* `loom-daemon`. Every port up

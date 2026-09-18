@@ -184,13 +184,13 @@ pub fn repeat_action(cooldown: Option<&Cooldown>, now: u64, window: u64) -> Repe
 #[must_use]
 pub fn flap_comment(hostname: &str, summary: &str, flap: u64, window: u64) -> String {
     format!(
-        "peer-claim coordination has gone DEGRADED again on `{hostname}` ({summary}).\n\
+        "peer-claim coordination has gone DEGRADED again on `{hostname}` ({summary}).\n\n\
          This is flap #{flap} since this tracking issue was first filed, landing within the \
          {window}s dedup window (#7664) since the last recovery — commenting here instead of \
-         filing a fresh issue.\n\
+         filing a fresh issue.\n\n\
          **Suspected cause** (unverified, per anvil#1270): `advertised` only moves at dispatch \
          time, so a RAM/disk-throttled host with cap 0 never advertises and cannot reach the \
-         sustained-receive recovery threshold.\n\
+         sustained-receive recovery threshold.\n\n\
          Filed automatically by the loom-daemon-watchdog.sh peer-coordination escalation \
          (#6222, dedup by #7664).\n"
     )
@@ -310,6 +310,61 @@ pub fn sentinel_issue_ref(sentinel: &Path) -> Option<String> {
     let mut it = text.split_whitespace();
     let _ts = it.next()?;
     it.next().map(str::to_string)
+}
+
+/// #7664: a REPEAT degradation inside the dedup window comments on the
+/// existing tracking issue and reopens it, instead of filing a fresh one.
+///
+/// Returns the operator-facing note on success. `None` means "fall through and
+/// file fresh" — the shell's `return 1`, which every failure path takes
+/// (no `gh`, no prior issue reference, the comment call failing). Reopen
+/// failure is deliberately NOT one of them: the comment is the record, and a
+/// closed-but-commented issue is better than a duplicate.
+///
+/// The cooldown row is rewritten with the ORIGINAL `recovered_at`, not now —
+/// the dedup window measures from the last recovery, so refreshing it here
+/// would let an indefinitely flapping host never escape the window.
+pub fn dedup_comment(
+    cooldown: &Cooldown,
+    sentinel: &Path,
+    cooldown_state: &Path,
+    hostname: &str,
+    summary: &str,
+    flap: u64,
+) -> Option<String> {
+    let window = dedup_window_secs();
+    let gh = std::time::Duration::from_secs(60);
+
+    let mut comment = std::process::Command::new("gh");
+    comment
+        .args(["issue", "comment", &cooldown.issue_ref, "--body"])
+        .arg(flap_comment(hostname, summary, flap, window));
+    let commented = crate::sweep_registry::output_with_timeout(comment, gh)
+        .ok()
+        .flatten()
+        .is_some_and(|o| o.status.success());
+    if !commented {
+        return None;
+    }
+
+    let mut reopen = std::process::Command::new("gh");
+    reopen.args(["issue", "reopen", &cooldown.issue_ref]);
+    let _ = crate::sweep_registry::output_with_timeout(reopen, gh);
+
+    write_sentinel(sentinel, &cooldown.issue_ref);
+    if let Some(dir) = cooldown_state.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(
+        cooldown_state,
+        format!("{} {} {flap}\n", cooldown.recovered_at, cooldown.issue_ref),
+    );
+
+    Some(format!(
+        "Repeat flap #{flap} within the {window}s dedup window (#7664) — commented on the \
+         existing tracking issue {} instead of filing a new one.",
+        cooldown.issue_ref
+    ))
 }
 
 /// The recovery counterpart: comment on and close the exact issue that was

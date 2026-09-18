@@ -873,6 +873,36 @@ fn peer_coordination(
                      this degradation, {}.",
                     paths.log.display()
                 )
+            } else if let Some(note) = peer_coord::read_cooldown(&state.peer_coord_cooldown)
+                .and_then(|c| {
+                    // #7664: the cooldown has ELAPSED, but this is still the
+                    // same episode if we are inside the (longer) dedup window
+                    // and have a usable prior issue reference. Comment on that
+                    // issue and reopen it rather than filing a duplicate.
+                    //
+                    // This path existed as `repeat_action`/`flap_comment` with
+                    // unit tests and NO callers — the fifth instance in this
+                    // port of code that a comment claimed was wired. The
+                    // CI-wired dedup suite is what proved it: 10 of its 27
+                    // assertions exercise exactly this, and I had not run it.
+                    match peer_coord::repeat_action(
+                        Some(&c),
+                        now_secs(),
+                        peer_coord::dedup_window_secs(),
+                    ) {
+                        peer_coord::Repeat::CommentOn { flap, .. } => peer_coord::dedup_comment(
+                            &c,
+                            &state.peer_coord_sentinel,
+                            &state.peer_coord_cooldown,
+                            &escalate::hostname(),
+                            &health.summary,
+                            flap,
+                        ),
+                        peer_coord::Repeat::FileFresh => None,
+                    }
+                })
+            {
+                note
             } else {
                 // #6222: file a forge tracking issue so the degradation is not
                 // confined to a logfile nobody tails.
