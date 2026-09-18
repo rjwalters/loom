@@ -1660,9 +1660,9 @@ function has_live_subst(str,    i, c, bs) {
 #     re-enters the loop as unquoted text. That direction over-splits at the
 #     escaped quote (fail-closed there) but the stray trailing quote can then
 #     open a span of its own, which can suppress a later separator -- a
-#     standing gap in this helper, tracked separately, NOT something the
-#     #8025 branch (which only ever fires OUTSIDE a span) introduced or is
-#     entitled to claim it closes.
+#     standing gap in this helper, tracked in #8166, NOT something the #8025
+#     branch (which only ever fires OUTSIDE a span) introduced or is entitled
+#     to claim it closes.
 # Do not restate either of these as "harmless": state the direction.
 #
 # Shared as a single awk source string so the three parsers cannot drift.
