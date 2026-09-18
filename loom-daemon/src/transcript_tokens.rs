@@ -146,7 +146,11 @@ pub fn head_names_sweep_issue(head: &str, issue: u32) -> bool {
 }
 
 /// Read at most [`HEAD_SCAN_BYTES`] from `path`, lossily decoded.
-fn read_head(path: &Path) -> Option<String> {
+///
+/// `pub(crate)` since #8056: the role-tick journal attributes transcripts by
+/// the SAME first-user-message slash-command marker, and a second private
+/// copy of this bounded head read would be free to drift from this one.
+pub(crate) fn read_head(path: &Path) -> Option<String> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(path).ok()?;
     let mut buf = vec![0_u8; HEAD_SCAN_BYTES];

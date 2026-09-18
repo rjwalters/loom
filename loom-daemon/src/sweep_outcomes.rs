@@ -342,32 +342,52 @@ pub fn append_outcome_telemetry(
     path: &Path,
     envelope: &telemetry::TelemetryEnvelope,
 ) -> Result<()> {
+    append_telemetry_envelope(path, envelope, "sweep.outcome", MAX_JOURNAL_BYTES)
+}
+
+/// Shared body of [`append_outcome_telemetry`] and
+/// [`append_role_tick_telemetry`]: append `envelope` as one JSON line to
+/// `path`, rotating first at `max_bytes`. `label` names the journal in error
+/// context only — the on-disk format is identical for every telemetry journal,
+/// which is what lets a single reader ([`read_all_outcome_telemetry`]) serve
+/// all of them.
+fn append_telemetry_envelope(
+    path: &Path,
+    envelope: &telemetry::TelemetryEnvelope,
+    label: &str,
+    max_bytes: u64,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating sweep.outcome telemetry journal dir {}", parent.display())
+            format!("creating {label} telemetry journal dir {}", parent.display())
         })?;
     }
-    rotate_telemetry_if_needed(path)?;
+    rotate_telemetry_if_needed_at(path, max_bytes)?;
     let line = serde_json::to_string(envelope).context("serializing telemetry envelope")?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("opening sweep.outcome telemetry journal {}", path.display()))?;
-    writeln!(file, "{line}").with_context(|| {
-        format!("appending to sweep.outcome telemetry journal {}", path.display())
-    })?;
+        .with_context(|| format!("opening {label} telemetry journal {}", path.display()))?;
+    writeln!(file, "{line}")
+        .with_context(|| format!("appending to {label} telemetry journal {}", path.display()))?;
     Ok(())
 }
 
 /// Rotate `path` to a single `.1` sibling (overwriting any previous backup)
-/// once it exceeds [`MAX_JOURNAL_BYTES`] OR its oldest line's `emitted_at` is
-/// older than [`MAX_JOURNAL_AGE_DAYS`]. Mirrors [`rotate_if_needed`].
-fn rotate_telemetry_if_needed(path: &Path) -> Result<()> {
+/// once it exceeds `max_bytes` OR its oldest line's `emitted_at` is older
+/// than [`MAX_JOURNAL_AGE_DAYS`]. Mirrors [`rotate_if_needed`].
+///
+/// The size ceiling is a parameter because the role-tick journal emits at a
+/// far higher rate than the per-sweep one and carries its own cap
+/// ([`ROLE_TICK_MAX_JOURNAL_BYTES`] vs. [`MAX_JOURNAL_BYTES`]). The age
+/// ceiling deliberately is NOT: 30 days is a retention policy, not a
+/// rate-derived number, so every telemetry journal shares it.
+fn rotate_telemetry_if_needed_at(path: &Path, max_bytes: u64) -> Result<()> {
     let Ok(meta) = std::fs::metadata(path) else {
         return Ok(());
     };
-    let oversized = meta.len() >= MAX_JOURNAL_BYTES;
+    let oversized = meta.len() >= max_bytes;
     let stale = !oversized && is_telemetry_stale(path);
     if !oversized && !stale {
         return Ok(());
@@ -427,6 +447,80 @@ pub fn read_all_sweep_outcomes(path: &Path) -> Vec<telemetry::SweepOutcomeRecord
         .into_iter()
         .filter_map(|envelope| match envelope.record {
             telemetry::TelemetryRecord::SweepOutcome(record) => Some(record),
+            _ => None,
+        })
+        .collect()
+}
+
+// ============================================================================
+// `role_tick.outcome` telemetry journal (Issue #8056)
+// ============================================================================
+
+/// Environment override for the `role_tick.outcome` telemetry journal path
+/// (test seam), mirrors [`OUTCOME_TELEMETRY_JOURNAL_PATH_ENV`].
+pub const ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV: &str = "LOOM_ROLE_TICK_TELEMETRY_JOURNAL_PATH";
+
+/// Default filename under `<workspace_root>/.loom/logs/`.
+pub const ROLE_TICK_TELEMETRY_JOURNAL_FILENAME: &str = "role-tick-telemetry.jsonl";
+
+/// Size ceiling for the role-tick journal, deliberately larger than
+/// [`MAX_JOURNAL_BYTES`] (Issue #8056).
+///
+/// **Why a separate file and a separate number.** A role tick is a far
+/// higher-frequency emitter than a sweep. Using
+/// [`ROLE_TICK_RING_CAPACITY`](crate::role_runner::ROLE_TICK_RING_CAPACITY)'s
+/// own published sizing derivation: [`DEFAULT_ROLES`](crate::role_runner::DEFAULT_ROLES)
+/// is 8 roles whose intervals sum to ~59 ticks/hour **per registered root**,
+/// and the ring is process-global across roots — the 20-root incident host
+/// behind #6239 produces ~1,180 ticks/hour. At ~700 bytes a record (the
+/// `tokens_by_model` rows dominate) that is ~20 MB/day. Sharing the 5 MiB
+/// per-sweep journal would therefore rotate ~2,600 sweep records out of
+/// existence roughly every 6 hours on such a host — destroying the very
+/// history #8056 exists to preserve. Hence: its own file, and its own cap.
+///
+/// 64 MiB retains ~3 days live plus ~3 more in the single `.1` backup on that
+/// same worst-case host, and far longer on a typical one- or two-root host.
+/// The 30-day age ceiling ([`MAX_JOURNAL_AGE_DAYS`]) still applies and is
+/// what bounds a *quiet* host's file.
+pub const ROLE_TICK_MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// Resolve the default `role_tick.outcome` telemetry journal path:
+/// [`ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV`] override (non-empty), else
+/// `<workspace_root>/.loom/logs/role-tick-telemetry.jsonl`. Mirrors
+/// [`default_outcome_telemetry_path`].
+#[must_use]
+pub fn default_role_tick_telemetry_path(workspace_root: &Path) -> PathBuf {
+    if let Ok(path) = std::env::var(ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV) {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    workspace_root
+        .join(".loom")
+        .join("logs")
+        .join(ROLE_TICK_TELEMETRY_JOURNAL_FILENAME)
+}
+
+/// Append `envelope` as one JSON line to the role-tick journal at `path`,
+/// rotating at [`ROLE_TICK_MAX_JOURNAL_BYTES`]. Same best-effort contract as
+/// [`append_outcome_telemetry`]: callers log a warning on `Err` and never let
+/// a write failure affect the tick itself.
+pub fn append_role_tick_telemetry(
+    path: &Path,
+    envelope: &telemetry::TelemetryEnvelope,
+) -> Result<()> {
+    append_telemetry_envelope(path, envelope, "role_tick.outcome", ROLE_TICK_MAX_JOURNAL_BYTES)
+}
+
+/// Read every [`crate::telemetry::RoleTickOutcomeRecord`] from `path`,
+/// unwrapping each envelope and discarding any other record kind. The
+/// role-tick counterpart of [`read_all_sweep_outcomes`].
+#[must_use]
+pub fn read_all_role_tick_outcomes(path: &Path) -> Vec<telemetry::RoleTickOutcomeRecord> {
+    read_all_outcome_telemetry(path)
+        .into_iter()
+        .filter_map(|envelope| match envelope.record {
+            telemetry::TelemetryRecord::RoleTickOutcome(record) => Some(record),
             _ => None,
         })
         .collect()
@@ -904,4 +998,100 @@ mod tests {
     fn median_i64_empty_is_zero() {
         assert_eq!(median_i64(&[]), 0);
     }
+
+    // --------------------------------------------------------------------
+    // role_tick.outcome journal (Issue #8056) — a SEPARATE file from the
+    // per-sweep one, because a role tick is a far higher-frequency emitter.
+    // --------------------------------------------------------------------
+
+    fn role_tick_envelope(role: &str) -> telemetry::TelemetryEnvelope {
+        telemetry::TelemetryEnvelope::new(
+            "host-abc",
+            telemetry::TelemetryRecord::RoleTickOutcome(telemetry::RoleTickOutcomeRecord {
+                repo: "rjwalters/loom".to_string(),
+                visibility: telemetry::RepoVisibility::Public,
+                role: role.to_string(),
+                started_at: Utc::now(),
+                duration_sec: 61,
+                result: telemetry::RoleTickResult::Success,
+                model: Some("claude-sonnet-5".to_string()),
+                effort: None,
+                detail: None,
+                tokens_by_model: None,
+                models_used: None,
+                actions: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn append_then_read_all_role_tick_outcomes_round_trips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(ROLE_TICK_TELEMETRY_JOURNAL_FILENAME);
+        append_role_tick_telemetry(&path, &role_tick_envelope("judge")).unwrap();
+        append_role_tick_telemetry(&path, &role_tick_envelope("curator")).unwrap();
+
+        let records = read_all_role_tick_outcomes(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].role, "judge");
+        assert_eq!(records[1].role, "curator");
+        assert_eq!(records[0].duration_sec, 61);
+    }
+
+    #[test]
+    fn read_all_role_tick_outcomes_ignores_other_record_kinds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(ROLE_TICK_TELEMETRY_JOURNAL_FILENAME);
+        append_role_tick_telemetry(&path, &role_tick_envelope("guide")).unwrap();
+        // A `sweep.outcome` line sharing the file (not how the daemon writes
+        // it, but the reader must not mis-decode one kind as another).
+        append_role_tick_telemetry(
+            &path,
+            &outcome_envelope(7, Some("opus"), telemetry::SweepResult::Success, 10),
+        )
+        .unwrap();
+
+        let role_ticks = read_all_role_tick_outcomes(&path);
+        assert_eq!(role_ticks.len(), 1);
+        assert_eq!(role_ticks[0].role, "guide");
+        assert_eq!(read_all_sweep_outcomes(&path).len(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn default_role_tick_telemetry_path_is_its_own_file_next_to_the_sweep_one() {
+        std::env::remove_var(ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV);
+        let root = Path::new("/repo/a");
+        let role_path = default_role_tick_telemetry_path(root);
+        assert_eq!(
+            role_path,
+            root.join(".loom")
+                .join("logs")
+                .join(ROLE_TICK_TELEMETRY_JOURNAL_FILENAME)
+        );
+        std::env::remove_var(OUTCOME_TELEMETRY_JOURNAL_PATH_ENV);
+        assert_ne!(
+            role_path,
+            default_outcome_telemetry_path(root),
+            "sharing the 5 MiB per-sweep journal would rotate sweep history away \
+             within hours on a busy host (#8056)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn default_role_tick_telemetry_path_honors_the_env_override() {
+        std::env::set_var(ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV, "/tmp/rt.jsonl");
+        assert_eq!(
+            default_role_tick_telemetry_path(Path::new("/repo/a")),
+            PathBuf::from("/tmp/rt.jsonl")
+        );
+        std::env::remove_var(ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV);
+    }
+
+    /// The role-tick emitter runs ~59 ticks/hour PER REGISTERED ROOT; the
+    /// per-sweep 5 MiB ceiling would rotate it away in hours on a busy host
+    /// (#8056). A compile-time assertion, so shrinking the constant below the
+    /// per-sweep one fails the build rather than a test run.
+    const _: () = assert!(ROLE_TICK_MAX_JOURNAL_BYTES > MAX_JOURNAL_BYTES);
 }

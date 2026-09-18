@@ -16,7 +16,9 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
-use crate::telemetry::{RepoVisibility, SweepResult, TelemetryEnvelope, TelemetryRecord};
+use crate::telemetry::{
+    RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryRecord,
+};
 
 // ============================================================================
 // Small AnyValue / KeyValue constructors
@@ -83,6 +85,35 @@ fn severity_for_result(result: SweepResult) -> SeverityNumber {
         SweepResult::Failure => SeverityNumber::Error,
         SweepResult::Blocked => SeverityNumber::Warn,
         SweepResult::Success | SweepResult::Cancelled => SeverityNumber::Info,
+    }
+}
+
+/// The wire string for a role-tick result (Issue #8056) — the serde
+/// `rename_all = "snake_case"` spelling, restated here so the OTLP attribute
+/// value matches the JSON one exactly.
+fn role_tick_result_str(result: RoleTickResult) -> &'static str {
+    match result {
+        RoleTickResult::Success => "success",
+        RoleTickResult::Failure => "failure",
+        RoleTickResult::RuntimeRejected => "runtime_rejected",
+        RoleTickResult::SkippedNoTokenPool => "skipped_no_token_pool",
+        RoleTickResult::SkippedPoolExhausted => "skipped_pool_exhausted",
+        RoleTickResult::SkippedModelRuntimeMismatch => "skipped_model_runtime_mismatch",
+        RoleTickResult::SkippedLoad => "skipped_load",
+    }
+}
+
+/// Only an outright `failure` is an error; every *skip* is `Info` (Issue
+/// #8056/#7607 — a fleet-wide exhausted pool's identical skips must not page
+/// as hundreds of broken roles), and a fail-closed runtime rejection is a
+/// `Warn` config signal.
+fn severity_for_role_tick(result: RoleTickResult) -> SeverityNumber {
+    match result {
+        RoleTickResult::Failure => SeverityNumber::Error,
+        RoleTickResult::RuntimeRejected | RoleTickResult::SkippedModelRuntimeMismatch => {
+            SeverityNumber::Warn
+        }
+        _ => SeverityNumber::Info,
     }
 }
 
@@ -254,6 +285,54 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                     r.repo,
                     r.issue,
                     r.total_duration_sec
+                ),
+                attributes,
+            )
+        }
+        TelemetryRecord::RoleTickOutcome(r) => {
+            // Issue #8056: the seventh record kind. Mapped as a log record
+            // alongside the sweep lifecycle kinds (not as a metric) because a
+            // tick is an event with a result and a detail string, not a gauge.
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.role", r.role.clone()),
+                kv_string("loom.result", role_tick_result_str(r.result)),
+                kv_int("loom.duration_sec", r.duration_sec),
+            ];
+            // Every optional field stays optional here too: an unobserved
+            // measurement must be an ABSENT attribute, never a zero one.
+            if let Some(model) = &r.model {
+                attributes.push(kv_string("loom.model", model.clone()));
+            }
+            if let Some(effort) = &r.effort {
+                attributes.push(kv_string("loom.effort", effort.clone()));
+            }
+            if let Some(detail) = &r.detail {
+                attributes.push(kv_string("loom.detail", detail.clone()));
+            }
+            if let Some(models_used) = &r.models_used {
+                attributes.push(kv_string("loom.models_used", models_used.join(",")));
+            }
+            if let Some(actions) = &r.actions {
+                attributes
+                    .push(kv_int("loom.actions.issues_labeled", i64::from(actions.issues_labeled)));
+                attributes.push(kv_int("loom.actions.prs_merged", i64::from(actions.prs_merged)));
+                attributes.push(kv_int(
+                    "loom.actions.comments_posted",
+                    i64::from(actions.comments_posted),
+                ));
+            }
+            (
+                "role_tick.outcome",
+                severity_for_role_tick(r.result),
+                format!(
+                    "role tick ({}): {} {} on {}, {}s",
+                    role_tick_result_str(r.result),
+                    r.role,
+                    r.model.as_deref().unwrap_or("model-unresolved"),
+                    r.repo,
+                    r.duration_sec
                 ),
                 attributes,
             )
@@ -451,10 +530,13 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
             }
             samples
         }
+        // Every lifecycle-shaped kind — including `role_tick.outcome`
+        // (#8056) — becomes a log record instead (see `log_record_for`).
         TelemetryRecord::SweepStarted(_)
         | TelemetryRecord::SweepPhase(_)
         | TelemetryRecord::SweepCompleted(_)
-        | TelemetryRecord::SweepOutcome(_) => Vec::new(),
+        | TelemetryRecord::SweepOutcome(_)
+        | TelemetryRecord::RoleTickOutcome(_) => Vec::new(),
     }
 }
 
