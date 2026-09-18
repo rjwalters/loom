@@ -206,8 +206,8 @@ if [[ -f "$CI_YML" && -f "$OWN_CONFIG" ]]; then
   missing=""
   while IFS= read -r ctx; do
     [[ -z "$ctx" ]] && continue
-    printf '%s\n' "$gated_names" | grep -Fxq "$ctx" && violations+="$ctx; "
-    printf '%s\n' "$all_names" | grep -Fxq "$ctx" || missing+="$ctx; "
+    grep -Fxq "$ctx" <<<"$gated_names" && violations+="$ctx; "
+    grep -Fxq "$ctx" <<<"$all_names" || missing+="$ctx; "
   done < <(jq -r '.branchProtection.requiredStatusChecks // [] | .[]' "$OWN_CONFIG")
 
   assert_eq "no path-filtered (needs: changes) job is in the required set" "" "${violations%; }"
