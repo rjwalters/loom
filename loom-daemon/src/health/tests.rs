@@ -55,7 +55,12 @@ fn healthy_status() -> DaemonStatusReport {
     status
 }
 
-fn healthy_inputs() -> HealthInputs {
+// `pub(crate)` (Issue #8091): the `operator_attention` sibling module's own
+// test suite needs a fixture where every OTHER section is Green to pin
+// "operator_attention alone does not change the exit code" — this is that
+// known-good fixture, reused rather than re-derived so the two suites cannot
+// silently drift into disagreeing about what "healthy" means.
+pub(crate) fn healthy_inputs() -> HealthInputs {
     HealthInputs {
         at: now(),
         window: Duration::from_secs(DEFAULT_WINDOW_SECS),
@@ -623,10 +628,11 @@ fn a_healthy_exporter_still_renders_no_observability_section() {
     let report = assess(&inputs);
     assert!(report.section("observability").is_none());
     assert_eq!(report.overall, Verdict::Green);
-    // 12 always-present sections: + `peer_coordination` (#6157),
+    // 13 always-present sections: + `peer_coordination` (#6157),
     // `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
-    // (#7584), `worktree_reaper` (#7590), and `pool_hold` (#7990).
-    assert_eq!(report.sections.len(), 12);
+    // (#7584), `worktree_reaper` (#7590), `pool_hold` (#7990), and
+    // `operator_attention` (#8091).
+    assert_eq!(report.sections.len(), 13);
 }
 
 #[test]

@@ -852,7 +852,7 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
                     changes_requested_unclaimed: Some(0),
                     approved: Some(0),
                     merged_24h: Some(3),
-                    error: None,
+                    ..Default::default()
                 })
                 .collect(),
         ),
