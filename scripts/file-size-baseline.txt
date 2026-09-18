@@ -47,7 +47,7 @@
 3138 loom-daemon/src/ipc.rs
 4194 loom-daemon/src/ipc/tests.rs
 1226 loom-daemon/src/main.rs
-1815 loom-daemon/src/main_health_gate.rs
+1788 loom-daemon/src/main_health_gate.rs
 2318 loom-daemon/src/main_health_gate/tests.rs
 1715 loom-daemon/src/orphan_process_reaper.rs
 1596 loom-daemon/src/peer_claims.rs
