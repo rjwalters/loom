@@ -410,18 +410,23 @@ assert_eq "MOCK invoked: strip-ansi" "$out" \
     "with no \$LOOM_DAEMON_SELF_BIN the stub still honours \$LOOM_DAEMON_BIN (operator pin preserved)"
 
 # ---------- 21. a set-but-not-executable LOOM_DAEMON_SELF_BIN falls through
-#                (never a hard failure) but SAYS SO — silently landing back on
-#                a LOOM_DAEMON_BIN that means something else is the failure
-#                mode this split exists to prevent, and it presents as a hang
-#                rather than an error. ----------
+#                rather than hard-failing — the same contract case 2 pins for
+#                $LOOM_DAEMON_BIN, so a typo'd pin degrades identically
+#                whichever of the two variables carries it. ----------
 stdout_out=$( env -i PATH="$MINIMAL_PATH" HOME="$WORKDIR/t21-nohome" \
     LOOM_DAEMON_BIN="$MOCK19" LOOM_DAEMON_SELF_BIN="$WORKDIR/t21/not-a-binary" \
-    bash "$STUB" </dev/null 2>"$WORKDIR/t21-stderr" )
-stderr_out="$(cat "$WORKDIR/t21-stderr")"
+    bash "$STUB" </dev/null 2>/dev/null )
 assert_eq "MOCK invoked: strip-ansi" "$stdout_out" \
     "a non-executable \$LOOM_DAEMON_SELF_BIN falls through to the normal resolution, not a hard failure"
+
+# ---------- 22. the stub's not-found error names BOTH knobs, so an operator
+#                who lands there learns which one pins the implementation. ----------
+stderr_out=$( env -i PATH="$MINIMAL_PATH" HOME="$WORKDIR/t22-nohome" \
+    bash "$STUB" </dev/null 2>&1 >/dev/null )
 assert_contains "LOOM_DAEMON_SELF_BIN" "$stderr_out" \
-    "…and the fall-through is announced on stderr rather than being silent"
+    "the 'loom-daemon not found' error names \$LOOM_DAEMON_SELF_BIN as the implementation knob"
+assert_contains "LOOM_DAEMON_BIN" "$stderr_out" \
+    "…and still names \$LOOM_DAEMON_BIN"
 
 # ---------- summary ----------
 echo

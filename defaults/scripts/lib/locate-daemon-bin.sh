@@ -225,22 +225,22 @@ loom_daemon_bin_search_paths() {
 # $LOOM_DAEMON_SELF_BIN, when set AND executable.
 #
 # Echoes the path and returns 0 on a hit; echoes nothing and returns 1
-# otherwise (including "set but not executable" -- the caller decides whether
-# that is worth a warning, and every caller falls through rather than failing).
+# otherwise -- including "set but not executable", which falls through exactly
+# as a non-executable $LOOM_DAEMON_BIN does in loom_locate_daemon_bin's step 1,
+# so a typo'd pin degrades identically whichever variable carries it.
 #
 # Split out from loom_resolve_self_daemon_bin (#8134) because a caller that
-# must NOT adopt the rest of that chain still needs this one tier. The Shape-A
-# stubs in lib/script-helper.sh are that caller: in production their correct
-# answer is exactly what loom_locate_daemon_bin returns (PATH, then the
-# machine-level install -- see step 4's `ssh host 'cmd'` case), so they take
-# tier 1 and then fall straight back to the normal resolution instead of
-# preferring a checkout-local build ahead of it.
+# must NOT adopt the rest of that chain still needs this one tier.
+#
+# A Shape-A stub uses it as `loom_daemon_self_bin_override || loom_locate_daemon_bin
+# "$root"`: tier 1, then the WHOLE normal chain. Deliberately not the rest of
+# loom_resolve_self_daemon_bin's chain -- in production the installed daemon IS
+# the implementation, $LOOM_DAEMON_BIN must keep pinning it (`loom update` and
+# an operator debugging a stub both rely on that), and hoisting a checkout-local
+# build above it would be the silent behaviour change #8134 rejected.
 loom_daemon_self_bin_override() {
-    if [[ -n "${LOOM_DAEMON_SELF_BIN:-}" && -x "${LOOM_DAEMON_SELF_BIN}" ]]; then
-        printf '%s\n' "$LOOM_DAEMON_SELF_BIN"
-        return 0
-    fi
-    return 1
+    [[ -n "${LOOM_DAEMON_SELF_BIN:-}" && -x "${LOOM_DAEMON_SELF_BIN}" ]] || return 1
+    printf '%s\n' "$LOOM_DAEMON_SELF_BIN"
 }
 
 # loom_resolve_self_daemon_bin -- the loom-daemon that IMPLEMENTS a caller's
@@ -272,11 +272,7 @@ loom_daemon_self_bin_override() {
 # cli/loom-daemon-update.sh by #8037, when claude-wrapper.sh became the second
 # caller that needs the IMPLEMENTATION rather than the managed install.
 loom_resolve_self_daemon_bin() {
-    local self_override
-    if self_override="$(loom_daemon_self_bin_override)"; then
-        printf '%s\n' "$self_override"
-        return 0
-    fi
+    loom_daemon_self_bin_override && return 0
     local self_root
     self_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." 2>/dev/null && pwd)" || self_root=""
     local base candidate

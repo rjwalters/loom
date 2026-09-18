@@ -90,32 +90,20 @@ loom_exec_script_helper() {
     # shellcheck source=/dev/null
     source "$(dirname "${BASH_SOURCE[0]}")/locate-daemon-bin.sh"
 
-    # Tier 1: the explicit implementation seam (see "WHICH BINARY A STUB
-    # EXECS" above). A set-but-not-executable value falls through like every
-    # other tier, but says so — silently landing back on a $LOOM_DAEMON_BIN
-    # that means something else is the failure this split exists to prevent,
-    # and it presents as a hang rather than an error.
-    if bin="$(loom_daemon_self_bin_override)"; then
-        :
-    else
-        if [[ -n "${LOOM_DAEMON_SELF_BIN:-}" ]]; then
-            echo "[WARN] LOOM_DAEMON_SELF_BIN=${LOOM_DAEMON_SELF_BIN} is not executable;" >&2
-            echo "       falling back to the normal loom-daemon resolution for '$subcommand'." >&2
-        fi
-        bin="$(loom_locate_daemon_bin "$repo_root")"
-    fi
+    # $LOOM_DAEMON_SELF_BIN first (the implementation), then the normal
+    # resolution completely unchanged — see "WHICH BINARY A STUB EXECS" above.
+    # Both tiers are defined in the resolver library, not here: this file stays
+    # glue, and every "which loom-daemon?" question is answered in one place.
+    bin="$(loom_daemon_self_bin_override || loom_locate_daemon_bin "$repo_root")"
 
     if [[ -n "$bin" ]]; then
         exec "$bin" "$subcommand" "$@"
     fi
 
-    echo "[ERROR] loom-daemon not found (needed for '$subcommand')." >&2
-    echo "" >&2
+    printf '%s\n\n' "[ERROR] loom-daemon not found (needed for '$subcommand')." >&2
     echo "This script is a thin stub over the native \`loom-daemon $subcommand\`" >&2
     echo "subcommand (issue #4275). Provide a binary by either:" >&2
-    echo "  - setting LOOM_DAEMON_SELF_BIN=/path/to/loom-daemon (the binary that" >&2
-    echo "    IMPLEMENTS this subcommand — checked first, #8134), or" >&2
-    echo "  - setting LOOM_DAEMON_BIN=/path/to/loom-daemon, or" >&2
+    echo "  - setting LOOM_DAEMON_SELF_BIN=/path/to/loom-daemon (the binary that IMPLEMENTS this subcommand, checked first) or LOOM_DAEMON_BIN=/path/to/loom-daemon, or" >&2
     if [[ -n "$repo_root" && -d "$repo_root/loom-daemon" ]]; then
         echo "  - building it: cargo build --release --manifest-path $repo_root/loom-daemon/Cargo.toml" >&2
     else
