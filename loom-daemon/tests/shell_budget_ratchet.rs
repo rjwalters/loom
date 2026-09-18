@@ -103,6 +103,26 @@ fn the_progress_denominator_pins_its_revision_too() {
 fn the_pinned_origin_rev_resolves_in_this_checkout() {
     let root = repo_root();
     let rev = shell_budget::read_origin_rev(&root).expect("origin_rev must be present");
+
+    // A shallow clone genuinely cannot reach the epic's first commit, and the
+    // report is built to degrade to omitting the figure there. I wrote that
+    // caveat into this assertion's own failure message and then asserted
+    // anyway; CI clones shallow, so it failed on the first run. Honour it.
+    let shallow = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false);
+    if shallow {
+        eprintln!(
+            "skipped: a shallow clone cannot reach {rev}, which the report handles by omitting \
+             the cumulative figure"
+        );
+        return;
+    }
+
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(&root)
@@ -116,9 +136,7 @@ fn the_pinned_origin_rev_resolves_in_this_checkout() {
         .expect("git rev-parse must run");
     assert!(
         out.status.success(),
-        "origin_rev {rev:?} does not resolve in this checkout. In a shallow clone that is \
-         expected and the report degrades to omitting the figure; in a full clone it means \
-         the anchor is wrong."
+        "origin_rev {rev:?} does not resolve in this FULL checkout, so the anchor is wrong."
     );
 }
 
