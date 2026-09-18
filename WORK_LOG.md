@@ -7,6 +7,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8157** (closed): main is red on the File Size Ratchet — the third baseline-staleness incident today
+- **Issue #8153** (closed): File Size Ratchet fails on main: role_runner/tests.rs grew past its frozen baseline (4036 -> 4043)
+- **PR #8159**: test(role-runner): extract role-tick health ring tests to a sibling module
+- **Issue #7970** (closed): guard: #7355 heredoc variable-capture masking has no $NAME read check (ask tier)
+- **PR #8019**: fix(guard): #7970 heredoc variable-capture masking has no $NAME read check (ask tier)
+- **Issue #8120** (closed): Shell-lint's 400-file floor will fail as epic #7810 succeeds, and blame 'broken discovery'
+- **PR #8142**: fix(gates): derive the shell-discovery floors from the allowlist, not a constant (#8120)
+- **Issue #7864** (closed): Port 2AMLogic/sky130-modexp#117's resync-installed.sh local-divergence protection to defaults/
+- **PR #7870**: feat(resync): warn and block instead of silently reverting a locally-fixed installed file
+- **PR #8148**: fix(merge): detect ruleset-sourced required status checks, emit the rule
+- **Issue #8010** (closed): Stacked-parent reconciliation is not reliably reachable after #7982's pin-and-warn downgrade
+- **Issue #8037** (closed): Port claude-wrapper.sh's six retry classifiers, with #8032's 44 assertions as the proof
+- **PR #8135**: feat(daemon): port claude-wrapper.sh's six retry classifiers (#8037)
 - **Issue #8064** (closed): Trim narrative/reference bloat from champion-*/judge-reference/watch skills and .loom/CLAUDE.md
 - **PR #8139**: docs(prompt-budget): trim narrative bloat from champion-reference/judge-reference/watch/.loom-CLAUDE.md
 - **Issue #8140** (closed): A retained suite's assertions about the SHELL's source text cannot survive the port, and the recipe is silent on them
