@@ -190,11 +190,17 @@ const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// `Last-Event-ID` replay capability that does not exist.
 const SSE_RETRY_MS: u64 = 3_000;
 
-/// Bounded timeout for a single connect + `DaemonStatus` round-trip against
-/// the daemon's own Unix socket. Deliberately a single attempt (unlike
-/// `loom-daemon status`'s dropped-connection retry, #4279) — a dashboard
-/// poller simply retries on its own next tick, so extra client-side
-/// complexity here is not worth it for a phase-1 read-only surface.
+/// Bounded timeout for a single IPC round-trip against the daemon's own Unix
+/// socket. Deliberately a single attempt (unlike `loom-daemon status`'s
+/// dropped-connection retry, #4279) — a dashboard poller simply retries on its
+/// own next tick, so extra client-side complexity here is not worth it for a
+/// phase-1 read-only surface.
+///
+/// **This is a floor, not the whole budget, for the `DaemonStatus` round-trip**
+/// (Issue #8224): [`status_fetch::fetch_report`] raises it by the registered
+/// workspace-root count, because the thing it waits on
+/// ([`crate::ipc::build_daemon_status`]) is `O(roots)`. See that module for why
+/// the [`open_event_subscription`] use below is deliberately left unscaled.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cap on bytes read while parsing an incoming HTTP request's headers, so a
@@ -259,40 +265,12 @@ pub fn build_snapshot(report: DaemonStatusReport) -> StatusSnapshot {
     }
 }
 
-/// Fetch the live [`DaemonStatusReport`] from the running daemon over its
-/// Unix socket — the exact same `Request::DaemonStatus` request
-/// `loom-daemon status --json` sends, so the aggregation itself (dynamic
-/// caps, per-repo breakdown, capacity, drain state, …) is computed exactly
-/// once, in [`crate::ipc::build_daemon_status`], never re-derived here.
-async fn fetch_report(socket_path: &Path) -> Result<DaemonStatusReport> {
-    let roundtrip = async {
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|e| anyhow!("connect to daemon socket failed: {e}"))?;
-        let (reader, mut writer) = stream.into_split();
-
-        let request_json = serde_json::to_string(&Request::DaemonStatus)?;
-        writer.write_all(request_json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
-
-        let mut lines = BufReader::new(reader).lines();
-        let line = lines
-            .next_line()
-            .await?
-            .ok_or_else(|| anyhow!("daemon closed the connection without responding"))?;
-        let response: Response = serde_json::from_str(&line)?;
-        match response {
-            Response::DaemonStatus(report) => Ok(*report),
-            Response::Error { message } => Err(anyhow!("daemon error: {message}")),
-            other => Err(anyhow!("unexpected response: {other:?}")),
-        }
-    };
-
-    tokio::time::timeout(FETCH_TIMEOUT, roundtrip)
-        .await
-        .map_err(|_| anyhow!("status round-trip timed out after {}s", FETCH_TIMEOUT.as_secs()))?
-}
+/// The `DaemonStatus` round-trip and its root-scaled budget (Issue #8224),
+/// extracted to a sibling module because this file is frozen by the file-size
+/// ratchet (`scripts/check-file-size-budget.sh`; see
+/// `.loom/docs/file-size-policy.md`).
+mod status_fetch;
+use status_fetch::fetch_report;
 
 /// Fetch a fresh [`StatusSnapshot`] (report + hostname) from the running
 /// daemon. Errors when the daemon is unreachable or the round-trip fails —
