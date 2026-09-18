@@ -39,6 +39,41 @@
 #   .loom/scripts/spawn-worker.sh -p "your prompt"
 #   LOOM_RUNTIME=claude .loom/scripts/spawn-worker.sh --use-wrapper -p "..."
 #
+# Test-isolation defaults (issue #8077):
+#
+# A worker spawned by the daemon inherits the DAEMON's environment, and the
+# daemon's own systemd unit sets `LOOM_SOCKET_PATH=$HOME/.loom/loom-daemon.sock`.
+# `resolve_loom_dir()` takes that variable's PARENT as the daemon's loom dir, so
+# the "default" any `loom-daemon` a worker spawns resolves is not a neutral one
+# — it is the LIVE production `~/.loom`. A test that merely omits an override
+# therefore writes into the operator's real `daemon.log`, reads the real
+# workspace registry, and reconciles against the real machine sweep journal.
+# That is not hypothetical: on 2026-09-17 a builder sweep on loom-worker-2 put
+# 17 daemon boot blocks into the production log and had one of those daemons
+# adopt the live host's in-flight sweep claim.
+#
+# The seam every sweep worker passes through is the right place to make the
+# default safe, because a Builder cannot forget what it never had to remember.
+# Both are set with `${VAR:-default}` semantics — an explicit caller value always
+# wins, so a deliberate operator override is preserved.
+#
+#   LOOM_DAEMON_LOG       A per-worker scratch log path. This is the daemon's
+#                         HIGHEST-precedence log tier (`resolve_log_path`, ahead
+#                         of the LOOM_SOCKET_PATH-derived default), so a daemon
+#                         spawned anywhere under this worker logs there instead
+#                         of into production. Deliberately the ONLY path var
+#                         repointed here: LOOM_SOCKET_PATH, LOOM_WORKSPACE and
+#                         LOOM_SHARED_TOKENS_DIR must keep their production
+#                         values, because the worker itself legitimately talks
+#                         to the real daemon and draws from the real token pool
+#                         (repointing them would break the sweep, not isolate
+#                         it). Test-side isolation for those lives in
+#                         defaults/scripts/tests/lib/live-state-sandbox.sh.
+#   LOOM_TEST_ALLOW_SYSTEMD  `0`. Blocks that drive the LIVE `systemctl --user`
+#                         manager are opt-in; inside a sweep, that manager is
+#                         the one supervising the production daemon, so the
+#                         answer is always no. CI opts in explicitly instead.
+#
 # Env vars:
 #   LOOM_RUNTIME     Selects the runtime adapter (highest precedence). An empty
 #                    value is treated as unset (falls through to config/default).
@@ -58,6 +93,17 @@ log_warn() { echo -e "${YELLOW}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] WARN${NC} $*" 
 log_error() { echo -e "${RED}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR${NC} $*" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- Test-isolation defaults (#8077) ---
+# See the header block for why these belong here rather than in each test. The
+# scratch log path is per-worker (pid-suffixed) so two concurrent workers on the
+# same host cannot interleave into one file, and lives under $TMPDIR so it is
+# reaped with the rest of the host's temp state rather than accumulating inside
+# a repo. Deliberately NOT `mkdir`ed here: `setup_logging()` already does
+# `create_dir_all(log_path.parent())` before opening the file, so the directory
+# materializes only if a daemon is actually spawned — a worker that never
+# spawns one (the overwhelming majority) leaves nothing behind at all.
+export LOOM_DAEMON_LOG="${LOOM_DAEMON_LOG:-${TMPDIR:-/tmp}/loom-worker-isolation-$$/daemon.log}" LOOM_TEST_ALLOW_SYSTEMD="${LOOM_TEST_ALLOW_SYSTEMD:-0}"
 
 # --- Repo root resolution (handles worktrees) ---
 # Only used to locate `.loom/config.json`. Mirrors spawn-claude.sh:
@@ -100,8 +146,7 @@ _available_runtimes() {
 }
 
 # --- Resolve the runtime (env > config > default) ---
-RUNTIME=""
-RUNTIME_SOURCE=""
+RUNTIME="" RUNTIME_SOURCE=""
 
 if [[ -n "${LOOM_RUNTIME:-}" ]]; then
     RUNTIME="$LOOM_RUNTIME"

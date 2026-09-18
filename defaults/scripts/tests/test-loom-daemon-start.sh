@@ -1792,8 +1792,19 @@ rm -rf "$WORKDIR/ad11"
 # cannot be redirected via an env HOME override the way the stub-based tests
 # above redirect it), uniquely named with $$ so a leftover from an
 # interrupted run cannot collide with a later one.
+#
+# OPT-IN ONLY (LOOM_TEST_ALLOW_SYSTEMD=1, #8077). "Reachable `systemctl --user`"
+# used to be the whole gate, which meant this block ran unconditionally on every
+# FLEET WORKER — where the reachable user manager is the one supervising the
+# PRODUCTION loom-daemon. That is not a hypothetical: a builder sweep on
+# loom-worker-2 (2026-09-17) drove 32 × `systemctl --user daemon-reload` into
+# the live manager from here. Unlike every other resolution tier in this file,
+# this one has no env seam to redirect — the ONLY safe default is not to run it.
+# CI keeps its coverage by setting LOOM_TEST_ALLOW_SYSTEMD=1 explicitly on a
+# runner with no production daemon; a sweep never does (spawn-worker.sh exports
+# `0`), so the two cases stay distinguishable without a host heuristic.
 MX_HAVE_SYSTEMD=false
-if command -v systemctl >/dev/null 2>&1 && [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+if [[ "${LOOM_TEST_ALLOW_SYSTEMD:-0}" =~ ^(1|true|yes|on)$ ]] && command -v systemctl >/dev/null 2>&1 && [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
     mx_state="$(systemctl --user is-system-running 2>/dev/null)"
     [[ "$mx_state" != "offline" && -n "$mx_state" ]] && MX_HAVE_SYSTEMD=true
 fi
@@ -1894,7 +1905,7 @@ MXEOF
     trap 'bg_proc_reap; [ -n "$WORKDIR" ] && pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"' EXIT
     trap 'bg_proc_reap; [ -n "$WORKDIR" ] && pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"; exit 1' INT TERM
 else
-    echo "  (skipping real-systemd #4862 regression: no reachable 'systemctl --user' manager on this host)"
+    echo "  (skipping real-systemd #4862 regression: needs LOOM_TEST_ALLOW_SYSTEMD=1 AND a reachable 'systemctl --user' manager — it writes real unit files into \$HOME/.config/systemd/user and reloads the LIVE user manager, which on a fleet worker supervises the production daemon, #8077)"
 fi
 
 # ===================================================================

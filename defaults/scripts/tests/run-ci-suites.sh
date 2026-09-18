@@ -49,6 +49,25 @@
 #                                    # override the serial lane (empty disables it)
 #   LOOM_CI_RETRY_LOG=<path>         # durable retry record location (default:
 #                                      /tmp/ci-suite-retry-log.tsv, see below)
+#   LOOM_CI_LIVE_LEAK_GUARD=warn     # downgrade the #8077 live-host leak guard
+#                                      from a hard failure to a warning
+#   LOOM_TEST_ALLOW_SYSTEMD=1        # (read by individual suites, not by this
+#                                      script) opt in to blocks that drive the
+#                                      LIVE `systemctl --user` manager — safe
+#                                      only on a host with no production daemon
+#
+# ## Live-host leak guard (#8077)
+#
+# The #6386 guard below decides whether a host-mutating suite RUNS. This one
+# checks, after the fact, whether the run that did happen moved live host
+# state: the boot-block count of every reachable `daemon.log`, the supervised
+# unit's restart identity, the systemd --user unit-file name set, the shared
+# token pool. It exists because #6386's per-suite skip list is a whitelist of
+# KNOWN-dangerous suites, and #8077 was an unlisted one — the sweep environment
+# inherits the production daemon's own `LOOM_SOCKET_PATH`, so ANY suite that
+# spawns a real daemon without an explicit override resolves the live
+# `~/.loom/daemon.log`, whatever else it sandboxes. A whitelist cannot see
+# that; a before/after fingerprint of the damage surface can.
 #
 # ## Retry-once-and-record (#7791)
 #
@@ -216,6 +235,30 @@ SERIAL_LANE_SUITES="${LOOM_CI_SERIAL_SUITES-test-loom-daemon-update.sh test-loom
 # shellcheck source=../lib/live-daemon-guard.sh
 source "$REPO_ROOT/defaults/scripts/lib/live-daemon-guard.sh"
 
+# live_host_leak_snapshot / live_host_leak_assert_unchanged (#8077) — the
+# whole-run guard that this script wraps around every suite it dispatches. The
+# #6386 guard above answers "should this suite run here?"; this one answers
+# "did the run that DID happen touch the live host?", which is the question
+# #8077 went unanswered on: the sweep environment inherits the production
+# daemon's own LOOM_SOCKET_PATH, so a suite that merely OMITS an override gets
+# the live `~/.loom/daemon.log` as its "default" rather than a neutral one.
+# Only the #8077 pair is used, NOT live_state_sandbox_snapshot: the state-path
+# pair fingerprints `.daemon.pid`, which a legitimate auto_update daemon roll
+# rewrites — fine inside one short suite, a guaranteed flake across a full
+# 20-minute run. See that file's "#8077 live-host leak guard" header section.
+#
+# Sourced fail-CLOSED. This script runs `set -uo pipefail` WITHOUT `-e`, so an
+# unreadable `source` only prints and continues — which would leave the guard's
+# functions undefined and its verdict indistinguishable from a real leak. A
+# missing guard must stop the run, not be silently absent (#7745/#7761's
+# fail-open pattern).
+if [[ ! -r "$SCRIPT_DIR/lib/live-state-sandbox.sh" ]]; then
+    echo "::error::run-ci-suites.sh: lib/live-state-sandbox.sh is missing — the #8077 live-host leak guard cannot run" >&2
+    exit 1
+fi
+# shellcheck source=lib/live-state-sandbox.sh
+source "$SCRIPT_DIR/lib/live-state-sandbox.sh"
+
 # print_suite_failure_excerpt — the failure excerpt printed for every failing
 # suite below. Extracted (#6662) so the excerpt's shape is testable against a
 # synthetic log without executing a real CI suite run; see that file for why
@@ -335,6 +378,13 @@ if [[ "$PLAN_ONLY" == "true" ]]; then
     done
     exit 0
 fi
+
+# Live-host leak guard (#8077): fingerprint the surfaces a test run must never
+# move — every reachable `daemon.log`'s boot-block count, the supervised unit's
+# restart identity, the systemd --user unit-file name set, the shared token
+# pool — BEFORE the first suite is dispatched. Taken here, after the --plan /
+# --print-candidates early exits, so a dry run pays nothing.
+live_host_leak_snapshot
 
 # PARALLELISM: how many suites run at once. Default is the host's logical
 # core count (nproc — the issue's own default) via the shared cpu-budget.sh
@@ -574,6 +624,35 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
             done
         fi
     } >>"$GITHUB_STEP_SUMMARY"
+fi
+
+# ---------- live-host leak guard, second half (#8077) ----------
+# Re-fingerprint what live_host_leak_snapshot recorded. A clean run says so
+# explicitly (naming the surface count), because a guard whose only output is
+# silence is indistinguishable from one that never ran — the same reasoning the
+# retry record above is built on. A leak is a HARD failure by default: #8077
+# was found by an operator reading a fleet-check digest 15 hours later, which
+# is exactly the discovery latency a gate exists to remove.
+if live_host_leak_assert_unchanged; then
+    printf '\nLive-host leak guard: clean (%d surface(s) checked, #8077)\n' \
+        "$(live_host_leak_snapshot_size)"
+else
+    {
+        echo
+        echo "############################################################"
+        echo "!!! A SUITE IN THIS RUN TOUCHED LIVE HOST STATE (#8077)"
+        echo "    The offending surface(s) are named above. This is the class of leak that"
+        echo "    wrote 17 daemon boot blocks into a fleet worker's PRODUCTION ~/.loom/daemon.log"
+        echo "    and reloaded the user manager supervising its live daemon."
+        echo "    Set LOOM_CI_LIVE_LEAK_GUARD=warn to downgrade this to a warning."
+        echo "############################################################"
+    } >&2
+    if [[ "${LOOM_CI_LIVE_LEAK_GUARD:-fail}" == "warn" ]]; then
+        echo "    (LOOM_CI_LIVE_LEAK_GUARD=warn — not failing the run)" >&2
+    else
+        failed=$((failed + 1))
+        failed_names+=("<live-host leak guard, #8077>")
+    fi
 fi
 
 if [[ "$failed" -ne 0 ]]; then

@@ -126,10 +126,14 @@ check "$([[ "$(plan_verdict "$PLAN_LIVE" "$PINNED_SUITE")" == "SKIP" ]] && echo 
 FIXTURE="$WORKDIR/fixture"
 FIX_TESTS="$FIXTURE/defaults/scripts/tests"
 FIX_LIB="$FIXTURE/defaults/scripts/lib"
-mkdir -p "$FIX_TESTS" "$FIX_LIB"
+mkdir -p "$FIX_TESTS" "$FIX_LIB" "$FIX_TESTS/lib"
 cp "$RUNNER" "$SCRIPT_DIR/check-ci-suite-manifest.sh" "$FIX_TESTS/"
 cp "$REPO_ROOT/defaults/scripts/lib/live-daemon-guard.sh" \
    "$REPO_ROOT/defaults/scripts/lib/cpu-budget.sh" "$FIX_LIB/"
+# The #8077 live-host leak guard (tests/lib/, not scripts/lib/). The runner
+# sources it fail-CLOSED, so a fixture without it exits 1 before running a
+# single suite.
+cp "$SCRIPT_DIR/lib/live-state-sandbox.sh" "$FIX_TESTS/lib/"
 
 # Fixture suites record their own start/end wall-clock, so overlap is measured
 # rather than inferred. $LANE_OUT is exported below and inherited by every

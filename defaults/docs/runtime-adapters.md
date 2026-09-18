@@ -877,6 +877,24 @@ dispatch the canonical single-issue lifecycle. With nothing configured this stay
 byte-for-byte the old `claude -p ... --dangerously-skip-permissions` invocation
 (via `spawn-worker.sh` → `spawn-claude.sh`).
 
+### Test-isolation defaults the dispatcher exports (#8077)
+
+Before dispatching, `spawn-worker.sh` sets two variables — with `${VAR:-default}`
+semantics, so an explicit caller value always wins:
+
+| Variable | Default | Why |
+|---|---|---|
+| `LOOM_DAEMON_LOG` | `$TMPDIR/loom-worker-isolation-<pid>/daemon.log` | A worker inherits the daemon's environment, and the daemon's own systemd unit sets `LOOM_SOCKET_PATH=$HOME/.loom/loom-daemon.sock`. `resolve_loom_dir()` takes that variable's **parent** as the loom dir, so any `loom-daemon` a worker spawns without an override resolves the **live** `~/.loom/daemon.log` — omitting an override yields the production path, not a neutral one. `LOOM_DAEMON_LOG` is the daemon's highest-precedence log tier, so setting it here makes the safe thing the default. |
+| `LOOM_TEST_ALLOW_SYSTEMD` | `0` | Test blocks that drive the **live** `systemctl --user` manager are opt-in. Inside a sweep, that manager is the one supervising the production daemon. CI opts in explicitly (`.github/workflows/ci.yml`); a sweep never does. |
+
+`LOOM_SOCKET_PATH`, `LOOM_WORKSPACE` and `LOOM_SHARED_TOKENS_DIR` are
+deliberately **not** repointed: the worker itself has to reach the real daemon
+over the real socket and draw from the real token pool, so isolating them would
+break the sweep rather than isolate a test. Test-side isolation for those lives
+in `defaults/scripts/tests/lib/live-state-sandbox.sh`, whose
+`live_host_leak_snapshot` / `live_host_leak_assert_unchanged` pair
+`run-ci-suites.sh` wraps around every suite it runs.
+
 ### Adapter observability markers
 
 Daemon-compatible runners emit a small, secret-free contract on stderr:

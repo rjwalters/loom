@@ -267,6 +267,68 @@ assert_eq "42" "$rc_pass" "runner exit code is passed through via exec"
 _make_stub "$STAGE/spawn-claude.sh" "claude" 0   # restore
 
 # ============================================================
+# Section N: test-isolation defaults exported into the worker env (#8077)
+#
+# A worker inherits the DAEMON's environment, and the daemon's systemd unit
+# sets LOOM_SOCKET_PATH=$HOME/.loom/loom-daemon.sock. `resolve_loom_dir()` takes
+# that variable's PARENT as the loom dir, so a `loom-daemon` spawned under a
+# worker that omits an override resolves the LIVE ~/.loom — that is how a
+# builder sweep put 17 daemon boot blocks into a fleet worker's production
+# daemon.log. These assertions pin the two defaults that close it, and — just
+# as load-bearing — pin what is deliberately NOT repointed: the worker itself
+# has to keep talking to the real daemon over the real socket.
+# ============================================================
+
+echo ""
+echo "Testing spawn-worker.sh test-isolation defaults (#8077)..."
+
+# A stub that reports the env it was exec'd with, rather than its args.
+cat > "$STAGE/spawn-claude.sh" <<'ENVSTUB'
+#!/usr/bin/env bash
+echo "stub-env LOOM_DAEMON_LOG=${LOOM_DAEMON_LOG:-<unset>}"
+echo "stub-env LOOM_TEST_ALLOW_SYSTEMD=${LOOM_TEST_ALLOW_SYSTEMD:-<unset>}"
+echo "stub-env LOOM_SOCKET_PATH=${LOOM_SOCKET_PATH:-<unset>}"
+echo "stub-env LOOM_WORKSPACE=${LOOM_WORKSPACE:-<unset>}"
+echo "stub-env LOOM_SHARED_TOKENS_DIR=${LOOM_SHARED_TOKENS_DIR:-<unset>}"
+ENVSTUB
+chmod +x "$STAGE/spawn-claude.sh"
+
+# Simulate the incident environment exactly: the production socket path
+# inherited from the daemon's own unit, and no isolation vars of any kind.
+PROD_SOCKET="$WS/fake-home/.loom/loom-daemon.sock"
+output="$(env -u LOOM_RUNTIME -u LOOM_DAEMON_LOG -u LOOM_TEST_ALLOW_SYSTEMD \
+    LOOM_WORKSPACE="$WS" LOOM_CONFIG_DEFAULTS_FILE="" \
+    LOOM_SOCKET_PATH="$PROD_SOCKET" \
+    bash "$WORKER" -p ping 2>&1 || true)"
+
+assert_not_contains "stub-env LOOM_DAEMON_LOG=<unset>" "$output" \
+    "#8077: the worker env always carries a LOOM_DAEMON_LOG, never an unset one"
+assert_not_contains "stub-env LOOM_DAEMON_LOG=$(dirname "$PROD_SOCKET")/daemon.log" "$output" \
+    "#8077: …and it is NOT the production log the inherited LOOM_SOCKET_PATH would resolve"
+assert_contains "loom-worker-isolation-" "$output" \
+    "#8077: LOOM_DAEMON_LOG points into a per-worker scratch dir"
+assert_contains "stub-env LOOM_TEST_ALLOW_SYSTEMD=0" "$output" \
+    "#8077: LOOM_TEST_ALLOW_SYSTEMD defaults to 0 — a sweep never drives the LIVE systemd --user manager"
+
+# NOT repointed: the sweep itself needs these. Isolating them here would break
+# the worker (no daemon IPC, no token pool) rather than isolate a test.
+assert_contains "stub-env LOOM_SOCKET_PATH=$PROD_SOCKET" "$output" \
+    "#8077: LOOM_SOCKET_PATH is left alone — the worker must still reach the real daemon"
+assert_contains "stub-env LOOM_SHARED_TOKENS_DIR=<unset>" "$output" \
+    "#8077: LOOM_SHARED_TOKENS_DIR is left alone — the worker draws from the real token pool"
+
+# An explicit caller value always wins over the default (both vars).
+output="$(env -u LOOM_RUNTIME LOOM_WORKSPACE="$WS" LOOM_CONFIG_DEFAULTS_FILE="" \
+    LOOM_DAEMON_LOG="$WS/explicit.log" LOOM_TEST_ALLOW_SYSTEMD=1 \
+    bash "$WORKER" -p ping 2>&1 || true)"
+assert_contains "stub-env LOOM_DAEMON_LOG=$WS/explicit.log" "$output" \
+    "#8077: an explicit LOOM_DAEMON_LOG is preserved, not overwritten"
+assert_contains "stub-env LOOM_TEST_ALLOW_SYSTEMD=1" "$output" \
+    "#8077: an explicit LOOM_TEST_ALLOW_SYSTEMD=1 is preserved (the CI opt-in path)"
+
+_make_stub "$STAGE/spawn-claude.sh" "claude" 0   # restore
+
+# ============================================================
 # Summary
 # ============================================================
 
