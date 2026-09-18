@@ -7,6 +7,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8211** (closed): guard mask_ws(): a quote inside an unquoted backtick substitution masks away a live statement boundary
+- **PR #8261**: fix(guard): mask_ws()/mask_gt() model an unquoted backtick span (#8211)
+- **Issue #8233** (closed): shell-budget reports lines, not fragility — add a fix-weighted progress figure
+- **PR #8236**: feat(shell-budget): report fix-weighted progress, not just lines (#8233)
+- **Issue #8077** (closed): Builder test runs leak into the live host: test daemons log to ~/.loom/daemon.log and reload the production user systemd manager (#7873 sweep on loom-worker-2)
+- **PR #8179**: fix(tests): stop sweep test runs leaking into the live host (#8077)
+- **PR #8199**: feat(merge-pr): port the closing-reference analysis to Rust (#8191 slice 1)
+- **PR #8190**: fix(cache): stop stamping the running version into CLAUDE.md (#8147)
 - **Issue #8112** (closed): Two Judges raced on one head: a PR can carry loom:pr and loom:changes-requested at once, and merge-pr.sh only reads the first
 - **PR #8226**: feat(worktree): port the worktree-add lock to Rust (#8195 slice 1)
 - **Issue #8138** (closed): Port PR #8058's model-class-marker logic to loom-daemon (Shell Budget Ratchet)
