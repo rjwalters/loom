@@ -135,17 +135,14 @@ impl ShellBudgetArgs {
                 );
             }
 
-            // Recategorisation voids the override (see check_against_rev).
-            let recategorised =
-                shell_budget::recategorised_since(&root, &cmp.rev).map_err(anyhow::Error::msg)?;
             let ctx = shell_budget::GrowthContext {
                 declared: &declared,
-                recategorised: &recategorised,
             };
 
             if let Err(why) = shell_budget::check_against_rev(&budget, &before, &desc, &ctx) {
                 // Not "PORTABLE SHELL GREW": three of the four refusal paths
-                // (floor growth, a short declaration, a recategorising change)
+                // (floor growth, a short declaration, a change that both grows
+                // the floor and retires portable shell)
                 // fire when portable FELL or held. A header that names the
                 // wrong cause sends the author to fix the wrong thing — the
                 // same message-vs-reality defect this whole change is about.

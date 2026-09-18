@@ -61,6 +61,14 @@ pub struct Budget {
     pub by_category: BTreeMap<String, u64>,
     /// Files per allowlist category.
     pub files_by_category: BTreeMap<String, u64>,
+    /// Per-file `(category, code lines)`, keyed by repo-relative path.
+    ///
+    /// Needed because the per-CATEGORY totals cannot distinguish "added 20
+    /// lines to a bootstrap script" from "retired 20 portable lines and added
+    /// 20 bootstrap ones" — the two produce identical category figures, and
+    /// review used exactly that to launder new portable shell past a
+    /// declaration (#8154).
+    pub by_file: BTreeMap<String, (String, u64)>,
     /// Production scripts carrying no allowlist entry at all. Non-zero means
     /// the allowlist and the tree have drifted, which makes every other number
     /// here an undercount — so it is surfaced rather than folded in silently.
@@ -226,6 +234,7 @@ pub fn measure(root: &Path) -> Result<Budget, String> {
             Some(cat) => {
                 *budget.by_category.entry(cat.clone()).or_default() += n;
                 *budget.files_by_category.entry(cat.clone()).or_default() += 1;
+                budget.by_file.insert(rel.clone(), (cat.clone(), n));
             }
             None => budget.unlisted.push(PathBuf::from(rel)),
         }
@@ -468,6 +477,7 @@ pub fn measure_at_rev(root: &Path, rev: &str) -> Result<Budget, String> {
             Some(cat) => {
                 *budget.by_category.entry(cat.clone()).or_default() += n;
                 *budget.files_by_category.entry(cat.clone()).or_default() += 1;
+                budget.by_file.insert((*rel).to_string(), (cat.clone(), n));
             }
             None => budget.unlisted.push(PathBuf::from(rel)),
         }
@@ -624,59 +634,59 @@ pub fn parse_growth_declarations(
         let Some(rest) = strip_trailer_prefix(line) else {
             continue;
         };
-        let rest = rest.trim();
-
-        // Leading integer: the declared line count.
-        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        if digits.is_empty() {
-            bad.push(MalformedDeclaration {
-                line: line.to_string(),
-                why: "no leading line count — expected `<n> lines — <reason> (#issue)`",
-            });
-            continue;
+        match parse_declaration_value(rest, line) {
+            Ok(d) => ok.push(d),
+            Err(m) => bad.push(m),
         }
-        let Ok(lines) = digits.parse::<u64>() else {
-            bad.push(MalformedDeclaration {
-                line: line.to_string(),
-                why: "line count does not fit in a u64",
-            });
-            continue;
-        };
-
-        let reason = rest[digits.len()..].trim_start();
-        let reason = reason
-            .strip_prefix("lines")
-            .or_else(|| reason.strip_prefix("line"))
-            .unwrap_or(reason);
-        let reason = reason
-            .trim_start()
-            .trim_start_matches(['-', '\u{2014}', '\u{2013}', ':'])
-            .trim();
-
-        if reason.is_empty() {
-            bad.push(MalformedDeclaration {
-                line: line.to_string(),
-                why: "no reason given after the line count",
-            });
-            continue;
-        }
-
-        let Some(issue) = first_issue_reference(reason) else {
-            bad.push(MalformedDeclaration {
-                line: line.to_string(),
-                why: "reason cites no issue — an override must reference `#<issue>`",
-            });
-            continue;
-        };
-
-        ok.push(GrowthDeclaration {
-            lines,
-            reason: reason.to_string(),
-            issue,
-        });
     }
 
     (ok, bad)
+}
+
+/// Parse a trailer's VALUE — everything after `Shell-Budget-Growth:`.
+///
+/// `raw` is the original line, carried only so a malformed report can quote
+/// what the author actually wrote.
+fn parse_declaration_value(
+    value: &str,
+    raw: &str,
+) -> Result<GrowthDeclaration, MalformedDeclaration> {
+    let bad = |why: &'static str| MalformedDeclaration {
+        line: raw.trim().to_string(),
+        why,
+    };
+    let rest = value.trim();
+
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return Err(bad("no leading line count — expected `<n> lines — <reason> (#issue)`"));
+    }
+    let Ok(lines) = digits.parse::<u64>() else {
+        return Err(bad("line count does not fit in a u64"));
+    };
+
+    let reason = rest[digits.len()..].trim_start();
+    let reason = reason
+        .strip_prefix("lines")
+        .or_else(|| reason.strip_prefix("line"))
+        .unwrap_or(reason);
+    let reason = reason
+        .trim_start()
+        .trim_start_matches(['-', '\u{2014}', '\u{2013}', ':'])
+        .trim();
+
+    if reason.is_empty() {
+        return Err(bad("no reason given after the line count"));
+    }
+    let Some(issue) = first_issue_reference(reason) else {
+        return Err(bad("reason cites no issue — an override must reference `#<issue>`"));
+    };
+
+    Ok(GrowthDeclaration {
+        lines,
+        reason: reason.to_string(),
+        issue,
+    })
 }
 
 /// Case-insensitive match on the trailer key, so `shell-budget-growth:` works.
@@ -712,7 +722,16 @@ fn first_issue_reference(text: &str) -> Option<u64> {
     None
 }
 
-/// Read every commit message in `base_rev..HEAD` and parse its trailers.
+/// Read the `Shell-Budget-Growth:` trailers from every commit in
+/// `base_rev..HEAD`, using **git's own** trailer parser.
+///
+/// Not a hand-rolled line scan. Review defeated the first one three ways —
+/// a trailer inside a fenced code block at column 0, a folded continuation
+/// line, and a trailer used as a commit SUBJECT (which git would never treat
+/// as a trailer, and which a squash rewrites into `* Shell-Budget-Growth: …`
+/// and drops). `git interpret-trailers`' semantics get all three right for
+/// free, and they are the semantics an author already expects from
+/// `Co-Authored-By` and `Signed-off-by`.
 ///
 /// # Errors
 /// Returns a message when `git log` cannot be run.
@@ -720,9 +739,18 @@ pub fn collect_growth_declarations(
     root: &Path,
     base_rev: &str,
 ) -> Result<(Vec<GrowthDeclaration>, Vec<MalformedDeclaration>), String> {
+    // A per-commit record separator, because a trailer value may itself span
+    // lines and commits may carry more than one.
     let out = Command::new("git")
         .current_dir(root)
-        .args(["log", "--format=%B", &format!("{base_rev}..HEAD")])
+        .args([
+            "log",
+            &format!(
+                "--format=%x00%(trailers:key={},valueonly)",
+                GROWTH_TRAILER.trim_end_matches(':')
+            ),
+            &format!("{base_rev}..HEAD"),
+        ])
         .output()
         .map_err(|e| format!("could not run git log: {e}"))?;
     if !out.status.success() {
@@ -731,56 +759,22 @@ pub fn collect_growth_declarations(
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(parse_growth_declarations(&String::from_utf8_lossy(&out.stdout)))
-}
 
-/// A script whose allowlist category changed between two revisions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Recategorised {
-    /// The script's path.
-    pub path: String,
-    /// Its category at the base revision.
-    pub from: String,
-    /// Its category now.
-    pub to: String,
-}
-
-/// Scripts whose allowlist category differs between `base_rev` and the working
-/// tree.
-///
-/// # Errors
-/// Returns a message when the base revision's allowlist cannot be read.
-pub fn recategorised_since(root: &Path, base_rev: &str) -> Result<Vec<Recategorised>, String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["show", &format!("{base_rev}:scripts/shell-allowlist.txt")])
-        .output()
-        .map_err(|e| format!("could not run git show: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git show {base_rev}:scripts/shell-allowlist.txt failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let before = parse_allowlist(&String::from_utf8_lossy(&out.stdout));
-    let now_text = std::fs::read_to_string(root.join("scripts/shell-allowlist.txt"))
-        .map_err(|e| format!("could not read scripts/shell-allowlist.txt: {e}"))?;
-    let now = parse_allowlist(&now_text);
-
-    let mut moved: Vec<Recategorised> = Vec::new();
-    for (path, cat_now) in &now {
-        if let Some(cat_before) = before.get(path) {
-            if cat_before != cat_now {
-                moved.push(Recategorised {
-                    path: path.clone(),
-                    from: cat_before.clone(),
-                    to: cat_now.clone(),
-                });
-            }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut ok = Vec::new();
+    let mut bad = Vec::new();
+    for value in text
+        .split('\0')
+        .flat_map(str::lines)
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        match parse_declaration_value(value, &format!("{GROWTH_TRAILER} {value}")) {
+            Ok(d) => ok.push(d),
+            Err(m) => bad.push(m),
         }
     }
-    Ok(moved)
+    Ok((ok, bad))
 }
 
 /// Everything `check_against_rev` needs beyond the two measurements.
@@ -788,8 +782,6 @@ pub fn recategorised_since(root: &Path, base_rev: &str) -> Result<Vec<Recategori
 pub struct GrowthContext<'a> {
     /// `Shell-Budget-Growth:` trailers found in the compared commit range.
     pub declared: &'a [GrowthDeclaration],
-    /// Scripts whose allowlist category moved in this change.
-    pub recategorised: &'a [Recategorised],
 }
 
 impl<'a> GrowthContext<'a> {
@@ -797,10 +789,7 @@ impl<'a> GrowthContext<'a> {
     /// every pre-#8154 caller had.
     #[must_use]
     pub const fn none() -> Self {
-        Self {
-            declared: &[],
-            recategorised: &[],
-        }
+        Self { declared: &[] }
     }
 }
 
@@ -841,33 +830,59 @@ pub fn check_against_rev(
 
         // A declaration must not launder PORTABLE growth into the floor.
         //
-        // The total leg exists because moving a 639-line file `contract` ->
-        // `bootstrap` while ADDING 200 portable lines makes NET portable fall,
-        // so the portable leg above cannot see it; only the total rises. A
-        // trailer that covers the total therefore buys exactly that case —
-        // new portable shell, declared as floor growth. Review reproduced it.
+        // The first cut of this vetoed a change that RECATEGORISED a script.
+        // Review defeated that three ways without ever recategorising: `git mv`
+        // the portable file and list the new path as `bootstrap`; delete it and
+        // add an equivalent; or leave the allowlist untouched and simply move
+        // the lines from a `contract` file into a `bootstrap` one. All three
+        // produce category totals byte-identical to the legitimate "add 20
+        // lines to a bootstrap script" case, so no rule over the two
+        // category-level `Budget`s can tell them apart.
         //
-        // Recategorising is already disallowed by the policy, so the override
-        // simply does not apply when any category moved. The growth is still
-        // refusable on its merits; it just cannot be bought with a trailer.
-        if !ctx.recategorised.is_empty() {
-            let moved = ctx
-                .recategorised
+        // The rule that actually closes it is per-FILE: a declaration applies
+        // only when no file that was PORTABLE at the base lost code lines. A
+        // file that shrank, or that vanished, is portable shell being retired —
+        // and retiring portable shell in the same change that grows the floor
+        // is exactly what makes the totals ambiguous. Once no portable file may
+        // shrink, any new portable line necessarily raises `now.portable()`,
+        // and the portable leg above fires.
+        //
+        // The cost is that "retire portable shell AND grow the floor" must be
+        // two PRs. That is the same "split the change" this already asks for,
+        // and each half is then reviewable on its own terms.
+        let mut lost: Vec<(&String, u64, u64)> = Vec::new();
+        for (path, (cat, before_lines)) in &before.by_file {
+            if !PORTABLE.contains(&cat.as_str()) {
+                continue;
+            }
+            let now_lines = now.by_file.get(path).map_or(0, |(_, n)| *n);
+            if now_lines < *before_lines {
+                lost.push((path, *before_lines, now_lines));
+            }
+        }
+        if !lost.is_empty() {
+            let detail = lost
                 .iter()
-                .map(|r| format!("    {}  {} -> {}", r.path, r.from, r.to))
+                .map(|(p, was, is)| {
+                    if *is == 0 {
+                        format!("    {p}  {was} -> gone")
+                    } else {
+                        format!("    {p}  {was} -> {is}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             return Err(format!(
                 "This change adds {growth} code lines of production shell (vs {base_desc}: {} -> \
-                 {}) AND moves {} script(s) between allowlist categories:\n\n{moved}\n\n\
-                 A `{GROWTH_TRAILER}` declaration does NOT apply to a change that recategorises. \
-                 Moving a file out of `contract` while adding portable shell makes net portable \
-                 FALL, so only the total rises — declaring that total would buy new portable \
-                 shell, which no trailer may do.\n\n\
-                 Split the change: recategorise in one PR (argued on its own), grow in another.",
+                 {}) while PORTABLE shell shrank or disappeared:\n\n{detail}\n\n\
+                 A `{GROWTH_TRAILER}` declaration does not apply to a change that does both. \
+                 Retiring portable lines while adding floor lines makes the two \
+                 indistinguishable from simply moving them, so the declaration could buy new \
+                 portable shell without the portable leg ever seeing it.\n\n\
+                 Split the change: retire portable shell in one PR, grow the floor in another. \
+                 Each is then reviewable on its own terms.",
                 before.total(),
-                now.total(),
-                ctx.recategorised.len()
+                now.total()
             ));
         }
 
@@ -1055,8 +1070,7 @@ mod tests {
             &before,
             "base",
             &GrowthContext {
-                declared: &decl(59),
-                recategorised: &[]
+                declared: &decl(59)
             }
         )
         .is_ok());
@@ -1072,8 +1086,7 @@ mod tests {
             &before,
             "base",
             &GrowthContext {
-                declared: &decl(59),
-                recategorised: &[]
+                declared: &decl(59)
             }
         )
         .is_ok());
@@ -1091,7 +1104,6 @@ mod tests {
             "base",
             &GrowthContext {
                 declared: &decl(10),
-                recategorised: &[],
             },
         )
         .expect_err("must fail");
@@ -1121,7 +1133,6 @@ mod tests {
             "base",
             &GrowthContext {
                 declared: &decl(9999),
-                recategorised: &[],
             },
         )
         .expect_err("must fail");
@@ -1152,16 +1163,7 @@ mod tests {
         assert!(bad.is_empty(), "the message's own template must parse: {bad:?}");
         assert_eq!(ok.len(), 1, "from {concrete:?}");
         assert_eq!(ok[0].lines, 500, "must carry the measured growth");
-        assert!(check_against_rev(
-            &now,
-            &before,
-            "base",
-            &GrowthContext {
-                declared: &ok,
-                recategorised: &[]
-            }
-        )
-        .is_ok());
+        assert!(check_against_rev(&now, &before, "base", &GrowthContext { declared: &ok }).is_ok());
     }
 
     #[test]
@@ -1173,16 +1175,7 @@ mod tests {
         assert_eq!(ok.len(), 2);
         let before = budget_with(&[("vendored", 500, 1)]);
         let now = budget_with(&[("vendored", 559, 1)]);
-        assert!(check_against_rev(
-            &now,
-            &before,
-            "base",
-            &GrowthContext {
-                declared: &ok,
-                recategorised: &[]
-            }
-        )
-        .is_ok());
+        assert!(check_against_rev(&now, &before, "base", &GrowthContext { declared: &ok }).is_ok());
     }
 
     #[test]
@@ -1255,61 +1248,61 @@ mod tests {
         assert!(ok.is_empty() && bad.is_empty(), "{ok:?} {bad:?}");
     }
 
-    #[test]
-    fn a_declaration_cannot_launder_portable_growth_through_recategorisation() {
-        // Review reproduced this: +20 brand-new PORTABLE lines while flipping a
-        // file `contract` -> `bootstrap` makes NET portable FALL, so the
-        // portable leg cannot see it and only the total rises. A trailer
-        // covering the total would then buy new portable shell — which no
-        // trailer may do. It is exactly the hole the total leg was added to
-        // close (`recategorising_to_hide_an_addition_is_caught`).
-        let before = budget_with(&[("contract", 1000, 10), ("bootstrap", 50, 1)]);
-        let now = budget_with(&[("contract", 381, 9), ("bootstrap", 709, 2)]);
-        assert!(now.portable() < before.portable(), "net portable must fall");
-        assert!(now.total() > before.total(), "only the total rises");
-
-        let moved = [Recategorised {
-            path: "defaults/scripts/c.sh".to_string(),
-            from: "contract".to_string(),
-            to: "bootstrap".to_string(),
-        }];
-        let d = decl(9999);
-        let err = check_against_rev(
-            &now,
-            &before,
-            "base",
-            &GrowthContext {
-                declared: &d,
-                recategorised: &moved,
-            },
-        )
-        .expect_err("a recategorising change must not be buyable");
-        assert!(err.contains("recategorises"), "{err}");
-        assert!(err.contains("defaults/scripts/c.sh"), "must name the file: {err}");
+    /// A budget with per-file detail, which the laundering rule needs.
+    fn budget_files(files: &[(&str, &str, u64)]) -> Budget {
+        let mut b = Budget::default();
+        for (path, cat, lines) in files {
+            *b.by_category.entry((*cat).to_string()).or_default() += lines;
+            *b.files_by_category.entry((*cat).to_string()).or_default() += 1;
+            b.by_file
+                .insert((*path).to_string(), ((*cat).to_string(), *lines));
+        }
+        b
     }
 
     #[test]
-    fn recategorisation_alone_without_growth_still_passes() {
-        // The veto is scoped to the growth path. A pure recategorisation that
-        // grows nothing is not this gate's business.
-        let before = budget_with(&[("contract", 1000, 10), ("bootstrap", 50, 1)]);
-        let now = budget_with(&[("contract", 361, 9), ("bootstrap", 689, 2)]);
-        assert_eq!(now.total(), before.total());
-        let moved = [Recategorised {
-            path: "defaults/scripts/c.sh".to_string(),
-            from: "contract".to_string(),
-            to: "bootstrap".to_string(),
-        }];
-        assert!(check_against_rev(
-            &now,
-            &before,
-            "base",
-            &GrowthContext {
-                declared: &[],
-                recategorised: &moved
-            },
-        )
-        .is_ok());
+    fn a_declaration_cannot_buy_growth_while_portable_shell_is_retired() {
+        // Review defeated the first cut of this rule three ways, all without
+        // recategorising anything. This is the shape they share: portable
+        // shell shrinks in the same change that grows the floor, which makes
+        // the category totals identical to an honest "add 20 bootstrap lines".
+        //
+        // (a) `git mv c.sh d.sh`, list d.sh as bootstrap, add 20 contract lines
+        let before = budget_files(&[("c.sh", "contract", 30), ("a.sh", "contract", 0)]);
+        let now = budget_files(&[("d.sh", "bootstrap", 30), ("a.sh", "contract", 20)]);
+        let d = decl(9999);
+        let err = check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
+            .expect_err("a renamed-away portable file must not be buyable");
+        assert!(err.contains("c.sh  30 -> gone"), "{err}");
+
+        // (b) the same, with the lines moved in place and NO allowlist change
+        let before = budget_files(&[("c.sh", "contract", 30), ("b.sh", "bootstrap", 0)]);
+        let now = budget_files(&[("c.sh", "contract", 10), ("b.sh", "bootstrap", 40)]);
+        let err = check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
+            .expect_err("a portable file that shrank must not be buyable");
+        assert!(err.contains("c.sh  30 -> 10"), "{err}");
+        assert!(err.contains("Split the change"), "{err}");
+    }
+
+    #[test]
+    fn an_honest_floor_addition_is_still_buyable() {
+        // The rule must not block what #8154 exists to unblock: adding a safety
+        // check to a `vendored` script that cannot be ported. Nothing portable
+        // shrinks here.
+        let before = budget_files(&[("c.sh", "contract", 30), ("v.sh", "vendored", 500)]);
+        let now = budget_files(&[("c.sh", "contract", 30), ("v.sh", "vendored", 559)]);
+        let d = decl(59);
+        assert!(check_against_rev(&now, &before, "base", &GrowthContext { declared: &d }).is_ok());
+    }
+
+    #[test]
+    fn retiring_portable_shell_on_its_own_still_passes() {
+        // The veto is scoped to the growth path. A pure retirement — the whole
+        // point of the epic — must sail through.
+        let before = budget_files(&[("c.sh", "contract", 300), ("b.sh", "bootstrap", 50)]);
+        let now = budget_files(&[("c.sh", "contract", 10), ("b.sh", "bootstrap", 50)]);
+        assert!(now.total() < before.total());
+        assert!(check_against_rev(&now, &before, "base", &GrowthContext::none()).is_ok());
     }
 
     #[test]
@@ -1330,16 +1323,7 @@ mod tests {
         ];
         // Debug would panic on a plain sum; release would wrap to a small
         // number and then REFUSE growth it should allow.
-        assert!(check_against_rev(
-            &now,
-            &before,
-            "base",
-            &GrowthContext {
-                declared: &d,
-                recategorised: &[]
-            },
-        )
-        .is_ok());
+        assert!(check_against_rev(&now, &before, "base", &GrowthContext { declared: &d },).is_ok());
     }
 
     #[test]

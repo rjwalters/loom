@@ -269,10 +269,16 @@ Shell-Budget-Growth: 59 lines — guards against a silent revert of a local fix 
 
 Rules the gate enforces:
 
-- The trailer must start at **column 0**. An indented line is prose showing the
-  format, not a declaration using it. (The PR that added this parser contained
-  an indented example of its own trailer and granted itself 59 lines because of
-  it — see below.)
+- It must be a **real git trailer** — in the commit's trailing paragraph, at
+  column 0, exactly as `Co-Authored-By` and `Signed-off-by` are. The check uses
+  git's own parser (`git log --format='%(trailers:key=…,valueonly)'`) rather
+  than scanning lines, so an indented example, a fenced code block, a folded
+  continuation, and a trailer written as the commit *subject* all correctly do
+  nothing.
+
+  That is not hypothetical: the PR adding this parser contained an indented
+  example of its own trailer, and the hand-rolled scan granted the PR 59 lines
+  attributed to an unmerged issue.
 - The declared count must **cover** the measured growth. Declaring 10 and
   growing 500 fails, and the message names the shortfall.
 - The reason must cite an issue (`#<n>`).
@@ -282,11 +288,22 @@ Rules the gate enforces:
 - A malformed trailer is reported as malformed. It is not silently treated as
   absent — otherwise the build fails with a message about growth while the real
   problem is a typo, and the author re-reads the wrong thing.
-- A change that **recategorises** any script between allowlist categories cannot
-  be bought with a trailer at all. Moving a file out of `contract` while adding
-  portable shell makes net portable *fall*, so only the total rises; declaring
-  that total would buy new portable shell, which no trailer may do. Split the
-  change: recategorise in one PR, grow in another.
+- A change that **retires portable shell** cannot be bought with a trailer at
+  all. If any file that was `contract`/`hook-entry` at the base lost code lines
+  (or vanished), the declaration does not apply.
+
+  This is the rule, rather than the narrower "does not recategorise" one, because
+  review defeated that three ways without recategorising anything: `git mv` the
+  portable file and list the new path as `bootstrap`; delete it and add an
+  equivalent; or leave the allowlist untouched and move the lines from a
+  `contract` file into a `bootstrap` one. All three produce category totals
+  byte-identical to an honest "add 20 lines to a bootstrap script", so no rule
+  over the category figures can tell them apart — only a per-file one can.
+
+  Once no portable file may shrink, any new portable line necessarily raises the
+  portable total, and the portable leg fires. The cost is that "retire portable
+  shell **and** grow the floor" must be two PRs, which is the same split this
+  already asks for, and each half is then reviewable on its own terms.
 
 ### What this override does NOT do
 
