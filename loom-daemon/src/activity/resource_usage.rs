@@ -104,7 +104,9 @@ impl ModelPricing {
     ///
     /// Prices verified against
     /// <https://platform.claude.com/docs/en/about-claude/pricing> on
-    /// **2026-09-17**. USD per 1k tokens (= the published $/MTok / 1000):
+    /// **2026-09-17**, re-verified against the same live page on **2026-09-18**
+    /// (every row below unchanged). USD per 1k tokens (= the published $/MTok
+    /// / 1000):
     ///
     /// | Row | Input | Output |
     /// |---|---|---|
