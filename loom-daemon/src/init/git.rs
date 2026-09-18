@@ -534,7 +534,12 @@ const MACHINE_DEFAULTS_REL: &str = ".local/share/loom-daemon/defaults";
 /// `~/` + [`MACHINE_DEFAULTS_REL`]. Returns `None` when the env var is
 /// explicitly set to an empty string (strategy disabled) or when no home
 /// directory can be determined.
-fn machine_level_defaults_path() -> Option<PathBuf> {
+///
+/// `pub(crate)` (Issue #7964): [`crate::auto_update::ScriptAutoUpdateProbe`]
+/// reuses this exact resolution for its own third fallback candidate — the
+/// `--fetch` path's `loom-daemon-update.sh` search — so the two mirror-path
+/// lookups in the codebase cannot drift apart on override behavior.
+pub(crate) fn machine_level_defaults_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var(MACHINE_DEFAULTS_ENV) {
         return if p.is_empty() {
             None
@@ -637,14 +642,20 @@ pub fn resolve_defaults_path(defaults_path: &str) -> Result<PathBuf, String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     // std::env::set_var mutates process-global state; serialize the tests
     // below that touch MACHINE_DEFAULTS_ENV so parallel execution doesn't
-    // race on it. Module-local lock is sufficient here (unlike
-    // worktree_root.rs's ENV_LOCK) because no other module reads
-    // LOOM_DAEMON_DEFAULTS_DIR.
+    // race on it. A module-local Mutex alone is NOT sufficient (the
+    // worktree_root.rs lesson, #5164/#5133): `LOOM_DAEMON_DEFAULTS_DIR` is
+    // process-global and, since Issue #7964, also read by
+    // `auto_update::tests` (`ScriptAutoUpdateProbe::candidate_roots`'s third
+    // fallback reuses [`machine_level_defaults_path`]). Every test below that
+    // calls `with_machine_defaults_env` therefore also carries
+    // `#[serial(loom_daemon_defaults_dir)]`, the same key `auto_update::tests`
+    // uses, so the two sides of that seam cannot interleave.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Run `f` with `LOOM_DAEMON_DEFAULTS_DIR` set to `value` (or unset if
@@ -666,6 +677,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_daemon_defaults_dir)]
     fn test_machine_level_defaults_path_honors_env_override() {
         with_machine_defaults_env(Some("/tmp/some/custom/defaults"), || {
             let resolved = machine_level_defaults_path();
@@ -674,6 +686,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_daemon_defaults_dir)]
     fn test_machine_level_defaults_path_empty_env_disables() {
         with_machine_defaults_env(Some(""), || {
             let resolved = machine_level_defaults_path();
@@ -682,6 +695,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_daemon_defaults_dir)]
     fn test_machine_level_defaults_path_default_is_home_relative() {
         with_machine_defaults_env(None, || {
             let resolved = machine_level_defaults_path();
@@ -696,6 +710,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_daemon_defaults_dir)]
     fn test_resolve_defaults_path_falls_back_to_machine_level_payload() {
         // A defaults_path guaranteed absent both as a cwd-relative path and
         // relative to this crate's own git root, so strategies 1 and 2 both
@@ -714,6 +729,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_daemon_defaults_dir)]
     fn test_resolve_defaults_path_errors_when_machine_level_payload_missing() {
         let bogus_defaults_path = "definitely-does-not-exist-issue-5389-defaults";
 
