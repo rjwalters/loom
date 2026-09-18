@@ -24,11 +24,20 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # where the version lives. package.json remains the file this script derives
 # `get_version()` from; VERSION is kept in sync alongside it, same as every
 # other entry here.
+#
+# CLAUDE.md is deliberately NOT here (#8147). It used to carry a
+# `**Loom Version**: X.Y.Z` header that this script rewrote on every bump —
+# but CLAUDE.md is injected into EVERY agent session's prompt prefix, and a
+# prompt-cache lookup matches the whole prefix up to a content-block
+# boundary. One changed byte in it therefore invalidates every cached byte
+# downstream (the entire role prompt included: ~79k of a judge tick's ~109k
+# prefix), fleet-wide, on every pulled bump — measured in #8066/#8147.
+# Installed-version provenance lives in .loom/install-metadata.json (below)
+# and in VERSION, neither of which is read into a session prefix.
 VERSION_FILES=(
   "package.json"
   "mcp-loom/package.json"
   "Cargo.toml"
-  "CLAUDE.md"
   "VERSION"
 )
 
@@ -64,9 +73,6 @@ get_version_from_file() {
       ;;
     *.toml)
       grep -m1 '^version' "$REPO_ROOT/$file" | sed 's/version = "\(.*\)"/\1/'
-      ;;
-    CLAUDE.md)
-      grep -o 'Loom Version\*\*: [0-9]*\.[0-9]*\.[0-9]*' "$REPO_ROOT/$file" | grep -o '[0-9]*\.[0-9]*\.[0-9]*'
       ;;
     VERSION)
       # Plain-text file: the version string, trimmed of surrounding whitespace
@@ -192,10 +198,10 @@ set_version() {
     "$REPO_ROOT/Cargo.toml" > "$REPO_ROOT/Cargo.toml.tmp" && mv "$REPO_ROOT/Cargo.toml.tmp" "$REPO_ROOT/Cargo.toml"
   echo "  Updated Cargo.toml"
 
-  # CLAUDE.md — portable in-place edit via temp file + mv (matches the
-  # Cargo.toml idiom above; avoids BSD vs GNU `sed -i` divergence).
-  sed "s/\*\*Loom Version\*\*: .*/\*\*Loom Version\*\*: $new_version/" "$REPO_ROOT/CLAUDE.md" > "$REPO_ROOT/CLAUDE.md.tmp" && mv "$REPO_ROOT/CLAUDE.md.tmp" "$REPO_ROOT/CLAUDE.md"
-  echo "  Updated CLAUDE.md"
+  # CLAUDE.md is deliberately NOT rewritten here (#8147) — see the note above
+  # VERSION_FILES. It is prompt-prefix-injected, so stamping the running
+  # version into it dropped every warm prefix in the fleet once per pulled
+  # bump.
 
   # VERSION (#5517) — plain text, single line.
   printf '%s\n' "$new_version" > "$REPO_ROOT/VERSION"
@@ -246,7 +252,7 @@ do_tag() {
     cd "$REPO_ROOT"
     git add package.json mcp-loom/package.json mcp-loom/package-lock.json \
            Cargo.toml \
-           CLAUDE.md VERSION Cargo.lock
+           VERSION Cargo.lock
     [ -f "CHANGELOG.md" ] && git add CHANGELOG.md
     [ -f ".loom/install-metadata.json" ] && git add .loom/install-metadata.json
     git commit -m "chore: bump version to $version"

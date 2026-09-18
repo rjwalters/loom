@@ -789,7 +789,7 @@ jobs:
     # (.github/workflows/version-bump-on-merge.yml, #7743) rather than
     # something every defaults/-touching PR carries itself -- a PR that
     # hand-edits a version-bearing file's value (package.json,
-    # mcp-loom/package.json, Cargo.toml, CLAUDE.md, VERSION) is either
+    # mcp-loom/package.json, Cargo.toml, VERSION) is either
     # duplicating that workflow's job (harmless but pointless) or racing it
     # (actively wrong: the PR's hand-picked value goes stale the moment any
     # other defaults/-touching PR merges first). This inverts the check this

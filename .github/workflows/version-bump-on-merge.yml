@@ -18,7 +18,7 @@ name: Version Bump on Merge
 #
 # Self-trigger note: the bump commit this workflow pushes never touches
 # `defaults/` (it only rewrites the version-bearing files themselves --
-# `package.json`, `mcp-loom/package.json`, `Cargo.toml`, `CLAUDE.md`,
+# `package.json`, `mcp-loom/package.json`, `Cargo.toml`,
 # `VERSION`, `.loom/install-metadata.json` if present, plus the derived
 # `Cargo.lock` / `mcp-loom/package-lock.json`), so the `paths: ['defaults/**']`
 # filter below can never see its own push and re-trigger a loop. Do NOT add
@@ -109,7 +109,7 @@ jobs:
             new_version="$(./scripts/version.sh show)"
 
             git add package.json mcp-loom/package.json mcp-loom/package-lock.json \
-                   Cargo.toml Cargo.lock CLAUDE.md VERSION
+                   Cargo.toml Cargo.lock VERSION
             if [ -f .loom/install-metadata.json ]; then
               git add .loom/install-metadata.json
             fi
