@@ -1002,6 +1002,11 @@ jobs:
       # builds. Wired alongside its parent rather than left excluded.
       - name: token model-class selection (#8058)
         run: bash defaults/scripts/tests/test-token-model-class.sh
+      # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
+      # closing-reference analysis now delegates to `loom-daemon`, so this
+      # suite's require-daemon-bin harness needs the binary this job builds.
+      - name: merge-pr partial-increment labels (#3667, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-partial-increment.sh
 
   installer-tests:
     name: Installer Integration Tests
