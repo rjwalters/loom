@@ -3730,10 +3730,11 @@ function mask_unquoted_cat_heredoc_bodies(s, orig,   out, lines, nl, i, j, line,
 # Held as its OWN awk snippet rather than folded into _MASKHEREDOC_AWK above,
 # even though it calls that snippet's heredoc_delim_at() and must therefore be
 # concatenated AFTER it. _MASKHEREDOC_AWK is re-parsed by awk on every fork at
-# six call sites, several of them on the guard's hot path; exactly ONE of those
-# sites (the span pass inside extract_write_targets()) needs these two
-# functions, so the rest should not pay to parse them. Behaviourally identical
-# either way -- this is purely about where the parse cost lands.
+# six call sites, several of them on the guard's hot path; only the span passes
+# (heredoc_subst_span_text() below, shared by extract_write_targets() and
+# extract_rm_targets()) need these two functions, so the rest should not pay to
+# parse them. Behaviourally identical either way -- this is purely about where
+# the parse cost lands.
 #
 # Full rationale, direction and limits: the shell-comment block titled
 # "UNQUOTED-DELIMITER HEREDOC BODY -> LIVE SUBSTITUTION SPANS" above.
@@ -3837,6 +3838,52 @@ function heredoc_unquoted_subst_spans(s,   lines, nl, i, j, line, trimmed, delim
     return _HDSPANS
 }
 '
+
+# heredoc_subst_span_text <command-text>
+#
+# Set $_HD_SPAN_TEXT to the inner text of every live `$( … )`/backtick span
+# found in an UNQUOTED-delimiter heredoc body of <command-text>, one span per
+# line; set it EMPTY when there is none. Thin shell wrapper around
+# heredoc_unquoted_subst_spans() above.
+#
+# Returns its result in a GLOBAL rather than on stdout, the same convention
+# mark_expandable_dollars()/_MARKED_TOKEN and strip_target_quoting()/
+# _UNQUOTED_TARGET already use in this file, so a caller on the hot path does
+# not pay a command-substitution subshell on every invocation just to learn
+# that the command has no heredoc in it.
+#
+# SHARED BY BOTH SPAN PASSES ON PURPOSE. extract_write_targets() (#8035) and
+# extract_rm_targets() (#8217) each run their own scanner over this text as an
+# independent SECOND pass. Routing both through one wrapper is what keeps them
+# from ever disagreeing about WHICH text bash will expand -- the same reason
+# heredoc_unquoted_subst_spans()'s block detection is kept byte-identical to
+# mask_heredoc_bodies_selective()'s.
+#
+# HOT PATH: the awk fork is gated behind a pure-bash substring test for a `<<`
+# AND a `$(`/backtick in the same command -- the same "only fork when the
+# command mentions the construct at all" gating _INDEXMUT_AWK uses at its own
+# call site. A command with no heredoc, or a plain prose heredoc with no
+# substitution anywhere in it (the overwhelmingly common Loom shape), pays
+# nothing at all; the guard's average-execution-time budget
+# (tests/hooks/test-guard-destructive-cargo-and-perf.sh) is measured on those.
+# The test is deliberately whole-COMMAND and not body-scoped: it is a cheap
+# necessary condition, and heredoc_unquoted_subst_spans() does the real,
+# body-scoped, backslash-aware decision.
+_HD_SPAN_TEXT=""
+heredoc_subst_span_text() {
+    _HD_SPAN_TEXT=""
+    case "$1" in
+        *'<<'*) ;;
+        *) return 0 ;;
+    esac
+    case "$1" in
+        *'$('*|*'`'*) ;;
+        *) return 0 ;;
+    esac
+    _HD_SPAN_TEXT=$(printf '%s' "$1" | awk "$_MASKHEREDOC_AWK""$_HDSUBST_AWK"'
+        { buf = buf (NR > 1 ? "\n" : "") $0 }
+        END { printf "%s", heredoc_unquoted_subst_spans(buf) }')
+}
 
 
 # =============================================================================
@@ -6484,11 +6531,77 @@ fi
 #     obliteration of a whole system/root directory, not cleanup of a subpath.
 # =============================================================================
 
+# =============================================================================
+# UNQUOTED-HEREDOC-BODY SUBSTITUTION SPANS ARE SCANNED AS A SECOND PASS (#8217)
+#
+# The rm-scope analogue of #8035's write-confinement fix (and of #8003's
+# index-mutation fix before it — same structural blind spot, third scanner).
+# `cat > /tmp/x <<EOF` does NOT make its body literal: the outer shell performs
+# command substitution on an UNQUOTED-delimiter body BEFORE the sink reads a
+# byte of it, so
+#     cat > /tmp/x <<EOF
+#     $( rm -rf /opt/some-vendor/important )
+#     EOF
+# really deletes that directory. The scan below keys a local `rm` on the
+# COMMAND WORD of a `;`/`&`/`|`-delimited segment (`seg ~ /^rm([ \t]|$)/`), and
+# qsplit() does not treat `$(` / `)` as segment boundaries — so the whole
+# invocation is ONE segment whose command word is `cat`, the `rm` inside the
+# live span is never a segment head, and the target was never scored.
+#
+# extract_rm_targets() is the public entry point and is now TWO scans of the
+# same scanner over two texts: the command itself, then the inner text of every
+# live `$( … )`/backtick span found in an UNQUOTED-delimiter heredoc body
+# (heredoc_subst_span_text() → heredoc_unquoted_subst_spans(); see the
+# "UNQUOTED-DELIMITER HEREDOC BODY -> LIVE SUBSTITUTION SPANS" block comment
+# above for why bash executes that text, why a QUOTED delimiter is excluded,
+# why a backslash-escaped `\$( … )` stays inert, and why this is a separate
+# pass rather than a buffer append). The two passes never share awk process
+# state, so the second one can only ever ADD rm targets to the caller's list;
+# every pre-#8217 verdict reachable without such a span is byte-for-byte
+# unchanged.
+#
+# SPAN-DERIVED TARGETS CARRY A PROVENANCE MARK. Tokens emitted by the second
+# pass are prefixed with $_RM_SPAN_MARK (0x1E). The caller strips the mark
+# before it uses the token for anything, and uses its presence for exactly one
+# decision: a span-derived target is NOT offered the two same-command
+# resolution fast paths (rm_scope_mktemp_same_command_safe() and
+# rm_scope_literal_same_command_resolve()). Both are RELAXATIONS that prove a
+# claim about the CURRENT shell's binding of a name by scanning
+# $COMMAND_RM_MKTEMP_SCAN — a copy with EVERY heredoc body masked (#6549) —
+# whereas a `$( … )` span is a SUBSHELL whose own assignments live inside that
+# masked text. Letting a span target consult that scan would let an assignment
+# outside the heredoc (`V=$(mktemp -d)`) vouch for a name the span rebinds
+# inside it (`$( V=/etc; rm -rf "$V" )`) — the #6549 decoy shape, one level
+# down. Skipping the fast paths keeps that structurally impossible: a
+# `$`-rooted span target simply fails closed on the `rm-scope-unresolved-var`
+# deny. The cost is stated rather than claimed away: a span target that WOULD
+# have been provably safe via those fast paths (`$( rm -rf "$TMPDIR_VAR" )`
+# with a real same-command `TMPDIR_VAR=$(mktemp -d)` outside the heredoc) now
+# denies instead of allowing. That is the conservative direction, it applies
+# only to text that was ENTIRELY unscanned before this change, and the fix for
+# it in a real command is the one the deny message already names: use an
+# explicit literal path.
+# =============================================================================
+_RM_SPAN_MARK=$'\036'
+
 extract_rm_targets() {
+    _extract_rm_targets_scan "$1" ""
+    heredoc_subst_span_text "$1"
+    [[ -n "$_HD_SPAN_TEXT" ]] && _extract_rm_targets_scan "$_HD_SPAN_TEXT" "$_RM_SPAN_MARK"
+    return 0
+}
+
+_extract_rm_targets_scan() {
     # Emit one rm-target token per line for every local `rm -r/-f` invocation.
     # Portable awk only (no GNU/BSD-specific escapes); replaces the shell
     # separators with newlines, then inspects each simple command.
-    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
+    #
+    # $2 is the provenance mark prefixed to every emitted token (empty for the
+    # primary pass over the command itself, $_RM_SPAN_MARK for the
+    # heredoc-substitution-span pass). It is a PREFIX and not a separate
+    # channel so the caller's existing `for target in $RM_TARGETS` word split
+    # keeps working unchanged.
+    printf '%s' "$1" | awk -v mark="$2" "$_QSPLIT_AWK"'
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
@@ -6506,7 +6619,7 @@ extract_rm_targets() {
             for (j = 2; j <= m; j++) {
                 if (toks[j] == "") continue
                 if (toks[j] ~ /^-/) continue
-                print toks[j]
+                print mark toks[j]
             }
         }
     }'
@@ -7047,32 +7160,16 @@ rm_scope_literal_same_command_resolve() {
 # only ever ADD write targets to the caller's list; every pre-#8035 verdict
 # reachable without such a span is byte-for-byte unchanged.
 #
-# HOT PATH: the extra awk forks are gated behind a pure-bash substring test for
-# a `<<` AND a `$(`/backtick in the same command — the same "only fork when the
-# command mentions the construct at all" gating _INDEXMUT_AWK uses at its own
-# call site. A command with no heredoc, or a plain prose heredoc with no
-# substitution anywhere in it (the overwhelmingly common Loom shape), pays
-# nothing at all; the guard's average-execution-time budget
-# (tests/hooks/test-guard-destructive-cargo-and-perf.sh) is measured on those.
-# The test is deliberately whole-COMMAND and not body-scoped: it is a cheap
-# necessary condition, and heredoc_unquoted_subst_spans() does the real,
-# body-scoped, backslash-aware decision.
+# HOT PATH: the extra awk fork is gated inside heredoc_subst_span_text() behind
+# a pure-bash substring test for a `<<` AND a `$(`/backtick in the same command
+# — see that wrapper's own header. A command with no heredoc, or a plain prose
+# heredoc with no substitution anywhere in it (the overwhelmingly common Loom
+# shape), pays nothing at all.
 # =============================================================================
 extract_write_targets() {
     _extract_write_targets_scan "$1" "$2"
-    case "$1" in
-        *'<<'*)
-            case "$1" in
-                *'$('*|*'`'*) ;;
-                *) return 0 ;;
-            esac
-            local _hd_spans
-            _hd_spans=$(printf '%s' "$1" | awk "$_MASKHEREDOC_AWK""$_HDSUBST_AWK"'
-                { buf = buf (NR > 1 ? "\n" : "") $0 }
-                END { printf "%s", heredoc_unquoted_subst_spans(buf) }')
-            [[ -n "$_hd_spans" ]] && _extract_write_targets_scan "$_hd_spans" "$2"
-            ;;
-    esac
+    heredoc_subst_span_text "$1"
+    [[ -n "$_HD_SPAN_TEXT" ]] && _extract_write_targets_scan "$_HD_SPAN_TEXT" "$2"
     return 0
 }
 
@@ -7876,6 +7973,21 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
     RM_TARGETS=$(extract_rm_targets "$COMMAND_ASK_SCAN" | head -20)
 
     for target in $RM_TARGETS; do
+        # Strip the #8217 provenance mark (0x1E) the span pass prefixes onto
+        # its tokens, recording only whether this target came from an
+        # UNQUOTED-heredoc-body substitution span. Everything downstream —
+        # the allowlist below, the classification copy, the deny messages —
+        # sees the ordinary, verbatim-quoted token it always saw. See the
+        # "SPAN-DERIVED TARGETS CARRY A PROVENANCE MARK" paragraph above
+        # extract_rm_targets() for what the flag is (and is not) used for.
+        _rm_from_hd_span=0
+        case "$target" in
+            "$_RM_SPAN_MARK"*)
+                _rm_from_hd_span=1
+                target="${target#"$_RM_SPAN_MARK"}"
+                ;;
+        esac
+
         # Skip empty targets
         [[ -z "$target" ]] && continue
 
@@ -7977,6 +8089,20 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                 mark_expandable_dollars "$target"
                 _rm_marked="$_MARKED_TOKEN"
                 if [[ "$_rm_marked" == $'\001'* || "$_rm_marked" == /$'\001'* ]]; then
+                    # SPAN-DERIVED TARGETS SKIP BOTH FAST PATHS (#8217). Both
+                    # prove a claim about the CURRENT shell's binding of a
+                    # name by scanning $COMMAND_RM_MKTEMP_SCAN, which masks
+                    # every heredoc body — so an assignment made INSIDE the
+                    # `$( … )` subshell this target came from is invisible to
+                    # them while a decoy OUTSIDE the heredoc is not. Fail
+                    # closed instead of relaxing on a binding neither scan can
+                    # see; full rationale (and the stated cost) in the
+                    # "SPAN-DERIVED TARGETS CARRY A PROVENANCE MARK" paragraph
+                    # above extract_rm_targets().
+                    if [[ "$_rm_from_hd_span" == 1 ]]; then
+                        deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime (guards.rmScope=repo). It was found inside an unquoted heredoc body's command substitution, whose own assignments this guard cannot see, so the same-command resolution fast paths do not apply (#8217). Use an explicit literal path." "rm-scope-unresolved-var"  # scan-reads: COMMAND_ASK_SCAN
+                    fi
+
                     # Narrow escape hatch (#6520): a same-command
                     # `NAME=$(mktemp -d)`/`NAME=$(mktemp)` assignment proves
                     # this variable is /tmp-or-$TMPDIR-rooted, even though the

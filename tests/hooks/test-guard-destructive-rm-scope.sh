@@ -521,5 +521,242 @@ assert_deny "#6519 regression: a genuine bare rm -rf /tmp still denied (rm-prote
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #8217: unquoted-heredoc-body substitution spans vs. rm scope ---${NC}"
+# =========================================================================
+#
+# rm-scope analogue of #8035 (write confinement) and #8003 (index mutation) —
+# the same structural blind spot, third scanner over. `cat > /tmp/x <<EOF` does
+# NOT make its body literal: the outer shell performs command substitution on
+# an UNQUOTED-delimiter body BEFORE the sink reads a byte of it, so an
+# `rm -rf` hidden in a `$( … )`/backtick span there is expanded and executed
+# for real. extract_rm_targets() keys a local `rm` on the COMMAND WORD of a
+# `;`/`&`/`|`-delimited segment and qsplit() does not treat `$(`/`)` as segment
+# boundaries, so the whole invocation was ONE segment whose command word is
+# `cat` and the target was never scored — measured ALLOW on origin/main, where
+# the bare control DENIES.
+#
+# The three discriminators are pinned here, not just the headline deny:
+#   * UNQUOTED delimiter + live span      -> DENY  (AC1/AC4, the fix)
+#   * QUOTED delimiter (<<'EOF'/<<"EOF")  -> ALLOW (AC2: body genuinely inert;
+#     this is why the masker is allowed to blank it at all, and it must not flip)
+#   * backslash-escaped `\$( … )`         -> ALLOW (AC3: the one expansion
+#     suppressor the shell honours inside a heredoc body)
+RMSCOPE_8217_REPO=$(make_sql_repo '{"guards":{"rmScope":"repo"}}')
+
+# ---- AC4: the Evidence-table row. Bare control first, then the heredoc form
+# ---- of the identical rm — the two must now agree. ----
+assert_deny "#8217 control: a bare out-of-repo rm -rf denies" \
+    "rm -rf /opt/some-vendor/important" "$RMSCOPE_8217_REPO"
+
+RM8217_SUBST=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<EOF
+$( rm -rf /opt/some-vendor/important )
+EOF
+TESTCMD_EOF
+)
+assert_deny "#8217 (AC1/AC4): rm -rf inside an UNQUOTED heredoc body's \$( ) span denies" \
+    "$RM8217_SUBST" "$RMSCOPE_8217_REPO"
+
+# Backtick spelling of the same substitution — the older syntax bash expands
+# identically inside an unquoted body.
+RM8217_BACKTICK=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<EOF
+` rm -rf /opt/some-vendor/important `
+EOF
+TESTCMD_EOF
+)
+assert_deny "#8217: rm -rf inside an UNQUOTED heredoc body's BACKTICK span denies" \
+    "$RM8217_BACKTICK" "$RMSCOPE_8217_REPO"
+
+# `<<-EOF` (tab-stripping) opener — same body semantics, different opener.
+RM8217_DASH=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<-EOF
+$( rm -rf /opt/some-vendor/important )
+EOF
+TESTCMD_EOF
+)
+assert_deny "#8217: rm -rf inside an UNQUOTED <<-EOF heredoc body's \$( ) span denies" \
+    "$RM8217_DASH" "$RMSCOPE_8217_REPO"
+
+# A span that OPENS on one line and CLOSES on a later one. Pinned as a CONTROL,
+# not a regression: this one already DENIED pre-#8217, because the continuation
+# line's own first word is `rm`, so the primary per-line scan reached it without
+# any span awareness. It must keep denying for the RIGHT reason now that the
+# span pass also sees it.
+RM8217_MULTILINE=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<EOF
+$( echo one
+rm -rf /opt/some-vendor/important )
+EOF
+TESTCMD_EOF
+)
+assert_deny "#8217: rm -rf inside a MULTI-LINE \$( ) span in an UNQUOTED heredoc body denies" \
+    "$RM8217_MULTILINE" "$RMSCOPE_8217_REPO"
+
+# Nested one level down — the recursion (bounded at depth 5) re-scans each
+# span's own inner text.
+RM8217_NESTED=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<EOF
+$( echo $( rm -rf /opt/some-vendor/important ) )
+EOF
+TESTCMD_EOF
+)
+assert_deny "#8217: rm -rf inside a NESTED \$( \$( … ) ) span in an UNQUOTED heredoc body denies" \
+    "$RM8217_NESTED" "$RMSCOPE_8217_REPO"
+
+# The unconditional catastrophic floor (rm-protected-path) applies to a span
+# target exactly as it does to a bare one — asserted with the DEFAULT config,
+# outside any rmScope opt-in.
+RM8217_TOPLEVEL=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<EOF
+$( rm -rf /tmp )
+EOF
+TESTCMD_EOF
+)
+assert_deny "#8217: a top-level-path rm inside a span denies on the unconditional floor too" \
+    "$RM8217_TOPLEVEL" "$REPO_ROOT"
+
+# ---- AC2: a QUOTED delimiter keeps today's behaviour (body stays inert) -----
+RM8217_SQ_DELIM=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<'EOF'
+$( rm -rf /opt/some-vendor/important )
+EOF
+TESTCMD_EOF
+)
+assert_allow "#8217 (AC2): a QUOTED <<'EOF' delimiter keeps its body inert — the same \$( rm ) text still allows" \
+    "$RM8217_SQ_DELIM" "$RMSCOPE_8217_REPO"
+
+RM8217_DQ_DELIM=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<"EOF"
+$( rm -rf /opt/some-vendor/important )
+EOF
+TESTCMD_EOF
+)
+assert_allow "#8217 (AC2): a QUOTED <<\"EOF\" delimiter keeps its body inert too" \
+    "$RM8217_DQ_DELIM" "$RMSCOPE_8217_REPO"
+
+# ---- AC3: a backslash-escaped `\$( … )` in an UNQUOTED body stays inert -----
+RM8217_ESCAPED=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<EOF
+\$( rm -rf /opt/some-vendor/important )
+EOF
+TESTCMD_EOF
+)
+assert_allow "#8217 (AC3): a backslash-escaped \\\$( ) in an UNQUOTED heredoc body is literal text and still allows" \
+    "$RM8217_ESCAPED" "$RMSCOPE_8217_REPO"
+
+RM8217_ESCAPED_BT=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<EOF
+\` rm -rf /opt/some-vendor/important \`
+EOF
+TESTCMD_EOF
+)
+assert_allow "#8217 (AC3): a backslash-escaped backtick span in an UNQUOTED heredoc body is literal text and still allows" \
+    "$RM8217_ESCAPED_BT" "$RMSCOPE_8217_REPO"
+
+# ---- Narrows, never widens: the #6519/#5216 false-positive fixes hold -------
+# Prose in an UNQUOTED body alongside a harmless span must stay ALLOW — this
+# pass only ever adds the SPAN text to the scan, never the surrounding prose.
+RM8217_PROSE=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.md <<EOF
+Never run rm -rf /opt/some-vendor/important on this host.
+generated $( date -u +%Y-%m-%d )
+EOF
+TESTCMD_EOF
+)
+assert_allow "#8217 x #6519: prose naming an rm example plus a harmless \$( date ) span in an UNQUOTED body still allows" \
+    "$RM8217_PROSE" "$RMSCOPE_8217_REPO"
+
+# An UNBALANCED `$(` in prose yields no span at all (recorded as not-covered,
+# not as safe) — it must not manufacture a deny out of ordinary text.
+#
+# NOTE (bash 3.2 compatibility — do NOT convert this back to the
+# `$(cat <<'TESTCMD_EOF' … )` form the other fixtures use): bash 3.2's
+# command-substitution scanner counts `(`/`)` across a heredoc body even when the
+# delimiter is quoted, so an UNBALANCED `$(` inside that body makes the whole
+# `$( … )` unparseable ("unexpected EOF while looking for matching `)'") on the
+# macOS system /bin/bash the "Shell Syntax (macos-latest)" CI leg pins. printf
+# with single-quoted arguments produces byte-identical fixture text — literal, no
+# expansion, same trailing-newline stripping by the outer `$( … )` — while
+# keeping the paren count balanced in the *source*, so it parses on both 3.2 and
+# 5.x. The fixture VALUE still contains the unbalanced `$(` this case is about.
+RM8217_UNBALANCED=$(printf '%s\n' \
+    'cat > /tmp/loom-8217.md <<EOF' \
+    'use $( to open a command substitution' \
+    'EOF')
+assert_allow "#8217: an UNBALANCED '\$(' in an UNQUOTED body's prose manufactures no rm target" \
+    "$RM8217_UNBALANCED" "$RMSCOPE_8217_REPO"
+
+# A span whose rm lands on the built-in ephemeral allowlist is a legitimate
+# cleanup and must not be denied just because it sits in a heredoc body.
+RM8217_EPHEMERAL=$(cat <<'TESTCMD_EOF'
+cat > /tmp/loom-8217.txt <<EOF
+$( rm -rf /tmp/loom-8217-scratch/inner )
+EOF
+TESTCMD_EOF
+)
+assert_allow "#8217: a span rm on an ephemeral /tmp subpath still allows" \
+    "$RM8217_EPHEMERAL" "$RMSCOPE_8217_REPO"
+
+# ---- The same-command fast paths do NOT apply to span-derived targets ------
+# rm_scope_mktemp_same_command_safe() and rm_scope_literal_same_command_resolve()
+# prove a claim about the CURRENT shell's binding of a name by scanning
+# COMMAND_RM_MKTEMP_SCAN, which masks EVERY heredoc body (#6549). A `$( … )`
+# span is a SUBSHELL whose own assignments live inside that masked text, so an
+# assignment OUTSIDE the heredoc must never vouch for a name the span rebinds
+# INSIDE it — the #6549 decoy shape, one level down.
+RM8217_SPAN_REBIND=$(cat <<'TESTCMD_EOF'
+V=$(mktemp -d)
+cat > /tmp/loom-8217.txt <<EOF
+$( V=/etc; rm -rf "$V" )
+EOF
+TESTCMD_EOF
+)
+assert_deny "#8217: a span that REBINDS a name the outer command proved mktemp-safe still denies (fail closed)" \
+    "$RM8217_SPAN_REBIND" "$RMSCOPE_8217_REPO"
+
+# Stated cost of that rule, pinned so it is a deliberate verdict and not a
+# surprise: a span target whose variable IS legitimately mktemp-rooted outside
+# the heredoc denies too. The text was entirely unscanned before #8217, so this
+# is a new DENY on previously-unexamined input, never a relaxation.
+RM8217_SPAN_MKTEMP=$(cat <<'TESTCMD_EOF'
+TMPD=$(mktemp -d)
+cat > /tmp/loom-8217.txt <<EOF
+$( rm -rf "$TMPD" )
+EOF
+TESTCMD_EOF
+)
+assert_deny "#8217: a span rm on a legitimately mktemp-rooted var denies (fast paths deliberately skipped)" \
+    "$RM8217_SPAN_MKTEMP" "$RMSCOPE_8217_REPO"
+
+# Non-regression for the #6520 fast path itself: the ordinary top-level idiom,
+# with an unrelated unquoted heredoc present in the same command, still ALLOWS.
+RM8217_MKTEMP_UNCHANGED=$(cat <<'TESTCMD_EOF'
+tmpdir=$(mktemp -d) && rm -rf "$tmpdir"
+cat > /tmp/loom-8217.md <<EOF
+generated $( date -u +%Y-%m-%d )
+EOF
+TESTCMD_EOF
+)
+assert_allow "#8217 non-regression: top-level tmpdir=\$(mktemp -d) && rm -rf \"\$tmpdir\" still allows alongside an unquoted heredoc" \
+    "$RM8217_MKTEMP_UNCHANGED" "$RMSCOPE_8217_REPO"
+
+# Non-regression for the #6676/#6805 literal fast path: a top-level literal
+# assignment resolved outside any heredoc is unaffected.
+RM8217_LITERAL_UNCHANGED=$(cat <<'TESTCMD_EOF'
+FARM=/tmp/loom-8217-farm; rm -rf "$FARM/bin"
+cat > /tmp/loom-8217.md <<EOF
+generated $( date -u +%Y-%m-%d )
+EOF
+TESTCMD_EOF
+)
+assert_allow "#8217 non-regression: top-level literal-path resolution still allows alongside an unquoted heredoc" \
+    "$RM8217_LITERAL_UNCHANGED" "$RMSCOPE_8217_REPO"
+
+[[ -n "$RMSCOPE_8217_REPO" && "$RMSCOPE_8217_REPO" != "/" && -d "$RMSCOPE_8217_REPO/.loom" ]] && rm -rf "$RMSCOPE_8217_REPO"
+
+echo ""
+
+# =========================================================================
 
 print_summary
