@@ -1163,6 +1163,15 @@ jobs:
       # the retry data survives past this run for #7789's quarantine
       # measurement rather than only ever being read by eye.
       - name: Run the CI-wired shell test suites
+        # LOOM_TEST_ALLOW_SYSTEMD (#8077): the #4862 real-systemd regression
+        # block writes real unit files into $HOME/.config/systemd/user and
+        # reloads the user manager. That is safe HERE — a throwaway runner with
+        # no production daemon — and unsafe on a fleet worker, where the same
+        # manager supervises the live daemon. So the block is opt-in and this
+        # is the one place that opts in; a sweep never does. If the runner has
+        # no reachable user manager the block still self-skips, unchanged.
+        env:
+          LOOM_TEST_ALLOW_SYSTEMD: "1"
         run: bash defaults/scripts/tests/run-ci-suites.sh
       - name: Upload CI suite retry log (#7791)
         if: always()
