@@ -6,9 +6,10 @@
 //! unit-tested directly — like `claim_reconciliation::forge` and
 //! `work_finder::forge`, they are thin `Command` wrappers; the decision logic
 //! that consumes their output lives in pure, fully-tested functions elsewhere
-//! in `worktree_ops`. The one exception is [`parse_open_linked_pr`], which IS a
-//! pure decision function (the `state == "OPEN"` closes-graph filter) and is
-//! unit-tested at the bottom of this file.
+//! in `worktree_ops`. The exceptions are [`parse_open_linked_pr`] and
+//! [`parse_open_linked_pr_timeline`], which ARE pure decision functions (the
+//! `state == "OPEN"` closes-graph filter and the REST cross-reference union),
+//! unit-tested at the bottom of this file along with both transports' argv.
 
 use std::path::Path;
 use std::process::Command;
@@ -210,6 +211,59 @@ pub const OPEN_LINKED_PR_QUERY: &str = "query($owner:String!,$repo:String!,$num:
      closedByPullRequestsReferences(first:20,includeClosedPrs:false){\
      nodes{ number state } } } } }";
 
+/// The REST `--jq` filter behind [`open_linked_pr_timeline_args`], as a format
+/// template over `{owner}/{repo}`.
+///
+/// Walks `issues/{n}/timeline` for `cross-referenced` events whose source is an
+/// OPEN pull request in this same repo. GitHub emits a `cross-referenced` event
+/// for **any** PR body reference to the issue, so this is a strict superset of
+/// the closes-graph for the yes/no question the #4123 guard actually asks: it
+/// sees `Part of #N` and `Refs #N` phase PRs, which
+/// `closedByPullRequestsReferences` structurally cannot (#7757/#7859, and the
+/// `worktree_ops` half of that in #8116).
+const OPEN_LINKED_PR_TIMELINE_JQ: &str = "[.[] | select(.event == \"cross-referenced\" \
+     and .source.issue.pull_request != null \
+     and .source.issue.state == \"open\" \
+     and .source.issue.repository.full_name == \"{full_name}\") \
+     | .source.issue.number] | unique | .[0] // empty";
+
+/// `gh` arguments for the REST timeline (non-closing-reference) probe on
+/// `issue` — the union transport shared by
+/// `sweep_registry::guards::SweepRegistry::probe_open_linked_pr_rest` and
+/// [`probe_open_linked_pr`], so the two cannot drift apart the way they had
+/// before #8116 (the registry gained the timeline union in #7859; this module's
+/// copy still asked only the closes-graph, so orphan recovery reset claims out
+/// from under live `Part of #N` phase PRs).
+#[must_use]
+pub fn open_linked_pr_timeline_args(owner: &str, repo: &str, issue: u32) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        format!("repos/{owner}/{repo}/issues/{issue}/timeline"),
+        "--paginate".to_string(),
+        "--jq".to_string(),
+        OPEN_LINKED_PR_TIMELINE_JQ.replace("{full_name}", &format!("{owner}/{repo}")),
+    ]
+}
+
+/// Classify the raw stdout of the [`open_linked_pr_timeline_args`] query.
+///
+/// Empty output is a verified [`OpenPrProbe::NoneOpen`] (the filter emitted
+/// nothing, i.e. no open cross-referencing PR); a leading line that parses as a
+/// PR number is [`OpenPrProbe::Open`]; anything else is
+/// [`OpenPrProbe::ProbeFailed`] — an answer we cannot read is never a verified
+/// absence, same contract as [`parse_open_linked_pr`].
+#[must_use]
+pub fn parse_open_linked_pr_timeline(stdout: &str) -> OpenPrProbe {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return OpenPrProbe::NoneOpen;
+    }
+    match trimmed.lines().next().unwrap_or("").trim().parse::<u32>() {
+        Ok(pr) => OpenPrProbe::Open(pr),
+        Err(_) => OpenPrProbe::ProbeFailed,
+    }
+}
+
 /// `gh` arguments for the closes-graph open-linked-PR query on `issue`.
 ///
 /// Deliberately emits the RAW GraphQL payload rather than pushing a `--jq`
@@ -314,29 +368,65 @@ pub fn resolve_owner_repo(repo_root: &Path) -> Option<(String, String)> {
     })
 }
 
-/// Best-effort probe for an **open** pull request linked to `issue` via
-/// GitHub's authoritative closes-graph (`closedByPullRequestsReferences`).
+/// Best-effort probe for an **open** pull request linked to `issue`.
 ///
 /// The `worktree_ops` counterpart of
-/// `sweep_registry::guards::SweepRegistry::probe_open_linked_pr` — same query
-/// ([`open_linked_pr_args`]) and same classification
-/// ([`parse_open_linked_pr`]), just resolved against `repo_root` instead of a
-/// registry workspace. Added for #5511, where orphan recovery reset a
-/// `loom:building` issue that had a live `Closes #N` PR open because nothing on
-/// that path ever asked the forge about linked PRs.
+/// `sweep_registry::guards::SweepRegistry::probe_open_linked_pr`, resolved
+/// against `repo_root` instead of a registry workspace, and — since #8116 —
+/// sharing that probe's two-transport union rather than only its first leg:
+///
+/// 1. **GraphQL closes-graph** ([`open_linked_pr_args`] /
+///    [`parse_open_linked_pr`]). Decisive when it finds an OPEN PR.
+/// 2. **REST timeline** ([`open_linked_pr_timeline_args`] /
+///    [`parse_open_linked_pr_timeline`]), consulted on *both* `NoneOpen` and
+///    `ProbeFailed`. The closes-graph only knows about **closing keywords**, so
+///    a phase PR saying `Part of #N` / `Refs #N` is invisible to leg 1 and the
+///    probe wrongly answered "no open linked PR" — which, for
+///    [`super::orphan_recovery`], is a verified `NoneOpen` that greenlights
+///    resetting a live claim. That is precisely the #8116 report: phase-scoped
+///    PRs use `Part of #N`, so the guard did not protect the issue even after
+///    its PR opened. REST also bills a separate quota, so leg 2 doubles as
+///    #5911's rate-limit fallback.
+///
+/// Fail direction is unchanged: only a verified answer from either leg is a
+/// verdict, and a union that cannot answer is [`OpenPrProbe::ProbeFailed`].
+/// Added for #5511, where orphan recovery reset a `loom:building` issue that
+/// had a live `Closes #N` PR open because nothing on that path ever asked the
+/// forge about linked PRs.
 #[must_use]
 pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
     // Repo resolution failure is a PROBE FAILURE, not a verified absence.
     let Some((owner, repo)) = resolve_owner_repo(repo_root) else {
         return OpenPrProbe::ProbeFailed;
     };
-    let out = gh_command(repo_root)
-        .args(open_linked_pr_args(&owner, &repo, issue))
-        .output();
-    match out {
-        Ok(o) if o.status.success() => parse_open_linked_pr(&String::from_utf8_lossy(&o.stdout)),
-        // Spawn error or non-zero exit (rate limit, auth failure, transient
-        // forge error) is a PROBE FAILURE, not a verified "no open PR".
+    let graphql = run_probe(repo_root, open_linked_pr_args(&owner, &repo, issue), &|s| {
+        parse_open_linked_pr(s)
+    });
+    if matches!(graphql, OpenPrProbe::Open(_)) {
+        return graphql;
+    }
+    let timeline = run_probe(repo_root, open_linked_pr_timeline_args(&owner, &repo, issue), &|s| {
+        parse_open_linked_pr_timeline(s)
+    });
+    // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2 is a
+    // superset *when it answers*, and an unanswered superset is no evidence.
+    if matches!(timeline, OpenPrProbe::ProbeFailed) {
+        return graphql;
+    }
+    timeline
+}
+
+/// Run one `gh` transport for [`probe_open_linked_pr`] and classify it.
+///
+/// A spawn error or non-zero exit (rate limit, auth failure, transient forge
+/// error) is a PROBE FAILURE, never a verified "no open PR".
+fn run_probe(
+    repo_root: &Path,
+    args: Vec<String>,
+    classify: &dyn Fn(&str) -> OpenPrProbe,
+) -> OpenPrProbe {
+    match gh_command(repo_root).args(args).output() {
+        Ok(o) if o.status.success() => classify(&String::from_utf8_lossy(&o.stdout)),
         _ => OpenPrProbe::ProbeFailed,
     }
 }
@@ -593,5 +683,49 @@ mod tests {
         assert!(args.iter().any(|a| a == "owner=rjwalters"));
         assert!(args.iter().any(|a| a == "repo=loom"));
         assert!(args.iter().any(|a| a == "num=5501"));
+    }
+
+    // -- REST timeline union (#8116) ----------------------------------------
+
+    #[test]
+    fn timeline_args_target_the_paginated_timeline_and_scope_the_filter_to_this_repo() {
+        let args = open_linked_pr_timeline_args("rjwalters", "loom", 8116);
+        assert_eq!(args[0], "api");
+        assert_eq!(args[1], "repos/rjwalters/loom/issues/8116/timeline");
+        assert!(args.iter().any(|a| a == "--paginate"));
+        let filter = args.last().unwrap();
+        assert!(filter.contains("cross-referenced"));
+        assert!(filter.contains(r#".source.issue.state == "open""#));
+        assert!(
+            filter.contains(r#"full_name == "rjwalters/loom""#),
+            "the filter must be scoped to this repo, got: {filter}"
+        );
+        assert!(
+            !filter.contains("{full_name}"),
+            "the template placeholder must be substituted, got: {filter}"
+        );
+    }
+
+    /// AC (#8116): an issue whose only open PR references it with a NON-closing
+    /// keyword (`Part of #N`) must read as `Open`. The closes-graph cannot see
+    /// such a PR at all; the timeline's `cross-referenced` event can, which is
+    /// the entire reason this transport exists.
+    #[test]
+    fn a_non_closing_part_of_reference_reads_as_an_open_linked_pr() {
+        assert_eq!(parse_open_linked_pr_timeline("8140\n"), OpenPrProbe::Open(8140));
+    }
+
+    #[test]
+    fn empty_timeline_output_is_a_verified_none_open() {
+        assert_eq!(parse_open_linked_pr_timeline(""), OpenPrProbe::NoneOpen);
+        assert_eq!(parse_open_linked_pr_timeline("  \n"), OpenPrProbe::NoneOpen);
+    }
+
+    #[test]
+    fn unparseable_timeline_output_is_a_probe_failure_not_an_absence() {
+        assert_eq!(
+            parse_open_linked_pr_timeline("gh: rate limit exceeded"),
+            OpenPrProbe::ProbeFailed
+        );
     }
 }

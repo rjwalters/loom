@@ -113,11 +113,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
 
 use crate::workspace_registry::WorkspaceRegistry;
+use crate::worktree_activity::{reclaim_skip_reason, resolve_activity_window};
 use crate::worktree_ops::clean::{
     self, CleanOptions, WorktreeDecision, WorktreeProbes, DEFAULT_GRACE_PERIOD_SECS,
 };
@@ -523,16 +524,22 @@ impl ReclaimReport {
 /// - Every other skip reason (open issue, open/unmerged/absent PR, grace
 ///   period, uncommitted changes, unmanaged, editable install, unknown PR
 ///   status): a **kept, idle** worktree — reclaim its build artifacts via
-///   [`clean::reclaim_worktree_artifacts`].
+///   [`clean::reclaim_worktree_artifacts`] — **unless** #8116's activity gate
+///   says otherwise. `activity_window` is the mtime window
+///   [`crate::worktree_activity::reclaim_skip_reason`] treats as "a live
+///   worker is here, whatever the registry thinks"; [`Duration::ZERO`]
+///   disables that gate and restores the pre-#8116 behavior.
 pub fn reclaim_kept_worktree_artifacts(
     repo_root: &Path,
     opts: &CleanOptions,
     probes: &WorktreeProbes<'_>,
     dry_run: bool,
+    activity_window: Duration,
 ) -> ReclaimReport {
     reclaim_kept_artifacts_generic(
         repo_root,
         dry_run,
+        activity_window,
         &crate::worktree_ops::naming::issue_from_worktree,
         &|path, issue_num| clean::classify_worktree(path, issue_num, opts, probes),
     )
@@ -558,10 +565,12 @@ pub fn reclaim_kept_pr_worktree_artifacts(
     opts: &CleanOptions,
     probes: &clean::PrWorktreeProbes<'_>,
     dry_run: bool,
+    activity_window: Duration,
 ) -> ReclaimReport {
     reclaim_kept_artifacts_generic(
         repo_root,
         dry_run,
+        activity_window,
         &crate::worktree_ops::naming::pr_from_worktree,
         &|path, pr_num| clean::classify_pr_worktree(path, pr_num, opts, probes),
     )
@@ -575,10 +584,12 @@ pub fn reclaim_kept_pr_worktree_artifacts(
 fn reclaim_kept_artifacts_generic(
     repo_root: &Path,
     dry_run: bool,
+    activity_window: Duration,
     parse_name: &dyn Fn(&str) -> Option<u32>,
     classify: &dyn Fn(&Path, u32) -> WorktreeDecision,
 ) -> ReclaimReport {
     let mut report = ReclaimReport::default();
+    let now = SystemTime::now();
 
     for entry in enumerate_worktree_dirs(repo_root) {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -590,19 +601,9 @@ fn reclaim_kept_artifacts_generic(
         let worktree_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
         let decision = classify(&worktree_path, num);
 
-        match &decision {
-            WorktreeDecision::Remove | WorktreeDecision::RemoveWithQuarantine => {
-                report.skipped.push((
-                    num,
-                    "eligible for full removal (handled by the directory reap pass)".to_string(),
-                ));
-                continue;
-            }
-            WorktreeDecision::SkipInUse(reason) => {
-                report.skipped.push((num, reason.clone()));
-                continue;
-            }
-            _ => {}
+        if let Some(reason) = reclaim_skip_reason(&decision, &worktree_path, now, activity_window) {
+            report.skipped.push((num, reason));
+            continue;
         }
 
         let reclaimed = clean::reclaim_worktree_artifacts(&worktree_path, dry_run);
@@ -913,14 +914,21 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // regenerable `target/`/`node_modules/` — reclaim those without
     // removing the worktree. Reuses the exact same probes/decision so
     // eligibility never drifts from the removal gates above.
-    let reclaim_report = reclaim_kept_worktree_artifacts(repo_root, &opts, &probes, false);
+    //
+    // #8116: plus the registry-independent activity gate — an in-session
+    // Task-tool builder has no claim-lock, no `.loom-in-use` marker and no
+    // long-lived process with a cwd inside the worktree, so its live build was
+    // classified "kept, idle" and had its `target/` deleted mid-`cargo`.
+    let window = resolve_activity_window();
+    let reclaim_report = reclaim_kept_worktree_artifacts(repo_root, &opts, &probes, false, window);
     log_reclaim_report(repo_root, &reclaim_report);
 
     // The same reclaim, for KEPT `pr-<N>` worktrees (#5939). The states that
     // preserve a `pr-<N>` worktree here are the long-lived ones by definition
     // (open PR, uncommitted work, unresolvable PR status), so they are
     // precisely the ones whose multi-GB `target/` sits on disk for days.
-    let pr_reclaim_report = reclaim_kept_pr_worktree_artifacts(repo_root, &opts, &pr_probes, false);
+    let pr_reclaim_report =
+        reclaim_kept_pr_worktree_artifacts(repo_root, &opts, &pr_probes, false, window);
     log_pr_reclaim_report(repo_root, &pr_reclaim_report);
 
     report
@@ -1441,7 +1449,11 @@ mod tests {
             now: Utc::now(),
         };
 
-        reclaim_kept_worktree_artifacts(repo, opts, &probes, false)
+        // `Duration::ZERO` disables #8116's activity gate: every worktree this
+        // harness builds is written microseconds before the pass runs, so a
+        // live window would make every pre-#8116 reclaim scenario skip. The
+        // gate's own behavior is covered in `crate::worktree_activity`.
+        reclaim_kept_worktree_artifacts(repo, opts, &probes, false, Duration::ZERO)
     }
 
     /// Populate `issue-<N>`'s worktree with a `target/` and `node_modules/`
@@ -2275,7 +2287,8 @@ mod tests {
             now: Utc::now(),
         };
 
-        reclaim_kept_pr_worktree_artifacts(repo, opts, &probes, false)
+        // `Duration::ZERO`: see `run_reclaim_pass`'s note on #8116's gate.
+        reclaim_kept_pr_worktree_artifacts(repo, opts, &probes, false, Duration::ZERO)
     }
 
     /// The `pr-<N>` counterpart of [`populate_build_artifacts`].
