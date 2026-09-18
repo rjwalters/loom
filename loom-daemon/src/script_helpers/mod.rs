@@ -21,6 +21,7 @@
 //! | [`checkpoints`] | `checkpoint.sh` | `loom_tools.checkpoints` |
 //! | [`claim`] | `loom-claim` (PATH shim → `loom-daemon claim`) | `loom_tools.claim` |
 //! | [`sweep_experiment`] | `sweep-experiment.sh` | `loom_tools.sweep_experiment` |
+//! | [`fleet_experiment`] | `sweep-experiment plan\|start\|stop` | new in #8055 |
 //! | [`validate_phase`] | `validate-phase.sh` | `loom_tools.validate_phase` |
 //!
 //! `loom_tools.backlog` had no shell caller and no test file — only historical
@@ -32,6 +33,7 @@
 
 pub mod checkpoints;
 pub mod claim;
+pub mod fleet_experiment;
 pub mod log_filter;
 pub mod model_tiers;
 pub mod sweep_experiment;

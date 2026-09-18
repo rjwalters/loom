@@ -11,7 +11,9 @@ use std::path::PathBuf;
 
 use loom_daemon::script_helpers;
 
-use crate::{CheckpointAction, SweepExperimentAction};
+use crate::CheckpointAction;
+
+use super::sweep_experiment::SweepExperimentAction;
 
 /// `loom-daemon strip-ansi [--file PATH]` — backs `strip-ansi.sh`.
 pub(crate) fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
@@ -355,6 +357,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
             }
             Ok(())
         }
+        SweepExperimentAction::Fleet(action) => action.run(),
         SweepExperimentAction::Harvest {
             stats_file,
             archive_dir,
