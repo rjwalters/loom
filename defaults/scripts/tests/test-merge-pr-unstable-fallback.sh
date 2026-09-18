@@ -93,8 +93,9 @@ cat > "$STUB_DIR/gh" <<'STUB'
 #      helper passed against it, so the fixture exercises the helper's own
 #      parsing of the documented API shape rather than a pre-digested answer.
 #      A `$STUB_DIR/ruleset-fail-<branch>` marker makes the call exit nonzero
-#      (network failure / 403), to test the fail-closed and partial-failure
-#      paths. No canned file at all = a 200 with an empty rules array.
+#      (network failure / 403), to test the fail-closed paths — either source
+#      erroring fails the lookup. No canned file at all = a 200 with an empty
+#      rules array (a SUCCESSFUL "no ruleset rules" answer, not a failure).
 #
 #   2. Classic branch protection:
 #        gh api graphql -f query=... -F owner=... -F name=... -F ref=refs/heads/<b>
@@ -246,16 +247,47 @@ assert_eq "Shared Check|Ruleset Only Check|Classic Only Check" "$result" \
   "#8103: ruleset + classic contexts are unioned and de-duplicated"
 
 # Subtest 1.8: partial lookup failure — the rules endpoint errors but classic
-# protection answers. One system erroring is not evidence the other's rules do
-# not exist, so the surviving source's answer is reported (exit 0).
+# protection answers. FAIL CLOSED anyway: a surviving source is a partial view
+# of what is required, and a partial view is not a safe input to a merge
+# decision. The surviving source's answer is NOT reported (empty stdout).
 : > "$STUB_DIR/ruleset-fail-partial"
 cat > "$STUB_DIR/required-checks-partial.txt" <<'EOF'
 Classic Survivor
 EOF
 rc=0
-result=$(forge_get_required_status_check_contexts "owner/repo" "partial" "$STUB_DIR/gh" | tr '\n' '|' | sed 's/|$//') || rc=$?
-assert_eq "0" "$rc" "#8103: one failing source does not fail the lookup"
-assert_eq "Classic Survivor" "$result" "#8103: partial failure still reports the surviving source's contexts"
+result=$(forge_get_required_status_check_contexts "owner/repo" "partial" "$STUB_DIR/gh" 2>/dev/null | tr '\n' '|' | sed 's/|$//') || rc=$?
+assert_eq "1" "$rc" "#8103: ruleset source failing -> nonzero exit even though classic answered"
+assert_eq "" "$result" "#8103: partial failure does not report the surviving source's contexts"
+
+# Subtest 1.8a: THE blind spot this whole fix exists to close — the ruleset
+# endpoint errors (403/404/network) and classic branch protection SUCCEEDS with
+# an empty result. Under a both-must-fail rule this returns success with an
+# empty list, which is indistinguishable at the callsite from a genuinely
+# unprotected branch and sends `merge-pr.sh --auto` down the
+# "No-required-checks fallback (#3720)" path — merging over red required checks
+# exactly as the pre-#8103 GraphQL-only helper did. Must fail closed.
+: > "$STUB_DIR/ruleset-fail-ruleset-err-classic-empty"
+rc=0
+result=$(forge_get_required_status_check_contexts "owner/repo" "ruleset-err-classic-empty" "$STUB_DIR/gh" 2>/dev/null | tr '\n' '|' | sed 's/|$//') || rc=$?
+assert_eq "1" "$rc" "#8103: ruleset errors + classic succeeds EMPTY -> nonzero (no silent no-required-checks)"
+assert_eq "" "$result" "#8103: ruleset errors + classic succeeds empty -> empty stdout"
+
+# Subtest 1.8b: the mirror image — the ruleset endpoint succeeds with real
+# contexts but the classic GraphQL query errors. Also fail closed: an
+# unreadable classic rule may require contexts the ruleset does not list.
+cat > "$STUB_DIR/ruleset-rules-classic-err.json" <<'EOF'
+[
+  {"type": "required_status_checks",
+   "parameters": {
+     "strict_required_status_checks_policy": true,
+     "required_status_checks": [{"context": "Ruleset Survivor"}]}}
+]
+EOF
+: > "$STUB_DIR/graphql-fail-classic-err"
+rc=0
+result=$(forge_get_required_status_check_contexts "owner/repo" "classic-err" "$STUB_DIR/gh" 2>/dev/null | tr '\n' '|' | sed 's/|$//') || rc=$?
+assert_eq "1" "$rc" "#8103: classic source failing -> nonzero exit even though the ruleset answered"
+assert_eq "" "$result" "#8103: classic failure does not report the ruleset's contexts"
 
 # Subtest 1.9: BOTH sources error -> fail closed (nonzero exit, empty stdout),
 # matching the Gitea path and the callers' documented fail-closed contract.

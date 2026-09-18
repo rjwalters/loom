@@ -1923,11 +1923,21 @@ _forge_gitea_paginate() {
 #   Branches with neither source configured, or whose rules list no contexts,
 #   yield empty output (exit 0). This is the desired behavior — "no required
 #   checks" means every failing check is informational, which is the case the
-#   UNSTABLE-fallback wants to unblock. A lookup that ERRORS on both sources is
-#   distinct from that and exits nonzero (fail-closed), matching the Gitea path
-#   and this function's documented contract; a partial failure still reports
-#   whatever the surviving source found, since one system erroring is not
-#   evidence that the other's rules do not exist.
+#   UNSTABLE-fallback wants to unblock. An EMPTY result from a source that
+#   SUCCEEDED is therefore still "no required checks", not a failure.
+#
+#   A lookup that ERRORS is distinct from that and exits nonzero (fail-closed),
+#   matching the Gitea path and this function's documented contract — and it
+#   fails closed when EITHER source errors, not only when both do. A 403/404/
+#   network failure on the ruleset endpoint combined with an empty (but
+#   successful) classic result is indistinguishable, at the call site, from a
+#   genuinely unprotected branch: it would emit an empty list and send
+#   `merge-pr.sh --auto` down the "No-required-checks fallback (#3720)" path —
+#   reproducing exactly the blind spot this function was rewritten to close.
+#   One source erroring is not evidence that the other's rules do not exist,
+#   but neither is it evidence that the erroring source has none; the callers
+#   in merge-pr.sh already treat a nonzero lookup as "refuse to merge," which
+#   is the correct disposition for an unknown.
 #
 # Gitea: GET /api/v1/repos/{owner}/{repo}/branch_protections/{name}. Gitea's
 #   branch-protection rule carries both `enable_status_check` (boolean toggle)
@@ -2024,13 +2034,15 @@ forge_get_required_status_check_contexts() {
   # `--jq` yielding nothing is not an error in either query: `.[]?` over an
   # empty rules array and a `null` branchProtectionRule both mean "this source
   # configures no required checks". Only a nonzero `gh` exit — network failure,
-  # 403, 404 on the repo itself — is a lookup failure, tracked per source so a
-  # single working source still produces an answer.
+  # 403, 404 on the repo itself — is a lookup failure, and a failure on EITHER
+  # source fails the whole lookup closed: a surviving source's answer is a
+  # partial view, and "partial view of what is required" is not a safe input to
+  # a merge decision.
   local ruleset_rc=0 classic_rc=0 ruleset_out="" classic_out=""
   local query='query($owner: String!, $name: String!, $ref: String!) { repository(owner: $owner, name: $name) { ref(qualifiedName: $ref) { branchProtectionRule { requiredStatusCheckContexts } } } }'
   ruleset_out="$("$gh_cmd" api "repos/${FORGE_OWNER}/${FORGE_REPO}/rules/branches/${branch}" --jq '.[]? | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context' 2>/dev/null)" || ruleset_rc=1
   classic_out="$("$gh_cmd" api graphql -f "query=$query" -F "owner=$FORGE_OWNER" -F "name=$FORGE_REPO" -F "ref=refs/heads/$branch" --jq '.data.repository.ref.branchProtectionRule.requiredStatusCheckContexts // [] | .[]' 2>/dev/null)" || classic_rc=1
-  if [[ "$ruleset_rc" -eq 1 && "$classic_rc" -eq 1 ]]; then return 1; fi
+  if [[ "$ruleset_rc" -ne 0 || "$classic_rc" -ne 0 ]]; then return 1; fi
   # Union, order-preserving, de-duplicated: a context can legitimately be
   # required by BOTH a ruleset and a classic rule, and the callers' `comm`
   # set-difference needs each name once.
