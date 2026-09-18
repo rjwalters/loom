@@ -46,6 +46,13 @@ pub(crate) enum ScriptPortCommand {
     /// flattened enum is what keeps a new top-level subcommand free.
     ShellBudget(super::shell_budget::ShellBudgetArgs),
 
+    /// `worktree.sh`'s repo-global worktree-add lock (#8195, slice 1) — the
+    /// lock every destructive path in that script stands behind, and which
+    /// #6014/#6017 showed could be released by a holder that no longer owned
+    /// it.
+    #[command(subcommand)]
+    WorktreeLock(super::worktree_lock::WorktreeLockCommand),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -63,6 +70,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseFetch(args) => args.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
+            ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
         }
     }
