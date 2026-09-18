@@ -531,6 +531,26 @@ check "$([[ "$leak_unit_out" == *"RC=1"* ]] && echo 0 || echo 1)" \
 check "$([[ "$leak_unit_out" == *"LOOM_TEST_ALLOW_SYSTEMD=1"* ]] && echo 0 || echo 1)" \
     "the unit-dir failure names the LOOM_TEST_ALLOW_SYSTEMD opt-in gate" "$leak_unit_out"
 
+# 12d-2. A test that `mkdir -p`s the LIVE systemd --user dir (absent beforehand)
+#        and then cleans up its own unit file — the #4862 MX block's mx_cleanup
+#        shape — must NOT trip the guard. The directory's own existence is not
+#        what is guarded, only the unit-file NAME SET; a CI runner with no
+#        pre-existing $HOME/.config/systemd/user hit this as a false positive
+#        (before=`<absent>`, after=`names=` — empty, but no longer `<absent>`).
+LEAK_MKDIR_HOME="$WORKDIR/leak-mkdir-home"
+mkdir -p "$LEAK_MKDIR_HOME/.loom"
+leak_unit_clean_out=$(
+    eval "$NEUTRAL_ENV"
+    export HOME="$LEAK_MKDIR_HOME" XDG_CONFIG_HOME="$LEAK_MKDIR_HOME/.config"
+    live_host_leak_snapshot
+    mkdir -p "$XDG_CONFIG_HOME/systemd/user"
+    : > "$XDG_CONFIG_HOME/systemd/user/loom-daemon-test-mx-mixed-999.service"
+    rm -f "$XDG_CONFIG_HOME/systemd/user/loom-daemon-test-mx-mixed-999.service"
+    live_host_leak_assert_unchanged 2>&1 && echo "RC=0" || echo "RC=1"
+)
+check "$([[ "$leak_unit_clean_out" == *"RC=0"* ]] && echo 0 || echo 1)" \
+    "mkdir -p'ing an absent LIVE systemd --user dir and cleaning up its own unit file does NOT trip the #8077 guard" "$leak_unit_clean_out"
+
 # 12e. A token written into the live shared pool is caught.
 leak_token_out=$(
     eval "$NEUTRAL_ENV"

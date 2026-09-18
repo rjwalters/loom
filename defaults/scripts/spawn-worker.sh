@@ -103,8 +103,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # `create_dir_all(log_path.parent())` before opening the file, so the directory
 # materializes only if a daemon is actually spawned — a worker that never
 # spawns one (the overwhelming majority) leaves nothing behind at all.
-export LOOM_DAEMON_LOG="${LOOM_DAEMON_LOG:-${TMPDIR:-/tmp}/loom-worker-isolation-$$/daemon.log}"
-export LOOM_TEST_ALLOW_SYSTEMD="${LOOM_TEST_ALLOW_SYSTEMD:-0}"
+export LOOM_DAEMON_LOG="${LOOM_DAEMON_LOG:-${TMPDIR:-/tmp}/loom-worker-isolation-$$/daemon.log}" LOOM_TEST_ALLOW_SYSTEMD="${LOOM_TEST_ALLOW_SYSTEMD:-0}"
 
 # --- Repo root resolution (handles worktrees) ---
 # Only used to locate `.loom/config.json`. Mirrors spawn-claude.sh:
@@ -147,8 +146,7 @@ _available_runtimes() {
 }
 
 # --- Resolve the runtime (env > config > default) ---
-RUNTIME=""
-RUNTIME_SOURCE=""
+RUNTIME="" RUNTIME_SOURCE=""
 
 if [[ -n "${LOOM_RUNTIME:-}" ]]; then
     RUNTIME="$LOOM_RUNTIME"

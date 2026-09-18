@@ -285,6 +285,13 @@ _lss_systemd_unit_identity() {
 # on an auto_update roll and rewrites the token pool's `.ranking` continuously,
 # so a content fingerprint would flap — but neither operation ADDS or REMOVES a
 # name, which is the thing a leaking test does.
+#
+# An empty match set prints as `<absent>` too, whether or not the directory
+# itself exists — a `mkdir -p` that a test's OWN cleanup leaves behind (e.g.
+# the #4862 MX block creating `$HOME/.config/systemd/user` before writing,
+# then removing, its unit files) is not a leak. A leak is a NAME appearing
+# that was not there before; the directory's own existence is not the thing
+# being guarded (#8077 CI false positive: before=`<absent>`, after=`names=`).
 _lss_dir_name_set() {
     local dir="$1" glob="${2:-*}" names
     [[ -d "$dir" ]] || { printf '%s' '<absent>'; return 0; }
@@ -296,6 +303,7 @@ _lss_dir_name_set() {
             printf '%s\n' "$entry"
         done | sort | tr '\n' ','
     )
+    [[ -z "$names" ]] && { printf '%s' '<absent>'; return 0; }
     printf 'names=%s' "$names"
 }
 
