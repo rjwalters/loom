@@ -614,19 +614,35 @@ pub fn parse_growth_declarations(
 ) -> (Vec<GrowthDeclaration>, Vec<MalformedDeclaration>) {
     let mut ok = Vec::new();
     let mut bad = Vec::new();
-    let mut fenced = false;
+    // The marker that opened the current fence, so it is closed only by its
+    // own kind. CommonMark does not let ``` close a ~~~ fence, and treating
+    // any marker as a toggle let an alternating pair un-fence a quoted example.
+    let mut fence: Option<&str> = None;
     let lines: Vec<&str> = text.lines().collect();
+
+    // git's subject is the first NON-BLANK line, not line 0: a
+    // `--cleanup=verbatim` message can begin with a blank, which would put a
+    // declaration at index 1 while git still calls it the subject.
+    let subject_idx = lines.iter().position(|l| !l.trim().is_empty());
 
     for (i, raw) in lines.iter().enumerate() {
         let trimmed = raw.trim();
 
-        // ``` or ~~~ toggles a fenced block. A declaration inside one is an
-        // example being quoted, which is how commit bodies in this repo show
-        // the format.
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
+        // A fence marker is indented at most 3 spaces; 4 or more makes it
+        // literal code in Markdown, and treating it as a fence silently
+        // refused a real declaration that followed it.
+        let indent = raw.len() - raw.trim_start().len();
+        if indent <= 3 {
+            if let Some(marker) = ["```", "~~~"].iter().find(|m| trimmed.starts_with(**m)) {
+                match fence {
+                    None => fence = Some(marker),
+                    Some(open) if open == *marker => fence = None,
+                    Some(_) => {}
+                }
+                continue;
+            }
         }
+        let fenced = fence.is_some();
 
         let looks_like = strip_trailer_prefix(trimmed).is_some();
         if !looks_like {
@@ -636,7 +652,7 @@ pub fn parse_growth_declarations(
         // The subject line is never a declaration. git would not treat it as a
         // trailer, and a squash rewrites it to `* Shell-Budget-Growth: …`,
         // where it would silently stop counting.
-        if i == 0 {
+        if Some(i) == subject_idx {
             bad.push(MalformedDeclaration {
                 line: trimmed.to_string(),
                 why: "a declaration cannot be the commit SUBJECT — put it in the body",
@@ -677,7 +693,19 @@ pub fn parse_growth_declarations(
             if !next.starts_with([' ', '\t']) || next.trim().is_empty() {
                 break;
             }
-            if strip_trailer_prefix(next.trim()).is_some() {
+            let nt = next.trim();
+            // Stop at anything that is itself a field rather than a
+            // continuation. Folding swallowed an indented `Closes #1` into a
+            // reason that cited no issue, manufacturing the citation the rule
+            // requires — and pulled `Co-Authored-By:` in with it.
+            if strip_trailer_prefix(nt).is_some()
+                || nt.split_once(':').is_some_and(|(k, _)| {
+                    !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                })
+                || ["Closes", "Fixes", "Resolves"]
+                    .iter()
+                    .any(|kw| nt.starts_with(kw))
+            {
                 break;
             }
             value.push(' ');
@@ -1330,6 +1358,55 @@ mod tests {
         assert!(ok.is_empty(), "{ok:?}");
         assert_eq!(bad.len(), 1);
         assert!(bad[0].why.contains("fenced"), "{:?}", bad[0]);
+    }
+
+    #[test]
+    fn an_alternating_fence_marker_does_not_unfence_an_example() {
+        // ``` does not close a ~~~ fence. Treating any marker as a toggle let
+        // an alternating pair leave the block and admit a quoted example.
+        let body = msg("```\n~~~\nShell-Budget-Growth: 5 lines — x (#1)\n```\n");
+        let (ok, bad) = parse_growth_declarations(&body);
+        assert!(ok.is_empty(), "still inside the ``` fence: {ok:?}");
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].why.contains("fenced"), "{:?}", bad[0]);
+    }
+
+    #[test]
+    fn an_indented_fence_marker_is_literal_code_not_a_fence() {
+        // 4+ spaces makes ``` literal in Markdown. Toggling on it silently
+        // refused the real declaration that followed.
+        let body = msg("    ```\n\nShell-Budget-Growth: 5 lines — x (#1)\n");
+        let (ok, bad) = parse_growth_declarations(&body);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(ok.len(), 1, "{ok:?}");
+    }
+
+    #[test]
+    fn a_leading_blank_line_does_not_shift_the_subject() {
+        // `--cleanup=verbatim` keeps a leading blank. git still calls the
+        // first non-blank line the subject; indexing on line 0 did not.
+        let (ok, bad) = parse_growth_declarations("\nShell-Budget-Growth: 5 lines — x (#1)\n");
+        assert!(ok.is_empty(), "{ok:?}");
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].why.contains("SUBJECT"), "{:?}", bad[0]);
+    }
+
+    #[test]
+    fn folding_does_not_absorb_a_following_field() {
+        // Folding swallowed an indented `Closes #1` into a reason that cited
+        // no issue — manufacturing the very citation the rule requires — and
+        // pulled `Co-Authored-By:` in with it.
+        let body = msg(
+            "Shell-Budget-Growth: 5 lines — no issue here\n  Closes #1\n  Co-Authored-By: X <a@b>\n",
+        );
+        let (ok, bad) = parse_growth_declarations(&body);
+        assert!(ok.is_empty(), "the citation must not be manufactured: {ok:?}");
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].why.contains("cites no issue"), "{:?}", bad[0]);
+
+        // A genuine wrapped reason still folds.
+        let good = msg("Shell-Budget-Growth: 5 lines — a reason that\n  wraps here (#1)\n");
+        assert_eq!(parse_growth_declarations(&good).0.len(), 1);
     }
 
     #[test]
