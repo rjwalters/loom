@@ -37,6 +37,10 @@ source "$SCRIPT_DIR/lib/bg-proc-trap.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+# Used by retired() below. A review pass removed this as unused, correctly for
+# the state of the file at the time: retired() was being CALLED four times but
+# had never actually been defined, so nothing referenced YELLOW.
+YELLOW='\033[0;33m'
 NC='\033[0m'
 
 TESTS_RUN=0
