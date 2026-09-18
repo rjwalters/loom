@@ -2212,6 +2212,13 @@ const LOOM_OWNED_PREFIXES: &[&str] = &[
     ".loom/logs/",
     ".loom/worktrees/",
     ".loom-managed",
+    // Host-local config overlay (#4039; added here for #8075, mirroring the
+    // bash list). Ungitted by design, so in a repo whose managed .gitignore
+    // block predates #8075 it is untracked dirt that would wedge this gate
+    // "dirty" forever — the same failure mode the lockfile class below exists
+    // to prevent. Safe to ignore here: the gate's remediation is `git reset
+    // --hard <remote>` and never `git clean`, so the overlay survives.
+    ".loom-local/",
 ];
 
 /// Common regenerable lockfile basenames (#3950): a package manager can

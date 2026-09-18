@@ -97,6 +97,7 @@ Thumbs.db
 .loom/.resync-in-progress
 .loom/gh-config/
 .loom/gh-config-by-owner/
+.loom-local/
 # <<< loom-managed <<<
 .loom-test-failure-context.json
 .loom/.daemon.flags
@@ -179,10 +180,9 @@ Thumbs.db
 # Skill routing local overrides (untracked, user-specific)
 .loom/config/skill-routes.local.json
 
-# Host-local config override tier (#4039, Epic #3835 Phase 2) — the
-# highest-precedence tier config_resolver.rs merges over the committed
-# .loom/config.json. Untracked and per-host on purpose: this is where a
-# genuinely host-specific value (e.g. observability.ingestKeyFile on a
-# non-default path) belongs, so it never gets committed and copied verbatim
-# onto a different host's `$HOME` the way #5336's incident did.
-.loom-local/
+# NOTE (#8075): the host-local config override tier `.loom-local/` used to be
+# ignored HERE, outside the managed block, which is precisely why consumer
+# repos never got it — the installer-managed block is generated from
+# EPHEMERAL_PATTERNS in loom-daemon/src/init/post_init.rs, not from this file.
+# It now lives in that list (and therefore in the block above), with the
+# rationale for ignoring it recorded alongside the pattern there.

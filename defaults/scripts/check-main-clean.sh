@@ -209,6 +209,16 @@ LOOM_OWNED_PREFIXES=(
     ".loom/logs/"
     ".loom/worktrees/"
     ".loom-managed"
+    # Host-local config overlay (#4039 / Epic #3835 Phase 2; listed here for
+    # #8075). `.loom-local/local.json` is the highest-precedence config tier and
+    # is ungitted BY DESIGN — so in a consumer repo whose managed .gitignore
+    # block predates #8075 it surfaces as `?? .loom-local/` and was eligible for
+    # `--quarantine`'s `git stash push --include-untracked`. Stashing it
+    # silently reverts whatever the operator overrode (e.g. a per-repo model
+    # pin) with no signal anywhere. It is never source a builder writes to main,
+    # so filtering it cannot mask contamination. Independent of the .gitignore
+    # fix, which only reaches a consumer repo after a resync.
+    ".loom-local/"
 )
 
 # ---- Loom-owned stash producers (#5185) ----------------------------------
