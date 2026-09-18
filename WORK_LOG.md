@@ -7,6 +7,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **Issue #8187** (closed): chore(ratchet): file-size baseline entry for role_runner/tests.rs is stale-high (4006 recorded, 3893 actual)
+- **PR #8204**: chore(ratchet): tighten file-size baseline for genuine stale-high entries
+- **Issue #8186** (closed): telemetry: sum_transcript_usage_by_model does not dedupe on message.id, so the safehouse completion feed over-counts tokens ~2x
+- **PR #8203**: docs(telemetry): document transcript usage block-sum overcounting
+- **Issue #8161** (closed): sweep: Mode B / all confirmation gate has no non-interactive acceptance path (add --yes)
+- **PR #8202**: docs(sweep): add --yes for non-interactive confirmation gates
+- **Issue #8198** (closed): Security Scan workflow cancels verification of distinct main commits — same bug #7779 fixed in ci.yml, unfixed here
+- **PR #8201**: fix(ci): stop Security Scan cancelling distinct main commits (#8198)
+- **Issue #8192** (closed): guard-loom-workflow.sh: 901 lines, 16 fixes in 6 months, zero tests — build the suite before considering a port
+- **Issue #8028** (closed): [epic #7810 PR 6a] Port the artifact fetch + verification; split Phase 6 into slices
+- **PR #8180**: feat(daemon): port the artifact fetch + verification (#8028)
+- **Issue #8059** (closed): telemetry: ingest transcript token usage into activity.db for dispatch-based sweeps (resource_usage/token_usage are empty)
+- **PR #8188**: feat(activity): ingest dispatch-sweep transcript token usage into activity.db (#8059)
 - **PR #8194**: fix(reaper): stop reaping target/ from live worktrees; honour non-closing PR refs
 - **PR #8174**: fix(dep-recheck): recognize dependency-phrase checklist items in named-dependency (#8119)
 - **Issue #8119** (closed): dep_recheck named-dependency item_re misses 'Blocked by #N'/'Depends on #N'/'Requires #N' checklist phrasings (false VERDICT=clear)
