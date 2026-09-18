@@ -111,7 +111,7 @@ pub fn emit(verdict: &Verdict, reporter: &Reporter) -> i32 {
         reporter.heartbeat_ok(&verdict.message);
         // exit_ok(): a divergence anywhere in this tick owns the exit code,
         // even when the last line read as healthy.
-        i32::from(reporter.probe_diverged)
+        i32::from(reporter.diverged())
     } else {
         reporter.report(verdict.level, &verdict.message);
         1

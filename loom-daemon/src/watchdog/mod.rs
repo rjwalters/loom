@@ -46,6 +46,7 @@ pub mod env;
 pub mod escalate;
 pub mod heartbeat;
 pub mod liveness;
+pub mod load_avg;
 pub mod locate;
 pub mod marker;
 pub mod probe;
@@ -110,10 +111,12 @@ fn marker_present(
     // no escalation sentinel.
     recovery::clear(&state.recovery, &state.escalation_sentinel);
 
-    // TODO(#8086): sections 12-22 (the bounded IPC probe, its consecutive and
-    // windowed signals) set `reporter.probe_diverged`, which is what makes an
-    // OK-shaped heartbeat line render as DEGRADED and owns the exit code. The
-    // 50-series peer-coordination checks run here too.
+    // Sections 12-22: the bounded in-band probe and its two signals.
+    if let Some(code) = ipc_probe(paths, reporter, state, &snap) {
+        return code;
+    }
+
+    // TODO(#8086): the 50-series peer-coordination checks run here.
 
     let heartbeat_file = snap.heartbeat_file.clone().unwrap_or_else(|| {
         paths
@@ -466,4 +469,142 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Sections 12-22: the bounded in-band IPC probe.
+///
+/// Returns `Some(code)` only for a CONFIRMED hang, which exits immediately.
+/// Every other outcome falls through to the heartbeat section, possibly having
+/// set [`report::Reporter::probe_diverged`] — which is what makes an OK-shaped
+/// heartbeat line render as `DEGRADED` and owns the tick's exit code (#5790).
+///
+/// Two signals, deliberately distinct:
+///
+/// - **Consecutive** (#4398): N failures in a row against the same pid is a
+///   confirmed hang. Resets on any clean round-trip, because a transient
+///   failure under concurrent-sweep load is the common case (#4279).
+/// - **Windowed** (#5944): N failures among the last M ticks. An intermittent
+///   probe — fail, succeed, fail, succeed — never reaches 3 consecutive, so the
+///   first signal never fires for it, yet failing half your ticks is not a
+///   clean bill of health either.
+fn ipc_probe(
+    paths: &config::Paths,
+    reporter: &report::Reporter,
+    state: &consts::StateFiles,
+    snap: &liveness::Snapshot,
+) -> Option<i32> {
+    let pid = snap.pid?;
+
+    let repo_root = marker::get_nonempty(&paths.marker, "repo_root").map(PathBuf::from);
+    let bin = locate::daemon_bin(repo_root.as_deref());
+    let attempt = probe::attempt(&paths.socket_path, bin.as_deref());
+    let (verdict, detail) = probe::classify_ipc(
+        &attempt,
+        snap.process_age_secs,
+        probe::probe_grace_secs(),
+        &paths.socket_path,
+        probe::probe_timeout_secs(),
+    );
+
+    let window_ticks =
+        env::num("LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS", consts::DEFAULT_PROBE_WINDOW_TICKS);
+    let window_threshold = env::num(
+        "LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD",
+        consts::DEFAULT_PROBE_WINDOW_FAIL_THRESHOLD,
+    );
+    let fail_threshold =
+        env::num("LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD", consts::DEFAULT_PROBE_FAIL_THRESHOLD);
+
+    match verdict {
+        probe::IpcVerdict::Healthy => {
+            probe_state::clear_fail_streak(&state.probe_fail_count);
+            let w = probe_state::record(&state.probe_window, pid, false, window_ticks);
+
+            if w.fails >= window_threshold {
+                let load = load_avg::sample();
+                reporter.report(
+                    report::Level::Degraded,
+                    &format!(
+                        "daemon IPC round-trip OK this tick ({detail}), but {} of the last {} \
+                         watchdog ticks failed the same probe (window threshold \
+                         {window_threshold}/{window_ticks}, #5944) — none of them were 3 \
+                         CONSECUTIVE, so neither the same-tick (#5790) nor sustained-CONFIRMED \
+                         (#4398) signal fired for this pattern, but failures this frequent are \
+                         not a clean bill of health either. Host load average at probe time: \
+                         {load}. NOT a confirmed hang (this tick's own round-trip answered) and \
+                         no remediation is attempted; the window ages out on its own as old \
+                         ticks roll off, and a run of clean ticks lets it clear naturally.",
+                        w.fails, w.len
+                    ),
+                );
+                reporter.set_diverged(format!(
+                    "the IPC probe has failed {} of the last {} watchdog ticks (see the \
+                     DEGRADED line above, #5944) — dispatch may be intermittently degraded \
+                     despite THIS tick's own round-trip succeeding; the exit code for this tick \
+                     reflects that windowed/rate signal, not this line.",
+                    w.fails, w.len
+                ));
+            } else {
+                reporter.report(report::Level::Ok, &format!("IPC probe OK: {detail}."));
+            }
+            None
+        }
+
+        probe::IpcVerdict::Unresponsive => {
+            let streak = probe_state::fail_streak(&state.probe_fail_count, pid) + 1;
+            probe_state::write_fail_streak(&state.probe_fail_count, pid, streak);
+            probe_state::record(&state.probe_window, pid, true, window_ticks);
+            let load = load_avg::sample();
+
+            if streak >= fail_threshold {
+                reporter.report(
+                    report::Level::Divergence,
+                    &format!(
+                        "daemon IPC UNRESPONSIVE (CONFIRMED): the process is alive ({}) — and \
+                         its heartbeat may well look FRESH — but the bounded socket round-trip \
+                         has now failed on {streak} CONSECUTIVE watchdog ticks (threshold \
+                         {fail_threshold}). {detail}. Host load average at probe time: {load}. \
+                         The heartbeat writer and the IPC accept loop are independent tokio \
+                         tasks, so a fresh heartbeat does NOT prove the daemon can still serve \
+                         work: autonomous dispatch is effectively DEAD while this holds. No \
+                         automatic kill/restart is attempted (#4398 — there is no provably-safe \
+                         unattended remediation for a wedged-but-alive process). RECOVER: \
+                         'loom-daemon restart' (note: the restart primitive travels over this \
+                         same wedged socket and may itself hang), else \
+                         ./.loom/scripts/cli/loom-daemon-stop.sh && \
+                         ./.loom/scripts/cli/loom-daemon-start.sh [flags]. Diagnose with: \
+                         LOOM_SOCKET_PATH={} {}s-bounded 'loom-daemon status'; sample the \
+                         process with 'sample {pid}' (macOS) or 'gdb -p {pid}' to capture the \
+                         wedge before killing it.",
+                        snap.detail,
+                        paths.socket_path.display(),
+                        probe::probe_timeout_secs()
+                    ),
+                );
+                return Some(1);
+            }
+
+            reporter.report(
+                report::Level::Divergence,
+                &format!(
+                    "daemon IPC probe FAILED while the process is alive ({}): {detail}. This is \
+                     consecutive failure {streak} of {fail_threshold} — NOT yet a confirmed hang \
+                     (a single failure can be transient contention under concurrent-sweep load, \
+                     #4279) and no remediation is attempted. Host load average at probe time: \
+                     {load}. If the next watchdog tick round-trips cleanly the streak resets.",
+                    snap.detail
+                ),
+            );
+            reporter.mark_diverged();
+            None
+        }
+
+        // Nothing was learned. Explicitly not counted as a hang, and the window
+        // is NOT recorded — an unobserved tick is not a healthy one, and
+        // recording it as either would bias the rate signal.
+        probe::IpcVerdict::Skipped => {
+            reporter.report(report::Level::Ok, &format!("IPC probe skipped: {detail}."));
+            None
+        }
+    }
 }

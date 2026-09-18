@@ -56,12 +56,12 @@ pub struct Reporter {
     colours: bool,
     /// Set when the IPC probe diverged on this tick. Drives both the
     /// `DEGRADED`-instead-of-`OK` substitution below and the tick's exit code.
-    pub probe_diverged: bool,
+    probe_diverged: std::cell::Cell<bool>,
     /// Overrides the historical note text for a divergence that did NOT come
     /// from this tick's own round-trip (#5944 — the windowed/rate signal can
     /// fire on a tick whose round-trip actually succeeded, and pointing the
     /// reader at a `DIVERGENCE` line that was never printed is a lie).
-    pub diverged_note: Option<String>,
+    diverged_note: std::cell::RefCell<Option<String>>,
 }
 
 impl Reporter {
@@ -71,9 +71,30 @@ impl Reporter {
             log_path,
             verbose,
             colours: stderr_is_tty(),
-            probe_diverged: false,
-            diverged_note: None,
+            probe_diverged: std::cell::Cell::new(false),
+            diverged_note: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Record that the probe diverged on this tick, keeping the historical
+    /// note text.
+    pub fn mark_diverged(&self) {
+        self.probe_diverged.set(true);
+    }
+
+    /// Record a divergence whose note must NOT point at a `DIVERGENCE` line —
+    /// the windowed signal fires on a tick whose own round-trip succeeded, so
+    /// the historical wording would send the reader looking for a line that was
+    /// never printed (#5944).
+    pub fn set_diverged(&self, note: String) {
+        self.probe_diverged.set(true);
+        *self.diverged_note.borrow_mut() = Some(note);
+    }
+
+    /// Whether anything diverged on this tick. Owns the exit code.
+    #[must_use]
+    pub fn diverged(&self) -> bool {
+        self.probe_diverged.get()
     }
 
     /// Force colours on or off, for tests that must assert on plain text.
@@ -122,8 +143,8 @@ impl Reporter {
     /// divergence was reported moments earlier. The exit code was already
     /// correct; this closes the matching gap in the log TEXT.
     pub fn heartbeat_ok(&self, msg: &str) {
-        if self.probe_diverged {
-            let note = self.diverged_note.clone().unwrap_or_else(|| {
+        if self.probe_diverged.get() {
+            let note = self.diverged_note.borrow().clone().unwrap_or_else(|| {
                 "the IPC probe diverged earlier this tick (see the DIVERGENCE line above) — \
                  dispatch may be degraded despite a fresh/liveness-only-OK heartbeat signal; \
                  the exit code for this tick reflects the divergence, not this line."
