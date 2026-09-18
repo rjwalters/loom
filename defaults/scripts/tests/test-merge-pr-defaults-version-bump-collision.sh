@@ -254,14 +254,16 @@ run_guard
 assert_eq "0" "$LAST_RC" "Failed fetch keeps skip contract"
 
 # Non-defaults edits of each other canonical value are forbidden too.
-for file in package.json mcp-loom/package.json Cargo.toml CLAUDE.md; do
+# CLAUDE.md is deliberately absent: #8147 removed it from the version-bearing
+# set (it is injected into every agent session's prompt prefix, so it carries
+# no version stamp at all any more) -- the case below asserts the inverse.
+for file in package.json mcp-loom/package.json Cargo.toml; do
     case_fixture
     git -C "$LOCAL" checkout -q -b feature/value
     mkdir -p "$(dirname "$LOCAL/$file")"
     case "$file" in
         *.json) printf '{"version":"2.0.0"}\n' > "$LOCAL/$file" ;;
         *.toml) printf 'version = "2.0.0"\n' > "$LOCAL/$file" ;;
-        CLAUDE.md) printf '**Loom Version**: 2.0.0\n' > "$LOCAL/$file" ;;
     esac
     git -C "$LOCAL" add "$file"
     git -C "$LOCAL" commit -q -m 'manual version value'
@@ -283,6 +285,20 @@ PR_BRANCH=feature/prose
 PR_HEAD_SHA="$(git -C "$LOCAL" rev-parse HEAD)"
 run_guard
 assert_eq 0 "$LAST_RC" "Prose in version-bearing file passes with unchanged value"
+
+# #8147: a CLAUDE.md edit that DOES rewrite a `**Loom Version**:` line is no
+# longer a hand-edit at all -- the file left the version-bearing set with the
+# stamp. Without this the PR that removed the stamp could not have merged.
+case_fixture
+git -C "$LOCAL" checkout -q -b feature/claude-version-line
+printf '**Loom Version**: 2.0.0\n' > "$LOCAL/CLAUDE.md"
+git -C "$LOCAL" add CLAUDE.md
+git -C "$LOCAL" commit -q -m 'CLAUDE.md version-looking line'
+git -C "$LOCAL" push --quiet origin feature/claude-version-line
+PR_BRANCH=feature/claude-version-line
+PR_HEAD_SHA="$(git -C "$LOCAL" rev-parse HEAD)"
+run_guard
+assert_eq 0 "$LAST_RC" "CLAUDE.md is no longer version-bearing (#8147)"
 
 case_fixture
 make_pr_branch "1.0.0"

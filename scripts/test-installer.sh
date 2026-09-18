@@ -2204,10 +2204,15 @@ else
       # match the exact placeholder set (mirrors Rust TEMPLATE_PLACEHOLDERS).
       if grep -Eq '\{\{(LOOM_VERSION|LOOM_COMMIT|INSTALL_DATE|REPO_OWNER|REPO_NAME)\}\}' "$CLAUDE_52"; then
         fail "#4050: .loom/CLAUDE.md still contains an unsubstituted Loom template placeholder"
-      elif grep -q '\*\*Loom Version\*\*: unknown' "$CLAUDE_52"; then
-        fail "#4050: .loom/CLAUDE.md renders 'Loom Version: unknown' on daemon-direct init"
+      # The companion "renders 'Loom Version: unknown'" assertion moved to
+      # install-metadata.json's loom_version (checked above): #8147 removed the
+      # `**Loom Version**:` header from this guide, since a per-release token in
+      # a prompt-prefix-injected file invalidates every agent's cached prefix on
+      # every bump.
+      elif grep -q '^\*\*Loom Version\*\*:' "$CLAUDE_52"; then
+        fail "#8147: .loom/CLAUDE.md must carry no **Loom Version** header (prompt-prefix cache churn)"
       else
-        pass "#4050: .loom/CLAUDE.md has a substituted version and no leftover placeholder"
+        pass "#4050/#8147: .loom/CLAUDE.md has no leftover placeholder and no version stamp"
       fi
     fi
   else
@@ -2425,10 +2430,12 @@ echo ""
 
 # Test 62: ./scripts/version.sh list emits the expected version-bearing files
 #
-# The base set is the 5 always-present files -- "VERSION" (issue #5517, the
+# The base set is the 4 always-present files -- "VERSION" (issue #5517, the
 # root plain-text file required by the tool-package installer contract's C8
-# "Honest source version") joined the original 5 alongside CLAUDE.md.
-# `.loom/install-metadata.json` is a conditional 6th entry (#4842): it exists
+# "Honest source version") joined the set, and CLAUDE.md left it in #8147
+# (a prompt-prefix-injected file must carry no per-bump token, so nothing
+# stamps a version into it any more).
+# `.loom/install-metadata.json` is a conditional 5th entry (#4842): it exists
 # only on a dogfooded install (loom installed on its own repo — which IS the
 # case for this repo's own CI run), and version.sh's `list` arm
 # existence-checks it before emitting. Mirror that same presence check here
@@ -2439,7 +2446,6 @@ LIST_OUTPUT="$("$LOOM_ROOT/scripts/version.sh" list)"
 EXPECTED_LIST="package.json
 mcp-loom/package.json
 Cargo.toml
-CLAUDE.md
 VERSION"
 if [[ -f "$LOOM_ROOT/.loom/install-metadata.json" ]]; then
   EXPECTED_LIST="$EXPECTED_LIST
@@ -2507,11 +2513,8 @@ EOF
   printf '[package]\nname = "loom-daemon"\nversion.workspace = true\nedition.workspace = true\n' > "$dir/loom-daemon/Cargo.toml"
   printf '[package]\nname = "loom-api"\nversion.workspace = true\nedition.workspace = true\n' > "$dir/loom-api/Cargo.toml"
 
-  cat > "$dir/CLAUDE.md" <<EOF
-# Scratch
-
-**Loom Version**: $version
-EOF
+  # No CLAUDE.md: since #8147 it is not a version-bearing file, so version.sh
+  # neither reads nor rewrites it.
 
   printf '%s\n' "$version" > "$dir/VERSION"
 

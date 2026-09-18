@@ -691,19 +691,24 @@ verify_install() {
   done
 
   # Defense-in-depth: surface any unsubstituted {{LOOM_VERSION}} /
-  # {{INSTALL_DATE}} survivors in .loom/CLAUDE.md (issue #3502). Also
-  # surface the literal "unknown" version line, which means the daemon's
-  # substituter ran but LOOM_VERSION was not exported before invocation.
+  # {{INSTALL_DATE}} survivors in .loom/CLAUDE.md (issue #3502).
   local claude_md="$target/.loom/CLAUDE.md"
-  if [[ -f "$claude_md" ]]; then
-    if grep -q '{{LOOM_VERSION}}\|{{LOOM_COMMIT}}\|{{INSTALL_DATE}}\|{{REPO_OWNER}}\|{{REPO_NAME}}' "$claude_md"; then
-      warning "Unsubstituted template placeholder(s) found in .loom/CLAUDE.md"
-      missing=$((missing + 1))
-    fi
-    if grep -Eq '^\*\*Loom Version\*\*:[[:space:]]+unknown' "$claude_md"; then
-      warning ".loom/CLAUDE.md has 'Loom Version: unknown' — LOOM_VERSION was not exported before loom-daemon init"
-      missing=$((missing + 1))
-    fi
+  if [[ -f "$claude_md" ]] && grep -q '{{LOOM_VERSION}}\|{{LOOM_COMMIT}}\|{{INSTALL_DATE}}\|{{REPO_OWNER}}\|{{REPO_NAME}}' "$claude_md"; then
+    warning "Unsubstituted template placeholder(s) found in .loom/CLAUDE.md"
+    missing=$((missing + 1))
+  fi
+
+  # Surface a literal "unknown" installed version, which means the daemon's
+  # substituter ran but LOOM_VERSION was not exported before invocation. Read
+  # from install-metadata.json rather than .loom/CLAUDE.md's old
+  # `**Loom Version**:` header: #8147 removed that header (a per-release token
+  # in a prompt-prefix-injected file invalidated every agent's cached prefix on
+  # each bump), leaving this JSON field as the authoritative record — and the
+  # one `loom-daemon init` writes "unknown" into in exactly the same failure.
+  local install_meta="$target/.loom/install-metadata.json"
+  if [[ -f "$install_meta" ]] && grep -Eq '"loom_version"[[:space:]]*:[[:space:]]*"unknown"' "$install_meta"; then
+    warning ".loom/install-metadata.json has 'loom_version: unknown' — LOOM_VERSION was not exported before loom-daemon init"
+    missing=$((missing + 1))
   fi
 
   if [[ $missing -gt 0 ]]; then

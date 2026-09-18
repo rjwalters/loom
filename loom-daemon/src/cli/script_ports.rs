@@ -46,6 +46,12 @@ pub(crate) enum ScriptPortCommand {
     /// flattened enum is what keeps a new top-level subcommand free.
     ShellBudget(super::shell_budget::ShellBudgetArgs),
 
+    /// `merge-pr.sh`'s closing-reference / partial-increment analysis (#8191,
+    /// slice 1). Reads the PR body on stdin — it is untrusted external content
+    /// and routinely tens of kilobytes, so it does not belong in argv.
+    #[command(subcommand)]
+    MergePrRefs(super::merge_pr_refs::MergePrRefsCommand),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -63,6 +69,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseFetch(args) => args.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
+            ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
         }
     }
