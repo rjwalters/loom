@@ -11,9 +11,24 @@ on:
   schedule:
     - cron: '0 0 * * 0'  # Weekly on Sunday
 
+# Supersede on a PR; NEVER on main (#8198, mirroring ci.yml's #7779 fix).
+#
+# `github.ref` is `refs/heads/main` for every push to main, so one shared group
+# meant each merge cancelled the previous merge's Security Scan -- including the
+# CodeQL Analysis job, which only runs on non-PR events and therefore has no
+# other place it gets verified. Observed live on 2026-09-18: CodeQL for commit
+# e2c02f41 started 10:06:56Z and was cancelled 10:08:19Z, 13s before the next
+# main commit appeared. That silently loses security coverage on any main commit
+# followed by another merge inside the scan's runtime, which at ~3.3 merges/hour
+# (#7779's measurement) is close to the steady state.
+#
+# Keyed on the PR number when there is one, and on the commit SHA otherwise, so
+# every main commit -- and every scheduled scan of a distinct tip -- gets its own
+# group and has nothing to supersede. See .loom/docs/ci-principles.md rule 2:
+# never cancel verification of a distinct commit.
 concurrency:
-  group: security-${{ github.ref }}
-  cancel-in-progress: true
+  group: security-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Belt-and-suspenders cancellation (#6683) — same rationale and mechanism as
@@ -25,6 +40,15 @@ jobs:
   # run). No `needs:`, so it runs in parallel and does not gate the jobs below.
   cancel-superseded:
     name: Cancel Superseded Runs (same ref)
+    # PR events only (#8198), exactly as ci.yml's identically-named job since
+    # #7779. The rationale above is entirely about a superseded PR push. On a
+    # push to main (or a scheduled run) there is nothing to supersede:
+    # `github.head_ref` is empty, so REF fell back to `github.ref_name` =
+    # `main`, and this job cancelled every other queued/in_progress main run --
+    # the dominant cause of the cancellation rate in ci.yml, not the
+    # `concurrency:` stanza alone. Each main commit is distinct work that
+    # deserves its own verification.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       actions: write
