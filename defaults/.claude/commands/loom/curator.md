@@ -1497,7 +1497,7 @@ PRIOR_HASH=$(printf '%s\n' "$PRIOR" | jq -r '.body // ""' \
 PRIOR_AT=$(printf '%s\n' "$PRIOR" | jq -r '.createdAt // empty')
 
 # Age in hours (portable: BSD `date -j -f` on macOS, GNU `date -d` elsewhere).
-_epoch() { date -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -d "$1" +%s; }
+_epoch() { date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -d "$1" +%s; }
 if [ -n "$PRIOR_AT" ]; then
   PRIOR_AGE_H=$(( ( $(date +%s) - $(_epoch "$PRIOR_AT") ) / 3600 ))
 else
@@ -1825,7 +1825,7 @@ PRIOR=$(gh issue view "$ISSUE_NUMBER" --json comments \
 PRIOR_HASH=$(printf '%s\n' "$PRIOR" | jq -r '.body // ""' \
   | sed -n 's|.*<!-- curator:operator-premise-recheck:\([0-9a-f]\{1,\}\) -->.*|\1|p' | tail -n 1)
 PRIOR_AT=$(printf '%s\n' "$PRIOR" | jq -r '.createdAt // empty')
-_epoch() { date -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -d "$1" +%s; }
+_epoch() { date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -d "$1" +%s; }
 if [ -n "$PRIOR_AT" ]; then
   PRIOR_AGE_H=$(( ( $(date +%s) - $(_epoch "$PRIOR_AT") ) / 3600 ))
 else
