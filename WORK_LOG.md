@@ -7,6 +7,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-18
+- **PR #8194**: fix(reaper): stop reaping target/ from live worktrees; honour non-closing PR refs
+- **PR #8174**: fix(dep-recheck): recognize dependency-phrase checklist items in named-dependency (#8119)
+- **Issue #8119** (closed): dep_recheck named-dependency item_re misses 'Blocked by #N'/'Depends on #N'/'Requires #N' checklist phrasings (false VERDICT=clear)
+- **PR #8171**: fix(guard): treat an unquoted backslash-escaped quote as literal, not a span opener
+- **Issue #8025** (closed): guard qsplit(): an unquoted backslash-escaped quote enters the quoted-span branch, hiding a real statement boundary
+- **PR #8189**: fix(role_runner): classify mid-run pool-exhaustion/rate-limit sentinels
+- **Issue #8123** (closed): role_runner 'tick failed' summary quotes the last stderr line (an MCP-config WARN), masking the real cause (token pool exhausted, disk full)
+- **PR #8183**: fix(sweep): skip a draft/unlabeled existing PR instead of routing it to Judge (#8160)
+- **Issue #8160** (closed): sweep: issue-side existing-PR probe routes a human-authored, unlabeled draft PR to Judge
+- **PR #8169**: fix(shell-budget): make "say why in the commit" real — declared floor growth (#8154)
+- **Issue #8154** (closed): shell-budget ratchet: message says 'say why in the commit' but nothing honours it — no override path, three approved safety PRs blocked
+- **PR #8181**: test(watchdog): assert case 20's probe skip by invocation marker, not wall-clock
+- **Issue #8168** (closed): test: watchdog case 20 proves "the probe did not run" with a 2s wall-clock budget, which flakes under host load
 - **Issue #8060** (closed): models: pricing table is one to two generations stale (opus 3× over, haiku 4× under, fable priced as opus); dormant workflows pin gen-4 IDs
 - **PR #8178**: fix(pricing): close the last #8060 gaps — retune doc, gate scope, schedule rationale
 - **Issue #8150** (closed): docs(config_resolver): drop the stale "tier 1 is not yet shipped" framing from two doc comments
