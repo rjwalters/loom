@@ -51,15 +51,19 @@ fn a_subject_that_merely_contains_fix_does_not_count() {
 }
 
 #[test]
-fn the_cap_matches_the_gate_that_actually_enforces_it() {
-    // `scripts/check-shell-allowlist.sh` is the authority. If someone retunes
-    // STUB_MAX_CODE_LINES there and not here, the two halves of the repo start
-    // disagreeing about what "cannot be carrying logic" means, silently.
-    let sh = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../scripts/check-shell-allowlist.sh"),
-    );
-    let Ok(sh) = sh else {
+fn the_cap_agrees_with_the_gate_at_the_boundary_itself() {
+    // This test previously asserted only that the two NUMBERS were equal, and
+    // it passed while the two mechanisms disagreed: the shell gate compares
+    // with `-lt` (strictly under) and `has_been_ported` read `<=`, so a script
+    // of exactly STUB_MAX_CODE_LINES lines was "trivial glue" here and "too
+    // big" there. Pinning a constant does not pin a predicate.
+    //
+    // So drive the REAL gate instead of re-encoding its comparison: extract
+    // `is_shape_a_stub` and its helpers from check-shell-allowlist.sh and run
+    // both implementations over synthetic scripts that straddle the cap.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let gate = root.join("scripts/check-shell-allowlist.sh");
+    let Ok(sh) = std::fs::read_to_string(&gate) else {
         return; // not a full checkout; nothing to compare against
     };
     let declared = sh
@@ -67,11 +71,70 @@ fn the_cap_matches_the_gate_that_actually_enforces_it() {
         .find_map(|l| l.trim().strip_prefix("STUB_MAX_CODE_LINES="))
         .and_then(|v| v.trim().parse::<usize>().ok())
         .expect("the shell gate declares STUB_MAX_CODE_LINES");
-    assert_eq!(
-        declared,
+    assert_eq!(declared, super::super::STUB_CAP, "the cap itself must agree");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    for n in [
+        super::super::STUB_CAP - 1,
         super::super::STUB_CAP,
-        "the trivial-glue cap must agree with the gate that enforces it"
-    );
+        super::super::STUB_CAP + 1,
+    ] {
+        // A literal `exec` handoff, so BOTH predicates agree on the handoff
+        // half and the only variable left is the line count. (They differ by
+        // design elsewhere: `is_handoff` also accepts `loom_exec_script_helper`
+        // and a resolved `$DAEMON_BIN`, which the shell's shape test does not.)
+        let mut body = String::from("#!/usr/bin/env bash\n");
+        // The shebang starts with `#`, so the counting rule treats it as a
+        // comment and it does not count. n-1 fillers + the exec line = n.
+        for i in 0..n.saturating_sub(1) {
+            body.push_str(&format!("filler_{i}=1\n"));
+        }
+        body.push_str("exec loom-daemon thing \"$@\"\n");
+        let f = dir.path().join(format!("s{n}.sh"));
+        std::fs::write(&f, &body).expect("write");
+
+        let code = body
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+            .count();
+        assert_eq!(code, n, "fixture must have exactly {n} code lines");
+
+        // Ask the shell gate itself.
+        let script = format!(
+            "STUB_MAX_CODE_LINES={declared}\n{}\n{}\n{}\nis_shape_a_stub \"$1\"",
+            extract_fn(&sh, "code_line_count"),
+            extract_fn(&sh, "last_code_line"),
+            extract_fn(&sh, "is_shape_a_stub"),
+        );
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .arg("bash")
+            .arg(&f)
+            .output()
+            .expect("bash runs");
+        let shell_says_glue = out.status.success();
+
+        assert_eq!(
+            has_been_ported(&body),
+            shell_says_glue,
+            "at {n} code lines the two mechanisms must agree \
+             (shell says trivial-glue={shell_says_glue})"
+        );
+    }
+}
+
+/// Pull one shell function's source out of the gate, so the test drives the
+/// shipped implementation rather than a copy of it that can drift.
+fn extract_fn(sh: &str, name: &str) -> String {
+    let start = sh
+        .find(&format!("{name}() {{"))
+        .unwrap_or_else(|| panic!("{name} not found in check-shell-allowlist.sh"));
+    let rest = &sh[start..];
+    let end = rest
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("{name} has no terminator"));
+    rest[..end + 3].to_string()
 }
 
 #[test]

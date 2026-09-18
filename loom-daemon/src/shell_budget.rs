@@ -53,8 +53,9 @@ pub const PORTABLE: &[&str] = &["contract", "hook-entry"];
 pub const FLOOR: &[&str] = &["bootstrap", "vendored"];
 /// What a fully ported file becomes: under 40 code lines, ending in `exec`.
 pub const STUB: &str = "stub";
-/// The trivial-glue cap: at or under this many code lines, a file cannot be
-/// carrying logic. `scripts/check-shell-allowlist.sh` (`STUB_MAX_CODE_LINES`)
+/// The trivial-glue cap: STRICTLY under this many code lines, a file cannot
+/// be carrying logic. The gate compares with `-lt`, so 40 is over the cap,
+/// not at it. `scripts/check-shell-allowlist.sh` (`STUB_MAX_CODE_LINES`)
 /// is the authority and enforces it on the `stub` category; the copy here is
 /// for [`churn`], which applies the same cap to a different question — has
 /// THIS file handed its logic off, whatever category it declares. Keep the

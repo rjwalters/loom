@@ -33,6 +33,10 @@
 //! 1. It hands off to the daemon — `exec`s the binary, or calls the repo's
 //!    shared [`loom_exec_script_helper`] handoff.
 //! 2. It is under the trivial-glue cap, so there is no logic left to carry.
+//!    STRICTLY under: `check-shell-allowlist.sh` gates on `-lt`, and a review
+//!    caught this reading `<=`. The two then disagreed about a script of
+//!    exactly [`super::STUB_CAP`] lines — no such script exists today, which
+//!    is precisely why it would have sat there until one did.
 //!
 //! Both halves are load-bearing. `loom-daemon-start.sh` is 1,184 code lines
 //! with 24 fixes — the single largest remaining target — and it `exec`s the
@@ -153,7 +157,7 @@ pub fn has_been_ported(text: &str) -> bool {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
-    code.len() <= super::STUB_CAP && code.iter().any(|l| is_handoff(l))
+    code.len() < super::STUB_CAP && code.iter().any(|l| is_handoff(l))
 }
 
 /// Count fix-commits per path over the window.
