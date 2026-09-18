@@ -78,3 +78,36 @@ fn mcp_error_reads_output_and_not_the_exit_code() {
     assert_eq!(run(Sub::McpError, &zero_exit, "MCP server failed"), 0);
     assert_eq!(run(Sub::McpError, &zero_exit, "connection reset by peer"), 1);
 }
+
+#[test]
+fn model_class_answers_with_the_same_polarity_as_every_other_predicate() {
+    // The caller splices stdout into `tokens mark-bad --reason` only when the
+    // status says to, so 0 must mean "a marker was printed". Reusing 1 for
+    // "account-wide" (rather than, say, exiting 0 with empty stdout) is what
+    // lets the shell's `&& printf` idiom stay a one-liner.
+    let scoped = Opts {
+        classification: Some("MODEL_CREDITS_EXHAUSTED".to_string()),
+        model: "claude-opus-5".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(run(Sub::ModelClass, &scoped, "You're out of usage credits."), 0);
+
+    let account_wide = Opts {
+        model: "claude-opus-5".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(run(Sub::ModelClass, &account_wide, "You've reached your weekly limit."), 1);
+}
+
+#[test]
+fn an_empty_model_is_an_answer_not_a_missing_value() {
+    // Unlike `--classification`, whose ABSENCE selects the degraded code path,
+    // an empty `--model` selects a different VERDICT on the same path: the
+    // spawn took the session default, so the mark stays account-wide. Spelling
+    // it as an Option would invite a caller to omit it and get the other one.
+    let no_model = Opts {
+        classification: Some("MODEL_CREDITS_EXHAUSTED".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(run(Sub::ModelClass, &no_model, "You're out of usage credits."), 1);
+}

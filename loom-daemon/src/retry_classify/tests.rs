@@ -269,3 +269,133 @@ fn a_fallback_pattern_cannot_straddle_a_newline() {
     assert!(!is_account_exhaustion(&degraded("You have hit your\nweekly limit", 1)));
     assert!(!is_account_auth_dead(&degraded("\"type\"\n: \"authentication_error\"", 1)));
 }
+
+// --- Behaviour 7: how narrow a .bad_tokens mark may be (#8058 / #8138) ------
+//
+// `model_class_marker` is the one predicate whose two error directions are NOT
+// symmetric, so each test below says which direction it is holding the line on.
+// Over-scoping (a marker where the death was account-wide) leaves a dead
+// account in rotation for every OTHER class — a live pool regression.
+// Under-scoping merely reproduces the pre-#8058 behaviour.
+
+#[test]
+fn model_credits_exhaustion_scopes_the_mark_to_the_model_in_flight() {
+    // Prevents: the #8058 fix being lost in the port. MODEL_CREDITS_EXHAUSTED
+    // (#5687) is per-tier BY DEFINITION, so an account that hit only its Opus
+    // ceiling must stay eligible for Sonnet work.
+    let input = with_library("You're out of usage credits.", 1, "MODEL_CREDITS_EXHAUSTED", true);
+    assert_eq!(
+        model_class_marker(&input, "claude-opus-5").as_deref(),
+        Some(" [model-class:claude-opus-5]")
+    );
+}
+
+#[test]
+fn the_marker_carries_the_raw_model_and_a_leading_space() {
+    // Both halves are contract. The RAW value (not a normalized class) is what
+    // `tokens_pool::bad_tokens` expects to normalize on READ, and the leading
+    // space is what keeps the reason a well-formed
+    // `exhausted: <phrase> [model-class:<m>]` when the caller concatenates it.
+    let input = with_library("out of usage credits", 1, "MODEL_CREDITS_EXHAUSTED", true);
+    let marker = model_class_marker(&input, "claude-sonnet-4-6").expect("scoped");
+    assert!(marker.starts_with(' '), "{marker:?} must be appendable as a suffix");
+    assert_eq!(
+        format!("exhausted: out of credits{marker}"),
+        "exhausted: out of credits [model-class:claude-sonnet-4-6]"
+    );
+}
+
+#[test]
+fn a_per_model_ceiling_scopes_but_an_account_wide_one_does_not() {
+    // THE asymmetry, and the reason the predicate is not the bare #4501 regex:
+    // "reached your Fable 5 limit" and "reached your weekly limit" both match
+    // that regex, and only the first is scoped to one class. Asserted with the
+    // SAME model in flight, because the model is not what tells them apart.
+    let ceiling = degraded("You've reached your Fable 5 limit.", 1);
+    assert_eq!(
+        model_class_marker(&ceiling, "claude-opus-5").as_deref(),
+        Some(" [model-class:claude-opus-5]")
+    );
+    for account_wide in [
+        "You've reached your weekly limit. Your limit will reset later.",
+        "You've reached your monthly usage limit.",
+        "You've reached your daily limit.",
+        "You've reached your account limit.",
+        "You've reached your plan limit.",
+        "You've reached your api spend limit.",
+    ] {
+        assert_eq!(
+            model_class_marker(&degraded(account_wide, 1), "claude-opus-5"),
+            None,
+            "'{account_wide}' must leave the mark ACCOUNT-WIDE"
+        );
+    }
+}
+
+#[test]
+fn a_ceiling_that_names_nothing_does_not_scope() {
+    // The `{1,3}` in CEILING_PHRASE, not EXHAUSTION_FALLBACK's `{0,3}`: a bare
+    // "reached your limit" names no class, so there is nothing to scope TO and
+    // the conservative answer is account-wide.
+    assert_eq!(
+        model_class_marker(&degraded("You've reached your limit.", 1), "claude-opus-5"),
+        None
+    );
+}
+
+#[test]
+fn credits_exhaustion_only_scopes_through_the_library_path() {
+    // Prevents: widening the #5687 arm into the degraded path. The shell gated
+    // it behind `declare -F classify_error`, so a caller with no classifier saw
+    // the credits phrasing and still wrote an account-wide mark. The port keeps
+    // that, because the phrase alone does not say WHICH tier ran out — only the
+    // category does.
+    assert_eq!(
+        model_class_marker(&degraded("You're out of usage credits.", 1), "claude-opus-5"),
+        None
+    );
+    // ...and a DIFFERENT category on the library path is not the credits one.
+    let exhausted = with_library("You're out of usage credits.", 1, "TOKEN_EXHAUSTED", true);
+    assert_eq!(model_class_marker(&exhausted, "claude-opus-5"), None);
+}
+
+#[test]
+fn no_model_in_flight_never_scopes() {
+    // The session default: the wrapper does not know which class the child ran,
+    // so there is no honest marker to write. Blank is treated as absent — the
+    // one deliberate divergence from the shell's `[[ -n ]]`, which would have
+    // written the meaningless `[model-class: ]`.
+    let input = with_library("out of usage credits", 1, "MODEL_CREDITS_EXHAUSTED", true);
+    assert_eq!(model_class_marker(&input, ""), None);
+    assert_eq!(model_class_marker(&input, "   "), None);
+}
+
+#[test]
+fn an_account_wide_qualifier_anywhere_on_the_matched_line_widens_the_mark() {
+    // `grep -m1 -ioE` semantics, both halves:
+    //   * ALL matches on the first matching line are judged, so a per-model
+    //     ceiling quoted alongside a weekly one still widens — the safe
+    //     direction when the text is ambiguous.
+    //   * Only the FIRST matching line is judged, so an unrelated later line
+    //     does not retroactively widen a clean one.
+    let mixed = degraded("reached your Fable 5 limit and reached your weekly limit", 1);
+    assert_eq!(model_class_marker(&mixed, "claude-opus-5"), None);
+
+    let later_line = degraded("reached your Fable 5 limit\nreached your weekly limit", 1);
+    assert_eq!(
+        model_class_marker(&later_line, "claude-opus-5").as_deref(),
+        Some(" [model-class:claude-opus-5]")
+    );
+}
+
+#[test]
+fn the_ceiling_phrase_cannot_straddle_a_newline() {
+    // Same widening this module's other regexes are pinned against: the shell
+    // fed `grep`, which matches within a LINE, so `[[:space:]]` can never eat a
+    // newline. A whole-buffer match would scope a mark off two unrelated log
+    // lines.
+    assert_eq!(
+        model_class_marker(&degraded("reached your\nFable 5 limit", 1), "claude-opus-5"),
+        None
+    );
+}

@@ -6,6 +6,13 @@
 //! in that script is preflight, MCP repair, output monitoring and process
 //! plumbing, and stays where it is.
 //!
+//! A seventh joined them in #8138: [`model_class_marker`], which shapes the
+//! remedy [`is_account_exhaustion`] calls for rather than choosing between
+//! remedies. It landed here rather than beside the `.bad_tokens` writer it
+//! feeds because the question it answers is the same kind this module already
+//! answers — what does this failure's *text* prove — and the #4501 ceiling
+//! phrasing it turns on is already in this file, in [`EXHAUSTION_FALLBACK`].
+//!
 //! `defaults/scripts/tests/test-claude-wrapper-retry.sh` (#8032) pinned all six
 //! against the shell *before* this port and runs unchanged against it. That
 //! suite, not review, is the equivalence evidence.
@@ -46,6 +53,7 @@ pub mod cli;
 #[cfg(test)]
 mod tests;
 
+use crate::tokens_pool::bad_tokens::MODEL_CLASS_MARKER_PREFIX;
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -189,6 +197,28 @@ static SESSION_LIMIT_FALLBACK: LazyLock<Regex> = LazyLock::new(|| {
     .expect("session-limit fallback pattern is a compile-time constant")
 });
 
+/// The #4501 per-model ceiling phrase, verbatim from
+/// `lib/classify-error.sh`'s `loom_model_class_marker` (#8058).
+///
+/// `{1,3}`, not [`EXHAUSTION_FALLBACK`]'s `{0,3}`: a bare "reached your limit"
+/// names no class at all, so there is nothing for a class-scoped mark to be
+/// scoped *to*.
+static CEILING_PHRASE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)reached your ([^[:space:]]+[[:space:]]+){1,3}limit")
+        .expect("ceiling phrase is a compile-time constant")
+});
+
+/// Words that make a [`CEILING_PHRASE`] match account-wide rather than
+/// per-class, verbatim from `loom_model_class_marker` (#8058).
+///
+/// "You've reached your weekly limit" matches [`CEILING_PHRASE`] just as
+/// "You've reached your Fable 5 limit" does, and is emphatically NOT scoped to
+/// one model class. This list is what tells them apart.
+static ACCOUNT_WIDE_QUALIFIER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(weekly|monthly|daily|hourly|session|usage|plan|spend|account|api)\b")
+        .expect("account-wide qualifier list is a compile-time constant")
+});
+
 /// `is_mcp_error`'s patterns, verbatim from `claude-wrapper.sh` — four
 /// `grep -qi` passes, joined into one alternation because `grep -q` over a list
 /// is exactly an alternation.
@@ -221,6 +251,73 @@ pub fn is_account_exhaustion(input: &Input<'_>) -> bool {
         // exhausted account.
         None => input.exit_code != 0 && any_line_matches(input.output, &EXHAUSTION_FALLBACK),
     }
+}
+
+/// `loom_model_class_marker` — how NARROW the `.bad_tokens` entry that
+/// [`is_account_exhaustion`] just called for is allowed to be (#8058, ported
+/// out of `lib/classify-error.sh` by #8138).
+///
+/// Returns the ` [model-class:<model>]` suffix to append to the mark's reason
+/// when the death is provably scoped to ONE model class, and `None` otherwise.
+/// This sits in the same place as every other function in this module — the
+/// shell says *what category* the failure is, this owns *what the wrapper does*
+/// about it — and it is the remedy-shaping half of `is_account_exhaustion`:
+/// that predicate decides to rotate and mark, this decides how much of the
+/// account the mark takes out.
+///
+/// Anthropic's subscription limits are not model-blind: a Max plan carries a
+/// per-model-class ceiling alongside the all-models weekly limit. Marking the
+/// whole account bad for one of those is what let a mixed-model fleet's Opus
+/// arm starve its Sonnet arm out of a shared pool.
+///
+/// # Deliberately conservative
+///
+/// The two error directions are not symmetric. A class-scoped mark is NARROWER
+/// than an account-wide one, so mis-scoping a genuinely account-wide death
+/// leaves a dead account in rotation for every other class; failing to scope a
+/// genuinely per-class death merely reproduces the pre-#8058 behaviour.
+/// Widening is therefore the safe default, and only two signatures qualify:
+///
+/// 1. `MODEL_CREDITS_EXHAUSTED` (#5687, "You're out of usage credits") — the
+///    category is per-tier by definition, per its own documentation. Available
+///    only on the library path; a caller with no `classify_error` (the
+///    `classification: None` degraded arm) falls through to the regex, exactly
+///    as the shell's `declare -F classify_error` guard did.
+/// 2. A [`CEILING_PHRASE`] match (#4501, "You've reached your Fable 5 limit")
+///    whose own words are not an [`ACCOUNT_WIDE_QUALIFIER`].
+///
+/// The class always comes from `model` — the resolved model in flight — not
+/// from the error text: a ceiling kill means "the class we were running ran
+/// out", which is a property of the dispatch, not of the message. The raw value
+/// is emitted verbatim; [`crate::tokens_pool::bad_tokens`] normalizes it through
+/// `model_tiers::task_alias_of` on read, and an unrecognizable marker reads as
+/// class-less (blocks everything) rather than as blocking nothing.
+///
+/// The one deliberate divergence from the shell: a whitespace-only `model` is
+/// treated as absent rather than written into the marker. The shell's `[[ -n
+/// ]]` would have emitted `[model-class: ]`, which
+/// [`crate::tokens_pool::bad_tokens::scoped_reason`] already treats as no class
+/// on the write side — so this only removes a way to produce a marker that
+/// means nothing.
+#[must_use]
+pub fn model_class_marker(input: &Input<'_>, model: &str) -> Option<String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    if input.classification != Some("MODEL_CREDITS_EXHAUSTED") {
+        // `grep -m1 -ioE` semantics: stop at the FIRST line carrying a match,
+        // then judge every match on that line. A qualifier anywhere among them
+        // widens the mark, because the conservative direction is account-wide.
+        let line = input.output.lines().find(|l| CEILING_PHRASE.is_match(l))?;
+        if CEILING_PHRASE
+            .find_iter(line)
+            .any(|m| ACCOUNT_WIDE_QUALIFIER.is_match(m.as_str()))
+        {
+            return None;
+        }
+    }
+    Some(format!(" {MODEL_CLASS_MARKER_PREFIX}{model}]"))
 }
 
 /// `is_account_auth_dead` — rotate **and** mark the credential dead.
