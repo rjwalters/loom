@@ -41,8 +41,8 @@ pub(crate) enum ScriptPortCommand {
     ReleaseResolve(super::release_resolve::ReleaseResolveArgs),
 
     /// `merge-pr.sh`'s verdict-label mutual-exclusion guard (#8112), the
-    /// second slice of the merge-pr port (#8191). Exit 0 = contradictory,
-    /// 1 = clean, 2 = the guard could not run — and 2 must refuse the merge.
+    /// second slice of the merge-pr port (#8191). Exit 1 = contradictory,
+    /// 0 = clean, 2 = the guard could not run — and 2 must refuse the merge.
     #[command(subcommand)]
     MergePr(MergePrCommand),
 
