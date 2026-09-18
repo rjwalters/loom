@@ -443,8 +443,36 @@ ensure_project_hook_wiring() {
         local htype="${_PHOOK_TYPES[$i]}"
         local matcher="${_PHOOK_MATCHERS[$i]}"
         # shellcheck disable=SC2016  # ${CLAUDE_PROJECT_DIR} is expanded by Claude Code, not bash
-        local cmd='${CLAUDE_PROJECT_DIR}/.loom/hooks/'"$name"
-        if _phook_merge_one "$settings" "$htype" "$matcher" ".loom/hooks/$name" "$cmd" "defaults/hooks/"; then
+        # #6544: quoted so a project path containing a space does not get
+        # word-split by `sh` at hook-execution time — ${CLAUDE_PROJECT_DIR} is
+        # substituted by Claude Code into a literal path string BEFORE the
+        # command reaches the shell, so the quotes must be part of the emitted
+        # command text itself, not bash-level quoting here.
+        local cmd='"${CLAUDE_PROJECT_DIR}/.loom/hooks/'"$name"'"'
+        # The pre-#6544 UNQUOTED form of the same command — passed as the
+        # upgrade_marker (7th arg) below so a pre-existing broken entry written
+        # by the old code is recognized as a stale Loom wrapper and rewritten to
+        # the quoted form in place, not left as an already-provisioned no-op
+        # (see _phook_merge_one's upgrade_marker doc, #4806). It is a strict
+        # superset of the dedup_marker (".loom/hooks/$name"), so it can never
+        # match MORE than the existing dedup test already matches, and it
+        # additionally requires the ${CLAUDE_PROJECT_DIR} prefix — so the
+        # legacy pre-#3277 bare-relative form (".loom/hooks/$name" with no
+        # prefix) is correctly left alone, as before. KNOWN LIMITATION: because
+        # `is_stale_loom_wrapper` is a substring `contains` test (shared with the
+        # machine-level upgrade path, which needs it for its much longer
+        # wrapper), a hand-authored entry that happens to embed this exact
+        # unquoted path text verbatim (e.g. with extra flags appended after it)
+        # would also be treated as a stale Loom wrapper and rewritten — unlike
+        # the machine-level marker, which is an internal wrapper-body substring
+        # unlikely to appear in a hand-written command, this one is the entire
+        # legacy command text, which a coincidental hand-written variant is more
+        # likely to share. Accepted: an entry matching this exact unquoted
+        # string is far more likely to be our own pre-#6544 output than a
+        # deliberate customization.
+        # shellcheck disable=SC2016
+        local legacy_cmd='${CLAUDE_PROJECT_DIR}/.loom/hooks/'"$name"
+        if _phook_merge_one "$settings" "$htype" "$matcher" ".loom/hooks/$name" "$cmd" "defaults/hooks/" "$legacy_cmd"; then
             wired=$((wired + 1))
         else
             _phook_warn "failed to assert project-level entry for $name in $settings"
