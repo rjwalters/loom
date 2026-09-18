@@ -149,10 +149,18 @@ run_harness() {
         bash "$RUNNER" "$@"
 }
 
-field() { # <KEY> <runner stdout>
-    local line
-    line="$(printf '%s\n' "$2" | grep "^$1=" | head -n1)"
-    printf '%s\n' "${line#"$1"=}"
+# field <KEY> <runner stdout> -- the first `KEY=value` line's value, or "".
+# A plain read loop rather than `grep | head`: an early-exit consumer under
+# `set -o pipefail` is the SIGPIPE class check-pipefail-early-exit.sh ratchets
+# (#7790).
+field() {
+    local key="$1" line
+    while IFS= read -r line; do
+        case "$line" in
+            "$key="*) printf '%s\n' "${line#"$key"=}"; return 0 ;;
+        esac
+    done <<< "$2"
+    printf '%s\n' ""
 }
 
 OLD_STAMP="202601010101"   # `touch -t` format: an unambiguously stale build

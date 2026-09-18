@@ -203,7 +203,11 @@ _loom_test_freshest_repo_build() {
 _loom_test_daemon_bin_newer_source() {
     local root="$1" bin="$2" src="$1/loom-daemon/src" newer
     [[ -d "$src" ]] || return 1
-    newer="$(find "$src" -type f -newer "$bin" -print 2>/dev/null | head -n1 || true)"
+    # `-print -quit` rather than `| head -n1`: a pipe to an early-exit consumer
+    # under the caller's `set -o pipefail` is the SIGPIPE class
+    # check-pipefail-early-exit.sh ratchets (#7790). `-quit` is in both GNU and
+    # BSD find.
+    newer="$(find "$src" -type f -newer "$bin" -print -quit 2>/dev/null || true)"
     [[ -n "$newer" ]] || return 1
     printf '%s\n' "$newer"
 }
