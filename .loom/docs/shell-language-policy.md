@@ -269,16 +269,41 @@ Shell-Budget-Growth: 59 lines — guards against a silent revert of a local fix 
 
 Rules the gate enforces:
 
+- The trailer must start at **column 0**. An indented line is prose showing the
+  format, not a declaration using it. (The PR that added this parser contained
+  an indented example of its own trailer and granted itself 59 lines because of
+  it — see below.)
 - The declared count must **cover** the measured growth. Declaring 10 and
   growing 500 fails, and the message names the shortfall.
-- The reason must cite an issue (`#<n>`). An override that argues for itself in
-  passing is a bare escape hatch, which is what this must not become.
+- The reason must cite an issue (`#<n>`).
 - Trailers **accumulate** across the commits in the range, so a multi-commit PR
   can declare its growth in pieces.
 - Undeclared growth still fails exactly as before.
 - A malformed trailer is reported as malformed. It is not silently treated as
   absent — otherwise the build fails with a message about growth while the real
   problem is a typo, and the author re-reads the wrong thing.
+- A change that **recategorises** any script between allowlist categories cannot
+  be bought with a trailer at all. Moving a file out of `contract` while adding
+  portable shell makes net portable *fall*, so only the total rises; declaring
+  that total would buy new portable shell, which no trailer may do. Split the
+  change: recategorise in one PR, grow in another.
+
+### What this override does NOT do
+
+It does not verify that a human wrote it. #8154 asked that the override not be
+"a bare escape hatch a Builder grants itself", and the check that ships is
+syntactic: the trailer must name an amount and cite some issue number. `#1`
+satisfies it. An agent can write one.
+
+What it actually buys is **attribution and visibility**, not authorisation:
+the growth is named, priced, tied to an issue, printed in CI output, and
+carried in the cumulative figure forever. Undeclared growth remains impossible.
+Whether the cited issue genuinely argues the cost is a **review** judgement, and
+it is one a reviewer can now make, because the claim is written down where the
+diff is.
+
+Stating that plainly is the point. A gate that advertises an authorisation it
+does not perform is the exact defect this section exists to correct.
 
 Declared growth is not absorbed or forgiven. It stays in the running total, and
 `loom-daemon shell-budget` prints the cumulative accepted figure since the epic
@@ -289,8 +314,14 @@ This exists because the gate's failure message used to end *"if that is right,
 say why in the commit"* while `check_against_rev` returned an error
 unconditionally. It promised an escape hatch that was never implemented, and
 three Judge-approved safety PRs sat red against it with no in-repo remedy. A
-test now lifts the trailer template out of the failure message and asserts it
-parses, so the message and the enforcement cannot drift apart again.
+test now lifts the trailer template out of the failure message, substitutes the
+placeholders, and asserts it parses **and** then admits the growth it was
+printed for — so the message and the enforcement cannot drift apart again.
+
+That test earned its keep immediately: when the parser was tightened to reject
+indented trailers, it failed, because the failure message's own template was
+indented. The message would have told every author to write something the
+parser rejected.
 
 ## Related
 

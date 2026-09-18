@@ -73,8 +73,8 @@ impl ShellBudgetArgs {
                     "files": budget.file_count(),
                     "origin_portable": origin,
                     "net_vs_epic_start": i128::from(budget.portable()) - i128::from(origin),
-                    "accepted_floor_growth": accepted_total,
-                    "accepted_floor_growth_declarations": accepted.iter().map(|d| serde_json::json!({
+                    "declared_floor_growth": accepted_total,
+                    "declared_floor_growth_declarations": accepted.iter().map(|d| serde_json::json!({
                         "lines": d.lines,
                         "reason": d.reason,
                         "issue": d.issue,
@@ -87,7 +87,7 @@ impl ShellBudgetArgs {
             print!("{}", shell_budget::render_report(&budget, origin));
             if !accepted.is_empty() {
                 println!(
-                    "\n  declared floor growth  {accepted_total:>6}   accepted across {} commit(s) since the epic began",
+                    "\n  declared floor growth  {accepted_total:>6}   declared across {} commit(s) since the epic began",
                     accepted.len()
                 );
                 for d in &accepted {
@@ -135,21 +135,59 @@ impl ShellBudgetArgs {
                 );
             }
 
-            if let Err(why) = shell_budget::check_against_rev(&budget, &before, &desc, &declared) {
-                eprintln!("\nshell-budget: PORTABLE SHELL GREW\n\n{why}");
+            // Recategorisation voids the override (see check_against_rev).
+            let recategorised =
+                shell_budget::recategorised_since(&root, &cmp.rev).map_err(anyhow::Error::msg)?;
+            let ctx = shell_budget::GrowthContext {
+                declared: &declared,
+                recategorised: &recategorised,
+            };
+
+            if let Err(why) = shell_budget::check_against_rev(&budget, &before, &desc, &ctx) {
+                // Not "PORTABLE SHELL GREW": three of the four refusal paths
+                // (floor growth, a short declaration, a recategorising change)
+                // fire when portable FELL or held. A header that names the
+                // wrong cause sends the author to fix the wrong thing — the
+                // same message-vs-reality defect this whole change is about.
+                eprintln!("\nshell-budget: REFUSED\n\n{why}");
                 std::process::exit(1);
             }
 
-            // Accepted growth stays visible. #8154 ask 3: the point is that
+            // Declared growth stays visible. #8154 ask 3: the point is that
             // growth remains a conscious act, so it must not vanish into a
             // silently-passing build.
-            if !declared.is_empty() && !self.json {
-                let total: u64 = declared.iter().map(|d| d.lines).sum();
-                println!("\nshell-budget: {total} line(s) of floor growth declared and accepted:");
-                // The reason carries its own `#<issue>` by construction — the
-                // parser rejects one that does not — so do not print it twice.
-                for d in &declared {
-                    println!("  {} lines — {}", d.lines, d.reason);
+            //
+            // "declared", not "accepted": over-declaring is allowed, so this is
+            // an upper bound on what the change actually spent, not a
+            // measurement of it. Calling it "accepted" invited reading the
+            // cumulative figure as real growth.
+            if !declared.is_empty() {
+                let total: u64 = declared
+                    .iter()
+                    .fold(0u64, |acc, d| acc.saturating_add(d.lines));
+                let actual = budget.total().saturating_sub(before.total());
+                if self.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "declared_this_change": total,
+                            "measured_growth_this_change": actual,
+                            "declarations": declared.iter().map(|d| serde_json::json!({
+                                "lines": d.lines, "reason": d.reason, "issue": d.issue,
+                            })).collect::<Vec<_>>(),
+                        })
+                    );
+                } else {
+                    println!(
+                        "\nshell-budget: {total} line(s) of floor growth DECLARED \
+                         ({actual} measured) — an upper bound, not a measurement:"
+                    );
+                    // The reason carries its own `#<issue>` by construction —
+                    // the parser rejects one that does not — so do not print
+                    // it twice.
+                    for d in &declared {
+                        println!("  {} lines — {}", d.lines, d.reason);
+                    }
                 }
             }
             if !self.json {
