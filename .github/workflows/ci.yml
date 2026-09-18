@@ -612,6 +612,71 @@ jobs:
       - name: Check generated TOCs are current
         run: bash scripts/check-doc-tocs.sh
 
+  stale-model-pins:
+    name: Stale Model Pin Check
+    # Cheap structural check; always runs, and deliberately NOT path-filtered:
+    # the thing it guards is a workflow file, so a filter keyed on anything
+    # else would skip it on exactly the PR that reintroduces a pin.
+    #
+    # #8060: the five `loom-*.yml` role workflows pinned `--model
+    # claude-opus-4-8` / `--model claude-sonnet-4-6` and sat two generations
+    # behind, because #3477's "pin an exact ID and bump deliberately" rule
+    # relied on a human bumping and nobody did. They now pass bare aliases,
+    # which the CLI resolves at dispatch. This keeps a pin from creeping back.
+    #
+    # SCOPE IS THE POINT: `.github/workflows/` only, and only a `--model`
+    # argument. The tree-wide grep the issue originally proposed matches 29
+    # files on main — test fixtures, doc-comment examples, CHANGELOG history —
+    # and would red-flag `tokens_pool/check.rs`'s `claude-haiku-4-5-20251001`,
+    # the one model ID in the repo that is genuinely current. A gate that is
+    # red on day one for 28 legitimate reasons gets disabled, not obeyed.
+    #
+    # Known over-match, accepted: the pattern would also fire on a HYPOTHETICAL
+    # `--model claude-haiku-4-5`, which is current. No workflow pins Haiku, and
+    # the fix if one ever wants to is the same as everywhere else — pass the
+    # `haiku` alias.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # Self-test first: a gate that silently stops matching reports OK forever
+      # while stale pins keep landing. Both controls run before the real scan.
+      - name: Self-test the detector
+        run: |
+          set -euo pipefail
+          PATTERN='--model[ =]claude-(opus|sonnet|haiku)-[34]'
+          if ! printf '%s\n' 'run: claude -p "/loom:judge" --model claude-opus-4-8 --dangerously-skip-permissions' \
+               | grep -qE -e "$PATTERN"; then
+            echo "::error::self-test failed: the detector no longer matches a known-stale pin"
+            exit 1
+          fi
+          if printf '%s\n' 'run: claude -p "/loom:judge" --model opus --dangerously-skip-permissions' \
+               | grep -qE -e "$PATTERN"; then
+            echo "::error::self-test failed: the detector matches a bare alias, which is the fixed state"
+            exit 1
+          fi
+          echo "detector self-test OK"
+      - name: No stale pinned model ID in a dispatching workflow
+        run: |
+          set -euo pipefail
+          PATTERN='--model[ =]claude-(opus|sonnet|haiku)-[34]'
+          # Two exclusions, both about the gate not tripping over itself:
+          #   --exclude=ci.yml  this file carries the pattern and a known-stale
+          #                     fixture as DATA for the self-test above, and
+          #                     dispatches no role model of its own.
+          #   the `grep -v`     a YAML comment explaining a past pin is prose,
+          #                     not a dispatch.
+          if hits="$(grep -rnE -e "$PATTERN" --exclude=ci.yml .github/workflows/ \
+                     | grep -vE ':[0-9]+:[[:space:]]*#')"; then
+            echo "::error::A workflow dispatches a pinned model ID that is at least one generation stale."
+            echo "The invariant: no workflow dispatches a pinned model older than the current"
+            echo "generation. Pass a bare alias (--model sonnet / --model opus) and let the CLI"
+            echo "resolve it, as the daemon dispatch path already does (#8060)."
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "No stale pinned model IDs in .github/workflows/"
+
   hooks-defaults-parity:
     name: Hooks/Scripts Defaults Parity Check
     # Cheap structural check; always runs. .loom/hooks/ and .loom/scripts/ are
