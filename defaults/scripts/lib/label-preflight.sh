@@ -104,30 +104,3 @@ loom_apply_issue_label() { _loom_apply_label "issue" "$@"; }
 
 # loom_apply_pr_label <pr-number> <label> [-R OWNER/NAME]
 loom_apply_pr_label() { _loom_apply_label "pr" "$@"; }
-
-# loom_verdict_label_contradiction_message <pr-number> <newline-separated labels> <head-sha>
-#   PR verdict-label mutual exclusion (#8112, generalizing #4570/#7018): `loom:pr`
-#   (a reviewer approved) must never coexist with a label asserting the opposite
-#   or a pending/blocking hold. On a contradiction, prints a ready-to-use
-#   refusal message naming BOTH the offending labels and returns 0; prints
-#   nothing and returns 1 when the label set is not contradictory.
-#
-#   Order-independent by construction: this walks a FIXED list of blocking
-#   labels rather than asking "which label appears first in the input", so the
-#   verdict cannot be silently bypassed by how the forge happens to order the
-#   PR's labels array.
-loom_verdict_label_contradiction_message() {
-    local pr="$1" labels="$2" sha="$3" blocker
-    printf '%s\n' "$labels" | grep -qx 'loom:pr' || return 1
-    for blocker in loom:changes-requested loom:blocked loom:operator loom:review-requested; do
-        printf '%s\n' "$labels" | grep -qx "$blocker" || continue
-        echo "Merge blocked: PR #$pr carries both \`loom:pr\` and \`$blocker\` simultaneously — a contradictory verdict state (see the mutual-exclusion invariant documented in .github/labels.yml). \`loom:pr\` means a reviewer approved this head; \`$blocker\` means a reviewer (possibly a different, concurrent one) found a blocking problem, is re-requesting review, or the item is otherwise on hold. Merging now could ship an unreviewed or explicitly rejected change on the strength of a racing approval.
-
-Current labels: $labels
-Current head SHA: $sha
-
-Get a fresh Judge verdict on the current head, then re-run this merge once the contradiction is gone. There is no override flag for this guard: overriding an explicit rejection/hold is a different act from overriding a merely-missing review (which --allow-unapproved already covers), so this check is not bypassable by any flag (#8112)."
-        return 0
-    done
-    return 1
-}

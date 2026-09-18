@@ -373,14 +373,6 @@ fi
 # than silently degrade a destructive decision to a guess.
 # shellcheck source=lib/branch-landed.sh
 source "$SCRIPT_DIR/lib/branch-landed.sh"
-# Verdict-label contradiction check (#8112) — same lib Curator/Builder/Judge
-# already share for label operations; the decision logic itself lives there
-# (label-preflight.sh is well under the file-size threshold, merge-pr.sh is
-# not), so this file only needs the source line plus the two-line guard below.
-# Required, not defensive: a missing lib must fail loudly rather than silently
-# skip a safety guard, mirroring branch-landed.sh's own reasoning above.
-# shellcheck source=lib/label-preflight.sh
-source "$SCRIPT_DIR/lib/label-preflight.sh"
 # Default-branch resolver (#4100) — the local-branch delete guard must never
 # target the repo's default branch. Sourced defensively: a repo where this
 # fails to resolve (e.g. no network + no origin/HEAD symref) still falls back
@@ -885,7 +877,7 @@ _check_loom_pr_label
 # said no" (a present, contradicting signal). Those are different acts, and
 # only the first has a documented override. The fix for a real block here is
 # a fresh Judge verdict, not a flag.
-_check_verdict_label_contradiction() { local msg; msg="$(loom_verdict_label_contradiction_message "$PR_NUMBER" "$PR_LABELS" "$PR_HEAD_SHA")" || return 0; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; error "$msg"; }
+_check_verdict_label_contradiction() { local msg rc=0; msg="$(printf '%s\n' "$PR_LABELS" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr verdict-contradiction --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" 2>/dev/null)" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-VERDICT-CLEAN" ]] && return 0; [[ $rc -eq 1 && "$msg" == "Merge blocked:"* ]] || msg="Merge blocked: PR #$PR_NUMBER's verdict-label contradiction guard (#8112) could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr verdict-contradiction' exited $rc without the LOOM-VERDICT-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'found nothing' from 'never ran', so only a positive clean signal is accepted. Build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; error "$msg"; }
 _check_verdict_label_contradiction
 
 # ---------------------------------------------------------------------------

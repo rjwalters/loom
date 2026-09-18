@@ -16,16 +16,19 @@
 # comment above the guard).
 #
 # The decision logic itself (which label pairs count as a contradiction) is
-# in lib/label-preflight.sh's loom_verdict_label_contradiction_message() and
-# is covered independently by test-label-preflight.sh; this suite exercises
-# the merge-pr.sh-side wiring (dry-run behavior, hard-block behavior, and
-# that no override flag exists).
+# `loom-daemon merge-pr verdict-contradiction` (Rust,
+# loom-daemon/src/merge_pr/labels.rs) as of epic #7810 slice 2 of #8191, and
+# is covered independently by its own unit tests — including that the verdict
+# is invariant under every permutation of the label set. This suite exercises
+# the merge-pr.sh-side wiring: dry-run behaviour, hard-block behaviour, that
+# no override flag exists, and that the guard FAILS CLOSED when the binary
+# behind it cannot run.
 #
 # Strategy (mirrors test-merge-pr-loom-pr-label-guard.sh): extract
 # _check_verdict_label_contradiction from the real merge-pr.sh source and
-# source it (plus the real label-preflight.sh lib, unstubbed — its logic is
-# pure string matching with no forge calls), then assert on exit code +
-# emitted message. The guard calls `error` (which `exit 1`s), so it is always
+# source it, driving the REAL `loom-daemon merge-pr verdict-contradiction`
+# behind it (no stub — its logic is pure string matching with no forge calls),
+# then assert on exit code + emitted message. The guard calls `error` (which `exit 1`s), so it is always
 # invoked inside a command-substitution subshell.
 #
 # Usage:
@@ -40,7 +43,6 @@ set -euo pipefail
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$TEST_DIR/.." && pwd)"
 MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
-LABEL_PREFLIGHT_LIB="$HELPERS_DIR/lib/label-preflight.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -100,12 +102,14 @@ success() { echo "OK: $*"; }
 warning() { echo "WARN: $*" >&2; }
 error()   { echo "ERROR: $*" >&2; exit 1; }
 
-if [[ ! -f "$LABEL_PREFLIGHT_LIB" ]]; then
-    echo -e "${RED}FATAL${NC}: $LABEL_PREFLIGHT_LIB not found" >&2
-    exit 2
-fi
-# shellcheck source=/dev/null
-source "$LABEL_PREFLIGHT_LIB"
+# The guard's decision is now `loom-daemon merge-pr verdict-contradiction`.
+# Pin the binary this suite tests against and verify it knows the subcommand —
+# FATAL, never a skip: a suite that skipped itself when no binary resolved
+# would report green while testing nothing, which is the exact failure this
+# epic keeps running into.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$TEST_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr"
 
 # --- Extract the function under test from merge-pr.sh and source it ---
 # From `_check_verdict_label_contradiction() {` up to (not including) the
@@ -224,14 +228,74 @@ run_guard
 assert_eq "1" "$LAST_RC" "loom:pr + loom:review-requested -> merge hard-blocked (exit 1)"
 assert_contains "$LAST_OUT" "loom:review-requested" "Block message names loom:review-requested"
 
+# --- FAILS CLOSED when the implementation behind the guard cannot run ---
+#
+# Moving this decision from a sourced shell function into a SUBPROCESS
+# (epic #7810 slice 2 of #8191) introduces a failure mode the original could
+# not have: the binary can be missing, or be an older install that does not
+# know the subcommand. A sourced function is either defined or the script does
+# not start.
+#
+# That new mode must fail CLOSED. To a caller that only checks for a zero exit,
+# "the guard found nothing" and "the guard never ran" are the same observation,
+# and this guard is the last thing standing between a racing approval and an
+# irreversible merge. So every outcome that is not a clean exit 1 refuses.
+echo ""
+echo "Testing fail-closed behavior when loom-daemon cannot answer..."
+
+# T-FC1: no binary at all. Driven with a genuinely absent path rather than a
+# stub returning 127, because what is under test is how the wrapper handles an
+# exit code it did not expect — inventing the code would assume the answer.
+DRY_RUN=false
+PR_LABELS=$'loom:pr\nloom:changes-requested'
+PR_HEAD_SHA="deadbeef"
+_SAVED_BIN="${LOOM_DAEMON_BIN:-}"
+LOOM_DAEMON_BIN="/nonexistent/loom-daemon"
+run_guard
+assert_eq "1" "$LAST_RC" "an absent loom-daemon BLOCKS the merge (never silently proceeds)"
+assert_contains "$LAST_OUT" "Merge blocked" "the refusal is stated as a block"
+assert_contains "$LAST_OUT" "could not run" "the message distinguishes 'never ran' from 'found a contradiction'"
+assert_contains "$LAST_OUT" "loom-daemon" "the message names what is missing, so it is actionable"
+
+# T-FC2: a binary that EXISTS and exits ZERO but never emits the clean
+# sentinel — e.g. an older loom-daemon, or anything substituted onto the path.
+# /bin/echo exits 0 and prints its arguments, so a contract that inferred
+# "clean" from a zero exit would wave this straight through.
+LOOM_DAEMON_BIN="/bin/echo"
+run_guard
+assert_eq "1" "$LAST_RC" "a zero-exit binary without the clean sentinel still BLOCKS"
+assert_contains "$LAST_OUT" "could not run" "its stdout is not mistaken for a verdict"
+
+# T-FC3: silent success. /bin/true exits 0 and prints nothing — the exact
+# shape that any "absence of a complaint means clean" contract accepts.
+LOOM_DAEMON_BIN="/usr/bin/true"
+run_guard
+assert_eq "1" "$LAST_RC" "a silently-succeeding binary BLOCKS (silence is not consent)"
+
+# T-FC4: silent failure with the code that used to mean "clean". This is the
+# case that killed the first contract: exit 1 is the most common generic
+# failure code there is, so mapping it to "reviewed and clean" was fail-open.
+LOOM_DAEMON_BIN="/usr/bin/false"
+run_guard
+assert_eq "1" "$LAST_RC" "a binary exiting 1 BLOCKS — exit 1 alone never means clean"
+
+# T-FC5: the fail-closed path still honours --dry-run's no-side-effects
+# contract — it reports the would-be block without exiting 1.
+DRY_RUN=true
+run_guard
+assert_eq "0" "$LAST_RC" "--dry-run reports the fail-closed block without exiting 1"
+assert_contains "$LAST_OUT" "dry-run" "the dry-run marker is present"
+DRY_RUN=false
+LOOM_DAEMON_BIN="$_SAVED_BIN"
+
 # --- Source-contains guards (fail if a refactor drops the key behavior) ---
 echo ""
 echo "Testing merge-pr.sh source guards..."
 src="$(cat "$MERGE_PR_SRC")"
 assert_contains "$src" "_check_verdict_label_contradiction" \
   "merge-pr.sh defines and invokes _check_verdict_label_contradiction"
-assert_contains "$src" "lib/label-preflight.sh" \
-  "merge-pr.sh sources label-preflight.sh"
+assert_contains "$src" "merge-pr verdict-contradiction" \
+  "merge-pr.sh delegates the verdict decision to loom-daemon"
 assert_not_contains "$src" '"$1" == "--allow-verdict-contradiction"' \
   "no bypass flag exists for this guard (deliberate — see merge-pr.sh's comment above the guard)"
 

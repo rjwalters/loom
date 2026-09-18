@@ -17,5 +17,10 @@
 //! `awk`/`sed`/`grep -oiE` pipelines whose entire bug history is about what
 //! the regex accidentally matched — and because it is pure, which makes a
 //! byte-for-byte differential against the shell possible.
+//!
+//! Slice 2 is [`labels`]: the verdict-label mutual-exclusion guard (#8112) —
+//! refusing to merge a PR that carries `loom:pr` alongside a contradicting
+//! label.
 
+pub mod labels;
 pub mod refs;

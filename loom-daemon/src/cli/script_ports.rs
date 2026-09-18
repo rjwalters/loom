@@ -40,6 +40,12 @@ pub(crate) enum ScriptPortCommand {
     /// 1 when none did — data, not an error.
     ReleaseResolve(super::release_resolve::ReleaseResolveArgs),
 
+    /// `merge-pr.sh`'s verdict-label mutual-exclusion guard (#8112), the
+    /// second slice of the merge-pr port (#8191). Exit 0 = contradictory,
+    /// 1 = clean, 2 = the guard could not run — and 2 must refuse the merge.
+    #[command(subcommand)]
+    MergePr(MergePrCommand),
+
     /// How far the epic actually is: portable shell remaining, the permanent
     /// floor, and the net change since the first port. Not a port itself — it
     /// lives here because `main.rs` is frozen by the file-size ratchet and this
@@ -68,9 +74,27 @@ impl ScriptPortCommand {
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
             ScriptPortCommand::ReleaseFetch(args) => args.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
+            ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
+        }
+    }
+}
+
+/// `merge-pr.sh`'s ported decisions, grouped under one subcommand so the
+/// script's slices stay legible as a family rather than scattering across the
+/// top level.
+#[derive(clap::Subcommand)]
+pub(crate) enum MergePrCommand {
+    /// Refuse a PR carrying `loom:pr` alongside a contradicting label.
+    VerdictContradiction(super::merge_pr_labels::VerdictContradictionArgs),
+}
+
+impl MergePrCommand {
+    pub(crate) fn run(self) -> Result<()> {
+        match self {
+            MergePrCommand::VerdictContradiction(args) => args.run(),
         }
     }
 }

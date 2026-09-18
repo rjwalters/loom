@@ -245,43 +245,6 @@ assert_contains "$(cat "$GH_LOG_FILE")" "label list -R octocat/hello-world" \
     "the -R flag is forwarded to the gh label list fallback lookup too"
 
 echo ""
-echo "=== loom_verdict_label_contradiction_message (#8112) ==="
-
-# No set +e/-e needed: this file only sets `-uo pipefail` (no `-e`), so a
-# non-zero command-substitution exit here does not abort the script.
-MSG="$(loom_verdict_label_contradiction_message 8076 "$(printf 'loom:pr\nloom:changes-requested')" deadbeef)"
-RC=$?
-assert_eq "0" "$RC" "loom:pr + loom:changes-requested -> contradiction detected (rc 0)"
-assert_contains "$MSG" "loom:pr" "message names loom:pr"
-assert_contains "$MSG" "loom:changes-requested" "message names the contradicting label"
-assert_contains "$MSG" "8076" "message names the PR number"
-assert_contains "$MSG" "deadbeef" "message names the head SHA"
-
-MSG="$(loom_verdict_label_contradiction_message 8076 "$(printf 'loom:changes-requested\nloom:pr')" deadbeef)"
-RC=$?
-assert_eq "0" "$RC" "reversed label order -> still detected (order-independent)"
-
-MSG="$(loom_verdict_label_contradiction_message 8076 "loom:pr" deadbeef)"
-RC=$?
-assert_eq "1" "$RC" "loom:pr alone -> no contradiction (rc 1)"
-assert_eq "" "$MSG" "loom:pr alone -> no message printed"
-
-MSG="$(loom_verdict_label_contradiction_message 8076 "loom:changes-requested" deadbeef)"
-RC=$?
-assert_eq "1" "$RC" "loom:changes-requested without loom:pr -> no contradiction (rc 1)"
-
-MSG="$(loom_verdict_label_contradiction_message 8076 "" deadbeef)"
-RC=$?
-assert_eq "1" "$RC" "empty label set -> no contradiction (rc 1)"
-
-for blocker in loom:blocked loom:operator loom:review-requested; do
-    MSG="$(loom_verdict_label_contradiction_message 8076 "$(printf 'loom:pr\n%s' "$blocker")" deadbeef)"
-    RC=$?
-    assert_eq "0" "$RC" "loom:pr + $blocker -> contradiction detected (rc 0)"
-    assert_contains "$MSG" "$blocker" "message names $blocker"
-done
-
-echo ""
 echo "=== source guard: re-sourcing is a harmless no-op ==="
 
 BEFORE_TYPE="$(type -t loom_label_exists)"
