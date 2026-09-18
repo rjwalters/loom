@@ -6,7 +6,59 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
-### 2026-09-17
+### 2026-09-18
+- **Issue #8057** (closed): sweep-outcomes summary: fleet-wide, grouped by arm/model/repo/day, spawn-death exclusion, merge join, merges per weighted token
+- **PR #8082**: feat(daemon): sweep-outcomes summary — fleet-wide grouped outcome report
+- **PR #8096**: feat(telemetry): failure_class, models_used, doctor_cycles on sweep.outcome; real token_account/effort (#8056 Phase 1)
+- **Issue #8065** (closed): Verify whether sweep-* progressive disclosure is honored at spawn time; fix if not
+- **PR #8111**: docs(sweep): verify sweep-* progressive disclosure IS honored at spawn time (#8065)
+- **Issue #8114** (closed): The shell ratchet asks for a baseline regeneration on every main merge; compare against the merge-base instead
+- **PR #8115**: fix(shell-budget): compare against the merge-base, so there is nothing to update (#8114)
+
+- **Issue #8072** (closed): Installer has three unguarded rm -rf expansions; shellcheck never looks at scripts/ or defaults/hooks/
+- **PR #8076**: fix: guard three rm -rf expansions; lint every tracked shell script (#8072)
+- **Issue #8084** (closed): Epic #7810 is net +65 lines: production shell grew 3.5x in 90 days and nothing measures the aggregate
+- **PR #8085**: test(shell): ratchet the shell we are retiring, not the shell we are keeping (#8084)
+- **Issue #8099** (closed): Differential classifier recognises a divergence class by an input property, absorbing 92% of what its own proof mutation changes
+- **PR #8100**: fix(review): recognise each divergence class by its mechanism, not the input (#8099)
+- **Issue #8061** (closed): fix loom-daemon stats crash: agent_effectiveness view not migrated for pre-#6150 activity.db (no such column: resource_rows)
+- **PR #8109**: fix(daemon): migrate stale pre-#6150 agent_effectiveness view shape
+- **Issue #8074** (closed): test-cpu-budget.sh: explicit-override tests leak the real daemon on hosts where one is installed
+- **PR #8107**: test(cpu-budget): isolate the override block from a real installed daemon
+- **Issue #8071** (closed): Release v0.19.118: loom-daemon-aarch64-unknown-linux-gnu asset missing (Error saving asset)
+- **PR #8108**: fix(release): retry + verify per-file release asset uploads
+- **Issue #8101** (closed): CI job comment asserts every step is a thin-stub port suite; #8070 made that false
+- **PR #8102**: fix(ci): the Native Port Suites comment no longer claims every step is a port suite (#8101)
+- **Issue #8053** (closed): prompt prefix budget: role sessions inject 50–170k fresh (uncached) tokens per session; context is ~91% of fleet spend, output ~9%
+- **Issue #8105** (closed): Baseline-file ratchets go stale on a branch and red main at merge (3 gates share the shape)
+- **Issue #8095** (closed): CI: main is red on 'Role Prompt Prefix Ratchet' from the commit that introduced it (304cccb7, #8073)
+- **PR #8104**: fix(ci): rebaseline the role prompt ratchet against the tree it guards (#8095)
+- **Issue #8079** (closed): Retained black-box suites let three divergences ship green (#8011); add differential testing to the port recipe
+- **PR #8080**: test(dep_recheck): differential-test the port against the shell it replaced (#8079)
+- **PR #8049**: fix(merge-pr): thread stacked-children snapshot through and re-pin to the merged SHA (#8010 items 2-3)
+- **Issue #7995** (closed): guard: deny in-place writes to installed Loom files in a consumer repo (needs a repo-identity discriminator first)
+- **PR #8039**: feat(guards): deny in-place writes to installed Loom files in a consumer repo (#7995)
+- **PR #8073**: feat(ci): ratchet each role's whole prompt prefix, not just per-file size
+- **Issue #8008** (closed): loom-daemon-update: assert a fetched artifact's Developer ID signature survives provisioning (post-provision signature check)
+- **PR #8050**: feat(loom-daemon-update): assert Developer ID signature survives provisioning
+- **Issue #8069** (closed): Three passing test suites run in no CI job; two are excluded for a runner CI never invokes
+- **PR #8070**: ci: run three test suites that passed but gated nothing (#8069)
+- **Issue #8083** (closed): The merge-risk hold digest (#6877) is undiscoverable: two docs call it pinned, it never was; labeled loom:blocked; referenced once
+- **PR #8092**: docs(champion): pin the merge-risk hold digest from Step 2 and route operators to it
+- **Issue #8021** (closed): ChatOps hardening: untested fail-closed allowlist gate, ungated dispatch verb, and a fail-open malformed 'enabled'
+- **PR #8068**: fix(daemon): ChatOps hardening — test the fail-closed allowlist gate, fail closed on a malformed `enabled`, record the dispatch/cancel nonce decision (#8021)
+- **Issue #8011** (closed): dep_recheck port: three undisclosed behavioural divergences from the shell original (follow-up to #7961 / PR #7969)
+- **PR #8067**: fix(dep_recheck): fail-safe --refs parsing; document two kept divergences
+- **Issue #8041** (closed): loom-daemon: make the watchdog's startup-grace discriminator readiness-based, not just process-age
+- **Issue #8045** (closed): Two more test-land-resync-commit.sh 'legitimate change landed' assertions are vacuous (cases (i) and (o2) check path presence, not content)
+- **PR #8051**: test(resync): make cases (i) and (o2) fail when the legitimate change never lands (#8045)
+- **Issue #8006** (closed): Two #7818 test assertions are insensitive to the fix they name (vacuous ls-tree check; group 2 executes a hardcoded pathspec, not the emitted one)
+- **PR #8044**: test(resync): make two #7818 credential-guard assertions fail when the guard is absent
+- **Issue #8012** (closed): docs(guard-hooks): force-op:all row cites 0 and 15 hits from unnamed logs; 'hard-denies' overstates protected mode (from PR #7981 review)
+- **Issue #7979** (closed): Deprecate prose-existence assertions over role prompts: they fail on rewording, on relocation, and once on a correct bug fix (10 red commits)
+- **Issue #7990** (closed): loom-daemon status/health: surface the #7708 host-level token-pool exhaustion hold (the deferred AC4)
+- **PR #8046**: feat(daemon): surface #7708 token-pool exhaustion hold in health/status
+
 - **Issue #7971** (closed): Builder/Doctor/Judge file side findings with no duplicate check — three agents filed the same bug in four minutes
 - **PR #8014**: fix(create-issue): add a duplicate backstop at the single filing call site
 - **Issue #7993** (closed): Migrate sweep_md_doc_lint.rs off prose-existence assertions to extract-and-execute tests (split from #7979)
