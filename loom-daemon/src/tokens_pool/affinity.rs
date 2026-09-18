@@ -296,6 +296,13 @@ impl Affinity {
         let Some(role) = role.map(str::trim).filter(|r| !r.is_empty()) else {
             return Self::inert();
         };
+        // One `resolve_effective_config` read per selection, on the spawn hot
+        // path, even when affinity is disabled. Deliberate and not cached: a
+        // cache would have to be invalidated on config edits the daemon does
+        // not observe, and the cost is small next to the `.ranking`,
+        // `.bad_tokens`, `.allowlist` and `index.json` reads the same
+        // selection already performs. The `role`-is-`None` fast path above
+        // means a caller that never sets `LOOM_ROLE` does not pay it at all.
         let config = resolve_config(workspace);
         if !config.enabled {
             return Self::inert();

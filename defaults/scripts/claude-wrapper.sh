@@ -1826,8 +1826,18 @@ reselect_account_no_mark() {
     # LOOM_MODEL and appends the flag), and on the rare path where they
     # disagree a mismatch costs at most one extra rotation -- never a wrong
     # mark, since marking is gated separately by `retry-classify model-class`.
+    # #8146: `env -u LOOM_ROLE` is load-bearing here, not hygiene. `tokens
+    # select --role` reads LOOM_ROLE straight from the environment (clap
+    # `env =`), and the role runner exports it into every spawn, so leaving it
+    # set would hand this call the prompt-cache affinity key -- which names the
+    # very account we are rotating AWAY from. This function deliberately does
+    # not bad-mark, so that account is still a candidate; affinity would re-pick
+    # it every time and burn the retry budget on the same limit. The two
+    # bad-marking rotation paths below unset it too: they already exclude the
+    # failed account, but unsetting keeps the invariant true end-to-end and
+    # stops a rotation re-recording the affinity key.
     # shellcheck disable=SC2046
-    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
+    sel_output="$(env -u LOOM_ROLE "${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
     _sel_rc=$?
     set -e
     if [[ ${_sel_rc} -ne 0 || -z "${sel_output}" ]]; then
@@ -1968,7 +1978,7 @@ rotate_exhausted_account() {
     # disagree a mismatch costs at most one extra rotation -- never a wrong
     # mark, since marking is gated separately by `retry-classify model-class`.
     # shellcheck disable=SC2046
-    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
+    sel_output="$(env -u LOOM_ROLE "${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
     _sel_rc=$?
     set -e
     if [[ ${_sel_rc} -ne 0 || -z "${sel_output}" ]]; then
@@ -2036,7 +2046,7 @@ rotate_auth_dead_account() {
     # disagree a mismatch costs at most one extra rotation -- never a wrong
     # mark, since marking is gated separately by `retry-classify model-class`.
     # shellcheck disable=SC2046
-    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
+    sel_output="$(env -u LOOM_ROLE "${daemon_bin}" tokens select --workspace "${ws}" --export $(declare -F loom_daemon_model_select_flag >/dev/null 2>&1 && loom_daemon_model_select_flag "${daemon_bin}" "${LOOM_MODEL:-}" || true) 2>/dev/null)"
     _sel_rc=$?
     set -e
     if [[ ${_sel_rc} -ne 0 || -z "${sel_output}" ]]; then
