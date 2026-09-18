@@ -137,7 +137,6 @@ use crate::sweep_registry::{
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::{Event, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
-use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
 
 // ============================================================================
 // Constants
@@ -3179,65 +3178,22 @@ where
     })
 }
 
-/// Reload the machine-level [`WorkspaceRegistry`] and provision every
-/// currently-registered (and still-existing-on-disk) root's
-/// [`SweepRegistry`](crate::sweep_registry::SweepRegistry) via the shared
-/// [`WorkspacePool`] (issue #8121).
-///
-/// Both steps are purely local — one filesystem read of
-/// `~/.loom/workspaces.json`, then in-memory registry construction plus
-/// config-file reads for any root not already pooled — with **zero GitHub API
-/// calls**. [`WorkspacePool::get_or_provision`] is idempotent (a cheap map
-/// lookup for an already-pooled root), so calling it for every root on every
-/// tick costs nothing extra once a workspace is warm.
-///
-/// The caller in [`spawn_multi_work_finder_task`]'s tick loop MUST call this
-/// **before** the rate-limit circuit breaker's early-`continue`: prior to
-/// #8121 the registry reload (and therefore provisioning) sat after that
-/// check, so `loom-daemon workspace add <path> --priority N` — which writes
-/// the registry unconditionally and reports success immediately — could sit
-/// un-provisioned (invisible to `loom-daemon status` and dispatch) for the
-/// breaker's entire suppression window, even though nothing about a registry
-/// edit touches the GitHub API budget the breaker protects.
-fn refresh_local_workspace_state(
-    pool: &WorkspacePool,
-    fallback_root: &Path,
-    missing_roots_warned: &mut HashSet<PathBuf>,
-) -> (WorkspaceRegistry, Vec<PathBuf>) {
-    let registry = WorkspaceRegistry::load_default().unwrap_or_else(|e| {
-        log::warn!("work_finder: could not load workspace registry ({e}); using cwd");
-        WorkspaceRegistry::default()
-    });
-    let roots = registry.effective_roots(fallback_root);
-    // Skip registered roots whose directory no longer exists on disk
-    // (#4326 — e.g. a leaked/stale registry entry) so a dangling entry cannot
-    // occupy top dispatch priority or burn the tick. This is warn-and-skip,
-    // never auto-remove: the entry stays registered (`loom-daemon status`
-    // flags it, `workspace remove` clears it).
-    let roots = filter_missing_roots(roots, missing_roots_warned);
-    for root in &roots {
-        // Hot-apply (#8121): provisioning a brand-new root right here — the
-        // `SweepRegistry` + reaper + watchdog construction in
-        // `WorkspacePool::get_or_provision` — is what makes a freshly
-        // registered workspace observable/dispatchable without waiting for
-        // (or being blocked by) the rate-limit breaker below.
-        let _ = pool.get_or_provision(root);
-    }
-    (registry, roots)
-}
-
 /// Spawn the **multi-workspace** work-finder loop (#3928) on the shared daemon
 /// runtime.
 ///
 /// This is the multi-repo replacement for [`spawn_work_finder_task`]. Every
 /// tick it:
 ///
-/// 1. Re-reads the machine-level [`WorkspaceRegistry`] and resolves
-///    [`effective_roots`](WorkspaceRegistry::effective_roots) against
+/// 1. Re-reads the machine-level
+///    [`WorkspaceRegistry`](crate::workspace_registry::WorkspaceRegistry) and
+///    resolves
+///    [`effective_roots`](crate::workspace_registry::WorkspaceRegistry::effective_roots)
+///    against
 ///    `fallback_root` — an **empty** registry yields `vec![fallback_root]`
 ///    (today's single-workspace behavior); a populated one yields the registered
 ///    roots. Re-reading each tick — and provisioning any new root — happens in
-///    [`refresh_local_workspace_state`], called BEFORE the rate-limit breaker
+///    `registry_refresh::refresh_local_workspace_state`, called BEFORE the
+///    rate-limit breaker
 ///    check (#8121), so `loom-daemon workspace add|remove|set-priority` is
 ///    hot-applied without a daemon restart even while gh polling is
 ///    suppressed.
@@ -3347,13 +3303,16 @@ pub fn spawn_multi_work_finder_task(
 
             // #8121: reload the registry and provision any newly-registered
             // root's `SweepRegistry` BEFORE the rate-limit breaker check
-            // below — see `refresh_local_workspace_state`'s doc comment for
+            // below — see `registry_refresh`'s module doc comment for
             // why this purely-local, no-GitHub-API work must never be gated
             // behind the breaker (`loom-daemon workspace add|remove
             // |set-priority` must hot-apply even while gh polling is
             // suppressed).
-            let (registry, roots) =
-                refresh_local_workspace_state(&pool, &fallback_root, &mut missing_roots_warned);
+            let (registry, roots) = registry_refresh::refresh_local_workspace_state(
+                &pool,
+                &fallback_root,
+                &mut missing_roots_warned,
+            );
 
             // GitHub rate-limit circuit breaker (#4429): when the shared API
             // budget is exhausted every workspace's candidate list is a doomed
@@ -4336,6 +4295,11 @@ pub mod forge {
 pub use forge::{GhWorkSource, RegistryDispatcher};
 
 pub mod pool_preflight;
+
+// Purely-local registry reload + workspace provisioning for the tick loop
+// (#8121). Lives in its own file because this one is over the file-size
+// ratchet threshold (.loom/docs/file-size-policy.md) and may not grow.
+mod registry_refresh;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
