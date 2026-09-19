@@ -7,6 +7,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-19
+- **Issue #8262** (closed): loom-daemon tests: LOOM_SOCKET_PATH-mutating tests serialize under mismatched keys; one spawns a real heartbeat writer with no #[serial] (Rust half of #8077)
+- **PR #8325**: fix(loom-daemon): unify LOOM_SOCKET_PATH-mutating tests onto one serial key (#8262)
+- **Issue #8254** (closed): dep-recheck-fingerprint: --block-reason is an uncanonicalized hash input, and the dep-recheck post is no longer serialized (gaps from 2am's retired premise-recheck.sh)
+- **PR #8320**: fix(dep-recheck): canonicalize block_reason/orthogonal before hashing + ADR-0019 on post serialization (#8254)
+- **Issue #8255** (closed): curator.md Priority-2 fallback query ignores autonomous.workFinder.extraSkipLabels — repo-local non-work labels (2am's `journal`) surface as curation candidates
+- **PR #8315**: fix(curator): honor autonomous.workFinder.extraSkipLabels in the fallback query
+- **Issue #8270** (closed): install-loom.sh fails on every fresh repo: 6 dangling intra-repo links after init (file-size-policy.md not shipped in defaults/docs; two ../../../.loom/docs links wrong for .loom/roles)
+- **PR #8312**: fix(install): 0 dangling links on a fresh init, and a self-describing failure (#8270)
+- **Issue #8224** (closed): health: extend #8163's root-scaled IPC budget to cli::status and the dashboard's serve.rs FETCH_TIMEOUT
+- **PR #8307**: fix(health): extend #8163's root-scaled IPC budget to cli::status and serve.rs
 - **Issue #8251** (closed): dep-classify --check-defer: a parenthetical (Epic #M …) mention is extracted as a second blocker, wedging phase issues in DEFER forever
 - **PR #8296**: fix(dep-classify): treat a `(Epic #M …)` parenthetical as annotation, not a blocker
 - **Issue #8252** (closed): auto-update: don't defer an artifact FETCH behind the build-stampede guard (only rebuilds should wait)
