@@ -1,8 +1,8 @@
 //! Reaper tests for the daemon-owned **claim-restore / PR-produced** family:
 //! whether a sweep that dies or is cancelled without a checkpoint restores its
 //! pre-dispatch `loom:building` claim to `loom:issue`, and (issue #8355)
-//! whether a reap that DID produce a PR seeds the #4123 dispatch guard's
-//! verified-open-PR memo.
+//! whether a reap whose sweep DID produce a PR seeds the #4123 dispatch
+//! guard's open-PR memo.
 //!
 //! Moved verbatim out of the sibling `tests.rs` — that file is over the
 //! file-size ratchet's 1000-line threshold and therefore frozen at its current
@@ -83,19 +83,29 @@ fn reap_restores_label_for_orphaned_clean_exit_without_pr() {
 }
 
 /// Issue #8355: when the reaper's orphaned-claim branch discovers a
-/// checkpoint-less clean exit that DID produce a PR (`info.pr_number`
-/// already known in memory), it must immediately seed the #4123 guard's
-/// verified-open-PR memo (#6788) with that answer — at zero extra forge
-/// cost — rather than leaving the memo cold until the next unrelated probe.
-/// This is the fix for the incident behind this issue: issue #8170's
-/// Builder sweep produced PR #8329 and exited cleanly (no checkpoint,
-/// landing in exactly this branch), but nothing recorded that PR into the
-/// guard's memo, so the FIRST re-probe of issue #8170 — potentially hours
-/// later — was cold and had no verified fallback when GraphQL and REST
-/// both failed under a correlated rate-limit exhaustion, letting the
-/// dispatch guard fall open onto an issue with a still-open, Judge-approved
-/// PR. Reproduces that shape structurally (no live forge round trip
-/// needed) and asserts the memo is warm immediately after `reap_once`.
+/// checkpoint-less clean exit whose sweep DID produce a PR, it must
+/// immediately seed the #4123 guard's open-PR memo (#6788) with that
+/// answer — at zero extra forge cost — rather than leaving the memo cold
+/// until the next unrelated probe. This is the fix for the incident behind
+/// this issue: issue #8170's Builder sweep produced PR #8329 and exited
+/// cleanly (checkpoint deleted on success, so the reap lands in exactly
+/// this branch), but nothing recorded that PR into the guard's memo, so the
+/// FIRST re-probe of issue #8170 — potentially hours later — was cold and
+/// had no fallback when GraphQL and REST both failed under a correlated
+/// rate-limit exhaustion, letting the dispatch guard fall open onto an
+/// issue with a still-open, Judge-approved PR.
+///
+/// **Reachability is the point of this test's shape.** The PR number is NOT
+/// hand-planted on the `SweepInfo` (`pr_number` there is reserved for a
+/// future phase and every production construction site sets it to `None`,
+/// so asserting on it would test a branch a real daemon can never enter).
+/// Instead the test drives the production path end to end: a first reap
+/// tick observes a live `builder-done` checkpoint carrying `pr_number`
+/// exactly as `sample_phase_transition` does on a real daemon, then the
+/// checkpoint is deleted (mirroring the sweep skill's success-path
+/// deletion) and the process dies, so the second tick lands in the
+/// checkpoint-less clean-exit branch with nothing but the sampled history
+/// to seed from.
 #[test]
 fn reap_seeds_open_pr_memo_when_pr_produced_without_checkpoint() {
     let dir = tempdir().unwrap();
@@ -119,22 +129,28 @@ fn reap_seeds_open_pr_memo_when_pr_produced_without_checkpoint() {
     let mut registry = SweepRegistry::new(config);
 
     let sweep_id = "sweep-issue-8170-test".to_string();
+    // `started_at` in the past so the checkpoint written below has an mtime
+    // inside this run's window (the #4009 freshness guard in
+    // `checkpoint_written_by_run`), and the sweep is still ALIVE on the
+    // first tick — this process's own pid is the cheapest guaranteed-live
+    // one. Production never populates `SweepInfo::pr_number`, so this
+    // fixture leaves it `None` too.
     registry.entries.insert(
         sweep_id.clone(),
         SweepInfo {
             pgid: None,
             sweep_id: sweep_id.clone(),
             kind: SweepKind::Issue(8170),
-            pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
+            pid: std::process::id(),
             token_name: "unknown".into(),
             runtime: "unknown".into(),
             runtime_source: None,
             log_path: registry.compute_log_path(8170),
             idempotency_key: None,
-            started_at: Utc::now(),
+            started_at: Utc::now() - chrono::Duration::seconds(600),
             state: SweepState::Running,
             latest_phase: None,
-            pr_number: Some(8329), // PR already known in memory at reap time
+            pr_number: None,
             model: None,
             effort: None,
             depends_on: None,
@@ -142,10 +158,37 @@ fn reap_seeds_open_pr_memo_when_pr_produced_without_checkpoint() {
         },
     );
 
-    // Sanity: before the reap, the memo has nothing for this issue.
+    // Sanity: before any reap, the memo has nothing for this issue.
     assert!(registry.fresh_open_pr_memo(8170, Utc::now()).is_none());
 
-    // No checkpoint file exists -> Exited branch -> orphaned-claim recovery,
+    // Tick 1 — the sweep is still running and its checkpoint records the PR
+    // it just opened, exactly as `sweep-checkpoint.sh` writes it from
+    // `builder-done` onward. The reaper samples it at the top of the tick.
+    let checkpoint_dir = registry.config().checkpoint_dir();
+    std::fs::create_dir_all(&checkpoint_dir).unwrap();
+    let checkpoint = checkpoint_dir.join("issue-8170.json");
+    std::fs::write(&checkpoint, r#"{"phase":"builder-done","issue":8170,"pr_number":8329}"#)
+        .unwrap();
+    assert_eq!(registry.reap_once(), 0, "a live sweep must not be reaped on the first tick");
+    assert_eq!(
+        registry.sampled_pr_number(&sweep_id),
+        Some(8329),
+        "the reap tick's sample_phase_transition must have captured the \
+             checkpoint's pr_number (#4704) — this is the production source \
+             the memo seed reads"
+    );
+    assert!(
+        registry.fresh_open_pr_memo(8170, Utc::now()).is_none(),
+        "sampling alone must not warm the memo — only the reap does"
+    );
+
+    // The sweep now finishes successfully: the skill DELETES the checkpoint,
+    // and the process exits. Nothing on disk or on the entry names the PR
+    // anymore; only the sampled phase history does.
+    std::fs::remove_file(&checkpoint).unwrap();
+    registry.entries.get_mut(&sweep_id).unwrap().pid = 2_147_483_640; // ~i32::MAX, dead
+
+    // Tick 2 -> Exited branch -> checkpoint-less orphaned-claim recovery,
     // the branch this fix's memo seed lives in.
     let changed = registry.reap_once();
     assert!(changed >= 1);
@@ -153,20 +196,17 @@ fn reap_seeds_open_pr_memo_when_pr_produced_without_checkpoint() {
     let info = registry.get(&sweep_id).unwrap();
     assert!(matches!(info.state, SweepState::Exited { .. }));
 
-    // The label restore must NOT fire (a PR was produced)...
+    // The memo MUST now be warm with the sweep's PR, at zero extra forge
+    // calls: the fake `gh` only ever saw label-flip-shaped commands.
+    let memo = registry.fresh_open_pr_memo(8170, Utc::now()).expect(
+        "expected reap_once to seed the open-PR memo for issue #8170 from the sampled pr_number",
+    );
+    assert_eq!(memo.pr, 8329);
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        !gh_calls.contains("--remove-label loom:building"),
-        "expected reap_once to NOT restore the label when a PR was produced; \
-             got gh invocations: {gh_calls:?}"
+        !gh_calls.contains("pr list") && !gh_calls.contains("api graphql"),
+        "the memo seed must cost no forge round trip; got gh invocations: {gh_calls:?}"
     );
-    // ...but the memo MUST now be warm with the verified PR, at zero extra
-    // forge calls (the fake `gh` only ever saw label-flip-shaped commands,
-    // if any at all).
-    let memo = registry
-        .fresh_open_pr_memo(8170, Utc::now())
-        .expect("expected reap_once to seed the open-PR memo for issue #8170 from info.pr_number");
-    assert_eq!(memo.pr, 8329);
 }
 
 /// Issue #3827: a cancelled daemon-owned Issue sweep that never opened a

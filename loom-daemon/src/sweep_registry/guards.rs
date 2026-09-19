@@ -771,22 +771,32 @@ impl SweepRegistry {
         guard.get(&issue).copied()
     }
 
-    /// Fold a **verified** probe verdict into the memo (Issue #6788).
+    /// Fold a verdict into the memo (Issue #6788).
     /// [`OpenPrProbe::Open`] records/refreshes it; [`OpenPrProbe::NoneOpen`]
     /// invalidates it immediately (so a closed or merged PR never lingers for
     /// the rest of [`OPEN_PR_MEMO_FRESH`]); [`OpenPrProbe::ProbeFailed`] leaves
     /// it untouched — an unanswered probe is not evidence either way.
     ///
-    /// `pub(crate)` (Issue #8355) so the reaper's post-exit handling
-    /// (`reaper.rs`'s checkpoint-less clean-exit branch) can seed a **verified**
-    /// `Open(pr)` entry the instant it reaps a sweep that produced a PR — using
-    /// `info.pr_number`, state the daemon already holds in memory — rather than
-    /// only ever recording an answer as a side effect of a live forge probe.
-    /// See that call site's doc comment for why: without it, the very first
+    /// # Not every entry is a live probe verdict (Issue #8355)
+    ///
+    /// Originally every memo entry came from a forge probe answered at that
+    /// instant. It is now `pub(crate)` so the reaper's post-exit handling
+    /// (`reaper.rs`'s checkpoint-less clean-exit branch) can also seed an
+    /// `Open(pr)` entry the instant it reaps a sweep that produced a PR, from
+    /// the PR number it already sampled off that sweep's checkpoint
+    /// (`sampled_pr_number`, #4704) — no forge call at all. So a fresh memo
+    /// entry now means "verified open **or** inferred open at reap time", not
+    /// "probed open"; a future reader must not take a warm memo as proof a
+    /// transport answered.
+    ///
+    /// That inference is bounded and deliberately conservative: it can only be
+    /// wrong for a PR that closed within [`OPEN_PR_MEMO_FRESH`] of its own
+    /// creation, and being wrong defers a dispatch by at most that window
+    /// rather than dispatching onto a live PR. Without it, the very first
     /// post-completion probe of a normal (non-crashed) issue+PR pair is always
-    /// cold, with no memo to fall back on if a later double-transport failure
-    /// (the #6058/#6788 fail-open window) strikes before anything else happens
-    /// to re-probe that issue.
+    /// cold, with no memo to fall back on if a double-transport failure (the
+    /// #6058/#6788 fail-open window) strikes before anything else happens to
+    /// re-probe that issue — the #8170 / PR #8329 incident.
     pub(crate) fn record_open_pr_memo(&self, issue: u32, verdict: OpenPrProbe) {
         if !open_pr_memo_enabled() {
             return;
