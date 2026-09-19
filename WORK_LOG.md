@@ -7,6 +7,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-19
+- **Issue #8241** (closed): [#8058 Phase 2] health.rs: class-scoped ModelCreditsExhausted marks for non-Claude providers
+- **PR #8278**: feat(tokens): class-scoped ModelCreditsExhausted marks in health.rs (#8058 Phase 2)
+- **Issue #8276** (closed): peer-claim coordination is DEGRADED on ip-172-31-74-176 (#6157 Layer 3)
+- **Issue #8173** (closed): test-loom-daemon-start.sh's #6568 control cases fail when the suite runs inside a Loom agent session (si_run does not strip LOOM_SWEEP_*/LOOM_TERMINAL_ID/LOOM_ROLE)
+- **PR #8274**: fix(tests): strip ambient agent-session env in test-loom-daemon-start.sh's si_run (#8173)
+- **Issue #8056** (closed): telemetry: outcome journal lacks judge verdicts, doctor cycles, failure class, effort, token account — and role-runner ticks emit no record at all
+- **Issue #8222** (closed): telemetry: source judge_verdicts and doctor_cycles from the forge label timeline, not the sampled phase history
+- **PR #8273**: feat(telemetry): source judge_verdicts + doctor_cycles from the PR label timeline
+- **Issue #8239** (closed): setup-branch-protection.sh drops non-admin bypass actors when updating an existing ruleset (would break version-bump-on-merge)
+- **PR #8271**: fix(install): preserve live bypass actors when updating a ruleset
 - **Issue #8086** (closed): Port loom-daemon-watchdog.sh to a daemon subcommand (994 lines, 233 retained assertions)
 - **PR #8184**: feat(watchdog): retire loom-daemon-watchdog.sh (2436 lines) — the epic goes net-negative
 
