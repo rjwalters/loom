@@ -919,6 +919,12 @@ Before creating your PR, answer these questions:
 
 If your fix is documentation-only for a process issue, you must justify why documentation alone will change behavior this time when it didn't before. If you can't justify it, find a structural approach.
 
+**If the change touches a role prompt or an operator dispatch brief itself**
+(not merely a fix that happens to live in a `.md` file), the root-cause bar is
+pressure-testing it against a scenario built to resist the instruction and
+auditing it for conflicts with rules already in force — see
+`.loom/docs/role-prompt-authoring.md`.
+
 ## When You Can't Determine Changes
 
 **If you investigate an issue but cannot determine what code changes to make, you MUST leave a comment on the issue before exiting.** This preserves context for the next attempt (human or automated).
