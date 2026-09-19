@@ -152,6 +152,84 @@ fn a_url_too_short_to_name_a_repo_is_dropped_not_guessed() {
 }
 
 // ---------------------------------------------------------------------------
+// The `(Epic #M …)` annotation exclusion (#8251)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_epic_parenthetical_is_annotation_not_a_blocker() {
+    // The live shape, from kicad-tools#5520: the verdict names the real blocker
+    // and then says, for a human reader, which epic phase that blocker is. The
+    // epic stays open for its whole phase lifecycle by design, so capturing it
+    // wedged the phase child in DEFER forever — even after #5519 closed.
+    let bullet = "- Technical Feasibility: Blocked by #5519 (Epic #5510 Phase 1a — \
+                  `RoutingPlan`, sidecar writer, `emit_routing_plan`), still open.";
+    assert_eq!(extract_refs(bullet, "o/r"), vec!["o/r#5519".to_string()]);
+}
+
+#[test]
+fn a_genuine_multi_blocker_bullet_still_yields_every_blocker() {
+    // The exclusion keys off the literal `Epic #` marker, never off position:
+    // "drop everything after the first ref" would silently lose a real blocker.
+    assert_eq!(
+        extract_refs("- Blocked by #3 and #4", "o/r"),
+        vec!["o/r#3".to_string(), "o/r#4".to_string()]
+    );
+}
+
+#[test]
+fn a_parenthetical_that_is_not_an_epic_annotation_still_over_captures() {
+    // Deliberately narrow: only `Epic #`-introduced groups are annotation. The
+    // established whole-text scan is otherwise untouched, so `(see also #99)`
+    // keeps yielding #99 exactly as every existing fixture reads it.
+    assert_eq!(
+        extract_refs("- Blocked by #3 (see also #99)", "o/r"),
+        vec!["o/r#3".to_string(), "o/r#99".to_string()]
+    );
+    // And the marker must introduce the group, not merely appear inside it.
+    assert_eq!(
+        extract_refs("- Blocked by #3 (see Epic #99)", "o/r"),
+        vec!["o/r#3".to_string(), "o/r#99".to_string()]
+    );
+}
+
+#[test]
+fn the_exclusion_is_scoped_to_the_parenthetical_span() {
+    // Refs before and after the annotation are unaffected, and a ref nested
+    // deeper inside the annotation is still annotation.
+    assert_eq!(
+        extract_refs("- Blocked by #3 (Epic #10 Phase 2 (tracked in #11)) and #4", "o/r"),
+        vec!["o/r#3".to_string(), "o/r#4".to_string()]
+    );
+}
+
+#[test]
+fn an_epic_annotation_may_cite_a_qualified_ref_or_a_url() {
+    assert_eq!(
+        extract_refs(
+            "- Blocked by #3 (Epic #10 — see a/b#12 and https://github.com/a/b/issues/13)",
+            "o/r"
+        ),
+        vec!["o/r#3".to_string()]
+    );
+}
+
+#[test]
+fn the_exclusion_is_per_line_so_an_unbalanced_paren_cannot_swallow_later_bullets() {
+    // A stray `(` on one bullet must not pair with a `)` several bullets later
+    // and silently erase real blockers in between.
+    let findings = "- Blocked by #3 (Epic #10 Phase 1a\n- Blocked by #4 (still open)\n";
+    assert_eq!(
+        extract_refs(findings, "o/r"),
+        vec![
+            "o/r#10".to_string(),
+            "o/r#3".to_string(),
+            "o/r#4".to_string()
+        ],
+        "an unterminated group excludes nothing — only a closed `(Epic # …)` does"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The differential tests that used to live here (epic #7810, PR 3)
 // ---------------------------------------------------------------------------
 //
