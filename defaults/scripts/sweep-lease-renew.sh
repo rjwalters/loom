@@ -919,7 +919,17 @@ cmd_start() {
                 break
             fi
             renew_rc=0
-            renew_err="$("$SELF" renew-once "$issue" "${extra_args[@]}" 2>&1 > /dev/null)" || renew_rc=$?
+            # The `${arr[@]+...}` guard below is mandatory -- NOT an
+            # unguarded expansion (Issue #8333, same defect class as #8281):
+            # under bash 3.2 (stock macOS /bin/bash) + `set -u`, expanding an
+            # EMPTY array dies with "extra_args[@]: unbound variable". The
+            # array is empty on every legal invocation that passed neither
+            # --host nor --sweep-id AND could not auto-resolve them above
+            # (any $LOOM_TERMINAL_ID without a `daemon-` prefix), so on those
+            # hosts each cycle's command substitution died and the lease was
+            # never actually renewed -- silently, since `|| renew_rc=$?`
+            # catches it and only a generic FAILED line reached fd 9.
+            renew_err="$("$SELF" renew-once "$issue" "${extra_args[@]+"${extra_args[@]}"}" 2>&1 > /dev/null)" || renew_rc=$?
             if [[ "$renew_rc" -ne 0 && "$renew_rc" -ne 2 && "$renew_rc" -ne 4 ]]; then
                 echo "sweep-lease-renew: renewal cycle for issue #${issue} FAILED (renew-once exit ${renew_rc}): ${renew_err}" >&9
             fi
