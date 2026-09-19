@@ -1326,14 +1326,12 @@ gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'
 
 ### If DIRTY: Attempt Automated Rebase
 
-**When a PR has merge conflicts, attempt automated rebase before routing to Doctor.**
-
-This reduces the Doctor→Judge→Merge cycle by handling simple conflicts directly.
+**When a PR has merge conflicts, attempt automated rebase before routing to
+Doctor** — this reduces the Doctor→Judge→Merge cycle for simple conflicts.
 
 **Both `gh pr edit` fallback writes below are verdict-label writes** — run the
-Verdict-Time CAS Recheck immediately before each one (see "Verdict-Time CAS
-Recheck" above) and abort instead of writing if it finds your claim lost or
-another Judge's verdict already landed.
+Verdict-Time CAS Recheck immediately before each (see above) and abort instead
+of writing if your claim is lost or another Judge's verdict already landed.
 
 ```bash
 PR_NUMBER=<number>
@@ -1342,8 +1340,7 @@ MERGE_STATE=$(gh pr view $PR_NUMBER --json mergeStateStatus --jq '.mergeStateSta
 if [ "$MERGE_STATE" = "DIRTY" ]; then
     echo "PR has merge conflicts - attempting automated rebase"
 
-    # Checkout PR branch (worktree-aware — see "PR Branch Isolation" and
-    # "Worktree-Aware Code Access")
+    # Checkout PR branch (worktree-aware — see "PR Branch Isolation")
     ISSUE_NUM=$(gh pr view $PR_NUMBER --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
     if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
         cd ".loom/worktrees/issue-${ISSUE_NUM}"
@@ -1359,24 +1356,27 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
         # Fall back to current behavior (see below)
     fi
 
-    # Fetch latest main
     git fetch origin main
+
+    # Commits ahead pre-rebase, for the payload-drop guard below (#8298).
+    PRE_REBASE_AHEAD=$(git rev-list --count origin/main..HEAD)
 
     # Attempt rebase
     if git rebase origin/main; then
-        # Version-bearing-file sync gate (#7168, #7341; largely moot after
-        # #7743): this auto-rebase pushes directly, never through
-        # create-pr.sh, so gate BEFORE the push below, folded into the same
-        # push condition. Under #7743 no PR carries a version-bearing edit,
-        # so a clean rebase lands exactly origin/main's values; if the gate
-        # still fires, this branch itself carries one (usually a pre-#7743
-        # bump commit): never hand-patch the version-bearing files yourself
-        # and never run `version.sh bump` (the printed Fix: predates #7743)
-        # -- fall back to the change request below, naming the file(s) to
-        # revert to origin/main's values.
+        # Version-bearing-file sync gate (#7168/#7341, moot after #7743): gate
+        # BEFORE push since this auto-rebase pushes directly. On failure,
+        # never hand-patch the version-bearing files yourself or run
+        # `version.sh bump` -- fall back below instead.
         GATE_OK=true
         if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
             echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - falling back to change request"
+            GATE_OK=false
+        fi
+        # Payload-drop guard (#8298): rebase succeeded but the tree is now
+        # identical to origin/main, silently dropping this PR's content (only
+        # flagged when the branch had real commits ahead pre-rebase).
+        if [ "$GATE_OK" = true ] && [ "$PRE_REBASE_AHEAD" -gt 0 ] && git diff --quiet origin/main HEAD; then
+            echo "Rebase silently dropped PR payload (empty diff vs origin/main) - falling back to change request"
             GATE_OK=false
         fi
         # Rebase succeeded - push changes
@@ -1387,7 +1387,7 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
         else
             echo "Push failed - falling back to change request"
             git rebase --abort 2>/dev/null || true
-            # Fall back: apply loom:merge-conflict + loom:changes-requested
+            # Fall back: merge-conflict + changes-requested
             ./.loom/scripts/post-verdict.sh $PR_NUMBER changes-requested "$VERDICT_SHA" --body "$(cat <<'EOF'
 ❌ **Changes Requested - Merge Conflict**
 
@@ -1409,7 +1409,7 @@ EOF
         echo "Rebase failed (complex conflicts) - falling back to change request"
         git rebase --abort
 
-        # Fall back: apply loom:merge-conflict + loom:changes-requested
+        # Fall back: merge-conflict + changes-requested
         ./.loom/scripts/post-verdict.sh $PR_NUMBER changes-requested "$VERDICT_SHA" --body "$(cat <<'EOF'
 ❌ **Changes Requested - Merge Conflict**
 
@@ -1439,6 +1439,7 @@ fi
 | Concurrent push during rebase | `--force-with-lease` fails safely, fall back |
 | Detached HEAD after checkout | Skip rebase, fall back to change request |
 | Rebase succeeds but CI may fail | Continue to evaluation - CI verification handles this |
+| Rebase succeeds but diff vs `origin/main` is empty | Payload-drop guard fires (#8298); fall back to change request |
 
 ### If BEHIND: Attempt Rebase
 
@@ -1447,11 +1448,9 @@ fi
 git fetch origin main
 git rebase origin/main
 
-# Version-bearing-file sync gate (#7168, #7341; moot after #7743) -- see the
-# DIRTY path's gate comment above. If it fires, this branch carries its own
-# version-bearing edit: never hand-patch VERSION/etc. and never run
-# `version.sh bump` (the printed Fix: predates #7743) -- abort the push and
-# request changes naming the file(s) to revert to origin/main's values.
+# Version-bearing-file sync gate (#7168/#7341, moot after #7743) -- see
+# DIRTY path's gate above. On failure, abort and request changes naming
+# the file(s) to revert to origin/main's values.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - aborting push"
   exit 1
