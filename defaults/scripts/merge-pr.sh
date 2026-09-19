@@ -712,9 +712,7 @@ _check_defaults_version_bump_collision() {
     head_checker="$(mktemp "${TMPDIR:-/tmp}/loom-version-policy-checker.XXXXXX")"
     if git -C "$REPO_ROOT" show "$PR_HEAD_SHA:$checker_rel" >"$head_checker" 2>/dev/null && [[ -s "$head_checker" ]] && chmod +x "$head_checker"; then
       check_script="$head_checker"; checker_ref="the PR head ($PR_HEAD_SHA)"
-    else
-      rm -f "$head_checker"; head_checker=""
-    fi
+    else rm -f "$head_checker"; head_checker=""; fi
     warning "Version policy guard: this PR's own commits change the version-policy machinery, so the guard evaluates the checker from $checker_ref — the ref CI's defaults-version-bump-check job evaluates (#8284). A head lookup that fails falls back to '$DEFAULT_BRANCH_NAME''s copy, never to skipping the check."
   fi
 
