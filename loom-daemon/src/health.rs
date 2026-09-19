@@ -149,6 +149,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use crate::capacity::model_class;
 use crate::daemon_install_state::{HeartbeatFreshness, InstallState, InstallStateReport};
 use crate::pipeline_snapshot::RepoPipelineSnapshot;
 use crate::script_helpers::log_filter::strip_ansi;
@@ -442,6 +443,17 @@ pub struct HealthInputs {
     pub ranking_present: bool,
     /// Age of the resolved pool's `.ranking` in seconds, when readable.
     pub ranking_age_secs: Option<u64>,
+    /// Per-model-class healthy counts for the resolved pool (#8058 Phase 3),
+    /// when its `.ranking` was readable.
+    ///
+    /// Collected client-side by the same collector that fills
+    /// [`Self::ranking_present`]/[`Self::ranking_age_secs`] — one more read of
+    /// the pool directory it already resolved, never a new probe. `None` (no
+    /// readable ranking) and `Some` with an empty
+    /// [`crate::capacity::model_class::ClassCapacity::by_class`] (a ranking
+    /// with no class-scoped `.bad_tokens` state, the common case) both render
+    /// as the exact pre-#8058 single number — see [`assess_tokens`].
+    pub token_class_capacity: Option<crate::capacity::model_class::ClassCapacity>,
     /// Per-repo forge snapshot (`queued` + merged-in-window), when collected.
     /// `None` both when the daemon was unreachable (nothing to fan out to)
     /// and when [`Self::gh_unavailable`] is `Some` — the collector skips the
@@ -1418,8 +1430,15 @@ pub fn assess_tokens(inputs: &HealthInputs) -> HealthSection {
         (true, None) => "ranking present (age unknown)".to_string(),
         (false, _) => "no ranking".to_string(),
     };
+    // Per-model-class breakdown (#8058 Phase 3). Empty — no class-scoped
+    // `.bad_tokens` state, or no readable ranking — splices in as nothing, so
+    // this line is byte-identical to its pre-#8058 form on every pool that has
+    // never recorded a class-scoped hold. When it is non-empty it is the
+    // answer to the question the single number cannot give: whether `2/20
+    // healthy` means a dead pool or one class at its ceiling.
+    let class_suffix = model_class::summary_suffix_of(inputs.token_class_capacity.as_ref());
     let base = format!(
-        "{}/{} healthy ({} exhausted), {ranking_age}",
+        "{}/{} healthy{class_suffix} ({} exhausted), {ranking_age}",
         cap.healthy_accounts, cap.total_accounts, cap.exhausted_accounts
     );
 
@@ -1486,6 +1505,11 @@ pub fn assess_tokens(inputs: &HealthInputs) -> HealthSection {
         summary,
         serde_json::json!({
             "healthy": cap.healthy_accounts,
+            // `class -> healthy` (#8058 Phase 3); `{}` when the pool carries
+            // no class-scoped `.bad_tokens` state, so the pre-#8058 shape of
+            // every other field is untouched and a consumer can read this one
+            // unconditionally.
+            "healthy_by_class": model_class::detail_of(inputs.token_class_capacity.as_ref()),
             "total": cap.total_accounts,
             "exhausted": cap.exhausted_accounts,
             "token_axis_limit": cap.token_axis_limit,

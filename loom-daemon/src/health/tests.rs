@@ -75,6 +75,10 @@ pub(crate) fn healthy_inputs() -> HealthInputs {
         pid_file: None,
         ranking_present: true,
         ranking_age_secs: Some(240),
+        // Healthy baseline: no class-scoped `.bad_tokens` state (#8058
+        // Phase 3), so every fixture built from this one renders the exact
+        // pre-#8058 single-number tokens line.
+        token_class_capacity: None,
         pipeline: Some(vec![RepoPipelineSnapshot {
             root: PathBuf::from("/repos/loom"),
             queued: Some(5),
@@ -3134,3 +3138,6 @@ fn worktree_reaper_is_unknown_without_a_status_round_trip() {
 }
 
 mod section_inventory;
+
+#[cfg(test)]
+mod model_class_tests;

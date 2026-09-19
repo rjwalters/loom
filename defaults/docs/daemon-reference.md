@@ -3693,13 +3693,33 @@ so the same account on a cheaper model still works. That matters on the in-sessi
 picks a `model` at every dispatch — see `sweep.md` → "Credit-exhaustion fallback"
 for the one-rung-down recovery, backed by `resolve-model.sh --downgrade`
 (`fable → opus → sonnet → haiku`, exit 3 at the cheapest rung).
-For the daemon/wrapper path the new category is a pure **rename**:
+For the daemon/wrapper path the new category started as a pure **rename**:
 `is_account_exhaustion` accepts it alongside `TOKEN_EXHAUSTED` (rotate + mark
 bad), `classification_is_transient` keeps it retryable, and
-`tokens_pool::health` records the identical `PlanExhausted` reason and cooldown.
-The pool has no per-model account state, so it must stay that way — the distinct
-name exists for the orchestrator's remedy choice and for forensics, not for a
-different pool policy.
+`tokens_pool::health` recorded the identical `PlanExhausted` reason and cooldown.
+The justification was that the pool had no per-model account state to narrow
+into — the distinct name existed for the orchestrator's remedy choice and for
+forensics, not for a different pool policy.
+
+**That justification expired with #8058.** The pool now *does* carry per-model
+account state, so the distinct name buys a distinct policy wherever the mark
+names a class:
+
+- Phase 1 (#8090) gave `.bad_tokens` a `[model-class:<class>]` marker, and
+  `tokens select --model` skips only the named class — an Opus ceiling no
+  longer starves Sonnet on the same account.
+- Phase 2 (#8241) gave `tokens_pool::health` the same shape for every
+  non-Claude provider: a class-naming `MODEL_CREDITS_EXHAUSTED` records a hold
+  in `AccountHealth::class_cooldowns` instead of an account-wide
+  `PlanExhausted` cooldown.
+- Phase 3 (#8242) made it visible: `loom-daemon health`'s `tokens` section and
+  `loom-daemon status`'s `Token capacity:` block break the healthy count down
+  per class (`tokens.healthy_by_class` / `capacity.healthy_accounts_by_class`
+  on the `--json` surfaces).
+
+A **class-less** `MODEL_CREDITS_EXHAUSTED` — no model known at mark time — is
+still the account-wide over-approximation described above, unchanged. See
+[`token-pool.md`](token-pool.md) → "Per-class observability".
 
 **Monthly spend-limit kill (#5631/#6518).** "You've hit your monthly spend
 limit" was already widened into the `TOKEN_EXHAUSTED` regex by #5631 — on the

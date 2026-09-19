@@ -51,7 +51,7 @@ pub const OPTIMIZATION_PROFILES: [&str; 3] = ["cost", "speed", "balanced"];
 /// [`downgrade_task_alias`] (issue #5687) — it is the ladder a mid-wave model
 /// credit exhaustion steps *down*, and the same ladder `sweep.escalation`
 /// climbs *up* on a Judge rejection.
-const TASK_TOOL_ALIASES: [&str; 4] = ["haiku", "sonnet", "opus", "fable"];
+pub const TASK_TOOL_ALIASES: [&str; 4] = ["haiku", "sonnet", "opus", "fable"];
 
 /// The generation each bare CLI alias resolves to on the wire TODAY (probed
 /// 2026-07-27). `opus` lags at generation 4 — the bug #3982 fixes at the

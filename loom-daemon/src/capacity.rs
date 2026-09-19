@@ -74,6 +74,13 @@
 
 use std::path::Path;
 
+/// Per-model-class capacity (#8058 Phase 3) — the health/status breakdown that
+/// keeps a class-scoped `.bad_tokens` hold from reading as a whole-account
+/// outage. Deliberately a sibling module, not more lines here: it serves the
+/// interactive CLI surfaces only and never joins [`read_ranking_at`] on the
+/// work-finder hot path.
+pub mod model_class;
+
 // ============================================================================
 // Constants
 // ============================================================================

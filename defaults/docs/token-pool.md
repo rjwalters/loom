@@ -632,8 +632,103 @@ class-less selection. Selection must never fail closed on a model name the
 classifier does not know.
 
 Scope note: `.ranking`-sourced exclusions (`exhausted`/`blocked` statuses) stay
-account-wide, because `.ranking` carries no per-class state yet — that, and the
-per-class `health`/`status` counts, are #8058's Phases 2-3.
+account-wide, because `.ranking` carries no per-class state — see
+[Per-class observability](#per-class-observability-8058-phase-3) below for why
+it still does not, and what the health/status surfaces report instead.
+
+### Per-class observability (#8058 Phase 3)
+
+Phases 1-2 changed what the *selector* does with a class-scoped hold. They did
+not change what an operator **sees**: every health/status surface printed one
+account-wide healthy count, which by construction reads a class-scoped hold as
+a whole-account outage. A pool reporting `2/20 healthy` while eighteen accounts
+could still serve Sonnet was indistinguishable from a genuinely dead pool.
+
+Both surfaces now carry a per-class breakdown beside that number:
+
+```text
+$ loom-daemon health
+  tokens  GREEN  2/20 healthy (per class: fable 20/20, haiku 20/20, opus 2/20, sonnet 20/20) (18 exhausted), ranking 3m old
+
+$ loom-daemon status
+Token capacity:
+  pool: /home/you/.loom/tokens
+  2/20 accounts healthy (per class: fable 20/20, haiku 20/20, opus 2/20, sonnet 20/20), 18 exhausted/near-ceiling (from .loom/tokens/.ranking)
+```
+
+and structurally, as a `class -> healthy` object:
+`health --json`'s `tokens.healthy_by_class`, `status --json`'s
+`capacity.healthy_accounts_by_class`. The Codex/other-provider health surface
+(`tokens_pool::health::ProviderCapacity`) carries the same field, populated
+from Phase 2's per-class cooldowns instead of `.bad_tokens` lines. It reports
+only the classes actually under a live hold, where the Claude surface reports
+the whole known vocabulary — deliberately: the Claude pool's classes are a
+closed set (`haiku`/`sonnet`/`opus`/`fable`), so the un-marked ones can be
+named and shown to be fine, while a provider whose class vocabulary is
+open-ended model IDs has no list to enumerate and must not invent one.
+
+Three properties are worth relying on:
+
+- **Degradation is the contract.** The breakdown appears only when
+  `.bad_tokens` actually names at least one model class. Without one — which is
+  every pool that has never recorded a class-scoped hold — the suffix is empty
+  and the JSON field is `{}`, so both lines are byte-identical to their
+  pre-#8058 form. An empty object means "no class-scoped state", which stays
+  distinguishable from `{"opus": 0}`, "this class has no capacity".
+- **Every known class is listed once any class is named**, not just the marked
+  one. The un-marked classes are the point: an operator staring at `2/20` needs
+  to be told Sonnet is `20/20`, and a class with no marks can never appear in
+  the file.
+- **Narrower, never wider.** Each count is computed through the same
+  class-scoped blocking scan the selector uses
+  (`bad_tokens::blocking_entry_in_dir_for_class`), which checks every
+  account-wide hold first — so a per-class count can only ever reveal capacity
+  the headline number was hiding, never claim capacity a spawn would be
+  refused. It is always `>=` the account-wide count.
+
+**Why `.ranking` gained no per-class columns.** The design called for them
+*if and only if* Anthropic's usage endpoint actually emits a per-class
+utilization header. Two independent live captures on 2026-09-19 — each 5
+accounts x 3 model classes (15 requests), the exact `POST /v1/messages`
+`max_tokens: 1` probe `tokens check` sends — found that it does **not**. The
+second capture's full header dump is posted on #8242. The recorded finding:
+
+- **The `200` path returns 12 `anthropic-ratelimit-unified-*` headers**
+  (`-5h-utilization`, `-7d-utilization`, `-5h-reset`, `-7d-reset`, `-5h-status`,
+  `-7d-status`, `-status`, `-reset`, `-representative-claim`, `-overage-status`,
+  `-overage-disabled-reason`, `-fallback-percentage`) — exactly 12 on every
+  `200` in the capture, rising to 13-15 on a window-scoped `429` as the
+  situational `-fallback` / `-5h-surpassed-threshold` /
+  `-7d-surpassed-threshold` appear. Every one is scoped to a **time window**
+  (5h / 7d) or to the account. **Not one is scoped to a model class**, and no
+  header name anywhere in either capture contains a class, model, or tier
+  token.
+- **A per-class limit demonstrably exists anyway — the endpoint just will not
+  name it.** On `agent10` at one instant, `claude-haiku-4-5-20251001` returned
+  `200` with `5h-utilization: 0.0`, `5h-status: allowed`, `status: allowed`,
+  while `claude-sonnet-4-6` and `claude-opus-5` were both refused `429`
+  `{"type":"rate_limit_error","message":"Error"}`. Three of five accounts
+  showed that exact split.
+- **The refusal carries strictly less information, not more.** Every one of
+  those class-scoped `429`s returned **zero** `anthropic-ratelimit-*` headers
+  and a body whose `message` is the literal string `"Error"`. (A *window*-scoped
+  `429` — the account's own 5h/7d ceiling — carries the full 13-15 header set
+  and a descriptive body, `"This request would exceed your account's rate
+  limit."`; the zero-header/`"Error"` shape is therefore diagnostic of *which
+  kind* of limit fired, but it still names no class.)
+
+So the per-class state above comes entirely from Phase 1/2 marks, and
+`.ranking` keeps its four-field `name|status|5h_util|limit_reset` shape.
+That is also the cheaper answer: `select::parse_ranking_line` splits on
+`splitn(4, '|')`, so a fifth column would be swallowed into `limit_reset` by
+every reader that has not been upgraded — a real compatibility cost to pay for
+a column no probe can currently fill.
+
+The one per-class source that *does* exist is claude-monitor's `ranking.json`,
+whose `accounts[].models.<class>.utilization` map was confirmed populated on a
+live host in the same pass. `monitor.rs` reads only the account-wide
+`utilization` / `resets` maps and ignores `models` entirely, so it is not an
+ingest path today; wiring it up is tracked separately (#8297).
 
 ## Error classification (`.loom/scripts/lib/classify-error.sh`)
 
@@ -655,8 +750,9 @@ whole account (see
 name also still matters for the in-session `/loom:sweep` orchestrator, which
 has no pool to rotate through and instead re-dispatches one model rung down
 (`sweep.md` → "Credit-exhaustion fallback"). On the **Codex/other-provider**
-health surface (`tokens_pool/health.rs`) the two categories remain fused —
-splitting those is #8058 Phase 2.
+health surface (`tokens_pool/health.rs`) the same split landed in #8058 Phase
+2, expressed as per-class entries in `AccountHealth::class_cooldowns` rather
+than as `.bad_tokens` lines.
 
 A **monthly spend-limit kill** ("You've hit your monthly spend limit", issue
 #5631/#6518) classifies as plain `TOKEN_EXHAUSTED` — it is not, and does not
