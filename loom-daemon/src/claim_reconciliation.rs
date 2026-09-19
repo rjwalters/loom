@@ -1919,6 +1919,12 @@ pub fn spawn_periodic_reconciliation_task(
     })
 }
 
+/// The `gh pr view --json labels,isDraft` lookup [`forge::reclaim_pr`] uses to
+/// decide whether its `loom:review-requested` safety net may fire — split
+/// into its own file per the file-size ratchet (`.loom/docs/file-size-policy.md`)
+/// rather than growing `forge` inline.
+mod pr_label_info;
+
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the
 /// decision logic above is the fully-covered surface; this module is a thin,
@@ -2814,66 +2820,6 @@ pub mod forge {
         most_recent_claim_activity_at(&comments, since)
     }
 
-    /// The PR's currently-applied state labels plus its draft status (a
-    /// best-effort subset of `--json labels,isDraft`, used only to decide
-    /// whether [`reclaim_pr`]'s safety net needs to fire, and whether it is
-    /// safe to backfill `loom:review-requested` at all). A `gh` failure here
-    /// degrades to an empty label list and `is_draft: false` — see
-    /// [`reclaim_pr`]'s call site for why that is the safe direction: it
-    /// makes the safety net fire (adds `loom:review-requested`) rather than
-    /// silently leaving a PR with no state label at all. Likewise, an
-    /// absent/unparseable `isDraft` field defaults to `false` (non-draft),
-    /// preserving that same fail-safe direction rather than silently
-    /// skipping the backfill.
-    #[derive(Debug, Default)]
-    struct PrLabelInfo {
-        labels: Vec<String>,
-        is_draft: bool,
-    }
-
-    fn pr_label_names(gh_bin: &Path, root: &Path, pr_number: u32) -> Result<PrLabelInfo> {
-        #[derive(Debug, Deserialize)]
-        struct GhLabel {
-            name: String,
-        }
-        #[derive(Debug, Default, Deserialize)]
-        struct GhPrLabels {
-            labels: Vec<GhLabel>,
-            #[serde(default, rename = "isDraft")]
-            is_draft: bool,
-        }
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("view")
-            .arg(pr_number.to_string())
-            .arg("--json")
-            .arg("labels,isDraft");
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
-        if !out.status.success() {
-            return Err(anyhow!(
-                "gh pr view {pr_number} --json labels,isDraft failed in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        let parsed: GhPrLabels =
-            serde_json::from_slice(&out.stdout).context("parse gh pr view labels,isDraft JSON")?;
-        Ok(PrLabelInfo {
-            labels: parsed.labels.into_iter().map(|l| l.name).collect(),
-            is_draft: parsed.is_draft,
-        })
-    }
-
     fn add_label(gh_bin: &Path, root: &Path, pr_number: u32, label: &str) -> Result<()> {
         let mut cmd = Command::new(gh_bin);
         cmd.arg("pr")
@@ -2940,7 +2886,8 @@ pub mod forge {
 
         const STATE_LABELS: [&str; 3] =
             ["loom:review-requested", "loom:changes-requested", "loom:pr"];
-        let pr_info = pr_label_names(gh_bin, root, pr_number).unwrap_or_default();
+        let pr_info =
+            super::pr_label_info::pr_label_names(gh_bin, root, pr_number).unwrap_or_default();
         let has_state_label = pr_info
             .labels
             .iter()
