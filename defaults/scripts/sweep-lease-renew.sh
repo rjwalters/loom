@@ -639,7 +639,7 @@ cmd_renew_once() {
     # eventual SUCCESS, and merging those into $comments_json would corrupt
     # the JSON this function is about to parse.
     local comments_json
-    if ! comments_json="$(forge_gh_perm_safe api "${repo_args[@]}" "repos/{owner}/{repo}/issues/${issue}/comments" --paginate)"; then
+    if ! comments_json="$(forge_gh_perm_safe api "${repo_args[@]+"${repo_args[@]}"}" "repos/{owner}/{repo}/issues/${issue}/comments" --paginate)"; then
         echo "ERROR: 'gh api .../issues/${issue}/comments --paginate' failed (escalation ladder exhausted)" >&2
         exit 1
     fi
@@ -712,7 +712,7 @@ cmd_renew_once() {
     local patch_body_file
     patch_body_file="$(mktemp)"
     printf '%s' "$new_body" > "$patch_body_file"
-    if ! forge_gh_perm_safe api "${repo_args[@]}" --method PATCH "repos/{owner}/{repo}/issues/comments/${candidate_id}" \
+    if ! forge_gh_perm_safe api "${repo_args[@]+"${repo_args[@]}"}" --method PATCH "repos/{owner}/{repo}/issues/comments/${candidate_id}" \
         -F "body=@${patch_body_file}" \
         > /dev/null; then
         rm -f "$patch_body_file"

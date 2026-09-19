@@ -950,6 +950,62 @@ RESOLVED_IS_SUP="false"
 is_supervisor_process "$RESOLVED_PID" && RESOLVED_IS_SUP="true"
 assert_eq "false" "$RESOLVED_IS_SUP" "(s) the resolved liveness pid is never a supervisor -- an immortal watch target by construction"
 
+# --- (t) LOOM_REPO unset -> empty `repo_args[@]` must never surface as
+# "unbound variable" and must not prevent renewal (#8281). First on the
+# ambient bash -- always runs -- then again under a real 3.x /bin/bash when one
+# is present (macOS system bash), which is the one environment that actually
+# exhibits the pre-fix bash-3.2 empty-array unbound-variable hazard; skipped,
+# not failed, elsewhere. Mirrors the pattern used in test-sweep-lease-fence.sh's
+# (s) case.
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 100, "body": "<!-- loom:lease host=studio-host sweep=sweep-renew-unset -->\nLease to renew."}]
+JSON
+unset LOOM_REPO
+run_script renew-once 6281
+assert_eq "0" "$RC" "(t) ambient bash: LOOM_REPO unset -> exit 0 (renew succeeds)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$ERR" != *"unbound variable"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: (t) ambient bash: no 'unbound variable' on stderr"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: (t) ambient bash: no 'unbound variable' on stderr"
+    echo "    stderr: $ERR"
+fi
+
+LEGACY_BASH=""
+if [[ -x /bin/bash ]]; then
+    bash_version_output="$(/bin/bash --version 2>/dev/null)"
+    if [[ "$bash_version_output" == *"version 3."* ]]; then
+        LEGACY_BASH=/bin/bash
+    fi
+fi
+if [[ -n "$LEGACY_BASH" ]]; then
+    unset LOOM_REPO
+    # Re-setup for bash 3.2 test run
+    rm -f "$STUB_DIR"/comments.json "$STUB_DIR"/comments-fail "$STUB_DIR"/patch-fail
+    rm -f "$STUB_DIR"/patch-*.body "$STUB_DIR"/patch-count-* "$STUB_DIR"/patch-calls.log
+    cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 101, "body": "<!-- loom:lease host=studio-host sweep=sweep-renew-unset-3x -->\nLease to renew."}]
+JSON
+    OUT="$("$LEGACY_BASH" "$SCRIPT" renew-once 6281 2>"$STUB_DIR/stderr-legacy.log")"
+    RC=$?
+    ERR="$(cat "$STUB_DIR/stderr-legacy.log" 2>/dev/null || true)"
+    assert_eq "0" "$RC" "(t) bash 3.2: LOOM_REPO unset -> exit 0 (renew succeeds)"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$ERR" != *"unbound variable"* ]]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: (t) bash 3.2: no 'unbound variable' on stderr"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: (t) bash 3.2: no 'unbound variable' on stderr"
+        echo "    stderr: $ERR"
+    fi
+else
+    echo "· skipped: (t) bash 3.2 unbound-variable regression check (no 3.x /bin/bash on this host)"
+fi
+
 # --- Contract checks (mirrors test-check-quarantine-stashes.sh's style) ---
 "$SCRIPT" --help > "$STUB_DIR/help.out" 2>&1
 HELP_RC=$?
