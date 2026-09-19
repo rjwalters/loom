@@ -100,9 +100,21 @@
 //! through the read-only `--resolve-json` mode rather than reimplementing
 //! release resolution in Rust, and it invokes the roll as `--fetch`
 //! (**rebuild fallback disabled**) so this path can never turn into a
-//! `cargo build`. Every gate in the list above — settle window, in-flight
-//! sweep deferral, defer deadline, backoff, terminal — applies to an artifact
-//! roll exactly as to a rebuild.
+//! `cargo build`. The settle window, backoff, and terminal gates all apply to
+//! an artifact roll exactly as to a rebuild.
+//!
+//! **The in-flight sweep deferral (gate 4) does NOT** (Issue #8252). That gate
+//! and its `deferDeadlineSecs` escape hatch exist to keep an unattended `cargo
+//! build --release` off a host that is already saturated with sweep builds;
+//! downloading a ~25 MB signed asset, verifying its checksum/signature, and
+//! relaunching under the supervisor costs the host nothing comparable. Coupling
+//! the two cost the fleet real availability: on 2026-09-18 a host sat on a
+//! resolved 0.19.168 artifact for ~1.5 h (deferral deadline: up to ~4.5 h more)
+//! while every `merge-pr.sh` invocation on it failed closed against a
+//! subcommand the stale binary did not have. So an artifact fetch now proceeds
+//! on the tick it is decided regardless of the in-flight count — still niced
+//! when the host is busy, but never postponed. Only [`AutoUpdateState::decide_source`]
+//! still defers.
 //!
 //! # `None` is never "stale"
 //!
@@ -1259,7 +1271,10 @@ pub enum TickDecision {
         /// 0.19.21"` or the same-version sha-convergence reason — so the tick
         /// log names the path AND the cause.
         why: String,
-        /// Same meaning as on [`Self::Rebuild`].
+        /// `true` when the host had in-flight sweeps at decision time, so the
+        /// fetch runs niced and yields CPU to them. Unlike [`Self::Rebuild`]'s
+        /// flag this is NOT a post-deadline escape hatch: the fetch was never
+        /// deferred in the first place (Issue #8252) — it just runs politely.
         low_priority: bool,
     },
 }
@@ -1384,7 +1399,9 @@ impl AutoUpdateState {
         } = *inputs;
         match artifact {
             ArtifactResolution::Resolved(info) => {
-                self.decide_artifact(now, info, in_flight, settle, defer_deadline)
+                // No `defer_deadline`: the artifact path does not defer at all
+                // (Issue #8252), so it has no deadline to bound.
+                self.decide_artifact(now, info, in_flight, settle)
             }
             ArtifactResolution::Unresolved(reason) => {
                 match self.decide_source(now, check, tree_clean, in_flight, settle, defer_deadline)
@@ -1400,20 +1417,24 @@ impl AutoUpdateState {
 
     /// The ARTIFACT path (Issue #7609): decide purely from the resolved
     /// release artifact vs. the installed binary, then apply the same
-    /// terminal / backoff / settle / in-flight gates a rebuild goes through.
+    /// terminal / backoff / settle gates a rebuild goes through.
     ///
     /// The clean-tree gate is deliberately NOT applied here: it exists because
     /// an unattended `cargo build --release` would compile whatever is
     /// uncommitted in the operator's checkout into the running daemon. A fetch
     /// of a published, checksum-verified artifact reads nothing from the
     /// working tree, so a stray untracked file there has no bearing on it.
+    ///
+    /// Neither is the in-flight sweep deferral (gate 4, Issue #8252) — see the
+    /// module doc: that gate protects the host from a `cargo build --release`
+    /// stampede, and a fetch is not a build. A busy host still gets the fetch
+    /// *niced* (`low_priority`), it just no longer gets it *postponed*.
     fn decide_artifact(
         &mut self,
         now: Instant,
         info: &ArtifactInfo,
         in_flight: usize,
         settle: Duration,
-        defer_deadline: Duration,
     ) -> TickDecision {
         let (target, why) = match classify_artifact(info) {
             ArtifactVerdict::UpToDate { version, why } => {
@@ -1464,6 +1485,10 @@ impl AutoUpdateState {
         };
 
         self.track_target(now, Some(target));
+        // Shared bookkeeping with the source path: an idle observation re-arms
+        // gate 4's continuous-busy clock for whichever path consults it next.
+        // This path no longer consults it at all (Issue #8252), but the clock
+        // is state shared with `decide_source`, so keep it honest.
         if in_flight == 0 {
             self.deferred_since = None;
         }
@@ -1473,14 +1498,15 @@ impl AutoUpdateState {
         if let Some(skip) = self.settle_gate(now, settle) {
             return skip;
         }
-        match self.in_flight_gate(now, in_flight, defer_deadline) {
-            Err(skip) => skip,
-            Ok(low_priority) => TickDecision::FetchArtifact {
-                version: info.version.clone(),
-                tag: info.tag.clone(),
-                why,
-                low_priority,
-            },
+        // NO in-flight gate here (Issue #8252): a fetch is not a build, so it
+        // is never deferred behind the build-stampede guard — only niced when
+        // the host is busy, exactly as the post-deadline path used to do,
+        // minus the wait. `defer_deadline` is consumed by `decide_source` only.
+        TickDecision::FetchArtifact {
+            version: info.version.clone(),
+            tag: info.tag.clone(),
+            why,
+            low_priority: in_flight > 0,
         }
     }
 
@@ -1640,6 +1666,11 @@ impl AutoUpdateState {
     /// forever. After `defer_deadline` of *continuous* deferral the loop rolls
     /// anyway, niced, so the update still converges.
     ///
+    /// **Rebuild path only** (Issue #8252): [`Self::decide_source`] is the sole
+    /// caller. [`Self::decide_artifact`] does not defer — a checksum-verified
+    /// download is not a `cargo build --release` and has no stampede to avoid —
+    /// so every skip reason produced here is unambiguously about a *rebuild*.
+    ///
     /// `Ok(low_priority)` ⇒ proceed; `Err(skip)` ⇒ defer this tick.
     fn in_flight_gate(
         &mut self,
@@ -1655,8 +1686,9 @@ impl AutoUpdateState {
         if waited < defer_deadline {
             let left = defer_deadline.saturating_sub(waited).as_secs();
             return Err(TickDecision::Skip(format!(
-                "{in_flight} in-flight sweep(s) — deferring rebuild to avoid a build stampede \
-                 (forcing a low-priority rebuild in ~{left}s if the host stays busy)"
+                "{in_flight} in-flight sweep(s) — deferring the source rebuild to avoid a build \
+                 stampede (forcing a low-priority rebuild in ~{left}s if the host stays busy; a \
+                 release-artifact fetch would not be deferred, #8252)"
             )));
         }
         log::warn!(
@@ -2015,7 +2047,10 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                 "auto_update: {why} — fetching release artifact {tag} ({version}) with the \
                  source-rebuild fallback disabled{}",
                 if low_priority {
-                    " (host busy past the gate-4 deadline; running at reduced priority)"
+                    // Issue #8252: a busy host no longer postpones the fetch
+                    // behind the rebuild-stampede gate — it only nices it.
+                    " (host busy; fetching now at reduced priority rather than deferring — the \
+                     build-stampede gate applies to rebuilds only)"
                 } else {
                     ""
                 }
@@ -2031,8 +2066,8 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
             let mut note = state.record_artifact_roll(now, &outcome, drain_accepted, &info);
             if low_priority {
                 note = format!(
-                    "{note} [forced past the in-flight gate after the defer deadline; fetched at \
-                     reduced priority]"
+                    "{note} [{in_flight} in-flight sweep(s): fetched immediately at reduced \
+                     priority — the in-flight gate defers rebuilds only]"
                 );
             }
             note = relaunch_verify_note::with_relaunch_verify_note(note, drain_accepted);

@@ -1115,6 +1115,11 @@ fn test_global_status_defaults_when_unset() {
 // Artifact-first tick (Issue #7609)
 // ===================================================================
 
+/// Issue #8252 — the in-flight/build-stampede gate applies to the rebuild path
+/// only. A sibling file (this one is over the file-size ratchet threshold); it
+/// reuses the fixtures below via `use super::*`.
+mod in_flight_gate;
+
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1390,34 +1395,6 @@ fn test_decide_artifact_respects_settle_window() {
     let later = base + settle + Duration::from_secs(1);
     let second = st.decide(later, &inputs(&info, &stale("c1"), true, 0), settle, DEFER);
     assert!(matches!(second, TickDecision::FetchArtifact { .. }), "got {second:?}");
-}
-
-#[test]
-fn test_decide_artifact_defers_for_in_flight_sweeps_then_forces_low_priority() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut st = state_with_record_dir(tmp.path());
-    let settle = Duration::from_secs(0);
-    let deadline = Duration::from_secs(100);
-    let base = Instant::now();
-    let info = resolved(artifact("0.19.24", Some("0.19.21"), Some(SHA_A), Some(SHA_B)));
-
-    let deferred = st.decide(base, &inputs(&info, &stale("c1"), true, 3), settle, deadline);
-    assert!(
-        matches!(deferred, TickDecision::Skip(ref r) if r.contains("in-flight sweep(s)")),
-        "got {deferred:?}"
-    );
-    let past = base + deadline + Duration::from_secs(1);
-    let forced = st.decide(past, &inputs(&info, &stale("c1"), true, 3), settle, deadline);
-    assert!(
-        matches!(
-            forced,
-            TickDecision::FetchArtifact {
-                low_priority: true,
-                ..
-            }
-        ),
-        "got {forced:?}"
-    );
 }
 
 #[test]
