@@ -8,10 +8,10 @@ so that Loom can drive Claude Code, OpenAI Codex CLI, Amp, oh-my-pi (omp), and
 future tools through **one** interface instead of a growing pile of per-runtime
 special cases.
 
-It is the reference for the multi-runtime effort tracked by epic **#4167**
-(first-class multi-runtime worker support) and the fork-harvest triage in
-**#4165**. The collaboration model is upstream PRs from the gpeyton/loom fork
-(see the [fork mapping table](#fork-mapping-table)), not one-way cherry-picks.
+Pi and OpenCode have experimental **native Rust** adapters behind the same
+worker entry point. Harness selection, model profiles and trial evidence are
+separate: see [Native harness and model trials](runtime-model-trials.md).
+Neither adapter is admitted for Builder, Doctor, Judge or full sweeps yet.
 
 > **Path convention.** This doc lives at `defaults/docs/runtime-adapters.md` in
 > the Loom source repo and cites `defaults/` paths throughout. A consumer

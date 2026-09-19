@@ -437,7 +437,6 @@ defaults/scripts/tests/test-safehoused-service.sh                              t
 defaults/scripts/tests/test-spawn-claude.sh                                    test        Tests `spawn-claude` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-spawn-codex.sh                                     test        Tests `spawn-codex` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-spawn-generic.sh                                   test        Tests `spawn-generic` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
-defaults/scripts/tests/test-spawn-worker.sh                                    test        Tests `spawn-worker` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-stale-claim-standdown-suppression.sh               test        Tests `stale-claim-standdown-suppression` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-sweep-auto-stack.sh                                test        Tests `sweep-auto-stack` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-sweep-checkpoint.sh                                test        Tests `sweep-checkpoint` — shell because its subject is shell; follows its subject, never an independent reason (#7758).

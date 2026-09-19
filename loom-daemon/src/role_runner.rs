@@ -1044,69 +1044,27 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 return RoleTickOutcome::Failure(e);
             }
         };
-        // Pre-spawn token-pool preflight (issue #4642): a workspace with
-        // neither a per-repo `.loom/tokens/` pool nor a provisioned shared
-        // pool is guaranteed to fail `spawn-claude.sh`'s own token-selection
-        // preflight (`EX_CONFIG`, exit 78) — checking here, before spawning
-        // anything, means the role runner skips the doomed spawn instead of
-        // burning a tick on a guaranteed exit-78 failure every single time.
-        // Gated the same way as the admission check just below: only the
-        // real production path (`spawn_bin` unset) checks this — tests that
-        // point `spawn_bin` at a fake script opt out, exactly like
-        // `resolve_and_admit` below.
-        if self.spawn_bin.is_none() && crate::tokens::token_pool_size(&self.workspace_root) == 0 {
-            NO_TOKEN_POOL_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
-            note_pre_spawn_skip(
-                &self.logs_dir(),
-                role,
-                "no token pool available (neither a per-repo .loom/tokens/ pool nor a provisioned \
-                 shared pool); run `loom-daemon tokens bootstrap` — #4642",
-            );
-            return RoleTickOutcome::NoTokenPool;
-        }
-        // Pre-spawn token-pool SPAWNABILITY preflight (issue #7607): the
-        // check just above only catches a pool that is entirely ABSENT
-        // (#4642). A pool that is present but fully exhausted — every
-        // account bad-marked (`.bad_tokens`) or `.ranking`-hard-excluded —
-        // slips past it and was still spawning a doomed `spawn-claude.sh`
-        // that burns ~10s discovering the exact same exit-78 outcome this
-        // read already knows. Uses the SAME resolution/usability logic
-        // `spawn-claude.sh`'s own `loom-daemon tokens select` performs
-        // (`tokens_pool::select::spawnable_pool_state`, itself built on
-        // `tokens_pool::paths::resolve_tokens_dir` — the repo-local
-        // shadow-pool-if-present-else-shared precedence, #3938/#7527), so
-        // this preflight can never disagree with what a real spawn would
-        // discover. Gated on `spawn_bin.is_none()` like the checks above and
-        // below — tests that point `spawn_bin` at a fake script opt out.
-        if self.spawn_bin.is_none() {
-            let pool = crate::tokens_pool::select::spawnable_pool_state(&self.workspace_root);
-            if pool.total > 0 && pool.usable == 0 {
-                POOL_EXHAUSTED_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
-                let next_clear_at = crate::tokens_pool::select::pool_clear_estimate(&pool.dir);
-                note_pre_spawn_skip(
-                    &self.logs_dir(),
-                    role,
-                    &format!(
-                        "token pool exhausted: 0/{} spawnable in {} (every account bad-marked or \
-                         hard-excluded by .ranking); next check ~{} — run `loom-daemon tokens \
-                         check --ranking` or `loom-daemon tokens unblock <name>` — #7607",
-                        pool.total,
-                        pool.dir.display(),
-                        next_clear_at.to_rfc3339()
-                    ),
-                );
-                return RoleTickOutcome::PoolExhausted {
-                    total: pool.total,
-                    next_clear_at,
-                };
-            }
+        // Resolve runtime before Claude-only auth preflights. Retain the old
+        // preflight ordering for Claude, including incomplete installations.
+        let admission_result = self
+            .spawn_bin
+            .is_none()
+            .then(|| crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None));
+        let claude_pool = admission_result.as_ref().is_some_and(|r| match r {
+            Ok(a) => a.runtime == "claude",
+            Err(e) => e.runtime == "claude",
+        });
+        if let Some(outcome) =
+            runtime_preflight::check(&self.workspace_root, &self.logs_dir(), role, claude_pool)
+        {
+            return outcome;
         }
         // Issue #5028 (follow-up to #5001 AC2/AC3): runtime admission now
         // resolves BEFORE the model, because the runtime is a per-role INPUT
         // to the model/runtime mismatch check just below — a Claude-shaped
         // model can only be judged wrong once the admitted runtime is known.
-        let admission = if self.spawn_bin.is_none() {
-            match crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None) {
+        let admission = if let Some(result) = admission_result {
+            match result {
                 Ok(value) => Some(value),
                 Err(e) => {
                     note_pre_spawn_skip(
@@ -4290,3 +4248,5 @@ pub use model_resolution::{
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+mod runtime_preflight;

@@ -1,0 +1,100 @@
+{
+  "date": "2026-09-19",
+  "scope": "Tool-use canary, not an issue-quality benchmark",
+  "model": "glm-5.3-flash",
+  "profile": "zai-flash",
+  "versions": {
+    "pi": "0.85.1",
+    "opencode": "1.18.31"
+  },
+  "task": "Remove a positive-only filter from sum-of-squares; preserve three independent unit tests covering signs, empty input and iterators.",
+  "billing": null,
+  "runs": [
+    {
+      "name": "pi",
+      "exit": 0,
+      "elapsed_seconds": 27.9,
+      "independent_tests_pass": true,
+      "test_file_unchanged": true,
+      "observed_models": [
+        "glm-5.3-flash"
+      ],
+      "observed_providers": [
+        "zai"
+      ],
+      "usage_events": 5,
+      "tokens_as_reported": {
+        "input": 2010,
+        "output": 286,
+        "reasoning": 48,
+        "cacheRead": 11520,
+        "cacheWrite": 0
+      },
+      "harness_cost_estimate_usd": 0.0003950499999999999,
+      "tools": {
+        "bash": 2,
+        "read": 2,
+        "edit": 1
+      },
+      "raw_events_sha256": "69b329ca8605faf2746712e12a409666690f92df184b6b20621feb2075d5a822"
+    },
+    {
+      "name": "opencode-initial",
+      "exit": 0,
+      "elapsed_seconds": 22.3,
+      "independent_tests_pass": false,
+      "test_file_unchanged": true,
+      "observed_models": [
+        "glm-5.3-flash"
+      ],
+      "observed_providers": [
+        "zai-coding-plan"
+      ],
+      "usage_events": 5,
+      "tokens_as_reported": {
+        "input": 17000,
+        "output": 156,
+        "reasoning": 238,
+        "cacheRead": 61440,
+        "cacheWrite": 0
+      },
+      "harness_cost_estimate_usd": 0,
+      "tools": {
+        "read": 2,
+        "glob": 1,
+        "bash": 1,
+        "grep": 1
+      },
+      "raw_events_sha256": "f3c78596cb84d39262a1bd3a097b8998c0ea766e1b4e647322d9a4d16560a366"
+    },
+    {
+      "name": "opencode-cwd-fixed",
+      "exit": 0,
+      "elapsed_seconds": 22.1,
+      "independent_tests_pass": true,
+      "test_file_unchanged": true,
+      "observed_models": [
+        "glm-5.3-flash"
+      ],
+      "observed_providers": [
+        "zai-coding-plan"
+      ],
+      "usage_events": 5,
+      "tokens_as_reported": {
+        "input": 10901,
+        "output": 239,
+        "reasoning": 33,
+        "cacheRead": 41664,
+        "cacheWrite": 0
+      },
+      "harness_cost_estimate_usd": 0,
+      "tools": {
+        "glob": 1,
+        "bash": 2,
+        "read": 2,
+        "edit": 1
+      },
+      "raw_events_sha256": "1fd5c0fad98102c173390286f351bc145c3e0eabfd771d2bc50361e448b4c4ee"
+    }
+  ]
+}
