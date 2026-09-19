@@ -1,6 +1,47 @@
 //! Provider-scoped account health for runtimes which do not have Claude's
 //! quota probe. This state is deliberately separate from the legacy Claude
 //! `.ranking`, `.bad_tokens`, and `.failure_counts` files.
+//!
+//! # Model-class scoping (#8058 Phase 2)
+//!
+//! Phase 1 taught the *Claude* pool that an exhaustion known to be scoped to a
+//! single model class should not bad-mark the account for every other class
+//! (`bad_tokens::scoped_reason` / `bad_tokens::is_bad_for_class`). This module
+//! is the same fix for every other provider, expressed in this module's own
+//! state shape rather than in `.bad_tokens` lines:
+//!
+//! * An **account-wide** hold is [`AccountHealth::cooldown_until`] (plus
+//!   [`HealthReason::ReauthRequired`], which is sticky and has no deadline).
+//!   `TOKEN_EXHAUSTED`, `RECOVERABLE`, and `SESSION_LIMIT` all still produce
+//!   one, unchanged.
+//! * A **class-scoped** hold is one entry in
+//!   [`AccountHealth::class_cooldowns`] — its own deadline, ageing out on its
+//!   own schedule, exactly like Phase 1's per-line `.bad_tokens` marks.
+//!   `MODEL_CREDITS_EXHAUSTED` produces one *when the caller names the model
+//!   that was in flight*.
+//!
+//! The rule, in both directions — this mirrors Phase 1 deliberately, because
+//! the widening/narrowing hazards are identical:
+//!
+//! * Nothing here ever **widens** a mark. A class-scoped hold blocks strictly
+//!   less than an account-wide one: it can only ever make a class-scoped query
+//!   ([`select_healthy_for_class_at`]) succeed where the account-wide one
+//!   fails, never the reverse.
+//! * Nothing here ever **narrows** an existing account-wide mark. A record
+//!   with no class — every state written before this phase, and every
+//!   `MODEL_CREDITS_EXHAUSTED` whose model the caller did not supply — stays
+//!   account-wide and keeps blocking all classes. Unknown model ⇒ account-wide
+//!   is the fail-safe default, never an error.
+//! * The **class-less question is unchanged**: [`select_healthy_at`] and
+//!   [`AccountHealth::is_eligible_at`] mean "is this account usable at all",
+//!   so a live class-scoped hold still blocks them — precisely as a
+//!   class-scoped `.bad_tokens` line still blocks Phase 1's [`is_bad`]. Only a
+//!   caller that names a *different* class gets the narrower answer.
+//! * `ReauthRequired` stays account-wide and permanent: a broken credential is
+//!   broken for every class, so the sticky-reauth arm swallows class-scoped
+//!   feedback exactly as it swallows every other terminal signal.
+//!
+//! [`is_bad`]: super::bad_tokens::is_bad
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -24,13 +65,21 @@ pub enum TerminalClassification {
     Success,
     TokenExpired,
     TokenExhausted,
-    /// Per-model-tier usage credits ran out (issue #5687). A distinct
-    /// classifier category so the in-session `/loom:sweep` orchestrator can
-    /// name the signature it downgrades models on, but the account pool treats
-    /// it exactly like [`TerminalClassification::TokenExhausted`] — same
-    /// `PlanExhausted` reason, same cooldown. Keep those two arms fused: this
-    /// variant must never diverge into its own health policy without an
-    /// explicit decision, because the pool has no per-model account state.
+    /// Per-model-tier usage credits ran out (issue #5687). Credits are scoped
+    /// to one model class, so — unlike
+    /// [`TerminalClassification::TokenExhausted`], which is an account-wide
+    /// plan/quota hold — this records a **class-scoped** cooldown in
+    /// [`AccountHealth::class_cooldowns`] and leaves the account serving every
+    /// other class (#8058 Phase 2). The two arms were fused until that phase,
+    /// because the pool had no per-model account state to narrow into; it has
+    /// one now.
+    ///
+    /// The narrowing is conditional and fail-safe: it applies only when the
+    /// caller names the model that was in flight
+    /// ([`record_terminal_for_model_at`]). With no model — the class-less
+    /// [`record_terminal_at`] — this still records the account-wide
+    /// `PlanExhausted` hold it always did, because "which class ran out" is
+    /// exactly what a class-scoped mark has to know and must never guess.
     ModelCreditsExhausted,
     Recoverable,
     Timeout,
@@ -68,6 +117,17 @@ pub enum HealthReason {
     PlanExhausted,
     TransientFailure,
     SessionLimit,
+    /// Per-model-class usage credits ran out and the account has **no**
+    /// account-wide hold (#8058 Phase 2). The blocking deadlines live in
+    /// [`AccountHealth::class_cooldowns`], never in
+    /// [`AccountHealth::cooldown_until`] — this reason exists so an operator
+    /// reading the state file can tell "one class is out of credits" apart
+    /// from the account-wide `PlanExhausted` that `TOKEN_EXHAUSTED` produces.
+    ///
+    /// Never overwrites a *live* account-wide reason: an account already
+    /// holding a `PlanExhausted`/`TransientFailure`/`SessionLimit` cooldown
+    /// keeps it, because the wider hold is the one that decides selection.
+    ModelCreditsExhausted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +152,24 @@ pub struct AccountHealth {
     /// account that has only ever been judged reactively.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_probe: Option<u64>,
+    /// Per-model-class exhaustion deadlines (#8058 Phase 2): `class` →
+    /// `cooldown_until`. Written only by `MODEL_CREDITS_EXHAUSTED` feedback
+    /// that named the model in flight; each entry ages out on its own
+    /// schedule, independently of every other class and of the account-wide
+    /// [`Self::cooldown_until`].
+    ///
+    /// Additive and optional, exactly like `last_probe` (#6927) before it:
+    /// `#[serde(default)]` means every record written before this phase reads
+    /// back as "no class-scoped holds" (i.e. account-wide behaviour,
+    /// unchanged), and `skip_serializing_if` keeps the field off disk entirely
+    /// until an account actually has one. That is why [`SCHEMA_VERSION`] is
+    /// **not** bumped here: `read_state` rejects any version it does not
+    /// recognize outright and there is no migration path, so bumping would
+    /// hard-fail every live `account-health.json` on upgrade — an outage, in
+    /// exchange for a field that already round-trips through both the old and
+    /// the new reader.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub class_cooldowns: HashMap<String, u64>,
 }
 
 impl AccountHealth {
@@ -102,11 +180,117 @@ impl AccountHealth {
         }
     }
 
+    /// Whether this account is usable **at all** at `now`.
+    ///
+    /// The account-wide question, unchanged by #8058 Phase 2: a live
+    /// class-scoped hold still counts here, exactly as a class-scoped
+    /// `.bad_tokens` line still counts for Phase 1's
+    /// [`super::bad_tokens::is_bad`]. Callers that can name the class they
+    /// need should ask [`Self::is_eligible_for_class_at`] instead.
     #[must_use]
     pub fn is_eligible_at(&self, now: u64) -> bool {
-        self.reason != HealthReason::ReauthRequired
-            && self.cooldown_until.is_none_or(|deadline| deadline <= now)
+        self.is_eligible_for_class_at(now, None)
     }
+
+    /// [`Self::is_eligible_at`], narrowed to one model class (#8058 Phase 2).
+    ///
+    /// `model_class` is an already-normalized class (see [`model_class_of`]);
+    /// `None` is exactly [`Self::is_eligible_at`]. A class-scoped query is
+    /// strictly narrower — it can only ever return `true` where the
+    /// account-wide question returns `false`, because every account-wide hold
+    /// (`ReauthRequired`, `cooldown_until`) is checked first and identically.
+    #[must_use]
+    pub fn is_eligible_for_class_at(&self, now: u64, model_class: Option<&str>) -> bool {
+        if self.reason == HealthReason::ReauthRequired {
+            return false;
+        }
+        if self.cooldown_until.is_some_and(|deadline| deadline > now) {
+            return false;
+        }
+        self.blocking_class_cooldown_at(now, model_class).is_none()
+    }
+
+    /// The live class-scoped hold that blocks `model_class` at `now`, as
+    /// `(class, cooldown_until)`, or `None` when no class hold applies.
+    ///
+    /// A `None` class asks the account-wide question, so *any* live class hold
+    /// answers it; the one reported back is the latest-clearing (ties broken
+    /// by class name) so the operator-facing message never promises an earlier
+    /// recovery than the state actually allows.
+    #[must_use]
+    pub fn blocking_class_cooldown_at(
+        &self,
+        now: u64,
+        model_class: Option<&str>,
+    ) -> Option<(&str, u64)> {
+        match model_class.and_then(normalize_class) {
+            Some(queried) => self
+                .class_cooldowns
+                .get_key_value(&queried)
+                .filter(|(_, deadline)| **deadline > now)
+                .map(|(class, deadline)| (class.as_str(), *deadline)),
+            None => {
+                let mut blocking: Option<(&str, u64)> = None;
+                for (class, deadline) in &self.class_cooldowns {
+                    if *deadline <= now {
+                        continue;
+                    }
+                    let candidate = (class.as_str(), *deadline);
+                    if blocking.is_none_or(|current| {
+                        (candidate.1, std::cmp::Reverse(candidate.0))
+                            > (current.1, std::cmp::Reverse(current.0))
+                    }) {
+                        blocking = Some(candidate);
+                    }
+                }
+                blocking
+            }
+        }
+    }
+}
+
+/// Normalize an already-classified model class for use as a
+/// [`AccountHealth::class_cooldowns`] key, or `None` when the value carries no
+/// usable class (#8058 Phase 2).
+///
+/// Deliberately permissive-then-rejecting: trims, lowercases, and requires the
+/// result to be a non-empty run of `[a-z0-9._-]`. Anything else — empty,
+/// whitespace, a stray quote, an embedded space — reads as **no class**, which
+/// is the account-wide (fail-safe) answer on both the write and the read side.
+fn normalize_class(class: &str) -> Option<String> {
+    let normalized = class.trim().to_ascii_lowercase();
+    if normalized.is_empty()
+        || !normalized
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Resolve a raw model alias or pinned ID to the class a class-scoped health
+/// hold is keyed by, or `None` when the value carries no usable class (#8058
+/// Phase 2).
+///
+/// A deliberate **superset** of [`super::bad_tokens::model_class_of`], not a
+/// second copy of it: a Claude model is routed through that function first, so
+/// `claude-opus-5` and `opus` collapse to the one `opus` class the Claude pool
+/// already uses and the two phases never disagree about a shared vocabulary.
+/// Every other provider — Codex above all, the reason this module exists —
+/// has no such classifier, so its model string normalizes to itself
+/// ([`normalize_class`]). That is the narrow direction: two Codex model names
+/// that happen to share one credit pool become two independent holds, which at
+/// worst costs one failed dispatch that re-marks the second class, whereas
+/// collapsing them by guesswork would block a class that still had credit.
+///
+/// **Unrecognized is `None`, never an error** — the same contract Phase 1
+/// chose. `None` degrades to today's account-wide behaviour everywhere it is
+/// consumed; account health must never fail closed on a model name it has not
+/// been taught.
+#[must_use]
+pub fn model_class_of(model: &str) -> Option<String> {
+    super::bad_tokens::model_class_of(model).or_else(|| normalize_class(model))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +422,8 @@ pub fn record_terminal(
     record_terminal_at(workspace, id, classification, provenance, now_epoch())
 }
 
+/// Record terminal feedback with no model information: every hold it writes is
+/// account-wide, exactly as before #8058 Phase 2.
 pub fn record_terminal_at(
     workspace: &Path,
     id: &AccountId,
@@ -245,9 +431,48 @@ pub fn record_terminal_at(
     provenance: &str,
     now: u64,
 ) -> Result<()> {
+    record_terminal_for_class_at(workspace, id, classification, None, provenance, now)
+}
+
+/// [`record_terminal_at`], told which **model** was in flight (#8058 Phase 2).
+///
+/// `model` is a raw alias or pinned ID — whatever the adapter reported —
+/// resolved here through [`model_class_of`], so classification happens in
+/// exactly one place. `None`, an empty value, or a model that normalizes to no
+/// class all reproduce [`record_terminal_at`] verbatim.
+///
+/// Only `MODEL_CREDITS_EXHAUSTED` uses the class: every other category is an
+/// account-level fact (the credential is dead, the plan is out, the session
+/// cap is hit) and stays account-wide whatever model provoked it. The one
+/// other class-aware arm is `SUCCESS`, which clears the named class's hold —
+/// direct evidence that that class works again.
+pub fn record_terminal_for_model_at(
+    workspace: &Path,
+    id: &AccountId,
+    classification: TerminalClassification,
+    model: Option<&str>,
+    provenance: &str,
+    now: u64,
+) -> Result<()> {
+    let class = model.and_then(model_class_of);
+    record_terminal_for_class_at(workspace, id, classification, class.as_deref(), provenance, now)
+}
+
+/// [`record_terminal_for_model_at`] with an **already-normalized** class
+/// (see [`model_class_of`]). Callers holding a raw model string should use
+/// [`record_terminal_for_model_at`] so the classification happens once.
+pub fn record_terminal_for_class_at(
+    workspace: &Path,
+    id: &AccountId,
+    classification: TerminalClassification,
+    model_class: Option<&str>,
+    provenance: &str,
+    now: u64,
+) -> Result<()> {
     if id.name.is_empty() || provenance.is_empty() {
         bail!("account identity and signal provenance are required");
     }
+    let model_class = model_class.and_then(normalize_class);
     with_state(workspace, |state| {
         let existing = state.accounts.iter().position(|entry| entry.id() == *id);
         if matches!(
@@ -270,6 +495,7 @@ pub fn record_terminal_at(
                 consecutive_transient_failures: 0,
                 last_success: None,
                 last_probe: None,
+                class_cooldowns: HashMap::new(),
             },
             |index| state.accounts.remove(index),
         );
@@ -292,25 +518,63 @@ pub fn record_terminal_at(
                 entry.consecutive_transient_failures = 0;
                 entry.reason = HealthReason::Healthy;
                 entry.cooldown_until = None;
+                // A success on a named class proves that class recovered, and
+                // says nothing about any other. A class-less success is the
+                // account-wide statement it has always been, so it clears
+                // every hold — which is exactly what it did before this phase,
+                // when a credit exhaustion WAS the account-wide cooldown it
+                // cleared. Never leaves the account more blocked than before.
+                match model_class.as_deref() {
+                    Some(class) => {
+                        entry.class_cooldowns.remove(class);
+                    }
+                    None => entry.class_cooldowns.clear(),
+                }
             }
             TerminalClassification::TokenExpired => {
                 entry.reason = HealthReason::ReauthRequired;
                 entry.cooldown_until = None;
             }
-            // #5687: a per-model-tier credit exhaustion is handled identically
-            // to a plan/quota exhaustion here. The pool tracks account health,
-            // not per-model account state, so "this account cannot serve the
-            // tier we asked for" is recorded as the same safe
-            // over-approximation #4501 already chose for the per-model ceiling.
-            // The model-downgrade remedy lives at the sweep-orchestrator layer,
-            // which is the only layer with a per-dispatch model knob.
-            TerminalClassification::TokenExhausted
-            | TerminalClassification::ModelCreditsExhausted => {
+            TerminalClassification::TokenExhausted => {
                 entry.reason = HealthReason::PlanExhausted;
                 entry.cooldown_until = Some(now.saturating_add(cooldown_from_env(
                     "LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS",
                     DEFAULT_EXHAUSTED_COOLDOWN_SECS,
                 )));
+            }
+            // #8058 Phase 2: credits are scoped to one model class, so this
+            // records a hold for that class alone and leaves the account
+            // serving every other one. #5687 fused this with the account-wide
+            // TOKEN_EXHAUSTED arm above because the pool had no per-model
+            // state to narrow into; `class_cooldowns` is that state.
+            //
+            // With no class the arms stay fused, and deliberately so: "which
+            // class ran out" is the whole content of a class-scoped mark, and
+            // guessing it would block a class that still had credit. Unknown
+            // model ⇒ the account-wide over-approximation, as before.
+            TerminalClassification::ModelCreditsExhausted => {
+                let deadline = now.saturating_add(cooldown_from_env(
+                    "LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS",
+                    DEFAULT_EXHAUSTED_COOLDOWN_SECS,
+                ));
+                match model_class.clone() {
+                    Some(class) => {
+                        entry.class_cooldowns.insert(class, deadline);
+                        // The account-wide summary only moves when there is no
+                        // wider live hold to preserve: a running
+                        // PlanExhausted / TransientFailure / SessionLimit
+                        // cooldown is the one that decides selection, and a
+                        // narrower fact must never overwrite it.
+                        if !entry.cooldown_until.is_some_and(|until| until > now) {
+                            entry.reason = HealthReason::ModelCreditsExhausted;
+                            entry.cooldown_until = None;
+                        }
+                    }
+                    None => {
+                        entry.reason = HealthReason::PlanExhausted;
+                        entry.cooldown_until = Some(deadline);
+                    }
+                }
             }
             TerminalClassification::Recoverable => {
                 entry.reason = HealthReason::TransientFailure;
@@ -400,6 +664,7 @@ pub fn record_probe_at(
                 consecutive_transient_failures: 0,
                 last_success: None,
                 last_probe: None,
+                class_cooldowns: HashMap::new(),
             },
             |index| state.accounts.remove(index),
         );
@@ -423,9 +688,10 @@ pub fn record_probe_at(
                 entry.signal_provenance = provenance.to_string();
                 ProbeEffect::ClearedReauthHold
             }
-            // A healthy probe says nothing about an exhaustion cooldown or a
-            // transient-failure backoff, so it deliberately leaves both
-            // alone — it only ever releases an auth hold.
+            // A healthy probe says nothing about an exhaustion cooldown, a
+            // per-class credit hold, or a transient-failure backoff, so it
+            // deliberately leaves all three alone — it only ever releases an
+            // auth hold.
             ProbeOutcome::LoggedIn | ProbeOutcome::NotLoggedIn => ProbeEffect::Unchanged,
         };
         state.accounts.push(entry);
@@ -463,12 +729,52 @@ pub fn account_health(workspace: &Path, id: &AccountId) -> Result<Option<Account
         .find(|entry| entry.id() == *id))
 }
 
+/// Select a healthy account for `provider` — the account-wide question, whose
+/// meaning is unchanged by #8058 Phase 2 (a live class-scoped hold still
+/// excludes the account). Callers that know which model they are about to run
+/// should use [`select_healthy_for_model_at`] instead.
 pub fn select_healthy_at(
     workspace: &Path,
     provider: AccountProvider,
     inventory: &[AccountDescriptor],
     now: u64,
 ) -> Result<AccountDescriptor> {
+    select_healthy_for_class_at(workspace, provider, inventory, None, now)
+}
+
+/// [`select_healthy_at`], narrowed to the class the **model** belongs to
+/// (#8058 Phase 2).
+///
+/// `model` is a raw alias or pinned ID, resolved through [`model_class_of`].
+/// `None`, an empty value, or a model that normalizes to no class all
+/// reproduce [`select_healthy_at`] exactly — selection must never fail closed
+/// on a model name it does not recognize.
+pub fn select_healthy_for_model_at(
+    workspace: &Path,
+    provider: AccountProvider,
+    inventory: &[AccountDescriptor],
+    model: Option<&str>,
+    now: u64,
+) -> Result<AccountDescriptor> {
+    let class = model.and_then(model_class_of);
+    select_healthy_for_class_at(workspace, provider, inventory, class.as_deref(), now)
+}
+
+/// [`select_healthy_for_model_at`] with an **already-normalized** class (see
+/// [`model_class_of`]).
+///
+/// This is the single scan both the class-aware and the account-wide readers
+/// share, so the two can never drift — the same shape Phase 1 chose for
+/// `bad_tokens::blocking_entry_in_dir_for_class`.
+pub fn select_healthy_for_class_at(
+    workspace: &Path,
+    provider: AccountProvider,
+    inventory: &[AccountDescriptor],
+    model_class: Option<&str>,
+    now: u64,
+) -> Result<AccountDescriptor> {
+    let model_class = model_class.and_then(normalize_class);
+    let model_class = model_class.as_deref();
     with_state(workspace, |state| {
         for entry in &mut state.accounts {
             if entry.reason == HealthReason::TransientFailure
@@ -477,6 +783,19 @@ pub fn select_healthy_at(
                 entry.reason = HealthReason::Healthy;
                 entry.cooldown_until = None;
                 entry.consecutive_transient_failures = 0;
+                entry.updated_at = now;
+            }
+            // Expired class holds are dropped on sight so `class_cooldowns`
+            // cannot grow without bound, and the account-wide summary follows
+            // them out: once the last class hold has aged away there is
+            // nothing left for `ModelCreditsExhausted` to describe.
+            let expired = entry.class_cooldowns.len();
+            entry.class_cooldowns.retain(|_, deadline| *deadline > now);
+            if entry.class_cooldowns.len() != expired
+                && entry.class_cooldowns.is_empty()
+                && entry.reason == HealthReason::ModelCreditsExhausted
+            {
+                entry.reason = HealthReason::Healthy;
                 entry.updated_at = now;
             }
         }
@@ -492,7 +811,7 @@ pub fn select_healthy_at(
             .filter(|account| {
                 health
                     .get(&account.id)
-                    .is_none_or(|entry| entry.is_eligible_at(now))
+                    .is_none_or(|entry| entry.is_eligible_for_class_at(now, model_class))
             })
             .cloned()
             .collect();
@@ -514,10 +833,22 @@ pub fn select_healthy_at(
                     } else if let Some(entry) = health.get(&account.id) {
                         match entry.reason {
                             HealthReason::ReauthRequired => "reauth_required".to_string(),
-                            _ => entry.cooldown_until.map_or_else(
-                                || "unavailable".to_string(),
-                                |until| format!("cooldown_until={until}"),
-                            ),
+                            // An account-wide cooldown is reported exactly as
+                            // before; only when there is none does a live
+                            // class hold get named, so the operator can see
+                            // *which* class is out rather than a bare
+                            // "unavailable" (#8058 Phase 2).
+                            _ => match entry.cooldown_until {
+                                Some(until) => format!("cooldown_until={until}"),
+                                None => entry
+                                    .blocking_class_cooldown_at(now, model_class)
+                                    .map_or_else(
+                                        || "unavailable".to_string(),
+                                        |(class, until)| {
+                                            format!("model_class={class} cooldown_until={until}")
+                                        },
+                                    ),
+                            },
                         }
                     } else {
                         "unavailable".to_string()
@@ -569,12 +900,17 @@ pub fn provider_capacity_at(
                 .is_some_and(|entry| entry.reason == HealthReason::ReauthRequired)
         })
         .count();
+    // Capacity answers the account-wide question, so a live class-scoped hold
+    // counts here too (#8058 Phase 2) — `select_healthy_at` excludes the
+    // account for exactly that reason, and a capacity report that disagreed
+    // with selection would be the dishonest kind.
     let cooldown = enabled
         .iter()
         .filter(|account| {
             health.get(&account.id).is_some_and(|entry| {
                 entry.reason != HealthReason::ReauthRequired
-                    && entry.cooldown_until.is_some_and(|until| until > now)
+                    && (entry.cooldown_until.is_some_and(|until| until > now)
+                        || entry.blocking_class_cooldown_at(now, None).is_some())
             })
         })
         .count();
@@ -590,379 +926,4 @@ pub fn provider_capacity_at(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tokens_pool::account_registry::{CredentialKind, InventoryProvenance};
-
-    fn descriptor(provider: AccountProvider, name: &str) -> AccountDescriptor {
-        AccountDescriptor {
-            id: AccountId {
-                provider,
-                name: name.into(),
-            },
-            credential_kind: CredentialKind::CodexHome,
-            credential_reference: PathBuf::from(name),
-            enabled: true,
-            provenance: InventoryProvenance::Shared,
-            email: None,
-        }
-    }
-
-    #[test]
-    fn exhausted_fails_over_and_expires_at_deadline() {
-        let tmp = tempfile::tempdir().unwrap();
-        let accounts = vec![
-            descriptor(AccountProvider::Codex, "a"),
-            descriptor(AccountProvider::Codex, "b"),
-        ];
-        record_terminal_at(
-            tmp.path(),
-            &accounts[0].id,
-            TerminalClassification::TokenExhausted,
-            "adapter_v1",
-            100,
-        )
-        .unwrap();
-        assert_eq!(
-            select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, 101)
-                .unwrap()
-                .id
-                .name,
-            "b"
-        );
-        assert!(select_healthy_at(
-            tmp.path(),
-            AccountProvider::Codex,
-            &accounts,
-            100 + DEFAULT_EXHAUSTED_COOLDOWN_SECS
-        )
-        .is_ok());
-    }
-
-    /// #5687: `MODEL_CREDITS_EXHAUSTED` is a distinct classifier category so
-    /// the sweep orchestrator can name the signature it downgrades models on,
-    /// but the account pool must treat it EXACTLY like `TOKEN_EXHAUSTED` —
-    /// same reason, same cooldown deadline. If these ever diverge, the pool has
-    /// silently grown a per-model health policy it has no state to support.
-    #[test]
-    fn model_credits_exhausted_is_recorded_identically_to_token_exhausted() {
-        assert_eq!(
-            "MODEL_CREDITS_EXHAUSTED"
-                .parse::<TerminalClassification>()
-                .unwrap(),
-            TerminalClassification::ModelCreditsExhausted
-        );
-
-        let mut recorded = Vec::new();
-        for classification in [
-            TerminalClassification::TokenExhausted,
-            TerminalClassification::ModelCreditsExhausted,
-        ] {
-            let tmp = tempfile::tempdir().unwrap();
-            let account = descriptor(AccountProvider::Codex, "a");
-            record_terminal_at(tmp.path(), &account.id, classification, "adapter_v1", 100).unwrap();
-            let state = read_state(tmp.path()).unwrap();
-            let entry = state.accounts.first().unwrap().clone();
-            recorded.push((entry.reason, entry.cooldown_until));
-        }
-        assert_eq!(recorded[0].0, HealthReason::PlanExhausted);
-        assert_eq!(
-            recorded[0], recorded[1],
-            "credit exhaustion must share TOKEN_EXHAUSTED's health treatment"
-        );
-    }
-
-    #[test]
-    fn expired_survives_time_and_success_until_explicit_clear() {
-        let tmp = tempfile::tempdir().unwrap();
-        let account = descriptor(AccountProvider::Codex, "a");
-        record_terminal_at(
-            tmp.path(),
-            &account.id,
-            TerminalClassification::TokenExpired,
-            "adapter_v1",
-            1,
-        )
-        .unwrap();
-        record_terminal_at(
-            tmp.path(),
-            &account.id,
-            TerminalClassification::Success,
-            "adapter_v1",
-            u64::MAX - 1,
-        )
-        .unwrap();
-        assert!(select_healthy_at(
-            tmp.path(),
-            AccountProvider::Codex,
-            std::slice::from_ref(&account),
-            u64::MAX
-        )
-        .is_err());
-        clear_reauth(tmp.path(), &account.id, "verified_reauth").unwrap();
-        assert!(select_healthy_at(tmp.path(), AccountProvider::Codex, &[account], u64::MAX).is_ok());
-    }
-
-    #[test]
-    fn expired_survives_all_later_runtime_feedback_until_explicit_clear() {
-        for classification in [
-            TerminalClassification::TokenExhausted,
-            TerminalClassification::Recoverable,
-            TerminalClassification::SessionLimit,
-        ] {
-            let tmp = tempfile::tempdir().unwrap();
-            let account = descriptor(AccountProvider::Codex, "a");
-            record_terminal_at(
-                tmp.path(),
-                &account.id,
-                TerminalClassification::TokenExpired,
-                "adapter_v1",
-                1,
-            )
-            .unwrap();
-            record_terminal_at(tmp.path(), &account.id, classification, "adapter_v1", 2).unwrap();
-
-            let health = account_health(tmp.path(), &account.id).unwrap().unwrap();
-            assert_eq!(health.reason, HealthReason::ReauthRequired);
-            assert_eq!(health.cooldown_until, None);
-            assert!(select_healthy_at(
-                tmp.path(),
-                AccountProvider::Codex,
-                std::slice::from_ref(&account),
-                u64::MAX
-            )
-            .is_err());
-        }
-    }
-
-    #[test]
-    fn expired_transient_backoff_restores_fair_rotation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let accounts = vec![
-            descriptor(AccountProvider::Codex, "a"),
-            descriptor(AccountProvider::Codex, "b"),
-        ];
-        record_terminal_at(
-            tmp.path(),
-            &accounts[0].id,
-            TerminalClassification::Recoverable,
-            "adapter_v1",
-            100,
-        )
-        .unwrap();
-
-        assert_eq!(
-            select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, 101)
-                .unwrap()
-                .id
-                .name,
-            "b"
-        );
-
-        let deadline = 100 + DEFAULT_RECOVERABLE_BACKOFF_SECS;
-        let first =
-            select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, deadline).unwrap();
-        let second =
-            select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, deadline).unwrap();
-        assert_ne!(first.id, second.id);
-        assert!([first.id.name, second.id.name].contains(&"a".to_string()));
-
-        let recovered = account_health(tmp.path(), &accounts[0].id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovered.reason, HealthReason::Healthy);
-        assert_eq!(recovered.cooldown_until, None);
-        assert_eq!(recovered.consecutive_transient_failures, 0);
-    }
-
-    #[test]
-    fn neutral_failures_do_not_poison_and_same_names_are_provider_scoped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let codex = descriptor(AccountProvider::Codex, "same");
-        let claude = descriptor(AccountProvider::Claude, "same");
-        record_terminal_at(
-            tmp.path(),
-            &codex.id,
-            TerminalClassification::TokenExpired,
-            "adapter_v1",
-            1,
-        )
-        .unwrap();
-        for category in [
-            TerminalClassification::Timeout,
-            TerminalClassification::Fatal,
-            TerminalClassification::CwdDeleted,
-            TerminalClassification::ModelRefusal,
-        ] {
-            record_terminal_at(tmp.path(), &claude.id, category, "adapter_v1", 2).unwrap();
-        }
-        assert!(account_health(tmp.path(), &claude.id).unwrap().is_none());
-        assert_eq!(
-            account_health(tmp.path(), &codex.id)
-                .unwrap()
-                .unwrap()
-                .reason,
-            HealthReason::ReauthRequired
-        );
-    }
-
-    /// Issue #6927: a proactive probe that finds an account logged out must
-    /// exclude it from selection through the SAME `ReauthRequired` mechanism
-    /// a reactive `TOKEN_EXPIRED` uses — before any dispatch is attempted.
-    #[test]
-    fn a_not_logged_in_probe_excludes_the_account_and_is_reported_as_such() {
-        let tmp = tempfile::tempdir().unwrap();
-        let accounts = vec![
-            descriptor(AccountProvider::Codex, "a"),
-            descriptor(AccountProvider::Codex, "b"),
-        ];
-        assert_eq!(
-            record_probe_at(
-                tmp.path(),
-                &accounts[0].id,
-                ProbeOutcome::NotLoggedIn,
-                "session_probe",
-                100,
-            )
-            .unwrap(),
-            ProbeEffect::MarkedReauthRequired
-        );
-        let entry = account_health(tmp.path(), &accounts[0].id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(entry.reason, HealthReason::ReauthRequired);
-        assert_eq!(entry.last_probe, Some(100));
-        assert_eq!(entry.cooldown_until, None);
-        assert_eq!(
-            select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, 101)
-                .unwrap()
-                .id
-                .name,
-            "b"
-        );
-        // Re-probing an already-held account is idempotent, not a re-mark.
-        assert_eq!(
-            record_probe_at(
-                tmp.path(),
-                &accounts[0].id,
-                ProbeOutcome::NotLoggedIn,
-                "session_probe",
-                200,
-            )
-            .unwrap(),
-            ProbeEffect::Unchanged
-        );
-    }
-
-    /// A healthy probe IS the "independently verified reauth" `clear_reauth`
-    /// demands — it observed the live credential, which ordinary runtime
-    /// feedback cannot.
-    #[test]
-    fn a_logged_in_probe_releases_a_reauth_hold_but_touches_nothing_else() {
-        let tmp = tempfile::tempdir().unwrap();
-        let account = descriptor(AccountProvider::Codex, "a");
-        record_terminal_at(
-            tmp.path(),
-            &account.id,
-            TerminalClassification::TokenExpired,
-            "adapter_v1",
-            1,
-        )
-        .unwrap();
-        assert!(select_healthy_at(
-            tmp.path(),
-            AccountProvider::Codex,
-            std::slice::from_ref(&account),
-            2
-        )
-        .is_err());
-
-        assert_eq!(
-            record_probe_at(tmp.path(), &account.id, ProbeOutcome::LoggedIn, "session_probe", 3,)
-                .unwrap(),
-            ProbeEffect::ClearedReauthHold
-        );
-        assert!(select_healthy_at(
-            tmp.path(),
-            AccountProvider::Codex,
-            std::slice::from_ref(&account),
-            4
-        )
-        .is_ok());
-
-        // A healthy auth probe says nothing about quota, so it must not
-        // rescue an exhausted account from its cooldown.
-        record_terminal_at(
-            tmp.path(),
-            &account.id,
-            TerminalClassification::TokenExhausted,
-            "adapter_v1",
-            5,
-        )
-        .unwrap();
-        assert_eq!(
-            record_probe_at(tmp.path(), &account.id, ProbeOutcome::LoggedIn, "session_probe", 6,)
-                .unwrap(),
-            ProbeEffect::Unchanged
-        );
-        let entry = account_health(tmp.path(), &account.id).unwrap().unwrap();
-        assert_eq!(entry.reason, HealthReason::PlanExhausted);
-        assert_eq!(entry.cooldown_until, Some(5 + DEFAULT_EXHAUSTED_COOLDOWN_SECS));
-        assert_eq!(entry.last_probe, Some(6));
-        // Nor does it fabricate a dispatch success.
-        assert_eq!(entry.last_success, None);
-    }
-
-    #[test]
-    fn probe_records_survive_a_read_write_round_trip_and_reject_empty_identity() {
-        let tmp = tempfile::tempdir().unwrap();
-        let id = AccountId {
-            provider: AccountProvider::Codex,
-            name: "a".into(),
-        };
-        record_probe_at(tmp.path(), &id, ProbeOutcome::NotLoggedIn, "session_probe", 7).unwrap();
-        // Written state must still parse under `deny_unknown_fields` (the new
-        // `last_probe` field is part of the schema, not a stowaway).
-        assert_eq!(read_state(tmp.path()).unwrap().accounts[0].last_probe, Some(7));
-        assert!(record_probe_at(tmp.path(), &id, ProbeOutcome::LoggedIn, "", 8).is_err());
-    }
-
-    #[test]
-    fn round_robin_is_persistent_and_capacity_is_honest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let accounts = vec![
-            descriptor(AccountProvider::Codex, "a"),
-            descriptor(AccountProvider::Codex, "b"),
-        ];
-        let first = select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, 1).unwrap();
-        let second = select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, 1).unwrap();
-        assert_ne!(first.id, second.id);
-        let capacity =
-            provider_capacity_at(tmp.path(), AccountProvider::Codex, &accounts, 1).unwrap();
-        assert_eq!((capacity.raw, capacity.enabled, capacity.healthy), (2, 2, 2));
-    }
-
-    #[test]
-    fn state_never_contains_credentials_or_raw_output() {
-        let tmp = tempfile::tempdir().unwrap();
-        let id = AccountId {
-            provider: AccountProvider::Codex,
-            name: "safe-name".into(),
-        };
-        record_terminal_at(tmp.path(), &id, TerminalClassification::Recoverable, "adapter_v1", 1)
-            .unwrap();
-        let state = fs::read_to_string(state_path(tmp.path())).unwrap();
-        assert!(!state.contains("auth.json"));
-        assert!(!state.contains("recognizable-secret"));
-    }
-
-    #[test]
-    fn malformed_and_unknown_schema_fail_closed() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir(tmp.path().join(".loom")).unwrap();
-        fs::write(state_path(tmp.path()), r#"{"version":99,"accounts":[]}"#).unwrap();
-        assert!(read_state(tmp.path()).is_err());
-        fs::write(state_path(tmp.path()), "{broken").unwrap();
-        assert!(read_state(tmp.path()).is_err());
-    }
-}
+mod tests;

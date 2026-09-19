@@ -84,8 +84,9 @@ pub use account_registry::{
 };
 pub use health::{
     account_health, clear_reauth, provider_capacity_at, record_probe_at, record_terminal,
-    select_healthy_at, AccountHealth, HealthReason, NoHealthyAccountError, ProbeEffect,
-    ProbeOutcome, ProviderCapacity, TerminalClassification,
+    record_terminal_for_class_at, record_terminal_for_model_at, select_healthy_at,
+    select_healthy_for_class_at, select_healthy_for_model_at, AccountHealth, HealthReason,
+    NoHealthyAccountError, ProbeEffect, ProbeOutcome, ProviderCapacity, TerminalClassification,
 };
 pub use select::{EmptyTokenPoolError, SelectedToken, EX_CONFIG};
 

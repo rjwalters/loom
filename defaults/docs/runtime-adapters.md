@@ -303,7 +303,7 @@ set:
 | `CWD_DELETED` | worktree removed mid-run | abandon cleanly |
 | `TOKEN_EXPIRED` | 401 / OAuth expired | skip this token |
 | `TOKEN_EXHAUSTED` | quota / weekly / usage limit | rotate to another account, mark bad |
-| `MODEL_CREDITS_EXHAUSTED` | per-model-**tier** credits ran out ("out of usage credits") | in-session dispatch: re-dispatch one model rung down, same account. Subprocess dispatch: rotate as for `TOKEN_EXHAUSTED`, but the Claude pool's `.bad_tokens` entry is scoped to the model class in flight (`[model-class:opus]`, #8058) so the account keeps serving other classes |
+| `MODEL_CREDITS_EXHAUSTED` | per-model-**tier** credits ran out ("out of usage credits") | in-session dispatch: re-dispatch one model rung down, same account. Subprocess dispatch: rotate, but the hold is **class-scoped**, not account-wide, so the account keeps serving every other class — Claude pool: a `.bad_tokens` entry carrying the class in flight (`[model-class:opus]`, #8058 Phase 1); every other provider: a `class_cooldowns` entry in `.loom/account-health.json` with its own deadline, distinct from the account-wide `plan_exhausted` cooldown `TOKEN_EXHAUSTED` still writes (#8058 Phase 2). Both narrow **only when the model in flight is known** — with no model, either path records the account-wide hold instead, because guessing which class ran out could block one that still has credit |
 | `SESSION_LIMIT` | concurrent-session cap (healthy account) | re-select, retry, do **not** mark bad |
 | `MODEL_REFUSAL` | safety classifier refused the turn | drop one ladder rung, no Doctor cycle consumed |
 | `RECOVERABLE` | rate limit / 5xx / network | retry with backoff |
