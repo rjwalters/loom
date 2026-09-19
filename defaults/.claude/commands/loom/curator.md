@@ -118,8 +118,11 @@ agent touches them.
   ./.loom/scripts/hard-exclusion-labels.sh --jq-not   # a jq select() fragment
   ```
 
-  Every `gh issue list` query below composes the `--jq-not` fragment rather
-  than spelling `external` out again.
+**Repo-local non-work labels (#8255)**: this fixed list has no per-repo
+extension point. `autonomous.workFinder.extraSkipLabels` in `.loom/config.json`
+(#6685) is the per-repo one — e.g. 2AMLogic/2am's `journal` status label
+(2am#625). `./.loom/scripts/skip-labels.sh --jq-not` folds both in (same
+output when unconfigured); Priority 2 below uses it for that reason.
 
 ## Exception: Explicit User Instructions
 
@@ -341,7 +344,7 @@ enhancement") is the entry point, so **target it first**:
 
 ```bash
 # Newly filed issues awaiting Curator enhancement
-EXCL="$(./.loom/scripts/hard-exclusion-labels.sh --jq-not)"   # #7528 shared source
+EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"   # #8255 shared source
 gh issue list --label="loom:triage" --state=open --limit 500 --json number,title,labels,createdAt \
   --jq "sort_by(.createdAt) | .[] | select($EXCL) | \"#\(.number) \(.title)\""
 ```
@@ -352,7 +355,7 @@ reserved for a human operator, so an autonomous Curator never "curates" an
 issue being built, awaiting evaluation, or outside its authority entirely:
 
 ```bash
-EXCL="$(./.loom/scripts/hard-exclusion-labels.sh --jq-not)"   # #7528 shared source
+EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"   # #8255 shared source
 gh issue list --state=open --limit 500 --json number,title,labels,createdAt \
   --jq "sort_by(.createdAt) | .[] | select(
     ([.labels[].name] | contains([\"loom:curated\"]) | not) and

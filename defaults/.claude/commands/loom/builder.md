@@ -1083,9 +1083,10 @@ gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=1
 **Step 3: If no curated, fall back to approved-only issues**
 
 ```bash
-# #7528: the hard-exclusion fragment comes from the shared source, never a
-# hardcoded `external` literal. Note the DOUBLE-quoted --jq so $EXCL expands.
-EXCL="$(./.loom/scripts/hard-exclusion-labels.sh --jq-not)"
+# #7528/#8255: the exclusion fragment comes from the shared source (hard
+# exclusions plus this repo's autonomous.workFinder.extraSkipLabels), never a
+# hardcoded literal. Note the DOUBLE-quoted --jq so $EXCL expands.
+EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"
 gh issue list --label="loom:issue" --state=open --json number,title,labels \
   --jq ".[] | select(([.labels[].name] | contains([\"loom:curated\"]) | not) and $EXCL) |
   \"#\(.number): \(.title)\""
