@@ -2244,3 +2244,15 @@ pub(crate) mod test_hooks {
     unused_imports
 )]
 mod tests;
+
+// The claim-restore / PR-produced test family lives in its own sibling module:
+// `tests` is over the file-size ratchet's 1000-line threshold and therefore
+// frozen at its current size (`.loom/docs/file-size-policy.md`).
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod claim_restore_tests;
