@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted. Implemented in the same PR as this ADR (issue #5849).
+Accepted. Implemented in the same PR as this ADR (issue #5849). **Amended by
+#8265** — see §4, which supersedes §2's "path is in the changed-files list →
+accept as verified" row.
 
 ## Context
 
@@ -71,8 +73,9 @@ to re-verify):
 |---|---|
 | `TDD:` line **absent** entirely | Note the absence in the evaluation comment. **Does not block approval.** |
 | `TDD: no — <reason>` present | Accept if the reason is plausible for the diff (e.g. docs/config-only, refactor with pre-existing coverage). **Does not block.** |
-| `TDD: yes — <path>` present, diff **corroborates** it (the referenced test file/path appears in the changed-files list) | Accept as verified. |
-| `TDD: yes — <path>` present, diff **contradicts** it (no test file touched at all, or the referenced path was not changed) | **Blocking** — request changes, same class of finding as any other inaccurate claim in a PR description. |
+| `TDD: yes — <path>` present, diff corroborates it **and** the test fails on the merge-base tree (see §4) | Accept as verified. |
+| `TDD: yes — <path>` present, but **contradicted** — no test file touched, the referenced path was not changed, or the test **passes** on the merge-base tree (§4) | **Blocking** — request changes, same class of finding as any other inaccurate claim in a PR description. |
+| `TDD: yes — <path>` present, path in the diff, but the test **cannot be run in isolation** (§4) | Advisory, **stated explicitly** in the verdict. Never recorded as verified. |
 
 **Rationale for the split, not a single toggle:**
 
@@ -117,6 +120,72 @@ the `TDD:` line as one specific claim worth checking, per the "adapt, not
 adopt" verdict in #5844's evaluation: Loom keeps the PR-level cross-context
 review as the loop; this closes only the narrower in-Builder gap).
 
+### 4. Amendment (#8265): path presence is not verification — require a merge-base run
+
+**Status of this section**: amends §2 as originally accepted. The original
+"diff corroborates it → accept as verified" row is superseded by the three
+`yes` rows now in §2's table and in `judge.md`'s verdict table.
+
+As shipped, the `yes` check was a changed-files comparison: does a file with
+the referenced path appear in the diff? That answers *"did a test file with
+that name change?"* It never answers *"does that test fail without the fix?"*
+— which is the only thing `TDD: yes` asserts. The two come apart routinely. A
+test can be in the diff and still be vacuous, tautological, exercise a mirror
+of the logic defined inside the test file itself, or assert the buggy
+behavior.
+
+Four such tests surfaced in a single 2026-09-16/17 session, each caught only
+because a reviewer was separately told to run the test against the merge base
+by hand:
+
+1. **PR #8092, Test 12C** — the decisive case. The path *was* in the diff.
+   Run against the merge-base tree it reported **189/189 passing**, on a tree
+   where its own `grep -c 'gh issue pin'` target had zero occurrences: it
+   exercised a mirror helper defined inside the test file, never the shipped
+   code. A second mutation also stayed green, because the harness runs
+   `set -uo pipefail` with no `set -e` (tracked as #8093).
+2. **PR #8003** — a PR-body claim of "exactly 8 verdicts moved deny → allow,
+   every one text no shell will ever execute" measured as ~11 more, at least 7
+   executable: a live guard-hook security regression, green on 24 checks.
+3. **`rjwalters/repo` PR #433** — four safety-floor tests built their command
+   with `\$(` inside a single-quoted `printf` format, so they exercised the
+   *escaped* spelling while their names claimed the live one.
+4. **#8006** — a test greps `ls-tree` for a path the fixture committed
+   *before* modifying it; it passes even when the script under test commits
+   nothing.
+
+**The decision.** A `TDD: yes — <path>` claim must be *falsified*, not
+path-matched. Judge materialises the merge-base tree, lays the PR's test file
+on top of it, runs it, and requires it to **fail there, for the reason the fix
+addresses**. A test that passes at the merge base is blocking — contradicted
+as surely as a path that is not in the diff, because a test that passes
+without the fix did not drive the fix. A test that cannot be run in isolation
+is advisory *and must be said out loud*; silence is the hole this row closes.
+
+**Why this and not "better testing guidance."** `judge.md` already carries
+"Testing" criteria (adequate coverage, edge cases, descriptive names), and
+those are judgment calls. `TDD: yes` is different in kind: a falsifiable
+factual claim with a cheap mechanical falsifier the original check skipped.
+It is also the one thing an instructional TDD discipline structurally cannot
+provide — `obra/superpowers`' `test-driven-development` skill states the rule
+more forcefully than Loom does, but enforces it on the honor system, with no
+checker. Loom's advantage is that it *has* a checker; this closes the hole in
+it.
+
+**Cost.** One test run against one tree. `judge-reference.md`'s
+"Scoped Test Execution" cookbook already covered per-language scoped runs; the
+amendment adds a `tdd_merge_base_run()` recipe there (`git archive` into a
+temp tree — no checkout, no stash, no `git worktree`, safe while the PR branch
+is checked out elsewhere) that echoes VERIFIED / CONTRADICTED / UNRUNNABLE.
+Behavioral coverage — the shipped function extracted from the markdown and
+executed against git fixtures, including a reconstruction of the #8092 Test
+12C mirror shape — lives in
+`defaults/scripts/tests/test-judge-tdd-merge-base.sh`.
+
+**Unchanged by this amendment**: the `TDD: no` rows and the absent-line row
+keep their original advisory treatment. This narrows only the row that used to
+say "no further action needed."
+
 ## Consequences
 
 ### Positive
@@ -138,6 +207,12 @@ review as the loop; this closes only the narrower in-Builder gap).
   a lightweight `merge-pr.sh`-side grep as a backstop, mirroring the
   `Closes #N` / `Part of #N` contradiction check already there — deliberately
   **not** done here; see Alternatives.
+- **Since §4**, the `yes` path costs one extra test run per PR that claims it,
+  and some suites genuinely will not run against a bare merge-base tree
+  (live-forge fixtures, unported harnesses). That case is an explicit advisory
+  row rather than a block, which means the check degrades to the pre-#8265
+  strength exactly where it cannot execute — visibly, in the verdict, instead
+  of silently.
 - The `TDD: no` reason is currently free text, so a Builder could write an
   implausible reason for a diff that clearly touches new behavior. Judge is
   expected to apply the same judgment it already applies to every other PR
@@ -171,9 +246,12 @@ review as the loop; this closes only the narrower in-Builder gap).
 ## References
 
 - Source issue: [#5849](https://github.com/rjwalters/loom/issues/5849)
+- Amendment §4: [#8265](https://github.com/rjwalters/loom/issues/8265) (evidence: PR #8092 / #8093, PR #8003, `rjwalters/repo` PR #433, #8006)
 - Research: `docs/research/atomic-claude-evaluation.md` § 3 (from #5844/#5852)
 - Implementation: `defaults/.claude/commands/loom/builder-pr.md` §
   "Test-First Discipline (TDD line)", `defaults/.claude/commands/loom/judge.md`
-  § "Test-First (TDD) Claim Verification", `defaults/.claude/commands/loom/builder.md`
-  (pointer only)
+  § "Test-First (TDD) Claim Verification",
+  `defaults/.claude/commands/loom/judge-reference.md` § "Merge-Base Run for a
+  `TDD: yes` Claim", `defaults/.claude/commands/loom/builder.md` (pointer only)
+- Coverage: `defaults/scripts/tests/test-judge-tdd-merge-base.sh`
 - Related: `.loom/docs/build-gate.md` (why this is not a `buildGate` check)
