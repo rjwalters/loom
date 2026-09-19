@@ -13,13 +13,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#8207**: feat(pricing): deliver the model rate card as a resync-updatable defaults/pricing.json asset
 - **#8220**: feat(tokens): prefer the account that last warmed this (repo, role) prompt cache (#8146)
 - **#8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
+- **#8258**: fix(provision-hooks): quote ${CLAUDE_PROJECT_DIR} in project-level hook entries
 - **#8279**: fix(worktree): reconcile the dirty-marker filter with its shell twin (#8195)
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6544**: provision-hooks.sh emits unquoted ${CLAUDE_PROJECT_DIR} — every hook breaks when the project path contains a space
+- **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
 - **#8097**: Differential corpus covers 2 of 7 separator chars, omits comments entirely, and its generator is not committed
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 
@@ -28,13 +29,15 @@ Issues flagged as highest priority (`loom:urgent`).
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
-- **#6544**: provision-hooks.sh emits unquoted ${CLAUDE_PROJECT_DIR} — every hook breaks when the project path contains a space
 - **#8013**: test-guard-destructive-rm-scope.sh:338 '../ escaping the repo' assertion fails when the suite runs from a linked worktree (passes from the primary checkout)
 - **#8097**: Differential corpus covers 2 of 7 separator chars, omits comments entirely, and its generator is not committed
 - **#8136**: Reconcile PR #8097's differential-corpus gaps with #8125's BotLoginNormalisation work
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 - **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes)
 - **#8221**: Guard: same-command mktemp fast paths count only bare `NAME=` assignments — `export`/`declare`/`read`/`printf -v` rebinding slips the ambiguity rule
+- **#8248**: A green ratchet check goes stale when the baseline tightens under an in-flight PR — this is what broke main
+- **#8251**: dep-classify --check-defer: a parenthetical (Epic #M …) mention is extracted as a second blocker, wedging phase issues in DEFER forever
+- **#8254**: dep-recheck-fingerprint: --block-reason is an uncanonicalized hash input, and the dep-recheck post is no longer serialized (gaps from 2am's retired premise-recheck.sh)
 
 ## In Progress
 
@@ -44,16 +47,20 @@ Issues currently being built (`loom:building`).
 - **#8217**: guard: an unquoted heredoc body's $( ) substitution bypasses rm-scope (extract_rm_targets analogue of #8035)
 - **#8224**: health: extend #8163's root-scaled IPC budget to cli::status and the dashboard's serve.rs FETCH_TIMEOUT
 - **#8237**: Add a 'settled' allowlist category: shell we are deliberately keeping (47 scripts, 3,809 lines)
+- **#8242**: [#8058 Phase 3] per-model-class observability: tokens health/status per-class counts, .ranking columns if the endpoint exposes them
 - **#8244**: [#8055 Phase 1] loom-daemon sweep-experiment plan — deterministic, repo-stratified arm assignment that writes nothing
-- **#8245**: Champion epic/proposal escalation re-parks issues over a newer standing operator ruling (#6109, #4489 on 2026-09-16)
+- **#8250**: claim_reconciliation::reclaim_pr backfills loom:review-requested onto draft PRs (no isDraft check)
+- **#8252**: auto-update: don't defer an artifact FETCH behind the build-stampede guard (only rebuilds should wait)
+- **#8253**: dep-recheck-fingerprint: an already-MERGED PR's transient UNKNOWN mergeability still moves CONCLUSION_HASH (churns curator dep-recheck comments)
 - **#8270**: install-loom.sh fails on every fresh repo: 6 dangling intra-repo links after init (file-size-policy.md not shipped in defaults/docs; two ../../../.loom/docs links wrong for .loom/roles)
-- **#8280**: worktree.sh reuses a stale LOCAL feature/issue-N with no landed check — #5657's guard only covers the remote arm
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#8296**: fix(dep-classify): treat a `(Epic #M …)` parenthetical as annotation, not a blocker
+- **#8300**: docs+test(sweep-experiment): close out `plan` phase 1 — daemon-reference section + writes-nothing process test (#8244)
+- **#8301**: fix(auto-update): fetch a release artifact immediately, never behind the stampede gate
 
 ## Approved (Awaiting Merge)
 
@@ -63,7 +70,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#8207**: feat(pricing): deliver the model rate card as a resync-updatable defaults/pricing.json asset
 - **#8220**: feat(tokens): prefer the account that last warmed this (repo, role) prompt cache (#8146)
 - **#8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
+- **#8258**: fix(provision-hooks): quote ${CLAUDE_PROJECT_DIR} in project-level hook entries
 - **#8279**: fix(worktree): reconcile the dirty-marker filter with its shell twin (#8195)
+- **#8300**: docs+test(sweep-experiment): close out `plan` phase 1 — daemon-reference section + writes-nothing process test (#8244)
 
 ## Proposed
 
@@ -99,10 +108,13 @@ Issues carrying `loom:curated`.
 - **#8237**: Add a 'settled' allowlist category: shell we are deliberately keeping (47 scripts, 3,809 lines) *(curated)*
 - **#8242**: [#8058 Phase 3] per-model-class observability: tokens health/status per-class counts, .ranking columns if the endpoint exposes them *(curated)*
 - **#8244**: [#8055 Phase 1] loom-daemon sweep-experiment plan — deterministic, repo-stratified arm assignment that writes nothing *(curated)*
-- **#8245**: Champion epic/proposal escalation re-parks issues over a newer standing operator ruling (#6109, #4489 on 2026-09-16) *(curated)*
 - **#8248**: A green ratchet check goes stale when the baseline tightens under an in-flight PR — this is what broke main *(curated)*
+- **#8250**: claim_reconciliation::reclaim_pr backfills loom:review-requested onto draft PRs (no isDraft check) *(curated)*
+- **#8251**: dep-classify --check-defer: a parenthetical (Epic #M …) mention is extracted as a second blocker, wedging phase issues in DEFER forever *(curated)*
+- **#8252**: auto-update: don't defer an artifact FETCH behind the build-stampede guard (only rebuilds should wait) *(curated)*
+- **#8253**: dep-recheck-fingerprint: an already-MERGED PR's transient UNKNOWN mergeability still moves CONCLUSION_HASH (churns curator dep-recheck comments) *(curated)*
+- **#8254**: dep-recheck-fingerprint: --block-reason is an uncanonicalized hash input, and the dep-recheck post is no longer serialized (gaps from 2am's retired premise-recheck.sh) *(curated)*
 - **#8270**: install-loom.sh fails on every fresh repo: 6 dangling intra-repo links after init (file-size-policy.md not shipped in defaults/docs; two ../../../.loom/docs links wrong for .loom/roles) *(curated)*
-- **#8280**: worktree.sh reuses a stale LOCAL feature/issue-N with no landed check — #5657's guard only covers the remote arm *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -120,13 +132,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 5 |
+| Operator merge-risk holds | 6 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 8 |
-| In Progress (`loom:building`) | 8 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 5 |
-| Curated | 34 |
+| Ready (`loom:issue`) | 10 |
+| In Progress (`loom:building`) | 10 |
+| PRs awaiting review | 3 |
+| Approved PRs awaiting merge | 7 |
+| Curated | 37 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
