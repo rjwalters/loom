@@ -2694,24 +2694,38 @@ EOF
 }
 
 SI_REPO="$(mktemp -d)"; mkdir -p "$SI_REPO/.loom/logs"
+# SI_UNSET_SESSION — `-u KEY` args for every agent-session key THIS shell exports
+# (#8173). The suite itself routinely runs from INSIDE a Loom sweep, which exports
+# LOOM_SWEEP_*/LOOM_TERMINAL_ID/LOOM_ROLE; without stripping them those leak into
+# every case below and fail SI4, whose entire premise is a start with NO session
+# context -- a failure invisible from a clean shell, where the same suite is green.
+# The key pattern is READ OUT of the script under test (its own
+# LOOM_SESSION_CONTEXT_KEY_RE) rather than restated here, so this list cannot drift
+# from the detector it has to mirror. The literal after `:-` is the fallback for
+# when that read comes up empty: an empty pattern would make `grep -E` match every
+# line and unset the entire environment, so it must never be allowed to be empty.
+# SI1-SI3 are unaffected: they pass their own session assignments to the same
+# `env`, and assignments are applied after `-u`, so they still win.
+SI_SESSION_RE="$(sed -n "s/^LOOM_SESSION_CONTEXT_KEY_RE='\(.*\)'\$/\1/p" "$START_SCRIPT" | head -1)"
+SI_UNSET_SESSION="$(env | grep -E "${SI_SESSION_RE:-^(LOOM_SWEEP_[A-Za-z0-9_]*|LOOM_TERMINAL_ID|LOOM_ROLE)=}" | cut -d= -f1 | sed 's/^/-u /' | tr '\n' ' ')"
 si_run() {
     # $1 = scratch HOME; remaining args are extra env assignments consumed by
     # `env` before the script name.
     local home="$1"; shift
+    # SI_UNSET_SESSION is intentionally unquoted: it is a word list of `-u KEY`
+    # pairs, and quoting would pass it as one argument (empty when this shell
+    # carries no session keys, which `env` would then read as the command name).
+    # shellcheck disable=SC2086
     ( cd "$SI_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-        -u LOOM_MACHINE_CHECKOUT -u LOOM_WORKSPACE \
+        -u LOOM_MACHINE_CHECKOUT -u LOOM_WORKSPACE $SI_UNSET_SESSION \
         PATH="$SI_BIN:$PATH" HOME="$home" \
         LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_BIN="$FAKE_BIN" \
         LOOM_SOCKET_PATH="$home/.loom/loom-daemon.sock" \
         LOOM_AUTONOMY_MARKER="$home/.loom/autonomy-desired" \
         "$@" bash "$START_SCRIPT" --no-launchd 2>&1 )
 }
-SI_SESSION_ENV=(
-    LOOM_SWEEP_CLAIM_OWNED=6388
-    LOOM_TERMINAL_ID=daemon-sweep-issue-6388-abcdef
-    LOOM_ROLE=sweep-lifecycle
-    LOOM_RUNTIME=claude
-)
+SI_SESSION_ENV=( LOOM_SWEEP_CLAIM_OWNED=6388 LOOM_TERMINAL_ID=daemon-sweep-issue-6388-abcdef
+    LOOM_ROLE=sweep-lifecycle LOOM_RUNTIME=claude )
 
 # SI1. The incident shape: a real start from a session context with NO
 #      identity override is REFUSED (exit 1) before anything is written.
