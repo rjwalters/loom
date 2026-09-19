@@ -2,6 +2,7 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import {
+  ephemeralComputeEnvelope,
   hostHealthEnvelope,
   revokeHost,
   seedHost,
@@ -131,6 +132,140 @@ describe("POST /ingest — validation", () => {
     const rows = await recordsForHost("host-abc");
     expect(rows).toHaveLength(1);
     expect(rows[0]?.schema_version).toBe(2);
+  });
+});
+
+describe("POST /ingest — ephemeral_compute (Issue #8304, Phase 1 of #8257)", () => {
+  it("accepts a well-formed ephemeral_compute envelope and persists it to records", async () => {
+    const response = await callWorker(ingestRequest([ephemeralComputeEnvelope()], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: 1, host_id: "host-abc" });
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.kind).toBe("ephemeral_compute");
+    // Host-level, like `tokens.snapshot`/`host.health`: no repo/issue/sweep_id
+    // apply to a bare compute job (see `telemetry.ts`'s `extractRecordFields`).
+    expect(rows[0]?.repo).toBeNull();
+    expect(rows[0]?.issue).toBeNull();
+    expect(rows[0]?.sweep_id).toBeNull();
+    // No `visibility` field on the wire envelope — `decodeVisibility`'s
+    // fail-safe default applies, same as every other host-level kind.
+    expect(rows[0]?.visibility).toBe("private");
+
+    const payload = JSON.parse(rows[0]?.payload as string) as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      kind: "ephemeral_compute",
+      job_id: "job-abc123",
+      instance_id: "i-0123456789abcdef0",
+      region: "us-east-1",
+      instance_type: "c7i.4xlarge",
+      spot: true,
+      ami: "ami-0123456789abcdef0",
+      started_at: "2026-09-19T12:00:00Z",
+      ended_at: "2026-09-19T12:45:00Z",
+      wall_clock_sec: 2700,
+      estimated_cost_usd: 1.23,
+    });
+  });
+
+  it("a second record for the same job_id ingests as its own row (no job-level dedup at this layer)", async () => {
+    // Unlike `sweep.completed`/`sweep.outcome` (migrations/0002), there is no
+    // partial-unique-index dedup keyed on `job_id` — a launch-time record and
+    // a completion-time record for the same job are two distinct emissions
+    // (per 2am's `report_record()` call sites at launch and completion), and
+    // both must persist as separate rows for Phase 2/3 to reconstruct a
+    // job's full history.
+    const jobId = "job-shared-000";
+    const launch = ephemeralComputeEnvelope({ job_id: jobId, ended_at: null, wall_clock_sec: null, estimated_cost_usd: null });
+    const completion = ephemeralComputeEnvelope({ job_id: jobId });
+
+    const response = await callWorker(ingestRequest([launch, completion], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(200);
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows).toHaveLength(2);
+    expect(rows.every((r) => r.kind === "ephemeral_compute")).toBe(true);
+  });
+
+  it("rejects the whole batch when an ephemeral_compute envelope is missing envelope-level required fields", async () => {
+    const bad = ephemeralComputeEnvelope();
+    delete (bad as Record<string, unknown>).host_id;
+
+    const response = await callWorker(ingestRequest([bad], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(400);
+    expect(await recordsForHost("host-abc")).toHaveLength(0);
+  });
+
+  it("accepts a record that omits kind-specific fields (accept-with-gaps, not reject-whole-batch)", async () => {
+    // Deliberate decision (see `migrations/0003_ephemeral_compute.sql`'s
+    // header): whole-batch rejection stays scoped to the ENVELOPE contract
+    // (`schema_version`/`emitted_at`/`host_id`/`record.kind`, validated
+    // kind-agnostically in `telemetry.ts`). There is no per-kind required-
+    // field validation for any kind today, and `ephemeral_compute` does not
+    // introduce one: a launch-time record legitimately has no `ended_at`,
+    // `wall_clock_sec`, or `estimated_cost_usd` yet, so "incomplete" is a
+    // normal, expected state rather than a malformed payload.
+    const partial = {
+      schema_version: 1,
+      emitted_at: "2026-09-19T12:00:00Z",
+      host_id: "host-abc",
+      record: { kind: "ephemeral_compute", job_id: "job-partial-1" },
+    };
+
+    const response = await callWorker(ingestRequest([partial], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: 1, host_id: "host-abc" });
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows).toHaveLength(1);
+    const payload = JSON.parse(rows[0]?.payload as string) as Record<string, unknown>;
+    expect(payload).toEqual({ kind: "ephemeral_compute", job_id: "job-partial-1" });
+  });
+
+  // Migration `0003_ephemeral_compute.sql` adds no table — its whole content
+  // is the two indexes that make the chosen "generic `records` + JSON1
+  // extraction" shape queryable (see that migration's header comment for the
+  // decision). These assertions are what make the schema decision *tested*
+  // rather than merely written down: they fail if the migration is dropped,
+  // renamed, or rewritten to a different shape.
+  it("migration 0003 creates the (kind, emitted_at) and partial job_id expression indexes", async () => {
+    const { results } = await env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (?, ?) ORDER BY name",
+    )
+      .bind("idx_records_ephemeral_compute_job_id", "idx_records_kind_time")
+      .all();
+    expect((results as { name: string }[]).map((r) => r.name)).toEqual([
+      "idx_records_ephemeral_compute_job_id",
+      "idx_records_kind_time",
+    ]);
+  });
+
+  it("a per-job lookup uses the partial expression index rather than a full scan", async () => {
+    await callWorker(ingestRequest([ephemeralComputeEnvelope()], "Bearer abc-ingest-key"));
+
+    const { results } = await env.DB.prepare(
+      `EXPLAIN QUERY PLAN
+         SELECT id FROM records
+          WHERE kind = 'ephemeral_compute'
+            AND json_extract(payload, '$.job_id') = ?`,
+    )
+      .bind("job-abc123")
+      .all();
+    const plan = (results as { detail: string }[]).map((r) => r.detail).join(" | ");
+    expect(plan).toContain("idx_records_ephemeral_compute_job_id");
+
+    // …and the lookup itself returns the row, so the index is not merely
+    // present but actually usable for the Phase 2/3 per-job query shape.
+    const { results: rows } = await env.DB.prepare(
+      `SELECT json_extract(payload, '$.instance_id') AS instance_id
+         FROM records
+        WHERE kind = 'ephemeral_compute'
+          AND json_extract(payload, '$.job_id') = ?`,
+    )
+      .bind("job-abc123")
+      .all();
+    expect(rows).toEqual([{ instance_id: "i-0123456789abcdef0" }]);
   });
 });
 

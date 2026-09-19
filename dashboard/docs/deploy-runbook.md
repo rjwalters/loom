@@ -472,6 +472,75 @@ curl -sS -X POST "$BASE/admin/hosts/<host_id>/revoke" -H "authorization: Bearer 
 Takes effect on the next request. Other hosts are unaffected. Already-stored
 records are retained (revocation stops writes, it does not erase history).
 
+### Provisioning a non-daemon emitter (e.g. 2am's elastic-compute batch runner, Issue #8304)
+
+Every host provisioned so far in this runbook is a `loom-daemon` process
+reporting its own `sweep.*`/`tokens.snapshot`/`host.health` telemetry. Not
+every emitter fits that shape: 2am's elastic EDA batch runner launches and
+tears down short-lived cloud instances and reports `ephemeral_compute`
+records for them (job id, instance id, region, instance type, spot flag,
+AMI, start/end timestamps, wall clock, estimated cost) via the same wire
+envelope and the same `POST /ingest` endpoint — but there is no single
+`loom-daemon` host that "is" the fleet of ephemeral instances themselves.
+
+**Decision: provision one dedicated, synthetic `host_id` for the whole
+elastic-compute fleet** (e.g. `2am-elastic`, or `2am-elastic-<region>` if a
+later phase wants independent per-region revocation) — via exactly the same
+`POST /admin/hosts` call as step 8 above:
+
+```bash
+curl -sS -X POST "$BASE/admin/hosts" -H "authorization: Bearer $ADMIN" \
+  -H 'content-type: application/json' -d '{"host_id":"2am-elastic"}'
+```
+
+Why a synthetic id rather than binding to a "real" host:
+
+- **`handleIngest` has no hostless code path, by design** (`src/index.ts`):
+  every ingested row is stamped with `auth.hostId` — the identity bound to
+  the authenticated key — never a value read out of the envelope or record.
+  "Hostless ingest" is therefore not a schema question at all; it is a
+  provisioning question, and the answer is the same mechanism every other
+  emitter already uses.
+- **The ephemeral instances themselves never hold a key.** They are gone
+  (terminated) by the time anyone would rotate or revoke a credential for
+  them, so per-instance key provisioning would need infrastructure this
+  backend has no other reason to build. The always-on orchestrating
+  controller — the process that launches instances and calls
+  `report_record()` on their behalf — holds the one ingest key instead, the
+  same one-key-per-reporting-process model every `loom-daemon` host already
+  uses.
+- **The controller's own hostname is deliberately NOT the `host_id`.** The
+  controller may itself be replaced, redeployed, or run from infrastructure
+  with no stable hostname (a scheduled job, a container that gets rescheduled
+  onto different underlying hardware) — a synthetic, stable id survives that
+  churn without a re-provisioning step, and keeps the fleet's rows queryable
+  under one identity across controller replacements. It also keeps
+  `ephemeral_compute` rows visibly distinct in the dashboard and in direct D1
+  queries (`records.host_id`, `GET /admin/fleet-state`) from genuine named
+  fleet hosts — this is compute-*job* telemetry, not host telemetry, and the
+  job/instance/region fields already carry the identity that actually
+  matters for these records (see `.loom/docs/observability.md` §5d).
+
+On an **already-deployed** instance, re-run step 4's migration command once
+before the first `ephemeral_compute` batch arrives, so
+`migrations/0003_ephemeral_compute.sql`'s two indexes exist (ingest itself
+works without them — they only decide whether a per-job lookup is an index
+seek or a full scan):
+
+```bash
+npx wrangler d1 migrations apply loom-observability --remote
+npx wrangler d1 execute loom-observability --remote \
+  --command "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_records_%'"
+# expect idx_records_kind_time and idx_records_ephemeral_compute_job_id among them
+```
+
+Rotation and revocation both follow the exact same admin-hosts flow
+documented above ("Rotating an ingest key" / "Revoking a host") — no new
+mechanism, no code change. Redaction policy for this kind (no fields survive
+to `/public/*` — job/instance/region/cost detail is private-fleet spend, the
+same category `sweep.outcome`'s work-output fields are held back for) lives
+in `src/redaction.ts`'s `RECORD_FIELD_ALLOWLIST["ephemeral_compute"]` entry.
+
 ### Tuning retention
 
 `RETENTION_DAYS` and `MAX_RECORDS` in `wrangler.toml`'s `[vars]`; both are

@@ -174,6 +174,24 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     // never a raw copy. The authenticated `/api/*` surface keeps the full
     // path (that path skips redaction entirely).
   ],
+  // `ephemeral_compute` (Issue #8304, Phase 1 of #8257 — 2am's elastic EDA
+  // batch runner): job id, instance id, region, instance type, spot flag,
+  // AMI, start/end timestamps, wall clock, and estimated cost are all
+  // infrastructure-spend detail about a private operator's compute fleet —
+  // the same "workload detail" category `sweep.outcome`'s `tokens_in`/
+  // `lines_added`/etc. (#5357) and `failure_class`/`models_used` (#8056) are
+  // held back for above, plus a leak vector those don't have: an exact
+  // dollar cost and cloud-provider region/instance-type footprint. Decision:
+  // NO fields survive to `/public/*` for this kind — explicitly listed here
+  // (identical to `DEFAULT_ALLOWLIST`) rather than left to the unrecognized-
+  // kind fallback, so this is a stated policy decision, not an omission a
+  // future reader has to infer. Also unlike every repo-scoped kind above,
+  // `ephemeral_compute` carries no `repo`/`issue`/`sweep_id` at all
+  // (`extractRecordFields` leaves all three `undefined` for it — see
+  // `telemetry.ts`), so there is no repo-identifying field to redact down
+  // to even on the authenticated `/api/*` surface's own terms; the
+  // allowlist boundary here is about the compute-spend fields themselves.
+  ephemeral_compute: ["kind"],
 };
 
 /** One account row inside a `tokens.snapshot`, as the daemon sends it. Every
