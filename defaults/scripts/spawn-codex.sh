@@ -680,12 +680,11 @@ else
         # mark (#8058 Phase 2) stays selectable. `EFFECTIVE_MODEL` was already
         # resolved above (model-selection block); an unrecognized value is not
         # an error on the daemon side, it just degrades to class-less selection.
-        _selection_args=(--provider "$_account_provider" --workspace "$WORKSPACE" --export)
-        if [[ -n "$EFFECTIVE_MODEL" ]]; then
-            _selection_args+=(--model "$EFFECTIVE_MODEL")
-        fi
-        if ! _selection_output="$("$_daemon_bin" tokens select "${_selection_args[@]}" \
-            2>"$_selection_stderr_file")"; then
+        # shellcheck disable=SC2086  # ${VAR:+...} is a deliberate word-split:
+        # it expands to the two-token `--model <value>`, or to nothing at all.
+        # A model name cannot contain whitespace (validated above).
+        if ! _selection_output="$("$_daemon_bin" tokens select --provider "$_account_provider" \
+            --workspace "$WORKSPACE" --export ${EFFECTIVE_MODEL:+--model "$EFFECTIVE_MODEL"} 2>"$_selection_stderr_file")"; then
             log_error "Codex account selection failed:"
             cat "$_selection_stderr_file" >&2 || true
             rm -f "$_selection_stderr_file"
@@ -1100,18 +1099,12 @@ if [[ -f "$_classifier_lib" ]]; then
     _classifier_input="$(tail -c 65536 "$_stderr_file" 2>/dev/null || true)"
     _terminal_category="$(classify_error "$_classifier_input" "$_exit_code" codex)"
     _terminal_account="${LOOM_ACCOUNT_NAME:-${CODEX_PROFILE_NAME:-unknown}}"
-    if [[ ! "$_terminal_account" =~ ^[A-Za-z0-9._-]+$ ]]; then
-        _terminal_account="unknown"
-    fi
+    [[ "$_terminal_account" =~ ^[A-Za-z0-9._-]+$ ]] || _terminal_account="unknown"
+    # `none` when nothing was pinned, when the #5499 guard stripped the pin
+    # before exec (the account's own default ran and we cannot name it), or
+    # when the value is not record-safe — all three fail safe to account-wide.
     _terminal_model="${EFFECTIVE_MODEL:-none}"
-    if [[ "${CODEX_DROP_PINNED_MODEL:-false}" == "true" ]]; then
-        # The pinned model was stripped before exec (#5499) — the account's
-        # default ran, and we cannot name it. Fail safe to account-wide.
-        _terminal_model="none"
-    fi
-    if [[ -z "$_terminal_model" || ! "$_terminal_model" =~ ^[A-Za-z0-9._@-]+$ ]]; then
-        _terminal_model="none"
-    fi
+    [[ "${CODEX_DROP_PINNED_MODEL:-false}" != "true" && "$_terminal_model" =~ ^[A-Za-z0-9._@-]+$ ]] || _terminal_model="none"
     case "$_terminal_category" in
         # MODEL_CREDITS_EXHAUSTED (#5687) is listed so the allowlist stays a
         # complete mirror of the classifier's category set. The `codex` table
