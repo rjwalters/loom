@@ -63,7 +63,19 @@ impl Pr {
             || self.merge_state_status == "UNKNOWN"
     }
 
-    /// `<pr#>:<state>:<block-label|no-block-label>:<conflicting|mergeable>`.
+    /// `<pr#>:<state>:<block-label|no-block-label>:<conflicting|mergeable|n/a>`.
+    ///
+    /// The merge-state bucket is only evaluated for an **OPEN** PR, mirroring
+    /// [`Pr::blocks`]'s existing gate (#8253). Once a PR merges or closes,
+    /// GitHub stops computing mergeability and `mergeable`/`mergeStateStatus`
+    /// can read back as `UNKNOWN` non-deterministically — which
+    /// [`Pr::is_conflicting`]'s fail-safe (correctly) treats as conflicting for
+    /// an OPEN PR, but for an already-MERGED/CLOSED PR that reading is
+    /// meaningless noise, not a signal. Evaluating it anyway let the
+    /// meaningless flicker move `blockers()` — and therefore
+    /// `conclusion_hash` — with nothing substantive changed, churning
+    /// duplicate `curator:dep-recheck` comments on issues whose linked PR had
+    /// already merged.
     fn blocker_line(&self) -> String {
         format!(
             "{}:{}:{}:{}",
@@ -74,7 +86,9 @@ impl Pr {
             } else {
                 "no-block-label"
             },
-            if self.is_conflicting() {
+            if self.state != "OPEN" {
+                "n/a"
+            } else if self.is_conflicting() {
                 "conflicting"
             } else {
                 "mergeable"
