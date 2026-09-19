@@ -1659,11 +1659,41 @@ impl SweepRegistry {
                             // this sweep produced no PR, so we never yank the
                             // label out from under an in-flight PR's issue
                             // should `pr_number` ever be recorded on the entry.
-                            let produced_pr = self
-                                .entries
-                                .get(&sweep_id)
-                                .and_then(|info| info.pr_number)
-                                .is_some();
+                            let produced_pr_number =
+                                self.entries.get(&sweep_id).and_then(|info| info.pr_number);
+                            let produced_pr = produced_pr_number.is_some();
+                            // #4123 open-PR guard memo seed (Issue #8355). This
+                            // is exactly the ordinary shape of a successful
+                            // Builder run: the checkpoint is deleted on success
+                            // (see the phase-sample comment above), so a clean
+                            // exit that produced a PR lands in THIS branch, not
+                            // the Crashed one — and until now nothing here ever
+                            // told `probe_open_linked_pr`'s memo (#6788) about
+                            // the PR it just watched get created. That left the
+                            // memo cold for every issue+PR pair from the moment
+                            // its Builder sweep finished until the next time
+                            // ANYTHING happened to call `probe_open_linked_pr`
+                            // for that issue (a lease-renewal tick, a watchdog,
+                            // a work-finder re-dispatch) — sometimes hours
+                            // later. A cold memo has no fallback if that first
+                            // probe's live GraphQL+REST transports both fail
+                            // (e.g. a correlated rate-limit exhaustion across
+                            // both), so the #4123 dispatch guard falls open on
+                            // an issue whose PR is demonstrably still open —
+                            // exactly the incident behind this issue (#8170 /
+                            // PR #8329). Seeding here costs zero extra forge
+                            // calls: `info.pr_number` is state the daemon
+                            // already holds in memory the moment it reaps this
+                            // sweep. This narrows the guard's documented,
+                            // intentionally-retained fail-open window (see
+                            // `probe_open_linked_pr`'s doc comment) — it does
+                            // NOT remove it, and does not change the guard's
+                            // fail-open contract for a genuine, memo-less
+                            // outage.
+                            if let Some(pr) = produced_pr_number.and_then(|n| u32::try_from(n).ok())
+                            {
+                                self.record_open_pr_memo(issue, OpenPrProbe::Open(pr));
+                            }
                             // Hard-exclusion decline (Issue #7528). The
                             // #3823b restore below is CORRECT for the case it
                             // was written for and stays byte-for-byte

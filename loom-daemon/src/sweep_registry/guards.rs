@@ -776,7 +776,18 @@ impl SweepRegistry {
     /// invalidates it immediately (so a closed or merged PR never lingers for
     /// the rest of [`OPEN_PR_MEMO_FRESH`]); [`OpenPrProbe::ProbeFailed`] leaves
     /// it untouched — an unanswered probe is not evidence either way.
-    fn record_open_pr_memo(&self, issue: u32, verdict: OpenPrProbe) {
+    ///
+    /// `pub(crate)` (Issue #8355) so the reaper's post-exit handling
+    /// (`reaper.rs`'s checkpoint-less clean-exit branch) can seed a **verified**
+    /// `Open(pr)` entry the instant it reaps a sweep that produced a PR — using
+    /// `info.pr_number`, state the daemon already holds in memory — rather than
+    /// only ever recording an answer as a side effect of a live forge probe.
+    /// See that call site's doc comment for why: without it, the very first
+    /// post-completion probe of a normal (non-crashed) issue+PR pair is always
+    /// cold, with no memo to fall back on if a later double-transport failure
+    /// (the #6058/#6788 fail-open window) strikes before anything else happens
+    /// to re-probe that issue.
+    pub(crate) fn record_open_pr_memo(&self, issue: u32, verdict: OpenPrProbe) {
         if !open_pr_memo_enabled() {
             return;
         }

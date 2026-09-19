@@ -1014,6 +1014,93 @@ fn reap_restores_label_for_orphaned_clean_exit_without_pr() {
     );
 }
 
+/// Issue #8355: when the reaper's orphaned-claim branch discovers a
+/// checkpoint-less clean exit that DID produce a PR (`info.pr_number`
+/// already known in memory), it must immediately seed the #4123 guard's
+/// verified-open-PR memo (#6788) with that answer — at zero extra forge
+/// cost — rather than leaving the memo cold until the next unrelated probe.
+/// This is the fix for the incident behind this issue: issue #8170's
+/// Builder sweep produced PR #8329 and exited cleanly (no checkpoint,
+/// landing in exactly this branch), but nothing recorded that PR into the
+/// guard's memo, so the FIRST re-probe of issue #8170 — potentially hours
+/// later — was cold and had no verified fallback when GraphQL and REST
+/// both failed under a correlated rate-limit exhaustion, letting the
+/// dispatch guard fall open onto an issue with a still-open, Judge-approved
+/// PR. Reproduces that shape structurally (no live forge round trip
+/// needed) and asserts the memo is warm immediately after `reap_once`.
+#[test]
+fn reap_seeds_open_pr_memo_when_pr_produced_without_checkpoint() {
+    let dir = tempdir().unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    let fake_gh = dir.path().join("fake-gh.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+        gh_log.display()
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
+    let mut registry = SweepRegistry::new(config);
+
+    let sweep_id = "sweep-issue-8170-test".to_string();
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(8170),
+            pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(8170),
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: Some(8329), // PR already known in memory at reap time
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+
+    // Sanity: before the reap, the memo has nothing for this issue.
+    assert!(registry.fresh_open_pr_memo(8170, Utc::now()).is_none());
+
+    // No checkpoint file exists -> Exited branch -> orphaned-claim recovery,
+    // the branch this fix's memo seed lives in.
+    let changed = registry.reap_once();
+    assert!(changed >= 1);
+
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(matches!(info.state, SweepState::Exited { .. }));
+
+    // The label restore must NOT fire (a PR was produced)...
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !gh_calls.contains("--remove-label loom:building"),
+        "expected reap_once to NOT restore the label when a PR was produced; \
+             got gh invocations: {gh_calls:?}"
+    );
+    // ...but the memo MUST now be warm with the verified PR, at zero extra
+    // forge calls (the fake `gh` only ever saw label-flip-shaped commands,
+    // if any at all).
+    let memo = registry
+        .fresh_open_pr_memo(8170, Utc::now())
+        .expect("expected reap_once to seed the open-PR memo for issue #8170 from info.pr_number");
+    assert_eq!(memo.pr, 8329);
+}
+
 /// Issue #3827: a cancelled daemon-owned Issue sweep that never opened a
 /// PR must have its pre-dispatch loom:building claim restored to loom:issue
 /// by `finish_cancel` — mirroring the reaper's clean-exit recovery (#3823b).
