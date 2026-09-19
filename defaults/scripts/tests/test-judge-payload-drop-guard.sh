@@ -119,7 +119,7 @@ pass "extracted the shipped DIRTY-rebase block (with PRE_REBASE_AHEAD) from judg
 # agent to fill in -- replace it with a real value so the block is runnable,
 # leaving everything else byte-for-byte as shipped.
 FENCE_SRC="$(printf '%s\n' "$FENCE_SRC" | sed '1s/^PR_NUMBER=<number>$/PR_NUMBER=999/')"
-if [[ "$(printf '%s\n' "$FENCE_SRC" | head -1)" != "PR_NUMBER=999" ]]; then
+if [[ "${FENCE_SRC%%$'\n'*}" != "PR_NUMBER=999" ]]; then
     echo "FATAL: judge.md's DIRTY-rebase fence no longer starts with 'PR_NUMBER=<number>' -- update this test's substitution" >&2
     exit 1
 fi
