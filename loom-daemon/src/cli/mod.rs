@@ -16,6 +16,7 @@ pub(crate) mod dispatch;
 pub(crate) mod dispatch_backoff;
 pub(crate) mod fleet_experiment;
 pub(crate) mod health;
+pub(crate) mod inflight;
 pub(crate) mod lease_ensure;
 pub(crate) mod legacy_script_cmds;
 mod merge_pr_labels;

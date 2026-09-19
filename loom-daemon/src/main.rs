@@ -896,6 +896,16 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Fleet-visible registry of long-running verification commands (issue
+    /// #8268): claim a (command, tree, branch) fingerprint before launching a
+    /// suite so a sibling agent or a coordinator can see it is already in
+    /// flight instead of running a second copy. Pure on-disk state — no
+    /// running daemon required.
+    Inflight {
+        #[command(subcommand)]
+        action: cli::inflight::InflightAction,
+    },
+
     /// Model-cost experiment instrumentation for `/loom:sweep` (issue #3725;
     /// native port of `loom_tools.sweep_experiment`, #4275). Backs
     /// `sweep-experiment.sh`.
@@ -2446,6 +2456,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
         }
         Commands::ScriptPorts(cmd) => cmd.run(),
         Commands::Lease { action } => action.run(),
+        Commands::Inflight { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
             phase,
