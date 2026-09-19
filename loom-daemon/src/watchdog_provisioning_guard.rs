@@ -372,6 +372,15 @@ pub fn spawn_watchdog_provisioning_guard_task(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    //! Every test here that mutates the process-global `LOOM_SOCKET_PATH` env
+    //! var (the `run_pass` group below) shares the crate-wide
+    //! `loom_socket_path_env` NAMED `#[serial]` key with
+    //! `daemon_service.rs`'s `resolve_paths_tests` and
+    //! `daemon_heartbeat.rs`'s socket-path tests (#8077). Keep it named: a
+    //! bare `#[serial]` takes a different, independent lock and would not
+    //! exclude those modules — the #6177 mismatch shape. The
+    //! enable/interval-precedence tests mutate different env vars and stay on
+    //! the default key on purpose.
     use super::*;
     use serial_test::serial;
     use std::fs;
