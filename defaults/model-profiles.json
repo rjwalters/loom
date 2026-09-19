@@ -1,0 +1,20 @@
+{
+  "zai-flash": {
+    "model": "glm-5.3-flash",
+    "providers": {
+      "pi": "zai",
+      "opencode": "zai-coding-plan"
+    },
+    "credentialEnv": "ZAI_API_KEY",
+    "effort": "max",
+    "allowedEfforts": [
+      "low",
+      "high",
+      "max"
+    ],
+    "credentialTargets": {
+      "pi": "ZAI_API_KEY",
+      "opencode": "ZHIPU_API_KEY"
+    }
+  }
+}

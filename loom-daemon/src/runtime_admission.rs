@@ -382,6 +382,8 @@ const BUNDLED_RUNTIME_MANIFESTS: &[(&str, &str)] = &[
     ("claude", include_str!("../../defaults/runtimes/claude.json")),
     ("codex", include_str!("../../defaults/runtimes/codex.json")),
     ("aider", include_str!("../../defaults/runtimes/aider.json")),
+    ("pi", include_str!("../../defaults/runtimes/pi.json")),
+    ("opencode", include_str!("../../defaults/runtimes/opencode.json")),
 ];
 
 /// Look up the bundled fallback manifest contents for `runtime`, if the
@@ -422,6 +424,40 @@ fn roots(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
     (roles.join("roles"), runtimes.join("runtimes"), scripts.join("scripts"))
 }
 
+/// Shared runtime selection, without capability or executable admission.
+/// The worker seam and scheduler must resolve the same per-role binding.
+pub fn resolve_binding(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+) -> Result<(String, RuntimeSource), RuntimeRejection> {
+    let canonical = canonical_role(role).ok_or_else(|| RuntimeRejection {
+        role: role.into(),
+        runtime: nonempty(explicit).unwrap_or_else(|| BUILTIN_RUNTIME.into()),
+        source: RuntimeSource::Explicit,
+        unmet_capabilities: vec![],
+        reason: "unknown role".into(),
+    })?;
+    let (role_config, default_config) =
+        config_runtime(root, canonical).map_err(|reason| RuntimeRejection {
+            role: canonical.into(),
+            runtime: nonempty(explicit).unwrap_or_else(|| BUILTIN_RUNTIME.into()),
+            source: RuntimeSource::RoleConfig,
+            unmet_capabilities: vec![],
+            reason,
+        })?;
+    let env_name = format!("LOOM_RUNTIME_{}", canonical.replace('-', "_").to_ascii_uppercase());
+    let role_env = std::env::var(env_name).ok();
+    let global_env = std::env::var("LOOM_RUNTIME").ok();
+    Ok(choose_runtime(
+        explicit,
+        role_env.as_deref(),
+        global_env.as_deref(),
+        role_config,
+        default_config,
+    ))
+}
+
 pub fn resolve_and_admit(
     root: &Path,
     role: &str,
@@ -441,47 +477,17 @@ pub fn resolve_and_admit(
     } else {
         canonical
     };
-    let env_name = format!("LOOM_RUNTIME_{}", canonical.replace('-', "_").to_ascii_uppercase());
-    // `roles`/`role_manifest` computed before runtime selection (#6201): the
-    // role manifest path depends only on `root`/`lookup_role`, never on the
-    // resolved runtime, so the best-effort `suggestedWorkerType` peek below
-    // (observability only — see `role_suggested_worker_type`'s doc comment
-    // for why this deliberately does NOT feed `choose_runtime`) can run
-    // before selection. `runtimes`/`scripts` are still resolved here too
-    // (unchanged from before) since they are equally runtime-independent;
-    // only `runtime_manifest`/`adapter` (which DO depend on the chosen
-    // runtime) are computed after `choose_runtime`.
     let (roles, runtimes, scripts) = roots(root);
     let role_manifest = roles.join(format!("{lookup_role}.json"));
     let role_suggested = role_suggested_worker_type(&role_manifest);
-    // A malformed `runtimes.roles` map fails closed for EVERY role, even one
-    // whose own key is spelled correctly and even under an explicit override:
-    // the config tier is the thing that is broken, and silently honouring the
-    // rest of a map with an unknown role key is exactly the "silently ignored"
-    // behaviour this rejects.
-    let (role_config, default_config) = match config_runtime(root, canonical) {
-        Ok(pair) => pair,
-        Err(reason) => {
-            return Err(RuntimeRejection {
-                role: canonical.to_string(),
-                runtime: nonempty(explicit).unwrap_or_else(|| BUILTIN_RUNTIME.into()),
-                source: RuntimeSource::RoleConfig,
-                unmet_capabilities: vec![],
-                reason,
-            });
-        }
-    };
-    let role_env = std::env::var(&env_name).ok();
-    let global_env = std::env::var("LOOM_RUNTIME").ok();
-    let (runtime, source) = choose_runtime(
-        explicit,
-        role_env.as_deref(),
-        global_env.as_deref(),
-        role_config,
-        default_config,
-    );
+    let (runtime, source) = resolve_binding(root, canonical, explicit)?;
     let runtime_manifest = runtimes.join(format!("{runtime}.json"));
-    let adapter = scripts.join(format!("spawn-{runtime}.sh"));
+    let adapter = if crate::worker_spawn::is_native(&runtime) {
+        // Native adapters are compiled into the deciding executable, not shell files.
+        std::env::current_exe().unwrap_or_default()
+    } else {
+        scripts.join(format!("spawn-{runtime}.sh"))
+    };
 
     let reject = |reason: String, unmet_capabilities: Vec<String>| RuntimeRejection {
         role: canonical.to_string(),

@@ -346,6 +346,13 @@ pub(super) fn reconcile_unpinned_model_with_runtime(
     if model_source != SHIPPED_DEFAULT_MODEL_SOURCE {
         return (model, model_source);
     }
+    if crate::worker_spawn::is_native(runtime) {
+        // Native adapters resolve their model profile; never inherit a Claude alias.
+        return (
+            String::new(),
+            format!("{SHIPPED_DEFAULT_MODEL_SOURCE} (model profile for {runtime})"),
+        );
+    }
     let Some(reason) = crate::sweep_registry::model_runtime_mismatch(runtime, &model) else {
         return (model, model_source);
     };

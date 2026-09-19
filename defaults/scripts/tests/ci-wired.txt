@@ -140,7 +140,6 @@ test-loom-daemon-quiesce.sh
 test-loom-daemon-start.sh
 test-loom-daemon-update.sh
 test-loom-daemon-stop.sh
-test-loom-dispatcher.sh
 test-loom-status.sh
 test-mcp-config.sh
 test-mcp-pnpm-selfrepair.sh
@@ -197,8 +196,6 @@ test-run-ci-suites-serial-lane.sh
 test-run-job.sh
 test-safe-stash-pop.sh
 test-safehoused-service.sh
-test-spawn-generic.sh
-test-spawn-worker.sh
 test-stale-claim-standdown-suppression.sh
 test-sweep-auto-stack.sh
 test-sweep-checkpoint.sh

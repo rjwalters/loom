@@ -55,6 +55,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Launch a worker through a native harness adapter or a legacy runtime.
+    SpawnWorker(loom_daemon::worker_spawn::WorkerArgs),
     /// Initialize a Loom workspace in a target repository
     Init {
         /// Target workspace directory (must be a git repository)
@@ -2508,6 +2510,13 @@ fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Tokens { action } => handle_tokens_command(action),
         Commands::Accounts { action, workspace } => handle_accounts_command(action, &workspace),
         Commands::ClaudeConfig { action } => handle_claude_config_command(action),
+        Commands::SpawnWorker(args) => {
+            if let Err(error) = loom_daemon::worker_spawn::run(args) {
+                eprintln!("{}", error.message);
+                std::process::exit(error.code);
+            }
+            Ok(())
+        }
         Commands::AgentSpawn {
             role,
             name,
@@ -2610,35 +2619,15 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("PeerClaims is handled in main() before handle_cli_command")
         }
-        Commands::Quarantine { .. } => {
-            // Routed directly in `main()` (it needs the async runtime for the
-            // socket round-trip), never dispatched through this sync handler.
-            unreachable!("Quarantine is handled in main() before handle_cli_command")
-        }
-        Commands::DispatchBackoff { .. } => {
-            // Routed directly in `main()` (it needs the async runtime for the
-            // socket round-trip), never dispatched through this sync handler.
-            unreachable!("DispatchBackoff is handled in main() before handle_cli_command")
-        }
-        Commands::NoopCooldown { .. } => {
-            // Routed directly in `main()` (it needs the async runtime for the
-            // socket round-trip), never dispatched through this sync handler.
-            unreachable!("NoopCooldown is handled in main() before handle_cli_command")
-        }
-        Commands::Dispatch { .. } => {
-            // Routed directly in `main()` (it needs the async runtime for the
-            // socket round-trip), never dispatched through this sync handler.
-            unreachable!("Dispatch is handled in main() before handle_cli_command")
-        }
-        Commands::Cancel { .. } => {
-            // Routed directly in `main()` (it needs the async runtime for the
-            // socket round-trip), never dispatched through this sync handler.
-            unreachable!("Cancel is handled in main() before handle_cli_command")
-        }
-        // Routed directly in `main()`, which has the async runtime these need
-        // (socket round-trips; for `serve`, an HTTP listener too). They never
-        // reach this sync handler.
-        Commands::Watch { .. } | Commands::Restart(..) | Commands::Serve { .. } => {
+        // Async commands are dispatched by main before reaching this sync handler.
+        Commands::Quarantine { .. }
+        | Commands::DispatchBackoff { .. }
+        | Commands::NoopCooldown { .. }
+        | Commands::Dispatch { .. }
+        | Commands::Cancel { .. }
+        | Commands::Watch { .. }
+        | Commands::Restart(..)
+        | Commands::Serve { .. } => {
             unreachable!("handled in main() before handle_cli_command")
         }
         Commands::Init {

@@ -249,6 +249,7 @@ pub mod watch_registry;
 pub mod watchdog;
 pub mod watchdog_provisioning_guard;
 pub mod work_finder;
+pub mod worker_spawn;
 pub mod workspace_pool;
 pub mod workspace_registry;
 pub mod worktree_activity;

@@ -1,0 +1,13 @@
+{
+  "runtime": "opencode",
+  "tier": 3,
+  "tierLabel": "experimental native adapter",
+  "capabilities": {
+    "mcp": "no",
+    "subagents": "no",
+    "hooks": "no",
+    "skills": "partial",
+    "worktreeIsolation": "no"
+  },
+  "note": "Native Rust launch adapter. OpenCode supports MCP, but Loom MCP provisioning and guard parity are not verified by this integration; no MCP-dependent role is admitted. Builder, Doctor and sweep remain blocked. Free-form prompts and roles without capability requirements support controlled trials."
+}
