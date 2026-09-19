@@ -2729,6 +2729,12 @@ would false-positive constantly on ordinary review prose. The bar is a
 habit: before writing a sentence that states a fact about code or behavior,
 ask whether you ran something to know it, and say so either way.
 
+**A role-prompt or operator-dispatch-brief PR is a related, flaggable case**:
+one that names neither the pressure-test scenario it was run against nor
+which existing rules were checked in the conflict audit is missing
+verification for the same reason an unmeasured claim above is — see
+`.loom/docs/role-prompt-authoring.md` → "Verification".
+
 ## Handling Minor Concerns
 
 When you identify issues during evaluation, take concrete action - never leave concerns as "notes for future" without creating an issue.

@@ -1307,6 +1307,14 @@ Read the full review, not just individual comments; check what the reviewer alre
 
 Address exactly what was requested — no new features or refactoring beyond the feedback (see "Scope Discipline"). Keep commits focused and well-described, and run tests after each change.
 
+### Fixing a Role Prompt or Dispatch Brief
+
+If the feedback you're addressing is on a role prompt (`.loom/roles/*.md`) or
+an operator dispatch brief, don't just patch the wording — pressure-test the
+fixed version against the scenario that exposed the defect and audit it
+against rules it can collide with before pushing. See
+`.loom/docs/role-prompt-authoring.md`.
+
 ### Communicate Clearly
 
 Comment on the PR when pushing fixes ("Addressed: formatting, added tests for edge cases"), reference the specific review comments you addressed, explain anything you could not address, and always re-request review.

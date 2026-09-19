@@ -235,6 +235,7 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   [`.loom/docs/runtime-adapters.md`](.loom/docs/runtime-adapters.md).
 - **File size policy** — over-threshold files, agent-facing markdown, and each role's whole prompt prefix are ratcheted (frozen at current size; may shrink, not grow), NOT refactor-on-touch: [`.loom/docs/file-size-policy.md`](.loom/docs/file-size-policy.md).
 - **Language policy** — new executable logic is a `loom-daemon` subcommand, NOT a new `.sh`; a new script needs a category + reason in `scripts/shell-allowlist.txt` (CI-enforced, `contract` is baseline-only): [`.loom/docs/shell-language-policy.md`](.loom/docs/shell-language-policy.md).
+- **Role-prompt authoring discipline** — pressure-test a non-trivial role-prompt/operator-dispatch-brief change against a resisting scenario, audit it for rule conflicts, and load-gate by default: [`.loom/docs/role-prompt-authoring.md`](.loom/docs/role-prompt-authoring.md).
 - **Custom roles** — add `.loom/roles/<name>.md` (and optional `<name>.json`).
 - **Branch rulesets & repository settings** — set at install time or via `./scripts/install/setup-branch-protection.sh` / `setup-repository-settings.sh`.
 - **Guard hooks** — `PreToolUse` guards block/ask on destructive commands and
