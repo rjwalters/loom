@@ -403,6 +403,15 @@ pub fn write_install_metadata(workspace_path: &Path, metadata: &LoomMetadata, de
 /// Attempts to run `.loom/scripts/verify-install.sh generate --quiet` to create
 /// `.loom/manifest.json` with SHA-256 checksums of all installed files.
 /// This is non-fatal - manifest generation failure doesn't prevent installation.
+///
+/// On failure the captured stderr is echoed after the warning (#8270). The bare
+/// `(exit N)` form this replaced named no cause, and the install flows that call
+/// it — `install-loom.sh` in particular — delete their worktree afterwards, so a
+/// report of "Manifest generation failed (non-fatal)" arrives with the evidence
+/// already gone and is not reproducible after the fact. `verify-install.sh`
+/// always explains itself on stderr ("No tracked files found", "No SHA-256
+/// command found", a `set -e` abort's own message); relaying that text is the
+/// difference between a diagnosable warning and an unactionable one.
 pub fn generate_manifest(workspace_path: &Path) {
     let script = workspace_path
         .join(".loom")
@@ -427,6 +436,10 @@ pub fn generate_manifest(workspace_path: &Path) {
                     "Warning: Manifest generation failed (exit {})",
                     output.status.code().unwrap_or(-1)
                 );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                for line in stderr.lines().filter(|l| !l.trim().is_empty()) {
+                    eprintln!("  verify-install.sh: {line}");
+                }
             }
         }
         Err(e) => {

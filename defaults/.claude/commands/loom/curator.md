@@ -326,9 +326,9 @@ be careful:
 This is the same discipline the base-branch trap requires: a fact about the
 repository read once at session start (your local checkout, or anything in
 your own context) is a snapshot, not a live fact, and drifts further from
-reality the longer a sweep runs. See [`troubleshooting.md` → "The base-branch
-trap: a session-start git snapshot is not evidence about the
-present"](../../../.loom/docs/troubleshooting.md) for the general form of this check
+reality the longer a sweep runs. See `.loom/docs/troubleshooting.md` → "The
+base-branch trap: a session-start git snapshot is not evidence about the
+present" for the general form of this check
 (three refs that must agree: local, remote-tracking after an explicit fetch,
 and the forge's own view) and why a reported divergence should carry the live
 command output that established it.
