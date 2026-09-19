@@ -359,6 +359,93 @@ fn model_classes_share_phase_ones_vocabulary_where_it_applies() {
     assert_eq!(model_class_of("gpt 5 codex"), None);
 }
 
+/// #8380: a `model@…` suffix — Loom's own `model@effort` rung grammar, or a
+/// pinned `model@date` ID — names an effort or a snapshot of the SAME model,
+/// never a second credit pool, so it must collapse onto the bare model's class.
+/// Before this, `normalize_class` rejected `@` outright and every suffixed
+/// model degraded to the account-wide path, costing a pinning fleet the whole
+/// of Phase 2.
+#[test]
+fn a_suffixed_model_collapses_onto_its_bare_class() {
+    // The issue's own example, and the effort-grammar sibling.
+    assert_eq!(model_class_of("gpt-5-codex@2026-01-01"), model_class_of("gpt-5-codex"));
+    assert_eq!(model_class_of("gpt-5-codex@high"), model_class_of("gpt-5-codex"));
+    assert_eq!(model_class_of("gpt-5-codex@2026-01-01").as_deref(), Some("gpt-5-codex"));
+    // Trim/lowercase still apply to the base half, and only the FIRST `@`
+    // splits — same rule as `model_tiers::base_of` / `model_family`.
+    assert_eq!(model_class_of(" GPT-5-Codex@High ").as_deref(), Some("gpt-5-codex"));
+    assert_eq!(model_class_of("gpt-5-codex@a@b").as_deref(), Some("gpt-5-codex"));
+    // A Claude-family suffixed ID keeps collapsing through Phase 1's
+    // vocabulary, not through the fallback.
+    assert_eq!(model_class_of("claude-opus-5@xhigh").as_deref(), Some("opus"));
+
+    // Fail-safe edges: an empty base is still no class (never the effort), and
+    // a value that is unrecognized for some OTHER reason stays unrecognized.
+    assert_eq!(model_class_of("@high"), None);
+    assert_eq!(model_class_of("  @2026-01-01"), None);
+    assert_eq!(model_class_of("gpt-5\"codex@high"), None);
+}
+
+/// The production consequence of the collapse above: a class hold written from
+/// a pinned/suffixed ID blocks the bare alias (and vice versa), because both
+/// resolve to one `class_cooldowns` key. The sibling class is untouched.
+#[test]
+fn a_hold_written_from_a_pinned_id_blocks_the_bare_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![descriptor(AccountProvider::Codex, "a")];
+    record_terminal_for_model_at(
+        tmp.path(),
+        &accounts[0].id,
+        TerminalClassification::ModelCreditsExhausted,
+        Some("gpt-5-codex@2026-01-01"),
+        "adapter_v2",
+        100,
+    )
+    .unwrap();
+
+    // The hold is keyed by the BARE class, not the pinned string.
+    let entry = account_health(tmp.path(), &accounts[0].id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entry.class_cooldowns.keys().collect::<Vec<_>>(),
+        vec!["gpt-5-codex"],
+        "{:?}",
+        entry.class_cooldowns
+    );
+
+    // …so selection blocks the bare alias, the pin it was written from, and a
+    // differently-suffixed form of the same model alike.
+    for held in ["gpt-5-codex", "gpt-5-codex@2026-01-01", "gpt-5-codex@high"] {
+        assert!(
+            select_healthy_for_model_at(
+                tmp.path(),
+                AccountProvider::Codex,
+                &accounts,
+                Some(held),
+                101
+            )
+            .is_err(),
+            "{held} must be blocked by the collapsed hold"
+        );
+    }
+    // A genuinely different class is still selectable — the narrowing did not
+    // widen into an account-wide outage.
+    assert_eq!(
+        select_healthy_for_model_at(
+            tmp.path(),
+            AccountProvider::Codex,
+            &accounts,
+            Some("gpt-5-mini@high"),
+            101
+        )
+        .unwrap()
+        .id
+        .name,
+        "a"
+    );
+}
+
 /// A state file written before #8058 Phase 2 (no `class_cooldowns` key)
 /// must still read back at the unchanged `SCHEMA_VERSION`, as account-wide
 /// as the day it was written — the field is additive and optional, exactly

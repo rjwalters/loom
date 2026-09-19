@@ -122,8 +122,15 @@ fn provider_health_feedback_with_no_model_stays_account_wide() {
 }
 
 /// AC #2: an UNRECOGNIZED model name (fails [`health::model_class_of`]'s
-/// normalization — here, an embedded `@` pinned-ID separator) also
-/// degrades to the account-wide hold rather than guessing a class.
+/// normalization — here, a stray quote, which the `model=` charset would
+/// never emit but the parser deliberately does not validate) degrades to the
+/// account-wide hold rather than guessing a class.
+///
+/// This used to be exercised with `model=gpt-5@pinned`; #8380 made the `model@…`
+/// suffix *recognized* (it collapses onto the bare model's class — see
+/// `provider_health_feedback_with_a_pinned_model_narrows_to_the_bare_class`
+/// below), so the fail-safe path needs an example that is still genuinely
+/// unclassifiable.
 #[test]
 fn provider_health_feedback_with_unrecognized_model_stays_account_wide() {
     let dir = tempdir().unwrap();
@@ -133,7 +140,7 @@ fn provider_health_feedback_with_unrecognized_model_stays_account_wide() {
         72,
         "profile-c",
         "# LOOM_TERMINAL_RESULT v=2 provider=codex account=profile-c \
-         category=MODEL_CREDITS_EXHAUSTED exit_code=1 model=gpt-5@pinned\n",
+         category=MODEL_CREDITS_EXHAUSTED exit_code=1 model=gpt-5\"pinned\n",
     );
 
     registry.apply_provider_health_feedback(&sweep_id, Some(1));
@@ -153,5 +160,43 @@ fn provider_health_feedback_with_unrecognized_model_stays_account_wide() {
     assert!(
         health.cooldown_until.is_some(),
         "an unrecognized model name still degrades to the account-wide cooldown"
+    );
+}
+
+/// #8380: a PINNED/suffixed `model@…` value — the shape `spawn-codex.sh`'s
+/// `model=` charset deliberately keeps `@` for — narrows to the bare model's
+/// class instead of degrading to the account-wide hold. Without this, a fleet
+/// that pins suffixed model IDs got zero benefit from #8058 Phase 2: every
+/// credit exhaustion was still a whole-account outage.
+#[test]
+fn provider_health_feedback_with_a_pinned_model_narrows_to_the_bare_class() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let sweep_id = insert_codex_entry_with_log(
+        &mut registry,
+        73,
+        "profile-d",
+        "# LOOM_TERMINAL_RESULT v=2 provider=codex account=profile-d \
+         category=MODEL_CREDITS_EXHAUSTED exit_code=1 model=gpt-5-codex@2026-01-01\n",
+    );
+
+    registry.apply_provider_health_feedback(&sweep_id, Some(1));
+
+    let id = AccountId {
+        provider: AccountProvider::Codex,
+        name: "profile-d".into(),
+    };
+    let health = tokens_pool::account_health(dir.path(), &id)
+        .unwrap()
+        .expect("health record written");
+    assert_eq!(
+        health.class_cooldowns.keys().collect::<Vec<_>>(),
+        vec!["gpt-5-codex"],
+        "the pinned ID is keyed by its bare class, never by the pin: {:?}",
+        health.class_cooldowns
+    );
+    assert!(
+        health.cooldown_until.is_none(),
+        "a class-scoped hold must not also set the account-wide cooldown"
     );
 }

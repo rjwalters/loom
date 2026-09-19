@@ -255,8 +255,17 @@ impl AccountHealth {
 ///
 /// Deliberately permissive-then-rejecting: trims, lowercases, and requires the
 /// result to be a non-empty run of `[a-z0-9._-]`. Anything else — empty,
-/// whitespace, a stray quote, an embedded space — reads as **no class**, which
-/// is the account-wide (fail-safe) answer on both the write and the read side.
+/// whitespace, a stray quote, an embedded space, an unstripped `@` suffix —
+/// reads as **no class**, which is the account-wide (fail-safe) answer on both
+/// the write and the read side.
+///
+/// This is the **key** normalizer, not the model classifier: it is applied to
+/// values that are already a class (a stored `class_cooldowns` key, a class
+/// handed to one of the `..._for_class_at` entry points). Callers holding a raw
+/// model string must go through [`model_class_of`], which strips the `model@…`
+/// suffix first — deliberately not done here, so a class key that somehow
+/// contains an `@` is rejected rather than silently truncated into a
+/// *different* class than the one that was stored.
 fn normalize_class(class: &str) -> Option<String> {
     let normalized = class.trim().to_ascii_lowercase();
     if normalized.is_empty()
@@ -284,13 +293,30 @@ fn normalize_class(class: &str) -> Option<String> {
 /// worst costs one failed dispatch that re-marks the second class, whereas
 /// collapsing them by guesswork would block a class that still had credit.
 ///
+/// **The `model@…` suffix is stripped first** (#8380), so a suffixed model
+/// collapses onto the same class as its bare form: `gpt-5-codex@high` (Loom's
+/// own `model@effort` rung grammar, #3702) and `gpt-5-codex@2026-01-01` (a
+/// pinned dated ID — the shape `spawn-codex.sh`'s `model=` charset keeps `@`
+/// for) both classify as `gpt-5-codex`. This is not guesswork: the suffix
+/// names a *reasoning effort* or a *snapshot date* of the same model, never a
+/// second credit pool, and every other model classifier in the tree already
+/// strips it the same way (`model_tiers::base_of`,
+/// `sweep_registry::model_family`, `spawn-codex.sh`'s own `${VAR%%@*}`
+/// Claude-shape check). Without it a fleet that pins suffixed IDs gets zero
+/// benefit from Phase 2 — every credit exhaustion degrades to an account-wide
+/// outage.
+///
 /// **Unrecognized is `None`, never an error** — the same contract Phase 1
 /// chose. `None` degrades to today's account-wide behaviour everywhere it is
 /// consumed; account health must never fail closed on a model name it has not
-/// been taught.
+/// been taught. A value that is *only* a suffix (`@high`) has an empty base and
+/// stays `None` rather than classifying as the effort.
 #[must_use]
 pub fn model_class_of(model: &str) -> Option<String> {
-    super::bad_tokens::model_class_of(model).or_else(|| normalize_class(model))
+    super::bad_tokens::model_class_of(model).or_else(|| {
+        let base = model.split_once('@').map_or(model, |(base, _)| base);
+        normalize_class(base)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

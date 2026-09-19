@@ -949,6 +949,17 @@ region, or an `account=unknown`/malformed identity. `category` is one of the
   classifier has been taught) degrades to the same class-less, account-wide
   health write a v1 record produces — selection must never fail closed on an
   unrecognized model name.
+- **A `model@…` suffix is stripped before classification** (#8380), so
+  `gpt-5-codex@high` (Loom's own `model@effort` rung grammar, #3702) and
+  `gpt-5-codex@2026-01-01` (a pinned dated ID — why `@` is in `model=`'s
+  charset at all) both resolve to the one `gpt-5-codex` class, exactly as
+  `model_tiers::base_of`, `sweep_registry::model_family`, and
+  `spawn-codex.sh`'s own `${EFFECTIVE_MODEL%%@*}` Claude-shape check already
+  do. The suffix names a reasoning effort or a snapshot of the *same* model,
+  never a second credit pool. Before this, `@` failed normalization outright
+  and a fleet pinning suffixed IDs got **zero** benefit from Phase 2 — every
+  credit exhaustion was still a whole-account outage. A value that is only a
+  suffix (`@high`, empty base) stays unrecognized, on the fail-safe side.
 
 Consumer: `sweep_registry::quarantine::apply_provider_health_feedback`, the
 only production caller, feeds the parsed `(provider, account, category,
@@ -964,6 +975,44 @@ An adapter emitting this record for the first time should start at `v=2`
 directly — there is no reason to ship the strictly-less-informative `v=1`
 shape going forward, though the daemon keeps parsing it for adapters (and
 historical logs) that already do.
+
+##### Known and accepted: selection narrows by a model the #5499 guard may then drop (#8380)
+
+`spawn-codex.sh` narrows account selection to the model about to be dispatched
+(`tokens select --model "$EFFECTIVE_MODEL"`, #8277) so an account held only for
+a *different* class stays selectable. But the [#5499 ChatGPT-plan
+guard](#chatgpt-plan-seats-cannot-serve-a-pinned-model-at-all-5499) that decides
+whether the pin actually survives runs **after** selection — it has to, because
+it shells out to `codex login status` against the profile selection just chose,
+and nothing before that point knows the profile's auth mode.
+
+So when the pin is dropped, selection was narrowed to class X while class Y —
+the account's own default — is what really runs. An account holding a live
+class-Y `class_cooldowns` entry is therefore selectable for a dispatch that will
+run exactly the exhausted class.
+
+**This is accepted, not a latent bug to be fixed opportunistically**, on these
+grounds:
+
+- **Bounded and self-correcting.** The blast radius is one failed dispatch. That
+  run reports `model=none` (the pin was dropped, so the adapter cannot name what
+  ran), which writes the **account-wide** hold — the account then drops out of
+  selection entirely rather than being re-offered the same doomed narrowing. It
+  cannot loop.
+- **The alternatives cost more than the failure.** Re-selecting after a drop
+  buys a second selection round-trip that lands on a *different* profile, whose
+  auth mode is again unknown — so the probe has to re-run, and the
+  select→probe→reselect cycle needs an arbitrary cutoff to terminate. The real
+  fix is to carry the profile's auth mode in the account descriptor so selection
+  knows up front which seats are ChatGPT-plan (they *always* drop the pin, so
+  the narrowing is always wrong for them — a persistent property, not a
+  per-dispatch accident). That is a larger change than this asymmetry justifies
+  on its own.
+- **It fails in the safe direction.** The mismatch can only ever *admit* an
+  account that should have been skipped; it can never block one that had credit.
+
+If the ordering is ever inverted, this subsection and the `model=none` bullet
+above are the two places that must change together.
 
 ### Runtime resolution (precedence)
 
