@@ -2748,6 +2748,24 @@ pub struct CodesignPreflightResult {
 /// anomaly-only, the same shape as [`assess_observability`], since there is
 /// nothing worth a permanent GREEN line for "no identity is configured" (the
 /// overwhelmingly common case: ad-hoc signing, unconfigured on purpose).
+///
+/// # Where this preflight actually ran (Issue #8286)
+///
+/// The probe behind [`HealthInputs::codesign_preflight`] runs entirely inside
+/// **this `health` invocation's own process** (`probe_codesign_identity_preflight`
+/// in `cli/health.rs`) — it never asks the long-running daemon (typically
+/// `launchd`-supervised, in a logged-in GUI session with an unlocked login
+/// keychain) what *it* would get signing with. Over a non-interactive ssh
+/// session the login keychain routinely refuses non-interactive `codesign`
+/// access outright (`errSecInternalComponent`/"User interaction is not
+/// allowed"), so this section reports DEGRADED **every single time it is run
+/// that way — independent of whether the identity actually works, or whether
+/// the daemon itself can sign fine**. The message below says so explicitly so
+/// a failing preflight over ssh does not get misread as "the identity fix
+/// didn't take" (the exact misreading in 2AMLogic/2am#917, which cost three
+/// verification rounds before anyone caught it): the message always names
+/// this invocation's own context and points at re-running from an
+/// interactive/tty session as the actual check.
 #[must_use]
 pub fn assess_codesign_identity(inputs: &HealthInputs) -> Option<HealthSection> {
     let probe = inputs.codesign_preflight.as_ref()?;
@@ -2758,10 +2776,16 @@ pub fn assess_codesign_identity(inputs: &HealthInputs) -> Option<HealthSection> 
         "codesign_identity",
         Verdict::Degraded,
         format!(
-            "configured codesign identity '{}' fails a non-interactive preflight ({}) — \
-             sign_daemon_binary falls back to ad-hoc signing rather than hanging, but the \
-             identity should be repaired: see 'Repairing an identity imported without codesign \
-             access' in defaults/docs/macos-tcc-codesign.md",
+            "configured codesign identity '{}' fails a non-interactive preflight evaluated in \
+             THIS `health` invocation's own process context ({}) — that context is NOT the \
+             daemon's: over a non-interactive ssh session the login keychain routinely refuses \
+             access here even when the identity is fine and the daemon itself (e.g. under \
+             launchd, in an unlocked GUI-session keychain) signs without issue, so before \
+             concluding the identity itself is broken, re-run this check from an \
+             interactive/tty session. sign_daemon_binary falls back to ad-hoc signing rather \
+             than hanging either way, but the identity should still be repaired: see \
+             'Repairing an identity imported without codesign access' in \
+             defaults/docs/macos-tcc-codesign.md",
             probe.identity, probe.detail
         ),
         serde_json::json!({

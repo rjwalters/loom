@@ -3062,6 +3062,32 @@ fn codesign_identity_failing_preflight_is_degraded_and_names_identity_and_doc() 
     assert_eq!(assess(&inputs).overall, Verdict::Degraded);
 }
 
+/// Issue #8286: the DEGRADED wording must say *where* the preflight ran and
+/// point at re-running from an interactive/tty session, so a failing
+/// preflight observed over non-interactive ssh (the login keychain refusing
+/// access, independent of whether the identity or the daemon itself is
+/// actually broken) is not misread as "the identity fix didn't take" — the
+/// exact misreading behind 2AMLogic/2am#917.
+#[test]
+fn codesign_identity_failing_preflight_names_its_own_invocation_context() {
+    let mut inputs = healthy_inputs();
+    inputs.codesign_preflight = Some(CodesignPreflightResult {
+        identity: "Developer ID Application: Example".to_string(),
+        ok: false,
+        detail: "codesign exited with exit status: 1".to_string(),
+    });
+    let section = assess_codesign_identity(&inputs).expect("section present");
+    assert!(
+        section
+            .summary
+            .contains("THIS `health` invocation's own process context"),
+        "{}",
+        section.summary
+    );
+    assert!(section.summary.contains("non-interactive ssh"), "{}", section.summary);
+    assert!(section.summary.contains("interactive/tty session"), "{}", section.summary);
+}
+
 /// Issue #7609: `health` reports the release artifact available for this
 /// host's platform next to the installed version — the fleet-visible
 /// answer to "is a newer signed binary published?". `null` (not absent)
