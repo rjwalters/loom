@@ -21,6 +21,7 @@
 - [Per-workspace registry pool (`WorkspacePool`, #3928/#3929)](#per-workspace-registry-pool-workspacepool-39283929)
 - [Delegated daemon administration (`daemon.delegatedTo`, #5345)](#delegated-daemon-administration-daemondelegatedto-5345)
 - [Fleet — operator-triggered multi-host worker fanout (`fleet`, #4340)](#fleet--operator-triggered-multi-host-worker-fanout-fleet-4340)
+- [Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)](#fleet-model-ab--sweep-experiment-plan-8055-phase-1)
 - [Token pool provisioning for managed repos (#3938)](#token-pool-provisioning-for-managed-repos-3938)
 - [Per-repo status breakdown + per-repo main-health gate (#3930 — phase d)](#per-repo-status-breakdown--per-repo-main-health-gate-3930--phase-d)
 - [Gate verdicts: VERIFIED_RED vs UNEVALUATED (#3974)](#gate-verdicts-verified_red-vs-unevaluated-3974)
@@ -1330,6 +1331,85 @@ not a claimed success or failure).
 CURRENT`; non-zero if any host is `FAILED`/`UNREACHABLE`, or `--all` was given
 against an empty fleet registry (mirrors `fleet status`'s #5060 "empty roster
 never reads as healthy" policy).
+
+## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
+
+`loom-daemon sweep-experiment` already randomizes **per issue**, by parity
+(`assign-arm`), on the dispatch path of a single repo. Asking whether a model
+earns its per-token weight across a *managed fleet* needs the other unit of
+assignment: the **workspace**. `plan` is that surface — and it is deliberately
+the read-only half of the trio, so an operator can run it against a live fleet
+before deciding anything.
+
+```bash
+loom-daemon sweep-experiment plan \
+  --arms opus,sonnet --stratify merges14d,kind --seed 7 [--out plan.json] [--offline] [--json]
+```
+
+It reads the machine-level workspace registry (`~/.loom/workspaces.json`, or
+`LOOM_WORKSPACES_PATH`), measures each registered workspace, assigns every one
+of them an arm, and prints the table. These are **sub-actions on the existing
+`sweep-experiment` verb**, not a second top-level `experiment` verb: that verb
+already owns the arm vocabulary (`assign_arm` / `arm_model` /
+`resolved_arm_model`), and a parallel verb speaking the same vocabulary is how
+the two would drift on what "an arm" means.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--arms A,B` | `opus,sonnet` | Comma-separated arms, at least two. An arm's name **is** the model alias `start` would write into the overlay |
+| `--stratify DIMS` | `merges14d,kind` | Stratification dimensions; `none` disables stratification (one `all` stratum) |
+| `--seed N` | `0` | Assignment seed — the only thing that varies the assignment for a fixed fleet |
+| `--out PATH` | *(none)* | The **only** thing `plan` ever writes. `start --plan <file>` consumes it |
+| `--offline` | off | Skip the `gh` merge-count query entirely (`merges14d` degrades to its alphabetical fallback) |
+| `--json` | off | Print the plan document instead of the operator table |
+
+**Writes nothing.** Without `--out`, a `plan` run leaves the filesystem
+byte-for-byte as it found it — the workspace roots, the registry, and `~/.loom`
+included; in particular it never creates `~/.loom/experiments/` (only `start`
+may). That is a property of the *command*, not merely of the assignment
+function, so it is asserted at the process boundary over a whole temp fixture
+by `loom-daemon/tests/sweep_experiment_plan_writes_nothing.rs` (#8244), with the
+`--out` case as the control proving the harness can see a write.
+
+**Deterministic by construction.** `build_plan` is a pure function of
+`(seed, sorted workspace list, strata, arms, now)`: SHA-256 shuffle keys — not
+`DefaultHasher`, whose output is explicitly unstable across Rust releases, so a
+re-plan on an upgraded host would silently reassign arms — strata grouped in a
+`BTreeMap`, and no wall clock beyond the injected `now`. The same seed, fleet
+and strata therefore produce a byte-identical assignment on any host and any
+release; a different seed produces a different one.
+
+**Stratification** pairs comparable repos so an arm difference is not
+confounded by one arm drawing all the busy Rust repos:
+
+| Dimension | How it is measured |
+|---|---|
+| `merges14d` | Merged PRs in the last 14 days (`gh pr list --state merged --search merged:>=<cutoff>`), median split into `high`/`low`. **One** unmeasurable repo degrades the whole dimension to the documented alphabetical fallback (`alpha-a`/`alpha-b`) — degrading wholesale keeps stratum labels comparable instead of dropping every unreachable repo into one bucket |
+| `kind` | First-match-wins build-manifest heuristic at the repo root: `Cargo.toml`→`rust`, `package.json`→`node`, `pyproject.toml`/`setup.py`/`requirements.txt`→`python`, `go.mod`→`go`, a `scripts/` dir→`shell`, else `docs`. Filesystem-only, so it is identical on every host |
+
+**Balance.** Within each stratum members are ordered by shuffle key and dealt
+round-robin, and the deal counter **continues across strata** (visited in
+`BTreeMap` order) rather than restarting in each one. Restarting would balance
+each stratum while handing the leftover member of every odd-sized stratum to
+the same arm — exactly the failure mode of a fleet of mostly singleton strata.
+Continuing it bounds arm sizes to differ by at most one *both* within each
+stratum and fleet-wide.
+
+**Output.** `--json` (and `--out`) emit the plan document `start` consumes:
+
+| Field | Meaning |
+|---|---|
+| `experiment_id` | `exp-<YYYYMMDD>-<hash8>`; the hash covers the seed, arms, strata and the full assignment, so two different assignments can never share an id |
+| `created_at` | When the plan was built (`%Y-%m-%dT%H:%M:%SZ`) |
+| `seed`, `arms`, `stratify` | The inputs the assignment is reproducible from |
+| `workspaces[]` | `path` (the key), `repo` (`owner/name`, else the basename — reporting only), `arm`, `stratum`; ordered by `path` |
+
+`start --plan <file>` / `stop --id <id>` (#8055 phase 2) are the mutating half:
+`start` deep-merges the arm's model into each workspace's `.loom-local/local.json`
+overlay and records the experiment under `~/.loom/experiments/`
+(`LOOM_EXPERIMENTS_DIR`); `stop` reverses exactly the keys `start` wrote.
+`status` / drift reporting, `--scope dispatch|pipeline`, pool-preflight refusal
+and authoritative arm stamping in outcome records remain tracked on #8055.
 
 ## Token pool provisioning for managed repos (#3938)
 
