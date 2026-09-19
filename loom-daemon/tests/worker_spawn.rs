@@ -362,3 +362,15 @@ fn malformed_profile_selection_does_not_fall_back_to_a_billable_default() {
         assert!(out.stdout.is_empty());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn legacy_argv_preserves_non_utf8_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+    let d = tempfile::tempdir().unwrap();
+    legacy(d.path(), "claude");
+    let arg = std::ffi::OsString::from_vec(b"filename-\xff".to_vec());
+    let out = worker(d.path(), "claude").arg(&arg).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("arg={arg:?}")));
+}

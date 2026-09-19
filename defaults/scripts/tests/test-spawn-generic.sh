@@ -314,10 +314,13 @@ assert_contains \
 echo ""
 echo "Testing LOOM_RUNTIME=aider dispatch through spawn-worker.sh..."
 
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin --self-only "$SCRIPTS_DIR" spawn-worker
+
 STAGE="$TMPROOT/stage"
 mkdir -p "$STAGE/lib"
 cp "$SCRIPTS_DIR/spawn-worker.sh" "$STAGE/spawn-worker.sh"
-cp "$SCRIPTS_DIR/lib/config-resolver.sh" "$STAGE/lib/config-resolver.sh"
+cp "$SCRIPTS_DIR/lib/"{config-resolver,locate-daemon-bin,loom-tools}.sh "$STAGE/lib/"
 cp "$SPAWN_GENERIC" "$STAGE/spawn-generic.sh"
 cp "$SPAWN_AIDER" "$STAGE/spawn-aider.sh"
 cp "$SCRIPTS_DIR/lib/classify-error.sh" "$STAGE/lib/classify-error.sh"

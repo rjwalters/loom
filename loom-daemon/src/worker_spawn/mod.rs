@@ -20,7 +20,7 @@ pub struct WorkerArgs {
     pub scripts_dir: Option<PathBuf>,
     /// Worker options, forwarded unchanged to legacy adapters. Use -- before them.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
+    pub args: Vec<std::ffi::OsString>,
 }
 
 #[derive(Default, Debug)]
@@ -33,13 +33,16 @@ pub struct Options {
     pub skip_permissions: bool,
 }
 impl Options {
-    fn parse(args: &[String]) -> Result<Self, LaunchError> {
+    fn parse(args: &[std::ffi::OsString]) -> Result<Self, LaunchError> {
         let mut out = Self::default();
         let mut args = args.iter();
         while let Some(arg) = args.next() {
+            let arg = arg
+                .to_str()
+                .ok_or_else(|| LaunchError::config("native worker options must be UTF-8"))?;
             let (flag, inline) = arg
                 .split_once('=')
-                .map_or((arg.as_str(), None), |(a, b)| (a, Some(b)));
+                .map_or((arg, None), |(a, b)| (a, Some(b)));
             if inline.is_none() && flag == "--use-wrapper" {
                 continue;
             }
@@ -61,7 +64,7 @@ impl Options {
                 return Err(LaunchError::config("unsupported worker option; expected --prompt, --model, --profile, --effort, --log, --use-wrapper or --dangerously-skip-permissions"));
             }
             let value = inline
-                .or_else(|| args.next().map(String::as_str))
+                .or_else(|| args.next().and_then(|s| s.to_str()))
                 .ok_or_else(|| LaunchError::config(format!("{flag} requires a value")))?;
             if value.is_empty() {
                 return Err(LaunchError::config(format!("{flag} requires a nonempty value")));

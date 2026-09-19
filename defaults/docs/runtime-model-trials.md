@@ -131,7 +131,7 @@ Sources: [Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-age
 [Z.ai OpenCode setup](https://docs.z.ai/devpack/tool/opencode),
 [OpenCode CLI](https://opencode.ai/docs/cli/).
 
-The [2026-09-19 canary receipt](../../docs/experiments/native-harness-canary-2026-09-19.json)
+The [2026-09-19 canary receipt](https://github.com/rjwalters/loom/blob/main/docs/experiments/native-harness-canary-2026-09-19.json)
 records CLI versions, observed model/provider IDs, token counters, event hashes
 and independent results. Pi passed; OpenCode initially selected the wrong
 working directory under stale `PWD`, then passed after explicit directory

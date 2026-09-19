@@ -833,11 +833,14 @@ assert_contains "session id: $MOCK_SESSION" "$mock_stderr" \
 echo ""
 echo "Testing LOOM_RUNTIME=codex dispatch through spawn-worker.sh..."
 
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin --self-only "$SCRIPTS_DIR" spawn-worker
+
 STAGE="$TMPROOT/stage"
 WS="$TMPROOT/ws"
 mkdir -p "$STAGE/lib" "$WS/.loom"
 cp "$SCRIPTS_DIR/spawn-worker.sh" "$STAGE/spawn-worker.sh"
-cp "$SCRIPTS_DIR/lib/config-resolver.sh" "$STAGE/lib/config-resolver.sh"
+cp "$SCRIPTS_DIR/lib/"{config-resolver,locate-daemon-bin,loom-tools}.sh "$STAGE/lib/"
 cp "$SPAWN_CODEX" "$STAGE/spawn-codex.sh"
 # A stub claude runner so the "available runtimes" list and the default path
 # stay realistic without ever reaching the real token-selection code.
@@ -860,18 +863,16 @@ assert_contains "routed" "$out" "the prompt survives the dispatcher hop"
 assert_not_contains "stub-claude reached" "$out" \
     "codex dispatch does not also reach the claude runner"
 
-if command -v jq >/dev/null 2>&1; then
-    printf '{ "runtimes": { "default": "codex" } }\n' > "$WS/.loom/config.json"
-    out="$(env -u LOOM_RUNTIME -u CODEX_HOME -u LOOM_CODEX_HOME \
-        LOOM_WORKSPACE="$WS" LOOM_CONFIG_DEFAULTS_FILE="" \
-        LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_SPAWN_NO_EXPORT=1 \
-        bash "$STAGE/spawn-worker.sh" -p "cfg" 2>&1 || true)"
-    assert_contains "runtime=codex (from config (runtimes.default))" "$out" \
-        "runtimes.default=codex resolves through the dispatcher"
-    assert_contains "spawn-codex would-exec" "$out" \
-        "config-resolved codex dispatch reaches spawn-codex.sh"
-    rm -f "$WS/.loom/config.json"
-fi
+printf '{ "runtimes": { "default": "codex" } }\n' > "$WS/.loom/config.json"
+out="$(env -u LOOM_RUNTIME -u CODEX_HOME -u LOOM_CODEX_HOME \
+    LOOM_WORKSPACE="$WS" LOOM_CONFIG_DEFAULTS_FILE="" \
+    LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_SPAWN_NO_EXPORT=1 \
+    bash "$STAGE/spawn-worker.sh" -p "cfg" 2>&1 || true)"
+assert_contains "runtime=codex (from config (runtimes.default))" "$out" \
+    "runtimes.default=codex resolves through the dispatcher"
+assert_contains "spawn-codex would-exec" "$out" \
+    "config-resolved codex dispatch reaches spawn-codex.sh"
+rm -f "$WS/.loom/config.json"
 
 # codex moving from unknown -> known must not weaken the unknown-runtime guard.
 set +e

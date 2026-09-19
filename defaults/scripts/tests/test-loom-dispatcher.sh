@@ -67,6 +67,10 @@ if [[ ! -f "$PROVISION_LIB" ]]; then
     exit 0
 fi
 
+# Pin the native dispatcher while leaving daemon-management mocks independent.
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin --self-only "$REPO_ROOT/defaults/scripts" spawn-worker
+
 # Build a fake machine-level checkout with stub daemon-lifecycle scripts and a
 # real copy of the config resolver. Echoes the checkout path.
 make_checkout() {
@@ -127,15 +131,15 @@ EOF
 }
 
 # Build a fake consumer repo whose .loom/scripts carries a REAL spawn-worker.sh
-# + config-resolver.sh, plus stub spawn-<runtime>.sh runners that just echo
-# their own name and argv (no real claude/codex, no live tokens) — the pattern
-# test-spawn-worker.sh uses. Exercises `loom sweep`'s runtime routing (#4480).
+# + its resolver libraries, plus stub spawn-<runtime>.sh runners that echo
+# their own name and argv (no real claude/codex, no live tokens).
+# Exercises `loom sweep`'s runtime routing (#4480).
 # Echoes the repo path.
 make_sweep_repo() {
     local r; r="$(mktemp -d)"
     mkdir -p "$r/.loom/scripts/lib"
     cp "$REAL_SPAWN_WORKER" "$r/.loom/scripts/spawn-worker.sh"
-    cp "$REAL_RESOLVER" "$r/.loom/scripts/lib/config-resolver.sh"
+    cp "$REPO_ROOT/defaults/scripts/lib/"{locate-daemon-bin,loom-tools}.sh "$r/.loom/scripts/lib/"
     # Stub runners: each announces which runtime ran and forwards its argv so a
     # test can assert on both the selected runner and the passthrough flags.
     cat > "$r/.loom/scripts/spawn-claude.sh" <<'EOF'

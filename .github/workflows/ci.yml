@@ -1094,6 +1094,8 @@ jobs:
         run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
       - name: loom-daemon-watchdog peer-coordination dedup (#7664)
         run: bash defaults/scripts/tests/test-loom-daemon-watchdog-dedup.sh
+      - name: generic runtime adapter through native worker dispatcher (#8362)
+        run: bash defaults/scripts/tests/test-spawn-generic.sh
       # #8255: skip-labels.sh is a thin stub over `loom-daemon skip-labels`,
       # the shell-facing union of the fixed hard-exclusion list and a repo's
       # configured `autonomous.workFinder.extraSkipLabels` — needs the
@@ -1104,12 +1106,16 @@ jobs:
   installer-tests:
     name: Installer Integration Tests
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
     # Portable across GNU/BSD sed (temp-file + mv idiom) — runs on ubuntu (#3515)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build native worker dispatcher
+        run: cargo build --package loom-daemon
       - name: Check role prompts reference only real labels (#3786)
         run: bash defaults/scripts/check-phantom-labels.sh
       - name: Check labels.yml copies are in sync (#3896)
@@ -1132,7 +1138,7 @@ jobs:
   codex-adapter-smoke:
     name: Codex Adapter Smoke (mocked)
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
     # Tier-2 admission gate for the Codex runtime adapter (epic #4167 Phase 2,
     # issue #4468): a green leg here is what admits the adapter per
     # defaults/docs/runtime-adapters.md's tier policy.
@@ -1146,6 +1152,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build native worker dispatcher
+        run: cargo build --package loom-daemon
       - name: Syntax-check the Codex adapter and its test
         run: |
           bash -n defaults/scripts/spawn-codex.sh

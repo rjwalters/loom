@@ -7,7 +7,7 @@ fn main() {
             .unwrap();
     }
     println!("pid={}", std::process::id());
-    for arg in std::env::args().skip(1) {
+    for arg in std::env::args_os().skip(1) {
         println!("arg={arg:?}");
     }
     for key in [
