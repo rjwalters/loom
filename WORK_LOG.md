@@ -7,6 +7,23 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-19
+- **Issue #8293** (closed): claim-staleness.sh --json fails on jq 1.6: reserved $label variable
+- **PR #8339**: fix(scripts): rename reserved-word jq --arg bindings for jq 1.6 compat
+- **Issue #8336** (closed): bug: sweep_experiment plan test is flaky — two seeds can collide on an 8-workspace / 2-arm assignment
+- **PR #8338**: fix(tests): search a seed window instead of betting on seed 8 (#8336)
+- **Issue #8334** (closed): sweep-experiment plan test asserts two arbitrary seeds differ — a coin flip that reddens unrelated PRs
+- **Issue #8242** (closed): [#8058 Phase 3] per-model-class observability: tokens health/status per-class counts, .ranking columns if the endpoint exposes them
+- **PR #8327**: feat(tokens): report per-model-class healthy counts on the health/status surfaces
+- **Issue #8313** (closed): security: audit role prompts missing the untrusted-external-content.md marker (secondary ask split out of #8256)
+- **Issue #8310** (closed): Design and wire a premise-check gate before Curator for autonomously-filed/design-reversing issues (#8269 points 1,2,4)
+- **Issue #8292** (closed): test: cover the positive direction of champion-issue-promo's bot-vs-human un-park attribution (#8245 follow-up)
+- **PR #8335**: test: cover the positive direction of champion-issue-promo's bot-vs-human un-park attribution (#8245 follow-up)
+- **Issue #8217** (closed): guard: an unquoted heredoc body's $( ) substitution bypasses rm-scope (extract_rm_targets analogue of #8035)
+- **PR #8316**: fix(guard): scan an unquoted heredoc body's substitution spans for rm targets (#8217)
+- **Issue #8281** (closed): bug(lease): publish and renew still fail on Bash 3.2 empty repo_args after fence fix
+- **PR #8324**: fix(sweep-lease): guard empty repo_args[@] in publish and renew scripts
+- **Issue #8237** (closed): Add a 'settled' allowlist category: shell we are deliberately keeping (47 scripts, 3,809 lines)
+- **PR #8319**: feat(shell-budget): add a `settled` allowlist category for shell we deliberately keep
 - **Issue #8262** (closed): loom-daemon tests: LOOM_SOCKET_PATH-mutating tests serialize under mismatched keys; one spawns a real heartbeat writer with no #[serial] (Rust half of #8077)
 - **PR #8325**: fix(loom-daemon): unify LOOM_SOCKET_PATH-mutating tests onto one serial key (#8262)
 - **Issue #8254** (closed): dep-recheck-fingerprint: --block-reason is an uncanonicalized hash input, and the dep-recheck post is no longer serialized (gaps from 2am's retired premise-recheck.sh)

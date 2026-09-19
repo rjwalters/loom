@@ -15,14 +15,16 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
 - **#8258**: fix(provision-hooks): quote ${CLAUDE_PROJECT_DIR} in project-level hook entries
 - **#8279**: fix(worktree): reconcile the dirty-marker filter with its shell twin (#8195)
+- **#8329**: test(sweep-registry): make the mid-build watchdog's git fixture hermetic (#8170)
+- **#8337**: feat(dashboard): ingest ephemeral_compute records with an explicit redaction policy
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
-- **#8097**: Differential corpus covers 2 of 7 separator chars, omits comments entirely, and its generator is not committed
+- **#8136**: Reconcile PR #8097's differential-corpus gaps with #8125's BotLoginNormalisation work
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
+- **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh
 
 ## Ready
 
@@ -37,33 +39,27 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#8221**: Guard: same-command mktemp fast paths count only bare `NAME=` assignments — `export`/`declare`/`read`/`printf -v` rebinding slips the ambiguity rule
 - **#8248**: A green ratchet check goes stale when the baseline tightens under an in-flight PR — this is what broke main
 - **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh
-- **#8281**: bug(lease): publish and renew still fail on Bash 3.2 empty repo_args after fence fix
+- **#8259**: Curator dep-recheck heartbeat spams issues held by champion:ac-hold (18 daily 'nothing changed' comments on gf180-pll#242) — a human-attestation gate has nothing to re-check
+- **#8277**: Thread the in-flight model into LOOM_TERMINAL_RESULT so #8058's class-scoped health marks have a producer
+- **#8297**: tokens: claude-monitor ranking.json exposes per-class utilization that monitor.rs ignores
+- **#8322**: Port PR #8314's per-role tool-restriction deny-spec computation out of spawn-claude.sh/spawn-codex.sh into loom-daemon (Shell Budget Ratchet blocker)
+- **#8326**: build-gate.sh runs `cargo test`, the shared-process runner `.config/nextest.toml` exists to avoid
+- **#8328**: Two loom-daemon unit tests fail on a live-daemon host by reading inherited LOOM_* env (escalate::decide, registry_refresh)
+- **#8333**: bug(lease): sweep-lease-renew.sh's cmd_start extra_args[@] hits the same Bash 3.2 empty-array bug as #8281
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#8170**: sweep_registry::watchdog midbuild_* tests fail under the full parallel suite, pass 90/90 in isolation
-- **#8217**: guard: an unquoted heredoc body's $( ) substitution bypasses rm-scope (extract_rm_targets analogue of #8035)
-- **#8237**: Add a 'settled' allowlist category: shell we are deliberately keeping (47 scripts, 3,809 lines)
-- **#8242**: [#8058 Phase 3] per-model-class observability: tokens health/status per-class counts, .ranking columns if the endpoint exposes them
 - **#8250**: claim_reconciliation::reclaim_pr backfills loom:review-requested onto draft PRs (no isDraft check)
 - **#8253**: dep-recheck-fingerprint: an already-MERGED PR's transient UNKNOWN mergeability still moves CONCLUSION_HASH (churns curator dep-recheck comments)
-- **#8254**: dep-recheck-fingerprint: --block-reason is an uncanonicalized hash input, and the dep-recheck post is no longer serialized (gaps from 2am's retired premise-recheck.sh)
-- **#8255**: curator.md Priority-2 fallback query ignores autonomous.workFinder.extraSkipLabels — repo-local non-work labels (2am's `journal`) surface as curation candidates
-- **#8259**: Curator dep-recheck heartbeat spams issues held by champion:ac-hold (18 daily 'nothing changed' comments on gf180-pll#242) — a human-attestation gate has nothing to re-check
-- **#8262**: loom-daemon tests: LOOM_SOCKET_PATH-mutating tests serialize under mismatched keys; one spawns a real heartbeat writer with no #[serial] (Rust half of #8077)
 - **#8263**: gh api call sites pass an unsupported --repo flag, silently disabling five LOOM_REPO-host probes
-- **#8265**: Judge accepts a 'TDD: yes' claim on path presence alone — require the test to fail at the merge-base
-- **#8266**: Adopt a role-prompt authoring discipline: we ratchet prompt bytes but never verify prompt behaviour
-- **#8277**: Thread the in-flight model into LOOM_TERMINAL_RESULT so #8058's class-scoped health marks have a producer
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#8314**: feat(guard): per-role tool-restriction allowlist enforced at the harness (#8256)
-- **#8316**: fix(guard): scan an unquoted heredoc body's substitution spans for rm targets (#8217)
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -75,6 +71,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
 - **#8258**: fix(provision-hooks): quote ${CLAUDE_PROJECT_DIR} in project-level hook entries
 - **#8279**: fix(worktree): reconcile the dirty-marker filter with its shell twin (#8195)
+- **#8318**: docs(roles): add role-prompt & dispatch-brief authoring discipline
+- **#8321**: fix(judge): require a merge-base run before accepting a TDD: yes claim (#8265)
+- **#8329**: test(sweep-registry): make the mid-build watchdog's git fixture hermetic (#8170)
+- **#8337**: feat(dashboard): ingest ephemeral_compute records with an explicit redaction policy
 
 ## Proposed
 
@@ -93,6 +93,7 @@ Issues carrying `loom:curated`.
 - **#8052**: telemetry: per-role × model token consumption report + weekly-limit calibration (activity.db token tables are empty, `loom-daemon stats` crashes) *(curated)*
 - **#8055**: experiment: fleet-wide repo-stratified model A/B — assign arms, write/remove overlays, cover role-runner ticks, stamp the arm explicitly in outcome records *(curated)*
 - **#8058**: token pool: per-model-class exhaustion state — an Opus ceiling bad-marks the whole account and starves Sonnet work *(curated)*
+- **#8063**: limit calibration: surface $-equivalent per weekly-limit-point in loom-daemon health, warn on step change *(curated)*
 - **#8087**: Port loom-daemon-start.sh to a daemon subcommand (1,184 lines; preserve the FLAGS-OFF contract across start) *(curated)*
 - **#8088**: Port loom-daemon-update.sh to a daemon subcommand (1,733 lines; the binary must replace itself) *(curated)*
 - **#8097**: Differential corpus covers 2 of 7 separator chars, omits comments entirely, and its generator is not committed *(curated)*
@@ -104,26 +105,26 @@ Issues carrying `loom:curated`.
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it) *(curated)*
 - **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes) *(curated)*
 - **#8197**: release-fetch: a .sig download failure is indistinguishable from an unsigned release, silently downgrading to checksum-only *(curated)*
-- **#8217**: guard: an unquoted heredoc body's $( ) substitution bypasses rm-scope (extract_rm_targets analogue of #8035) *(curated)*
 - **#8221**: Guard: same-command mktemp fast paths count only bare `NAME=` assignments — `export`/`declare`/`read`/`printf -v` rebinding slips the ambiguity rule *(curated)*
-- **#8237**: Add a 'settled' allowlist category: shell we are deliberately keeping (47 scripts, 3,809 lines) *(curated)*
-- **#8242**: [#8058 Phase 3] per-model-class observability: tokens health/status per-class counts, .ranking columns if the endpoint exposes them *(curated)*
 - **#8248**: A green ratchet check goes stale when the baseline tightens under an in-flight PR — this is what broke main *(curated)*
 - **#8250**: claim_reconciliation::reclaim_pr backfills loom:review-requested onto draft PRs (no isDraft check) *(curated)*
 - **#8253**: dep-recheck-fingerprint: an already-MERGED PR's transient UNKNOWN mergeability still moves CONCLUSION_HASH (churns curator dep-recheck comments) *(curated)*
-- **#8254**: dep-recheck-fingerprint: --block-reason is an uncanonicalized hash input, and the dep-recheck post is no longer serialized (gaps from 2am's retired premise-recheck.sh) *(curated)*
-- **#8255**: curator.md Priority-2 fallback query ignores autonomous.workFinder.extraSkipLabels — repo-local non-work labels (2am's `journal`) surface as curation candidates *(curated)*
 - **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh *(curated)*
 - **#8257**: dashboard: add an ephemeral_compute record type (running-now + elastic-spend views, leak detection, hostless ingest) with a D1 migration *(curated)*
 - **#8259**: Curator dep-recheck heartbeat spams issues held by champion:ac-hold (18 daily 'nothing changed' comments on gf180-pll#242) — a human-attestation gate has nothing to re-check *(curated)*
-- **#8262**: loom-daemon tests: LOOM_SOCKET_PATH-mutating tests serialize under mismatched keys; one spawns a real heartbeat writer with no #[serial] (Rust half of #8077) *(curated)*
 - **#8263**: gh api call sites pass an unsupported --repo flag, silently disabling five LOOM_REPO-host probes *(curated)*
 - **#8265**: Judge accepts a 'TDD: yes' claim on path presence alone — require the test to fail at the merge-base *(curated)*
 - **#8266**: Adopt a role-prompt authoring discipline: we ratchet prompt bytes but never verify prompt behaviour *(curated)*
 - **#8277**: Thread the in-flight model into LOOM_TERMINAL_RESULT so #8058's class-scoped health marks have a producer *(curated)*
-- **#8281**: bug(lease): publish and renew still fail on Bash 3.2 empty repo_args after fence fix *(curated)*
-- **#8292**: test: cover the positive direction of champion-issue-promo's bot-vs-human un-park attribution (#8245 follow-up) *(curated)*
+- **#8297**: tokens: claude-monitor ranking.json exposes per-class utilization that monitor.rs ignores *(curated)*
+- **#8304**: dashboard: ephemeral_compute ingest + D1 schema + redaction policy (Phase 1 of #8257) *(curated)*
 - **#8309**: Curator: state that an autonomous filing is not operator approval (#8269 point 3) *(curated)*
+- **#8322**: Port PR #8314's per-role tool-restriction deny-spec computation out of spawn-claude.sh/spawn-codex.sh into loom-daemon (Shell Budget Ratchet blocker) *(curated)*
+- **#8323**: dep-recheck-fingerprint.sh: multi-line DEPS/BLOCKERS/REFS output breaks the documented eval invocation with 2+ entries *(curated)*
+- **#8326**: build-gate.sh runs `cargo test`, the shared-process runner `.config/nextest.toml` exists to avoid *(curated)*
+- **#8328**: Two loom-daemon unit tests fail on a live-daemon host by reading inherited LOOM_* env (escalate::decide, registry_refresh) *(curated)*
+- **#8330**: shell-budget: ratchet `comparable()`, not just `portable()` — `settled` reclassification can buy portable growth behind a floor declaration *(curated)*
+- **#8333**: bug(lease): sweep-lease-renew.sh's cmd_start extra_args[@] hits the same Bash 3.2 empty-array bug as #8281 *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -141,13 +142,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 6 |
+| Operator merge-risk holds | 8 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 10 |
-| In Progress (`loom:building`) | 14 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 6 |
-| Curated | 44 |
+| Ready (`loom:issue`) | 16 |
+| In Progress (`loom:building`) | 3 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 10 |
+| Curated | 45 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
