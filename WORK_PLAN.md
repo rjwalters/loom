@@ -36,8 +36,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes)
 - **#8221**: Guard: same-command mktemp fast paths count only bare `NAME=` assignments — `export`/`declare`/`read`/`printf -v` rebinding slips the ambiguity rule
 - **#8248**: A green ratchet check goes stale when the baseline tightens under an in-flight PR — this is what broke main
-- **#8251**: dep-classify --check-defer: a parenthetical (Epic #M …) mention is extracted as a second blocker, wedging phase issues in DEFER forever
-- **#8254**: dep-recheck-fingerprint: --block-reason is an uncanonicalized hash input, and the dep-recheck post is no longer serialized (gaps from 2am's retired premise-recheck.sh)
+- **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh
+- **#8281**: bug(lease): publish and renew still fail on Bash 3.2 empty repo_args after fence fix
 
 ## In Progress
 
@@ -45,22 +45,25 @@ Issues currently being built (`loom:building`).
 
 - **#8170**: sweep_registry::watchdog midbuild_* tests fail under the full parallel suite, pass 90/90 in isolation
 - **#8217**: guard: an unquoted heredoc body's $( ) substitution bypasses rm-scope (extract_rm_targets analogue of #8035)
-- **#8224**: health: extend #8163's root-scaled IPC budget to cli::status and the dashboard's serve.rs FETCH_TIMEOUT
 - **#8237**: Add a 'settled' allowlist category: shell we are deliberately keeping (47 scripts, 3,809 lines)
 - **#8242**: [#8058 Phase 3] per-model-class observability: tokens health/status per-class counts, .ranking columns if the endpoint exposes them
-- **#8244**: [#8055 Phase 1] loom-daemon sweep-experiment plan — deterministic, repo-stratified arm assignment that writes nothing
 - **#8250**: claim_reconciliation::reclaim_pr backfills loom:review-requested onto draft PRs (no isDraft check)
-- **#8252**: auto-update: don't defer an artifact FETCH behind the build-stampede guard (only rebuilds should wait)
 - **#8253**: dep-recheck-fingerprint: an already-MERGED PR's transient UNKNOWN mergeability still moves CONCLUSION_HASH (churns curator dep-recheck comments)
-- **#8270**: install-loom.sh fails on every fresh repo: 6 dangling intra-repo links after init (file-size-policy.md not shipped in defaults/docs; two ../../../.loom/docs links wrong for .loom/roles)
+- **#8254**: dep-recheck-fingerprint: --block-reason is an uncanonicalized hash input, and the dep-recheck post is no longer serialized (gaps from 2am's retired premise-recheck.sh)
+- **#8255**: curator.md Priority-2 fallback query ignores autonomous.workFinder.extraSkipLabels — repo-local non-work labels (2am's `journal`) surface as curation candidates
+- **#8259**: Curator dep-recheck heartbeat spams issues held by champion:ac-hold (18 daily 'nothing changed' comments on gf180-pll#242) — a human-attestation gate has nothing to re-check
+- **#8262**: loom-daemon tests: LOOM_SOCKET_PATH-mutating tests serialize under mismatched keys; one spawns a real heartbeat writer with no #[serial] (Rust half of #8077)
+- **#8263**: gh api call sites pass an unsupported --repo flag, silently disabling five LOOM_REPO-host probes
+- **#8265**: Judge accepts a 'TDD: yes' claim on path presence alone — require the test to fail at the merge-base
+- **#8266**: Adopt a role-prompt authoring discipline: we ratchet prompt bytes but never verify prompt behaviour
+- **#8277**: Thread the in-flight model into LOOM_TERMINAL_RESULT so #8058's class-scoped health marks have a producer
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#8296**: fix(dep-classify): treat a `(Epic #M …)` parenthetical as annotation, not a blocker
-- **#8300**: docs+test(sweep-experiment): close out `plan` phase 1 — daemon-reference section + writes-nothing process test (#8244)
-- **#8301**: fix(auto-update): fetch a release artifact immediately, never behind the stampede gate
+- **#8314**: feat(guard): per-role tool-restriction allowlist enforced at the harness (#8256)
+- **#8316**: fix(guard): scan an unquoted heredoc body's substitution spans for rm targets (#8217)
 
 ## Approved (Awaiting Merge)
 
@@ -72,7 +75,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
 - **#8258**: fix(provision-hooks): quote ${CLAUDE_PROJECT_DIR} in project-level hook entries
 - **#8279**: fix(worktree): reconcile the dirty-marker filter with its shell twin (#8195)
-- **#8300**: docs+test(sweep-experiment): close out `plan` phase 1 — daemon-reference section + writes-nothing process test (#8244)
 
 ## Proposed
 
@@ -104,17 +106,24 @@ Issues carrying `loom:curated`.
 - **#8197**: release-fetch: a .sig download failure is indistinguishable from an unsigned release, silently downgrading to checksum-only *(curated)*
 - **#8217**: guard: an unquoted heredoc body's $( ) substitution bypasses rm-scope (extract_rm_targets analogue of #8035) *(curated)*
 - **#8221**: Guard: same-command mktemp fast paths count only bare `NAME=` assignments — `export`/`declare`/`read`/`printf -v` rebinding slips the ambiguity rule *(curated)*
-- **#8224**: health: extend #8163's root-scaled IPC budget to cli::status and the dashboard's serve.rs FETCH_TIMEOUT *(curated)*
 - **#8237**: Add a 'settled' allowlist category: shell we are deliberately keeping (47 scripts, 3,809 lines) *(curated)*
 - **#8242**: [#8058 Phase 3] per-model-class observability: tokens health/status per-class counts, .ranking columns if the endpoint exposes them *(curated)*
-- **#8244**: [#8055 Phase 1] loom-daemon sweep-experiment plan — deterministic, repo-stratified arm assignment that writes nothing *(curated)*
 - **#8248**: A green ratchet check goes stale when the baseline tightens under an in-flight PR — this is what broke main *(curated)*
 - **#8250**: claim_reconciliation::reclaim_pr backfills loom:review-requested onto draft PRs (no isDraft check) *(curated)*
-- **#8251**: dep-classify --check-defer: a parenthetical (Epic #M …) mention is extracted as a second blocker, wedging phase issues in DEFER forever *(curated)*
-- **#8252**: auto-update: don't defer an artifact FETCH behind the build-stampede guard (only rebuilds should wait) *(curated)*
 - **#8253**: dep-recheck-fingerprint: an already-MERGED PR's transient UNKNOWN mergeability still moves CONCLUSION_HASH (churns curator dep-recheck comments) *(curated)*
 - **#8254**: dep-recheck-fingerprint: --block-reason is an uncanonicalized hash input, and the dep-recheck post is no longer serialized (gaps from 2am's retired premise-recheck.sh) *(curated)*
-- **#8270**: install-loom.sh fails on every fresh repo: 6 dangling intra-repo links after init (file-size-policy.md not shipped in defaults/docs; two ../../../.loom/docs links wrong for .loom/roles) *(curated)*
+- **#8255**: curator.md Priority-2 fallback query ignores autonomous.workFinder.extraSkipLabels — repo-local non-work labels (2am's `journal`) surface as curation candidates *(curated)*
+- **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh *(curated)*
+- **#8257**: dashboard: add an ephemeral_compute record type (running-now + elastic-spend views, leak detection, hostless ingest) with a D1 migration *(curated)*
+- **#8259**: Curator dep-recheck heartbeat spams issues held by champion:ac-hold (18 daily 'nothing changed' comments on gf180-pll#242) — a human-attestation gate has nothing to re-check *(curated)*
+- **#8262**: loom-daemon tests: LOOM_SOCKET_PATH-mutating tests serialize under mismatched keys; one spawns a real heartbeat writer with no #[serial] (Rust half of #8077) *(curated)*
+- **#8263**: gh api call sites pass an unsupported --repo flag, silently disabling five LOOM_REPO-host probes *(curated)*
+- **#8265**: Judge accepts a 'TDD: yes' claim on path presence alone — require the test to fail at the merge-base *(curated)*
+- **#8266**: Adopt a role-prompt authoring discipline: we ratchet prompt bytes but never verify prompt behaviour *(curated)*
+- **#8277**: Thread the in-flight model into LOOM_TERMINAL_RESULT so #8058's class-scoped health marks have a producer *(curated)*
+- **#8281**: bug(lease): publish and renew still fail on Bash 3.2 empty repo_args after fence fix *(curated)*
+- **#8292**: test: cover the positive direction of champion-issue-promo's bot-vs-human un-park attribution (#8245 follow-up) *(curated)*
+- **#8309**: Curator: state that an autonomous filing is not operator approval (#8269 point 3) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -135,10 +144,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 6 |
 | Urgent | 3 |
 | Ready (`loom:issue`) | 10 |
-| In Progress (`loom:building`) | 10 |
-| PRs awaiting review | 3 |
-| Approved PRs awaiting merge | 7 |
-| Curated | 37 |
+| In Progress (`loom:building`) | 14 |
+| PRs awaiting review | 2 |
+| Approved PRs awaiting merge | 6 |
+| Curated | 44 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
