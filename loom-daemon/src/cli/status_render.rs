@@ -326,6 +326,11 @@ pub(crate) fn build_status_json_value(
             // its exact pre-#8058 meaning and a consumer can read this one
             // unconditionally.
             "healthy_accounts_by_class": model_class::capacity_detail(report),
+            // claude-monitor's predictive `class -> utilization` (issue
+            // #8297); `{}` when `healthy_accounts_by_class` above is also
+            // `{}` (same gate) or no fresh monitor sidecar exists. Never
+            // consulted by the selector, never changes the counts above.
+            "monitor_utilization_by_class": model_class::monitor_utilization_detail(report),
             "exhausted_accounts": rc.exhausted,
             "token_axis_limit": rc.token_axis_limit,
             "token_bound": rc.token_bound,

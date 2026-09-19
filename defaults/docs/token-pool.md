@@ -658,7 +658,10 @@ Token capacity:
 
 and structurally, as a `class -> healthy` object:
 `health --json`'s `tokens.healthy_by_class`, `status --json`'s
-`capacity.healthy_accounts_by_class`. The Codex/other-provider health surface
+`capacity.healthy_accounts_by_class` — each has a sibling
+`monitor_utilization_by_class` field carrying claude-monitor's predictive
+per-class data when present (see "The claude-monitor ingest path" below).
+The Codex/other-provider health surface
 (`tokens_pool::health::ProviderCapacity`) carries the same field, populated
 from Phase 2's per-class cooldowns instead of `.bad_tokens` lines. It reports
 only the classes actually under a live hold, where the Claude surface reports
@@ -724,11 +727,43 @@ That is also the cheaper answer: `select::parse_ranking_line` splits on
 every reader that has not been upgraded — a real compatibility cost to pay for
 a column no probe can currently fill.
 
-The one per-class source that *does* exist is claude-monitor's `ranking.json`,
-whose `accounts[].models.<class>.utilization` map was confirmed populated on a
-live host in the same pass. `monitor.rs` reads only the account-wide
-`utilization` / `resets` maps and ignores `models` entirely, so it is not an
-ingest path today; wiring it up is tracked separately (#8297).
+**The claude-monitor ingest path (#8297).** The one per-class source that
+*does* exist is claude-monitor's `ranking.json`, whose
+`accounts[].models.<class>.utilization` map was confirmed populated on a live
+host in the same pass — e.g. `{"fable": {"utilization": 0.91}}`. Three design
+decisions shape how it is consumed:
+
+- **Report-only, never a selection gate.** Phase 1/2's `.bad_tokens` marks are
+  *terminal* — a probe or a wrapper-observed rotation already concluded an
+  account is down for a class. claude-monitor's utilization is *predictive* —
+  a fraction approaching 100% forecasts a future block, it has not happened
+  yet. Mixing the two would need a threshold policy this issue did not scope,
+  and the "narrower, never wider" fail-safe direction above rules out guessing
+  one. So `select.rs`/`bad_tokens.rs` never consult it; it is surfaced for an
+  operator to read, nothing more.
+- **A JSON sidecar, not a fifth `.ranking` column.** `select::parse_ranking_line`
+  splits on `splitn(4, '|')`, so a naive fifth column would be silently
+  swallowed into `limit_reset` by any reader that has not been upgraded to
+  expect it — the exact compatibility cost the section above already paid to
+  avoid. Instead, `monitor.rs` writes `.ranking.classes.json` beside
+  `.ranking` (`tokens_pool::monitor_classes`, its own `schema` field), read
+  only by the observability path — `.ranking`'s four-field shape and every
+  existing reader are untouched.
+- **Coverage stays honest.** Only the class actually in use appears in
+  `models` (today: `fable` only). An absent class reads as "no data", never
+  coerced to a fabricated `0.0` — `MonitorAccount::class_utilization` is a map,
+  not a fixed-size record, so an absent key and a genuine `0.0` stay
+  distinguishable end to end.
+
+`capacity::model_class::ClassCapacity` consumes the sidecar (its
+`monitor_utilization` field, one number per class — the *highest* utilization
+seen across accounts, the actionable "which account is closest to a future
+block" signal) and appends it to the existing render, e.g. `per class: fable
+20/20, opus 2/20; monitor: opus 91%` and the JSON sidecar fields named above.
+It is consumed **only once `by_class` already has `.bad_tokens`-derived state
+to report beside** — so the degradation contract from the bullets above is
+unchanged: a pool with no class-scoped `.bad_tokens` state still renders
+exactly its pre-#8058 single number, whether or not a monitor sidecar exists.
 
 ## Error classification (`.loom/scripts/lib/classify-error.sh`)
 
