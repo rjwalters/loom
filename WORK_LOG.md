@@ -7,6 +7,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-19
+- **Issue #8259** (closed): Curator dep-recheck heartbeat spams issues held by champion:ac-hold (18 daily 'nothing changed' comments on gf180-pll#242) — a human-attestation gate has nothing to re-check
+- **Issue #8250** (closed): claim_reconciliation::reclaim_pr backfills loom:review-requested onto draft PRs (no isDraft check)
+- **PR #8332**: fix(claim-reconciliation): skip loom:review-requested backfill on draft PRs
+- **Issue #8266** (closed): Adopt a role-prompt authoring discipline: we ratchet prompt bytes but never verify prompt behaviour
+- **PR #8318**: docs(roles): add role-prompt & dispatch-brief authoring discipline
+- **Issue #8265** (closed): Judge accepts a 'TDD: yes' claim on path presence alone — require the test to fail at the merge-base
+- **PR #8321**: fix(judge): require a merge-base run before accepting a TDD: yes claim (#8265)
 - **Issue #8293** (closed): claim-staleness.sh --json fails on jq 1.6: reserved $label variable
 - **PR #8339**: fix(scripts): rename reserved-word jq --arg bindings for jq 1.6 compat
 - **Issue #8336** (closed): bug: sweep_experiment plan test is flaky — two seeds can collide on an 8-workspace / 2-arm assignment
