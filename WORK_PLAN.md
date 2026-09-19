@@ -17,6 +17,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#8279**: fix(worktree): reconcile the dirty-marker filter with its shell twin (#8195)
 - **#8329**: test(sweep-registry): make the mid-build watchdog's git fixture hermetic (#8170)
 - **#8337**: feat(dashboard): ingest ephemeral_compute records with an explicit redaction policy
+- **#8345**: fix(merge-pr): evaluate the PR head's version-policy checker when the PR changes it (#8284)
 
 ## Urgent
 
@@ -40,31 +41,36 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#8248**: A green ratchet check goes stale when the baseline tightens under an in-flight PR — this is what broke main
 - **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh
 - **#8286**: loom-daemon health: codesign_identity preflight runs in the CLI process, so over non-interactive ssh it always reads DEGRADED without saying why
-- **#8297**: tokens: claude-monitor ranking.json exposes per-class utilization that monitor.rs ignores
+- **#8287**: worktree.sh reset a stale local feature/issue-N to main although origin/feature/issue-N carried the PR's commits (Doctor on #8190)
+- **#8289**: create-issue.sh hard-refuses as a duplicate at 19% similarity, and sometimes with no message at all
+- **#8298**: Judge's DIRTY auto-rebase can silently drop a resync PR's payload (adjacent single-line JSON diff)
 - **#8322**: Port PR #8314's per-role tool-restriction deny-spec computation out of spawn-claude.sh/spawn-codex.sh into loom-daemon (Shell Budget Ratchet blocker)
-- **#8323**: dep-recheck-fingerprint.sh: multi-line DEPS/BLOCKERS/REFS output breaks the documented eval invocation with 2+ entries
 - **#8326**: build-gate.sh runs `cargo test`, the shared-process runner `.config/nextest.toml` exists to avoid
 - **#8328**: Two loom-daemon unit tests fail on a live-daemon host by reading inherited LOOM_* env (escalate::decide, registry_refresh)
 - **#8330**: shell-budget: ratchet `comparable()`, not just `portable()` — `settled` reclassification can buy portable growth behind a floor declaration
 - **#8333**: bug(lease): sweep-lease-renew.sh's cmd_start extra_args[@] hits the same Bash 3.2 empty-array bug as #8281
+- **#8347**: [Part of #8063] Persist daily weekly-limit-point samples from tokens check
+- **#8348**: [Part of #8063] $-eq-per-weekly-point calibration join + step-change detection (pure logic)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
 - **#8063**: limit calibration: surface $-equivalent per weekly-limit-point in loom-daemon health, warn on step change
-- **#8253**: dep-recheck-fingerprint: an already-MERGED PR's transient UNKNOWN mergeability still moves CONCLUSION_HASH (churns curator dep-recheck comments)
 - **#8263**: gh api call sites pass an unsupported --repo flag, silently disabling five LOOM_REPO-host probes
 - **#8267**: Agent work is lost by default: a subagent can report success with its entire deliverable uncommitted, and the completion notification looks identical
 - **#8268**: Subagents spend 30-40% of runtime re-verifying work the coordinator is already verifying, because neither can see the other
 - **#8277**: Thread the in-flight model into LOOM_TERMINAL_RESULT so #8058's class-scoped health marks have a producer
-- **#8284**: merge-pr.sh version guard runs main's checker, so a PR that changes the version-bearing set (e.g. #8190) can never pass it — evaluate the PR head's checker when the diff touches it
+- **#8297**: tokens: claude-monitor ranking.json exposes per-class utilization that monitor.rs ignores
+- **#8323**: dep-recheck-fingerprint.sh: multi-line DEPS/BLOCKERS/REFS output breaks the documented eval invocation with 2+ entries
+- **#8362**: Add Rust Pi and OpenCode runtime adapters for GLM-5.3-Flash trials
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#8353**: fix(forge-helpers): never exit silently on issue creation (#8289)
+- **#8357**: fix(daemon): pass LOOM_REPO to gh api as GH_REPO, not an unsupported --repo flag (#8263)
 
 ## Approved (Awaiting Merge)
 
@@ -78,6 +84,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#8279**: fix(worktree): reconcile the dirty-marker filter with its shell twin (#8195)
 - **#8329**: test(sweep-registry): make the mid-build watchdog's git fixture hermetic (#8170)
 - **#8337**: feat(dashboard): ingest ephemeral_compute records with an explicit redaction policy
+- **#8345**: fix(merge-pr): evaluate the PR head's version-policy checker when the PR changes it (#8284)
+- **#8359**: curator: an autonomous filing is not operator approval (#8309)
 
 ## Proposed
 
@@ -110,7 +118,6 @@ Issues carrying `loom:curated`.
 - **#8197**: release-fetch: a .sig download failure is indistinguishable from an unsigned release, silently downgrading to checksum-only *(curated)*
 - **#8221**: Guard: same-command mktemp fast paths count only bare `NAME=` assignments — `export`/`declare`/`read`/`printf -v` rebinding slips the ambiguity rule *(curated)*
 - **#8248**: A green ratchet check goes stale when the baseline tightens under an in-flight PR — this is what broke main *(curated)*
-- **#8253**: dep-recheck-fingerprint: an already-MERGED PR's transient UNKNOWN mergeability still moves CONCLUSION_HASH (churns curator dep-recheck comments) *(curated)*
 - **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh *(curated)*
 - **#8257**: dashboard: add an ephemeral_compute record type (running-now + elastic-spend views, leak detection, hostless ingest) with a D1 migration *(curated)*
 - **#8263**: gh api call sites pass an unsupported --repo flag, silently disabling five LOOM_REPO-host probes *(curated)*
@@ -120,7 +127,12 @@ Issues carrying `loom:curated`.
 - **#8284**: merge-pr.sh version guard runs main's checker, so a PR that changes the version-bearing set (e.g. #8190) can never pass it — evaluate the PR head's checker when the diff touches it *(curated)*
 - **#8285**: merge-pr.sh fails closed on a daemon predating a required subcommand — name the remediation (artifact roll) and declare the minimum daemon version per script *(curated)*
 - **#8286**: loom-daemon health: codesign_identity preflight runs in the CLI process, so over non-interactive ssh it always reads DEGRADED without saying why *(curated)*
+- **#8287**: worktree.sh reset a stale local feature/issue-N to main although origin/feature/issue-N carried the PR's commits (Doctor on #8190) *(curated)*
+- **#8288**: status table GATE column: 'disabled' reads as dispatch-disabled; it is the main-health gate verdict *(curated)*
+- **#8289**: create-issue.sh hard-refuses as a duplicate at 19% similarity, and sometimes with no message at all *(curated)*
+- **#8290**: release.yml: one-off HTTP 403 on 'gh release create' left v0.19.169 uncreated; step should retry *(curated)*
 - **#8297**: tokens: claude-monitor ranking.json exposes per-class utilization that monitor.rs ignores *(curated)*
+- **#8298**: Judge's DIRTY auto-rebase can silently drop a resync PR's payload (adjacent single-line JSON diff) *(curated)*
 - **#8304**: dashboard: ephemeral_compute ingest + D1 schema + redaction policy (Phase 1 of #8257) *(curated)*
 - **#8309**: Curator: state that an autonomous filing is not operator approval (#8269 point 3) *(curated)*
 - **#8322**: Port PR #8314's per-role tool-restriction deny-spec computation out of spawn-claude.sh/spawn-codex.sh into loom-daemon (Shell Budget Ratchet blocker) *(curated)*
@@ -129,6 +141,9 @@ Issues carrying `loom:curated`.
 - **#8328**: Two loom-daemon unit tests fail on a live-daemon host by reading inherited LOOM_* env (escalate::decide, registry_refresh) *(curated)*
 - **#8330**: shell-budget: ratchet `comparable()`, not just `portable()` — `settled` reclassification can buy portable growth behind a floor declaration *(curated)*
 - **#8333**: bug(lease): sweep-lease-renew.sh's cmd_start extra_args[@] hits the same Bash 3.2 empty-array bug as #8281 *(curated)*
+- **#8347**: [Part of #8063] Persist daily weekly-limit-point samples from tokens check *(curated)*
+- **#8348**: [Part of #8063] $-eq-per-weekly-point calibration join + step-change detection (pure logic) *(curated)*
+- **#8362**: Add Rust Pi and OpenCode runtime adapters for GLM-5.3-Flash trials *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -146,13 +161,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 8 |
+| Operator merge-risk holds | 9 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 17 |
-| In Progress (`loom:building`) | 7 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 8 |
-| Curated | 46 |
+| Ready (`loom:issue`) | 20 |
+| In Progress (`loom:building`) | 8 |
+| PRs awaiting review | 2 |
+| Approved PRs awaiting merge | 10 |
+| Curated | 53 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
