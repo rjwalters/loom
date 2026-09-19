@@ -67,6 +67,23 @@ failed=0
 pass() { echo -e "${GREEN}\xe2\x9c\x93${NC} $1"; passed=$((passed + 1)); }
 fail() { echo -e "${RED}\xe2\x9c\x97${NC} $1"; failed=$((failed + 1)); }
 
+# Exact whole-line membership in a newline-separated list, with no pipeline.
+# `printf '%s\n' "$list" | grep -qx "$x"` would be the obvious spelling, but
+# under this file's `set -o pipefail` that is the SIGPIPE class
+# scripts/check-pipefail-early-exit.sh ratchets (#7790/#7789): `grep -q` closes
+# the pipe the moment it matches, the producer takes SIGPIPE (141), and
+# pipefail reports the whole pipeline as failed — intermittently, depending on
+# output size vs. the pipe buffer. This is the pure-bash "exact membership in a
+# list" idiom from that script's own HOW TO FIX A FINDING table, and it is
+# bash-3.2-clean (the macOS leg of the Shell Syntax job).
+has_line() {
+    local list="$1" needle="$2"
+    case $'\n'"$list"$'\n' in
+        *$'\n'"$needle"$'\n'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 if [[ ! -f "$SUBJECT" ]]; then
     echo "ERROR: skip-labels.sh not found at $REPO_ROOT/.loom/scripts/ or $REPO_ROOT/defaults/scripts/" >&2
     exit 1
@@ -120,13 +137,13 @@ fi
 # --- 2. AC1: journal-configured repo folds it in ------------------------
 journal_out="$(bash "$SUBJECT" --repo-root "$JOURNAL_REPO" 2>&1)"
 
-if printf '%s\n' "$journal_out" | grep -qx 'journal'; then
+if has_line "$journal_out" 'journal'; then
     pass "a repo with extraSkipLabels: [journal] includes journal (AC1, 2am#625)"
 else
     fail "journal missing from: $journal_out"
 fi
 
-if printf '%s\n' "$journal_out" | grep -qx 'external'; then
+if has_line "$journal_out" 'external'; then
     pass "the fleet-wide external exclusion is still present alongside journal"
 else
     fail "external missing from: $journal_out"
@@ -134,8 +151,7 @@ fi
 
 # --- 3. loom:building can never be resolved, even if configured --------
 building_out="$(bash "$SUBJECT" --repo-root "$BUILDING_REPO" 2>&1)"
-if printf '%s\n' "$building_out" | grep -qx 'journal' \
-    && ! printf '%s\n' "$building_out" | grep -qx 'loom:building'; then
+if has_line "$building_out" 'journal' && ! has_line "$building_out" 'loom:building'; then
     pass "loom:building is never resolvable even when named in config"
 else
     fail "unexpected output with loom:building configured: $building_out"
