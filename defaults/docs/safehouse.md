@@ -1201,6 +1201,46 @@ bounded, non-blocking `try_send` off the dispatch path; a `Full`/`Closed` channe
 drops the ad. `safehouse.enabled` false/absent is a **byte-for-byte no-op**: no
 view, no channel, no coordination task, no socket.
 
+### Coordination-health tuning: the flapping-vs-false-positive investigation (#8276)
+
+`PeerClaimView::evaluate_coordination` (Issue #6157) flips `peer_coordination`
+DEGRADED once `LOOM_PEER_COORDINATION_DEGRADE_GRACE_SECS` elapses with no
+genuine inbound peer-claim receive, and clears it once
+`LOOM_PEER_COORDINATION_RECOVERY_THRESHOLD` consecutive receives land —
+see [`DEFAULT_COORDINATION_DEGRADE_GRACE`]/[`DEFAULT_COORDINATION_RECOVERY_THRESHOLD`]
+in `loom-daemon/src/peer_claims.rs` for the exact decision rule.
+
+Recurring flap escalations on this check (`#8276`/`#8303`, both auto-filed by
+the watchdog `#6222`, deduped by `#7664`) were investigated against two
+hypotheses:
+
+- **Hypothesis A** (from `anvil#1270`, a fleet-wide investigation of this
+  flapping class): a RAM/disk-throttled host's own `advertised` counter
+  stalling somehow prevents recovery. **Refuted** — code tracing shows
+  recovery gates solely on *received* peer ads (`observe_at`/
+  `evaluate_coordination`), never on `self.counters.advertised`, and the
+  three flap episodes on `#8276` each showed this host continuing to
+  advertise heavily (150+ dispatches per data point) throughout its own
+  "degraded" window — the opposite of a host too throttled to advertise.
+- **Hypothesis B** (confirmed): fleet-wide peer-claim-ad traffic has natural
+  quiet stretches that occasionally exceeded the grace window even though
+  nothing was broken. All three observed episodes self-recovered within
+  103-225s of crossing the (then-)600s grace — i.e. the underlying quiet gap
+  was only ~703-825s, comfortably self-healing via ordinary traffic resuming,
+  not a sustained one-way-transport failure that would need a reconnect to
+  clear.
+
+**Fix**: `DEFAULT_COORDINATION_DEGRADE_GRACE` was raised from 600s (10m) to
+1200s (20m) — enough headroom over the observed ~825s natural gap without
+materially weakening detection of the reference incident this check exists
+for (2026-08-13: `received=0` across 2510 advertisements, sustained for
+~21h at the 30s reaper cadence — still caught in 20 minutes, a ~60× margin).
+`DEFAULT_COORDINATION_RECOVERY_THRESHOLD` (3 consecutive receives) was left
+unchanged — the observed false positives were about the check tripping too
+eagerly, not about recovery being too slow once tripped. See #8276 for the
+full data points and reasoning, and `anvil#1270` (fleet-wide, blocked on
+`#7664`) for the upstream investigation this closes the loop on.
+
 ### Fleet-wide completion dedup: reusing the peer-claim channel (#6352)
 
 The [per-host completion dedup](#what-gets-narrated) documented under

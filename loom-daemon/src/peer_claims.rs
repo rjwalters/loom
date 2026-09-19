@@ -132,14 +132,35 @@ pub const DEFAULT_SAME_ISSUE_COLLISION_WINDOW: Duration = Duration::from_secs(24
 /// [`DEFAULT_COORDINATION_DEGRADE_GRACE`].
 pub const COORDINATION_DEGRADE_GRACE_ENV: &str = "LOOM_PEER_COORDINATION_DEGRADE_GRACE_SECS";
 
-/// Default degrade grace: 10 minutes — 20× the default reaper
+/// Default degrade grace: 20 minutes — 40× the default reaper
 /// re-advertisement cadence
 /// ([`crate::sweep_registry::reaper::DEFAULT_REAPER_INTERVAL_SECS`], 30s), so
 /// a handful of missed room round-trips (a momentary safehoused hiccup)
 /// never trips it, but a genuinely one-way transport — the 2026-08-13
-/// incident's `received=0` across 2510 advertisements, sustained for hours —
-/// is caught in single-digit minutes, not hours.
-pub const DEFAULT_COORDINATION_DEGRADE_GRACE: Duration = Duration::from_secs(600);
+/// incident's `received=0` across 2510 advertisements, sustained for
+/// **hours** (2510 advertisements × the 30s reaper cadence ≈ 21h) — is still
+/// caught in minutes, not hours.
+///
+/// Raised from the original 10-minute default (Issue #8276, 2026-09-19):
+/// three independent flap episodes on `ip-172-31-74-176` (#8276 itself) all
+/// self-recovered within 103-225s of crossing the (then-)600s grace, i.e. the
+/// underlying quiet-of-genuine-peer-traffic gap was ~703-825s — comfortably
+/// *above* the 10-minute grace but nowhere near the multi-hour signature the
+/// grace exists to catch. Code tracing (`evaluate_coordination`/`observe_at`)
+/// ruled out a receive-path defect: recovery depends solely on inbound peer
+/// ads, which are independent of this host's own dispatch/advertise activity,
+/// and this host kept advertising heavily (150+ dispatches per data point)
+/// throughout each "degraded" window — the opposite of the RAM/disk-throttled
+/// "never advertises" mechanism `anvil#1270` had (explicitly unverified)
+/// hypothesized. The remaining, evidence-consistent explanation is a natural
+/// quiet stretch in fleet-wide peer-claim-ad traffic (e.g. a lull between
+/// dispatches across every host at once) tripping a grace window sized for
+/// single-digit minutes, not one sized for the actual traffic pattern.
+/// Doubling the grace keeps a **large** (~60×) margin below the reference
+/// incident's ~21h duration while giving the observed ~700-825s natural gaps
+/// comfortable headroom not to trip DEGRADED at all. See #8276 for the full
+/// investigation, data points, and hypothesis analysis.
+pub const DEFAULT_COORDINATION_DEGRADE_GRACE: Duration = Duration::from_secs(1200);
 
 /// Env var overriding how many consecutive genuine peer receives must land
 /// while coordination is DEGRADED before it is judged recovered (Issue
@@ -2203,6 +2224,57 @@ mod tests {
     }
 
     // ---- peer-coordination health (Issue #6157) ----
+
+    /// Issue #8276: three independent flap episodes on `ip-172-31-74-176`
+    /// all showed a genuine-peer-traffic quiet gap of ~703-825s — above the
+    /// *old* 600s grace, but a natural fleet-traffic lull rather than the
+    /// multi-hour one-way-transport signature the check exists to catch (see
+    /// [`DEFAULT_COORDINATION_DEGRADE_GRACE`]'s doc comment for the full
+    /// investigation). Using the raised default directly (not a literal),
+    /// this reproduces the longest observed gap (825s, flap #2) and asserts
+    /// it no longer trips DEGRADED — the false-positive this issue tuned
+    /// away.
+    #[test]
+    fn coordination_survives_the_825s_quiet_gap_observed_in_issue_8276() {
+        let mut view = PeerClaimView::new("ip-172-31-74-176".into(), Duration::from_secs(2000));
+        let base = Instant::now();
+        view.record_advertised_at(base);
+
+        let grace = DEFAULT_COORDINATION_DEGRADE_GRACE;
+        let eval = view.evaluate_coordination(base + Duration::from_secs(825), grace, 3);
+        assert!(
+            !eval.degraded,
+            "an ~825s natural quiet gap must not trip DEGRADED under the raised default grace"
+        );
+        assert!(!eval.transitioned);
+    }
+
+    /// The raised default must still catch the 2026-08-13 incident's actual
+    /// signature (sustained advertising, zero receives, for **hours** —
+    /// 2510 advertisements at the 30s reaper cadence ≈ 21h) well within
+    /// minutes, not hours — the false-positive fix must not blind the check
+    /// to a genuine mesh partition.
+    #[test]
+    fn coordination_still_degrades_on_a_genuine_multi_hour_outage_under_raised_default() {
+        let mut view = PeerClaimView::new("robb-studio".into(), Duration::from_secs(3 * 3600));
+        let base = Instant::now();
+        view.record_advertised_at(base);
+
+        let grace = DEFAULT_COORDINATION_DEGRADE_GRACE;
+        // Exactly at the raised grace boundary: still healthy.
+        let still_healthy =
+            view.evaluate_coordination(base + grace - Duration::from_secs(1), grace, 3);
+        assert!(!still_healthy.degraded);
+
+        // One second later coordination flips DEGRADED — minutes, not the
+        // ~21h the reference incident actually ran for.
+        let eval = view.evaluate_coordination(base + grace, grace, 3);
+        assert!(eval.degraded && eval.transitioned);
+        assert!(
+            grace < Duration::from_secs(3600),
+            "the raised grace must still be well under an hour, let alone the ~21h reference incident"
+        );
+    }
 
     #[test]
     fn coordination_stays_healthy_when_never_advertised() {
