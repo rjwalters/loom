@@ -908,6 +908,88 @@ fn moving_lines_out_of_a_settled_file_into_a_portable_one_is_still_refused() {
     assert!(err.contains("PORTABLE"), "{err}");
 }
 
+// --- #8330: `comparable()` ratchet ---
+
+#[test]
+fn a_settled_reclassification_cannot_smuggle_portable_growth_elsewhere() {
+    // The exact reproduction from #8330: `a.sh` moves `contract` -> `settled`
+    // with an unchanged line count (passes the settled leg — it did not grow),
+    // while `c.sh` grows by exactly as much (`50 -> 150`). `a.sh`'s departure
+    // from PORTABLE offsets `c.sh`'s arrival at the CATEGORY level, so
+    // `portable()` reads `150 -> 150` and the portable leg passes too. Before
+    // this fix, a `Shell-Budget-Growth: 100 lines` declaration bought this
+    // outright — 100 brand-new portable lines landed behind a floor-growth
+    // trailer, and `comparable()` (what the report actually publishes as "net
+    // vs epic start") rose by 100.
+    let before = budget_files(&[("a.sh", "contract", 100), ("c.sh", "contract", 50)]);
+    let now = budget_files(&[("a.sh", "settled", 100), ("c.sh", "contract", 150)]);
+    assert_eq!(now.portable(), before.portable(), "the portable leg alone does not see this");
+    assert!(
+        settled_growth_message(&now, &before, "base").is_none(),
+        "the settled leg alone does not see this either — a.sh itself did not grow"
+    );
+    assert_eq!(now.comparable(), before.comparable() + 100);
+
+    let d = decl(100);
+    let err = check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
+        .expect_err("comparable() rose by 100 and there is no override for that");
+    assert!(err.contains("portable + settled"), "{err}");
+    assert!(err.contains("150 -> 250"), "must name the comparable delta: {err}");
+}
+
+#[test]
+fn the_silent_variant_paid_for_by_deleting_floor_lines_is_also_caught() {
+    // The issue's second wrinkle: the same smuggle, but with the total left
+    // flat by deleting an equal number of `bootstrap` lines — so the
+    // overridable total leg never even fires, and (pre-fix) nothing refused it
+    // and no declaration was required at all. `comparable()` does not net
+    // against the floor, so it still catches this without any total-growth
+    // involvement.
+    let before = budget_files(&[
+        ("a.sh", "contract", 100),
+        ("c.sh", "contract", 50),
+        ("gate.sh", "bootstrap", 400),
+    ]);
+    let now = budget_files(&[
+        ("a.sh", "settled", 100),
+        ("c.sh", "contract", 150),
+        ("gate.sh", "bootstrap", 300),
+    ]);
+    assert_eq!(now.total(), before.total(), "the total leg sees nothing here");
+    let err = check_against_rev(&now, &before, "base", &GrowthContext::none())
+        .expect_err("comparable() still rose by 100 even though total() did not move");
+    assert!(err.contains("portable + settled"), "{err}");
+}
+
+#[test]
+fn a_pure_reclassification_still_lands_with_no_declaration() {
+    // The property `Budget::comparable`'s doc comment argues for, exercised
+    // through `check_against_rev` rather than `render_report`: reclassifying
+    // `contract` -> `settled` with identical content changes nothing about
+    // `comparable()`, so it must need no declaration at all.
+    let before = budget_files(&[("a.sh", "contract", 100)]);
+    let now = budget_files(&[("a.sh", "settled", 100)]);
+    assert_eq!(now.comparable(), before.comparable());
+    check_against_rev(&now, &before, "base", &GrowthContext::none())
+        .expect("pure reclassification must not need an override");
+}
+
+#[test]
+fn pr_8319s_own_shape_still_lands() {
+    // Approximates the real change that introduced `settled` (#8319): the
+    // portable pool was 38,439 lines immediately before, and the PR moved
+    // 3,533 of them into `settled` with no line-count change anywhere.
+    // `comparable()` is invariant under that move (37493 in the issue's own
+    // verification is close in kind, not value, to this shape — the property
+    // being pinned is "before == after", not any one figure).
+    let before = budget_files(&[("a.sh", "contract", 34_906), ("b.sh", "contract", 3_533)]);
+    let now = budget_files(&[("a.sh", "contract", 34_906), ("b.sh", "settled", 3_533)]);
+    assert_eq!(before.comparable(), 38_439);
+    assert_eq!(before.comparable(), now.comparable());
+    check_against_rev(&now, &before, "base", &GrowthContext::none())
+        .expect("the change that populates `settled` must not need an override");
+}
+
 #[test]
 fn the_settled_refusal_teaches_the_way_out() {
     // A refusal that does not say what to do instead gets worked around rather
