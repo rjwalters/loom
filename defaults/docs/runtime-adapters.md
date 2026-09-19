@@ -957,7 +957,7 @@ model)` into `tokens_pool::record_terminal_for_model` — a
 **class-scoped** `class_cooldowns` entry (`.loom/account-health.json`)
 rather than the account-wide `plan_exhausted` cooldown every other category
 (and every v1 record) still writes. See
-[`tokens_pool::health`'s module doc](../../loom-daemon/src/tokens_pool/health.rs)
+[`tokens_pool::health`'s module doc](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens_pool/health.rs)
 for the full narrowing/fail-safe contract (#8058 Phase 2).
 
 An adapter emitting this record for the first time should start at `v=2`
