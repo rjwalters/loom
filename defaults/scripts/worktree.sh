@@ -2485,10 +2485,7 @@ fi
 # Check if branch already exists
 if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_warning "Branch '$BRANCH_NAME' already exists - reusing it"
-        print_info "To create a new branch instead, use a custom branch name:"
-        echo "  ./.loom/scripts/worktree.sh $ISSUE_NUMBER <custom-branch-name>"
-        echo ""
+        print_warning "Branch '$BRANCH_NAME' already exists - reusing it (for a fresh branch instead, pass a custom name: ./.loom/scripts/worktree.sh $ISSUE_NUMBER <custom-branch-name>)"
     fi
 
     # #6095: a pre-existing local branch can be carrying a stale or wrong
@@ -2518,6 +2515,17 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
             fi
             git branch --set-upstream-to="origin/$BRANCH_NAME" "$BRANCH_NAME" 2>/dev/null || true
         fi
+    fi
+
+    # #8280: the sibling arm below refuses an already-LANDED branch (#5657) and
+    # warns when the branch lacks the base ref's history. This arm did neither,
+    # so a stale local feature/issue-N left from an earlier slice was reused in
+    # SILENCE — yielding a worktree tens of commits behind the base, on a merged
+    # PR's branch, and a PR that re-proposed already-merged code with no CI. A
+    # surviving local ref is the normal state on a host that built the previous
+    # slice, which is exactly the partial-increment case #5657 was written for.
+    if [[ "$JSON_OUTPUT" != "true" ]] && ! git merge-base --is-ancestor "$BASE_REF" "$BRANCH_NAME" 2>/dev/null; then
+        print_warning "Branch '$BRANCH_NAME' has diverged from $BASE_DISPLAY (does not contain all of its history) - reusing it as-is; rebase or delete it if that is not what you want"
     fi
 
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
