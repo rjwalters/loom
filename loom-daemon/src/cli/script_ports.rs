@@ -74,6 +74,14 @@ pub(crate) enum ScriptPortCommand {
     /// `loom-daemon-watchdog.sh`. Run by a launchd/systemd timer on a
     /// `StartInterval` cadence, so it owns no long-lived process.
     DaemonWatchdog(super::watchdog::WatchdogArgs),
+
+    /// The combined "not a work item" label list for a role prompt's
+    /// unfiltered fallback query (#8255): the fleet-wide hard exclusions
+    /// (`hard-exclusion-labels.sh`'s list) plus this workspace's configured
+    /// `autonomous.workFinder.extraSkipLabels` (#6685). Backs
+    /// `skip-labels.sh`. See `cli/skip_labels.rs` for why the two knobs had
+    /// drifted apart (2AMLogic/2am's `journal` label).
+    SkipLabels(super::skip_labels::SkipLabelsArgs),
 }
 
 impl ScriptPortCommand {
@@ -91,6 +99,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
+            ScriptPortCommand::SkipLabels(args) => args.run(),
         }
     }
 }
