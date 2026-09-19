@@ -2930,7 +2930,7 @@ fn resolve_stale_treating_minutes_defaults_and_overrides() {
 /// Write a fake `gh` script (tests only) that logs every invocation to
 /// `gh_log`, reports exactly one PR carrying the requested claim label
 /// for `pr list`, and reports `extra_labels` (plus nothing else) for
-/// `pr view --json labels` -- letting a test control whether the
+/// `pr view --json labels,isDraft` -- letting a test control whether the
 /// safety-net `loom:review-requested` backfill should fire.
 fn write_fake_gh_pr(
     dir: &std::path::Path,
@@ -2939,6 +2939,30 @@ fn write_fake_gh_pr(
     updated_at: &str,
     head_ref_name: &str,
     extra_labels: &[&str],
+) -> std::path::PathBuf {
+    write_fake_gh_pr_with_draft(
+        dir,
+        gh_log,
+        pr_number,
+        updated_at,
+        head_ref_name,
+        extra_labels,
+        false,
+    )
+}
+
+/// Same as [`write_fake_gh_pr`], but also lets a test control the PR's
+/// `isDraft` value in the `pr view --json labels,isDraft` response — used
+/// to reproduce #8250 (a stale claim reclaimed on a draft PR must not be
+/// backfilled `loom:review-requested`).
+fn write_fake_gh_pr_with_draft(
+    dir: &std::path::Path,
+    gh_log: &std::path::Path,
+    pr_number: u32,
+    updated_at: &str,
+    head_ref_name: &str,
+    extra_labels: &[&str],
+    is_draft: bool,
 ) -> std::path::PathBuf {
     let fake_gh = dir.join("fake-gh-pr.sh");
     let labels_json = extra_labels
@@ -2954,7 +2978,7 @@ if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  echo '{{"labels":[{labels_json}]}}'
+  echo '{{"labels":[{labels_json}],"isDraft":{is_draft}}}'
   exit 0
 fi
 exit 0
@@ -3046,6 +3070,115 @@ fn reconcile_pr_claims_keeps_fresh_pr() {
         !gh_calls.contains("--remove-label loom:reviewing")
             && !gh_calls.contains("--remove-label loom:treating"),
         "no claim label should have been removed; got: {gh_calls:?}"
+    );
+
+    std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
+    std::env::remove_var(STALE_TREATING_MINUTES_ENV);
+}
+
+/// #8250: a stale `loom:reviewing`/`loom:treating` claim reclaimed off a
+/// **draft** PR (`isDraft: true`, no state label) must NOT be backfilled
+/// `loom:review-requested` -- Judge is not ready to look at a draft, so
+/// the backfill would just waste a review pass. The claim label itself
+/// must still be removed (the reclaim happens; only the backfill is
+/// skipped).
+#[test]
+#[serial]
+fn reconcile_pr_claims_reclaims_stale_claim_but_skips_backfill_on_draft_pr() {
+    let dir = tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let journal_path = dir.path().join("sweeps.json");
+    std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+    std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "30");
+    std::env::set_var(STALE_TREATING_MINUTES_ENV, "60");
+
+    let gh_log = dir.path().join("gh-invocations.log");
+    let old = (Utc::now() - Duration::minutes(90)).to_rfc3339();
+    let fake_gh = write_fake_gh_pr_with_draft(
+        dir.path(),
+        &gh_log,
+        502,
+        &old,
+        "some-random-branch",
+        &[],
+        true,
+    );
+
+    let (checked, reclaimed) = forge::reconcile_pr_claims(&fake_gh, &repo_root);
+
+    assert!(checked >= 1);
+    assert!(reclaimed >= 1, "the stale claim label must still be reclaimed");
+
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        gh_calls.contains("pr edit 502 --remove-label loom:reviewing"),
+        "expected loom:reviewing to be removed from #502; got: {gh_calls:?}"
+    );
+    assert!(
+        !gh_calls.contains("--add-label loom:review-requested"),
+        "a draft PR must never be backfilled loom:review-requested; got: {gh_calls:?}"
+    );
+
+    std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
+    std::env::remove_var(STALE_TREATING_MINUTES_ENV);
+}
+
+/// #8250 edge case: if `isDraft` is absent from the `pr view` response
+/// (e.g. an older `gh` or a partial API response), the fail-safe default
+/// is non-draft -- matching the existing accepted failure class for a
+/// wholesale `gh pr view` failure (see `pr_label_names`'s doc comment)
+/// -- so the backfill still fires rather than silently getting skipped.
+#[test]
+#[serial]
+fn reconcile_pr_claims_backfills_when_is_draft_field_is_absent() {
+    let dir = tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let journal_path = dir.path().join("sweeps.json");
+    std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+    std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "30");
+    std::env::set_var(STALE_TREATING_MINUTES_ENV, "60");
+
+    let gh_log = dir.path().join("gh-invocations.log");
+    let old = (Utc::now() - Duration::minutes(90)).to_rfc3339();
+    let fake_gh = dir.path().join("fake-gh-pr-no-draft-field.sh");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  echo '[{{"number":503,"updatedAt":"{old}","headRefName":"some-random-branch"}}]'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  echo '{{"labels":[]}}'
+  exit 0
+fi
+exit 0
+"#,
+        log = gh_log.display(),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+    }
+
+    let (checked, reclaimed) = forge::reconcile_pr_claims(&fake_gh, &repo_root);
+
+    assert!(checked >= 1);
+    assert!(reclaimed >= 1);
+
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        gh_calls.contains("pr edit 503 --add-label loom:review-requested"),
+        "a missing isDraft field must default to non-draft, not panic/skip the backfill: {gh_calls:?}"
     );
 
     std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);

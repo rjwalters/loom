@@ -2814,27 +2814,40 @@ pub mod forge {
         most_recent_claim_activity_at(&comments, since)
     }
 
-    /// The PR's currently-applied state labels (a best-effort subset of
-    /// `--json labels`, used only to decide whether [`reclaim_pr`]'s safety
-    /// net needs to fire). A `gh` failure here degrades to an empty list —
-    /// see [`reclaim_pr`]'s call site for why that is the safe direction:
-    /// it makes the safety net fire (adds `loom:review-requested`) rather
-    /// than silently leaving a PR with no state label at all.
-    fn pr_label_names(gh_bin: &Path, root: &Path, pr_number: u32) -> Result<Vec<String>> {
+    /// The PR's currently-applied state labels plus its draft status (a
+    /// best-effort subset of `--json labels,isDraft`, used only to decide
+    /// whether [`reclaim_pr`]'s safety net needs to fire, and whether it is
+    /// safe to backfill `loom:review-requested` at all). A `gh` failure here
+    /// degrades to an empty label list and `is_draft: false` — see
+    /// [`reclaim_pr`]'s call site for why that is the safe direction: it
+    /// makes the safety net fire (adds `loom:review-requested`) rather than
+    /// silently leaving a PR with no state label at all. Likewise, an
+    /// absent/unparseable `isDraft` field defaults to `false` (non-draft),
+    /// preserving that same fail-safe direction rather than silently
+    /// skipping the backfill.
+    #[derive(Debug, Default)]
+    struct PrLabelInfo {
+        labels: Vec<String>,
+        is_draft: bool,
+    }
+
+    fn pr_label_names(gh_bin: &Path, root: &Path, pr_number: u32) -> Result<PrLabelInfo> {
         #[derive(Debug, Deserialize)]
         struct GhLabel {
             name: String,
         }
-        #[derive(Debug, Deserialize)]
+        #[derive(Debug, Default, Deserialize)]
         struct GhPrLabels {
             labels: Vec<GhLabel>,
+            #[serde(default, rename = "isDraft")]
+            is_draft: bool,
         }
         let mut cmd = Command::new(gh_bin);
         cmd.arg("pr")
             .arg("view")
             .arg(pr_number.to_string())
             .arg("--json")
-            .arg("labels");
+            .arg("labels,isDraft");
         cmd.current_dir(root);
         // #5401: cross-owner managed repo -> its own owner's installation-token
         // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
@@ -2848,14 +2861,17 @@ pub mod forge {
             .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
         if !out.status.success() {
             return Err(anyhow!(
-                "gh pr view {pr_number} --json labels failed in {}: {}",
+                "gh pr view {pr_number} --json labels,isDraft failed in {}: {}",
                 root.display(),
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
         let parsed: GhPrLabels =
-            serde_json::from_slice(&out.stdout).context("parse gh pr view labels JSON")?;
-        Ok(parsed.labels.into_iter().map(|l| l.name).collect())
+            serde_json::from_slice(&out.stdout).context("parse gh pr view labels,isDraft JSON")?;
+        Ok(PrLabelInfo {
+            labels: parsed.labels.into_iter().map(|l| l.name).collect(),
+            is_draft: parsed.is_draft,
+        })
     }
 
     fn add_label(gh_bin: &Path, root: &Path, pr_number: u32, label: &str) -> Result<()> {
@@ -2889,10 +2905,13 @@ pub mod forge {
     /// Reclaim one stale PR-side claim: remove `claim_label`, then — as a
     /// safety net — add `loom:review-requested` if the PR is left with none
     /// of the three state labels (`loom:review-requested`,
-    /// `loom:changes-requested`, `loom:pr`). The safety-net check is
-    /// best-effort: a failure to read the PR's current labels defaults to
-    /// treating it as unlabeled (adds `loom:review-requested`) rather than
-    /// leaving a PR that might genuinely have no state label undiscoverable.
+    /// `loom:changes-requested`, `loom:pr`) **and** it is not a draft (#8250:
+    /// a draft PR is not ready for Judge, so the backfill is skipped even
+    /// when it has no state label). The safety-net check is best-effort: a
+    /// failure to read the PR's current labels/draft status defaults to
+    /// treating it as unlabeled and non-draft (adds `loom:review-requested`)
+    /// rather than leaving a PR that might genuinely have no state label
+    /// undiscoverable.
     fn reclaim_pr(gh_bin: &Path, root: &Path, pr_number: u32, claim_label: &str) -> Result<()> {
         let mut cmd = Command::new(gh_bin);
         cmd.arg("pr")
@@ -2921,12 +2940,19 @@ pub mod forge {
 
         const STATE_LABELS: [&str; 3] =
             ["loom:review-requested", "loom:changes-requested", "loom:pr"];
-        let current_labels = pr_label_names(gh_bin, root, pr_number).unwrap_or_default();
-        let has_state_label = current_labels
+        let pr_info = pr_label_names(gh_bin, root, pr_number).unwrap_or_default();
+        let has_state_label = pr_info
+            .labels
             .iter()
             .any(|l| STATE_LABELS.contains(&l.as_str()));
         if !has_state_label {
-            if let Err(e) = add_label(gh_bin, root, pr_number, "loom:review-requested") {
+            if pr_info.is_draft {
+                log::debug!(
+                    "claim_reconciliation: reclaimed {claim_label} from PR #{pr_number} in {} \
+                     but skipped backfilling loom:review-requested because the PR is a draft",
+                    root.display()
+                );
+            } else if let Err(e) = add_label(gh_bin, root, pr_number, "loom:review-requested") {
                 log::warn!(
                     "claim_reconciliation: reclaimed {claim_label} from PR #{pr_number} in {} \
                      but failed to backfill loom:review-requested: {e}",
