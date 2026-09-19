@@ -6,8 +6,10 @@
 //! its `KEY=VALUE` output. So three things are frozen:
 //!
 //! - **argv**: the same subcommands and long flags;
-//! - **stdout**: the same keys, in the same order, with the same quoting — see
-//!   [`shell_quote`], whose asymmetric application is deliberate;
+//! - **stdout**: the same keys, in the same order, with the same quoting —
+//!   [`shell_quote`] is applied uniformly to every multi-value field
+//!   (`REFS`, `BLOCKERS`, `DEPS`, #8323) so a 2+-entry value still `eval`s as
+//!   one assignment;
 //! - **exit codes**: `0` evaluated, `2` usage error, `3` missing dependency.
 //!
 //! `defaults/scripts/tests/test-dep-recheck-fingerprint.sh` drives all of it
@@ -65,11 +67,16 @@ fn die(msg: &str, code: i32) -> i32 {
 /// Quote a value the way bash's `printf %q` does, for the fields whose values
 /// may contain whitespace or newlines and which callers `eval`.
 ///
-/// Applied to `REFS` only. `BLOCKERS` and `DEPS` are emitted **unquoted**,
-/// exactly as the shell does — even though they are also multi-line. That
-/// asymmetry is preserved rather than normalised: a caller of one is not a
-/// caller of the other, and changing either side's quoting silently changes
-/// what their `eval` produces.
+/// Applied to `REFS`, `BLOCKERS`, and `DEPS` alike (#8323). `BLOCKERS`/`DEPS`
+/// used to be emitted **unquoted** even though they are just as multi-line as
+/// `REFS` — a 2+-entry value produced a second, bare `KEY=`-less line that
+/// broke every documented `eval "$(...)"` caller in `curator.md`'s "Checking
+/// Dependencies" and "Checking Operator-Only Premises" sections the moment an
+/// issue had 2+ dependencies/blockers. `shell_quote` already handled the
+/// single-value case identically (its "safe word" branch returns the bare
+/// value unquoted), so applying it here is a pure widening: single-value
+/// output is byte-for-byte unchanged, and multi-value output now survives
+/// `eval` as one continuous assignment.
 #[must_use]
 pub fn shell_quote(value: &str) -> String {
     if value.is_empty() {
@@ -177,7 +184,8 @@ fn run_dep_recheck(cwd: &Path, opts: &Opts, stdin_text: Option<&str>) -> Result<
         );
     } else {
         println!("VERDICT={}", o.verdict);
-        println!("BLOCKERS={}", o.blockers);
+        // Quoted: consumers eval these assignments and the list is multi-line.
+        println!("BLOCKERS={}", shell_quote(&o.blockers));
         println!("BLOCK_REASON={}", o.block_reason);
         println!("ORTHOGONAL={}", o.orthogonal);
         println!("CONCLUSION_HASH={}", o.conclusion_hash);
@@ -257,7 +265,8 @@ fn run_named_dependency(cwd: &Path, opts: &Opts, stdin_text: Option<&str>) -> Re
         );
     } else {
         println!("VERDICT={}", o.verdict);
-        println!("DEPS={}", o.deps);
+        // Quoted: consumers eval these assignments and the list is multi-line.
+        println!("DEPS={}", shell_quote(&o.deps));
         println!("CONCLUSION_HASH={}", o.conclusion_hash);
     }
     Ok(0)

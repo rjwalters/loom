@@ -87,6 +87,18 @@ field() { # <output> <KEY>
     grep -E "^$2=" <<<"$1" | head -n 1 | cut -d= -f2-
 }
 
+# eval_var <output> <VAR> - the documented curator.md consumer pattern itself:
+# `eval "$(...)"` the whole KEY=VALUE block, then read one variable back. Used
+# for #8323 regression coverage: a naive line-based `field()`/`grep` extractor
+# would still "pass" against the pre-fix unquoted multi-line bug (it only ever
+# reads the first line), so these assertions must go through a real `eval`
+# to catch a value whose second+ line breaks it. `rc` is intentionally left
+# in the caller's hands (not `set -e` here) so a failing eval is itself an
+# assertable outcome rather than aborting the whole suite.
+eval_var() {
+    printf '%s\n' "$1" | bash -c 'eval "$(cat)" && printf "%s" "${!1}"' _ "$2"
+}
+
 echo "Testing dep-recheck-fingerprint.sh..."
 echo ""
 
@@ -119,7 +131,12 @@ assert_ne "" "$(field "$out1" CONCLUSION_HASH)" "T1c: CONCLUSION_HASH is non-emp
 # --- T2: no linked PR at all -> VERDICT=clear, empty BLOCKERS ---------------
 out="$(echo '{"prs":[]}' | "$TARGET_SCRIPT" dep-recheck --stdin)"
 assert_eq "clear" "$(field "$out" VERDICT)" "T2: an empty prs list defaults to VERDICT=clear"
-assert_eq "" "$(field "$out" BLOCKERS)" "T2: BLOCKERS is empty when there are no linked PRs"
+# An empty value is now the same shell_quote()'d `''` literal that REFS has
+# always used for its own empty case (#8323 made BLOCKERS/DEPS consistent
+# with REFS's existing quoting) -- eval still resolves it to an empty string,
+# which is the only thing any documented consumer reads.
+assert_eq "''" "$(field "$out" BLOCKERS)" "T2: BLOCKERS renders as an empty shell_quote()'d literal when there are no linked PRs"
+assert_eq "" "$(eval_var "$out" BLOCKERS)" "T2: eval-consumed BLOCKERS resolves to an empty string when there are no linked PRs"
 
 # --- T3: THE #7281 REGRESSION - transient UNKNOWN must not flip the verdict -
 # A PR blocking purely on merge-state (no blocking label): CONFLICTING today.
@@ -385,10 +402,13 @@ assert_eq "clear" "$(field "$out" VERDICT)" "T14e: a checked dependency never bl
 assert_eq "1:checked" "$(field "$out" DEPS)" "T14e: DEPS renders a checked dependency as '<ref>:checked'"
 
 # T14f: no named dependencies at all -> VERDICT=clear, empty DEPS (mirrors
-# dep-recheck's "empty prs -> clear" default).
+# dep-recheck's "empty prs -> clear" default). Like T2/BLOCKERS, the raw
+# value is now the shell_quote()'d `''` literal (#8323); the eval-observable
+# value is still an empty string.
 out="$(echo '{"deps":[]}' | "$TARGET_SCRIPT" named-dependency --stdin)"
 assert_eq "clear" "$(field "$out" VERDICT)" "T14f: an empty deps list defaults to VERDICT=clear"
-assert_eq "" "$(field "$out" DEPS)" "T14f: DEPS is empty when there are no named dependencies"
+assert_eq "''" "$(field "$out" DEPS)" "T14f: DEPS renders as an empty shell_quote()'d literal when there are no named dependencies"
+assert_eq "" "$(eval_var "$out" DEPS)" "T14f: eval-consumed DEPS resolves to an empty string when there are no named dependencies"
 
 # T14g: label churn on a referenced OPEN PR (loom:pr/loom:review-requested/
 # loom:changes-requested/loom:merge-conflict/loom:operator, etc.) is
@@ -398,6 +418,20 @@ out1="$(echo '{"deps":[{"number":6333,"checked":false,"state":"OPEN"}]}' | "$TAR
 out2="$(echo '{"deps":[{"number":6333,"checked":false,"state":"OPEN"}]}' | "$TARGET_SCRIPT" named-dependency --stdin)"
 assert_eq "$(field "$out1" CONCLUSION_HASH)" "$(field "$out2" CONCLUSION_HASH)" \
     "T14g: identical named-dependency input twice produces an identical hash"
+
+# T14h (#8323 THE REGRESSION): 2+ still-open named dependencies emit a
+# multi-line DEPS value. The documented curator.md consumer is
+# `eval "$(./.loom/scripts/dep-recheck-fingerprint.sh named-dependency ...)"`
+# -- before the fix, an unquoted second+ line (no `KEY=` prefix) was itself
+# executed as a command by `eval` and failed with "command not found" instead
+# of extending the DEPS assignment. Assert the eval actually succeeds AND
+# that DEPS captures every line, not just the first.
+out_2deps="$(echo '{"deps":[{"number":8304,"checked":false,"state":"OPEN"},{"number":8305,"checked":false,"state":"OPEN"}]}' | "$TARGET_SCRIPT" named-dependency --stdin)"
+rc=0
+deps_2="$(eval_var "$out_2deps" DEPS)" || rc=$?
+assert_eq "0" "$rc" "T14h: eval \"\$(...)\" succeeds for a 2-entry DEPS value (#8323)"
+assert_eq "$(printf '8304:OPEN\n8305:OPEN')" "$deps_2" \
+    "T14h: the eval-consumed DEPS variable contains BOTH lines, not just the first (#8323)"
 
 # --- T15: named-dependency live --number mode (stubbed gh) - parses the
 # issue body's own `## Dependencies` checklist and looks up each unchecked
@@ -409,9 +443,12 @@ jq -n '{state: "OPEN"}' >"$STUB_DIR/issue-6333.json"
 out="$("$TARGET_SCRIPT" named-dependency --number 6335 --repo owner/repo)"
 assert_eq "blocked" "$(field "$out" VERDICT)" \
     "T15a: live --number mode parses the body's Dependencies checklist and reports VERDICT=blocked while the named ref is still OPEN"
-# DEPS can span multiple lines (one per named dependency); `field()` above
-# only returns the first, so extract the full multi-line block directly.
-deps="$(printf '%s\n' "$out" | sed -n '/^DEPS=/,/^CONCLUSION_HASH=/p' | sed '$d' | sed 's/^DEPS=//')"
+# DEPS can span multiple lines (one per named dependency); go through the
+# documented eval consumer (#8323) rather than a raw-line grep, since the
+# output is now a single quoted assignment, not a bare multi-line block.
+rc=0
+deps="$(eval_var "$out" DEPS)" || rc=$?
+assert_eq "0" "$rc" "T15b: eval \"\$(...)\" succeeds for named-dependency's live 2-entry DEPS value"
 assert_eq "$(printf '100:checked\n6333:OPEN')" "$deps" \
     "T15b: DEPS includes both the checked (#100) and unchecked-but-open (#6333) entries, and excludes #999 from an unrelated section"
 
@@ -540,6 +577,24 @@ assert_ne "$(field "$out_pr" CONCLUSION_HASH)" "$(field "$out_pr_conflicting" CO
     "T18a: mergeable MERGEABLE/CLEAN -> CONFLICTING (labels unchanged) changes CONCLUSION_HASH"
 assert_eq "blocked" "$(field "$out_pr_conflicting" VERDICT)" \
     "T18b: CONFLICTING merge state alone (no superseding label) is still VERDICT=blocked"
+
+# T18c (#8323 THE REGRESSION, dep-recheck side): 2+ blocking PRs emit a
+# multi-line BLOCKERS value -- same eval-breaking shape as T14h/T15b, but for
+# `dep-recheck` rather than `named-dependency`. Assert eval succeeds and
+# BLOCKERS captures every line.
+F_TWO_BLOCKERS='{"prs":[{"number":8304,"state":"OPEN","labels":["loom:changes-requested"],"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN"},{"number":8305,"state":"OPEN","labels":["loom:changes-requested"],"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN"}]}'
+out_two_blockers="$(echo "$F_TWO_BLOCKERS" | "$TARGET_SCRIPT" dep-recheck --stdin)"
+rc=0
+blockers_2="$(eval_var "$out_two_blockers" BLOCKERS)" || rc=$?
+assert_eq "0" "$rc" "T18c: eval \"\$(...)\" succeeds for a 2-entry BLOCKERS value (#8323)"
+assert_eq "$(printf '8304:OPEN:block-label:mergeable\n8305:OPEN:block-label:mergeable')" "$blockers_2" \
+    "T18c: the eval-consumed BLOCKERS variable contains BOTH lines, not just the first (#8323)"
+
+# T18d: the single-entry case (the common case that hid #8323) must keep
+# producing the same unquoted, backward-compatible form it always has.
+out_one_blocker="$(echo "$F_PR" | "$TARGET_SCRIPT" dep-recheck --stdin)"
+assert_eq "6817:OPEN:no-block-label:mergeable" "$(field "$out_one_blocker" BLOCKERS)" \
+    "T18d: a single-entry BLOCKERS value stays unquoted (no shell_quote overhead) after the #8323 fix"
 
 shell_refs() {
     printf '%s\n' "$1" | bash -euc 'eval "$(cat)"; printf "%s" "$REFS"'
