@@ -7,6 +7,21 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-19
+- **Issue #8330** (closed): shell-budget: ratchet `comparable()`, not just `portable()` — `settled` reclassification can buy portable growth behind a floor declaration
+- **PR #8368**: fix(shell-budget): ratchet comparable(), not just portable()
+- **Issue #8309** (closed): Curator: state that an autonomous filing is not operator approval (#8269 point 3)
+- **PR #8359**: curator: an autonomous filing is not operator approval (#8309)
+- **Issue #8333** (closed): bug(lease): sweep-lease-renew.sh's cmd_start extra_args[@] hits the same Bash 3.2 empty-array bug as #8281
+- **PR #8367**: fix(sweep-lease): guard empty extra_args[@] in cmd_start's renewal loop (#8333)
+- **Issue #8323** (closed): dep-recheck-fingerprint.sh: multi-line DEPS/BLOCKERS/REFS output breaks the documented eval invocation with 2+ entries
+- **PR #8365**: fix(dep-recheck): quote multi-line BLOCKERS/DEPS so eval survives 2+ entries
+- **Issue #8063** (closed): limit calibration: surface $-equivalent per weekly-limit-point in loom-daemon health, warn on step change
+- **PR #8366**: feat(health): surface $-eq-per-weekly-point calibration signal, warn on step change
+- **Issue #8362** (closed): Add Rust Pi and OpenCode runtime adapters for GLM-5.3-Flash trials
+- **PR #8363**: feat: add Rust Pi/OpenCode adapters and reusable model profiles
+- **Issue #8361** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #8253** (closed): dep-recheck-fingerprint: an already-MERGED PR's transient UNKNOWN mergeability still moves CONCLUSION_HASH (churns curator dep-recheck comments)
+- **PR #8356**: fix(dep-recheck): gate the merge-state bucket on state == "OPEN" (#8253)
 - **Issue #8346** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
 - **Issue #8232** (closed): champion-pr-merge.md: same BSD date -j -f UTC-parsing bug as #8230, 4 more occurrences
 - **PR #8343**: fix(champion): add -u to BSD date -j -f UTC parsing at 5 remaining sites (#8232)
