@@ -64,7 +64,7 @@
 2319 loom-daemon/src/sweep_registry/guards.rs
 1075 loom-daemon/src/sweep_registry/mod.rs
 1709 loom-daemon/src/sweep_registry/quarantine.rs
-2432 loom-daemon/src/sweep_registry/reaper/tests.rs
+2210 loom-daemon/src/sweep_registry/reaper/tests.rs
 1729 loom-daemon/src/sweep_registry/test_support.rs
 1220 loom-daemon/src/sweep_registry/watchdog.rs
 1836 loom-daemon/src/sweep_registry/watchdog/tests.rs

@@ -1664,6 +1664,60 @@ impl SweepRegistry {
                                 .get(&sweep_id)
                                 .and_then(|info| info.pr_number)
                                 .is_some();
+                            // #4123 open-PR guard memo seed (Issue #8355). This
+                            // is exactly the ordinary shape of a successful
+                            // Builder run: the checkpoint is deleted on success
+                            // (see the phase-sample comment above), so a clean
+                            // exit that produced a PR lands in THIS branch, not
+                            // the Crashed one — and until now nothing here ever
+                            // told `probe_open_linked_pr`'s memo (#6788) about
+                            // the PR it just watched get created. That left the
+                            // memo cold for every issue+PR pair from the moment
+                            // its Builder sweep finished until the next time
+                            // ANYTHING happened to call `probe_open_linked_pr`
+                            // for that issue (a lease-renewal tick, a watchdog,
+                            // a work-finder re-dispatch) — sometimes hours
+                            // later. A cold memo has no fallback if that first
+                            // probe's live GraphQL+REST transports both fail
+                            // (e.g. a correlated rate-limit exhaustion across
+                            // both), so the #4123 dispatch guard falls open on
+                            // an issue whose PR is demonstrably still open —
+                            // exactly the incident behind this issue (#8170 /
+                            // PR #8329).
+                            //
+                            // The PR number comes from `sampled_pr_number`
+                            // (#4704), NOT from `info.pr_number` above:
+                            // `SweepInfo::pr_number` is reserved for a future
+                            // phase and every production construction site
+                            // still sets it to `None` (see `types.rs`), so a
+                            // seed gated on it would be dead code on a real
+                            // daemon. `sampled_pr_number` reads the phase
+                            // history that `sample_phase_transition` fills in
+                            // at the top of every reap tick from the sweep's
+                            // own checkpoint (`pr_number` is written there from
+                            // `builder-done` onward) — the same zero-forge-call
+                            // source the terminal `sweep.outcome` record
+                            // already uses for a successful sweep whose
+                            // checkpoint is deleted before the record is
+                            // written. Seeding here therefore still costs zero
+                            // extra forge calls: it is state this daemon
+                            // already sampled into memory while the sweep was
+                            // running.
+                            //
+                            // Deliberately kept SEPARATE from `produced_pr`
+                            // above: widening the #3823b/#7528 label-restore
+                            // gate to also suppress on a *sampled* PR is a real
+                            // behavior change that needs its own rationale and
+                            // its own tests, and must not ride along inside a
+                            // memo seed. This narrows the guard's documented,
+                            // intentionally-retained fail-open window (see
+                            // `probe_open_linked_pr`'s doc comment) — it does
+                            // NOT remove it, and does not change the guard's
+                            // fail-open contract for a genuine, memo-less
+                            // outage.
+                            if let Some(pr) = self.sampled_pr_number(&sweep_id) {
+                                self.record_open_pr_memo(issue, OpenPrProbe::Open(pr));
+                            }
                             // Hard-exclusion decline (Issue #7528). The
                             // #3823b restore below is CORRECT for the case it
                             // was written for and stays byte-for-byte
@@ -2214,3 +2268,15 @@ pub(crate) mod test_hooks {
     unused_imports
 )]
 mod tests;
+
+// The claim-restore / PR-produced test family lives in its own sibling module:
+// `tests` is over the file-size ratchet's 1000-line threshold and therefore
+// frozen at its current size (`.loom/docs/file-size-policy.md`).
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod claim_restore_tests;
