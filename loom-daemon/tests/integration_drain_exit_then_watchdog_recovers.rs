@@ -312,6 +312,16 @@ esac
     let watchdog_output = Command::new("bash")
         .arg(&watchdog_script)
         .env("PATH", path_var)
+        // #8086: the watchdog script is now a thin stub over `loom-daemon
+        // daemon-watchdog`, so it has to be told WHICH binary implements it.
+        // LOOM_DAEMON_SELF_BIN is that pin (#8134) — distinct from
+        // LOOM_DAEMON_BIN, which means "the daemon this caller probes" and is
+        // what the retained suite injects a mock through.
+        //
+        // Without it the stub cannot resolve a binary and exits 3 (UNKNOWN —
+        // no evidence either way), which is the correct refusal but fails this
+        // test's "auto-remediation succeeded" assertion for the wrong reason.
+        .env("LOOM_DAEMON_SELF_BIN", daemon_bin())
         // Same #4573/#4556 confinement as the original daemon spawn — in
         // case the stub's `start` action ever runs before this env is set on
         // its own Command (it inherits from this one).

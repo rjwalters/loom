@@ -1,0 +1,557 @@
+loom-daemon-watchdog.sh - Host-side autonomy-loss detector for the RAW
+loom-daemon process (Issue #4011).
+
+THE PROBLEM IT SOLVES
+  On 2026-07-26 the loom-daemon launchd job took a SIGTERM two seconds after
+  starting and was left `bootout`-ed (unloaded) from launchd. Autonomous
+  dispatch (work finder, role runner) silently stopped. NOTHING surfaced it —
+  no log line, no forge signal, no notification. It was discovered hours later
+  only because someone happened to run `loom-daemon status` by hand. A pull
+  nobody performed for hours is not a detector.
+
+WHAT THIS IS
+  The payload of a SECOND launchd job (`<daemon-label>-watchdog`) that runs on
+  a `StartInterval` cadence, SEPARATE from the daemon job. It compares two
+  things:
+    (1) operator INTENT — the durable `autonomy-desired` marker that
+        loom-daemon-start.sh writes on a successful start and only an
+        operator-initiated loom-daemon-stop.sh removes; and
+    (2) REALITY — whether a daemon for the expected launchd label is actually
+        loaded and alive, and whether its declared-cadence heartbeat file
+        (written by the daemon, #4011) is fresh.
+  When intent says "a daemon should be running" but reality disagrees, it
+  REPORTS loudly (a timestamped line to the watchdog log + stderr, which
+  launchd captures) instead of staying silent — and, since #5391, it also
+  RECOVERS: a confirmed-down daemon is restarted under bounded retries with
+  exponential backoff behind a circuit breaker, escalating to a forge issue
+  (not just a logfile) once the attempt budget is spent. See "GENERAL-CASE
+  BOUNDED RECOVERY + CIRCUIT BREAKER (#5391)" below for the full policy and
+  the reasoning behind recovering rather than only reporting.
+
+WHY A SECOND LAUNCHD JOB, NOT A RESIDENT PROCESS
+  The reporter must live OUTSIDE the daemon process: a dead daemon cannot
+  report its own death (which is why #3971's in-daemon watch loop is not
+  reusable here). And it must itself be supervised — but a long-lived resident
+  watchdog just moves the "who watches the watchdog" problem up one level (it
+  too can crash and stay dead). A `StartInterval` job owns NO long-lived
+  process: launchd re-runs it every interval regardless of how the last run
+  exited, so it structurally cannot crash-and-stay-dead. That is what resolves
+  the recursion.
+
+WHY THE MARKER, NOT "is the pid file / launchd job present"
+  loom-daemon-stop.sh boots out the job AND deletes the pid file, so after ANY
+  stop those would be gone — making a deliberately-stopped daemon and a
+  silently-dead one byte-identical. A detector built on them would page on
+  every intentional stop or never page at all. The marker's lifetime is
+  OPERATOR INTENT: present ⇒ a daemon is expected; absent ⇒ it was
+  deliberately stopped (or never started) ⇒ stay silent.
+
+HANG-AWARE IPC LIVENESS PROBE (#4398)
+  Process-exists + heartbeat-fresh are BOTH out-of-band signals: neither ever
+  talks to the daemon over the socket it actually serves work on. Two observed
+  incidents show why that is not enough:
+    - #4381: the installed loom-daemon binary was replaced by a stub that
+      answered `--version` and then hung forever. A pid-alive check passes
+      against that indefinitely.
+    - 2026-07-29: the production daemon (pid 1484) was alive AND writing a
+      FRESH heartbeat while every `loom-daemon status` round-trip hung. The
+      heartbeat writer (`daemon_heartbeat::spawn_heartbeat_task`) and the IPC
+      accept loop are independent `tokio::spawn`ed tasks on a multi-threaded
+      runtime, so one can keep ticking while the other is wedged.
+  So after liveness is confirmed, this job also runs a BOUNDED in-band IPC
+  round-trip through the installed loom-daemon CLI. Design points:
+    * BOUNDED TWICE. The CLI bounds its own connect + round-trip (5s each,
+      `query_daemon_bounded`); this job additionally wraps the invocation in a
+      hard external timeout, so even a CLI that never returns at all (the
+      #4381 stub) cannot hang the watchdog tick.
+    * LIGHTWEIGHT SUBCOMMAND, NOT `status`. The probe defaults to
+      `quarantine list` — a pure IPC round-trip with no post-reply work.
+      `loom-daemon status --json` looks like the obvious probe but, AFTER a
+      successful round-trip, it also runs a per-account token-pool network
+      check plus a self-update check; measured at 15.3s against a HEALTHY
+      daemon, which would make the probe timeout itself the false-positive
+      generator. Override with LOOM_WATCHDOG_IPC_PROBE_ARGS if desired.
+    * DEBOUNCED. A single failed round-trip can be transient contention (a
+      per-connection task dropping a `status` under concurrent-sweep load —
+      #4279). One failure is REPORTED (loud, logged) but only N consecutive
+      failures, tracked in <loom_dir>/.watchdog-probe-fail-count and keyed to
+      the live pid, are called a CONFIRMED hang.
+    * STARTUP-GRACE AWARE. For up to ~90s after a supervised relaunch the
+      socket may not be bound yet even though launchd reports a live pid
+      (#4213). A probe against a process younger than the grace window is
+      skipped entirely and never counts toward the confirmed-hang tally —
+      the same window `daemon_install_state::DEFAULT_STARTUP_GRACE_SECS`
+      uses, so `status` and this watchdog cannot disagree.
+    * GRACEFULLY DEGRADING. No resolvable loom-daemon binary, a build whose
+      CLI does not know the probe subcommand, or any daemon-side application
+      error (the IPC round-trip demonstrably WORKED) skips the probe rather
+      than inventing a divergence. The probe must never become a new hard
+      dependency that pages on its own absence.
+    * REPORT-ONLY, DELIBERATELY. Unlike #4232's narrow auto-`kickstart`, there
+      is NO provably-safe unattended remediation for a wedged-but-alive
+      process: the only real fix is killing it, which would also kill a daemon
+      that is merely under heavy legitimate load. A confirmed hang therefore
+      escalates to a maximally actionable DIVERGENCE report (exit 1) with the
+      explicit recovery commands — never an automatic kill/restart.
+
+TICK-GRANULARITY DETECTION LATENCY IS AN ACCEPTED TRADEOFF (#5790)
+  An operator saw `loom-daemon status` itself time out on IPC twice ~20
+  minutes apart (one successful `status` in between) while this watchdog's
+  own log read `[OK] daemon healthy` throughout. Two independent, additive
+  mechanisms explain that without the probe being absent or broken:
+    1. SUB-TICK WEDGES ARE STRUCTURALLY INVISIBLE. This probe samples ONCE
+       per StartInterval tick (default LOOM_WATCHDOG_INTERVAL_SECS=300, see
+       defaults/docs/daemon-reference.md). A wedge that resolves faster than
+       one tick interval can fall entirely between two samples and never be
+       observed at all. This is inherent to any periodic sampled probe, not
+       a bug: closing it completely would require continuous polling or
+       multiple samples per tick, trading resource cost and forge-issue /
+       log noise for lower latency — a real design change, deliberately left
+       as future work rather than folded into this fix.
+    2. A SUB-THRESHOLD DIVERGENCE USED TO BE MASKED BY THE SAME TICK'S OK
+       LINE. Before #5790, a tick whose probe DID fire during a wedge and
+       correctly logged a sub-threshold `[DIVERGENCE] ... consecutive
+       failure N of <threshold>` line then fell through to section 4 and
+       unconditionally appended `[OK] daemon healthy ...` right after it —
+       so an operator or log-scraper reading only the last line, or grepping
+       for `[OK]`, saw a clean bill of health in the SAME tick a divergence
+       was already reported. #5790 fixes this specific defect (see
+       `report_heartbeat_ok()` below): that OK line now folds in the
+       divergence instead of reading as unambiguously healthy. This was a
+       pure reporting defect — the exit code (via `exit_ok()`) already
+       reflected `PROBE_DIVERGED` correctly, so any consumer keyed off exit
+       code alone (rather than the log text) was never misled by it.
+  Given (2) is now fixed, ANY wedge that persists through at least one full
+  tick is reported the very tick it is observed — detection latency for that
+  class is bounded by ONE tick (≤300s by default), not by
+  LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD (that threshold only gates the
+  CONFIRMED/report-vs-recover distinction, never whether a single failure is
+  reported at all — see "consecutive failure N of threshold" above). Only
+  (1), sub-tick-duration wedges, remains genuinely undetectable by this
+  probe's design, and this default cadence — 300s ticks, 3-consecutive
+  CONFIRMED threshold — is kept as the correct tradeoff: it already reports
+  every observed divergence immediately (loud, unconditional stderr, logged
+  regardless of --verbose) while reserving the escalation-worthy CONFIRMED
+  label and its exit-1-every-tick behavior for a hang proven to be sustained
+  across debounced samples (#4279's transient-contention rationale, above).
+  Lowering the default interval would shrink the sub-tick blind spot but
+  raise per-host probe overhead and false-positive risk fleet-wide for a
+  marginal gain; that tradeoff is not taken here without fleet data
+  justifying it.
+
+A WINDOWED/RATE FAILURE SIGNAL, ALONGSIDE THE CONSECUTIVE ONE (#5944)
+  Both mechanisms above — the same-tick fold-in (#5790) and the CONFIRMED
+  escalation (#4398) — key off `probe_fail_count_*`, a streak that is reset
+  to ZERO by a single successful round-trip ("ends any prior failure streak
+  outright", see that function's own comment). That reset is exactly right
+  for the CONFIRMED-hang decision — a hang that heals on its own should not
+  count toward the next one — but it leaves a THIRD failure shape
+  unhandled: a probe that fails, succeeds, fails, succeeds... under host
+  load, never 3-in-a-row. Every individual failing tick still gets its own
+  sub-threshold DIVERGENCE line (unchanged, and still correct), but each
+  intervening SUCCESS resets the streak to zero and reports a bare
+  `[OK] daemon healthy` for that tick — so hours of intermittent failure
+  never accumulate into anything an operator or log-scraper skimming the
+  last line, or grepping for `[OK]`, would notice. Observed live on a host
+  at load 45-65 across 28 cores: `loom-daemon status` timed out on
+  essentially every operator invocation for hours while this watchdog's log
+  read `[OK] daemon healthy` throughout.
+
+  The fix is a SECOND, independent tally: a rolling WINDOW of the last
+  LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS probe outcomes (default 6 — 30
+  minutes at the default 300s cadence), keyed to the live pid exactly like
+  the consecutive tally (a relaunched daemon starts a fresh window, same
+  reasoning as #4398's pid-keyed streak: a fresh process must never inherit
+  its wedged predecessor's history). Unlike the consecutive tally, a single
+  SUCCESS does NOT clear this history — only the window sliding an old tick
+  out of range does. When LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD
+  (default 3) or more of the last WINDOW_TICKS ticks failed, even a tick
+  whose OWN round-trip just succeeded is reported DEGRADED (not a bare OK,
+  via `report_heartbeat_ok()`'s existing PROBE_DIVERGED fold-in — the same
+  plumbing #5790 built, reused rather than duplicated) and the tick's exit
+  code reflects it (non-zero), carrying the host load average at probe time
+  (`get_load_average()`, #5790) so the report doubles as the load-contention
+  diagnosis.
+
+  Deliberately weaker than a CONFIRMED hang: the windowed signal is
+  report-only, never escalates to the "IPC UNRESPONSIVE (CONFIRMED)" text,
+  its exit-1-no-remediation posture, or the #5391 bounded-recovery path —
+  the daemon DID answer on the ticks in between, which is real evidence
+  against a genuine wedge (#4279's transient-contention rationale). The
+  default threshold (3 of the last 6) also will not fire on a single
+  isolated failure — that already gets its own sub-threshold DIVERGENCE
+  line via the unchanged #5790 path and is not this mechanism's job.
+
+SOCKET-FIRST LIVENESS, PID FILE DEMOTED TO A HINT (#5118)
+  Until #5118 the OUT-OF-BAND probe above was the ONLY thing that could
+  establish liveness, and on a host with neither a launchd job nor a
+  systemd-managed unit to ask, that reduced to a single artifact: the pid
+  file. Three stacked defects made that unusable fleet-wide:
+    1. PATH DISAGREEMENT. This script derived the pid file from the SOCKET's
+       directory (`<dirname $LOOM_SOCKET_PATH>/.daemon.pid`) in the
+       marker-absent path, while the daemon derives it from the START
+       SCRIPT's `LOOM_PID_FILE` / the workspace (`daemon_pidfile.rs`). On a
+       workspace-rooted install those are never the same directory.
+    2. `LOOM_PID_FILE` WAS IGNORED HERE. It is exported by
+       loom-daemon-start.sh and baked into every plist/unit it renders — and
+       honored by the daemon as precedence tier 1 — but this script had no
+       support for it at all, so the one variable that is supposed to
+       single-source the path could not align the two ends.
+    3. A STALE pid file reads as a CONFIRMED death. A pid file naming a
+       long-dead pid (#4774, before the daemon self-wrote it at bind) is
+       indistinguishable here from "no daemon".
+  Observed 2026-08-03: BOTH fleet hosts ran healthy daemons while this
+  watchdog reported `[DIVERGENCE] ... no live pid file at ~/.loom/.daemon.pid`
+  every five minutes since 2026-08-01. An alarm that is always on carries no
+  information — and two genuine outages that same session were
+  indistinguishable from it.
+
+  The fix inverts the precedence to match what `loom-daemon health` already
+  does: the IPC ROUND-TRIP IS AUTHORITATIVE, the pid file is a corroborating
+  hint. Concretely, when the out-of-band probe does NOT find a live daemon
+  this script now ASKS THE SOCKET before reporting anything:
+    * socket ANSWERS + no supervisor was consulted (pid-file path) ⇒ HEALTHY.
+      The pid file's absence/staleness is a note, never a page.
+    * socket ANSWERS + the supervisor (launchd/systemd) says its job is down
+      ⇒ a WARN state mismatch: a daemon is serving work but nothing is
+      supervising it. Auto-remediation is SUPPRESSED — kickstarting a second
+      daemon at a socket a live one already owns only produces a refusal.
+    * socket is UNREACHABLE ⇒ the daemon really is down: the existing
+      DIVERGENCE + bounded auto-remediation path, unchanged.
+    * liveness CANNOT BE DETERMINED (no probe available — no resolvable
+      binary, probe disabled, CLI wedged — AND no usable pid file) ⇒ a
+      DISTINCT `UNKNOWN` report and exit 3. Defaulting to "the daemon is
+      gone" is what manufactured the permanent false positive; an alerting
+      component must say "I cannot tell" in its own words.
+  The pid file's PATH is also now derived by the same precedence the daemon
+  uses (`LOOM_PID_FILE` > the marker's `pid_file=` > machine/workspace >
+  `<loom dir>`), so the two ends can no longer disagree about which file
+  they mean.
+
+BOUNDED AUTO-REMEDIATION (#4232)
+  The watchdog was deliberately report-only until #4232: on 2026-07-28 a
+  `loom-daemon restart` was ack'd (the running daemon exited 0, honoring its
+  #4054/#4077 restart contract) but launchd never relaunched it — the
+  watchdog could describe that outage but not fix it, which matters once
+  #4055's unattended self-update path can hit the same race with no operator
+  watching. This job now auto-runs `launchctl kickstart <label>` (PLAIN,
+  NEVER `-k`) for EXACTLY ONE divergence signature: the launchd job is
+  LOADED (launchctl still knows about it) + NOT running + its last exit
+  status was 0. That signature can ONLY arise from a restart-primitive exit
+  that launchd failed to honor — an operator SIGTERM stop exits 143/130
+  (loom-daemon-stop.sh), a crash exits non-zero, and a booted-out/never-
+  loaded job fails `launchctl print` outright. Every other divergence stays
+  report-only, exactly as before: no crash-loop revival, no reviving a
+  deliberate stop.
+
+  #4862 adds the systemd --user mirror of this gate: a clean main-process
+  exit (ExecMainCode=exited, ExecMainStatus=0) with the unit LOADED but not
+  running auto-runs 'systemctl --user reset-failed <unit> && systemctl
+  --user start <unit>' — the systemd analog of 'launchctl kickstart', for
+  the exact "Restart=on-success didn't fire" incident #4862 reported (and
+  the render_systemd_unit KillMode=mixed fix in loom-daemon-start.sh
+  addresses at the source). Same narrow construction: an operator stop, a
+  genuine crash, or a never-installed unit cannot produce this signature.
+
+GENERAL-CASE BOUNDED RECOVERY + CIRCUIT BREAKER (#5391)
+  THE DECISION: this watchdog RECOVERS. It is not a report-only detector.
+
+  The #4232/#4862 gates above only ever covered ONE divergence signature
+  ("loaded + down + last exit 0"). Every other confirmed outage — a genuine
+  crash, a booted-out job, a never-relaunched unit, a dead pid with an
+  unreachable socket — fell through to a plain `[DIVERGENCE] … Recover with:
+  loom-daemon-start.sh` line and stopped there. Observed on one fleet host:
+  252 such lines between 2026-07-28 and 2026-08-05, including a single
+  continuous 1h40m outage that ended only because a human went looking. A
+  detector that prints the exact recovery command every five minutes and never
+  runs it is, operationally, indistinguishable from no watchdog at all.
+
+  The counter-argument to auto-restarting is real: a naive reviver pointed at
+  a genuinely broken binary becomes a restart loop that burns tokens, hides
+  the real fault, and hammers the forge. So this is deliberately NOT a naive
+  reviver. Four constraints bound it:
+
+    1. BOUNDED ATTEMPTS. At most LOOM_WATCHDOG_RECOVER_MAX_ATTEMPTS (default
+       5) recovery attempts per outage EPISODE — not per tick. The tally is
+       durable (<loom dir>/.watchdog-recovery-state) so it survives the fact
+       that each tick is a brand-new process, and it is cleared the moment a
+       tick observes a healthy daemon (that, not a timer, is what ends an
+       episode).
+    2. EXPONENTIAL BACKOFF. Attempt N is only made once
+       base × 2^(N-1) seconds (base LOOM_WATCHDOG_RECOVER_BACKOFF_SECS=60,
+       capped at LOOM_WATCHDOG_RECOVER_BACKOFF_CAP_SECS=1800) have elapsed
+       since the last attempt. Ticks inside the backoff window still report,
+       they just do not re-run the recovery command. The attempt is recorded
+       BEFORE the command runs, so an overlapping tick cannot double-fire it.
+    3. CIRCUIT BREAKER. Once the attempt budget is spent the breaker LATCHES
+       OPEN: no further automatic attempts are made for this episode, at all,
+       until either a tick observes a healthy daemon or an operator deletes
+       the state file. A broken binary therefore gets at most 5 restarts,
+       never an unbounded loop.
+    4. NEVER REVIVES A DELIBERATE STOP — KEYED ON THE MARKER, NOT THE EXIT
+       CODE (#6388). A scripted stop (loom-daemon-stop.sh) removes the
+       autonomy-desired marker BEFORE it kills the daemon, so a deliberate
+       stop never reaches this block at all — the marker-ABSENT branch near
+       the top of this script is the ONLY place "never revive" fires, and it
+       fires unconditionally there, before any exit code is ever read. A
+       signal-shaped exit code recorded HERE (marker confirmed present) —
+       launchd `last exit status` 143/130/-15/-2; systemd
+       ExecMainCode=killed with TERM/INT — used to be misread as the SAME
+       "operator stop" intent and skipped recovery outright; a stray SIGTERM
+       (e.g. an unrelated test run) then reads exactly like a deliberate
+       stop and starves autonomy for as long as no human notices (an 11h
+       outage, #6388). It is now just another kind of death: it gets the
+       SAME bounded recovery as any other crash, with the signal named in
+       the report text so an operator can see which rule fired.
+
+  WHAT IT RUNS: the sibling ./loom-daemon-start.sh — the exact command this
+  watchdog has always printed — replaying ONLY the autonomy flags the last
+  start persisted to `<state home>/.daemon.flags` (#3968), filtered through a
+  strict allowlist so the FLAGS-OFF/opt-in contract can never widen across a
+  recovery. The invocation is wrapped in a hard wall-clock budget
+  (LOOM_WATCHDOG_RECOVER_TIMEOUT_SECS, default 120) so a wedged start can
+  never wedge the tick. Override the whole command with
+  LOOM_WATCHDOG_RECOVER_CMD; disable recovery entirely with
+  LOOM_WATCHDOG_AUTO_RECOVER=0 (the watchdog then says so explicitly in its
+  own DIVERGENCE text, so an operator can never mistake a report-only host
+  for a self-healing one).
+
+  ESCALATION THAT DOES NOT REQUIRE TAILING A LOGFILE. When the breaker trips —
+  or when recovery is structurally impossible on this host (disabled, no
+  resolvable start script) and the outage has persisted for
+  LOOM_WATCHDOG_RECOVER_MAX_ATTEMPTS consecutive ticks — the watchdog files
+  ONE tracking issue on the forge via ./.loom/scripts/create-issue.sh (never a
+  bare `gh issue create`), reusing the escalation channel #5343 already
+  established in loom-daemon-start.sh. It is deduped by a persistent sentinel
+  (<loom dir>/.watchdog-outage-escalated) so a multi-hour outage files exactly
+  one issue, and the sentinel is cleared with the rest of the episode state as
+  soon as a daemon is seen healthy again — so the NEXT outage escalates again.
+  Best-effort and non-fatal: no forge auth, offline, or no create-issue.sh
+  degrades to the log line it always was.
+
+EXIT CODES (a StartInterval/OnUnitActiveSec job's exit code does not affect
+relaunch — these exist for testability and for a human running it by hand):
+  0  no divergence — daemon healthy, OR no daemon expected AND none running
+     (marker absent + nothing alive), OR the #4232/#4862 bounded
+     auto-remediation (see above) successfully relaunched it via
+     'launchctl kickstart' / 'systemctl --user start', OR (#5391) the
+     general-case bounded recovery successfully relaunched it via
+     loom-daemon-start.sh
+  1  DIVERGENCE / state mismatch reported — a daemon is expected but is not
+     running (and either the #4232 remediation gate did not apply, or it fired
+     but the daemon is still not confirmed running, or #5391's bounded
+     recovery ran/was deferred/was suppressed and the daemon is still down),
+     or is running but its
+     heartbeat is stale (possibly wedged), OR (#4398) it is running with a
+     fresh heartbeat but its bounded IPC round-trip failed, OR (#5944) its
+     round-trip succeeded THIS tick but failed often enough across the
+     recent windowed history to report DEGRADED anyway, OR (#4331) a daemon
+     IS running while the marker is ABSENT (crash protection disarmed — a WARN
+     state mismatch), OR (#5118) the socket answers while the supervisor says
+     its job is down (an UNSUPERVISED daemon — serving work, but not crash
+     protected)
+  2  usage error
+  3  (#5118) LIVENESS UNDETERMINED — deliberately NOT exit 1: no out-of-band
+     signal found a live daemon AND the in-band socket probe could not run (no
+     resolvable loom-daemon binary, the probe is disabled, or the CLI itself
+     never returned), so this tick has NO EVIDENCE either way. Reported as
+     UNKNOWN, never as "the daemon is down".
+
+Usage:
+  ./.loom/scripts/cli/loom-daemon-watchdog.sh            Check once, report on divergence
+  ./.loom/scripts/cli/loom-daemon-watchdog.sh --verbose  Also log the healthy/idle no-op cases
+  ./.loom/scripts/cli/loom-daemon-watchdog.sh --help
+
+Environment:
+  LOOM_AUTONOMY_MARKER           Path to the intent marker (default: derived
+                                 from LOOM_SOCKET_PATH's dir, else ~/.loom/autonomy-desired)
+  LOOM_WATCHDOG_LOG              Report log path (default: <loom dir>/logs/daemon-watchdog.log)
+  LOOM_DAEMON_HEARTBEAT_STALE_SECS  Staleness threshold in seconds (default:
+                                 max(5 × heartbeat cadence, 300))
+  LOOM_SOCKET_PATH              Override the daemon socket (its dir is the loom dir)
+  LOOM_PID_FILE                 #5118: the pid file path, honored END-TO-END —
+                                the same precedence tier 1 the daemon itself
+                                uses (daemon_pidfile.rs) and the value
+                                loom-daemon-start.sh exports into every plist
+                                / systemd unit it renders. Wins over the
+                                marker's `pid_file=` field. The pid file is
+                                only ever a CORROBORATING hint here: the
+                                socket round-trip is authoritative.
+  LOOM_LAUNCHD_LABEL            macOS: the DAEMON label to probe (default com.rjwalters.loom-daemon)
+  LOOM_LAUNCHD_DOMAIN          macOS: pin the launchd domain (gui/<uid> or user/<uid>);
+                               else auto-resolved gui→user (#4130), matching the start
+  LOOM_DAEMON_LAUNCHD          0/false/no: treat as a non-launchd (nohup) daemon; check the pid file only
+  LOOM_SYSTEMD_UNIT             #4862: the systemd --user unit to probe (default
+                               loom-daemon.service, else the marker's systemd_unit)
+  LOOM_WATCHDOG_SYSTEMD_PROBE   #4862: 1/true/yes: opt in to the systemd --user
+                               probe (default: per the marker's use_systemd
+                               field, else OFF -- `systemctl` merely being on
+                               PATH is not proof of a systemd-managed daemon).
+                               0/false/no forces it off regardless of the marker.
+  LOOM_WATCHDOG_KICKSTART_RECHECK_ATTEMPTS  #4232/#4862/#5391: how many times to
+                               re-check for a live pid after the auto-kickstart /
+                               systemctl-start fallback, and after the #5391
+                               general-case recovery (default 3).
+  LOOM_WATCHDOG_KICKSTART_RECHECK_INTERVAL  #4232: seconds between re-checks
+                               (default 1; may be fractional).
+  LOOM_WATCHDOG_AUTO_RECOVER    #5391: 0/false/no disables the general-case
+                               bounded recovery entirely — the watchdog then
+                               becomes report-only for confirmed outages and
+                               SAYS SO in its own DIVERGENCE text (default: on).
+  LOOM_WATCHDOG_RECOVER_MAX_ATTEMPTS  #5391: circuit-breaker budget — recovery
+                               attempts per outage episode before the breaker
+                               latches open (default 5). Also the consecutive-tick
+                               threshold at which a structurally un-recoverable
+                               outage escalates.
+  LOOM_WATCHDOG_RECOVER_BACKOFF_SECS  #5391: base backoff; attempt N waits
+                               base × 2^(N-1) since the last attempt (default 60).
+  LOOM_WATCHDOG_RECOVER_BACKOFF_CAP_SECS  #5391: backoff ceiling (default 1800).
+  LOOM_WATCHDOG_RECOVER_TIMEOUT_SECS  #5391: hard wall-clock budget for the
+                               recovery command itself (default 120).
+  LOOM_WATCHDOG_RECOVER_CMD     #5391: override the recovery command (argv,
+                               word-split). Default: the sibling
+                               loom-daemon-start.sh + the allowlisted autonomy
+                               flags persisted in <state home>/.daemon.flags.
+  LOOM_WATCHDOG_RECOVERY_STATE  #5391: path to the durable episode state
+                               (default <loom dir>/.watchdog-recovery-state).
+  LOOM_WATCHDOG_ESCALATE        #5391: 0/false/no suppresses the forge-issue
+                               escalation when the breaker trips (default: on).
+  LOOM_WATCHDOG_ESCALATION_SENTINEL  #5391: dedupe sentinel for that escalation
+                               (default <loom dir>/.watchdog-outage-escalated).
+  LOOM_WATCHDOG_IPC_PROBE       #4398: 0/false/no disables the bounded in-band
+                               IPC probe entirely (pid + heartbeat checks only).
+  LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS  #4398: hard external budget for the
+                               probe (default 15). Must stay comfortably above
+                               the CLI's own 5s connect + 5s round-trip bound.
+  LOOM_WATCHDOG_IPC_PROBE_ARGS  #4398: the loom-daemon argv used as the probe
+                               (default 'quarantine list' — a pure IPC
+                               round-trip with no post-reply work).
+  LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD  #4398: consecutive failed probes
+                               before a hang is called CONFIRMED (default 3).
+  LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS  #4398: post-relaunch socket-bind grace
+                               window; a younger process is not probed
+                               (default: LOOM_DAEMON_STARTUP_GRACE_SECS, else 90).
+  LOOM_WATCHDOG_IPC_PROBE_STATE  #4398: path to the consecutive-failure counter
+                               (default <loom dir>/.watchdog-probe-fail-count).
+  LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS  #5944: size (in ticks) of the rolling
+                               window used for the rate-based failure signal,
+                               alongside (not instead of) the consecutive
+                               tally above (default 6 — 30 minutes at the
+                               default 300s cadence).
+  LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD  #5944: failures within the
+                               last WINDOW_TICKS ticks that report a
+                               DEGRADED verdict even on a tick whose own
+                               round-trip succeeded (default 3). Report-only,
+                               distinct from the CONFIRMED-hang escalation:
+                               never triggers exit-1-no-remediation posture
+                               changes or #5391 bounded recovery on its own.
+  LOOM_WATCHDOG_IPC_PROBE_WINDOW_STATE  #5944: path to the rolling-window
+                               state (default <loom dir>/.watchdog-probe-window).
+  LOOM_WATCHDOG_LOAD_AVG_PROC_PATH  #5790: test seam for the /proc/loadavg
+                               source get_load_average() reads on Linux
+                               (default /proc/loadavg). Not meant for
+                               production use — point it at an unreadable
+                               path to exercise the "unavailable" degrade.
+  LOOM_FORCE_PORTABLE_TIMEOUT    #4398, renamed from the watchdog-local
+                               LOOM_WATCHDOG_FORCE_PORTABLE_TIMEOUT by #4832
+                               when bounded_run() moved to the shared
+                               lib/bounded-run.sh: 1 forces the built-in
+                               bounded runner instead of `timeout(1)` (test
+                               seam for the default macOS no-`timeout` shape).
+  LOOM_DAEMON_BIN               Explicit loom-daemon binary for the IPC probe
+                               (same resolution order as loom-daemon-start.sh).
+  LOOM_WATCHDOG_PEER_COORD_CHECK  #6222 (Layer 3 of #6157): 0/false/no disables
+                               the peer-coordination alert entirely (default: on).
+                               Only ever attempted on a tick whose own IPC
+                               round-trip already succeeded (`probe_verdict ==
+                               healthy`) — never adds a new hang surface.
+  LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS  #6222: hard external budget for the
+                               `loom-daemon peer-claims --json` query (default:
+                               same as LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS).
+  LOOM_WATCHDOG_PEER_COORD_SENTINEL  #6222: dedupe sentinel for the peer-
+                               coordination escalation (default <loom dir>
+                               /.watchdog-peer-coordination-escalated). Stores
+                               `<timestamp> <issue-url>` so recovery can
+                               comment on and close the exact filed issue.
+  LOOM_WATCHDOG_PEER_COORD_COOLDOWN_SECS  #7258: post-recovery hysteresis —
+                               after clear_peer_coordination_escalation()
+                               closes an episode's tracking issue, a repeat
+                               DEGRADED excursion within this many seconds is
+                               suppressed (logged, no new issue filed) rather
+                               than filing a fresh one. Default 21600 (6h),
+                               comfortably above the ~1-2h flap interval
+                               observed on a flapping host (#7258). This is
+                               LAYERED ON TOP of, and does not replace, the
+                               PEER_COORD_SENTINEL within-episode dedupe
+                               above — it only governs repeat episodes AFTER
+                               a recovery already cleared that sentinel. The
+                               comparison is strict `<` (elapsed < cooldown):
+                               an excursion landing exactly AT the boundary
+                               is treated as cooldown-elapsed and escalates
+                               fresh, same as one landing after it. 0
+                               disables the cooldown outright (fires every
+                               time — as a dedup comment rather than a fresh
+                               issue when a #7664 tracking ref exists).
+  LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE  #7258/#7664: path to the cooldown
+                               state file a successful recovery writes
+                               (default <loom dir>
+                               /.watchdog-peer-coordination-cooldown), read
+                               back by the next escalation attempt. A
+                               missing OR corrupt/non-numeric file fails
+                               OPEN — treated as "no cooldown in effect",
+                               i.e. today's fire-every-time behavior — never
+                               an error and never a reason to skip
+                               escalating a genuine degradation. #7664 widened
+                               the file's format from a bare epoch to
+                               `<epoch> <issue-ref> <flap-count>` (still
+                               parsed via `read`, so an old bare-epoch file
+                               from before #7664 keeps working — the extra
+                               fields just read empty and the dedup window
+                               below fails open exactly like a corrupt file).
+  LOOM_WATCHDOG_PEER_COORD_DEDUP_WINDOW_SECS  #7664: a REPEAT DEGRADED
+                               excursion landing after the #7258 cooldown
+                               above has elapsed, but still within this many
+                               seconds of the last recovery, comments on (and
+                               reopens if needed) the SAME tracking issue
+                               that cooldown window's recovery closed —
+                               instead of calling create-issue.sh again —
+                               and bumps a running flap count carried in
+                               PEER_COORD_COOLDOWN_STATE. This is the fix for
+                               a chronically-flapping host (anvil#1270):
+                               the #7258 cooldown alone still refiles once
+                               per cooldown window forever; this widens the
+                               same-issue window so a flapping host
+                               accumulates comments on ONE tracking issue
+                               instead of a fresh issue every cooldown cycle.
+                               Default 86400 (24h) — deliberately longer than
+                               the default 21600s (6h) cooldown so it covers
+                               at least one full cooldown cycle of slack. A
+                               non-numeric override fails open to the
+                               default. Comparison is strict `<`, matching
+                               the cooldown boundary convention: an excursion
+                               landing exactly AT the window boundary is
+                               treated as window-elapsed and files a fresh
+                               issue, resetting the flap count to 1. Any
+                               failure along this path — no `gh` on PATH, a
+                               missing/corrupt issue reference in the state
+                               file, or a failed `gh issue comment`/`reopen`
+                               call — FAILS OPEN to filing a fresh issue,
+                               same fail-open contract as the cooldown state
+                               file itself: a genuine degradation is never
+                               silently dropped.
+  LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR  #6272: test seam ONLY — overrides
+                               the third (production-intent) branch of the
+                               create-issue.sh resolution shared by
+                               escalate_daemon_outage() and
+                               escalate_peer_coordination_degraded(), which
+                               otherwise resolves relative to wherever THIS
+                               SCRIPT lives on disk (default
+                               $_LOOM_WATCHDOG_CLI_DIR/..), not relative to
+                               the sandboxable $repo_root the first two
+                               branches use. Not meant for production use —
+                               point it at an empty sandbox dir in tests that
+                               need "no create-issue.sh reachable anywhere"
+                               to be genuinely unreachable (#6271: an earlier
+                               test without this seam fell through to this
+                               repo's own real create-issue.sh and filed a
+                               spurious live issue).

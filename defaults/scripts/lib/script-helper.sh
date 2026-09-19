@@ -87,6 +87,22 @@ loom_exec_script_helper() {
     script_dir="$(cd "$(dirname "${BASH_SOURCE[1]:-$0}")" && pwd)"
     repo_root="$(_lsh_find_repo_root "$script_dir")" || repo_root=""
 
+    # LOOM_DAEMON_SELF_BIN: which binary IMPLEMENTS this stub, as distinct from
+    # LOOM_DAEMON_BIN, which means "the loom-daemon binary a script should
+    # INVOKE". Those are the same thing for every port so far, and they are NOT
+    # the same for a script that invokes loom-daemon itself: the watchdog's
+    # retained suite sets LOOM_DAEMON_BIN to a MOCK so it can drive the IPC
+    # probe, and a stub resolving through it would exec the mock as its own
+    # implementation. Test 13's mock is `while true; do sleep 1; done`, so that
+    # presents as a hang rather than a failure (#8134).
+    #
+    # Unset in production, where the two ARE the same and the normal resolution
+    # below applies unchanged. Checked first, so a harness can pin the real
+    # binary without disturbing what LOOM_DAEMON_BIN means to everything else.
+    if [[ -n "${LOOM_DAEMON_SELF_BIN:-}" && -x "${LOOM_DAEMON_SELF_BIN}" ]]; then
+        exec "${LOOM_DAEMON_SELF_BIN}" "$subcommand" "$@"
+    fi
+
     # shellcheck source=/dev/null
     source "$(dirname "${BASH_SOURCE[0]}")/locate-daemon-bin.sh"
 

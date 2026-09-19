@@ -246,6 +246,7 @@ pub mod tokens_pool;
 pub mod transcript_tokens;
 pub mod types;
 pub mod watch_registry;
+pub mod watchdog;
 pub mod watchdog_provisioning_guard;
 pub mod work_finder;
 pub mod workspace_pool;

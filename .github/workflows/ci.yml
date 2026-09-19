@@ -1009,6 +1009,23 @@ jobs:
       # suite's require-daemon-bin harness needs the binary this job builds.
       - name: merge-pr partial-increment labels (#3667, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-partial-increment.sh
+      # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
+      # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
+      # (188 + 27 assertions, unchanged from the shell implementation apart
+      # from four explicitly-retired cases) need the binary this job builds.
+      # They pin it via loom_test_require_daemon_bin --self-only, which leaves
+      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this watchdog probes"
+      # — the mock seam every IPC-probe case drives.
+      #
+      # Running them here rather than in shell-suite-tests also means the
+      # live-daemon guard (#6386) no longer covers them. That is safe on THIS
+      # runner and only here: a GitHub runner has no daemon, no pid file and
+      # nothing to bootout. On a developer host, run them through
+      # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
+      - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
+        run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
+      - name: loom-daemon-watchdog peer-coordination dedup (#7664)
+        run: bash defaults/scripts/tests/test-loom-daemon-watchdog-dedup.sh
 
   installer-tests:
     name: Installer Integration Tests

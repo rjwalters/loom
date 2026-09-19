@@ -128,6 +128,14 @@ pub const DEFAULT_STARTUP_GRACE_SECS: u64 = 90;
 /// command an operator runs to diagnose a wedge. A couple of seconds is far
 /// above the real cost of these probes even on a loaded CI runner, yet keeps
 /// `status` responsive.
+mod launchctl;
+use launchctl::{
+    current_uid, launchctl_job_provisioned, launchctl_pid, launchctl_probe,
+    resolve_launchd_domain_detailed,
+};
+// Re-exported: callers outside this module resolved it here before the split.
+pub(crate) use launchctl::launchd_domain;
+
 const PROBE_TIMEOUT_SECS: u64 = 2;
 
 /// [`PROBE_TIMEOUT_SECS`] as a [`Duration`].
@@ -524,57 +532,19 @@ pub fn pgrep_daemon_pids() -> Vec<u32> {
         .collect()
 }
 
-/// Current uid via `id -u`. Bounded by [`PROBE_TIMEOUT`]; a hung `id` degrades
-/// to `None`, exactly like an absent one (#4548).
-fn current_uid() -> Option<String> {
-    let mut cmd = Command::new("id");
-    cmd.arg("-u");
-    probe_output(cmd, PROBE_TIMEOUT)
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Parse `launchctl print <domain>/<label>` output for a live pid — mirrors
-/// the watchdog's `awk -F'= ' '/^[[:space:]]*pid = /{...; print $2; exit}'`.
-/// `domain` is an already-resolved launchd domain (see
-/// [`resolve_launchd_domain_detailed`]) — the caller resolves it once and
-/// reuses it for both this probe and any human-readable detail string,
-/// avoiding a duplicate `launchctl`/`id` round trip per [`check_liveness`]
-/// call.
-///
-/// Bounded by [`PROBE_TIMEOUT`]: a `launchctl print` that stalls on XPC
-/// degrades to `None` — "no live pid" — exactly like an absent `launchctl`
-/// (#4548).
-fn launchctl_pid(domain: &str, label: &str) -> Option<u32> {
-    let service = format!("{domain}/{label}");
-    let mut cmd = Command::new("launchctl");
-    cmd.args(["print", &service]);
-    let output = probe_output(cmd, PROBE_TIMEOUT)?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("pid = ") {
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(pid) = digits.parse::<u32>() {
-                return Some(pid);
-            }
-        }
-    }
-    None
-}
-
 /// One liveness check result: whether the expected daemon is alive, a
 /// human-readable detail string (mirrors the watchdog's `liveness_detail`),
 /// and the live pid when alive.
-struct Liveness {
-    alive: bool,
-    detail: String,
-    pid: Option<u32>,
+pub(crate) struct Liveness {
+    pub(crate) alive: bool,
+    pub(crate) detail: String,
+    pub(crate) pid: Option<u32>,
+    /// The supervisor knows the job but it has no live pid — "LOADED but NOT
+    /// running". Distinct from both alive and simply-absent, because it is the
+    /// only state the watchdog's bounded auto-remediation may act on
+    /// (#4232/#6388): a job the supervisor still owns can be kickstarted,
+    /// whereas an unloaded one needs a full start.
+    pub(crate) job_loaded: bool,
     /// #4774: an advisory note when the pid file disagrees with the *authoritative*
     /// liveness signal this probe used (launchd's own pid). `None` when the file
     /// agrees, is absent, or was the signal itself — see [`pid_file_stale_note`].
@@ -589,6 +559,7 @@ impl Liveness {
             alive,
             detail,
             pid,
+            job_loaded: false,
             pid_file_stale_note: None,
         }
     }
@@ -633,12 +604,35 @@ fn pid_file_alive_pid(pid_file: &Path) -> Option<u32> {
     read_pid_file(pid_file).filter(|pid| pid_alive(*pid))
 }
 
-fn check_liveness(
+pub(crate) fn check_liveness(
     use_launchd: bool,
     label: &str,
     pid_file: Option<&Path>,
     domain_override: Option<&str>,
 ) -> Liveness {
+    check_liveness_with_systemd(use_launchd, label, pid_file, domain_override, None)
+}
+
+/// [`check_liveness`] plus the systemd tier the watchdog needs (#4862).
+///
+/// `systemd_unit` is `Some` only when the caller has opted in — `loom-daemon
+/// status` passes `None`, so its behaviour is unchanged. Before #8086 the
+/// systemd branch existed ONLY in `loom-daemon-watchdog.sh`, so on a
+/// systemd host the watchdog probed the unit while `status` probed the pid
+/// file: the two ends disagreeing about which signal is authoritative, which
+/// is the failure shape `resolve_pid_file`'s own comment describes for paths.
+pub(crate) fn check_liveness_with_systemd(
+    use_launchd: bool,
+    label: &str,
+    pid_file: Option<&Path>,
+    domain_override: Option<&str>,
+    systemd_unit: Option<&str>,
+) -> Liveness {
+    if !use_launchd {
+        if let Some(unit) = systemd_unit {
+            return check_systemd_liveness(unit);
+        }
+    }
     if use_launchd {
         // Same domain-resolution rule the reachable-path protection probe
         // uses (#4354/#4533): explicit `LOOM_LAUNCHD_DOMAIN` override, else
@@ -657,6 +651,7 @@ fn check_liveness(
                     alive: true,
                     detail: format!("launchd job {service} alive (pid {pid})"),
                     pid: Some(pid),
+                    job_loaded: false,
                     // launchd's pid is established independently of the file, so
                     // it can arbitrate against it (#4774).
                     pid_file_stale_note: pid_file_stale_note(pid_file, pid),
@@ -681,6 +676,7 @@ fn check_liveness(
                         alive: true,
                         detail: format!("launchd job {check_domain}/{label} alive (pid {pid})"),
                         pid: Some(pid),
+                        job_loaded: false,
                         pid_file_stale_note: pid_file_stale_note(pid_file, pid),
                     };
                 }
@@ -711,6 +707,22 @@ fn check_liveness(
             }
         }
 
+        // The job may be LOADED but not running — launchd prints it happily
+        // with no `pid =` line. That is the one state the #4232 bounded
+        // auto-remediation gate acts on, and the systemd branch below has
+        // always had its equivalent (`LoadState=loaded`). Without it the
+        // launchd half of the gate could never fire.
+        if let Some(d) = domain.as_deref() {
+            if launchctl_probe(d, label).loaded {
+                let mut l = Liveness::plain(
+                    false,
+                    format!("launchd job {service} is LOADED but NOT running (no live pid)"),
+                    None,
+                );
+                l.job_loaded = true;
+                return l;
+            }
+        }
         return Liveness::plain(false, format!("launchd job {service} is not loaded/alive"), None);
     }
 
@@ -743,6 +755,46 @@ fn check_liveness(
 /// this accepts `ss`, `mm:ss`, `hh:mm:ss`, and `dd-hh:mm:ss`. Any unexpected
 /// shape or non-numeric field yields `None` — the caller treats an unparseable
 /// age as *unknown* and makes no grace claim, never a false "starting" verdict.
+/// systemd --user liveness (#4862) — the Linux sibling of the launchd branch,
+/// so the watchdog's auto-remediation gate has an equivalent signal there.
+///
+/// `show -p X --value` against an unknown unit answers cleanly
+/// (`LoadState=not-found`) rather than erroring, so no separate return-code
+/// check is needed the way launchd's `print` exit code is used.
+fn check_systemd_liveness(unit: &str) -> Liveness {
+    let value = |prop: &str| -> Option<String> {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["--user", "show", "-p", prop, "--value", unit]);
+        probe_output(cmd, Duration::from_secs(5)).and_then(|o| {
+            let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            (!v.is_empty()).then_some(v)
+        })
+    };
+
+    let main_pid = value("MainPID")
+        .filter(|p| p != "0")
+        .and_then(|p| p.parse::<u32>().ok());
+    if let Some(pid) = main_pid {
+        if pid_alive(pid) {
+            return Liveness::plain(
+                true,
+                format!("systemd unit {unit} alive (pid {pid})"),
+                Some(pid),
+            );
+        }
+    }
+    if value("LoadState").as_deref() == Some("loaded") {
+        let mut l = Liveness::plain(
+            false,
+            format!("systemd unit {unit} is LOADED but NOT running (no live MainPID)"),
+            None,
+        );
+        l.job_loaded = true;
+        return l;
+    }
+    Liveness::plain(false, format!("systemd unit {unit} is not loaded/alive"), None)
+}
+
 fn parse_etime(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -769,7 +821,7 @@ fn parse_etime(raw: &str) -> Option<u64> {
 /// so the caller falls through to today's verdicts rather than falsely
 /// reporting "starting" (#4213). Bounded by [`PROBE_TIMEOUT`]: a hung `ps`
 /// takes the same `None` path (#4548).
-fn process_age_secs(pid: u32) -> Option<u64> {
+pub(crate) fn process_age_secs(pid: u32) -> Option<u64> {
     let mut cmd = Command::new("ps");
     cmd.args(["-o", "etime=", "-p", &pid.to_string()]);
     let output = probe_output(cmd, PROBE_TIMEOUT)?;
@@ -816,7 +868,7 @@ fn heartbeat_age_secs(path: &Path) -> Option<u64> {
 /// check. `None` (unparseable `ps` age) makes no prior-boot claim and
 /// degrades to the pre-#4368 Stale/Fresh verdicts, per the module's
 /// degrade-don't-false-report rule.
-fn check_heartbeat(
+pub(crate) fn check_heartbeat(
     heartbeat_file: &Path,
     stale_threshold_secs: u64,
     process_age_secs: Option<u64>,
@@ -840,7 +892,7 @@ fn check_heartbeat(
 
 /// The watchdog's staleness threshold formula: `max(interval * 5, 300)`,
 /// unless `LOOM_DAEMON_HEARTBEAT_STALE_SECS` overrides it.
-fn resolve_stale_threshold(interval_secs: u64, env_override: Option<u64>) -> u64 {
+pub(crate) fn resolve_stale_threshold(interval_secs: u64, env_override: Option<u64>) -> u64 {
     env_override.unwrap_or_else(|| (interval_secs * 5).max(300))
 }
 
@@ -1173,125 +1225,6 @@ pub fn resolve_watchdog_job(
         .unwrap_or_else(|| format!("{}-watchdog", daemon_unit.trim_end_matches(".service")));
     WatchdogJob::SystemdTimer {
         timer_unit: format!("{base}.timer"),
-    }
-}
-
-/// [`resolve_launchd_domain_detailed`]'s result, carrying enough detail for
-/// callers to cross-check a negative verdict against the domain that domain
-/// resolution *skipped* (#4694).
-///
-/// The `gui/<uid>` → `user/<uid>` fallback itself is intentional (#4130,
-/// headless-SSH support) — this struct does not change which domain is
-/// *primary*, it only lets a caller know when a second, skipped domain
-/// exists and is worth a cross-check before declaring a negative (dead /
-/// not-loaded / not-provisioned) verdict: the single reachability probe used
-/// to decide whether `gui/<uid>` is usable cannot distinguish "genuinely
-/// unreachable" from "a transient hang/flake within `PROBE_TIMEOUT`" —
-/// folding a flaky probe into a permanent domain choice for the rest of the
-/// call previously produced false negatives (#4694).
-struct DomainResolution {
-    /// The primary domain to probe. `None` only when the uid itself is
-    /// undeterminable.
-    domain: Option<String>,
-    /// The `gui/<uid>` domain that was skipped because its reachability probe
-    /// came back non-success, when that is why `domain` is `user/<uid>`.
-    /// `Some` only in that exact case — never when an explicit
-    /// `LOOM_LAUNCHD_DOMAIN` override was honored (AC6: no cross-check
-    /// fallback for an explicit override) and never when `gui/<uid>` was
-    /// itself the resolved domain (nothing was skipped).
-    fallback_check_domain: Option<String>,
-}
-
-/// Resolve the launchd domain to probe in, mirroring
-/// `lib/launchd-domain.sh::resolve_launchd_domain`: an explicit
-/// `LOOM_LAUNCHD_DOMAIN` wins, else `gui/<uid>` when that domain resolves, else
-/// the SSH-reachable background `user/<uid>` domain. `None` only when the uid
-/// itself is undeterminable (⇒ the caller degrades to `Unknown`). The result
-/// also carries the skipped-domain detail described in [`DomainResolution`],
-/// for callers that need to cross-check a negative verdict (#4694) — every
-/// caller in this module uses that detail, so there is no separate
-/// domain-only accessor.
-fn resolve_launchd_domain_detailed(override_value: Option<&str>) -> DomainResolution {
-    if let Some(explicit) = override_value.filter(|s| !s.is_empty()) {
-        return DomainResolution {
-            domain: Some(explicit.to_string()),
-            fallback_check_domain: None,
-        };
-    }
-    let Some(uid) = current_uid() else {
-        return DomainResolution {
-            domain: None,
-            fallback_check_domain: None,
-        };
-    };
-    let gui = format!("gui/{uid}");
-    let mut cmd = Command::new("launchctl");
-    cmd.args(["print", &gui]);
-    // A hung reachability probe reads as "gui/<uid> not reachable" — the same
-    // verdict an absent/nonzero `launchctl` gives — so the caller falls back to
-    // the SSH-reachable `user/<uid>` domain rather than blocking (#4548). That
-    // failure is exactly the ambiguous case #4694 cares about: it may be a
-    // genuine absence, or it may be a transient flake — either way `gui` is
-    // reported back as the domain worth cross-checking before a caller trusts
-    // a negative verdict from `user/<uid>` alone.
-    let gui_ok = probe_output(cmd, PROBE_TIMEOUT).is_some_and(|o| o.status.success());
-    if gui_ok {
-        return DomainResolution {
-            domain: Some(gui),
-            fallback_check_domain: None,
-        };
-    }
-    DomainResolution {
-        domain: Some(format!("user/{uid}")),
-        fallback_check_domain: Some(gui),
-    }
-}
-
-/// Probe whether the launchd job `<domain>/<label>` is loaded —
-/// `launchctl print <domain>/<label>` exits 0 only for a bootstrapped job, so
-/// a nonzero exit is a real (for *this domain*) "not loaded". A
-/// missing/unspawnable `launchctl` yields `None` — unknown, never a false
-/// negative. A probe that hangs past [`PROBE_TIMEOUT`] takes that same `None`
-/// path (#4548). Shared by [`launchctl_job_provisioned`]'s primary and
-/// cross-check probes (#4694) — both are this exact same call against
-/// different domains.
-fn probe_domain_provisioned(domain: &str, label: &str) -> Option<bool> {
-    let mut cmd = Command::new("launchctl");
-    cmd.args(["print", &format!("{domain}/{label}")]);
-    let output = probe_output(cmd, PROBE_TIMEOUT)?;
-    Some(output.status.success())
-}
-
-/// Is the watchdog launchd job loaded? A missing/unspawnable `launchctl` (or
-/// an undeterminable domain) yields `None` — unknown, never a false negative.
-///
-/// #4694: a negative (or unknown) primary-domain verdict is not trusted on
-/// its own when [`resolve_launchd_domain_detailed`] reports a
-/// `fallback_check_domain` — i.e. when domain resolution fell back to
-/// `user/<uid>` because its `gui/<uid>` reachability probe failed, which
-/// cannot distinguish a genuine absence from a transient flake. In that case
-/// this also probes the skipped `gui/<uid>` domain and only reports
-/// not-provisioned (`Some(false)`) when BOTH domains agree; any timeout/error
-/// on either probe, or a disagreement other than "either domain says loaded",
-/// degrades to `None` rather than a confident negative (never folds "unknown"
-/// into `Some(false)`). No cross-check occurs when an explicit
-/// `LOOM_LAUNCHD_DOMAIN` override was honored (AC6) — that always resolves
-/// with `fallback_check_domain: None`.
-fn launchctl_job_provisioned(label: &str, domain_override: Option<&str>) -> Option<bool> {
-    let resolution = resolve_launchd_domain_detailed(domain_override);
-    let domain = resolution.domain?;
-    let primary = probe_domain_provisioned(&domain, label);
-    if primary == Some(true) {
-        return primary;
-    }
-    let Some(check_domain) = resolution.fallback_check_domain.as_deref() else {
-        return primary;
-    };
-    let secondary = probe_domain_provisioned(check_domain, label);
-    match (primary, secondary) {
-        (_, Some(true)) => Some(true),
-        (Some(false), Some(false)) => Some(false),
-        _ => None,
     }
 }
 

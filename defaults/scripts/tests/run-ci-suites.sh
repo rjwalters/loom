@@ -157,6 +157,14 @@ done
 
 # ---------- live-daemon guard (#6386) ----------
 # Host-mutating suites: each one drives the real daemon lifecycle scripts.
+#
+# test-loom-daemon-watchdog.sh is deliberately still listed although #8086 moved
+# it to ci-excluded.txt (it needs a built loom-daemon; see that file). The entry
+# is inert while the suite is unwired -- this is a name filter over the wired
+# set -- and it must stay: the suite is no less host-mutating than before, so a
+# future re-wiring, or a run against a hand-edited manifest, has to land inside
+# the guard rather than outside it. test-run-ci-suites-daemon-guard.sh asserts
+# this entry's continued presence directly.
 LIVE_DAEMON_GUARDED_SUITES="test-loom-daemon-start.sh test-loom-daemon-stop.sh test-loom-daemon-update.sh test-loom-daemon-quiesce.sh test-loom-daemon-watchdog.sh"
 
 # ---------- serial lane (#6622 AC5, evidence in #6639) ----------
