@@ -44,6 +44,7 @@ mod claims;
 mod cost_analytics;
 mod db;
 mod models;
+pub mod pricing_card;
 mod prompts;
 mod quality;
 pub mod resource_usage;
@@ -92,6 +93,11 @@ pub use transcript_parse::{attribute_role, parse_transcript, ParsedTranscript, U
 // are provided for external crate access (future MCP servers, etc.)
 #[allow(unused_imports)]
 pub use resource_usage::{detect_provider, parse_resource_usage, ModelPricing, ResourceUsage};
+
+// Re-export the runtime-loadable rate card (#8177) alongside the pricing type
+// it feeds, so a consumer can inspect which card is in effect.
+#[allow(unused_imports)]
+pub use pricing_card::{PricingCard, PricingCardError};
 
 // Re-export stats types and trait for metrics queries
 // These types are used for the `loom stats` CLI commands
