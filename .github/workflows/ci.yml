@@ -524,6 +524,28 @@ jobs:
         # a portability bug in a script operators run locally, and this is where
         # it should surface. Adds ~0.4s.
         run: bash scripts/check-pipefail-early-exit.sh --quiet --require-baseline
+      - name: Ratchet undeclared loom-daemon subcommand dependencies
+        # #8285. A shell script that shells out to `loom-daemon <subcommand>`
+        # acquires a fleet-wide VERSION FLOOR the moment that subcommand is
+        # added, and every host whose binary predates it stops. On 2026-09-18
+        # that took out merges on a host running 0.19.161 against a `main` that
+        # had moved to 0.19.170+, and the refusal could name neither the version
+        # to roll to nor the command to roll with.
+        #
+        # The gate makes the floor declarable (`# requires-daemon: <sub> >= <v>`)
+        # and then enforces that a NEW dependency cannot land undeclared. Same
+        # one-way-ratchet shape as the two gates above: everything that exists
+        # today is frozen in scripts/daemon-subcommand-baseline.txt, so this
+        # fires only on a newly added dependency. --require-baseline so deleting
+        # the ledger reads as a failure rather than as "all clear".
+        #
+        # Both legs, for the same reason as the pipefail ratchet: detection is
+        # an awk pass, ubuntu and macOS ship different awks, and the gate is
+        # bash-3.2-clean by construction (no `declare -A`) so the macOS leg is
+        # real coverage of that claim rather than a formality. Adds ~1s.
+        run: bash scripts/check-daemon-subcommand-versions.sh --quiet --require-baseline
+      - name: Self-test the daemon-subcommand version gate
+        run: bash scripts/check-daemon-subcommand-versions.sh --self-test
 
   agents-md-sync:
     name: AGENTS.md Sync Check
