@@ -43,10 +43,16 @@ use crate::types::{Request, Response, SweepKind};
 const MIN_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Bound on one loopback IPC round-trip. `DispatchSweep` is the slow one — it
-/// flips a forge label and waits on the child's token name — so this mirrors the
-/// 30s budget `cli::common::DISPATCH_ACK_TIMEOUT` documents for the identical
-/// call rather than the 5s used for cheap reads.
+/// Base bound on one loopback IPC round-trip. `DispatchSweep` is the slow one —
+/// it flips a forge label and waits on the child's token name — so this mirrors
+/// the 30s budget `cli::common::DISPATCH_ACK_TIMEOUT` documents for the
+/// identical call rather than the 5s used for cheap reads.
+///
+/// It is a **base**, not the effective budget: [`round_trip_budget`] raises it
+/// for the one command whose cost is `O(registered roots)` (Issue #8311). It is
+/// deliberately not widened itself — every other command's 30s has its own
+/// rationale above, and a root-scaled `DispatchSweep` would be scaling a budget
+/// that does not depend on the root count.
 const IPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Grace period between SIGTERM and SIGKILL for a ChatOps `cancel`, matching the
@@ -176,11 +182,59 @@ pub fn render_response(command: &Command, response: &Response) -> String {
     }
 }
 
+/// Whether `request`'s server-side cost scales with the number of registered
+/// workspace roots, and therefore needs the root-scaled client floor
+/// (Issue #8311).
+///
+/// **`DaemonStatus` only.** [`crate::ipc::build_daemon_status`] walks every
+/// registered root on every call, so its wall-clock cost is `O(roots)` — the
+/// exact property [`crate::status_budget`] exists to budget for. None of the
+/// other ChatOps verbs has that shape: `DispatchSweep`, `CancelSweep`,
+/// `ClearQuarantine` and `RegisterWatch` each touch one sweep/issue/watch
+/// regardless of how many workspaces this host has registered, so scaling them
+/// by the root count would be scaling a budget by an input it does not depend
+/// on.
+///
+/// One predicate shared by [`round_trip_budget`] (what the budget is) and
+/// [`IpcExecutor::resolve_budget`] (whether to pay the registry read at all),
+/// so the two can never disagree about which commands are root-scaled.
+#[must_use]
+fn is_root_scaled(request: &Request) -> bool {
+    matches!(request, Request::DaemonStatus)
+}
+
+/// The effective budget for one loopback round-trip of `request` on a host with
+/// `root_count` registered workspace roots (Issue #8311).
+///
+/// `base` raised — never narrowed — to [`crate::status_budget::client_probe_budget`]
+/// for [`is_root_scaled`] requests, mirroring `cli::status::resolve_status_timeout`
+/// (#8224) and `serve::status_fetch::fetch_budget` (#8224). Before this, ChatOps
+/// `!status` waited a fixed 30s on a build that costs `(0.5s + 0.2s * roots)`,
+/// so a host past ~73 registered roots reported a false `status` timeout on a
+/// perfectly healthy daemon — the same class of bug #8163/#8224 fixed for the
+/// `health`/`status` CLI and the dashboard, on the one `Request::DaemonStatus`
+/// call site those passes missed.
+///
+/// Every other request comes back as `base`, bit-for-bit: the shared
+/// [`IPC_TIMEOUT`] is not widened, and a single-workspace host is unchanged for
+/// `status` too (at `root_count == 1` the probe budget is `1.4s`, far under the
+/// 30s base, so the raise-only `max` is a no-op).
+#[must_use]
+fn round_trip_budget(base: Duration, request: &Request, root_count: usize) -> Duration {
+    if is_root_scaled(request) {
+        crate::status_budget::apply_client_probe_floor(base, root_count)
+    } else {
+        base
+    }
+}
+
 /// The real executor: one bounded loopback round-trip per command over the
 /// daemon's own IPC socket.
 pub struct IpcExecutor {
     socket: PathBuf,
-    timeout: Duration,
+    /// The **base** per-round-trip budget ([`IPC_TIMEOUT`]); the effective one
+    /// is resolved per request by [`Self::resolve_budget`].
+    base_timeout: Duration,
 }
 
 impl IpcExecutor {
@@ -188,7 +242,7 @@ impl IpcExecutor {
     pub fn new(socket: PathBuf) -> Self {
         Self {
             socket,
-            timeout: IPC_TIMEOUT,
+            base_timeout: IPC_TIMEOUT,
         }
     }
 
@@ -206,12 +260,37 @@ impl IpcExecutor {
         dirs::home_dir().map(|home| home.join(".loom").join("loom-daemon.sock"))
     }
 
+    /// The budget this round-trip waits under, plus the registered root count
+    /// that floored it (`None` when the request is not root-scaled).
+    ///
+    /// The root count is read from the **local** workspace registry, and only
+    /// for a request that is actually root-scaled: the client cannot learn it
+    /// from the very round-trip it is trying to budget for, and a `dispatch`
+    /// must not pay a registry read it would ignore. Same rationale as
+    /// `cli::status::resolve_status_timeout` and
+    /// `serve::status_fetch::fetch_report`.
+    fn resolve_budget(&self, request: &Request) -> (Duration, Option<usize>) {
+        if !is_root_scaled(request) {
+            return (self.base_timeout, None);
+        }
+        let root_count = crate::status_budget::registered_root_count();
+        (round_trip_budget(self.base_timeout, request, root_count), Some(root_count))
+    }
+
     async fn round_trip(&self, request: &Request) -> anyhow::Result<Response> {
-        let stream =
-            tokio::time::timeout(self.timeout, tokio::net::UnixStream::connect(&self.socket))
-                .await
-                .map_err(|_| anyhow::anyhow!("connect timed out"))?
-                .map_err(|err| anyhow::anyhow!("connect failed: {err}"))?;
+        let (timeout, root_count) = self.resolve_budget(request);
+        // Name the budget (and the root count that sized it, when one did) in
+        // both timeout messages: a ChatOps reply is the only thing the operator
+        // sees, so "timed out" alone gives them no way to tell a wedged daemon
+        // from a too-small budget.
+        let budget_desc = match root_count {
+            Some(n) => format!("{}s ({n} registered workspace root(s))", timeout.as_secs()),
+            None => format!("{}s", timeout.as_secs()),
+        };
+        let stream = tokio::time::timeout(timeout, tokio::net::UnixStream::connect(&self.socket))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect timed out after {budget_desc}"))?
+            .map_err(|err| anyhow::anyhow!("connect failed: {err}"))?;
         let (reader, mut writer) = stream.into_split();
         let line = serde_json::to_string(request)?;
         let exchange = async move {
@@ -225,9 +304,9 @@ impl IpcExecutor {
                 .ok_or_else(|| anyhow::anyhow!("daemon closed the connection"))?;
             Ok::<Response, anyhow::Error>(serde_json::from_str(&reply)?)
         };
-        tokio::time::timeout(self.timeout, exchange)
+        tokio::time::timeout(timeout, exchange)
             .await
-            .map_err(|_| anyhow::anyhow!("round-trip timed out"))?
+            .map_err(|_| anyhow::anyhow!("round-trip timed out after {budget_desc}"))?
     }
 }
 
@@ -415,3 +494,6 @@ async fn send_reply(
     }
     true
 }
+
+#[cfg(test)]
+mod root_scaled_timeout_tests;
