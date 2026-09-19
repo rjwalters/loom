@@ -28,6 +28,10 @@
 //!
 //! **The phrase match is case-sensitive.** `grep -E` without `-i`, so
 //! `blocked by #3` in lower case does not register. Preserved deliberately.
+//!
+//! [`extract_refs`], the ungated parser used on findings text, keeps the same
+//! whole-text scan with exactly one exclusion — a `(Epic #M …)` annotation
+//! (#8251); see its own docs.
 
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -112,15 +116,77 @@ pub fn parse_dependency_refs(body: &str, default_repo: &str) -> Vec<String> {
 ///
 /// [`parse_dependency_refs`] keeps the phrase gate because it reads a whole
 /// issue **body**, where most `#N` mentions are not dependencies at all.
+///
+/// # The one exclusion: `(Epic #M …)` is annotation (#8251)
+///
+/// A Champion verdict bullet routinely names the real blocker and then says,
+/// for a human reader, which epic phase that blocker belongs to:
+///
+/// ```text
+/// - Technical Feasibility: Blocked by #5519 (Epic #5510 Phase 1a — …), still open.
+/// ```
+///
+/// Capturing `#5510` made it a required-to-close blocker, and an epic stays
+/// open for its whole phase lifecycle by design — so the phase child parked on
+/// it could never re-evaluate, even after `#5519` closed (kicad-tools#5520,
+/// #5517, #5518). References inside a parenthetical group whose content begins
+/// with the literal `Epic #` are therefore dropped.
+///
+/// The filter is **structural, not positional**: it keys off that marker and a
+/// balanced parenthetical span, never off a reference's position on the line.
+/// "Blocked by #3 and #4" still yields both — dropping every ref after the
+/// first would silently lose a real second blocker — and `(see also #99)` still
+/// over-captures exactly as before.
 #[must_use]
 pub fn extract_refs(text: &str, default_repo: &str) -> Vec<String> {
     let mut out: BTreeSet<String> = BTreeSet::new();
-    for m in bare_ref_re().find_iter(text) {
-        if let Some(normalised) = normalise(m.as_str(), default_repo) {
-            out.insert(normalised);
+    // Line by line: a reference never spans a newline, so the ref set is
+    // unchanged, but a stray `(` cannot pair with a `)` bullets later and
+    // erase the real blockers in between.
+    for line in text.lines() {
+        let annotations = epic_annotation_spans(line);
+        for m in bare_ref_re().find_iter(line) {
+            if annotations
+                .iter()
+                .any(|&(open, close)| m.start() > open && m.start() < close)
+            {
+                continue;
+            }
+            if let Some(normalised) = normalise(m.as_str(), default_repo) {
+                out.insert(normalised);
+            }
         }
     }
     out.into_iter().collect()
+}
+
+/// Byte spans of the `(…)` groups in `line` whose content begins with the
+/// literal `Epic #` — the annotation regions [`extract_refs`] ignores.
+///
+/// Groups are matched with a stack, so an inner group nested inside an
+/// annotation is covered by the enclosing span and a reference there is dropped
+/// too. An **unterminated** `(` yields no span at all: excluding to end of line
+/// would let one stray character silently erase real blockers, and the observed
+/// shape is always balanced.
+fn epic_annotation_spans(line: &str) -> Vec<(usize, usize)> {
+    let mut open_stack: Vec<usize> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    // Byte indices of ASCII `(`/`)` are always char boundaries, so slicing on
+    // them is safe even with multi-byte content (the em dash in the live shape).
+    for (i, byte) in line.bytes().enumerate() {
+        match byte {
+            b'(' => open_stack.push(i),
+            b')' => {
+                if let Some(open) = open_stack.pop() {
+                    if line[open + 1..i].trim_start().starts_with("Epic #") {
+                        spans.push((open, i));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
 }
 
 /// Normalise one raw reference to `owner/repo#N`.

@@ -180,6 +180,38 @@ fn findings_references_win_over_the_body() {
 }
 
 #[test]
+fn an_epic_parenthetical_does_not_wedge_a_phase_child_in_defer() {
+    // kicad-tools#5520 (#8251): the verdict names the real blocker and then
+    // annotates, for a human reader, which epic phase it belongs to. Capturing
+    // the epic as a second blocker parked the phase child forever — an epic
+    // stays open for its whole phase lifecycle by design.
+    let bullet = "- Technical Feasibility: Blocked by #5519 (Epic #5510 Phase 1a — \
+                  `RoutingPlan`, sidecar writer, `emit_routing_plan`), still open.\n";
+    let mut i = inputs(bullet, "");
+
+    let to_classify = blockers_to_classify(&i, REPO, SELF);
+    assert_eq!(
+        to_classify,
+        vec!["o/r#5519"],
+        "the epic mention is annotation, so the forge is never asked about it"
+    );
+
+    // Replay what the I/O boundary does with that list: the real blocker has
+    // closed, the epic (had it been asked about) is still open.
+    for r in to_classify {
+        if r == "o/r#5510" {
+            i.refs.open.push(r);
+        } else {
+            i.refs.resolved.push(r);
+        }
+    }
+    match decide(&i, REPO, SELF) {
+        Decision::Reevaluate { cleared } => assert_eq!(cleared, vec!["o/r#5519"]),
+        other => panic!("expected Reevaluate once the real blocker closed, got {other:?}"),
+    }
+}
+
+#[test]
 fn the_body_is_the_fallback_when_findings_name_nothing() {
     // Older verdicts did not always cite a reference.
     let got = resolve_blockers("- something vague\n", "Blocked by #77\n", REPO, SELF);
