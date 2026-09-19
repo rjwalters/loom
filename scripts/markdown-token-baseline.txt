@@ -25,7 +25,7 @@
 1836 defaults/.claude/commands/loom/champion-epic-standdown.md
 13864 defaults/.claude/commands/loom/champion-epic.md
 24447 defaults/.claude/commands/loom/champion-issue-promo.md
-47279 defaults/.claude/commands/loom/champion-pr-merge.md
+47277 defaults/.claude/commands/loom/champion-pr-merge.md
 12846 defaults/.claude/commands/loom/champion-reference.md
 3749 defaults/.claude/commands/loom/champion.md
 1100 defaults/.claude/commands/loom/comment-body-literal-path.md

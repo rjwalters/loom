@@ -1289,10 +1289,9 @@ LAST_ACTIVITY=$(jq -r '
   ] | max' <<<"$PR_DATA")
 
 # Convert to Unix timestamp
-LAST_ACTIVITY_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_ACTIVITY" +%s 2>/dev/null || \
+LAST_ACTIVITY_TS=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_ACTIVITY" +%s 2>/dev/null || \
                    date -d "$LAST_ACTIVITY" +%s 2>/dev/null)
 
-# Get current time
 NOW_TS=$(date +%s)
 
 # Calculate hours since last real activity
@@ -1687,7 +1686,7 @@ HELD_AT_DOCTOR=$(printf '%s\n' "$HELD_JSON" | jq '[.[] | select([.labels[].name]
 # Oldest by PR creation — the age of the head of the pile.
 OLDEST_CREATED=$(printf '%s\n' "$HELD_JSON" | jq -r 'min_by(.createdAt) | .createdAt // empty')
 if [ -n "$OLDEST_CREATED" ]; then
-  OLDEST_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$OLDEST_CREATED" +%s 2>/dev/null || \
+  OLDEST_TS=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$OLDEST_CREATED" +%s 2>/dev/null || \
               date -d "$OLDEST_CREATED" +%s 2>/dev/null)
   OLDEST_DAYS=$(( ($(date +%s) - OLDEST_TS) / 86400 ))
 else
@@ -1822,7 +1821,7 @@ for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r '.[].number'); do
     else
       CONFLICT_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     fi
-    SINCE_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$CONFLICT_SINCE" +%s 2>/dev/null || \
+    SINCE_TS=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$CONFLICT_SINCE" +%s 2>/dev/null || \
                date -d "$CONFLICT_SINCE" +%s 2>/dev/null)
     CONFLICT_DAYS=$(( ($(date +%s) - SINCE_TS) / 86400 ))
     STATUS="${STATUS} since ${CONFLICT_SINCE}, ${CONFLICT_DAYS}d"
@@ -1967,7 +1966,7 @@ DELETIONS=$(printf '%s\n' "$PR_DATA" | jq -r '.deletions')
 TOTAL_LINES=$((ADDITIONS + DELETIONS))
 
 UPDATED_AT=$(printf '%s\n' "$PR_DATA" | jq -r '.updatedAt')
-UPDATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
+UPDATED_TS=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
              date -d "$UPDATED_AT" +%s 2>/dev/null)
 NOW_TS=$(date +%s)
 HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
