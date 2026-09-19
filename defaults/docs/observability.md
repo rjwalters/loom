@@ -365,6 +365,50 @@ as §5b, mirroring `guide-docs-telemetry.sh`:
   `_recheck_mergeable_before_refusal()`'s actual decision logic in any way
   (#6156 recommended keeping that behavior as-is).
 
+## 5d. Non-daemon emitters onto the same backend (2am elastic compute, Issue #8304)
+
+Sections 1-5 above are all `loom-daemon` hosts pushing their own
+`sweep.*`/`tokens.snapshot`/`host.health` telemetry through the collector →
+queue → exporter pipeline. The same Cloudflare backend also accepts
+telemetry from emitters that are **not** a `loom-daemon` process at all —
+`POST /ingest`'s wire contract (a bare JSON array of `TelemetryEnvelope`s,
+bearer-authenticated) has no dependency on the sender being the daemon,
+provided the sender speaks the same envelope shape.
+
+The first such emitter (2am's elastic EDA batch runner, tracked in parent
+issue #8257) reports `ephemeral_compute` records — job id, instance id,
+region, instance type, spot flag, AMI, start/end timestamps, wall clock,
+estimated cost — for short-lived cloud compute jobs that have no
+`loom-daemon` host of their own. This raised a question the daemon-host
+model above never had to answer: **what `host_id` does a hostless emitter
+authenticate as?**
+
+**Decision: a dedicated synthetic `host_id` for the whole elastic-compute
+fleet** (e.g. `2am-elastic`), provisioned via the ordinary `POST
+/admin/hosts` flow — not a binding to any single real machine. Full
+rationale (why not the orchestrating controller's own hostname, why this
+needs no `handleIngest` change) is in
+[`dashboard/docs/deploy-runbook.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/deploy-runbook.md)
+§"Provisioning a non-daemon emitter". In short: `handleIngest` always stamps
+every row with the authenticated key's own bound identity, never a
+client-supplied value, so "hostless ingest" is a provisioning decision, not
+a schema one — exactly the same one-key-per-reporting-process model every
+`loom-daemon` host already uses, just pointed at a synthetic id instead of a
+real hostname so it survives the controller itself being replaced.
+
+`ephemeral_compute` rows land in the same `records` table as every other
+kind (`dashboard/migrations/0003_ephemeral_compute.sql`) — no dedicated
+per-kind table, see that migration's own header comment for the schema
+rationale — and carry no `repo`/`issue`/`sweep_id` (host-level, like
+`tokens.snapshot`/`host.health`). Redaction: **no field survives to
+`/public/*`** for this kind — job/instance/region/cost detail is private
+compute-spend detail, the same category `sweep.outcome`'s work-output
+fields are held back for (§5 above) — see `src/redaction.ts`'s
+`RECORD_FIELD_ALLOWLIST["ephemeral_compute"]` entry for the stated policy.
+
+Phase 2/3 of #8257 (live "running now" state + leak detection, and web UI
+views) build on this Phase 1 slice but are not part of it.
+
 ## 6. The operator reference instance
 
 `dashboard.example.com` is a live, operator-owned deployment of this same
@@ -387,5 +431,6 @@ capture, and why) so you can produce the equivalent for your own instance.
 | `dashboard/docs/token-analytics.md` | Burn curves, forecasting, per-repo attribution |
 | `defaults/scripts/guide-docs-telemetry.sh` | Local doc-maintenance throughput telemetry (§5b) — record + report, no daemon/Cloudflare involvement |
 | `defaults/scripts/merge-admission-telemetry.sh` | Local merge-admission-recheck outcome telemetry (§5c) — record + report, no daemon/Cloudflare involvement |
+| `dashboard/migrations/0003_ephemeral_compute.sql` | `ephemeral_compute` schema decision + hostless-ingest provisioning rationale (§5d) |
 | `dashboard/docs/reference-deployment.md` | Generic guidance/template for recording your own instance's deployment identity in your own infrastructure repo — carries no operator identity here |
 | `loom-daemon/src/observability/mod.rs` | Config resolution, collector/queue/exporter/sender source of truth |
