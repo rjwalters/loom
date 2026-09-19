@@ -28,6 +28,13 @@
 #     - For Gitea: GITEA_TOKEN or FORGE_TOKEN environment variable must be set
 #     - loom-daemon binary must be buildable (cargo build --package loom-daemon --release)
 #
+#   Environment:
+#     LOOM_INSTALL_KEEP_WORKTREE=1
+#       On failure, leave the install worktree in place instead of deleting it,
+#       so the failing tree can be inspected and the diagnostics this script
+#       suggests can actually be run against it (issue #8270). Remove it
+#       yourself afterwards: git -C <target> worktree remove <path> --force
+#
 #   After installation:
 #     - Merge the generated PR in the target repository
 #     - Loom will be ready to use in that workspace
@@ -314,6 +321,19 @@ cleanup_on_error() {
   if [[ $exit_code -ne 0 ]]; then
     echo ""
     warning "Installation failed at step: ${CURRENT_STEP:-unknown}"
+
+    # Post-mortem escape hatch (#8270): the failing tree is the ONLY evidence of
+    # why an install failed, and every diagnostic this script suggests has to be
+    # run INSIDE it. Deleting it first makes the suggestion unrunnable — that is
+    # how #8270's dangling-link list ended up having to be re-derived by hand in
+    # a scratch clone. `LOOM_INSTALL_KEEP_WORKTREE=1` suppresses the removal.
+    # Implemented by blanking WORKTREE_PATH rather than by a second guard on the
+    # removal block below, so the branch deletion nested inside it (which would
+    # orphan the kept worktree) is skipped by the same one decision.
+    if [[ "${LOOM_INSTALL_KEEP_WORKTREE:-0}" != "0" && -n "${WORKTREE_PATH:-}" ]]; then
+      warning "LOOM_INSTALL_KEEP_WORKTREE set — keeping ${TARGET_PATH}/${WORKTREE_PATH} for inspection (remove with: git -C '${TARGET_PATH}' worktree remove '${WORKTREE_PATH}' --force)"
+      WORKTREE_PATH=""
+    fi
 
     if [[ -n "${WORKTREE_PATH:-}" ]] && [[ -d "${TARGET_PATH}/${WORKTREE_PATH}" ]]; then
       info "Cleaning up worktree: ${WORKTREE_PATH}..."
@@ -2020,24 +2040,12 @@ if [[ -f "$LOOM_ROOT/defaults/.loom/bin/loom" ]]; then
 fi
 echo ""
 
-# Generate installation manifest (checksum of all installed files)
-if [[ -x ".loom/scripts/verify-install.sh" ]]; then
-  info "Generating installation manifest..."
-  ./.loom/scripts/verify-install.sh generate --quiet || \
-    warning "Manifest generation failed (non-fatal)"
-  success "Installation manifest generated (.loom/manifest.json)"
-
-  # Check intra-repo links in installed files resolve (issue #4097). A
-  # dangling target here means an installed file points at a sibling
-  # Loom never shipped (a packaging gap, like #4097 itself) — surfacing it
-  # here beats a downstream consumer audit finding it later.
-  info "Checking intra-repo links in installed files..."
-  if ./.loom/scripts/verify-install.sh check-links --quiet; then
-    success "All intra-repo links resolve"
-  else
-    error "Some intra-repo links in installed files are dangling — run './.loom/scripts/verify-install.sh check-links' for details"
-  fi
-fi
+# Generate the checksum manifest (.loom/manifest.json) and check that every
+# intra-repo link in the installed markdown resolves. Body lives in
+# scripts/install/manifest.sh (already sourced above) — see _verify_installed_tree
+# there for why, and for the #8270 reporting fixes it carries. CWD is the install
+# worktree here, which is what that function requires.
+_verify_installed_tree
 echo ""
 
 # ============================================================================

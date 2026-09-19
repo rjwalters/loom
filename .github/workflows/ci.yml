@@ -568,6 +568,66 @@ jobs:
       - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
         run: bash scripts/check-docs-defaults-parity.sh
 
+  fresh-install-links:
+    name: Fresh Install Link Check
+    # Always runs; deliberately NOT behind `needs: changes` (see
+    # .loom/docs/ci-principles.md — path-filtering is an optimisation, not a
+    # correctness tool).
+    #
+    # Why a REAL install instead of another static checker (#8270): every
+    # existing link gate reasons about ONE destination for each source file.
+    # `check-dangling-links.sh` maps `defaults/.claude/commands/loom/X.md` to
+    # its installed `.claude/commands/loom/X.md`, and
+    # `check-docs-defaults-parity.sh` only looks inside `defaults/docs/`.
+    # Neither models the fact that a handful of those command files are ALSO
+    # installed — one directory shallower — as `.loom/roles/X.md`, because
+    # `defaults/roles/X.md` is a symlink to them. A `../../../.loom/docs/…`
+    # link resolves correctly from the first destination and escapes the repo
+    # root from the second, so it was invisible to both gates while failing
+    # `install-loom.sh` Step 3 on every fresh consumer repo. Nor does either
+    # gate see backtick-only references (`` `.loom/docs/foo.md` ``), which is
+    # how a shipped file came to reference a doc that is deliberately never
+    # shipped.
+    #
+    # Materialising the install and running the installer's own check against
+    # it needs no model of the destination map at all — it IS the destination
+    # map. This is the exact command sequence that failed in #8270.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build loom-daemon
+        run: cargo build --release -p loom-daemon --bin loom-daemon
+      - name: Initialize Loom into an empty two-commit fixture repo
+        run: |
+          set -euo pipefail
+          FIXTURE="$(mktemp -d)"
+          echo "FIXTURE=$FIXTURE" >> "$GITHUB_ENV"
+          git init -q -b main "$FIXTURE"
+          git -C "$FIXTURE" config user.email "loom-ci@example.com"
+          git -C "$FIXTURE" config user.name "Loom CI"
+          printf '# fixture\n' > "$FIXTURE/README.md"
+          git -C "$FIXTURE" add README.md
+          git -C "$FIXTURE" commit -q -m "initial commit"
+          git -C "$FIXTURE" commit -q --allow-empty -m "second commit"
+          ./target/release/loom-daemon init \
+            --defaults "$GITHUB_WORKSPACE/defaults" "$FIXTURE" 2>&1 | tee /tmp/fresh-init.log
+      - name: Manifest generation succeeded on the fresh init
+        run: |
+          set -euo pipefail
+          if grep -q 'Manifest generation failed\|Could not run verify-install.sh' /tmp/fresh-init.log; then
+            echo "::error::loom-daemon init reported a manifest-generation failure on a fresh repo" >&2
+            grep -n 'Manifest\|verify-install' /tmp/fresh-init.log >&2 || true
+            exit 1
+          fi
+          test -s "$FIXTURE/.loom/manifest.json"
+      # The installer treats a dangling link as fatal (install-loom.sh Step 3),
+      # so reproduce it verbatim rather than paraphrasing the check.
+      - name: Check intra-repo links in the freshly installed tree
+        run: cd "$FIXTURE" && bash .loom/scripts/verify-install.sh check-links
+
   guard-scan-contracts:
     name: Guard Scan-String Tier Contracts
     # Cheap structural check; always runs. guard-destructive-generic.sh decides

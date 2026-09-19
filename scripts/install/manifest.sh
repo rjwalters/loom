@@ -317,3 +317,59 @@ _emit_loom_ownership_set() {
     }
   '
 }
+
+# Run the installed-tree verification step: generate `.loom/manifest.json` and
+# check that every intra-repo link in the installed markdown resolves.
+#
+# Note the two unrelated "manifest"s that meet in this file. The functions above
+# build the INSTALLED-FILES manifest (a JSON array of paths, consumed by
+# uninstall-loom.sh to decide what it may delete). This one drives
+# `verify-install.sh generate`, which writes the CHECKSUM manifest
+# `.loom/manifest.json` (SHA-256 per installed file, consumed by
+# `verify-install.sh verify` to detect drift). They share a word, nothing else.
+#
+# Extracted from install-loom.sh (#8270) because install-loom.sh is over the
+# file-size ratchet's threshold and may not grow (.loom/docs/file-size-policy.md);
+# this is the "new code lands in a sibling, dispatch arm stays behind" path.
+#
+# Must be called with the CWD set to the installed tree (the install worktree).
+# Uses install-loom.sh's info/success/warning/error reporters, which are in
+# scope because this file is sourced into it. `error` aborts the install.
+#
+# No-op when `.loom/scripts/verify-install.sh` is absent or not executable.
+_verify_installed_tree() {
+  [[ -x ".loom/scripts/verify-install.sh" ]] || return 0
+
+  # `generate` is non-fatal, but its outcome must be reported honestly. The
+  # unconditional `success` that used to follow the `|| warning` announced
+  # "Installation manifest generated" even on the failing branch (#8270), so a
+  # log could carry "⚠ Manifest generation failed" and "✓ Installation manifest
+  # generated" back to back with no way to tell which was true. verify-install.sh
+  # prints its own reason on stderr (`--quiet` silences only the success
+  # summary), so the cause is already in the log above the warning.
+  info "Generating installation manifest..."
+  if ./.loom/scripts/verify-install.sh generate --quiet; then
+    success "Installation manifest generated (.loom/manifest.json)"
+  else
+    warning "Manifest generation failed (non-fatal) — reason above; .loom/manifest.json may be missing or stale"
+  fi
+
+  # Check intra-repo links in installed files resolve (issue #4097). A dangling
+  # target here means an installed file points at a sibling Loom never shipped
+  # (a packaging gap, like #4097 itself, or #8270's four links to a doc that is
+  # deliberately repo-local) — surfacing it at install time beats a downstream
+  # consumer audit finding it later.
+  #
+  # Deliberately NOT --quiet (#8270): `error` trips install-loom.sh's EXIT trap,
+  # which deletes the install worktree, so the old message's advice ("run
+  # check-links for details") named a command that could no longer be run — the
+  # files it would check were already gone by the time anyone read it. Non-quiet
+  # puts the '<file> -> <target>' list into the install log itself, while the
+  # tree still exists. On the passing path it costs one extra summary line.
+  info "Checking intra-repo links in installed files..."
+  if ./.loom/scripts/verify-install.sh check-links; then
+    success "All intra-repo links resolve"
+  else
+    error "Some intra-repo links in installed files are dangling (listed above, as '<installed file> -> <unresolvable target>'). Re-run with LOOM_INSTALL_KEEP_WORKTREE=1 to keep the install worktree for inspection."
+  fi
+}

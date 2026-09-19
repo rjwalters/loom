@@ -1639,7 +1639,7 @@ steering must land where the operator actually is.
   shares one enablement decision with the rest of the daemon's room presence.
 
 > A sibling module rather than a `safehouse::` submodule because `safehouse.rs`
-> is frozen by the file-size ratchet (`.loom/docs/file-size-policy.md`) — new
+> is frozen by the file-size ratchet ([file-size-policy.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/file-size-policy.md)) — new
 > code lands in a new module, which is exactly what the ratchet is for.
 
 **Two structural properties a refactor must not quietly drop** (recorded because

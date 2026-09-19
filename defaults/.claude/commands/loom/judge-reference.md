@@ -231,7 +231,7 @@ Or when recommending a missing tool:
 | No test framework detected | Note absence in evaluation; check if project has tests at all |
 | PR touches shared utilities | Scoped tools may miss downstream tests — note this risk in evaluation |
 
-**Key principle**: Scoped execution is an optimization, not a replacement for CI. The full test suite still runs in CI (step 8 verifies CI status). Scoped execution gives the Judge faster local feedback during evaluation — see [`judge-reference-rationale.md`](../../../.loom/docs/judge-reference-rationale.md) for the full duration/confidence comparison.
+**Key principle**: Scoped execution is an optimization, not a replacement for CI. The full test suite still runs in CI (step 8 verifies CI status). Scoped execution gives the Judge faster local feedback during evaluation — see `.loom/docs/judge-reference-rationale.md` for the full duration/confidence comparison.
 
 ---
 
