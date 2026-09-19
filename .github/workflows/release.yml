@@ -173,8 +173,56 @@ jobs:
               else
                 # --target creates the tag at this exact commit when it does not
                 # exist yet; --generate-notes diffs against the previous tag.
-                gh release create "$tag" --repo "$REPO" --target "$SHA" \
-                  --title "$tag" --generate-notes
+                #
+                # Bounded retry (#8290): a one-off HTTP 403/5xx from the
+                # releases API (observed once, "Resource not accessible by
+                # integration", immediately followed by a clean run of the
+                # identical call one bump later) previously failed this step
+                # outright and left that version's tag/Release uncreated for
+                # good. Retry a transient-looking failure up to 2 times
+                # (3 attempts total) with a short backoff, logging every
+                # attempt, before giving up for real.
+                max_attempts=3
+                attempt=1
+                while :; do
+                  # `|| create_status=$?` serves two purposes here under
+                  # `set -e`: (1) it stops a failing `gh` call from
+                  # aborting the whole step immediately (a command
+                  # followed by `||` is exempt from errexit); (2) it lets
+                  # us capture the real exit status right here — `if
+                  # create_output="$(...)"; then …; fi` with no `else`
+                  # would instead report the *if statement's own* status
+                  # (0) on the false branch, not the failed command's.
+                  create_status=0
+                  create_output="$(gh release create "$tag" --repo "$REPO" --target "$SHA" \
+                    --title "$tag" --generate-notes 2>&1)" || create_status=$?
+                  if [ "$create_status" -eq 0 ]; then
+                    echo "$create_output"
+                    break
+                  fi
+                  echo "::warning::gh release create for $tag failed on attempt $attempt/$max_attempts: $create_output"
+                  # A concurrent run (or a retry racing our own prior attempt
+                  # that actually succeeded server-side before timing out)
+                  # can make gh report the release already exists — that is
+                  # success, not a transient failure, so don't retry-loop on it.
+                  if printf '%s' "$create_output" | grep -qiE 'already exists'; then
+                    echo "::notice::Release $tag already exists (created by a concurrent/prior attempt) — treating as success."
+                    break
+                  fi
+                  if [ "$attempt" -ge "$max_attempts" ]; then
+                    echo "::error::gh release create for $tag failed after $max_attempts attempts — giving up. Last output: $create_output"
+                    exit "$create_status"
+                  fi
+                  if printf '%s' "$create_output" | grep -qE 'HTTP (403|5[0-9]{2})'; then
+                    backoff=$((attempt * 5))
+                    echo "Transient-looking failure (403/5xx) — retrying in ${backoff}s (attempt $((attempt + 1))/$max_attempts)..."
+                    sleep "$backoff"
+                    attempt=$((attempt + 1))
+                  else
+                    echo "::error::gh release create for $tag failed with a non-retryable error: $create_output"
+                    exit "$create_status"
+                  fi
+                done
                 echo "- Created Release \`$tag\` at \`${SHA:0:12}\` (VERSION bump on main)." >> "$GITHUB_STEP_SUMMARY"
                 echo "tag=$tag" >> "$GITHUB_OUTPUT"
                 echo "publish=true" >> "$GITHUB_OUTPUT"
