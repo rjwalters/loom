@@ -688,18 +688,21 @@ Three properties are worth relying on:
 
 **Why `.ranking` gained no per-class columns.** The design called for them
 *if and only if* Anthropic's usage endpoint actually emits a per-class
-utilization header. A live capture on 2026-09-19 — 5 accounts x 3 model
-classes, the exact `POST /v1/messages` `max_tokens: 1` probe `tokens check`
-sends — found that it does **not**. The recorded finding:
+utilization header. Two independent live captures on 2026-09-19 — each 5
+accounts x 3 model classes (15 requests), the exact `POST /v1/messages`
+`max_tokens: 1` probe `tokens check` sends — found that it does **not**. The
+second capture's full header dump is posted on #8242. The recorded finding:
 
-- **The `200` path returns 12-13 `anthropic-ratelimit-unified-*` headers**
+- **The `200` path returns 12 `anthropic-ratelimit-unified-*` headers**
   (`-5h-utilization`, `-7d-utilization`, `-5h-reset`, `-7d-reset`, `-5h-status`,
   `-7d-status`, `-status`, `-reset`, `-representative-claim`, `-overage-status`,
-  `-overage-disabled-reason`, `-fallback-percentage`, and situationally
-  `-fallback` / `-5h-surpassed-threshold` / `-7d-surpassed-threshold`). Every
-  one is scoped to a **time window** (5h / 7d) or to the account. **Not one is
-  scoped to a model class**, and no header name anywhere in the capture
-  contains a class, model, or tier token.
+  `-overage-disabled-reason`, `-fallback-percentage`) — exactly 12 on every
+  `200` in the capture, rising to 13-15 on a window-scoped `429` as the
+  situational `-fallback` / `-5h-surpassed-threshold` /
+  `-7d-surpassed-threshold` appear. Every one is scoped to a **time window**
+  (5h / 7d) or to the account. **Not one is scoped to a model class**, and no
+  header name anywhere in either capture contains a class, model, or tier
+  token.
 - **A per-class limit demonstrably exists anyway — the endpoint just will not
   name it.** On `agent10` at one instant, `claude-haiku-4-5-20251001` returned
   `200` with `5h-utilization: 0.0`, `5h-status: allowed`, `status: allowed`,
@@ -709,9 +712,10 @@ sends — found that it does **not**. The recorded finding:
 - **The refusal carries strictly less information, not more.** Every one of
   those class-scoped `429`s returned **zero** `anthropic-ratelimit-*` headers
   and a body whose `message` is the literal string `"Error"`. (A *window*-scoped
-  `429` — the account's own 5h/7d ceiling — does carry the full 13-header set;
-  the difference is diagnostic of which kind of limit fired, but still names no
-  class.)
+  `429` — the account's own 5h/7d ceiling — carries the full 13-15 header set
+  and a descriptive body, `"This request would exceed your account's rate
+  limit."`; the zero-header/`"Error"` shape is therefore diagnostic of *which
+  kind* of limit fired, but it still names no class.)
 
 So the per-class state above comes entirely from Phase 1/2 marks, and
 `.ranking` keeps its four-field `name|status|5h_util|limit_reset` shape.
