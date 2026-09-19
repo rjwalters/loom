@@ -300,7 +300,13 @@ mod tests {
     // ===================================================================
 
     #[test]
-    #[serial]
+    // #8077: shares the `loom_socket_path_env` named key with every other
+    // `LOOM_SOCKET_PATH`-mutating test in the crate (`daemon_service.rs`'s
+    // `resolve_paths_tests`, `watchdog_provisioning_guard.rs`) — a bare
+    // `#[serial]` here would NOT exclude those (it is a different,
+    // independent lock), the exact #6177 mismatch shape that lets two
+    // "serialized" test groups race the same process-global env var.
+    #[serial(loom_socket_path_env)]
     fn test_resolve_heartbeat_path_honors_socket_path_env() {
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("loom-daemon.sock");
@@ -487,6 +493,16 @@ mod tests {
     // Loop wiring
     // ===================================================================
 
+    // #8077: this test previously carried NO `#[serial]` at all while mutating
+    // the process-global `LOOM_SOCKET_PATH` AND spawning a real background
+    // heartbeat-writer task via `spawn_heartbeat_task` — the widest-open
+    // version of the #6177 race shape. Any concurrently running test that
+    // `remove_var("LOOM_SOCKET_PATH")`s mid-flight (every case in
+    // `daemon_service.rs`'s `resolve_paths_tests` does) makes that loop's
+    // `resolve_heartbeat_path()` fall back to `$HOME/.loom` and write a real
+    // `daemon.heartbeat` on the host running `cargo test` — the very file the
+    // watchdog reads to decide whether the production daemon is alive.
+    #[serial(loom_socket_path_env)]
     #[tokio::test]
     async fn test_loop_writes_immediately_and_refreshes_mtime() {
         let tmp = tempfile::tempdir().unwrap();

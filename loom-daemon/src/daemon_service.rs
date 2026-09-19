@@ -2220,15 +2220,23 @@ mod resolve_paths_tests {
     //! in the same process. Splitting the pure path-resolution logic out into
     //! these two functions is exactly what makes it testable at all.
     //!
-    //! Both tests mutate the process-global `LOOM_SOCKET_PATH` / `LOOM_DAEMON_LOG`
-    //! env vars, so they're `#[serial]` (the crate already depends on
-    //! `serial_test` for this exact purpose — see `dispatch_tests` below) to
-    //! avoid racing other env-mutating tests in the same binary.
+    //! Every test below mutates the process-global `LOOM_SOCKET_PATH` /
+    //! `LOOM_DAEMON_LOG` env vars, so they're `#[serial(loom_socket_path_env)]`
+    //! (the crate already depends on `serial_test` for this exact purpose — see
+    //! `dispatch_tests` below) to avoid racing other env-mutating tests in the
+    //! same binary. The key is NAMED, not the default/unnamed `#[serial]`:
+    //! `serial_test` gives each key its own independent lock, so a bare
+    //! `#[serial]` here would not exclude `daemon_heartbeat.rs`'s or
+    //! `watchdog_provisioning_guard.rs`'s socket-path tests, which are on
+    //! `loom_socket_path_env`. That mismatch (#6177's shape) let a concurrent
+    //! `remove_var("LOOM_SOCKET_PATH")` from these tests redirect
+    //! `daemon_heartbeat.rs`'s live writer task at `$HOME/.loom` and write a
+    //! real `daemon.heartbeat` on the host running `cargo test` (#8077).
     use super::{resolve_log_path, resolve_loom_dir};
     use serial_test::serial;
 
     #[test]
-    #[serial]
+    #[serial(loom_socket_path_env)]
     fn resolve_loom_dir_defaults_to_home_loom() {
         std::env::remove_var("LOOM_SOCKET_PATH");
         let expected = dirs::home_dir().expect("home dir").join(".loom");
@@ -2236,7 +2244,7 @@ mod resolve_paths_tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_socket_path_env)]
     fn resolve_loom_dir_honors_socket_path_override() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("loom-daemon.sock");
@@ -2249,7 +2257,7 @@ mod resolve_paths_tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_socket_path_env)]
     fn resolve_log_path_defaults_to_home_loom_daemon_log() {
         std::env::remove_var("LOOM_SOCKET_PATH");
         std::env::remove_var("LOOM_DAEMON_LOG");
@@ -2261,7 +2269,7 @@ mod resolve_paths_tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_socket_path_env)]
     fn resolve_log_path_honors_loom_daemon_log_override() {
         std::env::remove_var("LOOM_SOCKET_PATH");
         std::env::set_var("LOOM_DAEMON_LOG", "/tmp/some/d/daemon.log");
@@ -2275,7 +2283,7 @@ mod resolve_paths_tests {
     /// `LOOM_DAEMON_LOG` must win even when `LOOM_SOCKET_PATH` is also set —
     /// the explicit log override always takes precedence over the derived path.
     #[test]
-    #[serial]
+    #[serial(loom_socket_path_env)]
     fn resolve_log_path_daemon_log_wins_over_socket_path_derivation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("loom-daemon.sock");
