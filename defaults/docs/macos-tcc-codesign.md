@@ -194,9 +194,9 @@ keychain routinely refuses `codesign` access there regardless of whether the
 identity is actually fixed and regardless of whether the daemon itself can
 sign fine — so `codesign_identity` reports DEGRADED **every time**, even
 right after a correct repair. This cost three verification rounds on
-2AMLogic/2am#917 before the DEGRADED reading was recognized as an artifact
-of running the check over ssh, not evidence the fix hadn't taken. The
-DEGRADED message itself now says so explicitly (it names its own
+example-org/tool-repo#202 before the DEGRADED reading was recognized as
+an artifact of running the check over ssh, not evidence the fix hadn't
+taken. The DEGRADED message itself now says so explicitly (it names its own
 invocation context and points at re-running from a tty), but the takeaway
 is the same either way: **treat a `codesign_identity` DEGRADED seen over ssh
 as inconclusive, and re-verify from an interactive/tty session** (a real

@@ -3067,7 +3067,7 @@ fn codesign_identity_failing_preflight_is_degraded_and_names_identity_and_doc() 
 /// preflight observed over non-interactive ssh (the login keychain refusing
 /// access, independent of whether the identity or the daemon itself is
 /// actually broken) is not misread as "the identity fix didn't take" — the
-/// exact misreading behind 2AMLogic/2am#917.
+/// exact misreading behind example-org/tool-repo#202.
 #[test]
 fn codesign_identity_failing_preflight_names_its_own_invocation_context() {
     let mut inputs = healthy_inputs();
