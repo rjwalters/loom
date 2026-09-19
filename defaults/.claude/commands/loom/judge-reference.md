@@ -201,7 +201,7 @@ The run command is the Step 4 scoped one narrowed to that path (`run-tests.sh <p
 | No test framework detected | Note absence in evaluation; check if project has tests at all |
 | PR touches shared utilities | Scoped tools may miss downstream tests — note this risk in evaluation |
 
-**Key principle**: Scoped execution is an optimization, not a replacement for CI — the full suite still runs there (step 8 verifies CI status); this just gives the Judge faster local feedback. Duration/confidence comparison: [`judge-reference-rationale.md`](../../../.loom/docs/judge-reference-rationale.md).
+**Key principle**: Scoped execution is an optimization, not a replacement for CI — the full suite still runs there (step 8 verifies CI status); this just gives the Judge faster local feedback. Duration/confidence comparison: `.loom/docs/judge-reference-rationale.md`.
 
 ---
 
