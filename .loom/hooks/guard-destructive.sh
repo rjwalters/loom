@@ -9,7 +9,7 @@
 # to it instead of shipping (and separately maintaining) a second generic guard.
 #
 # This dispatcher decides at RUNTIME which generic guard to run:
-#   1. The canonical Repo Skills guard, IF it is present AND passes ALL FOUR
+#   1. The canonical Repo Skills guard, IF it is present AND passes ALL FIVE
 #      probes below. This is the preferred path in a repo that has Repo Skills
 #      installed.
 #   2. Otherwise the vendored generic guard shipped alongside this file
@@ -17,7 +17,7 @@
 #      Skills — and any repo whose canonical guard fails any probe — keep full
 #      destructive-command coverage.
 #
-# The four probes (#4894, #5916, #5974 — ALL are REQUIRED, not either/or):
+# The five probes (#4894, #5916, #5974, #8256 — ALL are REQUIRED, not either/or):
 #   a. VERSION probe — the canonical guard carries the rjwalters/repo#29 fix
 #      (detected by the `repo#29` marker comment; presence/version probe, no
 #      semver arithmetic).
@@ -44,6 +44,13 @@
 #      own deny() call for that rule. Without this, a canonical guard that
 #      passes probes (a)-(c) can still silently drop the `--body @path`
 #      protection entirely, with no warning and no override.
+#   e. CAPABILITY probe (#8256) — the canonical guard also implements the
+#      Loom-only PER-ROLE TOOL-RESTRICTION backstop (`toolPolicy.
+#      allowedCapabilities` in defaults/roles/*.json, enforced at tool-call
+#      time), detected by the stable decision-tag prefix
+#      $ROLE_TOOL_POLICY_MARKER below. Without this, a canonical guard that
+#      passes probes (a)-(d) would be exec'd with that category silently
+#      absent, disarming the control for every role at once.
 #
 # Probe (a) alone used to be sufficient, but it only proves the canonical guard
 # picked up an unrelated upstream fix — it says nothing about whether the
@@ -51,10 +58,10 @@
 # carried the repo#29 marker WITHOUT the write-confinement category (Repo
 # Skills 0.7.0), the dispatcher would `exec` it and that category would stop
 # running silently, with no warning and no override (#4894). Requiring probes
-# (b), (c), and (d) too means the dispatcher only ever defers to a canonical
-# guard that genuinely offers equal-or-better coverage; a canonical guard
-# missing any one of the four still routes to the vendored fallback, which
-# always carries all four.
+# (b), (c), (d), and (e) too means the dispatcher only ever defers to a
+# canonical guard that genuinely offers equal-or-better coverage; a canonical
+# guard missing any one of the five still routes to the vendored fallback,
+# which always carries all five.
 #
 # Probe (c) is INERT today (never yet passing): as of 2026-08-10,
 # rjwalters/repo has not ported an equivalent search/jq masking fix upstream,
@@ -176,13 +183,36 @@ ARGJSON_MASK_MARKER='--arg|--argjson'
 # reverse.
 BODY_LITERAL_AT_MARKER='gh-comment-body-literal-at'
 
+# CAPABILITY probe (e) marker (#8256). Stable decision-tag prefix the vendored
+# guard's PER-ROLE TOOL-RESTRICTION backstop passes to its own deny() calls
+# (`role-tool-policy:<capability>`). That category is the harness-level
+# enforcement behind `toolPolicy.allowedCapabilities` in defaults/roles/*.json:
+# a role that declares an allowlist cannot reach ssh / aws / `gh secret` /
+# credential-store writes even once persuaded.
+#
+# It needs its own probe for exactly the reason probe (b) exists (#4894): it is
+# a LOOM-ONLY category with no upstream counterpart, and this dispatcher `exec`s
+# the canonical guard WHOLESALE. Without this probe, a Repo Skills guard that
+# happens to carry the other four markers would be exec'd and the per-role
+# restriction would stop running — silently, with no warning and no override —
+# for every repo with Repo Skills installed. A security control that can be
+# switched off by an unrelated upstream release is not a control, so a canonical
+# guard missing this tag routes to the vendored fallback, which always has it.
+#
+# Same safe failure direction as the other capability probes: a canonical guard
+# that implements the category under a different tag is a false NEGATIVE, and
+# the only cost of a false negative here is that the vendored guard runs — never
+# that the category stops running.
+ROLE_TOOL_POLICY_MARKER='role-tool-policy:'
+
 # Prefer the canonical guard ONLY when it carries the rjwalters/repo#29 fix
 # (VERSION probe) AND independently implements the write-confinement
 # category (CAPABILITY probe (b), #4894), the search/jq masking fix
-# (CAPABILITY probe (c), #5916), AND the --body @path literal-string hard
-# deny (CAPABILITY probe (d), #5974 — see the header comment above for why
-# all four are required). The cheap bash-builtin `[[ -r ]]` test (zero
-# forks) guards all five greps, so a repo without Repo Skills pays no extra
+# (CAPABILITY probe (c), #5916), the --body @path literal-string hard
+# deny (CAPABILITY probe (d), #5974), AND the per-role tool-restriction
+# backstop (CAPABILITY probe (e), #8256 — see the header comment above for
+# why all five are required). The cheap bash-builtin `[[ -r ]]` test (zero
+# forks) guards all six greps, so a repo without Repo Skills pays no extra
 # process — preserving the guard's #3687 read-only fast path in that common
 # case. In a dual-install repo the marker greps cost at most five forks per
 # command before the canonical guard's own fast path runs; each grep -q/-qF
@@ -193,14 +223,16 @@ if [[ -r "$CANONICAL_GUARD" ]] \
    && grep -q "$WRITE_CONFINEMENT_MARKER" "$CANONICAL_GUARD" 2>/dev/null \
    && grep -qF -- "$SEARCH_MASK_MARKER" "$CANONICAL_GUARD" 2>/dev/null \
    && grep -qF -- "$ARGJSON_MASK_MARKER" "$CANONICAL_GUARD" 2>/dev/null \
-   && grep -q -- "$BODY_LITERAL_AT_MARKER" "$CANONICAL_GUARD" 2>/dev/null; then
+   && grep -q -- "$BODY_LITERAL_AT_MARKER" "$CANONICAL_GUARD" 2>/dev/null \
+   && grep -qF -- "$ROLE_TOOL_POLICY_MARKER" "$CANONICAL_GUARD" 2>/dev/null; then
     exec bash "$CANONICAL_GUARD"
 fi
 
 # Fall back to the vendored generic guard (standalone-Loom repos, a repo whose
 # Repo Skills copy predates the repo#29 fix, or a repo whose Repo Skills copy
-# has the fix but not yet the write-confinement, search/jq masking, and/or
-# --body @path literal-string categories, #4894, #5916, #5974).
+# has the fix but not yet the write-confinement, search/jq masking, --body
+# @path literal-string, and/or per-role tool-restriction categories, #4894,
+# #5916, #5974, #8256).
 if [[ -r "$VENDORED_GUARD" ]]; then
     exec bash "$VENDORED_GUARD"
 fi

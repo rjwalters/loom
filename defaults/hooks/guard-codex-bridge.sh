@@ -35,6 +35,21 @@
 # the Claude path executes, with the same inputs they already understand, so a
 # policy change lands for both runtimes at once.
 #
+# That property is what gives Codex roles PER-ROLE TOOL RESTRICTION (#8256) for
+# free, and it is worth naming because the Codex half of that issue is easy to
+# mistake for missing. The Claude path has two halves — `--disallowedTools` at
+# session-spawn time (spawn-claude.sh) plus the guard-hook backstop — and the
+# Codex CLI has no equivalent of the first. So on this path the backstop is the
+# WHOLE mechanism: guard-destructive-generic.sh's PER-ROLE TOOL-RESTRICTION
+# block reads `toolPolicy.allowedCapabilities` from the acting role's JSON,
+# keyed on the LOOM_ROLE this bridge inherits and passes to its sub-guards, and
+# denies `ssh` / `aws` / `gh secret` / credential-store writes for a role that
+# did not declare them. Nothing about that policy is restated here, deliberately
+# — a second copy in the adapter is exactly how the two runtimes would drift.
+# The corollary, which spawn-codex.sh now warns about at launch: a Codex session
+# WITHOUT this managed hook installed and trusted has no per-role restriction at
+# all, because there is no other half to fall back on.
+#
 # ============================================================================
 # RUNTIME DISCRIMINATION (explicit wrapper mode, never payload sniffing)
 # ============================================================================

@@ -905,6 +905,56 @@ if [[ "$_hook_role_is_mutable" != "true" && "$_hook_status" != "ready" ]]; then
     log_warn "spawn-codex: hook parity unavailable — this session gets ONLY the Codex sandbox (${SANDBOX_MODE}) as a boundary. Read-only roles may proceed; this session is NOT Builder-capable."
 fi
 
+# --- Per-role tool restriction on the Codex path (issue #8256) ---
+#
+# The Codex CLI has no `--disallowedTools` equivalent, so there is no
+# session-spawn-time half here the way there is in spawn-claude.sh. Codex
+# parity comes from the OTHER half: guard-codex-bridge.sh normalizes every
+# `pre_tool_use` shell call into a Claude-shaped `Bash` request and runs it
+# through guard-destructive.sh, whose PER-ROLE TOOL-RESTRICTION backstop reads
+# the SAME `toolPolicy.allowedCapabilities` declaration in
+# defaults/roles/<role>.json. Nothing is restated in the bridge: the policy
+# lands once, in the guard the bridge already calls.
+#
+# Two things this block must therefore do.
+#
+# (1) Make the role identity REACH that guard. The backstop keys on LOOM_ROLE,
+#     which the bridge inherits from this process and passes down to its
+#     sub-guards. Exporting it here means a manual
+#     `LOOM_ROLE=curator spawn-codex.sh …` is enforced identically to a
+#     daemon-dispatched tick, rather than depending on whether the caller
+#     happened to export the variable.
+#
+# (2) Say so when the enforcement is NOT there. A read-only role is allowed to
+#     proceed without the managed hook (the warning directly above), and that
+#     was a defensible trade when the hook only carried worktree confinement —
+#     a read-only role has nothing to confine. It is a different statement once
+#     the hook is also the ONLY thing standing between a persuaded Curator and
+#     `ssh`/`aws`/`gh secret`: on this path, no hook means no restriction at
+#     all. That is still not a hard exit (refusing to start every read-only
+#     Codex role on an unprovisioned host would be a large, unrelated blast
+#     radius), but it must be stated in the audit line rather than left for
+#     someone to infer from the absence of one.
+if [[ -n "${LOOM_ROLE:-}" ]]; then
+    export LOOM_ROLE
+    if [[ "$_hook_status" != "ready" ]] && command -v jq >/dev/null 2>&1; then
+        _policy_role="$_hook_role"
+        [[ -n "$_policy_role" ]] || _policy_role="$(printf '%s' "$LOOM_ROLE" | tr '[:upper:]_' '[:lower:]-')"
+        _policy_json=""
+        for _policy_cand in "${WORKSPACE}/.loom/roles/${_policy_role}.json" \
+                            "${_SCRIPT_DIR}/../roles/${_policy_role}.json"; do
+            if [[ -r "$_policy_cand" ]]; then _policy_json="$_policy_cand"; break; fi
+        done
+        if [[ -n "$_policy_json" ]] \
+            && jq -e '(.toolPolicy.allowedCapabilities | type) == "array"
+                      and ((.toolPolicy.allowedCapabilities | index("*")) | not)' \
+                 "$_policy_json" >/dev/null 2>&1; then
+            log_warn "spawn-codex: per-role tool restriction (#8256) is NOT ENFORCED for role '$_policy_role' in this session — $_policy_json declares a restrictive toolPolicy.allowedCapabilities, but that policy is enforced only by the managed pre_tool_use hook (guard-codex-bridge.sh -> guard-destructive.sh), and hooks=$_hook_status. This session can reach ssh / aws / 'gh secret' / credential-store writes. Provision and trust the profile to restore enforcement: .loom/scripts/provision-codex-hooks.sh install --all-profiles --workspace $WORKSPACE"
+        fi
+        unset _policy_role _policy_json _policy_cand
+    fi
+fi
+
 # --- Assemble the codex invocation ---
 # Non-interactive (prompt present): `codex exec [flags] "<prompt>"`.
 # Interactive (no prompt):          `codex [flags]`.
