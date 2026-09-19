@@ -62,10 +62,18 @@ make_fake_github_repo() {
 STUB_DIR="$(mktemp -d)"
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
-# Only the admin-permission probe is reachable in LOOM_DRY_RUN mode; anything
-# else would mean the script tried to mutate the repository during a preview.
+# Only read-only probes are reachable in LOOM_DRY_RUN mode; anything else would
+# mean the script tried to mutate the repository during a preview.
+#   - the admin-permission probe
+#   - the ruleset listing the preview uses to decide whether it is previewing an
+#     UPDATE of an existing ruleset (#8239); this repo fixture has none, so an
+#     empty list keeps the payload at its create-a-fresh-ruleset defaults
 if [[ "$*" == *".permissions.admin"* ]]; then
   echo "true"
+  exit 0
+fi
+if [[ "$*" != *"--method"* && "$*" == *"/rulesets"* ]]; then
+  echo "[]"
   exit 0
 fi
 echo "stub gh: unexpected API call in dry-run: $*" >&2

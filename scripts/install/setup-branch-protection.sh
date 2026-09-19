@@ -11,7 +11,10 @@
 #                              "skip" (preserves existing protection, avoids
 #                              creating duplicate rulesets — issue #3216).
 #   LOOM_DRY_RUN=true          Print the exact ruleset payload that WOULD be
-#                              applied and exit without any API call (#8103).
+#                              applied and exit without mutating anything
+#                              (#8103). Read-only lookups still happen, so the
+#                              preview can show the live bypass actors an
+#                              in-place update would preserve (#8239).
 #   LOOM_REQUIRED_STATUS_CHECKS
 #                              Comma- or newline-separated check-run names to
 #                              require. Overrides the target repo's
@@ -93,6 +96,89 @@ detect_overlapping_rulesets() {
   done < <(echo "$rulesets_json" | jq -r '.[] | select(.target == "branch") | "\(.id)|\(.name)|\(.enforcement)"' 2>/dev/null || true)
 }
 
+# Read the bypass_actors currently configured on a live ruleset.
+# Prints a compact JSON array; "[]" when the ruleset cannot be read or reports
+# no bypass actors. GitHub omits/nulls the field for a token that is not a repo
+# admin, and such a token is also refused the ruleset PUT — so the preserve-on-
+# update guarantee holds for every token that can actually perform the update,
+# and a read-only token just previews the old admin-only default.
+fetch_live_bypass_actors() {
+  local owner="$1"
+  local repo="$2"
+  local rs_id="$3"
+
+  local detail
+  detail=$(gh api "repos/${owner}/${repo}/rulesets/${rs_id}" 2>/dev/null || echo "{}")
+  echo "$detail" | jq -c '.bypass_actors // []' 2>/dev/null || echo "[]"
+}
+
+# Union a live ruleset's bypass_actors into the payload's bypass_actors.
+#
+# A ruleset PUT REPLACES bypass_actors wholesale, so sending the hardcoded
+# admin-only list at an EXISTING ruleset silently deletes every other actor's
+# bypass (issue #8239). On rjwalters/loom that would have dropped the
+# `loom-fleet-dispatch` App, whose post-merge `git push origin HEAD:main` in
+# .github/workflows/version-bump-on-merge.yml depends on bypassing the
+# pull_request rule.
+#
+# Entries are keyed by (actor_id, actor_type). The LIVE entry wins on conflict,
+# so a deliberately narrowed bypass_mode (e.g. "pull_request" for the admin
+# role) is not silently widened back to "always" by an installer re-run; payload
+# actors with no live counterpart are appended. A fresh POST never calls this —
+# a brand new ruleset keeps the admin-only default.
+merge_bypass_actors() {
+  local payload="$1"
+  local live_actors="$2"
+
+  echo "$payload" | jq --argjson live "$live_actors" '
+    .bypass_actors = (
+      $live
+      + [ (.bypass_actors // [])[]
+          | . as $p
+          | select(
+              [ $live[]
+                | select(.actor_id == $p.actor_id and .actor_type == $p.actor_type)
+              ] | length == 0
+            )
+        ]
+    )'
+}
+
+# Resolve the id of the ruleset that an apply would UPDATE in place, or print
+# nothing when it would create a fresh one. Read-only.
+#
+# Used by the LOOM_DRY_RUN preview so the printed payload matches what would
+# actually be sent (#8239) — the preview runs before the apply path's own
+# lookups, so without this it can only ever show the hardcoded defaults.
+#
+# Preference mirrors the apply path: the same-named ruleset is the ordinary
+# in-place update target, while a differently-named overlapping ruleset is only
+# updated when the operator answers "u" at the overlap prompt, so it is the
+# fallback.
+resolve_update_target_id() {
+  local owner="$1"
+  local repo="$2"
+  local our_name="$3"
+  local branch="$4"
+
+  local rulesets_json same_id
+  rulesets_json=$(gh api "repos/${owner}/${repo}/rulesets" 2>/dev/null || echo "[]")
+  same_id=$(echo "$rulesets_json" | jq -r --arg n "$our_name" \
+    'if type == "array" then (map(select(.name == $n)) | .[0].id // "") else "" end' 2>/dev/null || echo "")
+
+  if [[ -n "$same_id" && "$same_id" != "null" ]]; then
+    printf '%s' "$same_id"
+    return 0
+  fi
+
+  detect_overlapping_rulesets "$owner" "$repo" "$our_name" "$branch"
+  if (( ${#OVERLAPPING_RULESETS[@]} > 0 )); then
+    local first_id
+    IFS='|' read -r first_id _ _ <<< "${OVERLAPPING_RULESETS[0]}"
+    printf '%s' "$first_id"
+  fi
+}
+
 setup_github_branch_protection() {
   local owner="$FORGE_OWNER"
   local repo="$FORGE_REPO"
@@ -110,6 +196,9 @@ setup_github_branch_protection() {
   # Ruleset payload
   # bypass_actors: actor_id 5 = RepositoryRole/admin — allows repo admins to push
   # directly to main without a PR (e.g. for hotfixes or initial setup).
+  # This admin-only list is the default for a FRESH ruleset. When an existing
+  # ruleset is updated in place, merge_bypass_actors() unions the live actors in
+  # first, because a ruleset PUT replaces the list wholesale (#8239).
   local ruleset_payload='{
     "name": "'"$ruleset_name"'",
     "target": "branch",
@@ -196,9 +285,23 @@ setup_github_branch_protection() {
 
   # Preview the exact payload without touching the repository. This is the
   # supported way to review a ruleset change before applying it to a live repo:
-  # it makes no API call at all, so it is also how the test suite asserts the
+  # it makes no MUTATING API call, so it is also how the test suite asserts the
   # payload's shape.
-  if [[ "${LOOM_DRY_RUN:-false}" == "true" ]]; then printf '%s\n' "$ruleset_payload" | jq .; return 0; fi
+  #
+  # The preview must match what would actually be SENT. When an existing ruleset
+  # would be updated in place, the payload sent carries that ruleset's live
+  # bypass_actors merged in (#8239), so resolve the update target here — the
+  # read-only lookups the apply path does further down have not run yet.
+  if [[ "${LOOM_DRY_RUN:-false}" == "true" ]]; then
+    local preview_id
+    preview_id="$(resolve_update_target_id "$owner" "$repo" "$ruleset_name" "$branch")"
+    if [[ -n "$preview_id" ]]; then
+      info "Preview targets existing ruleset id=${preview_id} (its live bypass actors are preserved)"
+      ruleset_payload="$(merge_bypass_actors "$ruleset_payload" "$(fetch_live_bypass_actors "$owner" "$repo" "$preview_id")")"
+    fi
+    printf '%s\n' "$ruleset_payload" | jq .
+    return 0
+  fi
 
   # Detect cross-name overlapping rulesets BEFORE the same-name update path,
   # so we don't silently POST a second ruleset overlapping a differently-named
@@ -257,8 +360,11 @@ setup_github_branch_protection() {
         # Preserves the existing ruleset's name/id; PUTs the rules onto it.
         IFS='|' read -r rs_id rs_name rs_enforcement <<< "${OVERLAPPING_RULESETS[0]}"
         info "Updating ruleset id=${rs_id} name='${rs_name}' in place with Loom rules..."
-        local update_payload
-        update_payload=$(echo "$ruleset_payload" | jq --arg n "$rs_name" '.name = $n')
+        local update_payload live_actors
+        # A PUT replaces bypass_actors wholesale — carry the live ones over so
+        # an update never revokes a bypass this script did not grant (#8239).
+        live_actors="$(fetch_live_bypass_actors "$owner" "$repo" "$rs_id")"
+        update_payload=$(merge_bypass_actors "$ruleset_payload" "$live_actors" | jq --arg n "$rs_name" '.name = $n')
         if echo "$update_payload" | gh api --method PUT "repos/${owner}/${repo}/rulesets/${rs_id}" --input - > /dev/null 2>&1; then
           success "Branch ruleset updated in place (id=${rs_id} name='${rs_name}')"
           echo ""
@@ -281,6 +387,9 @@ setup_github_branch_protection() {
     info "Found existing ruleset '${ruleset_name}' (ID: ${existing_id}), updating..."
     api_method="PUT"
     api_url="repos/${owner}/${repo}/rulesets/${existing_id}"
+    # Same as the overlap "update" branch: the PUT replaces bypass_actors, so
+    # merge the live ones in rather than dropping them (#8239).
+    ruleset_payload="$(merge_bypass_actors "$ruleset_payload" "$(fetch_live_bypass_actors "$owner" "$repo" "$existing_id")")"
   else
     info "Creating new ruleset '${ruleset_name}'..."
     api_method="POST"
