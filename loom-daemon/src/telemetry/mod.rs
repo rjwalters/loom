@@ -502,25 +502,63 @@ pub struct SweepOutcomeRecord {
     /// one model" are therefore distinguishable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_used: Option<Vec<String>>,
-    /// How many times the Doctor phase was observed completing for this sweep
-    /// (Issue #8056) — the "sonnet passed" vs. "sonnet failed, the ladder's
-    /// Doctor fixed it" discriminator.
+    /// How many Doctor cycles this sweep's PR completed (Issue #8056,
+    /// re-sourced by #8222) — the "sonnet passed" vs. "sonnet failed, the
+    /// ladder's Doctor fixed it" discriminator.
     ///
-    /// Counted from the sampled phase-transition history the same
-    /// [`phase_durations`](Self::phase_durations) is built from (one entry per
-    /// observed `doctor-done`/`doctor-rejected` marker), so it is an **interim
-    /// proxy**: the reaper samples the on-disk checkpoint on a ~30s tick, and a
-    /// Doctor phase that opens and closes entirely between two ticks is not
-    /// counted. It is a lower bound, not a certified count, until label-event
-    /// sourcing lands (#8056 Phase 2).
+    /// Read from the **forge label timeline** of the PR named by
+    /// [`pr_number`](Self::pr_number), not from the sampled phase history: one
+    /// cycle per `loom:changes-requested` arrival that a later
+    /// `loom:review-requested` arrival closed the loop on (a Doctor handing a
+    /// fixed PR back to Judge). A rejection nobody handed back — the
+    /// Doctor-cycle cap, or a dead sweep — is not a cycle. The label events are
+    /// written by the Judge/Doctor themselves and retained by the forge, so
+    /// unlike the interim ~30s-sampled proxy this replaces, a cycle that opens
+    /// and closes between two reaper ticks is still counted: this is a
+    /// certified count, not a lower bound.
     ///
-    /// `Some(0)` means "the lifecycle was observed and no Doctor phase
-    /// appeared"; omitted means "no phase history was sampled at all"
-    /// (a sweep that died before the first reaper tick, or one reconstructed
-    /// after a daemon restart). The two are deliberately distinguishable —
-    /// the same "unknown != zero" contract as `tokens_in`/`tokens_by_model`.
+    /// `Some(0)` means "the PR's timeline was read and no Doctor cycle
+    /// completed"; omitted means the timeline was not successfully read at all
+    /// — the sweep opened no PR, the fetch was rate-limited/failed, or the
+    /// daemon was told not to touch the forge. The two are deliberately
+    /// distinguishable: the same "unknown != zero" contract as
+    /// `tokens_in`/`tokens_by_model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doctor_cycles: Option<u32>,
+    /// Every Judge verdict on this sweep's PR, in lifecycle order (Issue
+    /// #8222) — what makes **first-pass judge approval rate** computable from
+    /// this journal alone: `judge_verdicts[0].verdict == "pass"` over the
+    /// sweeps that carry the field.
+    ///
+    /// Same source and same PR as [`doctor_cycles`](Self::doctor_cycles): the
+    /// forge label timeline of the PR named by [`pr_number`](Self::pr_number).
+    /// Deliberately NOT the sampled phase history — a first-pass approval rate
+    /// computed from a lossy sample is worse than no number at all, because a
+    /// silently-low verdict count reads as a silently-high approval rate.
+    ///
+    /// `Some([])` means "the timeline was read and carried no verdict" (a PR
+    /// whose sweep died before Judge); omitted means the timeline was not
+    /// successfully read. A consumer that coerces an absent list to `[]` counts
+    /// an unobserved sweep as a judged-zero-times one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_verdicts: Option<Vec<JudgeVerdict>>,
+}
+
+/// One Judge verdict on a PR, as reconstructed from the forge label timeline
+/// (Issue #8222) — the element type of [`SweepOutcomeRecord::judge_verdicts`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeVerdict {
+    /// Which Judge pass this verdict settled: **1-based per PR**, counting
+    /// `loom:review-requested` arrivals. Attempt 1 is the PR as first opened by
+    /// the Builder; attempt 2 is the pass after the first Doctor hand-back, and
+    /// so on. Numbering restarts at 1 for a different PR — a record covers
+    /// exactly one PR and never aggregates across them.
+    pub attempt: u32,
+    /// `"pass"` (the Judge applied `loom:pr`) or `"fail"` (the Judge applied
+    /// `loom:changes-requested`). A string rather than an enum so a future
+    /// verdict shape is an additive value, not a breaking wire change for a
+    /// backend that already pattern-matches this field.
+    pub verdict: String,
 }
 
 /// How one role-runner tick ended (Issue #8056).

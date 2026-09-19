@@ -64,7 +64,7 @@ only on a **breaking** wire change to the record shapes below. A backend should:
 | Version | Change | Compatibility |
 |---|---|---|
 | `1` | The original six record kinds (`sweep.started`, `sweep.phase`, `sweep.completed`, `sweep.outcome`, `tokens.snapshot`, `host.health`). | — |
-| `2` | Adds the `role_tick.outcome` record kind (Issue #8056). | **Every `1`-era record shape is byte-identical in `2`.** The bump exists solely because a backend that pattern-matches exhaustively on `kind` has no arm for the new one. A `2` envelope carrying any of the original six kinds is still parseable by a `1`-era reader; a `1` envelope is still parseable by the current daemon (the version is read, never validated, on the read path). Issue #8056's *additive* fields on `sweep.outcome` — `failure_class`, `models_used`, `doctor_cycles` — shipped under `1` and did **not** bump it, exactly as this section prescribes: a new optional field is not a breaking change, a new record kind is. |
+| `2` | Adds the `role_tick.outcome` record kind (Issue #8056). | **Every `1`-era record shape is byte-identical in `2`.** The bump exists solely because a backend that pattern-matches exhaustively on `kind` has no arm for the new one. A `2` envelope carrying any of the original six kinds is still parseable by a `1`-era reader; a `1` envelope is still parseable by the current daemon (the version is read, never validated, on the read path). Issue #8056's *additive* fields on `sweep.outcome` — `failure_class`, `models_used`, `doctor_cycles` — shipped under `1` and did **not** bump it, exactly as this section prescribes: a new optional field is not a breaking change, a new record kind is. Issue #8222's `judge_verdicts` is additive under `2` for the same reason (and re-sourcing `doctor_cycles` changed the value's provenance, never its wire type). |
 
 ## `/ingest` response (the bound-`host_id` echo)
 
@@ -298,14 +298,15 @@ processed and lines changed. (A distinct type from the daemon's internal
     }
   ],
   "models_used": ["claude-sonnet-5"],
-  "doctor_cycles": 0
+  "doctor_cycles": 0,
+  "judge_verdicts": [{ "attempt": 1, "verdict": "pass" }]
 }
 ```
 
 `config` (free-form string map), `phase_durations`, `model`, `effort`,
 `pr_number`, `tokens_in`, `tokens_out`, `lines_added`, `lines_deleted`,
-`tokens_by_model`, `failure_class`, `models_used`, and `doctor_cycles` are
-omitted when empty/unset. `config` is a map — not fixed fields — so
+`tokens_by_model`, `failure_class`, `models_used`, `doctor_cycles`, and
+`judge_verdicts` are omitted when empty/unset. `config` is a map — not fixed fields — so
 operator-tunable knobs can be captured without a schema bump.
 
 `tokens_by_model` (Issue #6384) is the same per-model breakdown documented
@@ -335,9 +336,9 @@ allowlist — like `pr_number`, they are workload detail about a private repo
 and stay behind the same authenticated-only boundary (see
 `dashboard/src/redaction.ts`).
 
-#### Completeness fields (Issue #8056)
+#### Completeness fields (Issues #8056, #8222)
 
-Three more **independently optional** fields, added additively (no
+Four more **independently optional** fields, added additively (no
 `schema_version` bump — none of them is a new record kind). Each answers a
 question that previously required joining the sibling `sweep-outcomes.jsonl`
 by `sweep_id`, or could not be answered at all.
@@ -346,14 +347,30 @@ by `sweep_id`, or could not be answered at all.
 |---|---|---|---|
 | `failure_class` | string | The paired `sweep_outcomes::OutcomeRecord`'s own classification for the same terminal transition: `death_class` when the pre-flight classifier derived one (`preflight-token-selection-failed`, `preflight-no-cli-start`, …), otherwise `crash_classification` (`account-exhausted:model-credits-exhausted`, `no-usable-account`, …). | Copied at emit time in the same function that writes the sibling record — never a post-hoc joiner. Lets a consumer separate real build failures from sub-60s spawn deaths from this journal alone. The sibling record still carries both classifier fields separately; this is the single most canonical label, not a replacement. Omitted entirely when nothing classified the transition — including on every success. |
 | `models_used` | string array | The distinct `model` ids in `tokens_by_model`, sorted and deduped. | The top-level "did this sweep run more than one model?" signal. `model` names the **dispatched** model, so a sweep that escalated to `claude-opus-5` through the Doctor ladder still reports `model: "sonnet"`; `models_used` is what makes the escalation visible. Inherits `tokens_by_model`'s contract exactly: omitted (never `[]`) when no attributable transcript was found. |
-| `doctor_cycles` | integer | Count of Doctor phases in the sampled phase-transition history — the same history `phase_durations` is built from. | **Interim proxy.** The reaper samples the on-disk checkpoint on a ~30s tick, so a Doctor phase that opens and closes between two ticks is not counted: treat this as a lower bound until label-event sourcing lands. `0` means "the lifecycle was observed and no Doctor phase appeared"; an **absent** key means no phase history was sampled at all (a sweep that died before the first tick). |
+| `doctor_cycles` | integer | **The forge label timeline** of the PR named by this record's own `pr_number` (Issue #8222 — re-sourced; the #8056 shipment counted sampled checkpoint markers instead): one cycle per `loom:changes-requested` arrival that a later `loom:review-requested` arrival closed the loop on. | A rejection nobody handed back (the sweep hit the Doctor-cycle cap, or died) is **not** a cycle. Because the label events are durable forge state rather than a ~30s sample, a cycle that opens and closes between two reaper ticks is still counted: this is a certified count, **not** the lower-bound proxy it was under #8056. `0` means "the timeline was read and no Doctor cycle completed"; an **absent** key means the timeline was not read at all. |
+| `judge_verdicts` | array of `{ "attempt": int, "verdict": string }` | The same PR's label timeline: `loom:pr` ⇒ `"pass"`, `loom:changes-requested` ⇒ `"fail"`, in lifecycle order. | What makes **first-pass judge approval rate** computable from this journal alone: `judge_verdicts[0].verdict == "pass"` over the records that carry the field. `attempt` is **1-based per PR**, counting `loom:review-requested` arrivals — attempt 1 is the PR as first opened, attempt 2 the pass after the first Doctor hand-back. A repeat of the same verdict inside one attempt (a label removed and re-applied) is one entry, not two. `[]` means "the timeline was read and carried no verdict" (a sweep that died before Judge); an **absent** key means the timeline was not read. |
 
-All three follow the established "unknown != zero" contract: `0` / a
+**Which PR the two timeline fields describe.** Exactly the one named by this
+record's `pr_number` — the latest PR the sweep's own checkpoint recorded. A
+sweep that opened more than one PR (a re-dispatch after a park, a
+partial-increment slice) reports its **latest** PR and never aggregates across
+PRs, so `attempt` numbering always restarts at 1 per record and a join from
+`sweep.outcome` to a PR is exact rather than a blend.
+
+**When the timeline fields are absent.** Both are omitted together, and only
+together: the sweep opened no PR, the daemon was configured not to touch the
+forge, the fleet rate-limit breaker was suppressing forge polling, or the read
+itself failed/timed out. The fetch is best-effort by contract — it never blocks
+or fails the journal append, and a failure is logged and omitted rather than
+recorded as a zero.
+
+All four follow the established "unknown != zero" contract: `0` / `[]` / a
 one-element array is an observation, an absent key is not. A consumer that
-coerces a missing `doctor_cycles` to `0` reports "no Doctor phase happened"
-about a sweep nobody watched.
+coerces a missing `doctor_cycles` to `0` reports "no Doctor cycle happened"
+about a sweep nobody watched; one that coerces a missing `judge_verdicts` to
+`[]` counts an unobserved sweep into its approval-rate denominator.
 
-None of the three is added to the public redaction allowlist, for the same
+None of the four is added to the public redaction allowlist, for the same
 reason as the work-output fields above.
 
 `config.token_account` (Issue #8056) is now resolved from three sources at

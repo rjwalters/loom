@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Judge/Doctor signals read off the sweep PR's forge label timeline (Issue
+/// #8222) — the source of the record's `judge_verdicts` and `doctor_cycles`.
+pub(crate) mod label_timeline;
+
 /// One observed lifecycle-phase transition for a live sweep (Issue #4704):
 /// the checkpoint phase marker and the instant [`SweepRegistry::reap_once`]
 /// first observed it.
@@ -35,13 +39,6 @@ pub(crate) const MAX_PHASE_OBSERVATIONS: usize = 32;
 /// means the sweep merged — the `Success` signal for the durable
 /// `sweep.outcome` record (Issue #4704).
 pub(crate) const MERGE_PHASE_LABEL: &str = "merge";
-
-/// The normalized lifecycle phase name (see [`phase_label`]) for a Doctor
-/// phase — counted per observation into the `sweep.outcome` record's
-/// `doctor_cycles` (Issue #8056). Both `doctor-done` and a (hypothetical)
-/// `doctor-rejected` marker normalize to this, so a cycle is counted by the
-/// phase it belongs to rather than by how it ended.
-pub(crate) const DOCTOR_PHASE_LABEL: &str = "doctor";
 
 /// Normalize a checkpoint phase marker to the lifecycle phase name the
 /// telemetry schema documents (Issue #4704): `"curator-done"` → `"curator"`,
@@ -392,24 +389,24 @@ impl SweepRegistry {
         // (Issue #8056) — see `models_used_from`.
         let models_used = models_used_from(tokens_by_model.as_deref());
 
-        // Observed Doctor phases (Issue #8056). Counted from the SAMPLED
-        // transition history, not from `phase_durations` above: the latter
-        // falls back to a synthesized single entry naming `latest_phase` when
-        // no history exists, and counting that would report a fabricated
-        // `doctor_cycles: 1` for a sweep whose lifecycle was never observed.
-        // `None` here means "no history sampled" and `Some(0)` means "observed,
-        // no Doctor phase" — the "unknown != zero" contract the schema
-        // documents. Interim proxy until label-event sourcing lands: a Doctor
-        // phase that opens and closes between two ~30s reaper ticks is missed,
-        // so this is a lower bound.
-        let doctor_cycles = self.phase_history.get(sweep_id).map(|history| {
-            u32::try_from(
-                history
-                    .iter()
-                    .filter(|o| phase_label(&o.phase) == DOCTOR_PHASE_LABEL)
-                    .count(),
-            )
-            .unwrap_or(u32::MAX)
+        // Judge verdicts + completed Doctor cycles (Issue #8222), read off the
+        // forge label timeline of the PR resolved just above — NOT off the
+        // sampled phase history the `doctor_cycles` proxy used through #8056.
+        // See `label_timeline`'s module doc for the label vocabulary, the
+        // which-PR rule (this record's own `pr_number`, i.e. the sweep's
+        // latest PR, never a blend across PRs), the 1-based-per-PR `attempt`
+        // numbering, and why the read is REST + breaker-gated rather than a
+        // bare call on this terminal-transition path.
+        //
+        // Strictly best-effort: `None` — no PR, breaker suppressed, failed or
+        // timed-out fetch, `skip_label_flip` — omits BOTH keys and never
+        // blocks or fails the journal append below. Never a fabricated `0`/
+        // `[]`: `Some(0)`/`Some([])` mean "the timeline was read and there was
+        // nothing", which #8057's summary must be able to tell apart from "not
+        // observed".
+        let timeline = pr_number.and_then(|pr| self.fetch_timeline_signals(pr));
+        let (doctor_cycles, judge_verdicts) = timeline.map_or((None, None), |signals| {
+            (Some(signals.doctor_cycles), Some(signals.judge_verdicts))
         });
 
         let outcome_record = telemetry::SweepOutcomeRecord {
@@ -432,6 +429,7 @@ impl SweepRegistry {
             failure_class,
             models_used,
             doctor_cycles,
+            judge_verdicts,
         };
         let envelope = telemetry::TelemetryEnvelope::new(
             host_identity(),
@@ -655,3 +653,16 @@ impl SweepRegistry {
     unused_imports
 )]
 mod tests;
+
+// End-to-end tests for the #8222 label-timeline sourcing, in their own sibling
+// file rather than appended to `tests` above: that module is already near the
+// file-size ratchet's threshold (`scripts/check-file-size-budget.sh`), and the
+// rule there is to add a new sibling module rather than grow a big one.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod timeline_tests;

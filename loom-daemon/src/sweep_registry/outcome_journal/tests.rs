@@ -1017,11 +1017,13 @@ fn telemetry_outcome_omits_failure_class_when_there_was_no_classification() {
     );
 }
 
-/// AC: a sweep whose lifecycle included two Doctor phases reports
-/// `doctor_cycles: 2` — the "sonnet passed" vs. "sonnet failed, the Doctor
-/// fixed it" discriminator, counted per observed phase, not collapsed.
+/// The sampled phase history is NO LONGER a `doctor_cycles` source (Issue
+/// #8222 retired the #8056 proxy): a lifecycle whose checkpoint markers show
+/// two Doctor phases reports **no** `doctor_cycles` at all when the forge
+/// label timeline was not read, rather than the old sampled lower bound. The
+/// positive cases live in `timeline_tests.rs`, against the new source.
 #[test]
-fn telemetry_outcome_counts_doctor_cycles_from_sampled_phases() {
+fn telemetry_outcome_no_longer_counts_doctor_cycles_from_sampled_phases() {
     let dir = tempdir().unwrap();
     let (mut registry, _rec) = fixture_registry(dir.path());
     let issue = 8060;
@@ -1042,43 +1044,22 @@ fn telemetry_outcome_counts_doctor_cycles_from_sampled_phases() {
     }
     registry.reap_once();
 
-    let path = registry.config().resolve_outcome_telemetry_path();
-    let records = sweep_outcomes::read_all_sweep_outcomes(&path);
-    let record = records.iter().find(|r| r.issue == issue).unwrap();
-    assert_eq!(record.doctor_cycles, Some(2));
-}
-
-/// "Observed, no Doctor phase" is `0` — a real, load-bearing value, and
-/// distinct from the omitted case below.
-#[test]
-fn telemetry_outcome_reports_zero_doctor_cycles_for_an_observed_clean_lifecycle() {
-    let dir = tempdir().unwrap();
-    let (mut registry, _rec) = fixture_registry(dir.path());
-    let issue = 8061;
-
-    let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-4", "log\n");
-    let started_at = Utc::now() - Duration::from_secs(120);
-    registry.entries.get_mut(&sweep_id).unwrap().started_at = started_at;
-    write_checkpoint_with_mtime(&registry, issue, "builder-done", SystemTime::now());
-    registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
-    registry.reap_once();
-
-    let record = raw_outcome_record(&registry, issue);
-    assert_eq!(
-        record
-            .get("doctor_cycles")
-            .and_then(serde_json::Value::as_u64),
-        Some(0),
-        "an observed lifecycle with no Doctor phase reports 0, not an absent key: {record}"
+    let raw = raw_outcome_record(&registry, issue);
+    assert!(
+        raw.get("doctor_cycles").is_none(),
+        "a sampled lifecycle is no longer a doctor_cycles source (#8222): {raw}"
+    );
+    assert!(
+        raw.get("judge_verdicts").is_none(),
+        "judge_verdicts is never derived from the sampled history: {raw}"
     );
 }
 
-/// "Not observed" is an ABSENT key — a sweep that died before the first
-/// reaper tick sampled anything has no lifecycle to count, and reporting
-/// `0` there would fabricate a "no Doctor phase happened" claim the daemon
-/// cannot make.
+/// "Not observed" is an ABSENT key — a sweep whose PR timeline was never read
+/// has no review history to count, and reporting `0` there would fabricate a
+/// "no Doctor cycle happened" claim the daemon cannot make.
 #[test]
-fn telemetry_outcome_omits_doctor_cycles_without_a_sampled_history() {
+fn telemetry_outcome_omits_doctor_cycles_without_a_readable_timeline() {
     let dir = tempdir().unwrap();
     let (mut registry, _rec) = fixture_registry(dir.path());
     let issue = 8062;
