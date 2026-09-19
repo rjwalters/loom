@@ -1271,6 +1271,61 @@ Ask yourself: "Is the original issue already clear and actionable?"
 
 Before marking an issue as `loom:curated`, check if it has a **Dependencies** section with a task list.
 
+### First: Champion out-of-band AC hold, not a dependency (#8259)
+
+**Run before anything else below**, on any `loom:blocked` + `loom:operator`
+issue. That pair marks Champion's Out-of-Band Acceptance-Criteria Gate
+(`champion-pr-merge.md` → "Out-of-Band Acceptance-Criteria Gate", #6883) —
+its own `<!-- champion:ac-hold pr=<n> sha=<sha> -->` comment already states
+the terminal condition (a human posting `<!-- loom:ac-verified sha=<sha>
+-->`). There is no dependency to re-check, so routing it through "Re-check
+Idempotency" below heartbeats a textually-stable block reason every 24h
+**forever** — `decide()` has no terminal state for "never re-check again"
+(18 near-identical comments on one issue over three weeks, #8259). Same class
+of bug "Checking Operator-Only Premises" (#6849) fixed for
+`loom:operator-only`; this covers the `loom:operator` + `loom:blocked` case
+that section does not reach.
+
+```bash
+ISSUE_NUMBER=<number>
+LABELS=$(gh issue view "$ISSUE_NUMBER" --json labels --jq '[.labels[].name] | join(",")')
+COMMENTS=$(gh issue view "$ISSUE_NUMBER" --json comments --jq '.comments[].body')
+HOLD=""
+[[ ",$LABELS," == *",loom:operator,"* ]] && HOLD=$(printf '%s\n' "$COMMENTS" \
+  | grep -oE '<!-- champion:ac-hold pr=[0-9]+ sha=[0-9a-f]+ -->' | tail -n 1)
+
+if [ -n "$HOLD" ]; then
+  # AC hold, not a dependency — re-run the exact classifier Champion used to
+  # post it (abbreviation-tolerant SHA match; never hand-roll it).
+  HOLD_PR=$(printf '%s' "$HOLD" | sed -n 's/.*pr=\([0-9]*\) sha=.*/\1/p')
+  HOLD_SHA=$(printf '%s' "$HOLD" | sed -n 's/.*sha=\([0-9a-f]*\) -->.*/\1/p')
+  NOTICE_MARKER="<!-- curator:ac-hold-verified-notice:sha=$HOLD_SHA -->"
+
+  if ! printf '%s\n' "$COMMENTS" | grep -qF "$NOTICE_MARKER"; then
+    ./.loom/scripts/classify-ac-verification.sh \
+      --issue "$ISSUE_NUMBER" --pr "$HOLD_PR" --head-sha "$HOLD_SHA" >/dev/null 2>&1
+    if [ "$?" -eq 11 ]; then   # SATISFIED: an ac-verified marker names this tree.
+      gh issue edit "$ISSUE_NUMBER" --add-label "loom:curating"
+      gh issue comment "$ISSUE_NUMBER" --body "**Champion's out-of-band AC hold now has a \`loom:ac-verified\` marker** for \`$HOLD_SHA\` — needs a human to close this issue (Curator does not). $NOTICE_MARKER"
+      gh issue edit "$ISSUE_NUMBER" --remove-label "loom:curating"
+    fi
+    # Any other exit (12/13 unverified/stale, 0/10 no AC left, 1 error):
+    # silent skip — no comment, no claim. Never route this through decide()'s
+    # heartbeat: a verified hold is a one-shot transition, not a recurring
+    # conclusion to reconfirm.
+  fi
+  # STOP either way — do NOT fall into "How to Check Dependencies" /
+  # "Re-check Idempotency" below for this issue this pass.
+fi
+```
+
+**Never does**: remove `loom:blocked`/`loom:operator`, add `loom:curated`
+(closing an AC-held issue is a human call), or claim `loom:curating` outside
+the one-shot notice above. Only fires on `loom:blocked` + `loom:operator` +
+an ac-hold marker — an ordinary `loom:blocked` (no `loom:operator`) falls
+through to "How to Check Dependencies" unchanged, and `loom:operator-only`
+stays "Checking Operator-Only Premises"'s case.
+
 ### How to Check Dependencies
 
 Look for a section like this in the issue:

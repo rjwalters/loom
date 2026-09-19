@@ -20,11 +20,11 @@ architect      14795        -
 auditor        20260        -
 builder        29996        -
 champion       14114        -
-curator        46157    30000
+curator        46941    30000
 doctor         33426    30000
 driver         10496        -
 guide          50113        -
 hermit         16233        -
-judge          55937    30000
+judge          55934    30000
 loom           18964        -
-sweep          63988    60000
+sweep          63987    60000
