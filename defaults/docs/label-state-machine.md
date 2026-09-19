@@ -555,6 +555,30 @@ sweep). The prompt-side convention is enforced mechanically by
 `--add-label` in a role prompt, doc, or script that applies `loom:operator-only`
 without a sub-kind in the same argument.
 
+### An issue's own autonomous filing is not operator approval (#7855, #8309)
+
+Filing an issue — by any role, including one footed "🤖 Generated with Claude
+Code" — is not itself an operator ruling, even when the issue's substance is
+a proposal to reverse a documented design decision, safety posture, or a
+test's asserted intent. That reversal still needs `loom:operator-only` +
+`loom:operator-decision`; the filing agent's own presence on the issue is
+never a substitute for that routing.
+
+**Named anti-pattern**: on #7855, a Curator pass reasoned "the operator
+filing it is the ruling that reverses it" about an issue — itself filed
+autonomously — proposing to drop the deliberate no-auto-restart posture for a
+wedged-but-alive daemon (`loom-daemon/src/watchdog/help.txt` and
+`loom-daemon/src/watchdog/mod.rs`'s "no automatic kill/restart" rationale,
+asserted by `defaults/scripts/tests/test-loom-daemon-watchdog.sh`'s Test 14).
+Champion caught the reversal at the promotion gate, one stage after Curator
+had already spent a pass enriching and scoping it on that premise. Do not
+restate this reasoning — an issue's own filing, autonomous or not, carries no
+approval weight over a documented decision.
+
+This is narrow: it flags proposed *reversals* of existing, documented/tested
+behaviour, not autonomously-filed issues in general (see CLAUDE.md § "Issues
+Are Suggestions").
+
 ## `loom:needs-capability` — a narrower claim than `loom:operator-only` (#5817)
 
 A fleet-wide census (example-org/fleet-repo#301) found `loom:operator-only` carrying at

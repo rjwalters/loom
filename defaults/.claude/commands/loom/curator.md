@@ -886,6 +886,7 @@ gh issue close <number> --reason "not planned"
 **Guardrails (safety — do NOT skip these):**
 - **Always comment the rationale BEFORE closing.** A silent close destroys context. `--reason "not planned"` distinguishes a judgment-call close from a fix.
 - **Never close an issue that encodes a still-pending human decision.** If the right call requires a human (a policy choice, a controversial trade-off, a security/access decision, anything you are not authorized to settle), route it instead — add `loom:blocked` (automatable but waiting on a dependency/clarification) or `loom:operator-only` **plus exactly one sub-kind label**, per "Applying `loom:operator-only`" immediately below — do **not** close it.
+- **An autonomous filing is never operator approval.** Reversing a documented design/safety/test decision still routes to `loom:operator-decision` — don't reason "the filing IS the approval" (#7855's anti-pattern). Detail: `.loom/docs/label-state-machine.md` → "loom:operator-only sub-kinds".
 - **Never invent new labels.** Use only the existing label set.
 - **Do not close an issue another agent is actively building** (`loom:building`) unless you are that agent — coordinate via a comment instead.
 - **Stand down on operator-session-lane issues.** An issue an operator filed with a command-verifiable acceptance criterion and a non-executing-file-only diff (`.md`/`.txt`; see CLAUDE.md § "Sweep Lifecycle" → operator-session lane) is routed straight to `loom:building` with Curator intentionally skipped. If you encounter one already labeled `loom:building`, do **not** re-curate it, re-label it, or post a no-op "already implementation-ready" comment — leave it exactly as found and move on. Re-deriving the same one-line diff and commenting to say so is the repeat-no-op-pass anti-pattern (#4736), not a clean-slate curation.
@@ -2265,20 +2266,11 @@ Added comment:
 **Complexity**: Medium (3-5 days)
 **Dependencies**: #78 (daemon API refactor)
 
-### Option 3: SQLite full-text search
-**Approach**: Store all terminal output in FTS5 table
-**Pros**: Powerful search, persistent history, analytics potential
-**Cons**: Storage overhead, migration complexity
-**Complexity**: High (1-2 weeks)
-**Dependencies**: #78, #92 (database schema)
-
 ### Recommendation
-Start with **Option 1** for v0.3.0 (quick win), then add **Option 2** in v0.4.0 if user feedback shows need for persistent search. Option 3 is overkill unless we also need analytics.
+Start with **Option 1** for v0.3.0 (quick win), then add **Option 2** in v0.4.0 if user feedback shows need for persistent search.
 
 ### Related Work
-- #78: Daemon API refactor (required for options 2 & 3)
-- #92: Database schema design (required for option 3)
-- Similar feature in Warp terminal: [link]
+- #78: Daemon API refactor (required for option 2)
 ---
 ```
 
