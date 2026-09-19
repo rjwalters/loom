@@ -294,8 +294,12 @@ fn run_probe_against_pool(
         model: DEFAULT_PROBE_MODEL,
         stagger: !no_stagger,
     };
-    let transport = CurlTransport;
-    check::run_check(tokens_dir, &opts, &transport)
+    let report = check::run_check(tokens_dir, &opts, &CurlTransport);
+    // Issue #8347: persist today's weekly-limit-point sample. Best-effort and
+    // `--ranking`-gated — see `super::tokens_weekly_points` for why this is
+    // the call site (it rides the daemon's existing ranking-refresh cadence).
+    super::tokens_weekly_points::record_probe_run(ranking, &report);
+    report
 }
 
 /// Result of running `tokens unblock`'s validate-then-clear logic against a

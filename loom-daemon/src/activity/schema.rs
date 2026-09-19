@@ -315,6 +315,28 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_issue_claims_terminal ON issue_claims(terminal_id);
             CREATE INDEX IF NOT EXISTS idx_issue_claims_heartbeat ON issue_claims(last_heartbeat);
             CREATE INDEX IF NOT EXISTS idx_issue_claims_type ON issue_claims(claim_type);
+
+            -- Daily weekly-limit-point samples (Issue #8347, part of #8063)
+            -- One row per UTC calendar day holding that day's HIGH-WATER MARK
+            -- of weekly-limit consumption across the token pool: the sum over
+            -- every bootstrapped account of its `7d_utilization` expressed in
+            -- percentage points (a fully-consumed account contributes 100).
+            -- Written best-effort by `loom-daemon tokens check --ranking`
+            -- (see `activity::weekly_point_history`), which the daemon's
+            -- existing ~10-minute ranking refresh already runs — there is no
+            -- separate poller for this table.
+            --
+            -- Upsert-MAX, never append: 7d utilization is monotonic
+            -- non-decreasing inside a rolling window until it resets, so the
+            -- day's maximum is a stable summary that recomputing cannot
+            -- corrupt (a later, lower reading after a window reset, or a
+            -- partial reading from a failed probe, can never lower the row).
+            CREATE TABLE IF NOT EXISTS weekly_point_samples (
+                day TEXT PRIMARY KEY,           -- UTC calendar day, 'YYYY-MM-DD'
+                points REAL NOT NULL,           -- summed 7d utilization, in percentage points
+                account_count INTEGER NOT NULL, -- accounts contributing to `points`
+                updated_at DATETIME NOT NULL    -- when `points` last increased
+            );
             ",
     )?;
 

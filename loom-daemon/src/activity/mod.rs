@@ -55,6 +55,7 @@ pub mod transcript_parse;
 pub mod tuning;
 mod usage_report;
 pub mod weekly_point_calibration;
+pub mod weekly_point_history;
 
 // Re-export public types from models
 // Only export types that are used by other modules
@@ -123,4 +124,11 @@ pub use usage_report::{UsageReportGroupBy, UsageReportRow};
 pub use weekly_point_calibration::{
     calibrate, CalibrationSeries, DailyValue, DayCalibration, StepChangeDirection, BASELINE_DAYS,
     STEP_CHANGE_FOLD_THRESHOLD,
+};
+
+// Daily weekly-limit-point history (Issue #8347, part of #8063) — the sampling
+// side is written best-effort by `loom-daemon tokens check --ranking`; the read
+// side is the daily series #8063 joins against `usage-report --by day`.
+pub use weekly_point_history::{
+    record_daily_sample_best_effort, sum_account_points, WeeklyPointSample,
 };
