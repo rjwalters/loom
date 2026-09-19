@@ -28,11 +28,33 @@ pub(crate) struct TerminalResult {
     pub(crate) account: String,
     pub(crate) category: TerminalClassification,
     pub(crate) exit_code: i32,
+    /// The model in flight when this terminal record was emitted (issue
+    /// #8277, threading #8058 Phase 2's `class_cooldowns` a producer). Only a
+    /// v2 record carries this — `None` for a v1 record (no `model=` field at
+    /// all, e.g. an older adapter still talking to a newer daemon) and for a
+    /// v2 record whose `model=` value is the `none` sentinel or otherwise
+    /// empty. This is the raw string the adapter reported, unvalidated
+    /// against any known model class — that normalization happens exactly
+    /// once, downstream, in `tokens_pool::health::model_class_of`.
+    pub(crate) model: Option<String>,
 }
 
-/// Parse the adapter's strict v1 record from only the current dispatch region.
+/// Parse the adapter's terminal record from only the current dispatch region.
 /// Unknown fields, duplicate records, malformed identities, and unknown
 /// categories all fail closed: no account health is mutated.
+///
+/// Two versions are accepted (issue #8277):
+///
+/// - `v=1`, exactly 5 fields (`v provider account category exit_code`) — the
+///   original contract, byte-for-byte unchanged, so an older adapter talking
+///   to a newer daemon still parses exactly as before (degrading to the
+///   account-wide health path with no model, never dropping the signal).
+/// - `v=2`, exactly 6 fields, adding `model=<value>` — emitted by adapters
+///   that know which model was in flight. `model=none` (or an absent value)
+///   parses to `TerminalResult::model == None`, same as v1.
+///
+/// Any other arity or `v=` value fails closed like everything else this
+/// parser rejects.
 pub(crate) fn parse_terminal_result_after(
     contents: &str,
     header_anchor: &str,
@@ -49,9 +71,14 @@ pub(crate) fn parse_terminal_result_after(
         .split_ascii_whitespace()
         .filter_map(|field| field.split_once('='))
         .collect();
-    if fields.len() != 5 || fields.get("v") != Some(&"1") {
-        return None;
-    }
+    let model = match fields.get("v") {
+        Some(&"1") if fields.len() == 5 => None,
+        Some(&"2") if fields.len() == 6 => match fields.get("model") {
+            Some(&"none") | Some(&"") | None => None,
+            Some(model) => Some((*model).to_string()),
+        },
+        _ => return None,
+    };
     let provider = match *fields.get("provider")? {
         "claude" => AccountProvider::Claude,
         "codex" => AccountProvider::Codex,
@@ -71,6 +98,7 @@ pub(crate) fn parse_terminal_result_after(
         account,
         category: fields.get("category")?.parse().ok()?,
         exit_code: fields.get("exit_code")?.parse().ok()?,
+        model,
     })
 }
 
@@ -1398,6 +1426,7 @@ sweep_id=current
                 account: "profile-a".into(),
                 category: TerminalClassification::TokenExhausted,
                 exit_code: 42,
+                model: None,
             })
         );
         assert!(parse_terminal_result_after(
@@ -1623,3 +1652,7 @@ spawn-claude: using OAuth account 'stale-account' (mode=random)
 #[cfg(test)]
 #[path = "crash_signals_empty_pool_tests.rs"]
 mod empty_pool_tests;
+
+#[cfg(test)]
+#[path = "crash_signals_model_class_tests.rs"]
+mod model_class_tests;

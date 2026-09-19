@@ -438,6 +438,19 @@ pub fn record_terminal(
     record_terminal_at(workspace, id, classification, provenance, now_epoch())
 }
 
+/// [`record_terminal`], telling it which **model** was in flight (#8058 Phase
+/// 2's producer, issue #8277). See [`record_terminal_for_model_at`] for the
+/// narrowing/fail-safe contract.
+pub fn record_terminal_for_model(
+    workspace: &Path,
+    id: &AccountId,
+    classification: TerminalClassification,
+    model: Option<&str>,
+    provenance: &str,
+) -> Result<()> {
+    record_terminal_for_model_at(workspace, id, classification, model, provenance, now_epoch())
+}
+
 /// Record terminal feedback with no model information: every hold it writes is
 /// account-wide, exactly as before #8058 Phase 2.
 pub fn record_terminal_at(

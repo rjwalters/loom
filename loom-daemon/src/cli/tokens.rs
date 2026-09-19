@@ -591,8 +591,13 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             // `--json`'s (non-`--export`) stdout stays a bare JSON object.
             eprintln!("Resolved workspace: {}", ws.display());
             if provider == loom_daemon::tokens_pool::AccountProvider::Codex {
-                let selected = loom_daemon::tokens_pool::select_account(&ws, provider)
-                    .map_err(|error| anyhow!(error))?;
+                // #8277: the same `--model` this arm's Claude sibling already
+                // accepts (see `select_token_for_model` below) now also
+                // narrows Codex selection past a class-scoped
+                // `MODEL_CREDITS_EXHAUSTED` hold (#8058 Phase 2).
+                let selected =
+                    loom_daemon::tokens_pool::select_account(&ws, provider, model.as_deref())
+                        .map_err(|error| anyhow!(error))?;
                 let directory = match &selected.binding {
                     loom_daemon::tokens_pool::AccountBinding::CodexHome { directory } => directory,
                     _ => unreachable!("Codex selection returned a non-Codex binding"),

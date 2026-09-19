@@ -624,7 +624,21 @@ pub fn account_capacity(workspace: &Path, provider: AccountProvider) -> Result<u
         .count())
 }
 
-pub fn select_account(workspace: &Path, provider: AccountProvider) -> Result<SelectedAccount> {
+/// `model`, when supplied, is the model alias/pinned ID about to be
+/// dispatched (issue #8277). On the Codex arm it narrows selection to
+/// [`super::health::select_healthy_for_model_at`], so an account held only
+/// for a *different* model class (a class-scoped `MODEL_CREDITS_EXHAUSTED`
+/// mark — #8058 Phase 2) stays selectable. `None`, or a model the class
+/// classifier does not recognize, reproduces the prior class-less selection
+/// exactly — selection must never fail closed on an unrecognized name. The
+/// Claude arm does not yet consult `model` (its own `--model` narrowing lives
+/// in `select::select_token_for_model`, a separate call path); threading it
+/// here too is future work, not a regression of this change.
+pub fn select_account(
+    workspace: &Path,
+    provider: AccountProvider,
+    model: Option<&str>,
+) -> Result<SelectedAccount> {
     match provider {
         AccountProvider::Claude => {
             let selected = super::select::select_token(workspace, None)?;
@@ -652,8 +666,9 @@ pub fn select_account(workspace: &Path, provider: AccountProvider) -> Result<Sel
             // adopted by `accounts session start`, and never fatal — see
             // `refresh_session_health`.
             let _ = super::session_lifecycle::refresh_session_health(workspace, &inventory, now);
-            let descriptor =
-                super::health::select_healthy_at(workspace, provider, &inventory, now)?;
+            let descriptor = super::health::select_healthy_for_model_at(
+                workspace, provider, &inventory, model, now,
+            )?;
             Ok(SelectedAccount {
                 id: descriptor.id,
                 binding: AccountBinding::CodexHome {

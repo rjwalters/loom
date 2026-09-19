@@ -476,48 +476,6 @@ impl SweepRegistry {
         self.record_terminal_outcome(issue, insta_crash);
     }
 
-    /// Persist provider health before any reaper retry/failover decision.
-    pub(crate) fn apply_provider_health_feedback(
-        &self,
-        sweep_id: &SweepId,
-        exit_code: Option<i32>,
-    ) {
-        let Some(info) = self.entries.get(sweep_id) else {
-            return;
-        };
-        if info.runtime != "codex" || info.token_name == UNKNOWN_TOKEN_NAME {
-            return;
-        }
-        let Ok(contents) = std::fs::read_to_string(&info.log_path) else {
-            return;
-        };
-        let anchor = format!("sweep_id={sweep_id}");
-        let Some(result) = parse_terminal_result_after(&contents, &anchor) else {
-            return;
-        };
-        if result.provider != AccountProvider::Codex
-            || result.account != info.token_name
-            || exit_code.is_some_and(|code| code != result.exit_code)
-        {
-            log::warn!("sweep_registry: ignored mismatched Codex terminal feedback for {sweep_id}");
-            return;
-        }
-        let id = AccountId {
-            provider: result.provider,
-            name: result.account,
-        };
-        if let Err(error) = tokens_pool::record_terminal(
-            &self.config.workspace_root,
-            &id,
-            result.category,
-            "spawn-codex:v1",
-        ) {
-            log::warn!(
-                "sweep_registry: failed to persist Codex terminal feedback for {sweep_id}: {error}"
-            );
-        }
-    }
-
     /// Classify whether an insta-crash death was caused by account exhaustion
     /// (#4122).
     ///
@@ -2613,6 +2571,12 @@ exit 0
         );
     }
 }
+
+/// The Codex provider-health-feedback bridge, split out of this file by #8277
+/// (see its module doc). Declared here rather than in `sweep_registry/mod.rs`
+/// because it is this module's extracted half, not a new peer subsystem.
+#[path = "provider_health_feedback.rs"]
+mod provider_health_feedback;
 
 #[cfg(test)]
 #[path = "quarantine_empty_pool_tests.rs"]

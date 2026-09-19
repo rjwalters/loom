@@ -408,6 +408,11 @@ assert_contains "-m sonnet" "$out" "LOOM_CODEX_MODEL_CHECK=0 disables the refusa
 echo ""
 echo "Testing spawn-codex.sh ChatGPT-plan auth-mode guard..."
 
+# Issue #8277: the expected v2 terminal record, built from its four varying
+# fields so the long literal is not repeated at every assertion site.
+_tr() { printf '# LOOM_TERMINAL_RESULT v=2 provider=codex account=%s category=%s exit_code=%s model=%s' "$1" "$2" "$3" "$4"; }
+
+
 AUTHMODE_BIN="$TMPROOT/authmode-bin"
 mkdir -p "$AUTHMODE_BIN"
 AUTHMODE_ARGV_FILE="$TMPROOT/authmode-argv.txt"
@@ -459,6 +464,11 @@ assert_not_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
     "the pinned model is NOT forwarded to the ChatGPT-plan profile's codex invocation"
 assert_contains "AUTHMODE-FINAL" "$out" \
     "the invocation still runs (on the account's own default) rather than being refused outright"
+# Issue #8277: the v2 terminal record reports the model that was ACTUALLY in
+# flight. The pin was stripped before exec, so the account's own default ran —
+# naming the dropped model here would pin a class-scoped credit-exhaustion
+# hold on a class that never ran, and leave the class that DID run selectable.
+assert_contains "$(_tr unknown SUCCESS 0 none)" "$out" "a DROPPED pin reports model=none (#8277)"
 
 # (2) An API-key profile: no conflict, the pinned model passes through
 # unchanged.
@@ -468,6 +478,7 @@ assert_not_contains "authenticated via a ChatGPT plan" "$out" \
     "an API-key profile is never warned about the auth-mode conflict"
 assert_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
     "the pinned model IS forwarded to an API-key profile's codex invocation"
+assert_contains "$(_tr unknown SUCCESS 0 gpt-5-codex)" "$out" "an in-flight model IS named (#8277)"
 
 # (3) No model pinned at all: the guard has nothing to check and never shells
 # out to `codex login status` (the mocked codex still errors if it did, since
@@ -746,10 +757,8 @@ assert_contains "spawn-codex: session=$MOCK_SESSION" "$mock_stderr" \
     "the 'session id:' line is parsed and reported as the transcript join key"
 assert_contains "spawn-codex: tokens_used=2502" "$mock_stderr" \
     "'tokens used' is parsed (comma-stripped) and reported"
-assert_contains \
-    "# LOOM_TERMINAL_RESULT v=1 provider=codex account=unknown category=SUCCESS exit_code=0" \
-    "$mock_stderr" \
-    "a successful child emits one strict structured terminal record"
+assert_contains "$(_tr unknown SUCCESS 0 none)" "$mock_stderr" \
+    "a successful child emits one strict structured record, no model pinned"
 assert_not_contains "MOCK-SAW-STDIN" "$mock_stderr" \
     "the child's stdin is /dev/null (no <stdin> append, no hang)"
 
@@ -777,9 +786,7 @@ set -e
 assert_eq "42" "$classified_rc" \
     "structured classification preserves the original child exit code"
 terminal_record="$(printf '%s\n' "$classified_stderr" | grep '^# LOOM_TERMINAL_RESULT ' || true)"
-assert_eq \
-    "# LOOM_TERMINAL_RESULT v=1 provider=codex account=profile-a category=TOKEN_EXPIRED exit_code=42" \
-    "$terminal_record" \
+assert_eq "$(_tr profile-a TOKEN_EXPIRED 42 none)" "$terminal_record" \
     "the structured record matches the direct Codex classifier and carries account identity"
 assert_not_contains "recognizable-secret" "$terminal_record" \
     "the structured record never copies raw child output"
@@ -1336,7 +1343,7 @@ STUB
             LOOM_SWEEP_NICE=0 \
             LOOM_WORKSPACE="$PROVIDER_WS" LOOM_DAEMON_BIN="$PROVIDER_BIN/loom-daemon" \
             PATH="$PROVIDER_BIN:$PATH" \
-            bash "$SPAWN_CODEX" -p "hi" >/dev/null 2>&1 || true
+            bash "$SPAWN_CODEX" "$@" -p "hi" >/dev/null 2>&1 || true
         cat "$PROVIDER_ARGV_LOG" 2>/dev/null || echo "<no selection call captured>"
     }
 
@@ -1348,6 +1355,13 @@ JSON
     argv="$(run_provider_select)"
     assert_contains "--provider codex" "$argv" \
         "spawn-codex.sh passes the manifest's accountProvider (codex) to tokens select (#5609)"
+    assert_not_contains "--model" "$argv" "no --model flag when no model was pinned (#8277)"
+
+    # Issue #8277: an explicitly pinned model narrows account selection past a
+    # class-scoped MODEL_CREDITS_EXHAUSTED hold (#8058 Phase 2) — threaded
+    # into the SAME `tokens select` call this section already exercises.
+    argv="$(run_provider_select -m gpt-5-codex)"
+    assert_contains "--model gpt-5-codex" "$argv" "-m is threaded into tokens select (#8277)"
 
     # A runtime manifest present but missing the accountProvider field falls
     # back to claude (D8's fail-open default), never fails closed.
@@ -1573,10 +1587,8 @@ assert_contains "spawn-codex: session=$MOCK_SESSION" "$session_stderr" \
     "session-exec parses the transcript join key identically to bare-metal"
 assert_contains "spawn-codex: tokens_used=2502" "$session_stderr" \
     "session-exec parses tokens_used identically to bare-metal"
-assert_contains \
-    "# LOOM_TERMINAL_RESULT v=1 provider=codex account=session-acct category=SUCCESS exit_code=0" \
-    "$session_stderr" \
-    "session-exec emits the same structured terminal record classify-error.sh bare-metal does"
+assert_contains "$(_tr session-acct SUCCESS 0 none)" "$session_stderr" \
+    "session-exec emits the same structured record classify-error.sh bare-metal does"
 assert_contains "# LOOM_CLI_START runtime=codex" "$session_stderr" \
     "session-exec still emits the LOOM_CLI_START observability marker"
 assert_not_contains "MOCK-SAW-STDIN" "$session_stderr" \

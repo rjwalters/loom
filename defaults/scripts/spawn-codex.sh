@@ -675,8 +675,16 @@ else
         _account_provider="$(_loom_account_provider_for_runtime codex)"
         _selection_stderr_file="$(mktemp)"
         _selection_output=""
+        # #8277: narrow selection to the model about to be dispatched, so an
+        # account held only for a DIFFERENT class-scoped MODEL_CREDITS_EXHAUSTED
+        # mark (#8058 Phase 2) stays selectable. `EFFECTIVE_MODEL` was already
+        # resolved above (model-selection block); an unrecognized value is not
+        # an error on the daemon side, it just degrades to class-less selection.
+        # shellcheck disable=SC2086  # ${VAR:+...} is a deliberate word-split:
+        # it expands to the two-token `--model <value>`, or to nothing at all.
+        # A model name cannot contain whitespace (validated above).
         if ! _selection_output="$("$_daemon_bin" tokens select --provider "$_account_provider" \
-            --workspace "$WORKSPACE" --export 2>"$_selection_stderr_file")"; then
+            --workspace "$WORKSPACE" --export ${EFFECTIVE_MODEL:+--model "$EFFECTIVE_MODEL"} 2>"$_selection_stderr_file")"; then
             log_error "Codex account selection failed:"
             cat "$_selection_stderr_file" >&2 || true
             rm -f "$_selection_stderr_file"
@@ -1066,6 +1074,24 @@ fi
 # single source of truth; this adapter only packages its result with the
 # provider/account attribution already selected for this child. Raw output is
 # neither included in this record nor persisted by the health layer.
+#
+# v2 (#8277) adds `model=` so a class-scoped MODEL_CREDITS_EXHAUSTED mark
+# (#8058 Phase 2, `class_cooldowns`) has a producer: `EFFECTIVE_MODEL` is the
+# same value already threaded into token selection above, sanitized to the
+# same charset `account=` uses (plus `@`, for a pinned `model@date` ID) —
+# anything else, or no model at all, becomes the `none` sentinel, which the
+# daemon parser treats identically to a v1 record with no model field
+# (fail-safe: account-wide, never a fabricated class).
+#
+# The field reports the model that was ACTUALLY IN FLIGHT, which is not always
+# `EFFECTIVE_MODEL`: the #5499 ChatGPT-plan guard above may set
+# CODEX_DROP_PINNED_MODEL, in which case the `-m`/`--model` flag was stripped
+# from the invocation and the account's own default model ran instead. Naming
+# the dropped model here would pin a class-scoped credit-exhaustion hold on a
+# class that never ran — and, worse, leave the class that DID run selectable.
+# We cannot know the account's default from here, so that case reports `none`
+# and takes the account-wide path, which is the fail-safe direction #8058
+# requires.
 _classifier_lib="${_SCRIPT_DIR}/lib/classify-error.sh"
 if [[ -f "$_classifier_lib" ]]; then
     # shellcheck source=./lib/classify-error.sh
@@ -1073,9 +1099,12 @@ if [[ -f "$_classifier_lib" ]]; then
     _classifier_input="$(tail -c 65536 "$_stderr_file" 2>/dev/null || true)"
     _terminal_category="$(classify_error "$_classifier_input" "$_exit_code" codex)"
     _terminal_account="${LOOM_ACCOUNT_NAME:-${CODEX_PROFILE_NAME:-unknown}}"
-    if [[ ! "$_terminal_account" =~ ^[A-Za-z0-9._-]+$ ]]; then
-        _terminal_account="unknown"
-    fi
+    [[ "$_terminal_account" =~ ^[A-Za-z0-9._-]+$ ]] || _terminal_account="unknown"
+    # `none` when nothing was pinned, when the #5499 guard stripped the pin
+    # before exec (the account's own default ran and we cannot name it), or
+    # when the value is not record-safe — all three fail safe to account-wide.
+    _terminal_model="${EFFECTIVE_MODEL:-none}"
+    [[ "${CODEX_DROP_PINNED_MODEL:-false}" != "true" && "$_terminal_model" =~ ^[A-Za-z0-9._@-]+$ ]] || _terminal_model="none"
     case "$_terminal_category" in
         # MODEL_CREDITS_EXHAUSTED (#5687) is listed so the allowlist stays a
         # complete mirror of the classifier's category set. The `codex` table
@@ -1083,8 +1112,8 @@ if [[ -f "$_classifier_lib" ]]; then
         # unreachable for provider=codex — but an allowlist that silently drops
         # a valid category is exactly how terminal feedback goes missing.
         SUCCESS|TOKEN_EXPIRED|TOKEN_EXHAUSTED|MODEL_CREDITS_EXHAUSTED|RECOVERABLE|TIMEOUT|FATAL|CWD_DELETED|MODEL_REFUSAL|SESSION_LIMIT)
-            printf '# LOOM_TERMINAL_RESULT v=1 provider=codex account=%s category=%s exit_code=%s\n' \
-                "$_terminal_account" "$_terminal_category" "$_exit_code" >&2
+            printf '# LOOM_TERMINAL_RESULT v=2 provider=codex account=%s category=%s exit_code=%s model=%s\n' \
+                "$_terminal_account" "$_terminal_category" "$_exit_code" "$_terminal_model" >&2
             ;;
         *)
             log_warn "spawn-codex: classifier returned an invalid category; terminal feedback omitted"

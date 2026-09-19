@@ -912,6 +912,59 @@ values and credential paths must never appear. Parsers anchor these markers
 after the newest daemon dispatch header. Historical `spawn-claude:` preamble
 and `# CLAUDE_CLI_START` records remain supported.
 
+#### The `LOOM_TERMINAL_RESULT` record (Codex/generic-only, #8058/#8277)
+
+`spawn-codex.sh` and `spawn-generic.sh` emit one more line to stderr right
+before exiting: a strict, exact-arity terminal-feedback record consumed by
+`sweep_registry::crash_signals::parse_terminal_result_after` (never by the
+Claude runtime — `tokens_pool::health` is Codex/generic-only, see that
+module's header comment).
+
+```text
+# LOOM_TERMINAL_RESULT v=1 provider=<provider> account=<account> category=<CATEGORY> exit_code=<n>
+# LOOM_TERMINAL_RESULT v=2 provider=<provider> account=<account> category=<CATEGORY> exit_code=<n> model=<model-or-none>
+```
+
+Both versions are strict: the parser requires the exact field count for the
+declared `v=` and fails closed (mutates no account health) on any other
+arity, an unrecognized `v=`, a duplicate record in the current dispatch
+region, or an `account=unknown`/malformed identity. `category` is one of the
+[error-classification](#3-error-classification) categories.
+
+- **`v=1`** (5 fields) is the original contract — still emitted verbatim by
+  `spawn-generic.sh`, which always reports `account=unknown` and so is
+  already inert past the account-identity check.
+- **`v=2`** (6 fields) adds `model=`, the model alias/pinned ID that was in
+  flight — `spawn-codex.sh`'s own `-m`/`--model` resolution
+  (`EFFECTIVE_MODEL`), sanitized to `[A-Za-z0-9._@-]+`. `model=none` is the
+  explicit "no model was in flight" sentinel, parsed identically to a v1
+  record's absent field. It is reported both when nothing was pinned **and**
+  when a pin was resolved but then *dropped before exec* by the #5499
+  ChatGPT-plan auth-mode guard — in that case the account's own default model
+  ran, and naming the dropped model would pin a class-scoped hold on a class
+  that never ran while leaving the class that did run selectable. A `model`
+  value the class classifier
+  (`tokens_pool::health::model_class_of`) does not recognize (e.g. it fails
+  `model=`'s own charset once normalized, or is simply not a name the
+  classifier has been taught) degrades to the same class-less, account-wide
+  health write a v1 record produces — selection must never fail closed on an
+  unrecognized model name.
+
+Consumer: `sweep_registry::quarantine::apply_provider_health_feedback`, the
+only production caller, feeds the parsed `(provider, account, category,
+model)` into `tokens_pool::record_terminal_for_model` — a
+`MODEL_CREDITS_EXHAUSTED` category with a recognized `model` writes a
+**class-scoped** `class_cooldowns` entry (`.loom/account-health.json`)
+rather than the account-wide `plan_exhausted` cooldown every other category
+(and every v1 record) still writes. See
+[`tokens_pool::health`'s module doc](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens_pool/health.rs)
+for the full narrowing/fail-safe contract (#8058 Phase 2).
+
+An adapter emitting this record for the first time should start at `v=2`
+directly — there is no reason to ship the strictly-less-informative `v=1`
+shape going forward, though the daemon keeps parsing it for adapters (and
+historical logs) that already do.
+
 ### Runtime resolution (precedence)
 
 The runtime is resolved with the standard Loom precedence chain
