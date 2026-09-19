@@ -188,6 +188,7 @@ test-resync-installed-guard-check.sh
 test-resync-installed-local-fix-guard.sh
 test-resync-installed.sh
 test-review-feedback-reconciliation.sh
+test-role-tool-policy-spawn.sh
 test-run-ci-suites-daemon-guard.sh
 test-run-ci-suites-failure-excerpt.sh
 test-run-ci-suites-retry.sh
@@ -253,6 +254,7 @@ tests/hooks/test-guard-destructive-matching-precision.sh
 tests/hooks/test-guard-destructive-mkdir-confinement.sh
 tests/hooks/test-guard-destructive-readonly-fastpath.sh
 tests/hooks/test-guard-destructive-rm-scope.sh
+tests/hooks/test-guard-destructive-role-tool-policy.sh
 tests/hooks/test-guard-destructive-stash-scope.sh
 tests/hooks/test-guard-destructive-write-confinement.sh
 tests/hooks/test-guard-loom-workflow.sh

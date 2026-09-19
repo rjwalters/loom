@@ -10,5 +10,8 @@
   "stuckThresholds": {
     "maxNoOutput": 1800000,
     "maxNeedsInput": 300000
+  },
+  "toolPolicy": {
+    "allowedCapabilities": ["*"]
   }
 }
