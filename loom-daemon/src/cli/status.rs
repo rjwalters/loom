@@ -44,6 +44,12 @@ pub(crate) struct StatusTimeoutInfo {
     pub loadavg_1m: Option<f64>,
     pub load_per_core: Option<f64>,
     pub logical_cpus: usize,
+    /// Registered workspace roots this host's `build_daemon_status` walks
+    /// (Issue #8224) — the `O(roots)` cost the round-trip actually waits on,
+    /// reported alongside the load reading for exactly the reason #6011
+    /// reported the load reading: an operator seeing a timeout fire should be
+    /// able to tell which input sized the budget.
+    pub root_count: usize,
 }
 
 /// Scale `base` by observed load-per-core (Issue #6011 AC2). Below 1.0
@@ -82,12 +88,34 @@ pub(crate) fn scale_timeout_for_load(base: Duration, load_per_core: Option<f64>)
 /// 2. Otherwise, [`scale_timeout_for_load`] over [`DEFAULT_STATUS_TIMEOUT`]
 ///    using the freshly-read host load, then [`LOOM_DAEMON_IPC_TIMEOUT_MS`]
 ///    (shared with `dispatch`, via
-///    [`super::common::apply_ipc_timeout_env_floor`]) as a final raise-only
-///    floor over that.
+///    [`super::common::apply_ipc_timeout_env_floor`]) as a raise-only floor
+///    over that, then
+///    [`loom_daemon::status_budget::apply_client_probe_floor`] over the
+///    registered root count as a second raise-only floor (Issue #8224).
 ///
 /// The load reading is always taken and returned alongside the timeout —
 /// even when `explicit_secs` bypasses the scaling — so the caller can report
-/// it in a timeout message regardless of which path produced the budget.
+/// it in a timeout message regardless of which path produced the budget. The
+/// registered root count is taken and reported the same way.
+///
+/// # Why a root-scaled floor, and why it is not capped at 30s
+///
+/// [`MAX_SCALED_STATUS_TIMEOUT`] bounds *load* scaling, which is a speculative
+/// multiplier over a cost nobody has measured. The root-count term is not
+/// speculative: [`loom_daemon::ipc::build_daemon_status`] walks every
+/// registered workspace root on every round-trip, so the thing this timeout
+/// waits on is known to be `O(roots)` (#8163 measured `13.1s`/`14.3s` builds
+/// on a "several dozen" root host). Capping that term at the load ceiling
+/// would reintroduce exactly the false timeout it exists to prevent, so the
+/// root-scaled floor is applied *after* the clamp and carries its own,
+/// higher, bound — [`loom_daemon::status_budget::MAX_ROOT_SCALED_PROBE_TIMEOUT`].
+///
+/// Unlike `cli::health`, `status` has no retry/escalation concept: there is
+/// one attempt, so the floor is applied to it unconditionally rather than
+/// gated on corroborating local evidence the way
+/// `cli::health::resolve_retry_timeout` gates its escalated retry. An explicit
+/// `--timeout-secs` still wins verbatim — an operator asking for a 3s probe is
+/// asking for a fast negative, and #8224 does not overrule that.
 ///
 /// [`LOOM_DAEMON_IPC_TIMEOUT_MS`]: super::common::DAEMON_IPC_TIMEOUT_ENV
 #[must_use]
@@ -95,12 +123,17 @@ pub(crate) fn resolve_status_timeout(explicit_secs: Option<u64>) -> StatusTimeou
     let logical_cpus = loom_daemon::cpu_headroom::logical_cpu_count();
     let loadavg_1m = loom_daemon::cpu_headroom::read_loadavg_1m();
     let load_per_core = loom_daemon::cpu_headroom::load_per_core_from(loadavg_1m, logical_cpus);
+    // Read from the LOCAL workspace registry (a cheap JSON read), never from
+    // the daemon: the client cannot learn the root count from a round-trip it
+    // is still trying to budget for. Same rationale as #8163's health client.
+    let root_count = loom_daemon::status_budget::registered_root_count();
 
     let timeout = match explicit_secs {
         Some(secs) => Duration::from_secs(secs.max(1)),
         None => {
             let scaled = scale_timeout_for_load(DEFAULT_STATUS_TIMEOUT, load_per_core);
-            super::common::apply_ipc_timeout_env_floor(scaled)
+            let env_floored = super::common::apply_ipc_timeout_env_floor(scaled);
+            loom_daemon::status_budget::apply_client_probe_floor(env_floored, root_count)
         }
     };
 
@@ -109,20 +142,23 @@ pub(crate) fn resolve_status_timeout(explicit_secs: Option<u64>) -> StatusTimeou
         loadavg_1m,
         load_per_core,
         logical_cpus,
+        root_count,
     }
 }
 
 /// Render `info` for a human-readable timeout error/log line (Issue #6011
-/// AC2) — always names the effective timeout, and the load reading behind it
-/// when one was available.
+/// AC2) — always names the effective timeout, the registered root count that
+/// floors it (Issue #8224), and the load reading behind it when one was
+/// available.
 fn describe_status_timeout(info: &StatusTimeoutInfo) -> String {
+    let roots = format!("{} registered workspace root(s)", info.root_count);
     match (info.loadavg_1m, info.load_per_core) {
         (Some(load), Some(lpc)) => format!(
-            "{}s (host load {load:.2} across {} logical CPUs, {lpc:.2}/core)",
+            "{}s (host load {load:.2} across {} logical CPUs, {lpc:.2}/core; {roots})",
             info.timeout.as_secs(),
             info.logical_cpus
         ),
-        _ => format!("{}s (host load unavailable)", info.timeout.as_secs()),
+        _ => format!("{}s (host load unavailable; {roots})", info.timeout.as_secs()),
     }
 }
 
@@ -1639,3 +1675,9 @@ mod degraded_journal_tests {
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     }
 }
+
+/// Issue #8224: the root-scaled floor `resolve_status_timeout` applies, in a
+/// sibling file so the over-threshold parent (`scripts/check-file-size-budget.sh`)
+/// does not grow — see `.loom/docs/file-size-policy.md`.
+#[cfg(test)]
+mod root_scaled_timeout_tests;

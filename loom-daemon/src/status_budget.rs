@@ -136,6 +136,27 @@ pub fn registered_root_count() -> usize {
         .max(1)
 }
 
+/// Raise `base` to at least [`client_probe_budget`] over `root_count`.
+///
+/// This is the **raise-only** combinator every client-side caller of
+/// `Request::DaemonStatus` applies (Issue #8224 generalised it out of
+/// `cli::health::resolve_retry_timeout`, #8163's first caller). `max`, never
+/// assignment, is the whole contract: a wider operator override
+/// (`LOOM_DAEMON_IPC_TIMEOUT_MS`), a heavily load-scaled base, or a caller's
+/// own escalated floor must never be *narrowed* by root scaling, and a
+/// single-workspace host must come out bit-for-bit unchanged (at
+/// `root_count == 1` the budget is `1.4s`, under every caller's base).
+///
+/// `root_count` is passed in rather than read here so callers resolve it
+/// exactly once via [`registered_root_count`] and can *report* the value they
+/// budgeted from — `cli::status` returns it alongside the timeout, and the
+/// dashboard's `fetch_report` names it in its timeout error. A hidden read
+/// would make the two disagree the moment a workspace is registered mid-call.
+#[must_use]
+pub fn apply_client_probe_floor(base: Duration, root_count: usize) -> Duration {
+    base.max(client_probe_budget(root_count))
+}
+
 /// The per-phase wall-clock breakdown #7513 accumulates inside
 /// [`crate::ipc::build_daemon_status`], passed here so the logging policy
 /// (and the budget it is compared against) lives in one place instead of

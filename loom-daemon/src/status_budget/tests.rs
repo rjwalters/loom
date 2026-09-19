@@ -62,6 +62,37 @@ fn the_client_budget_is_capped_and_overflow_safe() {
     let _ = status_build_budget(usize::MAX);
 }
 
+/// **Issue #8224.** [`apply_client_probe_floor`] is a *floor*, never an
+/// assignment: it may only ever raise a caller's own budget. Every client-side
+/// caller (`cli::health`'s escalated retry, `cli::status`'s single attempt, the
+/// dashboard's `fetch_report`) depends on this, because each has its own wider
+/// source of budget — an operator env override, a load-scaled base, a fixed
+/// escalated floor — that root scaling must not undercut.
+#[test]
+fn the_client_probe_floor_only_ever_raises() {
+    // A base wider than any root-scaled budget survives untouched.
+    let wide = MAX_ROOT_SCALED_PROBE_TIMEOUT + Duration::from_secs(30);
+    assert_eq!(apply_client_probe_floor(wide, 1), wide);
+    assert_eq!(apply_client_probe_floor(wide, DOCUMENTED_MAX_ROOTS), wide);
+    assert_eq!(apply_client_probe_floor(wide, usize::MAX), wide);
+
+    // A narrow base is raised to exactly the root-scaled budget.
+    let narrow = Duration::from_millis(1);
+    assert_eq!(
+        apply_client_probe_floor(narrow, DOCUMENTED_MAX_ROOTS),
+        client_probe_budget(DOCUMENTED_MAX_ROOTS)
+    );
+
+    // And it is monotonic in the root count for a fixed base.
+    let base = Duration::from_secs(5);
+    let mut prev = apply_client_probe_floor(base, 0);
+    for n in 1..=DOCUMENTED_MAX_ROOTS * 2 {
+        let next = apply_client_probe_floor(base, n);
+        assert!(next >= prev, "apply_client_probe_floor regressed at n={n}");
+        prev = next;
+    }
+}
+
 /// An unreadable/absent registry resolves to one root — the same fallback
 /// `WorkspaceRegistry::effective_roots` applies — never zero, which would
 /// budget below the fixed floor's intent.
