@@ -1,3 +1,50 @@
+//! Tests for the startup (#3887), mid-build-death (#3895) and review-stall
+//! (#3910) watchdogs.
+//!
+//! # If several `midbuild_*` tests fail together, read this first (#8170)
+//!
+//! This module is **more exposed than most** to the shared-process hazard
+//! `loom-daemon/src/lib.rs` documents under "Test isolation convention"
+//! (#4385): nearly every test here `Command::spawn`s real children — `git`
+//! (repo fixture, dirty probe, `reset --hard`, `clean -fd`), `lsof`, a fake
+//! `spawn-claude.sh`, a fake `gh`, a stand-in sweep process — while hundreds
+//! of unrelated tests in the same binary call `env::set_var`/`remove_var`.
+//! `spawn` snapshots the environ non-atomically, so a concurrent mutation can
+//! hand one of those children a torn environment.
+//!
+//! The mid-build watchdog amplifies a single torn `git status` into a
+//! module-wide failure, because `SweepRegistry::worktree_dirty` fails closed:
+//! a `git` invocation that does not exit 0 reads as "not dirty", which makes
+//! `midbuild_decision` return `Healthy`, which means **nothing** is recorded —
+//! no recovery, no `midbuild_inuse` refusal, no `midbuild_gaveup`, no
+//! `midbuild_lease_superseded`. So one flaked subprocess takes down every
+//! recovery-path test *and* the positive-control leg of every
+//! refuse-to-destroy test at once, while the pure-refusal tests pass. That
+//! pattern — 6-8 `midbuild_*` failures under `cargo test --lib`, 90/90 green
+//! when the module is re-run alone — is this, not a regression in the guards.
+//!
+//! Issue #8170 measured it directly: the module was run in its **own process**
+//! three times while the rest of the suite ran concurrently in a second
+//! process, saturating the same host (same `lsof`, same `git`, same disk, same
+//! CPU). 90/90 passed on all three runs. Host-level interference — including
+//! the operator's concurrent `git worktree` activity suspected in the report —
+//! is therefore ruled out; the interference is intra-process.
+//!
+//! `#[serial]` cannot fix it (its lock is advisory and only binds *marked*
+//! tests, while the mutating tests are unmarked), and neither can anything
+//! inside this module: the shared resource is the process environment itself.
+//! The structural fix is the one the repo already ships — **run the suite
+//! under `cargo nextest run`, one process per test** (`.config/nextest.toml`,
+//! which is what CI uses). What #8170 *did* change here is the part that is
+//! fixable locally: [`make_dirty_git_worktree`] is now hermetic with respect
+//! to the host's git config and asserts its own dirty post-condition, so a
+//! torn or host-perturbed `git` surfaces at the fixture with an explanation
+//! instead of as an unrelated-looking assertion five layers up.
+//!
+//! Do not "fix" a failure here by loosening an assertion. These are
+//! refuse-to-destroy guards (#4449/#4556/#4564/#7612); their strictness is the
+//! whole point.
+
 use super::*;
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
