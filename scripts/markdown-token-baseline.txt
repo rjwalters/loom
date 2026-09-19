@@ -29,7 +29,7 @@
 12846 defaults/.claude/commands/loom/champion-reference.md
 3749 defaults/.claude/commands/loom/champion.md
 1100 defaults/.claude/commands/loom/comment-body-literal-path.md
-34692 defaults/.claude/commands/loom/curator.md
+35476 defaults/.claude/commands/loom/curator.md
 21961 defaults/.claude/commands/loom/doctor.md
 131 defaults/.claude/commands/loom/driver.md
 2998 defaults/.claude/commands/loom/epic.md
@@ -38,8 +38,8 @@
 9970 defaults/.claude/commands/loom/hermit-patterns.md
 5868 defaults/.claude/commands/loom/hermit.md
 4102 defaults/.claude/commands/loom/imagine.md
-2438 defaults/.claude/commands/loom/judge-reference.md
-42034 defaults/.claude/commands/loom/judge.md
+2437 defaults/.claude/commands/loom/judge-reference.md
+42032 defaults/.claude/commands/loom/judge.md
 316 defaults/.claude/commands/loom/loom-iteration.md
 254 defaults/.claude/commands/loom/loom-parent.md
 9385 defaults/.claude/commands/loom/loom.md
@@ -48,7 +48,7 @@
 11546 defaults/.claude/commands/loom/sweep-backend-detection.md
 5186 defaults/.claude/commands/loom/sweep-dry-run.md
 1949 defaults/.claude/commands/loom/sweep-examples.md
-18400 defaults/.claude/commands/loom/sweep-execution-model.md
+18399 defaults/.claude/commands/loom/sweep-execution-model.md
 5176 defaults/.claude/commands/loom/sweep-mode-c-lifecycle.md
 7291 defaults/.claude/commands/loom/sweep-reference.md
 4266 defaults/.claude/commands/loom/sweep-run-hygiene.md
