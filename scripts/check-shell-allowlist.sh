@@ -28,6 +28,15 @@
 #      STUB_MAX_CODE_LINES code lines AND a last code line that is `exec`. The
 #      one category meant to be easy to claim is the one a human never has to
 #      take on trust — that is what stops the allowlist becoming a rubber stamp.
+#   6. A `settled` entry is MACHINE-CHECKED against both admission halves, on
+#      every run (#8237): zero fix-commits in the trailing SETTLED_FIX_WINDOW
+#      (the same window and the same fix/revert/hotfix test the shell-budget
+#      churn report uses), AND no irreversible operation anywhere in the file.
+#      Membership is therefore a rolling measurement rather than a permanent
+#      verdict — the moment a settled script takes a fix, this gate fails and
+#      the script returns to `contract` without anyone deciding to revisit it.
+#      `settled` is baseline-only for the same reason `contract` is: a file
+#      with no history has zero fixes only vacuously.
 #
 # Scope: `git ls-files '*.sh'`, minus `.loom/**` and build output. `.loom/scripts`
 # is a symlink to `defaults/scripts` here and a resync copy downstream, and
@@ -60,10 +69,31 @@
 
 set -euo pipefail
 
-VALID_CATEGORIES="bootstrap hook-entry vendored stub contract test"
-# Categories a NEW file may claim. `contract` is absent by construction.
+VALID_CATEGORIES="bootstrap hook-entry vendored stub contract settled test"
+# Categories a NEW file may claim. `contract` and `settled` are absent by
+# construction: neither "something already calls it by name" nor "it has taken
+# no fixes in six months" can be true of a file that did not exist yet.
 NEW_CATEGORIES="bootstrap hook-entry vendored stub test"
 STUB_MAX_CODE_LINES=40
+
+# --- `settled` admission (#8237) ---------------------------------------------
+# The trailing window, kept in step with `shell_budget::churn::WINDOW` and its
+# fix/revert/hotfix subject test so the category and the progress report cannot
+# disagree about what a fix is.
+SETTLED_FIX_WINDOW="6.months"
+
+# The irreversible-operation screen. Deliberately crude, and deliberately
+# ASYMMETRIC: a false positive costs nothing (the script simply stays
+# `contract`, i.e. in scope for the epic), while a false negative admits a
+# script that can destroy data. `loom-stop.sh` trips this on 12 lines and has
+# zero fixes in six months — quiet is not the same as safe, and a rarely-exercised script
+# with a latent data-loss bug is worse, not better, because nothing has forced
+# the bug into the open yet.
+#
+# A leading space is prepended to each line before matching, so the alternation
+# can require a non-word character before `rm`/`kill` without an anchor inside
+# a group (which not every awk accepts).
+IRREVERSIBLE_RE='[^[:alnum:]_-](rm[[:space:]]+-[[:alnum:]]*[rRf]|kill[[:space:]]|pkill[[:space:]]|killall[[:space:]])|git[[:space:]]+push|--force|git[[:space:]]+reset[[:space:]]+--hard|git[[:space:]]+worktree[[:space:]]+remove|gh[[:space:]]+[a-z-]+[[:space:]]+(create|edit|delete|close|merge|comment|reopen|ready|upload|rename|transfer|archive)|gh[[:space:]]+api[^|]*(-X|--method)[[:space:]]*(POST|PUT|PATCH|DELETE)'
 
 MODE="check"
 ROOT_ARG=""
@@ -73,7 +103,7 @@ while [ $# -gt 0 ]; do
     --list)      MODE="list"; shift ;;
     --self-test) MODE="self-test"; shift ;;
     --root)      ROOT_ARG="${2:?--root needs a directory}"; shift 2 ;;
-    --help|-h)   sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h)   sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           echo "check-shell-allowlist: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -144,6 +174,78 @@ is_shape_a_stub() { # <abs path> -> 0 if it satisfies the trivial-glue cap
   esac
 }
 
+# --- `settled` admission checks ----------------------------------------------
+# ONE `git log` pass per run, built on first use. A per-entry walk would be one
+# six-month history scan per settled script, on a gate that runs on every PR.
+build_fix_index() { # <tmpdir>
+  local tmp="$1"
+  [ -f "$tmp/fixes.state" ] && return 0
+  if [ "$(git -C "$ROOT" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    : > "$tmp/fixes.tsv"
+    printf 'shallow\n' > "$tmp/fixes.state"
+    return 0
+  fi
+  ( cd "$ROOT" && git log --since="$SETTLED_FIX_WINDOW" --name-only --format='@@@%h %s' 2>/dev/null ) \
+    | awk '
+        /^@@@/ {
+          rec = substr($0, 4)
+          hash = rec; sub(/ .*/, "", hash)
+          subj = rec; sub(/^[^ ]*[ ]?/, "", subj)
+          low = tolower(subj)
+          isfix = (low ~ /^fix/ || low ~ /^revert/ || low ~ /^hotfix/)
+          next
+        }
+        { if ($0 != "" && isfix) printf "%s\t%s\t%s\n", $0, hash, subj }
+      ' > "$tmp/fixes.tsv"
+  printf 'ok\n' > "$tmp/fixes.state"
+}
+
+# The window's fix-commits touching <path>, at most 3, `<hash> <subject>` each.
+settled_fix_commits() { # <tmpdir> <repo-relative path>
+  awk -F'\t' -v p="$2" '$1 == p && n < 3 { n++; printf "%s %s\n", $2, $3 }' "$1/fixes.tsv"
+}
+
+# The first code line performing an irreversible operation, as `<lineno>:<text>`.
+first_irreversible_line() { # <abs path>
+  awk -v re="$IRREVERSIBLE_RE" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line == "") next
+      if (substr(line, 1, 1) == "#") next
+      if ((" " $0) ~ re) { printf "%d:%s\n", NR, line; exit }
+    }
+  ' "$1" 2>/dev/null
+}
+
+check_settled_entry() { # <tmpdir> <repo-relative path>
+  local tmp="$1" path="$2" fixes hit n
+  # Half 1 — zero fix-commits in the window. This is the rolling re-check: the
+  # evidence for the claim is re-derived on every run, so a script that starts
+  # misbehaving re-enters scope by itself rather than sitting on a curated list
+  # that nobody revisits.
+  build_fix_index "$tmp"
+  if [ "$(cat "$tmp/fixes.state" 2>/dev/null)" = "shallow" ]; then
+    if [ ! -f "$tmp/shallow.warned" ]; then
+      : > "$tmp/shallow.warned"
+      err "the manifest has 'settled' entries, whose admission is 'zero fix-commits in the last $SETTLED_FIX_WINDOW', but this is a SHALLOW clone with no history to measure that against. A gate that cannot tell 'checked, fine' from 'could not check' reports OK forever — check out with full history (\`fetch-depth: 0\`)."
+    fi
+  else
+    fixes="$(settled_fix_commits "$tmp" "$path")"
+    if [ -n "$fixes" ]; then
+      n="$(printf '%s\n' "$fixes" | wc -l | tr -d ' ')"
+      err "entry '$path' claims 'settled' but took a fix-commit in the last $SETTLED_FIX_WINDOW ($n shown): $(printf '%s' "$fixes" | tr '\n' ';') — 'settled' means the script has not needed fixing, so it is no longer settled: move the entry back to 'contract'."
+    fi
+  fi
+  # Half 2 — no irreversible operations. Necessary on its own: 26 of the quiet
+  # scripts perform them, and a file with no commits at all passes half 1
+  # vacuously.
+  hit="$(first_irreversible_line "$ROOT/$path")"
+  if [ -n "$hit" ]; then
+    err "entry '$path' claims 'settled' but performs an irreversible operation at line ${hit%%:*}: ${hit#*:} — settled means low blast radius, and quiet is not the same as safe. Keep it as 'contract'."
+  fi
+}
+
 is_in_list() { # <needle> <space-separated haystack>
   local needle="$1" item
   for item in $2; do
@@ -211,7 +313,7 @@ run_check() {
       err "entry '$path' ($category) has no reason — format: '<path>  <category>  <reason>'"
     fi
     if [ "$section" = "new" ] && ! is_in_list "$category" "$NEW_CATEGORIES"; then
-      err "entry '$path' claims '$category' in the @section new block. A file that did not exist yet cannot already be invoked by name; use one of: $NEW_CATEGORIES — or make it a loom-daemon subcommand."
+      err "entry '$path' claims '$category' in the @section new block. A file that did not exist yet cannot already be invoked by name, nor have a $SETTLED_FIX_WINDOW record of never needing a fix; use one of: $NEW_CATEGORIES — or make it a loom-daemon subcommand."
     fi
     if ! in_scope "$path"; then
       err "entry '$path' is outside this manifest's scope (tracked *.sh, excluding .loom/ and build output)"
@@ -220,6 +322,9 @@ run_check() {
     if [ ! -f "$ROOT/$path" ]; then
       err "manifest references nonexistent file: $path — delete the entry"
       continue
+    fi
+    if [ "$category" = "settled" ]; then
+      check_settled_entry "$tmp" "$path"
     fi
     if [ "$category" = "stub" ] && ! is_shape_a_stub "$ROOT/$path"; then
       err "entry '$path' claims 'stub' but fails the trivial-glue cap: it must be under $STUB_MAX_CODE_LINES code lines AND end in \`exec\` (it is $(code_line_count "$ROOT/$path") code lines, last code line: '$(last_code_line "$ROOT/$path")')"
@@ -428,12 +533,62 @@ defaults/scripts/gone.sh  test  Tests something that no longer exists.
   _run; _expect "duplicate entry fails" 1 "$got"
   _expect_match "names the duplicate" 'duplicate entries' "$out"
 
-  # 10. A missing manifest fails rather than passing vacuously.
+  # 10-13. `settled` is machine-checked on BOTH admission halves (#8237).
+  # Same treatment `stub` gets: the categories that are easy to claim are the
+  # ones a human never has to take on trust.
+  printf '#!/usr/bin/env bash\necho quiet\n' > "$tmp/scripts/quiet.sh"
+  printf '#!/usr/bin/env bash\nrm -rf "$1"\n' > "$tmp/scripts/dangerous.sh"
+  git -C "$tmp" add -A >/dev/null && git -C "$tmp" commit -qm "feat: settled fixtures"
+
+  local settled_base
+  settled_base='# @section baseline
+defaults/scripts/listed.sh  contract  Invoked by name.
+scripts/good-stub.sh        stub      Shape-A stub.
+scripts/not-a-stub.sh       contract  Invoked by name.
+scripts/too-long.sh         contract  Invoked by name.
+'
+
+  # 10. Quiet AND low blast radius: admitted.
+  printf '%s%s' "$settled_base" 'scripts/quiet.sh            settled   Quiet, low blast radius, not a port target.
+scripts/dangerous.sh        contract  Invoked by name.
+' | _manifest
+  _run; _expect "a quiet, low-blast-radius settled entry passes" 0 "$got"
+
+  # 11. Quiet but DANGEROUS: refused, naming the line. Necessary on its own —
+  #     a script with no history passes half 1 vacuously.
+  printf '%s%s' "$settled_base" 'scripts/quiet.sh            contract  Invoked by name.
+scripts/dangerous.sh        settled   Claims settled but deletes trees.
+' | _manifest
+  _run; _expect "settled entry with an irreversible operation fails" 1 "$got"
+  _expect_match "names the offending line" 'irreversible operation at line 2' "$out"
+  _expect_match "quotes the line itself" 'rm -rf' "$out"
+
+  # 12. The ROLLING re-check: a fix lands, and the claim expires by itself.
+  printf '#!/usr/bin/env bash\necho quiet\necho patched\n' > "$tmp/scripts/quiet.sh"
+  git -C "$tmp" add -A >/dev/null
+  git -C "$tmp" commit -qm "fix: quiet.sh mishandled an empty argument" >/dev/null
+  printf '%s%s' "$settled_base" 'scripts/quiet.sh            settled   Quiet, low blast radius, not a port target.
+scripts/dangerous.sh        contract  Invoked by name.
+' | _manifest
+  _run; _expect "settled entry that took a fix in the window fails" 1 "$got"
+  _expect_match "names the fix commit" 'mishandled an empty argument' "$out"
+  _expect_match "says the claim has expired" 'no longer settled' "$out"
+
+  # 13. `settled` is baseline-only: zero fixes is vacuous without history.
+  printf '%s%s' "$settled_base" 'scripts/quiet.sh            contract  Invoked by name.
+
+# @section new
+scripts/dangerous.sh        settled   Brand new, therefore never fixed.
+' | _manifest
+  _run; _expect "settled in @section new fails" 1 "$got"
+  _expect_match "explains why settled is unavailable to new files" 'never needing a fix' "$out"
+
+  # 14. A missing manifest fails rather than passing vacuously.
   rm -f "$tmp/scripts/shell-allowlist.txt"
   _run; _expect "missing manifest fails" 1 "$got"
   _expect_match "names the missing manifest" 'missing manifest' "$out"
 
-  # 11. A non-git tree fails rather than reporting OK on zero files.
+  # 15. A non-git tree fails rather than reporting OK on zero files.
   local nogit
   nogit="$(mktemp -d)"
   mkdir -p "$nogit/scripts"

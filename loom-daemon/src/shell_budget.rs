@@ -53,6 +53,22 @@ pub const PORTABLE: &[&str] = &["contract", "hook-entry"];
 pub const FLOOR: &[&str] = &["bootstrap", "vendored"];
 /// What a fully ported file becomes: under 40 code lines, ending in `exec`.
 pub const STUB: &str = "stub";
+/// Shell we are deliberately keeping (#8237): it works, its blast radius is
+/// small, and nobody intends to port it.
+///
+/// It is in neither [`PORTABLE`] nor [`FLOOR`] on purpose. `bootstrap` means
+/// "runs before a `loom-daemon` binary exists" and `vendored` means "the
+/// canonical copy is upstream" — both are claims that the file *cannot* be
+/// Rust. `settled` is a claim that it *will not be*, which is a different
+/// thing and must not be laundered into the permanent floor.
+///
+/// Membership is a rolling measurement, not a verdict:
+/// `scripts/check-shell-allowlist.sh` re-derives both admission halves on
+/// every run — zero fix-commits in the trailing six-month window (the same
+/// window and the same fix/revert/hotfix test [`churn`] uses) AND no
+/// irreversible operations. A script that starts misbehaving re-enters scope
+/// by itself.
+pub const SETTLED: &str = "settled";
 /// The trivial-glue cap: STRICTLY under this many code lines, a file cannot
 /// be carrying logic. The gate compares with `-lt`, so 40 is over the cap,
 /// not at it. `scripts/check-shell-allowlist.sh` (`STUB_MAX_CODE_LINES`)
@@ -104,6 +120,27 @@ impl Budget {
     #[must_use]
     pub fn stubbed(&self) -> u64 {
         self.by_category.get(STUB).copied().unwrap_or(0)
+    }
+
+    /// Shell deliberately kept rather than ported — descoped, not retired.
+    #[must_use]
+    pub fn settled(&self) -> u64 {
+        self.by_category.get(SETTLED).copied().unwrap_or(0)
+    }
+
+    /// The pool that is comparable with the epic-start denominator.
+    ///
+    /// Every `settled` script was `contract` or `hook-entry` when
+    /// `origin_portable` was measured — `settled` is baseline-only, so nothing
+    /// can enter it from outside the portable pool. Measuring progress against
+    /// `portable()` alone would therefore hand the very change that introduced
+    /// the category 3,533 lines of "net retired" — 44 scripts, for editing one
+    /// column of the allowlist. Reclassification moves
+    /// lines BETWEEN the two components of this sum and leaves the sum alone,
+    /// which is exactly the property the epic-start comparison needs.
+    #[must_use]
+    pub fn comparable(&self) -> u64 {
+        self.portable() + self.settled()
     }
 
     #[must_use]
@@ -255,7 +292,11 @@ pub fn measure(root: &Path) -> Result<Budget, String> {
 #[must_use]
 pub fn render_report(budget: &Budget, origin_portable: u64) -> String {
     let portable = budget.portable();
-    let net = i128::from(portable) - i128::from(origin_portable);
+    // Against `comparable()`, NOT `portable()` (#8237 constraint 1). See
+    // `Budget::comparable`: reclassifying a script `contract` -> `settled` must
+    // not read as progress, and computing this from `portable()` would improve
+    // it by the whole reclassified figure for doing no work at all.
+    let net = i128::from(budget.comparable()) - i128::from(origin_portable);
     let direction = if net > 0 {
         format!("+{net} — the pool has GROWN since the epic began")
     } else if net < 0 {
@@ -283,11 +324,20 @@ pub fn render_report(budget: &Budget, origin_portable: u64) -> String {
         budget.stubbed()
     ));
     s.push_str(&format!(
+        "  settled (descoped)   {:>7}   deliberately kept shell — DESCOPED, not retired\n",
+        budget.settled()
+    ));
+    s.push_str(&format!(
         "  ----------------------------\n  total production     {:>7}   across {} files\n\n",
         budget.total(),
         budget.file_count()
     ));
     s.push_str(&format!("  net vs epic start    {direction}\n"));
+    s.push_str(
+        "                       measured on portable + settled, so moving a script into\n  \
+         \x20                    `settled` cannot improve this figure — descoping is not\n  \
+         \x20                    retiring\n",
+    );
     s.push_str(&format!("  still to retire      {retirable:>7}\n"));
     s.push_str("\n  by category:\n");
     for (cat, lines) in &budget.by_category {
@@ -296,6 +346,8 @@ pub fn render_report(budget: &Budget, origin_portable: u64) -> String {
             "port target"
         } else if FLOOR.contains(&cat.as_str()) {
             "stays shell"
+        } else if cat == SETTLED {
+            "descoped"
         } else {
             "ported"
         };
@@ -674,6 +726,18 @@ pub fn check_against_rev(
         return Err(portable_growth_message(now, before, base_desc));
     }
 
+    // `settled` may shrink, never grow — per FILE, and with no override
+    // (#8237 constraint 2). This is deliberately NOT the floor-growth path: a
+    // `Shell-Budget-Growth:` trailer buys a larger permanent floor, and
+    // `settled` is not the floor. Without an unconditional check here the
+    // category is a laundering route — an author blocked by the portable leg
+    // reclassifies the script, then grows it freely behind an overridable
+    // total-growth check. The category buys exemption from being PORTED, never
+    // permission to expand.
+    if let Some(why) = settled_growth_message(now, before, base_desc) {
+        return Err(why);
+    }
+
     // Total is checked too, as a delta. Dropping it entirely (as the first cut
     // of this redesign did) opened two holes review reproduced: a 500-line
     // `bootstrap` script passed, and recategorising a 639-line file
@@ -722,10 +786,18 @@ pub fn check_against_rev(
             // to launder 20 new portable lines past a declaration after the
             // first per-file cut shipped. Reading only the count re-opened the
             // hole the deleted `recategorised_since` used to cover.
+            //
+            // `settled` counts on the NOW side as well as `PORTABLE`, and only
+            // because the check immediately above makes it safe: a settled file
+            // can never grow, so it cannot be the destination the laundering
+            // needs. Without this, the very act of moving a file
+            // `contract` -> `settled` reads as "30 -> gone" and every
+            // reclassification PR that adds a single shell line anywhere is
+            // refused — the feature would be unlandable rather than guarded.
             let now_lines = now
                 .by_file
                 .get(path)
-                .filter(|(c, _)| PORTABLE.contains(&c.as_str()))
+                .filter(|(c, _)| PORTABLE.contains(&c.as_str()) || c == SETTLED)
                 .map_or(0, |(_, n)| *n);
             if now_lines < *before_lines {
                 lost.push((path, *before_lines, now_lines));
@@ -802,6 +874,66 @@ pub fn check_against_rev(
     Ok(())
 }
 
+/// The `settled` ratchet: no file in that category may have MORE code lines
+/// than it did at the base, and no file may appear there that was not there
+/// before.
+///
+/// Per-file rather than per-category, because the category total is not a
+/// ratchetable number at all: the change that POPULATES `settled` raises it
+/// from 0 to several thousand, and a category-level rule would refuse exactly
+/// the reclassification the category exists for. What must not happen is a
+/// settled FILE getting bigger, and that is what this measures — against the
+/// file's line count at the base whatever category it held there, so
+/// "reclassify and grow in one move" is refused too.
+///
+/// A file that is settled now and absent at the base is refused as well.
+/// `settled` is baseline-only in `scripts/check-shell-allowlist.sh`, so this
+/// is a second, independent expression of the same rule: a brand-new script
+/// has zero fixes only vacuously, and vacuous quiet is not evidence.
+fn settled_growth_message(now: &Budget, before: &Budget, base_desc: &str) -> Option<String> {
+    let mut grew: Vec<(&String, u64, u64)> = Vec::new();
+    for (path, (cat, now_lines)) in &now.by_file {
+        if cat != SETTLED {
+            continue;
+        }
+        let was = before.by_file.get(path).map_or(0, |(_, n)| *n);
+        if *now_lines > was {
+            grew.push((path, was, *now_lines));
+        }
+    }
+    if grew.is_empty() {
+        return None;
+    }
+    let detail = grew
+        .iter()
+        .map(|(p, was, is)| {
+            if *was == 0 {
+                format!("    {p}  new -> {is}")
+            } else {
+                format!("    {p}  {was} -> {is}  (+{})", is - was)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(format!(
+        "This change GROWS shell in the `{SETTLED}` category (vs {base_desc}):\n\n{detail}\n\n\
+         `{SETTLED}` is shell this repo has deliberately decided to keep: quiet (no fix-commits \
+         in the trailing six-month window), low blast radius (no irreversible operations), and \
+         not a port target. That buys exemption from being PORTED. It does not buy permission to \
+         EXPAND, and there is no `{GROWTH_TRAILER}` override for it — otherwise any author \
+         blocked by the portable ratchet could reclassify a script and then grow it freely.\n\n\
+         Options, best first:\n\n\
+         \x20 1. Put the new logic in the daemon instead (.loom/docs/shell-language-policy.md).\n\
+         \x20 2. If the script genuinely needs this change, it is no longer settled: move its\n\
+         \x20    allowlist entry back to `contract` in the same change. It rejoins the portable\n\
+         \x20    pool, and the portable ratchet then applies to it like any other script.\n\
+         \x20 3. A brand-new file may not be `{SETTLED}` at all. Zero fixes is vacuous for a file\n\
+         \x20    with no history, so the category is baseline-only.\n\n\
+         Note this compares against the MERGE-BASE, so it is measuring what YOUR change did."
+    ))
+}
+
 /// The portable-growth explanation, split out so both callers read the same.
 fn portable_growth_message(now: &Budget, before: &Budget, base_desc: &str) -> String {
     let mut grew: Vec<(&String, u64, u64)> = Vec::new();
@@ -830,7 +962,12 @@ fn portable_growth_message(now: &Budget, before: &Budget, base_desc: &str) -> St
          \x20 2. Remove portable shell elsewhere in the same change to pay for it.\n\
          \x20 3. If the script must stay shell forever, it may belong in `bootstrap` or\n\
          \x20    `vendored` rather than `contract` — but that is a claim about the script,\n\
-         \x20    argued in scripts/shell-allowlist.txt, not a way around this number.\n\n\
+         \x20    argued in scripts/shell-allowlist.txt, not a way around this number.\n\
+         \x20 4. If it is shell we are deliberately KEEPING — quiet, low blast radius, and\n\
+         \x20    nobody intends to port it — it may belong in `settled` (#8237). That is a\n\
+         \x20    mechanical claim, machine-checked on every run by\n\
+         \x20    scripts/check-shell-allowlist.sh, and it does NOT let the file grow: a\n\
+         \x20    settled file may shrink, never expand, with no override.\n\n\
          Note this compares against the MERGE-BASE, so it is measuring what YOUR change did.\n\
          Whatever main did meanwhile is not your problem and not this gate's business.",
         now.portable() - before.portable(),

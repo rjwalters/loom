@@ -154,3 +154,45 @@ fn the_progress_denominator_is_the_pre_epic_figure() {
          say so in the commit."
     );
 }
+
+/// #8237 constraint 1, against the REAL tree rather than a fixture.
+///
+/// The unit tests pin the arithmetic; this pins that the arithmetic is wired to
+/// the manifest actually shipped. Un-settling the whole population — folding
+/// every `settled` line back into `contract`, which is where each of them came
+/// from — must leave `net vs epic start` exactly where it was. If it does not,
+/// the category has been made to pay progress for an allowlist edit.
+#[test]
+fn settling_scripts_cannot_improve_the_epic_figure_on_the_real_tree() {
+    let root = repo_root();
+    let budget = shell_budget::measure(&root).expect("measure");
+    let origin = shell_budget::read_origin_portable(&root).expect("origin_portable");
+
+    let settled = budget.settled();
+    assert!(
+        settled > 0,
+        "the manifest carries no `settled` entries, so this invariant is untested rather than \
+         upheld — see .loom/docs/shell-language-policy.md"
+    );
+
+    // What the tree would have measured with the category never introduced.
+    let mut unsettled = budget.clone();
+    unsettled.by_category.remove(shell_budget::SETTLED);
+    *unsettled
+        .by_category
+        .entry("contract".to_string())
+        .or_default() += settled;
+
+    assert_eq!(
+        i128::from(budget.comparable()) - i128::from(origin),
+        i128::from(unsettled.comparable()) - i128::from(origin),
+        "reclassifying {settled} lines as `settled` changed the epic figure — descoping is not \
+         retiring, and the report must not say otherwise"
+    );
+    assert_eq!(
+        unsettled.portable(),
+        budget.comparable(),
+        "every settled script came out of the portable pool, so folding them back must \
+         reproduce `comparable()` exactly"
+    );
+}
