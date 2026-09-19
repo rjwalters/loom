@@ -257,6 +257,17 @@ Full convention and rationale: `.loom/docs/untrusted-external-content.md`.
 
 For each `loom:pr` PR, verify ALL 6 safety criteria. If ANY criterion fails, do NOT merge.
 
+### 0. Trusted-Bot Dependency-PR Pre-Check (opt-in, #4765)
+
+Off by default. One cheap call, no forge reads, decides whether it applies:
+`./.loom/scripts/champion-bot-pr.sh config >/dev/null 2>&1`.
+
+- **Non-zero** (the default, or no `loom-daemon`) → ignore this section; nothing
+  in this file changes.
+- **Zero** → read and follow `champion-bot-pr.md` first. It classifies the PR
+  deterministically; one it does **not** qualify falls straight back here with
+  no waivers of any kind.
+
 ### 1. Label Check
 - [ ] PR has `loom:pr` label (Judge approval)
 - [ ] That approval is **not stale** — the Verdict-State Janitor's Part 2 above returned `0` (FRESH) or `11` (UNVERIFIABLE), never `12` (STALE). A `loom:pr` label rendered against a head SHA that has since moved is not an approval of the tree you are about to merge (#5686).

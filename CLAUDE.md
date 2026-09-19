@@ -230,6 +230,7 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   self-update, epic supervisor: [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)
   §Operability (precedence **env > config > default**; daemon defaults FLAGS-OFF).
 - **Post-Builder quality gate (`buildGate`)** — [`.loom/docs/build-gate.md`](.loom/docs/build-gate.md).
+- **Bot dependency-PR auto-merge (`champion.autoMergeDependabot`, opt-in)** — [`champion-bot-prs`](.loom/docs/champion-bot-prs.md).
 - **Runtime dispatch (`runtimes`)** — `spawn-worker.sh` selects the worker runtime
   (`LOOM_RUNTIME` env > `runtimes.default` > `"claude"`), execing `spawn-<runtime>.sh`:
   [`.loom/docs/runtime-adapters.md`](.loom/docs/runtime-adapters.md).

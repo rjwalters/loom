@@ -1,0 +1,1 @@
+../../defaults/docs/champion-bot-prs.md

@@ -132,6 +132,7 @@ pub mod admission_brake;
 pub mod agent_session;
 pub mod auto_update;
 pub mod autonomy_marker;
+pub mod bot_pr;
 pub mod build_slot;
 pub mod calibrate;
 pub mod capability;

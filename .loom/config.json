@@ -138,6 +138,9 @@
   "sweep": {
     "modelExperiment": "observe"
   },
+  "champion": {
+    "autoMergeDependabot": true
+  },
   "guide": {
     "docsMaintenance": {
       "poolPressureThreshold": 0.7,

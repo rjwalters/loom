@@ -18,6 +18,13 @@ use anyhow::Result;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ScriptPortCommand {
+    /// Champion's trusted-bot dependency-PR classifier (#4765), behind
+    /// `champion-bot-pr.sh`. Decides whether a PR is a trusted-bot,
+    /// dependency-manifest-only change whose size and critical-file criteria
+    /// may be waived. Exit 0 qualifies, 1 does not — a verdict, not an error.
+    #[command(subcommand)]
+    BotPr(super::bot_pr::BotPrCommand),
+
     /// Champion's dependency-classification family (PR 3):
     /// `classify-dependency-block`, `detect-dependency-cycle`,
     /// `detect-startable-subset`.
@@ -64,6 +71,7 @@ impl ScriptPortCommand {
     /// the stubs' callers branch on.
     pub(crate) fn run(self) -> Result<()> {
         match self {
+            ScriptPortCommand::BotPr(cmd) => cmd.run(),
             ScriptPortCommand::DepClassify(cmd) => cmd.run(),
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
             ScriptPortCommand::ReleaseFetch(args) => args.run(),

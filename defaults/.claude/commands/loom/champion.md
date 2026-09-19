@@ -253,6 +253,7 @@ Champion uses context-specific instruction files to keep token usage efficient:
 | File | Purpose | When to Load |
 |------|---------|--------------|
 | `champion-pr-merge.md` | PR auto-merge workflow + capped-PR recovery pass | Priority 1 or 5 work found |
+| `champion-bot-pr.md` | Trusted-bot dependency-PR class (opt-in, #4765) | `champion-bot-pr.sh config` exits 0 |
 | `champion-issue-promo.md` | Issue promotion workflow | Priority 2/3 work found |
 | `champion-epic.md` | Epic evaluation workflow | Priority 4 work found |
 | `champion-reference.md` | Edge cases and scripts | Complex situations |
