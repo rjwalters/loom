@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{ClaudeConfigAction, ForgeAction, PinAction, TokensAction};
 
+mod select_cmd;
+
 /// Resolve the `--workspace` flag to an absolute path. No upward `.git`
 /// walk (unlike Python's `find_repo_root()`) — a deliberate Phase-1
 /// simplification since this CLI has no existing callers yet; pass the
@@ -568,7 +570,7 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
-    use loom_daemon::tokens_pool::{allowlist, bad_tokens, failure_counts, select};
+    use loom_daemon::tokens_pool::{allowlist, bad_tokens, failure_counts};
 
     match action {
         TokensAction::Select {
@@ -578,148 +580,16 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             no_key,
             auto_unpin,
             model,
-        } => {
-            // #5609 (design D8/D9): parsed through `AccountProvider`'s
-            // `FromStr` rather than compared against two hardcoded string
-            // literals, so the valid vocabulary has exactly one definition
-            // and the error message enumerates it from that same place.
-            let provider: loom_daemon::tokens_pool::AccountProvider =
-                provider.parse().map_err(|error| anyhow!("{error}"))?;
-            let ws = resolve_tokens_workspace(&workspace)?;
-            // Resolved workspace (issue #4948, suggested-fix option 3) —
-            // always stderr so `--export`'s stdout stays eval-safe and
-            // `--json`'s (non-`--export`) stdout stays a bare JSON object.
-            eprintln!("Resolved workspace: {}", ws.display());
-            if provider == loom_daemon::tokens_pool::AccountProvider::Codex {
-                let selected = loom_daemon::tokens_pool::select_account(&ws, provider)
-                    .map_err(|error| anyhow!(error))?;
-                let directory = match &selected.binding {
-                    loom_daemon::tokens_pool::AccountBinding::CodexHome { directory } => directory,
-                    _ => unreachable!("Codex selection returned a non-Codex binding"),
-                };
-                if export {
-                    println!(
-                        "export CODEX_HOME={}",
-                        shell_single_quote(&directory.display().to_string())
-                    );
-                    println!(
-                        "export LOOM_ACCOUNT_PROVIDER='{}'\nexport LOOM_ACCOUNT_NAME={}",
-                        selected.id.provider,
-                        shell_single_quote(&selected.id.name)
-                    );
-                    // #5609 AC 6: alongside the existing PROVIDER/NAME pair,
-                    // so a dispatched sweep can be correlated back to the
-                    // exact upstream account. Codex's storage backend has no
-                    // upstream id to carry (see `SelectedAccount::upstream_id`
-                    // doc comment), so this is a no-op today and becomes live
-                    // the day a Codex-backed `ProviderAdapter` gains one.
-                    if let Some(upstream_id) = &selected.upstream_id {
-                        println!(
-                            "export LOOM_ACCOUNT_UPSTREAM_ID={}",
-                            shell_single_quote(upstream_id)
-                        );
-                    }
-                    println!("LOOM_TOKEN_MODE='{}'", selected.mode);
-                } else {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "provider": selected.id.provider.to_string(),
-                            "name": selected.id.name,
-                            "upstream_id": selected.upstream_id,
-                            "credential_kind": "codex_home",
-                            "credential_reference": directory,
-                            "mode": selected.mode,
-                        })
-                    );
-                }
-                return Ok(());
-            }
-            debug_assert_eq!(provider, loom_daemon::tokens_pool::AccountProvider::Claude);
-            if auto_unpin {
-                if let Some(msg) = loom_daemon::tokens_pool::maybe_auto_unpin(&ws) {
-                    eprintln!("{msg}");
-                }
-            }
-            // Routine `.bad_tokens` hygiene (#4643). `cleanup_bad_tokens` had
-            // zero callers in the whole tree, so pools accumulated expired
-            // exhaustion entries forever (the live shared pool still held
-            // days-old lines). Selection is the routine path every spawn takes,
-            // and pruning is behavior-neutral — `is_bad` already ignores
-            // aged-out entries — so this only bounds the file. Best-effort:
-            // never let a cleanup failure block a spawn, and no lock is taken
-            // at all when there is nothing to prune.
-            let _ = bad_tokens::cleanup_bad_tokens(&ws, bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS);
-            // #8058: `--model` narrows the `.bad_tokens` skip to the
-            // model class this spawn will actually run. `None`, or a model the
-            // classifier does not recognize, degrades to account-wide
-            // selection — selection must never fail closed on a model name it
-            // does not know.
-            match select::select_token_for_model(&ws, None, model.as_deref()) {
-                Ok(sel) => {
-                    if export {
-                        if no_key {
-                            println!(
-                                "# selected={} mode={} file={}",
-                                sel.name,
-                                sel.mode,
-                                sel.file.display()
-                            );
-                        } else {
-                            // Tokens are base64/hex-like and never contain a
-                            // single quote in practice; this is a simple
-                            // wrap, not a full Python repr() escape.
-                            println!("export CLAUDE_CODE_OAUTH_TOKEN='{}'", sel.key);
-                            // Shell-evalable (issue #4228): lets
-                            // spawn-claude.sh / claude-wrapper.sh `eval` this
-                            // output directly instead of round-tripping
-                            // through `python3 -c 'import json...'`.
-                            println!("export LOOM_TOKEN_NAME='{}'", sel.name);
-                            // #5609 AC 6: alongside the existing
-                            // LOOM_TOKEN_NAME, so a dispatched sweep can be
-                            // correlated back to the exact upstream account.
-                            // `None` for a `.token` file with no `index.json`
-                            // row (fail-open pool) — never fabricated.
-                            if let Some(upstream_id) = &sel.upstream_id {
-                                println!("export LOOM_ACCOUNT_UPSTREAM_ID='{upstream_id}'");
-                            }
-                            println!("LOOM_TOKEN_MODE='{}'", sel.mode);
-                            println!(
-                                "# selected={} mode={} file={}",
-                                sel.name,
-                                sel.mode,
-                                sel.file.display()
-                            );
-                        }
-                    } else {
-                        let mut obj = serde_json::Map::new();
-                        obj.insert("name".to_string(), serde_json::Value::String(sel.name));
-                        obj.insert(
-                            "provider".to_string(),
-                            serde_json::Value::String(provider.to_string()),
-                        );
-                        obj.insert("upstream_id".to_string(), serde_json::json!(sel.upstream_id));
-                        obj.insert(
-                            "file".to_string(),
-                            serde_json::Value::String(sel.file.display().to_string()),
-                        );
-                        obj.insert(
-                            "mode".to_string(),
-                            serde_json::Value::String(sel.mode.to_string()),
-                        );
-                        if !no_key {
-                            obj.insert("key".to_string(), serde_json::Value::String(sel.key));
-                        }
-                        println!("{}", serde_json::Value::Object(obj));
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(select::EX_CONFIG);
-                }
-            }
-        }
+            role,
+        } => select_cmd::handle_select(select_cmd::SelectArgs {
+            workspace,
+            provider,
+            export,
+            no_key,
+            auto_unpin,
+            model,
+            role,
+        }),
 
         TokensAction::Bootstrap {
             workspace,
