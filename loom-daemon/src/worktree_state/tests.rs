@@ -154,6 +154,25 @@ fn render_line_states_both_halves() {
     assert!(line.contains("verdict=uncommitted"), "{line}");
 }
 
+#[test]
+fn the_sentence_form_spells_the_push_state_out() {
+    // `pushed=no` is right in a key=value line and useless in a sentence
+    // ("1 commit(s) ahead (no)" was the first draft). Both forms must stay
+    // available and must not be confused for each other.
+    let mut state = state_with(1, 0, 0);
+    state.push_state = PushState::Absent;
+    let sentence = state.render_sentence();
+    assert!(sentence.contains("NOT pushed"), "{sentence}");
+    assert!(!sentence.contains("ahead (no)"), "{sentence}");
+    assert!(state.render_line().contains("pushed=no"), "the token form is unchanged");
+
+    state.push_state = PushState::Unknown;
+    assert!(
+        state.render_sentence().contains("unverifiable"),
+        "an unverified push is never described as published"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Stop-hook decision
 // ---------------------------------------------------------------------------
@@ -403,6 +422,96 @@ fn an_unmanaged_directory_is_never_owned() {
         None,
         "the primary checkout legitimately holds operator WIP"
     );
+}
+
+#[test]
+fn an_unborn_branch_still_reports_its_branch_name() {
+    // The zero-commit incident's exact shape. `rev-parse --abbrev-ref HEAD`
+    // FAILS on an unborn branch, so the branch-name field used to render
+    // `(detached)` for the one session this guard most needs to describe.
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "feature/issue-8267"]);
+    std::fs::write(dir.path().join(MANAGED_SENTINEL), "").unwrap();
+    std::fs::write(dir.path().join("probe.sh"), "#!/bin/sh\n").unwrap();
+
+    let state = collect(dir.path(), "origin/main");
+    assert_eq!(state.branch.as_deref(), Some("feature/issue-8267"));
+    assert_eq!(state.commits_ahead, 0);
+    assert_eq!(state.verdict, Verdict::Uncommitted);
+    assert!(!state.render_sentence().contains("detached"), "{}", state.render_sentence());
+}
+
+#[test]
+fn the_toggle_is_read_from_the_main_checkout_not_the_worktree() {
+    // The host-local override tier (`.loom-local/local.json`) is gitignored, so
+    // an operator's opt-out exists ONLY in the main checkout. Resolving config
+    // against the worktree would ignore it — the same main-checkout-only config
+    // trap #4273 hit for the forge config.
+    if std::env::var(stop_hook::TOGGLE_ENV_VAR).is_ok() {
+        // The env override wins by design; this case is covered by its own
+        // precedence and cannot be asserted while the ambient value is set.
+        return;
+    }
+    let main = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(main.path())
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(main.path().join("README.md"), "seed\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "seed"]);
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = wt_parent.path().join("issue-8267");
+    git(&[
+        "worktree",
+        "add",
+        "-q",
+        wt.to_str().unwrap(),
+        "-b",
+        "feature/issue-8267",
+    ]);
+    std::fs::write(wt.join(MANAGED_SENTINEL), "").unwrap();
+
+    let resolved = main_checkout_root(&wt).expect("git answers --git-common-dir");
+    assert_eq!(
+        std::fs::canonicalize(&resolved).unwrap(),
+        std::fs::canonicalize(main.path()).unwrap(),
+        "a linked worktree resolves to the primary clone"
+    );
+    assert!(stop_hook::guard_enabled(&wt), "on by default");
+
+    // The opt-out, written where an operator actually writes it.
+    let local_dir = main.path().join(crate::config_resolver::LOCAL_CONFIG_REL);
+    std::fs::create_dir_all(local_dir.parent().unwrap()).unwrap();
+    std::fs::write(&local_dir, r#"{"guards": {"uncommittedWork": false}}"#).unwrap();
+    assert!(
+        !stop_hook::guard_enabled(&wt),
+        "an opt-out in the main checkout must disable the guard for its worktrees"
+    );
+
+    git(&["worktree", "remove", "--force", wt.to_str().unwrap()]);
 }
 
 #[test]

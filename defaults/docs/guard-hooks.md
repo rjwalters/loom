@@ -1223,10 +1223,31 @@ The guard is **on by default**, resolved highest-precedence-first:
    ```
 3. **Default** — `true` (guard on).
 
+The config is read from the **main checkout**, resolved from the worktree via
+`git rev-parse --git-common-dir`, not from the worktree itself: the host-local
+override tier (`.loom-local/local.json`) is gitignored and exists only there,
+and an uncommitted edit to the main checkout's `.loom/config.json` is likewise
+invisible inside a worktree. Reading the worktree's own copy would mean an
+operator's opt-out silently did nothing — the same main-checkout-only config
+trap `forge_cmd` hit in #4273.
+
 Every failure path allows the stop: an unreadable payload, a missing transcript,
 an absent `git`, a worktree that no longer exists, or a daemon binary the
 wiring cannot resolve all resolve to "allow, say nothing". A guard that wedges a
 headless sweep on its own parse bug would be worse than the loss it prevents.
+
+**Where it is wired (deliberately narrow for now).** The `Stop` /`SubagentStop`
+entries live in this repository's project-level `.claude/settings.json` only.
+Consumer repos get their guard hooks from the user-scope wiring
+`scripts/install/provision-hooks.sh` installs, whose set is the six
+`defaults/hooks/*.sh` scripts — this guard is a `loom-daemon` subcommand, not one
+of them, so it does **not** fire in consumer repos yet. That is a choice, not an
+oversight: this is a new *blocking* turn-end guard, and the only other one
+(`guard-background-subagents.sh`) needed eight follow-up corrections
+(#4389/#4462/#4696/#5013/#5086/#5976/#6175/#6645) before its false-positive rate
+was acceptable fleet-wide. It is dogfooded here — where every Loom sweep in this
+repo exercises it — before being offered to every installed workspace at once.
+Issue #8372 tracks the consumer-repo wiring.
 
 ### Workspace Registry Guard (`guards.workspaceRegistry` / `LOOM_GUARD_WORKSPACE_REGISTRY`)
 

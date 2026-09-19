@@ -90,18 +90,25 @@ impl Decision {
     }
 }
 
-/// Whether the guard is enabled for `repo_root`.
+/// Whether the guard is enabled for the workspace containing `worktree`.
 ///
 /// Precedence mirrors every other guard toggle: env var wins, then
 /// `guards.uncommittedWork` in the resolved config, then the default (on).
+///
+/// The config is resolved against the **main checkout**, not the worktree —
+/// the host-local override tier (`.loom-local/local.json`) is gitignored and
+/// therefore exists only there, exactly as `guard-background-subagents.sh`
+/// reads its toggle from `$MAIN_ROOT/.loom/config.json`. See
+/// [`main_checkout_root`](super::main_checkout_root).
 #[must_use]
-pub fn guard_enabled(repo_root: &Path) -> bool {
+pub fn guard_enabled(worktree: &Path) -> bool {
     match std::env::var(TOGGLE_ENV_VAR).ok().as_deref() {
         Some("0" | "false" | "no" | "off") => return false,
         Some("1" | "true" | "yes" | "on") => return true,
         _ => {}
     }
-    let config = crate::config_resolver::resolve_effective_config(repo_root);
+    let repo_root = super::main_checkout_root(worktree).unwrap_or_else(|| worktree.to_path_buf());
+    let config = crate::config_resolver::resolve_effective_config(&repo_root);
     !matches!(
         crate::config_resolver::get_path(&config, TOGGLE_CONFIG_KEY),
         Some(serde_json::Value::Bool(false))

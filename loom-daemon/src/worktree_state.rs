@@ -122,6 +122,23 @@ impl PushState {
             PushState::Unknown => "unknown",
         }
     }
+
+    /// The same fact in words, for prose a human or an agent reads.
+    ///
+    /// [`as_str`](Self::as_str) is a machine token in a `key=value` line, where
+    /// `pushed=no` reads correctly. Dropped into a sentence it does not: an
+    /// early draft of this guard rendered "1 commit(s) ahead (no)", which
+    /// states nothing a reader can act on. The whole point of the feature is a
+    /// legible completion notification, so the sentence form spells it out.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            PushState::Pushed => "pushed",
+            PushState::Behind => "NOT pushed — origin does not have these commits",
+            PushState::Absent => "NOT pushed — no remote branch",
+            PushState::Unknown => "push state unverifiable",
+        }
+    }
 }
 
 /// The measured state of one worktree.
@@ -172,9 +189,9 @@ impl WorktreeState {
         let branch = self.branch.as_deref().unwrap_or("(detached HEAD)");
         let at_risk = self.uncommitted + self.untracked;
         format!(
-            "branch {branch}: {} commit(s) ahead ({}), worktree: {at_risk} uncommitted file(s) ({} modified, {} untracked)",
+            "branch {branch}: {} commit(s) ahead, {}; worktree: {at_risk} uncommitted file(s) ({} modified, {} untracked)",
             self.commits_ahead,
-            self.push_state.as_str(),
+            self.push_state.describe(),
             self.uncommitted,
             self.untracked,
         )
@@ -300,6 +317,30 @@ pub fn is_managed_worktree(path: &Path) -> bool {
     path.join(MANAGED_SENTINEL).exists()
 }
 
+/// The main checkout that owns `worktree` — the parent of the git *common*
+/// dir, so a linked worktree resolves to the primary clone rather than to
+/// itself.
+///
+/// Config must be read from there, not from the worktree: the host-local
+/// override tier (`.loom-local/local.json`) is gitignored and so exists **only**
+/// in the main checkout, and an uncommitted edit to the main checkout's
+/// `.loom/config.json` is likewise invisible from a worktree checked out before
+/// it. Resolving against the worktree would silently ignore an operator who had
+/// turned this guard off — a toggle that does not toggle is worse than no
+/// toggle. `forge_cmd` hit the same main-checkout-only config trap (#4273).
+///
+/// `None` when the question cannot be answered (no git, not a repository);
+/// callers fall back to the worktree, which is still a Loom workspace.
+#[must_use]
+pub fn main_checkout_root(worktree: &Path) -> Option<PathBuf> {
+    use crate::script_helpers::run_git;
+
+    let common = run_git(worktree, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .ok_stdout_trimmed()
+        .filter(|s| !s.is_empty())?;
+    Path::new(&common).parent().map(Path::to_path_buf)
+}
+
 /// Measure `worktree` against `base_ref`.
 ///
 /// Every git question is asked independently and every failure degrades to the
@@ -310,9 +351,21 @@ pub fn is_managed_worktree(path: &Path) -> bool {
 pub fn collect(worktree: &Path, base_ref: &str) -> WorktreeState {
     use crate::script_helpers::run_git;
 
-    let branch = run_git(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+    // `branch --show-current` first: it is the only form that answers on an
+    // UNBORN branch (a freshly-created worktree with no commit yet), which is
+    // precisely the zero-commit shape this guard exists to catch — reporting
+    // that session's branch as `(detached)` would misdescribe the incident in
+    // the one message that has to be trusted. `rev-parse --abbrev-ref` is kept
+    // as the fallback (it predates `--show-current`, git 2.22) and its literal
+    // `HEAD` answer is filtered, since that means genuinely detached.
+    let branch = run_git(worktree, &["branch", "--show-current"])
         .ok_stdout_trimmed()
-        .filter(|b| !b.is_empty() && b != "HEAD");
+        .filter(|b| !b.is_empty())
+        .or_else(|| {
+            run_git(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .ok_stdout_trimmed()
+                .filter(|b| !b.is_empty() && b != "HEAD")
+        });
 
     // `<base>..HEAD` needs the base ref to exist. A worktree whose origin has
     // never been fetched (or a fixture repo with no remote) answers 0 rather
