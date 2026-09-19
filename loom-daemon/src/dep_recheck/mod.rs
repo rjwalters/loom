@@ -26,8 +26,17 @@
 //!
 //! `BLOCK_REASON` (free-text justification) and `ORTHOGONAL` (#6516) stay
 //! caller-supplied pass-throughs: they are judgment calls made by reading prose,
-//! not mechanical PR-state facts. They fold into the hash verbatim, exactly as
-//! the old inline formula did.
+//! not mechanical PR-state facts. They are echoed back verbatim, but they are
+//! **canonicalized before hashing** (#8254) — trimmed, internal whitespace runs
+//! collapsed, casefolded — because they are the one hash input still typed as
+//! prose by an agent, and `doctor cycle exhausted` / `Doctor cycle exhausted` /
+//! a stray trailing space are one conclusion, not three. See
+//! [`recheck::compute`].
+//!
+//! The *posting* sequence around this hash is serialized only by Curator's
+//! ordinary `loom:curating` label claim, which is not a compare-and-swap. That
+//! is a deliberate, recorded decision, not an oversight:
+//! `docs/adr/0019-dep-recheck-post-serialization.md` (#8254 Gap 1).
 
 pub mod cli;
 pub mod decide;

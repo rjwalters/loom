@@ -121,6 +121,35 @@ pub fn verdict(prs: &[Pr]) -> &'static str {
     }
 }
 
+/// Canonicalize a caller-supplied free-text hash input: trim, collapse every
+/// internal whitespace run to a single space, and casefold.
+///
+/// **Hash input only** (#8254). `--block-reason` is the documented escape hatch
+/// for `curator.md`'s secondary heuristic (no linked PR at all), where the
+/// agent passes *its own prose* for the cited justification. Folded verbatim,
+/// `doctor cycle exhausted` / `Doctor cycle exhausted` / a stray trailing space
+/// were three different `CONCLUSION_HASH` values for one unchanged state — the
+/// #557/#298 comment-churn shape, surviving on the one input still open to it
+/// after the PR-derived components were made deterministic. `--orthogonal` gets
+/// the same treatment: it is a structured identity in practice, but it is typed
+/// by an agent too.
+///
+/// The [`Outcome`] fields keep the **original** text, because `cli.rs` echoes
+/// them back as `BLOCK_REASON=`/`ORTHOGONAL=` for `curator.md` to `eval` into
+/// the comment it posts. Canonicalizing what is hashed must not flatten what is
+/// read by a human.
+///
+/// An all-whitespace value canonicalizes to the empty string, so it hashes
+/// identically to passing nothing at all — which is what it means.
+fn canonical_hash_input(s: &str) -> String {
+    // `split_whitespace` trims and collapses in one pass, over Unicode
+    // whitespace rather than just ASCII.
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Compute the fingerprint.
 ///
 /// `verdict_override` is for the case the script cannot infer: no linked PR at
@@ -138,8 +167,12 @@ pub fn compute(
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| verdict(prs))
         .to_string();
+    // Canonicalized for the hash, verbatim in the Outcome — see
+    // `canonical_hash_input`.
+    let reason_key = canonical_hash_input(block_reason);
+    let orthogonal_key = canonical_hash_input(orthogonal);
     // `printf '%s\n%s\n%s\n%s'` — newline-separated, no trailing newline.
-    let hash = short_sha16(&format!("{verdict}\n{blockers}\n{block_reason}\n{orthogonal}"));
+    let hash = short_sha16(&format!("{verdict}\n{blockers}\n{reason_key}\n{orthogonal_key}"));
     Outcome {
         verdict,
         blockers,

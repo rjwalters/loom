@@ -187,6 +187,15 @@ assert_eq "doctor cycle exhausted" "$(field "$out" BLOCK_REASON)" "T7b: --block-
 out2="$(echo '{"prs":[]}' | "$TARGET_SCRIPT" dep-recheck --stdin --verdict blocked --block-reason "Sweep coordination: blocking")"
 assert_ne "$(field "$out" CONCLUSION_HASH)" "$(field "$out2" CONCLUSION_HASH)" \
     "T7c: a changed --block-reason (same verdict) still changes CONCLUSION_HASH"
+# #8254: --block-reason is agent-authored prose, so it is canonicalized (trim,
+# collapse internal whitespace, casefold) before hashing -- otherwise three
+# spellings of one unchanged state read as three changed conclusions, which is
+# the #557/#298 churn shape on the one input still open to it.
+out_case="$(echo '{"prs":[]}' | "$TARGET_SCRIPT" dep-recheck --stdin --verdict blocked --block-reason "  Doctor   Cycle	Exhausted ")"
+assert_eq "$(field "$out" CONCLUSION_HASH)" "$(field "$out_case" CONCLUSION_HASH)" \
+    "T7d: a --block-reason differing only in case/whitespace yields the SAME CONCLUSION_HASH"
+assert_eq "  Doctor   Cycle	Exhausted " "$(field "$out_case" BLOCK_REASON)" \
+    "T7e: the echoed BLOCK_REASON stays verbatim -- only the hash input is canonicalized"
 
 # --- T8: --orthogonal folds into the hash without disturbing the ordinary
 #         (empty) case -------------------------------------------------------
