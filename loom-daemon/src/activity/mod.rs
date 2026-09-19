@@ -54,6 +54,7 @@ pub mod transcript_ingest;
 pub mod transcript_parse;
 pub mod tuning;
 mod usage_report;
+pub mod weekly_point_calibration;
 
 // Re-export public types from models
 // Only export types that are used by other modules
@@ -115,3 +116,11 @@ pub use models::{ClaimResult, ClaimType, ClaimsSummary, IssueClaim};
 
 // Token/cost usage report types (Issue #8062) — `loom-daemon usage-report`.
 pub use usage_report::{UsageReportGroupBy, UsageReportRow};
+
+// $-eq-per-weekly-limit-point calibration (Issue #8348, part of #8063) — the
+// pure join + step-change detector; its `loom-daemon health` wiring is a
+// separate sub-issue.
+pub use weekly_point_calibration::{
+    calibrate, CalibrationSeries, DailyValue, DayCalibration, StepChangeDirection, BASELINE_DAYS,
+    STEP_CHANGE_FOLD_THRESHOLD,
+};
