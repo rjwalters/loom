@@ -7,6 +7,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-19
+- **Issue #8251** (closed): dep-classify --check-defer: a parenthetical (Epic #M …) mention is extracted as a second blocker, wedging phase issues in DEFER forever
+- **PR #8296**: fix(dep-classify): treat a `(Epic #M …)` parenthetical as annotation, not a blocker
+- **Issue #8252** (closed): auto-update: don't defer an artifact FETCH behind the build-stampede guard (only rebuilds should wait)
+- **PR #8301**: fix(auto-update): fetch a release artifact immediately, never behind the stampede gate
+- **Issue #8244** (closed): [#8055 Phase 1] loom-daemon sweep-experiment plan — deterministic, repo-stratified arm assignment that writes nothing
+- **PR #8300**: docs+test(sweep-experiment): close out `plan` phase 1 — daemon-reference section + writes-nothing process test (#8244)
+- **Issue #8280** (closed): worktree.sh reuses a stale LOCAL feature/issue-N with no landed check — #5657's guard only covers the remote arm
+- **PR #8299**: fix(worktree): refuse to reuse a LOCAL branch whose PR already landed (#8280)
+- **PR #8291**: fix(worktree): warn when a reused LOCAL branch lacks the base ref's history (#8280)
 - **Issue #8245** (closed): Champion epic/proposal escalation re-parks issues over a newer standing operator ruling (#6109, #4489 on 2026-09-16)
 - **PR #8283**: fix(champion): stop the proposal escalation ladder from re-fighting a human ruling (#8245)
 - **Issue #8241** (closed): [#8058 Phase 2] health.rs: class-scoped ModelCreditsExhausted marks for non-Claude providers
