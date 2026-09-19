@@ -259,6 +259,7 @@ pub mod worktree_disk_status;
 pub mod worktree_ops;
 pub mod worktree_reaper;
 pub mod worktree_root;
+pub mod worktree_state;
 
 use std::collections::HashSet;
 use std::fs;

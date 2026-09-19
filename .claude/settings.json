@@ -62,6 +62,21 @@
           {
             "type": "command",
             "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/hooks/hook-wiring.sh; [ -r \"$L\" ] && LOOM_PROJECT_ROOT=$W exec bash \"$L\" Stop guard-background-subagents.sh; G=$W/.loom/hooks/guard-background-subagents.sh; [ -x \"$G\" ] && exec \"$G\"; [ -r \"$G\" ] && exec bash \"$G\"; [ -d \"$W/.loom/hooks\" ] || exit 0; echo \"[loom] BROKEN GUARD INSTALL: guard-background-subagents.sh is not installed in this Loom workspace ($W/.loom/hooks/guard-background-subagents.sh); re-run scripts/install-loom.sh.\" >&2; exit 0'"
+          },
+          {
+            "type": "command",
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/scripts/lib/locate-daemon-bin.sh; [ -r \"$L\" ] || exit 0; . \"$L\" >/dev/null 2>&1 || exit 0; B=$(loom_resolve_self_daemon_bin 2>/dev/null) || exit 0; [ -n \"$B\" ] && [ -x \"$B\" ] || exit 0; exec \"$B\" worktree-state stop-hook'"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/scripts/lib/locate-daemon-bin.sh; [ -r \"$L\" ] || exit 0; . \"$L\" >/dev/null 2>&1 || exit 0; B=$(loom_resolve_self_daemon_bin 2>/dev/null) || exit 0; [ -n \"$B\" ] && [ -x \"$B\" ] || exit 0; exec \"$B\" worktree-state stop-hook'"
           }
         ]
       }

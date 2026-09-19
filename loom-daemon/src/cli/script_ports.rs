@@ -82,6 +82,14 @@ pub(crate) enum ScriptPortCommand {
     /// `skip-labels.sh`. See `cli/skip_labels.rs` for why the two knobs had
     /// drifted apart (2AMLogic/2am's `journal` label).
     SkipLabels(super::skip_labels::SkipLabelsArgs),
+
+    /// What a dispatched agent actually left behind (#8267): commits on the
+    /// branch vs. deliverables still sitting uncommitted in the worktree, plus
+    /// the `Stop`/`SubagentStop` hook that refuses a clean completion when the
+    /// two disagree. Not a port either — same frozen-`main.rs` reason as
+    /// `shell-budget` above.
+    #[command(subcommand)]
+    WorktreeState(super::worktree_state::WorktreeStateCommand),
 }
 
 impl ScriptPortCommand {
@@ -100,6 +108,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
+            ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
         }
     }
 }
