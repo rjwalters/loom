@@ -896,8 +896,9 @@ lexer state with the primary scan), so it can turn an allow into a deny and
 never the reverse; an unbalanced `$(`, an unterminated backtick, or
 recursion past depth 5 yields **no** span, i.e. the pre-#8035 not-covered
 behaviour rather than a new false positive on prose. The sibling
-`extract_rm_targets()` scan has the same structural blind spot and is
-**not** covered here (tracked separately).
+`extract_rm_targets()` scan had the same structural blind spot; it was closed
+the same way by #8217 — see § "Same-command literal declaration" → "An unquoted
+heredoc body is not literal here either" below.
 
 The guard is **on by default**. It is resolved in this order (highest precedence first):
 
@@ -1022,6 +1023,36 @@ previously denied at the catastrophic tier purely because the target was
 spelled through a variable.
 
 Anything outside those two shapes still requires an explicit literal path.
+
+**An unquoted heredoc body is not literal here either (issue #8217).** The
+rm-scope analogue of #8035 above (and of #8003 before it — the same structural
+blind spot, third scanner over). `cat > /tmp/x <<EOF` ⏎ `$( rm -rf /opt/vendor )`
+⏎ `EOF` really deletes that directory: the shell expands the *unquoted*-delimiter
+body before `cat` reads a byte. `extract_rm_targets()` keys a local `rm` on the
+**command word** of a `;`/`&`/`|`-delimited segment, and `$(`/`)` is not a
+segment boundary — so the whole invocation was one segment whose command word is
+`cat`, and the target was never scored at all (measured **allow**, where the bare
+`rm -rf /opt/vendor` control denies). It now runs the **same scanner a second,
+independent time** over the inner text of each such span, reusing #8035's
+`heredoc_unquoted_subst_spans()` so the two passes can never disagree about which
+text bash will expand. All of #8035's discriminators carry over unchanged: a
+**quoted** delimiter (`<<'EOF'` / `<<"EOF"`) is skipped entirely, a
+backslash-escaped `\$( … )` stays inert, and an unbalanced `$(` / unterminated
+backtick / recursion past depth 5 yields **no** span — not-covered rather than a
+new false positive on prose.
+
+One rm-specific rule comes with it: a target found inside a span does **not** get
+the two same-command fast paths in the table above. Both prove a claim about the
+*current* shell's binding of a name by scanning a copy with every heredoc body
+masked (#6549), while a `$( … )` span is a subshell whose own assignments live
+inside that masked text — so an assignment outside the heredoc must never vouch
+for a name the span rebinds inside it (`V=$(mktemp -d)` … `$( V=/etc; rm -rf
+"$V" )`). A `$`-rooted span target therefore fails closed on
+`rm-scope-unresolved-var`, whose message names the span explicitly. Stated cost:
+a span target whose variable genuinely *is* mktemp-rooted outside the heredoc
+denies too. That text was entirely unscanned before #8217, so this is a new deny
+on previously-unexamined input rather than a relaxation, and the remedy is the
+one the message already gives — use an explicit literal path.
 
 ### Installed-File Write Guard (`guards.installedFileWrites` / `LOOM_GUARD_INSTALLED_FILE_WRITES`)
 

@@ -44,7 +44,19 @@ unset LOOM_FORCE_SCOPE LOOM_DEFAULT_BRANCH LOOM_GUARD_SQL LOOM_GUARD_CLOUD \
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-GUARD="$REPO_ROOT/defaults/hooks/guard-destructive-generic.sh"
+# $LOOM_GUARD_OVERRIDE (#8217) points the whole corpus at a DIFFERENT guard
+# binary for one run. Its only purpose is the differential sweep every
+# guard-parsing fix in this family owes (#8003 → #8035 → #8217): run the corpus
+# once against a pre-fix copy of the hook, once against the fixed one, and diff
+# the per-assertion verdicts so a verdict flip cannot hide behind a green suite.
+# Deliberately NOT in the hermetic unset list above — it has to survive to do
+# its job — so it is the one var that can change what this harness tests; leave
+# it unset for every ordinary run (CI never sets it). The pre-fix copy belongs
+# under defaults/hooks/, NOT /tmp: the guard sources
+# $SCRIPT_DIR/../scripts/lib/config-resolver.sh, so a /tmp copy silently loses
+# guards.* config resolution and manufactures phantom verdict flips (#8218's
+# methodology note).
+GUARD="${LOOM_GUARD_OVERRIDE:-$REPO_ROOT/defaults/hooks/guard-destructive-generic.sh}"
 
 # Hermetic default cwd (#7808). The guard resolves REPO_ROOT from the hook
 # input's cwd (git rev-parse --show-toplevel) and reads THAT repo's
