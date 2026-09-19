@@ -130,6 +130,7 @@ test-install-sync-labels.sh
 test-jq-reserved-word-args.sh
 test-judge-fallback-cap.sh
 test-judge-fanout-experiment.sh
+test-judge-payload-drop-guard.sh
 test-judge-tdd-merge-base.sh
 test-label-preflight.sh
 test-land-resync-commit.sh
