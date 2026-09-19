@@ -43,13 +43,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use chrono::Utc;
+
 use crate::tokens_pool::bad_tokens;
+use crate::tokens_pool::monitor_classes;
 use crate::tokens_pool::select::parse_ranking_line;
 
 use super::AccountHealth;
 
 /// Per-model-class healthy counts for one resolved token-pool directory.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClassCapacity {
     /// Accounts listed in `.ranking` — the same inventory
     /// [`super::read_ranking_at`] counts as `total`.
@@ -66,6 +69,22 @@ pub struct ClassCapacity {
     /// **Empty means "no class-scoped state exists"**, not "no class has
     /// capacity" — callers must render today's single number in that case.
     pub by_class: BTreeMap<String, usize>,
+    /// The highest per-class utilization fraction (`0.0..=1.0`) claude-monitor
+    /// reported across every account in this pool (issue #8297), keyed by
+    /// whatever class name(s) claude-monitor's `ranking.json` `models` map
+    /// actually carries — not necessarily the full `by_class` vocabulary.
+    ///
+    /// This is a **predictive** signal (a fraction approaching 100% forecasts
+    /// a future class-scoped block; it has not happened yet), sourced from
+    /// [`monitor_classes::read_class_utilization_sidecar`]. It never changes
+    /// `healthy`/`by_class` above — Phase 1/2's terminal `.bad_tokens` marks
+    /// remain the only thing a class-scoped hold is decided from — and it is
+    /// only ever populated once `by_class` already has state to report beside
+    /// (see [`read_class_capacity_at`]), so an empty map here can never by
+    /// itself turn "no class-scoped state" into a per-class render: the
+    /// degradation contract (`no class-scoped state => today's single
+    /// number`) is unchanged.
+    pub monitor_utilization: BTreeMap<String, f64>,
 }
 
 impl ClassCapacity {
@@ -109,7 +128,43 @@ impl ClassCapacity {
             .map(|(class, n)| format!("{class} {n}/{}", self.total))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("per class: {per_class}")
+        if self.monitor_utilization.is_empty() {
+            format!("per class: {per_class}")
+        } else {
+            // claude-monitor's predictive utilization (issue #8297) — never
+            // gates `by_class` above, only ever appended beside it once there
+            // is already class-scoped state to report (see
+            // `read_class_capacity_at`).
+            let monitor = self
+                .monitor_utilization
+                .iter()
+                .map(|(class, util)| format!("{class} {:.0}%", util * 100.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("per class: {per_class}; monitor: {monitor}")
+        }
+    }
+
+    /// Whether claude-monitor's predictive per-class utilization
+    /// (issue #8297) has anything to show. `false` ⇒
+    /// [`Self::summary_fragment`]/[`Self::detail`] render exactly as they did
+    /// before this field existed.
+    #[must_use]
+    pub fn has_monitor_utilization(&self) -> bool {
+        !self.monitor_utilization.is_empty()
+    }
+
+    /// The structured `--json` payload for [`Self::monitor_utilization`]: a
+    /// plain `class -> utilization` object, `None` when empty — kept as a
+    /// separate accessor from [`Self::detail`] rather than folded into it, so
+    /// `detail`'s own promised shape (a plain `class -> healthy` object that
+    /// never changes) stays exactly as it was before this field existed.
+    #[must_use]
+    pub fn monitor_detail(&self) -> Option<serde_json::Value> {
+        if self.monitor_utilization.is_empty() {
+            return None;
+        }
+        Some(serde_json::json!(self.monitor_utilization))
     }
 
     /// [`Self::summary_fragment`] wrapped as a ` (…)` suffix for splicing into
@@ -163,6 +218,15 @@ pub fn summary_suffix_of(cap: Option<&ClassCapacity>) -> String {
 #[must_use]
 pub fn detail_of(cap: Option<&ClassCapacity>) -> serde_json::Value {
     cap.and_then(ClassCapacity::detail)
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// [`ClassCapacity::monitor_detail`] for an optional snapshot — `{}` when
+/// there is none, mirroring [`detail_of`]'s "never changes shape" contract
+/// for claude-monitor's predictive per-class utilization (issue #8297).
+#[must_use]
+pub fn monitor_detail_of(cap: Option<&ClassCapacity>) -> serde_json::Value {
+    cap.and_then(ClassCapacity::monitor_detail)
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
@@ -278,13 +342,45 @@ pub fn read_class_capacity_at(pool_dir: &Path) -> Option<ClassCapacity> {
     if cap.total == 0 {
         return None;
     }
+    // claude-monitor's predictive per-class utilization (issue #8297) is
+    // consumed only once there is already `.bad_tokens`-derived class state
+    // to report it beside — this is what keeps the degradation contract
+    // ("no class-scoped state => today's single number") unchanged: an empty
+    // `by_class` never gains a per-class render on the strength of monitor
+    // data alone.
+    if !cap.by_class.is_empty() {
+        let sidecar = monitor_classes::read_class_utilization_sidecar(pool_dir, Utc::now());
+        cap.monitor_utilization = max_monitor_utilization_by_class(&sidecar);
+    }
     Some(cap)
+}
+
+/// The highest utilization fraction reported for each class across every
+/// account in a [`monitor_classes::read_class_utilization_sidecar`] snapshot
+/// — the account closest to a future class-scoped block is the actionable
+/// one an operator needs to see.
+fn max_monitor_utilization_by_class(
+    sidecar: &BTreeMap<String, BTreeMap<String, f64>>,
+) -> BTreeMap<String, f64> {
+    let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    for classes in sidecar.values() {
+        for (class, util) in classes {
+            out.entry(class.clone())
+                .and_modify(|max: &mut f64| {
+                    if *util > *max {
+                        *max = *util;
+                    }
+                })
+                .or_insert(*util);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{read_class_capacity_at, ClassCapacity};
+    use super::{monitor_detail_of, read_class_capacity_at, ClassCapacity};
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -309,6 +405,28 @@ mod tests {
 
     fn counts(cap: &ClassCapacity) -> BTreeMap<&str, usize> {
         cap.by_class.iter().map(|(c, n)| (c.as_str(), *n)).collect()
+    }
+
+    /// Write a fresh `.ranking.classes.json` sidecar directly (the format
+    /// [`monitor_classes::write_class_utilization_sidecar`] produces) rather
+    /// than through that `pub(super)` writer, which this module cannot call.
+    fn write_monitor_sidecar(dir: &Path, accounts: &[(&str, &[(&str, f64)])]) {
+        let by_account: serde_json::Map<String, serde_json::Value> = accounts
+            .iter()
+            .map(|(name, classes)| {
+                let obj: serde_json::Map<String, serde_json::Value> = classes
+                    .iter()
+                    .map(|(class, util)| ((*class).to_string(), serde_json::json!(util)))
+                    .collect();
+                ((*name).to_string(), serde_json::Value::Object(obj))
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "schema": 1,
+            "written_at": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "accounts": by_account,
+        });
+        std::fs::write(dir.join(".ranking.classes.json"), payload.to_string()).unwrap();
     }
 
     // ---- degradation ---------------------------------------------------
@@ -543,6 +661,7 @@ mod tests {
             total: 4,
             healthy: 1,
             by_class: BTreeMap::from([("opus".to_string(), 1), ("sonnet".to_string(), 3)]),
+            ..ClassCapacity::default()
         };
         assert_eq!(cap.detail().unwrap(), serde_json::json!({"opus": 1, "sonnet": 3}));
         assert_eq!(cap.summary_fragment(), "per class: opus 1/4, sonnet 3/4");
@@ -565,5 +684,74 @@ mod tests {
             counts(&cap),
             BTreeMap::from([("fable", 3), ("haiku", 3), ("opus", 2), ("sonnet", 3)])
         );
+    }
+
+    // ---- claude-monitor predictive utilization (issue #8297) ------------
+
+    /// AC3: once `.bad_tokens` already put class-scoped state on the table,
+    /// a fresh monitor sidecar is consumed alongside it, and the reported
+    /// value is the *worst* (highest) utilization seen for that class across
+    /// every account, not merely one account's.
+    #[test]
+    fn monitor_utilization_is_consumed_when_class_state_already_exists() {
+        let dir = pool(
+            "a|available\nb|available\nc|available\n",
+            &fresh("a", "exhausted: credits [model-class:opus]"),
+        );
+        write_monitor_sidecar(
+            dir.path(),
+            &[
+                ("a", &[("opus", 0.40)]),
+                ("b", &[("opus", 0.91), ("fable", 0.10)]),
+            ],
+        );
+        let cap = read_class_capacity_at(dir.path()).unwrap();
+        assert!(cap.has_monitor_utilization());
+        assert_eq!(cap.monitor_utilization.get("opus"), Some(&0.91), "the higher of the two wins");
+        assert_eq!(cap.monitor_utilization.get("fable"), Some(&0.10));
+        assert_eq!(cap.monitor_detail().unwrap(), serde_json::json!({"fable": 0.10, "opus": 0.91}));
+        assert!(
+            cap.summary_fragment()
+                .contains("; monitor: fable 10%, opus 91%"),
+            "unexpected fragment: {}",
+            cap.summary_fragment()
+        );
+    }
+
+    /// The degradation contract itself (AC3's explicit constraint): a fresh
+    /// monitor sidecar existing is NOT by itself enough to turn "no
+    /// class-scoped `.bad_tokens` state" into a per-class render — the
+    /// `.bad_tokens` gate is unchanged and monitor data never widens it.
+    #[test]
+    fn monitor_utilization_is_never_consumed_without_bad_tokens_class_state() {
+        let dir = pool("a|available\nb|available\n", "");
+        write_monitor_sidecar(dir.path(), &[("a", &[("opus", 0.99)])]);
+        let cap = read_class_capacity_at(dir.path()).unwrap();
+        assert!(!cap.has_class_state());
+        assert!(
+            !cap.has_monitor_utilization(),
+            "monitor data must not surface on its own — the degradation contract is unchanged"
+        );
+        assert_eq!(cap.summary_fragment(), "");
+        assert_eq!(cap.summary_suffix(), "");
+        assert_eq!(cap.detail(), None);
+        assert_eq!(cap.monitor_detail(), None);
+    }
+
+    /// No sidecar at all (the overwhelmingly common case — no claude-monitor
+    /// on this host) leaves `monitor_utilization` empty and the rendered
+    /// output byte-identical to its pre-#8297 form.
+    #[test]
+    fn no_monitor_sidecar_renders_exactly_as_before() {
+        let dir = pool(
+            "a|available\nb|available\nc|available\nd|available\n",
+            &fresh("a", "exhausted: credits [model-class:opus]"),
+        );
+        let cap = read_class_capacity_at(dir.path()).unwrap();
+        assert!(!cap.has_monitor_utilization());
+        assert_eq!(cap.summary_fragment(), "per class: fable 4/4, haiku 4/4, opus 3/4, sonnet 4/4");
+        assert_eq!(cap.monitor_detail(), None);
+        assert_eq!(monitor_detail_of(Some(&cap)), serde_json::json!({}));
+        assert_eq!(monitor_detail_of(None), serde_json::json!({}));
     }
 }

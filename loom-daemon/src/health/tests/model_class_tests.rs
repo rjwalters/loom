@@ -21,6 +21,7 @@ fn class_capacity(total: usize, healthy: usize, by_class: &[(&str, usize)]) -> C
             .iter()
             .map(|(c, n)| ((*c).to_string(), *n))
             .collect(),
+        ..ClassCapacity::default()
     }
 }
 
@@ -121,6 +122,69 @@ fn a_pool_on_disk_renders_its_per_class_counts_end_to_end() {
     assert_eq!(
         section.detail["healthy_by_class"],
         serde_json::json!({"fable": 4, "haiku": 4, "opus": 1, "sonnet": 4})
+    );
+}
+
+/// AC3, end-to-end through the `health` `tokens` section: a fresh
+/// claude-monitor sidecar (issue #8297) alongside `.bad_tokens` class state
+/// is consumed by the same `read_class_capacity_at` the collector calls, and
+/// both `assess_tokens`'s summary line and its `--json` detail carry it —
+/// without touching `healthy`/`healthy_by_class`, which stay exactly the
+/// `.bad_tokens`-only figures from the sibling test above.
+#[test]
+fn a_pool_on_disk_with_a_monitor_sidecar_reports_it_alongside_the_bad_tokens_breakdown() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".ranking"),
+        "a|available|0.1|2026-09-20T03:00:00Z\nb|available|0.2|2026-09-20T03:00:00Z\n\
+         c|available|0.3|2026-09-20T03:00:00Z\nd|available|0.4|2026-09-20T03:00:00Z\n",
+    )
+    .unwrap();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let marks: String = ["a", "b", "c"]
+        .iter()
+        .map(|n| format!("{now} {n} exhausted: out of usage credits [model-class:opus]\n"))
+        .collect();
+    std::fs::write(dir.path().join(".bad_tokens"), marks).unwrap();
+    std::fs::write(
+        dir.path().join(".ranking.classes.json"),
+        serde_json::json!({
+            "schema": 1,
+            "written_at": now.to_string(),
+            "accounts": {"d": {"opus": 0.87}},
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let collected = crate::capacity::model_class::read_class_capacity_at(dir.path())
+        .expect("a readable ranking yields a snapshot");
+    assert_eq!(collected.monitor_utilization.get("opus"), Some(&0.87));
+
+    let mut inputs = healthy_inputs();
+    let cap = &mut inputs.status.as_mut().unwrap().capacity;
+    cap.healthy_accounts = collected.healthy;
+    cap.total_accounts = collected.total;
+    cap.exhausted_accounts = collected.total - collected.healthy;
+    inputs.token_class_capacity = Some(collected);
+
+    let section = assess_tokens(&inputs);
+    assert!(
+        section.summary.starts_with(
+            "1/4 healthy (per class: fable 4/4, haiku 4/4, opus 1/4, sonnet 4/4; monitor: opus 87%)"
+        ),
+        "{}",
+        section.summary
+    );
+    // The account-wide and `.bad_tokens`-derived per-class figures are
+    // untouched by the monitor sidecar's presence.
+    assert_eq!(
+        section.detail["healthy_by_class"],
+        serde_json::json!({"fable": 4, "haiku": 4, "opus": 1, "sonnet": 4})
+    );
+    assert_eq!(
+        section.detail["monitor_utilization_by_class"],
+        serde_json::json!({"opus": 0.87})
     );
 }
 

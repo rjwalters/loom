@@ -61,7 +61,7 @@
 //! (two emails, one Loom account) and only misfired because the map used to
 //! be provider-blind.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -69,11 +69,14 @@ use chrono::{DateTime, Utc};
 
 use super::account_registry::AccountProvider;
 use super::check::{status_rank, AccountResult, ProbeReport};
+use super::monitor_classes;
+use super::monitor_ranking_json::{
+    coerce_float, coerce_reset, load_ranking_json, ranking_row_is_non_claude_provider,
+    ranking_row_upstream_id,
+};
 
 const CLAUDE_MONITOR_DIR_VAR: &str = "LOOM_CLAUDE_MONITOR_DIR";
 const DEFAULT_CLAUDE_MONITOR_DIR: &str = "~/.claude-monitor";
-const RANKING_JSON_NAME: &str = "ranking.json";
-const SUPPORTED_SCHEMA: i64 = 1;
 /// Freshness window (10 min); a `ranking.json` older than this is stale.
 const MONITOR_FRESH_SECONDS: i64 = 600;
 /// Utilization sentinel for absent values so they sort after known (lower)
@@ -96,6 +99,11 @@ pub struct MonitorAccount {
     /// account, and the rollover the 5h utilization is racing for every other
     /// status — see [`super::check::limit_reset`].
     pub reset_5h: Option<String>,
+    /// Per-class utilization (`accounts[].models.<class>.utilization`, issue
+    /// #8297); see [`super::monitor_classes`] for the ingest/report-only
+    /// design decision. Empty when `models` is absent — never coerced to a
+    /// fabricated per-class `0.0`.
+    pub class_utilization: BTreeMap<String, f64>,
 }
 
 /// Resolve the claude-monitor directory: `$LOOM_CLAUDE_MONITOR_DIR` (tilde
@@ -217,94 +225,10 @@ fn load_index_upstream_id_map(tokens_dir: &Path) -> HashMap<String, String> {
     out
 }
 
-/// Resolve a `ranking.json` account entry's upstream id, if it carries one,
-/// namespaced to match `index.json`'s own `monitor-pk:<id>` convention
-/// (design D2, the only namespace `monitor_db.rs`'s import actually confirms
-/// today — see its `provider_from_monitor_value` doc comment for the same
-/// unconfirmed-upstream-schema caveat). claude-monitor's `ranking.json` is
-/// not confirmed to carry an account-id field at all (unlike `index.json`,
-/// which #5607 added one to); this is opportunistic — absent, unrecognized,
-/// or malformed input all yield `None`, and the caller falls back cleanly to
-/// the email map.
-fn ranking_row_upstream_id(entry: &serde_json::Value) -> Option<String> {
-    let raw = entry.get("account_id")?;
-    if let Some(s) = raw.as_str() {
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        return Some(format!("monitor-pk:{trimmed}"));
-    }
-    if let Some(n) = raw.as_i64() {
-        return Some(format!("monitor-pk:{n}"));
-    }
-    None
-}
-
-/// Whether a `ranking.json` account entry **self-identifies** as a
-/// non-Claude provider (design D6b, issue #5608).
-///
-/// This is the mechanism that makes the §3 collision unrepresentable even
-/// when two `ranking.json` rows genuinely share one email — one row tracking
-/// the human's real Anthropic account, one tracking a different provider's
-/// account under the same operator email. Email alone cannot disambiguate
-/// that pair; a row that names its own provider can be dropped before the
-/// join is even attempted, so it never reaches the severity-merge that used
-/// to let it override the Anthropic row's status.
-///
-/// claude-monitor's `ranking.json` schema is not confirmed to carry a
-/// `provider` field in this repo today (the confirmed shape is
-/// email/status/utilization/resets only — see [`ranking_row_upstream_id`]'s
-/// sibling caveat); this is forward-compatible defense-in-depth, not a load-
-/// bearing assumption. A row with no `provider` field at all — the only
-/// shape any fixture or live host in this repo currently exercises — is
-/// permissive (`false`, fail-open), so behavior is unchanged until/unless a
-/// future claude-monitor version starts emitting one.
-fn ranking_row_is_non_claude_provider(entry: &serde_json::Value) -> bool {
-    match entry.get("provider").and_then(|v| v.as_str()) {
-        Some(p) => {
-            let p = p.trim();
-            !p.is_empty()
-                && !p.eq_ignore_ascii_case("anthropic")
-                && !p.eq_ignore_ascii_case("claude")
-        }
-        None => false,
-    }
-}
-
-/// Read + validate `ranking.json`; `None` when absent, unreadable, not valid
-/// JSON, not an object, or an unsupported `schema`.
-fn load_ranking_json(monitor_dir: &Path) -> Option<serde_json::Value> {
-    let ranking_path = monitor_dir.join(RANKING_JSON_NAME);
-    let raw = std::fs::read_to_string(&ranking_path).ok()?;
-    let data: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    if !data.is_object() {
-        return None;
-    }
-    if data.get("schema").and_then(serde_json::Value::as_i64) != Some(SUPPORTED_SCHEMA) {
-        return None;
-    }
-    Some(data)
-}
-
-fn coerce_float(value: Option<&serde_json::Value>) -> Option<f64> {
-    match value {
-        Some(serde_json::Value::Bool(_)) | None => None,
-        Some(serde_json::Value::Number(n)) => n.as_f64(),
-        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
-        _ => None,
-    }
-}
-
-/// Normalize a monitor-reported reset instant to the canonical
-/// `%Y-%m-%dT%H:%M:%SZ` text the `.ranking` writer emits (issue #4874).
-/// Anything unparseable as a timestamp yields `None` — an account with no
-/// usable reset stays "unknown" rather than carrying junk downstream to the
-/// dashboard's countdown.
-fn coerce_reset(value: Option<&serde_json::Value>) -> Option<String> {
-    let raw = value?.as_str()?;
-    parse_iso8601(Some(raw)).map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-}
+// `ranking_row_upstream_id`, `ranking_row_is_non_claude_provider`,
+// `load_ranking_json`, `coerce_float`, `coerce_reset`: see
+// `super::monitor_ranking_json` (issue #8297 file-size split) — imported
+// above, used exactly as before.
 
 fn order_key(a: &MonitorAccount) -> (i32, f64, f64) {
     (
@@ -429,6 +353,7 @@ pub fn build_monitor_accounts(
                 util_5h,
                 reset_7d,
                 reset_5h,
+                class_utilization: monitor_classes::ranking_row_class_utilization(entry),
             };
             if let Some(&idx) = index_by_name.get(&name) {
                 if status_rank(&candidate.status) > status_rank(&accounts[idx].status) {
@@ -468,6 +393,7 @@ pub fn build_monitor_accounts(
                 util_5h: None,
                 reset_7d: None,
                 reset_5h: None,
+                class_utilization: BTreeMap::new(),
             });
         }
     }
@@ -642,6 +568,13 @@ pub fn run_monitor_check_with_reprobe(
         let ranking_path = tokens_dir.join(".ranking");
         if let Err(e) = write_monitor_ranking_atomic(&accounts, &ranking_path) {
             eprintln!("WARNING failed to write {}: {e}", ranking_path.display());
+        }
+        if let Err(e) = monitor_classes::write_class_utilization_sidecar(&accounts, tokens_dir, now)
+        {
+            eprintln!(
+                "WARNING failed to write class-utilization sidecar in {}: {e}",
+                tokens_dir.display()
+            );
         }
     }
 
@@ -1115,6 +1048,7 @@ mod tests {
             util_5h: None,
             reset_7d: None,
             reset_5h: None,
+            class_utilization: BTreeMap::new(),
         }];
         assert_eq!(format_ranking_lines(&accounts), "acct-z|\n");
     }
@@ -1131,6 +1065,7 @@ mod tests {
                 util_5h: Some(0.90),
                 reset_7d: None,
                 reset_5h: None,
+                class_utilization: BTreeMap::new(),
             },
             MonitorAccount {
                 name: "b".into(),
@@ -1139,6 +1074,7 @@ mod tests {
                 util_5h: None,
                 reset_7d: None,
                 reset_5h: None,
+                class_utilization: BTreeMap::new(),
             },
         ];
         assert_eq!(format_ranking_lines(&accounts), "a|available|0.90\nb|available\n");
@@ -1157,6 +1093,7 @@ mod tests {
             util_5h: Some(0.0),
             reset_7d: Some("2026-08-02T03:00:00Z".into()),
             reset_5h: Some("2026-08-01T05:20:00Z".into()),
+            class_utilization: BTreeMap::new(),
         }];
         assert_eq!(
             format_ranking_lines(&exhausted),
@@ -1175,6 +1112,7 @@ mod tests {
             util_5h: Some(1.0),
             reset_7d: Some("2026-08-07T01:00:00Z".into()),
             reset_5h: Some("2026-08-01T07:00:00Z".into()),
+            class_utilization: BTreeMap::new(),
         }];
         assert_eq!(
             format_ranking_lines(&rate_limited),
@@ -1191,6 +1129,7 @@ mod tests {
             util_5h: Some(0.12),
             reset_7d: Some("2026-08-04T23:00:00Z".into()),
             reset_5h: Some("2026-08-01T06:50:00Z".into()),
+            class_utilization: BTreeMap::new(),
         }];
         assert_eq!(format_ranking_lines(&available), "c|available|0.12|2026-08-01T06:50:00Z\n");
     }
@@ -1313,6 +1252,40 @@ mod tests {
         let b = accounts.iter().find(|a| a.name == "acct-b").unwrap();
         assert_eq!(b.reset_7d, None, "an account with no resets block stays unknown");
         assert_eq!(b.reset_5h, None);
+    }
+
+    /// Issue #8297: `accounts[].models.<class>.utilization` is ingested into
+    /// `MonitorAccount::class_utilization`, and a class `ranking.json` never
+    /// mentions stays absent — never a fabricated `0.0`.
+    #[test]
+    fn build_monitor_accounts_reads_per_class_utilization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index(&tokens_dir, &[("acct-a", "a@example.com"), ("acct-b", "b@example.com")]);
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                {
+                    "email": "a@example.com",
+                    "status": "rate_limited",
+                    "utilization": {"5h": 1.0, "7d": 0.54},
+                    "models": {"fable": {"utilization": 0.91}},
+                },
+                // No `models` at all — must stay empty, not a zeroed map.
+                {"email": "b@example.com", "status": "available", "utilization": {"7d": 0.30}},
+            ]),
+        );
+        let accounts =
+            build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).expect("fresh");
+
+        let a = accounts.iter().find(|a| a.name == "acct-a").unwrap();
+        assert_eq!(a.class_utilization.get("fable"), Some(&0.91));
+        assert_eq!(a.class_utilization.get("opus"), None, "an un-reported class stays absent");
+        let b = accounts.iter().find(|a| a.name == "acct-b").unwrap();
+        assert!(b.class_utilization.is_empty(), "no `models` object means no class data at all");
     }
 
     // Serialized against its sibling above for the same reason.

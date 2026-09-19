@@ -1510,6 +1510,12 @@ pub fn assess_tokens(inputs: &HealthInputs) -> HealthSection {
             // every other field is untouched and a consumer can read this one
             // unconditionally.
             "healthy_by_class": model_class::detail_of(inputs.token_class_capacity.as_ref()),
+            // claude-monitor's predictive `class -> utilization` (issue
+            // #8297); `{}` when `healthy_by_class` above is also `{}` (same
+            // gate — see `capacity::model_class`'s degradation contract) or
+            // no fresh monitor sidecar exists. Report-only: never consulted
+            // by the selector, never changes `healthy`/`healthy_by_class`.
+            "monitor_utilization_by_class": model_class::monitor_detail_of(inputs.token_class_capacity.as_ref()),
             "total": cap.total_accounts,
             "exhausted": cap.exhausted_accounts,
             "token_axis_limit": cap.token_axis_limit,

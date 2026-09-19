@@ -53,10 +53,19 @@ pub(crate) fn capacity_detail(report: &DaemonStatusReport) -> serde_json::Value 
     model_class::detail_of(snapshot(report).as_ref())
 }
 
+/// The `class -> utilization` object for `--json`'s
+/// `capacity.monitor_utilization_by_class` — claude-monitor's predictive,
+/// report-only per-class signal (issue #8297). `{}` when [`capacity_detail`]
+/// is also `{}` (same gate — see `capacity::model_class`'s degradation
+/// contract) or no fresh monitor sidecar exists.
+pub(crate) fn monitor_utilization_detail(report: &DaemonStatusReport) -> serde_json::Value {
+    model_class::monitor_detail_of(snapshot(report).as_ref())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{capacity_detail, capacity_suffix};
+    use super::{capacity_detail, capacity_suffix, monitor_utilization_detail};
     use crate::cli::status::sample_report::sample_report;
     use loom_daemon::types::DaemonStatusReport;
     use std::path::Path;
@@ -110,6 +119,58 @@ mod tests {
             capacity_detail(&report),
             serde_json::json!({"fable": 4, "haiku": 4, "opus": 1, "sonnet": 4})
         );
+    }
+
+    /// AC3, end-to-end on the `status` side: a fresh claude-monitor sidecar
+    /// (issue #8297) is consumed alongside an existing `.bad_tokens` class
+    /// breakdown, in both the human suffix and `--json`'s
+    /// `capacity.monitor_utilization_by_class` — without moving
+    /// `capacity_detail`'s own `.bad_tokens`-derived figures.
+    #[test]
+    fn a_monitor_sidecar_renders_alongside_the_bad_tokens_breakdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut marks = String::new();
+        for name in ["a", "b", "c"] {
+            marks.push_str(&fresh_mark(name, "exhausted: credits [model-class:opus]"));
+        }
+        write_pool(dir.path(), "a|available\nb|available\nc|available\nd|available\n", &marks);
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        std::fs::write(
+            dir.path().join(".ranking.classes.json"),
+            serde_json::json!({
+                "schema": 1,
+                "written_at": now,
+                "accounts": {"d": {"opus": 0.87}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let report = report_for(dir.path());
+        assert_eq!(
+            capacity_suffix(&report),
+            " (per class: fable 4/4, haiku 4/4, opus 1/4, sonnet 4/4; monitor: opus 87%)"
+        );
+        // The `.bad_tokens`-derived figure is untouched by the sidecar.
+        assert_eq!(
+            capacity_detail(&report),
+            serde_json::json!({"fable": 4, "haiku": 4, "opus": 1, "sonnet": 4})
+        );
+        assert_eq!(monitor_utilization_detail(&report), serde_json::json!({"opus": 0.87}));
+    }
+
+    /// No sidecar at all (the common case — no claude-monitor on this host)
+    /// leaves the monitor detail empty, same as `capacity_detail`'s own
+    /// degradation contract.
+    #[test]
+    fn no_monitor_sidecar_renders_an_empty_monitor_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut marks = String::new();
+        for name in ["a", "b", "c"] {
+            marks.push_str(&fresh_mark(name, "exhausted: credits [model-class:opus]"));
+        }
+        write_pool(dir.path(), "a|available\nb|available\nc|available\nd|available\n", &marks);
+        let report = report_for(dir.path());
+        assert_eq!(monitor_utilization_detail(&report), serde_json::json!({}));
     }
 
     /// A pre-#4292 daemon sends no pool directory. Rendering must stay silent
