@@ -273,7 +273,7 @@ pub mod forge {
     /// Returns `None` on any failure/timeout/unparseable-output — callers
     /// must treat that as "no recency signal", which [`decide`] resolves by
     /// falling back to the pre-#4206 marker-presence-only rule.
-    fn fetch_last_blocked_labeled_at(
+    pub(crate) fn fetch_last_blocked_labeled_at(
         gh_bin: &Path,
         root: &Path,
         issue: u32,
@@ -290,9 +290,9 @@ pub mod forge {
         // #5401: cross-owner managed repo -> its own owner's installation-token
         // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
         crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
+        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
+        // a `--repo` flag (`gh api` has none and aborts on one).
+        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
         let out = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
         if !out.status.success() {
             return None;
@@ -896,5 +896,80 @@ exit 0
         let stdout = b"\"2026-01-01T00:00:00Z\"\n\"2026-06-06T06:06:06Z\"\n";
         let parsed = forge::parse_timestamp(stdout).unwrap();
         assert_eq!(parsed.to_rfc3339(), "2026-06-06T06:06:06+00:00");
+    }
+
+    // --- #8263: `gh api` takes GH_REPO, never `--repo` ---------------------
+    //
+    // `gh api` has no `--repo` flag and exits `unknown flag: --repo` before
+    // issuing any request. `fetch_last_blocked_labeled_at` is fail-open, so
+    // the flag never surfaced as an error — it silently erased the recency
+    // signal `decide_with_recency` needs to tell the daemon's own
+    // contemporaneous label-flip from a later manual park, on every host that
+    // exports `LOOM_REPO`.
+
+    /// A fake `gh` that mimics the real `gh api`: it rejects a `--repo`
+    /// argument and answers only when `GH_REPO` names the expected repo.
+    #[cfg(unix)]
+    fn write_fake_gh_requiring_gh_repo_env(
+        dir: &std::path::Path,
+        payload: &str,
+    ) -> std::path::PathBuf {
+        let fake_gh = dir.join("fake-gh-repo-env.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             for a in \"$@\"; do\n\
+             if [[ \"$a\" == \"--repo\" ]]; then\n\
+             printf 'unknown flag: --repo\\n' >&2\n\
+             exit 1\n\
+             fi\n\
+             done\n\
+             if [[ \"${{GH_REPO:-}}\" != 'rjwalters/loom' ]]; then\n\
+             printf 'gh: could not determine the repository\\n' >&2\n\
+             exit 1\n\
+             fi\n\
+             printf '%s\\n' '{payload}'\n\
+             exit 0\n",
+            payload = payload.replace('\'', "'\\''"),
+        );
+        std::fs::write(&fake_gh, script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        fake_gh
+    }
+
+    /// AC (#8263): with `LOOM_REPO` exported, the `loom:blocked` timeline
+    /// probe still reaches `gh` and parses a timestamp instead of returning
+    /// its fail-open `None`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn fetch_last_blocked_labeled_at_reaches_gh_under_a_loom_repo_override() {
+        let dir = tempdir().unwrap();
+        let gh = write_fake_gh_requiring_gh_repo_env(dir.path(), "\"2026-09-19T12:00:00Z\"");
+
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let at = forge::fetch_last_blocked_labeled_at(&gh, dir.path(), 8263);
+        std::env::remove_var("LOOM_REPO");
+
+        assert_eq!(
+            at.map(|t| t.to_rfc3339()),
+            Some("2026-09-19T12:00:00+00:00".to_string()),
+            "a `--repo` flag would have made `gh api` exit before the request, \
+             erasing the recency signal on every LOOM_REPO-configured host"
+        );
+    }
+
+    /// The negative control: the fixture answers ONLY when `GH_REPO` is set,
+    /// so the assertion above cannot pass vacuously.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn fetch_last_blocked_labeled_at_fixture_requires_the_gh_repo_env_var() {
+        let dir = tempdir().unwrap();
+        let gh = write_fake_gh_requiring_gh_repo_env(dir.path(), "\"2026-09-19T12:00:00Z\"");
+
+        std::env::remove_var("LOOM_REPO");
+        assert!(forge::fetch_last_blocked_labeled_at(&gh, dir.path(), 8263).is_none());
     }
 }
