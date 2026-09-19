@@ -624,10 +624,12 @@ async fn handle_health(
         _ => None,
     };
 
-    let (ranking_present, ranking_age_secs) = report
-        .as_ref()
-        .and_then(|r| r.token_pool_dir.clone())
-        .map_or((false, None), |dir| ranking_state(&dir));
+    // The pool the DAEMON resolved (#4292), resolved once so the `.ranking`
+    // staleness figure and the per-model-class breakdown beside it (#8058
+    // Phase 3) are structurally incapable of describing different pools.
+    let pool_dir = report.as_ref().and_then(|r| r.token_pool_dir.as_deref());
+    let (ranking_present, ranking_age_secs) = pool_dir.map_or((false, None), ranking_state);
+    let token_class_capacity = crate::capacity::model_class::read_for_pool_dir(pool_dir);
 
     // Pid-file observation (#4774) against the path the daemon itself
     // reported, falling back to a local resolution for an unreachable /
@@ -657,6 +659,7 @@ async fn handle_health(
         pid_file,
         ranking_present,
         ranking_age_secs,
+        token_class_capacity,
         pipeline,
         gh_unavailable,
         // #4824 — this route runs *inside* the daemon, so its own

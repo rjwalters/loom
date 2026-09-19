@@ -43,7 +43,7 @@
 //!
 //! [`is_bad`]: super::bad_tokens::is_bad
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -321,6 +321,22 @@ pub struct ProviderCapacity {
     pub healthy: usize,
     pub cooldown: usize,
     pub reauth_required: usize,
+    /// Enabled accounts eligible for each model class currently under a live
+    /// class-scoped hold (#8058 Phase 3) — the per-class counterpart of
+    /// [`Self::healthy`], which answers only the account-wide question and so
+    /// counts a class-scoped hold as a whole-account outage.
+    ///
+    /// **Empty means "no class-scoped state exists"**, not "no class has
+    /// capacity": only classes with a live entry in some account's
+    /// [`AccountHealth::class_cooldowns`] appear, so a provider that has never
+    /// recorded one reports exactly its pre-#8058 shape and every consumer
+    /// degrades to [`Self::healthy`] on its own.
+    ///
+    /// Narrower, never wider: each count is computed through
+    /// [`AccountHealth::is_eligible_for_class_at`], which checks every
+    /// account-wide hold first, so `healthy_by_class[c] >= healthy` always.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub healthy_by_class: BTreeMap<String, usize>,
     pub observed_at: u64,
 }
 
@@ -914,6 +930,32 @@ pub fn provider_capacity_at(
             })
         })
         .count();
+    // #8058 Phase 3: the classes worth reporting are exactly those some
+    // enabled account is *currently* held for. An expired entry names no live
+    // hold, so including it would report a class whose count equals `healthy`
+    // and tell the operator nothing; a provider with no class-scoped state at
+    // all reports an empty map and every surface degrades to `healthy`.
+    let live_classes: std::collections::BTreeSet<String> = enabled
+        .iter()
+        .filter_map(|account| health.get(&account.id))
+        .flat_map(|entry| &entry.class_cooldowns)
+        .filter(|(_, deadline)| **deadline > now)
+        .map(|(class, _)| class.clone())
+        .collect();
+    let healthy_by_class = live_classes
+        .into_iter()
+        .map(|class| {
+            let count = enabled
+                .iter()
+                .filter(|account| {
+                    health
+                        .get(&account.id)
+                        .is_none_or(|entry| entry.is_eligible_for_class_at(now, Some(&class)))
+                })
+                .count();
+            (class, count)
+        })
+        .collect();
     Ok(ProviderCapacity {
         provider,
         raw: accounts.len(),
@@ -921,6 +963,7 @@ pub fn provider_capacity_at(
         healthy: enabled.len().saturating_sub(reauth_required + cooldown),
         cooldown,
         reauth_required,
+        healthy_by_class,
         observed_at: now,
     })
 }

@@ -707,3 +707,183 @@ fn malformed_and_unknown_schema_fail_closed() {
     fs::write(state_path(tmp.path()), "{broken").unwrap();
     assert!(read_state(tmp.path()).is_err());
 }
+
+// ============================================================================
+// Per-model-class capacity reporting (#8058 Phase 3)
+// ============================================================================
+
+/// AC2's degradation clause on this surface: a provider with no class-scoped
+/// state reports an empty map, so every consumer falls back to `healthy` and
+/// sees exactly the pre-#8058 shape. It must also stay off disk entirely.
+#[test]
+fn capacity_reports_no_class_state_when_there_is_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![
+        descriptor(AccountProvider::Codex, "a"),
+        descriptor(AccountProvider::Codex, "b"),
+    ];
+    record_terminal_at(
+        tmp.path(),
+        &accounts[0].id,
+        TerminalClassification::TokenExhausted,
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+    let capacity =
+        provider_capacity_at(tmp.path(), AccountProvider::Codex, &accounts, 101).unwrap();
+    assert_eq!((capacity.healthy, capacity.cooldown), (1, 1));
+    assert!(capacity.healthy_by_class.is_empty());
+    let json = serde_json::to_value(&capacity).unwrap();
+    assert!(
+        json.get("healthy_by_class").is_none(),
+        "an empty map must not appear on the wire: {json}"
+    );
+}
+
+/// The observability gap this phase closes: one class held on most accounts
+/// reads as a nearly-dead provider account-wide, while the per-class count
+/// shows the capacity that is actually still there.
+#[test]
+fn capacity_reports_healthy_counts_per_class() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![
+        descriptor(AccountProvider::Codex, "a"),
+        descriptor(AccountProvider::Codex, "b"),
+        descriptor(AccountProvider::Codex, "c"),
+    ];
+    for account in &accounts[..2] {
+        record_terminal_for_model_at(
+            tmp.path(),
+            &account.id,
+            TerminalClassification::ModelCreditsExhausted,
+            Some("gpt-5-codex"),
+            "adapter_v1",
+            100,
+        )
+        .unwrap();
+    }
+    let capacity =
+        provider_capacity_at(tmp.path(), AccountProvider::Codex, &accounts, 101).unwrap();
+    // Account-wide: a live class hold still blocks the class-less question.
+    assert_eq!((capacity.healthy, capacity.cooldown), (1, 2));
+    // Per class: the hold really is on two accounts, and nothing else is.
+    assert_eq!(capacity.healthy_by_class, BTreeMap::from([("gpt-5-codex".to_string(), 1)]));
+    assert_eq!(
+        serde_json::to_value(&capacity).unwrap()["healthy_by_class"],
+        serde_json::json!({"gpt-5-codex": 1})
+    );
+}
+
+/// Two classes held on disjoint accounts are counted independently — neither
+/// class inherits the other's hold.
+#[test]
+fn capacity_counts_each_class_independently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![
+        descriptor(AccountProvider::Codex, "a"),
+        descriptor(AccountProvider::Codex, "b"),
+        descriptor(AccountProvider::Codex, "c"),
+    ];
+    for (account, model) in accounts.iter().zip(["gpt-5-codex", "gpt-5-mini"]) {
+        record_terminal_for_model_at(
+            tmp.path(),
+            &account.id,
+            TerminalClassification::ModelCreditsExhausted,
+            Some(model),
+            "adapter_v1",
+            100,
+        )
+        .unwrap();
+    }
+    let capacity =
+        provider_capacity_at(tmp.path(), AccountProvider::Codex, &accounts, 101).unwrap();
+    assert_eq!(capacity.healthy, 1);
+    assert_eq!(
+        capacity.healthy_by_class,
+        BTreeMap::from([
+            ("gpt-5-codex".to_string(), 2),
+            ("gpt-5-mini".to_string(), 2)
+        ])
+    );
+}
+
+/// Narrower, never wider: no class count may fall below the account-wide
+/// `healthy`, because every account-wide hold is checked first and
+/// identically. An account-wide exhaustion and a sticky reauth are invisible
+/// to the class filter and stay counted out for every class.
+#[test]
+fn no_class_count_is_ever_below_the_account_wide_healthy_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![
+        descriptor(AccountProvider::Codex, "a"),
+        descriptor(AccountProvider::Codex, "b"),
+        descriptor(AccountProvider::Codex, "c"),
+        descriptor(AccountProvider::Codex, "d"),
+    ];
+    record_terminal_at(
+        tmp.path(),
+        &accounts[0].id,
+        TerminalClassification::TokenExpired,
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+    record_terminal_at(
+        tmp.path(),
+        &accounts[1].id,
+        TerminalClassification::TokenExhausted,
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+    record_terminal_for_model_at(
+        tmp.path(),
+        &accounts[2].id,
+        TerminalClassification::ModelCreditsExhausted,
+        Some("gpt-5-codex"),
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+    let capacity =
+        provider_capacity_at(tmp.path(), AccountProvider::Codex, &accounts, 101).unwrap();
+    assert_eq!(capacity.healthy, 1);
+    for (class, count) in &capacity.healthy_by_class {
+        assert!(
+            *count >= capacity.healthy,
+            "class {class} reported {count}, below the account-wide {}",
+            capacity.healthy
+        );
+    }
+    // Only `d` is free of every hold; `c` adds itself back for no class but
+    // its own, so `gpt-5-codex` stays at 1 while nothing else is reported.
+    assert_eq!(capacity.healthy_by_class, BTreeMap::from([("gpt-5-codex".to_string(), 1)]));
+}
+
+/// An EXPIRED class hold names no live class, so it is not reported at all —
+/// a class whose count would simply equal `healthy` tells an operator
+/// nothing, and reporting it would make the map look permanently populated.
+#[test]
+fn an_expired_class_hold_is_not_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![descriptor(AccountProvider::Codex, "a")];
+    record_terminal_for_model_at(
+        tmp.path(),
+        &accounts[0].id,
+        TerminalClassification::ModelCreditsExhausted,
+        Some("gpt-5-codex"),
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+    let capacity = provider_capacity_at(
+        tmp.path(),
+        AccountProvider::Codex,
+        &accounts,
+        100 + DEFAULT_EXHAUSTED_COOLDOWN_SECS,
+    )
+    .unwrap();
+    assert_eq!(capacity.healthy, 1);
+    assert!(capacity.healthy_by_class.is_empty());
+}

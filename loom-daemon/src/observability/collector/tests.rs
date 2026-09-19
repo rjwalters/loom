@@ -840,6 +840,7 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         pid_file: None,
         ranking_present: true,
         ranking_age_secs: Some(120),
+        token_class_capacity: None,
         pipeline: Some(
             roots
                 .iter()

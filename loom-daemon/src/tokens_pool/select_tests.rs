@@ -802,6 +802,52 @@ fn parse_ranking_line_reset_is_comment_stripped_and_trimmed() {
     assert_eq!(parse_ranking_line("a|exhausted|0.00|").unwrap().limit_reset, None);
 }
 
+/// #8058 Phase 3 (#8242) considered appending per-model-class utilization
+/// columns to `.ranking`, conditional on Anthropic's usage endpoint actually
+/// emitting a per-class header. A live capture on 2026-09-19 established it
+/// does not (see `defaults/docs/token-pool.md` → "Per-class observability"),
+/// so **no columns were added** and the four-field
+/// `name|status|5h_util|limit_reset` shape is the format of record.
+///
+/// This test pins the compatibility reasoning behind that call, so a future
+/// attempt (#8297, the claude-monitor ingest path) cannot quietly append a
+/// fifth column without meeting it: `splitn(4, '|')` does not stop at the
+/// fourth separator, so a fifth field is **swallowed into `limit_reset`**
+/// rather than ignored. That corrupts the reset instant for every reader that
+/// has not been upgraded — it is a breaking change, not an additive one, and
+/// any real per-class column has to be versioned or side-carred instead.
+#[test]
+fn parse_ranking_line_has_no_room_for_a_fifth_per_class_column() {
+    // Today's format, all four fields — the shape every writer emits.
+    let row = parse_ranking_line("a|available|0.42|2026-09-20T03:00:00Z").unwrap();
+    assert_eq!(row.name, "a");
+    assert_eq!(row.status, "available");
+    assert_eq!(row.util_5h, Some(0.42));
+    assert_eq!(row.limit_reset.as_deref(), Some("2026-09-20T03:00:00Z"));
+
+    // Every shorter legacy row still parses, unchanged — the backward
+    // compatibility AC1's negative-finding path requires.
+    for line in ["a|available", "a|available|0.42"] {
+        let legacy = parse_ranking_line(line).unwrap();
+        assert_eq!(legacy.name, "a");
+        assert_eq!(legacy.status, "available");
+        assert_eq!(legacy.limit_reset, None, "{line} must not fabricate a reset");
+    }
+
+    // The hazard itself: a hypothetical trailing `|opus=0.91` is NOT dropped.
+    // It lands inside `limit_reset`, which then fails `parse_reset`'s shape
+    // check and reads as "unknown" — so the account silently loses its reset
+    // instant. This is exactly why the column was not added.
+    let with_fifth = parse_ranking_line("a|available|0.42|2026-09-20T03:00:00Z|opus=0.91").unwrap();
+    assert_eq!(with_fifth.util_5h, Some(0.42), "the util field survives");
+    assert_ne!(
+        with_fifth.limit_reset.as_deref(),
+        Some("2026-09-20T03:00:00Z"),
+        "a 5th column is swallowed into limit_reset, corrupting it -- \
+         any per-class column must be versioned or side-carred (#8297)"
+    );
+}
+
 #[test]
 fn read_ranking_ignores_the_reset_field_for_selection() {
     // Selection consumes the projected triple: a 4-field row must behave

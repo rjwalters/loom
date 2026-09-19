@@ -46,7 +46,7 @@
 //!   rendered text but never the exit code.
 
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -244,6 +244,12 @@ async fn collect(window: Duration) -> HealthReport {
     //    the same rule `status`'s client-side token probe follows.
     let (ranking_present, ranking_age_secs) = probe_ranking(status.as_ref());
 
+    // 3b. Per-model-class healthy counts for that same pool (#8058 Phase 3).
+    //     One more read of the directory step 3 already resolved, never a new
+    //     probe — so the per-class breakdown and the `.ranking` staleness it
+    //     is printed next to can never be scoped to different pools.
+    let token_class_capacity = probe_class_capacity(status.as_ref());
+
     // 4. The forge fan-out for queue depth + review pipeline + throughput.
     //    Only the metrics those sections actually read (#4761's
     //    `PipelineMetrics::HEALTH`, widened by #5021 to carry the review-side
@@ -325,6 +331,7 @@ async fn collect(window: Duration) -> HealthReport {
         pid_file,
         ranking_present,
         ranking_age_secs,
+        token_class_capacity,
         pipeline,
         gh_unavailable,
         // This CLI process's own build commit (#4824), compared daemon-side
@@ -613,23 +620,47 @@ async fn query_status_once(
     }
 }
 
-/// Stat the resolved pool's `.ranking`: `(present, age_secs)`.
+/// The token-pool directory every pool-scoped health input is read from.
 ///
-/// The pool directory comes from the daemon's own
-/// [`DaemonStatusReport::token_pool_dir`] (#4292) when available, falling back
-/// to this process's cwd resolution only for a pre-#4292 daemon or an
-/// unreachable one.
-fn probe_ranking(status: Option<&DaemonStatusReport>) -> (bool, Option<u64>) {
-    let dir = match status.and_then(|r| r.token_pool_dir.clone()) {
-        Some(dir) => dir,
+/// The daemon's own [`DaemonStatusReport::token_pool_dir`] (#4292) when
+/// available, falling back to this process's cwd resolution only for a
+/// pre-#4292 daemon or an unreachable one. `None` when neither resolves, in
+/// which case every pool-scoped input reports "absent" rather than guessing.
+///
+/// Shared by [`probe_ranking`] and [`probe_class_capacity`] (#8058 Phase 3) so
+/// the staleness figure and the per-class breakdown printed beside it are
+/// structurally incapable of describing different pools.
+fn resolve_health_pool_dir(status: Option<&DaemonStatusReport>) -> Option<PathBuf> {
+    match status.and_then(|r| r.token_pool_dir.clone()) {
+        Some(dir) => Some(dir),
         None => {
-            let Ok(ws) = super::tokens::resolve_tokens_workspace(".") else {
-                return (false, None);
-            };
-            loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws)
+            let ws = super::tokens::resolve_tokens_workspace(".").ok()?;
+            Some(loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws))
         }
+    }
+}
+
+/// Stat the resolved pool's `.ranking`: `(present, age_secs)`.
+fn probe_ranking(status: Option<&DaemonStatusReport>) -> (bool, Option<u64>) {
+    let Some(dir) = resolve_health_pool_dir(status) else {
+        return (false, None);
     };
     ranking_state(&dir)
+}
+
+/// Per-model-class healthy counts for the resolved pool (#8058 Phase 3), or
+/// `None` when there is no pool directory or no readable `.ranking` there.
+///
+/// Filesystem-only, like every other input this collector gathers: it reads
+/// `.ranking` and `.bad_tokens` and asks
+/// [`loom_daemon::tokens_pool::bad_tokens`] the same class-scoped blocking
+/// question the selector asks, so the counts cannot drift from what a spawn
+/// would actually be handed.
+fn probe_class_capacity(
+    status: Option<&DaemonStatusReport>,
+) -> Option<loom_daemon::capacity::model_class::ClassCapacity> {
+    let dir = resolve_health_pool_dir(status)?;
+    loom_daemon::capacity::model_class::read_class_capacity_at(&dir)
 }
 
 /// `(present, age_secs)` for `<dir>/.ranking`. Delegates to
