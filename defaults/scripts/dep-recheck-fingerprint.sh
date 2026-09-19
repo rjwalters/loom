@@ -30,6 +30,9 @@
 #
 # BLOCK_REASON and ORTHOGONAL (#6516) stay caller-supplied pass-throughs: both
 # are judgement calls made by reading prose, not mechanical PR-state facts.
+# They are echoed back verbatim but CANONICALIZED before hashing (#8254) -
+# trimmed, internal whitespace collapsed, casefolded - so "doctor cycle
+# exhausted" and "Doctor cycle  exhausted" are one conclusion, not two.
 #
 # Usage:
 #   dep-recheck-fingerprint.sh dep-recheck (--number N [--repo OWNER/NAME] | --stdin)

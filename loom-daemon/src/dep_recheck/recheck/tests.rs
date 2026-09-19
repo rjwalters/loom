@@ -157,7 +157,7 @@ fn an_empty_override_is_a_no_op_and_the_computation_stands() {
 }
 
 #[test]
-fn the_block_reason_folds_into_the_hash_verbatim() {
+fn a_substantively_changed_block_reason_still_changes_the_hash() {
     let a = compute(&[], Some("blocked"), "doctor cycle exhausted", "");
     let b = compute(&[], Some("blocked"), "Sweep coordination: blocking", "");
     assert_ne!(a.conclusion_hash, b.conclusion_hash);
@@ -174,6 +174,82 @@ fn the_orthogonal_identity_changes_the_hash_when_present_and_not_when_empty() {
     let empty = compute(&prs, None, "", "");
     assert_ne!(plain.conclusion_hash, with.conclusion_hash);
     assert_eq!(plain.conclusion_hash, empty.conclusion_hash);
+}
+
+// ---------------------------------------------------------------------------
+// #8254: the free-text pass-throughs are canonicalized before hashing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_block_reason_differing_only_in_case_or_whitespace_hashes_the_same() {
+    // The one hash input still typed as prose by an agent. Unnormalised, these
+    // five spellings of one unchanged state were five CONCLUSION_HASH values,
+    // i.e. five "changed conclusion -> always comment" rows in curator.md's
+    // four-way decision: exactly the #557/#298 churn shape.
+    let base = compute(&[], Some("blocked"), "doctor cycle exhausted", "");
+    for variant in [
+        "Doctor cycle exhausted",
+        "DOCTOR CYCLE EXHAUSTED",
+        "  doctor cycle exhausted  ",
+        "doctor   cycle\texhausted",
+        "doctor\ncycle exhausted",
+    ] {
+        assert_eq!(
+            base.conclusion_hash,
+            compute(&[], Some("blocked"), variant, "").conclusion_hash,
+            "{variant:?} is the same conclusion, differently typed"
+        );
+    }
+}
+
+#[test]
+fn a_whitespace_only_block_reason_hashes_as_if_it_were_absent() {
+    assert_eq!(
+        compute(&[], Some("blocked"), "", "").conclusion_hash,
+        compute(&[], Some("blocked"), "  \t \n ", "").conclusion_hash
+    );
+}
+
+#[test]
+fn an_orthogonal_identity_is_canonicalized_the_same_way() {
+    let prs = [open_clean(7)];
+    let a = compute(&prs, None, "", "epic-open-but-complete:owner/repo#14");
+    let b = compute(&prs, None, "", "  Epic-Open-But-Complete:owner/repo#14 ");
+    assert_eq!(a.conclusion_hash, b.conclusion_hash);
+    // ...and a genuinely different identity is still a different conclusion.
+    let c = compute(&prs, None, "", "epic-open-but-complete:owner/repo#15");
+    assert_ne!(a.conclusion_hash, c.conclusion_hash);
+}
+
+#[test]
+fn the_echoed_pass_throughs_stay_verbatim_uncanonicalized() {
+    // cli.rs prints these as BLOCK_REASON=/ORTHOGONAL= for curator.md to eval
+    // into the comment body. Canonicalizing what is HASHED must not flatten
+    // what is READ.
+    let o = compute(
+        &[],
+        Some("blocked"),
+        "  Doctor Cycle   Exhausted ",
+        " Epic-Open-But-Complete:owner/repo#14 ",
+    );
+    assert_eq!(o.block_reason, "  Doctor Cycle   Exhausted ");
+    assert_eq!(o.orthogonal, " Epic-Open-But-Complete:owner/repo#14 ");
+}
+
+#[test]
+fn the_ordinary_empty_pass_through_case_hashes_exactly_as_it_did_before() {
+    // CONCLUSION_HASH is a PERSISTED identifier: it sits in live marker
+    // comments on `loom:blocked` issues and is compared on the next pass, so a
+    // change to the hash input re-posts every issue it moves. Canonicalizing
+    // the empty string yields the empty string, which is why the ordinary case
+    // — no --block-reason, no --orthogonal, the overwhelming majority of live
+    // markers — is untouched by #8254. These two values were computed from the
+    // pre-#8254 formula; they must not move.
+    assert_eq!(compute(&[], None, "", "").conclusion_hash, "d88c83f77b541ea4");
+    assert_eq!(
+        compute(&[pr(7, "OPEN", &[], "CONFLICTING", "DIRTY")], None, "", "").conclusion_hash,
+        "b869e5c416771254"
+    );
 }
 
 // ---------------------------------------------------------------------------

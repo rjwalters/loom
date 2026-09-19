@@ -43,6 +43,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Use GitHub labels as state machine for agent workflow coordination
   - **Key Decision**: Leverage GitHub labels over database, message queue, or file-based queue
 
+- [ADR-0019: The `loom:curating` Label Claim Is Sufficient Serialization for the Dep-Recheck Post](0019-dep-recheck-post-serialization.md)
+  - **Status**: Accepted
+  - **Summary**: Records why Curator's dep-recheck posting sequence keeps a plain (non-atomic) `loom:curating` label claim rather than the POSIX-atomic `mkdir` lock plus under-lock re-decide of the retired `premise-recheck.sh` — the duplicate-comment incidents that motivated the lock were hours-to-weeks apart and were fully explained by hash non-determinism (since fixed by #7281/#7362/#8254), not by any claim race
+  - **Key Decision**: Accept the non-atomic forge-side claim, with a falsifiable revisit trigger (duplicate same-hash re-check comments less than ~1 minute apart), over an emulated CAS that would add forge calls on a hot path under live quota pressure to prevent one self-suppressing duplicate comment
+
 ### Orchestration Architecture
 
 - [ADR-0009: Deprecate and Delete Shepherd Brain and Python Daemon (Phase 3)](0009-shepherd-deprecation.md)
