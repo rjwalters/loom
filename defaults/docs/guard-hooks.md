@@ -1143,6 +1143,112 @@ The guard is **on by default**. It is resolved in this order (highest precedence
 
 The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-ON and never causes the hook to exit non-zero; a missing/unreadable/unparseable transcript, or a missing `jq`, also fails open (allow the stop) rather than wedging the session.
 
+### Uncommitted-Work Stop Guard (`guards.uncommittedWork` / `LOOM_GUARD_UNCOMMITTED_WORK`)
+
+`loom-daemon worktree-state stop-hook` (issue #8267) is the sibling of the
+guard above, on the other turn-end hazard. That one blocks a turn that ends
+**too early** (children still running); this one blocks a turn that ends with
+the work **still only on this machine's disk** — an agent reporting success
+while its entire deliverable sits uncommitted in its worktree.
+
+The reported failure, twice in one session: an agent ran a long investigation,
+committed nothing (**zero commits on its branch**), and left six probe scripts
+untracked — recovered by hand only because the files happened to still be on
+disk; and a second agent left a 52 KB tool untracked, then left a further fix
+uncommitted *after reporting done*. In both cases **the completion notification
+was indistinguishable** from one where everything had been committed. Loom does
+not own the harness's `<usage>` completion block, so the fix lives at the turn
+boundary it does own.
+
+It is wired on **both** `Stop` (a headless role agent, whose whole process is
+one turn) and `SubagentStop` (a `Task`-tool Builder/Doctor inside an
+orchestrator session), and it decides in three steps:
+
+1. **Ownership.** It acts only on a worktree this session actually wrote into:
+   the payload `cwd` when that is a `.loom-managed` worktree, otherwise the most
+   recent `Edit`/`Write`/`MultiEdit`/`NotebookEdit` `file_path` in the
+   transcript that lands inside one. A `Bash` command *mentioning* a worktree
+   path is deliberately not ownership — the orchestrator's own transcript is
+   full of those (`check-main-clean.sh --label issue=N`, checkpoint writes), and
+   blocking an orchestrator for a Builder's mess would block a turn that cannot
+   fix it. The primary checkout is never a subject: it legitimately holds an
+   operator's WIP, and `check-main-clean.sh` already covers contamination there.
+2. **Measurement.** `git rev-list --count <base>..HEAD` for commits, plus
+   `git status --porcelain=v1 -z` for working-tree changes, minus the same
+   scratch exclusions `buildGate` documents (`.loom-*` runtime markers, `*.log`,
+   `.no-changes-needed`, `.snapshots/`). A Builder that deliberately concluded
+   "no changes needed" leaves exactly one excluded marker file and is never
+   flagged for it.
+3. **Verdict.** `uncommitted` (deliverable-shaped changes not committed) blocks;
+   `committed`, `unpushed` and `empty` do not. An unverifiable push state
+   renders as `unpushed`, never as `committed` — the same
+   "existence treated as evidence of a property" trap #8265 names.
+
+On a block the reason names the counts, up to 8 at-risk paths (`+N more` beyond
+that) and the three ways out: commit and push, restate explicitly that the files
+are intermediate, or write `.no-changes-needed`. It blocks **at most once per
+stop sequence** (`stop_hook_active`, exactly as the background-subagent guard
+does): the second stop downgrades to a `systemMessage` advisory that still
+records the state, so a deliberate judgement costs one extra turn and can never
+wedge a session. A clean completion **with commits** also emits an advisory —
+that is the "surface repo state in the completion notification" half: a turn
+that ends well says so with evidence rather than an assertion. A session that
+produced nothing at all stays silent.
+
+Read the same numbers directly at any time:
+
+```bash
+loom-daemon worktree-state report --issue 8267        # one key=value line
+loom-daemon worktree-state report --worktree "$PWD" --json
+# exit 0 = nothing at risk · exit 3 = unsaved deliverables (check-main-clean.sh's code)
+```
+
+This is also the executable home of `buildGate`'s documented **has-commits**
+primitive (see [`build-gate.md`](build-gate.md)) — anything else that needs to
+ask "did this agent actually commit anything?" calls it rather than growing a
+second commit-counter.
+
+The guard is **on by default**, resolved highest-precedence-first:
+
+1. **`LOOM_GUARD_UNCOMMITTED_WORK` env var** — `0`/`false`/`no`/`off` disables;
+   `1`/`true`/`yes`/`on` forces on.
+2. **`.loom/config.json`** — `guards.uncommittedWork` (default `true` when
+   absent):
+   ```json
+   {
+     "guards": {
+       "uncommittedWork": false
+     }
+   }
+   ```
+3. **Default** — `true` (guard on).
+
+The config is read from the **main checkout**, resolved from the worktree via
+`git rev-parse --git-common-dir`, not from the worktree itself: the host-local
+override tier (`.loom-local/local.json`) is gitignored and exists only there,
+and an uncommitted edit to the main checkout's `.loom/config.json` is likewise
+invisible inside a worktree. Reading the worktree's own copy would mean an
+operator's opt-out silently did nothing — the same main-checkout-only config
+trap `forge_cmd` hit in #4273.
+
+Every failure path allows the stop: an unreadable payload, a missing transcript,
+an absent `git`, a worktree that no longer exists, or a daemon binary the
+wiring cannot resolve all resolve to "allow, say nothing". A guard that wedges a
+headless sweep on its own parse bug would be worse than the loss it prevents.
+
+**Where it is wired (deliberately narrow for now).** The `Stop` /`SubagentStop`
+entries live in this repository's project-level `.claude/settings.json` only.
+Consumer repos get their guard hooks from the user-scope wiring
+`scripts/install/provision-hooks.sh` installs, whose set is the six
+`defaults/hooks/*.sh` scripts — this guard is a `loom-daemon` subcommand, not one
+of them, so it does **not** fire in consumer repos yet. That is a choice, not an
+oversight: this is a new *blocking* turn-end guard, and the only other one
+(`guard-background-subagents.sh`) needed eight follow-up corrections
+(#4389/#4462/#4696/#5013/#5086/#5976/#6175/#6645) before its false-positive rate
+was acceptable fleet-wide. It is dogfooded here — where every Loom sweep in this
+repo exercises it — before being offered to every installed workspace at once.
+Issue #8372 tracks the consumer-repo wiring.
+
 ### Workspace Registry Guard (`guards.workspaceRegistry` / `LOOM_GUARD_WORKSPACE_REGISTRY`)
 
 `guard-loom-workflow.sh` (issue #4326) ASKS for confirmation before a `loom-daemon workspace add|remove|set-priority` command runs — these mutate the machine-level workspace registry (Issue #3926), normally the operator's **real** `~/.loom/workspaces.json`, a file shared across every repo and session on the host. The hazard it backstops: an ad-hoc verification step (a builder/auditor sweep exercising registry behavior) that calls the real CLI directly leaves dangling or incorrect entries in the operator's actual registry. Issue #4326 found exactly this — a leaked `/private/tmp/mig-test` entry sat at explicit dispatch priority `3`, ahead of every real managed repo, for most of a day, because the scratch directory was deleted without a matching `workspace remove`. `loom-daemon workspace list` is read-only and is **never** matched by this guard.

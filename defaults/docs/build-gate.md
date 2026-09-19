@@ -30,6 +30,12 @@ Without a gate, the Judge phase has to catch every one of these post-hoc, which 
 The gate runs three checks in order. Any failure short-circuits PR creation:
 
 1. **has-commits** — `git rev-list --count origin/main..HEAD > 0` in the worktree.
+   Since #8267 this check has an executable implementation that any caller can
+   reuse — `loom-daemon worktree-state report` (exit `3` = unsaved deliverables)
+   and the turn-end guard built on it, documented under
+   [`guard-hooks.md` → Uncommitted-Work Stop Guard](guard-hooks.md). Ask it
+   rather than writing a second commit-counter: the gate below and the guard
+   must never be able to disagree about whether an agent committed anything.
 2. **has-real-changes** — at least one changed file matches the configured `realChangeGlobs` (or the default scratch-exclusion list when no globs are configured).
 3. **build-passes** — the configured `buildGate.command` exits with code 0 inside the worktree.
 
