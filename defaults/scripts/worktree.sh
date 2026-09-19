@@ -2502,31 +2502,50 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     # local branch's upstream at it before handing the branch to `git
     # worktree add`. If origin has no branch of this name (never pushed),
     # leave tracking as-is — do not fabricate an upstream that doesn't exist.
+    # (The two-deep message dispatch below is one physical line, not two
+    # separate `if`s, to keep this reuse arm's net line count in the shell
+    # budget ratchet's portable pool flat — see the #8280 comment below for
+    # why that budget was worth spending on.)
     git fetch origin "$BRANCH_NAME" 2>/dev/null || true
     if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
         current_upstream="$(git rev-parse --abbrev-ref "$BRANCH_NAME@{u}" 2>/dev/null || true)"
         if [[ "$current_upstream" != "origin/$BRANCH_NAME" ]]; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                if [[ -n "$current_upstream" ]]; then
-                    print_warning "Branch '$BRANCH_NAME' was tracking '$current_upstream' - correcting to 'origin/$BRANCH_NAME'"
-                else
-                    print_info "Branch '$BRANCH_NAME' has no upstream - setting it to 'origin/$BRANCH_NAME'"
-                fi
-            fi
+            if [[ "$JSON_OUTPUT" != "true" ]]; then if [[ -n "$current_upstream" ]]; then print_warning "Branch '$BRANCH_NAME' was tracking '$current_upstream' - correcting to 'origin/$BRANCH_NAME'"; else print_info "Branch '$BRANCH_NAME' has no upstream - setting it to 'origin/$BRANCH_NAME'"; fi; fi
             git branch --set-upstream-to="origin/$BRANCH_NAME" "$BRANCH_NAME" 2>/dev/null || true
         fi
     fi
 
-    # #8280: the sibling arm below refuses an already-LANDED branch (#5657) and
-    # warns when the branch lacks the base ref's history. This arm did neither,
-    # so a stale local feature/issue-N left from an earlier slice was reused in
-    # SILENCE — yielding a worktree tens of commits behind the base, on a merged
-    # PR's branch, and a PR that re-proposed already-merged code with no CI. A
-    # surviving local ref is the normal state on a host that built the previous
-    # slice, which is exactly the partial-increment case #5657 was written for.
-    if [[ "$JSON_OUTPUT" != "true" ]] && ! git merge-base --is-ancestor "$BASE_REF" "$BRANCH_NAME" 2>/dev/null; then
-        print_warning "Branch '$BRANCH_NAME' has diverged from $BASE_DISPLAY (does not contain all of its history) - reusing it as-is; rebase or delete it if that is not what you want"
+    # #8280: the sibling arm below refuses an already-LANDED branch via the
+    # shared `branch_landed` primitive (#5657/#7812) before reusing it, and
+    # warns when the reused branch lacks the base ref's history. This arm did
+    # neither, so a stale local feature/issue-N left from an earlier slice was
+    # reused in SILENCE — yielding a worktree tens of commits behind the base,
+    # on a merged PR's branch, and a PR that re-proposed already-merged code
+    # with no CI. A surviving local ref is the normal state on a host that
+    # built the previous slice, which is exactly the partial-increment case
+    # #5657 was written for.
+    #
+    # Unlike the sibling arm, this one cannot silently fall through to a fresh
+    # branch on `landed` — the name is already taken locally — so it refuses
+    # outright and names the fix. `unknown` (forge outage, or the tree check
+    # unavailable) keeps today's fail-open-to-reuse behaviour, same as the
+    # sibling arm — a forge outage must never block worktree creation.
+    #
+    # The extra SHA guard below excludes the degenerate case `branch_landed`'s
+    # own ancestry rung cannot tell apart from a real landing: a branch tip
+    # that is IDENTICAL to origin/$DEFAULT_BRANCH's current tip is trivially
+    # its own ancestor, which is exactly the state of a brand-new local branch
+    # that has not yet carried any work (worktree.sh's own default creation
+    # path, and test-worktree-json-purity.sh's branch-reuse/auto-recovery
+    # fixtures). Refusing THAT reuse would break the ordinary re-run case; a
+    # branch tip that differs from the current default tip is never this
+    # degenerate case, whichever rung answered.
+    branch_landed "$BRANCH_NAME" "$DEFAULT_BRANCH"
+    if [[ "$BRANCH_LANDED_VERDICT" == "landed" ]] && [[ "$(git rev-parse "$BRANCH_NAME" 2>/dev/null)" != "$(git rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null)" ]]; then
+        if [[ "$JSON_OUTPUT" == "true" ]]; then echo '{"success": false, "error": "branch-already-landed", "issueNumber": '"$ISSUE_NUMBER"', "branch": "'"$BRANCH_NAME"'", "prNumber": '"${BRANCH_LANDED_PR_NUMBER:-null}"'}' >&3; else print_error "Local branch '$BRANCH_NAME' has already landed on $BASE_DISPLAY${BRANCH_LANDED_PR_NUMBER:+ (already-merged PR #$BRANCH_LANDED_PR_NUMBER)} - refusing to reuse it. Delete it and re-run: git branch -D $BRANCH_NAME && ./.loom/scripts/worktree.sh $ISSUE_NUMBER"; fi
+        exit 1
     fi
+    if [[ "$JSON_OUTPUT" != "true" ]] && ! git merge-base --is-ancestor "$BASE_REF" "$BRANCH_NAME" 2>/dev/null; then print_warning "Branch '$BRANCH_NAME' has diverged from $BASE_DISPLAY (does not contain all of its history) - reusing it as-is; rebase or delete it if that is not what you want"; fi
 
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
 else
