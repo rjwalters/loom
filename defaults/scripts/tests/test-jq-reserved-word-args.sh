@@ -59,7 +59,13 @@ KWRE='(if|then|elif|else|end|as|def|reduce|foreach|try|catch|import|include|labe
 
 # --- Test 1: the real repo tree has zero matches ----------------------------
 echo "Test 1: the guard finds zero --arg(json) <jq-keyword> bindings in the live tree"
-matches="$(cd "$REPO_ROOT" && git grep -noP -- "--arg(json)? +${KWRE}\b" -- '*.sh' 2>/dev/null | grep -v '\.loom/worktrees/' || true)"
+# This file's own path is excluded: its comments/echo text and fixture
+# heredocs below deliberately spell out the exact violation shape (as
+# documentation and as Test 2/3 fixtures), which would otherwise
+# self-match once this file itself is tracked -- confirmed the hard way
+# while writing this test.
+SELF_PATH="defaults/scripts/tests/$(basename "$0")"
+matches="$(cd "$REPO_ROOT" && git grep -noP -- "--arg(json)? +${KWRE}\b" -- '*.sh' 2>/dev/null | grep -v '\.loom/worktrees/' | grep -vF "$SELF_PATH:" || true)"
 if [[ -z "$matches" ]]; then
     pass "no reserved-word --arg/--argjson bindings found"
 else
