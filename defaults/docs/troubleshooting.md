@@ -167,6 +167,53 @@ ordinary failure. A genuine rejection (the ref really did not move) is still
 reported and handled as a failure — the check only reclassifies a reported
 rejection whose ref update is confirmed to have landed.
 
+### `merge-pr.sh` blocks a PR whose job is to change the version-bearing set (#8284)
+
+**Symptom**: `merge-pr.sh <PR>` refuses a PR that CI's `PRs Must Not Hand-Edit
+Version-Bearing Files` job (`defaults-version-bump-check`) passed:
+
+```
+Merge blocked: PR #8190 hand-edits a version-bearing value (#7827).
+  CLAUDE.md: '0.19.168' -> ''
+… a no-surface-change marker cannot waive this policy.
+```
+
+**Root cause** (fixed): the guard ran the **operator checkout's** copy of
+`defaults/scripts/check-defaults-version-bump.sh` — i.e. the default branch's —
+against the PR's diff. For a PR whose whole purpose is to change *which files
+are version-bearing*, that copy still encodes the OLD set, so the PR could never
+pass: on 2026-09-18 PR #8190 (#8147, dropping `CLAUDE.md` from the set) was
+blocked exactly this way, while CI — which checks out
+`pull_request.head.sha` and runs the checker from **that** tree — passed on the
+same commit. The operator had to merge it with a hand-patched scratch copy of
+`merge-pr.sh`.
+
+**Current behavior**: when the PR's *own* commits (`merge-base..head`, so
+base-branch drift never counts) touch the version-policy machinery —
+`check-defaults-version-bump.sh`, `version-check-gate.sh`, or
+`scripts/version.sh` — the guard evaluates the checker extracted from the **PR
+head** (`git show <head>:defaults/scripts/check-defaults-version-bump.sh`),
+matching CI, and names the ref it used in its output:
+
+```
+WARN: Version policy guard: this PR's own commits change the version-policy
+machinery, so the guard evaluates the checker from the PR head (<sha>) …
+```
+
+Every other PR is unchanged: the default branch's checker, and every existing
+fail-open skip (no ancestry, failed fetch, guard-internal fault). Two things the
+head oracle deliberately is **not**:
+
+- **Not a bypass** — the head's own checker still blocks a hand-bump it forbids,
+  so touching `scripts/version.sh` does not excuse editing `VERSION`.
+- **Not fail-open** — if the head's copy cannot be read (the PR deletes it, the
+  object is missing), the guard falls **back** to the default branch's checker
+  and says so, rather than skipping the comparison.
+
+If you still see a block on a PR that legitimately changes the set, check the
+`WARN:` line for which ref was used: a fallback line means the head lookup
+failed, so fetch the PR branch (`git fetch origin <branch>`) and re-run.
+
 ### Cleaning Up Stale Worktrees and Branches
 
 Use the `loom-clean` command to restore your repository to a clean state:
