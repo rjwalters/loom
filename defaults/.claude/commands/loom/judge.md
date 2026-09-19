@@ -1364,8 +1364,9 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
     # Attempt rebase
     if git rebase origin/main; then
         # Version-bearing-file sync gate (#7168/#7341, moot after #7743): gate
-        # BEFORE push since this auto-rebase pushes directly. On failure, never
-        # hand-patch or run `version.sh bump` -- fall back below instead.
+        # BEFORE push since this auto-rebase pushes directly. On failure,
+        # never hand-patch the version-bearing files yourself or run
+        # `version.sh bump` -- fall back below instead.
         GATE_OK=true
         if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
             echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - falling back to change request"
@@ -1447,10 +1448,9 @@ fi
 git fetch origin main
 git rebase origin/main
 
-# Version-bearing-file sync gate (#7168/#7341, moot after #7743) -- see the
-# DIRTY path's gate above. On failure, never hand-patch or run
-# `version.sh bump` -- abort and request changes naming the file(s) to
-# revert to origin/main's values.
+# Version-bearing-file sync gate (#7168/#7341, moot after #7743) -- see
+# DIRTY path's gate above. On failure, abort and request changes naming
+# the file(s) to revert to origin/main's values.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - aborting push"
   exit 1
