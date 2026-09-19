@@ -7,6 +7,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-19
+- **Issue #8232** (closed): champion-pr-merge.md: same BSD date -j -f UTC-parsing bug as #8230, 4 more occurrences
+- **PR #8343**: fix(champion): add -u to BSD date -j -f UTC parsing at 5 remaining sites (#8232)
+- **PR #8341**: fix(curator): stop heartbeating Champion's out-of-band AC hold as a dependency
 - **Issue #8259** (closed): Curator dep-recheck heartbeat spams issues held by champion:ac-hold (18 daily 'nothing changed' comments on gf180-pll#242) — a human-attestation gate has nothing to re-check
 - **Issue #8250** (closed): claim_reconciliation::reclaim_pr backfills loom:review-requested onto draft PRs (no isDraft check)
 - **PR #8332**: fix(claim-reconciliation): skip loom:review-requested backfill on draft PRs
