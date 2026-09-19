@@ -85,7 +85,7 @@ assert_role_deny_reason_matches() {
     output=$(run_guard_env "LOOM_ROLE=$role" "$cmd" "$cwd") || true
     reason=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty' 2>/dev/null)
     if echo "$output" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1 && \
-       echo "$reason" | grep -qE "$pattern"; then
+       grep -qE "$pattern" <<<"$reason"; then
         PASS=$((PASS + 1))
         echo -e "  ${GREEN}PASS${NC}: $description"
     else
