@@ -164,6 +164,17 @@ assert_eq "clear" "$(field "$out_merged" VERDICT)" "T5d: a MERGED PR no longer b
 assert_ne "$(field "$out1" CONCLUSION_HASH)" "$(field "$out_merged" CONCLUSION_HASH)" \
     "T5e: OPEN -> MERGED (a real change) changes CONCLUSION_HASH"
 
+# T5f/T5g (#8253): once a PR merges, GitHub stops computing mergeability and
+# can read mergeable/mergeStateStatus back as UNKNOWN non-deterministically.
+# That transient reading must not move CONCLUSION_HASH for an already-MERGED
+# PR the way it correctly does for an OPEN one (T3).
+FIXTURE_MERGED_CONCRETE='{"prs":[{"number":4743,"state":"MERGED","labels":["loom:changes-requested"],"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN"}]}'
+out_merged_concrete="$(echo "$FIXTURE_MERGED_CONCRETE" | "$TARGET_SCRIPT" dep-recheck --stdin)"
+assert_eq "$(field "$out_merged_concrete" CONCLUSION_HASH)" "$(field "$out_merged" CONCLUSION_HASH)" \
+    "T5f: a MERGED PR's mergeable flicker (MERGEABLE/CLEAN <-> UNKNOWN) does NOT change CONCLUSION_HASH"
+assert_eq "4743:MERGED:block-label:n/a" "$(field "$out_merged" BLOCKERS)" \
+    "T5g: a non-OPEN PR's BLOCKERS line reports a fixed n/a merge-state bucket, not its (meaningless) mergeability reading"
+
 # --- T6: label ordering churn from the API never looks like a changed
 #         conclusion (labels are sorted before hashing) -------------------
 FIXTURE_LABELS_A='{"prs":[{"number":1,"state":"OPEN","labels":["loom:blocked","loom:changes-requested"],"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN"}]}'

@@ -115,6 +115,54 @@ fn a_closed_pr_never_blocks_whatever_labels_it_carries() {
 }
 
 // ---------------------------------------------------------------------------
+// #8253: a MERGED/CLOSED PR's transient UNKNOWN mergeability must not move
+// the hash
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_merged_pr_flickering_between_a_concrete_mergeability_and_unknown_hashes_the_same() {
+    // GitHub stops computing mergeability once a PR merges and can read back
+    // mergeable/mergeStateStatus as UNKNOWN non-deterministically. is_conflicting()
+    // fails UNKNOWN safe to "conflicting" — correct for an OPEN PR, but for an
+    // already-MERGED PR that reading is meaningless noise and must not move
+    // blockers()/conclusion_hash.
+    let concrete = [pr(7, "MERGED", &[], "MERGEABLE", "CLEAN")];
+    let unknown = [pr(7, "MERGED", &[], "UNKNOWN", "UNKNOWN")];
+    assert_eq!(
+        hash_of(&concrete),
+        hash_of(&unknown),
+        "a MERGED PR's mergeability flicker must not move CONCLUSION_HASH"
+    );
+    assert_eq!(verdict(&concrete), "clear");
+    assert_eq!(verdict(&unknown), "clear");
+}
+
+#[test]
+fn a_closed_pr_flickering_between_a_concrete_mergeability_and_unknown_hashes_the_same() {
+    let concrete = [pr(7, "CLOSED", &[], "MERGEABLE", "CLEAN")];
+    let unknown = [pr(7, "CLOSED", &[], "UNKNOWN", "UNKNOWN")];
+    assert_eq!(hash_of(&concrete), hash_of(&unknown));
+}
+
+#[test]
+fn a_non_open_pr_blocker_line_reports_a_fixed_placeholder_not_the_mergeability() {
+    // The merge-state bucket must be a fixed placeholder for a non-OPEN PR,
+    // never the outcome of is_conflicting() — otherwise the flicker is merely
+    // reproduced with a different label.
+    assert!(blockers(&[pr(7, "MERGED", &[], "CONFLICTING", "DIRTY")]).ends_with(":n/a"));
+    assert!(blockers(&[pr(7, "CLOSED", &[], "UNKNOWN", "UNKNOWN")]).ends_with(":n/a"));
+}
+
+#[test]
+fn an_open_prs_unknown_failsafe_is_unchanged_by_the_open_state_gate() {
+    // The fix must not touch OPEN-PR behavior: UNKNOWN still fails safe to
+    // conflicting, and it still differs from the n/a bucket a non-OPEN PR gets.
+    let open_unknown = [pr(7, "OPEN", &[], "UNKNOWN", "UNKNOWN")];
+    assert!(blockers(&open_unknown).ends_with(":conflicting"));
+    assert_eq!(verdict(&open_unknown), "blocked");
+}
+
+// ---------------------------------------------------------------------------
 // Ordering
 // ---------------------------------------------------------------------------
 
