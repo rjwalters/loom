@@ -2190,7 +2190,7 @@ pub mod forge {
     /// exactly (case-insensitively) `"closed"` — including a genuine
     /// `"open"` — returns `false`, so a transient `gh` hiccup can never
     /// itself suppress a legitimate reclaim.
-    fn issue_is_confirmed_closed(gh_bin: &Path, root: &Path, issue: u32) -> bool {
+    pub(crate) fn issue_is_confirmed_closed(gh_bin: &Path, root: &Path, issue: u32) -> bool {
         let mut cmd = Command::new(gh_bin);
         cmd.arg("api")
             .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}"))
@@ -2200,9 +2200,9 @@ pub mod forge {
         // #5401: cross-owner managed repo -> its own owner's installation-token
         // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
         crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
+        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
+        // a `--repo` flag (`gh api` has none and aborts on one).
+        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let Ok(out) = cmd.output() else {
             return false;
@@ -2572,7 +2572,7 @@ pub mod forge {
     /// when the label was never applied — callers fall back to `updatedAt`
     /// in that case, the same fail-open posture used elsewhere in this
     /// module.
-    fn fetch_claim_labeled_at(
+    pub(crate) fn fetch_claim_labeled_at(
         gh_bin: &Path,
         root: &Path,
         pr_number: u32,
@@ -2590,9 +2590,9 @@ pub mod forge {
         // #5401: cross-owner managed repo -> its own owner's installation-token
         // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
         crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
+        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
+        // a `--repo` flag (`gh api` has none and aborts on one).
+        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let out = cmd.output().ok()?;
         if !out.status.success() {
@@ -2720,9 +2720,9 @@ pub mod forge {
         // #5401: cross-owner managed repo -> its own owner's installation-token
         // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
         crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
+        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
+        // a `--repo` flag (`gh api` has none and aborts on one).
+        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let Ok(out) = cmd.output() else {
             return LeaseProbe::ReadFailed;
@@ -3441,3 +3441,8 @@ pub mod forge {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+// Issue #8263's `gh api` GH_REPO regression coverage, in its own sibling file
+// so this over-threshold module does not grow (scripts/file-size-baseline.txt).
+#[cfg(test)]
+mod repo_env_tests;

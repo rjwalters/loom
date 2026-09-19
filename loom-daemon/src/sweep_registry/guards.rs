@@ -412,9 +412,9 @@ impl SweepRegistry {
             &mut cmd,
             &self.config.workspace_root,
         );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
+        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
+        // a `--repo` flag (`gh api` has none and aborts on one).
+        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
         let timeout = reap_gh_timeout();
         let output = output_with_timeout(cmd, timeout).ok().flatten()?;
         if !output.status.success() {
@@ -3863,3 +3863,10 @@ mod union_tests;
 #[cfg(test)]
 #[path = "guards_preflip_tests.rs"]
 mod preflip_tests;
+
+// Issue #8263's `gh api` GH_REPO regression coverage. A plain child module
+// (guards/repo_env_tests.rs) rather than another `#[path]` sibling: this file
+// is frozen at its current size by scripts/file-size-baseline.txt, and the
+// two-line form fits the budget the shared-helper call site above freed.
+#[cfg(test)]
+mod repo_env_tests;

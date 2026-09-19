@@ -167,6 +167,7 @@ pub mod forge_cached_list;
 pub mod forge_cmd;
 pub mod forge_listing;
 pub mod forge_parser;
+pub mod gh_repo_env;
 pub mod git_parser;
 pub mod git_utils;
 pub mod hard_exclusion;
