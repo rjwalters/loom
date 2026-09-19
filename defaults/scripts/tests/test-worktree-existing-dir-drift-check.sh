@@ -30,6 +30,14 @@
 #   3. Worktree already correctly synced (HEAD matches origin's tip, upstream
 #      already correct, no uncommitted changes): no-op, no warning of any
 #      kind (regression guard against false positives on the common case).
+#   4. (#8287) Local branch reset back to the base (0 commits ahead of
+#      main, no uncommitted changes — "stale" by the OLD main-only
+#      criterion) while a LIVE origin/feature/issue-N still carries the
+#      branch's real commit: worktree.sh resets/checks out at the remote
+#      tip, never at main — the Doctor-on-#8190 incident this closes.
+#   5. (#8287) Same stale-local shape, but origin's tip IS already the head
+#      of a merged PR (#5657): worktree.sh still falls back to resetting at
+#      main — the merged-tip skip keeps working on this code path too.
 #
 # Pattern follows test-worktree-local-branch-upstream-tracking.sh: throwaway
 # bare origin + repo in a mktemp dir, copy worktree.sh + lib/, but here the
@@ -132,6 +140,66 @@ cleanup_repo() {
     local repo="$1"
     [[ -z "$repo" ]] && return 0
     rm -rf "$(dirname "$repo")"
+}
+
+# Reset the worktree's LOCAL branch tip back to origin/main in place, WITHOUT
+# touching origin/feature/issue-<n> — simulating a worktree whose local branch
+# never advanced (or lost its commit) while the branch's real content still
+# lives on the remote. This is "0 commits ahead of main, no uncommitted
+# changes" by the pre-#8287 staleness criterion, with the PR's actual content
+# reachable only via origin/feature/issue-<n>. Also removes the `.loom-managed`
+# sentinel the first `worktree.sh` invocation left behind: it is untracked and
+# this throwaway fixture repo has no .gitignore for it, so leaving it in place
+# would make `git status --porcelain` permanently non-empty and force every
+# re-invocation down the "preserve existing work" branch instead of the
+# staleness check under test (worktree.sh re-creates it on every exit path).
+rewind_worktree_to_main() {
+    local wt="$1"
+    git -C "$wt" reset -q --hard origin/main
+    rm -f "$wt/.loom-managed"
+}
+
+# A minimal `gh` stand-in on PATH, modeling
+# `pr list --head <branch> --state merged --json headRefOid,number --limit 1`
+# — same fixture shape as test-worktree-stale-merged-branch.sh's
+# install_fake_gh. FAKE_GH_MODE=merged reports a merged PR whose headRefOid is
+# the CURRENT tip of origin/<branch> (the #5657 skip case); FAKE_GH_MODE=off
+# makes every call fail (forge unavailable).
+install_fake_gh() {
+    local repo="$1"
+    local fake_bin
+    fake_bin="$(dirname "$repo")/fakebin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/gh" << EOF
+#!/bin/bash
+if [[ "\${FAKE_GH_MODE:-none}" == "off" ]]; then
+    echo "gh: fake forge unavailable in this test" >&2
+    exit 1
+fi
+if [[ "\$1" == "pr" && "\$2" == "list" ]]; then
+    shift 2
+    branch=""
+    while [[ \$# -gt 0 ]]; do
+        case "\$1" in
+            --head) branch="\$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    if [[ "\${FAKE_GH_MODE:-none}" == "merged" && -n "\$branch" ]]; then
+        sha="\$(git -C "$repo" rev-parse --verify -q "refs/remotes/origin/\$branch" 2>/dev/null || echo "")"
+        if [[ -n "\$sha" ]]; then
+            echo "[{\"headRefOid\": \"\$sha\", \"number\": 999}]"
+            exit 0
+        fi
+    fi
+    echo "[]"
+    exit 0
+fi
+echo "fake gh: unsupported invocation: \$*" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/gh"
+    echo "$fake_bin"
 }
 
 # --- Test 1: behind pushed tip + wrong upstream + uncommitted changes (the incident) ---
@@ -252,6 +320,74 @@ if [[ "$WT_UPSTREAM" == "origin/feature/issue-303" ]]; then
     pass "worktree's upstream remains origin/feature/issue-303 (unaffected)"
 else
     fail "worktree's upstream is '$WT_UPSTREAM', expected unchanged 'origin/feature/issue-303'"
+fi
+cleanup_repo "$REPO"
+rm -f "$OUT_LOG"
+
+# --- Test 4 (#8287): stale local branch + LIVE remote branch -> resets at the remote tip, never main ---
+echo ""
+echo "Test 4 (#8287): local branch rewound to main (0 ahead, no uncommitted changes) while origin/feature/issue-N is a live, unmerged branch -> worktree.sh resets/checks out at the remote tip, not main"
+read -r REPO WT_REL <<< "$(setup_repo_with_worktree stale8287 401)"
+WT="$REPO/$WT_REL"
+FAKE_BIN=$(install_fake_gh "$REPO")
+ORIGIN_TIP=$(git -C "$REPO" rev-parse origin/feature/issue-401)
+
+rewind_worktree_to_main "$WT"
+
+OUT_LOG="/tmp/wtdrift-stale8287.$$"
+(
+    cd "$REPO"
+    PATH="$FAKE_BIN:$PATH" FAKE_GH_MODE=none ./.loom/scripts/worktree.sh 401 >"$OUT_LOG" 2>&1 || { echo "FAILED"; cat "$OUT_LOG"; }
+)
+
+if [[ -f "$WT/work.txt" ]]; then
+    pass "worktree recovered the branch's real content from origin (not reset to bare main)"
+else
+    fail "worktree lost the branch's content — it was reset to main instead of the live remote tip"
+    cat "$OUT_LOG"
+fi
+WT_HEAD=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "")
+if [[ "$WT_HEAD" == "$ORIGIN_TIP" ]]; then
+    pass "worktree HEAD equals origin/feature/issue-401's tip (reset target was the remote branch)"
+else
+    fail "worktree HEAD ($WT_HEAD) does not equal origin/feature/issue-401's tip ($ORIGIN_TIP)"
+fi
+if grep -q "origin/feature/issue-401" "$OUT_LOG"; then
+    pass "output names origin/feature/issue-401 as the staleness reference / reset target"
+else
+    fail "output never mentions origin/feature/issue-401 as the reference used (see $OUT_LOG)"
+    cat "$OUT_LOG"
+fi
+cleanup_repo "$REPO"
+rm -f "$OUT_LOG"
+
+# --- Test 5 (#8287): stale local branch + origin tip already MERGED -> the #5657 skip still applies here ---
+echo ""
+echo "Test 5 (#8287): same stale-local shape, but origin/feature/issue-N is already the head of a merged PR -> worktree.sh still falls back to resetting at main (#5657 skip unaffected)"
+read -r REPO WT_REL <<< "$(setup_repo_with_worktree stale8287merged 402)"
+WT="$REPO/$WT_REL"
+FAKE_BIN=$(install_fake_gh "$REPO")
+MAIN_TIP=$(git -C "$REPO" rev-parse origin/main)
+
+rewind_worktree_to_main "$WT"
+
+OUT_LOG="/tmp/wtdrift-stale8287merged.$$"
+(
+    cd "$REPO"
+    PATH="$FAKE_BIN:$PATH" FAKE_GH_MODE=merged ./.loom/scripts/worktree.sh 402 >"$OUT_LOG" 2>&1 || { echo "FAILED"; cat "$OUT_LOG"; }
+)
+
+if [[ ! -f "$WT/work.txt" ]]; then
+    pass "worktree was NOT reset onto the already-merged branch's dead content"
+else
+    fail "worktree picked up the already-merged branch's content — the #5657 skip regressed on this code path"
+    cat "$OUT_LOG"
+fi
+WT_HEAD=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "")
+if [[ "$WT_HEAD" == "$MAIN_TIP" ]]; then
+    pass "worktree HEAD equals origin/main's tip (fell back to the base ref, as #5657 requires)"
+else
+    fail "worktree HEAD ($WT_HEAD) does not equal origin/main's tip ($MAIN_TIP)"
 fi
 cleanup_repo "$REPO"
 rm -f "$OUT_LOG"

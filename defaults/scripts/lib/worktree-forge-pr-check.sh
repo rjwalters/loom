@@ -28,13 +28,19 @@
 #                                                   "reuse origin/<branch> or
 #                                                   branch fresh?" decision
 #                                                   (#4823 / #5657 / #7765)
+#   _worktree_resolve_stale_reset_ref               the #8287 decision arm
+#                                                   for worktree.sh's
+#                                                   ALREADY-registered-worktree
+#                                                   staleness check
 #
 # They live here rather than inline in worktree.sh per
 # `.loom/docs/file-size-policy.md` — worktree.sh is over the 1000-line ratchet
 # threshold and therefore frozen at its current size, and "new sibling module,
 # small dispatch arm left behind" is that policy's own preferred remedy.
-# worktree.sh calls `_worktree_resolve_origin_branch_reuse` and reads back
-# `_WT_REUSE_REMOTE_BRANCH`; the other two are internal to this file.
+# worktree.sh calls `_worktree_resolve_origin_branch_reuse` and
+# `_worktree_resolve_stale_reset_ref`, reading back `_WT_REUSE_REMOTE_BRANCH`
+# and `_WT_STALE_RESET_REF` respectively; the other two are internal to this
+# file.
 #
 # Both functions depend on worktree.sh's `print_error` / `print_info`, and on
 # fd 3 being open for `--json` output; fallbacks are defined below so the file
@@ -429,5 +435,38 @@ _worktree_resolve_origin_branch_reuse() {
         # rather than let a fresh branch shadow a real PR.
         _worktree_guard_fresh_branch_against_open_pr "$branch" "$issue_number" "$json_output" "$base_display" "$base_ref" "$origin_fetch_result"
     fi
+    return 0
+}
+
+# _worktree_resolve_stale_reset_ref <worktree_path> <branch> <default_branch>
+#
+# #8287: worktree.sh's "worktree directory already exists, registered with
+# git" fast path judges the worktree "stale" (0 commits ahead, no
+# uncommitted changes) purely against BASE_REF/main, then resets it there.
+# That is wrong whenever a LIVE `origin/<branch>` exists: a stale local
+# branch there is the NORMAL state (a worktree that never advanced past
+# whatever it was created from), while the branch's real commits — a PR's
+# entire content — live on origin. Resetting to main discards the only local
+# trace of them and hands the next session (Judge/Doctor) an EMPTY branch to
+# rebase and force-push over the real PR (the #8147/#8190 incident this
+# closes).
+#
+# Sets `_WT_STALE_RESET_REF` to "origin/<branch>" and returns 0 when that ref
+# exists AND has not already landed as a merged PR — the #5657 skip: a
+# landed tip is dead history, so falling back to BASE_REF/main is still
+# correct for it. Returns 1 with `_WT_STALE_RESET_REF` unset in every other
+# case, so the caller falls back to comparing/resetting against BASE_REF
+# exactly as before. "origin/<branch>" (not the bare branch name) is passed
+# to `branch_landed` deliberately: a LOCAL `<branch>` also exists here (that
+# is this whole code path's premise), and `branch_landed`'s resolution ladder
+# prefers a local ref over the remote one — passing the bare name would judge
+# the STALE local tip's landed status instead of the live remote tip's.
+_worktree_resolve_stale_reset_ref() {
+    local worktree_path="$1" branch="$2" default_branch="$3"
+    _WT_STALE_RESET_REF=""
+    git -C "$worktree_path" show-ref --verify --quiet "refs/remotes/origin/$branch" || return 1
+    branch_landed "origin/$branch" "$default_branch" >/dev/null
+    [[ "$BRANCH_LANDED_VERDICT" != "landed" ]] || return 1
+    _WT_STALE_RESET_REF="origin/$branch"
     return 0
 }
