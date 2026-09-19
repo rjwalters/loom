@@ -156,6 +156,8 @@ This is the Builder-side counterpart of the orchestrator guardrail in `sweep.md`
 - **Headless (`claude -p` sweep, daemon dispatch)**: ending your turn *terminates the process*. The watcher is killed with it, the build result is never read, no PR is opened, and the issue is left claimed `loom:building` with nobody to release it.
 - **Interactive (Task-tool subagent)**: the re-invocation you are counting on never arrives. The sweep simply stalls until a human notices and nudges you — in the incident behind #5659 the orchestrator had to nudge parked Builder/Judge subagents roughly eight times in a single sweep.
 
+This rule is about *when your own turn may end*, not about *whether someone else is already running the same check*. For that second, separate question — a coordinator re-verifying what you already verified, or a sibling subagent duplicating your suite — see `.loom/docs/verification-ownership.md` → "Reconciling the two background-work rules already in force" (#8268) and `loom-daemon inflight claim` before you launch a long one.
+
 ### Local build/test runs
 
 Run them in the **foreground** and read the exit status yourself. If a command is too slow for one foreground tool call, background it and **poll in-turn against an explicit cap** — never park on it:

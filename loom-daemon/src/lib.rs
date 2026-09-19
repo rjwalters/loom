@@ -175,6 +175,7 @@ pub mod health_monitor;
 pub mod host_affinity;
 pub mod host_breaker;
 pub mod idle_exit;
+pub mod inflight;
 pub mod init;
 pub mod install_self_check;
 pub mod ipc;

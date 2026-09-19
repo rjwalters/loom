@@ -9401,9 +9401,16 @@ what Phase 3 deletes vs preserves".
   precedence, and how it composes with `env > config > default`:
   [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md)
   (upstream Loom repo — not shipped to consumer installs).
+- **`loom-daemon inflight` (#8268)**: a separate, no-daemon-required CLI
+  surface — a machine-wide registry that lets a coordinator and any
+  subagent/worktree it spawns see "is a long-running verification command
+  already running against this tree/branch" before launching a duplicate.
+  Not part of the IPC/MCP surface documented above (it needs no running
+  daemon process). Full reference: [`verification-ownership.md`](verification-ownership.md).
 - **Source** (upstream Loom repo — not shipped to consumer installs):
   - [`loom-daemon/src/types.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/types.rs) — IPC types.
   - [`loom-daemon/src/sweep_registry.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/sweep_registry.rs) — registry + reaper.
   - [`loom-daemon/src/event_bus.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/event_bus.rs) — pub/sub bus.
   - [`loom-daemon/src/ipc.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/ipc.rs) — request dispatcher.
   - [`mcp-loom/src/tools/sweeps.ts`](https://github.com/rjwalters/loom/blob/main/mcp-loom/src/tools/sweeps.ts) — MCP tool definitions.
+  - [`loom-daemon/src/inflight.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/inflight.rs) — the in-flight registry.
