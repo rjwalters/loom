@@ -4032,7 +4032,7 @@ knobs not yet audited here.
 | `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055). **Opt-in** (it rebuilds + restarts the daemon process). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
 | `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default |
-| `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
+| `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
 
 ### Idle exit for remote hosts (#4467)
 
@@ -8884,13 +8884,25 @@ anything about whether a newer signed binary exists.
   still-differing local sha afterwards is reported and left alone. If **either**
   checksum is unknown, the tick treats the artifact as converged rather than
   guessing — a wrong "differs" is far more costly than a missed convergence.
-- **Every gate below applies to an artifact roll exactly as to a rebuild** —
-  settle window (including the #6261 ceiling), the in-flight-sweep stampede
-  gate and its defer deadline, exponential backoff, and terminal state. The
-  settle window tracks an `artifact:<version>:<sha>` identity on this path in
-  place of the source commit, so a host that switches paths mid-streak (a
-  release appears) restarts its settle window exactly as it would for a new
-  commit.
+- **Every gate below applies to an artifact roll exactly as to a rebuild,
+  except the in-flight-sweep stampede gate (#8252)** — the settle window
+  (including the #6261 ceiling), exponential backoff, and terminal state all
+  apply unchanged. The settle window tracks an `artifact:<version>:<sha>`
+  identity on this path in place of the source commit, so a host that switches
+  paths mid-streak (a release appears) restarts its settle window exactly as it
+  would for a new commit.
+- **An artifact fetch is never deferred for in-flight sweeps (#8252).** The
+  stampede gate and its `deferDeadlineSecs` bound exist to keep an unattended
+  `cargo build --release` off a saturated host; downloading a signed asset,
+  verifying its checksum, and relaunching under the supervisor is not a build.
+  Coupling them cost real availability: on 2026-09-18 a host sat on a resolved
+  `0.19.168` artifact for ~1.5h (with up to ~4.5h of deferral still to run)
+  while every `merge-pr.sh` invocation on it failed closed against a subcommand
+  the stale binary lacked, and the operator rolled by hand in ~40s. A busy host
+  now fetches on the tick the decision is made, merely niced (`nice 19`) so it
+  yields CPU to the in-flight sweeps. Only the source/rebuild path still defers,
+  and `loom-daemon status` says which: `deferring the source rebuild …` versus
+  `fetched release artifact …`.
 - **Reported, not just logged.** `loom-daemon status` (human and `--json`) and
   `loom-daemon health` report `artifact_available` (`version`, `published_at`;
   `null` when none resolved) next to the installed version, so fleet-wide

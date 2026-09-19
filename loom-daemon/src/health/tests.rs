@@ -2904,7 +2904,7 @@ fn auto_update_is_green_when_stale_past_threshold_but_only_deferring() {
     let status = inputs.status.as_mut().unwrap();
     status.auto_update_enabled = true;
     status.auto_update_note =
-        Some("3 in-flight sweep(s) — deferring rebuild to avoid a build stampede".to_string());
+        Some("3 in-flight sweep(s) — deferring the source rebuild (#8252)".to_string());
     inputs.self_update = Some(stale_self_update(199, 110));
     let section = assess_auto_update(&inputs);
     assert_eq!(section.verdict, Verdict::Green, "{}", section.summary);
