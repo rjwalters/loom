@@ -203,7 +203,12 @@ fn percent_encode_path(path: &str) -> String {
 /// **read-write** against claude-monitor's live database (#4095). `%` fares
 /// even worse: the unencoded form fails to open a database that is present and
 /// readable.
-fn read_only_uri(path: &Path) -> String {
+///
+/// `pub(crate)` (not private): [`crate::limit_calibration`] (issue #8063)
+/// reads claude-monitor's `usage_history` table read-only and reuses this
+/// exact URI-construction rule rather than re-deriving a second,
+/// independently-written copy of the `#4095` percent-encoding fix.
+pub(crate) fn read_only_uri(path: &Path) -> String {
     format!("file:{}?mode=ro", percent_encode_path(&path.to_string_lossy()))
 }
 

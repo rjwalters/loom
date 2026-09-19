@@ -189,6 +189,36 @@ more is better, and a wider spread of issue difficulty makes `merge_rate` more
 trustworthy. Accumulating this sample is an **out-of-band, over-time activity** — it
 is deliberately **not** a Builder deliverable and must not be fabricated.
 
+### Watch for a metering step change mid-sample (#8063)
+
+`cost_opus_attempt`/`cost_sonnet_attempt` are priced from the daemon's own rate
+card (Section 2's "2.5x" note above), but the *external* conversion this
+policy ultimately cares about — how much of the weekly Claude quota a dollar
+of measured cost actually buys — is not fixed. #8052 documents an incident
+where that ratio (the fleet's $-equivalent cost per weekly-limit point)
+dropped sharply over a few days with every raw usage counter flat: an
+upstream metering change, invisible to every measurement this document
+otherwise relies on. `loom-daemon health`'s `limit_calibration` section
+(issue #8063, `loom_daemon::limit_calibration`) is the automated signal for
+that: a daily $-eq-per-weekly-point series, sourced from claude-monitor's
+`usage_history` table joined against the activity DB's daily cost-equivalent,
+with a warning when the metric moves more than 1.5x over its trailing 3-day
+baseline. A representative sample accrued while that section reported a step
+change should be treated as suspect and re-measured after the new baseline
+settles, rather than fed into the §2 inequality as-is.
+
+The section is **conditional**, like `observability`: it prints only on a host
+that has both halves of the join — claude-monitor's `usage.db` (or
+`LOOM_CLAUDE_MONITOR_DIR`) and an activity database with `resource_usage` rows
+(#8059). No `limit_calibration` line at all means the signal is not configured
+on that host, **not** that it was checked and found clean — so before treating
+an observe-mode sample as metering-stable, confirm the line is actually
+present:
+
+```bash
+loom-daemon health --json | jq '.sections[] | select(.key == "limit_calibration")'
+```
+
 ### Runbook: accruing the observe-mode sample
 
 The `agent-metrics.sh --by-model` plumbing above reads the **activity DB**. A
