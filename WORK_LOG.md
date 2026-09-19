@@ -6,7 +6,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-19
+- **Issue #8086** (closed): Port loom-daemon-watchdog.sh to a daemon subcommand (994 lines, 233 retained assertions)
+- **PR #8184**: feat(watchdog): retire loom-daemon-watchdog.sh (2436 lines) — the epic goes net-negative
+
 ### 2026-09-18
+- **Issue #8240** (closed): [epic #7810 PR 5, remainder] Native download/verify/provision; auto_update.rs stops shelling out to loom-daemon-update.sh --no-restart
+- **PR #8124**: fix(merge): refuse to merge a PR carrying loom:pr + a blocking label
+- **PR #8078**: fix(install): ignore .loom-local/ in consumer repos and treat it as Loom-owned
+- **PR #8090**: feat(tokens): per-model-class exhaustion marks and `tokens select --model` (#8058)
 - **Issue #8211** (closed): guard mask_ws(): a quote inside an unquoted backtick substitution masks away a live statement boundary
 - **PR #8261**: fix(guard): mask_ws()/mask_gt() model an unquoted backtick span (#8211)
 - **Issue #8233** (closed): shell-budget reports lines, not fragility — add a fix-weighted progress figure
