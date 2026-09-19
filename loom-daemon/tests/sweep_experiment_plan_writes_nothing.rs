@@ -250,7 +250,16 @@ fn the_writes_nothing_assertion_would_catch_a_write() {
 }
 
 /// End-to-end determinism, at the process boundary the acceptance criterion
-/// names: same seed ⇒ same assignment, different seed ⇒ a different one.
+/// names: same seed ⇒ same assignment, and the seed is load-bearing — *some*
+/// other seed moves the assignment.
+///
+/// The second half is deliberately a search over a small window of seeds rather
+/// than a claim about one hard-coded pair. "Seed 8 differs from seed 7" is
+/// probabilistic, not an invariant: 8 workspaces over 2 arms, dealt round-robin
+/// within each stratum, is a small enough outcome space that two arbitrary
+/// seeds land on the same assignment from time to time — which is exactly how
+/// the hard-coded form of this assertion flaked in CI (#8336). Searching a
+/// window tests the property that actually matters without betting on one pair.
 ///
 /// `created_at` is compared out (it is a wall-clock stamp, and two runs
 /// straddling a second boundary would make an otherwise-sound assertion flaky),
@@ -301,7 +310,6 @@ fn plan_is_byte_identical_for_a_seed_and_differs_across_seeds() {
         "the same seed must produce a byte-identical plan"
     );
 
-    let other_seed = assignment("8");
     let arms_of = |doc: &serde_json::Value| -> Vec<String> {
         doc["workspaces"]
             .as_array()
@@ -310,9 +318,19 @@ fn plan_is_byte_identical_for_a_seed_and_differs_across_seeds() {
             .map(|w| w["arm"].as_str().unwrap_or_default().to_string())
             .collect()
     };
-    assert_ne!(
-        arms_of(&first),
-        arms_of(&other_seed),
-        "a different seed must produce a different assignment"
+
+    // The seed must reach the assignment: at least one seed in this window has
+    // to move it off seed 7's. A window that finds nothing means the seed is
+    // being ignored — no single collision can mask that, and no single
+    // collision can fail this either.
+    let baseline = arms_of(&first);
+    let seeds = 8..=24u64;
+    let differing = seeds
+        .clone()
+        .find(|seed| arms_of(&assignment(&seed.to_string())) != baseline);
+    assert!(
+        differing.is_some(),
+        "no seed in {seeds:?} produced an assignment different from seed 7's \
+         ({baseline:?}) — the seed is not reaching the assignment"
     );
 }
