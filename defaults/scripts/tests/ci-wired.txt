@@ -44,6 +44,7 @@ test-champion-epic-escalation-respects-human-hold.sh
 test-champion-epic-phase-marker-normalization.sh
 test-champion-epic-verdict-marker-scope.sh
 test-champion-held-pr-health-pass.sh
+test-champion-issue-promo-escalation-respects-human-hold.sh
 test-champion-premise-false-close.sh
 test-champion-standing-authorization.sh
 test-check-ci-status.sh
