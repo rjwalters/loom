@@ -495,6 +495,24 @@ else
     else
         fail "4e: expected ALREADY_ROUTED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
     fi
+
+    # --- 4f. POSITIVE direction of the bot-vs-human attribution comparison
+    # (4c is the negative-direction control): a human un-park strictly NEWER
+    # than a prior bot un-escalation marker must still be read as a human
+    # ruling on this revision, reusing BOT_COMMENTS from 4c (verdict comment
+    # at VERDICT_TS, bot un-escalation marker at UNPARK_TS).
+    HUMAN_AFTER_BOT_TS="2026-09-16T18:00:00Z"
+    TL_HUMAN_AFTER_BOT="$(jq -nc --arg t "$HUMAN_AFTER_BOT_TS" \
+        '[{event:"unlabeled", label:{name:"loom:operator-only"}, created_at:$t}]')"
+    F="$RUN_DIR/fix/human-after-bot"
+    make_fixture "$F" '[]' "$BOT_COMMENTS" "$TL_HUMAN_AFTER_BOT" "$REST_COMMENTS" 1
+    OUT="$(run_guard "$F")"
+    if [[ "$(result_of "$OUT" OPERATOR_RULED)" == "yes" \
+       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "no" ]]; then
+        pass "4f: a human un-park strictly newer than a prior bot un-escalation marker sets OPERATOR_RULED=yes and does NOT escalate"
+    else
+        fail "4f: expected OPERATOR_RULED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
+    fi
 fi
 
 # --- Test 5: WIRING -- Step 4 and the batch outcome table carry both flags
