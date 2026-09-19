@@ -44,6 +44,35 @@
 //!   `gh_unavailable_section`. `operator_attention` (#8091) is always
 //!   `Verdict::Green` regardless, so a missing `gh` there changes the
 //!   rendered text but never the exit code.
+//!
+//! # `limit_calibration` (#8063): appended, not roll-up-wired in `health.rs`
+//!
+//! [`loom_daemon::health`] (the pure collector this module hands off to) is
+//! frozen by this repo's file-size ratchet
+//! (`.loom/docs/file-size-policy.md`) — it cannot gain a new `assess_*`
+//! function without exceeding its recorded baseline. The `limit_calibration`
+//! section is therefore computed independently by
+//! [`loom_daemon::limit_calibration::compute`] and appended to the collected
+//! report's `sections` in [`collect`], following the exact same
+//! [`health::HealthSection`] shape (`key`/`verdict`/`summary`/`detail`) every
+//! other section uses — the "existing convention" #8063's AC asks for — just
+//! wired in from this file instead of from `assess()`'s own roll-up. A
+//! `Degraded` calibration verdict still promotes `overall` from `Green` (see
+//! [`collect`]), so it participates in the exit-code contract like any other
+//! section; it just cannot flip `overall` to `Dead`/`IndeterminateBusy`,
+//! which no advisory section does anyway.
+//!
+//! It is **conditional**, the same way [`health::assess_observability`]
+//! (#4830) is: [`calibration_section`] returns `None` — no line at all — when
+//! the calibration signal is simply not configured on this host
+//! (claude-monitor absent, no activity database). A Loom install with no
+//! claude-monitor companion would otherwise carry a permanent non-green
+//! `limit_calibration` line reporting nothing but its own absence, which is
+//! exactly the noise that convention exists to prevent. The consequence is
+//! that this section **never** emits [`health::Verdict::Unknown`]: every
+//! state it can be in is either a real reading (`Green`/`Degraded`) or no
+//! section, so a reader never sees a non-green section line sitting under a
+//! `Green` overall.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -53,6 +82,7 @@ use std::time::Duration;
 use loom_daemon::daemon_install_state;
 use loom_daemon::daemon_pidfile;
 use loom_daemon::health::{self, HealthInputs, HealthReport};
+use loom_daemon::limit_calibration::{self, CalibrationStatus};
 use loom_daemon::pipeline_snapshot::{self, GhPipelineSource, PipelineMetrics};
 use loom_daemon::types::{DaemonStatusReport, Request, Response};
 
@@ -321,7 +351,7 @@ async fn collect(window: Duration) -> HealthReport {
     //    preflight cap.
     let codesign_preflight = probe_codesign_identity_preflight(status.as_ref());
 
-    health::assess(&HealthInputs {
+    let mut report = health::assess(&HealthInputs {
         at: chrono::Utc::now(),
         window,
         status,
@@ -343,7 +373,106 @@ async fn collect(window: Duration) -> HealthReport {
         self_update: Some(self_update),
         codesign_preflight,
         load_per_core,
-    })
+    });
+
+    // 8. `limit_calibration` (#8063) — see this module's doc for why this is
+    //    appended here rather than wired into `health::assess`'s own roll-up.
+    //    Independent of every input above: sourced from claude-monitor's
+    //    `usage_history` (read-only, best-effort) joined against the activity
+    //    DB's daily cost-equivalent, never from the IPC round-trip.
+    let since =
+        chrono::Utc::now() - chrono::Duration::days(limit_calibration::DEFAULT_LOOKBACK_DAYS);
+    let calibration = calibration_section(limit_calibration::compute(
+        &limit_calibration::default_monitor_db_path(),
+        &limit_calibration::default_activity_db_path(),
+        since,
+    ));
+    if let Some(section) = calibration {
+        if section.verdict == health::Verdict::Degraded && report.overall == health::Verdict::Green
+        {
+            report.overall = health::Verdict::Degraded;
+        }
+        report.sections.push(section);
+    }
+    report
+}
+
+/// Render [`loom_daemon::limit_calibration::compute`]'s degrade-safe result as
+/// the `limit_calibration` health section (#8063), or `None` when there is
+/// nothing worth printing.
+///
+/// Pure (takes the already-computed status rather than doing the I/O itself)
+/// so the mapping from calibration state to verdict/summary is unit-testable
+/// without a claude-monitor install.
+///
+/// - [`CalibrationStatus::Ready`] with a warning -> `Degraded`, summary names
+///   the date, both ratios, and the multiple. This is the step-change warning
+///   #8063's AC asks for, on the existing anomaly surface.
+/// - [`CalibrationStatus::Ready`] without one -> `Green`, summary carries the
+///   latest day's $-eq-per-weekly-point. This is the "surface the metric" AC:
+///   the number is printed on an ordinary healthy run, not only on an alarm.
+/// - [`CalibrationStatus::InsufficientData`] -> `Green`. Not yet having four
+///   joined days is the expected state of a fresh install, not a fault; the
+///   line still prints so an operator can see the pipeline is alive and
+///   accruing.
+/// - [`CalibrationStatus::Unavailable`] -> `None`. claude-monitor (or the
+///   activity database) not being present on this host means the signal is
+///   not configured here, not that the fleet is unhealthy — the same
+///   "no section rather than a permanent non-green line" rule
+///   [`health::assess_observability`] applies to a disabled exporter (#4830).
+fn calibration_section(status: CalibrationStatus) -> Option<health::HealthSection> {
+    const KEY: &str = "limit_calibration";
+    let section = match status {
+        CalibrationStatus::Ready {
+            series,
+            warning: Some(w),
+        } => health::HealthSection {
+            key: KEY,
+            verdict: health::Verdict::Degraded,
+            summary: format!(
+                "$-eq/weekly-point STEP CHANGE on {}: {:.2} -> {:.2} ({:.2}x trailing {}d \
+                 baseline)",
+                w.date,
+                w.baseline_usd_per_point,
+                w.current_usd_per_point,
+                w.ratio,
+                limit_calibration::BASELINE_WINDOW_DAYS
+            ),
+            detail: serde_json::json!({ "series": series, "warning": w }),
+        },
+        CalibrationStatus::Ready {
+            series,
+            warning: None,
+        } => {
+            let summary =
+                series.last().map_or_else(
+                    || "no calibration data in window".to_string(),
+                    |d| {
+                        format!(
+                        "$-eq/weekly-point {:.2} on {} (no step change vs trailing {}d baseline)",
+                        d.usd_per_weekly_point, d.date, limit_calibration::BASELINE_WINDOW_DAYS
+                    )
+                    },
+                );
+            health::HealthSection {
+                key: KEY,
+                verdict: health::Verdict::Green,
+                summary,
+                detail: serde_json::json!({ "series": series }),
+            }
+        }
+        CalibrationStatus::InsufficientData { joined_days } => health::HealthSection {
+            key: KEY,
+            verdict: health::Verdict::Green,
+            summary: format!(
+                "calibrating — {joined_days} joined day(s) of history, need {}",
+                limit_calibration::BASELINE_WINDOW_DAYS + 1
+            ),
+            detail: serde_json::json!({ "joinedDays": joined_days }),
+        },
+        CalibrationStatus::Unavailable(_) => return None,
+    };
+    Some(section)
 }
 
 /// Issue #7605: probe a configured `codesign.identity` for whether it can
@@ -869,5 +998,84 @@ mod tests {
         std::env::remove_var("LOOM_ROOT");
 
         assert_eq!(resolved, None);
+    }
+
+    // -- limit_calibration section mapping (#8063) -------------------------
+
+    fn calibration_day(date: &str, usd_per_point: f64) -> limit_calibration::CalibrationDay {
+        limit_calibration::CalibrationDay {
+            date: chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            cost_usd: usd_per_point * 10.0,
+            weekly_points_delta: 10.0,
+            usd_per_weekly_point: usd_per_point,
+        }
+    }
+
+    /// AC: "the computed $-eq-per-weekly-point metric is surfaced in
+    /// `loom-daemon health` output" — on an ordinary healthy run, not only
+    /// when something is wrong.
+    #[test]
+    fn calibration_section_surfaces_the_metric_when_green() {
+        let section = calibration_section(CalibrationStatus::Ready {
+            series: vec![
+                calibration_day("2026-09-10", 5.0),
+                calibration_day("2026-09-11", 5.2),
+            ],
+            warning: None,
+        })
+        .expect("a readable calibration series always renders a section");
+        assert_eq!(section.key, "limit_calibration");
+        assert_eq!(section.verdict, health::Verdict::Green);
+        assert!(
+            section.summary.contains("5.20") && section.summary.contains("2026-09-11"),
+            "the latest day's ratio must be in the summary line: {}",
+            section.summary
+        );
+    }
+
+    /// AC: "a step-change warning fires ... visible in whatever surface
+    /// `loom-daemon health` already uses for anomaly signals" — i.e. a
+    /// `Degraded` section, which `collect` promotes into `overall`.
+    #[test]
+    fn calibration_section_is_degraded_and_names_the_step_change() {
+        let section = calibration_section(CalibrationStatus::Ready {
+            series: vec![calibration_day("2026-09-17", 2.5)],
+            warning: Some(limit_calibration::StepChangeWarning {
+                date: chrono::NaiveDate::parse_from_str("2026-09-17", "%Y-%m-%d").unwrap(),
+                baseline_usd_per_point: 6.5,
+                current_usd_per_point: 2.5,
+                ratio: 2.6,
+            }),
+        })
+        .expect("a step change always renders a section");
+        assert_eq!(section.verdict, health::Verdict::Degraded);
+        assert!(section.summary.contains("STEP CHANGE"), "{}", section.summary);
+        assert!(section.summary.contains("6.50"), "{}", section.summary);
+        assert!(section.summary.contains("2.50"), "{}", section.summary);
+        assert!(section.summary.contains("2.60x"), "{}", section.summary);
+        assert_eq!(section.detail["warning"]["ratio"], serde_json::json!(2.6));
+    }
+
+    /// Too little history is the expected state of a fresh install, not a
+    /// fault: the line prints (so the pipeline is visibly alive) but stays
+    /// `Green` so it cannot flip the command's exit code.
+    #[test]
+    fn calibration_section_is_green_while_still_accruing_history() {
+        let section = calibration_section(CalibrationStatus::InsufficientData { joined_days: 2 })
+            .expect("an accruing pipeline still renders a section");
+        assert_eq!(section.verdict, health::Verdict::Green);
+        assert!(section.summary.contains("calibrating"), "{}", section.summary);
+    }
+
+    /// No claude-monitor / no activity database on this host means the signal
+    /// is not configured here — emit no section at all rather than a
+    /// permanent non-green line, the same rule `assess_observability` (#4830)
+    /// applies to a disabled exporter.
+    #[test]
+    fn calibration_section_is_omitted_entirely_when_unavailable() {
+        assert!(calibration_section(CalibrationStatus::Unavailable(
+            "claude-monitor database not found".to_string()
+        ))
+        .is_none());
     }
 }
