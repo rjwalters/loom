@@ -44,9 +44,10 @@ gets the treatment `defaults/scripts/tests/ci-wired.txt` gets: a committed
 list, a required reason per entry, and a check that fails on anything in
 neither state.
 
-## The six categories
+## The seven categories
 
-These are #7758's categorical verdicts. Do **not** invent a second taxonomy.
+These are #7758's categorical verdicts, plus `settled` (#8237). Do **not**
+invent a second taxonomy.
 
 | Category | Means | Available to a NEW file? |
 |---|---|---|
@@ -56,16 +57,99 @@ These are #7758's categorical verdicts. Do **not** invent a second taxonomy.
 | `stub` | Shape-A stub: under 40 code lines **and** its last code line is `exec`. This is the trivial-glue cap. | Yes |
 | `test` | Shell because its subject is shell. Follows its subject — never an independent reason to keep either in shell. | Yes |
 | `contract` | An existing invocation contract: the file's *name* is consumed by role prompts, CI workflows, hooks, or consumer repos. | **No** |
+| `settled` | Shell we are deliberately **keeping**: it works, its blast radius is small, and nobody intends to port it. Machine-checked on both halves, every run. | **No** |
 
-`contract` is baseline-only, and the checker enforces that structurally rather
-than by convention: an entry claiming `contract` under `# @section new` fails.
-"Something already calls it by name" cannot be true of a file that did not
-exist yet.
+`contract` and `settled` are baseline-only, and the checker enforces that
+structurally rather than by convention: an entry claiming either under
+`# @section new` fails. "Something already calls it by name" cannot be true of
+a file that did not exist yet, and neither can "it has needed no fix in six
+months".
 
 `stub` is the one category cheap enough to be tempting, so it is the one the
 checker verifies rather than takes on trust: a `stub` entry whose file is 40+
 code lines, or whose last code line is not `exec`, fails. That is what keeps
 the category from becoming the rubber stamp the whole list exists to prevent.
+
+### `settled`: shell we are deliberately keeping (#8237)
+
+The epic's target is ~145 portable lines. A large slice of the pool is never
+going to move: 90-line helpers that work, have never needed a fix, and that
+nobody intends to port. Before this category existed they stayed `contract` —
+counted as unfinished epic work forever, and **taxing every fix to them**. PR
+#8078 was a one-line bug fix (`ignore .loom-local/ in consumer repos`) refused
+with `PORTABLE shell grew by 1 code lines`. The refusal was correct under the
+rules; the rules were the problem.
+
+`bootstrap` and `vendored` were the only escape hatches, and neither fits.
+Both are claims that a file **cannot** be Rust — `bootstrap` because it runs
+before a `loom-daemon` binary exists, `vendored` because the canonical copy is
+upstream and a local restructure gets reverted. `settled` is a claim that a
+file **will not be** ported. That is a different kind of claim and must not be
+laundered into the permanent floor, which is why `settled` is in neither
+`PORTABLE` nor `FLOOR`.
+
+**Admission is mechanical, and both halves are required.**
+
+1. **Zero fix-commits in the trailing six-month window** — the same window and
+   the same `fix`/`revert`/`hotfix` subject test `shell_budget::churn` uses, so
+   the category and the progress report cannot disagree about what a fix is.
+2. **No irreversible operations** — `rm -rf`, `git push`, `--force`,
+   `git reset --hard`, `git worktree remove`, `gh` writes, `kill`.
+
+The second half is not decoration. Of the 71 portable-pool scripts with zero
+fixes in the window, **26 (4,753 lines) perform an irreversible operation** and
+stay `contract` on purpose. `loom-stop.sh` trips the screen on 12 lines and has
+taken zero fixes in six months. Quiet is not the same as safe: a
+rarely-exercised script with a latent data-loss bug is *worse*, not better,
+because nothing has forced the bug into the open yet. **Do not re-propose those
+26** — the screen is deliberately crude and asymmetric, because a false
+positive costs nothing (the script simply stays in scope) while a false
+negative admits a script that can delete your work.
+
+Passing both halves makes a script **eligible**, not automatically settled —
+the two halves are necessary conditions, and the category is still a statement
+that nobody intends to port this file. 45 scripts are eligible; the initial
+population is the **44 (3,533 lines) of them categorised `contract`**. The
+45th, `defaults/scripts/lib/installed-file-guard.sh`, is `hook-entry` and its
+own allowlist entry says it "ports with" the two PreToolUse entry points it
+backs — an active port target with a known destination shape (the Shape-A
+stub) is not shell we are deliberately keeping, so it keeps `hook-entry`.
+
+That population is a measurement, not a list anyone curated, so it drifts as
+the six-month window rolls — the gate re-derives it rather than trusting it.
+Nothing pushes an eligible script into `settled`: the gate only ever refuses a
+`settled` entry that has stopped qualifying, never a `contract` entry that
+would qualify. Settling is opt-in, and staying in scope is always allowed.
+
+**Three constraints keep this a safety valve rather than a loophole.**
+
+1. **Reclassification is not progress, and the report does not pretend
+   otherwise.** `net vs epic start` is measured against `portable + settled`
+   (`Budget::comparable()`), not `portable` alone. Moving a script into
+   `settled` therefore moves lines between the two halves of one sum and leaves
+   the sum alone. Deleting settled shell still registers as retirement, because
+   that is real. If landing a reclassification makes the headline look better,
+   something has broken.
+2. **`settled` stays ratcheted: it may shrink, never grow.** Enforced per
+   **file**, against the file's size at the merge-base *whatever category it
+   held there* — so "reclassify and grow in one move" is refused too, and so is
+   a file that appears in `settled` without having existed at the base. There
+   is **no `Shell-Budget-Growth:` override**: that trailer buys a larger
+   permanent floor, and `settled` is not the floor. Without this the category
+   is a laundering route — an author blocked by the portable ratchet
+   reclassifies the script, then grows it freely. The category buys exemption
+   from being **ported**, never permission to **expand**.
+3. **Membership is a rolling measurement, not a permanent verdict.** A script
+   is settled *only while* it has taken zero fixes in the window.
+   `check-shell-allowlist.sh` re-derives both halves on every run; the moment a
+   fix lands, the gate fails and names the commit, and the entry goes back to
+   `contract`. Nobody has to decide to revisit it. That is what stops `settled`
+   rotting into "we stopped looking".
+
+**If the gate refuses a change to a settled script**, the way out is not to
+argue with the category. The script needed fixing, so it is not settled: move
+its entry back to `contract` in the same change. It rejoins the portable pool
+and the ordinary portable ratchet applies to it like any other script.
 
 ## The four objections, as settled
 
@@ -149,6 +233,11 @@ bash scripts/check-shell-allowlist.sh --list       # every in-scope .sh + catego
 bash scripts/check-shell-allowlist.sh --self-test  # verify the gate still works
 bash scripts/check-shell-allowlist.sh --help
 ```
+
+The gate needs **full git history** (`fetch-depth: 0` in CI) because `settled`
+admission is measured over a trailing six-month window. On a shallow clone it
+fails with an explanation rather than skipping the check — a gate that cannot
+tell "checked, fine" from "could not check" reports OK forever.
 
 CI runs the self-test and then the gate in the `Shell Allowlist` job on every
 PR, unfiltered by path — a new `.sh` in a directory nobody expected is exactly

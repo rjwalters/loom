@@ -77,10 +77,17 @@ impl ShellBudgetArgs {
                     "portable": budget.portable(),
                     "floor": budget.floor(),
                     "stubbed": budget.stubbed(),
+                    // #8237. `settled` is descoped, not retired: shell this
+                    // repo deliberately keeps. `comparable` is what
+                    // `net_vs_epic_start` is measured on — portable + settled,
+                    // so reclassifying a script cannot improve the figure.
+                    "settled": budget.settled(),
+                    "settled_files": budget.files_by_category.get(shell_budget::SETTLED).copied().unwrap_or(0),
+                    "comparable": budget.comparable(),
                     "total": budget.total(),
                     "files": budget.file_count(),
                     "origin_portable": origin,
-                    "net_vs_epic_start": i128::from(budget.portable()) - i128::from(origin),
+                    "net_vs_epic_start": i128::from(budget.comparable()) - i128::from(origin),
                     "churn_retired": churn.retired,
                     "churn_remaining": churn.remaining,
                     "churn_retired_pct": churn.retired_pct(),
@@ -209,6 +216,21 @@ impl ShellBudgetArgs {
                 println!(
                     "\nshell-budget: this change moves portable shell by {delta:+} vs {desc}."
                 );
+                // #8237 constraint 1, at the one place the gate speaks to the
+                // author directly. A change that reclassifies scripts as
+                // `settled` shrinks the PORTABLE pool without retiring a
+                // single line, and a bare `-3533` reads as a win that did not
+                // happen. Say which part was descoped and what the epic
+                // figure — measured on portable + settled — actually did.
+                let comparable = i128::from(budget.comparable()) - i128::from(before.comparable());
+                if comparable != delta {
+                    println!(
+                        "  {} line(s) of that moved into `settled` rather than out of the repo. \
+                         Descoping is not retiring, so the epic figure moved by {comparable:+}, \
+                         not {delta:+}.",
+                        comparable - delta
+                    );
+                }
             }
         }
         Ok(())

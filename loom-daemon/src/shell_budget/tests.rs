@@ -732,3 +732,210 @@ fn an_allowlist_line_needs_both_a_path_and_a_category() {
     assert_eq!(m.get("c.sh").map(String::as_str), Some("bootstrap"));
     assert!(!m.contains_key("b.sh"), "a path with no category is not an entry");
 }
+
+// --- #8237: the `settled` category ---
+//
+// Three properties make the category a safety valve rather than a loophole,
+// and each is pinned here: reclassification is not progress, a settled file may
+// shrink but never grow, and a settled file cannot appear from nowhere.
+
+#[test]
+fn reclassifying_a_script_as_settled_does_not_improve_net_vs_epic_start() {
+    // Constraint 1, and the specific failure the curator located: `net` used to
+    // be computed from `portable()` alone, so moving 3,533 lines out of
+    // `contract` into a category outside PORTABLE would have reported them as
+    // retired for editing one column of the allowlist. If landing #8237 makes
+    // the headline look better, it has been built wrong.
+    let before = budget_of(&[("contract", 1000), ("bootstrap", 50)]);
+    let after = budget_of(&[("contract", 700), ("settled", 300), ("bootstrap", 50)]);
+
+    let origin = 1000;
+    let before_report = render_report(&before, origin);
+    let after_report = render_report(&after, origin);
+
+    assert_eq!(
+        before.comparable(),
+        after.comparable(),
+        "the comparable pool is invariant under reclassification — that IS the property"
+    );
+    assert!(before_report.contains("0 — unchanged since the epic began"), "{before_report}");
+    assert!(
+        after_report.contains("0 — unchanged since the epic began"),
+        "moving 300 lines into `settled` must not read as 300 lines retired:\n{after_report}"
+    );
+}
+
+#[test]
+fn retiring_a_settled_script_for_real_still_shows_up_as_progress() {
+    // The mirror of the test above, and the reason it is not simply "ignore
+    // settled": deleting settled shell is real retirement and must still move
+    // the number. A `comparable()` that excluded settled would report nothing.
+    let after = budget_of(&[("contract", 700), ("settled", 100), ("bootstrap", 50)]);
+    let report = render_report(&after, 1000);
+    assert!(report.contains("-200"), "{report}");
+    assert!(report.contains("retired since"), "{report}");
+}
+
+#[test]
+fn the_report_labels_settled_as_descoped_not_as_retired() {
+    let b = budget_with(&[("contract", 700, 10), ("settled", 300, 4), ("stub", 20, 1)]);
+    let out = render_report(&b, 1000);
+    assert!(out.contains("settled (descoped)"), "it needs its own line: {out}");
+    assert!(out.contains("descoped"), "{out}");
+    assert!(
+        out.contains("DESCOPED, not retired"),
+        "the distinction is the whole point of the line: {out}"
+    );
+}
+
+#[test]
+fn settled_is_neither_portable_nor_floor() {
+    let b = budget_of(&[
+        ("contract", 100),
+        ("hook-entry", 10),
+        ("bootstrap", 999),
+        ("vendored", 999),
+        ("stub", 5),
+        ("settled", 300),
+    ]);
+    assert_eq!(b.portable(), 110, "settled is not a port target");
+    assert_eq!(b.floor(), 1998, "settled is not the permanent floor either");
+    assert_eq!(b.settled(), 300);
+    assert_eq!(b.comparable(), 410, "portable + settled, and nothing else");
+    assert_eq!(b.total(), 2413, "but it is still production shell");
+}
+
+#[test]
+fn a_settled_file_may_not_grow_and_there_is_no_override() {
+    // Constraint 2. Without this the category is a laundering route: an author
+    // blocked by the portable ratchet reclassifies the script, then grows it
+    // freely behind the OVERRIDABLE total-growth check.
+    let before = budget_files(&[("s.sh", "settled", 100), ("b.sh", "bootstrap", 50)]);
+    let now = budget_files(&[("s.sh", "settled", 130), ("b.sh", "bootstrap", 50)]);
+
+    let err = check_against_rev(&now, &before, "base", &GrowthContext::none())
+        .expect_err("a settled file that grew must be refused");
+    assert!(err.contains("s.sh  100 -> 130  (+30)"), "{err}");
+    assert!(err.contains("`settled`"), "{err}");
+
+    // And a declaration — which DOES buy floor growth — must not buy this.
+    let d = decl(9999);
+    let err = check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
+        .expect_err("no override exists for settled growth");
+    assert!(err.contains("GROWS shell in the `settled` category"), "{err}");
+    assert!(
+        err.contains(&format!("no `{GROWTH_TRAILER}` override")),
+        "the message must say the override does not apply here: {err}"
+    );
+}
+
+#[test]
+fn reclassify_and_grow_in_one_move_is_refused_too() {
+    // The obvious way around a per-CATEGORY ratchet: the category total rises
+    // from 0 legitimately when the category is first populated, so the rule has
+    // to be per-FILE and has to compare against the file's size at the base
+    // WHATEVER category it held there.
+    let before = budget_files(&[("s.sh", "contract", 100)]);
+    let now = budget_files(&[("s.sh", "settled", 130)]);
+    assert!(now.portable() < before.portable(), "the portable leg sees a DROP here");
+    let err = check_against_rev(&now, &before, "base", &GrowthContext::none())
+        .expect_err("growing a script in the same change that settles it must be refused");
+    assert!(err.contains("s.sh  100 -> 130"), "{err}");
+}
+
+#[test]
+fn a_brand_new_file_cannot_be_born_settled() {
+    // `settled` is baseline-only in check-shell-allowlist.sh because zero fixes
+    // is vacuous for a file with no history. This is the same rule expressed
+    // independently in the ratchet, so neither gate is the only thing standing
+    // between a new script and the category.
+    let before = budget_files(&[("c.sh", "contract", 100)]);
+    let now = budget_files(&[("c.sh", "contract", 100), ("new.sh", "settled", 40)]);
+    let err = check_against_rev(&now, &before, "base", &GrowthContext::none())
+        .expect_err("a settled file absent at the base must be refused");
+    assert!(err.contains("new.sh  new -> 40"), "{err}");
+}
+
+#[test]
+fn a_settled_file_that_shrinks_is_fine() {
+    // "May shrink, not grow" — the shrinking half, which is the whole point of
+    // keeping the ratchet on the category at all.
+    let before = budget_files(&[("s.sh", "settled", 100), ("c.sh", "contract", 50)]);
+    let now = budget_files(&[("s.sh", "settled", 60), ("c.sh", "contract", 50)]);
+    assert!(check_against_rev(&now, &before, "base", &GrowthContext::none()).is_ok());
+}
+
+#[test]
+fn a_settled_file_deleted_outright_is_fine() {
+    let before = budget_files(&[("s.sh", "settled", 100), ("c.sh", "contract", 50)]);
+    let now = budget_files(&[("c.sh", "contract", 50)]);
+    assert!(check_against_rev(&now, &before, "base", &GrowthContext::none()).is_ok());
+}
+
+#[test]
+fn settling_a_script_does_not_read_as_retiring_it_when_the_floor_grows() {
+    // The change that POPULATES the category is exactly this shape: 44 files
+    // move `contract` -> `settled` with identical content, while the gate
+    // script itself (bootstrap) grows by the checks that enforce the category.
+    //
+    // Without counting `settled` on the NOW side of the per-file laundering
+    // rule, every one of those 44 reads as "100 -> gone" and the declaration
+    // path refuses — the feature would be unlandable rather than guarded.
+    let before = budget_files(&[
+        ("a.sh", "contract", 100),
+        ("b.sh", "contract", 80),
+        ("gate.sh", "bootstrap", 400),
+    ]);
+    let now = budget_files(&[
+        ("a.sh", "settled", 100),
+        ("b.sh", "settled", 80),
+        ("gate.sh", "bootstrap", 460),
+    ]);
+    let d = decl(60);
+    check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
+        .expect("a declared floor addition alongside a pure reclassification must land");
+}
+
+#[test]
+fn moving_lines_out_of_a_settled_file_into_a_portable_one_is_still_refused() {
+    // The edge case the test plan names: a settled file that "shrinks" only
+    // because its lines moved elsewhere buys nothing. The portable leg fires on
+    // the destination.
+    let before = budget_files(&[("s.sh", "settled", 100), ("c.sh", "contract", 50)]);
+    let now = budget_files(&[("s.sh", "settled", 60), ("c.sh", "contract", 90)]);
+    let err = check_against_rev(&now, &before, "base", &GrowthContext::none())
+        .expect_err("the lines reappeared in the portable pool");
+    assert!(err.contains("PORTABLE"), "{err}");
+}
+
+#[test]
+fn the_settled_refusal_teaches_the_way_out() {
+    // A refusal that does not say what to do instead gets worked around rather
+    // than obeyed. The way out of this one is specific: the script is no longer
+    // settled, so its entry goes back to `contract` in the same change.
+    let before = budget_files(&[("s.sh", "settled", 100)]);
+    let now = budget_files(&[("s.sh", "settled", 130)]);
+    let err =
+        check_against_rev(&now, &before, "base", &GrowthContext::none()).expect_err("must fail");
+    assert!(err.contains("back to `contract`"), "{err}");
+    assert!(err.contains("MERGE-BASE"), "must say what it compared against: {err}");
+}
+
+#[test]
+fn the_allowlist_actually_populates_the_category_it_documents() {
+    // A category nothing is in is a category nothing checks. This pins that the
+    // real manifest carries the initial population, so deleting every entry
+    // (and quietly turning the whole feature into dead code) fails a test.
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .join("scripts/shell-allowlist.txt"),
+    )
+    .expect("the manifest is in the repo");
+    let n = parse_allowlist(&text)
+        .values()
+        .filter(|c| *c == SETTLED)
+        .count();
+    assert!(n >= 20, "expected the settled population, found {n} entries");
+}
