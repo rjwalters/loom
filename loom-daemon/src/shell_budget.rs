@@ -738,6 +738,26 @@ pub fn check_against_rev(
         return Err(why);
     }
 
+    // `comparable()` = portable() + settled() is the figure `render_report`
+    // actually publishes as "net vs epic start" (#8237 constraint 1), and it is
+    // NOT the same invariant as the portable leg above once a file can move
+    // between the two pools (#8330). A file leaving PORTABLE for `settled` with
+    // an unchanged line count passes both legs above on its own — the portable
+    // leg because that file's departure can be offset, at the CATEGORY level,
+    // by a DIFFERENT file's growth elsewhere in the portable pool, and the
+    // settled leg because the reclassified file itself did not grow. Neither
+    // leg sees the other file, so `portable() + settled()` still rises by
+    // whatever the other file added, and that growth would otherwise pass
+    // through the overridable total leg below behind a `Shell-Budget-Growth:`
+    // declaration meant for the permanent floor. Ratcheting `comparable()`
+    // directly — unconditional, no override, same as the portable leg — closes
+    // that route and, as a side effect, guarantees any growth the total leg
+    // reports below is genuinely floor growth rather than smuggled portable
+    // growth, so that message's claim is no longer only sometimes true.
+    if now.comparable() > before.comparable() {
+        return Err(comparable_growth_message(now, before, base_desc));
+    }
+
     // Total is checked too, as a delta. Dropping it entirely (as the first cut
     // of this redesign did) opened two holes review reproduced: a 500-line
     // `bootstrap` script passed, and recategorising a 639-line file
@@ -932,6 +952,56 @@ fn settled_growth_message(now: &Budget, before: &Budget, base_desc: &str) -> Opt
          \x20    with no history, so the category is baseline-only.\n\n\
          Note this compares against the MERGE-BASE, so it is measuring what YOUR change did."
     ))
+}
+
+/// The `comparable()` explanation — fires only when the portable and settled
+/// legs above each passed on their own, so this always means the growth was
+/// split across the two pools rather than concentrated in either one.
+fn comparable_growth_message(now: &Budget, before: &Budget, base_desc: &str) -> String {
+    let cats: Vec<&str> = PORTABLE
+        .iter()
+        .copied()
+        .chain(std::iter::once(SETTLED))
+        .collect();
+    let mut moved: Vec<(&str, u64, u64)> = Vec::new();
+    for cat in cats {
+        let was = before.by_category.get(cat).copied().unwrap_or(0);
+        let is = now.by_category.get(cat).copied().unwrap_or(0);
+        if was != is {
+            moved.push((cat, was, is));
+        }
+    }
+    let detail = moved
+        .iter()
+        .map(|(c, was, is)| {
+            let sign = if is >= was { "+" } else { "-" };
+            format!("    {c:<12} {was} -> {is}  ({sign}{})", is.abs_diff(*was))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "This change grows portable + settled shell (vs {base_desc}: {} -> {}), even though \
+         neither the PORTABLE leg nor the `{SETTLED}` leg above caught it by itself:\n\n{detail}\n\n\
+         `portable() + settled()` (`Budget::comparable`) is the figure this repo's report \
+         publishes as \"net vs epic start\", and it is a different invariant from `portable()` \
+         alone once a file can move between the two pools: a file leaving PORTABLE for \
+         `{SETTLED}` with an unchanged line count can offset, at the CATEGORY level, growth added \
+         to a DIFFERENT portable file in the same change — the departure and the growth cancel in \
+         `portable()`, and neither one shows up as growth in `{SETTLED}` on its own. \
+         `portable() + settled()` does not cancel that way, so it is what actually catches this.\n\n\
+         There is no `{GROWTH_TRAILER}` override for this leg, for the same reason there is none \
+         for the portable leg above: the trailer buys a larger permanent floor. It does not buy \
+         more of the pool the epic is retiring, and this is still that pool — just measured across \
+         both categories a script in it can currently be in.\n\n\
+         Options, best first:\n\n\
+         \x20 1. Put the new logic in the daemon instead (.loom/docs/shell-language-policy.md).\n\
+         \x20 2. Do not grow a portable file in the same change that reclassifies a different one\n\
+         \x20    to `{SETTLED}` — split the two changes so each is reviewable on its own terms.\n\n\
+         Note this compares against the MERGE-BASE, so it is measuring what YOUR change did.",
+        before.comparable(),
+        now.comparable(),
+    )
 }
 
 /// The portable-growth explanation, split out so both callers read the same.
