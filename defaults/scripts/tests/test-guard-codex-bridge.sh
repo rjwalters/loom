@@ -653,6 +653,72 @@ claude_deny="$(run_claude_guard guard-worktree-paths.sh "$(claude_event Write "$
 [[ "${claude_deny#*|}" == "deny" ]] && pass "claude: main-checkout write still denied" || fail "claude: main-checkout write still denied (got ${claude_deny#*|})"
 
 echo
+echo "=== per-role tool restriction reaches Codex through the shared guard (#8256) ==="
+
+# #8256's Codex acceptance criterion is "Codex-run roles get the same
+# enforcement via guard-codex-bridge.sh". The bridge itself carries NO copy of
+# that policy — it normalizes the shell call into a Claude-shaped `Bash` request
+# and hands it to guard-destructive.sh, whose per-role backstop reads the acting
+# role's `toolPolicy.allowedCapabilities`. These cases prove the whole chain:
+# the LOOM_ROLE this process exports reaches the sub-guard, the declaration is
+# found, and the verdict comes back on Codex's wire.
+#
+# This matters more on the Codex path than on the Claude one: there is no
+# `--disallowedTools` equivalent for the Codex CLI, so the hook is not a
+# backstop here — it is the ENTIRE mechanism.
+mkdir -p "$TMPROOT/.loom/roles"
+printf '%s' '{"name":"Fixture RO","toolPolicy":{"allowedCapabilities":[]}}' \
+    > "$TMPROOT/.loom/roles/fixture-restricted.json"
+printf '%s' '{"name":"Fixture Open","toolPolicy":{"allowedCapabilities":["*"]}}' \
+    > "$TMPROOT/.loom/roles/fixture-open.json"
+
+run_bridge_as_role() {
+    local role="$1" event="$2" out exit_code=0
+    out="$(cd "$TMPROOT" && printf '%s' "$event" \
+        | LOOM_ROLE="$role" bash "$BRIDGE" --project-root "$TMPROOT" 2>/dev/null)" || exit_code=$?
+    printf '%s|%s' "$exit_code" "$out"
+}
+
+codex_shell_event() {
+    codex_event shell "$(jq -nc --arg c "$1" '{command:["bash","-lc",$c]}')" "$WT"
+}
+
+for _cmd_desc in \
+    "ssh deploy@example.invalid|ssh" \
+    "aws sts get-caller-identity|aws" \
+    "gh secret list|gh secret" \
+    "echo k > ~/.ssh/authorized_keys|a ~/.ssh write"; do
+    _cmd="${_cmd_desc%%|*}"
+    _desc="${_cmd_desc#*|}"
+    _res="$(run_bridge_as_role fixture-restricted "$(codex_shell_event "$_cmd")")"
+    assert_bridge "codex: a restricted role cannot invoke $_desc" deny "$_res"
+    assert_wire_conformance "wire: role-tool-policy deny ($_desc)" "$_res"
+done
+
+# ...and an unrestricted role is unaffected, so this does not become a blanket
+# Codex restriction dressed up as a per-role one.
+for _cmd_desc in \
+    "ssh deploy@example.invalid|ssh" \
+    "aws sts get-caller-identity|aws" \
+    "gh secret list|gh secret"; do
+    _cmd="${_cmd_desc%%|*}"
+    _desc="${_cmd_desc#*|}"
+    assert_bridge "codex: a \"*\" role keeps $_desc" allow \
+        "$(run_bridge_as_role fixture-open "$(codex_shell_event "$_cmd")")"
+done
+
+# A Codex session with no role identity is byte-for-byte unaffected.
+assert_bridge "codex: LOOM_ROLE unset leaves ssh unrestricted" allow \
+    "$(run_bridge "$(codex_shell_event "ssh deploy@example.invalid")")"
+
+# Ordinary restricted-role traffic must not be caught — a guard that
+# false-denies `gh pr list` is one an agent learns to route around.
+assert_bridge "codex: a restricted role keeps 'gh pr list'" allow \
+    "$(run_bridge_as_role fixture-restricted "$(codex_shell_event "gh pr list")")"
+assert_bridge "codex: a restricted role keeps 'gh auth status'" allow \
+    "$(run_bridge_as_role fixture-restricted "$(codex_shell_event "gh auth status")")"
+
+echo
 echo "=== credential hygiene ==="
 
 # A fake credential in the event must never appear in the guard response.
