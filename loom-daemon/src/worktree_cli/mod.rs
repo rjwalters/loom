@@ -16,5 +16,15 @@
 //! Slice 1 is [`lock`]: the repo-global worktree-add lock that every
 //! destructive path is supposed to stand behind, and which #6014/#6017 showed
 //! could be released by a holder that no longer owned it.
+//!
+//! Slice 2 is the WIP-shelving family — [`snapshot`] and the [`baseline`]
+//! `stash-push`/`stash-pop` pair, over shared plumbing in [`wip`]. They are
+//! the verbs whose whole job is *not losing uncommitted work*: they exist
+//! because `refs/stash` is repo-global and two builders shelving at once
+//! clobbered each other (#4821), and `stash-push` runs `git reset --hard HEAD`
+//! once its capture has succeeded.
 
+pub mod baseline;
 pub mod lock;
+pub mod snapshot;
+pub mod wip;

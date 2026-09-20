@@ -65,6 +65,13 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     WorktreeLock(super::worktree_lock::WorktreeLockCommand),
 
+    /// `worktree.sh`'s WIP-shelving verbs (#8195, slice 2): `snapshot`,
+    /// `stash-push`, `stash-pop`. The part of that script whose entire purpose
+    /// is not losing somebody's uncommitted work — and whose `stash-push` runs
+    /// `git reset --hard` once a capture has succeeded.
+    #[command(subcommand)]
+    WorktreeWip(super::worktree_wip::WorktreeWipCommand),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -113,6 +120,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
+            ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),

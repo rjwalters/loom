@@ -488,12 +488,35 @@ pub fn check_uncommitted_changes(worktree_path: &Path) -> bool {
 /// `.no-changes-needed` as user work and declined to reclaim a worktree the
 /// shell would have removed. `dirty_marker_filter_matches_the_shell_twin`
 /// drives the real shell helper and fails if they drift apart again.
-const LOOM_OWN_UNTRACKED_FILES: [&str; 4] = [
+pub const LOOM_OWN_UNTRACKED_FILES: [&str; 4] = [
     ".loom-managed",
     ".loom-in-use",
     ".loom-checkpoint",
     ".no-changes-needed",
 ];
+
+/// Is this `git ls-files --others` path one of Loom's own runtime markers?
+///
+/// The predicate, rather than the constant, is what callers should ask — the
+/// #8279 drift happened because two places re-encoded the *list* instead of
+/// sharing the *test*, and the WIP-shelving verbs ported in #8195 need the
+/// same answer for a stronger reason than this module's original caller does:
+/// `stash-push --include-untracked` MOVES every unfiltered file out of the
+/// worktree, so a marker this predicate fails to recognise is a marker that
+/// gets carried away. Losing `.loom-managed` that way makes every cleanup path
+/// refuse the worktree afterwards (#3548).
+///
+/// Anchoring matches the shell twin's `(^|/)\.loom-managed$|…` regex in
+/// `worktree.sh`'s `_worktree_dirty_lines`: the final path component decides,
+/// so a marker in a subdirectory is recognised too. That is a superset of the
+/// whole-path equality this module used before, and it can only ever filter
+/// MORE of Loom's own bookkeeping — never a user's file, since the four names
+/// are Loom's alone.
+#[must_use]
+pub fn is_loom_own_untracked_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    LOOM_OWN_UNTRACKED_FILES.contains(&name)
+}
 
 /// True if `worktree_path` contains untracked, non-gitignored files that are
 /// not Loom's own sentinels (issue #5939).
@@ -529,7 +552,7 @@ pub fn has_untracked_files(worktree_path: &Path) -> bool {
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .any(|l| !LOOM_OWN_UNTRACKED_FILES.contains(&l))
+        .any(|l| !is_loom_own_untracked_path(l))
 }
 
 /// [`check_uncommitted_changes`] widened to also catch untracked files

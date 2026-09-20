@@ -22,7 +22,7 @@
 2169 defaults/scripts/tests/test-resync-installed.sh
 1822 defaults/scripts/tests/test-spawn-claude.sh
 1125 defaults/scripts/tests/test-spawn-codex.sh
-1812 defaults/scripts/worktree.sh
+1434 defaults/scripts/worktree.sh
 1365 install.sh
 1598 loom-daemon/src/agent_session/spawn.rs
 1232 loom-daemon/src/auto_update.rs
