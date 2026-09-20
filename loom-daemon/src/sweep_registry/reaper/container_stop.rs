@@ -348,7 +348,7 @@ pub(crate) fn finish_container_stop_with(
          grace window — docker kill: {} (#8435)",
         describe(&containers)
     );
-    let cmd = command_with(&program, kill_args(&containers));
+    let cmd = command_with(program, kill_args(&containers));
     match output_with_timeout(cmd, reap_gh_timeout()) {
         Ok(Some(out)) if out.status.success() => {
             log::info!(
