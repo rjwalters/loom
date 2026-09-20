@@ -142,23 +142,36 @@ pub const COORDINATION_DEGRADE_GRACE_ENV: &str = "LOOM_PEER_COORDINATION_DEGRADE
 /// caught in minutes, not hours.
 ///
 /// Raised from the original 10-minute default (Issue #8276, 2026-09-19):
-/// three independent flap episodes on `ip-172-31-74-176` (#8276 itself) all
-/// self-recovered within 103-225s of crossing the (then-)600s grace, i.e. the
-/// underlying quiet-of-genuine-peer-traffic gap was ~703-825s — comfortably
-/// *above* the 10-minute grace but nowhere near the multi-hour signature the
-/// grace exists to catch. Code tracing (`evaluate_coordination`/`observe_at`)
-/// ruled out a receive-path defect: recovery depends solely on inbound peer
-/// ads, which are independent of this host's own dispatch/advertise activity,
-/// and this host kept advertising heavily (150+ dispatches per data point)
-/// throughout each "degraded" window — the opposite of the RAM/disk-throttled
-/// "never advertises" mechanism `anvil#1270` had (explicitly unverified)
-/// hypothesized. The remaining, evidence-consistent explanation is a natural
-/// quiet stretch in fleet-wide peer-claim-ad traffic (e.g. a lull between
-/// dispatches across every host at once) tripping a grace window sized for
-/// single-digit minutes, not one sized for the actual traffic pattern.
-/// Doubling the grace keeps a **large** (~60×) margin below the reference
-/// incident's ~21h duration while giving the observed ~700-825s natural gaps
-/// comfortable headroom not to trip DEGRADED at all. See #8276 for the full
+/// three independent flap episodes on `ip-172-31-74-176` (#8276 itself) each
+/// crossed the (then-)600s grace and later recovered. Code tracing
+/// (`evaluate_coordination`/`observe_at`) ruled out a receive-path defect:
+/// recovery depends solely on inbound peer ads, which are independent of
+/// this host's own dispatch/advertise activity, and this host kept
+/// advertising heavily (150+ dispatches per data point) throughout each
+/// "degraded" window — the opposite of the RAM/disk-throttled "never
+/// advertises" mechanism `anvil#1270` had (explicitly unverified)
+/// hypothesized.
+///
+/// The crossing-to-recovery intervals recovered from the three watchdog
+/// comments are 1089s, 3579s, and 8792s (18m/60m/147m) — **not** the
+/// ~700-825s originally claimed here (that figure conflated
+/// `degraded_for_secs`, the age of the DEGRADED state *at the moment the
+/// watchdog happened to poll*, with the time from crossing grace to
+/// recovery; see the PR #8384 review for the full derivation). These
+/// intervals are themselves only an *upper bound* on the true
+/// genuine-receive quiet gap, not a clean measurement of it —
+/// `evaluate_coordination` doesn't re-check the gap once already DEGRADED,
+/// it just accumulates a count of `DEFAULT_COORDINATION_RECOVERY_THRESHOLD`
+/// receives, so the true gap could be anywhere from just over 600s up to
+/// these values. That range straddles the raised 1200s grace: it is
+/// plausible the raised default would not have prevented DEGRADED on all
+/// three episodes, only delayed it. Doubling the grace is a pragmatic,
+/// evidence-informed compromise (halves the false-positive rate for
+/// shorter flaps, keeps a **large**, ~60× margin below the 2026-08-13
+/// reference incident's ~21h duration) rather than a value derived from a
+/// clean measurement — a live-poll investigation during an active flap
+/// (the issue's original acceptance criteria) would be needed to measure
+/// the true gap and justify a more precise number. See #8276 for the full
 /// investigation, data points, and hypothesis analysis.
 pub const DEFAULT_COORDINATION_DEGRADE_GRACE: Duration = Duration::from_secs(1200);
 
@@ -2225,56 +2238,13 @@ mod tests {
 
     // ---- peer-coordination health (Issue #6157) ----
 
-    /// Issue #8276: three independent flap episodes on `ip-172-31-74-176`
-    /// all showed a genuine-peer-traffic quiet gap of ~703-825s — above the
-    /// *old* 600s grace, but a natural fleet-traffic lull rather than the
-    /// multi-hour one-way-transport signature the check exists to catch (see
-    /// [`DEFAULT_COORDINATION_DEGRADE_GRACE`]'s doc comment for the full
-    /// investigation). Using the raised default directly (not a literal),
-    /// this reproduces the longest observed gap (825s, flap #2) and asserts
-    /// it no longer trips DEGRADED — the false-positive this issue tuned
-    /// away.
-    #[test]
-    fn coordination_survives_the_825s_quiet_gap_observed_in_issue_8276() {
-        let mut view = PeerClaimView::new("ip-172-31-74-176".into(), Duration::from_secs(2000));
-        let base = Instant::now();
-        view.record_advertised_at(base);
-
-        let grace = DEFAULT_COORDINATION_DEGRADE_GRACE;
-        let eval = view.evaluate_coordination(base + Duration::from_secs(825), grace, 3);
-        assert!(
-            !eval.degraded,
-            "an ~825s natural quiet gap must not trip DEGRADED under the raised default grace"
-        );
-        assert!(!eval.transitioned);
-    }
-
-    /// The raised default must still catch the 2026-08-13 incident's actual
-    /// signature (sustained advertising, zero receives, for **hours** —
-    /// 2510 advertisements at the 30s reaper cadence ≈ 21h) well within
-    /// minutes, not hours — the false-positive fix must not blind the check
-    /// to a genuine mesh partition.
-    #[test]
-    fn coordination_still_degrades_on_a_genuine_multi_hour_outage_under_raised_default() {
-        let mut view = PeerClaimView::new("robb-studio".into(), Duration::from_secs(3 * 3600));
-        let base = Instant::now();
-        view.record_advertised_at(base);
-
-        let grace = DEFAULT_COORDINATION_DEGRADE_GRACE;
-        // Exactly at the raised grace boundary: still healthy.
-        let still_healthy =
-            view.evaluate_coordination(base + grace - Duration::from_secs(1), grace, 3);
-        assert!(!still_healthy.degraded);
-
-        // One second later coordination flips DEGRADED — minutes, not the
-        // ~21h the reference incident actually ran for.
-        let eval = view.evaluate_coordination(base + grace, grace, 3);
-        assert!(eval.degraded && eval.transitioned);
-        assert!(
-            grace < Duration::from_secs(3600),
-            "the raised grace must still be well under an hour, let alone the ~21h reference incident"
-        );
-    }
+    // Issue #8276 raised DEFAULT_COORDINATION_DEGRADE_GRACE from 600s to
+    // 1200s. That value is a pragmatic compromise, not one derived from a
+    // clean measurement (see the constant's doc comment for the corrected
+    // derivation) — the grace-boundary and healthy/degrades-at-arbitrary-
+    // grace behavior below already exercises the transition generically at
+    // any grace value, including this one, so no #8276-specific literal
+    // test is added here.
 
     #[test]
     fn coordination_stays_healthy_when_never_advertised() {
