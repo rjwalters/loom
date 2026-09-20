@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-20
+- **Issue #8269** (closed): Add a premise-check gate before Curator: an autonomous filing is not operator approval (#7855)
 - **Issue #8326** (closed): build-gate.sh runs `cargo test`, the shared-process runner `.config/nextest.toml` exists to avoid
 - **PR #8417**: fix(build-gate): prefer `cargo nextest run` over the shared-process `cargo test` (#8326)
 - **Issue #8306** (closed): dashboard: web UI — running-now panel + elastic-spend-this-period view for ephemeral_compute (Phase 3 of #8257)
