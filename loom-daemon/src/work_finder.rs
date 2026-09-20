@@ -3078,7 +3078,7 @@ where
                              (#4027 guard); {} ready issue(s) this tick were skipped in one \
                              batch rather than retried individually every tick (#6440). Run \
                              `loom-daemon init {}` there. `loom-daemon status` reports this \
-                             repo's GATE as `no-sweep` until fixed.",
+                             repo's HEALTH-GATE as `no-sweep` until fixed.",
                             workspace_root.display(),
                             report.skipped_workspace_commands_missing,
                             workspace_root.display()
@@ -3601,7 +3601,7 @@ pub fn spawn_multi_work_finder_task(
                          .claude/commands/loom/sweep.md — every dispatch to it is refused \
                          (#4027 guard). Its ready issues will be skipped in one batch per tick \
                          rather than retried individually (#6440). Run `loom-daemon init {}` \
-                         there. `loom-daemon status` reports this repo's GATE as `no-sweep` \
+                         there. `loom-daemon status` reports this repo's HEALTH-GATE as `no-sweep` \
                          until fixed.",
                         root.display(),
                         root.display()

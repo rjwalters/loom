@@ -916,11 +916,22 @@ fn format_gate_status(verdict: &GateVerdict) -> String {
     }
 }
 
-/// Render `verdict` as a short label for the per-repo table's 13-char `GATE`
-/// column (#4012) — the short-form counterpart to [`format_gate_status`].
+/// Render `verdict` as a short label for the per-repo table's 13-char
+/// `HEALTH-GATE` column (#4012) — the short-form counterpart to
+/// [`format_gate_status`].
+///
+/// The off-state reads `"off"`, not `"disabled"` (#8288): in a column an
+/// operator scans for "why is nothing dispatching into this repo?", the word
+/// "disabled" was read as *dispatch* being disabled for the workspace, when
+/// it only ever meant the main-health gate feature itself is off (the
+/// default) and dispatch is entirely unaffected. `"off"` pairs with the
+/// adjacent `ROLES on/off` column's vocabulary — a feature switch, not a
+/// verdict — and stays visually distinct from `"HALTED"` (gate on, main
+/// verified red, dispatch actually paused) and `"pending"` (gate on, no
+/// verdict yet).
 fn gate_status_short_label(verdict: &GateVerdict) -> &'static str {
     match verdict {
-        GateVerdict::Disabled => "disabled",
+        GateVerdict::Disabled => "off",
         GateVerdict::Pending => "pending",
         GateVerdict::Clear { tier: Some(t), .. } if t == "fast" => "clear(fast)",
         GateVerdict::Clear { .. } => "clear",
@@ -957,12 +968,12 @@ fn format_stash_age(secs: u64) -> String {
     }
 }
 
-/// Render the per-repo table's `GATE` column value (Issue #5682): the
+/// Render the per-repo table's `HEALTH-GATE` column value (Issue #5682): the
 /// distinguishing `"no-sweep"` label when `sweep_command_missing` is `true`,
 /// overriding whatever the main-health gate itself reports — a root missing
 /// `.claude/commands/loom/sweep.md` is refused by `dispatch()`
 /// unconditionally, so the gate's own verdict (which would otherwise render
-/// identically to a healthy idle repo, e.g. `GATE disabled` / `ROLES on`) is
+/// identically to a healthy idle repo, e.g. `HEALTH-GATE off` / `ROLES on`) is
 /// irrelevant to why nothing dispatches into it. Falls through to
 /// [`gate_status_short_label`] in the common case.
 fn gate_column_label(sweep_command_missing: bool, verdict: &GateVerdict) -> &'static str {
@@ -2500,7 +2511,17 @@ pub(crate) fn print_status_human(
     if report.per_repo.is_empty() {
         println!("  (none)");
     } else {
-        println!("  {:>4}  {:>9}  {:<13}  {:<5}  REPO", "PRIO", "IN-FLIGHT", "GATE", "ROLES");
+        // The gate column is named `HEALTH-GATE`, not `GATE` (#8288): the bare
+        // noun invited the reading "this repo's dispatch gate", so an `off`
+        // there looked like dispatch being switched off for the workspace.
+        // Naming the feature it reports on — the main-health gate — keeps the
+        // column's own value about that feature. `HEALTH-GATE` is 11 chars, so
+        // it still fits the existing 13-wide column and the row width (and thus
+        // the separator below) is unchanged.
+        println!(
+            "  {:>4}  {:>9}  {:<13}  {:<5}  REPO",
+            "PRIO", "IN-FLIGHT", "HEALTH-GATE", "ROLES"
+        );
         println!("  {:-<68}", "");
         for r in &report.per_repo {
             // Same classification as the top-level summary above, condensed
@@ -2545,7 +2566,7 @@ pub(crate) fn print_status_human(
                     r.root.display()
                 );
             }
-            // Issue #5682: name the reason behind the `GATE no-sweep` override
+            // Issue #5682: name the reason behind the `HEALTH-GATE no-sweep` override
             // above so an operator reading past the table sees the fix, not
             // just the symptom.
             if r.sweep_command_missing {
@@ -3057,7 +3078,7 @@ mod status_render_tests {
         ];
         for v in cases {
             let short = gate_status_short_label(&v);
-            assert!(short.len() <= 13, "{short:?} exceeds the 13-char GATE column");
+            assert!(short.len() <= 13, "{short:?} exceeds the 13-char HEALTH-GATE column");
         }
         // The short label and long form must agree on the halted/not distinction.
         let halted = classify(Some(true), true, false, None, None);
@@ -3065,21 +3086,78 @@ mod status_render_tests {
         assert!(format_gate_status(&halted).starts_with("HALTED"));
     }
 
+    /// Issue #8288: the off-state short label must not be the word
+    /// "disabled". In the `HEALTH-GATE` column that read as "dispatch is
+    /// disabled for this workspace" (a real operator misread, 2026-09-18),
+    /// when it only ever meant the main-health gate feature is off — the
+    /// default — with dispatch entirely unaffected.
+    #[test]
+    fn gate_status_short_label_off_state_does_not_read_as_dispatch_disabled() {
+        let off = classify(Some(false), false, false, None, None);
+        assert_eq!(off, GateVerdict::Disabled);
+        assert_eq!(gate_status_short_label(&off), "off");
+
+        // The three gate-feature states an operator has to tell apart at a
+        // glance must stay mutually distinct: off (feature not enabled,
+        // dispatch allowed), pending (enabled, no verdict yet, dispatch
+        // allowed), HALTED (enabled, main verified red, dispatch paused).
+        let pending = classify(Some(true), false, false, None, None);
+        let halted = classify(Some(true), true, false, None, None);
+        let labels = [
+            gate_status_short_label(&off),
+            gate_status_short_label(&pending),
+            gate_status_short_label(&halted),
+        ];
+        assert_eq!(labels, ["off", "pending", "HALTED"]);
+
+        // The long form is unchanged and still spells out the consequence —
+        // only the width-constrained column label was shortened.
+        assert!(
+            format_gate_status(&off).contains("dispatch allowed"),
+            "got: {}",
+            format_gate_status(&off)
+        );
+    }
+
+    /// Issue #8288: the column header names the feature it reports on, and
+    /// still fits the 13-wide column the row values are formatted into — so
+    /// the header cannot silently widen the table past its separator rule.
+    #[test]
+    fn health_gate_column_header_names_the_gate_and_fits_the_column() {
+        const HEADER: &str = "HEALTH-GATE";
+        assert!(HEADER.len() <= 13, "{HEADER:?} exceeds the 13-char HEALTH-GATE column");
+        assert_ne!(HEADER, "GATE", "the bare noun is what #8288 was about");
+        // Header and separator must describe the same row width: the header
+        // row is `2 + 4 + 2 + 9 + 2 + 13 + 2 + 5 + 2` of fixed columns before
+        // the variable-width REPO column, and the separator is `2 + 68`.
+        let header_row =
+            format!("  {:>4}  {:>9}  {:<13}  {:<5}  REPO", "PRIO", "IN-FLIGHT", HEADER, "ROLES");
+        let separator = format!("  {:-<68}", "");
+        assert!(
+            header_row.len() <= separator.len(),
+            "header row {:?} ({} chars) outgrew the separator rule ({} chars)",
+            header_row,
+            header_row.len(),
+            separator.len()
+        );
+    }
+
     /// Issue #5682: a workspace missing `.claude/commands/loom/sweep.md`
-    /// must render a `GATE` value that is visibly distinct from a healthy
-    /// idle repo's — the exact `GATE disabled` a fresh/unconfigured repo
-    /// (no `buildGate` block) already reports, which is what made the bug
+    /// must render a `HEALTH-GATE` value that is visibly distinct from a
+    /// healthy idle repo's — the exact `HEALTH-GATE off` a fresh/unconfigured
+    /// repo (no `buildGate` block) already reports, which is what made the bug
     /// invisible in `status` in the first place.
     #[test]
     fn gate_column_label_distinguishes_missing_sweep_command_from_healthy_idle() {
-        // A healthy idle repo: gate disabled (no buildGate block configured),
+        // A healthy idle repo: gate off (no buildGate block configured),
         // nothing halted, nothing deferred — exactly the state a freshly
         // registered, empty-backlog repo reports.
         let healthy_idle_verdict = classify(Some(false), false, false, None, None);
         let healthy_idle_label = gate_column_label(false, &healthy_idle_verdict);
         assert_eq!(
-            healthy_idle_label, "disabled",
-            "sanity check: healthy idle repo's own GATE label is unchanged"
+            healthy_idle_label, "off",
+            "sanity check: healthy idle repo's own HEALTH-GATE label passes through \
+             gate_status_short_label unchanged (#8288 renamed it from \"disabled\")"
         );
 
         // Same underlying gate verdict — the bug is that today this is the
@@ -3087,13 +3165,13 @@ mod status_render_tests {
         let missing_sweep_label = gate_column_label(true, &healthy_idle_verdict);
         assert_ne!(
             missing_sweep_label, healthy_idle_label,
-            "a workspace missing /loom:sweep must not render the same GATE value as a \
-             healthy idle repo"
+            "a workspace missing /loom:sweep must not render the same HEALTH-GATE value \
+             as a healthy idle repo"
         );
         assert_eq!(missing_sweep_label, "no-sweep");
         assert!(
             missing_sweep_label.len() <= 13,
-            "{missing_sweep_label:?} exceeds the 13-char GATE column"
+            "{missing_sweep_label:?} exceeds the 13-char HEALTH-GATE column"
         );
     }
 

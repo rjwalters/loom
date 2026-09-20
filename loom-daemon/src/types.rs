@@ -2989,7 +2989,7 @@ pub struct RepoStatus {
     /// `dispatch()` already refuses this root unconditionally
     /// (`sweep_registry/dispatch.rs`); this field is what lets
     /// `loom-daemon status` render that undispatchable-forever state as
-    /// visibly distinct from a healthy idle repo instead of `GATE disabled` /
+    /// visibly distinct from a healthy idle repo instead of `HEALTH-GATE off` /
     /// `ROLES on` — indistinguishable from "no work" — forever. `#[serde(default)]`
     /// keeps pre-#5682 wire data compatible (an absent field parses as
     /// `false`, i.e. "not known to be missing").
