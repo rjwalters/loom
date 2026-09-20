@@ -1117,6 +1117,21 @@ jobs:
       # binary this job builds.
       - name: skip-labels (#8255)
         run: bash defaults/scripts/tests/test-skip-labels.sh
+      # Moved out of shell-suite-tests by #8195 slice 2: worktree.sh's three
+      # WIP-shelving verbs (`snapshot`, `stash-push`, `stash-pop`) are now thin
+      # stubs over `loom-daemon worktree-wip`, so these two suites' 67
+      # assertions — unchanged from the shell implementation, and the
+      # equivalence evidence for deleting ~385 code lines of it — need the
+      # binary this job builds. Both pin it via loom_test_require_daemon_bin
+      # and FAIL rather than skip without one.
+      #
+      # Only these two of the 19 test-worktree-*.sh suites move. The other 17
+      # drive paths this slice did not touch and stay hermetic in
+      # shell-suite-tests, which is the point of porting one family at a time.
+      - name: worktree snapshot verb (#4778, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-snapshot.sh
+      - name: worktree stash-push/stash-pop pair (#5217, #6076, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-stash-baseline.sh
 
   installer-tests:
     name: Installer Integration Tests
