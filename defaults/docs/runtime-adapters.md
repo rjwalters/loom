@@ -1239,12 +1239,16 @@ design" property to systemd via the container boundary instead of process
 reparenting. `loom-daemon restart --drain` (#4090/#5119) remains the
 recommended path on both supervisors and is unaffected: a containerized
 sweep is admitted into the same in-flight accounting `--drain` already polls
-to zero. **Not shipped by this issue** (explicit Phase 3 follow-up ADR-0017
-names but defers): `SweepRegistry::reconstruct`'s container-recognition
-extension (so a restarted daemon re-admits a still-running orphaned
-container instead of risking a duplicate re-dispatch), and teaching
-`cancel_sweep` to `docker stop`/`docker rm` a containerized sweep it
-explicitly cancels.
+to zero. **Cancellation no longer leaks the container** (#8435): the
+daemon's cancellation path — the explicit `cancel_sweep` verb and every
+watchdog/deadline-driven cancel, which compose the same begin/finish pair —
+label-identifies the cancelled issue's container via
+`loom.sweep.issue=<N>` + `loom.dispatch=container` and issues
+`docker stop --time <grace>` (the cancel's own grace) then `docker kill` on
+expiry; `--rm` removes the stopped container. Still deferred (the remaining
+ADR-0017 follow-up): `SweepRegistry::reconstruct`'s container-recognition
+extension, so a restarted daemon re-admits a still-running orphaned
+container instead of risking a duplicate re-dispatch.
 
 **Explicitly out of scope for this issue**: the fleet-default rollout
 decision (a separate, later Phase 3 issue). Per-sweep resource limits shipped

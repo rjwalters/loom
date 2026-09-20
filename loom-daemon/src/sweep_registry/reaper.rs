@@ -3,6 +3,7 @@
 
 use super::*;
 
+pub(crate) mod container_stop;
 pub(crate) mod pid_identity;
 
 // ============================================================================
@@ -772,9 +773,12 @@ impl SweepRegistry {
     /// Cancel a running sweep.
     ///
     /// Sends SIGTERM to the sweep's process group, waits up to `grace` for the
-    /// child to exit, then SIGKILL to the group if still alive. On any path the
-    /// registry entry is transitioned to `Exited{code: None, at: now}`
-    /// and the per-issue lock is released. Emits the same lifecycle
+    /// child to exit, then SIGKILL to the group if still alive. Since #8435 a
+    /// containerized sweep's container is stopped in lockstep (`docker stop
+    /// --time <grace>` at the SIGTERM step, `docker kill` at the SIGKILL one)
+    /// so the dockerd-owned container cannot outlive the cancelled client. On
+    /// any path the registry entry is transitioned to `Exited{code: None, at:
+    /// now}` and the per-issue lock is released. Emits the same lifecycle
     /// events the reaper would emit on a clean exit
     /// (`sweep.issue.{N}.exited` + `sweep.global.completed`).
     ///
@@ -793,7 +797,7 @@ impl SweepRegistry {
     /// IPC handler for `CancelSweep`, Issue #3807). Kept for direct callers
     /// and unit tests where lock contention is irrelevant.
     pub fn cancel(&mut self, sweep_id: &str, grace: Duration) -> Result<CancelOutcome> {
-        let (pid, kind, started_at) = match self.begin_cancel(sweep_id)? {
+        let (pid, kind, started_at) = match self.begin_cancel(sweep_id, grace)? {
             BeginCancel::AlreadyTerminal(outcome) => return Ok(outcome),
             BeginCancel::Signalled {
                 pid,
@@ -822,16 +826,29 @@ impl SweepRegistry {
     /// **no** blocking poll — so the caller can release the registry lock
     /// before entering the (potentially multi-second) grace window.
     ///
+    /// `grace` is the caller's cancel grace; since #8435 it is also forwarded
+    /// to the container teardown (`docker stop --time <grace>`) so a
+    /// containerized sweep's container gets the same bound the host-side
+    /// process group gets.
+    ///
     /// SIGTERM (signal 15) is sent to the whole process group via `kill(2)`
     /// directly rather than spawning `kill(1)` so the path is identical on
     /// macOS + Linux and doesn't depend on `PATH`. `signal_sweep` falls back
     /// to single-PID delivery for entries with no retained handle.
     ///
+    /// Issue #8435: for a containerized sweep (either dispatch shape), the
+    /// supervised process is only the `docker run` CLIENT — the group signal
+    /// below kills the client while dockerd keeps the container running. So
+    /// BEFORE the group SIGTERM, [`container_stop::begin_container_stop`]
+    /// label-identifies the issue's container and issues `docker stop` on a
+    /// detached thread (fail-safe: no container / no docker / a docker
+    /// failure is logged and skipped, never an error).
+    ///
     /// - Unknown sweep IDs return `Err`.
     /// - Already-terminal sweeps return [`BeginCancel::AlreadyTerminal`] with
     ///   an idempotent `was_running = false` outcome (no signal, no state
     ///   change) — cancel-from-monitor retries stay idempotent.
-    pub fn begin_cancel(&mut self, sweep_id: &str) -> Result<BeginCancel> {
+    pub fn begin_cancel(&mut self, sweep_id: &str, grace: Duration) -> Result<BeginCancel> {
         let (pid, kind, was_running, started_at) = {
             let info = self
                 .entries
@@ -848,6 +865,16 @@ impl SweepRegistry {
                 sigkill_sent: false,
                 was_running: false,
             }));
+        }
+
+        // Issue #8435: stop the container FIRST (before/alongside the group
+        // SIGTERM below) so dockerd's own TERM→KILL escalation starts at the
+        // same moment the host-side one does. Label-keyed and shape-agnostic:
+        // both containerized dispatch shapes stamp `loom.sweep.issue=<N>` +
+        // `loom.dispatch=container`, and no container / no docker / a docker
+        // failure inside is a logged no-op.
+        if let SweepKind::Issue(issue) = &kind {
+            container_stop::begin_container_stop(sweep_id, *issue, grace);
         }
 
         let term_sent = self.signal_sweep(sweep_id, pid, 15);
@@ -881,7 +908,12 @@ impl SweepRegistry {
     /// exit would (`sweep.issue.{N}.exited` + `sweep.global.completed`).
     ///
     /// `exited_within_grace` is the terminal result of the caller's poll loop.
-    /// Returns the [`CancelOutcome`] for the (running) sweep.
+    /// Since #8435, the same expiry condition that escalates the host-side
+    /// SIGKILL also escalates the container one —
+    /// [`container_stop::finish_container_stop`] re-lists the issue's
+    /// container(s) by label and `docker kill`s whatever is still running
+    /// (fail-safe, logged, never an error). Returns the [`CancelOutcome`] for
+    /// the (running) sweep.
     pub fn finish_cancel(
         &mut self,
         sweep_id: &str,
@@ -900,6 +932,14 @@ impl SweepRegistry {
             }
             true
         };
+
+        // Issue #8435: the same grace-expiry condition escalates the
+        // container teardown — `docker kill` whatever is still running for
+        // this issue (a stop client that died before dockerd acted, a wedged
+        // stop). Clean debug-level no-op when nothing is left.
+        if let SweepKind::Issue(issue) = kind {
+            container_stop::finish_container_stop(sweep_id, *issue, !exited_within_grace);
+        }
 
         // Reap the retained handle so the killed leader does not linger as a
         // `<defunct>` zombie under the daemon PID (Issue #3801). A no-op when
