@@ -144,6 +144,40 @@ is the ratchet slipping, which is the entire thing this prevents. A baseline
 diff that raises a number, or grows the total, without a stated reason should be
 treated by Judge as a red flag.
 
+## `--update` is narrow by default (#8248)
+
+A baseline is **repo-global mutable state**, and a check result is evidence
+about **one tree**. Before #8248, `--update` was wholesale: it retightened
+every entry whose file had shrunk, not just the ones the author touched. On
+2026-09-18 that armed a trap: hygiene PR #8204 tightened
+`main_health_gate.rs` 1845 → 1815 (the file had shrunk on `main`), while
+in-flight #8078 — whose `File Size Ratchet` had run green 22 hours earlier
+against the 1845 baseline and never re-ran — hand-merged its 1816-line tree
+onto the 1815 baseline. **main was red**, and every gate involved had worked
+correctly. A wholesale `--update` spends the slack of files nobody in that PR
+was thinking about, for every PR in flight at once.
+
+The default is now **narrow**: `--update` retightens only entries whose files
+*this change* touched (working tree vs HEAD, plus this branch's own commits vs
+its merge-base with the first resolvable base ref). Every untouched entry
+keeps its recorded number even if the file has since shrunk — that slack is
+what in-flight PRs' green results are standing on, and spending it is a
+deliberate act, not a side effect of recording your own refactor.
+
+- `--update` — narrow (default). Records your touched files' current sizes;
+  admits a touched new over-threshold file; drops a touched file that fell
+  under threshold.
+- `--update --all` — the wholesale sweep, unchanged from pre-#8248 behaviour.
+  For deliberate hygiene like #8204, done in the knowledge that it re-arms the
+  trap for every in-flight PR touching those files.
+
+The stale-green side of the same incident is closed in `merge-pr.sh`: its
+required-check freshness guard (#8248, `loom-daemon merge-pr stale-checks`)
+refuses a merge whose green *required* check runs predate the base branch's
+current tip. Option (3) of #8248 — a branch ruleset requiring up-to-date
+branches — was rejected: it forces a rebase per merge, at a cadence this fleet
+(125-commits-behind PRs are ordinary) would pay constantly.
+
 ## When the baseline goes stale under you
 
 CI evaluates the **merge result**, not your branch in isolation. So if an
@@ -163,7 +197,11 @@ scripts/check-file-size-budget.sh --update
 and **say in the PR description that the raised number came from `main`, not
 from your change**. This is the one legitimate reason for a baseline number to
 go up, and it should be visibly justified every time, because the policy
-otherwise treats an upward edit as the ratchet slipping.
+otherwise treats an upward edit as the ratchet slipping. (Post-rebase, the
+raised number usually arrives by git's own merge of the baseline file;
+`--update` here is belt-and-suspenders for *your* touched files, since the
+narrow default of #8248 deliberately does not re-record files this change did
+not touch.)
 
 ## Mechanical refactors: use the language's own tooling, never text surgery
 
