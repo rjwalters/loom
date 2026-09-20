@@ -479,7 +479,21 @@ pub fn check_uncommitted_changes(worktree_path: &Path) -> bool {
 /// to [`has_untracked_files`] — most repos gitignore them (the `loom-managed`
 /// block in `.gitignore`), but a repo that predates or has edited that block
 /// would otherwise see every managed worktree as permanently unreclaimable.
-const LOOM_OWN_UNTRACKED_FILES: [&str; 2] = [".loom-managed", ".loom-in-use"];
+///
+/// This list has a TWIN in shell: `_worktree_dirty_lines` in
+/// `defaults/scripts/worktree.sh`, which is the same guard for the same
+/// reason on the `worktree.sh remove` path. The two disagreed (#8195): this
+/// side listed two markers and the shell listed four, so in a repo with a
+/// stale `.gitignore` the daemon saw `.loom-checkpoint` and
+/// `.no-changes-needed` as user work and declined to reclaim a worktree the
+/// shell would have removed. `dirty_marker_filter_matches_the_shell_twin`
+/// drives the real shell helper and fails if they drift apart again.
+const LOOM_OWN_UNTRACKED_FILES: [&str; 4] = [
+    ".loom-managed",
+    ".loom-in-use",
+    ".loom-checkpoint",
+    ".no-changes-needed",
+];
 
 /// True if `worktree_path` contains untracked, non-gitignored files that are
 /// not Loom's own sentinels (issue #5939).
@@ -569,6 +583,107 @@ pub fn read_in_use_marker(worktree_path: &Path) -> Option<InUseMarker> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// The dirty-marker filter must agree with its shell twin.
+    ///
+    /// `worktree.sh`'s `_worktree_dirty_lines` is the same guard for the same
+    /// reason on the `worktree.sh remove` path, and the two had already
+    /// drifted: this side filtered two markers, the shell filtered four. In a
+    /// repo whose `.gitignore` predates the `loom-managed` block (exactly the
+    /// case both filters exist for), the daemon read `.loom-checkpoint` and
+    /// `.no-changes-needed` as user work and refused to reclaim a worktree the
+    /// shell removed without comment.
+    ///
+    /// So this drives the REAL shell helper rather than re-encoding its list:
+    /// a constant pinned against a constant would have passed while the two
+    /// predicates disagreed.
+    #[test]
+    fn dirty_marker_filter_matches_the_shell_twin() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let wt_sh = repo_root.join("defaults/scripts/worktree.sh");
+        let Ok(sh) = std::fs::read_to_string(&wt_sh) else {
+            return; // not a full checkout
+        };
+        let start = sh
+            .find("_worktree_dirty_lines() {")
+            .expect("worktree.sh defines _worktree_dirty_lines");
+        let body = &sh[start..];
+        let end = body.find("\n}\n").expect("function has a terminator");
+        let helper = &body[..end + 3];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git runs");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("real.txt"), "x\n").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        // Deliberately NO .gitignore: the drift only shows in a repo that does
+        // not ignore the markers, which is the case the filters exist for.
+        //
+        // The fixture list is a LITERAL, not `LOOM_OWN_UNTRACKED_FILES`.
+        // Generating it from the constant would make the test move with the
+        // bug — shrink the constant and the fixture shrinks with it, and the
+        // assertion passes while the two guards disagree. That is the same
+        // shape of hole as pinning a number instead of a predicate.
+        for m in [
+            ".loom-managed",
+            ".loom-in-use",
+            ".loom-checkpoint",
+            ".no-changes-needed",
+        ] {
+            std::fs::write(dir.path().join(m), "").expect("write marker");
+        }
+
+        let script = format!("{helper}\n_worktree_dirty_lines \"$1\"");
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .arg("bash")
+            .arg(dir.path())
+            .output()
+            .expect("bash runs");
+        let shell_sees_dirt = !String::from_utf8_lossy(&out.stdout).trim().is_empty();
+
+        assert!(
+            !shell_sees_dirt,
+            "the shell treats every marker as bookkeeping; got: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(
+            has_untracked_files(dir.path()),
+            shell_sees_dirt,
+            "markers alone: the two guards must reach the same verdict"
+        );
+
+        // And both must still see real user work.
+        std::fs::write(dir.path().join("work.txt"), "mine\n").expect("write");
+        let out2 = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .arg("bash")
+            .arg(dir.path())
+            .output()
+            .expect("bash runs");
+        let shell_sees_dirt2 = !String::from_utf8_lossy(&out2.stdout).trim().is_empty();
+        assert!(shell_sees_dirt2, "a real untracked file is dirt");
+        assert_eq!(
+            has_untracked_files(dir.path()),
+            shell_sees_dirt2,
+            "real work: the two guards must reach the same verdict"
+        );
+    }
+
     use super::*;
     use tempfile::tempdir;
 
