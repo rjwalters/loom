@@ -101,6 +101,22 @@ fn unknown_tool_and_ambiguous_edit_fail_closed() {
 
 #[test]
 fn native_sweep_uses_profile_and_does_not_inherit_claude_pool_holds() {
+    // #4739 convention (mirrors ClearedLoomRuntimeEnv in runtime_admission.rs):
+    // ambient LOOM_RUNTIME outranks the config writes below (env > config
+    // precedence), so any host that exports it — e.g. a native worker session —
+    // would flip the claude half of this test. Isolate it for this test's scope
+    // and restore afterwards, including on panic.
+    struct RestoreLoomRuntime(Option<String>);
+    impl Drop for RestoreLoomRuntime {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("LOOM_RUNTIME", v),
+                None => std::env::remove_var("LOOM_RUNTIME"),
+            }
+        }
+    }
+    let _runtime = RestoreLoomRuntime(std::env::var("LOOM_RUNTIME").ok());
+    std::env::remove_var("LOOM_RUNTIME");
     let d = fixture();
     fs::write(
         d.path().join(".loom/config.json"),
