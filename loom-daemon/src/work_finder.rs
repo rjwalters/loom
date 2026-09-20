@@ -226,44 +226,8 @@ pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
 /// config). See [`resolve_extra_skip_labels_with_config`].
 pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP_LABELS";
 
-/// Labels marking a **deliberate park** — a human (or an agent acting on a
-/// human's behalf) has taken the issue out of the automation queue and it must
-/// stay out until the label is cleared (Issue #4444).
-///
-/// This is the strict subset of [`SKIP_LABELS`] that survives *every* dispatch
-/// route, so it is the constant the dispatch-time guard in
-/// `SweepRegistry::dispatch()` (step 2.7) consults. It deliberately EXCLUDES
-/// [`BUILDING_LABEL`]: `loom:building` is legitimately present on the daemon's
-/// own in-flight claim, so a guard that refused it would break the watchdogs'
-/// cancel-and-re-dispatch and the reaper's checkpoint-resume — both of which
-/// re-dispatch an issue the daemon itself already flipped to `loom:building`.
-///
-/// **One narrow exemption exists (#6893).** `loom:operator-only`'s park is
-/// capability-aware for the `loom:operator-mechanical` sub-kind *only*: an item
-/// carrying both labels, declaring `<!-- loom:capability=<name> -->` markers
-/// (#6892) that this worker's own `LOOM_WORKER_CAPABILITIES` declaration fully
-/// covers, may be dispatched into a propose-mode lane instead of parked. See
-/// [`WorkItem::is_skipped_with_capabilities`] and [`crate::capability`]. The
-/// list here is unchanged and stays the authoritative *set* of park labels —
-/// the exemption is applied by the callers that opt into it, never by removing
-/// a label from this constant, and it is inert unless a host opts in.
-pub const PARK_LABELS: &[&str] = &["loom:blocked", "loom:operator-only"];
-
-/// The daemon's own claim label. Disqualifies a *fresh* work-finder candidate
-/// (a `loom:building` row is already being worked), but is NOT a park — see
-/// [`PARK_LABELS`].
-pub const BUILDING_LABEL: &str = "loom:building";
-
-/// Labels that disqualify an issue from dispatch even if it still appears in
-/// the `loom:issue`-filtered listing.
-///
-/// A `loom:issue` row should never itself carry these (they are mutually
-/// exclusive states in the `.github/labels.yml` state machine), but `gh`'s
-/// label cache can be briefly stale, so the finder checks defensively.
-///
-/// Composed as [`BUILDING_LABEL`] + [`PARK_LABELS`] rather than re-listing the
-/// label strings, so the two constants can never drift apart (#4444).
-pub const SKIP_LABELS: &[&str] = &[BUILDING_LABEL, PARK_LABELS[0], PARK_LABELS[1]];
+mod labels;
+pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
 
 /// Label that promotes an issue ahead of its non-urgent siblings **within the
 /// same workspace-priority tier** (Issue #3946). Detection is best-effort: if no

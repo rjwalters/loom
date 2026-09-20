@@ -60,7 +60,7 @@
 1839 loom-daemon/src/serve.rs
 1132 loom-daemon/src/stash_retirement.rs
 1607 loom-daemon/src/sweep_registry/dispatch.rs
-3196 loom-daemon/src/sweep_registry/dispatch/tests.rs
+3198 loom-daemon/src/sweep_registry/dispatch/tests.rs
 2319 loom-daemon/src/sweep_registry/guards.rs
 1075 loom-daemon/src/sweep_registry/mod.rs
 1709 loom-daemon/src/sweep_registry/quarantine.rs
@@ -76,8 +76,8 @@
 1510 loom-daemon/src/tokens_pool/session_lifecycle.rs
 1741 loom-daemon/src/types.rs
 1050 loom-daemon/src/watch_registry.rs
-1910 loom-daemon/src/work_finder.rs
-3450 loom-daemon/src/work_finder/tests.rs
+1908 loom-daemon/src/work_finder.rs
+3455 loom-daemon/src/work_finder/tests.rs
 1225 loom-daemon/src/worktree_ops/cargo_target.rs
 2370 loom-daemon/src/worktree_ops/clean.rs
 1702 loom-daemon/src/worktree_ops/clean/tests.rs

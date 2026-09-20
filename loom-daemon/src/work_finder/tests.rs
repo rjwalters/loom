@@ -1963,9 +1963,9 @@ fn test_tick_lease_order_refusal_counts_as_backoff_skip_not_error() {
 fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     // #4444: the dispatch-time guard keys on PARK_LABELS, so the two
     // constants must stay in lockstep — SKIP_LABELS is exactly
-    // BUILDING_LABEL + PARK_LABELS, and PARK_LABELS must never contain
-    // `loom:building` (a guard that refused it would break the watchdogs'
-    // and the reaper's re-dispatch of the daemon's OWN claim).
+    // BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL, and PARK_LABELS
+    // must never contain `loom:building` (a guard that refused it would break
+    // the watchdogs' and the reaper's re-dispatch of the daemon's OWN claim).
     assert!(
         !PARK_LABELS.contains(&BUILDING_LABEL),
         "PARK_LABELS must exclude {BUILDING_LABEL}: it is legitimately present on a \
@@ -1979,8 +1979,19 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     }
     let mut expected: Vec<&str> = vec![BUILDING_LABEL];
     expected.extend_from_slice(PARK_LABELS);
-    assert_eq!(SKIP_LABELS, expected, "SKIP_LABELS is composed as BUILDING_LABEL + PARK_LABELS");
+    expected.push(OPERATOR_HOLD_LABEL);
+    assert_eq!(
+        SKIP_LABELS, expected,
+        "SKIP_LABELS is composed as BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL"
+    );
 }
+
+// The vibesql#6664 operator-hold skip-not-park test lives in its own
+// sibling file rather than being appended here: this module is over the
+// 1000-line ratchet threshold and frozen at its current size
+// (`.loom/docs/file-size-policy.md`), the same pattern `roster_fence`
+// already uses in this file.
+mod operator_hold;
 
 #[test]
 fn test_hard_exclusion_labels_are_disjoint_from_skip_labels() {

@@ -3932,6 +3932,15 @@ fn dispatch_refuses_operator_only_issue() {
     std::env::remove_var("LOOM_REPO");
 }
 
+// The vibesql#6664 operator-hold park-guard test lives in its own sibling
+// file rather than being appended here: this module is over the 1000-line
+// ratchet threshold and frozen at its current size
+// (`.loom/docs/file-size-policy.md` — "put the new code in a NEW sibling
+// module"). Registered from here, the same shape `guards.rs` uses for
+// `guards_union_tests.rs` / `guards_preflip_tests.rs`.
+#[path = "operator_hold_tests.rs"]
+mod operator_hold_tests;
+
 /// AC (the load-bearing exclusion): `loom:building` ALONE must NOT refuse.
 /// It is legitimately present on the daemon's own in-flight claim, so a guard
 /// keyed on the full `SKIP_LABELS` set would break the review-stall
