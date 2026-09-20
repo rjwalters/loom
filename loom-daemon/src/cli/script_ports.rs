@@ -105,6 +105,14 @@ pub(crate) enum ScriptPortCommand {
     /// candidate pool on stdin; stdout and exit codes are the lines and codes
     /// the script's own aggregation always consumed.
     DuplicateScan(super::duplicate_scan::DuplicateScanArgs),
+
+    /// The premise gate (#8396), one stage before Curator: is this issue in
+    /// the gated population, and does a consistent premise record exist for
+    /// it? Backs `premise-check.sh`. Exit 0 proceed, 10 record required, 11
+    /// route to `loom:operator-decision`, 12 record malformed, 13 premise
+    /// false, 1 could not run — and 1 must be treated as 10, never as 0. Not
+    /// a port either: same frozen-`main.rs` reason as `shell-budget` above.
+    PremiseCheck(super::premise_check::PremiseCheckArgs),
 }
 
 impl ScriptPortCommand {
@@ -126,6 +134,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
+            ScriptPortCommand::PremiseCheck(args) => args.run(),
         }
     }
 }

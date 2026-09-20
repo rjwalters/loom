@@ -1134,6 +1134,11 @@ jobs:
         run: bash defaults/scripts/tests/test-worktree-snapshot.sh
       - name: worktree stash-push/stash-pop pair (#5217, #6076, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-stash-baseline.sh
+      # #8396: premise-check.sh is a thin stub over `loom-daemon
+      # premise-check`, the gate Curator and the sweep orchestrator run before
+      # enrichment — needs the binary this job builds.
+      - name: premise gate exit-code contract (#8396)
+        run: bash defaults/scripts/tests/test-premise-check.sh
 
   installer-tests:
     name: Installer Integration Tests

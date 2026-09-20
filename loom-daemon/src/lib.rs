@@ -193,6 +193,7 @@ pub mod orphan_process_reaper;
 pub mod peer_claims;
 pub mod phase_join;
 pub mod pipeline_snapshot;
+pub mod premise_check;
 pub mod primary_checkout_reaper;
 pub mod proc_exec;
 pub mod quarantine_reconciliation;
