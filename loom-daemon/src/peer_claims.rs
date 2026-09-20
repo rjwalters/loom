@@ -132,14 +132,48 @@ pub const DEFAULT_SAME_ISSUE_COLLISION_WINDOW: Duration = Duration::from_secs(24
 /// [`DEFAULT_COORDINATION_DEGRADE_GRACE`].
 pub const COORDINATION_DEGRADE_GRACE_ENV: &str = "LOOM_PEER_COORDINATION_DEGRADE_GRACE_SECS";
 
-/// Default degrade grace: 10 minutes — 20× the default reaper
+/// Default degrade grace: 20 minutes — 40× the default reaper
 /// re-advertisement cadence
 /// ([`crate::sweep_registry::reaper::DEFAULT_REAPER_INTERVAL_SECS`], 30s), so
 /// a handful of missed room round-trips (a momentary safehoused hiccup)
 /// never trips it, but a genuinely one-way transport — the 2026-08-13
-/// incident's `received=0` across 2510 advertisements, sustained for hours —
-/// is caught in single-digit minutes, not hours.
-pub const DEFAULT_COORDINATION_DEGRADE_GRACE: Duration = Duration::from_secs(600);
+/// incident's `received=0` across 2510 advertisements, sustained for
+/// **hours** (2510 advertisements × the 30s reaper cadence ≈ 21h) — is still
+/// caught in minutes, not hours.
+///
+/// Raised from the original 10-minute default (Issue #8276, 2026-09-19):
+/// three independent flap episodes on `ip-172-31-74-176` (#8276 itself) each
+/// crossed the (then-)600s grace and later recovered. Code tracing
+/// (`evaluate_coordination`/`observe_at`) ruled out a receive-path defect:
+/// recovery depends solely on inbound peer ads, which are independent of
+/// this host's own dispatch/advertise activity, and this host kept
+/// advertising heavily (150+ dispatches per data point) throughout each
+/// "degraded" window — the opposite of the RAM/disk-throttled "never
+/// advertises" mechanism `anvil#1270` had (explicitly unverified)
+/// hypothesized.
+///
+/// The crossing-to-recovery intervals recovered from the three watchdog
+/// comments are 1089s, 3579s, and 8792s (18m/60m/147m) — **not** the
+/// ~700-825s originally claimed here (that figure conflated
+/// `degraded_for_secs`, the age of the DEGRADED state *at the moment the
+/// watchdog happened to poll*, with the time from crossing grace to
+/// recovery; see the PR #8384 review for the full derivation). These
+/// intervals are themselves only an *upper bound* on the true
+/// genuine-receive quiet gap, not a clean measurement of it —
+/// `evaluate_coordination` doesn't re-check the gap once already DEGRADED,
+/// it just accumulates a count of `DEFAULT_COORDINATION_RECOVERY_THRESHOLD`
+/// receives, so the true gap could be anywhere from just over 600s up to
+/// these values. That range straddles the raised 1200s grace: it is
+/// plausible the raised default would not have prevented DEGRADED on all
+/// three episodes, only delayed it. Doubling the grace is a pragmatic,
+/// evidence-informed compromise (halves the false-positive rate for
+/// shorter flaps, keeps a **large**, ~60× margin below the 2026-08-13
+/// reference incident's ~21h duration) rather than a value derived from a
+/// clean measurement — a live-poll investigation during an active flap
+/// (the issue's original acceptance criteria) would be needed to measure
+/// the true gap and justify a more precise number. See #8276 for the full
+/// investigation, data points, and hypothesis analysis.
+pub const DEFAULT_COORDINATION_DEGRADE_GRACE: Duration = Duration::from_secs(1200);
 
 /// Env var overriding how many consecutive genuine peer receives must land
 /// while coordination is DEGRADED before it is judged recovered (Issue
@@ -2203,6 +2237,14 @@ mod tests {
     }
 
     // ---- peer-coordination health (Issue #6157) ----
+
+    // Issue #8276 raised DEFAULT_COORDINATION_DEGRADE_GRACE from 600s to
+    // 1200s. That value is a pragmatic compromise, not one derived from a
+    // clean measurement (see the constant's doc comment for the corrected
+    // derivation) — the grace-boundary and healthy/degrades-at-arbitrary-
+    // grace behavior below already exercises the transition generically at
+    // any grace value, including this one, so no #8276-specific literal
+    // test is added here.
 
     #[test]
     fn coordination_stays_healthy_when_never_advertised() {
