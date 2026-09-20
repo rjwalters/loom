@@ -156,6 +156,53 @@ _is_head_mismatch_response() {
   echo "$1" | grep -Eiq 'Head branch was modified\.|head out of date|expectedHeadOid'
 }
 
+# #8164: record that THIS script pushed to the head branch, via
+# forge_update_branch() ("Base branch was modified" retry). Deliberately does
+# NOT re-read or adopt the new head SHA — that adoption used to be blind (no
+# parent inspection, no containment check), which meant a session pushing a
+# commit on top of ours mid-sync (the exact #5579 scenario) got squashed into
+# the merge with no refusal and no trace once the squash discarded ancestry.
+# Leaving $MERGE_PRECONDITION_SHA untouched means the next merge attempt gets
+# its own 409 "Head branch was modified", which routes through
+# _head_moved_or_resync() below exactly like the residual-timing-window case —
+# so EVERY head-SHA adoption on this path goes through the same structural
+# attribution check, not just the asynchronous-push one. One extra round trip
+# buys uniform attribution instead of two different safety levels for the same
+# claim ("this new head is our own sync").
+# Written as one dense line for the same reason the guards above are: this file
+# is frozen by the file-size ratchet, and `shell-budget --check` refuses a
+# change that grows the portable pool at all.
+_refresh_precondition_sha() { _HEAD_SELF_SYNCED=true; return 0; }
+
+# #8164: a head-SHA mismatch is retried ONCE when — and only when — this run's
+# own base-sync caused it. Returns 0 when the caller should re-attempt the
+# merge against the refreshed $MERGE_PRECONDITION_SHA; otherwise never
+# returns, exiting 3 through error_head_moved() exactly as before.
+#
+# The decision is `loom-daemon merge-pr head-sync-retry` (Rust,
+# loom-daemon/src/merge_pr/head_sync.rs — slice 4 of the merge-pr port #8191),
+# which authorizes a retry only when the new head is a two-parent merge whose
+# FIRST parent is the head we were about to merge and whose SECOND parent is
+# already contained in the base branch. Under that shape the new head's
+# content is (approved head ∪ base) and nothing else — the same tree the merge
+# would have produced. Attribution is structural, never the commit message:
+# a message is attacker-supplied text, parent SHAs are not. Any other shape
+# (a rebase-style update, a commit pushed on top, a merge of some other
+# branch) stays the #5579 hard stop.
+#
+# Fails safe by construction: only exit 0 PLUS the sentinel retries, so a
+# missing/old/substituted binary, a forge read failure, or any silent failure
+# lands on the pre-#8164 behaviour — exit 3, re-queue — which is why this
+# guard needs no new helper-missing exit code. It can only add merges that
+# would otherwise have been re-queued; it can never remove a refusal.
+_head_moved_or_resync() {
+  local _CURRENT_HEAD_SHA="" _CHR_JSON _HMR_OUT _HMR_RC=0 _HMR_FLAGS=(); _CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"; _CURRENT_HEAD_SHA="$(echo "$_CHR_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"; unset _CHR_JSON
+  [[ "${_HEAD_SELF_SYNCED:-}" == "true" ]] && _HMR_FLAGS+=(--self-synced); [[ "${_HEAD_RESYNC_USED:-}" == "true" || "${MERGE_ATTEMPT:-1}" -ge "${MAX_MERGE_RETRIES:-3}" ]] && _HMR_FLAGS+=(--retry-used); [[ "${2:-}" == "exit-code" ]] && _HMR_FLAGS+=(--mismatch-confirmed)
+  _HMR_OUT="$(printf '%s' "$1" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr head-sync-retry --pr "$PR_NUMBER" --repo "$REPO_NWO" --precondition-sha "$MERGE_PRECONDITION_SHA" "${_HMR_FLAGS[@]+"${_HMR_FLAGS[@]}"}" 2>/dev/null)" || _HMR_RC=$?
+  if [[ $_HMR_RC -eq 0 && "$_HMR_OUT" == "LOOM-HEAD-SELF-SYNC-RETRY "* ]]; then _HEAD_RESYNC_USED=true; MERGE_PRECONDITION_SHA="${_HMR_OUT##* }"; info "PR #$PR_NUMBER: head-SHA mismatch attributed to this run's own base-sync; retrying once against ${MERGE_PRECONDITION_SHA:0:8} (#8164)"; return 0; fi
+  [[ -n "$_HMR_OUT" ]] && warning "$_HMR_OUT"; error_head_moved "PR #$PR_NUMBER: $1" "$MERGE_PRECONDITION_SHA" "$_CURRENT_HEAD_SHA"
+}
+
 # Function to show help
 show_help() {
     cat << EOF
@@ -2092,12 +2139,15 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
         # stale approval" signal as the shell path's
         # _is_head_mismatch_response() check further down; do not fall
         # through to the generic failure/retry branch.
-        # Fetch current head SHA for diagnostic output (degrade gracefully on fetch failure)
-        _CURRENT_HEAD_SHA=""
-        _CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
-        _CURRENT_HEAD_SHA="$(echo "$_CHR_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"
-        unset _CHR_JSON
-        error_head_moved "PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT" "$MERGE_PRECONDITION_SHA" "$_CURRENT_HEAD_SHA"
+        #
+        # Routed through _head_moved_or_resync() (#8164) exactly like the two
+        # text-classified sites: it re-queues via error_head_moved() unless
+        # THIS run's own base-sync is what moved the head, in which case the
+        # merge is retried once against the re-read head. `exit-code` says the
+        # mismatch was established by the native path's exit 4 rather than by
+        # the response text (which is loom-daemon's wording, not a forge
+        # string _is_head_mismatch_response() would recognize).
+        _head_moved_or_resync "$AUTO_MERGE_OUTPUT" exit-code && continue
       elif [[ $_AM_RC -ne 3 ]]; then
         # Native attempted and failed (not a Gitea decline) — keep the gh error
         # in AUTO_MERGE_OUTPUT and fall through to the recheck/retry logic.
@@ -2128,13 +2178,11 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     # trying to merge changed). Do NOT retry-and-merge: exit 3 so the caller
     # (Champion) re-queues this PR for a fresh pass instead of treating it as
     # a failure. See error_head_moved()/_is_head_mismatch_response() above.
+    # Since #8164, via _head_moved_or_resync(): still exit 3 for every head
+    # move this run did not cause, but its own base-sync push gets one
+    # re-read-and-retry instead of a spurious re-queue.
     if _is_head_mismatch_response "$AUTO_MERGE_OUTPUT"; then
-      # Fetch current head SHA for diagnostic output (degrade gracefully on fetch failure)
-      _CURRENT_HEAD_SHA=""
-      _CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
-      _CURRENT_HEAD_SHA="$(echo "$_CHR_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"
-      unset _CHR_JSON
-      error_head_moved "PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT" "$MERGE_PRECONDITION_SHA" "$_CURRENT_HEAD_SHA"
+      _head_moved_or_resync "$AUTO_MERGE_OUTPUT" && continue
     fi
 
     # Retry on stale-branch race ("Base branch was modified")
@@ -2145,6 +2193,9 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
           warning "Failed to update branch (continuing anyway)"
         info "Waiting ${MERGE_RETRY_DELAY}s for branch to sync..."
         sleep "$MERGE_RETRY_DELAY"
+        # The sync just pushed to the head branch: re-read it, or the retry
+        # below re-gates on a SHA the forge has already superseded (#8164).
+        _refresh_precondition_sha
         MERGE_RETRY_DELAY=$((MERGE_RETRY_DELAY * 2))
         continue
       fi
@@ -2642,13 +2693,11 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
   # pushing) or silently squash a different diff than the one Judge approved.
   # Exit 3 so the caller (Champion) re-queues instead of treating this as a
   # failure. See error_head_moved()/_is_head_mismatch_response() above.
+  # Since #8164, via _head_moved_or_resync(): a mismatch caused by this run's
+  # own base-sync earns exactly one re-read-and-retry; anything else is the
+  # same exit-3 re-queue as before.
   if _is_head_mismatch_response "$MERGE_RESPONSE"; then
-    # Fetch current head SHA for diagnostic output (degrade gracefully on fetch failure)
-    _CURRENT_HEAD_SHA=""
-    _CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
-    _CURRENT_HEAD_SHA="$(echo "$_CHR_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"
-    unset _CHR_JSON
-    error_head_moved "PR #$PR_NUMBER: $MERGE_RESPONSE" "$MERGE_PRECONDITION_SHA" "$_CURRENT_HEAD_SHA"
+    _head_moved_or_resync "$MERGE_RESPONSE" && continue
   fi
 
   # Check for stale branch error (base branch was modified)
@@ -2665,6 +2714,10 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
       # Wait for branch to sync
       info "Waiting ${MERGE_RETRY_DELAY}s for branch to sync..."
       sleep "$MERGE_RETRY_DELAY"
+
+      # The sync just pushed to the head branch: re-read it, or the retry
+      # below re-gates on a SHA the forge has already superseded (#8164).
+      _refresh_precondition_sha
 
       # Increase delay for next attempt (exponential backoff)
       MERGE_RETRY_DELAY=$((MERGE_RETRY_DELAY * 2))

@@ -449,18 +449,40 @@ native_dispatch_order=$(awk '
 ' "$MERGE_PR_SRC")
 assert_eq "mismatch" "$native_dispatch_order" "native _AM_RC dispatch checks the head-mismatch exit code (4) before the Gitea-decline check (-ne 3)"
 
+# ANCHOR UPDATED by #8164 (NOT retired — the property is unchanged and still
+# asserted, in two halves instead of one). The branch no longer calls
+# error_head_moved() inline; it calls _head_moved_or_resync(), whose only
+# non-retry exit IS error_head_moved(). Asserting both halves is strictly
+# stronger than the old single grep: the old one could not have noticed a
+# wrapper that forgot to exit 3 on the refusal path, and this one does.
 TESTS_RUN=$((TESTS_RUN + 1))
 if awk '
   /AUTO_MERGE_OUTPUT=\$\((forge_cmd_perm_safe )?loom-daemon forge auto-merge/ { indispatch=1; next }
   indispatch && /_AM_RC -eq 4/ { found=1 }
-  found && /error_head_moved "PR #\$PR_NUMBER: \$AUTO_MERGE_OUTPUT"/ { print "ok"; exit }
+  found && /_head_moved_or_resync "\$AUTO_MERGE_OUTPUT"/ { print "ok"; exit }
   indispatch && /^    fi$/ { exit }
 ' "$MERGE_PR_SRC" | grep -q ok; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: the native _AM_RC -eq 4 branch calls error_head_moved() (re-queue, not a generic failure)"
+    echo -e "  ${GREEN}PASS${NC}: the native _AM_RC -eq 4 branch routes through _head_moved_or_resync() (re-queue, not a generic failure)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: could not confirm the native _AM_RC -eq 4 branch calls error_head_moved()"
+    echo -e "  ${RED}FAIL${NC}: could not confirm the native _AM_RC -eq 4 branch routes to the head-moved path"
+fi
+
+# The other half of that property: _head_moved_or_resync()'s refusal path is
+# still error_head_moved() with both SHAs, i.e. exit 3, i.e. a re-queue.
+TESTS_RUN=$((TESTS_RUN + 1))
+_hmr_refusal_probe=$(awk '
+  /^_head_moved_or_resync\(\) \{/ { infn=1 }
+  infn && /error_head_moved "PR #\$PR_NUMBER: \$1" "\$MERGE_PRECONDITION_SHA" "\$_CURRENT_HEAD_SHA"/ { print "ok"; exit }
+  infn && /^}$/ { exit }
+' "$MERGE_PR_SRC")
+if [[ "$_hmr_refusal_probe" == "ok" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: _head_moved_or_resync()'s non-retry path is error_head_moved() with both SHAs (exit 3)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: _head_moved_or_resync() does not end in error_head_moved() — a head move could escape the re-queue path"
 fi
 
 # ============================================================================
