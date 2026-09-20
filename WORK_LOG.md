@@ -7,6 +7,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-20
+- **Issue #8438** (closed): OpenCode adapter cannot launch on OpenCode 2.x: --dir was removed, and the default background service never sees per-launch credentials (needs --standalone)
+- **PR #8445**: fix(opencode): launch on OpenCode 2.x via a pre-exec version probe; refuse guarded 2.x launches until a live canary exists
+- **Issue #8408** (closed): Role-runner pool-exhaustion gate is not runtime-aware: a codex-pinned role skips on an empty *Claude* pool
+- **PR #8442**: fix(role-runner): gate a role tick on the pool its admitted runtime draws from (#8408)
+- **Issue #8430** (closed): test-loom-dispatcher.sh Test 22 fails on main: runtime-provenance wording drifted from 'env (LOOM_RUNTIME)' to 'global-environment'
+- **PR #8441**: test(dispatcher): scrub inherited LOOM_ROLE in Test 22 to pin the bare-env provenance tier (#8430)
+- **PR #8433**: feat(worktree): port snapshot/stash-push/stash-pop to `loom-daemon worktree-wip` (#8195 slice 2)
+- **Issue #8402** (closed): model profiles: multi-variable credential mapping + provider options so Bedrock, Vertex AI, and OpenAI-compatible open-weights endpoints are data-only profiles (no new executable)
+- **PR #8421**: feat(profiles): multi-variable credential mapping + provider options for model profiles
 - **PR #8405**: fix(work-finder): skip fresh candidates carrying a loom:operator hold (vibesql#6664)
 - **Issue #8269** (closed): Add a premise-check gate before Curator: an autonomous filing is not operator approval (#7855)
 - **Issue #8326** (closed): build-gate.sh runs `cargo test`, the shared-process runner `.config/nextest.toml` exists to avoid
