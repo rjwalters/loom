@@ -22,11 +22,17 @@
 //! refusing to merge a PR that carries `loom:pr` alongside a contradicting
 //! label.
 //!
+//! Slice 4 is [`head_sync`]: the self-sync head-SHA attribution guard
+//! (#8164) — deciding when a 409 "Head branch was modified" was caused by
+//! this run's OWN base-sync push, and may therefore be retried once against a
+//! freshly-read head, versus a foreign push that must stay a hard stop.
+//!
 //! Slice 3 is [`stale_checks`]: the required-check freshness guard (#8248) —
 //! refusing a merge whose green required-check results predate the base
 //! branch's current tip, which is how a ratchet baseline tightened under an
 //! in-flight PR red-lined main on 2026-09-18.
 
+pub mod head_sync;
 pub mod labels;
 pub mod refs;
 pub mod stale_checks;

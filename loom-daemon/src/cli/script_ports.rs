@@ -143,6 +143,12 @@ pub(crate) enum MergePrCommand {
     /// tree that no longer exists. Exit 0+CLEAN = fresh, 1 = stale, 2 =
     /// could not determine (must also refuse).
     StaleChecks(super::merge_pr_stale_checks::StaleChecksArgs),
+
+    /// Decide whether a head-SHA-mismatch refusal was caused by THIS merge
+    /// run's own base-sync push (#8164) and may be retried once against a
+    /// freshly-read head. Exit 0 + sentinel = retry authorized, 1 = foreign
+    /// head move (re-queue), 2 = attribution undeterminable (also re-queue).
+    HeadSyncRetry(super::merge_pr_head_sync::HeadSyncRetryArgs),
 }
 
 impl MergePrCommand {
@@ -150,6 +156,7 @@ impl MergePrCommand {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run(),
+            MergePrCommand::HeadSyncRetry(args) => args.run(),
         }
     }
 }
