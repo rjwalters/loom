@@ -89,6 +89,13 @@ name: Build and Release
 # for Phase 2's per-account session containers. Mirrors build-worker-image's
 # shape (build+smoke-test unconditionally, push gated to a canonical-repo
 # release) exactly; see docker/session/README.md for its own FROM contract.
+#
+# `build-native-image` (#8403, Epic #6896 Phase 3, ADR-0017) publishes
+# `ghcr.io/rjwalters/loom-worker-native` — a same-version FROM layer on top of
+# loom-worker adding the PINNED Pi/OpenCode CLIs, for the per-sweep EPHEMERAL
+# containers native-harness sweeps run in. Same shape as build-session-image
+# (which serves the other, PERSISTENT lifetime for Codex); see
+# docker/native/README.md for why the two are separate images rather than one.
 
 on:
   release:
@@ -956,3 +963,133 @@ jobs:
           tags: |
             ghcr.io/rjwalters/loom-worker-session:${{ steps.version.outputs.version }}
             ghcr.io/rjwalters/loom-worker-session:latest
+
+  build-native-image:
+    name: Build and publish loom-worker-native image
+    # `build-native-image` (#8403, Epic #6896 Phase 3) publishes
+    # ghcr.io/rjwalters/loom-worker-native — a same-version FROM layer on top
+    # of loom-worker adding the PINNED Pi/OpenCode CLIs, for the per-sweep
+    # EPHEMERAL containers native-harness sweeps run in (docker/native/README.md
+    # explains why this is a separate image from loom-worker-session rather
+    # than another CLI added to it: a different container LIFETIME, not a
+    # different CLI).
+    #
+    # Every structural decision below is build-session-image's, for exactly
+    # the same reasons documented there — the `needs:` dependency (base-image
+    # smoke test already passed, AND its multi-arch push has completed before
+    # this job's own push step names the registry tag as BASE_IMAGE), the
+    # local single-platform base rebuild (job isolation means that job's
+    # loaded image is not in this runner's store, and `buildx --load` cannot
+    # produce a multi-platform result), and the canonical-repo/release push
+    # gate. Kept as a sibling job rather than a matrix over the two overlay
+    # images on purpose: a matrix would couple two independent deliverables'
+    # failure modes, and CI here is deliberately dumb and reliable.
+    needs: [resolve, build-worker-image]
+    if: needs.resolve.outputs.publish != 'skip'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.tag || github.ref }}
+
+      - name: Resolve image version
+        id: version
+        run: |
+          set -euo pipefail
+          echo "version=$(./scripts/version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Download loom-daemon release assets (release event)
+        if: needs.resolve.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ needs.resolve.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'loom-daemon-x86_64-unknown-linux-gnu*' \
+            --pattern 'loom-daemon-aarch64-unknown-linux-gnu*' \
+            --dir dist
+          cd dist
+          sha256sum -c loom-daemon-x86_64-unknown-linux-gnu.sha256
+          sha256sum -c loom-daemon-aarch64-unknown-linux-gnu.sha256
+
+      - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
+        if: needs.resolve.outputs.publish == 'false'
+        uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-x86_64-unknown-linux-gnu
+
+      - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
+        if: needs.resolve.outputs.publish == 'false'
+        uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-aarch64-unknown-linux-gnu
+
+      - name: Verify binaries are present, executable, and staged per-arch
+        run: |
+          set -euo pipefail
+          test -f dist/loom-daemon-x86_64-unknown-linux-gnu
+          test -f dist/loom-daemon-aarch64-unknown-linux-gnu
+          chmod +x dist/loom-daemon-x86_64-unknown-linux-gnu dist/loom-daemon-aarch64-unknown-linux-gnu
+          cp dist/loom-daemon-x86_64-unknown-linux-gnu dist/loom-daemon-linux-amd64
+          cp dist/loom-daemon-aarch64-unknown-linux-gnu dist/loom-daemon-linux-arm64
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build loom-worker base image (local, for FROM)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/worker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: |
+            ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+
+      - name: Build loom-worker-native image (native amd64, for smoke test)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/native/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          build-args: |
+            BASE_IMAGE=ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+          tags: |
+            ghcr.io/rjwalters/loom-worker-native:${{ steps.version.outputs.version }}
+            ghcr.io/rjwalters/loom-worker-native:latest
+
+      - name: Smoke-test the built image
+        run: ./docker/native/test-image.sh "ghcr.io/rjwalters/loom-worker-native:${{ steps.version.outputs.version }}"
+
+      - name: Build and push multi-arch loom-worker-native image
+        if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/native/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            BASE_IMAGE=ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+          tags: |
+            ghcr.io/rjwalters/loom-worker-native:${{ steps.version.outputs.version }}
+            ghcr.io/rjwalters/loom-worker-native:latest

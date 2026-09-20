@@ -791,8 +791,14 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # `loom-daemon status`/health output — see
     # `sweep_registry::containment_signal::parse_containment_after`. `none`
     # (not an empty field) marks an intentionally-unbounded axis so the
-    # parser can always find both `cpus=`/`memory=` tokens.
-    echo "# LOOM_DISPATCH_MODE mode=container image=${_containment_image} cpus=${_containment_cpus:-none} memory=${_containment_memory:-none}" >&2
+    # parser can always find both `cpus=`/`memory=` tokens. The trailing
+    # `containment=` token (issue #8403) names the container SHAPE, so a
+    # reader can tell this per-sweep Claude container apart from a native
+    # harness's (`containment=native-ephemeral`, written by the Rust
+    # `worker_spawn::containment` dispatch) without inspecting the image name.
+    # It is APPENDED, never inserted: every existing parser and test asserts
+    # on the prefix through `memory=`, and this keeps all of them valid.
+    echo "# LOOM_DISPATCH_MODE mode=container image=${_containment_image} cpus=${_containment_cpus:-none} memory=${_containment_memory:-none} containment=claude-ephemeral" >&2
     # Retained for backward compatibility with anything already grepping the
     # pre-#7430 marker text.
     echo "# LOOM_CONTAINMENT_ENABLED image=${_containment_image}" >&2

@@ -40,6 +40,23 @@ pub struct ContainmentSignal {
     pub cpus: Option<String>,
     /// The `--memory` value applied to the container, mirroring `cpus`.
     pub memory: Option<String>,
+    /// The containment SHAPE this dispatch used, from the marker's
+    /// `containment=<kind>` token (issue #8403): `claude-ephemeral` for
+    /// `spawn-claude.sh`'s per-sweep container, `native-ephemeral` for a
+    /// Pi/OpenCode worker's. `None` for a marker written before the token
+    /// existed — a containerized dispatch whose shape is simply unrecorded,
+    /// never a claim that it was uncontained.
+    pub kind: Option<String>,
+}
+
+impl ContainmentSignal {
+    /// The short label to render for this sweep, or `None` when the dispatch
+    /// was bare-metal (or unknown). Folds the "containerized?" check and the
+    /// kind fallback into one call so a caller needs neither.
+    pub fn label(&self) -> Option<&str> {
+        self.containerized
+            .then(|| self.kind.as_deref().unwrap_or("container"))
+    }
 }
 
 /// Extract the containment signal from log `contents`, scanning only the
@@ -78,8 +95,7 @@ pub fn parse_containment_after(contents: &str, header_anchor: &str) -> Containme
 
     let mut signal = ContainmentSignal {
         containerized: true,
-        cpus: None,
-        memory: None,
+        ..ContainmentSignal::default()
     };
     for kv in parts {
         if let Some(v) = kv.strip_prefix("cpus=") {
@@ -89,6 +105,10 @@ pub fn parse_containment_after(contents: &str, header_anchor: &str) -> Containme
         } else if let Some(v) = kv.strip_prefix("memory=") {
             if v != "none" {
                 signal.memory = Some(v.to_string());
+            }
+        } else if let Some(v) = kv.strip_prefix("containment=") {
+            if !v.is_empty() && v != "none" {
+                signal.kind = Some(v.to_string());
             }
         }
     }
@@ -175,6 +195,39 @@ mod tests {
         assert!(sig.containerized);
         assert_eq!(sig.cpus.as_deref(), Some("2"));
         assert_eq!(sig.memory.as_deref(), Some("1024m"));
+    }
+
+    #[test]
+    fn containment_kind_token_is_parsed_for_both_shapes() {
+        // Issue #8403: the marker's `containment=` field distinguishes the
+        // native-harness ephemeral container from Claude's.
+        for (kind, sweep) in [("claude-ephemeral", "a"), ("native-ephemeral", "b")] {
+            let log = format!(
+                "==== loom-daemon dispatch: sweep_id={sweep} ====\n\
+                 # LOOM_DISPATCH_MODE mode=container image=w cpus=2 memory=1g containment={kind}\n"
+            );
+            let sig = parse_containment_after(&log, &format!("sweep_id={sweep}"));
+            assert_eq!(sig.kind.as_deref(), Some(kind));
+            assert_eq!(sig.label(), Some(kind));
+        }
+    }
+
+    #[test]
+    fn a_marker_without_the_kind_token_still_reads_as_containerized() {
+        // Backward compatibility: every pre-#8403 marker line omits the token.
+        let log = "==== loom-daemon dispatch: sweep_id=old ====\n\
+                   # LOOM_DISPATCH_MODE mode=container image=w cpus=2 memory=1g\n";
+        let sig = parse_containment_after(log, "sweep_id=old");
+        assert!(sig.containerized);
+        assert_eq!(sig.kind, None);
+        assert_eq!(sig.label(), Some("container"));
+    }
+
+    #[test]
+    fn a_bare_metal_dispatch_has_no_label() {
+        let log =
+            "==== loom-daemon dispatch: sweep_id=bm ====\n# LOOM_DISPATCH_MODE mode=bare-metal\n";
+        assert_eq!(parse_containment_after(log, "sweep_id=bm").label(), None);
     }
 
     #[test]

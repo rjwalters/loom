@@ -1411,6 +1411,12 @@ fn worktree_disk_lines(worktree_disk: Option<&[WorktreeDiskSummary]>) -> Option<
 /// in `spawn-claude.sh`), or a compact `cpu=<v>,mem=<v>` / `unbounded`
 /// summary for a containerized one.
 ///
+/// The prefix names the containment SHAPE when the marker records one (issue
+/// #8403): `claude-ephemeral(...)` for `spawn-claude.sh`'s per-sweep
+/// container, `native-ephemeral(...)` for a Pi/OpenCode worker's. A
+/// pre-#8403 marker carries no `containment=` token and renders under the
+/// generic `container(...)` prefix it always did.
+///
 /// This is a CLIENT-SIDE, render-time read of the sweep's own per-sweep log
 /// (`loom_daemon::sweep_registry::containment_signal::detect_containment`) —
 /// deliberately NOT a `SweepInfo` field. `log_path` is always an absolute,
@@ -1425,14 +1431,14 @@ fn format_containment_column(s: &loom_daemon::types::SweepInfo) -> String {
 
     let header_anchor = format!("sweep_id={}", s.sweep_id);
     let signal = detect_containment(&s.log_path, &header_anchor);
-    if !signal.containerized {
+    let Some(kind) = signal.label() else {
         return "-".to_string();
-    }
+    };
     match (signal.cpus.as_deref(), signal.memory.as_deref()) {
-        (None, None) => "container(unbounded)".to_string(),
-        (Some(cpu), None) => format!("container(cpu={cpu})"),
-        (None, Some(mem)) => format!("container(mem={mem})"),
-        (Some(cpu), Some(mem)) => format!("container(cpu={cpu},mem={mem})"),
+        (None, None) => format!("{kind}(unbounded)"),
+        (Some(cpu), None) => format!("{kind}(cpu={cpu})"),
+        (None, Some(mem)) => format!("{kind}(mem={mem})"),
+        (Some(cpu), Some(mem)) => format!("{kind}(cpu={cpu},mem={mem})"),
     }
 }
 
