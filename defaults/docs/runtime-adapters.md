@@ -1289,11 +1289,15 @@ the generic `container(...)` for a pre-#8403 marker.
 the *same* soak criteria as #7431 (14 days, 50 sweeps, zero
 containment-attributable failures, zero saturation incidents, success rate at or
 above the trailing bare-metal baseline) rather than inventing new ones — until
-then it is opt-in per workspace. Live end-to-end canary validation inside a real
-container, a post-run writable-layer credential scan, and `cancel_sweep`'s
-container teardown (a named ADR-0017 obligation still outstanding for the
-*Claude* ephemeral path too, so not a native-specific gap) are tracked
-separately.
+then it is opt-in per workspace. Two pieces are tracked separately because
+neither can be established from a builder worktree: **#8434** is the live
+verification (an in-container canary run, two concurrent workers' filesystems
+inspected for disjointness, and a post-run writable-layer credential scan — the
+check that tests what the *CLI* writes, not only what the dispatcher passes),
+and **#8435** is `cancel_sweep`'s container teardown, which is owed to the
+*Claude* ephemeral path identically (killing the `docker run` client does not
+stop the container dockerd owns) and so is fixed once for both shapes rather
+than branched per runtime.
 
 ### Containerized dispatch mode for Claude sweeps (issue #7429, epic #6896 Phase 3)
 
