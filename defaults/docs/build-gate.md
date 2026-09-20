@@ -480,7 +480,9 @@ load average overstates consumption on macOS (see "measured idle fraction",
 
 Explicitly **out of scope** here (separable follow-ups): a dedicated gate cargo
 target-dir to isolate contention (never shipped by #4020); per-test timeouts
-(would require adopting cargo-nextest); and any change to sweep spawn priority
+(would require adopting cargo-nextest — #8326 has since done exactly that, so
+`.config/nextest.toml`'s `slow-timeout` now applies to the gate's Rust unit
+step); and any change to sweep spawn priority
 (that is #4233). The **shared build lock** half of that first item did land
 later — see the next section.
 

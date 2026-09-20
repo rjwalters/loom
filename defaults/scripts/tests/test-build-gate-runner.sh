@@ -144,7 +144,7 @@ else
     pass "the shared-process 'cargo test --workspace --lib --bins' step is not run when nextest is available"
 fi
 
-if printf '%s' "$present_output" | grep -q "WARNING"; then
+if [[ "$present_output" == *"WARNING"* ]]; then
     fail "no fallback WARNING should be printed when nextest is installed, got: $present_output"
 else
     pass "no spurious fallback warning when nextest is installed"
@@ -156,7 +156,7 @@ else
     fail "expected a 'cargo test --workspace --doc' step, cargo calls were: $(cat "$CARGO_LOG")"
 fi
 
-if printf '%s' "$present_output" | grep -q "bash scripts/test-installer.sh"; then
+if [[ "$present_output" == *"bash scripts/test-installer.sh"* ]]; then
     fail "gate should have aborted at the deliberately-failed doctest step, got: $present_output"
 else
     pass "a failing Rust step aborts the gate before the later bash suites (set -e)"
@@ -186,19 +186,19 @@ else
         pass "no nextest invocation is attempted when cargo-nextest is absent"
     fi
 
-    if printf '%s' "$absent_output" | grep -q "WARNING: cargo-nextest is NOT installed"; then
+    if [[ "$absent_output" == *"WARNING: cargo-nextest is NOT installed"* ]]; then
         pass "the degradation is loud (a [build-gate] WARNING block), not silent"
     else
         fail "expected a loud missing-nextest warning, got: $absent_output"
     fi
 
-    if printf '%s' "$absent_output" | grep -q "#4385"; then
+    if [[ "$absent_output" == *"#4385"* ]]; then
         pass "the warning names #4385 (the shared-process env/spawn race it exposes)"
     else
         fail "expected the warning to name #4385, got: $absent_output"
     fi
 
-    if printf '%s' "$absent_output" | grep -q "cargo install cargo-nextest"; then
+    if [[ "$absent_output" == *"cargo install cargo-nextest"* ]]; then
         pass "the warning tells the reader how to fix it (cargo install cargo-nextest)"
     else
         fail "expected the warning to suggest 'cargo install cargo-nextest', got: $absent_output"
