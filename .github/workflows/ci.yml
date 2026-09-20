@@ -1038,6 +1038,8 @@ jobs:
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: merge-pr verdict-label contradiction guard (#8112, #8191 slice 2)
         run: bash defaults/scripts/tests/test-merge-pr-verdict-label-guard.sh
+      - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
+        run: bash defaults/scripts/tests/test-merge-pr-stale-required-checks.sh
       # Split out of test-loom-daemon-update.sh by #7977: these assertions
       # now drive `loom-daemon release-resolve` through the stub's delegation,
       # so they need the binary this job builds. The parent suite stays in

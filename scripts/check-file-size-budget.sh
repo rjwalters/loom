@@ -80,7 +80,7 @@ while [[ $# -gt 0 ]]; do
     --list)      MODE="list"; shift ;;
     --self-test) MODE="self-test"; shift ;;
     --threshold) THRESHOLD="${2:?--threshold needs a value}"; shift 2 ;;
-    --help|-h)   sed -n '2,70p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h)   sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           echo "check-file-size-budget: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
