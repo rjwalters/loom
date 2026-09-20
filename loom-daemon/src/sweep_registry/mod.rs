@@ -483,11 +483,22 @@ pub struct SweepRegistry {
     /// Keyed by issue like [`insta_crash_counts`](Self::insta_crash_counts).
     resume_attempt_counts: HashMap<u32, u32>,
     /// Currently-quarantined issues → the instant they were quarantined (Issue
-    /// #3939). The work finder skips these until the entry ages past
-    /// [`QuarantineConfig::ttl`], at which point [`reap_once`](Self::reap_once)
-    /// releases it. Keyed by issue number; since each registry is scoped to one
-    /// workspace root, this is effectively a `(workspace, issue)` key.
+    /// #3939). The work finder skips these until the entry ages past the
+    /// issue's **effective** TTL (generation-escalated, vibesql#6639), at which
+    /// point [`reap_once`](Self::reap_once) releases it. Keyed by issue number;
+    /// since each registry is scoped to one workspace root, this is effectively
+    /// a `(workspace, issue)` key.
     quarantined: HashMap<u32, DateTime<Utc>>,
+    /// Per-issue quarantine **generation** (vibesql#6639): how many times this
+    /// issue has been quarantined this daemon lifetime without an intervening
+    /// healthy outcome (progress/clean exit) or operator clear. An entry's
+    /// presence is the probation condition — after a TTL release, the FIRST
+    /// further insta-crash re-quarantines immediately at an escalated TTL
+    /// (`ttl * 2^(gen-1)`, capped at `ttl_max`) instead of re-running the full
+    /// 3-crash runway, so a persistent breakage's crash-pause-repeat flap decays
+    /// instead of cycling every TTL forever. Not persisted across daemon
+    /// restarts, same as [`quarantined`](Self::quarantined) itself.
+    quarantine_generations: HashMap<u32, u32>,
     /// Issues whose `loom:blocked` -> `loom:issue` label restore failed at
     /// least once (Issue #4110): [`release_quarantine_label`](Self::release_quarantine_label)
     /// is a best-effort `gh` call, and a transient failure must not silently
@@ -1020,6 +1031,7 @@ impl SweepRegistry {
             insta_crash_counts: HashMap::new(),
             resume_attempt_counts: HashMap::new(),
             quarantined: HashMap::new(),
+            quarantine_generations: HashMap::new(),
             pending_quarantine_release: HashSet::new(),
             detect_collisions: false,
             collision_count: 0,
@@ -1072,6 +1084,7 @@ impl SweepRegistry {
             insta_crash_counts: HashMap::new(),
             resume_attempt_counts: HashMap::new(),
             quarantined: HashMap::new(),
+            quarantine_generations: HashMap::new(),
             pending_quarantine_release: HashSet::new(),
             detect_collisions: false,
             collision_count: 0,

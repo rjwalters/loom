@@ -39,6 +39,11 @@ pub const QUARANTINE_THRESHOLD_ENV: &str = "LOOM_WORK_FINDER_QUARANTINE_THRESHOL
 /// through to config/default.
 pub const QUARANTINE_TTL_ENV: &str = "LOOM_WORK_FINDER_QUARANTINE_TTL_SECS";
 
+/// Env var overriding the quarantine TTL ceiling, in seconds — the cap on the
+/// per-generation escalation introduced for vibesql#6639. A zero/invalid value
+/// falls through to config/default.
+pub const QUARANTINE_TTL_MAX_ENV: &str = "LOOM_WORK_FINDER_QUARANTINE_TTL_MAX_SECS";
+
 /// Env var overriding the insta-crash window, in seconds: a checkpoint-less
 /// terminal transition within this wall-clock window of dispatch counts as an
 /// insta-crash. A zero/invalid value falls through to config/default.
@@ -49,8 +54,17 @@ pub const DEFAULT_QUARANTINE_THRESHOLD: u32 = 3;
 
 /// Default quarantine TTL: a quarantined issue is auto-released after this window
 /// so a transient breakage (e.g. a token pool that was re-provisioned) recovers
-/// without operator action (#3939).
+/// without operator action (#3939). This is the **generation-1** TTL: a
+/// quarantine that relapses after its TTL release serves an escalated TTL
+/// (vibesql#6639) — see [`effective_quarantine_ttl_secs`].
 pub const DEFAULT_QUARANTINE_TTL_SECS: u64 = 3600;
+
+/// Default ceiling on the escalated quarantine TTL (vibesql#6639): generation N
+/// serves `ttl * 2^(N-1)` capped here, so a persistently-broken issue's
+/// crash-pause-repeat flap decays toward at-most-daily retries instead of
+/// cycling every TTL forever. 24h: an operator running
+/// `loom-daemon quarantine list` on any working day still sees the entry.
+pub const DEFAULT_QUARANTINE_TTL_MAX_SECS: u64 = 86400;
 
 /// Default insta-crash window (#3939): a checkpoint-less terminal transition
 /// within this many seconds of dispatch counts toward the insta-crash tally. A
@@ -79,6 +93,8 @@ pub struct QuarantineConfig {
     pub threshold: u32,
     /// How long a quarantine entry persists before auto-release.
     pub ttl: Duration,
+    /// Ceiling on the escalated (per-generation) TTL (vibesql#6639).
+    pub ttl_max: Duration,
     /// The insta-crash wall-clock window: a checkpoint-less terminal transition
     /// within this many seconds of dispatch counts as an insta-crash.
     pub insta_crash_secs: i64,
@@ -90,9 +106,25 @@ impl Default for QuarantineConfig {
             enabled: true,
             threshold: DEFAULT_QUARANTINE_THRESHOLD,
             ttl: Duration::from_secs(DEFAULT_QUARANTINE_TTL_SECS),
+            ttl_max: Duration::from_secs(DEFAULT_QUARANTINE_TTL_MAX_SECS),
             insta_crash_secs: DEFAULT_QUARANTINE_INSTA_CRASH_SECS,
         }
     }
+}
+
+/// The escalated TTL, in seconds, a **generation-N** quarantine serves
+/// (vibesql#6639): `min(ttl * 2^(N-1), ttl_max)` with saturating arithmetic.
+/// Generation 1 is the plain configured TTL; every relapse without an
+/// intervening healthy outcome or operator clear doubles the pause.
+#[must_use]
+pub fn effective_quarantine_ttl_secs(config: &QuarantineConfig, generation: u32) -> u64 {
+    let shift = generation.saturating_sub(1).min(31);
+    config
+        .ttl
+        .as_secs()
+        .saturating_mul(1u64 << shift)
+        .min(config.ttl_max.as_secs())
+        .max(config.ttl.as_secs())
 }
 
 // ============================================================================
@@ -238,6 +270,10 @@ pub struct QuarantineFileConfig {
     /// `autonomous.workFinder.quarantine.ttlSecs` — quarantine TTL, in seconds
     /// (zero/invalid dropped to `None`).
     pub ttl_secs: Option<u64>,
+    /// `autonomous.workFinder.quarantine.ttlMaxSecs` — ceiling on the
+    /// escalated per-generation TTL (vibesql#6639; zero/invalid dropped to
+    /// `None`).
+    pub ttl_max_secs: Option<u64>,
     /// `autonomous.workFinder.quarantine.instaCrashSecs` — insta-crash window, in
     /// seconds (zero/invalid dropped to `None`).
     pub insta_crash_secs: Option<u64>,
@@ -263,6 +299,10 @@ pub fn read_quarantine_file_config(repo_root: &Path) -> QuarantineFileConfig {
             .and_then(|n| u32::try_from(n).ok()),
         ttl_secs: q
             .get("ttlSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        ttl_max_secs: q
+            .get("ttlMaxSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
         insta_crash_secs: q
@@ -300,6 +340,16 @@ pub fn resolve_quarantine_config(repo_root: &Path) -> QuarantineConfig {
         .or(file.ttl_secs)
         .unwrap_or(DEFAULT_QUARANTINE_TTL_SECS);
 
+    let ttl_max_secs = std::env::var(QUARANTINE_TTL_MAX_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(file.ttl_max_secs)
+        .unwrap_or(DEFAULT_QUARANTINE_TTL_MAX_SECS)
+        // The ceiling only ever *extends* the pause; a ceiling below the base
+        // TTL would silently shorten generation 1 — clamp instead.
+        .max(ttl_secs);
+
     let insta_crash_secs = std::env::var(QUARANTINE_INSTA_CRASH_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -312,6 +362,7 @@ pub fn resolve_quarantine_config(repo_root: &Path) -> QuarantineConfig {
         enabled,
         threshold,
         ttl: Duration::from_secs(ttl_secs),
+        ttl_max: Duration::from_secs(ttl_max_secs),
         insta_crash_secs,
     }
 }
@@ -364,6 +415,12 @@ impl SweepRegistry {
     /// instead of leaving the issue permanently stranded at `loom:blocked`.
     pub fn clear_quarantine(&mut self, issue: u32) -> bool {
         self.insta_crash_counts.remove(&issue);
+        // vibesql#6639: the operator's clear is a vote of confidence — it also
+        // clears the probation generation, so the next quarantine (if the
+        // operator was wrong and it insta-crashes again) serves the
+        // generation-1 TTL with the full 3-strike runway rather than resuming
+        // the escalated ladder the operator just cut short.
+        self.quarantine_generations.remove(&issue);
         // #4485: the operator's "let this run now" action also clears any
         // dispatch-backoff window — otherwise a cleared quarantine could still
         // be held back for up to `DispatchBackoffConfig::max`, making the
@@ -393,19 +450,31 @@ impl SweepRegistry {
     /// expected, not a bug.
     #[must_use]
     pub fn quarantine_entries(&self, now: DateTime<Utc>) -> Vec<crate::types::QuarantineEntry> {
-        let ttl = self.quarantine_config.ttl;
         let mut entries: Vec<crate::types::QuarantineEntry> = self
             .quarantined
             .iter()
             .map(|(&issue, &quarantined_at)| {
+                // vibesql#6639: the TTL this row reports is the entry's
+                // generation-escalated effective TTL, so `quarantine list`
+                // shows the pause an operator is actually waiting on.
+                let generation = self
+                    .quarantine_generations
+                    .get(&issue)
+                    .copied()
+                    .unwrap_or(1);
+                let effective_ttl = Duration::from_secs(effective_quarantine_ttl_secs(
+                    &self.quarantine_config,
+                    generation,
+                ));
                 let elapsed = (now - quarantined_at).to_std().unwrap_or_default();
-                let ttl_remaining_secs = ttl.saturating_sub(elapsed).as_secs();
+                let ttl_remaining_secs = effective_ttl.saturating_sub(elapsed).as_secs();
                 crate::types::QuarantineEntry {
                     issue,
                     workspace_root: self.config.workspace_root.clone(),
                     quarantined_at,
                     insta_crash_count: self.insta_crash_count(issue),
                     insta_crash_threshold: self.quarantine_config.threshold,
+                    generation,
                     ttl_remaining_secs,
                 }
             })
@@ -843,6 +912,11 @@ impl SweepRegistry {
             // dispatched, so it cannot reach here; this only clears the runway for
             // an issue that has NOT yet been quarantined.
             self.insta_crash_counts.remove(&issue);
+            // vibesql#6639: a healthy outcome also clears the probation — the
+            // issue proved the breakage was transient, so the next quarantine
+            // (if any) starts again from generation 1 with the full 3-strike
+            // runway rather than insta-re-quarantining on one crash.
+            self.quarantine_generations.remove(&issue);
             return;
         }
         let count = self
@@ -851,22 +925,41 @@ impl SweepRegistry {
             .and_modify(|c| *c += 1)
             .or_insert(1);
         let count = *count;
-        if count >= self.quarantine_config.threshold && !self.quarantined.contains_key(&issue) {
+        // vibesql#6639 probation: an issue that has already been quarantined
+        // this daemon lifetime (a `quarantine_generations` entry survives the
+        // TTL release — only a healthy outcome or an operator clear removes
+        // it) re-quarantines on the FIRST further insta-crash, not after the
+        // full threshold run again. A relapse after a release is presumptive
+        // evidence the breakage persisted through the pause; making it cost
+        // three more wasted dispatches per flap cycle is how #6639's
+        // 8-cycle loop accreted.
+        let effective_threshold = if self.quarantine_generations.contains_key(&issue) {
+            1
+        } else {
+            self.quarantine_config.threshold
+        };
+        if count >= effective_threshold && !self.quarantined.contains_key(&issue) {
+            let generation = self
+                .quarantine_generations
+                .entry(issue)
+                .and_modify(|g| *g += 1)
+                .or_insert(1);
+            let generation = *generation;
+            let ttl_secs = effective_quarantine_ttl_secs(&self.quarantine_config, generation);
             self.quarantined.insert(issue, Utc::now());
             log::warn!(
-                "sweep_registry: issue #{issue} QUARANTINED after {count} consecutive \
-                 insta-crashes (each <{}s with no checkpoint) — pausing re-dispatch for {}s so it \
-                 stops starving the shared queue (#3939). Clear via operator action or wait for \
-                 the TTL.",
+                "sweep_registry: issue #{issue} QUARANTINED (generation {generation}) after \
+                 {count} consecutive insta-crash(es) (each <{}s with no checkpoint) — pausing \
+                 re-dispatch for {ttl_secs}s so it stops starving the shared queue (#3939, \
+                 escalation vibesql#6639). Clear via operator action or wait for the TTL.",
                 self.quarantine_config.insta_crash_secs,
-                self.quarantine_config.ttl.as_secs()
             );
             self.apply_quarantine_label(issue, count);
         } else {
             log::info!(
                 "sweep_registry: issue #{issue} insta-crashed ({count}/{} consecutive, <{}s, no \
                  checkpoint) (#3939)",
-                self.quarantine_config.threshold,
+                effective_threshold,
                 self.quarantine_config.insta_crash_secs
             );
         }
@@ -883,7 +976,6 @@ impl SweepRegistry {
         if self.quarantined.is_empty() {
             return;
         }
-        let ttl_secs = i64::try_from(self.quarantine_config.ttl.as_secs()).unwrap_or(i64::MAX);
         let now = Utc::now();
         // Keep each expired entry's own `quarantined_at` alongside the issue
         // number (Issue #5725): the manual-repark recency probe below must
@@ -893,15 +985,34 @@ impl SweepRegistry {
         // across a daemon restart) can carry several marker comments, and
         // re-deriving "the" marker at release time risked picking up a
         // newer, unrelated re-quarantine cycle's marker instead.
+        //
+        // vibesql#6639: the TTL each entry is checked against is its own
+        // **effective** TTL — `ttl` escalated by the entry's generation — so a
+        // relapsed quarantine serves a doubling pause rather than the flat
+        // base TTL every cycle.
         let expired: Vec<(u32, DateTime<Utc>)> = self
             .quarantined
             .iter()
-            .filter(|(_, at)| (now - **at).num_seconds() >= ttl_secs)
+            .filter(|(issue, at)| {
+                let generation = self
+                    .quarantine_generations
+                    .get(*issue)
+                    .copied()
+                    .unwrap_or(1);
+                let ttl_secs = effective_quarantine_ttl_secs(&self.quarantine_config, generation);
+                let ttl_secs = i64::try_from(ttl_secs).unwrap_or(i64::MAX);
+                (now - **at).num_seconds() >= ttl_secs
+            })
             .map(|(issue, at)| (*issue, *at))
             .collect();
         for (issue, quarantined_at) in expired {
             self.quarantined.remove(&issue);
             self.insta_crash_counts.remove(&issue);
+            // The generation entry is deliberately KEPT (vibesql#6639): it is
+            // the probation marker that makes the first post-release
+            // insta-crash re-quarantine immediately at an escalated TTL, and
+            // only a healthy outcome (record_terminal_outcome's reset branch)
+            // or an operator clear (clear_quarantine) removes it.
 
             // Issue #4206 (refined by #5725): before restoring the forge
             // label, check whether a human re-applied `loom:blocked` well
@@ -923,9 +1034,16 @@ impl SweepRegistry {
                 continue;
             }
 
+            let generation = self
+                .quarantine_generations
+                .get(&issue)
+                .copied()
+                .unwrap_or(1);
             log::info!(
-                "sweep_registry: issue #{issue} quarantine expired after {ttl_secs}s — eligible \
-                 for re-dispatch again (#3939)"
+                "sweep_registry: issue #{issue} quarantine (generation {generation}) expired \
+                 after {}s — eligible for re-dispatch again (#3939; vibesql#6639: probation \
+                 holds, one further insta-crash re-quarantines at an escalated TTL)",
+                effective_quarantine_ttl_secs(&self.quarantine_config, generation)
             );
             self.attempt_quarantine_release(issue);
         }
@@ -1074,6 +1192,22 @@ impl SweepRegistry {
             Err(e) => log::debug!("sweep_registry: quarantine label edit for #{issue} failed: {e}"),
         }
 
+        let generation = self
+            .quarantine_generations
+            .get(&issue)
+            .copied()
+            .unwrap_or(1);
+        let escalation_note = if generation > 1 {
+            format!(
+                " This is quarantine **generation {generation}** for this issue (vibesql#6639): \
+                 the pause is escalated to {ttl}s because prior quarantines relapsed after their \
+                 TTL released — each further relapse doubles the pause, and a single healthy run \
+                 (or `quarantine clear`) resets the ladder.",
+                ttl = effective_quarantine_ttl_secs(&self.quarantine_config, generation),
+            )
+        } else {
+            String::new()
+        };
         let body = format!(
             "{marker}: this issue's sweep insta-crashed {count} \
              times in a row — each child died within {secs}s of dispatch without writing a phase \
@@ -1082,13 +1216,13 @@ impl SweepRegistry {
              is paused so it stops occupying a global concurrency slot and starving other work. \
              Once the underlying cause is fixed, clear the quarantine with `loom-daemon \
              quarantine clear {issue}`, or simply wait for the {ttl}s TTL — both paths release the \
-             in-memory pause AND restore `loom:issue` (#4110). Note: manually flipping \
-             `loom:blocked` -> `loom:issue` on the forge does NOT release the daemon's in-memory \
-             quarantine on its own — the work finder skips it until the CLI clear or the TTL \
-             fires.",
+             in-memory pause AND restore `loom:issue` (#4110).{escalation_note} Note: manually \
+             flipping `loom:blocked` -> `loom:issue` on the forge does NOT release the daemon's \
+             in-memory quarantine on its own — the work finder skips it until the CLI clear or \
+             the TTL fires.",
             marker = QUARANTINE_COMMENT_MARKER,
             secs = self.quarantine_config.insta_crash_secs,
-            ttl = self.quarantine_config.ttl.as_secs(),
+            ttl = effective_quarantine_ttl_secs(&self.quarantine_config, generation),
         );
         let mut comment = Command::new(&gh);
         comment
@@ -2013,6 +2147,153 @@ mod tests {
         assert!(registry.is_quarantined(45), "a fresh quarantine survives the TTL check");
     }
 
+    /// vibesql#6639: the flap itself. A quarantine that relapses after its TTL
+    /// release must re-quarantine on the FIRST further insta-crash (probation),
+    /// not after the full 3-strike runway — the old behavior cost three wasted
+    /// dispatches per hourly cycle and cycled forever on #6170/#6172/#6174.
+    /// Drives the real death-classification path (checkpoint-less fast deaths),
+    /// not just the tally entrypoints.
+    #[test]
+    fn relapse_after_ttl_release_requarantines_on_first_insta_crash() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        // Zero TTL: every reap_once ages the entry out immediately, so the
+        // release step is exercisable without clock manipulation.
+        registry.set_quarantine_config(QuarantineConfig {
+            ttl: Duration::ZERO,
+            ..QuarantineConfig::default()
+        });
+
+        // Generation 1: three real insta-crash deaths quarantine the issue.
+        for seq in 0..3 {
+            insert_dead_running_at(&mut registry, 61, seq, Utc::now());
+            registry.reap_once();
+        }
+        assert!(registry.is_quarantined(61), "three strikes quarantine (gen 1)");
+
+        // The next reap expires the zero-TTL entry: released, but the
+        // generation marker (probation) must survive the release.
+        registry.reap_once();
+        assert!(!registry.is_quarantined(61), "zero-TTL entry releases on the next reap");
+        assert_eq!(
+            registry.quarantine_generations.get(&61),
+            Some(&1),
+            "probation generation survives the TTL release (vibesql#6639)"
+        );
+
+        // ONE further insta-crash re-quarantines immediately at generation 2.
+        insert_dead_running_at(&mut registry, 61, 3, Utc::now());
+        registry.reap_once();
+        assert!(
+            registry.is_quarantined(61),
+            "a post-release relapse re-quarantines on the FIRST insta-crash, not the third"
+        );
+        assert_eq!(
+            registry.quarantine_generations.get(&61),
+            Some(&2),
+            "the relapse increments the escalation generation"
+        );
+    }
+
+    /// vibesql#6639: the escalation math itself. Generation N serves
+    /// `ttl * 2^(N-1)` capped at `ttl_max`; a ceiling below the base TTL clamps
+    /// UP to the base (the cap may only extend the pause, never shorten gen 1).
+    #[test]
+    fn quarantine_ttl_escalates_by_generation_and_caps() {
+        let config = QuarantineConfig {
+            ttl: Duration::from_secs(3600),
+            ttl_max: Duration::from_secs(86400),
+            ..QuarantineConfig::default()
+        };
+        assert_eq!(effective_quarantine_ttl_secs(&config, 1), 3600);
+        assert_eq!(effective_quarantine_ttl_secs(&config, 2), 7200);
+        assert_eq!(effective_quarantine_ttl_secs(&config, 3), 14400);
+        assert_eq!(effective_quarantine_ttl_secs(&config, 5), 57600);
+        // 3600 << 5 = 115200 > 86400: capped.
+        assert_eq!(effective_quarantine_ttl_secs(&config, 6), 86400);
+        assert_eq!(effective_quarantine_ttl_secs(&config, 40), 86400, "saturates, never overflows");
+        // A misconfigured ceiling below the base TTL never shortens generation 1.
+        let clamped = QuarantineConfig {
+            ttl: Duration::from_secs(3600),
+            ttl_max: Duration::from_secs(60),
+            ..QuarantineConfig::default()
+        };
+        assert_eq!(effective_quarantine_ttl_secs(&clamped, 1), 3600);
+        assert_eq!(effective_quarantine_ttl_secs(&clamped, 4), 3600);
+    }
+
+    /// vibesql#6639: `quarantine_entries` surfaces the generation and reports
+    /// `ttl_remaining` against the ESCALATED TTL, so `loom-daemon quarantine
+    /// list` shows the pause an operator is actually waiting on.
+    #[test]
+    fn quarantine_entries_reflect_escalated_generation_ttl() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        registry.set_quarantine_config(QuarantineConfig {
+            ttl: Duration::from_secs(3600),
+            ..QuarantineConfig::default()
+        });
+
+        registry.quarantined.insert(62, Utc::now());
+        registry.quarantine_generations.insert(62, 2);
+        registry.insta_crash_counts.insert(62, 1);
+
+        let entries = registry.quarantine_entries(Utc::now());
+        let entry = entries
+            .iter()
+            .find(|e| e.issue == 62)
+            .expect("entry present");
+        assert_eq!(entry.generation, 2);
+        assert_eq!(entry.insta_crash_count, 1);
+        // Generation 2 serves 7200s; just-applied → ~all of it remains, and
+        // crucially MORE than the base 3600s a flat-TTL rendering would show.
+        assert!(
+            entry.ttl_remaining_secs > 3600 && entry.ttl_remaining_secs <= 7200,
+            "ttl_remaining reflects the escalated TTL, got {}",
+            entry.ttl_remaining_secs
+        );
+    }
+
+    /// vibesql#6639: a healthy outcome (progress / clean exit) resets the
+    /// probation — the issue proved the breakage transient, so the next
+    /// quarantine run starts from generation 1 with the full 3-strike runway.
+    #[test]
+    fn healthy_outcome_resets_quarantine_generation() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        registry.quarantine_generations.insert(63, 2);
+
+        registry.record_terminal_outcome(63, false);
+
+        assert!(
+            !registry.quarantine_generations.contains_key(&63),
+            "a healthy outcome clears the probation generation"
+        );
+        // And the restored runway: one insta-crash alone no longer quarantines.
+        registry.record_terminal_outcome(63, true);
+        assert_eq!(registry.insta_crash_count(63), 1);
+        assert!(
+            !registry.is_quarantined(63),
+            "full threshold runway is restored after a healthy run"
+        );
+    }
+
+    /// vibesql#6639: the operator clear is a vote of confidence — it resets
+    /// the escalation ladder too, so a wrongly-cleared issue serves the
+    /// generation-1 TTL, not the escalated pause it just escaped.
+    #[test]
+    fn clear_quarantine_resets_escalation_generation() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        registry.quarantined.insert(64, Utc::now());
+        registry.quarantine_generations.insert(64, 3);
+        registry.insta_crash_counts.insert(64, 1);
+
+        assert!(registry.clear_quarantine(64));
+        assert!(!registry.quarantine_generations.contains_key(&64));
+        assert!(!registry.is_quarantined(64));
+    }
+
     /// AC #2/#4: the operator-action release path clears both the quarantine and
     /// the insta-crash tally.
     #[test]
@@ -2478,7 +2759,7 @@ exit 0
         std::fs::create_dir_all(project.parent().unwrap()).unwrap();
         std::fs::write(
             &project,
-            r#"{"autonomous":{"workFinder":{"quarantine":{"enabled":true,"threshold":4,"ttlSecs":900,"instaCrashSecs":45}}}}"#,
+            r#"{"autonomous":{"workFinder":{"quarantine":{"enabled":true,"threshold":4,"ttlSecs":900,"ttlMaxSecs":7200,"instaCrashSecs":45}}}}"#,
         )
         .unwrap();
 
@@ -2490,6 +2771,7 @@ exit 0
                 enabled: Some(true),
                 threshold: Some(4),
                 ttl_secs: Some(900),
+                ttl_max_secs: Some(7200),
                 insta_crash_secs: Some(45),
             }
         );
