@@ -271,6 +271,7 @@ defaults/scripts/tests/test-blame-issue.sh                                     t
 defaults/scripts/tests/test-body-repo-affinity.sh                              test        Tests `body-repo-affinity` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-bounded-run.sh                                     test        Tests `bounded-run` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-branch-landed.sh                                   test        Tests `branch-landed` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
+defaults/scripts/tests/test-build-gate-runner.sh                               test        Tests `build-gate-runner` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-build-gate-timeout.sh                              test        Tests `build-gate-timeout` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-build-rs-watchset.sh                               test        Tests `build-rs-watchset` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-build-slot.sh                                      test        Tests `build-slot` — shell because its subject is shell; follows its subject, never an independent reason (#7758).

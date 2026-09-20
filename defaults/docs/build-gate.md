@@ -191,14 +191,62 @@ The wrapper lives at [`defaults/scripts/build-gate.sh`](../scripts/build-gate.sh
 to it via the `.loom/scripts -> ../defaults/scripts` symlink). It runs these
 stages in order under `set -euo pipefail`, aborting on the first non-zero exit:
 
-1. `cargo test --workspace --lib --bins` — the Rust crates' **unit tests**
-   (`loom-daemon`, `loom-api`). The integration test **targets** under
+1. `cargo nextest run --workspace --lib --bins --profile ci` — the Rust crates'
+   **unit tests** (`loom-daemon`, `loom-api`), run with the same runner and the
+   same profile CI uses. Falls back to `cargo test --workspace --lib --bins`
+   with a loud warning when `cargo-nextest` is not installed — see "Why the
+   gate prefers `cargo nextest`" below. The integration test **targets** under
    `loom-daemon/tests/` are deliberately excluded here — see "Local gate vs.
    CI" below.
-2. `bash scripts/test-installer.sh` — the 131-case bash installer suite.
-3. `bash scripts/test-changelog.sh` — `scripts/changelog.sh`'s unit suite
-   (#5196), against a disposable scratch repo (`CHANGELOG_REPO_ROOT`); no
-   network, no dependency on this repo's own history.
+2. `cargo test --workspace --doc` — the workspace **doctests**, as their own
+   step because nextest does not run doctests (#4385). CI keeps a separate
+   "Run doctests" step for exactly this reason. Unconditional: identical on
+   both runner branches above, so doctest coverage never depends on which
+   unit-test runner a host happens to have.
+3. The bash suites, in order, one `run_gate_step` each —
+   `scripts/test-installer.sh` (the 131-case installer suite),
+   `scripts/test-changelog.sh` (`scripts/changelog.sh`'s unit suite, #5196,
+   against a disposable scratch repo `CHANGELOG_REPO_ROOT` — no network, no
+   dependency on this repo's own history), `scripts/test-daemon-liveness.sh`
+   (#5548), `scripts/test-install-local-mode.sh` and
+   `scripts/test-migrate-consumer.sh` (#5276).
+
+### Why the gate prefers `cargo nextest` (#8326)
+
+`cargo test` runs every test in a binary **in one shared process, on shared
+threads** — precisely the execution mode [`.config/nextest.toml`](https://github.com/rjwalters/loom/blob/main/.config/nextest.toml)
+and `loom-daemon`'s crate-level "Test isolation convention" (#4385) exist to
+avoid: the daemon's unit tests mutate the process environment
+(`std::env::set_var` / `remove_var`) at ~774 call sites while other tests in
+the same binary `Command::spawn` children, and `Command::spawn` reads the
+environ non-atomically, so an env mutation racing a spawn can corrupt a child's
+environment mid-flight. nextest runs each test in its own process, closing that
+window by construction.
+
+CI has always done this (`cargo nextest run --workspace --profile ci`); until
+#8326 the local gate did not, which made the gate **both slower and less
+reliable than the runner it is supposed to predict**. That mismatch produced
+#8170's false red — 8 `sweep_registry::watchdog::tests::midbuild_*` "failures"
+under `cargo test` that were 90/90 green under nextest on the same commit, and
+cost a whole investigation to establish as a runner artifact. Every false red
+the gate emits trains agents to distrust a real signal.
+
+**When `cargo-nextest` is absent** the gate still runs — it degrades to `cargo
+test --workspace --lib --bins` — but it prints a multi-line `[build-gate]
+WARNING:` block on stderr naming #4385, the false-red hazard, and the fix:
+
+```
+cargo install cargo-nextest --locked
+```
+
+The degradation is never silent: a `cargo test` verdict from this gate is a
+weaker signal than CI's, and a reader triaging a red needs to know that before
+spending an investigation on a failure that only reproduces locally.
+
+[`nextest-daemon-guard.sh`](../scripts/tests/nextest-daemon-guard.sh) (#6528) is
+deliberately **not** used by the gate: it guards the host-global tmux sweep
+performed by the `integration_*` test **targets**, and `--lib --bins` never
+builds or runs those targets at all (#3985).
 
 **The gate requires no Python toolchain at all (epic #4081 Phase 4, #4557;
 finished by #4970).** Stage 2 used to be `cd loom-tools && uv run pytest
@@ -234,8 +282,12 @@ measure different things, and that difference is deliberate:
 
 | | Command | Measures |
 |---|---------|----------|
-| **CI** (`.github/workflows/ci.yml`) | `cargo test --workspace` (all targets, incl. integration) | **the commit**, in a controlled runner with a guaranteed-live tmux |
-| **Local gate** (`build-gate.sh`) | `cargo test --workspace --lib --bins` (unit tests only) | **the commit**, on whatever host is actively running Loom |
+| **CI** (`.github/workflows/ci.yml`) | `cargo nextest run --workspace --profile ci` (all targets, incl. integration) + `cargo test --workspace --doc` | **the commit**, in a controlled runner with a guaranteed-live tmux |
+| **Local gate** (`build-gate.sh`) | `cargo nextest run --workspace --lib --bins --profile ci` (unit tests only; `cargo test` fallback) + `cargo test --workspace --doc` | **the commit**, on whatever host is actively running Loom |
+
+Since #8326 both sides run the **same runner** (`cargo nextest`, process-per-test)
+under the **same profile** (`ci`); the remaining difference is target scope, not
+execution model.
 
 The local gate runs on the machine that is *also running the sweeps* — a busy,
 sometimes headless, sometimes tmux-less host. Any assertion in the gate that
@@ -370,7 +422,7 @@ stage set the wrapper runs:
 
 | Tier | `LOOM_BUILD_GATE_TIER` | Stages | Cost |
 |------|------------------------|--------|------|
-| **full** (DEFAULT) | unset / `full` | `cargo test --lib --bins` + installer suite | minutes, cold |
+| **full** (DEFAULT) | unset / `full` | `cargo nextest run --lib --bins --profile ci` (or a warned `cargo test --lib --bins` fallback) + `cargo test --doc` + installer suite | minutes, cold |
 | **fast** | `fast` | `cargo build --workspace --lib --bins` (compile) + a `loom-daemon --version` startup smoke | a few minutes cold, no test execution |
 
 The default is unchanged when the variable is absent, so **CI parity, manual
@@ -428,7 +480,9 @@ load average overstates consumption on macOS (see "measured idle fraction",
 
 Explicitly **out of scope** here (separable follow-ups): a dedicated gate cargo
 target-dir to isolate contention (never shipped by #4020); per-test timeouts
-(would require adopting cargo-nextest); and any change to sweep spawn priority
+(would require adopting cargo-nextest — #8326 has since done exactly that, so
+`.config/nextest.toml`'s `slow-timeout` now applies to the gate's Rust unit
+step); and any change to sweep spawn priority
 (that is #4233). The **shared build lock** half of that first item did land
 later — see the next section.
 
