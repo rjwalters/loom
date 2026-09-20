@@ -178,6 +178,34 @@ assert_allow "write-confinement (#7986 regression): plain single-assignment mkte
 assert_deny "write-confinement (#7986 regression): mktemp then arbitrary reassignment still denies" \
     'tmp=$(mktemp -d); tmp=/some/other/path; echo x > "$tmp/out.txt"' "$WT_REPO"
 
+# ---- #8221: the write-confinement sibling of the rm-scope fix above -----
+# New test cases land HERE rather than in test-guard-destructive-write-
+# confinement.sh (frozen at its scripts/file-size-baseline.txt size, same
+# reason #7986's own cases live in this sibling file -- see the suite header).
+#
+# The same ambiguity-counting gap: a same-command rebind of the mktemp-
+# captured variable via a declaration keyword or an `=`-free mechanism
+# (read/printf -v/for-in) was invisible to the awk scan's `varname "="`
+# prefix test, so the second, dangerous rebind never poisoned the count and
+# the fast path incorrectly allowed the write. Exact issue repro plus one
+# case per other rebind shape.
+assert_deny "write-confinement (#8221): tmp=\$(mktemp -d); export tmp=<outside path> still denies (export rebind, issue repro)" \
+    'tmp=$(mktemp -d); export tmp=/Users/someone/important; echo x > "$tmp/f"' "$WT_REPO"
+assert_deny "write-confinement (#8221): tmp=\$(mktemp -d); declare tmp=/ still denies (declare rebind)" \
+    'tmp=$(mktemp -d); declare tmp=/; echo x > "$tmp/f"' "$WT_REPO"
+assert_deny "write-confinement (#8221): tmp=\$(mktemp -d); printf -v tmp \"%s\" / still denies (printf -v rebind)" \
+    'tmp=$(mktemp -d); printf -v tmp "%s" /; echo x > "$tmp/f"' "$WT_REPO"
+assert_deny "write-confinement (#8221): tmp=\$(mktemp -d); read tmp < /etc/passwd still denies (read rebind)" \
+    'tmp=$(mktemp -d); read tmp < /etc/passwd; echo x > "$tmp/f"' "$WT_REPO"
+assert_deny "write-confinement (#8221): tmp=\$(mktemp -d); for tmp in / still denies (for-in rebind)" \
+    'tmp=$(mktemp -d); for tmp in /; do :; done; echo x > "$tmp/f"' "$WT_REPO"
+# Control (regression check): a genuine same-command mktemp assignment with
+# no other rebind must keep allowing (duplicates the #7986-regression case
+# above with an explicit #8221 label so a future change to the rebind
+# detector cannot silently narrow the historic #6949 fast path).
+assert_allow "write-confinement (#8221 regression): plain single-assignment mktemp fast path still allows" \
+    'tmp=$(mktemp -d); echo x > "$tmp/f"' "$WT_REPO"
+
 [[ -n "$WT_REPO" && "$WT_REPO" != "/" && -d "$WT_REPO/.loom" ]] && rm -rf "$WT_REPO"
 
 echo ""

@@ -6784,6 +6784,60 @@ _mktemp_canon_mask() {
     return 0
 }
 
+# =============================================================================
+# SAME-COMMAND REBINDING RECOGNITION FOR THE TWO MKTEMP FAST PATHS (#8221)
+#
+# Both same-command mktemp fast paths below poison their ambiguity proof by
+# scanning for a `NAME=...` assignment whose segment text LITERALLY BEGINS
+# WITH `varname "="`. That misses every OTHER shell mechanism that rebinds the
+# same name: a leading declaration keyword (`export`/`readonly`/`declare`/
+# `typeset`/`local NAME=...`, already recognized by the general assignment
+# machinery above -- see match_assignword()'s and record_assign()'s header
+# comments and the identical keyword-stripping regex extract_write_targets()
+# applies, reused verbatim here rather than inventing a second copy) and three
+# rebindings-without-an-`=` at all: `read NAME`, `printf -v NAME`, and
+# `for NAME in ...`. Left unrecognized, `total` stayed at 1 for the FIRST
+# (mktemp-shaped, provably safe) assignment while the SECOND, dangerous
+# rebinding sailed through invisibly, so `total == 1 && safe == 1` still fired
+# and allowed a target the guard could no longer account for.
+#
+# _mktemp_strip_decl_kw() strips a leading declaration keyword (and its
+# flags) so the caller's existing `varname "="` prefix test also recognizes
+# `export NAME=...`/`declare NAME=...`/etc, not just a bare `NAME=...`
+# segment.
+#
+# _mktemp_is_other_rebind() recognizes the three `=`-free rebindings.
+# Deliberately permissive: a coincidental word match (e.g. a `read` argument
+# that happens to equal `varname`) still counts. The caller only ever adds
+# this to a POISONING total, never removes anything from it, so a false
+# positive here can only WIDEN a deny, never manufacture a new allow --
+# anything the scanner cannot confidently classify as NOT a rebinding of
+# `varname` counts as one (fail closed, per the issue's own framing).
+# =============================================================================
+_MKTEMP_REBIND_AWK='
+function _mktemp_strip_decl_kw(seg,   out) {
+    out = seg
+    if (out ~ /^(export|readonly|declare|typeset|local)[ \t]/) {
+        sub(/^(export|readonly|declare|typeset|local)[ \t]+/, "", out)
+        while (out ~ /^-/) {
+            if (!sub(/^-[^ \t]*[ \t]*/, "", out)) break
+        }
+    }
+    return out
+}
+function _mktemp_is_other_rebind(seg, varname,   n, i, toks) {
+    if (seg ~ /^printf([ \t]|$)/ && seg ~ ("(^|[ \t])-v[ \t]+" varname "([ \t]|$)")) return 1
+    if (seg ~ ("^for[ \t]+" varname "[ \t]+in([ \t]|$)")) return 1
+    if (seg ~ /^read([ \t]|$)/) {
+        n = split(seg, toks, /[ \t]+/)
+        for (i = 2; i <= n; i++) {
+            if (toks[i] == varname) return 1
+        }
+    }
+    return 0
+}
+'
+
 rm_scope_mktemp_same_command_safe() {
     local target="$1" cmdtext="$2" varname verdict
     varname=$(_rm_scope_bare_var_name "$target") || return 1
@@ -6793,7 +6847,7 @@ rm_scope_mktemp_same_command_safe() {
     # _mktemp_canon_mask()'s doc comment above. A refusal (the token's bytes
     # already occur in the command text) fails closed.
     _mktemp_canon_mask "$varname" "$cmdtext" || return 1
-    verdict=$(printf '%s' "$_MKTEMP_CANON_MASKED" | awk -v varname="$varname" -v canontok="$_MKTEMP_CANON_TOKEN" "$_QSPLIT_AWK"'
+    verdict=$(printf '%s' "$_MKTEMP_CANON_MASKED" | awk -v varname="$varname" -v canontok="$_MKTEMP_CANON_TOKEN" "$_QSPLIT_AWK""$_MKTEMP_REBIND_AWK"'
     {
         $0 = qsplit($0)
         n = split($0, segs, "\n")
@@ -6801,10 +6855,13 @@ rm_scope_mktemp_same_command_safe() {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
             sub(/[ \t]+$/, "", seg)
+            # #8221: recognize export/readonly/declare/typeset/local NAME=...
+            # as an assignment too (see _MKTEMP_REBIND_AWK'"'"'s header comment).
+            bseg = _mktemp_strip_decl_kw(seg)
             prefix = varname "="
             plen = length(prefix)
-            if (length(seg) > plen && substr(seg, 1, plen) == prefix) {
-                rhs = substr(seg, plen + 1)
+            if (length(bseg) > plen && substr(bseg, 1, plen) == prefix) {
+                rhs = substr(bseg, plen + 1)
                 total++
                 if (rhs == "$(mktemp -d)" || rhs == "$(mktemp)" || \
                     rhs == "\"$(mktemp -d)\"" || rhs == "\"$(mktemp)\"") {
@@ -6814,6 +6871,11 @@ rm_scope_mktemp_same_command_safe() {
                     canon++
                     if (canonat == 0) canonat = total
                 }
+            } else if (_mktemp_is_other_rebind(seg, varname)) {
+                # #8221: read NAME / printf -v NAME / for NAME in ... rebind
+                # NAME without an `=` at all -- poison the count exactly like
+                # a second `NAME=` assignment, never treated as safe/canon.
+                total++
             }
         }
     }
@@ -6927,7 +6989,7 @@ wt_write_mktemp_same_command_safe() {
     # before the segment scan, and fail closed if the token's own bytes are
     # already present in the command text.
     _mktemp_canon_mask "$varname" "$cmdtext" || return 1
-    verdict=$(printf '%s' "$_MKTEMP_CANON_MASKED" | awk -v varname="$varname" -v canontok="$_MKTEMP_CANON_TOKEN" "$_QSPLIT_AWK"'
+    verdict=$(printf '%s' "$_MKTEMP_CANON_MASKED" | awk -v varname="$varname" -v canontok="$_MKTEMP_CANON_TOKEN" "$_QSPLIT_AWK""$_MKTEMP_REBIND_AWK"'
     {
         $0 = qsplit($0)
         n = split($0, segs, "\n")
@@ -6935,10 +6997,13 @@ wt_write_mktemp_same_command_safe() {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
             sub(/[ \t]+$/, "", seg)
+            # #8221: recognize export/readonly/declare/typeset/local NAME=...
+            # as an assignment too (see _MKTEMP_REBIND_AWK'"'"'s header comment).
+            bseg = _mktemp_strip_decl_kw(seg)
             prefix = varname "="
             plen = length(prefix)
-            if (length(seg) > plen && substr(seg, 1, plen) == prefix) {
-                rhs = substr(seg, plen + 1)
+            if (length(bseg) > plen && substr(bseg, 1, plen) == prefix) {
+                rhs = substr(bseg, plen + 1)
                 total++
                 if (rhs == "$(mktemp -d)" || rhs == "$(mktemp)" || \
                     rhs == "\"$(mktemp -d)\"" || rhs == "\"$(mktemp)\"") {
@@ -6948,6 +7013,11 @@ wt_write_mktemp_same_command_safe() {
                     canon++
                     if (canonat == 0) canonat = total
                 }
+            } else if (_mktemp_is_other_rebind(seg, varname)) {
+                # #8221: read NAME / printf -v NAME / for NAME in ... rebind
+                # NAME without an `=` at all -- poison the count exactly like
+                # a second `NAME=` assignment, never treated as safe/canon.
+                total++
             }
         }
     }

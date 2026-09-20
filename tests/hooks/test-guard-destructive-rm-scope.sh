@@ -252,6 +252,36 @@ assert_deny_env "rmScope repo (#6520): mktemp -d with a custom template excluded
 # own suite alongside the identical write-confinement half:
 # tests/hooks/test-guard-destructive-mktemp-canon.sh.
 
+# ---- #8221: the ambiguity-counting awk scan only recognized a bare `NAME=`
+# ---- assignment segment, so a SECOND rebinding of the same name via any
+# ---- other shell mechanism (a declaration keyword, or one of the three
+# ---- `=`-free rebindings) was invisible to the counter and the fast path
+# ---- incorrectly fired anyway. Every row is the exact reproduction from the
+# ---- issue; each must now deny.
+assert_deny_env "rmScope repo (#8221): tmp=\$(mktemp -d); export tmp=/ still denies (export rebind)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); export tmp=/; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#8221): tmp=\$(mktemp -d); export tmp=<outside path> still denies (export rebind)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); export tmp=/Users/someone/important; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#8221): tmp=\$(mktemp -d); declare tmp=/ still denies (declare rebind)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); declare tmp=/; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#8221): tmp=\$(mktemp -d); printf -v tmp \"%s\" / still denies (printf -v rebind)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); printf -v tmp "%s" /; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#8221): tmp=\$(mktemp -d); read tmp < /etc/passwd still denies (read rebind)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); read tmp < /etc/passwd; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#8221): tmp=\$(mktemp -d); for tmp in / still denies (for-in rebind)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); for tmp in /; do :; done; rm -rf "$tmp"' "$REPO_ROOT"
+# Controls (regression check) — confirm the ambiguity rule was already
+# working for these shapes and must keep working after the fix above.
+assert_deny_env "rmScope repo (#8221 control): export tmp=/ with no mktemp assignment still denies" \
+    "LOOM_RM_SCOPE=repo" 'export tmp=/; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#8221 control): bare tmp=/ with no mktemp assignment still denies" \
+    "LOOM_RM_SCOPE=repo" 'tmp=/; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#8221 control): a real second bare NAME= reassignment still denies" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); tmp=/; rm -rf "$tmp"' "$REPO_ROOT"
+# Non-regression: the plain single-assignment fast path itself must still allow.
+assert_allow_env "rmScope repo (#8221 regression): plain single-assignment mktemp fast path still allows" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); rm -rf "$tmp"' "$REPO_ROOT"
+
 # ---- Same-command LITERAL-path resolution (#6676) — a SIBLING fast path to
 # ---- the mktemp one above: a same-command `NAME=<literal absolute path>`
 # ---- assignment resolves the rm target instead of denying unconditionally —
