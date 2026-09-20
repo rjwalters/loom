@@ -80,7 +80,7 @@
 
 import type { RepoVisibility } from "./telemetry";
 import { decodeVisibility } from "./telemetry";
-import type { HistoryQueryResult, HistoryRecord } from "./query";
+import type { ElasticSpendSummary, HistoryQueryResult, HistoryRecord } from "./query";
 import type { ActiveSweepState, FleetSnapshot } from "./fleetState";
 
 // ---------------------------------------------------------------------------
@@ -588,6 +588,66 @@ export function redactFleetSnapshot(snapshot: FleetSnapshot, isAuthenticated: bo
     // private operator's fleet — the very thing the allowlist withholds).
     activeCompute: isAuthenticated ? snapshot.activeCompute : [],
   };
+}
+
+// ---------------------------------------------------------------------------
+// `GET /api/spend` / `GET /public/spend` — elastic compute spend (Issue #8306)
+// ---------------------------------------------------------------------------
+
+/** What an unauthenticated viewer gets from `/public/spend`.
+ *
+ * **Deliberately not a zeroed summary.** `RECORD_FIELD_ALLOWLIST`'s
+ * `ephemeral_compute` entry says no field of that kind survives to `/public/*`
+ * — including `estimated_cost_usd`, the only input this aggregation has — so
+ * there is nothing left to return. The obvious shortcut, returning the normal
+ * shape with every number set to `0`, would be a *lie* rather than a
+ * redaction: `$0.00 across 0 jobs` is indistinguishable from a real idle
+ * window, and a public reader would draw a false conclusion about the
+ * operator's compute spend instead of learning that the figure is withheld.
+ * An explicit `withheld: true` with no numeric field at all says the true
+ * thing. Same reasoning as [`redactFleetSnapshot`]'s empty `activeCompute`
+ * (which withholds even the running-instance count), one step further: there
+ * the empty list already reads as "nothing to show", here a zero would not.
+ *
+ * The echoed `since`/`until` survive because they are the *requester's own*
+ * query parameters coming back — this response reveals nothing by repeating
+ * what the request already stated. */
+export interface WithheldElasticSpend {
+  since: string | null;
+  until: string | null;
+  withheld: true;
+}
+
+/** The withheld response for a window, built from the request's own bounds.
+ *
+ * Exported separately from {@link redactElasticSpend} so `src/index.ts` can
+ * answer a public request **without running the D1 aggregation at all** — the
+ * unredacted numbers then never exist on the public code path, which is a
+ * stronger guarantee than computing and discarding them, and it costs the
+ * database nothing to serve a response with no data in it. The policy still
+ * lives in exactly one module (this one), which is the invariant the module
+ * doc's "single enforcement point" states. */
+export function withheldElasticSpend(window: {
+  since?: string | null;
+  until?: string | null;
+}): WithheldElasticSpend {
+  return { since: window.since ?? null, until: window.until ?? null, withheld: true };
+}
+
+/** Redact an {@link ElasticSpendSummary} for the given auth state: returned
+ * unchanged to an authenticated viewer, replaced by
+ * {@link WithheldElasticSpend} for a public one.
+ *
+ * Unlike every other function in this module there is no per-record
+ * `visibility` check, because `ephemeral_compute` carries no `repo`/
+ * `visibility` at all (host-level, like `tokens.snapshot`/`host.health` — see
+ * the module doc). `decodeVisibility`'s fail-safe default already classifies
+ * every such row `private`, so the auth flag alone is the whole decision. */
+export function redactElasticSpend(
+  summary: ElasticSpendSummary,
+  isAuthenticated: boolean,
+): ElasticSpendSummary | WithheldElasticSpend {
+  return isAuthenticated ? summary : withheldElasticSpend(summary);
 }
 
 // ---------------------------------------------------------------------------

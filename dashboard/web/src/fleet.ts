@@ -18,7 +18,14 @@
  */
 
 import { roleFailureLabel, secondsSince } from "./format";
-import type { ActiveSweep, FleetSnapshot, HostEntry, HostHealthRecord, TokenAccount } from "./types";
+import type {
+  ActiveComputeJob,
+  ActiveSweep,
+  FleetSnapshot,
+  HostEntry,
+  HostHealthRecord,
+  TokenAccount,
+} from "./types";
 
 /**
  * Fleet-wide `host.health.roles` totals, summed across every reporting host
@@ -124,6 +131,22 @@ export interface FleetView {
    * exported signal to show alongside it so `0` is never mistaken for
    * "nothing is running". */
   roleTicks: RoleTickAggregate | undefined;
+  /** Live `ephemeral_compute` jobs (Issue #8306), leaked-first then
+   * longest-running — see `sortComputeJobs`.
+   *
+   * Deliberately **not** joined onto `hosts` the way `activeSweeps` is. A
+   * compute job's `hostId` names the process that *reported* it, not a machine
+   * the fleet manages: the reference emitter is a hostless elastic batch
+   * runner authenticating as one synthetic id for the whole fleet (see
+   * `defaults/docs/observability.md` §5d), so grouping by it would pile every
+   * instance in the world under a single card that has no `host.health` to
+   * render beside them. The jobs are a fleet-level list of their own instead.
+   */
+  activeCompute: ActiveComputeJob[];
+  /** How many of `activeCompute` the backend flagged as leaked — an instance
+   * still billing with no completion record. The count the overview headline
+   * shows, so a leak is visible without scanning the list. */
+  leakedCompute: number;
 }
 
 /**
@@ -332,13 +355,37 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
         a.hostId.localeCompare(b.hostId),
     );
 
+  // `activeCompute` is absent on a snapshot parsed from a pre-#8305 backend
+  // and on any hand-built fixture that predates this field.
+  const activeCompute = sortComputeJobs(snapshot.activeCompute ?? []);
+
   return {
     hosts,
     reportingHosts: hosts.filter((host) => host.status !== "unknown").length,
     totalSweeps: snapshot.activeSweeps.length,
     needsAttention: hosts.filter((host) => host.status === "stale" || host.status === "degraded").length,
     roleTicks: aggregateRoleTicks(hosts),
+    activeCompute,
+    leakedCompute: activeCompute.filter((job) => job.leaked === true).length,
   };
+}
+
+/** Leaked jobs first (they are the ones costing money with nobody watching),
+ * then longest-running, then by `jobId` so the list does not reshuffle between
+ * polls when nothing changed. Mirrors `sortSweeps`' tie-breaking, including
+ * its "a job with no start time sorts last" rule — an unparseable or absent
+ * `startedAt` must not masquerade as the oldest job. */
+export function sortComputeJobs(jobs: readonly ActiveComputeJob[]): ActiveComputeJob[] {
+  const startKey = (job: ActiveComputeJob): number => {
+    const parsed = job.startedAt ? Date.parse(job.startedAt) : Number.POSITIVE_INFINITY;
+    return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed;
+  };
+  return [...jobs].sort(
+    (a, b) =>
+      Number(b.leaked === true) - Number(a.leaked === true) ||
+      startKey(a) - startKey(b) ||
+      a.jobId.localeCompare(b.jobId),
+  );
 }
 
 /** Longest-running first (a sweep with no `startedAt` sorts last), then by

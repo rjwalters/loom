@@ -243,6 +243,209 @@ export async function queryHistory(db: D1Database, filter: HistoryFilter): Promi
 }
 
 // ---------------------------------------------------------------------------
+// Elastic compute spend (`GET /api/spend`) — Issue #8306, Phase 3 of #8257
+// ---------------------------------------------------------------------------
+
+/** The record kind this aggregation reads. Named rather than inlined because
+ * three separate SQL predicates below depend on it matching the partial index
+ * `migrations/0003_ephemeral_compute.sql` creates. */
+export const EPHEMERAL_COMPUTE_KIND = "ephemeral_compute";
+
+/** Parsed, validated filter for a {@link queryElasticSpend} call. Every field
+ * is optional — an unfiltered call sums every `ephemeral_compute` completion
+ * record in the table. */
+export interface ElasticSpendFilter {
+  /** Inclusive lower bound on `emitted_at` (RFC 3339). */
+  since?: string;
+  /** Exclusive upper bound on `emitted_at` (RFC 3339). */
+  until?: string;
+  /** Only the named emitting host (the synthetic elastic-fleet `host_id` — see
+   * `defaults/docs/observability.md` §5d). */
+  host?: string;
+}
+
+/** One UTC day's spend within the queried window. Only days that actually had
+ * a completed job appear — a gap is a day with no spend, and the renderer
+ * decides whether to draw it as a zero or skip it (a zero here would be
+ * indistinguishable from "a job that cost nothing"). */
+export interface ElasticSpendDay {
+  /** UTC calendar day, `YYYY-MM-DD`. */
+  day: string;
+  costUsd: number;
+  jobCount: number;
+}
+
+/** Aggregate `ephemeral_compute` spend over a time window. */
+export interface ElasticSpendSummary {
+  /** Echo of the requested window, so a renderer can label the period without
+   * re-deriving it from its own request. `null` for an open-ended bound. */
+  since: string | null;
+  until: string | null;
+  /** Summed `estimated_cost_usd` across every completed job in the window. */
+  totalCostUsd: number;
+  /** Completed jobs in the window — i.e. records carrying a numeric
+   * `estimated_cost_usd`. A launch record has none (the job has not finished,
+   * so there is no cost yet) and is deliberately excluded: counting it would
+   * inflate the job count with rows contributing `0` to the total. Jobs still
+   * running are the "running now" panel's subject, sourced from the Durable
+   * Object rather than from here. */
+  jobCount: number;
+  /** Summed `wall_clock_sec` across those jobs, or `null` when none reported
+   * one — never a fabricated `0` (the "unknown != zero" contract every other
+   * surface in this backend follows). */
+  totalWallClockSec: number | null;
+  /** The largest single-day `costUsd` in the window, or `null` when the window
+   * had no spend at all. This is the number an operator compares against a
+   * standing per-day spot ceiling — a window total cannot answer "did any day
+   * breach the cap", and an average hides exactly the day that did. */
+  peakDailyCostUsd: number | null;
+  /** Per-UTC-day breakdown, oldest first. */
+  days: ElasticSpendDay[];
+}
+
+/** Parse+validate `GET /api/spend`'s query-string params, or a `{ error }`
+ * describing the first invalid one. Mirrors {@link parseHistoryQuery}'s
+ * contract exactly (same param names, same RFC 3339 validation) so the two
+ * read surfaces stay one idiom rather than two. */
+export function parseElasticSpendQuery(
+  params: URLSearchParams,
+): ElasticSpendFilter | HistoryQueryError {
+  const filter: ElasticSpendFilter = {};
+
+  const host = params.get("host");
+  if (host) filter.host = host;
+
+  const since = params.get("since");
+  if (since !== null) {
+    if (Number.isNaN(Date.parse(since))) return { error: "since must be an RFC 3339 datetime" };
+    filter.since = since;
+  }
+
+  const until = params.get("until");
+  if (until !== null) {
+    if (Number.isNaN(Date.parse(until))) return { error: "until must be an RFC 3339 datetime" };
+    filter.until = until;
+  }
+
+  return filter;
+}
+
+/** Round a dollar figure to 4 decimal places. Summing IEEE-754 floats in
+ * SQLite produces trailing noise (`3.6899999999999995`) that would render as
+ * a nonsense precision; 4 places keeps sub-cent resolution — spot pricing is
+ * quoted per-hour to 4-6 places, so a short job's real cost can be a fraction
+ * of a cent — while dropping the artifact. */
+function roundUsd(value: number): number {
+  return Math.round(value * 10_000) / 10_000;
+}
+
+/** Raw shape of one grouped row from the aggregation below. SQLite's `SUM`
+ * returns `NULL` for an empty group, which cannot happen here (a group exists
+ * only because a row matched) but is typed honestly anyway. */
+interface RawSpendDayRow {
+  day: string | null;
+  cost_usd: number | null;
+  job_count: number | null;
+  wall_clock_sec: number | null;
+  wall_clock_reported: number | null;
+}
+
+/**
+ * Sum `ephemeral_compute` spend over a window, bucketed by UTC day.
+ *
+ * **Which rows count.** Exactly the rows whose payload carries a *numeric*
+ * `estimated_cost_usd` — enforced with `json_type(...) IN ('integer','real')`
+ * rather than a bare `IS NOT NULL`, because `json_extract` happily returns a
+ * string for a malformed payload and SQLite's `SUM` silently coerces one to
+ * `0`, which would understate the total rather than fail visibly. Per
+ * `migrations/0003_ephemeral_compute.sql`, a job emits two records — a launch
+ * record (no cost yet) and a completion record (cost, wall clock, `ended_at`)
+ * — so this predicate is also what makes the aggregation count each job once.
+ *
+ * **Why `emitted_at`, not `ended_at`.** `emitted_at` is the envelope field the
+ * `(kind, emitted_at)` index that same migration adds is built on, and it is
+ * the field `since`/`until` filter on everywhere else in this module, so day
+ * bucketing and window filtering agree by construction. A completion record is
+ * emitted at completion, so the two are the same instant in practice.
+ *
+ * **UTC day bucketing** is `substr(emitted_at, 1, 10)` — the daemon and every
+ * other emitter write RFC 3339 with a `Z` offset (see
+ * `.loom/docs/telemetry-schema.md`), so the leading 10 characters *are* the
+ * UTC calendar day. A row written with a non-`Z` offset would bucket by its
+ * local day; that is a deliberate accepted approximation rather than a
+ * `datetime(...)` conversion, because converting would make the expression
+ * non-sargable and force a full scan of the kind's rows.
+ */
+export async function queryElasticSpend(
+  db: D1Database,
+  filter: ElasticSpendFilter = {},
+): Promise<ElasticSpendSummary> {
+  const clauses: string[] = [
+    "kind = ?",
+    "json_type(payload, '$.estimated_cost_usd') IN ('integer', 'real')",
+  ];
+  const bindings: unknown[] = [EPHEMERAL_COMPUTE_KIND];
+
+  if (filter.host) {
+    clauses.push("host_id = ?");
+    bindings.push(filter.host);
+  }
+  if (filter.since) {
+    clauses.push("emitted_at >= ?");
+    bindings.push(filter.since);
+  }
+  if (filter.until) {
+    clauses.push("emitted_at < ?");
+    bindings.push(filter.until);
+  }
+
+  const { results } = await db
+    .prepare(
+      `SELECT substr(emitted_at, 1, 10) AS day,
+              SUM(json_extract(payload, '$.estimated_cost_usd')) AS cost_usd,
+              COUNT(*) AS job_count,
+              SUM(CASE WHEN json_type(payload, '$.wall_clock_sec') IN ('integer', 'real')
+                       THEN json_extract(payload, '$.wall_clock_sec') ELSE 0 END) AS wall_clock_sec,
+              SUM(CASE WHEN json_type(payload, '$.wall_clock_sec') IN ('integer', 'real')
+                       THEN 1 ELSE 0 END) AS wall_clock_reported
+         FROM records
+        WHERE ${clauses.join(" AND ")}
+        GROUP BY day
+        ORDER BY day ASC`,
+    )
+    .bind(...bindings)
+    .all<RawSpendDayRow>();
+
+  const days: ElasticSpendDay[] = [];
+  let totalCostUsd = 0;
+  let jobCount = 0;
+  let totalWallClockSec = 0;
+  let wallClockReported = 0;
+
+  for (const row of results) {
+    const costUsd = typeof row.cost_usd === "number" ? row.cost_usd : 0;
+    const dayJobCount = typeof row.job_count === "number" ? row.job_count : 0;
+    totalCostUsd += costUsd;
+    jobCount += dayJobCount;
+    totalWallClockSec += typeof row.wall_clock_sec === "number" ? row.wall_clock_sec : 0;
+    wallClockReported += typeof row.wall_clock_reported === "number" ? row.wall_clock_reported : 0;
+    days.push({ day: row.day ?? "", costUsd: roundUsd(costUsd), jobCount: dayJobCount });
+  }
+
+  return {
+    since: filter.since ?? null,
+    until: filter.until ?? null,
+    totalCostUsd: roundUsd(totalCostUsd),
+    jobCount,
+    // `0` here would claim every job ran instantaneously; absence of the field
+    // on every row means the duration is unknown, not zero.
+    totalWallClockSec: wallClockReported > 0 ? totalWallClockSec : null,
+    peakDailyCostUsd: days.length > 0 ? roundUsd(Math.max(...days.map((day) => day.costUsd))) : null,
+    days,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Live tail (`GET /api/events`)
 // ---------------------------------------------------------------------------
 

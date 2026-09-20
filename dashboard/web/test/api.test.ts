@@ -44,7 +44,7 @@ describe("fetchFleetState", () => {
     const snapshot = await fetchFleetState({
       fetchImpl: (async () => jsonResponse(EMPTY_SNAPSHOT)) as unknown as typeof fetch,
     });
-    expect(snapshot).toEqual({ hosts: {}, activeSweeps: [] });
+    expect(snapshot).toEqual({ hosts: {}, activeSweeps: [], activeCompute: [] });
   });
 
   it("throws FleetStateError on a non-2xx status", async () => {

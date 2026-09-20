@@ -1,5 +1,6 @@
 /**
- * Hash-based routing (`#/`, `#/hosts/<hostId>`, `#/charts`, `#/tokens`, `#/feed`).
+ * Hash-based routing (`#/`, `#/hosts/<hostId>`, `#/charts`, `#/tokens`,
+ * `#/spend`, `#/feed`).
  *
  * Hash routing rather than the History API is a deliberate deploy-shape
  * decision, not laziness. The UI ships as Workers Assets on the *same* Worker
@@ -18,22 +19,27 @@ export type Route =
   | { name: "host"; hostId: string }
   | { name: "charts" }
   | { name: "tokens" }
+  | { name: "spend" }
   | { name: "feed" };
 
 export const OVERVIEW: Route = { name: "overview" };
 
 /** Routes that render a self-contained panel owning its own data fetching,
  * rather than a view over the fleet snapshot the app polls (issue #4895). */
-export type PanelRouteName = "charts" | "tokens" | "feed";
+export type PanelRouteName = "charts" | "tokens" | "spend" | "feed";
 
 const PANEL_ROUTES: Readonly<Record<string, PanelRouteName>> = {
   "/charts": "charts",
   "/tokens": "tokens",
+  "/spend": "spend",
   "/feed": "feed",
 };
 
 export function isPanelRoute(route: Route): route is { name: PanelRouteName } {
-  return route.name === "charts" || route.name === "tokens" || route.name === "feed";
+  // Derived from `PANEL_ROUTES` rather than an `||` chain of literals: the
+  // chain silently omitted a new panel from `routeToHash` when one was added,
+  // which turned its nav link into a link back to the overview.
+  return Object.values(PANEL_ROUTES).includes(route.name as PanelRouteName);
 }
 
 export function parseRoute(hash: string): Route {

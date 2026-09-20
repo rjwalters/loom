@@ -12,6 +12,7 @@
  */
 
 import { el, field } from "../dom";
+import { isAuthenticatedViewer } from "../api";
 import {
   UNKNOWN,
   formatDiskFree,
@@ -29,6 +30,7 @@ import {
 import type { FleetView, HostStatus, HostView } from "../fleet";
 import type { HostHealthRecord, HostProtection, ManagedRepoEntry } from "../types";
 import { emptyFleetView } from "./states";
+import { runningComputeSection, type RunningComputeOptions } from "./runningCompute";
 
 const STATUS_LABEL: Record<HostStatus, string> = {
   ok: "OK",
@@ -370,8 +372,26 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
   );
 }
 
-export function fleetOverviewView(view: FleetView, now: Date = new Date()): HTMLElement {
-  if (view.hosts.length === 0) return emptyFleetView();
+export function fleetOverviewView(
+  view: FleetView,
+  now: Date = new Date(),
+  options: RunningComputeOptions = {},
+): HTMLElement {
+  // Resolved once, then passed down, so the panel and the headline count below
+  // can never disagree about who the viewer is.
+  const authenticated = options.authenticated ?? isAuthenticatedViewer();
+  // Rendered before the host-count check on purpose: a hostless elastic
+  // emitter (`defaults/docs/observability.md` §5d) pushes `ephemeral_compute`
+  // and nothing else, so a fleet can legitimately have running instances and
+  // zero reporting hosts. Short-circuiting to the "no hosts" empty state would
+  // hide the one thing that *is* running — including a leak (#8306).
+  const compute = runningComputeSection(view.activeCompute, now, { authenticated });
+
+  if (view.hosts.length === 0) {
+    return compute
+      ? el("div", { class: "overview overview--hostless" }, compute, emptyFleetView())
+      : emptyFleetView();
+  }
 
   return el(
     "section",
@@ -406,7 +426,29 @@ export function fleetOverviewView(view: FleetView, now: Date = new Date()): HTML
         { class: view.needsAttention > 0 ? "overview__attention" : undefined },
         `${view.needsAttention} need${view.needsAttention === 1 ? "s" : ""} attention`,
       ),
+      // Only when there is elastic compute to count (#8306). Most fleets run
+      // none at all, and a permanent "0 compute jobs" in a headline already
+      // carrying three carefully-worded counts is noise, not information —
+      // the `#/spend` route is where "is anything running / what did it cost"
+      // always has an answer, including zero. Also suppressed for a viewer
+      // not entitled to the count: `/public/fleet-state` withholds it, so a
+      // rendered `0` would not be a fact about the fleet.
+      authenticated && view.activeCompute.length > 0
+        ? el(
+            "span",
+            {
+              class: view.leakedCompute > 0 ? "overview__attention" : undefined,
+              title:
+                "Ephemeral compute instances currently running (cloud batch jobs reported by a " +
+                "non-daemon emitter) — see the panel below",
+              data: { testid: "fleet-compute-summary" },
+            },
+            `${view.activeCompute.length} compute job${view.activeCompute.length === 1 ? "" : "s"}` +
+              (view.leakedCompute > 0 ? ` · ${view.leakedCompute} possibly leaked` : ""),
+          )
+        : null,
     ),
+    compute,
     el(
       "div",
       { class: "overview__grid" },

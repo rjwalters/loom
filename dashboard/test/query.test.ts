@@ -3,6 +3,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import {
   authedRequest,
+  ephemeralComputeEnvelope,
   initAccessTestKeys,
   mockJwksFetch,
   seedHost,
@@ -217,6 +218,184 @@ describe("GET /api/history — pagination", () => {
     expect(thirdBody.records).toHaveLength(1);
     expect(thirdBody.records[0]?.sweepId).toBe("sweep-0");
     expect(thirdBody.nextCursor).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Elastic compute spend (Issue #8306, Phase 3 of #8257)
+// ---------------------------------------------------------------------------
+
+/** One completed `ephemeral_compute` job, emitted at `emittedAt` (which is
+ * also what the aggregation buckets by). */
+function completedJob(
+  jobId: string,
+  emittedAt: string,
+  costUsd: number,
+  extra: Partial<Record<string, unknown>> = {},
+): Record<string, unknown> {
+  return {
+    ...ephemeralComputeEnvelope({ job_id: jobId, estimated_cost_usd: costUsd, ...extra }),
+    emitted_at: emittedAt,
+  };
+}
+
+interface SpendBody {
+  since: string | null;
+  until: string | null;
+  totalCostUsd?: number;
+  jobCount?: number;
+  totalWallClockSec?: number | null;
+  peakDailyCostUsd?: number | null;
+  days?: { day: string; costUsd: number; jobCount: number }[];
+  withheld?: boolean;
+}
+
+async function getSpend(query = ""): Promise<SpendBody> {
+  const response = await callWorker(await authedRequest(`https://ingest.example/api/spend${query}`));
+  expect(response.status).toBe(200);
+  return (await response.json()) as SpendBody;
+}
+
+describe("GET /api/spend — elastic compute spend", () => {
+  it("sums estimated_cost_usd across the window and buckets it by UTC day", async () => {
+    await ingest([
+      completedJob("job-1", "2026-09-17T01:00:00Z", 1.5),
+      completedJob("job-2", "2026-09-17T23:00:00Z", 2.25),
+      completedJob("job-3", "2026-09-18T12:00:00Z", 10),
+    ]);
+
+    const body = await getSpend();
+    expect(body.totalCostUsd).toBe(13.75);
+    expect(body.jobCount).toBe(3);
+    expect(body.days).toEqual([
+      { day: "2026-09-17", costUsd: 3.75, jobCount: 2 },
+      { day: "2026-09-18", costUsd: 10, jobCount: 1 },
+    ]);
+    // The number an operator compares against a standing daily ceiling — the
+    // window total cannot answer "did any one day breach it".
+    expect(body.peakDailyCostUsd).toBe(10);
+    // `wall_clock_sec` defaults to 2700 in the fixture, so three jobs sum to
+    // 8100 — proving the second SUM is wired to the same row set.
+    expect(body.totalWallClockSec).toBe(8100);
+  });
+
+  it("honours the since/until window bounds", async () => {
+    await ingest([
+      completedJob("job-old", "2026-09-10T00:00:00Z", 100),
+      completedJob("job-in", "2026-09-17T00:00:00Z", 7),
+      completedJob("job-new", "2026-09-25T00:00:00Z", 100),
+    ]);
+
+    const body = await getSpend("?since=2026-09-15T00:00:00Z&until=2026-09-20T00:00:00Z");
+    expect(body.totalCostUsd).toBe(7);
+    expect(body.jobCount).toBe(1);
+    expect(body.days).toEqual([{ day: "2026-09-17", costUsd: 7, jobCount: 1 }]);
+    // The requested window is echoed back so a renderer can label the period
+    // without re-deriving it.
+    expect(body.since).toBe("2026-09-15T00:00:00Z");
+    expect(body.until).toBe("2026-09-20T00:00:00Z");
+  });
+
+  it("counts a job once — a launch record carries no cost and is excluded", async () => {
+    await ingest([
+      // The launch half of the two-record lifecycle: no cost, no wall clock.
+      ephemeralComputeEnvelope({
+        job_id: "job-running",
+        ended_at: undefined,
+        wall_clock_sec: undefined,
+        estimated_cost_usd: undefined,
+      }),
+      completedJob("job-done", "2026-09-19T06:00:00Z", 4),
+    ]);
+
+    const body = await getSpend();
+    expect(body.jobCount).toBe(1);
+    expect(body.totalCostUsd).toBe(4);
+  });
+
+  it("ignores a non-numeric estimated_cost_usd rather than coercing it to 0", async () => {
+    await ingest([
+      completedJob("job-good", "2026-09-19T06:00:00Z", 4),
+      completedJob("job-bad", "2026-09-19T07:00:00Z", 0, { estimated_cost_usd: "1.23" }),
+    ]);
+
+    const body = await getSpend();
+    // The malformed row is excluded from BOTH the sum and the count — a
+    // silent `SUM` coercion would have added a phantom $0.00 job instead.
+    expect(body.jobCount).toBe(1);
+    expect(body.totalCostUsd).toBe(4);
+  });
+
+  it("reports wall clock as null, not 0, when no job in the window carried one", async () => {
+    await ingest([completedJob("job-nowall", "2026-09-19T06:00:00Z", 3, { wall_clock_sec: undefined })]);
+
+    const body = await getSpend();
+    expect(body.totalCostUsd).toBe(3);
+    expect(body.totalWallClockSec).toBeNull();
+  });
+
+  it("returns an empty $0 summary — not an error — for a window with no jobs", async () => {
+    const body = await getSpend("?since=2030-01-01T00:00:00Z&until=2030-01-08T00:00:00Z");
+    expect(body.totalCostUsd).toBe(0);
+    expect(body.jobCount).toBe(0);
+    expect(body.days).toEqual([]);
+    // Unknown is not zero: no spend means no peak day, not a $0 peak day.
+    expect(body.peakDailyCostUsd).toBeNull();
+    expect(body.totalWallClockSec).toBeNull();
+  });
+
+  it("filters by the emitting host", async () => {
+    await seedHost(env.DB, "host-xyz", "xyz-ingest-key");
+    await ingest([completedJob("job-abc", "2026-09-19T06:00:00Z", 5)], "Bearer abc-ingest-key");
+    await ingest(
+      [{ ...completedJob("job-xyz", "2026-09-19T06:00:00Z", 50), host_id: "host-xyz" }],
+      "Bearer xyz-ingest-key",
+    );
+
+    const body = await getSpend("?host=host-abc");
+    expect(body.totalCostUsd).toBe(5);
+    expect(body.jobCount).toBe(1);
+  });
+
+  it("rejects a malformed since/until with 400, matching /api/history", async () => {
+    const response = await callWorker(await authedRequest("https://ingest.example/api/spend?since=yesterday"));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "since must be an RFC 3339 datetime" });
+  });
+
+  it("requires authentication", async () => {
+    const response = await callWorker(new Request("https://ingest.example/api/spend"));
+    expect(response.status).toBe(401);
+  });
+});
+
+describe("GET /public/spend — redaction", () => {
+  it("withholds every figure rather than returning a zeroed summary", async () => {
+    await ingest([completedJob("job-secret", "2026-09-19T06:00:00Z", 42.5)]);
+
+    const response = await callWorker(
+      new Request("https://ingest.example/public/spend?since=2026-09-01T00:00:00Z"),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as SpendBody;
+
+    // `withheld: true` and NOT a `$0.00` summary — a zero would read as a real
+    // idle window (see src/redaction.ts's WithheldElasticSpend doc).
+    expect(body.withheld).toBe(true);
+    expect(body).not.toHaveProperty("totalCostUsd");
+    expect(body).not.toHaveProperty("jobCount");
+    expect(body).not.toHaveProperty("days");
+    expect(body).not.toHaveProperty("peakDailyCostUsd");
+    // The requester's own query parameter comes back; nothing is revealed by
+    // repeating what the request already stated.
+    expect(body.since).toBe("2026-09-01T00:00:00Z");
+    // Belt and braces: no cost figure reaches the wire by any path.
+    expect(JSON.stringify(body)).not.toContain("42.5");
+  });
+
+  it("still validates its query params", async () => {
+    const response = await callWorker(new Request("https://ingest.example/public/spend?until=soon"));
+    expect(response.status).toBe(400);
   });
 });
 

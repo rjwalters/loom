@@ -18,6 +18,7 @@
  */
 
 import type {
+  ActiveComputeJob,
   ActiveSweep,
   FleetSnapshot,
   HostEntry,
@@ -187,8 +188,39 @@ export function parseActiveSweep(value: unknown): ActiveSweep | undefined {
   });
 }
 
+/** Narrow one `activeCompute` entry (Issue #8305/#8306).
+ *
+ * `hostId`/`jobId` are structurally guaranteed by the Durable Object, and an
+ * entry missing either is unaddressable in the UI — it could not be listed
+ * under a stable key or attributed to an emitter — so it is dropped rather
+ * than rendered under a fabricated identity, exactly as
+ * {@link parseActiveSweep} drops a sweep with no `sweepId`.
+ *
+ * `leaked` decodes only the literal `true` to `true`. A backend predating
+ * Issue #8305 omits the field entirely, and "unknown" must render as
+ * *not flagged* — the opposite default would paint every job on an older
+ * deployment as a leak. */
+export function parseActiveComputeJob(value: unknown): ActiveComputeJob | undefined {
+  if (!isObject(value)) return undefined;
+  const hostId = str(value.hostId);
+  const jobId = str(value.jobId);
+  if (!hostId || !jobId) return undefined;
+  return stripUndefined<ActiveComputeJob>({
+    hostId,
+    jobId,
+    instanceId: str(value.instanceId),
+    region: str(value.region),
+    instanceType: str(value.instanceType),
+    spot: bool(value.spot),
+    ami: str(value.ami),
+    startedAt: str(value.startedAt),
+    updatedAt: str(value.updatedAt),
+    leaked: value.leaked === true ? true : undefined,
+  });
+}
+
 export function parseFleetSnapshot(value: unknown): FleetSnapshot {
-  const snapshot: FleetSnapshot = { hosts: {}, activeSweeps: [] };
+  const snapshot: FleetSnapshot = { hosts: {}, activeSweeps: [], activeCompute: [] };
   if (!isObject(value)) return snapshot;
 
   if (isObject(value.hosts)) {
@@ -209,6 +241,18 @@ export function parseFleetSnapshot(value: unknown): FleetSnapshot {
       if (sweep) snapshot.activeSweeps.push(sweep);
     }
   }
+
+  // Absent on a `/public/fleet-state` response's older shape and on any
+  // backend predating Issue #8305 — both degrade to the empty list, same as
+  // every other malformed sub-tree above.
+  const activeCompute: ActiveComputeJob[] = [];
+  if (Array.isArray(value.activeCompute)) {
+    for (const raw of value.activeCompute) {
+      const job = parseActiveComputeJob(raw);
+      if (job) activeCompute.push(job);
+    }
+  }
+  snapshot.activeCompute = activeCompute;
 
   return snapshot;
 }
