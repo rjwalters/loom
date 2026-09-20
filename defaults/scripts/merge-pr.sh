@@ -2985,8 +2985,7 @@ _find_worktree_by_branch() {
 #
 # Never fails the cleanup pipeline — always returns 0, warns on errors.
 _maybe_delete_local_branch() {
-  local branch="$1"
-  local expected_head_sha="${2:-}"
+  local branch="$1" expected_head_sha="${2:-}"
   if [[ -z "$branch" ]]; then
     return 0
   fi
