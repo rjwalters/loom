@@ -41,21 +41,32 @@ impl Harness {
         let cwd = std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?;
         command.env("PWD", &cwd);
         command.env("LOOM_NATIVE_WORKER_PID", std::process::id().to_string());
-        if let (Some(source), Some(target)) =
-            (&selection.credential_env, &selection.credential_target)
-        {
+        // Secrets travel only as environment variables the child inherits: the
+        // mapping renames them, it never reads or copies a value elsewhere.
+        for (source, target) in &selection.credentials {
             if let Some(value) = std::env::var_os(source).filter(|v| !v.is_empty()) {
                 command.env(target, value);
             }
         }
+        let provider = crate::native_tools::provision::ProviderConfig {
+            id: &selection.provider,
+            options: selection.provider_options.as_ref(),
+            definition: selection.provider_definition.as_ref(),
+        };
         match self {
             Self::Pi => {
+                if !provider.is_empty() {
+                    return Err(LaunchError::config(
+                        "providerOptions/providerDefinition are only supported by the opencode harness",
+                    ));
+                }
                 if guarded {
                     crate::native_tools::provision::configure(
                         &mut command,
                         root,
                         self.name(),
                         &format!("{}/{}", selection.provider, selection.model),
+                        &provider,
                     )
                     .map_err(|e| LaunchError::config(e.to_string()))?;
                 }
@@ -90,8 +101,12 @@ impl Harness {
                         root,
                         self.name(),
                         &format!("{}/{}", selection.provider, selection.model),
+                        &provider,
                     )
                     .map_err(|e| LaunchError::config(e.to_string()))?;
+                } else {
+                    crate::native_tools::provision::provider_only(&mut command, &provider)
+                        .map_err(|e| LaunchError::config(e.to_string()))?;
                 }
                 command.args([
                     "--model",

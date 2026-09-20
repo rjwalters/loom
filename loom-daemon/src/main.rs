@@ -57,6 +57,9 @@ struct Cli {
 enum Commands {
     /// Launch a worker through a native harness adapter or a legacy runtime.
     SpawnWorker(loom_daemon::worker_spawn::WorkerArgs),
+    /// Inspect worker model profiles without launching anything.
+    #[command(subcommand_required = true)]
+    Worker(loom_daemon::worker_spawn::WorkerCommand),
     /// Execute one guarded native harness tool request from stdin.
     RuntimeTool(loom_daemon::native_tools::ToolArgs),
     /// Initialize a Loom workspace in a target repository
@@ -2543,6 +2546,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Accounts { action, workspace } => handle_accounts_command(action, &workspace),
         Commands::ClaudeConfig { action } => handle_claude_config_command(action),
         Commands::SpawnWorker(args) => loom_daemon::worker_spawn::cli(args),
+        Commands::Worker(args) => loom_daemon::worker_spawn::profile_cli(args),
         Commands::RuntimeTool(args) => loom_daemon::native_tools::cli(args),
         Commands::AgentSpawn {
             role,

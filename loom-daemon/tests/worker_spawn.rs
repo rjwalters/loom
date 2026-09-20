@@ -348,6 +348,214 @@ fn credential_aliases_are_profile_data_and_never_argv_or_logs() {
     }
 }
 
+fn builder_role(root: &std::path::Path) {
+    let roles = root.join(".loom/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::write(roles.join("builder.json"), "{}").unwrap();
+}
+fn native_config(text: &str) -> serde_json::Value {
+    serde_json::from_str(
+        text.lines()
+            .find_map(|s| s.strip_prefix("native_config="))
+            .unwrap(),
+    )
+    .unwrap()
+}
+fn profile_check(root: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+    c.args(["worker", "profile-check"])
+        .args(args)
+        .current_dir(root)
+        .env("LOOM_WORKSPACE", root)
+        .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        .env_remove("AWS_PROFILE")
+        .env_remove("GOOGLE_APPLICATION_CREDENTIALS")
+        .env_remove("GOOGLE_CLOUD_PROJECT")
+        .env_remove("VERTEX_LOCATION");
+    c.output().unwrap()
+}
+
+#[test]
+fn credential_env_accepts_the_legacy_string_form_and_a_required_array() {
+    let d = tempfile::tempdir().unwrap();
+    // String form: unchanged, and still optional so a CLI login keeps working.
+    let out = worker(d.path(), "pi")
+        .env_remove("ZAI_API_KEY")
+        .args(["--profile", "zai-flash", "-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("glm-5.3-flash"));
+    // Array form: every declared variable is mapped onto the harness's names.
+    config(
+        d.path(),
+        serde_json::json!({"runtimes":{"defaultModelProfile":"multi","modelProfiles":{"multi":{"model":"m","providers":{"pi":"p"},"credentialEnv":["LOOM_TEST_ONE","LOOM_TEST_TWO"],"credentialTargets":{"pi":{"LOOM_TEST_ONE":"HARNESS_ONE","LOOM_TEST_TWO":"HARNESS_TWO"}}}}}}),
+    );
+    let out = worker(d.path(), "pi")
+        .env("LOOM_TEST_ONE", "first-value")
+        .env("LOOM_TEST_TWO", "second-value")
+        .env("FIXTURE_PRINT_ENV", "HARNESS_ONE,HARNESS_TWO")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("child_env HARNESS_ONE=first-value"), "{text}");
+    assert!(text.contains("child_env HARNESS_TWO=second-value"), "{text}");
+    // The bundled examples are part of the schema surface: all four must load.
+    for name in [
+        "zai-flash",
+        "example-bedrock",
+        "example-vertex",
+        "example-openai-compatible",
+    ] {
+        let out = profile_check(d.path(), &[name]);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!("profile: {name}")),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn bedrock_profile_injects_provider_options_and_maps_every_variable() {
+    let d = tempfile::tempdir().unwrap();
+    builder_role(d.path());
+    config(
+        d.path(),
+        serde_json::json!({"runtimes":{"defaultModelProfile":"bedrock","modelProfiles":{"bedrock":{"model":"m","providers":{"opencode":"amazon-bedrock"},"credentialEnv":["AWS_PROFILE","LOOM_TEST_BEDROCK_TOKEN"],"credentialTargets":{"opencode":{"AWS_PROFILE":"AWS_PROFILE","LOOM_TEST_BEDROCK_TOKEN":"AWS_BEARER_TOKEN_BEDROCK"}},"providerOptions":{"opencode":{"region":"us-east-1"}}}}}}),
+    );
+    let log = d.path().join("worker.log");
+    let out = worker(d.path(), "opencode")
+        .env("LOOM_ROLE", "builder")
+        .env("AWS_PROFILE", "loom-trial")
+        .env("LOOM_TEST_BEDROCK_TOKEN", "fake-bedrock-bearer-token")
+        .env("FIXTURE_NATIVE_CONFIG", "1")
+        .env("FIXTURE_PRINT_ENV", "AWS_PROFILE,AWS_BEARER_TOKEN_BEDROCK")
+        .args(["--log", log.to_str().unwrap(), "-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // `--log` merges the launch record and the child's own streams into one file.
+    let text = std::fs::read_to_string(&log).unwrap();
+    let config = native_config(&text);
+    assert_eq!(config["provider"]["amazon-bedrock"]["options"]["region"], "us-east-1");
+    assert!(text.contains("child_env AWS_PROFILE=loom-trial"), "{text}");
+    assert!(
+        text.contains("child_env AWS_BEARER_TOKEN_BEDROCK=fake-bedrock-bearer-token"),
+        "{text}"
+    );
+    // The launch record names harness/provider/model/effort, never a credential.
+    let record = text.lines().find(|l| l.contains("LOOM_LAUNCH")).unwrap();
+    for secret in ["fake-bedrock-bearer-token", "loom-trial"] {
+        assert!(!record.contains(secret), "{record}");
+        assert!(!config.to_string().contains(secret), "{config}");
+    }
+}
+
+#[test]
+fn custom_provider_definition_keeps_the_key_in_env_indirection_form() {
+    let d = tempfile::tempdir().unwrap();
+    builder_role(d.path());
+    config(
+        d.path(),
+        serde_json::json!({"runtimes":{"defaultModelProfile":"openweights","modelProfiles":{"openweights":{"model":"m","providers":{"opencode":"loom-openweights"},"credentialEnv":["LOOM_TEST_OPENWEIGHTS_KEY"],"credentialTargets":{"opencode":{"LOOM_TEST_OPENWEIGHTS_KEY":"LOOM_TEST_OPENWEIGHTS_KEY"}},"providerDefinition":{"opencode":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"https://example.invalid/v1","apiKey":"{env:LOOM_TEST_OPENWEIGHTS_KEY}"},"models":{"m":{}}}}}}}}),
+    );
+    for guarded in [true, false] {
+        let mut command = worker(d.path(), "opencode");
+        if guarded {
+            command.env("LOOM_ROLE", "builder");
+        }
+        let out = command
+            .env("LOOM_TEST_OPENWEIGHTS_KEY", "fake-openweights-secret-key")
+            .env("FIXTURE_NATIVE_CONFIG", "1")
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8_lossy(&out.stdout);
+        let injected = text
+            .lines()
+            .find(|s| s.starts_with("native_config="))
+            .unwrap();
+        let config = native_config(&text);
+        let provider = &config["provider"]["loom-openweights"];
+        assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(provider["options"]["apiKey"], "{env:LOOM_TEST_OPENWEIGHTS_KEY}");
+        assert_eq!(provider["options"]["baseURL"], "https://example.invalid/v1");
+        assert!(provider["models"]["m"].is_object(), "{config}");
+        // The exact injected string must never carry the literal key.
+        assert!(!injected.contains("fake-openweights-secret-key"), "{injected}");
+    }
+}
+
+#[test]
+fn unset_or_embedded_credentials_fail_closed_before_launch() {
+    let d = tempfile::tempdir().unwrap();
+    config(
+        d.path(),
+        serde_json::json!({"runtimes":{"defaultModelProfile":"partial","modelProfiles":{"partial":{"model":"m","providers":{"opencode":"p"},"credentialEnv":["LOOM_TEST_PRESENT","LOOM_TEST_ABSENT_A","LOOM_TEST_ABSENT_B"],"credentialTargets":{"opencode":{"LOOM_TEST_PRESENT":"HARNESS_KEY"}}}}}}),
+    );
+    let out = worker(d.path(), "opencode")
+        .env("LOOM_TEST_PRESENT", "fake-present-value")
+        .env_remove("LOOM_TEST_ABSENT_A")
+        .env_remove("LOOM_TEST_ABSENT_B")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(78));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("LOOM_TEST_ABSENT_A"), "{text}");
+    assert!(text.contains("LOOM_TEST_ABSENT_B"), "{text}");
+    assert!(!text.contains("fake-present-value"), "{text}");
+    assert!(out.stdout.is_empty());
+    // A credential VALUE pasted into provider configuration is also fail-closed.
+    config(
+        d.path(),
+        serde_json::json!({"runtimes":{"defaultModelProfile":"leaky","modelProfiles":{"leaky":{"model":"m","providers":{"opencode":"p"},"credentialEnv":["LOOM_TEST_PRESENT"],"providerOptions":{"opencode":{"apiKey":"fake-present-value"}}}}}}),
+    );
+    let out = worker(d.path(), "opencode")
+        .env("LOOM_TEST_PRESENT", "fake-present-value")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(78));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("{env:LOOM_TEST_PRESENT}"));
+}
+
+#[test]
+fn profile_check_reports_resolvability_without_spawning() {
+    let d = tempfile::tempdir().unwrap();
+    let out = profile_check(d.path(), &["example-bedrock"]);
+    assert_eq!(out.status.code(), Some(78));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("harness opencode: provider amazon-bedrock"), "{text}");
+    assert!(text.contains("providerOptions: region"), "{text}");
+    assert!(text.contains("unresolvable, set AWS_PROFILE"), "{text}");
+    let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+    let out = c
+        .args(["worker", "profile-check", "example-bedrock"])
+        .current_dir(d.path())
+        .env("LOOM_WORKSPACE", d.path())
+        .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        .env("AWS_PROFILE", "loom-trial")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("status: resolvable"));
+    // The lenient string form stays resolvable without the variable exported.
+    let out = profile_check(d.path(), &["zai-flash"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("harness pi: provider zai"));
+    let out = profile_check(d.path(), &["example-vertex", "--runtime", "pi"]);
+    assert_eq!(out.status.code(), Some(78));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no provider binding"));
+    let out = profile_check(d.path(), &["no-such-profile"]);
+    assert_eq!(out.status.code(), Some(78));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown model profile"));
+}
+
 #[test]
 fn malformed_profile_selection_does_not_fall_back_to_a_billable_default() {
     let d = tempfile::tempdir().unwrap();

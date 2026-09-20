@@ -1,9 +1,79 @@
 //! Launch-time bindings are binary-owned; no edit to global harness configuration.
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use std::{fs, io::Write, path::Path, process::Command};
 
-pub fn configure(command: &mut Command, root: &Path, runtime: &str, model: &str) -> Result<()> {
+/// Profile-declared, non-secret provider data merged into the per-launch config.
+/// Secrets never appear here: OpenCode resolves its own `{env:VAR}` indirection
+/// against the child environment the profile's credential mapping populates.
+#[derive(Default)]
+pub struct ProviderConfig<'a> {
+    pub id: &'a str,
+    pub options: Option<&'a Map<String, Value>>,
+    pub definition: Option<&'a Map<String, Value>>,
+}
+impl ProviderConfig<'_> {
+    pub fn is_empty(&self) -> bool {
+        self.options.is_none() && self.definition.is_none()
+    }
+}
+
+fn inherited_config() -> Result<Value> {
+    match std::env::var("OPENCODE_CONFIG_CONTENT") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            serde_json::from_str(&raw).context("OPENCODE_CONFIG_CONTENT must be a JSON object")
+        }
+        _ => Ok(json!({})),
+    }
+}
+
+fn object_at<'a>(object: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
+    let entry = object.entry(key).or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    entry.as_object_mut().expect("object entry")
+}
+
+fn merge_provider(object: &mut Map<String, Value>, provider: &ProviderConfig) {
+    if provider.is_empty() {
+        return;
+    }
+    let providers = object_at(object, "provider");
+    let entry = object_at(providers, provider.id);
+    for (key, value) in provider.definition.into_iter().flatten() {
+        entry.insert(key.clone(), value.clone());
+    }
+    if let Some(options) = provider.options {
+        let target = object_at(entry, "options");
+        for (key, value) in options {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// An unguarded trial still needs the profile's provider block: a cloud or
+/// custom endpoint is not present in the operator's own OpenCode configuration.
+pub fn provider_only(command: &mut Command, provider: &ProviderConfig) -> Result<()> {
+    if provider.is_empty() {
+        return Ok(());
+    }
+    let mut config = inherited_config()?;
+    let object = config
+        .as_object_mut()
+        .context("OPENCODE_CONFIG_CONTENT must be a JSON object")?;
+    merge_provider(object, provider);
+    command.env("OPENCODE_CONFIG_CONTENT", config.to_string());
+    Ok(())
+}
+
+pub fn configure(
+    command: &mut Command,
+    root: &Path,
+    runtime: &str,
+    model: &str,
+    provider: &ProviderConfig,
+) -> Result<()> {
     super::guard::ready(root)?;
     let binary = std::env::current_exe()?;
     let directory = root.join(".loom/native-tools");
@@ -30,11 +100,7 @@ pub fn configure(command: &mut Command, root: &Path, runtime: &str, model: &str)
             r#"{"private":true,"dependencies":{"@opencode-ai/plugin":"1.18.31"}}"#,
         )?;
         command.env("OPENCODE_CONFIG_DIR", &config_dir);
-        let mut config: serde_json::Value = match std::env::var("OPENCODE_CONFIG_CONTENT") {
-            Ok(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw)
-                .context("OPENCODE_CONFIG_CONTENT must be a JSON object")?,
-            _ => json!({}),
-        };
+        let mut config = inherited_config()?;
         let object = config
             .as_object_mut()
             .context("OPENCODE_CONFIG_CONTENT must be a JSON object")?;
@@ -46,6 +112,7 @@ pub fn configure(command: &mut Command, root: &Path, runtime: &str, model: &str)
             "tools":{"*":false,"loom_read":true,"loom_edit":true,"loom_write":true,"loom_bash":true}
         });
         object.extend(guarded.as_object().expect("guarded config object").clone());
+        merge_provider(object, provider);
         command.env("OPENCODE_CONFIG_CONTENT", config.to_string());
         command.args(["--agent", "loom-worker"]);
     }

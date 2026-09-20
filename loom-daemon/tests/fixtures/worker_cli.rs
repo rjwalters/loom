@@ -18,6 +18,14 @@ fn main() {
     ] {
         println!("{key}={}", std::env::var(key).unwrap_or_default());
     }
+    for key in std::env::var("FIXTURE_PRINT_ENV")
+        .unwrap_or_default()
+        .split(',')
+    {
+        if !key.is_empty() {
+            println!("child_env {key}={}", std::env::var(key).unwrap_or_default());
+        }
+    }
     if let Ok(source) = std::env::var("LOOM_TEST_PROVIDER_SECRET") {
         println!(
             "credential_alias_matches={}",

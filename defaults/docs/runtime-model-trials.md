@@ -88,6 +88,56 @@ provider fallback. For repeatable comparisons, define a named profile:
 }
 ```
 
+### Multi-variable credentials and provider options
+
+One API key is the simplest case, not the only one. `credentialEnv` also takes
+an **array** of variable names, and `credentialTargets.<harness>` a **map** from
+each source variable to the name the harness expects in the child environment:
+
+| Form | Meaning | Presence |
+|------|---------|----------|
+| `"credentialEnv": "VAR"` | one variable, mapped by a `credentialTargets.<harness>` **string** | optional — a harness login store may supply it instead |
+| `"credentialEnv": ["A","B"]` | the **required set**, mapped by a `credentialTargets.<harness>` **object** | every entry must be present in the launching environment |
+
+The array form fails closed before spawn (exit 78) with a diagnostic naming the
+missing *variable names*; the legacy string form is unchanged, so `zai-flash`
+still launches against a CLI login with `ZAI_API_KEY` unexported. Only mapped
+variables are set on the child, and a `credentialTargets` entry naming a
+variable `credentialEnv` did not declare is rejected.
+
+Two optional per-harness fields carry **non-secret** provider configuration into
+OpenCode's per-launch injected config (`OPENCODE_CONFIG_CONTENT`); Pi rejects
+both, since it has no equivalent:
+
+- `providerOptions.<harness>` — merged into `provider.<providerId>.options`
+  (region, project, anything the provider block accepts).
+- `providerDefinition.<harness>` — the whole `provider.<providerId>` block, for
+  an endpoint the harness does not know natively (`npm`, `options`, `models`).
+
+**Secrets travel only as environment variables the child inherits.** Never
+interpolate a key into these blocks: reference it with OpenCode's own
+`{env:VAR}` indirection and let the credential mapping populate that variable.
+A profile whose provider configuration embeds the literal value of one of its
+own `credentialEnv` variables is rejected before launch.
+
+Three bundled **examples** (placeholder model ids, no account-specific values —
+copy into `runtimes.modelProfiles` and edit, they are not usable as shipped):
+
+| Profile | Provider | Requires |
+|---------|----------|----------|
+| `example-bedrock` | `amazon-bedrock` | `AWS_PROFILE`; `providerOptions.opencode.region` |
+| `example-vertex` | `google-vertex` | `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `VERTEX_LOCATION` |
+| `example-openai-compatible` | `loom-openweights` | `LOOM_OPENWEIGHTS_API_KEY`, `LOOM_OPENWEIGHTS_BASE_URL`; `providerDefinition.opencode` declares `@ai-sdk/openai-compatible` with `{env:…}` options |
+
+Check any profile's resolvability without spawning a worker — it reads no
+secret values, contacts no provider, and exits 78 when a bound harness cannot
+be resolved:
+
+```sh
+loom-daemon worker profile-check example-bedrock
+loom-daemon worker profile-check my-comparison --runtime opencode
+```
+
 Native adapters require `--prompt`; use the harness CLI directly for interactive
 sessions. Legacy runtimes retain their interactive behavior.
 

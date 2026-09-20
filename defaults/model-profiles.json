@@ -16,5 +16,77 @@
       "pi": "ZAI_API_KEY",
       "opencode": "ZHIPU_API_KEY"
     }
+  },
+  "example-bedrock": {
+    "model": "REPLACE_WITH_BEDROCK_MODEL_ID",
+    "providers": {
+      "opencode": "amazon-bedrock"
+    },
+    "credentialEnv": [
+      "AWS_PROFILE"
+    ],
+    "credentialTargets": {
+      "opencode": {
+        "AWS_PROFILE": "AWS_PROFILE"
+      }
+    },
+    "providerOptions": {
+      "opencode": {
+        "region": "REPLACE_WITH_AWS_REGION"
+      }
+    },
+    "effort": "high",
+    "allowedEfforts": [
+      "low",
+      "high",
+      "max"
+    ]
+  },
+  "example-vertex": {
+    "model": "REPLACE_WITH_VERTEX_MODEL_ID",
+    "providers": {
+      "opencode": "google-vertex"
+    },
+    "credentialEnv": [
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "GOOGLE_CLOUD_PROJECT",
+      "VERTEX_LOCATION"
+    ],
+    "credentialTargets": {
+      "opencode": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT": "GOOGLE_CLOUD_PROJECT",
+        "VERTEX_LOCATION": "VERTEX_LOCATION"
+      }
+    }
+  },
+  "example-openai-compatible": {
+    "model": "REPLACE_WITH_MODEL_ID",
+    "providers": {
+      "opencode": "loom-openweights"
+    },
+    "credentialEnv": [
+      "LOOM_OPENWEIGHTS_API_KEY",
+      "LOOM_OPENWEIGHTS_BASE_URL"
+    ],
+    "credentialTargets": {
+      "opencode": {
+        "LOOM_OPENWEIGHTS_API_KEY": "LOOM_OPENWEIGHTS_API_KEY",
+        "LOOM_OPENWEIGHTS_BASE_URL": "LOOM_OPENWEIGHTS_BASE_URL"
+      }
+    },
+    "providerDefinition": {
+      "opencode": {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "Loom open-weights endpoint",
+        "options": {
+          "baseURL": "{env:LOOM_OPENWEIGHTS_BASE_URL}",
+          "apiKey": "{env:LOOM_OPENWEIGHTS_API_KEY}"
+        },
+        "models": {
+          "REPLACE_WITH_MODEL_ID": {}
+        }
+      }
+    }
   }
 }
