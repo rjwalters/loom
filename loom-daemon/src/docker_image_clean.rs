@@ -40,8 +40,9 @@
 //!    fixed-tag build sites (Option 3 in the issue, the floor of the fix).
 //! 2. **Tracked repositories keep only the newest N tagged images.** For any
 //!    repository name in the configured `trackedRepos` allowlist (default:
-//!    the `loom-worker` / `loom-worker-session` family and their `ghcr.io`
-//!    aliases), only the `keepLastN` most recently created images survive;
+//!    the `loom-worker` / `loom-worker-session` / `loom-worker-native`
+//!    family and their `ghcr.io` aliases), only the `keepLastN` most
+//!    recently created images survive;
 //!    older ones are removed by image ID (not by tag) so **every** alias tag
 //!    pointing at that ID goes with it in one `docker rmi` call — this is
 //!    [`RetentionPlan::remove_stale_tracked`] (Option 2), a generalization
@@ -107,13 +108,20 @@ pub const DEFAULT_MIN_INTERVAL_SECS: u64 = 1_800;
 
 /// The repositories this pass manages by default — the exact build sites
 /// `.github/workflows/ci.yml`'s `worker-image-smoke` / `session-image-smoke`
-/// jobs tag, plus their `ghcr.io` aliases (verified against `origin/main`,
-/// 2026-09-07, issue #7332).
+/// / `native-image-smoke` jobs tag, plus their `ghcr.io` aliases (verified
+/// against `origin/main`, 2026-09-07, issue #7332; `loom-worker-native`
+/// added with the image itself, issue #8403).
+///
+/// Membership is **exact repository-name equality** (see
+/// [`plan_retention`]), not a substring test — `loom-worker-native` is a
+/// distinct entry precisely because `loom-worker` does not cover it.
 pub const DEFAULT_TRACKED_REPOS: &[&str] = &[
     "loom-worker",
     "loom-worker-session",
+    "loom-worker-native",
     "ghcr.io/rjwalters/loom-worker",
     "ghcr.io/rjwalters/loom-worker-session",
+    "ghcr.io/rjwalters/loom-worker-native",
 ];
 
 /// How long the pass waits for the machine-wide build slot before deferring —

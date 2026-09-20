@@ -124,6 +124,15 @@ small edit interface in both harnesses; this is not a benchmark of OpenCode's
 full native editing/tool ecosystem. CLI exit zero is not acceptance evidence.
 Record failed attempts and independently verify code and forge outcomes.
 
+An OS-level backstop for exactly those residual limits is available, opt-in, as
+per-sweep ephemeral containment (`runtimes.containment.native: "ephemeral"`,
+issue #8403) — the same container lifetime Claude sweeps use, with an image
+pinning the CLI versions recorded above, per-launch XDG/config/session
+directories, and env-only credential injection. It does not narrow the
+application-policy limits described here; it bounds their blast radius. See
+[runtime adapters](runtime-adapters.md) § "Native-harness ephemeral
+containment". Uncontained dispatch remains the default and is unchanged.
+
 The shared bridge's historical filename is `guard-codex-bridge.sh`; the Rust
 boundary uses its established internal request/decision protocol, not a Codex
 process or account. Future policy retirement should replace that shared service,

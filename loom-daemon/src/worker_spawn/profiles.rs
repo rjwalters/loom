@@ -76,6 +76,12 @@ pub struct Selection {
     pub profile: Option<String>,
     /// (source variable in the launching environment, variable set on the child).
     pub credentials: Vec<(String, String)>,
+    /// Every variable the profile declares in `credentialEnv`, whether or not a
+    /// `credentialTargets` entry renames it. Containment (#8403) forwards these
+    /// by NAME into the container, where profile resolution re-runs against the
+    /// container's own environment: an unmapped-but-required source dropped
+    /// here would fail that inner resolution closed (exit 78).
+    pub credential_sources: Vec<String>,
     pub provider_options: Option<Map<String, Value>>,
     pub provider_definition: Option<Map<String, Value>>,
 }
@@ -271,6 +277,7 @@ pub fn resolve(
         effort: profile.effort.clone(),
         profile: Some(name.to_string()),
         credentials: mapping.pairs,
+        credential_sources: declared.iter().map(|s| (*s).to_string()).collect(),
         provider_options,
         provider_definition,
     })
@@ -289,6 +296,7 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
                 effort: options.effort.clone(),
                 profile: None,
                 credentials: Vec::new(),
+                credential_sources: Vec::new(),
                 provider_options: None,
                 provider_definition: None,
             });

@@ -1144,12 +1144,160 @@ unknown to known did not weaken this guard for other names.)
 Containers as a session-persistence and containment boundary for worker
 runtimes — per-account persistent session containers for runtimes with
 mutable interactive auth (Codex), per-sweep ephemeral containers for
-stateless-auth runtimes (Claude) — are specified in
+stateless-auth runtimes (Claude, Pi/OpenCode) — are specified in
 [ADR-0017: Session-Container Architecture](https://github.com/rjwalters/loom/blob/main/docs/adr/0017-session-container-architecture.md)
 (epic #6896). Both container lifetimes dispatch through the existing
 `spawn-worker.sh` → `spawn-<runtime>.sh` seam described above with **no new
 dispatch path**; this doc's seven contract points are unchanged by that ADR.
 This is a pointer only — no contract-point changes ship with it.
+
+| Runtime | Lifetime | Image | Enable with | Telemetry `containment=` |
+|---|---|---|---|---|
+| Claude | per-sweep **ephemeral** | `ghcr.io/rjwalters/loom-worker` | `runtimes.containment.enabled: true` (#7429) | `claude-ephemeral` |
+| Codex | per-account **persistent session** | `ghcr.io/rjwalters/loom-worker-session` | ADR-0017 Phase 2 | — |
+| Pi, OpenCode | per-sweep **ephemeral** | `ghcr.io/rjwalters/loom-worker-native` | `runtimes.containment.native: "ephemeral"` (#8403) | `native-ephemeral` |
+
+#### Why native harnesses do NOT reuse Codex's session container
+
+The per-account session container exists for exactly one reason: Codex's
+`CODEX_HOME/auth.json` is a **mutable OAuth refresh chain**. A refresh rotates
+the stored credential in place, so the chain needs exactly one owning process —
+a second concurrent owner invalidates the first — and container *persistence*
+is what gives it that owner.
+
+An API-key subscription has no refresh chain. There is no rotating stored
+credential, nothing to own, and therefore nothing for persistence to buy. The
+key is injected as container **env** at `docker run` time (by NAME, `-e VAR`
+with no `=value`, so it is read live from the dispatching process's own
+environment and never appears in the container's argv) and exists nowhere on
+the container's filesystem — not in a profile directory, not in a mounted
+volume, not in a config file.
+
+Reusing the session shape here would therefore cost both of the properties the
+ephemeral shape gives for free — a guaranteed-clean filesystem per sweep, and a
+hard teardown at sweep end — in exchange for solving a problem native harnesses
+do not have. The two images differ by **lifetime**, not by which CLI they
+install; see [`docker/native/README.md`](https://github.com/rjwalters/loom/blob/main/docker/native/README.md).
+
+### Native-harness ephemeral containment (issue #8403, epic #6896 Phase 3)
+
+Native-harness sweeps (Pi, OpenCode — admitted by #8363/#8400) run **uncontained
+on the host by default**, exactly as before. Opt in per workspace:
+
+```json
+{
+  "runtimes": {
+    "containment": {
+      "native": "ephemeral"
+    }
+  }
+}
+```
+
+| Precedence | Source |
+|---|---|
+| 1 (highest) | `LOOM_NATIVE_CONTAINERIZED` env var (`1`/`true`/`yes`/`ephemeral` enables; anything else disables) |
+| 2 | `.loom/config.json` → `runtimes.containment.native` |
+| 3 (default) | off — byte-for-byte uncontained native dispatch, unchanged |
+
+This is a **separate switch** from Claude's `runtimes.containment.enabled`, on
+purpose. That flag selects the `loom-worker` base image, which ships no Node and
+therefore neither native CLI, so inheriting it would dispatch a native sweep
+into an image that cannot run it. The image resolves
+`LOOM_NATIVE_CONTAINER_IMAGE` env → `runtimes.containment.nativeImage` config →
+`ghcr.io/rjwalters/loom-worker-native:latest`.
+
+**Mechanism.** The same one `spawn-claude.sh` uses — re-exec the dispatcher
+inside a `docker run`, guarded by the shared `LOOM_SPAWN_CONTAINERIZED=1`
+recursion sentinel — expressed where the native launch decision actually lives.
+Native harnesses have no shell adapter to re-exec (`spawn-worker.sh` is a stub
+that execs `loom-daemon spawn-worker`), so the block is
+`loom_daemon::worker_spawn::containment` rather than a new wrapper script. The
+container runs `<workspace>/.loom/scripts/spawn-worker.sh <original args>`; the
+re-exec'd copy sees the sentinel, dispatches bare, and does its prompt expansion
+and guarded-binding provisioning *there*, against the container's own isolated
+directories.
+
+**Mounts** follow `docker/worker/MOUNT-CONTRACT.md`: the workspace read-write at
+its identical absolute host path (§1, so git's absolute worktree pointers
+resolve the same inside and out), the git commit identity (`~/.gitconfig`) and —
+only when neither `GH_TOKEN` nor `GITHUB_TOKEN` is in the environment — `gh`'s
+config directory, both read-only and both remapped under the *container's* home
+rather than the host's (HOME is not path-parity-load-bearing; `gh`'s copy lands
+inside the redirected `XDG_CONFIG_HOME`, because `gh` honours XDG), a log
+directory that lives outside the workspace, and an out-of-workspace
+`CARGO_TARGET_DIR` (§4) so a contained sweep shares the host's warm build cache
+instead of recompiling into a layer `--rm` discards. Everything else on the host
+is simply absent — the "read-only view of everything outside the worktree" is
+the container boundary itself, not a flag.
+
+**Per-launch directory isolation** — the concrete problem this closes.
+Uncontained, `XDG_DATA_HOME` is not relocated per launch, so N concurrent native
+workers on one host share **one** `~/.local/share/opencode` session store and
+**one** `auth.json`, and a `/connect`-style login by one worker is visible to
+all. Contained, every one of these is pointed at
+`/home/loom/.loom-native/<per-launch-id>/…` inside the container's own ephemeral
+writable layer:
+
+| Variable | Why it matters |
+|---|---|
+| `XDG_DATA_HOME` | OpenCode's session store and `auth.json` |
+| `XDG_CONFIG_HOME` | XDG-honouring config, including `gh`'s (bind-mounted *into* this path, not the host's `~/.config/gh`, so `gh` can still find it) |
+| `XDG_CACHE_HOME`, `XDG_STATE_HOME` | the remaining XDG bases, relocated for completeness rather than left to leak |
+| `OPENCODE_CONFIG_DIR` | the injected deny-by-default `loom-worker` agent config; `OPENCODE_CONFIG_CONTENT` itself is unchanged |
+| `LOOM_NATIVE_TOOLS_DIR` | the generated guarded-tool bindings (`native_tools::provision`), which otherwise default to the *shared*, parity-mounted `<workspace>/.loom/native-tools` |
+
+Two concurrent contained workers are therefore disjoint twice over: different
+containers, **and** different paths within them. The per-launch id is not
+redundant — it makes the disjointness inspectable (`docker exec <id> ls
+/home/loom/.loom-native`) rather than merely implied by the container boundary.
+
+**Credential shape.** The selected model profile's `credentialEnv` and its
+per-harness `credentialTargets` entry are forwarded **by name only** (`-e VAR`,
+never `-e VAR=value`), so docker reads the value live from the dispatching
+process's environment: the key never enters this dispatch's argv (and so never
+`ps`, a shell history, or a log), and nothing writes it to a file anywhere in the
+container. The source→target mapping happens inside the container, by the same
+`worker_spawn::harness` code that does it on the host. Host-only variables that
+name host filesystem paths (`LOOM_PI_BIN`, `LOOM_OPENCODE_BIN`, `LOOM_DAEMON_BIN`,
+…) are deliberately *not* forwarded, and neither is `CLAUDE_*`: a native
+container has no business holding a Claude token, and the Claude token pool is
+not mounted into it at all.
+
+**Resource limits and teardown** are inherited from #7430's shape, not
+reinvented: `--cpus` resolves `LOOM_SWEEP_CONTAINER_CPUS` → `runtimes.containment.cpus`
+→ the same host-wide `LOOM_SWEEP_CPU_BUDGET_CORES` budget bare-metal dispatch
+computed → no flag (unbounded); `--memory` resolves the analogous chain and is
+**always** applied, divided across in-flight sweeps
+(`LOOM_SWEEP_INFLIGHT_SWEEPS`) exactly the way `lib/memory-budget.sh` divides it
+for the Claude path. `docker run --rm` means the container and its whole
+writable layer are destroyed when the sweep's process tree ends.
+
+**Telemetry.** The dispatch writes the canonical marker to the per-sweep log
+before it execs docker — `# LOOM_DISPATCH_MODE mode=container image=<image>
+cpus=<v|none> memory=<v|none> containment=native-ephemeral` — and labels the
+container `loom.containment=native-ephemeral` alongside the existing
+`loom.sweep`/`loom.dispatch*` labels. The `containment=` token is new in #8403
+and is **appended** to the marker: `spawn-claude.sh` now emits
+`containment=claude-ephemeral` in the same position, and a pre-#8403 marker
+(which carries no token at all) still parses as containerized, with an
+unrecorded shape. `loom-daemon status`'s `CTR` column renders the shape as its
+prefix — `native-ephemeral(cpu=2,mem=4096m)`, `claude-ephemeral(unbounded)`, or
+the generic `container(...)` for a pre-#8403 marker.
+
+**What this does NOT ship.** The fleet-default flip for native workers follows
+the *same* soak criteria as #7431 (14 days, 50 sweeps, zero
+containment-attributable failures, zero saturation incidents, success rate at or
+above the trailing bare-metal baseline) rather than inventing new ones — until
+then it is opt-in per workspace. Two pieces are tracked separately because
+neither can be established from a builder worktree: **#8434** is the live
+verification (an in-container canary run, two concurrent workers' filesystems
+inspected for disjointness, and a post-run writable-layer credential scan — the
+check that tests what the *CLI* writes, not only what the dispatcher passes),
+and **#8435** is `cancel_sweep`'s container teardown, which is owed to the
+*Claude* ephemeral path identically (killing the `docker run` client does not
+stop the container dockerd owns) and so is fixed once for both shapes rather
+than branched per runtime.
 
 ### Containerized dispatch mode for Claude sweeps (issue #7429, epic #6896 Phase 3)
 

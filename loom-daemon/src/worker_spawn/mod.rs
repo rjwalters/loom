@@ -1,6 +1,7 @@
 //! Native runtime dispatch behind the existing spawn-worker.sh invocation contract.
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
+pub mod containment;
 mod harness;
 mod opencode_version;
 mod profile_check;
@@ -147,6 +148,34 @@ fn workspace(scripts: Option<&Path>) -> Result<PathBuf, LaunchError> {
         .ok_or_else(|| LaunchError::config("cannot locate workspace"))
 }
 
+/// Point `command`'s stdout/stderr at the `--log` file (creating its directory
+/// if needed) and hand back a writer onto the SAME destination, so the
+/// dispatcher's own marker lines interleave with the worker's output instead
+/// of splitting across two sinks. With no `--log`, both stay on stderr.
+fn attach_log(command: &mut Command, path: Option<&Path>) -> Result<Box<dyn Write>, LaunchError> {
+    let Some(path) = path else {
+        return Ok(Box::new(std::io::stderr()));
+    };
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_err(|e| LaunchError::config(format!("cannot create log directory: {e}")))?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| LaunchError::config(format!("cannot open worker log: {e}")))?;
+    command.stdout(
+        file.try_clone()
+            .map_err(|e| LaunchError::config(e.to_string()))?,
+    );
+    command.stderr(
+        file.try_clone()
+            .map_err(|e| LaunchError::config(e.to_string()))?,
+    );
+    Ok(Box::new(file))
+}
+
 fn scripts_dir(root: &Path) -> PathBuf {
     let installed = root.join(".loom/scripts");
     if installed.is_dir() {
@@ -198,6 +227,43 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
                 .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
         let selection = profiles::select(&runtime, &options, &config)?;
+        // Per-sweep ephemeral containment (issue #8403). Decided here, after
+        // admission and profile selection (so a misconfigured launch still
+        // fails fast on the host) but BEFORE prompt expansion and binding
+        // provisioning — both of those must happen inside the container,
+        // against its own isolated directories, not against the shared
+        // workspace the host would use.
+        if let Some(profile) = containment::resolve(&config) {
+            // Forward the profile's credential variables by NAME: every
+            // declared source (profile resolution re-runs inside the container
+            // and fails closed on an unset required source), plus each mapped
+            // child variable, which covers an operator who exported the target
+            // name directly instead of the source.
+            let credentials: Vec<&str> = selection
+                .credential_sources
+                .iter()
+                .map(String::as_str)
+                .chain(
+                    selection
+                        .credentials
+                        .iter()
+                        .flat_map(|(source, target)| [source.as_str(), target.as_str()]),
+                )
+                .collect();
+            let mut command = containment::docker_command(
+                &profile,
+                &root,
+                &std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?,
+                options.log.as_deref(),
+                &args.args,
+                &credentials,
+            )?;
+            let mut log = attach_log(&mut command, options.log.as_deref())?;
+            writeln!(log, "{}", profile.dispatch_marker())
+                .and_then(|()| log.flush())
+                .map_err(|e| LaunchError::config(e.to_string()))?;
+            return exec(command);
+        }
         let expanded = options
             .prompt
             .as_deref()
@@ -210,27 +276,7 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
             &root,
             role.is_some() || prompt_role.is_some(),
         )?;
-        if let Some(path) = &options.log {
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                fs::create_dir_all(parent).map_err(|e| {
-                    LaunchError::config(format!("cannot create log directory: {e}"))
-                })?;
-            }
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| LaunchError::config(format!("cannot open worker log: {e}")))?;
-            command.stdout(
-                file.try_clone()
-                    .map_err(|e| LaunchError::config(e.to_string()))?,
-            );
-            command.stderr(
-                file.try_clone()
-                    .map_err(|e| LaunchError::config(e.to_string()))?,
-            );
-            log = Box::new(file);
-        }
+        log = attach_log(&mut command, options.log.as_deref())?;
         writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"usage":"native-json-events","billing":"not-measured"})).map_err(|e| LaunchError::config(e.to_string()))?;
         command
     } else {
