@@ -2,8 +2,11 @@
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
 mod harness;
+mod profile_check;
 mod profiles;
 mod prompt;
+
+pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
 
 use harness::Harness;
 use std::{

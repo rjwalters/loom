@@ -1,8 +1,40 @@
 //! Model/provider choices are data; harness adapters only translate the launch protocol.
 use super::{LaunchError, Options};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+
+/// One variable (the original form) or the whole set a provider requires.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum CredentialEnv {
+    One(String),
+    Many(Vec<String>),
+}
+impl CredentialEnv {
+    pub fn names(&self) -> Vec<&str> {
+        match self {
+            Self::One(name) => vec![name.as_str()],
+            Self::Many(names) => names.iter().map(String::as_str).collect(),
+        }
+    }
+    /// The array form declares a *required* set and fails closed when one is
+    /// unset. The single-string form stays optional, so profiles that rely on a
+    /// harness's own login store keep launching exactly as before.
+    fn required(&self) -> bool {
+        matches!(self, Self::Many(_))
+    }
+}
+
+/// Alias: the one declared variable under a harness's own name. Map: an explicit
+/// source-variable to child-variable mapping, for multi-variable providers
+/// (Bedrock, Vertex AI).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum CredentialTargets {
+    Alias(String),
+    Map(BTreeMap<String, String>),
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -11,10 +43,19 @@ pub struct ModelProfile {
     /// Provider IDs are harness vocabulary (Pi `zai`, OpenCode `zai-coding-plan`).
     pub providers: BTreeMap<String, String>,
     pub effort: Option<String>,
-    /// Name only. Secrets remain in the inherited environment or CLI auth store.
-    pub credential_env: Option<String>,
+    /// Names only. Secrets remain in the inherited environment or CLI auth store.
+    pub credential_env: Option<CredentialEnv>,
     #[serde(default)]
-    pub credential_targets: BTreeMap<String, String>,
+    pub credential_targets: BTreeMap<String, CredentialTargets>,
+    /// Non-secret provider options (region, project) merged into the harness's
+    /// per-launch injected configuration under `provider.<id>.options`.
+    #[serde(default)]
+    pub provider_options: BTreeMap<String, Value>,
+    /// A whole provider block (npm package, baseURL, model map) declared in the
+    /// injected configuration under `provider.<id>`, for endpoints the harness
+    /// does not know natively.
+    #[serde(default)]
+    pub provider_definition: BTreeMap<String, Value>,
     #[serde(default)]
     pub allowed_efforts: Vec<String>,
 }
@@ -33,8 +74,206 @@ pub struct Selection {
     pub model: String,
     pub effort: Option<String>,
     pub profile: Option<String>,
-    pub credential_env: Option<String>,
-    pub credential_target: Option<String>,
+    /// (source variable in the launching environment, variable set on the child).
+    pub credentials: Vec<(String, String)>,
+    pub provider_options: Option<Map<String, Value>>,
+    pub provider_definition: Option<Map<String, Value>>,
+}
+
+fn check_name(value: &str) -> Result<(), LaunchError> {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Ok(());
+    }
+    // Never echo the offending string: a mistaken value must not reach a log.
+    Err(LaunchError::config(
+        "credential mapping must contain environment variable names, not values",
+    ))
+}
+
+pub fn bundled() -> BTreeMap<String, ModelProfile> {
+    serde_json::from_str(include_str!("../../../defaults/model-profiles.json"))
+        .expect("bundled profiles")
+}
+
+/// Resolve a profile by name, falling back to configuration's default and then
+/// the bundled set. Configuration profiles shadow bundled ones of the same name.
+pub fn lookup(name: Option<&str>, config: &Value) -> Result<(String, ModelProfile), LaunchError> {
+    let configured: ProfileConfig = serde_json::from_value(
+        config
+            .get("runtimes")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+    .map_err(|_| LaunchError::config("invalid runtime model profile configuration"))?;
+    let name = name
+        .or(configured.default_model_profile.as_deref())
+        .unwrap_or("zai-flash")
+        .to_string();
+    let profile = configured
+        .model_profiles
+        .get(&name)
+        .cloned()
+        .or_else(|| bundled().remove(&name))
+        .ok_or_else(|| LaunchError::config("unknown model profile"))?;
+    if profile.model.trim().is_empty()
+        || profile.effort.as_ref().is_some_and(|s| s.trim().is_empty())
+    {
+        return Err(LaunchError::config("model profile has an empty model or effort"));
+    }
+    Ok((name, profile))
+}
+
+/// One harness's credential mapping: (source variable, child variable) pairs,
+/// plus the variables that must be present before launch.
+#[derive(Debug, Default)]
+pub struct CredentialMapping {
+    pub pairs: Vec<(String, String)>,
+    pub required: Vec<String>,
+}
+
+/// Resolve that mapping. Names are validated; values are never read here.
+pub fn credentials(
+    profile: &ModelProfile,
+    runtime: &str,
+) -> Result<CredentialMapping, LaunchError> {
+    let Some(declared) = &profile.credential_env else {
+        if profile.credential_targets.contains_key(runtime) {
+            return Err(LaunchError::config(
+                "credentialTargets requires credentialEnv to declare the source variables",
+            ));
+        }
+        return Ok(CredentialMapping::default());
+    };
+    let sources = declared.names();
+    for name in &sources {
+        check_name(name)?;
+    }
+    let pairs = match profile.credential_targets.get(runtime) {
+        None => Vec::new(),
+        Some(CredentialTargets::Alias(target)) => {
+            check_name(target)?;
+            if sources.len() != 1 {
+                return Err(LaunchError::config("a single credentialTargets name needs exactly one credentialEnv variable; use a variable map"));
+            }
+            vec![(sources[0].to_string(), target.clone())]
+        }
+        Some(CredentialTargets::Map(map)) => {
+            let mut pairs = Vec::new();
+            for (source, target) in map {
+                check_name(source)?;
+                check_name(target)?;
+                if !sources.contains(&source.as_str()) {
+                    return Err(LaunchError::config(
+                        "credentialTargets maps a variable that credentialEnv does not declare",
+                    ));
+                }
+                pairs.push((source.clone(), target.clone()));
+            }
+            pairs
+        }
+    };
+    let required = if declared.required() {
+        sources.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    Ok(CredentialMapping { pairs, required })
+}
+
+/// Required variables that are unset or empty in the launching environment.
+pub fn missing(required: &[String]) -> Vec<String> {
+    required
+        .iter()
+        .filter(|name| std::env::var_os(name.as_str()).is_none_or(|value| value.is_empty()))
+        .cloned()
+        .collect()
+}
+
+fn provider_block(
+    field: &BTreeMap<String, Value>,
+    runtime: &str,
+    what: &str,
+) -> Result<Option<Map<String, Value>>, LaunchError> {
+    match field.get(runtime) {
+        None => Ok(None),
+        Some(Value::Object(map)) => Ok(Some(map.clone())),
+        Some(_) => Err(LaunchError::config(format!("{what} must be a JSON object"))),
+    }
+}
+
+/// Provider configuration is data the harness reads, so a credential VALUE in it
+/// would be written into the injected configuration string. Reject that: the
+/// harness's own `{env:VAR}` indirection resolves against the mapped child
+/// environment instead.
+fn reject_literal_secrets(
+    blocks: &[&Map<String, Value>],
+    names: &[&str],
+) -> Result<(), LaunchError> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let text = serde_json::to_string(blocks).unwrap_or_default();
+    for name in names {
+        // Short values collide with ordinary words; a real credential is long.
+        if let Some(value) = std::env::var(name).ok().filter(|v| v.len() >= 8) {
+            if text.contains(&value) {
+                return Err(LaunchError::config(format!(
+                    "provider configuration embeds the value of {name}; reference it as {{env:{name}}} instead"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Everything a harness needs from a profile, resolved and fail-closed.
+pub fn resolve(
+    runtime: &str,
+    name: &str,
+    profile: &ModelProfile,
+) -> Result<Selection, LaunchError> {
+    let provider = profile
+        .providers
+        .get(runtime)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            LaunchError::config("model profile has no provider binding for this harness")
+        })?
+        .clone();
+    let mapping = credentials(profile, runtime)?;
+    let unset = missing(&mapping.required);
+    if !unset.is_empty() {
+        return Err(LaunchError::config(format!(
+            "model profile '{name}' requires environment variables that are unset: {}",
+            unset.join(", ")
+        )));
+    }
+    let provider_options = provider_block(&profile.provider_options, runtime, "providerOptions")?;
+    let provider_definition =
+        provider_block(&profile.provider_definition, runtime, "providerDefinition")?;
+    let blocks: Vec<&Map<String, Value>> = provider_options
+        .iter()
+        .chain(provider_definition.iter())
+        .collect();
+    let declared = profile
+        .credential_env
+        .as_ref()
+        .map(CredentialEnv::names)
+        .unwrap_or_default();
+    reject_literal_secrets(&blocks, &declared)?;
+    Ok(Selection {
+        provider,
+        model: profile.model.clone(),
+        effort: profile.effort.clone(),
+        profile: Some(name.to_string()),
+        credentials: mapping.pairs,
+        provider_options,
+        provider_definition,
+    })
 }
 
 pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Selection, LaunchError> {
@@ -49,74 +288,28 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
                 model: model.into(),
                 effort: options.effort.clone(),
                 profile: None,
-                credential_env: None,
-                credential_target: None,
+                credentials: Vec::new(),
+                provider_options: None,
+                provider_definition: None,
             });
         }
     }
-    let configured: ProfileConfig = serde_json::from_value(
-        config
-            .get("runtimes")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({})),
-    )
-    .map_err(|_| LaunchError::config("invalid runtime model profile configuration"))?;
-    let name = options
-        .profile
-        .as_deref()
-        .or(configured.default_model_profile.as_deref())
-        .unwrap_or("zai-flash");
-    let bundled: BTreeMap<String, ModelProfile> =
-        serde_json::from_str(include_str!("../../../defaults/model-profiles.json"))
-            .expect("bundled profiles");
-    let profile = configured
-        .model_profiles
-        .get(name)
-        .or_else(|| bundled.get(name))
-        .ok_or_else(|| LaunchError::config("unknown model profile"))?
-        .clone();
-    if profile.model.trim().is_empty()
-        || profile.effort.as_ref().is_some_and(|s| s.trim().is_empty())
-    {
-        return Err(LaunchError::config("model profile has an empty model or effort"));
-    }
-    for name in profile
-        .credential_env
-        .iter()
-        .chain(profile.credential_targets.values())
-    {
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(LaunchError::config(
-                "credential mapping must contain environment variable names, not values",
-            ));
+    let (name, profile) = lookup(options.profile.as_deref(), config)?;
+    let mut selection = resolve(runtime, &name, &profile)?;
+    if let Some(model) = options.model.clone() {
+        if model != profile.model {
+            return Err(LaunchError::config("bare model differs from the selected profile; use provider/model or define a model profile"));
         }
     }
-    let provider = profile
-        .providers
-        .get(runtime)
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            LaunchError::config("model profile has no provider binding for this harness")
-        })?
-        .clone();
-    let model = options.model.clone().unwrap_or(profile.model.clone());
-    if model != profile.model {
-        return Err(LaunchError::config("bare model differs from the selected profile; use provider/model or define a model profile"));
+    if let Some(effort) = options.effort.clone() {
+        selection.effort = Some(effort);
     }
-    let effort = options.effort.clone().or(profile.effort);
-    if let Some(e) = &effort {
+    if let Some(e) = &selection.effort {
         if !profile.allowed_efforts.is_empty() && !profile.allowed_efforts.contains(e) {
             return Err(LaunchError::config(
                 "reasoning effort is unsupported by the selected model profile",
             ));
         }
     }
-    Ok(Selection {
-        provider,
-        model,
-        effort,
-        profile: Some(name.into()),
-        credential_env: profile.credential_env,
-        credential_target: profile.credential_targets.get(runtime).cloned(),
-    })
+    Ok(selection)
 }
