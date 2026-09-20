@@ -1828,6 +1828,25 @@ enum TokensAction {
         /// a model name the classifier does not know.
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
+
+        /// Spawning role name — the second half of the prompt-cache affinity
+        /// key (issue #8146). Read from the `LOOM_ROLE` env var (already in
+        /// every spawner's environment, no shell-side passing needed) rather
+        /// than requiring `--role` on the command line, so an older daemon
+        /// binary that predates this field simply never reads it — no
+        /// capability probe required on the caller's side. When affinity is
+        /// configured (`tokens.cacheAffinity.enabled`, off by default),
+        /// selection *prefers* the account that most recently ran this same
+        /// `(workspace, role)`, provided that account is still spawnable
+        /// under every existing exclusion rule, the record is inside the
+        /// TTL, and its 5h utilization is under the quota guard. Omitted —
+        /// or with affinity unconfigured — selection is unchanged.
+        /// `claude-wrapper.sh`'s post-failure rotation paths deliberately
+        /// run this subcommand under `env -u LOOM_ROLE`, so a retry after a
+        /// concurrent-session limit is never steered back onto the account
+        /// that just failed.
+        #[arg(long, value_name = "ROLE", env = "LOOM_ROLE")]
+        role: Option<String>,
     },
 
     /// Materialize `.loom/tokens/` from `ACCOUNT_*_N` triples, merging by email

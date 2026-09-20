@@ -402,7 +402,113 @@ Tokens marked bad in `.loom/tokens/.bad_tokens` are skipped at every tier.
 CLAUDE_CODE_OAUTH_TOKEN=...` / `export LOOM_TOKEN_NAME=...` lines (plus a
 non-exported `LOOM_TOKEN_MODE=...`) so callers `eval` the output directly
 instead of round-tripping through a JSON parser; `--auto-unpin` runs the
-pinned-account auto-recovery pre-flight (see below) before selecting.
+pinned-account auto-recovery pre-flight (see below) before selecting, and
+`--role <name>` supplies the prompt-cache affinity key described next.
+
+### Prompt-cache affinity: a preference tier, off by default (issue #8146)
+
+Anthropic's prompt cache is scoped **per account**. A role tick therefore reads
+its ~20–80k-token injected prefix (Claude Code system prompt + tool schemas +
+repo `CLAUDE.md` + the expanded role prompt) from cache only when it lands on
+the same account as the previous tick of that same `(repo, role)`. Measured
+over 378 role ticks on one host: ticks whose previous same-role tick <60 min
+ago ran on the **same** account were a full prefix hit **65%** of the time;
+ticks that landed on a different account, **1.4%**. The caching machinery
+already works — rotation is what keeps it from paying off.
+
+When enabled, selection **prefers** the account that most recently ran the same
+`(workspace, role)`. State lives in `.loom/tokens/.cache_affinity`, a JSON
+`{"<workspace>|<role>": {"account": ..., "at": ...}}` map written next to
+`.ranking` / `.bad_tokens` / `.failure_counts` and pruned of records older than
+7 days on each write.
+
+**It is a preference, never a constraint.** The implementation
+(`tokens_pool::affinity`) can only return an *index into a candidate list one of
+the three tiers already built*, so an affine account that is rate-limited,
+bad-marked, `.ranking`-hard-excluded, non-Claude, pinned out by `.allowlist`, or
+over the tier-1 load gate is passed over exactly as it is today. There is no
+path by which affinity admits an account the existing algorithm refused, and
+none by which it changes *which* tier fires. In the ranked tier the rotation
+cursor is left un-advanced on an affine pick, so the spread of the spawns that
+do rotate is unaffected.
+
+Three bounds keep it from defeating the rotation the pool exists for:
+
+| Bound | Default | Why |
+|---|---|---|
+| **Off unless configured** | disabled | An unconfigured pool behaves bit-for-bit as before, and never grows a `.cache_affinity` file. |
+| **TTL** | 3600 s | The observed cache window is ~1h (a hit was recorded 56 min after the warming tick). Past it there is nothing left to hit. |
+| **Quota guard** | 0.50 of the 5h window | Affinity is withdrawn unless the affine account's own `5h_util` is *measured* and strictly below the threshold, so one repo's load cannot concentrate on one account. Deliberately stricter than the 0.70 tier-1 load gate — a cache hit is never worth trading quota headroom for. |
+
+**The quota guard requires evidence, and this is the one operational
+prerequisite.** An *unknown* 5h utilization — no `.ranking` row for the affine
+account, a legacy 2-field row, or no `.ranking` file at all — withdraws the
+preference rather than waiving the guard. That deliberately inverts the tier-1
+load gate's "unknown → never gated" rule (#4195), because the two fail in
+opposite directions: the load gate is an *exclusion*, so gating on unknown
+there could empty a live pool, whereas this guard only chooses whether to
+express a preference among candidates a tier already admitted, so failing
+closed costs one cache hit and nothing else. It matters because the record's
+timestamp is refreshed on every reuse — a role ticking more often than once per
+TTL stays pinned indefinitely, and the quota guard is then the *only* live
+bound on concentration; waiving it whenever telemetry is missing would make
+that bound vacuous exactly when a pool is least observable.
+
+Practically: **affinity needs `tokens check --ranking` to be running** (the
+daemon's ranking refresher does this on a 600 s cadence by default). On a pool
+with no ranking data the feature stays inert. An operator who wants it anyway
+can set `maxUtil5h` above `1.0`, which disables the guard outright — the same
+escape hatch `LOOM_TOKEN_5H_LOAD_GATE` has. Unlike tier 1, the `.ranking` is
+read at **any** age here: a stale-but-low measurement is still evidence the
+account is not saturated, and a stale-but-high one still withdraws.
+
+The record always follows the account that *actually ran*, never the one merely
+preferred, so a withdrawn preference costs one cache miss rather than causing a
+tick-by-tick thrash: once some rule pushes a key off its affine account, the
+replacement becomes the new affine account and the key warms up there.
+
+Config (`.loom/config.json`) and env overrides, **env > config > default** like
+every other knob:
+
+```jsonc
+{
+  "tokens": {
+    "cacheAffinity": {
+      "enabled": true,        // LOOM_TOKEN_CACHE_AFFINITY=1|0
+      "ttlSeconds": 3600,     // LOOM_TOKEN_CACHE_AFFINITY_TTL
+      "maxUtil5h": 0.50,      // LOOM_TOKEN_CACHE_AFFINITY_MAX_UTIL (>1.0 disables the guard)
+      "roles": ["judge", "guide", "curator", "doctor", "champion", "auditor"]
+    }
+  }
+}
+```
+
+`roles` (env: `LOOM_TOKEN_CACHE_AFFINITY_ROLES`, comma-separated) scopes the
+preference; **empty or absent means every role**. It exists because sweeps are
+the harder case, explicitly deferred to a second phase: they spawn as
+`LOOM_ROLE=sweep-lifecycle`, their parallel waves deliberately fan out across
+accounts, and each sweep's prompt carries a different issue number anyway, so
+the cache upside is smaller and the concentration risk larger. Listing only the
+support roles is the recommended first configuration.
+
+The key is populated from `LOOM_ROLE`, which `tokens select`'s `--role` arg
+reads straight from the environment (`spawn-claude.sh` passes nothing extra on
+the command line — the env var is already present in its own environment, and
+a daemon binary predating the `--role` field simply never reads it, no
+shell-side capability probe required).
+
+That env pickup is exactly why `claude-wrapper.sh`'s three post-failure
+rotation `tokens select` calls are each invoked as `env -u LOOM_ROLE
+"${daemon_bin}" tokens select …`: LOOM_ROLE *is* inherited all the way into the
+wrapper, so without the explicit unset the affinity key would be live on those
+paths too. `reselect_account_no_mark()` is the load-bearing one — it handles a
+concurrent-session-limit fault and deliberately does **not** bad-mark, so the
+saturated account is still a candidate and an active affinity key would name it
+as the preferred one, re-picking the account the retry exists to move away from.
+The other two bad-mark first, so the affine account is already excluded there;
+they unset it anyway, so the invariant holds end-to-end and a rotation never
+re-records the affinity key. `test-token-cache-affinity.sh` is the regression
+guard for all three.
 
 ### `.ranking` status exclusions reach every tier (issue #5629)
 

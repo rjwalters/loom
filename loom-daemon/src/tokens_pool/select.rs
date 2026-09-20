@@ -41,6 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::account_registry::AccountProvider;
+use super::affinity::Affinity;
 use super::bad_tokens::{
     blocking_entry, blocking_entry_in_dir, exhaustion_cooldown_secs, is_bad_for_class,
     latest_block_was_session_limit, EXHAUSTION_COOLDOWN_ENV,
@@ -626,6 +627,26 @@ fn read_ranking(ranking_file: &Path) -> Vec<(String, String, Option<f64>)> {
         .collect()
 }
 
+/// `name`'s 5h-window utilization from this pool's `.ranking`, when the row
+/// carries one (issue #4195's optional third field). `None` for an unranked
+/// account, a legacy 2-field row, or an unparseable field — never coerced to
+/// `0.0`.
+///
+/// Read at **any** ranking age, unlike the tier-1 load gate, which only runs
+/// on a fresh `.ranking`. Its sole consumer is [`super::affinity`]'s quota
+/// guard (#8146), and there `None` **withdraws** the preference rather than
+/// waiving the guard — the opposite of the load gate's "unknown → not gated".
+/// The asymmetry is deliberate and is explained at
+/// [`super::affinity::under_quota_guard`]: gating on unknown can only ever
+/// fall back to ordinary rotation, whereas the load gate would shrink the
+/// candidate set.
+pub(super) fn ranking_util_5h(tokens_dir: &Path, name: &str) -> Option<f64> {
+    read_ranking(&tokens_dir.join(".ranking"))
+        .into_iter()
+        .find(|(row_name, _, _)| row_name == name)
+        .and_then(|(_, _, util)| util)
+}
+
 fn read_allowlist_lines(allowlist_file: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(allowlist_file) else {
         return Vec::new();
@@ -752,7 +773,8 @@ fn collect_ranked_candidates(
 }
 
 /// Strategy 1: read `.ranking`, rotate one-per-account across eligible
-/// entries.
+/// entries — unless `affinity` names one of those same eligible entries
+/// (#8146), in which case the rotation cursor steps aside for it.
 fn try_ranking(
     tokens_dir: &Path,
     ranking_file: &Path,
@@ -760,6 +782,7 @@ fn try_ranking(
     rng: &mut Rng,
     manifest: &HashMap<String, ManifestRow>,
     model_class: Option<&str>,
+    affinity: &Affinity,
 ) -> Option<SelectedToken> {
     let age = file_age_seconds(ranking_file)?;
     if age >= RANKING_FRESH_SECONDS {
@@ -793,6 +816,15 @@ fn try_ranking(
     }
     if eligible.is_empty() {
         return None;
+    }
+    // Cache affinity (#8146) reorders *within* `eligible` only — whatever the
+    // passes above refused (hard-excluded, bad-marked, non-Claude, over the
+    // load gate, outside the spread-top-N window) is not in this slice and
+    // therefore cannot be picked. The rotation cursor is deliberately left
+    // un-advanced: an affine pick is not a rotation, and consuming a cursor
+    // slot for it would skew the spread of the spawns that do rotate.
+    if let Some(index) = affinity.pick(&eligible, |token| token.name.clone()) {
+        return Some(eligible.swap_remove(index));
     }
     let index = next_rotation_index(tokens_dir, eligible.len(), rng);
     Some(eligible.swap_remove(index))
@@ -844,6 +876,7 @@ fn try_allowlist(
     rng: &mut Rng,
     exclude: &HashSet<String>,
     model_class: Option<&str>,
+    affinity: &Affinity,
 ) -> Option<SelectedToken> {
     if !allowlist_file.is_file() {
         return None;
@@ -858,6 +891,13 @@ fn try_allowlist(
         return None;
     }
     rng.shuffle(&mut eligible);
+    // #8146: promote the affine account to the front of the already-filtered,
+    // already-shuffled list. `exclude` and the `is_bad` filter above have
+    // already run, so this can only reorder accounts this tier would have been
+    // willing to hand out anyway.
+    if let Some(index) = affinity.pick(&eligible, |file| stem(file)) {
+        eligible.swap(0, index);
+    }
     for token_file in eligible {
         let Ok(key) = read_token_file(&token_file) else {
             continue;
@@ -886,6 +926,7 @@ fn try_random(
     rng: &mut Rng,
     exclude: &HashSet<String>,
     model_class: Option<&str>,
+    affinity: &Affinity,
 ) -> Option<SelectedToken> {
     let mut candidates: Vec<PathBuf> = list_token_files(tokens_dir)
         .into_iter()
@@ -897,6 +938,11 @@ fn try_random(
         return None;
     }
     rng.shuffle(&mut candidates);
+    // #8146 — see `try_allowlist`: reordering only, within this tier's own
+    // already-filtered candidate set.
+    if let Some(index) = affinity.pick(&candidates, |file| stem(file)) {
+        candidates.swap(0, index);
+    }
     for token_file in candidates {
         let Ok(key) = read_token_file(&token_file) else {
             continue;
@@ -930,7 +976,7 @@ pub fn select_token(
     workspace: &Path,
     rng: Option<&mut Rng>,
 ) -> Result<SelectedToken, EmptyTokenPoolError> {
-    select_token_for_class(workspace, rng, None)
+    select_token_for_class_and_role(workspace, rng, None, None)
 }
 
 /// [`select_token`], skipping only accounts bad-marked **for the model class
@@ -962,20 +1008,7 @@ pub fn select_token_for_model(
     rng: Option<&mut Rng>,
     model: Option<&str>,
 ) -> Result<SelectedToken, EmptyTokenPoolError> {
-    let model_class = match model.map(str::trim).filter(|m| !m.is_empty()) {
-        Some(raw) => match super::bad_tokens::model_class_of(raw) {
-            Some(class) => Some(class),
-            None => {
-                eprintln!(
-                    "warning: model '{raw}' is not a recognized Claude model class; \
-                     selecting account-wide (no per-class skip)"
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    select_token_for_class(workspace, rng, model_class.as_deref())
+    select_token_for_model_and_role(workspace, rng, model, None)
 }
 
 /// [`select_token_for_model`] with an **already-normalized** class
@@ -990,8 +1023,95 @@ pub fn select_token_for_class(
     rng: Option<&mut Rng>,
     model_class: Option<&str>,
 ) -> Result<SelectedToken, EmptyTokenPoolError> {
-    let tokens_dir = resolve_tokens_dir(workspace);
+    select_token_for_class_and_role(workspace, rng, model_class, None)
+}
 
+/// [`select_token`], plus the `(workspace, role)` identity the prompt-cache
+/// affinity preference is keyed on (issue #8146).
+///
+/// `role` is the spawning role's name (`LOOM_ROLE`, e.g. `judge`,
+/// `sweep-lifecycle`), threaded in by `loom-daemon tokens select --role`.
+/// With `None` — or with affinity unconfigured, which is the default — this is
+/// bit-for-bit [`select_token`]: nothing is read, nothing is preferred, and no
+/// `.cache_affinity` file is written. See [`super::affinity`] for the bounds
+/// that apply when it *is* configured.
+///
+/// # Errors
+/// See [`select_token`].
+pub fn select_token_for_role(
+    workspace: &Path,
+    rng: Option<&mut Rng>,
+    role: Option<&str>,
+) -> Result<SelectedToken, EmptyTokenPoolError> {
+    select_token_for_class_and_role(workspace, rng, None, role)
+}
+
+/// [`select_token_for_class_and_role`] taking a **raw** model alias or pinned
+/// ID rather than an already-normalized class. This is `tokens select`'s own
+/// entry point: the CLI carries both `--model` (#8058) and the `LOOM_ROLE`-fed
+/// `--role` (#8146), and the two narrowings are orthogonal — the model class
+/// decides *which accounts are eligible*, the role only *reorders* accounts
+/// that are already eligible.
+///
+/// # Errors
+/// Same as [`select_token`].
+pub fn select_token_for_model_and_role(
+    workspace: &Path,
+    rng: Option<&mut Rng>,
+    model: Option<&str>,
+    role: Option<&str>,
+) -> Result<SelectedToken, EmptyTokenPoolError> {
+    let model_class = match model.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(raw) => match super::bad_tokens::model_class_of(raw) {
+            Some(class) => Some(class),
+            None => {
+                eprintln!(
+                    "warning: model '{raw}' is not a recognized Claude model class; \
+                     selecting account-wide (no per-class skip)"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    select_token_for_class_and_role(workspace, rng, model_class.as_deref(), role)
+}
+
+/// The combined entry point both narrowings flow through: `model_class`
+/// (#8058) narrows the `.bad_tokens` skip to one model class, `role` (#8146)
+/// supplies the prompt-cache affinity key. Every other `select_token_*` above
+/// delegates here with one or both set to `None`, so the tier functions have
+/// exactly one signature to carry and the two features cannot drift apart.
+///
+/// Passing `None` for both reproduces [`select_token`] bit for bit.
+///
+/// # Errors
+/// Same as [`select_token`].
+pub fn select_token_for_class_and_role(
+    workspace: &Path,
+    rng: Option<&mut Rng>,
+    model_class: Option<&str>,
+    role: Option<&str>,
+) -> Result<SelectedToken, EmptyTokenPoolError> {
+    let tokens_dir = resolve_tokens_dir(workspace);
+    let affinity = Affinity::resolve(workspace, &tokens_dir, role);
+    let selected = select_inner(workspace, &tokens_dir, rng, model_class, &affinity)?;
+    // Record only after a token is actually in hand, so a failed selection
+    // never rewrites the key and steals the next spawn's cache hit.
+    affinity.record(&tokens_dir, &selected.name);
+    Ok(selected)
+}
+
+/// The 3-tier algorithm proper. Split out of
+/// [`select_token_for_class_and_role`] so the affinity record is written at
+/// exactly one place rather than at each of the five success returns below.
+fn select_inner(
+    workspace: &Path,
+    tokens_dir: &Path,
+    rng: Option<&mut Rng>,
+    model_class: Option<&str>,
+    affinity: &Affinity,
+) -> Result<SelectedToken, EmptyTokenPoolError> {
     if !tokens_dir.is_dir() {
         return Err(EmptyTokenPoolError(format!(
             "Token directory does not exist: {}{}. Run `loom-daemon tokens bootstrap` to populate it \
@@ -1001,7 +1121,7 @@ pub fn select_token_for_class(
         )));
     }
 
-    let all_tokens = list_token_files(&tokens_dir);
+    let all_tokens = list_token_files(tokens_dir);
     if all_tokens.is_empty() {
         return Err(EmptyTokenPoolError(format!(
             "No .token files in {}{}. Run `loom-daemon tokens bootstrap` \
@@ -1026,10 +1146,10 @@ pub fn select_token_for_class(
     // #5609 (design D8/D9): `index.json` rows keyed by name, consulted below
     // both to skip a non-Claude account and to carry `upstream_id` through to
     // the caller. A pool with no manifest is an empty map — fail-open, D6/D8.
-    let manifest = read_manifest_index(&tokens_dir);
+    let manifest = read_manifest_index(tokens_dir);
 
     if let Some(selected) =
-        try_ranking(&tokens_dir, &ranking_file, workspace, rng, &manifest, model_class)
+        try_ranking(tokens_dir, &ranking_file, workspace, rng, &manifest, model_class, affinity)
     {
         return Ok(selected);
     }
@@ -1044,7 +1164,7 @@ pub fn select_token_for_class(
     //   advisory   — other non-healthy statuses from a *stale* ranking
     //                (#3894); readmitted by the fail-safe if they would empty
     //                the pool.
-    let hard_map = ranking_hard_exclusions(&tokens_dir, &ranking_file);
+    let hard_map = ranking_hard_exclusions(tokens_dir, &ranking_file);
     let mut hard: HashSet<String> = hard_map.keys().cloned().collect();
     let non_claude: HashSet<String> = manifest
         .iter()
@@ -1056,12 +1176,14 @@ pub fn select_token_for_class(
     exclude.extend(hard.iter().cloned());
 
     if let Some(mut selected) =
-        try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &exclude, model_class)
+        try_allowlist(tokens_dir, &allowlist_file, workspace, rng, &exclude, model_class, affinity)
     {
         selected.upstream_id = upstream_id_for(&manifest, &selected.name);
         return Ok(selected);
     }
-    if let Some(mut selected) = try_random(&tokens_dir, workspace, rng, &exclude, model_class) {
+    if let Some(mut selected) =
+        try_random(tokens_dir, workspace, rng, &exclude, model_class, affinity)
+    {
         selected.upstream_id = upstream_id_for(&manifest, &selected.name);
         return Ok(selected);
     }
@@ -1073,12 +1195,14 @@ pub fn select_token_for_class(
     // non-Claude provider, is still never handed out.
     if exclude.len() > hard.len() {
         if let Some(mut selected) =
-            try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &hard, model_class)
+            try_allowlist(tokens_dir, &allowlist_file, workspace, rng, &hard, model_class, affinity)
         {
             selected.upstream_id = upstream_id_for(&manifest, &selected.name);
             return Ok(selected);
         }
-        if let Some(mut selected) = try_random(&tokens_dir, workspace, rng, &hard, model_class) {
+        if let Some(mut selected) =
+            try_random(tokens_dir, workspace, rng, &hard, model_class, affinity)
+        {
             selected.upstream_id = upstream_id_for(&manifest, &selected.name);
             return Ok(selected);
         }
@@ -1112,10 +1236,17 @@ pub fn select_token_for_class(
         tokens_dir.display(),
         deciding_binary_identity(),
         exhaustion_cooldown_secs(),
-        shadowed_shared_pool_hint(&tokens_dir),
+        shadowed_shared_pool_hint(tokens_dir),
     )))
 }
 
 #[cfg(test)]
 #[path = "select_tests.rs"]
 mod tests;
+
+/// Integration tests for the cache-affinity preference tier (#8146). A sibling
+/// of [`tests`] rather than a section of it: that file is over the file-size
+/// ratchet, so new tests go in a new module instead of growing it.
+#[cfg(test)]
+#[path = "select_affinity_tests.rs"]
+mod affinity_tests;
