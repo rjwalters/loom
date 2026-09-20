@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-20
+- **Issue #8326** (closed): build-gate.sh runs `cargo test`, the shared-process runner `.config/nextest.toml` exists to avoid
+- **PR #8417**: fix(build-gate): prefer `cargo nextest run` over the shared-process `cargo test` (#8326)
+- **Issue #8306** (closed): dashboard: web UI — running-now panel + elastic-spend-this-period view for ephemeral_compute (Phase 3 of #8257)
+- **PR #8419**: feat(dashboard): running-now panel + elastic spend view for ephemeral_compute (#8306)
 - **Issue #8248** (closed): A green ratchet check goes stale when the baseline tightens under an in-flight PR — this is what broke main
 - **PR #8416**: fix(merge): a stale green ratchet result is not merge evidence — freshness guard + narrow --update (#8248)
 - **Issue #8328** (closed): Two loom-daemon unit tests fail on a live-daemon host by reading inherited LOOM_* env (escalate::decide, registry_refresh)
