@@ -335,8 +335,26 @@ assert_deny_env "rmScope repo (#6805): WT=/; rm -rf \"\$WT/usr\" still denies (r
     "LOOM_RM_SCOPE=repo" 'WT=/; rm -rf "$WT/usr"' "$REPO_ROOT"
 # A `..` inside the suffix is collapsed by normalize_abs_path() BEFORE the
 # scope check, so it cannot climb out of the resolved literal unnoticed.
+# NB: the climb count must not assume a checkout depth (#8013). Hard-coding
+# six `../` only escapes when the suite runs from a depth-3 checkout: from a
+# linked worktree (.loom/worktrees/issue-N adds three components) the same six
+# climbs can resolve INSIDE the repo — and for /private-tmp-rooted checkouts
+# onto the ephemeral temp allowlist — yielding an allow where deny is asserted.
+# Build the climb instead: three `../` return from $WT to $REPO_ROOT, then one
+# per component of $REPO_ROOT itself, so the resolved target is always
+# /etc/foo — genuinely outside the repo at ANY checkout depth.
+_rm_scope_up=""
+for (( _rm_scope_i = 0; _rm_scope_i < 3; _rm_scope_i++ )); do _rm_scope_up+="../"; done
+_rm_scope_rest="${REPO_ROOT#/}"
+while [[ $_rm_scope_rest == */* ]]; do
+    _rm_scope_up+="../"
+    _rm_scope_rest="${_rm_scope_rest#*/}"
+done
+_rm_scope_up+="../"    # the final component (no trailing slash to strip)
+unset _rm_scope_rest _rm_scope_i
 assert_deny_env "rmScope repo (#6805): suffix with ../ escaping the repo still denies" \
-    "LOOM_RM_SCOPE=repo" "WT=$REPO_ROOT/.loom/worktrees/issue-1; rm -rf \"\$WT/../../../../../../etc/foo\"" "$REPO_ROOT"
+    "LOOM_RM_SCOPE=repo" "WT=$REPO_ROOT/.loom/worktrees/issue-1; rm -rf \"\$WT/${_rm_scope_up}etc/foo\"" "$REPO_ROOT"
+unset _rm_scope_up
 # A suffix that itself carries a SECOND unresolved expansion is not a literal —
 # fail closed.
 assert_deny_env "rmScope repo (#6805): suffix containing another unresolved var still denies" \
