@@ -157,6 +157,9 @@ impl PoolHoldState {
     /// for, and it is what keeps a multi-hour outage from producing one log
     /// line per tick per root.
     pub fn observe_root(&self, root: &Path, now: DateTime<Utc>) -> bool {
+        if crate::worker_spawn::uses_native_sweep(root) {
+            return false;
+        }
         let pool = spawnable_pool_state(root);
         // `total == 0` is the ABSENT-pool condition (#4642), not this one —
         // see the module doc. Falling through to the clear path below is

@@ -1420,12 +1420,10 @@ impl SweepRegistry {
     /// unreadable ranking degrades to `true` (proceed) — matching current
     /// behavior where the spawn-time selector makes its own choice.
     pub(crate) fn token_pool_has_capacity(&self) -> bool {
-        let ranking = self
-            .config
-            .workspace_root
-            .join(".loom")
-            .join("tokens")
-            .join(".ranking");
+        if crate::worker_spawn::uses_native_sweep(&self.config.workspace_root) {
+            return true;
+        }
+        let ranking = self.config.workspace_root.join(".loom/tokens/.ranking");
         match std::fs::read_to_string(&ranking) {
             Ok(contents) => ranking_has_capacity(&contents),
             Err(_) => true,

@@ -222,6 +222,7 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/metrics/",
     ".loom/usage-cache.json",
     ".loom/claude-config/",
+    ".loom/native-tools/",
     // Secret-bearing token pool + repo-local account source (#3695). These
     // hold OAuth keys and must never be committed.
     ".loom/tokens/",
@@ -886,6 +887,7 @@ mod tests {
             ".loom/metrics/",
             ".loom/usage-cache.json",
             ".loom/claude-config/",
+            ".loom/native-tools/",
             // #5014: per-repo token-pool health cache + its sibling mkdir lock.
             ".loom/account-health.json",
             ".loom/account-health.lock",

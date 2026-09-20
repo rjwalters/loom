@@ -26,6 +26,8 @@ impl Harness {
         options: &Options,
         selection: &Selection,
         prompt: Option<&str>,
+        root: &std::path::Path,
+        guarded: bool,
     ) -> Result<Command, LaunchError> {
         let bin_key = match self {
             Self::Pi => "LOOM_PI_BIN",
@@ -38,6 +40,7 @@ impl Harness {
         let mut command = Command::new(bin);
         let cwd = std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?;
         command.env("PWD", &cwd);
+        command.env("LOOM_NATIVE_WORKER_PID", std::process::id().to_string());
         if let (Some(source), Some(target)) =
             (&selection.credential_env, &selection.credential_target)
         {
@@ -47,6 +50,15 @@ impl Harness {
         }
         match self {
             Self::Pi => {
+                if guarded {
+                    crate::native_tools::provision::configure(
+                        &mut command,
+                        root,
+                        self.name(),
+                        &format!("{}/{}", selection.provider, selection.model),
+                    )
+                    .map_err(|e| LaunchError::config(e.to_string()))?;
+                }
                 command.args([
                     "--provider",
                     &selection.provider,
@@ -71,6 +83,15 @@ impl Harness {
                         .args(["run", "--format", "json"])
                         .arg("--dir")
                         .arg(&cwd);
+                }
+                if guarded {
+                    crate::native_tools::provision::configure(
+                        &mut command,
+                        root,
+                        self.name(),
+                        &format!("{}/{}", selection.provider, selection.model),
+                    )
+                    .map_err(|e| LaunchError::config(e.to_string()))?;
                 }
                 command.args([
                     "--model",

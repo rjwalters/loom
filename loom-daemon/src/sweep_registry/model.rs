@@ -76,7 +76,12 @@ pub fn resolve_dispatch_model(repo_root: &Path, explicit: Option<&str>) -> (Stri
     } else if let Some(m) = read_autonomous_model(repo_root) {
         (m, ModelSource::Config)
     } else {
-        (DEFAULT_DISPATCH_MODEL.to_string(), ModelSource::Default)
+        let default = if crate::worker_spawn::uses_native_sweep(repo_root) {
+            ""
+        } else {
+            DEFAULT_DISPATCH_MODEL
+        };
+        (default.to_string(), ModelSource::Default)
     };
     // Issue #3982: resolve the logical tier/alias to the concrete model ID before
     // it goes on the wire. This is the daemon's half of the single indirection
@@ -398,6 +403,15 @@ pub fn resolve_autonomous_dispatch_model_lazy(
     complexity: impl FnOnce() -> Option<String>,
 ) -> ExperimentDispatchModel {
     use crate::script_helpers::sweep_experiment as se;
+    if crate::worker_spawn::uses_native_sweep(repo_root) {
+        let (model, _) = resolve_dispatch_model(repo_root, None);
+        return ExperimentDispatchModel {
+            model,
+            mode: "off".into(),
+            arm: None,
+            source_label: "native-profile",
+        };
+    }
 
     let config = crate::config_resolver::resolve_effective_config(repo_root);
     let env_mode = std::env::var("LOOM_MODEL_EXPERIMENT").ok();

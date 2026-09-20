@@ -11,7 +11,7 @@ special cases.
 Pi and OpenCode have experimental **native Rust** adapters behind the same
 worker entry point. Harness selection, model profiles and trial evidence are
 separate: see [Native harness and model trials](runtime-model-trials.md).
-Neither adapter is admitted for Builder, Doctor, Judge or full sweeps yet.
+Guarded issue roles and sweeps: [native guardrail parity](guardrail-parity-native.md).
 
 > **Path convention.** This doc lives at `defaults/docs/runtime-adapters.md` in
 > the Loom source repo and cites `defaults/` paths throughout. A consumer
@@ -109,14 +109,14 @@ tier-1/tier-2:
   than exactly `"yes"` as unmet, so `"no"` fails closed identically to
   `"partial"`.
 - **Read-only admission is per-role, not automatic for the whole "read-only"
-  category.** `judge.json` declares `runtimeRequirements: ["mcp"]`, so a
-  tier-3 runtime with no MCP support (the honest default — see below) is
+  category.** `judge.json` declares `runtimeRequirements: ["loomControl"]`, so a
+  tier-3 runtime with no verified Loom control route is
   refused for Judge too, for the same reason it is refused for Builder: a
   declared `"no"` is not a declared `"yes"`. `curator.json`, `guide.json`, and
   `auditor.json` declare **no** `runtimeRequirements` today, so they are the
-  roles a no-MCP tier-3 runtime is actually admitted for (any runtime is
+  roles an unverified tier-3 runtime is actually admitted for (any runtime is
   trivially compatible with a role that declares no requirements). A tier-3
-  runtime that *does* support MCP can declare `mcp: "yes"` and pick up Judge
+  runtime with a verified control route can declare `loomControl: "yes"` and admit Judge
   too — the manifest is the single source of truth, not a hardcoded
   runtime-vs-role table.
 
@@ -456,7 +456,7 @@ separate issue (epic #4167, design pillar 2). Sketch:
 }
 ```
 
-Roles declare requirements (e.g. Builder needs `worktreeIsolation` + `mcp`;
+Roles declare requirements (e.g. Builder needs `worktreeIsolation` + `loomControl`;
 Judge needs read-only + forge access). Dispatch computes role → runtime
 compatibility and refuses to dispatch a role onto a runtime that cannot meet its
 requirements, rather than letting the session fail partway. The declaration is
@@ -469,10 +469,10 @@ by the standalone checker and daemon admission:
 - **Declaration** — `defaults/runtimes/<name>.json` (e.g.
   `defaults/runtimes/claude.json`), matching the sketch above exactly (tri-state
   `"yes" | "no" | "partial"` string values, capability set `mcp`, `subagents`,
-  `hooks`, `skills`, `worktreeIsolation`).
+  `hooks`, `skills`, `worktreeIsolation`, `loomControl`).
 - **Requirements** — an optional `"runtimeRequirements"` array on a role sidecar
   (`defaults/roles/<name>.json`), e.g. `"runtimeRequirements": ["worktreeIsolation",
-  "mcp"]` on `builder.json`. A role with no `runtimeRequirements` key has no
+  "loomControl"]` on `builder.json`. A role with no `runtimeRequirements` key has no
   constraints (any runtime is compatible). This is a distinct field from the
   pre-existing `suggestedWorkerType` (a dispatch *preference* hint) — the checker
   reads only `runtimeRequirements`, and `runtime_admission::resolve_and_admit`
@@ -523,7 +523,7 @@ there is no parity doc for tier-3 at all (see
 [Tier 3: generic passthrough](#tier-3-generic-passthrough)). The same "any
 non-`yes` value fails closed" matcher rule that enforces Codex's `partial`
 enforces this `no` identically — `--role builder --runtime aider` and
-`--role judge --runtime aider` (judge requires `mcp`, declared `"no"` here)
+`--role judge --runtime aider` (judge requires `loomControl`, declared `"no"` here)
 both exit 78, while `--role curator --runtime aider` exits 0 because
 `curator.json` declares no `runtimeRequirements` at all.
 
@@ -535,7 +535,7 @@ unchanged, deliberately: they are **evidence-gated**, and the remaining evidence
 is recorded machine-readably in `codex.json`'s `capabilityGate.pending` and in
 prose in [`guardrail-parity-codex.md`](guardrail-parity-codex.md) § "Promotion
 gate". Read that block before changing either value. `defaults/roles/doctor.json`
-also declares `["worktreeIsolation", "mcp"]` as of #4495 — Doctor mutates a
+now declares `["worktreeIsolation", "loomControl"]` — Doctor mutates a
 worktree exactly as Builder does, so it must fail closed for the same reason
 instead of slipping through with no constraints.
 

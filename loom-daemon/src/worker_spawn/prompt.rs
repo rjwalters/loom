@@ -14,20 +14,23 @@ pub fn expand(root: &Path, prompt: &str) -> Result<String, LaunchError> {
     };
     let canonical = crate::runtime_admission::canonical_role(role)
         .ok_or_else(|| LaunchError::config("unknown Loom role in prompt"))?;
-    let name = if canonical == "sweep-lifecycle" {
-        "sweep"
+    let (path, role_text) = if canonical == "sweep-lifecycle" {
+        (
+            std::path::PathBuf::from("bundled native-sweep.md"),
+            include_str!("../../../defaults/docs/native-sweep.md").to_string(),
+        )
     } else {
-        canonical
+        let installed = root.join(".loom/roles").join(format!("{canonical}.md"));
+        let path = if installed.is_file() {
+            installed
+        } else {
+            root.join("defaults/roles").join(format!("{canonical}.md"))
+        };
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            LaunchError::config(format!("cannot read role instructions {}: {e}", path.display()))
+        })?;
+        (path, text)
     };
-    let installed = root.join(".loom/roles").join(format!("{name}.md"));
-    let path = if installed.is_file() {
-        installed
-    } else {
-        root.join("defaults/roles").join(format!("{name}.md"))
-    };
-    let role_text = std::fs::read_to_string(&path).map_err(|e| {
-        LaunchError::config(format!("cannot read role instructions {}: {e}", path.display()))
-    })?;
     let mut expanded = format!(
         "Loom role instructions (source: {}):\n{}",
         path.display(),
@@ -44,5 +47,6 @@ pub fn expand(root: &Path, prompt: &str) -> Result<String, LaunchError> {
                 .push_str(&format!("\n\nRepository instructions ({}):\n{text}", path.display()));
         }
     }
+    expanded.push_str("\n\nNative runtime: use loom_read/loom_edit/loom_write/loom_bash and Loom's CLI helpers. Do not invoke model workers or unavailable MCP/Task tools. Execute this role in the current session. Guard denials are failures, not approval prompts.\n");
     Ok(expanded)
 }

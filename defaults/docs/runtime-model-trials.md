@@ -12,10 +12,9 @@ stub. No background daemon or MCP server is needed for a free-form trial.
   settings and credential environment mapping. `defaults/model-profiles.json`
   is bundled in the binary. Configuration can add or replace profiles under
   `runtimes.modelProfiles`; no new launcher is needed to add a model.
-- **Capability admission** remains Loom's role-specific gate. Neither adapter
-  has verified Loom guard/MCP parity. Builder, Doctor, Judge and full sweeps
-  remain refused. OpenCode supports MCP upstream; this integration does not
-  claim that the Loom server is provisioned or its guards enforced.
+- **Capability admission** remains Loom's role-specific gate. Role launches now use [guarded native tools](guardrail-parity-native.md) for
+  Builder, Doctor, Judge and sequential sweeps. MCP remains unprovisioned;
+  `loomControl` records the verified CLI route independently of transport.
 - **Evaluation** is external to the worker: freeze inputs, retain raw events,
   run independent acceptance checks, and include failures and repairs. A CLI
   exit status alone does not establish that an issue was solved.
@@ -56,8 +55,8 @@ LOOM_RUNTIME=opencode loom-daemon spawn-worker -- --profile zai-flash \
 ```
 
 Pi's tools execute without interactive approval. OpenCode's Loom skip-permission
-flag maps to `run --auto`, which still respects explicit denials. Neither is a
-Loom worktree guard. The actual working directory is preserved; OpenCode gets
+flag maps to `run --auto`, which still respects explicit denials. Role launches separately provision Loom
+guarded tools; free-form trials use the ordinary harness tools. The actual working directory is preserved; OpenCode gets
 an explicit `--dir` so an inherited stale `PWD` cannot redirect a trial.
 
 The compatibility entry point accepts the same worker options:

@@ -157,7 +157,7 @@ impl std::error::Error for ExecError {}
 /// [`ExecError::Spawn`] if the child could not be started; [`ExecError::Collect`]
 /// if it started but waiting on it failed.
 pub fn run_bounded(cmd: Command, timeout: Duration) -> Result<Completion, ExecError> {
-    run_bounded_inner(cmd, timeout)
+    run_bounded_cancellable(cmd, timeout, || false)
 }
 
 #[cfg(unix)]
@@ -192,7 +192,13 @@ fn terminate_group(pid: u32) {
 #[cfg(not(unix))]
 fn terminate_group(_pid: u32) {}
 
-fn run_bounded_inner(mut cmd: Command, timeout: Duration) -> Result<Completion, ExecError> {
+/// Run with cooperative cancellation, terminating the owned process group.
+/// Cancellation returns `Collect(Interrupted)` because side effects may have run.
+pub fn run_bounded_cancellable(
+    mut cmd: Command,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> Result<Completion, ExecError> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     place_in_own_process_group(&mut cmd);
 
@@ -228,6 +234,16 @@ fn run_bounded_inner(mut cmd: Command, timeout: Duration) -> Result<Completion, 
             }
         }
 
+        if cancelled() {
+            terminate_group(pid);
+            let _ = child.wait();
+            let _ = collect(&stdout_rx, DRAIN_GRACE);
+            let _ = collect(&stderr_rx, DRAIN_GRACE);
+            return Err(ExecError::Collect(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "execution cancelled; process group terminated",
+            )));
+        }
         if Instant::now() >= deadline {
             terminate_group(pid);
             let _ = child.wait();
