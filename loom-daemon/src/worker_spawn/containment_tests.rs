@@ -33,6 +33,7 @@ fn clear_env() {
         "LOOM_SWEEP_INFLIGHT_SWEEPS",
         "LOOM_SWEEP_CONTAINER_RESERVED_MEMORY_MB",
         "LOOM_SWEEP_CLAIM_OWNED",
+        "CARGO_TARGET_DIR",
     ] {
         std::env::remove_var(key);
     }
@@ -299,6 +300,46 @@ fn an_absent_credential_var_is_not_forwarded() {
         "forwarding `-e NAME` for an unset NAME is noise at best: {args:?}"
     );
     assert!(args.iter().any(|a| a == "-e"), "sanity: -e flags are present");
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+#[test]
+fn a_redirected_cargo_cache_is_parity_mounted_and_forwarded() {
+    // MOUNT-CONTRACT.md §4: without this the contained sweep recompiles the
+    // world into a writable layer `--rm` then discards.
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    let cache = std::env::temp_dir().join(format!("loom-8403-cargo-{}", std::process::id()));
+    std::fs::create_dir_all(&cache).expect("cache dir");
+    std::env::set_var("CARGO_TARGET_DIR", &cache);
+    let args = build(&profile(None, Some("1g")), &[]);
+    let spec = format!("{0}:{0}", cache.display());
+    assert!(
+        args.contains(&spec),
+        "an out-of-workspace CARGO_TARGET_DIR must be parity-mounted: {args:?}"
+    );
+    assert!(
+        args.iter().any(|a| a == "CARGO_TARGET_DIR"),
+        "…and forwarded by name so the container's cargo uses it: {args:?}"
+    );
+    let _ = std::fs::remove_dir_all(&cache);
+    clear_env();
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+#[test]
+fn a_cargo_cache_inside_the_workspace_is_not_mounted_twice() {
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    std::env::set_var("CARGO_TARGET_DIR", "/srv/repo/target");
+    let args = build(&profile(None, Some("1g")), &[]);
+    assert!(
+        !args.iter().any(|a| a.starts_with("/srv/repo/target:")),
+        "the workspace parity mount already covers it: {args:?}"
+    );
+    clear_env();
     std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
 }
 

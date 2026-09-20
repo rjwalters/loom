@@ -4,7 +4,7 @@
 that **per-sweep ephemeral containers for native-harness (Pi / OpenCode)
 sweeps** run in — published by `.github/workflows/release.yml` FROM the
 same-version `ghcr.io/rjwalters/loom-worker:<version>` base image, so the two
-version in lockstep by construction, exactly like
+versions stay in lockstep by construction, exactly like
 [`loom-worker-session`](../session/README.md) does.
 
 Filed as issue #8403 (epic #6896 Phase 3). Full architecture context:

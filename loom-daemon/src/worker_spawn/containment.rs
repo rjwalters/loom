@@ -266,7 +266,7 @@ fn forwarded_by_name(name: &str) -> bool {
     }
     name.starts_with("LOOM_")
         || name.starts_with("SAFEHOUSE")
-        || matches!(name, "GH_TOKEN" | "GITHUB_TOKEN" | "NO_COLOR" | "TERM")
+        || matches!(name, "GH_TOKEN" | "GITHUB_TOKEN" | "NO_COLOR" | "TERM" | "CARGO_TARGET_DIR")
 }
 
 /// Build the `docker run` command that re-execs `spawn-worker.sh` inside the
@@ -441,6 +441,24 @@ fn extra_mounts(
     {
         if !dir.starts_with(workspace) && dir.is_dir() {
             out.push((dir.to_path_buf(), dir.display().to_string(), false));
+        }
+    }
+    // MOUNT-CONTRACT.md §4 (build-cache placement, #6013/#6014): a
+    // `CARGO_TARGET_DIR` redirect pointing OUTSIDE the workspace is
+    // parity-mounted read-write, so a contained sweep shares the host's warm
+    // build cache instead of recompiling the world into a writable layer that
+    // `--rm` then throws away. Env-only, deliberately narrower than
+    // `spawn-claude.sh`'s `loom_resolve_cargo_target_dir` (env → `cargo
+    // metadata` → `<root>/target`): a `build.target-dir` set in a config file
+    // is read identically by the CONTAINER's own cargo, so the worst case
+    // there is a cold cache in the ephemeral layer, never a failure.
+    if let Some(dir) = env_nonempty("CARGO_TARGET_DIR").map(PathBuf::from) {
+        if dir.is_absolute() && !dir.starts_with(workspace) {
+            let _ = std::fs::create_dir_all(&dir);
+            if dir.is_dir() {
+                let spec = dir.display().to_string();
+                out.push((dir, spec, false));
+            }
         }
     }
     out

@@ -136,7 +136,10 @@ for pattern in \
     'accounts\.env' \
     '\.loom/tokens/.*\.token' \
     'auth\.json'; do
-    if echo "$HISTORY" | grep -qE "$pattern"; then
+    # Here-string, not `echo … | grep -q`: under `pipefail` an early-exit
+    # consumer can SIGPIPE the producer and fail the whole pipeline
+    # (scripts/check-pipefail-early-exit.sh, #7060/#7771).
+    if grep -qE "$pattern" <<<"$HISTORY"; then
         fail "docker history matched a secret-shaped pattern: $pattern"
         SECRET_HIT=1
     fi

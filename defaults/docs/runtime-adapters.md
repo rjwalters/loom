@@ -1218,6 +1218,19 @@ re-exec'd copy sees the sentinel, dispatches bare, and does its prompt expansion
 and guarded-binding provisioning *there*, against the container's own isolated
 directories.
 
+**Mounts** follow `docker/worker/MOUNT-CONTRACT.md`: the workspace read-write at
+its identical absolute host path (§1, so git's absolute worktree pointers
+resolve the same inside and out), the git commit identity (`~/.gitconfig`) and —
+only when neither `GH_TOKEN` nor `GITHUB_TOKEN` is in the environment — `gh`'s
+config directory, both read-only and both remapped under the *container's* home
+rather than the host's (HOME is not path-parity-load-bearing; `gh`'s copy lands
+inside the redirected `XDG_CONFIG_HOME`, because `gh` honours XDG), a log
+directory that lives outside the workspace, and an out-of-workspace
+`CARGO_TARGET_DIR` (§4) so a contained sweep shares the host's warm build cache
+instead of recompiling into a layer `--rm` discards. Everything else on the host
+is simply absent — the "read-only view of everything outside the worktree" is
+the container boundary itself, not a flag.
+
 **Per-launch directory isolation** — the concrete problem this closes.
 Uncontained, `XDG_DATA_HOME` is not relocated per launch, so N concurrent native
 workers on one host share **one** `~/.local/share/opencode` session store and
