@@ -7,7 +7,6 @@
 //! sharpest pin available.
 
 use super::*;
-use chrono::TimeZone;
 
 fn run(name: &str, status: &str, conclusion: Option<&str>, started: Option<&str>) -> CheckRun {
     CheckRun {
