@@ -1715,6 +1715,18 @@ impl SweepRegistry {
                             // NOT remove it, and does not change the guard's
                             // fail-open contract for a genuine, memo-less
                             // outage.
+                            //
+                            // #8381: this seed lands BEFORE this same branch's
+                            // own `probe_open_linked_pr` call below, and a
+                            // fresh memo is a full short circuit there, so
+                            // that probe is deliberately served from the entry
+                            // written here — saving its forge round trip, and
+                            // (when the PR merged/closed before this reap)
+                            // yielding `Open` where a live probe would have
+                            // said `NoneOpen`. Both shapes are pinned by
+                            // `reap_seeded_memo_serves_this_branchs_own_open_pr_probe`
+                            // and
+                            // `reap_seeded_memo_for_a_closed_pr_arms_backoff_without_quarantine`.
                             if let Some(pr) = self.sampled_pr_number(&sweep_id) {
                                 self.record_open_pr_memo(issue, OpenPrProbe::Open(pr));
                             }

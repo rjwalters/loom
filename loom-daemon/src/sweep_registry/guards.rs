@@ -789,10 +789,19 @@ impl SweepRegistry {
     /// "probed open"; a future reader must not take a warm memo as proof a
     /// transport answered.
     ///
-    /// That inference is bounded and deliberately conservative: it can only be
-    /// wrong for a PR that closed within [`OPEN_PR_MEMO_FRESH`] of its own
-    /// creation, and being wrong defers a dispatch by at most that window
-    /// rather than dispatching onto a live PR. Without it, the very first
+    /// That inference is bounded and deliberately conservative: it is wrong for
+    /// any PR that is already merged or closed when the seed is written, or
+    /// that closes before the seeded entry expires — i.e. anywhere inside the
+    /// [`OPEN_PR_MEMO_FRESH`] window that starts at the *reap*, NOT merely
+    /// within that window of the PR's own creation (#8381). A full
+    /// Builder → Judge → Merge sweep reaps
+    /// well over 900s after it opened its PR and can merge that PR itself
+    /// before exiting, so "inferred open" being wrong is an ordinary shape,
+    /// not an exotic one. Being wrong is still cheap: it defers a dispatch by
+    /// at most the memo's remaining freshness rather than dispatching onto a
+    /// live PR (and, at the reaper's own post-exit probe, arms the #4485
+    /// per-issue dispatch backoff while staying exempt from the quarantine
+    /// tally — see `reaper.rs`'s `yielded_open_pr`). Without it, the very first
     /// post-completion probe of a normal (non-crashed) issue+PR pair is always
     /// cold, with no memo to fall back on if a double-transport failure (the
     /// #6058/#6788 fail-open window) strikes before anything else happens to
