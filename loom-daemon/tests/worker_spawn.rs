@@ -30,8 +30,28 @@ fn worker(root: &std::path::Path, runtime: &str) -> Command {
             concat!(env!("CARGO_MANIFEST_DIR"), "/../defaults/hooks"),
         )
         .env("LOOM_PI_BIN", fixture())
-        .env("LOOM_OPENCODE_BIN", fixture());
+        .env("LOOM_OPENCODE_BIN", fixture())
+        // The OpenCode adapter probes `--version` before exec (#8438). Every test
+        // that does not say otherwise runs against a 1.x-shaped CLI, so the
+        // pre-existing OpenCode tests passing unmodified IS the "1.18.x behavior
+        // is unchanged" evidence.
+        .env("FIXTURE_VERSION", OPENCODE_V1)
+        .env_remove("FIXTURE_VERSION_EXIT");
     c
+}
+const OPENCODE_V1: &str = "1.18.31";
+/// Exactly what `opencode --version` prints on 2.0.10.
+const OPENCODE_V2: &str = "opencode v2.0.10";
+/// The harness argv, in order, as the fixture's `arg=<Debug>` lines.
+fn argv(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("arg="))
+        .map(str::to_string)
+        .collect()
+}
+fn quoted(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| format!("{a:?}")).collect()
 }
 #[test]
 fn pi_translates_headless_flags_and_keeps_prompt_literal() {
@@ -297,6 +317,282 @@ fn opencode_pins_actual_working_directory_even_with_stale_pwd() {
         text.contains(&format!("arg={:?}", d.path().canonicalize().unwrap().to_str().unwrap())),
         "{text}"
     );
+    // 1.x keeps its whole shape: no 2.x-only flag, effort still a separate flag.
+    assert!(!text.contains("arg=\"--standalone\""), "{text}");
+    assert!(text.contains("arg=\"--variant\""), "{text}");
+    assert!(!text.contains('#'), "{text}");
+}
+
+#[test]
+fn opencode_argv_is_exact_per_major_version() {
+    let d = tempfile::tempdir().unwrap();
+    let cwd = d.path().canonicalize().unwrap();
+    let cwd = cwd.to_str().unwrap();
+    let launch = |version: &str, extra: &[&str]| {
+        let out = worker(d.path(), "opencode")
+            .env("PWD", "/stale-parent-checkout")
+            .env("FIXTURE_VERSION", version)
+            .env("FIXTURE_PRINT_ENV", "PWD")
+            .args(extra)
+            .args(["--dangerously-skip-permissions", "-p", "hello"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // 1.x: byte-for-byte the argv this adapter produced before the probe existed.
+    for version in [OPENCODE_V1, "v1.18.31", "opencode 1.18.31"] {
+        let text = launch(version, &[]);
+        assert_eq!(
+            argv(&text),
+            quoted(&[
+                "run",
+                "--format",
+                "json",
+                "--dir",
+                cwd,
+                "--model",
+                "zai-coding-plan/glm-5.3-flash",
+                "--variant",
+                "max",
+                "--auto",
+                "--",
+                "hello",
+            ]),
+            "{text}"
+        );
+    }
+    // 2.x: no --dir, no --variant; a private server; effort rides on the model.
+    let text = launch(OPENCODE_V2, &[]);
+    assert_eq!(
+        argv(&text),
+        quoted(&[
+            "run",
+            "--format",
+            "json",
+            "--standalone",
+            "--model",
+            "zai-coding-plan/glm-5.3-flash#max",
+            "--auto",
+            "--",
+            "hello",
+        ]),
+        "{text}"
+    );
+    // Without --dir, the working directory has to arrive by inheritance.
+    assert!(text.contains(&format!("cwd={cwd:?}")), "{text}");
+    assert!(text.contains(&format!("child_env PWD={cwd}")), "{text}");
+    // No effort, no suffix.
+    let text = launch(OPENCODE_V2, &["--model", "example/model-v2"]);
+    assert_eq!(
+        argv(&text),
+        quoted(&[
+            "run",
+            "--format",
+            "json",
+            "--standalone",
+            "--model",
+            "example/model-v2",
+            "--auto",
+            "--",
+            "hello"
+        ]),
+        "{text}"
+    );
+    // A '#' that would make the 2.x model#effort form ambiguous is refused.
+    let out = worker(d.path(), "opencode")
+        .env("FIXTURE_VERSION", OPENCODE_V2)
+        .args([
+            "--model",
+            "example/model#v2",
+            "--effort",
+            "high",
+            "-p",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(78));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ambiguous"));
+    // ...and only there: 1.x passes effort as its own flag, so it is unaffected.
+    let out = worker(d.path(), "opencode")
+        .args([
+            "--model",
+            "example/model#v2",
+            "--effort",
+            "high",
+            "-p",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn opencode_v2_unguarded_provider_block_still_travels_in_the_per_launch_config() {
+    // After #8421 a profile's provider block reaches OpenCode ONLY through the
+    // child's OPENCODE_CONFIG_CONTENT, which a shared 2.x background service never
+    // sees: --standalone must therefore be present on an UNGUARDED launch too.
+    let d = tempfile::tempdir().unwrap();
+    config(
+        d.path(),
+        serde_json::json!({"runtimes":{"defaultModelProfile":"openweights","modelProfiles":{"openweights":{"model":"m","providers":{"opencode":"loom-openweights"},"credentialEnv":["LOOM_TEST_OPENWEIGHTS_KEY"],"credentialTargets":{"opencode":{"LOOM_TEST_OPENWEIGHTS_KEY":"LOOM_TEST_OPENWEIGHTS_KEY"}},"providerDefinition":{"opencode":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"https://example.invalid/v1","apiKey":"{env:LOOM_TEST_OPENWEIGHTS_KEY}"},"models":{"m":{}}}}}}}}),
+    );
+    let out = worker(d.path(), "opencode")
+        .env("FIXTURE_VERSION", OPENCODE_V2)
+        .env("LOOM_TEST_OPENWEIGHTS_KEY", "fake-openweights-secret-key")
+        .env("FIXTURE_NATIVE_CONFIG", "1")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(argv(&text).contains(&"\"--standalone\"".to_string()), "{text}");
+    assert!(!argv(&text).contains(&"\"--agent\"".to_string()), "{text}");
+    let config = native_config(&text);
+    assert_eq!(
+        config["provider"]["loom-openweights"]["options"]["apiKey"],
+        "{env:LOOM_TEST_OPENWEIGHTS_KEY}"
+    );
+    assert!(!text.contains("fake-openweights-secret-key"), "{text}");
+}
+
+#[test]
+fn guarded_opencode_launch_is_refused_on_a_major_without_a_live_canary_receipt() {
+    // SAFETY-CRITICAL (#8438). 2.x `run --auto` approves anything not explicitly
+    // denied, and whether 2.x honors Loom's deny-by-default agent is unverified.
+    // This fixture can only show that Loom REFUSES; it can never show that a real
+    // 2.x CLI honors the guard. That is the out-of-band canary's job.
+    let d = tempfile::tempdir().unwrap();
+    builder_role(d.path());
+    std::fs::write(d.path().join(".loom/roles/builder.md"), "Role task: $ARGUMENTS").unwrap();
+    let guarded: [(&str, Option<&str>); 2] =
+        [("hello", Some("builder")), ("/loom:builder 8438", None)];
+    for (prompt, role) in guarded {
+        let mut command = worker(d.path(), "opencode");
+        if let Some(role) = role {
+            command.env("LOOM_ROLE", role);
+        }
+        let out = command
+            .env("FIXTURE_VERSION", OPENCODE_V2)
+            .args(["--dangerously-skip-permissions", "-p", prompt])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{stderr}");
+        assert!(out.stdout.is_empty(), "the harness must never have started");
+        assert!(stderr.contains("guarded"), "{stderr}");
+        assert!(stderr.contains("v2.0.10"), "{stderr}");
+        assert!(stderr.contains("1.x"), "{stderr}");
+        assert!(stderr.contains("guardrail-parity-native.md"), "{stderr}");
+        assert!(!stderr.contains("LOOM_CLI_START"), "{stderr}");
+        // Refused before anything was provisioned, not after.
+        assert!(!d.path().join(".loom/native-tools").exists());
+    }
+    // The same major, unguarded, is unaffected.
+    let out = worker(d.path(), "opencode")
+        .env("FIXTURE_VERSION", OPENCODE_V2)
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("arg=\"--standalone\""));
+    // Pi never probes OpenCode, so its guarded launches are untouched.
+    let out = worker(d.path(), "pi")
+        .env("LOOM_ROLE", "builder")
+        .env("FIXTURE_VERSION", OPENCODE_V2)
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // Control: the identical guarded launch on the verified major still runs.
+    let out = worker(d.path(), "opencode")
+        .env("LOOM_ROLE", "builder")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("arg=\"loom-worker\""), "{text}");
+    assert!(text.contains("arg=\"--dir\""), "{text}");
+}
+
+#[test]
+fn unrecognized_opencode_version_is_refused_before_launch_and_missing_binary_is_127() {
+    let d = tempfile::tempdir().unwrap();
+    for (version, exit) in [
+        ("3.0.0", "0"),
+        ("opencode v3.1.4", "0"),
+        ("0.9.9", "0"),
+        ("garbage", "0"),
+        ("", "0"),
+        (OPENCODE_V1, "1"),
+        (OPENCODE_V2, "70"),
+    ] {
+        let out = worker(d.path(), "opencode")
+            .env("FIXTURE_VERSION", version)
+            .env("FIXTURE_VERSION_EXIT", exit)
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{version:?}: {stderr}");
+        assert!(stderr.contains("1.x") && stderr.contains("2.x"), "{version:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{version:?}");
+    }
+    let out = worker(d.path(), "opencode")
+        .env("LOOM_OPENCODE_BIN", d.path().join("missing"))
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(127), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty());
+    // The probe belongs to the OpenCode arm only.
+    let out = worker(d.path(), "pi")
+        .env("FIXTURE_VERSION", "garbage")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn native_launches_null_stdin_even_when_the_parent_has_an_open_pipe() {
+    // On OpenCode 2.x an open non-TTY stdin stalls `run` forever, silently. The
+    // parent MUST hand the worker a live pipe here: `Command::output()` does not
+    // inherit stdin, so without it this would pass even if the adapter stopped
+    // nulling stdin. The legacy runtime below is the control that proves it.
+    use std::process::Stdio;
+    let d = tempfile::tempdir().unwrap();
+    legacy(d.path(), "claude");
+    let run = |runtime: &str, version: &str| {
+        let mut child = worker(d.path(), runtime)
+            .env("FIXTURE_VERSION", version)
+            .args(["-p", "hello"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Held open across the whole run: `wait_with_output` would close it first.
+        let write_end = child.stdin.take().unwrap();
+        let out = child.wait_with_output().unwrap();
+        drop(write_end);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    for (runtime, version) in [
+        ("pi", OPENCODE_V1),
+        ("opencode", OPENCODE_V1),
+        ("opencode", OPENCODE_V2),
+    ] {
+        let text = run(runtime, version);
+        assert!(text.contains("stdin_is_dev_null=true"), "{runtime} {version}: {text}");
+    }
+    let text = run("claude", OPENCODE_V1);
+    assert!(text.contains("stdin_is_dev_null=false"), "control must see the pipe: {text}");
 }
 
 #[test]
