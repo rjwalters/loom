@@ -12,13 +12,15 @@
  * state" a single object lookup rather than a fan-out across N per-host
  * objects.
  *
- * Storage layout (three key prefixes, iterated via `list({ prefix })` to
+ * Storage layout (four key prefixes, iterated via `list({ prefix })` to
  * build a snapshot):
  *   `health:<hostId>`  → latest `host.health` record + when it was applied.
  *   `tokens:<hostId>`  → latest `tokens.snapshot` record + when applied.
  *   `sweep:<sweepId>`  → the in-flight sweep's current known state; removed
  *                        entirely on `sweep.completed` (a finished sweep is
  *                        not "live" — its full history lives in D1).
+ *   `compute:<jobId>`  → a currently-running ephemeral compute job (Issue
+ *                        #8305); removed on that job's completion record.
  *
  * This D1-vs-DO split is deliberate: D1 answers "what happened", the DO
  * answers "what is happening right now", and the DO is never treated as a
@@ -47,6 +49,33 @@
  *     rebuilding right after its own restart) must never be read as "zero
  *     sweeps running" — that would wipe every legitimately-live entry for
  *     the host instead of fixing the leak.
+ *
+ * # Live `compute:` entries (Issue #8305, Phase 2 of #8257)
+ *
+ * 2am's elastic EDA batch runner emits **two** `ephemeral_compute` records
+ * per job — a launch-time one and, separately, a completion-time one for the
+ * same `job_id` (see `migrations/0003_ephemeral_compute.sql`'s "No per-job
+ * dedup index" section) — which is exactly the `sweep.started` /
+ * `sweep.completed` shape above, so it is handled the same way: the launch
+ * record creates a `compute:<jobId>` entry, the completion record deletes it.
+ * Both records share `kind: "ephemeral_compute"` (there is no `.started` /
+ * `.completed` sub-kind), so the two are told apart by the presence of
+ * `ended_at` on the payload.
+ *
+ * Leak handling differs from `sweep:` in two deliberate ways:
+ *
+ *  - **A much wider bound** ([`STALE_COMPUTE_MS`], 24h vs. `STALE_SWEEP_MS`'s
+ *    4h). Nothing refreshes a `compute:` entry between its launch and its
+ *    completion — there is no `sweep.phase` analogue — so its `updatedAt` is
+ *    effectively the job's launch time, and the bound has to clear the
+ *    longest plausible job wall-clock rather than the longest plausible gap
+ *    between heartbeats.
+ *  - **Flag, then prune** rather than prune-on-sight. A crossed bound marks
+ *    the entry `leaked: true` in the snapshot (parent AC 4) and keeps
+ *    returning it — a leaked job must be *distinguishable* from one that
+ *    closed normally, and a normally-closed job is already gone from the
+ *    snapshot entirely. Only after [`PRUNE_COMPUTE_AFTER_MS`] is the entry
+ *    deleted, so the DO's working set still stays bounded.
  */
 
 export interface ActiveSweepState {
@@ -61,6 +90,42 @@ export interface ActiveSweepState {
   model?: string;
   effort?: string;
   updatedAt: string;
+}
+
+/**
+ * One currently-running ephemeral compute job (Issue #8305) — the
+ * `compute:<jobId>` live-state entry, built from an `ephemeral_compute`
+ * launch record.
+ *
+ * Field names are the camelCase projection of the payload's snake_case ones
+ * (`job_id` → `jobId`, …), matching how [`ActiveSweepState`] projects a
+ * `sweep.started` record. The cost/duration fields (`wall_clock_sec`,
+ * `estimated_cost_usd`) are deliberately absent: they only exist on the
+ * *completion* record, which removes this entry rather than updating it —
+ * D1 is where a finished job's cost is read from.
+ */
+export interface ActiveComputeState {
+  /** The host whose emitter reported the job — not necessarily where the
+   * instance itself runs (that is `region`/`instanceId`). */
+  hostId: string;
+  jobId: string;
+  instanceId?: string;
+  region?: string;
+  instanceType?: string;
+  spot?: boolean;
+  ami?: string;
+  /** The payload's own `started_at`, i.e. the emitter's clock. Kept for
+   * display only — never used for leak detection, which uses `updatedAt`
+   * (this backend's own ingest clock) so a skewed host clock cannot fake
+   * liveness. */
+  startedAt?: string;
+  /** When this backend first applied a launch record for `jobId`. A re-sent
+   * launch record deliberately does NOT refresh it — see `applyUpdate`. */
+  updatedAt: string;
+  /** Derived at snapshot time by [`classifyComputeEntries`], never stored:
+   * `true` once the entry has gone [`STALE_COMPUTE_MS`] without a completion
+   * record. */
+  leaked?: boolean;
 }
 
 /**
@@ -186,6 +251,9 @@ export interface FleetSnapshot {
     }
   >;
   activeSweeps: ActiveSweepState[];
+  /** Currently-running ephemeral compute jobs (Issue #8305). Each entry
+   * carries a `leaked` flag set by [`classifyComputeEntries`]. */
+  activeCompute: ActiveComputeState[];
 }
 
 /**
@@ -207,7 +275,10 @@ export interface FleetSnapshot {
  * comment: "an in-flight sweep on a host being revoked mid-run is a real
  * anomaly worth surfacing"), not something this filter should hide; it stays
  * visible (as an unattributed sweep, once the host's `hosts` entry above is
- * gone — see `publicPage.ts`'s `renderFleetOverview`).
+ * gone — see `publicPage.ts`'s `renderFleetOverview`). `activeCompute`
+ * (Issue #8305) is passed through untouched for the same reason, and with an
+ * extra one of its own: a still-running cloud instance costs money whether or
+ * not its reporting host was revoked, so hiding it is exactly backwards.
  */
 export function filterRevokedHosts(
   snapshot: FleetSnapshot,
@@ -220,7 +291,7 @@ export function filterRevokedHosts(
       hosts[hostId] = entry;
     }
   }
-  return { hosts, activeSweeps: snapshot.activeSweeps };
+  return { hosts, activeSweeps: snapshot.activeSweeps, activeCompute: snapshot.activeCompute };
 }
 
 /** Body accepted by the internal `POST /update` route — one record's worth
@@ -313,6 +384,75 @@ export function selectReconciledAwaySweepKeys(
   return staleKeys;
 }
 
+/** A `compute:` entry that has gone this long with no completion record is
+ * flagged as a leak (Issue #8305, parent #8257 AC 4).
+ *
+ * **Deliberately 6x [`STALE_SWEEP_MS`], not a reuse of it.** The two bounds
+ * measure different things. A `sweep:` entry is refreshed by every
+ * `sweep.phase` record, so 4h of silence means the *reporting* died, not that
+ * the work is long. A `compute:` entry is refreshed by nothing at all between
+ * launch and completion, so its age is simply the job's wall clock — and an
+ * elastic EDA batch job (full-chip simulation/synthesis on a large spot
+ * instance) plausibly runs for the better part of a day, an order of
+ * magnitude past any sweep. At 4h this would flag long-but-healthy jobs as
+ * leaks constantly, which is worse than useless: it trains the reader to
+ * ignore the flag. 24h clears the realistic job envelope while still bounding
+ * a lost completion record to one day of phantom "running now" state.
+ * `wall_clock_sec` on the completion records already landing in D1 is the
+ * evidence to re-tune this against once real job durations accumulate. */
+export const STALE_COMPUTE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/** A leaked `compute:` entry is deleted from the Durable Object entirely
+ * once it is this old — the hygiene half of leak handling, mirroring
+ * [`PRUNE_AFTER_MS`]'s role for `health:`/`tokens:` entries and sharing its
+ * 7-day value. Much larger than [`STALE_COMPUTE_MS`] on purpose: a leak has
+ * to stay *visible* long enough for an operator to see it and go reap the
+ * instance, so flagging and pruning are separate steps rather than the
+ * single prune-on-sight step `sweep:` entries get. */
+export const PRUNE_COMPUTE_AFTER_MS = PRUNE_AFTER_MS;
+
+/** `true` once a `compute:` entry has outlived [`STALE_COMPUTE_MS`] with no
+ * completion record — i.e. it is a leak, not a live job.
+ *
+ * An unparseable `updatedAt` decodes to `NaN` and is treated as NOT leaked
+ * (fail open), the same "unknown is not evidence" posture
+ * [`isSweepEntryStale`] and [`isPruneable`] take. */
+export function isComputeEntryLeaked(
+  entry: ActiveComputeState,
+  nowMs: number,
+  staleMs: number = STALE_COMPUTE_MS,
+): boolean {
+  const updatedAtMs = Date.parse(entry.updatedAt);
+  return Number.isFinite(updatedAtMs) && nowMs - updatedAtMs > staleMs;
+}
+
+/** Pure core of `buildSnapshot`'s `compute:` pass (Issue #8305), split out so
+ * the leak/prune decisions are unit-testable without a Durable Object — same
+ * split as [`classifyAndPruneHosts`] and [`selectStaleSweepKeys`].
+ *
+ * Returns every entry that still belongs in the snapshot, each with an
+ * explicit `leaked` boolean, plus the storage keys old enough to delete.
+ * `leaked` is always set (never left `undefined`) so a consumer can branch on
+ * it without having to know whether this backend computed it. */
+export function classifyComputeEntries(
+  entries: Iterable<[string, ActiveComputeState]>,
+  nowMs: number,
+  staleMs: number = STALE_COMPUTE_MS,
+  pruneMs: number = PRUNE_COMPUTE_AFTER_MS,
+): { activeCompute: ActiveComputeState[]; pruneKeys: string[] } {
+  const activeCompute: ActiveComputeState[] = [];
+  const pruneKeys: string[] = [];
+  for (const [key, entry] of entries) {
+    const ageMs = nowMs - Date.parse(entry.updatedAt);
+    if (Number.isFinite(ageMs) && ageMs > pruneMs) {
+      pruneKeys.push(key);
+      continue;
+    }
+    activeCompute.push({ ...entry, leaked: isComputeEntryLeaked(entry, nowMs, staleMs) });
+  }
+  return { activeCompute, pruneKeys };
+}
+
 export class FleetState implements DurableObject {
   private readonly state: DurableObjectState;
 
@@ -358,7 +498,10 @@ export class FleetState implements DurableObject {
    * concept at this layer. Does **not** touch that host's `sweep:<sweepId>`
    * entries: an in-flight sweep on a host being revoked mid-run is a real
    * anomaly worth surfacing (via its own staleness), not something this
-   * best-effort cleanup should paper over. Because the caller's fetch to
+   * best-effort cleanup should paper over. Its `compute:<jobId>` entries
+   * (Issue #8305) are left alone for the same reason — and they are not even
+   * keyed by host, so reaping them here would mean a full prefix scan to hide
+   * a still-running, still-billing cloud instance. Because the caller's fetch to
    * this route is itself best-effort (issue #5078), a failure here can leave
    * these entries behind indefinitely — [`filterRevokedHosts`] is the
    * read-time backstop for exactly that case, treating D1's `revoked_at` as
@@ -427,6 +570,49 @@ export class FleetState implements DurableObject {
         // landed in D1 via the same ingest batch. Removing it here keeps
         // the DO's working set bounded by concurrently-running sweeps only.
         await this.state.storage.delete(`sweep:${sweepId}`);
+        break;
+      }
+      case "ephemeral_compute": {
+        // Issue #8305. Both a launch record and a completion record arrive
+        // under this one kind; `ended_at` is what tells them apart (a launch
+        // record simply omits it — see `migrations/0003_ephemeral_compute.sql`).
+        // A present-but-empty/null `ended_at` reads as "not ended", the
+        // conservative direction: it keeps the entry live (visible, and
+        // eventually flagged as a leak) rather than silently retiring a job
+        // that may still be burning money.
+        const jobId = record.job_id;
+        if (typeof jobId !== "string" || jobId.length === 0) return;
+        const endedAt = record.ended_at;
+        if (typeof endedAt === "string" && endedAt.length > 0) {
+          // A completed job is no longer "live" — both of its records are
+          // already durable in D1. A completion whose launch record never
+          // reached this DO (host restarted mid-job, or the DO was recreated)
+          // deletes a key that does not exist, which Durable Object storage
+          // treats as a no-op: the right behaviour, since the end state
+          // ("this job is not running") is identical either way, and the DO
+          // has no log sink to report the anomaly to anyway. D1 still holds
+          // the completion record for anyone reconstructing history.
+          await this.state.storage.delete(`compute:${jobId}`);
+          break;
+        }
+        const existing = await this.state.storage.get<ActiveComputeState>(`compute:${jobId}`);
+        const entry: ActiveComputeState = {
+          hostId,
+          jobId,
+          instanceId: typeof record.instance_id === "string" ? record.instance_id : undefined,
+          region: typeof record.region === "string" ? record.region : undefined,
+          instanceType: typeof record.instance_type === "string" ? record.instance_type : undefined,
+          spot: typeof record.spot === "boolean" ? record.spot : undefined,
+          ami: typeof record.ami === "string" ? record.ami : undefined,
+          startedAt: typeof record.started_at === "string" ? record.started_at : undefined,
+          // Keying on `job_id` alone (never `jobId+instanceId`) means a
+          // re-sent launch record collapses onto the same entry instead of
+          // creating a second one. First-seen `updatedAt` wins so that
+          // at-least-once redelivery cannot postpone leak detection
+          // indefinitely by resetting the entry's clock on every retry.
+          updatedAt: existing?.updatedAt ?? now,
+        };
+        await this.state.storage.put(`compute:${jobId}`, entry);
         break;
       }
       default:
@@ -503,6 +689,19 @@ export class FleetState implements DurableObject {
       await this.state.storage.delete(Array.from(staleKeys));
     }
 
-    return { hosts, activeSweeps };
+    // Issue #8305: the `compute:` prefix's own pass — flag leaks, prune the
+    // long-dead. Same shape as the two passes above (a third independent
+    // policy over a disjoint key prefix, sharing this one read path), with
+    // its own bounds; see `classifyComputeEntries`.
+    const computeEntries = await this.state.storage.list<ActiveComputeState>({ prefix: "compute:" });
+    const { activeCompute, pruneKeys: computePruneKeys } = classifyComputeEntries(
+      computeEntries,
+      now.getTime(),
+    );
+    if (computePruneKeys.length > 0) {
+      await this.state.storage.delete(computePruneKeys);
+    }
+
+    return { hosts, activeSweeps, activeCompute };
   }
 }
