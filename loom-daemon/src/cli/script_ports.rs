@@ -90,6 +90,14 @@ pub(crate) enum ScriptPortCommand {
     /// `shell-budget` above.
     #[command(subcommand)]
     WorktreeState(super::worktree_state::WorktreeStateCommand),
+
+    /// `check-duplicate.sh`'s similarity scan (#8360): keyword extraction,
+    /// true-Jaccard scoring (#4409), threshold banding, the #8289 near-match
+    /// band and the degenerate-result detector, ported out of the
+    /// `contract`-category script per the shell language policy. Reads the
+    /// candidate pool on stdin; stdout and exit codes are the lines and codes
+    /// the script's own aggregation always consumed.
+    DuplicateScan(super::duplicate_scan::DuplicateScanArgs),
 }
 
 impl ScriptPortCommand {
@@ -109,6 +117,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
+            ScriptPortCommand::DuplicateScan(args) => args.run(),
         }
     }
 }
