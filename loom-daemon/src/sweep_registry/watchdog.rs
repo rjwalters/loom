@@ -2,6 +2,8 @@
 //! watchdog, and the review-stall watchdog, plus their shared
 //! `StartupRaceConfig` timing knobs.
 
+mod dirty_probe;
+
 use super::*;
 
 // ----------------------------------------------------------------------------
@@ -1238,23 +1240,10 @@ impl SweepRegistry {
     ///
     /// Degrades to `false` (not a recovery candidate) when the worktree is
     /// absent, `git` is unavailable, or the command fails — we never treat an
-    /// unprobeable worktree as recoverable.
+    /// unprobeable worktree as recoverable. See
+    /// [`dirty_probe::worktree_is_dirty`] for why the failure arm is logged.
     pub(crate) fn worktree_dirty(&self, issue: u32) -> bool {
-        let wt = self.worktree_path(issue);
-        if !wt.exists() {
-            return false;
-        }
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&wt)
-            .arg("status")
-            .arg("--porcelain")
-            .arg("--untracked-files=all")
-            .output();
-        match output {
-            Ok(o) if o.status.success() => !o.stdout.iter().all(u8::is_ascii_whitespace),
-            _ => false,
-        }
+        dirty_probe::worktree_is_dirty(&self.worktree_path(issue), issue)
     }
 
     /// Gather every signal that issue `N`'s worktree is still being used by a

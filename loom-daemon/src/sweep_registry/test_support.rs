@@ -1191,40 +1191,12 @@ impl Drop for FakeSweep {
 }
 
 // --- worktree_dirty / clean_worktree filesystem probes ---
-
-/// Create a git repo at `.loom/worktrees/issue-<N>` with one commit plus an
-/// untracked file, so `worktree_dirty` reports it dirty. Returns the path.
-pub(crate) fn make_dirty_git_worktree(ws: &Path, issue: u32) -> PathBuf {
-    let wt = ws
-        .join(".loom")
-        .join("worktrees")
-        .join(format!("issue-{issue}"));
-    std::fs::create_dir_all(&wt).unwrap();
-    let git = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&wt)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    git(&["init", "-q"]);
-    std::fs::write(wt.join("committed.txt"), "base\n").unwrap();
-    git(&["add", "-A"]);
-    git(&["commit", "-q", "-m", "base"]);
-    // Now dirty it with an untracked file (mimics mid-build edits).
-    std::fs::write(wt.join("dirty.txt"), "uncommitted mid-build edit\n").unwrap();
-    wt
-}
+//
+// `make_dirty_git_worktree` lives in the child `git_worktree_fixture` module
+// (Issue #8170) and is re-exported here so every existing
+// `use crate::sweep_registry::test_support::*;` keeps working unchanged.
+mod git_worktree_fixture;
+pub(crate) use git_worktree_fixture::make_dirty_git_worktree;
 
 /// Insert a terminal (`Exited`) Issue entry directly, mimicking the state
 /// the reaper leaves after a dead child is reaped.
