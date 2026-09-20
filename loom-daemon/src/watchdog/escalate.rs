@@ -27,10 +27,25 @@ pub enum Decision {
     AlreadyEscalated,
 }
 
-/// Decide, from the knob and the sentinel.
+/// Decide, from the resolved `LOOM_WATCHDOG_ESCALATE` knob and the sentinel.
+///
+/// Thin wrapper reading the knob from the process env; the pure decision lives
+/// in [`decide_with_knob`] so tests can pass the knob explicitly instead of
+/// inheriting whatever a live daemon on this host exported (#8328).
 #[must_use]
 pub fn decide(sentinel: &Path) -> Decision {
-    if env::var("LOOM_WATCHDOG_ESCALATE").is_some_and(|v| env::is_false(&v)) {
+    decide_with_knob(env::tri("LOOM_WATCHDOG_ESCALATE"), sentinel)
+}
+
+/// The pure decision, from the already-resolved knob and the sentinel.
+///
+/// `escalate` is [`env::tri`]'s tri-state: `Some(false)` — `0`/`false`/`no`,
+/// the shell's exact negative spelling — switches escalation off; `Some(true)`
+/// and `None` (unset, empty, or an unrecognised value, matching the shell's
+/// fall-through) leave it on.
+#[must_use]
+pub fn decide_with_knob(escalate: Option<bool>, sentinel: &Path) -> Decision {
+    if escalate == Some(false) {
         return Decision::Disabled;
     }
     if sentinel.exists() {
@@ -228,9 +243,40 @@ mod tests {
     fn an_existing_sentinel_suppresses_a_duplicate() {
         let d = tempfile::tempdir().expect("tempdir");
         let s = d.path().join("sentinel");
-        assert_eq!(decide(&s), Decision::Escalate);
+        // The knob is passed explicitly: this host may export
+        // `LOOM_WATCHDOG_ESCALATE=0` (a live daemon's environment leaks into
+        // every spawned test, #8328), and the sentinel-suppression claim must
+        // not depend on it.
+        assert_eq!(decide_with_knob(None, &s), Decision::Escalate);
         std::fs::write(&s, "x").expect("write");
-        assert_eq!(decide(&s), Decision::AlreadyEscalated);
+        assert_eq!(decide_with_knob(None, &s), Decision::AlreadyEscalated);
+    }
+
+    #[test]
+    fn a_disabled_knob_short_circuits_before_the_sentinel_is_consulted() {
+        // The regression half of #8328: the Disabled verdict must survive, so
+        // it is asserted here explicitly rather than only ever inherited from
+        // a hostile host environment.
+        let d = tempfile::tempdir().expect("tempdir");
+        let s = d.path().join("absent-sentinel");
+        assert_eq!(decide_with_knob(Some(false), &s), Decision::Disabled);
+        std::fs::write(&s, "x").expect("write");
+        assert_eq!(decide_with_knob(Some(false), &s), Decision::Disabled);
+    }
+
+    #[test]
+    fn an_explicitly_enabled_or_unrecognised_knob_leaves_escalation_on() {
+        // `Some(true)` and `None` (unset/empty/unrecognised — env::tri's
+        // fall-through) both behave identically to the wrapper's unset case.
+        let d = tempfile::tempdir().expect("tempdir");
+        let s = d.path().join("sentinel");
+        for knob in [Some(true), None] {
+            assert_eq!(decide_with_knob(knob, &s), Decision::Escalate);
+        }
+        std::fs::write(&s, "x").expect("write");
+        for knob in [Some(true), None] {
+            assert_eq!(decide_with_knob(knob, &s), Decision::AlreadyEscalated);
+        }
     }
 
     #[test]

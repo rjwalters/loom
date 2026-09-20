@@ -91,6 +91,14 @@ async fn refresh_local_workspace_state_hot_applies_a_newly_registered_workspace(
     let fallback_root = scratch.path().join("fallback-unused");
     let new_repo = scratch.path().join("newly-added-repo");
     std::fs::create_dir_all(&new_repo).unwrap();
+    // `WorkspaceRegistry::add` stores the CANONICALIZED root (`normalize_path`
+    // resolves symlinks), and `refresh_local_workspace_state` returns the
+    // registry's own paths — on macOS a tempdir handed out as `/var/...` lives
+    // behind the `/private/var/...` symlink, so every comparison below must
+    // use the canonical form (the idiom `workspace_registry`'s own tests use)
+    // or the assertion is symlink-layout-dependent and red on this host class
+    // (#8328), env or no env.
+    let new_repo = std::fs::canonicalize(&new_repo).unwrap();
 
     // Start with an empty registry (mirrors a freshly-installed daemon).
     WorkspaceRegistry::default().save(&registry_path).unwrap();
