@@ -31,7 +31,7 @@
     "@cloudflare/workers-types": "^5.20260916.1",
     "patch-package": "^8.0.1",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.1",
+    "vitest": "^4.1.0",
     "wrangler": "4.133.0"
   }
 }
