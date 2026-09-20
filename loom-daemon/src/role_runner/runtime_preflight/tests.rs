@@ -1,0 +1,512 @@
+//! Tests for the runtime-aware pre-spawn credential-pool gate (Issue #8408).
+//!
+//! Kept beside the module they cover rather than in `role_runner/tests.rs`,
+//! which is at its `scripts/file-size-baseline.txt` ceiling.
+//!
+//! Every test that reaches `invoke()` leaves `spawn_bin` unset so runtime
+//! admission — and with it the gate — runs for real against an on-disk
+//! fixture, exactly like `mixed_runtime_role_launch_is_admitted_and_pinned_
+//! before_spawn` in the parent test module.
+
+use super::*;
+use crate::tokens_pool::health::record_terminal_at;
+use crate::tokens_pool::{record_terminal_for_class_at, AccountId, TerminalClassification};
+use serial_test::serial;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::AtomicUsize;
+
+/// Every env var that can change which runtime a role resolves to, or which
+/// credential source `spawn-codex.sh` (and therefore the gate) would use.
+/// Cleared for the scope of a test and restored on drop — including across an
+/// assertion panic — so an ambient `LOOM_RUNTIME_JUDGE=codex` or `CODEX_HOME`
+/// in a developer shell (or a dispatched sweep's own environment) can neither
+/// mask nor fake the behaviour under test.
+const GUARDED_ENV: [&str; 8] = [
+    "LOOM_RUNTIME",
+    "LOOM_RUNTIME_JUDGE",
+    "LOOM_CODEX_HOME",
+    "CODEX_HOME",
+    "LOOM_CODEX_PROFILE",
+    "LOOM_SPAWN_NO_EXPORT",
+    "LOOM_CODEX_NO_EXEC",
+    "LOOM_CODEX_PROFILE_ROOT",
+];
+
+struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+impl EnvGuard {
+    /// Clear every guarded var, then point the codex profile root at
+    /// `profile_root` so no test ever reads the host's real
+    /// `~/.loom/codex-profiles`.
+    fn new(profile_root: &Path) -> Self {
+        let prior = GUARDED_ENV
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        for key in GUARDED_ENV {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root);
+        Self(prior)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.0.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+fn write_executable(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The installed `codex.json` shape: `accountProvider` is what makes
+/// `spawn-codex.sh` select from the codex account pool.
+const CODEX_MANIFEST: &str =
+    r#"{"runtime":"codex","accountProvider":"codex","capabilities":{"mcp":"yes"}}"#;
+
+/// A workspace whose `judge` role is pinned to the codex runtime (the config
+/// the issue's live repro had: `runtimes.roles.judge = "codex"`), with a
+/// codex-shaped model pin so #5028's mismatch refusal stays out of scope.
+///
+/// `claude_pool_exhausted` decides the state of the per-repo Claude pool: one
+/// token, bad-marked (the live repro's "0/N spawnable") or healthy. A per-repo
+/// pool always wins `resolve_tokens_dir`, so `LOOM_SHARED_TOKENS_DIR` never
+/// needs touching here.
+///
+/// Returns the marker path the fake `spawn-worker.sh` touches when it runs.
+fn codex_judge_workspace(root: &Path, manifest: &str, claude_pool_exhausted: bool) -> PathBuf {
+    for sub in [
+        ".loom/roles",
+        ".loom/runtimes",
+        ".loom/scripts",
+        ".loom/tokens",
+    ] {
+        fs::create_dir_all(root.join(sub)).unwrap();
+    }
+    fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
+    if claude_pool_exhausted {
+        fs::write(
+            root.join(".loom/tokens/.bad_tokens"),
+            format!("{} fake auth failure\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join(".loom/config.json"),
+        r#"{"runtimes":{"roles":{"judge":"codex"}},"autonomous":{"roleRunner":{"roleModels":{"judge":"gpt-5-codex"}}}}"#,
+    )
+    .unwrap();
+    fs::write(root.join(".loom/roles/judge.json"), r#"{"runtimeRequirements":["mcp"]}"#).unwrap();
+    fs::write(root.join(".loom/runtimes/codex.json"), manifest).unwrap();
+    write_executable(&root.join(".loom/scripts/spawn-codex.sh"), "#!/bin/sh\nexit 0\n");
+    let marker = root.join("script-ran");
+    write_executable(
+        &root.join(".loom/scripts/spawn-worker.sh"),
+        &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    );
+    marker
+}
+
+fn codex_id(name: &str) -> AccountId {
+    AccountId {
+        provider: AccountProvider::Codex,
+        name: name.to_string(),
+    }
+}
+
+fn judge_runner(root: &Path) -> ScriptRoleInvocationRunner {
+    ScriptRoleInvocationRunner::new(root.to_path_buf()).with_timeout(Duration::from_secs(5))
+}
+
+fn judge_log(root: &Path) -> String {
+    fs::read_to_string(root.join(".loom/logs/role-judge.log")).unwrap_or_default()
+}
+
+fn epoch_now() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp()).unwrap()
+}
+
+// ---- AC1: the repro ---------------------------------------------------------
+
+/// The issue's live repro, as a test: `runtimes.roles.judge = "codex"`, an
+/// exhausted Claude pool (0/1 spawnable), and one valid codex account. The
+/// tick must reach the spawn — not skip as `PoolExhausted` over a pool the
+/// codex runtime never reads.
+#[test]
+#[serial]
+fn codex_pinned_role_spawns_despite_an_exhausted_claude_pool() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, true);
+
+    // Precondition: this really is the exhausted-Claude-pool state that used
+    // to gate the tick.
+    let claude = crate::tokens_pool::select::spawnable_pool_state(workspace.path());
+    assert_eq!((claude.total, claude.usable), (1, 0));
+
+    let before = pool_exhausted_skip_count();
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
+    assert!(marker.exists(), "the codex-pinned tick must actually reach the spawn");
+    assert_eq!(pool_exhausted_skip_count(), before, "no pool skip may be counted");
+    assert!(
+        !judge_log(workspace.path()).contains("SKIPPED BEFORE SPAWN"),
+        "no pre-spawn skip marker may be written: {}",
+        judge_log(workspace.path())
+    );
+}
+
+// ---- AC2: the symmetric case ------------------------------------------------
+
+/// No codex account at all, and a perfectly healthy Claude pool: the tick
+/// skips pre-spawn, and the diagnostic names the codex account pool — never
+/// `.loom/tokens`, which the codex runtime does not read.
+#[test]
+#[serial]
+fn codex_pinned_role_with_no_codex_account_skips_naming_the_codex_pool() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+
+    let before = pool_exhausted_skip_count();
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    let RoleTickOutcome::PoolExhausted { total, pool, .. } = outcome else {
+        panic!("expected PoolExhausted, got {outcome:?}");
+    };
+    assert_eq!(pool, CredentialPool::CodexAccounts);
+    assert_eq!(total, 0);
+    assert!(!marker.exists(), "the doomed spawn must never run");
+    assert_eq!(pool_exhausted_skip_count(), before + 1);
+
+    let log = judge_log(workspace.path());
+    assert!(
+        log.contains("SKIPPED BEFORE SPAWN (#6201): codex account pool exhausted"),
+        "{log}"
+    );
+    assert!(log.contains("`loom-daemon accounts`"), "{log}");
+    assert!(log.contains("no enabled codex account is provisioned"), "{log}");
+    assert!(!log.contains(".loom/tokens"), "must not name the Claude pool dir: {log}");
+    assert!(!log.contains(".ranking"), "must not name the Claude ranking file: {log}");
+}
+
+/// Accounts exist but every one is under an account-wide hold the selector
+/// could not release: one needs re-auth (not session-managed), one is in an
+/// exhaustion cooldown. Same skip, `total` counts the enabled accounts, and
+/// the very next tick proceeds once a hold clears — no cached verdict.
+#[test]
+#[serial]
+fn codex_pinned_role_skips_while_every_account_is_held_then_recovers() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    for name in ["alice", "bob"] {
+        fs::create_dir(profiles.path().join(name)).unwrap();
+    }
+    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+    let now = epoch_now();
+    record_terminal_at(
+        workspace.path(),
+        &codex_id("alice"),
+        TerminalClassification::TokenExpired,
+        "test",
+        now,
+    )
+    .unwrap();
+    record_terminal_at(
+        workspace.path(),
+        &codex_id("bob"),
+        TerminalClassification::TokenExhausted,
+        "test",
+        now,
+    )
+    .unwrap();
+
+    let mut runner = judge_runner(workspace.path());
+    let outcome = runner.invoke("judge", "/loom:judge");
+    let RoleTickOutcome::PoolExhausted {
+        total,
+        pool,
+        next_clear_at,
+    } = outcome
+    else {
+        panic!("expected PoolExhausted, got {outcome:?}");
+    };
+    assert_eq!((total, pool), (2, CredentialPool::CodexAccounts));
+    assert!(next_clear_at <= chrono::Utc::now() + chrono::Duration::seconds(901));
+    assert!(!marker.exists());
+    assert!(
+        judge_log(workspace.path())
+            .contains("every enabled account is cooling down or needs re-auth"),
+        "{}",
+        judge_log(workspace.path())
+    );
+
+    // Readmission: bob's next run succeeds elsewhere, clearing his cooldown.
+    record_terminal_at(
+        workspace.path(),
+        &codex_id("bob"),
+        TerminalClassification::Success,
+        "test",
+        now + 1,
+    )
+    .unwrap();
+    assert_eq!(runner.invoke("judge", "/loom:judge"), RoleTickOutcome::Success);
+    assert!(marker.exists());
+}
+
+// ---- the gate never skips a launch that could have succeeded -----------------
+
+/// The pool reader counts only holds the spawn-time selector could not get
+/// past: a class-scoped credit hold (#8058) blocks one model class, and a
+/// re-auth hold on a session-managed profile can be released by the selector's
+/// own probe (#6927) — neither makes the pool "empty".
+#[test]
+#[serial]
+fn codex_pool_state_counts_only_holds_the_selector_cannot_release() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    for name in ["class-held", "session-reauth", "hard-reauth", "cooling"] {
+        fs::create_dir(profiles.path().join(name)).unwrap();
+    }
+    fs::write(
+        profiles
+            .path()
+            .join("session-reauth")
+            .join(crate::tokens_pool::session_lifecycle::SESSION_MARKER_FILE),
+        "{}",
+    )
+    .unwrap();
+    let root = workspace.path();
+    fs::create_dir_all(root.join(".loom")).unwrap();
+    let now = epoch_now();
+    record_terminal_for_class_at(
+        root,
+        &codex_id("class-held"),
+        TerminalClassification::ModelCreditsExhausted,
+        Some("opus"),
+        "test",
+        now,
+    )
+    .unwrap();
+    for name in ["session-reauth", "hard-reauth"] {
+        record_terminal_at(
+            root,
+            &codex_id(name),
+            TerminalClassification::TokenExpired,
+            "test",
+            now,
+        )
+        .unwrap();
+    }
+    record_terminal_at(
+        root,
+        &codex_id("cooling"),
+        TerminalClassification::TokenExhausted,
+        "test",
+        now,
+    )
+    .unwrap();
+
+    let state = codex_pool_state(root, now);
+    assert_eq!(state.read_error, None);
+    assert_eq!(state.enabled, 4);
+    assert_eq!(state.spawnable, 2, "class-held and session-reauth stay spawnable: {state:?}");
+    assert!(state.earliest_clear.is_some_and(|deadline| deadline > now), "{state:?}");
+}
+
+/// An unreadable health state is the one fail-closed case — the selector
+/// reads the same file and exits 78 on it — and the skip says why.
+#[test]
+#[serial]
+fn codex_pool_state_fails_closed_on_an_unreadable_health_state() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    fs::create_dir_all(workspace.path().join(".loom")).unwrap();
+    fs::write(workspace.path().join(".loom/account-health.json"), "{not json").unwrap();
+
+    let state = codex_pool_state(workspace.path(), epoch_now());
+    assert_eq!((state.enabled, state.spawnable), (1, 0));
+    assert!(state.read_error.is_some(), "{state:?}");
+}
+
+/// An explicit profile pin means `spawn-codex.sh` never reaches the account
+/// selector, so an empty account pool is not the wall — the tick proceeds.
+#[test]
+#[serial]
+fn codex_gate_stands_down_for_an_explicit_profile_pin() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+    std::env::set_var("LOOM_CODEX_PROFILE", "pinned-elsewhere");
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
+    assert!(marker.exists());
+}
+
+/// A codex manifest with no `accountProvider` (an install that predates the
+/// key) makes `spawn-codex.sh` fall open to the `claude` provider, so the
+/// codex account pool is not what that launch selects from — no codex gate.
+#[test]
+#[serial]
+fn codex_gate_stands_down_when_the_manifest_names_no_codex_account_provider() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    let marker = codex_judge_workspace(
+        workspace.path(),
+        r#"{"runtime":"codex","capabilities":{"mcp":"yes"}}"#,
+        false,
+    );
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
+    assert!(marker.exists());
+}
+
+// ---- AC3: the claude runtime is byte-identical -------------------------------
+
+/// The Claude-runtime skip — outcome, counter, and the role-log line — is what
+/// it was before #8408, byte for byte. The expected line is rebuilt here from
+/// the pre-#8408 literal, not from the production formatter.
+#[test]
+#[serial]
+fn claude_runtime_pool_exhausted_skip_is_byte_identical() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    let root = workspace.path();
+    fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+    fs::create_dir_all(root.join(".loom/tokens")).unwrap();
+    fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
+    fs::write(
+        root.join(".loom/tokens/.bad_tokens"),
+        format!("{} fake auth failure\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")),
+    )
+    .unwrap();
+    let marker = root.join("script-ran");
+    write_executable(
+        &root.join(".loom/scripts/spawn-worker.sh"),
+        &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    );
+
+    let before = pool_exhausted_skip_count();
+    let outcome = ScriptRoleInvocationRunner::new(root.to_path_buf()).invoke("curator", "/x");
+    let RoleTickOutcome::PoolExhausted {
+        total,
+        next_clear_at,
+        pool,
+    } = outcome
+    else {
+        panic!("expected PoolExhausted, got {outcome:?}");
+    };
+    assert_eq!((total, pool), (1, CredentialPool::ClaudeTokens));
+    assert!(!marker.exists());
+    assert_eq!(pool_exhausted_skip_count(), before + 1);
+
+    let pool_dir = crate::tokens_pool::select::spawnable_pool_state(root).dir;
+    let expected_reason = format!(
+        "token pool exhausted: 0/1 spawnable in {} (every account bad-marked or hard-excluded by \
+         .ranking); next check ~{} — run `loom-daemon tokens check --ranking` or `loom-daemon \
+         tokens unblock <name>` — #7607",
+        pool_dir.display(),
+        next_clear_at.to_rfc3339()
+    );
+    let log = fs::read_to_string(root.join(".loom/logs/role-curator.log")).unwrap();
+    assert!(
+        log.ends_with(&format!(
+            " role=curator SKIPPED BEFORE SPAWN (#6201): {expected_reason} ====\n"
+        )),
+        "{log}"
+    );
+}
+
+/// The pre-#8408 literals every Claude-pool rendering is now built from.
+#[test]
+fn claude_pool_renderings_are_the_pre_8408_literals() {
+    assert_eq!(
+        CredentialPool::ClaudeTokens.exhausted_phrase(21),
+        "token pool exhausted: 0/21 spawnable (every account bad-marked or hard-excluded by \
+         .ranking)"
+    );
+    assert_eq!(CredentialPool::ClaudeTokens.detail_tag(), "pool-exhausted");
+    let codex = CredentialPool::CodexAccounts.exhausted_phrase(4);
+    assert!(codex.starts_with("codex account pool exhausted: 0/4 spawnable"), "{codex}");
+    assert!(!codex.contains(".loom/tokens") && !codex.contains(".ranking"), "{codex}");
+}
+
+// ---- AC4: which pool gated the skip ------------------------------------------
+
+#[test]
+fn gated_pool_names_the_pool_that_was_read() {
+    let at = chrono::Utc::now();
+    let exhausted = |pool| RoleTickOutcome::PoolExhausted {
+        total: 2,
+        next_clear_at: at,
+        pool,
+    };
+    assert_eq!(exhausted(CredentialPool::ClaudeTokens).gated_pool(), Some("claude_tokens"));
+    assert_eq!(exhausted(CredentialPool::CodexAccounts).gated_pool(), Some("codex_accounts"));
+    assert_eq!(RoleTickOutcome::NoTokenPool.gated_pool(), Some("claude_tokens"));
+    assert_eq!(RoleTickOutcome::Success.gated_pool(), None);
+    assert_eq!(RoleTickOutcome::Failure("boom".into()).gated_pool(), None);
+}
+
+// ---- the sweep-dispatch brake is a Claude-pool signal only -------------------
+
+#[derive(Default)]
+struct CountingObserver(AtomicUsize);
+
+impl PoolExhaustedObserver for CountingObserver {
+    fn note_pool_exhausted(&self, _root: &Path, _role: &str) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// #7607's observer feeds the #6614 brake that holds *sweep* dispatch on a
+/// token-selection wall. A dry codex account pool must never trip it: sweeps
+/// do not draw from the pool the codex-pinned role found empty.
+#[test]
+fn a_dry_codex_pool_never_feeds_the_sweep_dispatch_brake() {
+    let observer = CountingObserver::default();
+    let root = Path::new("/repo/a");
+    let exhausted = |pool| RoleTickOutcome::PoolExhausted {
+        total: 3,
+        next_clear_at: chrono::Utc::now(),
+        pool,
+    };
+
+    feed_pool_exhausted_observer(
+        Some(&observer),
+        &exhausted(CredentialPool::CodexAccounts),
+        root,
+        "judge",
+    );
+    assert_eq!(observer.0.load(Ordering::Relaxed), 0);
+
+    feed_pool_exhausted_observer(
+        Some(&observer),
+        &exhausted(CredentialPool::ClaudeTokens),
+        root,
+        "judge",
+    );
+    assert_eq!(observer.0.load(Ordering::Relaxed), 1);
+}

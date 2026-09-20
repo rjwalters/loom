@@ -311,6 +311,10 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(detail) = &r.detail {
                 attributes.push(kv_string("loom.detail", detail.clone()));
             }
+            // #8408: which credential pool gated a pre-spawn pool skip.
+            if let Some(gated_pool) = &r.gated_pool {
+                attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
+            }
             if let Some(models_used) = &r.models_used {
                 attributes.push(kv_string("loom.models_used", models_used.join(",")));
             }

@@ -19,6 +19,7 @@ fn tick(result: RoleTickResult) -> RoleTickTelemetry {
         model: Some("claude-sonnet-5".to_string()),
         effort: Some("high".to_string()),
         detail: None,
+        gated_pool: None,
     }
 }
 
@@ -456,6 +457,7 @@ fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
         &RoleTickOutcome::PoolExhausted {
             total: 4,
             next_clear_at: at(9_000),
+            pool: crate::role_runner::CredentialPool::ClaudeTokens,
         },
         None,
     );
@@ -467,6 +469,10 @@ fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
     let r = &records[0];
     assert_eq!(r.result, RoleTickResult::SkippedPoolExhausted);
     assert!(r.detail.as_deref().unwrap().contains("0/4 spawnable"));
+    // #8408: the Claude-pool detail keeps its pre-#8408 tag, and the record
+    // now says which pool was read.
+    assert!(r.detail.as_deref().unwrap().starts_with("pool-exhausted: "));
+    assert_eq!(r.gated_pool.as_deref(), Some("claude_tokens"));
     assert_eq!(r.model, None, "no model was resolved before the bail-out");
     assert_eq!(
         r.tokens_by_model, None,
@@ -489,6 +495,7 @@ fn classify_maps_every_outcome_variant_to_its_own_result() {
             RoleTickOutcome::PoolExhausted {
                 total: 2,
                 next_clear_at: at(10),
+                pool: crate::role_runner::CredentialPool::ClaudeTokens,
             },
             RoleTickResult::SkippedPoolExhausted,
         ),
@@ -529,4 +536,42 @@ fn classify_maps_every_outcome_variant_to_its_own_result() {
             "only a success carries no detail ({outcome:?})"
         );
     }
+}
+
+/// #8408 AC: the `role_tick.outcome` record names the pool that gated a
+/// pre-spawn pool skip — and for a codex-pinned role that is the codex account
+/// pool, never Claude's. Every other result leaves the key absent.
+#[test]
+fn a_pool_skip_record_names_the_pool_that_gated_it() {
+    let codex = RoleTickOutcome::PoolExhausted {
+        total: 4,
+        next_clear_at: at(900),
+        pool: crate::role_runner::CredentialPool::CodexAccounts,
+    };
+    let (result, detail) = classify(&codex);
+    assert_eq!(result, RoleTickResult::SkippedPoolExhausted);
+    assert!(detail
+        .as_deref()
+        .unwrap()
+        .starts_with("codex-account-pool-exhausted: 0/4 spawnable"));
+
+    let mut skipped = tick(result);
+    skipped.detail = detail;
+    skipped.gated_pool = codex.gated_pool().map(str::to_string);
+    let record = build_record(&skipped, "o/r".to_string(), RepoVisibility::Private, None);
+    assert_eq!(record.gated_pool.as_deref(), Some("codex_accounts"));
+    let wire = serde_json::to_value(&record).unwrap();
+    assert_eq!(wire["gated_pool"], "codex_accounts");
+
+    let success = build_record(
+        &tick(RoleTickResult::Success),
+        "o/r".to_string(),
+        RepoVisibility::Private,
+        None,
+    );
+    assert_eq!(success.gated_pool, None);
+    assert!(serde_json::to_value(&success)
+        .unwrap()
+        .get("gated_pool")
+        .is_none());
 }

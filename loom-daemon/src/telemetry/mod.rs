@@ -683,6 +683,17 @@ pub struct RoleTickOutcomeRecord {
     /// sentinel). Always absent for [`RoleTickResult::Success`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Which credential pool gated a pre-spawn pool skip (Issue #8408):
+    /// `claude_tokens` (the `.loom/tokens/` OAuth pool) or `codex_accounts`
+    /// (the `loom-daemon accounts` codex profiles) — the pool the role's
+    /// **admitted runtime** draws from, which is no longer always Claude's.
+    /// Present only on [`RoleTickResult::SkippedNoTokenPool`] and
+    /// [`RoleTickResult::SkippedPoolExhausted`]; absent on every other result,
+    /// and on every record written before #8408 (additive — no
+    /// `schema_version` bump, exactly as the schema doc prescribes for a new
+    /// optional field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gated_pool: Option<String>,
     /// Per-`(model, speed, service_tier)` token totals for this tick, summed
     /// from the `/loom:<role>` Claude Code transcripts whose mtime falls in
     /// this tick's own window — the same grouped shape, and the same raw

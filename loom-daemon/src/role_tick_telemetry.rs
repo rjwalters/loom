@@ -96,6 +96,9 @@ pub struct RoleTickTelemetry {
     pub effort: Option<String>,
     /// Failure/skip detail; `None` for a success.
     pub detail: Option<String>,
+    /// Which credential pool gated a pre-spawn pool skip (Issue #8408) — see
+    /// [`RoleTickOutcome::gated_pool`]. `None` for every other result.
+    pub gated_pool: Option<String>,
 }
 
 /// Project one [`crate::role_runner::RoleTickOutcome`] onto the
@@ -122,13 +125,18 @@ pub fn classify(outcome: &RoleTickOutcome) -> (RoleTickResult, Option<String>) {
         RoleTickOutcome::NoTokenPool => {
             (RoleTickResult::SkippedNoTokenPool, Some("no-token-pool".to_string()))
         }
+        // #8408: the tag names the pool that was read (`pool-exhausted` is the
+        // Claude pool's pre-#8408 literal); the machine-readable form is the
+        // record's `gated_pool` key, projected by `RoleTickOutcome::gated_pool`.
         RoleTickOutcome::PoolExhausted {
             total,
             next_clear_at,
+            pool,
         } => (
             RoleTickResult::SkippedPoolExhausted,
             Some(format!(
-                "pool-exhausted: 0/{total} spawnable; next check ~{}",
+                "{}: 0/{total} spawnable; next check ~{}",
+                pool.detail_tag(),
                 next_clear_at.to_rfc3339()
             )),
         ),
@@ -175,6 +183,7 @@ pub fn emit_for_tick(
         model,
         effort,
         detail,
+        gated_pool: outcome.gated_pool().map(str::to_string),
     });
 }
 
@@ -439,6 +448,7 @@ pub fn build_record(
         model: tick.model.clone().filter(|m| !m.is_empty()),
         effort: tick.effort.clone().filter(|e| !e.is_empty()),
         detail: tick.detail.clone().filter(|d| !d.is_empty()),
+        gated_pool: tick.gated_pool.clone().filter(|p| !p.is_empty()),
         tokens_by_model,
         models_used,
         actions,

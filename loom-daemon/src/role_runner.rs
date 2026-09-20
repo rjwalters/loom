@@ -759,10 +759,12 @@ pub fn record_role_tick_at(
         RoleTickOutcome::PoolExhausted {
             total,
             next_clear_at,
+            pool,
         } => (
             false,
             Some(format!(
-                "pool-exhausted: 0/{total} spawnable, next check ~{}",
+                "{}: 0/{total} spawnable, next check ~{}",
+                pool.detail_tag(),
                 next_clear_at.to_rfc3339()
             )),
         ),
@@ -1044,19 +1046,20 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 return RoleTickOutcome::Failure(e);
             }
         };
-        // Resolve runtime before Claude-only auth preflights. Retain the old
-        // preflight ordering for Claude, including incomplete installations.
+        // Resolve the runtime BEFORE the credential-pool preflight (#8408): the
+        // gate reads the pool the admitted runtime draws from, never Claude's
+        // by default. Claude keeps its old ordering (pool gate ahead of an
+        // admission rejection), including on incomplete installations.
         let admission_result = self
             .spawn_bin
             .is_none()
             .then(|| crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None));
-        let claude_pool = admission_result.as_ref().is_some_and(|r| match r {
-            Ok(a) => a.runtime == "claude",
-            Err(e) => e.runtime == "claude",
-        });
-        if let Some(outcome) =
-            runtime_preflight::check(&self.workspace_root, &self.logs_dir(), role, claude_pool)
-        {
+        if let Some(outcome) = runtime_preflight::check(
+            &self.workspace_root,
+            &self.logs_dir(),
+            role,
+            admission_result.as_ref(),
+        ) {
             return outcome;
         }
         // Issue #5028 (follow-up to #5001 AC2/AC3): runtime admission now
@@ -3719,8 +3722,11 @@ pub fn spawn_multi_role_task(
 }
 
 /// Feed the fleet-wide #6614 empty-pool brake from one role-tick outcome
-/// (issue #7607) — a no-op for every outcome except
-/// [`RoleTickOutcome::PoolExhausted`], and for a `None` observer.
+/// (issue #7607) — a no-op for every outcome except a
+/// [`RoleTickOutcome::PoolExhausted`] of the **Claude** pool, and for a `None`
+/// observer. A dry codex account pool (#8408) never feeds it: the brake it
+/// trips holds *sweep* dispatch on a token-selection wall, and sweeps do not
+/// draw from the pool a codex-pinned role just found empty.
 ///
 /// Called BEFORE the log-dedup decision in
 /// [`log_outcome_for_root_deduped`], and deliberately on **every**
@@ -3735,7 +3741,7 @@ fn feed_pool_exhausted_observer(
     root: &Path,
     role: &str,
 ) {
-    if !matches!(outcome, RoleTickOutcome::PoolExhausted { .. }) {
+    if !outcome.exhausted_claude_token_pool() {
         return;
     }
     if let Some(observer) = observer {
@@ -3794,11 +3800,11 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
         RoleTickOutcome::PoolExhausted {
             total,
             next_clear_at,
+            pool,
         } => {
             log::warn!(
-                "role_runner: {role} tick skipped after {elapsed:.1?} — token pool exhausted: \
-                 0/{total} spawnable (every account bad-marked or hard-excluded by .ranking); \
-                 next check ~{} (#7607)",
+                "role_runner: {role} tick skipped after {elapsed:.1?} — {}; next check ~{} (#7607)",
+                pool.exhausted_phrase(*total),
                 next_clear_at.to_rfc3339()
             );
         }
@@ -3867,11 +3873,12 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
         RoleTickOutcome::PoolExhausted {
             total,
             next_clear_at,
+            pool,
         } => log::warn!(
-            "role_runner: {role} tick for {} skipped after {elapsed:.1?} — token pool exhausted: \
-             0/{total} spawnable (every account bad-marked or hard-excluded by .ranking); next \
-             check ~{} (#7607)",
+            "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {}; next check ~{} \
+             (#7607)",
             root.display(),
+            pool.exhausted_phrase(*total),
             next_clear_at.to_rfc3339()
         ),
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => log::warn!(
@@ -4159,14 +4166,15 @@ fn log_outcome_for_root_deduped(
             if let RoleTickOutcome::PoolExhausted {
                 total,
                 next_clear_at,
+                pool,
             } = outcome
             {
                 log::warn!(
-                    "role_runner: {role} tick for {} skipped after {elapsed:.1?} — token pool \
-                     exhausted: 0/{total} spawnable (every account bad-marked or hard-excluded \
-                     by .ranking); next check ~{} (further identical skips for this root are \
-                     logged at DEBUG until the pool regains capacity, #7607)",
+                    "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {}; next \
+                     check ~{} (further identical skips for this root are logged at DEBUG until \
+                     the pool regains capacity, #7607)",
                     root.display(),
+                    pool.exhausted_phrase(*total),
                     next_clear_at.to_rfc3339()
                 );
             }
@@ -4224,7 +4232,7 @@ fn log_outcome_for_root_deduped(
 
 // The per-invocation result type (#8056) — see `role_runner/outcome.rs`.
 mod outcome;
-pub use outcome::RoleTickOutcome;
+pub use outcome::{CredentialPool, RoleTickOutcome};
 
 // Failure-sentinel classification for a role's `role-<role>.log` (issues
 // #6757, #8123) — see `role_runner/failure_sentinel.rs`.

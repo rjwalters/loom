@@ -11,6 +11,69 @@
 
 use super::ModelRuntimeMismatch;
 
+/// Which credential source a pre-spawn pool gate consulted (Issue #8408).
+///
+/// The #7607 gate used to read `.loom/tokens/` — the Claude OAuth pool — for
+/// every role, whatever runtime the role was admitted onto, so a
+/// `runtimes.roles.<role> = "codex"` pin went inert the moment the *Claude*
+/// pool ran dry: the one situation the pin exists to relieve. The gate now
+/// asks the pool the admitted runtime actually draws from, and this enum is
+/// how a [`RoleTickOutcome::PoolExhausted`] skip says which one that was — in
+/// the daemon log, the role log, and the `role_tick.outcome` record's
+/// `gated_pool` key.
+///
+/// Native harness runtimes (`pi`, `opencode`) deliberately have no variant:
+/// their credential may live in the harness CLI's own auth store, which the
+/// daemon cannot observe, so an absent `credentialEnv` variable is not proof
+/// of an empty credential source and nothing sound can be gated on it (see
+/// `runtime_preflight`'s module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialPool {
+    /// The Claude OAuth token pool (`.loom/tokens/`, else the shared pool).
+    ClaudeTokens,
+    /// The Codex account pool (`loom-daemon accounts`, provider `codex`).
+    CodexAccounts,
+}
+
+impl CredentialPool {
+    /// Stable wire value for `role_tick.outcome`'s `gated_pool` key.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeTokens => "claude_tokens",
+            Self::CodexAccounts => "codex_accounts",
+        }
+    }
+
+    /// Leading tag of the in-memory ring / telemetry `detail` string. The
+    /// Claude value is the pre-#8408 literal, byte for byte.
+    #[must_use]
+    pub fn detail_tag(self) -> &'static str {
+        match self {
+            Self::ClaudeTokens => "pool-exhausted",
+            Self::CodexAccounts => "codex-account-pool-exhausted",
+        }
+    }
+
+    /// The `<pool> exhausted: 0/N spawnable (<why>)` clause shared by every
+    /// daemon-log WARN for this skip. The Claude rendering is the pre-#8408
+    /// literal, byte for byte; only a non-Claude pool reads differently.
+    #[must_use]
+    pub fn exhausted_phrase(self, total: usize) -> String {
+        match self {
+            Self::ClaudeTokens => format!(
+                "token pool exhausted: 0/{total} spawnable (every account bad-marked or \
+                 hard-excluded by .ranking)"
+            ),
+            Self::CodexAccounts => format!(
+                "codex account pool exhausted: 0/{total} spawnable (no enabled `loom-daemon \
+                 accounts` codex profile is free of a cooldown or re-auth hold; the Claude \
+                 token pool is not consulted for this runtime)"
+            ),
+        }
+    }
+}
+
 /// The result of one role invocation.
 // Deliberately `PartialEq` only (not `Eq`): `LoadSkipped` carries an `f64`
 // load-per-core reading, and `f64` has no total ordering (`NaN`), so it
@@ -63,6 +126,11 @@ pub enum RoleTickOutcome {
         /// gate: the very next tick re-checks the live pool state regardless
         /// of this estimate.
         next_clear_at: chrono::DateTime<chrono::Utc>,
+        /// Which credential pool was read as exhausted (Issue #8408) — the
+        /// one the admitted runtime actually draws from. `total` counts that
+        /// pool's members: `*.token` files for [`CredentialPool::ClaudeTokens`],
+        /// enabled codex profiles for [`CredentialPool::CodexAccounts`].
+        pool: CredentialPool,
     },
     /// A provable model/runtime mismatch (#5028, follow-up to #5001 AC2/AC3):
     /// the admitted runtime and the resolved model are confidently-known,
@@ -102,5 +170,48 @@ impl RoleTickOutcome {
     #[must_use]
     pub fn is_success(&self) -> bool {
         matches!(self, Self::Success)
+    }
+
+    /// True only for a [`Self::PoolExhausted`] skip of the **Claude** token
+    /// pool — the one state that may feed the #6614/#7607 cross-source brake,
+    /// which holds *sweep* dispatch on a token-selection wall. A dry codex
+    /// account pool (#8408) says nothing about the pool sweeps draw from.
+    #[must_use]
+    pub fn exhausted_claude_token_pool(&self) -> bool {
+        matches!(
+            self,
+            Self::PoolExhausted {
+                pool: CredentialPool::ClaudeTokens,
+                ..
+            }
+        )
+    }
+
+    /// Test fixture: a Claude-pool [`Self::PoolExhausted`]. Lives here rather
+    /// than in `role_runner/tests.rs`, which is at its file-size ceiling.
+    #[cfg(test)]
+    pub(crate) fn claude_pool_exhausted(
+        total: usize,
+        next_clear_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self::PoolExhausted {
+            total,
+            next_clear_at,
+            pool: CredentialPool::ClaudeTokens,
+        }
+    }
+
+    /// Which credential pool gated this tick pre-spawn, as the stable
+    /// `role_tick.outcome` `gated_pool` wire value (Issue #8408). `None` for
+    /// every outcome that was not a credential-pool skip.
+    /// [`Self::NoTokenPool`] is by construction a Claude-pool verdict: it is
+    /// only ever produced for a role admitted onto the `claude` runtime.
+    #[must_use]
+    pub fn gated_pool(&self) -> Option<&'static str> {
+        match self {
+            Self::NoTokenPool => Some(CredentialPool::ClaudeTokens.as_str()),
+            Self::PoolExhausted { pool, .. } => Some(pool.as_str()),
+            _ => None,
+        }
     }
 }
