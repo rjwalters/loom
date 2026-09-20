@@ -19,7 +19,7 @@ Issues flagged as highest priority (`loom:urgent`).
 
 - **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh
 - **#8322**: Port PR #8314's per-role tool-restriction deny-spec computation out of spawn-claude.sh/spawn-codex.sh into loom-daemon (Shell Budget Ratchet blocker)
-- **#8410**: merge-pr.sh --auto: a server-side armed auto-merge ignores later loom:pr revocation and non-required test suites
+- **#8407**: Codex per-subscription availability probe: expose quota/rate-limit state per account into provider-aware ranking (the `tokens check` analogue)
 
 ## Ready
 
@@ -28,30 +28,30 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
 - **#8097**: Differential corpus covers 2 of 7 separator chars, omits comments entirely, and its generator is not committed
 - **#8136**: Reconcile PR #8097's differential-corpus gaps with #8125's BotLoginNormalisation work
+- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 - **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh
 - **#8287**: worktree.sh reset a stale local feature/issue-N to main although origin/feature/issue-N carried the PR's commits (Doctor on #8190)
 - **#8322**: Port PR #8314's per-role tool-restriction deny-spec computation out of spawn-claude.sh/spawn-codex.sh into loom-daemon (Shell Budget Ratchet blocker)
 - **#8354**: Port _worktree_resolve_stale_reset_ref (#8287) to loom-daemon per shell-language-policy
+- **#8396**: Design and wire a premise-check gate before Curator for autonomously-filed/design-reversing issues (re-file of #8310, corrected citation)
+- **#8401**: native harness API-key account pool: rotate a fleet of Z.ai coding-plan subscriptions through OpenCode/Pi with per-account exhaustion state (the API-key analogue of the Claude token pool)
+- **#8408**: Role-runner pool-exhaustion gate is not runtime-aware: a codex-pinned role skips on an empty *Claude* pool
+- **#8413**: Worktree reaper hard-reset an in-flight builder's worktree mid-compile (idle-detection misfire)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 - **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes)
-- **#8396**: Design and wire a premise-check gate before Curator for autonomously-filed/design-reversing issues (re-file of #8310, corrected citation)
-- **#8401**: native harness API-key account pool: rotate a fleet of Z.ai coding-plan subscriptions through OpenCode/Pi with per-account exhaustion state (the API-key analogue of the Claude token pool)
 - **#8403**: run native-harness (OpenCode/Pi) sweeps in the per-sweep ephemeral container with isolated XDG/config dirs and env-only credentials — not the Codex session container
 - **#8407**: Codex per-subscription availability probe: expose quota/rate-limit state per account into provider-aware ranking (the `tokens check` analogue)
 - **#8408**: Role-runner pool-exhaustion gate is not runtime-aware: a codex-pinned role skips on an empty *Claude* pool
-- **#8410**: merge-pr.sh --auto: a server-side armed auto-merge ignores later loom:pr revocation and non-required test suites
-- **#8413**: Worktree reaper hard-reset an in-flight builder's worktree mid-compile (idle-detection misfire)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#8425**: feat(premise-gate): refuse a self-approved design reversal before Curator enriches it
 
 ## Approved (Awaiting Merge)
 
@@ -60,6 +60,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
 - **#8386**: fix(merge-pr): name the daemon roll in the refusal, and declare every script's daemon version floor
 - **#8421**: feat(profiles): multi-variable credential mapping + provider options for model profiles
+- **#8426**: fix(merge-pr): --auto settles checks and re-validates in-process instead of arming a server-side merge (#8410)
 
 ## Proposed
 
@@ -118,10 +119,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 3 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 7 |
-| In Progress (`loom:building`) | 9 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 3 |
+| Ready (`loom:issue`) | 12 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 4 |
 | Curated | 34 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 4 |
