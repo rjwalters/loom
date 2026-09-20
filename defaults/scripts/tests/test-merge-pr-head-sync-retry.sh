@@ -16,11 +16,14 @@
 #
 # The fix has two halves, and this suite covers both:
 #
-#   1. _refresh_precondition_sha() — after ANY push to the head branch,
-#      re-read the head SHA. Closes the common case, and records the fact
-#      attribution depends on (this run pushed to the head branch at all).
-#   2. _head_moved_or_resync() — the residual window (update-branch is
-#      asynchronous, so the push can land after that read). A mismatch is
+#   1. _refresh_precondition_sha() — after ANY push to the head branch, record
+#      the fact attribution depends on (this run pushed to the head branch at
+#      all). Deliberately does NOT re-read or adopt the new head SHA itself —
+#      an earlier version did, blindly, which meant a session pushing a commit
+#      on top of ours mid-sync got squashed into the merge with no refusal.
+#      Leaving the precondition alone routes every adoption through part 2.
+#   2. _head_moved_or_resync() — reached on EVERY head-SHA adoption on this
+#      path now, not just the asynchronous-push residual window. A mismatch is
 #      retried ONCE, and only when `loom-daemon merge-pr head-sync-retry`
 #      attributes the new head to our own sync: a two-parent merge whose FIRST
 #      parent is the head we were about to merge and whose SECOND parent is
@@ -221,51 +224,61 @@ run_resync_isolated() {
 }
 
 # ============================================================================
-# Part 1: _refresh_precondition_sha — the primary fix
+# Part 1: _refresh_precondition_sha — records the push, adopts nothing
 # ============================================================================
 echo ""
-echo "Testing _refresh_precondition_sha (post-push head re-read)..."
+echo "Testing _refresh_precondition_sha (records the push; leaves the SHA alone)..."
 
-# T1: THE INCIDENT. The precondition was read before the sync; after the sync
-# pushed to the head branch, the re-read must adopt the new head — otherwise
-# the retry below re-gates on a SHA the forge has already superseded.
+# T1: THE INCIDENT, corrected. An earlier version of this fix blindly adopted
+# whatever head.sha the forge reported here — no parent inspection, no
+# containment check. That is unsafe: a session pushing a commit on top of ours
+# mid-sync (the #5579 scenario) would get squashed into the merge with no
+# refusal, because nothing downstream re-checked the adopted SHA. The
+# precondition must stay exactly what it was; only _head_moved_or_resync()
+# below is allowed to move it, and only under the structural attribution check.
 MERGE_PRECONDITION_SHA="$APPROVED"
 _HEAD_SELF_SYNCED=""
 STUB_HEAD_SHA="$SYNCED"
 capture _refresh_precondition_sha || true
 T1_OUT="$CAPTURED"
-assert_eq "$SYNCED" "$MERGE_PRECONDITION_SHA" "after a base-sync push, the merge precondition is re-read (the #8164 fix)"
-assert_eq "true" "$_HEAD_SELF_SYNCED" "the re-read records that THIS run pushed to the head branch"
-assert_contains "$T1_OUT" "#8164" "the re-read announces itself with the issue reference"
-assert_contains "$T1_OUT" "${SYNCED:0:8}" "the re-read names the new head"
+assert_eq "$APPROVED" "$MERGE_PRECONDITION_SHA" "the precondition is left untouched — no blind adoption of the new head"
+assert_eq "true" "$_HEAD_SELF_SYNCED" "it still records that THIS run pushed to the head branch"
+assert_eq "" "$T1_OUT" "it performs no forge read and logs nothing (there is no SHA to report yet)"
 
-# T2: an unchanged head is not announced — the sync was a no-op, and a log
-# line claiming the head advanced when it did not is a false breadcrumb.
+# T2: it does not consult the forge at all — no STUB_HEAD_SHA/STUB_PR_READ_FAILS
+# dependency, so a forge read failure at this point cannot affect it, unlike
+# the old re-read which had to special-case that failure.
 MERGE_PRECONDITION_SHA="$APPROVED"
-STUB_HEAD_SHA="$APPROVED"
-capture _refresh_precondition_sha || true
-T2_OUT="$CAPTURED"
-assert_eq "$APPROVED" "$MERGE_PRECONDITION_SHA" "an unchanged head leaves the precondition alone"
-assert_not_contains "$T2_OUT" "advanced the head" "an unchanged head is not announced as an advance"
-
-# T3: a failed/empty read must NEVER blank the precondition — merging with no
-# precondition at all is exactly the unguarded merge #5579 closed.
-MERGE_PRECONDITION_SHA="$APPROVED"
+_HEAD_SELF_SYNCED=""
 STUB_PR_READ_FAILS=true
 _refresh_precondition_sha >/dev/null 2>&1
-assert_eq "$APPROVED" "$MERGE_PRECONDITION_SHA" "a failed head read keeps the known precondition (never empty)"
-assert_eq "true" "$_HEAD_SELF_SYNCED" "a failed head read still records the push (attribution needs the fact, not the SHA)"
+assert_eq "$APPROVED" "$MERGE_PRECONDITION_SHA" "the precondition is untouched even when the forge read would have failed"
+assert_eq "true" "$_HEAD_SELF_SYNCED" "the push is still recorded regardless of forge state"
 STUB_PR_READ_FAILS=false
 
-# T4: it returns 0 even when nothing changed — it runs mid-loop under
-# `set -e`, so a nonzero return would abort the merge run outright.
+# T3: it returns 0 unconditionally — it runs mid-loop under `set -e`, so a
+# nonzero return would abort the merge run outright.
 MERGE_PRECONDITION_SHA="$APPROVED"
-STUB_HEAD_SHA="$APPROVED"
 set +e
 _refresh_precondition_sha >/dev/null 2>&1
-T4_RC=$?
+T3_RC=$?
 set -e
-assert_eq "0" "$T4_RC" "_refresh_precondition_sha always returns 0 (it runs under set -e)"
+assert_eq "0" "$T3_RC" "_refresh_precondition_sha always returns 0 (it runs under set -e)"
+
+# T4: two base-syncs in the same run (e.g. the first retry's attributed
+# resync itself needed a further base-sync) do not un-set an already-spent
+# retry budget — _refresh_precondition_sha only ever sets _HEAD_SELF_SYNCED,
+# it never touches _HEAD_RESYNC_USED. The second sync's eventual head-mismatch
+# therefore reaches _head_moved_or_resync() with the budget still spent and is
+# re-queued rather than silently granted a second retry (Judge's #8429 review:
+# "if every base-sync now spends the single retry, two syncs in one run will
+# re-queue where today's code would proceed — safe, but ... covered by a test").
+MERGE_PRECONDITION_SHA="$APPROVED"
+_HEAD_SELF_SYNCED=""
+_HEAD_RESYNC_USED=true
+_refresh_precondition_sha >/dev/null 2>&1
+assert_eq "true" "$_HEAD_RESYNC_USED" "a second base-sync does not reset an already-spent retry budget"
+_HEAD_RESYNC_USED=""
 
 # ============================================================================
 # Part 2: _head_moved_or_resync — the residual-window fix, and its fail-safety

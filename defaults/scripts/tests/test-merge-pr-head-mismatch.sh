@@ -472,11 +472,12 @@ fi
 # The other half of that property: _head_moved_or_resync()'s refusal path is
 # still error_head_moved() with both SHAs, i.e. exit 3, i.e. a re-queue.
 TESTS_RUN=$((TESTS_RUN + 1))
-if awk '
+_hmr_refusal_probe=$(awk '
   /^_head_moved_or_resync\(\) \{/ { infn=1 }
   infn && /error_head_moved "PR #\$PR_NUMBER: \$1" "\$MERGE_PRECONDITION_SHA" "\$_CURRENT_HEAD_SHA"/ { print "ok"; exit }
   infn && /^}$/ { exit }
-' "$MERGE_PR_SRC" | grep -q ok; then
+' "$MERGE_PR_SRC")
+if [[ "$_hmr_refusal_probe" == "ok" ]]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "  ${GREEN}PASS${NC}: _head_moved_or_resync()'s non-retry path is error_head_moved() with both SHAs (exit 3)"
 else

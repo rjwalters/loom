@@ -156,24 +156,23 @@ _is_head_mismatch_response() {
   echo "$1" | grep -Eiq 'Head branch was modified\.|head out of date|expectedHeadOid'
 }
 
-# #8164: re-read the head SHA after THIS script pushes to the head branch.
-#
-# Both merge-retry loops answer "Base branch was modified" by calling
-# forge_update_branch(), which lands a `Merge branch 'main' into <branch>`
-# commit ON THE HEAD BRANCH — and then retried the merge with the
-# $MERGE_PRECONDITION_SHA read BEFORE that push. The forge compares the stale
-# precondition against its own current head and refuses with 409 "Head branch
-# was modified", which _is_head_mismatch_response() then (correctly, given
-# what it can see) reads as "the head moved under us" → exit 3. The script
-# lost a merge to a race it created itself. Re-reading here closes the common
-# case; _head_moved_or_resync() below handles the residual timing window,
-# because update-branch is asynchronous and the push can land after this read.
-# Also records that we pushed to the head branch at all, which is the fact
-# attribution depends on: an unexplained head move must stay a hard stop.
+# #8164: record that THIS script pushed to the head branch, via
+# forge_update_branch() ("Base branch was modified" retry). Deliberately does
+# NOT re-read or adopt the new head SHA — that adoption used to be blind (no
+# parent inspection, no containment check), which meant a session pushing a
+# commit on top of ours mid-sync (the exact #5579 scenario) got squashed into
+# the merge with no refusal and no trace once the squash discarded ancestry.
+# Leaving $MERGE_PRECONDITION_SHA untouched means the next merge attempt gets
+# its own 409 "Head branch was modified", which routes through
+# _head_moved_or_resync() below exactly like the residual-timing-window case —
+# so EVERY head-SHA adoption on this path goes through the same structural
+# attribution check, not just the asynchronous-push one. One extra round trip
+# buys uniform attribution instead of two different safety levels for the same
+# claim ("this new head is our own sync").
 # Written as one dense line for the same reason the guards above are: this file
 # is frozen by the file-size ratchet, and `shell-budget --check` refuses a
 # change that grows the portable pool at all.
-_refresh_precondition_sha() { local _RPS; _HEAD_SELF_SYNCED=true; _RPS="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null | jq -r '.head.sha // empty' 2>/dev/null || echo '')"; [[ -n "$_RPS" && "$_RPS" != "$MERGE_PRECONDITION_SHA" ]] && { info "PR #$PR_NUMBER: base-sync advanced the head ${MERGE_PRECONDITION_SHA:0:8} → ${_RPS:0:8}; re-reading it as the merge precondition (#8164)"; MERGE_PRECONDITION_SHA="$_RPS"; }; return 0; }
+_refresh_precondition_sha() { _HEAD_SELF_SYNCED=true; return 0; }
 
 # #8164: a head-SHA mismatch is retried ONCE when — and only when — this run's
 # own base-sync caused it. Returns 0 when the caller should re-attempt the
