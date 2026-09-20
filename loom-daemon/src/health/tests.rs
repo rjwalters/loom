@@ -69,7 +69,6 @@ pub(crate) fn healthy_inputs() -> HealthInputs {
         at: now(),
         window: Duration::from_secs(DEFAULT_WINDOW_SECS),
         status: Some(healthy_status()),
-        ipc_error: None,
         install_state: Some(install_report(InstallState::AliveButUnresponsive)),
         pgrep_pids: vec![4321],
         pid_file: None,
@@ -87,7 +86,6 @@ pub(crate) fn healthy_inputs() -> HealthInputs {
         }]),
         gh_unavailable: None,
         cli_build_commit: CLI_COMMIT.to_string(),
-        work_finder_log_tick_age_secs: None,
         // Healthy baseline: the auto_update loop reports disabled (the
         // default) — same "opted out" GREEN every fixture below builds
         // from unless a test explicitly enables/mutates it.
@@ -100,6 +98,12 @@ pub(crate) fn healthy_inputs() -> HealthInputs {
         // refute an `indeterminate-busy` story, so every pre-#8163 fixture
         // built from this one keeps its exact pre-#8163 verdict.
         load_per_core: None,
+        // The not-collected optionals — `ipc_error`,
+        // `work_finder_log_tick_age_secs`, and the #8349
+        // `limit_calibration` reading — stay at their `Default` (`None`)
+        // via the tail, so this fixture (and the section-inventory tests
+        // it feeds) is unchanged by any future optional-signal field.
+        ..Default::default()
     }
 }
 

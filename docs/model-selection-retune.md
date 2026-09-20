@@ -201,7 +201,9 @@ upstream metering change, invisible to every measurement this document
 otherwise relies on. `loom-daemon health`'s `limit_calibration` section
 (issue #8063, `loom_daemon::limit_calibration`) is the automated signal for
 that: a daily $-eq-per-weekly-point series, sourced from claude-monitor's
-`usage_history` table joined against the activity DB's daily cost-equivalent,
+`usage_history` table joined against the activity DB's daily cost-equivalent —
+or, on a host without claude-monitor (#8349), from the activity DB's own
+persisted `weekly_point_samples` (#8347) joined by #8348's pure `calibrate()` —
 with a warning when the metric moves more than 1.5x over its trailing 3-day
 baseline. A representative sample accrued while that section reported a step
 change should be treated as suspect and re-measured after the new baseline
@@ -210,10 +212,13 @@ settles, rather than fed into the §2 inequality as-is.
 The section is **conditional**, like `observability`: it prints only on a host
 that has both halves of the join — claude-monitor's `usage.db` (or
 `LOOM_CLAUDE_MONITOR_DIR`) and an activity database with `resource_usage` rows
-(#8059). No `limit_calibration` line at all means the signal is not configured
-on that host, **not** that it was checked and found clean — so before treating
-an observe-mode sample as metering-stable, confirm the line is actually
-present:
+(#8059) — or, on a host without claude-monitor, an activity database carrying
+both `resource_usage` rows and #8347's `weekly_point_samples` (accrued by
+`loom-daemon tokens check --ranking`, so it needs a few days of runs before it
+can say anything). No `limit_calibration` line at all means the signal is not
+configured on that host, **not** that it was checked and found clean — so
+before treating an observe-mode sample as metering-stable, confirm the line is
+actually present:
 
 ```bash
 loom-daemon health --json | jq '.sections[] | select(.key == "limit_calibration")'

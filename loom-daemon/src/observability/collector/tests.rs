@@ -879,6 +879,10 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         // fixture's IPC round-trip succeeds, so the `indeterminate-busy`
         // corroboration this field feeds never comes into play.
         load_per_core: None,
+        // `HealthInputs` gained this field in #8349 after this fixture was
+        // added — `None` (calibration not collected) is fine here since
+        // this fixture is not about the `limit_calibration` axis.
+        limit_calibration: None,
     }
 }
 
