@@ -54,10 +54,12 @@ fn incident_message_names_the_check_and_both_timestamps() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let started: DateTime<Utc> = INCIDENT_RUN_STARTED.parse().unwrap();
     let msg = stale_message("8078", "File Size Ratchet", started, base_tip, "abc123");
+    // chrono's Display renders RFC3339 as "2026-09-17 22:54:20 UTC" — assert
+    // the rendered form, which is what an operator actually reads.
     for needle in [
         "File Size Ratchet",
-        "2026-09-17T22:54:20Z",
-        "2026-09-18T11:45:21Z",
+        "2026-09-17 22:54:20 UTC",
+        "2026-09-18 11:45:21 UTC",
         "abc123",
     ] {
         assert!(msg.contains(needle), "message must name {needle}: {msg}");
