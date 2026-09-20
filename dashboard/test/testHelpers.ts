@@ -115,6 +115,34 @@ export function sweepOutcomeEnvelope(overrides: Partial<Record<string, unknown>>
   };
 }
 
+/** Build a minimal, valid `ephemeral_compute` envelope for a batch fixture
+ * (Issue #8304 — 2am's elastic EDA batch runner; host-level like
+ * `tokens.snapshot`/`host.health`, no `repo`/`visibility`/`issue`/
+ * `sweep_id`). Carries the minimum required fields per the parent issue's
+ * AC 1: job id, instance id, region, instance type, spot flag, AMI,
+ * start/end timestamps, wall clock, and estimated cost. */
+export function ephemeralComputeEnvelope(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    emitted_at: "2026-09-19T12:00:00Z",
+    host_id: "host-abc",
+    record: {
+      kind: "ephemeral_compute",
+      job_id: "job-abc123",
+      instance_id: "i-0123456789abcdef0",
+      region: "us-east-1",
+      instance_type: "c7i.4xlarge",
+      spot: true,
+      ami: "ami-0123456789abcdef0",
+      started_at: "2026-09-19T12:00:00Z",
+      ended_at: "2026-09-19T12:45:00Z",
+      wall_clock_sec: 2700,
+      estimated_cost_usd: 1.23,
+      ...overrides,
+    },
+  };
+}
+
 /** Build a minimal, valid `tokens.snapshot` envelope for a batch fixture
  * (host-level — no `repo`/`visibility`). */
 export function tokensSnapshotEnvelope(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {

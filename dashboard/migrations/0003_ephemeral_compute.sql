@@ -1,0 +1,74 @@
+-- `ephemeral_compute` ingest support (Issue #8304, Phase 1 of #8257).
+--
+-- Schema decision: reuse the generic `records` table (migrations/0001_init.sql)
+-- rather than add a dedicated `ephemeral_compute` summary table. Every other
+-- `kind` already lands here with its kind-specific fields folded into the
+-- JSON `payload` column and read back via SQLite's JSON1 functions at query
+-- time (`json_extract(payload, '$.field')`) — `ephemeral_compute` has no
+-- ingest-time need to diverge from that pattern for this phase's "durably
+-- ingested and queryable by kind" acceptance criteria. Concretely this means
+-- `src/index.ts`'s `handleIngest` needs ZERO changes: envelope validation is
+-- already kind-agnostic (`src/telemetry.ts`), and every `ephemeral_compute`
+-- field (job id, instance id, region, instance type, spot flag, AMI,
+-- start/end timestamps, wall clock, estimated cost) rides inside `payload`
+-- exactly like `sweep.outcome`'s `model`/`config`/`phase_durations` do today.
+--
+-- The alternative — a dedicated table keyed by job id, upserted at launch and
+-- again at completion — is deliberately NOT built here. Phase 2 of #8257
+-- ("live running now state + leak detection") is exactly the kind of mutable,
+-- current-state query this backend already has a purpose-built home for: the
+-- Durable Object (`src/fleetState.ts`'s module doc — "the Durable Object
+-- holds live/current state ... `records` is NOT backed by this schema"), same
+-- as every sweep's live phase/status today. Building a second, D1-resident
+-- mutable summary table before Phase 2's actual query patterns exist would be
+-- guessing at a shape this issue has no evidence for yet; `records` plus the
+-- two indexes below is the durable-history half of the job that Phase 1 can
+-- commit to today, and it is deliberately query-pattern-agnostic so Phase 2
+-- can build whichever live-state mechanism it needs on top without this
+-- migration being wrong in retrospect.
+--
+-- Two additions:
+--
+--   1. `idx_records_kind_time` — a general (kind, emitted_at) index. Every
+--      existing index on `records` (migrations/0001_init.sql) is scoped to
+--      `host_id` or `repo`, not `kind` alone. `ephemeral_compute` rows have
+--      no `repo` (a compute job is not repo-scoped — see the
+--      `redaction.ts` policy entry added alongside this migration) and are
+--      naturally queried "every ephemeral_compute row in a time range",
+--      which is exactly the query shape this repo's existing indexes do not
+--      cover.
+--   2. `idx_records_ephemeral_compute_job_id` — a partial expression index on
+--      `json_extract(payload, '$.job_id')`, scoped via the partial `WHERE`
+--      to exactly `kind = 'ephemeral_compute'` so it costs nothing for every
+--      other kind's rows and never requires a `job_id` column on the shared
+--      table. This turns "every record for job X" (a launch-time record and
+--      a completion-time record, per 2am's `report_record()` call sites)
+--      into an index lookup instead of a full table scan, however large
+--      `records` grows — the exact lookup Phase 2/3's per-job queries need.
+--
+-- Two deliberate NON-additions, both consequences of the decision above:
+--
+--   * **No per-job dedup index.** Migration 0002 gave `sweep.completed`/
+--     `sweep.outcome` a partial UNIQUE index on `(kind, sweep_id)` because
+--     those are *terminal* records a retrying exporter can re-send verbatim.
+--     `ephemeral_compute` is not that shape: a launch-time record and a
+--     completion-time record for the same job are two distinct emissions
+--     (2am's `report_record()` is called at both points), and both must
+--     survive for Phase 2/3 to reconstruct a job's history. A UNIQUE index
+--     here would silently drop the second one. Dedup, if a later phase finds
+--     it needs any, belongs on a narrower key than `job_id` alone.
+--   * **No per-kind required-field validation.** `handleIngest`'s whole-batch
+--     rejection contract stays scoped to the ENVELOPE (`schema_version`/
+--     `emitted_at`/`host_id`/`record.kind`, validated kind-agnostically in
+--     `src/telemetry.ts`); a record whose kind-specific fields are partial is
+--     accepted as-is. That is not a gap: a launch-time record legitimately
+--     has no `ended_at`, `wall_clock_sec`, or `estimated_cost_usd` yet, so
+--     "incomplete" is the normal in-flight state for this kind, and no other
+--     kind has per-field validation either. Both decisions are pinned by
+--     tests in `test/ingest.test.ts`.
+
+CREATE INDEX idx_records_kind_time ON records (kind, emitted_at);
+
+CREATE INDEX idx_records_ephemeral_compute_job_id
+  ON records (json_extract(payload, '$.job_id'))
+  WHERE kind = 'ephemeral_compute';

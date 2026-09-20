@@ -503,6 +503,28 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redactPayload("host.health", payload)).not.toHaveProperty("managed_repos");
   });
 
+  // Issue #8304 (Phase 1 of #8257): job/instance/region/cost detail is
+  // infrastructure-spend detail about a private compute fleet — no field
+  // survives to a public, unauthenticated view. This is a stated policy
+  // entry (see `RECORD_FIELD_ALLOWLIST`'s comment), not the unrecognized-kind
+  // fallback, even though the resulting allowlist is identical to it.
+  it("ephemeral_compute: strips every field, revealing only `kind` (stated no-public-fields policy)", () => {
+    const redacted = redactPayload("ephemeral_compute", {
+      kind: "ephemeral_compute",
+      job_id: "job-abc123",
+      instance_id: "i-0123456789abcdef0",
+      region: "us-east-1",
+      instance_type: "c7i.4xlarge",
+      spot: true,
+      ami: "ami-0123456789abcdef0",
+      started_at: "2026-09-19T12:00:00Z",
+      ended_at: "2026-09-19T12:45:00Z",
+      wall_clock_sec: 2700,
+      estimated_cost_usd: 1.23,
+    });
+    expect(redacted).toEqual({ kind: "ephemeral_compute" });
+  });
+
   it("an unrecognized (forward-compatible) kind reveals only `kind`", () => {
     const redacted = redactPayload("future.kind", {
       kind: "future.kind",
