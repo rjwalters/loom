@@ -20,7 +20,7 @@ use super::models::{
     PromptChanges, PromptForgeEvent, RunwayProjection,
 };
 use super::schema::init_schema;
-use super::{claims, cost_analytics, prompts, quality, usage_report};
+use super::{claims, cost_analytics, prompts, quality, usage_report, weekly_point_history};
 
 /// Activity database for tracking agent inputs and results
 pub struct ActivityDb {
@@ -310,6 +310,38 @@ impl ActivityDb {
         group_by: usage_report::UsageReportGroupBy,
     ) -> Result<Vec<usage_report::UsageReportRow>> {
         usage_report::get_usage_report(&self.conn, since, group_by)
+    }
+
+    /// Record one UTC day's weekly-limit-point sample (Issue #8347), keeping
+    /// the day's maximum on conflict. See
+    /// [`super::weekly_point_history`] for what a point is and why the day's
+    /// maximum — not its latest reading — is the stored summary.
+    ///
+    /// Callers that must not fail (the `tokens check` probe path) go through
+    /// [`super::weekly_point_history::record_daily_sample_best_effort_in`],
+    /// which wraps this.
+    pub fn record_weekly_point_sample(
+        &self,
+        day: NaiveDate,
+        points: f64,
+        account_count: i64,
+    ) -> Result<()> {
+        weekly_point_history::record_weekly_point_sample(
+            &self.conn,
+            day,
+            points,
+            account_count,
+            Utc::now(),
+        )
+    }
+
+    /// The daily weekly-limit-point series from `since` (inclusive) onward,
+    /// oldest day first (Issue #8347).
+    pub fn get_weekly_point_series(
+        &self,
+        since: NaiveDate,
+    ) -> Result<Vec<weekly_point_history::WeeklyPointSample>> {
+        weekly_point_history::get_weekly_point_series(&self.conn, since)
     }
 
     // ========================================================================
