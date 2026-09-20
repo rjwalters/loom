@@ -14,6 +14,7 @@ pub(crate) mod dep_classify;
 pub(crate) mod dep_recheck;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_backoff;
+mod duplicate_scan;
 pub(crate) mod fleet_experiment;
 pub(crate) mod health;
 pub(crate) mod inflight;
