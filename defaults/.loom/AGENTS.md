@@ -120,7 +120,7 @@ second copy can go missing its pre-claim guard.
 ### Merging PRs
 
 **Never use `gh pr merge`** — always use `./.loom/scripts/merge-pr.sh <PR_NUMBER>`
-instead (`--auto` to queue until checks pass, `--dry-run` to preview). `gh pr
+instead (`--auto` to wait then merge, `--dry-run` to preview). `gh pr
 merge` attempts a local checkout that fails when the PR branch is linked to a
 worktree; the script merges via the forge API directly and handles worktree
 cleanup automatically. A `PreToolUse` hook redirects `gh pr merge` calls to

@@ -2055,7 +2055,11 @@ echo "Attempting to merge PR #$PR_NUMBER..."
 git checkout main 2>/dev/null || true
 
 # Use merge-pr.sh for worktree-safe merge via GitHub API
-# --auto enables auto-merge if ruleset requires wait
+# --auto waits (<= LOOM_AUTO_MERGE_TIMEOUT, default 600s) for the head's checks
+# to settle, re-validates loom:pr + head SHA, then merges HERE — never via the
+# server-side queue, which ignored both on PR #8220 (#8410). So this call can
+# block for minutes, and CI outlasting the timeout exits non-zero: retry next
+# pass, not a broken merge.
 #
 # merge-pr.sh reads the PR's head SHA itself (a fresh, uncached read — see
 # "Cached forge reads" above) immediately before merging, and passes it
@@ -2095,7 +2099,7 @@ fi
 **Merge strategy**:
 - Uses `merge-pr.sh` which merges via GitHub API (worktree-safe)
 - **Squash merge**: Combines all commits into single commit (clean history)
-- **`--auto`**: Enables GitHub's auto-merge if ruleset requires wait
+- **`--auto`**: Settles the head's checks, re-validates, merges in-process (#8410)
 - Branch deleted automatically after merge
 - **Head-moved guard (#5579)**: `merge-pr.sh` refuses to merge (exit 3, not a
   failure) if the PR's head branch advanced past the SHA it read immediately

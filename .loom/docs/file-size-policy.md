@@ -306,7 +306,7 @@ these an API change rather than a rewrite.
 | `cli/loom-daemon-watchdog.sh` | ~990 | `main_health_gate.rs`, `health.rs` | poll cadence and restart policy |
 | `claude-wrapper.sh` | 1,675 → 1,657 | `retry_classify/` (#8037) owns the six classifiers; preflight, MCP repair, output monitoring and process plumbing are still shell | **Classification done.** Retry vs give up, the three rotation predicates and the backoff curve now delegate to `loom-daemon retry-classify`, with #8032's 44 assertions as the equivalence proof. What remains to retire is `run_with_retry`'s loop and the monitors (#7810 Phase 7–8) |
 | `worktree.sh` | ~1,820 | `worktree_ops/`, `worktree_reaper.rs` | the `.loom-managed` sentinel contract; also forge-blind today (#7765) |
-| `merge-pr.sh` | ~1,460 | `forge_cmd.rs` (`loom-daemon forge auto-merge`) | already has a delegation ladder — the most incremental port available |
+| `merge-pr.sh` | 1,460 → 1,221 | `merge_pr/` (`verdict-contradiction`, `stale-checks`) | #8410 retired the server-side auto-merge arm (−239 lines) and with it the `forge auto-merge` delegation; the guard subcommands are now the ladder |
 | `resync-installed.sh` | ~1,170 | `init/`, `daemon_install_state.rs` | vendored **and** a port candidate; resolve the upstream question first |
 | `lib/forge-helpers.sh` | 1,072 | forge dispatch already in the daemon | none of its own — it evaporates as its callers port, so it follows its consumers |
 | `check-main-clean.sh` | 489 | — (git-state inspection) | the build-gate invocation name, which stays behind as a stub |
