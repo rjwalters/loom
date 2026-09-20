@@ -6,7 +6,11 @@ Loom-managed native roles use four tools: `loom_read`, `loom_write`,
 Rust normalizes requests through the existing shared guard bridge and its
 workflow, destructive-command, and worktree policies.
 
-Tested versions and live outcomes: [verification receipt](native-runtime-verification-2026-09-19.md).
+Tested versions and live outcomes: [verification receipt](native-runtime-verification-2026-09-19.md)
+— Pi 0.85.1 and OpenCode **1.18.31**. Everything this page says about OpenCode's
+guard was verified on OpenCode 1.x only. **No OpenCode 2.x guarded receipt
+exists yet**, so a guarded launch on 2.x is refused before spawn; see
+"OpenCode major versions" below.
 
 ## Enforcement boundary
 
@@ -15,7 +19,7 @@ Tested versions and live outcomes: [verification receipt](native-runtime-verific
 | Native edits stay in managed worktrees | Every write/edit target is checked by the existing worktree policy before access. Shell commands use the existing shell-write policy. |
 | Protected branches and workflow rules | The same destructive and workflow guards used by the existing runtimes inspect each shell call. |
 | Broken guard cannot permit a tool | Missing guard files, malformed/unknown output, nonzero exit, and a 20-second policy timeout refuse the operation. |
-| Binding fails to load | Pi starts with builtin tools and extension discovery disabled. OpenCode uses a dedicated primary agent whose default permission is deny, with only the four named tools enabled. Missing bindings therefore leave no executable unguarded tool surface. |
+| Binding fails to load | Pi starts with builtin tools and extension discovery disabled. OpenCode uses a dedicated primary agent whose default permission is deny, with only the four named tools enabled. Missing bindings therefore leave no executable unguarded tool surface. *(OpenCode: verified on 1.18.31 only.)* |
 | Concurrent file edits | File operations share a workspace mutation lock; an edit must match exactly one nonempty old-text occurrence. |
 | Large output and hung commands | Reads/output are bounded; shell execution uses the existing Rust bounded process executor and a maximum 600-second deadline. SIGTERM/SIGINT cancels the owned shell process group. |
 | Model/provider selection | Existing named profiles and explicit provider/model selections; no Claude token-pool preflight or implicit Sonnet default on native sweeps. |
@@ -24,7 +28,34 @@ Tested versions and live outcomes: [verification receipt](native-runtime-verific
 Bindings are generated from the binary under `.loom/native-tools/`, which is
 machine-local ignored state. The OpenCode binding depends on the matching
 `@opencode-ai/plugin` package; OpenCode installs it into that isolated config
-directory. No global CLI model/login settings are rewritten by Loom dispatch.
+directory. That package is pinned to 1.18.31 and was verified against an
+OpenCode 1.18.31 host only; whether a 2.x host loads it is unverified. No
+global CLI model/login settings are rewritten by Loom dispatch.
+
+## OpenCode major versions
+
+The adapter probes `opencode --version` before `exec` and tracks, in code, which
+majors have a **live guarded-canary receipt** (`Major::guard_verified` in
+`loom-daemon/src/worker_spawn/opencode_version.rs`). Today that is 1.x only. A
+guarded launch — `LOOM_ROLE` set, or a `/loom:<role>` prompt — on any other
+major is refused before spawn with exit 78, before any binding is provisioned.
+Unguarded free-form launches on 2.x are unaffected. This is evidence tracking,
+not a setting: there is no configuration key or environment override, and a
+major is added only by the change that also adds its dated receipt here.
+
+Why a passing fake-CLI test suite is not enough: OpenCode 2.x documents
+`run --auto` as approving every permission that is *not explicitly denied*, and
+Loom passes `--auto` for `--dangerously-skip-permissions`. If 2.x ignores any of
+the deny-by-default agent, top-level `permission`, or `tools` keys Loom injects,
+a role launch would run OpenCode's built-in write and shell tools, auto-approved
+and outside Loom's guards — and still exit 0. Fixture tests prove Loom *sets*
+that configuration, never that a real CLI *honors* it. Only a live canary that
+includes the deliberately-broken-binding case (pass condition: no file written
+and no executable unguarded tool, not the exit code) distinguishes "failed
+closed" from "fell open". Still unverified on 2.x: the isolated
+`OPENCODE_CONFIG_DIR`, `plugins/loom.ts` discovery, the plugin SDK pin above,
+the agent/permission/tools config keys, and `OPENCODE_CONFIG_CONTENT` being read
+by the private server `--standalone` starts.
 
 Free-form trials without a Loom role retain the harness's ordinary tools.
 The guarded tool contract applies to role-tagged launches and `/loom:<role>`
@@ -78,6 +109,14 @@ a shell command analyzer understands), filesystem check/use races, and the
 existing path-derived managed-worktree ownership limits. Trusted installed
 hooks, helper binaries, harness plugins and configuration are executable code.
 Do not treat this integration as containment of a malicious plugin or host.
+
+OpenCode 2.x `run` attaches by default to a shared, long-lived background
+service. The guarded binding reads `LOOM_WORKSPACE`, `LOOM_NATIVE_TOOL_BIN` and
+its working directory from *whichever process loads the plugin*; under a shared
+service those belong to the service — absent, so no tools, or stale from an
+earlier launch, so tool calls are guarded against the wrong workspace. Loom
+therefore always passes `--standalone` on 2.x. An operator who starts OpenCode
+some other way, or points a worker at a shared server, is outside this boundary.
 
 The initial guarded tool set deliberately excludes native task delegation,
 MCP tools, interactive stdin, and unclassified plugin tools. It uses the same
