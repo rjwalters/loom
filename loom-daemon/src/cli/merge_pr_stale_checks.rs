@@ -56,7 +56,9 @@ impl StaleChecksArgs {
         // with the merge that actually matters.
         let (tip_sha, verdict) = if self.from_stdin {
             match self.stdin_inputs() {
-                Ok(inputs) => (inputs.0, assess(inputs.1, &inputs.2, &inputs.3)),
+                Ok(inputs) => {
+                    (inputs.tip_sha, assess(inputs.base_tip, &inputs.required, &inputs.runs))
+                }
                 Err(why) => (String::new(), Verdict::Unknown(why)),
             }
         } else {
@@ -103,17 +105,9 @@ impl StaleChecksArgs {
         }
     }
 
-    fn stdin_inputs(
-        &self,
-    ) -> std::result::Result<
-        (
-            String,
-            chrono::DateTime<chrono::Utc>,
-            Vec<String>,
-            Vec<loom_daemon::merge_pr::stale_checks::CheckRun>,
-        ),
-        String,
-    > {
+    /// The `--from-stdin` payload: the same evidence [`fetch::live_inputs`]
+    /// gathers, supplied offline (suites/debug).
+    fn stdin_inputs(&self) -> std::result::Result<StdinInputs, String> {
         use chrono::{DateTime, Utc};
         use loom_daemon::merge_pr::stale_checks::CheckRun;
 
@@ -124,11 +118,6 @@ impl StaleChecksArgs {
         let v: serde_json::Value =
             serde_json::from_str(&buf).map_err(|e| format!("stdin is not valid JSON: {e}"))?;
 
-        let tip_sha = v
-            .get("tip_sha")
-            .and_then(|s| s.as_str())
-            .unwrap_or("<unknown>")
-            .to_string();
         let base_tip = v
             .get("base_tip")
             .and_then(|s| s.as_str())
@@ -173,6 +162,24 @@ impl StaleChecksArgs {
                 }
             })
             .collect();
-        Ok((tip_sha, base_tip, required, runs))
+        let tip_sha = v
+            .get("tip_sha")
+            .and_then(|s| s.as_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+        Ok(StdinInputs {
+            tip_sha,
+            base_tip,
+            required,
+            runs,
+        })
     }
+}
+
+/// The offline twin of [`fetch::LiveInputs`] — what `--from-stdin` parses.
+struct StdinInputs {
+    tip_sha: String,
+    base_tip: chrono::DateTime<chrono::Utc>,
+    required: Vec<String>,
+    runs: Vec<loom_daemon::merge_pr::stale_checks::CheckRun>,
 }
