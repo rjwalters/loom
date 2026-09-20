@@ -279,6 +279,54 @@ mod tests {
         }
     }
 
+    /// Save/restore guard for the knob a live daemon on this host may have
+    /// exported into this very process (#8328) — the `ClearedGhConfigDirEnv`
+    /// pattern from `role_runner::tests`: pin the exact hostile value, put
+    /// back whatever was there afterward.
+    struct PinnedEscalateKnob(Option<String>);
+
+    impl PinnedEscalateKnob {
+        fn new(value: &str) -> Self {
+            let prior = std::env::var("LOOM_WATCHDOG_ESCALATE").ok();
+            std::env::set_var("LOOM_WATCHDOG_ESCALATE", value);
+            Self(prior)
+        }
+    }
+
+    impl Drop for PinnedEscalateKnob {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("LOOM_WATCHDOG_ESCALATE", v),
+                None => std::env::remove_var("LOOM_WATCHDOG_ESCALATE"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_poisoned_escalate_knob_cannot_leak_into_the_pure_decision() {
+        // The #8328 regression test proper. A live-daemon host exports
+        // `LOOM_WATCHDOG_ESCALATE=0` into every spawned test, which is exactly
+        // how `an_existing_sentinel_suppresses_a_duplicate` used to go red.
+        // This test pins that hostile value in the REAL process env and then
+        // asserts both halves of the fix:
+        //   * the pure decision ignores the env entirely (hermeticity — this
+        //     is the assertion that fails if the suite ever regresses to
+        //     calling the env-reading `decide` from a test), and
+        //   * the env-reading wrapper still honours the knob (no behaviour
+        //     was weakened to buy the isolation).
+        let _env = PinnedEscalateKnob::new("0");
+        let d = tempfile::tempdir().expect("tempdir");
+        let s = d.path().join("sentinel");
+        assert_eq!(decide_with_knob(None, &s), Decision::Escalate);
+        std::fs::write(&s, "x").expect("write");
+        assert_eq!(decide_with_knob(None, &s), Decision::AlreadyEscalated);
+        // The wrapper is the one place the knob is SUPPOSED to be read: with
+        // the hostile value pinned, `decide` must still short-circuit to
+        // `Disabled` before the (now existing) sentinel is ever consulted.
+        assert_eq!(decide(&s), Decision::Disabled);
+    }
+
     #[test]
     fn the_body_names_every_path_an_operator_needs() {
         let b = body(&ctx(Some("bash /x/loom-daemon-start.sh --from-config")));
