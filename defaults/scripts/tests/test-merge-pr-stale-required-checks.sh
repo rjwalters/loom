@@ -244,8 +244,10 @@ assert_eq "0" "$BIN_RC" "real binary: fresh run -> exit 0"
 assert_contains "$BIN_OUT" "LOOM-STALE-CHECKS-CLEAN" "real binary: fresh run prints the CLEAN sentinel"
 
 # --- Placement: the guard must run before either merge path -----------------
-guard_line="$(grep -n '^_check_required_check_freshness$' "$MERGE_PR_SRC" | head -1 | cut -d: -f1)"
-automerge_line="$(grep -n '^# Handle auto-merge mode' "$MERGE_PR_SRC" | head -1 | cut -d: -f1)"
+IFS= read -r first_match < <(grep -n '^_check_required_check_freshness$' "$MERGE_PR_SRC")
+guard_line="${first_match%%:*}"
+IFS= read -r first_match < <(grep -n '^# Handle auto-merge mode' "$MERGE_PR_SRC")
+automerge_line="${first_match%%:*}"
 assert_eq yes "$( [[ -n "$guard_line" && -n "$automerge_line" && "$guard_line" -lt "$automerge_line" ]] && echo yes || echo no )" "Guard precedes both merge paths"
 
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
