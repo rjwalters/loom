@@ -139,12 +139,21 @@ pub(crate) struct DuplicateScanArgs {
     #[arg(long, value_enum)]
     pool: Pool,
 
-    /// The new issue's title (the query).
-    #[arg(long, value_name = "TEXT")]
+    /// The new issue's title (the query). Hyphen-leading values are titles
+    /// too (#5898: a bug report's title often quotes the offending flag) —
+    /// the shell side guards this with its `--` end-of-options separator, so
+    /// the argument here must not re-parse a literal title as a flag.
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
     title: String,
 
-    /// The new issue's body (the query's second half). Optional.
-    #[arg(long, value_name = "TEXT", default_value = "")]
+    /// The new issue's body (the query's second half). Optional. Same
+    /// #5898 rule as `--title`.
+    #[arg(
+        long,
+        value_name = "TEXT",
+        default_value = "",
+        allow_hyphen_values = true
+    )]
     body: String,
 
     /// Block threshold: similarity at/above this is a match, on the true
@@ -183,20 +192,20 @@ pub(crate) struct DuplicateScanArgs {
 /// One candidate from the pool. Extra fields are ignored; `number` must be
 /// present and non-null (the shell skipped nulls silently, so we do too).
 #[derive(Deserialize, Debug)]
-struct Candidate {
-    number: u64,
+pub(crate) struct Candidate {
+    pub(crate) number: u64,
     #[serde(default)]
-    title: String,
+    pub(crate) title: String,
     #[serde(default)]
-    body: String,
+    pub(crate) body: String,
 }
 
 /// A near-match row as written to `--near-file`.
 #[derive(serde::Serialize, Debug, PartialEq, Eq)]
-struct NearMatch {
-    number: u64,
-    title: String,
-    similarity: u32,
+pub(crate) struct NearMatch {
+    pub(crate) number: u64,
+    pub(crate) title: String,
+    pub(crate) similarity: u32,
 }
 
 /// The scan's answer: everything the caller prints or branches on.
@@ -253,11 +262,11 @@ pub(crate) fn jaccard_percent(a: &[String], b: &[String]) -> u32 {
         }
     }
     let union = a.len() + b.len() - matches;
-    if union == 0 {
-        0
-    } else {
-        ((matches * 100) / union) as u32
-    }
+    // checked_div: an empty union (two empty sets) scores 0, exactly as the
+    // shell's `union -eq 0` early-out did.
+    ((matches * 100) as u32)
+        .checked_div(union as u32)
+        .unwrap_or(0)
 }
 
 /// The banding decision, pure: given query keywords and candidates (already
@@ -479,9 +488,11 @@ mod tests {
     #[test]
     fn extract_keywords_splits_on_non_alphanumerics() {
         let got = extract_keywords("sweep-lease-fence.sh:392 repo_args unbound");
-        // "sh" is dropped by the 3-char floor, like the shell's `grep -E
-        // '.{3,}'`; digits are alphanumeric tokens.
-        assert_eq!(got, kws(&["392", "fence", "lease", "repo_args", "sweep", "unbound"]));
+        // Underscores separate too (the shell's `tr -cs '[:alnum:]'` did the
+        // same: `repo_args` was never one keyword), "sh" is dropped by the
+        // 3-char floor like the shell's `grep -E '.{3,}'`, and digits are
+        // alphanumeric tokens.
+        assert_eq!(got, kws(&["392", "args", "fence", "lease", "repo", "sweep", "unbound"]));
     }
 
     #[test]
