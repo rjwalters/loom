@@ -1078,10 +1078,15 @@ fi
 # v2 (#8277) adds `model=` so a class-scoped MODEL_CREDITS_EXHAUSTED mark
 # (#8058 Phase 2, `class_cooldowns`) has a producer: `EFFECTIVE_MODEL` is the
 # same value already threaded into token selection above, sanitized to the
-# same charset `account=` uses (plus `@`, for a pinned `model@date` ID) —
-# anything else, or no model at all, becomes the `none` sentinel, which the
-# daemon parser treats identically to a v1 record with no model field
-# (fail-safe: account-wide, never a fabricated class).
+# same charset `account=` uses, plus `@` for a suffixed ID — Loom's own
+# `model@effort` rung grammar (#3702, the same suffix the #5028 check above
+# strips with `${EFFECTIVE_MODEL%%@*}`) or a pinned `model@date`. Anything
+# else, or no model at all, becomes the `none` sentinel, which the daemon
+# parser treats identically to a v1 record with no model field (fail-safe:
+# account-wide, never a fabricated class). The suffix is NOT stripped here:
+# `tokens_pool::health::model_class_of` collapses it onto the bare model's
+# class daemon-side (#8380), so the record stays a faithful report of what
+# was actually pinned and classification keeps happening in exactly one place.
 #
 # The field reports the model that was ACTUALLY IN FLIGHT, which is not always
 # `EFFECTIVE_MODEL`: the #5499 ChatGPT-plan guard above may set
