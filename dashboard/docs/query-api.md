@@ -65,8 +65,8 @@ redaction suite — every record kind × visibility × auth combination).
 Current state of every host/sweep known to the `FleetState` Durable Object —
 the query-API equivalent of the operator-only `GET /admin/fleet-state` (same
 underlying snapshot, no `ADMIN_TOKEN` required). `/public/fleet-state`
-redacts each `activeSweeps` entry per the visibility policy above; `/api/fleet-state`
-always returns full detail.
+redacts each `activeSweeps` entry per the visibility policy above and empties
+`activeCompute` entirely; `/api/fleet-state` always returns full detail.
 
 **Response** (`200`, camelCase — mirrors the Durable Object's own JSON, see
 `src/fleetState.ts`'s `FleetSnapshot`):
@@ -121,6 +121,42 @@ numbers as historical, never as current.
 A completed sweep is not present in `activeSweeps` (removed on
 `sweep.completed` — see `src/fleetState.ts`'s module doc); its full record
 lives in D1 and is queryable via `GET /api/history`.
+
+**`activeCompute`** (issue #8305) is the same idea for `ephemeral_compute`:
+one entry per currently-running cloud compute job, created by the launch
+record and deleted by the completion record, so presence *is* the definition
+of "running". Each entry carries `hostId`, `jobId`, and whatever the launch
+record described (`instanceId`/`region`/`instanceType`/`spot`/`ami`/
+`startedAt`), plus `updatedAt` (the backend's own ingest clock) and a derived
+`leaked` boolean:
+
+```json
+"activeCompute": [
+  {
+    "hostId": "2am-elastic",
+    "jobId": "job-abc123",
+    "instanceId": "i-0123456789abcdef0",
+    "region": "us-east-1",
+    "instanceType": "c7i.4xlarge",
+    "spot": true,
+    "startedAt": "2026-09-19T12:00:00Z",
+    "updatedAt": "2026-09-19T12:00:00Z",
+    "leaked": false
+  }
+]
+```
+
+`leaked` is `true` once an entry has gone 24 hours with no completion record
+— the instance is very likely still running and billing with nothing watching
+it. It is computed from `updatedAt`, never the emitter-supplied `startedAt`,
+so a skewed emitter clock cannot fake liveness. Cost and wall clock are
+deliberately absent: both exist only on the completion record, which removes
+the entry — a finished job's cost is read from `GET /api/spend`.
+
+On `GET /public/fleet-state` this is **always `[]`**, not a reduced entry: no
+`ephemeral_compute` field survives the allowlist, so even the count of
+running instances is withheld (it is itself infrastructure-spend detail about
+a private compute fleet).
 
 **Consumer**: the Phase-3 dashboard UI ([`../web/`](../web/)) reads this route
 and only this route. Its client (`web/src/api.ts`) plus the narrowing layer
@@ -232,6 +268,68 @@ non-integer), or `cursor` (non-positive or non-integer) returns `400` with a
   `limit_window_reset_at` is the reset of whichever window is gating *that*
   account (7d once exhausted, 5h otherwise; the daemon resolves it before
   export), so the aggregate reads as "the first moment any account frees up".
+
+## `GET /api/spend` / `GET /public/spend`
+
+Aggregate `ephemeral_compute` spend over a time window, bucketed by UTC day
+(issue #8306, Phase 3 of #8257). Unlike `/api/history` this returns a
+*summary*, not rows: the underlying `SUM` runs in D1 rather than shipping
+every completion record to the browser to add up.
+
+### Query parameters (all optional)
+
+| Param | Meaning |
+|---|---|
+| `since` | Inclusive lower bound on `emitted_at` (RFC 3339). |
+| `until` | Exclusive upper bound on `emitted_at` (RFC 3339). |
+| `host` | Only the named emitting host (for an elastic fleet, the synthetic ingest identity — see [`../../defaults/docs/observability.md`](../../defaults/docs/observability.md) §5d). |
+
+An invalid `since`/`until` is a `400` with `{ "error": ... }`, exactly as on
+`/api/history`.
+
+### Response (`200`, authenticated)
+
+```json
+{
+  "since": "2026-09-12T00:00:00Z",
+  "until": "2026-09-19T00:00:00Z",
+  "totalCostUsd": 137.5,
+  "jobCount": 9,
+  "totalWallClockSec": 41400,
+  "peakDailyCostUsd": 104.25,
+  "days": [{ "day": "2026-09-18", "costUsd": 104.25, "jobCount": 6 }]
+}
+```
+
+Three contracts worth knowing:
+
+- **Which rows count.** Exactly those whose payload carries a *numeric*
+  `estimated_cost_usd`. A job emits two records — a launch record (no cost
+  yet) and a completion record — so this predicate is also what makes each
+  job count once. Jobs still *running* are not here at all; they live in the
+  Durable Object and surface on `GET /api/fleet-state`'s `activeCompute`.
+- **Unknown is not zero.** `totalWallClockSec` is `null` — never `0` — when
+  no job in the window reported one, and `peakDailyCostUsd` is `null` when
+  the window had no spend at all. A window with genuinely no completed jobs
+  returns `totalCostUsd: 0` with `days: []`, which is a real answer, not an
+  error.
+- **`peakDailyCostUsd` exists because a window total cannot answer "did any
+  one day breach the standing daily ceiling".** An average hides exactly the
+  day that did.
+
+### Response (`200`, public)
+
+```json
+{ "since": "2026-09-12T00:00:00Z", "until": null, "withheld": true }
+```
+
+**No field of `ephemeral_compute` survives redaction** (see
+[`src/redaction.ts`](../src/redaction.ts)'s allowlist entry), so there is no
+reduced variant to serve — and a zeroed summary would be a *lie* rather than
+a redaction, indistinguishable from a real idle window. The echoed
+`since`/`until` are the requester's own parameters coming back. The public
+handler does not run the D1 aggregation at all, so the unredacted numbers
+never exist on that code path.
 
 ## `GET /api/events` / `GET /public/events`
 

@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PANEL_STATUS, mountPanel } from "../src/panels";
 import type { PanelRouteName } from "../src/router";
 
-const PANEL_NAMES: PanelRouteName[] = ["charts", "tokens", "feed"];
+const PANEL_NAMES: PanelRouteName[] = ["charts", "tokens", "spend", "feed"];
 
 /** Panels fetch on mount. Nothing here asserts on the response — the point is
  * that mounting reaches the network at all, and never throws when it fails. */
@@ -83,6 +83,14 @@ describe("mountPanel", () => {
   it("mounts the token analytics container", () => {
     mountPanel("tokens", root);
     expect(root.querySelector('[data-testid="token-analytics"]')).not.toBeNull();
+  });
+
+  it("mounts the elastic spend panel with its period selector (#8306)", () => {
+    mountPanel("spend", root);
+    expect(root.querySelector('[data-testid="spend-panel"]')).not.toBeNull();
+    // The selector is built during construction, so it is on screen before
+    // the first fetch resolves rather than appearing after it.
+    expect(root.querySelector('[data-testid="spend-period"]')).not.toBeNull();
   });
 
   it("mounts the live feed and states the sweep.phase gap", () => {

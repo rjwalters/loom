@@ -211,9 +211,53 @@ export interface ActiveSweep {
   updatedAt?: string;
 }
 
+/** One currently-running ephemeral compute job. Mirrors `ActiveComputeState`
+ * in `../../src/fleetState.ts` (Issue #8305).
+ *
+ * `hostId`/`jobId`/`updatedAt` are always present there (the first comes from
+ * the authenticated ingest key, the second is the storage key itself); every
+ * descriptive field depends on what the launch record carried.
+ *
+ * `wall_clock_sec`/`estimated_cost_usd` are deliberately absent: they exist
+ * only on the *completion* record, which deletes this entry rather than
+ * updating it. A finished job's cost is read from D1 instead — that is what
+ * `spendPanel.ts` renders. */
+export interface ActiveComputeJob {
+  /** The host whose emitter reported the job — for a hostless elastic fleet
+   * this is the synthetic ingest identity, not where the instance runs. */
+  hostId: string;
+  jobId: string;
+  instanceId?: string;
+  region?: string;
+  instanceType?: string;
+  spot?: boolean;
+  ami?: string;
+  /** The emitter's own `started_at`. Display only — see `leaked`. */
+  startedAt?: string;
+  /** When the backend first applied this job's launch record. This, not
+   * `startedAt`, is what leak detection measures (a skewed emitter clock
+   * cannot fake liveness). */
+  updatedAt?: string;
+  /** Set by the backend once the entry has outlived `STALE_COMPUTE_MS` (24h)
+   * with no completion record — i.e. the instance is very likely still billing
+   * with nothing watching it. `undefined` from a backend that predates
+   * Issue #8305, which must render as "not flagged", never as "leaked". */
+  leaked?: boolean;
+}
+
 export interface FleetSnapshot {
   hosts: Record<string, HostEntry>;
   activeSweeps: ActiveSweep[];
+  /** Live `ephemeral_compute` jobs (Issue #8305). Always `[]` for an
+   * unauthenticated viewer — the redaction policy withholds every field of
+   * that kind, including the count (`../../src/redaction.ts`).
+   *
+   * Optional on the *type* (like `RedactedFleetSnapshot.activeCompute` on the
+   * Worker side, and for the same reason: a backend predating #8305 omits it
+   * entirely, and hand-built fixtures that predate it construct a bare
+   * `{ hosts, activeSweeps }`) even though `parse.ts`'s `parseFleetSnapshot`
+   * always populates it. */
+  activeCompute?: ActiveComputeJob[];
 }
 
 // ---------------------------------------------------------------------------

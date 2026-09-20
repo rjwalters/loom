@@ -20,7 +20,7 @@ describe("parseFleetSnapshot", () => {
   it("degrades a non-object body to an empty snapshot instead of throwing", () => {
     for (const body of [null, undefined, 42, "nope", [1, 2, 3]]) {
       const snapshot = parseFleetSnapshot(body);
-      expect(snapshot).toEqual({ hosts: {}, activeSweeps: [] });
+      expect(snapshot).toEqual({ hosts: {}, activeSweeps: [], activeCompute: [] });
     }
   });
 

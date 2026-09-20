@@ -30,6 +30,8 @@ accident.
 | View | Route | Content |
 |---|---|---|
 | Fleet overview | `#/` | One card per host: the whole `host.health` field set (the binary identity `daemon_version` + `build_commit` + `built_at`, rendered as one line — `0.17.0 @ 8c16fb5b, built 6h ago` — plus `uptime_sec`, `logical_cpus`, `cpu_idle_fraction`, `load_per_core`, `worktree_root_free_gb` — rendered with a `worktree_root_total_gb` percentage when that denominator is also known, GB-only otherwise), a `tokens.snapshot` summary (exhausted count + peak `usage_fraction`), a status badge, and that host's live sweeps. |
+| Ephemeral compute running now | `#/` (panel on the overview) | One row per live `ephemeral_compute` job instance — job id, instance id, `instanceType · region · spot`, and how long it has been running — from `GET /api/fleet-state`'s `activeCompute` (#8306). A **leaked** instance (no completion record for 24h, so likely still billing with nothing watching it) is distinguished by a `LEAKED` badge, a row tint, and a `data-leaked` attribute, and sorts to the top. Rendered only when something is running — a fleet that uses no elastic compute sees nothing added to the overview at all; `#/spend` is where zero has an answer. |
+| Elastic spend this period | `#/spend` | `ephemeral_compute` cost over a selectable window (24h / 7d / 30d) from `GET /api/spend` (#8306): total, completed-job count, compute time, and a per-UTC-day breakdown drawn against the standing daily spot ceiling, with any day that breached it flagged. |
 | Host drill-down | `#/hosts/<hostId>` | The same health fields in full, one row per token-pool account, and one row per in-flight sweep with `repo` / `issue` / `phase` / `model` / `effort` / how long it has been running (`startedAt`) / how long it has been in its current phase (`enteredPhaseAt`). |
 
 Hosts needing attention sort first (stale, then token-degraded), then busiest,
@@ -324,7 +326,8 @@ Split so that the parts worth testing hard need no DOM:
 | `src/format.ts` | Display formatting. Owns the unknown-is-not-zero rule. |
 | `src/dom.ts` | `el()` — a ~30-line DOM builder. Text always via `textContent`. |
 | `src/router.ts` | Hash routing. |
-| `src/views/*.ts` | Pure `(viewModel) => HTMLElement` renderers, including the loading/empty/error states. |
+| `src/views/*.ts` | Pure `(viewModel) => HTMLElement` renderers, including the loading/empty/error states and the "running now" ephemeral-compute panel (`views/runningCompute.ts`). |
+| `src/spendPanel.ts` | The `#/spend` panel: period selector, `GET /api/spend` fetch, and the per-day breakdown against the standing daily ceiling (#8306). |
 | `src/app.ts` | The controller: fetch → render, polling, routing, error-over-stale-data. All dependencies (fetch, clock, timers) injected. |
 | `src/main.ts` | Browser wiring only — nothing testable lives here. |
 

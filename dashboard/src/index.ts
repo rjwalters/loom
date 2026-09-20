@@ -47,6 +47,9 @@
  *                                      below).
  *   GET  /api/history                — authenticated: filterable, paginated
  *                                      D1 history query, full detail.
+ *   GET  /api/spend                  — authenticated: `ephemeral_compute`
+ *                                      spend summed over a time window,
+ *                                      bucketed by UTC day (issue #8306).
  *   GET  /api/events                 — authenticated: SSE live tail of
  *                                      newly-ingested telemetry, full
  *                                      detail.
@@ -54,6 +57,11 @@
  *                                      private-visibility data is
  *                                      summarized (see `./redaction.ts`).
  *   GET  /public/history             — public: same query, redacted.
+ *   GET  /public/spend               — public: `{ withheld: true }` — no
+ *                                      `ephemeral_compute` field survives
+ *                                      redaction, so there is no reduced
+ *                                      variant to serve (see
+ *                                      `./redaction.ts`).
  *   GET  /public/events              — public: same live tail, redacted.
  *   GET  /public                     — 301s to `/` (issue #4795 — the
  *                                      single-URL fallback layout replaced
@@ -109,11 +117,19 @@ import { renderPublicPage } from "./publicPage";
 import {
   createLiveTailStream,
   DEFAULT_HISTORY_LIMIT,
+  parseElasticSpendQuery,
   parseHistoryQuery,
+  queryElasticSpend,
   queryHistory,
   type LiveTailFilter,
 } from "./query";
-import { redactFleetSnapshot, redactHistoryQueryResult, redactLiveTailStream } from "./redaction";
+import {
+  redactElasticSpend,
+  redactFleetSnapshot,
+  redactHistoryQueryResult,
+  redactLiveTailStream,
+  withheldElasticSpend,
+} from "./redaction";
 import { parseRetentionConfig, runRetentionSweep } from "./retention";
 import { validateEnvelope, extractRecordFields, type TelemetryEnvelope } from "./telemetry";
 
@@ -511,6 +527,31 @@ async function handleHistoryQuery(env: Env, url: URL, isAuthenticated: boolean):
   return new Response(JSON.stringify(body), { status: 200, headers: JSON_HEADERS });
 }
 
+/** `GET /api/spend` (authenticated) / `GET /public/spend` (public, withheld)
+ * — `ephemeral_compute` spend aggregated over a time window (Issue #8306,
+ * Phase 3 of #8257). See `query.ts`'s `parseElasticSpendQuery`/
+ * `queryElasticSpend` for the filter contract and which records count, and
+ * `./redaction.ts`'s `redactElasticSpend` for why the public variant answers
+ * `withheld: true` rather than a zeroed summary.
+ *
+ * The `/public/*` route exists (rather than 404-ing) so the surface stays the
+ * documented 1:1 mirror of `/api/*` — a client that asks gets a truthful "not
+ * for you" instead of a routing error it would have to distinguish from a
+ * deploy that predates this endpoint. */
+async function handleElasticSpendQuery(env: Env, url: URL, isAuthenticated: boolean): Promise<Response> {
+  const filter = parseElasticSpendQuery(url.searchParams);
+  if ("error" in filter) {
+    return jsonError(400, filter.error);
+  }
+  // Skip the D1 aggregation entirely for a public viewer: nothing it returns
+  // can reach the response, so running it would be pure cost — and it keeps
+  // the unredacted numbers from ever existing on the public code path.
+  const body = isAuthenticated
+    ? redactElasticSpend(await queryElasticSpend(env.DB, filter), true)
+    : withheldElasticSpend(filter);
+  return new Response(JSON.stringify(body), { status: 200, headers: JSON_HEADERS });
+}
+
 /** `GET /api/events` (authenticated) / `GET /public/events` (public,
  * redacted) — SSE live tail of newly-ingested telemetry. See `query.ts`'s
  * `createLiveTailStream` doc comment for the framing/polling contract;
@@ -737,6 +778,12 @@ export default {
     }
     if (request.method === "GET" && url.pathname === "/public/history") {
       return handleHistoryQuery(env, url, /* isAuthenticated */ false);
+    }
+    if (request.method === "GET" && url.pathname === "/api/spend") {
+      return handleElasticSpendQuery(env, url, /* isAuthenticated */ true);
+    }
+    if (request.method === "GET" && url.pathname === "/public/spend") {
+      return handleElasticSpendQuery(env, url, /* isAuthenticated */ false);
     }
     if (request.method === "GET" && url.pathname === "/api/events") {
       return handleLiveTail(request, env, url, /* isAuthenticated */ true);

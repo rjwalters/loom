@@ -4,14 +4,16 @@ import worker from "../src/index";
 import {
   deriveTokenPoolAggregate,
   redactActiveSweep,
+  redactElasticSpend,
   redactFleetSnapshot,
   redactHistoryQueryResult,
   redactHistoryRecord,
   redactManagedRepos,
   redactPayload,
   redactSseFrame,
+  withheldElasticSpend,
 } from "../src/redaction";
-import type { HistoryRecord } from "../src/query";
+import type { ElasticSpendSummary, HistoryRecord } from "../src/query";
 import type { ActiveComputeState, ActiveSweepState, FleetSnapshot } from "../src/fleetState";
 import {
   authedRequest,
@@ -691,6 +693,42 @@ describe("redactFleetSnapshot", () => {
     expect(redactFleetSnapshot(snapshot, false).activeCompute).toEqual([]);
     // The authenticated dashboard still sees the whole entry.
     expect(redactFleetSnapshot(snapshot, true).activeCompute).toEqual([computeEntry]);
+  });
+
+  it("withholds an elastic spend summary from a public viewer without faking a $0 window (#8306)", () => {
+    const summary: ElasticSpendSummary = {
+      since: "2026-09-12T00:00:00Z",
+      until: "2026-09-19T00:00:00Z",
+      totalCostUsd: 137.5,
+      jobCount: 9,
+      totalWallClockSec: 41_400,
+      peakDailyCostUsd: 104.25,
+      days: [{ day: "2026-09-18", costUsd: 104.25, jobCount: 6 }],
+    };
+
+    expect(redactElasticSpend(summary, true)).toBe(summary);
+
+    const redacted = redactElasticSpend(summary, false);
+    expect(redacted).toEqual({
+      since: "2026-09-12T00:00:00Z",
+      until: "2026-09-19T00:00:00Z",
+      withheld: true,
+    });
+    // The distinction this policy turns on: a zeroed summary would read as a
+    // real idle window, so no numeric field survives at all.
+    expect(redacted).not.toHaveProperty("totalCostUsd");
+    expect(JSON.stringify(redacted)).not.toContain("137.5");
+    expect(JSON.stringify(redacted)).not.toContain("104.25");
+  });
+
+  it("builds the withheld shape from a bare window, so the public path need not run the query (#8306)", () => {
+    expect(withheldElasticSpend({ since: "2026-09-12T00:00:00Z" })).toEqual({
+      since: "2026-09-12T00:00:00Z",
+      until: null,
+      withheld: true,
+    });
+    // An entirely unbounded request still gets an explicit, well-formed body.
+    expect(withheldElasticSpend({})).toEqual({ since: null, until: null, withheld: true });
   });
 
   it("collapses a private repo's slug for a public viewer, and shows every slug to an authenticated one (#4976)", () => {

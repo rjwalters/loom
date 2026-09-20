@@ -551,3 +551,157 @@ a:hover {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+
+/* --- Ephemeral compute: running now + elastic spend (#8306) ------------- */
+
+.badge--leaked {
+  color: var(--bad);
+  border-color: color-mix(in srgb, var(--bad) 55%, transparent);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+}
+
+.compute {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 18px;
+}
+.compute__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.compute__title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.compute__note {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.compute__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.compute__table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 10px 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.compute__table td {
+  padding: 5px 10px 5px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+}
+.compute-row__job {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.compute-row__job-id,
+.compute-row__instance {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+/* A leak is flagged by a badge, this row tint, and a `data-leaked` attribute
+   — never colour alone (see `views/runningCompute.ts`). */
+.compute-row--leaked {
+  background: color-mix(in srgb, var(--bad) 8%, transparent);
+}
+.compute-row--leaked .compute-row__age {
+  color: var(--bad);
+  font-weight: 600;
+}
+
+.spend__header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.spend__title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.spend__period {
+  margin-left: auto;
+  background: var(--bg-sunken);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+.spend__fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 4px 16px;
+  margin: 0 0 14px;
+}
+.spend__total {
+  font-size: 20px;
+  font-weight: 600;
+}
+.spend--over-ceiling {
+  color: var(--bad);
+  font-weight: 600;
+}
+.spend__days {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+.spend-day {
+  display: grid;
+  grid-template-columns: 96px 1fr 80px 70px;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.spend-day__date {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.spend-day__bar {
+  display: block;
+  height: 10px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.spend-day__fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.spend-day--over-ceiling .spend-day__fill {
+  background: var(--bad);
+}
+.spend-day--over-ceiling .spend-day__cost {
+  color: var(--bad);
+  font-weight: 600;
+}
+.spend-day__cost,
+.spend-day__jobs {
+  font-variant-numeric: tabular-nums;
+}
+.spend-day__jobs {
+  color: var(--text-dim);
+}
+.spend__note {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+}

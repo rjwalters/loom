@@ -28,6 +28,7 @@ import { el } from "./dom";
 import { isAuthenticatedViewer } from "./api";
 import { HistoricalChartsPanel } from "./historicalChartsPanel";
 import { LiveFeedPanel } from "./liveFeedPanel";
+import { SpendPanel } from "./spendPanel";
 import { currentSurface } from "./analytics/bootstrap";
 import { mountTokenAnalytics } from "./analytics/render";
 import type { PanelRouteName } from "./router";
@@ -37,6 +38,7 @@ import type { PanelRouteName } from "./router";
 export const PANEL_STATUS: Readonly<Record<PanelRouteName, string>> = {
   charts: "Historical charts",
   tokens: "Token & cost analytics",
+  spend: "Elastic compute spend",
   feed: "Live event feed",
 };
 
@@ -71,6 +73,14 @@ function section(title: string, ...children: (Node | null)[]): HTMLElement {
  */
 export function historyBasePath(): string {
   return isAuthenticatedViewer() ? "/api/history" : "/public/history";
+}
+
+/** Same resolution as {@link historyBasePath}, for the `ephemeral_compute`
+ * spend aggregation (#8306). `/public/spend` answers `{ withheld: true }`
+ * rather than a reduced dataset — no field of that kind survives redaction —
+ * so the anonymous variant renders a notice, not an error. */
+export function spendBasePath(): string {
+  return isAuthenticatedViewer() ? "/api/spend" : "/public/spend";
 }
 
 function mountCharts(root: HTMLElement): PanelTeardown {
@@ -114,6 +124,31 @@ function mountTokens(root: HTMLElement): PanelTeardown {
   return () => {};
 }
 
+function mountSpend(root: HTMLElement): PanelTeardown {
+  const container = el("div", { data: { testid: "spend-panel" } });
+
+  root.replaceChildren(
+    section(
+      "Elastic compute spend",
+      el(
+        "p",
+        { class: "panel-route__note" },
+        "Cost of completed ephemeral compute jobs, summed over the selected period and " +
+          "broken down per UTC day against the standing daily ceiling. Jobs still running " +
+          "are on the fleet overview, not here — a running job has no cost recorded yet.",
+      ),
+      container,
+    ),
+  );
+
+  // The panel builds its own period selector into `container` during
+  // construction, so the control is on screen before the first fetch resolves.
+  const panel = new SpendPanel({ basePath: spendBasePath(), container });
+  panel.refresh().catch((error: unknown) => renderMountError(container, error));
+
+  return () => {};
+}
+
 function mountFeed(root: HTMLElement): PanelTeardown {
   const feed = el("div", { data: { testid: "live-feed" } });
 
@@ -150,6 +185,7 @@ function mountFeed(root: HTMLElement): PanelTeardown {
 const MOUNTERS: Readonly<Record<PanelRouteName, (root: HTMLElement) => PanelTeardown>> = {
   charts: mountCharts,
   tokens: mountTokens,
+  spend: mountSpend,
   feed: mountFeed,
 };
 

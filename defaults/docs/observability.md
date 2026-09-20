@@ -406,8 +406,19 @@ compute-spend detail, the same category `sweep.outcome`'s work-output
 fields are held back for (§5 above) — see `src/redaction.ts`'s
 `RECORD_FIELD_ALLOWLIST["ephemeral_compute"]` entry for the stated policy.
 
-Phase 2/3 of #8257 (live "running now" state + leak detection, and web UI
-views) build on this Phase 1 slice but are not part of it.
+Phase 2 (#8305) turned the launch/completion record pair into live Durable
+Object state — a `compute:<jobId>` entry created at launch, deleted at
+completion, and flagged `leaked` once it has gone 24h with no completion
+record — surfaced on `GET /api/fleet-state`'s `activeCompute` (always `[]` on
+`/public/*`, per the redaction decision above). Phase 3 (#8306) added the two
+dashboard views over both halves: a "running now" panel on the fleet overview
+(leaked instances flagged and sorted first) and an "elastic spend this period"
+view at `#/spend`, backed by a new `GET /api/spend` aggregation — spend summed
+over a `since`/`until` window and bucketed by UTC day, against the standing
+daily spot ceiling. `/public/spend` answers `{ "withheld": true }` rather than
+a zeroed summary, since no field of this kind survives redaction and a `$0.00`
+would read as a real idle window. See
+[`dashboard/docs/query-api.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/query-api.md).
 
 ## 6. The operator reference instance
 
