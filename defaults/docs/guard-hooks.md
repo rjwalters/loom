@@ -1012,6 +1012,29 @@ and an unassigned name stays unresolved. Heredoc bodies are masked before the
 scan, so an inert decoy assignment inside one cannot launder a real
 unresolved target (#6549).
 
+**One exception to the two-assignment rule (#7986)**, shared by the mktemp fast
+path above and its write-confinement sibling `wt_write_mktemp_same_command_safe()`
+(#6949): a `NAME=$(mktemp -d)` / `NAME=$(mktemp)` assignment may be followed by
+**exactly one** self-referential canonicalization of the **same** variable,
+whose entire RHS is exactly `$(realpath "$NAME")` (optionally double-quoted) —
+the routine way to resolve a symlinked temp root (`/tmp` → `/private/tmp`)
+before use. That second assignment cannot escape the directory the first one
+already proved safe: `realpath` either fails (the substitution captures
+nothing and `NAME` becomes empty) or prints the canonical path of that same
+directory. Everything else still fails closed — a third assignment, the
+reverse order, `${NAME}` inside the `realpath` call, a canonicalization of a
+*different* variable, or any prefix/suffix around the admitted form.
+
+**`$(cd "$NAME" && pwd -P)` is deliberately NOT admitted**, even though it
+looks like an equally safe canonicalization of the same shape: `cd ""` is a
+documented no-op *success* on bash 3.2 (macOS stock `/bin/bash`), zsh, and
+`/bin/sh`, so when `mktemp` fails and `NAME` is empty, a `;`/newline-joined
+`NAME=$(cd "$NAME" && pwd -P)` still runs and resolves to the **caller's
+cwd** instead of staying empty — converting a benign `mktemp`-failure no-op
+into `rm -rf <cwd>` or a write into `<cwd>`. `realpath` has no such
+shell-builtin special case for an empty path, so it fails safely on every
+join style.
+
 Because the literal fast path re-runs the ordinary checks on the *resolved*
 path, it is a false-positive refinement rather than a relaxation:
 `WT=/etc/foo; rm -rf "$WT/.snapshots"` still denies as out-of-scope,
