@@ -202,7 +202,8 @@ of which are structural.
 
 **Option 1 — a new shared script, invoked at the top of the pass.** Mechanical,
 unit-testable, and shared so the roles cannot drift apart. But
-`.loom/docs/shell-language-policy.md` (#7762, ADR-0018) has since closed the
+[shell-language-policy.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md)
+(#7762, ADR-0018) has since closed the
 literal form: new executable logic is a `loom-daemon` subcommand, and `contract`
 is baseline-only. **Adopted in substance, in its current form** — a Rust
 subcommand plus a Shape-A stub so the by-path invocation contract role prompts
@@ -280,6 +281,7 @@ enrichment pass is spent.
   #8310 — the predecessor closed for a stale citation. #8269 — the parent.
 - `defaults/docs/label-state-machine.md` § "`loom:operator-only` sub-kinds" —
   the taxonomy this routes into, unchanged.
-- `.loom/docs/shell-language-policy.md`, `.loom/docs/file-size-policy.md` —
+- [shell-language-policy.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md),
+  [file-size-policy.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/file-size-policy.md) —
   why the implementation is Rust behind a stub.
 - #7979 — why the enforcement is structural rather than text-matching.
