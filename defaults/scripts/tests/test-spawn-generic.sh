@@ -326,7 +326,11 @@ cp "$SPAWN_AIDER" "$STAGE/spawn-aider.sh"
 cp "$SCRIPTS_DIR/lib/classify-error.sh" "$STAGE/lib/classify-error.sh"
 chmod +x "$STAGE"/spawn-*.sh
 
-out="$(env -u LOOM_RUNTIME LOOM_WORKSPACE="$TMPROOT/ws" \
+# -u LOOM_ROLE pins the bare-env tier the "(from env (LOOM_RUNTIME))" label
+# describes (#8430): an inherited role reroutes resolution through
+# runtime_admission's binding, whose source label is the kebab-case
+# RuntimeSource rendering (e.g. "global-environment") instead.
+out="$(env -u LOOM_RUNTIME -u LOOM_ROLE LOOM_WORKSPACE="$TMPROOT/ws" \
     LOOM_CONFIG_DEFAULTS_FILE="" LOOM_RUNTIME=aider LOOM_SWEEP_NICE=0 \
     LOOM_GENERIC_NO_EXEC=1 bash "$STAGE/spawn-worker.sh" -p "routed" 2>&1 || true)"
 assert_contains "runtime=aider (from env (LOOM_RUNTIME))" "$out" \
