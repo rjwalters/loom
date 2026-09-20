@@ -49,6 +49,20 @@
 //! when claude-monitor is not installed on this host at all, so a Loom
 //! install with no claude-monitor companion is unaffected.
 //!
+//! # The #8347/#8348 fallback (#8349)
+//!
+//! When claude-monitor *is* absent, [`compute_with_fallback`] now reaches for
+//! Loom's own persisted weekly-point series instead: the
+//! `weekly_point_samples` table #8347 started accruing (written best-effort
+//! by every `loom-daemon tokens check --ranking` run), read back through
+//! [`ActivityDb::get_weekly_point_series`] and joined against the same
+//! `get_usage_report(…, Day)` cost series by #8348's pure
+//! [`crate::activity::calibrate`]. That makes the `limit_calibration` health
+//! section (#8349) work on a claude-monitor-independent host, at the cost of
+//! the cold start #8347's table implies — claude-monitor stays the preferred
+//! source wherever it is installed, because its `usage_history` carries
+//! months of already-accrued baseline.
+//!
 //! # Read-only, soft dependency
 //!
 //! Exactly like [`crate::tokens_pool::monitor_db`], claude-monitor's
@@ -77,7 +91,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
-use crate::activity::{ActivityDb, UsageReportGroupBy};
+use crate::activity::{calibrate, ActivityDb, DailyValue, UsageReportGroupBy, WeeklyPointSample};
 
 /// A step change fires when the current day's $/point ratio differs from its
 /// trailing baseline by more than this factor, in either direction — matches
@@ -478,6 +492,175 @@ pub fn compute(
     CalibrationStatus::Ready { series, warning }
 }
 
+// ============================================================================
+// Orchestration — the #8349 claude-monitor-independent fallback
+// ============================================================================
+
+/// [`compute`], falling back to [`compute_from_persisted_samples`] when the
+/// claude-monitor source is unavailable on this host (#8349) — the collection
+/// step `loom-daemon health` actually calls.
+///
+/// Precedence is deliberate: claude-monitor's `usage_history` carries months
+/// of already-accrued baseline, while #8347's `weekly_point_samples` only
+/// started accruing when that issue merged, so the fallback is used exactly
+/// when the primary cannot be read at all (claude-monitor not installed, its
+/// database missing/locked, or its schema unreadable) — never to second-guess
+/// a readable primary.
+#[must_use]
+pub fn compute_with_fallback(
+    monitor_db_path: &Path,
+    activity_db_path: &Path,
+    since: DateTime<Utc>,
+) -> CalibrationStatus {
+    match compute(monitor_db_path, activity_db_path, since) {
+        CalibrationStatus::Unavailable(_) => {
+            compute_from_persisted_samples(activity_db_path, since)
+        }
+        status => status,
+    }
+}
+
+/// The #8349 claude-monitor-independent source: #8347's persisted
+/// `weekly_point_samples` (in the activity DB) joined against #8062's daily
+/// cost-equivalent by #8348's pure [`calibrate`].
+///
+/// Degrade-safe exactly like [`compute`]: never panics, never returns `Err` —
+/// an unreadable database becomes [`CalibrationStatus::Unavailable`], which
+/// the health section renders as "not collected" (no section at all).
+#[must_use]
+pub fn compute_from_persisted_samples(
+    activity_db_path: &Path,
+    since: DateTime<Utc>,
+) -> CalibrationStatus {
+    if !activity_db_path.is_file() {
+        return CalibrationStatus::Unavailable(format!(
+            "no activity database at {} — nothing to source either calibration series from",
+            activity_db_path.display()
+        ));
+    }
+    let db = match ActivityDb::new(activity_db_path.to_path_buf()) {
+        Ok(db) => db,
+        Err(e) => return CalibrationStatus::Unavailable(format!("activity.db open failed: {e}")),
+    };
+    let costs = match daily_cost_series_from_activity_db(&db, since) {
+        Ok(c) => c,
+        Err(e) => return CalibrationStatus::Unavailable(format!("usage-report query failed: {e}")),
+    };
+    // The cost series is cut at the `since` *instant*; the sample series at
+    // its UTC *date*. The half-day skew at the window's oldest edge cannot
+    // matter: `calibrate` re-joins by day key and the trailing baseline only
+    // ever reads the newest days.
+    let samples = match db.get_weekly_point_series(since.date_naive()) {
+        Ok(s) => s,
+        Err(e) => {
+            return CalibrationStatus::Unavailable(format!(
+                "weekly_point_samples query failed: {e}"
+            ))
+        }
+    };
+    calibration_status_from_join(&costs, &persisted_samples_to_daily_values(&samples))
+}
+
+/// Convert #8347's stored series — one high-water mark per day of the pool's
+/// cumulative weekly utilization — into the per-day points-**consumed** flow
+/// [`calibrate`] joins against, mirroring the day-over-day delta semantics
+/// [`aggregate_weekly_points`] applies to claude-monitor's per-account
+/// samples:
+///
+/// - only calendar-adjacent sample pairs contribute (a gap would fold several
+///   days of consumption into one delta, so it contributes nothing);
+/// - a negative delta (the rolling 7-day window resetting) is clamped to
+///   zero — `calibrate` then treats that day as absent rather than dividing
+///   by it, the same "absent, never zero" rule its module doc states;
+/// - a day whose `account_count` differs from its predecessor is skipped
+///   entirely: the pool gaining or losing an account moves the pool-wide sum
+///   by the newcomer's whole accrued window, which is a composition change,
+///   not consumption — exactly the ambiguity #8347's `account_count` column
+///   exists to let a consumer resolve.
+fn persisted_samples_to_daily_values(samples: &[WeeklyPointSample]) -> Vec<DailyValue> {
+    let mut out = Vec::new();
+    for pair in samples.windows(2) {
+        let (prev, curr) = (&pair[0], &pair[1]);
+        if curr.day.signed_duration_since(prev.day).num_days() != 1 {
+            continue;
+        }
+        if curr.account_count != prev.account_count {
+            continue;
+        }
+        let consumed = (curr.points - prev.points).max(0.0);
+        // The same `YYYY-MM-DD` spelling `UsageReportGroupBy::Day` emits, so
+        // the two sides of `calibrate`'s join compare as plain strings.
+        out.push(DailyValue::new(curr.day.format("%Y-%m-%d").to_string(), consumed));
+    }
+    out
+}
+
+/// Join the two daily series with #8348's pure [`calibrate`] and map the
+/// result into this module's [`CalibrationStatus`] shape, so the fallback
+/// renders through the exact same section logic as the claude-monitor path.
+///
+/// `point_values` must already be in points-consumed-per-day form (see
+/// [`persisted_samples_to_daily_values`]); `calibrate` itself skips any day
+/// that is non-positive or non-finite on either axis, so a clamped-to-zero
+/// delta simply leaves no row behind.
+fn calibration_status_from_join(
+    costs: &[DailyCost],
+    point_values: &[DailyValue],
+) -> CalibrationStatus {
+    let cost_values: Vec<DailyValue> = costs
+        .iter()
+        .map(|c| DailyValue::new(c.date.format("%Y-%m-%d").to_string(), c.cost_usd))
+        .collect();
+    let joined = calibrate(&cost_values, point_values);
+    if joined.days.len() < BASELINE_WINDOW_DAYS + 1 {
+        return CalibrationStatus::InsufficientData {
+            joined_days: joined.days.len(),
+        };
+    }
+
+    let series: Vec<CalibrationDay> = joined
+        .days
+        .iter()
+        .filter_map(|d| {
+            parse_day_key(&d.day).map(|date| CalibrationDay {
+                date,
+                cost_usd: d.cost_usd,
+                weekly_points_delta: d.weekly_points,
+                usd_per_weekly_point: d.usd_per_point,
+            })
+        })
+        .collect();
+
+    // #8348 flags *any* day whose fold change left the band, and a sustained
+    // step can stay flagged for a few days while the trailing window still
+    // mixes pre-step values. This section's contract — like
+    // `detect_step_change` on the claude-monitor path — is "is something
+    // wrong *now*", so only the most recent day's flag becomes the warning.
+    let warning = joined.days.last().and_then(|d| {
+        // A warned day always carries both a baseline and a fold change.
+        d.warning?;
+        let fold = d.fold_change?;
+        let baseline = d.baseline?;
+        let ratio = if fold >= 1.0 { fold } else { 1.0 / fold };
+        parse_day_key(&d.day).map(|date| StepChangeWarning {
+            date,
+            baseline_usd_per_point: baseline,
+            current_usd_per_point: d.usd_per_point,
+            ratio,
+        })
+    });
+
+    CalibrationStatus::Ready { series, warning }
+}
+
+/// Parse a `YYYY-MM-DD` day key back into a date. `None` on a malformed key —
+/// which cannot happen for a key this module itself formatted, but the join's
+/// day axis is a plain string, and a hand-edited row stays a skipped day
+/// rather than a panic.
+fn parse_day_key(day: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -876,6 +1059,206 @@ mod tests {
                 assert!(w.ratio > STEP_CHANGE_RATIO_THRESHOLD);
             }
             other => panic!("expected Ready with a warning, got {other:?}"),
+        }
+    }
+
+    // -- #8349: the persisted-samples fallback --------------------------------
+
+    /// Seed #8347's `weekly_point_samples` with `(day, high-water points,
+    /// account_count)` rows, in write order.
+    fn seed_weekly_point_samples(db: &ActivityDb, rows: &[(&str, f64, i64)]) {
+        for (day, points, accounts) in rows {
+            db.record_weekly_point_sample(date(day), *points, *accounts)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn persisted_samples_become_day_over_day_consumed_deltas() {
+        let samples = seed_samples(&[
+            ("2026-09-07", 10.0, 3),
+            ("2026-09-08", 22.0, 3), // +12
+            ("2026-09-09", 30.0, 3), // +8
+        ]);
+        let values = persisted_samples_to_daily_values(&samples);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].day, "2026-09-08");
+        assert!((values[0].value - 12.0).abs() < 1e-9);
+        assert!((values[1].value - 8.0).abs() < 1e-9);
+    }
+
+    /// Build #8347-shaped samples from `(day, high-water points,
+    /// account_count)` rows, for the pure-mapping tests below.
+    fn seed_samples(rows: &[(&str, f64, i64)]) -> Vec<WeeklyPointSample> {
+        rows.iter()
+            .map(|(day, points, accounts)| WeeklyPointSample {
+                day: date(day),
+                points: *points,
+                account_count: *accounts,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_window_reset_clamps_to_zero_and_a_gap_contributes_nothing() {
+        let samples = seed_samples(&[
+            ("2026-09-07", 90.0, 2),
+            // Rolling 7-day window reset: the reading falls. Clamped to a
+            // zero delta — a row `calibrate` then treats as absent, never a
+            // negative consumption.
+            ("2026-09-08", 10.0, 2),
+            ("2026-09-09", 25.0, 2), // +15
+            // 09-10 missing entirely: 09-11 is not calendar-adjacent to its
+            // predecessor, so its jump folds into no delta at all.
+            ("2026-09-11", 60.0, 2),
+        ]);
+        let values = persisted_samples_to_daily_values(&samples);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].day, "2026-09-08");
+        assert!((values[0].value - 0.0).abs() < 1e-9);
+        assert_eq!(values[1].day, "2026-09-09");
+        assert!((values[1].value - 15.0).abs() < 1e-9);
+        assert!(
+            !values.iter().any(|v| v.day == "2026-09-11"),
+            "a gap day's successor must contribute no delta"
+        );
+    }
+
+    #[test]
+    fn an_account_count_change_is_a_composition_change_not_consumption() {
+        let samples = seed_samples(&[
+            ("2026-09-07", 30.0, 3),
+            // A fourth account joins: +40 points of already-accrued window
+            // appear in the pool sum overnight. That day must contribute no
+            // delta — #8347's account_count column exists for exactly this.
+            ("2026-09-08", 70.0, 4),
+            ("2026-09-09", 80.0, 4), // +10, same pool
+        ]);
+        let values = persisted_samples_to_daily_values(&samples);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].day, "2026-09-09");
+        assert!((values[0].value - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_from_persisted_samples_reports_unavailable_when_activity_db_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = compute_from_persisted_samples(
+            &dir.path().join("does-not-exist.db"),
+            ts("2026-09-01T00:00:00Z"),
+        );
+        assert!(matches!(status, CalibrationStatus::Unavailable(_)));
+    }
+
+    #[test]
+    fn compute_from_persisted_samples_is_insufficient_with_too_few_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let activity_db_path = dir.path().join("activity.db");
+        let activity_db = ActivityDb::new(activity_db_path.clone()).unwrap();
+        // Two samples -> one delta -> one joined day, four short of a
+        // baseline + current.
+        seed_weekly_point_samples(
+            &activity_db,
+            &[("2026-09-10", 10.0, 2), ("2026-09-11", 30.0, 2)],
+        );
+        seed_activity_cost(&activity_db, ts("2026-09-10T12:00:00Z"), 5.0);
+        seed_activity_cost(&activity_db, ts("2026-09-11T12:00:00Z"), 5.0);
+        drop(activity_db);
+
+        let status = compute_from_persisted_samples(&activity_db_path, ts("2026-09-01T00:00:00Z"));
+        assert!(matches!(status, CalibrationStatus::InsufficientData { joined_days: 1 }));
+    }
+
+    /// The #8349 wiring end-to-end: with no claude-monitor on the host at
+    /// all, the persisted samples + usage-report cost series still produce a
+    /// Ready reading, joined by #8348's `calibrate` — here a flat ~5.0 $/pt
+    /// baseline dropping to 2.0 on the last day.
+    #[test]
+    fn compute_with_fallback_detects_a_step_change_without_claude_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let activity_db_path = dir.path().join("activity.db");
+        let activity_db = ActivityDb::new(activity_db_path.clone()).unwrap();
+        // High-water marks climbing +10/day, then +25 on the last day.
+        seed_weekly_point_samples(
+            &activity_db,
+            &[
+                ("2026-09-07", 10.0, 2),
+                ("2026-09-08", 20.0, 2),
+                ("2026-09-09", 30.0, 2),
+                ("2026-09-10", 40.0, 2),
+                ("2026-09-11", 65.0, 2),
+            ],
+        );
+        for day in ["08", "09", "10", "11"] {
+            seed_activity_cost(&activity_db, ts(&format!("2026-09-{day}T12:00:00Z")), 50.0);
+        }
+        drop(activity_db);
+
+        let status = compute_with_fallback(
+            &dir.path().join("usage.db"), // no claude-monitor on this host
+            &activity_db_path,
+            ts("2026-09-01T00:00:00Z"),
+        );
+        match status {
+            CalibrationStatus::Ready { series, warning } => {
+                assert_eq!(series.len(), 4);
+                let w = warning.expect("the >1.5x drop must survive the fallback join");
+                assert_eq!(w.date, date("2026-09-11"));
+                // ~5.0 baseline -> 2.0 current: a magnitude of ~2.5x, with
+                // the direction still readable from the two ratios.
+                assert!((w.baseline_usd_per_point - 5.0).abs() < 1e-9);
+                assert!((w.current_usd_per_point - 2.0).abs() < 1e-9);
+                assert!(w.ratio > STEP_CHANGE_RATIO_THRESHOLD);
+            }
+            other => panic!("expected Ready with a warning, got {other:?}"),
+        }
+    }
+
+    /// Precedence: a readable claude-monitor wins even when the persisted
+    /// samples would have told a different (here: alarming) story — the
+    /// fallback never second-guesses the primary source.
+    #[test]
+    fn compute_with_fallback_prefers_a_readable_claude_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let monitor_db_path = dir.path().join("usage.db");
+        let activity_db_path = dir.path().join("activity.db");
+
+        // Primary (claude-monitor): flat +10 pts/day at $50/day -> steady
+        // 5.0 $/pt, no step change.
+        seed_monitor_db(
+            &monitor_db_path,
+            &[
+                ("acct-a", "2026-09-07T00:00:00Z", 0.0),
+                ("acct-a", "2026-09-08T00:00:00Z", 10.0),
+                ("acct-a", "2026-09-09T00:00:00Z", 20.0),
+                ("acct-a", "2026-09-10T00:00:00Z", 30.0),
+                ("acct-a", "2026-09-11T00:00:00Z", 40.0),
+            ],
+        );
+        let activity_db = ActivityDb::new(activity_db_path.clone()).unwrap();
+        // Fallback (#8347 samples): +25 on the last day — would warn.
+        seed_weekly_point_samples(
+            &activity_db,
+            &[
+                ("2026-09-07", 10.0, 2),
+                ("2026-09-08", 20.0, 2),
+                ("2026-09-09", 30.0, 2),
+                ("2026-09-10", 40.0, 2),
+                ("2026-09-11", 65.0, 2),
+            ],
+        );
+        for day in ["08", "09", "10", "11"] {
+            seed_activity_cost(&activity_db, ts(&format!("2026-09-{day}T12:00:00Z")), 50.0);
+        }
+        drop(activity_db);
+
+        let status =
+            compute_with_fallback(&monitor_db_path, &activity_db_path, ts("2026-09-01T00:00:00Z"));
+        match status {
+            CalibrationStatus::Ready { warning, .. } => {
+                assert!(warning.is_none(), "the claude-monitor reading must win");
+            }
+            other => panic!("expected Ready, got {other:?}"),
         }
     }
 }

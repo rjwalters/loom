@@ -661,6 +661,12 @@ async fn handle_health(
         // `loom-daemon health` (the CLI path, `cli/health.rs`) is the one
         // place this actually runs.
         codesign_preflight: None,
+        // #8349: the limit-calibration reading is likewise a CLI-collector
+        // input (`cli/health.rs` reads claude-monitor / the activity DB
+        // best-effort); this dashboard route reports the
+        // daemon-authoritative sections only, so it threads `None` ("not
+        // collected here") and no `limit_calibration` section renders.
+        limit_calibration: None,
         // #8163: corroborates (or refutes) an `indeterminate-busy` roll-up.
         // A `/proc/loadavg`-class read — cheap enough for this route's poll
         // cadence, and taken here rather than daemon-side-over-IPC precisely

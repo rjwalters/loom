@@ -527,6 +527,21 @@ pub struct HealthInputs {
     /// can neither support nor refute the busy story and therefore preserves
     /// the pre-#8163 verdict exactly; see [`busy::load_corroborates_busy`].
     pub load_per_core: Option<f64>,
+    /// The collected limit-calibration reading (#8063, threaded by #8349):
+    /// the fleet's $-equivalent cost per weekly-limit point and any step
+    /// change detected against its trailing baseline. Computed by the
+    /// `loom-daemon health` CLI collector via
+    /// [`crate::limit_calibration::compute_with_fallback`] — claude-monitor's
+    /// `usage_history` where present, else #8347's persisted
+    /// `weekly_point_samples` joined by #8348's
+    /// [`crate::activity::calibrate`] — and rendered by
+    /// [`calibration_section::assess_limit_calibration`].
+    ///
+    /// `None` means "not collected": neither source was readable on this
+    /// host, which reports no section at all (never a non-green line for the
+    /// absence of an optional signal), the same rule
+    /// [`Self::codesign_preflight`] follows.
+    pub limit_calibration: Option<crate::limit_calibration::CalibrationStatus>,
 }
 
 // ============================================================================
@@ -2726,6 +2741,17 @@ mod codesign;
 pub use codesign::{assess_codesign_identity, CodesignPreflightResult};
 
 // ============================================================================
+// Limit calibration (Issues #8063 / #8349) — conditional
+// ============================================================================
+
+/// The conditional `limit_calibration` section: the fleet's $-eq per
+/// weekly-limit point plus its step-change warning, rendered only when the
+/// collector actually produced a reading on this host.
+mod calibration_section;
+
+pub use calibration_section::assess_limit_calibration;
+
+// ============================================================================
 // Roll-up
 // ============================================================================
 
@@ -2740,9 +2766,11 @@ mod busy;
 /// round-trip that could not happen), and the overall verdict is `Dead` so the
 /// exit code is `2` rather than a misleading `1`.
 ///
-/// Every section is unconditional except `observability` (#4830), which is
-/// appended only when there is a mismatch to report — see
-/// [`assess_observability`].
+/// Every section is unconditional except `observability` (#4830),
+/// `codesign_identity` (#7605) and `limit_calibration` (#8063/#8349), each of
+/// which is appended only when there is something to report — see
+/// [`assess_observability`], [`assess_codesign_identity`] and
+/// [`assess_limit_calibration`].
 ///
 /// # `IndeterminateBusy` (#6191, #8163)
 ///
@@ -2776,6 +2804,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     ];
     sections.extend(assess_observability(inputs));
     sections.extend(assess_codesign_identity(inputs));
+    sections.extend(assess_limit_calibration(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {
