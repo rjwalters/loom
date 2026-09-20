@@ -530,6 +530,14 @@ export function redactActiveSweep(sweep: ActiveSweepState, isAuthenticated: bool
 export interface RedactedFleetSnapshot {
   hosts: FleetSnapshot["hosts"];
   activeSweeps: PublicActiveSweep[];
+  /** Live `ephemeral_compute` entries (Issue #8305). Always `[]` for an
+   * unauthenticated viewer — see [`redactFleetSnapshot`].
+   *
+   * Optional on the *type* (like `hosts[].health.freshness` in
+   * `fleetState.ts`, and for the same reason: renderers and fixtures that
+   * predate this field construct a bare `{ hosts, activeSweeps }`) even
+   * though [`redactFleetSnapshot`] always populates it. */
+  activeCompute?: FleetSnapshot["activeCompute"];
 }
 
 /** Redact a full `FleetSnapshot`: every host's `health`/`tokens` entry is
@@ -571,6 +579,14 @@ export function redactFleetSnapshot(snapshot: FleetSnapshot, isAuthenticated: bo
   return {
     hosts,
     activeSweeps: snapshot.activeSweeps.map((sweep) => redactActiveSweep(sweep, isAuthenticated)),
+    // Issue #8305: live compute entries follow the `ephemeral_compute`
+    // allowlist above verbatim — NO field of that kind reaches `/public/*`.
+    // There is no per-entry projection to apply here because there is nothing
+    // left after the projection; an unauthenticated viewer gets an empty list
+    // rather than a stripped-down one, which also withholds the *count* (a
+    // running-instance count is itself infrastructure-spend detail about a
+    // private operator's fleet — the very thing the allowlist withholds).
+    activeCompute: isAuthenticated ? snapshot.activeCompute : [],
   };
 }
 

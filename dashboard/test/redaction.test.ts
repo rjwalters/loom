@@ -12,7 +12,7 @@ import {
   redactSseFrame,
 } from "../src/redaction";
 import type { HistoryRecord } from "../src/query";
-import type { ActiveSweepState, FleetSnapshot } from "../src/fleetState";
+import type { ActiveComputeState, ActiveSweepState, FleetSnapshot } from "../src/fleetState";
 import {
   authedRequest,
   hostHealthEnvelope,
@@ -663,10 +663,34 @@ describe("redactFleetSnapshot", () => {
         },
       },
       activeSweeps: [activeSweepFixture()],
+      activeCompute: [],
     };
     const redacted = redactFleetSnapshot(snapshot, false);
     expect(redacted.hosts["host-abc"]?.health?.record).toEqual({ kind: "host.health", uptime_sec: 100 });
     expect(redacted.activeSweeps[0]).not.toHaveProperty("sweepId");
+  });
+
+  it("withholds live activeCompute entries entirely from a public viewer, including their count (#8305)", () => {
+    const computeEntry: ActiveComputeState = {
+      hostId: "host-abc",
+      jobId: "job-abc123",
+      instanceId: "i-0123456789abcdef0",
+      region: "us-east-1",
+      instanceType: "c7i.4xlarge",
+      spot: true,
+      ami: "ami-0123456789abcdef0",
+      startedAt: "2026-09-19T12:00:00Z",
+      updatedAt: "2026-09-19T12:00:00Z",
+      leaked: false,
+    };
+    const snapshot: FleetSnapshot = { hosts: {}, activeSweeps: [], activeCompute: [computeEntry] };
+
+    // `PUBLIC_RECORD_ALLOWLIST.ephemeral_compute` is `["kind"]` — a stated
+    // "no fields survive to /public/*" policy — so there is nothing to
+    // project down to and even the number of running instances is withheld.
+    expect(redactFleetSnapshot(snapshot, false).activeCompute).toEqual([]);
+    // The authenticated dashboard still sees the whole entry.
+    expect(redactFleetSnapshot(snapshot, true).activeCompute).toEqual([computeEntry]);
   });
 
   it("collapses a private repo's slug for a public viewer, and shows every slug to an authenticated one (#4976)", () => {
@@ -687,6 +711,7 @@ describe("redactFleetSnapshot", () => {
         },
       },
       activeSweeps: [],
+      activeCompute: [],
     };
 
     const publicRecord = redactFleetSnapshot(snapshot, false).hosts["host-abc"]?.health?.record;
@@ -720,6 +745,7 @@ describe("redactFleetSnapshot", () => {
         },
       },
       activeSweeps: [],
+      activeCompute: [],
     };
 
     const record = redactFleetSnapshot(snapshot, false).hosts["host-abc"]?.tokens?.record;
@@ -741,6 +767,7 @@ describe("redactFleetSnapshot", () => {
         },
       },
       activeSweeps: [],
+      activeCompute: [],
     };
 
     const record = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.tokens?.record;
@@ -771,6 +798,7 @@ describe("redactFleetSnapshot", () => {
         },
       },
       activeSweeps: [],
+      activeCompute: [],
     };
 
     const authedRecord = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.health?.record;
