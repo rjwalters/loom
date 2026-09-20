@@ -6,6 +6,66 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-20
+- **Issue #8284** (closed): merge-pr.sh version guard runs main's checker, so a PR that changes the version-bearing set (e.g. #8190) can never pass it — evaluate the PR head's checker when the diff touches it
+- **PR #8345**: fix(merge-pr): evaluate the PR head's version-policy checker when the PR changes it (#8284)
+- **Issue #8304** (closed): dashboard: ephemeral_compute ingest + D1 schema + redaction policy (Phase 1 of #8257)
+- **PR #8337**: feat(dashboard): ingest ephemeral_compute records with an explicit redaction policy
+- **Issue #7986** (closed): Guard: same-command mktemp safe-path denies the routine `VAR=$(cd "$VAR" && pwd -P)` realpath-canonicalization reassignment
+- **PR #8016**: fix(guard): admit the exact mktemp-then-canonicalize chain in both same-command fast paths
+- **Issue #8381** (closed): test(daemon): cover the #8355 reap-time memo seed's interaction with the same branch's open-PR probe
+- **PR #8398**: test(daemon): cover the #8355 reap-time memo seed's interaction with the same branch's open-PR probe
+- **Issue #6544** (closed): provision-hooks.sh emits unquoted ${CLAUDE_PROJECT_DIR} — every hook breaks when the project path contains a space
+- **PR #8258**: fix(provision-hooks): quote ${CLAUDE_PROJECT_DIR} in project-level hook entries
+- **Issue #8380** (closed): Codex class-scoped health: pinned model@date IDs never resolve to a class, and the #5499 drop-pin guard runs after selection
+- **PR #8388**: fix(tokens): collapse a pinned/suffixed `model@...` onto its bare class (#8380)
+- **Issue #8177** (closed): pricing: deliver the model rate card as a resync-updatable defaults/pricing.json asset (ask 2 of #8060)
+- **PR #8207**: feat(pricing): deliver the model rate card as a resync-updatable defaults/pricing.json asset
+- **PR #8279**: fix(worktree): reconcile the dirty-marker filter with its shell twin (#8195)
+- **Issue #8170** (closed): sweep_registry::watchdog midbuild_* tests fail under the full parallel suite, pass 90/90 in isolation
+- **PR #8329**: test(sweep-registry): make the mid-build watchdog's git fixture hermetic (#8170)
+- **Issue #8286** (closed): loom-daemon health: codesign_identity preflight runs in the CLI process, so over non-interactive ssh it always reads DEGRADED without saying why
+- **PR #8352**: fix(health): codesign_identity DEGRADED names its own ssh-preflight context
+- **PR #8390**: chore(deps): bump clap from 4.6.6 to 4.6.7 in the all-dependencies group
+- **PR #8389**: chore(deps): bump actions/create-github-app-token from 2.2.2 to 3.2.0
+- **PR #8393**: chore(deps-dev): bump the all-dependencies group in /dashboard with 3 updates
+- **PR #8392**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 3 updates
+- **PR #8391**: chore(deps-dev): bump the all-dependencies group in /mcp-loom with 2 updates
+- **Issue #8289** (closed): create-issue.sh hard-refuses as a duplicate at 19% similarity, and sometimes with no message at all
+- **PR #8353**: fix(forge-helpers): never exit silently on issue creation (#8289)
+- **PR #8384**: fix(peer-claims): raise coordination-degrade grace to 20m per #8276 flap investigation
+- **Issue #8399** (closed): Enable guarded Pi/OpenCode issue lifecycles through the native runtime
+- **PR #8400**: Enable guarded Pi/OpenCode issue lifecycles (#8399)
+- **Issue #8303** (closed): peer-claim coordination is DEGRADED on robb-studio (#6157 Layer 3)
+- **Issue #8377** (closed): Stop hook wedges every turn when the installed loom-daemon predates `worktree-state` (#8267) — wrapper fails closed, violating its own always-allow contract
+- **PR #8395**: fix(hooks): stop-hook wrapper fails open on an unsupported subcommand (#8377)
+- **Issue #8288** (closed): status table GATE column: 'disabled' reads as dispatch-disabled; it is the main-health gate verdict
+- **PR #8394**: fix(status): name the gate column HEALTH-GATE and read its off-state as "off"
+- **Issue #8347** (closed): [Part of #8063] Persist daily weekly-limit-point samples from tokens check
+- **PR #8373**: feat(activity): persist daily weekly-limit-point samples from tokens check (#8347)
+
+### 2026-09-19
+- **Issue #8290** (closed): release.yml: one-off HTTP 403 on 'gh release create' left v0.19.169 uncreated; step should retry
+- **PR #8383**: fix(release): retry gh release create on transient 403/5xx
+- **Issue #8297** (closed): tokens: claude-monitor ranking.json exposes per-class utilization that monitor.rs ignores
+- **PR #8382**: feat(tokens): ingest claude-monitor's per-class utilization, report-only
+- **Issue #8298** (closed): Judge's DIRTY auto-rebase can silently drop a resync PR's payload (adjacent single-line JSON diff)
+- **PR #8358**: fix(judge): detect and block a rebase that silently drops a PR's payload
+- **Issue #8263** (closed): gh api call sites pass an unsupported --repo flag, silently disabling five LOOM_REPO-host probes
+- **PR #8357**: fix(daemon): pass LOOM_REPO to gh api as GH_REPO, not an unsupported --repo flag (#8263)
+- **Issue #8268** (closed): Subagents spend 30-40% of runtime re-verifying work the coordinator is already verifying, because neither can see the other
+- **PR #8379**: feat(daemon): machine-wide in-flight verification registry (#8268)
+- **Issue #8355** (closed): Daemon's #4123 open-PR dispatch guard fails open under GraphQL exhaustion (observed on #8170/PR #8329)
+- **PR #8374**: fix(daemon): seed #4123 open-PR memo at reap time from known pr_number
+- **Issue #8277** (closed): Thread the in-flight model into LOOM_TERMINAL_RESULT so #8058's class-scoped health marks have a producer
+- **PR #8378**: feat(codex): thread the in-flight model into LOOM_TERMINAL_RESULT (#8277)
+- **Issue #8311** (closed): status_budget: safehouse ChatOps IpcExecutor still uses a fixed 30s DaemonStatus timeout, unscaled by root count
+- **PR #8376**: fix(chatops): root-scale the `!status` IPC budget (#8311)
+- **Issue #8267** (closed): Agent work is lost by default: a subagent can report success with its entire deliverable uncommitted, and the completion notification looks identical
+- **PR #8375**: feat(guard): refuse a completion that leaves the deliverable uncommitted
+- **Issue #8348** (closed): [Part of #8063] $-eq-per-weekly-point calibration join + step-change detection (pure logic)
+- **PR #8369**: feat(activity): $-eq-per-weekly-point calibration join + step-change detection (#8348)
+
 ### 2026-09-19
 - **Issue #8330** (closed): shell-budget: ratchet `comparable()`, not just `portable()` — `settled` reclassification can buy portable growth behind a floor declaration
 - **PR #8368**: fix(shell-budget): ratchet comparable(), not just portable()
