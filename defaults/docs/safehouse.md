@@ -1250,8 +1250,10 @@ were about the check tripping too eagerly, not about recovery being too
 slow once tripped. A live-poll investigation during an active flap (the
 issue's original acceptance criteria) would be needed to measure the true
 gap and justify a more precise number. See #8276 for the full data points
-and reasoning, and `anvil#1270` (fleet-wide, blocked on `#7664`) for the
-upstream investigation this closes the loop on.
+and reasoning, and `anvil#1270` (the fleet-wide investigation this closes the
+loop on) for background — closed 2026-09-16 as obsolete once the automated
+per-episode dedup (`#7664`/`#7680`) replaced the need for it as a manual
+duplicate-closing anchor.
 
 ### Fleet-wide completion dedup: reusing the peer-claim channel (#6352)
 
