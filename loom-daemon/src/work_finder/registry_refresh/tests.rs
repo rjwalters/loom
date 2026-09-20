@@ -91,6 +91,14 @@ async fn refresh_local_workspace_state_hot_applies_a_newly_registered_workspace(
     let fallback_root = scratch.path().join("fallback-unused");
     let new_repo = scratch.path().join("newly-added-repo");
     std::fs::create_dir_all(&new_repo).unwrap();
+    // `WorkspaceRegistry::add` stores the CANONICALIZED root (`normalize_path`
+    // resolves symlinks), and `refresh_local_workspace_state` returns the
+    // registry's own paths — on macOS a tempdir handed out as `/var/...` lives
+    // behind the `/private/var/...` symlink, so every comparison below must
+    // use the canonical form (the idiom `workspace_registry`'s own tests use)
+    // or the assertion is symlink-layout-dependent and red on this host class
+    // (#8328), env or no env.
+    let new_repo = std::fs::canonicalize(&new_repo).unwrap();
 
     // Start with an empty registry (mirrors a freshly-installed daemon).
     WorkspaceRegistry::default().save(&registry_path).unwrap();
@@ -126,5 +134,66 @@ async fn refresh_local_workspace_state_hot_applies_a_newly_registered_workspace(
     assert!(
         pool.provisioned_registry_for(&new_repo).is_some(),
         "the newly registered repo must be provisioned on the next refresh"
+    );
+}
+
+/// #8328's spelling class, made host-independent: the hot-apply test above
+/// only goes red on hosts whose `TMPDIR` hands out a non-canonical spelling
+/// (macOS `/var/...` behind the `/private/var/...` symlink), so a revert of
+/// the canonicalization would stay green on a canonical-`TMPDIR` CI runner.
+/// This test MANUFACTURES that spelling — a symlink alias inside the scratch
+/// dir pointing at the scratch dir itself — so `alias/newly-added-repo` is a
+/// genuinely non-canonical spelling of the same directory on every host, and
+/// the registry/comparison contract is exercised everywhere.
+#[tokio::test]
+#[serial]
+async fn refresh_local_workspace_state_hot_applies_through_a_symlink_alias_spelling() {
+    let scratch = tempfile::tempdir().unwrap();
+    let registry_path = scratch.path().join("workspaces.json");
+    let fallback_root = scratch.path().join("fallback-unused");
+    // `alias -> scratch`: reading through `alias` resolves to `scratch`, so
+    // the aliased path and its canonical form differ on ANY unix host.
+    let alias = scratch.path().join("alias");
+    std::os::unix::fs::symlink(scratch.path(), &alias).unwrap();
+    let aliased_repo = alias.join("newly-added-repo");
+    std::fs::create_dir_all(&aliased_repo).unwrap();
+    let new_repo = std::fs::canonicalize(&aliased_repo).unwrap();
+    assert_ne!(
+        new_repo, aliased_repo,
+        "the fixture must really be a non-canonical spelling, or it proves nothing"
+    );
+
+    // Start with an empty registry (mirrors a freshly-installed daemon).
+    WorkspaceRegistry::default().save(&registry_path).unwrap();
+
+    let pool = local_state_pool();
+    let mut missing_roots_warned = HashSet::new();
+
+    let (_registry, roots_before) = with_scratch_registry_path(&registry_path, || {
+        refresh_local_workspace_state(&pool, &fallback_root, &mut missing_roots_warned)
+    });
+    assert!(
+        !roots_before.contains(&new_repo),
+        "the new repo is not registered yet: {roots_before:?}"
+    );
+
+    // Simulate `loom-daemon workspace add <aliased spelling on the CLI>`: the
+    // operator's shell may hand the daemon either spelling; `add` normalizes
+    // what it stores, and the refresh below must surface the canonical form.
+    let mut registry = WorkspaceRegistry::load(&registry_path).unwrap();
+    registry.add(&aliased_repo, None).unwrap();
+    registry.save(&registry_path).unwrap();
+
+    let (_registry, roots_after) = with_scratch_registry_path(&registry_path, || {
+        refresh_local_workspace_state(&pool, &fallback_root, &mut missing_roots_warned)
+    });
+    assert!(
+        roots_after.contains(&new_repo),
+        "the repo registered through an aliased spelling must be hot-applied in \
+         canonical form: {roots_after:?}"
+    );
+    assert!(
+        pool.provisioned_registry_for(&new_repo).is_some(),
+        "the repo registered through an aliased spelling must be provisioned"
     );
 }
