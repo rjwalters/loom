@@ -638,8 +638,14 @@ else
 fi
 
 echo "Test 22: 'loom sweep' with an unknown runtime exits 78 naming runtime, source, and runners present"
+# Pin the bare-env resolution tier this test's wording assertion describes
+# (#8430): an inherited LOOM_ROLE (every daemon-launched shell — a Builder
+# running build-gate.sh carries LOOM_ROLE=sweep-lifecycle) reroutes
+# spawn-worker through runtime_admission's role binding, which renders the
+# same LOOM_RUNTIME var as the RuntimeSource label "global-environment"
+# instead of the dispatcher-era label "env (LOOM_RUNTIME)" asserted below.
 set +e
-out=$(cd "$SWEEPREPO" && LOOM_RUNTIME=nonexistent LOOM_CONFIG_DEFAULTS_FILE="" LOOM_HOME="$CHK" bash "$DISPATCHER" sweep 4467 2>&1)
+out=$(cd "$SWEEPREPO" && env -u LOOM_ROLE LOOM_RUNTIME=nonexistent LOOM_CONFIG_DEFAULTS_FILE="" LOOM_HOME="$CHK" bash "$DISPATCHER" sweep 4467 2>&1)
 rc=$?
 set -e 2>/dev/null || true
 assert_eq "$rc" "78" "unknown runtime exits 78 (EX_CONFIG)"
