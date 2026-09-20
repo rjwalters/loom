@@ -24,6 +24,13 @@ fn main() {
             std::env::var("LOOM_TEST_HARNESS_SECRET").ok().as_deref() == Some(source.as_str())
         );
     }
+    if std::env::var("FIXTURE_NATIVE_CONFIG").is_ok() {
+        println!("native_config={}", std::env::var("OPENCODE_CONFIG_CONTENT").unwrap());
+        println!(
+            "native_worker_pid_matches={}",
+            std::env::var("LOOM_NATIVE_WORKER_PID").unwrap() == std::process::id().to_string()
+        );
+    }
     eprintln!("fixture stderr");
     std::process::exit(
         std::env::var("FIXTURE_EXIT")

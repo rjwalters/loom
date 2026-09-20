@@ -25,6 +25,10 @@ fn worker(root: &std::path::Path, runtime: &str) -> Command {
         .env_remove("LOOM_MODEL")
         .env_remove("LOOM_MODEL_PROFILE")
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        .env(
+            "LOOM_NATIVE_GUARD_DIR",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../defaults/hooks"),
+        )
         .env("LOOM_PI_BIN", fixture())
         .env("LOOM_OPENCODE_BIN", fixture());
     c
@@ -92,7 +96,7 @@ fn invalid_model_effort_and_unknown_flags_fail_before_launch() {
     }
 }
 #[test]
-fn missing_binary_is_127_and_builder_is_not_admitted() {
+fn missing_binary_is_127_and_builder_uses_guarded_tools() {
     let d = tempfile::tempdir().unwrap();
     let out = worker(d.path(), "pi")
         .env("LOOM_PI_BIN", d.path().join("missing"))
@@ -105,8 +109,8 @@ fn missing_binary_is_127_and_builder_is_not_admitted() {
         .args(["-p", "hello"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(78));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("worktreeIsolation"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("--no-builtin-tools"));
 }
 #[cfg(unix)]
 #[test]
@@ -231,15 +235,14 @@ fn role_instructions_are_expanded_and_gate_cannot_be_bypassed_by_slash_prompt() 
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Role task: 8362"));
     assert!(text.contains("Repository rule marker"));
-    std::fs::write(roles.join("builder.json"), r#"{"runtimeRequirements":["worktreeIsolation"]}"#)
-        .unwrap();
+    std::fs::write(roles.join("builder.json"), r#"{"runtimeRequirements":["mcp"]}"#).unwrap();
     for runtime in ["pi", "opencode"] {
         let out = worker(d.path(), runtime)
             .args(["-p", "/loom:builder 8362"])
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(78));
-        assert!(String::from_utf8_lossy(&out.stderr).contains("worktreeIsolation"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("mcp"));
     }
 }
 #[test]
@@ -373,4 +376,91 @@ fn legacy_argv_preserves_non_utf8_bytes() {
     let out = worker(d.path(), "claude").arg(&arg).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("arg={arg:?}")));
+}
+
+#[test]
+fn native_sweep_prompt_uses_sequential_cli_lifecycle_and_fails_closed_tools() {
+    let d = tempfile::tempdir().unwrap();
+    let roles = d.path().join(".loom/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::write(
+        roles.join("builder.json"),
+        r#"{"runtimeRequirements":["loomControl","worktreeIsolation"]}"#,
+    )
+    .unwrap();
+    for role in ["curator", "judge", "doctor"] {
+        std::fs::write(
+            roles.join(format!("{role}.json")),
+            r#"{"runtimeRequirements":["loomControl"]}"#,
+        )
+        .unwrap();
+    }
+    for runtime in ["pi", "opencode"] {
+        let out = worker(d.path(), runtime)
+            .args(["-p", "/loom:sweep 8399 --claim-owned 8399"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("8399 --claim-owned 8399"));
+        assert!(text.contains("Native sequential issue lifecycle"));
+        assert!(text.contains("post-verdict.sh"));
+        assert!(text.contains("merge-pr.sh"));
+        if runtime == "pi" {
+            assert!(text.contains("--no-builtin-tools"));
+        } else {
+            assert!(text.contains("loom-worker"));
+        }
+    }
+}
+
+#[test]
+fn native_sweep_cannot_bypass_a_phase_capability_requirement() {
+    let d = tempfile::tempdir().unwrap();
+    let roles = d.path().join(".loom/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    for role in ["builder", "curator", "doctor"] {
+        std::fs::write(roles.join(format!("{role}.json")), "{}").unwrap();
+    }
+    std::fs::write(roles.join("judge.json"), r#"{"runtimeRequirements":["mcp"]}"#).unwrap();
+    for runtime in ["pi", "opencode"] {
+        let out = worker(d.path(), runtime)
+            .args(["-p", "/loom:sweep 1"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(78));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("native sweep phase judge"));
+        assert!(out.stdout.is_empty());
+    }
+}
+
+#[test]
+fn guarded_opencode_pins_auxiliary_models_preserves_provider_and_worker_identity() {
+    let d = tempfile::tempdir().unwrap();
+    let roles = d.path().join(".loom/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::write(roles.join("builder.json"), "{}").unwrap();
+    let out = worker(d.path(), "opencode")
+        .env("LOOM_ROLE", "builder")
+        .env(
+            "OPENCODE_CONFIG_CONTENT",
+            r#"{"small_model":"anthropic/stale","provider":{"private":{"name":"fixture"}}}"#,
+        )
+        .env("FIXTURE_NATIVE_CONFIG", "1")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let config: serde_json::Value = serde_json::from_str(
+        text.lines()
+            .find_map(|s| s.strip_prefix("native_config="))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["small_model"], "zai-coding-plan/glm-5.3-flash");
+    assert_eq!(config["agent"]["loom-worker"]["model"], config["small_model"]);
+    assert_eq!(config["provider"]["private"]["name"], "fixture");
+    assert_eq!(config["permission"]["*"], "deny");
+    assert!(text.contains("native_worker_pid_matches=true"));
 }

@@ -1,13 +1,14 @@
 {
   "runtime": "opencode",
-  "tier": 3,
-  "tierLabel": "experimental native adapter",
+  "tier": 2,
+  "tierLabel": "guarded native tools",
   "capabilities": {
     "mcp": "no",
     "subagents": "no",
-    "hooks": "no",
+    "hooks": "partial",
     "skills": "partial",
-    "worktreeIsolation": "no"
+    "worktreeIsolation": "yes",
+    "loomControl": "yes"
   },
-  "note": "Native Rust launch adapter. OpenCode supports MCP, but Loom MCP provisioning and guard parity are not verified by this integration; no MCP-dependent role is admitted. Builder, Doctor and sweep remain blocked. Free-form prompts and roles without capability requirements support controlled trials."
+  "note": "Loom-managed role launches disable unguarded harness tools and provide four Rust-backed tools using the shared worktree/workflow/destructive policies. CLI workflow control is supported; MCP and subagent support are not claimed. See guardrail-parity-native.md for the tested versions, evidence and residual limits."
 }

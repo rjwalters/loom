@@ -36,8 +36,9 @@ libc = "0.2"
 # no gRPC transport stack is pulled in.
 opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["logs", "metrics", "gen-tonic-messages", "with-serde"], optional = true }
 
-[dev-dependencies]
 tempfile = "3.27"
+
+[dev-dependencies]
 tokio-test = "0.4"
 serial_test = "4.0"
 criterion = "0.8"

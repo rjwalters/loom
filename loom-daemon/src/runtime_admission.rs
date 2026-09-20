@@ -595,6 +595,16 @@ pub fn resolve_and_admit(
     if !unmet.is_empty() {
         return Err(reject(format!("unmet capabilities: {}", unmet.join(", ")), unmet));
     }
+    if canonical == "sweep-lifecycle" && crate::worker_spawn::is_native(&runtime) {
+        for phase in ["curator", "judge", "doctor"] {
+            resolve_and_admit(root, phase, Some(&runtime)).map_err(|error| {
+                reject(
+                    format!("native sweep phase {phase}: {}", error.reason),
+                    error.unmet_capabilities,
+                )
+            })?;
+        }
+    }
     Ok(ResolvedRuntime {
         role: canonical.to_string(),
         runtime,

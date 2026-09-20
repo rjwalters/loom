@@ -108,6 +108,12 @@ fn nonempty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Native sweep workers authenticate through their harness, not Claude's pool.
+pub fn uses_native_sweep(root: &Path) -> bool {
+    crate::runtime_admission::resolve_binding(root, "sweep-lifecycle", None)
+        .is_ok_and(|(runtime, _)| is_native(&runtime))
+}
+
 pub fn is_native(runtime: &str) -> bool {
     Harness::parse(runtime).is_some()
 }
@@ -193,7 +199,13 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
             .as_deref()
             .map(|p| prompt::expand(&root, p))
             .transpose()?;
-        let mut command = harness.command(&options, &selection, expanded.as_deref())?;
+        let mut command = harness.command(
+            &options,
+            &selection,
+            expanded.as_deref(),
+            &root,
+            role.is_some() || prompt_role.is_some(),
+        )?;
         if let Some(path) = &options.log {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 fs::create_dir_all(parent).map_err(|e| {
@@ -282,4 +294,12 @@ fn exec(mut command: Command) -> Result<(), LaunchError> {
             message: error.to_string(),
         }),
     }
+}
+
+pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
+    if let Err(error) = run(args) {
+        eprintln!("{}", error.message);
+        std::process::exit(error.code);
+    }
+    Ok(())
 }
