@@ -65,7 +65,7 @@
           },
           {
             "type": "command",
-            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/scripts/lib/locate-daemon-bin.sh; [ -r \"$L\" ] || exit 0; . \"$L\" >/dev/null 2>&1 || exit 0; B=$(loom_resolve_self_daemon_bin 2>/dev/null) || exit 0; [ -n \"$B\" ] && [ -x \"$B\" ] || exit 0; exec \"$B\" worktree-state stop-hook'"
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/scripts/lib/locate-daemon-bin.sh; [ -r \"$L\" ] || exit 0; . \"$L\" >/dev/null 2>&1 || exit 0; B=$(loom_resolve_self_daemon_bin 2>/dev/null) || exit 0; [ -n \"$B\" ] && [ -x \"$B\" ] || exit 0; \"$B\" worktree-state stop-hook || exit 0'"
           }
         ]
       }
@@ -76,7 +76,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/scripts/lib/locate-daemon-bin.sh; [ -r \"$L\" ] || exit 0; . \"$L\" >/dev/null 2>&1 || exit 0; B=$(loom_resolve_self_daemon_bin 2>/dev/null) || exit 0; [ -n \"$B\" ] && [ -x \"$B\" ] || exit 0; exec \"$B\" worktree-state stop-hook'"
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/scripts/lib/locate-daemon-bin.sh; [ -r \"$L\" ] || exit 0; . \"$L\" >/dev/null 2>&1 || exit 0; B=$(loom_resolve_self_daemon_bin 2>/dev/null) || exit 0; [ -n \"$B\" ] && [ -x \"$B\" ] || exit 0; \"$B\" worktree-state stop-hook || exit 0'"
           }
         ]
       }

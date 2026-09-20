@@ -1236,6 +1236,29 @@ an absent `git`, a worktree that no longer exists, or a daemon binary the
 wiring cannot resolve all resolve to "allow, say nothing". A guard that wedges a
 headless sweep on its own parse bug would be worse than the loss it prevents.
 
+**The shell wrapper has to fail open too, and originally did not (#8377).** That
+"always allow" contract is implemented in Rust — but the `bash -c` wrapper in
+`.claude/settings.json` runs *before* any Rust code does, and it used to end in a
+bare `exec "$B" worktree-state stop-hook`. On a host whose installed
+`loom-daemon` predated the `worktree-state` subcommand, clap rejected the unknown
+subcommand with **usage-error exit code 2** — and `exec` made that the *hook's*
+exit code, which Claude Code reads as "block this turn from ending". Every turn
+on such a host wedged, headless sweeps included. The wrapper now ends in
+
+```bash
+"$B" worktree-state stop-hook || exit 0
+```
+
+so **"binary too old to know this subcommand" is treated exactly like "binary
+absent": both exit 0.** Swallowing the exit code costs nothing, because a block
+is signalled by printing `{"decision":"block","reason":"…"}` on **stdout** with
+exit 0 — never by an exit code — so the guard's verdicts still reach Claude Code
+intact while every genuine failure (usage error, panic, missing binary) allows
+the stop. `defaults/scripts/tests/test-stop-hook-subcommand-skew.sh` asserts both
+halves against stub binaries, for both `Stop` and `SubagentStop`. Any future hook
+wrapper that `exec`s a versioned `loom-daemon` subcommand inherits this hazard and
+needs the same `|| exit 0`.
+
 **Where it is wired (deliberately narrow for now).** The `Stop` /`SubagentStop`
 entries live in this repository's project-level `.claude/settings.json` only.
 Consumer repos get their guard hooks from the user-scope wiring

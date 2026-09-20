@@ -198,6 +198,7 @@ test-run-job.sh
 test-safe-stash-pop.sh
 test-safehoused-service.sh
 test-stale-claim-standdown-suppression.sh
+test-stop-hook-subcommand-skew.sh
 test-sweep-auto-stack.sh
 test-sweep-checkpoint.sh
 test-sweep-lease-convergence.sh
