@@ -21,6 +21,7 @@ writing) will additionally push these records to a cloud backend.
 - [`RepoVisibility` contract — private by default](#repovisibility-contract--private-by-default)
 - [Record kinds](#record-kinds)
 - [Persistence & read surface (`sweep.outcome`, Issue #4704)](#persistence--read-surface-sweepoutcome-issue-4704)
+- [Refreshing the model rate card](#refreshing-the-model-rate-card)
 <!-- toc:end -->
 
 ## Envelope
@@ -796,11 +797,14 @@ Four properties worth knowing before reading the numbers:
   row carries `arm_source` (`explicit` | `inferred` | `unknown`); unstamped
   records land in an `unknown` bucket rather than being dropped, so the group
   counts always sum to `records_grouped`.
-- **Weighted tokens price through a named, known-stale rate card.**
-  `ModelPricing::for_model`'s rates are the Jan-2025 set (#8060 tracks the
-  refresh), and `claude-fable-*` is deliberately priced at the Opus rate. Both
-  the human header and the JSON name the card and its as-of date. "Merges per
-  weighted-token" is exactly as trustworthy as that card.
+- **Weighted tokens price through a named rate card, and are exactly as
+  trustworthy as it is.** `ModelPricing::for_model` reads the resync-delivered
+  `.loom/pricing.json` asset when it is present and valid, and the rate card
+  compiled into the running `loom-daemon` otherwise; the fallback is logged at
+  warn level, never applied silently (#8177). Both the human header and the
+  JSON name the card and its as-of date. Fixing a wrong price no longer needs a
+  Loom release: edit `defaults/pricing.json` and resync — see [Refreshing the
+  model rate card](#refreshing-the-model-rate-card) below.
 
 `--exclude-spawn-deaths` drops runs that died before doing any work: a
 classified `preflight-token-selection-failed` / `account-exhausted:*` (joined
@@ -815,5 +819,43 @@ not-yet-merged one is re-checked after 6h. **A forge failure reports the
 affected groups' merged counts as unavailable (`null` / `n/a`), never as `0`**
 — the same "unknown != zero" contract `tokens_in`/`tokens_by_model` use — and
 one failure latches, so a dead forge costs one subprocess, not one per PR.
+
+## Refreshing the model rate card
+
+Every cost figure in this document — `cost_usd` on a `sweep.outcome`, the
+cost-weighted token totals in `summary`, the arm-vs-arm ratio in
+`docs/model-selection-retune.md` — is produced by one rate card. Since #8177
+that card lives in **two** places, and they must agree:
+
+| Tier | File | How it reaches a repo |
+|---|---|---|
+| Asset (preferred) | `defaults/pricing.json` -> `.loom/pricing.json` | `.loom/scripts/resync-installed.sh` |
+| Compiled fallback | `ModelPricing::lookup` in `loom-daemon/src/activity/resource_usage.rs` | a Loom release |
+
+**To correct a price**: edit `defaults/pricing.json` *and* the compiled cascade
+in the same PR, bump `verified_on`, then resync. The
+`shipped_pricing_asset_agrees_with_the_compiled_card` test fails if you change
+only one of them — that is what stops the two tiers from drifting, since a
+repo that has resynced and one that has not would otherwise report different
+costs for identical work.
+
+**The asset is all-or-nothing.** Rows are an ordered cascade (first `match`
+substring contained in the lowercased, alias-resolved model id wins), and the
+whole document is parsed and validated before any of it is used. A missing,
+unreadable, malformed, partial, or future-`schema_version` asset is rejected
+by name and the compiled card is used **whole** — logged at warn level, never
+silently, and never priced at zero or at an invented default. The same warn
+discipline applies to a model id no row matches (it is priced at the newest
+Sonnet row and says so).
+
+**Staleness is visible, not fatal.** The asset carries its own `verified_on`
+date. Past 90 days (`pricing_card::STALENESS_THRESHOLD_DAYS`) the card is
+still used — a stale published rate beats no rate — but its age is reported at
+warn level once per process, so "nobody has re-checked the vendor's page this
+quarter" shows up in the log instead of quietly degrading every cost figure
+above.
+
+Set `LOOM_PRICING_CARD` to an explicit path to load the asset from elsewhere,
+or to the empty string to pin a process to the compiled card.
 
 [`TelemetryEnvelope`]: #envelope

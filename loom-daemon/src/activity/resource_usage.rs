@@ -20,6 +20,8 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use std::sync::LazyLock;
 
+use super::pricing_card::{self, PricingCard};
+
 /// Parsed resource usage data from terminal output
 #[derive(Debug, Clone, Default)]
 pub struct ResourceUsage {
@@ -95,7 +97,18 @@ impl ModelPricing {
         }
     }
 
-    /// Look up a model in the published rate card.
+    /// Look up a model in the **compiled** rate card.
+    ///
+    /// Since #8177 this is the *fallback* tier, not the only one: the same
+    /// table also ships as `defaults/pricing.json`, resync-delivered to
+    /// `.loom/pricing.json` and loaded at runtime by
+    /// [`crate::activity::pricing_card`], so a vendor price change reaches the
+    /// fleet on a resync rather than on a Loom release. This cascade is what
+    /// [`Self::resolve`] uses when that asset is absent or fails validation,
+    /// and the two are held in agreement by
+    /// `shipped_pricing_asset_agrees_with_the_compiled_card` below. **Any edit
+    /// to the rates here must be mirrored in `defaults/pricing.json`** (that
+    /// test fails otherwise, by design).
     ///
     /// Returns `None` only for an ID that matches no row at all — the caller
     /// decides what to do about that (see [`Self::for_model`]).
@@ -261,7 +274,24 @@ impl ModelPricing {
         None
     }
 
-    /// Whether `model` matches a row in the published rate card rather than
+    /// Look `model` up in whichever rate card is in effect for this process:
+    /// the resync-delivered `.loom/pricing.json` asset when it loaded cleanly,
+    /// the compiled cascade otherwise (#8177).
+    ///
+    /// Which tier is active — and, on the fallback path, exactly why — is
+    /// decided and logged once per process by
+    /// [`crate::activity::pricing_card::active`], not once per costed record.
+    fn resolve(model: &str) -> Option<Self> {
+        Self::resolve_with(pricing_card::active(), model)
+    }
+
+    /// [`Self::resolve`] against an explicit card, so a test can exercise both
+    /// tiers without depending on what the host checkout has installed.
+    fn resolve_with(card: Option<&PricingCard>, model: &str) -> Option<Self> {
+        card.map_or_else(|| Self::lookup(model), |c| c.lookup(model))
+    }
+
+    /// Whether `model` matches a row in the active rate card rather than
     /// falling through to the unknown-model default.
     ///
     /// Exposed so a test can assert the card still knows every model ID the
@@ -269,13 +299,15 @@ impl ModelPricing {
     /// (the cost record still gets *a* number), so only a test can catch it.
     #[must_use]
     pub fn is_known_model(model: &str) -> bool {
-        Self::lookup(model).is_some()
+        Self::resolve(model).is_some()
     }
 
     /// Get pricing for a given model.
     ///
-    /// See [`Self::lookup`] for the rate card, its verification date and
-    /// source, and the generation-matching rules.
+    /// See [`Self::lookup`] for the compiled rate card, its verification date
+    /// and source, and the generation-matching rules; see
+    /// [`crate::activity::pricing_card`] for the runtime-loaded asset that
+    /// supersedes it when present.
     ///
     /// An ID that matches no family at all is logged at **warn** level and
     /// priced at the newest Sonnet row. It is warn rather than debug because
@@ -286,14 +318,23 @@ impl ModelPricing {
     /// not an unknown model, and is logged at debug.
     #[must_use]
     pub fn for_model(model: &str) -> Self {
-        if let Some(pricing) = Self::lookup(model) {
+        Self::for_model_with(pricing_card::active(), model)
+    }
+
+    /// [`Self::for_model`] against an explicit card. See [`Self::resolve_with`].
+    fn for_model_with(card: Option<&PricingCard>, model: &str) -> Self {
+        if let Some(pricing) = Self::resolve_with(card, model) {
             return pricing;
         }
         if model.is_empty() {
             log::debug!("No model recorded; using default Sonnet pricing");
         } else {
+            let provenance = card.map_or_else(
+                || "the rate card compiled into this build".to_string(),
+                |c| format!("{} (verified {})", c.path().display(), c.verified_on()),
+            );
             log::warn!(
-                "Unknown model '{model}' is not on the pricing card (checked 2026-09-17); \
+                "Unknown model '{model}' is not on the pricing card in effect — {provenance}; \
                  cost is being estimated at the newest Sonnet rate and may be badly wrong"
             );
         }
@@ -766,6 +807,129 @@ mod tests {
         let sonnet = ModelPricing::for_model("claude-sonnet-5");
         assert!((opus.input_cost_per_1k / sonnet.input_cost_per_1k - 2.5).abs() < 1e-9);
         assert!((opus.output_cost_per_1k / sonnet.output_cost_per_1k - 2.5).abs() < 1e-9);
+    }
+
+    // ---- #8177: the shipped asset and the compiled fallback cannot drift ---
+
+    /// Every ID the parity check below sweeps: the dispatchable set the
+    /// compiled card must know, plus the unknown-generation probes and the
+    /// non-Anthropic rows, which exercise cascade ORDER and the explicit
+    /// (non-multiplier-derived) cache-rate form respectively.
+    fn parity_model_ids() -> Vec<String> {
+        let mut ids: Vec<String> = KNOWN_MODEL_IDS.iter().map(|s| (*s).to_string()).collect();
+        for extra in [
+            "OPUS",
+            "claude-opus-6",
+            "claude-sonnet-99",
+            "claude-haiku-9",
+            "claude-fable-9",
+            "claude-mythos-9",
+            "claude-3-sonnet",
+            "claude-3-5-haiku",
+            "gpt-4o",
+            "gpt-4-turbo",
+            "gpt-3.5-turbo",
+        ] {
+            ids.push(extra.to_string());
+        }
+        ids
+    }
+
+    /// AC3: the resync-delivered `defaults/pricing.json` must produce rates
+    /// identical to the compiled cascade for every model ID
+    /// `pricing_card_knows_every_dispatchable_model_id` enumerates.
+    ///
+    /// This is the only thing keeping the two tiers from drifting: a price
+    /// edited in one place and not the other changes what the fleet reports
+    /// depending on whether a repo has resynced, which is silent in production.
+    #[test]
+    fn shipped_pricing_asset_agrees_with_the_compiled_card() {
+        let path = pricing_card::shipped_asset_path();
+        let card = PricingCard::load(&path)
+            .unwrap_or_else(|e| panic!("defaults/pricing.json must load cleanly: {e}"));
+
+        for id in parity_model_ids() {
+            let compiled = ModelPricing::lookup(&id).unwrap_or_else(|| {
+                panic!("'{id}' is not on the COMPILED card — fix resource_usage.rs::lookup")
+            });
+            let shipped = card.lookup(&id).unwrap_or_else(|| {
+                panic!(
+                    "'{id}' is on the compiled card but matches no row in \
+                     defaults/pricing.json — the asset would price it at the unknown-model \
+                     default on any repo that has resynced"
+                )
+            });
+            for (field, a, b) in [
+                ("input", compiled.input_cost_per_1k, shipped.input_cost_per_1k),
+                ("output", compiled.output_cost_per_1k, shipped.output_cost_per_1k),
+                ("cache_read", compiled.cache_read_cost_per_1k, shipped.cache_read_cost_per_1k),
+                (
+                    "cache_write_5m",
+                    compiled.cache_write_cost_per_1k,
+                    shipped.cache_write_cost_per_1k,
+                ),
+                (
+                    "cache_write_1h",
+                    compiled.cache_write_1h_cost_per_1k,
+                    shipped.cache_write_1h_cost_per_1k,
+                ),
+            ] {
+                assert!(
+                    (a - b).abs() < f64::EPSILON,
+                    "{id}: {field} disagrees — compiled {a}, defaults/pricing.json {b}. \
+                     Update BOTH the cascade in resource_usage.rs and defaults/pricing.json."
+                );
+            }
+        }
+    }
+
+    /// ...and the same in the other direction, through the public entry point:
+    /// a repo running off the asset must observe exactly what a repo running
+    /// off the compiled fallback observes, including the unknown-model default.
+    #[test]
+    fn for_model_is_tier_agnostic() {
+        let card = PricingCard::load(&pricing_card::shipped_asset_path()).unwrap();
+        for id in parity_model_ids()
+            .iter()
+            .map(String::as_str)
+            .chain(["totally-not-a-model", ""])
+        {
+            let from_asset = ModelPricing::for_model_with(Some(&card), id);
+            let from_compiled = ModelPricing::for_model_with(None, id);
+            assert!(
+                (from_asset.input_cost_per_1k - from_compiled.input_cost_per_1k).abs()
+                    < f64::EPSILON
+                    && (from_asset.output_cost_per_1k - from_compiled.output_cost_per_1k).abs()
+                        < f64::EPSILON,
+                "{id:?}: asset tier and compiled tier disagree"
+            );
+            assert_eq!(
+                ModelPricing::resolve_with(Some(&card), id).is_some(),
+                ModelPricing::resolve_with(None, id).is_some(),
+                "{id:?}: the two tiers disagree about whether the model is known"
+            );
+        }
+    }
+
+    /// A malformed asset must not be partially applied: the caller keeps the
+    /// compiled card, whole.
+    #[test]
+    fn a_rejected_asset_leaves_the_compiled_card_in_charge() {
+        let err = PricingCard::from_str_at(
+            r#"{"schema_version": 1, "verified_on": "2026-09-18"}"#,
+            std::path::Path::new("/test/pricing.json"),
+        )
+        .expect_err("a document missing `rows` must be rejected");
+        assert!(err.to_string().contains("malformed"), "{err}");
+
+        // `for_model_with(None, ..)` is exactly what `for_model` does after a
+        // rejection, and it still knows every dispatchable ID.
+        for id in KNOWN_MODEL_IDS {
+            assert!(
+                ModelPricing::resolve_with(None, id).is_some(),
+                "{id} must still price off the compiled fallback"
+            );
+        }
     }
 
     #[test]

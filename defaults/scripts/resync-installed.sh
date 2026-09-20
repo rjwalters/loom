@@ -57,6 +57,11 @@
 #                                                              if absent, #6031)
 #   .claude/biome.jsonc     <- defaults/.claude/biome.jsonc    (single file, BACKFILLED
 #                                                              if absent, #6031)
+#   .loom/pricing.json      <- defaults/pricing.json           (single file, BACKFILLED
+#                                                              if absent, #8177 — the
+#                                                              model rate card
+#                                                              loom-daemon prices token
+#                                                              usage from)
 #
 # It also applies one targeted field edit outside the pure-copy model (#4285):
 # a root package.json whose "name" is exactly "loom-workspace" (the Loom
@@ -1606,6 +1611,27 @@ if [[ -f "$DEFAULTS_DIR/.loom/biome.jsonc" ]]; then
 fi
 if [[ -f "$DEFAULTS_DIR/.claude/biome.jsonc" ]]; then
     sync_one "$DEFAULTS_DIR/.claude/biome.jsonc" "$WRITE_ROOT/.claude/biome.jsonc" ".claude/biome.jsonc"
+fi
+
+# ---------- single-file model rate card (#8177) ----------
+#
+# `.loom/pricing.json` is the whole point of the asset: it lets a vendor price
+# change reach the fleet on a RESYNC instead of on a Loom release. Without this
+# call the asset would only ever arrive with a fresh install, which is exactly
+# the release-coupling #8177 set out to remove.
+#
+# Same shape as the Biome configs above and for the same reasons: UNCONDITIONAL
+# (a new payload file no already-installed repo has, so a destination-gated
+# sync would never deliver it) but gated on the SOURCE existing (a resync run
+# against an older `defaults/` checkout is a clean no-op). `sync_one` still
+# honors `.loom/resync-ignore` and still refuses to clobber a symlinked target,
+# so a consumer who deliberately pins a fork of the rate card is untouched.
+#
+# loom-daemon treats a missing or malformed copy as "use the rate card compiled
+# into this build" and says so at warn level, so a partial or skipped sync
+# degrades loudly to correct-as-of-build rates rather than to zero.
+if [[ -f "$DEFAULTS_DIR/pricing.json" ]]; then
+    sync_one "$DEFAULTS_DIR/pricing.json" "$WRITE_ROOT/.loom/pricing.json" ".loom/pricing.json"
 fi
 
 # ---------- remove retired payload files (#5981) ----------
