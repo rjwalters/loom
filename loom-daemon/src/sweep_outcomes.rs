@@ -1018,6 +1018,7 @@ mod tests {
                 model: Some("claude-sonnet-5".to_string()),
                 effort: None,
                 detail: None,
+                gated_pool: None,
                 tokens_by_model: None,
                 models_used: None,
                 actions: None,

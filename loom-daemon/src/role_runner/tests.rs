@@ -4111,10 +4111,7 @@ fn test_root_tick_log_action_no_token_pool_is_not_failing() {
 // ---- pool-exhausted classification (#7607) -------------------------
 
 fn pool_exhausted_outcome() -> RoleTickOutcome {
-    RoleTickOutcome::PoolExhausted {
-        total: 3,
-        next_clear_at: chrono::Utc::now() + chrono::Duration::seconds(60),
-    }
+    RoleTickOutcome::claude_pool_exhausted(3, chrono::Utc::now() + chrono::Duration::seconds(60))
 }
 
 #[test]

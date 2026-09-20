@@ -748,6 +748,20 @@ model-selection block resolves an effective model (explicit `-m`/`--model` >
 options and exits `78` (`EX_CONFIG`) before any auth work. Escape hatch:
 `LOOM_CODEX_MODEL_CHECK=0`.
 
+#### The credential-pool preflight follows the admitted runtime (#8408)
+
+Resolving admission first also decides **which credential pool** the role
+runner's pre-spawn pool gate (#4642 / #7607) reads. It used to read the Claude
+token pool for every role, so `runtimes.roles.judge = "codex"` on a host whose
+Claude pool was exhausted skipped every judge tick (`token pool exhausted: 0/N
+spawnable in .loom/tokens`) while valid codex accounts sat idle. The gate now
+reads the pool the admitted runtime draws from — `.loom/tokens/` for `claude`
+(unchanged), the enabled `loom-daemon accounts` codex profiles for `codex`,
+nothing for the native harnesses — and a skip names that pool in the role log,
+the daemon log, and `role_tick.outcome`'s `gated_pool` key. Full contract,
+including when the codex gate deliberately stands down:
+[token-pool.md § The gate follows the admitted runtime](token-pool.md#the-gate-follows-the-admitted-runtime-8408).
+
 #### ChatGPT-plan seats cannot serve a pinned model at all (#5499)
 
 The family-level checks above only catch a Claude-shaped model on a Codex

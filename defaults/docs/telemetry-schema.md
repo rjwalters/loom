@@ -435,6 +435,7 @@ gradeable by a model or prompt experiment.
 | `model` | string | no | The model the runner **actually resolved and launched with**, including the #7894 unpinned-model reconciliation — not a re-read of config, so it cannot disagree with what ran. Omitted for a skip that bailed out before model resolution. |
 | `effort` | string | no | The resolved reasoning-effort level (#8054). Omitted when unconfigured — the honest "inherited the runtime default", never a fabricated `"medium"`. |
 | `detail` | string | no | The failure / skip detail, matching what the in-memory ring carries. Always absent for `success`. |
+| `gated_pool` | `"claude_tokens"` / `"codex_accounts"` | no | Which credential pool gated a pre-spawn pool skip (#8408): the one the role's **admitted runtime** draws from — `.loom/tokens/` (else the shared pool) for `claude`, the `loom-daemon accounts` codex profiles for `codex`. Present only on `skipped_no_token_pool` and `skipped_pool_exhausted`; absent on every other result and on records written before #8408. Additive, so it did not bump `schema_version`. |
 | `tokens_by_model` | array | no | Same grouped, raw (not cost-weighted) shape as `sweep.outcome`'s `tokens_by_model`, summed from the tick's own transcripts. |
 | `models_used` | string array | no | The distinct model ids in `tokens_by_model`, sorted and deduped — "did this tick's session escalate past the model it was launched with?" |
 | `actions` | object | no | Forge-mutating work observed in the transcripts: `issues_labeled`, `prs_merged`, `comments_posted`. |
@@ -448,7 +449,7 @@ gradeable by a model or prompt experiment.
 | `skipped_load` | yes | Terminated at the wall-clock ceiling while the host was measurably saturated (#6637) — a starved tick, not a broken role. |
 | `runtime_rejected` | no | Fail-closed runtime-admission rejection. |
 | `skipped_no_token_pool` | no | No token pool provisioned for this workspace (#4642). |
-| `skipped_pool_exhausted` | no | A pool exists but has zero spawnable accounts (#7607). |
+| `skipped_pool_exhausted` | no | The credential pool the admitted runtime draws from has zero spawnable accounts (#7607) — `gated_pool` says which pool (#8408). |
 | `skipped_model_runtime_mismatch` | no | The resolved model provably conflicts with the admitted runtime (#5028). |
 
 Folding the skips into `failure` is the exact mis-read #7607 documents: one

@@ -20,6 +20,7 @@ pub(super) fn role_tick_outcome() -> TelemetryRecord {
         model: Some("claude-sonnet-5".to_string()),
         effort: Some("high".to_string()),
         detail: None,
+        gated_pool: None,
         tokens_by_model: Some(vec![ModelUsageTotals {
             model: "claude-sonnet-5".to_string(),
             speed: "standard".to_string(),
@@ -90,6 +91,7 @@ fn role_tick_outcome_omits_every_unobserved_field() {
         model: None,
         effort: None,
         detail: Some("no-token-pool".to_string()),
+        gated_pool: None,
         tokens_by_model: None,
         models_used: None,
         actions: None,
@@ -98,6 +100,7 @@ fn role_tick_outcome_omits_every_unobserved_field() {
     for key in [
         "model",
         "effort",
+        "gated_pool",
         "tokens_by_model",
         "models_used",
         "actions",
@@ -210,4 +213,26 @@ fn a_pre_bump_schema_version_1_envelope_still_parses() {
     assert_eq!(record.failure_class, None);
     assert_eq!(record.models_used, None);
     assert_eq!(record.doctor_cycles, None);
+}
+
+/// Issue #8408: `gated_pool` is additive under schema `2` — it round-trips
+/// when present, and a record written before it existed still parses (to
+/// `None`), which is what lets it ship without a `schema_version` bump.
+#[test]
+fn role_tick_outcome_gated_pool_round_trips_and_older_records_still_parse() {
+    let mut record = match role_tick_outcome() {
+        TelemetryRecord::RoleTickOutcome(r) => r,
+        other => panic!("fixture changed: {other:?}"),
+    };
+    record.result = RoleTickResult::SkippedPoolExhausted;
+    record.gated_pool = Some("codex_accounts".to_string());
+    let value = serde_json::to_value(&record).unwrap();
+    assert_eq!(value["gated_pool"], "codex_accounts");
+    let back: RoleTickOutcomeRecord = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(back, record);
+
+    let mut older = value;
+    older.as_object_mut().unwrap().remove("gated_pool");
+    let parsed: RoleTickOutcomeRecord = serde_json::from_value(older).unwrap();
+    assert_eq!(parsed.gated_pool, None);
 }

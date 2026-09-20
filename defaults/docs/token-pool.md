@@ -1118,7 +1118,7 @@ Each role tick now reads the pool it would resolve to (repo-local shadow pool if
 it holds `.token` files, else shared — the same precedence `spawn-claude.sh`
 performs) and counts **spawnable** accounts. When that count is zero and the pool
 is non-empty, the tick returns `RoleTickOutcome::PoolExhausted { total,
-next_clear_at }` and **spawns nothing**:
+next_clear_at, pool }` and **spawns nothing**:
 
 - The skip is logged at `WARN` on the state **edge** for each `(workspace, role)`
   and downgraded to `DEBUG` on every repeat, so a dry pool costs one line per
@@ -1141,6 +1141,45 @@ fail-safe retry, #5629) enforces, so `usable == 0` guarantees a real selection
 would have failed. It does not model the `index.json` non-Claude exclusion
 (#5609), which can only make the real count *lower* — so this can never block a
 spawn that would have succeeded.
+
+### The gate follows the admitted runtime (#8408)
+
+This pool is Claude's. A role admitted onto another runtime
+(`runtimes.roles.<role> = "codex"`) never draws a token from it, so since #8408
+the role runner resolves the runtime **first** and gates on the credential
+source that runtime actually consumes — everything above describes the `claude`
+row, which is unchanged byte for byte:
+
+| Admitted runtime | Gate reads | `PoolExhausted.pool` / telemetry `gated_pool` |
+|---|---|---|
+| `claude` (default) | this pool | `ClaudeTokens` / `claude_tokens` |
+| `codex` | enabled `loom-daemon accounts` codex profiles | `CodexAccounts` / `codex_accounts` |
+| `pi`, `opencode`, other | nothing (no pre-spawn pool gate) | — |
+
+Before this, an exhausted Claude pool skipped a codex-pinned role on every tick
+even with valid codex accounts idle — the pin could not relieve the very
+pressure it exists for. The fail-closed shape is kept: a codex-pinned role with
+no spawnable codex account still skips pre-spawn, with a role-log line naming
+the **codex account pool** rather than `.loom/tokens`. Two differences from the
+Claude row are deliberate:
+
+- **Only a Claude-pool skip feeds the #6614 brake.** That brake holds *sweep*
+  dispatch on a token-selection wall; a dry codex account pool says nothing
+  about the pool sweeps draw from.
+- **The codex gate only counts holds the spawn-time selector could not get
+  past**, so it can never block a launch that would have succeeded. It stands
+  down entirely when `spawn-codex.sh` would not reach the account selector (an
+  explicit `LOOM_CODEX_HOME` / `CODEX_HOME` / `LOOM_CODEX_PROFILE` pin, or a
+  `codex.json` whose `accountProvider` is not `codex`), and it does not count a
+  class-scoped credit hold (#8058 — the role's model is not resolved yet) or a
+  re-auth hold on a session-managed profile (#6927 — the selector's own probe
+  can release it). An unreadable inventory or health state fails closed,
+  exactly as the selector does.
+
+Native harness runtimes are not gated: their credential may live in the harness
+CLI's own auth store, which the daemon cannot observe, so an unset
+`credentialEnv` variable is not proof of an empty credential source. The
+API-key account pool (#8401) is the countable source a native gate can use.
 
 ## Sweep dispatch pre-flights the pool too, and holds the host (#7708)
 
