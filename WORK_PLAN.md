@@ -32,7 +32,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#8287**: worktree.sh reset a stale local feature/issue-N to main although origin/feature/issue-N carried the PR's commits (Doctor on #8190)
 - **#8322**: Port PR #8314's per-role tool-restriction deny-spec computation out of spawn-claude.sh/spawn-codex.sh into loom-daemon (Shell Budget Ratchet blocker)
 - **#8354**: Port _worktree_resolve_stale_reset_ref (#8287) to loom-daemon per shell-language-policy
-- **#8410**: merge-pr.sh --auto: a server-side armed auto-merge ignores later loom:pr revocation and non-required test suites
 
 ## In Progress
 
@@ -45,6 +44,7 @@ Issues currently being built (`loom:building`).
 - **#8403**: run native-harness (OpenCode/Pi) sweeps in the per-sweep ephemeral container with isolated XDG/config dirs and env-only credentials — not the Codex session container
 - **#8407**: Codex per-subscription availability probe: expose quota/rate-limit state per account into provider-aware ranking (the `tokens check` analogue)
 - **#8408**: Role-runner pool-exhaustion gate is not runtime-aware: a codex-pinned role skips on an empty *Claude* pool
+- **#8410**: merge-pr.sh --auto: a server-side armed auto-merge ignores later loom:pr revocation and non-required test suites
 - **#8413**: Worktree reaper hard-reset an in-flight builder's worktree mid-compile (idle-detection misfire)
 
 ## PRs Awaiting Review
@@ -59,7 +59,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
 - **#8386**: fix(merge-pr): name the daemon roll in the refusal, and declare every script's daemon version floor
-- **#8405**: fix(work-finder): skip fresh candidates carrying a loom:operator hold (vibesql#6664)
 - **#8421**: feat(profiles): multi-variable credential mapping + provider options for model profiles
 
 ## Proposed
@@ -119,10 +118,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 3 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 8 |
-| In Progress (`loom:building`) | 8 |
+| Ready (`loom:issue`) | 7 |
+| In Progress (`loom:building`) | 9 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 4 |
+| Approved PRs awaiting merge | 3 |
 | Curated | 34 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 4 |
