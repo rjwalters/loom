@@ -3497,7 +3497,13 @@ if command -v jq >/dev/null 2>&1; then
   Q_DANGLING=0
   while IFS= read -r _cmd; do
     [[ -n "$_cmd" ]] || continue
-    _rel="${_cmd#\$\{CLAUDE_PROJECT_DIR\}/}"
+    # #6544: project-level entries are now quoted
+    # ("${CLAUDE_PROJECT_DIR}/...") to avoid word-splitting on a project path
+    # containing a space, so strip a matching pair of surrounding double
+    # quotes before the prefix strip below. `#`/`%` no-op when unmatched, so
+    # this handles both the quoted and legacy unquoted form.
+    _unquoted="${_cmd#\"}"; _unquoted="${_unquoted%\"}"
+    _rel="${_unquoted#\$\{CLAUDE_PROJECT_DIR\}/}"
     [[ -x "$Q_FRESH/$_rel" ]] || Q_DANGLING=$((Q_DANGLING + 1))
   done < <(jq -r '[ (.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command // ""
                     | select(contains(".loom/hooks/")) | select(contains("defaults/hooks/") | not) ] | .[]' \
