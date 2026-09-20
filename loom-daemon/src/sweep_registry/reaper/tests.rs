@@ -1589,7 +1589,12 @@ fn split_cancel_does_not_hold_lock_across_grace_window() {
     let reg_a = Arc::clone(&registry);
     let target_a = target.clone();
     let canceller = thread::spawn(move || {
-        let (pid, kind, started_at) = match reg_a.lock().unwrap().begin_cancel(&target_a).unwrap() {
+        let (pid, kind, started_at) = match reg_a
+            .lock()
+            .unwrap()
+            .begin_cancel(&target_a, grace)
+            .unwrap()
+        {
             BeginCancel::Signalled {
                 pid,
                 kind,

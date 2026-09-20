@@ -1992,7 +1992,7 @@ async fn cancel_sweep_nonblocking(
         let mut sr = sweep_registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sr.begin_cancel(sweep_id)
+        sr.begin_cancel(sweep_id, grace)
     };
     let (pid, kind, started_at) = match began {
         Ok(BeginCancel::AlreadyTerminal(outcome)) => {
