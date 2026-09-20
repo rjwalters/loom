@@ -7,6 +7,23 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-20
+- **Issue #8248** (closed): A green ratchet check goes stale when the baseline tightens under an in-flight PR — this is what broke main
+- **PR #8416**: fix(merge): a stale green ratchet result is not merge evidence — freshness guard + narrow --update (#8248)
+- **Issue #8328** (closed): Two loom-daemon unit tests fail on a live-daemon host by reading inherited LOOM_* env (escalate::decide, registry_refresh)
+- **PR #8406**: test(daemon): isolate escalate::decide and registry_refresh from inherited LOOM_* env (#8328)
+- **Issue #8221** (closed): Guard: same-command mktemp fast paths count only bare `NAME=` assignments — `export`/`declare`/`read`/`printf -v` rebinding slips the ambiguity rule
+- **PR #8415**: fix(guard): recognize non-bare-assignment rebindings in mktemp fast paths
+- **Issue #8305** (closed): dashboard: ephemeral_compute live state — running-now tracking + leak detection (Phase 2 of #8257)
+- **PR #8414**: feat(dashboard): track running ephemeral_compute jobs in fleet live state
+- **Issue #8360** (closed): Re-land the near-match duplicate band (#8289) as loom-daemon logic or a net-neutral shell change
+- **PR #8412**: feat(duplicate-backstop): re-land the near-match band as a loom-daemon scan port (#8360)
+- **Issue #8397** (closed): Orphaned #8347/#8348 read path: weekly_point_calibration::calibrate() and get_weekly_point_series() have zero production callers
+- **PR #8411**: feat(health): wire #8348's calibrate() into the limit_calibration section via HealthInputs (#8349)
+- **Issue #8349** (closed): [Part of #8063] Surface $-eq-per-weekly-point + step-change warning in loom-daemon health
+- **Issue #8146** (closed): Token selection: prefer the account that last warmed this (repo, role) prompt cache (65% vs 1.4% hit rate)
+- **PR #8220**: feat(tokens): prefer the account that last warmed this (repo, role) prompt cache (#8146)
+- **Issue #8013** (closed): test-guard-destructive-rm-scope.sh:338 '../ escaping the repo' assertion fails when the suite runs from a linked worktree (passes from the primary checkout)
+- **PR #8404**: test(guard): make destructive-rm-scope '../ escapes repo' assertion worktree-safe
 - **Issue #8284** (closed): merge-pr.sh version guard runs main's checker, so a PR that changes the version-bearing set (e.g. #8190) can never pass it — evaluate the PR head's checker when the diff touches it
 - **PR #8345**: fix(merge-pr): evaluate the PR head's version-policy checker when the PR changes it (#8284)
 - **Issue #8304** (closed): dashboard: ephemeral_compute ingest + D1 schema + redaction policy (Phase 1 of #8257)
