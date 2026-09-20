@@ -208,7 +208,7 @@ write_baseline() {
             else if (p in old)         { print old[p], p; kept++ }
             else if (cur[p] > t)       { unlisted++ }
           }
-          printf "# narrow update (#8248): %d untouched entr%s kept at its recorded number%s, %d over-threshold untouched file(s) left unlisted — deliberate sweep: --update --all\n", kept, (kept == 1 ? "y" : "ies"), (kept == 1 ? "" : "s"), unlisted | "cat 1>&2"
+          printf "# narrow update (#8248): %d untouched entries kept at their recorded numbers (slack preserved), %d over-threshold untouched files left unlisted — deliberate sweep: --update --all\n", kept, unlisted | "cat 1>&2"
         }' | LC_ALL=C sort -k2,2
     fi
   } > "$BASELINE.tmp"
