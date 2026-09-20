@@ -49,7 +49,7 @@ each definition, for the terse version of this same table):
 | `loom:blocked` | Waiting on a dependency, but still automatable once that clears | No |
 | `loom:operator-only` | Requires human action or ruling *outside* automation entirely (credentials, infra, hardware, an owner-gated decision) | **Yes** — sweep/shepherd skip it, except the narrow capability-matched `loom:operator-mechanical` case (#6893, see "Dispatch path" below) |
 | `loom:needs-capability` | Blocked on a missing tool/agent capability — not an operator-by-right decision, but automation genuinely cannot proceed without the capability existing first (#5817) | **Yes** — sweep/shepherd skip it, identically to `loom:operator-only` today |
-| `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **No** — stays in the normal re-evaluation queue |
+| `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **New-builder skip only** — the work finder does not *start* a fresh `--claim-owned` build on it (vibesql#6664); re-evaluation lanes (Champion/role ticks, watchdog re-dispatch, reaper resume, explicit `loom-daemon dispatch <N>`) still reach it |
 
 The distinguishing property of `loom:operator` is that it is **re-evaluable**:
 unlike `loom:operator-only`, applying it must never cause sweep/shepherd
@@ -57,6 +57,17 @@ dispatch to skip the item. That is what makes it safe to apply to a PR that
 still needs to pass through its normal Champion tick — the hold that put the
 label on can also be the mechanism that takes it back off, without a human
 having to remember to remove it.
+
+One lane is deliberately excluded from that guarantee (vibesql#6664): the
+work finder's *candidate* filter. A sweep that concludes "a human is needed"
+releases its claim (restoring `loom:issue`) and applies `loom:operator` in one
+motion — without the candidate skip, the finder immediately re-listed the
+issue and dispatched another builder onto the fresh hold (observed 3× in 13
+minutes on vibesql#6172). So the finder treats a held candidate like an
+already-claimed one (it will not *start* work), while every route that
+*re-evaluates* or explicitly targets the item still proceeds. The label never
+refuses dispatch by itself — it is not in the park set the dispatch-time
+guard consults.
 
 ## Entry points
 

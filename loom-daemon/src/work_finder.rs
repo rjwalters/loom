@@ -247,12 +247,43 @@ pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP
 /// list here is unchanged and stays the authoritative *set* of park labels —
 /// the exemption is applied by the callers that opt into it, never by removing
 /// a label from this constant, and it is inert unless a host opts in.
+///
+/// **`loom:operator` deliberately does NOT belong here (vibesql#6664).** The
+/// generic hold is *re-evaluable* by design (`defaults/docs/label-state-machine.md`:
+/// "the hold that put the label on can also be the mechanism that takes it back
+/// off"), so it must never refuse the dispatch routes that re-evaluate held
+/// work — the watchdogs' cancel-and-re-dispatch, the reaper's checkpoint-resume,
+/// and an operator's explicit `loom-daemon dispatch <N>` override. Its
+/// automation-stop effect on *new builder candidates* is expressed one layer
+/// up, in [`SKIP_LABELS`] via [`OPERATOR_HOLD_LABEL`]: the work finder does not
+/// START fresh `--claim-owned` builds on a held item (the vibesql#6664
+/// 3×-in-13-minutes redispatch loop), while every park-guarded route above
+/// keeps working the item. The invariant is pinned by test in
+/// `work_finder::tests`.
 pub const PARK_LABELS: &[&str] = &["loom:blocked", "loom:operator-only"];
 
 /// The daemon's own claim label. Disqualifies a *fresh* work-finder candidate
 /// (a `loom:building` row is already being worked), but is NOT a park — see
 /// [`PARK_LABELS`].
 pub const BUILDING_LABEL: &str = "loom:building";
+
+/// The generic operator hold — "the engine has stopped on this artifact and a
+/// human must act" (`defaults/docs/label-state-machine.md`). Disqualifies a
+/// *fresh work-finder candidate* exactly like [`BUILDING_LABEL`] does, but is
+/// **not** a park ([`PARK_LABELS`]) and must never become one: the hold is
+/// re-evaluable by design, and the park-guarded routes (watchdog re-dispatch,
+/// reaper checkpoint-resume, explicit `loom-daemon dispatch <N>`) must keep
+/// reaching held items.
+///
+/// vibesql#6664: a sweep that concludes "a human is needed" releases its claim
+/// (restoring `loom:issue`) and applies this label in one motion. Without this
+/// constant in [`SKIP_LABELS`] the work finder immediately re-listed the issue
+/// and dispatched another `--claim-owned` builder onto the fresh hold —
+/// observed 3× in 13 minutes on vibesql#6172 (each new session noticed the
+/// hold in the comment trail and declined, which is luck, not a contract).
+/// Skipping the candidate here IS the contract; the human (or the re-evaluation
+/// lanes) takes it from there.
+pub const OPERATOR_HOLD_LABEL: &str = "loom:operator";
 
 /// Labels that disqualify an issue from dispatch even if it still appears in
 /// the `loom:issue`-filtered listing.
@@ -261,9 +292,19 @@ pub const BUILDING_LABEL: &str = "loom:building";
 /// exclusive states in the `.github/labels.yml` state machine), but `gh`'s
 /// label cache can be briefly stale, so the finder checks defensively.
 ///
-/// Composed as [`BUILDING_LABEL`] + [`PARK_LABELS`] rather than re-listing the
-/// label strings, so the two constants can never drift apart (#4444).
-pub const SKIP_LABELS: &[&str] = &[BUILDING_LABEL, PARK_LABELS[0], PARK_LABELS[1]];
+/// Composed as [`BUILDING_LABEL`] + [`PARK_LABELS`] + [`OPERATOR_HOLD_LABEL`]
+/// rather than re-listing the label strings, so the constants can never drift
+/// apart (#4444). The operator hold sits in this list but NOT in
+/// [`PARK_LABELS`]: it stops the work finder from *starting* new builder work
+/// on a held item (vibesql#6664) without refusing the dispatch routes that
+/// re-evaluate held work — dispatch step 2.7's park guard deliberately consults
+/// `PARK_LABELS` only, so `loom:operator` alone never trips it.
+pub const SKIP_LABELS: &[&str] = &[
+    BUILDING_LABEL,
+    PARK_LABELS[0],
+    PARK_LABELS[1],
+    OPERATOR_HOLD_LABEL,
+];
 
 /// Label that promotes an issue ahead of its non-urgent siblings **within the
 /// same workspace-priority tier** (Issue #3946). Detection is best-effort: if no
