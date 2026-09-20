@@ -234,16 +234,29 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         // against its own isolated directories, not against the shared
         // workspace the host would use.
         if let Some(profile) = containment::resolve(&config) {
+            // Forward the profile's credential variables by NAME: every
+            // declared source (profile resolution re-runs inside the container
+            // and fails closed on an unset required source), plus each mapped
+            // child variable, which covers an operator who exported the target
+            // name directly instead of the source.
+            let credentials: Vec<&str> = selection
+                .credential_sources
+                .iter()
+                .map(String::as_str)
+                .chain(
+                    selection
+                        .credentials
+                        .iter()
+                        .flat_map(|(source, target)| [source.as_str(), target.as_str()]),
+                )
+                .collect();
             let mut command = containment::docker_command(
                 &profile,
                 &root,
                 &std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?,
                 options.log.as_deref(),
                 &args.args,
-                &[
-                    selection.credential_env.as_deref().unwrap_or_default(),
-                    selection.credential_target.as_deref().unwrap_or_default(),
-                ],
+                &credentials,
             )?;
             let mut log = attach_log(&mut command, options.log.as_deref())?;
             writeln!(log, "{}", profile.dispatch_marker())
