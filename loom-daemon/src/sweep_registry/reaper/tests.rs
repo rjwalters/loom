@@ -957,28 +957,7 @@ fn reap_marks_dead_pid_crashed_when_checkpoint_present() {
     std::fs::write(cp_dir.join("issue-33.json"), r#"{"phase":"builder","issue":33}"#).unwrap();
 
     let sweep_id = "sweep-issue-33-test".to_string();
-    registry.entries.insert(
-        sweep_id.clone(),
-        SweepInfo {
-            pgid: None,
-            sweep_id: sweep_id.clone(),
-            kind: SweepKind::Issue(33),
-            pid: 2_147_483_640,
-            token_name: "unknown".into(),
-            runtime: "unknown".into(),
-            runtime_source: None,
-            log_path: registry.compute_log_path(33),
-            idempotency_key: None,
-            started_at: Utc::now(),
-            state: SweepState::Running,
-            latest_phase: None,
-            pr_number: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            repo: None,
-        },
-    );
+    insert_dead_running_entry(&mut registry, 33, &sweep_id);
 
     let changed = registry.reap_once();
     assert!(changed >= 1);
