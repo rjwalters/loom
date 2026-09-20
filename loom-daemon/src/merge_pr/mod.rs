@@ -21,6 +21,12 @@
 //! Slice 2 is [`labels`]: the verdict-label mutual-exclusion guard (#8112) —
 //! refusing to merge a PR that carries `loom:pr` alongside a contradicting
 //! label.
+//!
+//! Slice 3 is [`stale_checks`]: the required-check freshness guard (#8248) —
+//! refusing a merge whose green required-check results predate the base
+//! branch's current tip, which is how a ratchet baseline tightened under an
+//! in-flight PR red-lined main on 2026-09-18.
 
 pub mod labels;
 pub mod refs;
+pub mod stale_checks;

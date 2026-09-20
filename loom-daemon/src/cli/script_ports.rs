@@ -120,12 +120,19 @@ impl ScriptPortCommand {
 pub(crate) enum MergePrCommand {
     /// Refuse a PR carrying `loom:pr` alongside a contradicting label.
     VerdictContradiction(super::merge_pr_labels::VerdictContradictionArgs),
+
+    /// Refuse a merge whose required checks ran before the base branch's
+    /// current tip (#8248): a stale green ratchet result is evidence about a
+    /// tree that no longer exists. Exit 0+CLEAN = fresh, 1 = stale, 2 =
+    /// could not determine (must also refuse).
+    StaleChecks(super::merge_pr_stale_checks::StaleChecksArgs),
 }
 
 impl MergePrCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
+            MergePrCommand::StaleChecks(args) => args.run(),
         }
     }
 }
