@@ -1,5 +1,5 @@
 //! Harness-specific command construction. No provider HTTP client, shell parsing or retries.
-use super::{profiles::Selection, LaunchError, Options};
+use super::{opencode_version::Major, profiles::Selection, LaunchError, Options};
 use std::{path::PathBuf, process::Command};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,7 +37,7 @@ impl Harness {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| self.name().into());
-        let mut command = Command::new(bin);
+        let mut command = Command::new(&bin);
         let cwd = std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?;
         command.env("PWD", &cwd);
         command.env("LOOM_NATIVE_WORKER_PID", std::process::id().to_string());
@@ -89,11 +89,20 @@ impl Harness {
                 }
             }
             Self::OpenCode => {
+                // Probed before anything is provisioned: the launch `exec`s, so an
+                // unsupported CLI (or an unverified guard) can only be refused here.
+                let major = super::opencode_version::detect(&bin, guarded)?;
                 if prompt.is_some() {
-                    command
-                        .args(["run", "--format", "json"])
-                        .arg("--dir")
-                        .arg(&cwd);
+                    command.args(["run", "--format", "json"]);
+                    match major {
+                        Major::V1 => command.arg("--dir").arg(&cwd),
+                        // 2.x has no --dir: the working directory is the one `exec`
+                        // inherits (PWD is pinned above). Its `run` attaches to a
+                        // shared background service by default, which never sees
+                        // this child's credentials, OPENCODE_CONFIG_CONTENT or
+                        // isolated config dir, so a private server is unconditional.
+                        Major::V2 => command.arg("--standalone").current_dir(&cwd),
+                    };
                 }
                 if guarded {
                     crate::native_tools::provision::configure(
@@ -108,12 +117,23 @@ impl Harness {
                     crate::native_tools::provision::provider_only(&mut command, &provider)
                         .map_err(|e| LaunchError::config(e.to_string()))?;
                 }
-                command.args([
-                    "--model",
-                    &format!("{}/{}", selection.provider, selection.model),
-                ]);
-                if let Some(effort) = &selection.effort {
-                    command.args(["--variant", effort]);
+                let model = format!("{}/{}", selection.provider, selection.model);
+                match (major, &selection.effort) {
+                    (Major::V1, Some(effort)) => {
+                        command.args(["--model", &model, "--variant", effort]);
+                    }
+                    // 2.x dropped --variant: effort rides on the model as `#<effort>`.
+                    (Major::V2, Some(effort)) => {
+                        if model.contains('#') || effort.contains('#') {
+                            return Err(LaunchError::config(
+                                "OpenCode 2.x carries effort as provider/model#effort; a '#' in the model or effort is ambiguous",
+                            ));
+                        }
+                        command.args(["--model", &format!("{model}#{effort}")]);
+                    }
+                    (_, None) => {
+                        command.args(["--model", &model]);
+                    }
                 }
                 if options.skip_permissions {
                     if prompt.is_none() {

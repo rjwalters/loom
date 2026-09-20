@@ -2,6 +2,7 @@
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
 mod harness;
+mod opencode_version;
 mod profile_check;
 mod profiles;
 mod prompt;
