@@ -96,7 +96,8 @@ batching boundary: there is deliberately no asynchronous batch processor ahead
 of disk queues, which would acknowledge volatile in-memory data. Each destination
 has three persistent queues, one per signal, each holding **1,000 requests** and
 two active consumers. Stores are separate files/directories, fsync is enabled,
-and retries use 1–10 second backoff with a 600-second retry limit. Graceful stop
+and retries configure a 1-second initial / 10-second maximum base backoff
+(Collector jitter varies actual waits), with a 600-second retry limit. Graceful stop
 has 30 seconds; abrupt restart resumes persisted items. Delivery is at least
 once: a lost acknowledgement or one full destination queue can cause upstream
 retries to duplicate already accepted data at the other destination.
