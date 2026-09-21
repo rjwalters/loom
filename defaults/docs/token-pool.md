@@ -1156,6 +1156,33 @@ row, which is unchanged byte for byte:
 | `codex` | enabled `loom-daemon accounts` codex profiles | `CodexAccounts` / `codex_accounts` |
 | `pi`, `opencode`, other | nothing (no pre-spawn pool gate) | — |
 
+**Which paths write the holds this gate reads (#8443).** The codex row reads
+account-wide `cooldown_until` holds out of `.loom/account-health.json`
+(`tokens_pool::health::record_terminal_for_class_at`) — but reading them is only
+half the story; something has to have written one first. Two producers turn an
+adapter's own `# LOOM_TERMINAL_RESULT …` log line into that write, both by
+parsing the log region for *that one dispatch* (never a stale line left by an
+earlier one) and validating provider/account/exit-code before trusting it:
+
+- **Sweeps**: `sweep_registry::SweepRegistry::apply_provider_health_feedback`,
+  anchored on the dispatch's `sweep_id=` header line, called from the reaper
+  before any retry/failover decision.
+- **Role ticks**: `role_runner::provider_health_feedback::
+  apply_role_tick_provider_health_feedback`, anchored on the tick's own
+  `role_runner: <timestamp> role=…` header line, called from
+  `run_role_with_timeout` right after the child exits — the role-tick analogue
+  of the sweep path above, added because a codex-pinned role tick otherwise had
+  no producer at all: the adapter printed `TOKEN_EXHAUSTED` on every exhausted
+  spawn, nothing ever read it back into health, and every account looked
+  spawnable no matter how many times it had already died.
+
+Both share the same log-parsing primitives
+(`sweep_registry::parse_terminal_result_after` /
+`sweep_registry::parse_token_name_after`) rather than each reimplementing
+terminal-line parsing. If a third dispatch surface starts running the codex
+runtime, it needs its own producer wired the same way — the gate above never
+writes a hold, it only ever reads one.
+
 Before this, an exhausted Claude pool skipped a codex-pinned role on every tick
 even with valid codex accounts idle — the pin could not relieve the very
 pressure it exists for. The fail-closed shape is kept: a codex-pinned role with
