@@ -1,0 +1,164 @@
+//! A bounded final drain through the existing sender, never a second consumer.
+use super::{exporter::Exporter, queue::DurableQueue, ExportStatus};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
+
+struct Request {
+    deadline: Instant,
+    reply: oneshot::Sender<()>,
+}
+static SENDERS: Mutex<Vec<mpsc::Sender<Request>>> = Mutex::new(Vec::new());
+
+pub(super) fn spawn_sender<E: Exporter + 'static>(
+    queue: Arc<DurableQueue>,
+    exporter: E,
+    batch_size: usize,
+    interval: Duration,
+    status: Arc<ExportStatus>,
+) -> tokio::task::JoinHandle<()> {
+    let (tx, mut rx) = mpsc::channel::<Request>(1);
+    {
+        let mut senders = SENDERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        senders.retain(|sender| !sender.is_closed());
+        if senders.len() < 64 {
+            senders.push(tx);
+        } else {
+            log::warn!("observability: shutdown sender registration limit reached");
+        }
+    }
+    tokio::spawn(async move {
+        let shutdown = async {
+            match rx.recv().await {
+                Some(request) => request,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = super::sender::run_sender(queue.clone(), &exporter, batch_size, interval, status.clone()) => {},
+            request = shutdown => {
+                if !drain_until(&queue, &exporter, batch_size, &status, request.deadline).await {
+                    log::warn!("observability: final drain incomplete; remaining queue retained for restart");
+                }
+                let _ = request.reply.send(());
+            }
+        }
+    })
+}
+
+async fn drain_until<E: Exporter>(
+    queue: &DurableQueue,
+    exporter: &E,
+    batch_size: usize,
+    status: &ExportStatus,
+    deadline: Instant,
+) -> bool {
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            match super::sender::try_flush(queue, exporter, batch_size, status).await {
+                super::sender::FlushOutcome::Empty => return exporter.flush().await.is_ok(),
+                super::sender::FlushOutcome::Sent(_) => {}
+                super::sender::FlushOutcome::Failed => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+pub async fn flush_before_shutdown(budget: Duration) {
+    let senders = {
+        let mut registry = SENDERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *registry)
+    };
+    let deadline = Instant::now() + budget;
+    let mut replies = Vec::new();
+    for sender in senders {
+        let (reply, received) = oneshot::channel();
+        if sender.try_send(Request { deadline, reply }).is_ok() {
+            replies.push(received);
+        }
+    }
+    let _ = tokio::time::timeout_at(deadline, async {
+        for reply in replies {
+            let _ = reply.await;
+        }
+    })
+    .await;
+}
+
+/// Signal/IPC shutdown preserves active work; it exports only already-completed
+/// queued spans. SIGKILL cannot run this path and relies on persisted state.
+pub async fn exit(code: i32) -> ! {
+    flush_before_shutdown(Duration::from_secs(2)).await;
+    std::process::exit(code)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::telemetry::{
+        RepoVisibility, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord,
+    };
+    struct Sink {
+        stall: bool,
+    }
+    impl Exporter for Sink {
+        async fn emit_batch(
+            &self,
+            _: &[TelemetryEnvelope],
+        ) -> Result<(), super::super::exporter::ExportError> {
+            if self.stall {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn final_drain_is_bounded_and_retains_unsent_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.jsonl");
+        let queue = DurableQueue::open(path.clone(), 5);
+        queue.push(TelemetryEnvelope::new(
+            "host",
+            TelemetryRecord::SweepStarted(SweepStartedRecord {
+                repo: "test/fixture".into(),
+                visibility: RepoVisibility::Private,
+                issue: 18,
+                sweep_id: "fixture".into(),
+                started_at: chrono::Utc::now(),
+                model: None,
+                effort: None,
+            }),
+        ));
+        let status = ExportStatus::started("host", "http://localhost", "otlp", 30);
+        assert!(
+            !drain_until(
+                &queue,
+                &Sink { stall: true },
+                5,
+                &status,
+                Instant::now() + Duration::from_millis(30)
+            )
+            .await
+        );
+        assert_eq!(DurableQueue::open(path, 5).len(), 1);
+        assert!(
+            drain_until(
+                &queue,
+                &Sink { stall: false },
+                5,
+                &status,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await
+        );
+        assert!(queue.is_empty());
+    }
+}

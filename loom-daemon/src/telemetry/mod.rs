@@ -55,7 +55,10 @@ use std::path::PathBuf;
 
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
+mod envelope;
+pub mod trace;
 pub mod visibility;
+pub use envelope::TelemetryEnvelope;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
 /// record shapes below so a Phase-2 backend ingesting a mixed-version fleet can
@@ -215,41 +218,6 @@ impl<'de> Visitor<'de> for RepoVisibilityVisitor {
 // Versioned envelope
 // ============================================================================
 
-/// The versioned wrapper every telemetry record is emitted inside. Carries the
-/// [`schema_version`](Self::schema_version) a mixed-version fleet's backend gates
-/// on, plus host-identifying context shared by every record kind, and the tagged
-/// [`record`](Self::record) payload itself.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TelemetryEnvelope {
-    /// Wire-schema version — [`CURRENT_SCHEMA_VERSION`] for a freshly constructed
-    /// envelope. A `#[serde(default)]` is intentionally NOT applied: an envelope
-    /// with no `schema_version` on the wire is a bug the backend should see,
-    /// not silently coerce to version 0.
-    pub schema_version: u32,
-    /// When the emitting daemon produced this envelope.
-    pub emitted_at: DateTime<Utc>,
-    /// Stable identifier for the emitting host (e.g. hostname or a configured
-    /// fleet host id). Populated by the exporter (#4705); opaque to the schema.
-    pub host_id: String,
-    /// The record payload — internally tagged on a `kind` discriminant so it
-    /// serializes to a single flat object (see [`TelemetryRecord`]).
-    pub record: TelemetryRecord,
-}
-
-impl TelemetryEnvelope {
-    /// Wrap `record` in an envelope stamped with [`CURRENT_SCHEMA_VERSION`] and
-    /// the current time. `host_id` identifies the emitting host.
-    #[must_use]
-    pub fn new(host_id: impl Into<String>, record: TelemetryRecord) -> Self {
-        TelemetryEnvelope {
-            schema_version: CURRENT_SCHEMA_VERSION,
-            emitted_at: Utc::now(),
-            host_id: host_id.into(),
-            record,
-        }
-    }
-}
-
 // ============================================================================
 // Record kinds — internally tagged on `kind`
 // ============================================================================
@@ -288,6 +256,8 @@ pub enum TelemetryRecord {
     /// variant, and the reason [`CURRENT_SCHEMA_VERSION`] is `2`.
     #[serde(rename = "role_tick.outcome")]
     RoleTickOutcome(RoleTickOutcomeRecord),
+    #[serde(rename = "trace.span")]
+    Span(trace::SpanRecord),
 }
 
 /// A sweep's terminal result. `#[serde(default)]`-friendly variants are not

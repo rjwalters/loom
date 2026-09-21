@@ -112,6 +112,7 @@ mod decline_cooldown;
 mod dispatch;
 mod guards;
 mod locks;
+mod log_paths;
 mod model;
 mod noop_cooldown;
 mod outcome_journal;

@@ -94,12 +94,12 @@ pub fn spawn_task<E>(
 where
     E: Exporter + Send + Sync + 'static,
 {
-    tokio::spawn(run_sender(queue, exporter, batch_size, flush_interval, status))
+    super::shutdown::spawn_sender(queue, exporter, batch_size, flush_interval, status)
 }
 
-async fn run_sender<E: Exporter>(
+pub(super) async fn run_sender<E: Exporter>(
     queue: Arc<DurableQueue>,
-    exporter: E,
+    exporter: &E,
     batch_size: usize,
     flush_interval: Duration,
     status: Arc<ExportStatus>,
@@ -112,7 +112,7 @@ async fn run_sender<E: Exporter>(
         // burst that arrived between ticks does not wait a full extra
         // `flush_interval` per batch.
         loop {
-            match try_flush(&queue, &exporter, batch_size, &status).await {
+            match try_flush(&queue, exporter, batch_size, &status).await {
                 FlushOutcome::Empty => {
                     backoff = MIN_BACKOFF;
                     break;

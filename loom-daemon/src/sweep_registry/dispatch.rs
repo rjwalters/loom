@@ -2792,26 +2792,6 @@ impl SweepRegistry {
     // Spawn
     // ------------------------------------------------------------------------
 
-    pub(crate) fn compute_log_path(&self, issue: u32) -> PathBuf {
-        self.config
-            .logs_dir()
-            .join(format!("sweep-issue-{issue}.log"))
-    }
-
-    /// The `PrSet` counterpart of [`Self::compute_log_path`] (Issue #5342):
-    /// one log file per PR set, named after every member so an operator can
-    /// tell two overlapping-but-distinct sets apart at a glance.
-    pub(crate) fn compute_prset_log_path(&self, prs: &[u32]) -> PathBuf {
-        let joined = prs
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("-");
-        self.config
-            .logs_dir()
-            .join(format!("sweep-prs-{joined}.log"))
-    }
-
     /// Enforce the configured dispatch stagger (Issue #3887): if less than
     /// `dispatch_stagger` has elapsed since the previous spawn, sleep the
     /// remainder, then record now as the latest spawn instant. A zero stagger
@@ -3028,6 +3008,11 @@ impl SweepRegistry {
         // `PrSet` one. Both the rationale and the clearing (#7915) live in
         // [`child_env_markers::apply_issue_scoped_markers`].
         child_env_markers::apply_issue_scoped_markers(&mut cmd, kind);
+        crate::observability::tracing::prepare_child(
+            &mut cmd,
+            &self.config.workspace_root,
+            sweep_id,
+        );
         cmd
             // Always pin LOOM_WORKSPACE to the registry's configured root so
             // spawn-claude.sh resolves `.loom/tokens/` from the same place

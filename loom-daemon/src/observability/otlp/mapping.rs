@@ -38,7 +38,7 @@ fn kv(key: &str, value: AnyValue) -> KeyValue {
     }
 }
 
-fn kv_string(key: &str, value: impl Into<String>) -> KeyValue {
+pub(super) fn kv_string(key: &str, value: impl Into<String>) -> KeyValue {
     kv(key, any_string(value))
 }
 
@@ -55,7 +55,7 @@ fn kv_int(key: &str, value: i64) -> KeyValue {
 /// `timestamp_nanos_opt` only returns `None` far outside any timestamp this
 /// daemon ever produces (year ~1677 or ~2262), so the floor is unreachable in
 /// practice and exists only to avoid a panic/wraparound on the conversion.
-fn nanos(ts: DateTime<Utc>) -> u64 {
+pub(super) fn nanos(ts: DateTime<Utc>) -> u64 {
     ts.timestamp_nanos_opt()
         .and_then(|n| u64::try_from(n).ok())
         .unwrap_or(0)
@@ -128,7 +128,7 @@ fn severity_text(severity: SeverityNumber) -> &'static str {
 /// A `Resource` describing the emitting daemon host. `daemon_version` is only
 /// known from a `host.health` record, so it is threaded in separately rather
 /// than read off `envelope.record` — see [`build_metrics_request`].
-fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
+pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
     let mut attributes = vec![
         kv_string("service.name", "loom-daemon"),
         kv_string("service.instance.id", host_id),
@@ -341,7 +341,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes,
             )
         }
-        TelemetryRecord::TokensSnapshot(_) | TelemetryRecord::HostHealth(_) => return None,
+        TelemetryRecord::TokensSnapshot(_)
+        | TelemetryRecord::HostHealth(_)
+        | TelemetryRecord::Span(_) => return None,
     };
     Some(LogRecord {
         time_unix_nano,
@@ -351,6 +353,21 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         body: Some(any_string(body)),
         attributes,
         event_name: event_name.to_string(),
+        trace_id: envelope
+            .trace_context
+            .as_ref()
+            .map(|c| c.trace_id.bytes())
+            .unwrap_or_default(),
+        span_id: envelope
+            .trace_context
+            .as_ref()
+            .map(|c| c.span_id.bytes())
+            .unwrap_or_default(),
+        flags: envelope
+            .trace_context
+            .as_ref()
+            .map(|c| u32::from(c.flags))
+            .unwrap_or_default(),
         ..Default::default()
     })
 }
@@ -540,7 +557,8 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         | TelemetryRecord::SweepPhase(_)
         | TelemetryRecord::SweepCompleted(_)
         | TelemetryRecord::SweepOutcome(_)
-        | TelemetryRecord::RoleTickOutcome(_) => Vec::new(),
+        | TelemetryRecord::RoleTickOutcome(_)
+        | TelemetryRecord::Span(_) => Vec::new(),
     }
 }
 

@@ -201,6 +201,7 @@ fn synthesize_completed(
     outcome: &telemetry::SweepOutcomeRecord,
 ) -> TelemetryEnvelope {
     TelemetryEnvelope {
+        trace_context: envelope.trace_context.clone(),
         schema_version: envelope.schema_version,
         emitted_at: envelope.emitted_at,
         host_id: envelope.host_id.clone(),

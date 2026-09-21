@@ -62,6 +62,7 @@
 
 mod mapping;
 mod transport;
+mod traces;
 
 use transport::{post, Signal};
 
@@ -83,6 +84,7 @@ pub struct OtlpExporter {
     client: reqwest::Client,
     logs_endpoint: String,
     metrics_endpoint: String,
+    traces_endpoint: String,
     ingest_key: String,
 }
 
@@ -107,6 +109,7 @@ impl OtlpExporter {
             client,
             logs_endpoint: format!("{base}/v1/logs"),
             metrics_endpoint: format!("{base}/v1/metrics"),
+            traces_endpoint: format!("{base}/v1/traces"),
             ingest_key,
         })
     }
@@ -130,6 +133,7 @@ impl Exporter for OtlpExporter {
                 .take_while(|e| signal_for(e) == signal)
                 .count();
             let group = &envelopes[offset..offset + count];
+            let mut exported_envelopes = count;
             let response = match signal {
                 Signal::Logs => {
                     let Some(request) = mapping::build_logs_request(group) else {
@@ -182,7 +186,18 @@ impl Exporter for OtlpExporter {
                     .await
                 }
                 Signal::Traces => {
-                    unreachable!("trace mapping is introduced by the trace foundation")
+                    let request = traces::build_traces_request(group);
+                    let items = request.as_ref().map_or(0, |request| request.resource_spans
+                        .iter().flat_map(|r| &r.scope_spans).map(|s| s.spans.len()).sum::<usize>());
+                    exported_envelopes = items;
+                    outcome.signals.entry(signal.unit().to_string()).or_default().dropped += (count - items) as u64;
+                    let Some(request) = request else {
+                        outcome.acknowledged += count;
+                        offset += count;
+                        continue;
+                    };
+                    post(&self.client, &self.traces_endpoint, &self.ingest_key,
+                        signal, items as u64, &request).await
                 }
             };
             let fully_accepted =
@@ -200,7 +215,7 @@ impl Exporter for OtlpExporter {
             }
             outcome.acknowledged += count;
             if fully_accepted {
-                outcome.exported += count;
+                outcome.exported += exported_envelopes;
             }
             offset += count;
         }
@@ -212,7 +227,22 @@ fn signal_for(envelope: &TelemetryEnvelope) -> Signal {
     match envelope.record {
         crate::telemetry::TelemetryRecord::HostHealth(_)
         | crate::telemetry::TelemetryRecord::TokensSnapshot(_) => Signal::Metrics,
+        crate::telemetry::TelemetryRecord::Span(_) => Signal::Traces,
         _ => Signal::Logs,
+    }
+}
+
+fn signal_for(envelope: &TelemetryEnvelope) -> Signal {
+    match envelope.record {
+        crate::telemetry::TelemetryRecord::HostHealth(_)
+        | crate::telemetry::TelemetryRecord::TokensSnapshot(_) => Signal::Metrics,
+        _ => Signal::Logs,
+=======
+        if let Some(request) = traces::build_traces_request(envelopes) {
+            self.post(&self.traces_endpoint, &request).await?;
+        }
+        Ok(())
+>>>>>>> 34823755 (feat(observability): persist execution trace context and export completed spans (#8524))
     }
 }
 
