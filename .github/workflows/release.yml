@@ -734,15 +734,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
-          # No `path:` — the artifact already carries its own `dist/…` prefix
-          # (uploaded from repo-root-relative paths above), so downloading to
-          # the default (repo root) lands it at `dist/loom-daemon-…` directly.
+          path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
+          path: dist
 
       # Stage both triple-named binaries under the `linux-<arch>` naming the
       # Dockerfile's `LOOM_DAEMON_BIN` default expects (`TARGETARCH`-keyed —
@@ -886,12 +885,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
+          path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
+          path: dist
 
       - name: Verify binaries are present, executable, and staged per-arch
         run: |
@@ -1033,12 +1034,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
+          path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
+          path: dist
 
       - name: Verify binaries are present, executable, and staged per-arch
         run: |
