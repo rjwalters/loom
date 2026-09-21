@@ -1405,8 +1405,8 @@ printf '{"schema_version":1,"container_name":"loom-codex-session-session-acct","
 out="$(run_auth "LOOM_CODEX_HOME=$SESSION_PROFILE" -- -p "hi")"
 assert_contains "profile 'session-acct' is session-managed" "$out" \
     "a session-managed profile is detected via the on-disk marker"
-assert_contains "would-exec: docker exec loom-codex-session-session-acct codex exec" "$out" \
-    "session-exec mode dispatches via docker exec into the account's container"
+assert_contains "would-exec: docker exec -e CARGO_INCREMENTAL=0 loom-codex-session-session-acct codex exec" "$out" \
+    "session-exec mode dispatches via docker exec into the account's container, with CARGO_INCREMENTAL=0 carried across the boundary (#6926, #8456)"
 would_exec_line="$(printf '%s\n' "$out" | grep '^spawn-codex would-exec:' || true)"
 assert_not_contains "tmux" "$would_exec_line" \
     "the resolved dispatch invocation itself never mentions tmux (docker exec only, no send-keys)"
@@ -1436,7 +1436,7 @@ NO_MARKER_PROFILE="$TMPROOT/profiles/forced"
 mkdir -p "$NO_MARKER_PROFILE"
 printf '{"token":"stub"}\n' > "$NO_MARKER_PROFILE/auth.json"
 out="$(run_auth "LOOM_CODEX_HOME=$NO_MARKER_PROFILE" LOOM_CODEX_SESSION_EXEC=1 -- -p "hi")"
-assert_contains "would-exec: docker exec loom-codex-session-forced codex exec" "$out" \
+assert_contains "would-exec: docker exec -e CARGO_INCREMENTAL=0 loom-codex-session-forced codex exec" "$out" \
     "LOOM_CODEX_SESSION_EXEC=1 forces session-exec even without the marker file"
 assert_contains "forces session-exec mode though" "$out" \
     "LOOM_CODEX_SESSION_EXEC=1 warns that the profile was never adopted"
@@ -1556,6 +1556,11 @@ if [[ "\$1" == "inspect" ]]; then
 fi
 if [[ "\$1" == "exec" ]]; then
     shift
+    # Options precede the container name (real docker exec is clap-parsed);
+    # -e KEY=VALUE pairs are exported so the exec'd process sees them, the
+    # way real docker exec seeds its environment (#8456's CARGO_INCREMENTAL=0
+    # rides this path).
+    while [[ "\$1" == "-e" ]]; do export "\$2"; shift 2; done
     _container="\$1"
     shift
     printf '%s\n' "\$_container \$*" > "$SESSION_DOCKER_EXEC_ARGV"
@@ -1594,8 +1599,7 @@ assert_contains "# LOOM_CLI_START runtime=codex" "$session_stderr" \
 assert_not_contains "MOCK-SAW-STDIN" "$session_stderr" \
     "session-exec closes the exec'd process's stdin, same as bare-metal (never a hang)"
 
-assert_contains "loom-codex-session-session-acct codex exec" "$(cat "$SESSION_DOCKER_EXEC_ARGV")" \
-    "docker exec targets the account's own session container with the codex exec argv"
+assert_contains "loom-codex-session-session-acct codex exec" "$(cat "$SESSION_DOCKER_EXEC_ARGV")" "docker exec targets the account's own session container with the codex exec argv"
 
 set +e
 run_session_mock MOCK_RC=42 -- -p "hi" >/dev/null 2>&1

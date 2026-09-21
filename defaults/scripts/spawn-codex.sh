@@ -958,7 +958,16 @@ fi
 # codex <CODEX_ARGS...>` — the exact shape docker/session/README.md's
 # "Headless dispatch" section documents, never `tmux send-keys`.
 if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
-    CODEX_INVOKE=(docker exec "$CODEX_SESSION_CONTAINER" codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
+    # -e CARGO_INCREMENTAL=0 (issue #8456, parent #8453 §1): `docker exec`
+    # does NOT inherit this script's environment, so the value the
+    # daemon-side dispatcher injects for bare-metal dispatch would be
+    # stripped at the container boundary — carry it across explicitly, the
+    # same way spawn-claude.sh's containment env does. sccache cannot cache
+    # an incrementally-compiled crate, and cargo keys incremental session
+    # state by the crate's absolute source path, so it is orphaned disk the
+    # moment a worktree goes away. An inline `CARGO_INCREMENTAL=1 cargo …`
+    # prefix still outranks it per-invocation.
+    CODEX_INVOKE=(docker exec -e CARGO_INCREMENTAL=0 "$CODEX_SESSION_CONTAINER" codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
 else
     CODEX_INVOKE=(codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
 fi
