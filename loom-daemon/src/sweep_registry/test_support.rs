@@ -1198,6 +1198,31 @@ impl Drop for FakeSweep {
 mod git_worktree_fixture;
 pub(crate) use git_worktree_fixture::make_dirty_git_worktree;
 
+/// [`make_dirty_git_worktree`] plus the other half of what a fixture worktree
+/// has always meant: **dirty and QUIET** (Issue #8487).
+///
+/// Every file the fixture writes is microseconds old, so #8413's
+/// filesystem-activity leg reads the worktree as "an untracked worker is
+/// inside it" and every destructive-path test would stop at that veto before
+/// reaching its actual subject. Pinning `reg`'s activity window to
+/// [`Duration::ZERO`] disables that leg — for **this registry only**, which is
+/// the whole point: the fixture used to pin it by writing a process-global env
+/// var it never restored, silently disabling the gate for unrelated tests
+/// later in the same binary (see [`make_dirty_git_worktree`]'s own note).
+///
+/// A test that wants the filesystem leg back on calls
+/// `reg.set_activity_window(Some(window))` itself — see
+/// `watchdog/liveness_tests.rs`, the one place that does.
+pub(crate) fn make_quiet_dirty_git_worktree(
+    reg: &mut SweepRegistry,
+    ws: &Path,
+    issue: u32,
+) -> PathBuf {
+    let wt = make_dirty_git_worktree(ws, issue);
+    reg.set_activity_window(Some(Duration::ZERO));
+    wt
+}
+
 /// Insert a terminal (`Exited`) Issue entry directly, mimicking the state
 /// the reaper leaves after a dead child is reaped.
 pub(crate) fn insert_terminal_issue(

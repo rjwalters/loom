@@ -1316,7 +1316,14 @@ impl SweepRegistry {
         //    builder — no claim-lock, no marker, one-shot subshells, output
         //    going only into `target/` — that signals 1-4 cannot see at all.
         //    See `worktree_activity`'s "Destructive passes" section.
-        evidence.extend(crate::worktree_activity::live_use_evidence(&wt));
+        //
+        //    The window is `self.activity_window` when a caller pinned one
+        //    explicitly (tests only — see the field's doc comment, #8487),
+        //    else resolved from the environment exactly as before.
+        evidence.extend(match self.activity_window {
+            Some(window) => crate::worktree_activity::live_use_evidence_in(&wt, window),
+            None => crate::worktree_activity::live_use_evidence(&wt),
+        });
         evidence
     }
 

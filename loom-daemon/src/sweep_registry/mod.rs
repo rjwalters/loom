@@ -726,6 +726,22 @@ pub struct SweepRegistry {
     /// mutex, and blocking there is the 2026-07-26 wedge shape. Entries are
     /// removed as soon as the group drains, so this never accumulates.
     pending_group_reaps: HashMap<SweepId, PendingGroupReap>,
+    /// Explicit override for the filesystem-activity window
+    /// [`worktree_in_use`](Self::worktree_in_use) judges a worktree's mtimes
+    /// against (Issue #8487). `None` — the only value production ever holds —
+    /// means "resolve it per call from
+    /// [`ACTIVITY_WINDOW_ENV`](crate::worktree_activity::ACTIVITY_WINDOW_ENV),
+    /// else the default", i.e. byte-for-byte the pre-#8487 behavior.
+    ///
+    /// It exists because the *tests* need to say "this worktree is dirty and
+    /// QUIET" — every fixture worktree is written microseconds before the
+    /// assertion, so its mtimes always read as a live worker (#8413) unless the
+    /// filesystem leg is disabled. They used to say that by writing
+    /// `ACTIVITY_WINDOW_ENV=0` into the *process* environment and never
+    /// restoring it, which leaked "the gate is off" into every later test in
+    /// the same binary. Scoping the pin to one registry removes the shared
+    /// mutable global instead of adding another lock around it.
+    activity_window: Option<Duration>,
 }
 
 /// Resolve this host's identity string for collision records (Issue #4085) and
@@ -1044,6 +1060,7 @@ impl SweepRegistry {
             phase_history: HashMap::new(),
             sampled_loc: HashMap::new(),
             pending_group_reaps: HashMap::new(),
+            activity_window: None,
         }
     }
 
@@ -1096,6 +1113,7 @@ impl SweepRegistry {
             phase_history: HashMap::new(),
             sampled_loc: HashMap::new(),
             pending_group_reaps: HashMap::new(),
+            activity_window: None,
         }
     }
 
@@ -1111,6 +1129,18 @@ impl SweepRegistry {
     /// env > config > default value. `Duration::ZERO` disables the stagger.
     pub fn set_dispatch_stagger(&mut self, stagger: Duration) {
         self.dispatch_stagger = stagger;
+    }
+
+    /// Override the filesystem-activity window this registry's
+    /// [`worktree_in_use`](Self::worktree_in_use) judges mtimes against, or
+    /// `None` to resolve it from the environment per call (Issue #8487).
+    ///
+    /// Test-only: production leaves it `None` and reads
+    /// [`ACTIVITY_WINDOW_ENV`](crate::worktree_activity::ACTIVITY_WINDOW_ENV)
+    /// exactly as before. See the field's own doc comment for why it exists.
+    #[cfg(test)]
+    pub(crate) fn set_activity_window(&mut self, window: Option<Duration>) {
+        self.activity_window = window;
     }
 
     /// Read-only accessor for the configured dispatch stagger (Issue #3887).

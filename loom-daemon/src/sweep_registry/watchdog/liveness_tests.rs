@@ -60,7 +60,7 @@ fn an_in_session_builders_inflight_claim_refuses_the_midbuild_reset() {
     let tmp = tempdir().unwrap();
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
-    let wt = make_dirty_git_worktree(ws, 8413);
+    let wt = make_quiet_dirty_git_worktree(&mut reg, ws, 8413);
     insert_terminal_issue(&mut reg, "sweep-issue-8413-dead", 8413, None);
 
     let store = ws.join("inflight-store");
@@ -97,22 +97,25 @@ fn an_in_session_builders_inflight_claim_refuses_the_midbuild_reset() {
 /// `target/` — is NOT reset, even though the builder registered nothing at all.
 ///
 /// This is the incident's shape without the cooperation the test above assumes:
-/// no claim, no marker, no lock, no visible process. The fixture pins the
-/// activity window off (see `make_dirty_git_worktree`); this test turns it back
-/// on, which is exactly the production default.
+/// no claim, no marker, no lock, no visible process. The fixture pins this
+/// registry's activity window off (see `make_quiet_dirty_git_worktree`); this
+/// test turns it back on — at the production default — for the same registry,
+/// with no process-global state involved either way (#8487).
 #[test]
 #[serial]
 fn a_live_compile_writing_only_into_target_refuses_the_midbuild_reset() {
     let tmp = tempdir().unwrap();
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
-    let wt = make_dirty_git_worktree(ws, 8417);
+    let wt = make_quiet_dirty_git_worktree(&mut reg, ws, 8417);
     insert_terminal_issue(&mut reg, "sweep-issue-8417-dead", 8417, None);
 
     // A compile's writes: `target/` only, nothing the tracked tree can see.
     std::fs::create_dir_all(wt.join("target/debug")).unwrap();
     std::fs::write(wt.join("target/debug/partial.rlib"), "…").unwrap();
-    std::env::set_var(crate::worktree_activity::ACTIVITY_WINDOW_ENV, "30");
+    reg.set_activity_window(Some(Duration::from_secs(
+        crate::worktree_activity::DEFAULT_ACTIVITY_WINDOW_MINUTES * 60,
+    )));
 
     let evidence = reg.worktree_in_use(8417);
     assert!(
@@ -132,10 +135,8 @@ fn a_live_compile_writing_only_into_target_refuses_the_midbuild_reset() {
     );
 
     // …and once the worktree goes quiet, the same dead sweep is recovered.
-    std::env::set_var(crate::worktree_activity::ACTIVITY_WINDOW_ENV, "0");
+    reg.set_activity_window(Some(Duration::ZERO));
     assert_eq!(reg.midbuild_watchdog_once(), 1, "recovery resumes once the writes stop");
-
-    std::env::remove_var(crate::worktree_activity::ACTIVITY_WINDOW_ENV);
 }
 
 /// The positive control for the test above, and the other half of the gate:
@@ -147,7 +148,7 @@ fn recovery_resumes_once_the_inflight_claim_is_released() {
     let tmp = tempdir().unwrap();
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
-    let wt = make_dirty_git_worktree(ws, 8415);
+    let wt = make_quiet_dirty_git_worktree(&mut reg, ws, 8415);
     insert_terminal_issue(&mut reg, "sweep-issue-8415-dead", 8415, None);
 
     let store = ws.join("inflight-store");
@@ -173,7 +174,7 @@ fn a_performed_reset_leaves_a_recoverable_quarantine_stash() {
     let tmp = tempdir().unwrap();
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
-    let wt = make_dirty_git_worktree(ws, 8416);
+    let wt = make_quiet_dirty_git_worktree(&mut reg, ws, 8416);
     insert_terminal_issue(&mut reg, "sweep-issue-8416-dead", 8416, None);
 
     assert_eq!(reg.midbuild_watchdog_once(), 1, "a genuinely dead sweep is still recovered");
