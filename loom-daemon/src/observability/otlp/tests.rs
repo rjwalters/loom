@@ -33,8 +33,9 @@ impl MockSink {
 
     fn with_content_type(
         responses: Vec<(u16, String, Duration)>,
-        content_type: &'static str,
+        content_type: impl Into<String>,
     ) -> Self {
+        let content_type = content_type.into();
         let mut responses = std::collections::VecDeque::from(responses);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -398,4 +399,20 @@ async fn response_media_type_is_required() {
             .exported,
         1
     );
+}
+
+#[tokio::test]
+async fn redirects_are_permanent_responses_not_hidden_reposts() {
+    let target = MockSink::start();
+    let sink = MockSink::with_content_type(
+        vec![(307, "{}".to_string(), Duration::ZERO)],
+        format!("application/json\r\nLocation: {}/v1/logs", target.base_url()),
+    );
+    let exporter = OtlpExporter::new(sink.base_url(), "secret".to_string()).unwrap();
+    let outcome = exporter
+        .emit_batch_outcome(&[sweep_started_envelope()])
+        .await;
+    assert_eq!(outcome.signals["log_records"].dropped, 1);
+    assert_eq!(outcome.exported, 0);
+    assert!(target.requests().is_empty());
 }

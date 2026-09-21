@@ -106,6 +106,7 @@ impl OtlpExporter {
             ));
         }
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|error| ExportError::Transport(error.to_string()))?;
