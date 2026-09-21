@@ -180,6 +180,93 @@ fn an_unrecognised_failure_is_no_opinion() {
     assert!(ingest_launch_log(tmp.path(), &bare, ANCHOR, Some(1)).is_none());
 }
 
+/// #8521: the anchored region is the run's **entire transcript**, so the
+/// agent's own words are in it. Both native harnesses are launched in a JSON
+/// event mode (`pi --print --mode json`, `opencode run --format json`, see
+/// `worker_spawn::harness`), which is what makes the agent's prose separable:
+/// it arrives inside non-`error` events. An agent that quotes an exhaustion
+/// phrase — this repo's own `judge.md` GraphQL rate-limit signature table
+/// holds three of the classifier's needles verbatim — and then exits nonzero
+/// must NOT bad-mark the account it ran on.
+#[test]
+fn an_exhaustion_needle_in_the_agents_own_transcript_never_bad_marks() {
+    let tmp = workspace(&["alpha"]);
+    let transcript = [
+        r#"{"type":"text","text":"judge.md's signature table lists quota exceeded, rate limit and too many requests as the GraphQL exhaustion signatures."}"#,
+        r#"{"type":"tool_use","tool":"loom_read","input":{"path":"judge.md"}}"#,
+        r#"{"type":"step_finish","tool":"loom_read"}"#,
+        // The harness's own statement of what went wrong is unrelated: a 403
+        // is deliberately left unclassified (see `classify_error_event`).
+        r#"{"type":"error","error":{"type":"provider.http","status":403}}"#,
+    ]
+    .join("\n");
+    let contents = log("pool", Some("alpha"), "glm-5.3-flash", &transcript);
+
+    assert!(
+        ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).is_none(),
+        "the agent's own transcript must not be read as the provider speaking"
+    );
+    assert_eq!(bad_marks::read_marks(&pool_root(tmp.path()), PROVIDER).unwrap(), Vec::new());
+    assert!(active(tmp.path(), "alpha", None).is_none());
+    assert!(select::select_api_key(tmp.path(), PROVIDER, None).is_ok());
+}
+
+/// The other half of #8521: narrowing the prose fallback must not cost a true
+/// positive. Each of these is the provider/harness speaking, not the agent.
+#[test]
+fn a_genuine_provider_signal_still_bad_marks_after_the_transcript_narrowing() {
+    // 1. Plain adapter/CLI stderr prose — not part of any event stream.
+    let tmp = workspace(&["alpha"]);
+    let contents = log(
+        "pool",
+        Some("alpha"),
+        "glm-5.3-flash",
+        "{\"type\":\"text\",\"text\":\"starting work\"}\nError: insufficient balance",
+    );
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    assert_eq!(feedback.classification, Classification::Exhausted);
+    assert!(feedback.mark.is_some(), "{}", feedback.detail);
+
+    // 2. A structured error event the classifier reads structurally.
+    let tmp = workspace(&["alpha"]);
+    let contents = log(
+        "pool",
+        Some("alpha"),
+        "glm-5.3-flash",
+        r#"{"type":"error","error":{"type":"provider.http","status":402}}"#,
+    );
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    assert_eq!(feedback.classification, Classification::Exhausted);
+    assert!(feedback.mark.is_some(), "{}", feedback.detail);
+
+    // 3. An error event whose *status* is unrecognised but whose message is
+    //    the provider's own words: an error event is the harness speaking, so
+    //    its prose is still read.
+    let tmp = workspace(&["alpha"]);
+    let contents = log(
+        "pool",
+        Some("alpha"),
+        "glm-5.3-flash",
+        r#"{"type":"error","error":{"type":"provider.http","message":"quota exceeded for coding plan","status":400}}"#,
+    );
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    assert_eq!(feedback.classification, Classification::Exhausted);
+    assert!(feedback.mark.is_some(), "{}", feedback.detail);
+
+    // 4. A raw provider error body echoed into the log: JSON, but not a
+    //    harness event at all (no `type`), so it is provider text.
+    let tmp = workspace(&["alpha"]);
+    let contents = log(
+        "pool",
+        Some("alpha"),
+        "glm-5.3-flash",
+        r#"{"error":{"code":"1113","message":"balance exhausted"}}"#,
+    );
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    assert_eq!(feedback.classification, Classification::Exhausted);
+    assert!(feedback.mark.is_some(), "{}", feedback.detail);
+}
+
 /// #8424 item 3 through the automatic path: the mark is scoped to the model
 /// the launch record names, so the same account stays selectable for another
 /// model class.

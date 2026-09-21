@@ -342,6 +342,81 @@ pub fn classify(output: &str, _exit_code: i32) -> Option<Classification> {
     None
 }
 
+/// `true` when `line` is one of the harness's **transcript** events — a JSON
+/// object carrying a string `type` that is not `"error"`.
+///
+/// This is the same definition of "the harness's own error event"
+/// [`classify_error_event`] already applies (`type == "error"`, exactly), read
+/// the other way round: everything else in the event stream is the *model's*
+/// output — assistant text, reasoning, tool calls and their results — not the
+/// provider's. `tool_result`-shaped events are deliberately on the transcript
+/// side of that line: a tool's output (an agent running `gh`, say) is the
+/// agent's doing, not the API key's provider speaking.
+///
+/// Non-JSON prose and JSON objects with **no** `type` (a raw provider error
+/// body echoed into the log, `{"error":{"code":"1113",…}}`) are not transcript
+/// events and stay readable.
+fn is_transcript_event(line: &str) -> bool {
+    let line = line.trim();
+    if !line.starts_with('{') {
+        return false;
+    }
+    let Ok(event) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    event
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "error")
+}
+
+/// `region` with the harness's transcript events removed — see
+/// [`is_transcript_event`]. Cheap and line-oriented, the same shape every
+/// other reader of a retained log in this tree uses.
+fn without_transcript(region: &str) -> String {
+    region
+        .lines()
+        .filter(|line| !is_transcript_event(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// [`classify`] for the **automatic** path: a region of a retained launch log,
+/// which is a whole run's transcript rather than a provider's error output.
+///
+/// # Why this is not just [`classify`] (#8521)
+///
+/// `classify` assumes its input is the provider's/harness's own words — true
+/// when an operator hands it captured error output, false for the region
+/// [`super::ingest::classify_launch_log`] holds. That region is everything
+/// after a sweep's `sweep_id=` anchor (or a role tick's header), i.e. the
+/// **agent's entire transcript**, and both native harnesses are launched in a
+/// JSON event mode — `pi --print --mode json`, `opencode run --format json`
+/// (`super::super::worker_spawn::harness`) — so the model's prose arrives
+/// inside event payloads that the substring table happily matched, because it
+/// never re-parsed them.
+///
+/// The exhaustion needles are ordinary English an agent in this repo emits
+/// routinely: `judge.md`'s own GraphQL rate-limit signature table holds
+/// `quota exceeded`, `rate limit` and `too many requests` verbatim. Any failed
+/// run that merely *quoted* it therefore satisfied a match and could bad-mark
+/// a healthy account for 6h — the exact inversion of this subsystem's stated
+/// lean ("under-marking self-corrects … over-marking idles an allowance that
+/// was never exhausted").
+///
+/// So the prose table is shown only the lines the *provider or harness* wrote:
+/// structured `{"type":"error",…}` events (read structurally first, as
+/// before), raw provider error bodies, and the adapter's/CLI's own non-JSON
+/// stderr prose. Nothing else changes — precedence, the pattern table and the
+/// HTTP-status guards are `classify`'s, unmodified.
+#[must_use]
+pub fn classify_launch_region(region: &str, exit_code: i32) -> Option<Classification> {
+    // `classify_error_event` ignores every non-`error` event, so running the
+    // whole ladder over the filtered text is equivalent for the structured
+    // pass and narrowed for the prose pass — which is the entire change.
+    classify(&without_transcript(region), exit_code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +604,102 @@ mod tests {
             .iter()
             .filter(|p| p.classification == Classification::Exhausted)
             .all(|p| p.provenance == Provenance::DocumentedShape));
+    }
+
+    /// #8521: the automatic path's prose table must not read the model's own
+    /// output. Every needle here is inside a non-`error` event — exactly the
+    /// shape `opencode run --format json` / `pi --print --mode json` produce.
+    #[test]
+    fn the_launch_region_classifier_ignores_needles_in_the_agents_own_events() {
+        for transcript in [
+            r#"{"type":"text","text":"the table lists quota exceeded and rate limit"}"#,
+            r#"{"type":"message","content":"HTTP 429 too many requests is the signature"}"#,
+            r#"{"type":"reasoning","text":"insufficient balance would mean the plan ran dry"}"#,
+            r#"{"type":"tool_result","output":"gh: API rate limit exceeded"}"#,
+            r#"{"type":"step_finish","tool":"loom_read","text":"concurrency limit"}"#,
+            // A whole plausible transcript, plus an unclassified 403.
+            "{\"type\":\"text\",\"text\":\"quota exceeded\"}\n{\"type\":\"error\",\"error\":{\"type\":\"provider.http\",\"status\":403}}",
+        ] {
+            assert_eq!(classify_launch_region(transcript, 1), None, "{transcript:?}");
+            // The un-narrowed classifier is what made this a false positive.
+            assert!(classify(transcript, 1).is_some(), "{transcript:?}");
+        }
+    }
+
+    /// The narrowing must not cost a true positive: the provider and the
+    /// harness both still get heard, in every shape they speak in.
+    #[test]
+    fn the_launch_region_classifier_still_hears_the_provider_and_the_harness() {
+        // Structured events — unchanged, read before any prose.
+        assert_eq!(
+            classify_launch_region(CAPTURED_OPENCODE_AUTH_EVENT, 1),
+            Some(Classification::CredentialFailure)
+        );
+        assert_eq!(
+            classify_launch_region(r#"{"type":"error","error":{"status":402}}"#, 1),
+            Some(Classification::Exhausted)
+        );
+        assert_eq!(
+            classify_launch_region(r#"{"type":"error","error":{"status":429}}"#, 1),
+            Some(Classification::RateLimited)
+        );
+        // An error event's own prose, when its status is unrecognised.
+        assert_eq!(
+            classify_launch_region(
+                r#"{"type":"error","error":{"message":"insufficient balance","status":400}}"#,
+                1
+            ),
+            Some(Classification::Exhausted)
+        );
+        // Adapter/CLI stderr prose — never part of an event stream.
+        assert_eq!(
+            classify_launch_region("Error: insufficient balance for this account", 1),
+            Some(Classification::Exhausted)
+        );
+        // A raw provider error body: JSON, but no `type`, so not a transcript
+        // event.
+        assert_eq!(
+            classify_launch_region(r#"{"error":{"code":"1113","message":"…"}}"#, 1),
+            Some(Classification::Exhausted)
+        );
+        // Interleaved in a real retained log, among Loom's own marker lines
+        // and the agent's transcript: the provider's line is still found.
+        let log = "==== loom-daemon dispatch: sweep_id=sweep-issue-8521-1 ====\n\
+                   # LOOM_LAUNCH {\"schema\":1}\n\
+                   # LOOM_CLI_START runtime=opencode\n\
+                   {\"type\":\"text\",\"text\":\"working\"}\n\
+                   Error: insufficient balance\n";
+        assert_eq!(classify_launch_region(log, 1), Some(Classification::Exhausted));
+        // A credential failure still outranks an exhaustion in the same region.
+        assert_eq!(
+            classify_launch_region(
+                &format!("Error: insufficient balance\n{CAPTURED_OPENCODE_AUTH_EVENT}\n"),
+                1
+            ),
+            Some(Classification::CredentialFailure)
+        );
+    }
+
+    #[test]
+    fn only_a_typed_non_error_json_object_counts_as_a_transcript_event() {
+        for transcript in [
+            r#"{"type":"text","text":"hi"}"#,
+            r#"  {"type":"step_finish"}  "#,
+            r#"{"type":"tool_use","tool":"loom_read"}"#,
+        ] {
+            assert!(is_transcript_event(transcript), "{transcript:?}");
+        }
+        for kept in [
+            r#"{"type":"error","error":{"status":402}}"#,
+            r#"{"error":{"code":"1113"}}"#, // no `type` at all
+            r#"{"type":429}"#,              // `type` is not a string
+            "Error: insufficient balance",  // not JSON
+            "{not json at all",
+            "",
+            r#"["type","error"]"#, // not an object
+        ] {
+            assert!(!is_transcript_event(kept), "{kept:?}");
+        }
     }
 
     #[test]
