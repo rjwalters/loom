@@ -27,17 +27,27 @@
 use super::*;
 use crate::tokens_pool::{self, AccountId, AccountProvider};
 
-/// After a role tick exits, parse its own `LOOM_TERMINAL_RESULT` record out
-/// of `log_path` — scoped to this tick's own dispatch region via
-/// `tick_anchor` (a string unique to this tick, appearing in the header
-/// line `run_role_with_timeout` writes before spawning; mirrors the sweep
-/// path's `sweep_id=` anchor) — and persist it as account health.
+/// After a role tick exits, feed its own retained log back into the health
+/// state of whichever account pool the tick actually spawned against —
+/// scoped to this tick's own dispatch region via `tick_anchor` (a string
+/// unique to this tick, appearing in the header line
+/// `run_role_with_timeout` writes before spawning; mirrors the sweep path's
+/// `sweep_id=` anchor).
 ///
-/// A no-op unless `admission` names the `codex` runtime: a Claude-runtime
-/// tick, or a test invocation that opted out of admission entirely (a
-/// `spawn_bin` override, which leaves `admission` as `None`), never reaches
-/// this far — mirroring `apply_provider_health_feedback`'s own
-/// `info.runtime != "codex"` guard.
+/// **One seam per dispatch surface**, by runtime:
+///
+/// | Runtime | Reads | Writes |
+/// |---|---|---|
+/// | `codex` | `LOOM_TERMINAL_RESULT` | `.loom/account-health.json` (#8443) |
+/// | native (`pi`/`opencode`) | `# LOOM_LAUNCH` + the harness's error events | the API-key pool's bad marks (#8424 item 1) |
+///
+/// Both are post-hoc readers of text a launch already wrote — the only
+/// option once a native launch `exec`s (see
+/// [`crate::api_keys_pool::ingest`]'s design note) — so they belong behind
+/// one call rather than two competing hooks in the tick loop. A
+/// Claude-runtime tick, or a test invocation that opted out of admission
+/// entirely (a `spawn_bin` override, which leaves `admission` as `None`),
+/// reaches neither.
 pub(super) fn apply_role_tick_provider_health_feedback(
     workspace_root: &Path,
     log_path: &Path,
@@ -48,6 +58,16 @@ pub(super) fn apply_role_tick_provider_health_feedback(
     let Some(admission) = admission else {
         return;
     };
+    if crate::worker_spawn::is_native(&admission.runtime) {
+        apply_role_tick_api_key_feedback(
+            workspace_root,
+            log_path,
+            admission,
+            tick_anchor,
+            exit_code,
+        );
+        return;
+    }
     if admission.runtime != "codex" {
         return;
     }
@@ -93,6 +113,32 @@ pub(super) fn apply_role_tick_provider_health_feedback(
             admission.role
         );
     }
+}
+
+/// The native-runtime half (#8424 item 1): ingest this tick's own region of
+/// the role log and let [`crate::api_keys_pool::ingest`] decide whether the
+/// account it spawned against should be bad-marked.
+///
+/// Every safety decision lives in that module (pool-selected credentials
+/// only, never an exit-0 run, auth failures surfaced without a mark), so this
+/// is a call site and a log line — nothing here decides anything about an
+/// account.
+fn apply_role_tick_api_key_feedback(
+    workspace_root: &Path,
+    log_path: &Path,
+    admission: &crate::runtime_admission::ResolvedRuntime,
+    tick_anchor: &str,
+    exit_code: Option<i32>,
+) {
+    let Some(feedback) = crate::api_keys_pool::ingest::ingest_launch_log_at(
+        workspace_root,
+        log_path,
+        tick_anchor,
+        exit_code,
+    ) else {
+        return;
+    };
+    log::warn!("role_runner: role={} {}", admission.role, feedback.detail);
 }
 
 #[cfg(test)]

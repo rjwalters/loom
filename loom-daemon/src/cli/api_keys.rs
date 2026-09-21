@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use super::tokens::resolve_tokens_workspace;
 use loom_daemon::api_keys_pool::{
-    bad_marks,
+    bad_marks, limits,
     paths::{
         default_env_name, is_conventional_env_name, per_repo_api_keys_dir, pool_roots,
         resolve_provider_root,
@@ -48,6 +48,11 @@ pub enum ApiKeysAction {
         /// Replace an existing account of the same name.
         #[arg(long)]
         force: bool,
+        /// Most spawns that may hold this account at once — the provider's own
+        /// concurrent-request ceiling (#8424). Omit for unbounded. Change it
+        /// later with `api-keys limit`.
+        #[arg(long, value_name = "N")]
+        max_concurrent: Option<u32>,
         #[arg(long)]
         json: bool,
     },
@@ -85,6 +90,25 @@ pub enum ApiKeysAction {
         #[arg(long)]
         json: bool,
     },
+    /// Declare (or clear) an account's concurrency cap — the most spawns that
+    /// may hold it at once (#8424). An account at its cap is skipped in
+    /// favour of another eligible account, and becomes selectable again as
+    /// soon as one of those spawns exits.
+    Limit {
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The cap. Must be > 0 — use `disable` to take an account out of
+        /// selection entirely.
+        #[arg(long, value_name = "N", conflicts_with = "unlimited")]
+        max_concurrent: Option<u32>,
+        /// Clear the cap (unbounded again).
+        #[arg(long)]
+        unlimited: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Per-provider pool health: totals, selectable count, and why each
     /// excluded account is excluded.
     Health {
@@ -112,6 +136,11 @@ pub enum ApiKeysAction {
         /// indefinite mark (clear explicitly with `unblock`).
         #[arg(long)]
         cooldown_secs: Option<u64>,
+        /// Scope the mark to one model class — the model id whose allowance
+        /// ran out, e.g. `glm-5.3-flash` (#8424). The same account stays
+        /// selectable for every other class. Omit to mark the whole account.
+        #[arg(long, value_name = "CLASS")]
+        model_class: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -121,6 +150,11 @@ pub enum ApiKeysAction {
         provider: String,
         #[arg(value_name = "NAME")]
         name: String,
+        /// Clear only this model class's mark, leaving any account-wide mark
+        /// (and any other class's) in place. Omit to clear every mark for the
+        /// account.
+        #[arg(long, value_name = "CLASS")]
+        model_class: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -136,6 +170,7 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
             env_var,
             shared,
             force,
+            max_concurrent,
             json,
         } => {
             let root = if shared {
@@ -147,12 +182,18 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
             };
             let env_var = env_var.unwrap_or_else(|| default_env_name(&provider));
             let secret = read_key(key_file.as_deref())?;
-            let account = registry::add(&root, &provider, &name, &env_var, &secret, force)
+            registry::add(&root, &provider, &name, &env_var, &secret, force)
                 .map_err(anyhow::Error::msg)?;
+            // After `add`, so a rejected cap cannot leave a registered key
+            // behind with a half-applied declaration.
+            if max_concurrent.is_some() {
+                limits::set_max_concurrent(&root, &provider, &name, max_concurrent)
+                    .map_err(anyhow::Error::msg)?;
+            }
             if !shared {
                 note_shadowed_shared_accounts(&workspace, &provider);
             }
-            print_account(&account, json)
+            print_account(&registry::describe_account(&root, &provider, &name), json)
         }
         ApiKeysAction::List { provider, json } => {
             // `?`: an unreadable pool is reported as such, never as "no
@@ -201,6 +242,21 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
             }
             Ok(())
         }
+        ApiKeysAction::Limit {
+            provider,
+            name,
+            max_concurrent,
+            unlimited,
+            json,
+        } => {
+            if max_concurrent.is_none() && !unlimited {
+                bail!("pass --max-concurrent <N> to declare a cap, or --unlimited to clear it");
+            }
+            let root = provider_root(&workspace, &provider)?;
+            limits::set_max_concurrent(&root, &provider, &name, max_concurrent)
+                .map_err(anyhow::Error::msg)?;
+            print_account(&registry::describe_account(&root, &provider, &name), json)
+        }
         ApiKeysAction::Health { provider, json } => {
             let snapshot = select::health(&workspace, provider.as_deref())?;
             let unreadable: Vec<&str> = snapshot
@@ -219,14 +275,15 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
                     continue;
                 }
                 println!(
-                    "{}: {}/{} selectable ({} disabled, {} malformed, {} exhausted, {} \
-                     unverifiable) in {}",
+                    "{}: {}/{} selectable ({} disabled, {} malformed, {} exhausted, {} at \
+                     concurrency cap, {} unverifiable) in {}",
                     provider_health.provider,
                     provider_health.selectable,
                     provider_health.total,
                     provider_health.disabled,
                     provider_health.malformed,
                     provider_health.exhausted,
+                    provider_health.at_capacity,
                     provider_health.unverifiable,
                     provider_health.dir.display(),
                 );
@@ -255,16 +312,25 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
             name,
             reason,
             cooldown_secs,
+            model_class,
             json,
         } => {
             let root = provider_root(&workspace, &provider)?;
-            let mark = bad_marks::mark_bad(&root, &provider, &name, &reason, cooldown_secs)
-                .map_err(anyhow::Error::msg)?;
+            let mark = bad_marks::mark_bad_for_class(
+                &root,
+                &provider,
+                &name,
+                &reason,
+                cooldown_secs,
+                model_class.as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&mark)?);
             } else {
                 println!(
-                    "Marked {provider}/{name} bad{}.",
+                    "Marked {provider}/{name}{} bad{}.",
+                    mark.class_suffix(),
                     mark.resets_at
                         .map_or(" indefinitely (until `unblock`)".to_string(), |secs| {
                             format!(" until unix {secs}")
@@ -276,17 +342,27 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
         ApiKeysAction::Unblock {
             provider,
             name,
+            model_class,
             json,
         } => {
             let root = provider_root(&workspace, &provider)?;
-            bad_marks::unmark(&root, &provider, &name).map_err(anyhow::Error::msg)?;
+            bad_marks::unmark_for_class(&root, &provider, &name, model_class.as_deref())
+                .map_err(anyhow::Error::msg)?;
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"provider": provider, "name": name, "unblocked": true})
+                    serde_json::json!({
+                        "provider": provider,
+                        "name": name,
+                        "modelClass": model_class,
+                        "unblocked": true,
+                    })
                 );
             } else {
-                println!("Unblocked {provider}/{name}.");
+                println!(
+                    "Unblocked {provider}/{name}{}.",
+                    model_class.map_or(String::new(), |class| format!(" [model-class:{class}]"))
+                );
             }
             Ok(())
         }
@@ -347,13 +423,14 @@ fn print_account(account: &ApiKeyAccount, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{}/{}: {} (variable={}, permissions={}{})",
+        "{}/{}: {} (variable={}, permissions={}{}{})",
         account.provider,
         account.name,
         match &account.ineligible {
             None => "selectable",
             Some(registry::Ineligible::Disabled) => "disabled",
             Some(registry::Ineligible::Exhausted) => "exhausted",
+            Some(registry::Ineligible::AtCapacity) => "at concurrency cap",
             Some(registry::Ineligible::Malformed) => "unusable",
             Some(registry::Ineligible::Unverifiable) => "withheld",
         },
@@ -363,6 +440,9 @@ fn print_account(account: &ApiKeyAccount, json: bool) -> Result<()> {
         } else {
             "TOO OPEN"
         },
+        account
+            .max_concurrent
+            .map_or(String::new(), |cap| format!(", maxConcurrent={cap}")),
         account
             .problem
             .as_ref()

@@ -1,19 +1,38 @@
-//! Spawn-time account selection for the API-key pool (issue #8401).
+//! Spawn-time account selection for the API-key pool (issues #8401, #8424).
 //!
 //! The ladder mirrors `spawn-claude.sh`'s / [`crate::tokens_pool::select`]'s
-//! shape, minus the tiers that have no data source yet in this slice:
+//! shape, minus the tiers that have no data source yet:
 //!
-//! | Tier | Claude OAuth pool | API-key pool (this slice) |
+//! | Tier | Claude OAuth pool | API-key pool |
 //! |---|---|---|
-//! | 1 | `.ranking` health order | *not yet* — see the exhaustion-state follow-up |
+//! | 0 | — | per-account concurrency cap (#8424 item 4) |
+//! | 1 | `.ranking` health order | *not yet* — no health probe exists |
 //! | 2 | `.allowlist` operator pin | `.allowlist` operator pin |
 //! | 3 | rotation cursor / random | rotation cursor (round-robin) |
 //!
-//! Tier 1 is a deliberate, documented gap rather than a stub: until the
-//! exhaustion classifier exists there is nothing truthful to rank on, and an
-//! invented ordering would be worse than round-robin. The tier-2/3 code below
-//! is already written against a filtered candidate set, so adding a health
-//! filter later is an additional filter, not a restructure.
+//! Tier 1 is a deliberate, documented gap rather than a stub: until a health
+//! probe exists there is nothing truthful to rank on, and an invented ordering
+//! would be worse than round-robin. The tier-2/3 code below is written against
+//! a filtered candidate set, so adding a health filter later is an additional
+//! filter, not a restructure — which is exactly how tier 0 was added.
+//!
+//! # Tier 0: the cap is enforced, not merely recorded (#8424 item 4)
+//!
+//! An account already holding [`super::limits::AccountLimits::max_concurrent`]
+//! live spawns ([`super::inflight`]) is marked
+//! [`Ineligible::AtCapacity`] **before** the pin and rotation tiers run, so it
+//! is *skipped in favour of another eligible account* rather than reported
+//! after the fact. When every account is at its cap the selection fails closed
+//! at 78 like any other empty pool — launching anyway would breach the
+//! provider-side ceiling the operator declared, which is the failure the cap
+//! exists to prevent.
+//!
+//! # Model-class scoping (#8424 item 3)
+//!
+//! Selection takes the model the spawn asked for and resolves bad marks
+//! *for that class*: an exhausted `glm-5.3-flash` allowance leaves the same
+//! account's `glm-5` allowance selectable. A class-less mark still blocks
+//! every class — see [`super::bad_marks`].
 //!
 //! Failure is **fail-closed at exit 78** (`EX_CONFIG`), the same code and
 //! operator-diagnostic shape an empty Claude pool produces — but only once a
@@ -30,12 +49,14 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::tokens_pool::locking::MkdirLock;
 use crate::tokens_pool::{rng::Rng, rotation::next_rotation_index};
 
+use super::inflight::{self, Lease};
 use super::paths::{list_workspace_providers, provider_dir, resolve_provider_root, PoolReadError};
 use super::registry::{
-    list_provider, provider_is_pooled, read_credential, ApiKeyAccount, Credential, Ineligible,
-    ALLOWLIST_FILE,
+    list_provider, list_provider_for_class, provider_is_pooled, read_credential, ApiKeyAccount,
+    Credential, Ineligible, ALLOWLIST_FILE,
 };
 
 /// Exit code when no account is available (sysexits.h `EX_CONFIG`), identical
@@ -43,7 +64,6 @@ use super::registry::{
 pub const EX_CONFIG: i32 = 78;
 
 /// A selected account plus its credential. No `Serialize`; `Debug` redacts.
-#[derive(Clone)]
 pub struct SelectedApiKey {
     pub provider: String,
     /// The account **name** — this is what may be recorded in a launch record,
@@ -51,6 +71,16 @@ pub struct SelectedApiKey {
     pub name: String,
     pub credential: Credential,
     pub path: PathBuf,
+    /// This spawn's hold on the account, counted by the concurrency cap
+    /// (#8424 item 4). `None` when the lease store was unusable — the spawn
+    /// proceeds uncapped, see [`super::inflight`].
+    ///
+    /// **Dropping it does not release it**, deliberately: the ordinary caller
+    /// `exec`s a harness immediately afterwards, so the lease must outlive
+    /// this handle and is reaped when the owning PID dies. A caller that
+    /// *supervises* the run instead should call [`Lease::release`] when it
+    /// ends.
+    pub lease: Option<Lease>,
 }
 
 impl std::fmt::Debug for SelectedApiKey {
@@ -60,6 +90,7 @@ impl std::fmt::Debug for SelectedApiKey {
             .field("name", &self.name)
             .field("credential", &self.credential)
             .field("path", &self.path)
+            .field("lease", &self.lease.as_ref().map(Lease::path))
             .finish()
     }
 }
@@ -93,24 +124,34 @@ pub fn select_api_key(
     provider: &str,
     rng: Option<&mut Rng>,
 ) -> Result<SelectedApiKey, EmptyApiKeyPoolError> {
-    select_api_key_for(workspace, provider, None, rng)
+    select_api_key_for(workspace, provider, None, None, rng)
 }
 
 /// [`select_api_key`] for a caller that knows which variable the credential is
-/// *for* (a profile's `credentialEnv`). An account whose file assigns a
-/// different variable is withheld: the pool namespace is only a directory
-/// name, so without this check a key registered under the wrong namespace
-/// would be injected under this profile's harness variable and sent to the
-/// other provider's endpoint.
+/// *for* (a profile's `credentialEnv`) and which model the spawn will ask for.
+///
+/// An account whose file assigns a different variable is withheld: the pool
+/// namespace is only a directory name, so without this check a key registered
+/// under the wrong namespace would be injected under this profile's harness
+/// variable and sent to the other provider's endpoint.
+///
+/// `model_class` narrows bad marks to one model class (#8424 item 3) — pass
+/// the model id the spawn resolved (`glm-5.3-flash`); `None` keeps the
+/// account-wide behaviour, where any active mark withholds the account.
 pub fn select_api_key_for(
     workspace: &Path,
     provider: &str,
     expected_env: Option<&str>,
+    model_class: Option<&str>,
     rng: Option<&mut Rng>,
 ) -> Result<SelectedApiKey, EmptyApiKeyPoolError> {
     let unreadable = |e: PoolReadError| EmptyApiKeyPoolError(e.to_string());
     let root = resolve_provider_root(workspace, provider).map_err(unreadable)?;
-    let mut accounts = list_provider(&root, provider).map_err(unreadable)?;
+    // An unrecognisable model normalizes to `None` — i.e. account-wide marks,
+    // today's behaviour — rather than failing the spawn.
+    let model_class = model_class.and_then(super::bad_marks::normalize_model_class);
+    let mut accounts =
+        list_provider_for_class(&root, provider, model_class.as_deref()).map_err(unreadable)?;
     if let Some(expected) = expected_env {
         for account in &mut accounts {
             let Some(actual) = account.env_name.as_deref().filter(|a| *a != expected) else {
@@ -141,6 +182,14 @@ pub fn select_api_key_for(
             &mut owned_rng
         }
     };
+
+    // Tier 0: per-account concurrency cap (#8424 item 4). Held across the
+    // count *and* the lease registration below, so two concurrent spawns
+    // cannot both read `in_flight == cap - 1` and both admit themselves.
+    // `None` means "no cap is declared, or the lock store is unusable" — in
+    // both cases selection proceeds exactly as it did before #8424.
+    let _cap_lock = capacity_lock(&root, provider, &accounts);
+    mark_accounts_at_capacity(&root, provider, &mut accounts);
 
     let eligible: Vec<&ApiKeyAccount> = accounts.iter().filter(|a| a.selectable()).collect();
     if eligible.is_empty() {
@@ -178,12 +227,46 @@ pub fn select_api_key_for(
 
     let credential = read_credential(&root, provider, &chosen.name)
         .map_err(|e| EmptyApiKeyPoolError(format!("selected account became unreadable: {e}")))?;
+    // Count this spawn against the chosen account, still under `_cap_lock`.
+    let lease = inflight::register(&root, provider, &chosen.name);
     Ok(SelectedApiKey {
         provider: provider.to_string(),
         name: chosen.name.clone(),
         credential,
         path: chosen.path.clone(),
+        lease,
     })
+}
+
+/// Serialise the count-then-register window of tier 0, or `None` when there is
+/// nothing to serialise (no account declares a cap) or the lock store is
+/// unusable (degrade open — see [`super::inflight`]).
+fn capacity_lock(root: &Path, provider: &str, accounts: &[ApiKeyAccount]) -> Option<MkdirLock> {
+    if !accounts.iter().any(|a| a.max_concurrent.is_some()) {
+        return None;
+    }
+    MkdirLock::acquire(&provider_dir(root, provider).join(".inflight.lock")).ok()
+}
+
+/// Mark every selectable account that already holds its declared number of
+/// live spawns as [`Ineligible::AtCapacity`], so the tiers below skip it.
+///
+/// Only accounts that are otherwise selectable are counted: an account already
+/// excluded for a stronger reason (disabled, malformed, bad-marked) must keep
+/// reporting that reason, and counting leases for it would be wasted IO.
+fn mark_accounts_at_capacity(root: &Path, provider: &str, accounts: &mut [ApiKeyAccount]) {
+    for account in accounts.iter_mut() {
+        let Some(cap) = account.max_concurrent.filter(|_| account.selectable()) else {
+            continue;
+        };
+        let in_flight = inflight::live_count(root, provider, &account.name);
+        if in_flight >= cap {
+            account.problem = Some(format!(
+                "at its declared concurrency cap ({in_flight} in flight, maxConcurrent {cap})"
+            ));
+            account.ineligible = Some(Ineligible::AtCapacity);
+        }
+    }
 }
 
 /// Per-account "why not" detail, mirroring the Claude pool's empty-pool error
@@ -211,6 +294,12 @@ fn exhausted_detail(provider: &str, root: &Path, accounts: &[ApiKeyAccount]) -> 
                     a.problem.as_deref().unwrap_or("bad-marked"),
                     a.name
                 ),
+                Some(Ineligible::AtCapacity) => format!(
+                    "{} — clears as soon as one of those spawns exits, or raise it with \
+                     `loom-daemon api-keys limit {provider} {} --max-concurrent <N>`",
+                    a.problem.as_deref().unwrap_or("at its concurrency cap"),
+                    a.name
+                ),
                 Some(Ineligible::Unverifiable) => format!(
                     "withheld, pool state unreadable — {}",
                     a.problem.as_deref().unwrap_or("state file unreadable")
@@ -221,7 +310,8 @@ fn exhausted_detail(provider: &str, root: &Path, accounts: &[ApiKeyAccount]) -> 
         })
         .collect();
     format!(
-        "All {} API-key account(s) for provider {provider:?} in {} are disabled or unusable.\
+        "All {} API-key account(s) for provider {provider:?} in {} are disabled, unusable, or at \
+         their concurrency cap.\
          {detail}\n  deciding binary: {}\n  \
          Inspect with `loom-daemon api-keys health --provider {provider}`.",
         accounts.len(),
@@ -243,6 +333,11 @@ pub struct ProviderHealth {
     /// Accounts with an active [`super::bad_marks`] entry (exhausted/rate-
     /// limited, until their reset horizon).
     pub exhausted: usize,
+    /// Accounts that declare a concurrency cap and are currently holding it
+    /// (#8424 item 4). Transient by nature — it clears as spawns exit — and
+    /// counted live here rather than derived from
+    /// [`Ineligible::AtCapacity`], which only the selection ladder sets.
+    pub at_capacity: usize,
     /// Accounts withheld because `.disabled` / `.bad_accounts.json` exists but
     /// cannot be read or parsed.
     pub unverifiable: usize,
@@ -318,6 +413,14 @@ pub fn health(
                 disabled: count(Ineligible::Disabled),
                 malformed: count(Ineligible::Malformed),
                 exhausted: count(Ineligible::Exhausted),
+                at_capacity: accounts
+                    .iter()
+                    .filter(|a| {
+                        a.max_concurrent.is_some_and(|cap| {
+                            inflight::live_count(&root, &provider, &a.name) >= cap
+                        })
+                    })
+                    .count(),
                 unverifiable: count(Ineligible::Unverifiable),
                 unreadable,
                 insecure_permissions: accounts

@@ -2148,6 +2148,9 @@ provider-side allowance) fits neither this pool's OAuth-token/`.ranking`
 probes nor the Codex pool's mutable `auth.json` refresh chain.
 
 Full reference, including the registry format, the selection ladder
-(explicit env > pool > fail-closed 78), bad-marking/exhaustion state, and the
-`loom-daemon api-keys {add,list,disable,enable,remove,mark-bad,unblock,health}`
+(explicit env > pool > fail-closed 78), bad-marking/exhaustion state
+(model-class-scoped the same way [`bad_tokens::is_bad_for_class`](#model-class-scoped-entries-8058)
+scopes this pool's, and applied automatically from a finished run's own log),
+the per-account concurrency cap, and the
+`loom-daemon api-keys {add,list,disable,enable,limit,remove,mark-bad,unblock,health}`
 CLI: [`runtime-model-trials.md` § "API-key account pool"](runtime-model-trials.md#api-key-account-pool-loom-daemon-api-keys-8401).

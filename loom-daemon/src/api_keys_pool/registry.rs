@@ -19,11 +19,11 @@ use std::path::{Path, PathBuf};
 
 use crate::tokens_pool::locking::MkdirLock;
 
-use super::bad_marks;
 use super::paths::{
     list_account_files, provider_dir, validate_account, validate_provider,
     validate_stored_env_name, PoolReadError, ACCOUNT_FILE_EXT,
 };
+use super::{bad_marks, inflight, limits};
 
 /// Per-provider file listing the accounts an operator has taken out of
 /// selection. One account name per line; `#` starts a comment.
@@ -42,12 +42,23 @@ pub enum Ineligible {
     Malformed,
     /// A [`bad_marks::mark_bad`] entry is active (has not reached its
     /// `resets_at`, or has none — see `api-keys mark-bad`/`unblock`).
+    ///
+    /// For a class-scoped mark this means "exhausted **for the model class
+    /// this listing asked about**" — the same account is reported selectable
+    /// by a listing that asks about another class (#8424 item 3).
     Exhausted,
+    /// The account already has [`limits::AccountLimits::max_concurrent`]
+    /// spawns in flight (#8424 item 4). Unlike every other variant this is
+    /// transient and self-clearing: the moment one of those spawns exits the
+    /// account is selectable again. Set only by the selection ladder, which is
+    /// the only caller that counts leases.
+    AtCapacity,
     /// A pool state file that decides eligibility (`.disabled`,
-    /// `.bad_accounts.json`) exists but cannot be read or parsed, so whether
-    /// this account is disabled or exhausted cannot be established. The
-    /// account itself may be perfectly good; it is withheld because "I could
-    /// not read the list of disabled accounts" must never mean "none are".
+    /// `.bad_accounts.json`, `.limits.json`) exists but cannot be read or
+    /// parsed, so whether this account is disabled, exhausted or capped cannot
+    /// be established. The account itself may be perfectly good; it is
+    /// withheld because "I could not read the list of disabled accounts" must
+    /// never mean "none are".
     Unverifiable,
 }
 
@@ -70,6 +81,12 @@ pub struct ApiKeyAccount {
     /// Operator-facing detail for a malformed entry. Never contains file
     /// contents.
     pub problem: Option<String>,
+    /// Declared per-account concurrency cap (#8424 item 4), or `None` for
+    /// unbounded — see [`limits`]. A *declaration*, not a live count: the
+    /// in-flight tally lives in [`inflight`] and is consulted only by the
+    /// selection ladder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
 }
 
 impl ApiKeyAccount {
@@ -160,6 +177,21 @@ fn permissions_ok(_path: &Path) -> bool {
 
 /// Read one account's names/state without retaining its value.
 fn describe(root: &Path, provider: &str, path: &Path) -> ApiKeyAccount {
+    describe_for_class(root, provider, path, None)
+}
+
+/// [`describe`], resolving bad marks for one model class (#8424 item 3).
+///
+/// `model_class = None` is the account-wide question and is exactly
+/// [`describe`]: any active mark makes the account [`Ineligible::Exhausted`].
+/// `Some(class)` narrows to the marks that block that class, so a same-account
+/// allowance for a different class stays selectable.
+fn describe_for_class(
+    root: &Path,
+    provider: &str,
+    path: &Path,
+    model_class: Option<&str>,
+) -> ApiKeyAccount {
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -175,7 +207,14 @@ fn describe(root: &Path, provider: &str, path: &Path) -> ApiKeyAccount {
         Ok(credential) => (Some(credential.env_name), None),
         Err(problem) => (None, Some(problem)),
     };
-    let active_mark = bad_marks::active_mark(root, provider, &name, bad_marks::epoch_now());
+    let active_mark = bad_marks::active_mark_for_class(
+        root,
+        provider,
+        &name,
+        model_class,
+        bad_marks::epoch_now(),
+    );
+    let declared_cap = limits::max_concurrent(root, provider, &name);
     let ineligible = if problem.is_some() {
         Some(Ineligible::Malformed)
     } else if let Err(unreadable) = &disabled {
@@ -186,10 +225,17 @@ fn describe(root: &Path, provider: &str, path: &Path) -> ApiKeyAccount {
     } else if let Err(unreadable) = &active_mark {
         problem = Some(unreadable.clone());
         Some(Ineligible::Unverifiable)
+    } else if let Err(unreadable) = &declared_cap {
+        // An unreadable `.limits.json` withholds the account for the same
+        // reason an unreadable `.disabled` does: the operator's declared
+        // ceiling is unknown, and guessing "unbounded" would breach it.
+        problem = Some(unreadable.clone());
+        Some(Ineligible::Unverifiable)
     } else if let Ok(Some(mark)) = &active_mark {
         problem = Some(format!(
-            "bad-marked — \"{}\"{}",
+            "bad-marked — \"{}\"{}{}",
             mark.reason,
+            mark.class_suffix(),
             mark.resets_at.map_or(
                 " (no reset horizon; needs `api-keys unblock`)".to_string(),
                 |resets_at| format!(" (resets at unix {resets_at})")
@@ -208,7 +254,17 @@ fn describe(root: &Path, provider: &str, path: &Path) -> ApiKeyAccount {
         permissions_ok,
         ineligible,
         problem,
+        max_concurrent: declared_cap.unwrap_or(None),
     }
+}
+
+/// Secret-free description of one account by name — what `add`/`limit` print
+/// back after mutating it. A name that is not registered still describes
+/// (as [`Ineligible::Malformed`], "unreadable"), the same way `list` reports
+/// an account file it cannot read.
+#[must_use]
+pub fn describe_account(root: &Path, provider: &str, name: &str) -> ApiKeyAccount {
+    describe(root, provider, &account_path(root, provider, name))
 }
 
 /// Every registered account for one provider, sorted by name.
@@ -217,9 +273,22 @@ fn describe(root: &Path, provider: &str, path: &Path) -> ApiKeyAccount {
 /// [`PoolReadError`] when the provider directory exists but cannot be read —
 /// never an empty list, which would read as "this provider is not pooled".
 pub fn list_provider(root: &Path, provider: &str) -> Result<Vec<ApiKeyAccount>, PoolReadError> {
+    list_provider_for_class(root, provider, None)
+}
+
+/// [`list_provider`], resolving bad marks for one model class (#8424 item 3).
+/// `None` is exactly [`list_provider`].
+///
+/// # Errors
+/// As [`list_provider`].
+pub fn list_provider_for_class(
+    root: &Path,
+    provider: &str,
+    model_class: Option<&str>,
+) -> Result<Vec<ApiKeyAccount>, PoolReadError> {
     Ok(list_account_files(&provider_dir(root, provider))?
         .iter()
-        .map(|path| describe(root, provider, path))
+        .map(|path| describe_for_class(root, provider, path, model_class))
         .collect())
 }
 
@@ -394,6 +463,8 @@ pub fn remove(root: &Path, provider: &str, name: &str) -> Result<(), String> {
     let _ = set_listed(root, provider, DISABLED_FILE, name, false);
     let _ = set_listed(root, provider, ALLOWLIST_FILE, name, false);
     let _ = bad_marks::forget(root, provider, name);
+    let _ = limits::forget(root, provider, name);
+    inflight::forget(root, provider, name);
     Ok(())
 }
 
