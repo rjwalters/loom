@@ -146,7 +146,7 @@ spec:
                   exporters:
                     - signozclickhousemeter
           opamp.yaml: |
-            server_endpoint: ws://loom-signoz-metastore-postgres-0:4320/v1/opamp
+            server_endpoint: ws://loom-signoz-signoz-0:4320/v1/opamp
       enabled: true
       env:
         SIGNOZ_OTEL_COLLECTOR_TIMEOUT: 10m

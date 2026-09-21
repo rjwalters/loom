@@ -84,6 +84,9 @@ curl --fail http://127.0.0.1:18081/api/v1/health
 The migration job must complete before the app starts, and the ingester waits
 for app health before contacting its OpAMP service. Readiness
 budgets allow a busy development VM; a timeout still needs investigation.
+The explicit `opamp.yaml` override is required: this pinned Foundry render
+otherwise selected PostgreSQL's hostname for the app's port 4320. Verify that
+regeneration retains the correct app endpoint, not just valid YAML.
 Inspect `docker compose ... logs` for the failing service, with credentials and
 workload content removed before sharing. Register the first local user at
 <http://localhost:18081>. Account passwords/session tokens are distinct from

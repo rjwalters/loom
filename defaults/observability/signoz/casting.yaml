@@ -20,6 +20,10 @@ spec:
     spec:
       version: v0.144.10
       image: signoz/signoz-otel-collector:v0.144.10@sha256:34ecb436b687cc23bef5f706904cdf005998ca4ebe543653a634055a9fe204f6
+      config:
+        data:
+          opamp.yaml: |
+            server_endpoint: ws://loom-signoz-signoz-0:4320/v1/opamp
   telemetrystore:
     kind: clickhouse
     spec:

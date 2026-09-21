@@ -30,9 +30,11 @@ the missing-secret warning is absent. API health returned `{"status":"ok"}`;
 a synthetic local account was registered only after the secret was configured.
 The account and organization survived app recreation.
 
-App recreation also changed its private IP while the existing ingester kept
-retrying the old OpAMP address. Restarting the ingester is required; the casting
-now declares `depends_on` app health with `restart: true` for Compose-controlled
+The initial Foundry render pointed the ingester's OpAMP endpoint at PostgreSQL's
+hostname on port 4320. Inspecting the mounted configuration and original lock
+confirmed the incorrect target; it was not a DNS-cache failure. The casting
+explicitly overrides `ingester.spec.config.data.opamp.yaml` with the app hostname.
+It also declares app-health ordering with `restart: true` for Compose-controlled
 updates. A container-running result alone is insufficient ingestion evidence.
 
 The histogram helper's two Linux archives independently matched the upstream
