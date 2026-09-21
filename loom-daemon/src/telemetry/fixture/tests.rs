@@ -19,7 +19,7 @@ fn replay_is_byte_stable_but_new_trials_do_not_collide() {
     assert_ne!(a.manifest["spans"][0]["trace_id"], c.manifest["spans"][0]["trace_id"]);
     assert_eq!(
         a.manifest["expected_distinct"],
-        json!({"spans":35,"logs":14,"metric_data_points":3})
+        json!({"spans":37,"logs":14,"metric_data_points":3})
     );
     assert!(build("../unsafe", "2026-09-21T12:00:00Z".parse().unwrap()).is_err());
 }
@@ -44,13 +44,32 @@ fn graph_separates_repair_attempts_repos_and_intentionally_missing_root() {
         .find(|s| s["name"] == "crash_incomplete")
         .unwrap();
     assert_eq!(crash["root_exported"], false);
+    assert!(crash["model_launch_expected"].is_null());
     let spans = bundle.manifest["spans"].as_array().unwrap();
     assert!(!spans.iter().any(|s| s["span_id"] == crash["root_span_id"]));
     let ids: BTreeSet<_> = spans
         .iter()
         .map(|s| s["span_id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids.len(), 35);
+    assert_eq!(ids.len(), 37);
+    for (index, expected) in [(1, "1"), (3, "2")] {
+        let judge = spans
+            .iter()
+            .find(|s| s["span_id"] == repair["phases"][index]["span_id"])
+            .unwrap();
+        assert_eq!(judge["attributes"]["loom.attempt"], expected);
+    }
+    let tool = spans.iter().find(|s| s["name"] == "loom.tool").unwrap();
+    let runtime = spans
+        .iter()
+        .find(|s| s["span_id"] == tool["parent_span_id"])
+        .unwrap();
+    assert_eq!(runtime["name"], "loom.runtime.run");
+    let attempt = spans
+        .iter()
+        .find(|s| s["span_id"] == runtime["parent_span_id"])
+        .unwrap();
+    assert_eq!(attempt["name"], "loom.role_attempt");
     for span in spans {
         if let Some(parent) = span["parent_span_id"].as_str() {
             assert!(ids.contains(parent) || parent == crash["root_span_id"].as_str().unwrap());

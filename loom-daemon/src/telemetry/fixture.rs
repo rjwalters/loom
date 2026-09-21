@@ -172,7 +172,7 @@ pub fn build(run_id: &str, start: DateTime<Utc>) -> Result<FixtureBundle> {
         envelopes: vec![],
         manifest: json!({
             "schema_version":1,"synthetic":true,"run_id":run_id,"host_id":host,
-            "resource_attributes":{"service.name":"loom-daemon","host.id":host},
+            "resource_attributes":{"service.name":"loom-daemon","service.instance.id":host,"host.id":host},
             "start_time":start,"sampling":"all","backend_verification":"not_performed",
             "identity_policy":"same run-id and start-time replay identical envelopes; change run-id for a distinct trial",
             "log_identity_fields":["host.id","trace_id","span_id","time_unix_nano","event_name"],
@@ -187,7 +187,11 @@ pub fn build(run_id: &str, start: DateTime<Utc>) -> Result<FixtureBundle> {
         let root = context(run_id, scenario.name, "root")?;
         let sweep_id = format!("synthetic-{run_id}-{}", scenario.name);
         let mut phases = vec![];
+        let mut attempts = std::collections::BTreeMap::new();
         for (index, (phase, result)) in scenario.phases.iter().enumerate() {
+            let attempt = attempts.entry(*phase).or_insert(0_usize);
+            *attempt += 1;
+            let attempt = *attempt;
             let at = start + Duration::seconds(10 * i64::try_from(index)?);
             let end = at + Duration::seconds(8);
             let ctx = context(run_id, scenario.name, &format!("attempt-{index}"))?;
@@ -206,12 +210,12 @@ pub fn build(run_id: &str, start: DateTime<Utc>) -> Result<FixtureBundle> {
                     } else {
                         SpanStatus::Error
                     },
-                    attributes: attributes(scenario, phase, result, index + 1),
+                    attributes: attributes(scenario, phase, result, attempt),
                     events: vec![],
                     links: vec![],
                 },
             )?;
-            let mut attrs = attributes(scenario, phase, result, index + 1);
+            let mut attrs = attributes(scenario, phase, result, attempt);
             attrs.insert("loom.sweep_id".into(), sweep_id.clone());
             // A harmless synthetic privacy probe must be removed by the OTLP
             // attribute allowlist. It is deliberately visible only in input.
@@ -239,6 +243,41 @@ pub fn build(run_id: &str, start: DateTime<Utc>) -> Result<FixtureBundle> {
                     links: vec![],
                 },
             )?;
+            if scenario.name == "success" && *phase == "builder" {
+                let runtime = context(run_id, scenario.name, "runtime-builder")?;
+                push_span(
+                    &mut bundle,
+                    &host,
+                    SpanRecord {
+                        context: runtime.clone(),
+                        parent_span_id: Some(ctx.span_id.clone()),
+                        name: SpanName::RuntimeRun,
+                        started_at: at + Duration::seconds(1),
+                        ended_at: at + Duration::seconds(7),
+                        status: SpanStatus::Ok,
+                        attributes: attributes(scenario, phase, result, attempt),
+                        events: vec![],
+                        links: vec![],
+                    },
+                )?;
+                let mut tool_attrs = attributes(scenario, phase, result, attempt);
+                tool_attrs.insert("loom.tool.name".into(), "synthetic-owned-tool".into());
+                push_span(
+                    &mut bundle,
+                    &host,
+                    SpanRecord {
+                        context: context(run_id, scenario.name, "owned-tool-builder")?,
+                        parent_span_id: Some(runtime.span_id),
+                        name: SpanName::Tool,
+                        started_at: at + Duration::seconds(2),
+                        ended_at: at + Duration::seconds(3),
+                        status: SpanStatus::Ok,
+                        attributes: tool_attrs,
+                        events: vec![],
+                        links: vec![],
+                    },
+                )?;
+            }
             let mut log = envelope(
                 &host,
                 at,
@@ -287,7 +326,7 @@ pub fn build(run_id: &str, start: DateTime<Utc>) -> Result<FixtureBundle> {
             "name":scenario.name,"repo":scenario.repo,"issue":18,"trace_id":root.trace_id,
             "root_span_id":root.span_id,"root_exported":scenario.terminal.is_some(),
             "terminal_result":scenario.terminal,"phases":phases,
-            "model_launch_expected":scenario.name != "preflight_rejection",
+            "model_launch_expected":if scenario.name == "crash_incomplete" { None } else { Some(scenario.name != "preflight_rejection") },
             "note":if scenario.terminal.is_none() {"Missing root ending is intentional; never infer success or fabricate its span."} else {"Synthetic expected graph, not an observed execution."},
         }));
     }

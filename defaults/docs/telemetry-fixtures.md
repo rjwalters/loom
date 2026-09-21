@@ -15,8 +15,8 @@ overwrites a trial. It publishes `manifest.json` last; an interrupted directory
 without that file is incomplete. The exporter needs an OTLP-enabled binary and
 an explicitly configured Collector. Generation itself works without OTLP.
 
-Choose a timestamp inside the backend retention and query windows. The default
-is a fixed historical anchor, not the current time. Identical run ID and anchor
+Choose the required timestamp inside the backend retention and query windows.
+There is no historical default. Identical run ID and anchor
 produce identical input bytes; repeating them tests duplicate delivery. Use a
 new run ID for a distinct trial. IDs include the run and scenario, so issue 18
 in two repositories cannot cross-parent. The host resource also contains the
@@ -24,7 +24,7 @@ run ID, allowing backend queries to isolate the trial.
 
 ## Expected dataset
 
-The version-1 manifest describes **35 spans, 14 correlated logs, and 3 metric
+The version-1 manifest describes **37 spans, 14 correlated logs, and 3 metric
 data points**. These are expected distinct identities, not accepted issues or
 observed backend counts. Delivery remains at least once.
 
@@ -37,9 +37,12 @@ observed backend counts. Delivery remains at least once.
 | Timeout | Explicit timeout outcome |
 | Crash/incomplete | Completed preflight child with an intentionally absent root ending |
 | Concurrent repositories | Overlapping timestamps and the same issue number, distinct trace IDs |
-| Usage | Observed `0.0` is present; unknown usage has no data point |
+| Token-pool usage | Observed `0.0` is present; unknown usage has no data point |
 
-The graph nests attempts under phases under a sweep. Logs use actual OTLP trace
+The graph nests attempts under phases under a sweep, including a synthetic
+runtime and owned-tool span under the successful Builder. Attempt numbers are
+per role; the repaired Judge has attempts 1 and 2. Crash-time model launch is
+unknown, not inferred from a completed preflight. Logs use actual OTLP trace
 and span fields, not merely string attributes. A log's stable identity is the
 manifest's resource host, trace ID, span ID, event type and timestamp tuple;
 there is no invented provider event ID. Span timestamps/statuses, parent IDs,
@@ -69,6 +72,7 @@ unauthorized viewers and whether retention actually removes old records.
 `backend_verification: not_performed` and the manifest's `unproven` list are
 deliberate. These inputs do not demonstrate real process crash/adoption,
 instrumentation correctness, two-way outage isolation, Collector restart,
-buffer saturation, UI usability, or paid inference cost. Those require the live
+buffer saturation, UI usability, per-attempt inference usage, or paid inference
+cost. Those require the live
 trial protocol and a measured report. Never replace these gaps with a product
 winner or a claim that the comparison issue is complete.

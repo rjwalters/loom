@@ -14,7 +14,7 @@ pub(crate) struct FixtureArgs {
     #[arg(long)]
     run_id: String,
     /// Fixed RFC3339 anchor. Set inside the backend's query/retention window.
-    #[arg(long, default_value = "2026-09-21T12:00:00Z")]
+    #[arg(long)]
     start_time: DateTime<Utc>,
 }
 
