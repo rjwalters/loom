@@ -109,5 +109,6 @@ source "$SCRIPT_DIR/lib/script-helper.sh"
 # Guarded so `source`ing this file is a no-op: a stub that exec'd on source
 # would replace the sourcing shell and run the subcommand with ITS arguments.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # requires-daemon: dep-recheck-fingerprint >= 0.19.104   #7961/#7969 — the Rust port added loom-daemon/src/cli/dep_recheck.rs in 71d1fbae3, merged when VERSION read 0.19.103 (so 0.19.103 is the last version WITHOUT it); the post-merge bump that first shipped it was 0.19.104 (d3ea1a822). Hard, not `optional`: curator.md `eval`s this output, so there is nothing to degrade to. The refusal exits LOOM_SCRIPT_HELPER_MISSING_RC=2 set above, never 1 — 1 MEANS "unreadable issue/PR, fail safe" here (#8484).
     loom_exec_script_helper dep-recheck-fingerprint "$@"
 fi
