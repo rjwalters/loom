@@ -656,7 +656,7 @@ mod tests {
     fn plan_prune_separates_stale_from_fresh_and_reports_accurate_bytes() {
         let candidates = vec![
             candidate("old-incr", EntryKind::IncrementalSession, 10 * 86_400, 100),
-            candidate("new-incr", EntryKind::IncrementalSession, 1 * 86_400, 200),
+            candidate("new-incr", EntryKind::IncrementalSession, 86_400, 200),
             candidate("old-deps", EntryKind::DepsFile, 8 * 86_400, 50),
             candidate("new-deps", EntryKind::DepsFile, 2 * 86_400, 400),
         ];
@@ -690,11 +690,11 @@ mod tests {
         // A fresh session for the same crate.
         touch_with_mtime(
             &root.join("debug/incremental/loom_daemon-abc/s-new-working/dep-graph.bin"),
-            -1 * 86_400,
+            -86_400,
         );
         // deps/ files, mixed age.
         touch_with_mtime(&root.join("debug/deps/libfoo-old.rlib"), -9 * 86_400);
-        touch_with_mtime(&root.join("debug/deps/libfoo-new.rlib"), -1 * 86_400);
+        touch_with_mtime(&root.join("debug/deps/libfoo-new.rlib"), -86_400);
 
         let scanned = scan(root).unwrap();
         // 2 incremental session dirs + 2 deps files.
@@ -832,7 +832,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         touch_with_mtime(&root.join("debug/incremental/c-abc/s-old-working/x.bin"), -10 * 86_400);
-        touch_with_mtime(&root.join("debug/incremental/c-abc/s-new-working/x.bin"), -1 * 86_400);
+        touch_with_mtime(&root.join("debug/incremental/c-abc/s-new-working/x.bin"), -86_400);
 
         let report = run(root, 7, false, t(0));
         assert!(!report.dry_run);
