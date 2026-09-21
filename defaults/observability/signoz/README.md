@@ -51,8 +51,15 @@ Keeper 256 MiB each), plus 768 MiB for transient initialization/migration.
 These are trial limits, not capacity claims. Check `evidence.md` for observations.
 
 Before rendering Compose configuration or starting services, create a private
-mode-0600 env file outside the checkout containing
-`SIGNOZ_TOKENIZER_JWT_SECRET=<independent random session-signing secret>`.
+mode-0600 env file outside every checkout containing
+`SIGNOZ_TOKENIZER_JWT_SECRET=<independent random session-signing secret>` and
+`SIGNOZ_POSTGRES_PASSWORD=<independent random hexadecimal database password>`.
+Use a hexadecimal database password so its raw interpolation is URL-safe.
+Foundry escapes userinfo placeholders; an asserted declarative patch restores
+Compose interpolation in the generated application DSN. Neither the casting,
+lock nor rendered files contain actual credentials. Missing either value fails
+Compose validation. Never place private env files, browser state or token/session
+responses in a repository, including ignored paths or managed worktrees.
 Keep this stable across restarts and include it in private backups. Missing it
 fails Compose interpolation rather than starting with an empty signing secret.
 Full `docker compose config` would expose it: use `config --quiet`.
@@ -71,8 +78,12 @@ exporter for `http://signoz-otel-collector:4318` without an ingestion header.
 This follows self-hosted SigNoz's unauthenticated private receiver convention.
 The neutral gateway authenticates Loom. Trust containers attached to the shared
 network and administrators of the host/Docker socket. The generated private
-PostgreSQL account uses upstream's local `signoz` credentials; it is not an
-Internet-facing credential or a production hardening recipe. No provider key,
+PostgreSQL account is named `signoz` and requires the external password above.
+For an existing volume, changing the env file alone does not rotate PostgreSQL:
+change the owned database role password first through a private administrative
+connection, then update the app and database together with the matching env file.
+Keep password values out of command arguments, output and SQL/query logs.
+This is not a production hardening recipe. No provider key,
 including `ZAI_API_KEY`, belongs in this deployment.
 
 ```console

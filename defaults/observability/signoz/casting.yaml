@@ -39,9 +39,19 @@ spec:
     spec:
       version: "16"
       image: postgres:16@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6
+      env:
+        POSTGRES_PASSWORD: "${SIGNOZ_POSTGRES_PASSWORD:?set a private database password}"
   patches:
     - target: deployment/compose.yaml
       operations:
+        # Foundry URL-escapes userinfo, including Compose placeholders. Keep the
+        # password external and assert the pinned render before replacing it.
+        - op: test
+          path: /services/loom-signoz-signoz-0/environment/2
+          value: "SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:$%7BSIGNOZ_POSTGRES_PASSWORD%3A%3Fset%20a%20private%20database%20password%7D@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable"
+        - op: replace
+          path: /services/loom-signoz-signoz-0/environment/2
+          value: "SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:${SIGNOZ_POSTGRES_PASSWORD:?set a private database password}@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable"
         - op: add
           path: /networks/loom-observability
           value:

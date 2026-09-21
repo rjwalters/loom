@@ -317,7 +317,7 @@ spec:
       enabled: true
       env:
         POSTGRES_DB: signoz
-        POSTGRES_PASSWORD: signoz
+        POSTGRES_PASSWORD: ${SIGNOZ_POSTGRES_PASSWORD:?set a private database password}
         POSTGRES_USER: signoz
       image: postgres:16@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6
       version: "16"
@@ -328,10 +328,17 @@ spec:
       config: {}
       env:
         POSTGRES_DB: signoz
-        POSTGRES_PASSWORD: signoz
+        POSTGRES_PASSWORD: ${SIGNOZ_POSTGRES_PASSWORD:?set a private database password}
         POSTGRES_USER: signoz
   patches:
   - operations:
+    - op: test
+      path: /services/loom-signoz-signoz-0/environment/2
+      value: SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:$%7BSIGNOZ_POSTGRES_PASSWORD%3A%3Fset%20a%20private%20database%20password%7D@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
+    - op: replace
+      path: /services/loom-signoz-signoz-0/environment/2
+      value: SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:${SIGNOZ_POSTGRES_PASSWORD:?set
+        a private database password}@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
     - op: add
       path: /networks/loom-observability
       value:
@@ -496,7 +503,7 @@ spec:
       env:
         SIGNOZ_ANALYTICS_ENABLED: "false"
         SIGNOZ_PROMETHEUS_ACTIVE__QUERY__TRACKER_PATH: /tmp/signoz-active-queries
-        SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://signoz:signoz@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
+        SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://signoz:$%7BSIGNOZ_POSTGRES_PASSWORD%3A%3Fset%20a%20private%20database%20password%7D@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
         SIGNOZ_SQLSTORE_PROVIDER: postgres
         SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
         SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
@@ -524,7 +531,7 @@ spec:
       env:
         SIGNOZ_ANALYTICS_ENABLED: "false"
         SIGNOZ_PROMETHEUS_ACTIVE__QUERY__TRACKER_PATH: /tmp/signoz-active-queries
-        SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://signoz:signoz@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
+        SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://signoz:$%7BSIGNOZ_POSTGRES_PASSWORD%3A%3Fset%20a%20private%20database%20password%7D@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
         SIGNOZ_SQLSTORE_PROVIDER: postgres
         SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
         SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse

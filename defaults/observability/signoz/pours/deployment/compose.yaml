@@ -49,7 +49,7 @@ services:
     cpus: 0.5
     environment:
     - POSTGRES_DB=signoz
-    - POSTGRES_PASSWORD=signoz
+    - POSTGRES_PASSWORD=${SIGNOZ_POSTGRES_PASSWORD:?set a private database password}
     - POSTGRES_USER=signoz
     healthcheck:
       interval: 30s
@@ -82,7 +82,8 @@ services:
     environment:
     - SIGNOZ_ANALYTICS_ENABLED=false
     - SIGNOZ_PROMETHEUS_ACTIVE__QUERY__TRACKER_PATH=/tmp/signoz-active-queries
-    - SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:signoz@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
+    - SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:${SIGNOZ_POSTGRES_PASSWORD:?set
+      a private database password}@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
     - SIGNOZ_SQLSTORE_PROVIDER=postgres
     - SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN=tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
     - SIGNOZ_TELEMETRYSTORE_PROVIDER=clickhouse

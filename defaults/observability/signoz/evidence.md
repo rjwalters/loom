@@ -104,6 +104,23 @@ This verifies receiver recovery and preserves honest duplicate accounting; a
 gateway HTTP success alone was not used as the delivery criterion. This was a
 normal stop/start, not a volume-loss backup restoration or crash-recovery test.
 
+The later machine-credential audit externalized PostgreSQL's initially upstream-
+default password. Only this trial's database role was rotated, through private
+stdin; both the database environment and app DSN were checked against the private
+machine key using boolean-only output. Foundry percent-encodes placeholders in
+DSNs, so the casting asserts the pinned generated value before replacing it with
+Compose interpolation. Missing database credentials now fail configuration.
+After app/database recreation, health and the existing account login succeeded;
+the **8/4 span rows/unique spans, 2 logs and 2 gauges (value 3)** remained intact.
+Private credential/session files live outside every checkout with mode 0600.
+
+Attempting to keep both local backends running during this rotation made their
+health probes time out under host contention, without OOM flags. Stopping only
+the owned ClickStack restored SigNoz readiness. This is a deployment-capacity
+limitation of the occupied trial host, not an ingest-latency result. Volumes are
+preserved for sequential checks; the intended permanent Cloud destinations need
+separate endpoint/credential configuration before any live comparison.
+
 ## Acceptance ledger
 
 | Check | Status |
