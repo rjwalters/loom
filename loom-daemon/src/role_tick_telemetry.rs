@@ -128,17 +128,26 @@ pub fn classify(outcome: &RoleTickOutcome) -> (RoleTickResult, Option<String>) {
         // #8408: the tag names the pool that was read (`pool-exhausted` is the
         // Claude pool's pre-#8408 literal); the machine-readable form is the
         // record's `gated_pool` key, projected by `RoleTickOutcome::gated_pool`.
+        // #8444: a permanent hold (nothing provisioned, unreadable pool
+        // state) carries the same stable, timestamp-free tail the in-memory
+        // ring uses, so a consumer reading the durable records sees the same
+        // "identical every tick" shape the stuck-role streak is built on.
         RoleTickOutcome::PoolExhausted {
             total,
             next_clear_at,
             pool,
+            hold,
         } => (
             RoleTickResult::SkippedPoolExhausted,
-            Some(format!(
-                "{}: 0/{total} spawnable; next check ~{}",
-                pool.detail_tag(),
-                next_clear_at.to_rfc3339()
-            )),
+            Some(if hold.is_self_healing() {
+                format!(
+                    "{}: 0/{total} spawnable; next check ~{}",
+                    pool.detail_tag(),
+                    next_clear_at.to_rfc3339()
+                )
+            } else {
+                format!("{}: {}", pool.detail_tag(), hold.detail_suffix())
+            }),
         ),
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => {
             (RoleTickResult::SkippedModelRuntimeMismatch, Some(mismatch.detail()))

@@ -746,28 +746,20 @@ pub fn record_role_tick_at(
         RoleTickOutcome::NoTokenPool => (false, Some("no-token-pool".to_string())),
         // #7607: recorded as NOT ok, same as `NoTokenPool` — a role that
         // cannot run at all is exactly what a health check must surface —
-        // but the `RoleTickRecord::pool_exhausted` flag set below routes it
-        // into `crate::health::RoleTickSummary::pool_exhausted` instead of
-        // `persistent`, so it is never counted as (or mistaken for) an
-        // ordinary role failure. The
-        // detail is deliberately volatile (spawnable/total counts and the
-        // next-clear estimate change every tick) — unlike `NoTokenPool`'s
-        // fixed sentinel, this means it never accidentally builds an
-        // escalation streak (`consecutive_identical_failures` below), which
-        // is correct: pool exhaustion is expected to self-heal, not a
-        // config-shaped defect that "can never succeed as configured".
-        RoleTickOutcome::PoolExhausted {
-            total,
-            next_clear_at,
-            pool,
-        } => (
-            false,
-            Some(format!(
-                "{}: 0/{total} spawnable, next check ~{}",
-                pool.detail_tag(),
-                next_clear_at.to_rfc3339()
-            )),
-        ),
+        // but the `RoleTickRecord::pool_exhausted` flag set below routes a
+        // SELF-HEALING hold into `crate::health::RoleTickSummary::
+        // pool_exhausted` instead of `persistent`, so it is never counted as
+        // (or mistaken for) an ordinary role failure. That hold's detail is
+        // deliberately volatile (spawnable/total counts and the next-clear
+        // estimate change every tick) — unlike `NoTokenPool`'s fixed
+        // sentinel, this means it never accidentally builds an escalation
+        // streak (`consecutive_identical_failures` below), which is correct:
+        // pool exhaustion is expected to self-heal, not a config-shaped
+        // defect that "can never succeed as configured". A PERMANENT hold
+        // (#8444: nothing provisioned, or unreadable pool state) is the
+        // config-shaped defect, and gets the opposite of both treatments —
+        // see `RoleTickOutcome::pool_exhausted_detail`.
+        RoleTickOutcome::PoolExhausted { .. } => (false, Some(outcome.pool_exhausted_detail())),
         // #5028: same reasoning as `NoTokenPool` — a permanent config
         // conflict is exactly what a health check must surface, and the
         // operator-facing `detail()` names the broken config key directly
@@ -784,9 +776,11 @@ pub fn record_role_tick_at(
             detail,
         } => (true, Some(format!("load-skipped (load/core {load_per_core:.2}): {detail}"))),
     };
-    // #7607: distinguishes a `PoolExhausted` skip from every other
-    // not-ok outcome — see `RoleTickRecord::pool_exhausted`'s doc comment.
-    let pool_exhausted = matches!(outcome, RoleTickOutcome::PoolExhausted { .. });
+    // #7607: distinguishes a `PoolExhausted` skip from every other not-ok
+    // outcome — see `RoleTickRecord::pool_exhausted`'s doc comment. #8444:
+    // only the SELF-HEALING hold; the two permanent ones stay on the
+    // persistent/escalatable path, where a `NoTokenPool` already sits.
+    let pool_exhausted = outcome.self_healing_pool_hold();
     let mut ring = role_tick_ring()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
@@ -3827,14 +3821,10 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
                  .loom/docs/token-pool.md, #4642)"
             );
         }
-        RoleTickOutcome::PoolExhausted {
-            total,
-            next_clear_at,
-            pool,
-        } => {
+        RoleTickOutcome::PoolExhausted { next_clear_at, .. } => {
             log::warn!(
                 "role_runner: {role} tick skipped after {elapsed:.1?} — {}; next check ~{} (#7607)",
-                pool.exhausted_phrase(*total),
+                outcome.pool_hold_phrase(),
                 next_clear_at.to_rfc3339()
             );
         }
@@ -3900,15 +3890,11 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
              .loom/docs/token-pool.md, #4642)",
             root.display()
         ),
-        RoleTickOutcome::PoolExhausted {
-            total,
-            next_clear_at,
-            pool,
-        } => log::warn!(
+        RoleTickOutcome::PoolExhausted { next_clear_at, .. } => log::warn!(
             "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {}; next check ~{} \
              (#7607)",
             root.display(),
-            pool.exhausted_phrase(*total),
+            outcome.pool_hold_phrase(),
             next_clear_at.to_rfc3339()
         ),
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => log::warn!(
@@ -4193,28 +4179,27 @@ fn log_outcome_for_root_deduped(
             );
         }
         RootTickLogAction::PoolExhaustedEdge => {
-            if let RoleTickOutcome::PoolExhausted {
-                total,
-                next_clear_at,
-                pool,
-            } = outcome
-            {
+            if let RoleTickOutcome::PoolExhausted { next_clear_at, .. } = outcome {
                 log::warn!(
                     "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {}; next \
                      check ~{} (further identical skips for this root are logged at DEBUG until \
                      the pool regains capacity, #7607)",
                     root.display(),
-                    pool.exhausted_phrase(*total),
+                    outcome.pool_hold_phrase(),
                     next_clear_at.to_rfc3339()
                 );
             }
         }
+        // #8444: the clause names the pool that was actually gated (a codex
+        // skip no longer reports "token pool") and the hold it is still
+        // under — see `CredentialPool::repeat_phrase`.
         RootTickLogAction::PoolExhaustedRepeat => {
             log::debug!(
-                "role_runner: {role} tick for {} skipped again after {elapsed:.1?} — token pool \
-                 still exhausted (repeat of an already-logged skip; not re-warned every tick — \
-                 see the skip-edge WARN above, #7607)",
-                root.display()
+                "role_runner: {role} tick for {} skipped again after {elapsed:.1?} — {} (repeat \
+                 of an already-logged skip; not re-warned every tick — see the skip-edge WARN \
+                 above, #7607)",
+                root.display(),
+                outcome.pool_repeat_phrase()
             );
         }
         RootTickLogAction::ModelMismatchEdge => {
@@ -4262,7 +4247,7 @@ fn log_outcome_for_root_deduped(
 
 // The per-invocation result type (#8056) — see `role_runner/outcome.rs`.
 mod outcome;
-pub use outcome::{CredentialPool, RoleTickOutcome};
+pub use outcome::{CredentialPool, PoolHold, PoolStateFile, RoleTickOutcome};
 
 // Failure-sentinel classification for a role's `role-<role>.log` (issues
 // #6757, #8123) — see `role_runner/failure_sentinel.rs`.

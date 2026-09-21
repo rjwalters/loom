@@ -184,11 +184,17 @@ fn codex_pinned_role_with_no_codex_account_skips_naming_the_codex_pool() {
     let before = pool_exhausted_skip_count();
     let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
 
-    let RoleTickOutcome::PoolExhausted { total, pool, .. } = outcome else {
+    let RoleTickOutcome::PoolExhausted {
+        total, pool, hold, ..
+    } = outcome
+    else {
         panic!("expected PoolExhausted, got {outcome:?}");
     };
     assert_eq!(pool, CredentialPool::CodexAccounts);
     assert_eq!(total, 0);
+    // #8444: an unprovisioned pool can never clear on its own, so it must not
+    // be reported as the self-healing hold.
+    assert_eq!(hold, PoolHold::Unprovisioned);
     assert!(!marker.exists(), "the doomed spawn must never run");
     assert_eq!(pool_exhausted_skip_count(), before + 1);
 
@@ -241,11 +247,16 @@ fn codex_pinned_role_skips_while_every_account_is_held_then_recovers() {
         total,
         pool,
         next_clear_at,
+        hold,
     } = outcome
     else {
         panic!("expected PoolExhausted, got {outcome:?}");
     };
     assert_eq!((total, pool), (2, CredentialPool::CodexAccounts));
+    // #8444: cooldowns/re-auth holds ARE the self-healing case — the one this
+    // variant was written for, and the only one kept out of the escalation
+    // path.
+    assert_eq!(hold, PoolHold::SelfHealing);
     assert!(next_clear_at <= chrono::Utc::now() + chrono::Duration::seconds(901));
     assert!(!marker.exists());
     assert!(
@@ -329,8 +340,8 @@ fn codex_pool_state_counts_only_holds_the_selector_cannot_release() {
     assert!(state.earliest_clear.is_some_and(|deadline| deadline > now), "{state:?}");
 }
 
-/// An unreadable health state is the one fail-closed case — the selector
-/// reads the same file and exits 78 on it — and the skip says why.
+/// An unreadable health state is one of the two fail-closed cases — the
+/// selector reads the same file and exits 78 on it — and the skip says why.
 #[test]
 #[serial]
 fn codex_pool_state_fails_closed_on_an_unreadable_health_state() {
@@ -343,7 +354,217 @@ fn codex_pool_state_fails_closed_on_an_unreadable_health_state() {
 
     let state = codex_pool_state(workspace.path(), epoch_now());
     assert_eq!((state.enabled, state.spawnable), (1, 0));
-    assert!(state.read_error.is_some(), "{state:?}");
+    // #8444: the read error names the file that failed, so the skip text
+    // cannot blame the inventory for a health-state parse error.
+    let (file, error) = state.read_error.clone().expect("a read error");
+    assert_eq!(file, PoolStateFile::HealthState);
+    assert!(error.contains("account-health.json"), "{error}");
+}
+
+/// The other fail-closed case (#8444): the **inventory** itself is malformed.
+/// `spawn-codex.sh`'s selector reads the same `.loom/accounts.json` through
+/// the same reader and exits 78 on it, so the gate must skip — and must say
+/// which file to repair, through `invoke()`, not just at the state-reader
+/// level. The pool reads as 0 enabled because nothing could be enumerated.
+#[test]
+#[serial]
+fn codex_pinned_role_fails_closed_on_a_malformed_account_inventory() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+    fs::write(workspace.path().join(".loom/accounts.json"), "{not json").unwrap();
+
+    let state = codex_pool_state(workspace.path(), epoch_now());
+    let (file, _) = state.read_error.clone().expect("a read error");
+    assert_eq!(file, PoolStateFile::Inventory);
+    assert_eq!((state.enabled, state.spawnable), (0, 0), "{state:?}");
+
+    let before = pool_exhausted_skip_count();
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    let RoleTickOutcome::PoolExhausted { pool, hold, .. } = outcome else {
+        panic!("expected PoolExhausted, got {outcome:?}");
+    };
+    assert_eq!(pool, CredentialPool::CodexAccounts, "#8444: gated_pool stays the codex pool");
+    assert_eq!(hold, PoolHold::Unreadable(PoolStateFile::Inventory));
+    assert!(!marker.exists(), "a launch the selector would kill must never run");
+    assert_eq!(pool_exhausted_skip_count(), before + 1);
+
+    let log = judge_log(workspace.path());
+    assert!(
+        log.contains("the account inventory (.loom/accounts.json) could not be read"),
+        "{log}"
+    );
+    assert!(!log.contains("account-health.json"), "must not blame the health state: {log}");
+}
+
+/// The health-state half of the same claim, through `invoke()`: the skip text
+/// names `account-health.json` — never the inventory, which read fine.
+#[test]
+#[serial]
+fn codex_pinned_role_skip_text_names_the_health_state_when_that_is_what_failed() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+    fs::write(workspace.path().join(".loom/account-health.json"), "{not json").unwrap();
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let RoleTickOutcome::PoolExhausted { total, hold, .. } = outcome else {
+        panic!("expected PoolExhausted, got {outcome:?}");
+    };
+    assert_eq!(hold, PoolHold::Unreadable(PoolStateFile::HealthState));
+    assert_eq!(total, 1, "the inventory read fine, so its count is still reported");
+    assert!(!marker.exists());
+
+    let log = judge_log(workspace.path());
+    assert!(
+        log.contains("the account health state (.loom/account-health.json) could not be read"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("the account inventory (.loom/accounts.json) could not be read"),
+        "must not blame the inventory: {log}"
+    );
+}
+
+/// #8444 AC1/AC2: the two permanent holds must reach the stuck-role /
+/// escalation path, which is built on a byte-identical `detail` repeating
+/// tick after tick. So their detail carries no timestamp and no moving count
+/// — asserted by recording the same outcome twice, a simulated second apart,
+/// and requiring the two details to be equal; the self-healing hold's detail
+/// (deliberately volatile) must NOT be.
+#[test]
+fn a_permanent_pool_hold_has_a_stable_detail_and_a_self_healing_one_does_not() {
+    let at = chrono::Utc::now();
+    let detail = |hold, next_clear_at| {
+        RoleTickOutcome::PoolExhausted {
+            total: 0,
+            next_clear_at,
+            pool: CredentialPool::CodexAccounts,
+            hold,
+        }
+        .pool_exhausted_detail()
+    };
+    let later = at + chrono::Duration::seconds(1);
+    for hold in [
+        PoolHold::Unprovisioned,
+        PoolHold::Unreadable(PoolStateFile::Inventory),
+        PoolHold::Unreadable(PoolStateFile::HealthState),
+    ] {
+        assert_eq!(detail(hold, at), detail(hold, later), "{hold:?} must be stable");
+        assert!(!hold.is_self_healing(), "{hold:?}");
+    }
+    assert_ne!(
+        detail(PoolHold::SelfHealing, at),
+        detail(PoolHold::SelfHealing, later),
+        "the self-healing detail stays volatile, so it can never build a streak"
+    );
+    assert!(detail(PoolHold::Unprovisioned, at).starts_with("codex-account-pool-exhausted: "));
+}
+
+/// The same split, at the routing layer: only a self-healing hold belongs in
+/// `health::RoleTickSummary::pool_exhausted`'s disjoint bucket (#7607). The
+/// permanent ones fall through to `persistent`, where an identical-detail
+/// streak becomes an escalation — the behaviour `NoTokenPool` already had.
+#[test]
+fn only_a_self_healing_hold_is_routed_to_the_disjoint_pool_exhausted_bucket() {
+    let exhausted = |hold| RoleTickOutcome::PoolExhausted {
+        total: 0,
+        next_clear_at: chrono::Utc::now(),
+        pool: CredentialPool::CodexAccounts,
+        hold,
+    };
+    assert!(exhausted(PoolHold::SelfHealing).self_healing_pool_hold());
+    assert!(!exhausted(PoolHold::Unprovisioned).self_healing_pool_hold());
+    assert!(!exhausted(PoolHold::Unreadable(PoolStateFile::HealthState)).self_healing_pool_hold());
+    assert!(!RoleTickOutcome::NoTokenPool.self_healing_pool_hold());
+    assert!(!RoleTickOutcome::Success.self_healing_pool_hold());
+    // Whatever the hold, the skip still names the pool it read.
+    for hold in [PoolHold::SelfHealing, PoolHold::Unprovisioned] {
+        assert_eq!(exhausted(hold).gated_pool(), Some("codex_accounts"));
+    }
+}
+
+/// #8444 AC1 end to end: a codex-pinned role on a host with zero enabled
+/// codex accounts reaches the **escalation path**, exactly as the Claude
+/// pool's permanent `NoTokenPool` state does — it builds the byte-identical
+/// streak `health::assess_role_liveness` reads as a STUCK role, and lands in
+/// `summarize_role_ticks`'s `persistent`/`escalated` lists rather than the
+/// disjoint self-healing `pool_exhausted` bucket. The self-healing hold is
+/// the control: same variant, same pool, opposite routing.
+#[test]
+#[serial(role_tick_ring)]
+fn a_permanently_empty_codex_pool_escalates_while_a_cooldown_hold_does_not() {
+    let at = chrono::Utc::now();
+    let tick = |hold, i: i64| RoleTickOutcome::PoolExhausted {
+        total: 0,
+        // Moves every tick — the self-healing detail's volatility comes from
+        // here, and a permanent hold's detail must ignore it.
+        next_clear_at: at + chrono::Duration::seconds(i),
+        pool: CredentialPool::CodexAccounts,
+        hold,
+    };
+    let threshold = i64::try_from(crate::health::ROLE_TICK_ESCALATION_THRESHOLD).unwrap();
+    let summarize = |root: &Path, hold| {
+        reset_role_tick_ring();
+        reset_last_role_tick_map();
+        for i in 0..threshold {
+            record_role_tick_at("judge", root, &tick(hold, i), at + chrono::Duration::seconds(i));
+        }
+        let streak = last_role_tick_snapshot()
+            .into_iter()
+            .find(|t| t.role == "judge" && t.root == root)
+            .expect("a recorded tick");
+        (streak, crate::health::summarize_role_ticks(&role_tick_records(), at))
+    };
+
+    let root = Path::new("/repo/unprovisioned");
+    let (streak, summary) = summarize(root, PoolHold::Unprovisioned);
+    assert!(!streak.ok);
+    assert_eq!(
+        streak.consecutive_identical_failures,
+        crate::health::ROLE_TICK_ESCALATION_THRESHOLD,
+        "a permanent hold must repeat byte-identically: {:?}",
+        streak.detail
+    );
+    assert_eq!(summary.pool_exhausted, vec![], "not the self-healing bucket");
+    assert_eq!(summary.persistent.len(), 1, "{summary:?}");
+    assert_eq!(summary.escalated.len(), 1, "{summary:?}");
+    assert!(summary.escalated[0]
+        .detail
+        .as_deref()
+        .is_some_and(|d| d.contains("codex-account-pool-exhausted")));
+
+    let root = Path::new("/repo/cooling");
+    let (streak, summary) = summarize(root, PoolHold::SelfHealing);
+    assert_eq!(
+        streak.consecutive_identical_failures, 1,
+        "the self-healing detail stays volatile, so no streak forms"
+    );
+    assert_eq!(summary.persistent, vec![], "{summary:?}");
+    assert_eq!(summary.escalated, vec![], "{summary:?}");
+    assert_eq!(summary.pool_exhausted.len(), 1, "{summary:?}");
+}
+
+/// The repeat-skip DEBUG line's clause (#8444): pool-aware, so a codex skip
+/// never reports "token pool", and hold-aware, so a pool that was never
+/// provisioned is not described as exhausted.
+#[test]
+fn the_repeat_skip_clause_names_the_gated_pool_and_its_hold() {
+    let claude = CredentialPool::ClaudeTokens.repeat_phrase(PoolHold::SelfHealing);
+    assert_eq!(claude, "token pool still exhausted");
+    let codex = CredentialPool::CodexAccounts.repeat_phrase(PoolHold::SelfHealing);
+    assert_eq!(codex, "codex account pool still exhausted");
+    let unprovisioned = CredentialPool::CodexAccounts.repeat_phrase(PoolHold::Unprovisioned);
+    assert!(!unprovisioned.contains("token pool"), "{unprovisioned}");
+    assert!(unprovisioned.contains("no account provisioned"), "{unprovisioned}");
+    let unreadable =
+        CredentialPool::CodexAccounts.repeat_phrase(PoolHold::Unreadable(PoolStateFile::Inventory));
+    assert!(unreadable.contains(".loom/accounts.json"), "{unreadable}");
 }
 
 /// An explicit profile pin means `spawn-codex.sh` never reaches the account
@@ -414,11 +635,13 @@ fn claude_runtime_pool_exhausted_skip_is_byte_identical() {
         total,
         next_clear_at,
         pool,
+        hold,
     } = outcome
     else {
         panic!("expected PoolExhausted, got {outcome:?}");
     };
     assert_eq!((total, pool), (1, CredentialPool::ClaudeTokens));
+    assert_eq!(hold, PoolHold::SelfHealing, "#8444: the Claude arm is only ever self-healing");
     assert!(!marker.exists());
     assert_eq!(pool_exhausted_skip_count(), before + 1);
 
@@ -462,6 +685,7 @@ fn gated_pool_names_the_pool_that_was_read() {
         total: 2,
         next_clear_at: at,
         pool,
+        hold: PoolHold::SelfHealing,
     };
     assert_eq!(exhausted(CredentialPool::ClaudeTokens).gated_pool(), Some("claude_tokens"));
     assert_eq!(exhausted(CredentialPool::CodexAccounts).gated_pool(), Some("codex_accounts"));
@@ -492,6 +716,7 @@ fn a_dry_codex_pool_never_feeds_the_sweep_dispatch_brake() {
         total: 3,
         next_clear_at: chrono::Utc::now(),
         pool,
+        hold: PoolHold::SelfHealing,
     };
 
     feed_pool_exhausted_observer(

@@ -536,7 +536,36 @@ fn discovered_codex_profiles(root: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(out)
 }
 
-fn codex_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
+/// Warn once per process that a registered Codex account has no profile
+/// directory on this host (Issue #8444).
+///
+/// The warning is real — a committed registry entry this host never
+/// provisioned is worth saying out loud once — but it sits on a read the
+/// daemon's pre-spawn codex gate performs on **every** role tick, which
+/// turned it into steady stderr noise (one line per unprovisioned entry, per
+/// tick, forever). Deduped on the `(name, reference)` pair, so a second
+/// registry entry still gets its own line and a re-provisioned account that
+/// later goes missing again is not re-announced within the same process.
+fn warn_unprovisioned_once(name: &str, credential_reference: &str, root: &Path) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    let key = (name.to_string(), credential_reference.to_string());
+    let first = WARNED
+        .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+        .lock()
+        .map_or(true, |mut seen| seen.insert(key));
+    if !first {
+        return;
+    }
+    eprintln!(
+        "WARNING Codex account {name:?} is registered but its profile directory \
+         {credential_reference:?} was not found under {}; this host has not provisioned it yet, \
+         skipping (further identical warnings are suppressed for the life of this process)",
+        root.display()
+    );
+}
+
+fn codex_inventory(workspace: &Path, quiet: bool) -> Result<Vec<AccountDescriptor>> {
     let root = codex_profile_root()
         .ok_or_else(|| anyhow!("Codex profile root is disabled by LOOM_CODEX_PROFILE_ROOT"))?;
     if let (Ok(root), Ok(workspace)) = (root.canonicalize(), workspace.canonicalize()) {
@@ -558,14 +587,13 @@ fn codex_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
                 Ok(directory) => directory,
                 Err(err) => {
                     if codex_directory_is_missing(&root, &entry.credential_reference) {
-                        eprintln!(
-                            "WARNING Codex account {:?} is registered but its profile \
-                             directory {:?} was not found under {}; this host has not \
-                             provisioned it yet, skipping",
-                            entry.name,
-                            entry.credential_reference,
-                            root.display()
-                        );
+                        if !quiet {
+                            warn_unprovisioned_once(
+                                &entry.name,
+                                &entry.credential_reference,
+                                &root,
+                            );
+                        }
                         continue;
                     }
                     // Anything else (invalid name, wrong type, escapes the
@@ -612,7 +640,25 @@ pub fn account_inventory(
 ) -> Result<Vec<AccountDescriptor>> {
     match provider {
         AccountProvider::Claude => claude_inventory(workspace),
-        AccountProvider::Codex => codex_inventory(workspace),
+        AccountProvider::Codex => codex_inventory(workspace, false),
+    }
+}
+
+/// [`account_inventory`], with the "registered but not provisioned on this
+/// host" stderr warning suppressed (Issue #8444).
+///
+/// The same inventory, byte for byte — this changes nothing but whether a
+/// skipped registry entry is announced. For callers on a polling path (the
+/// role runner's per-tick pre-spawn codex gate), where the warning is noise
+/// rather than news: the operator-facing surfaces (`accounts list`, account
+/// selection) keep the loud read.
+pub fn account_inventory_quiet(
+    workspace: &Path,
+    provider: AccountProvider,
+) -> Result<Vec<AccountDescriptor>> {
+    match provider {
+        AccountProvider::Claude => claude_inventory(workspace),
+        AccountProvider::Codex => codex_inventory(workspace, true),
     }
 }
 

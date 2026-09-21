@@ -607,6 +607,70 @@ fn empty_batch_produces_no_metrics_request() {
     assert!(build_metrics_request(&[]).is_none());
 }
 
+/// A `role_tick.outcome` envelope, parameterized on the two fields #8408's
+/// `gated_pool` attribute depends on.
+fn role_tick_outcome_envelope(
+    result: crate::telemetry::RoleTickResult,
+    gated_pool: Option<&str>,
+) -> TelemetryEnvelope {
+    envelope(
+        "host-a",
+        TelemetryRecord::RoleTickOutcome(crate::telemetry::RoleTickOutcomeRecord {
+            repo: "rjwalters/loom".to_string(),
+            visibility: RepoVisibility::Private,
+            role: "judge".to_string(),
+            started_at: ts(),
+            duration_sec: 1,
+            result,
+            model: None,
+            effort: None,
+            detail: Some("codex-account-pool-exhausted: no account provisioned".to_string()),
+            gated_pool: gated_pool.map(str::to_string),
+            tokens_by_model: None,
+            models_used: None,
+            actions: None,
+        }),
+    )
+}
+
+/// Issue #8408 shipped `loom.gated_pool` with no assertion behind it (#8444):
+/// a pre-spawn pool skip must carry the pool it was gated on all the way to
+/// the wire, and every other tick must leave the attribute absent — never an
+/// empty-string placeholder.
+#[test]
+fn role_tick_outcome_maps_the_gated_pool_attribute_only_when_a_pool_gated_it() {
+    use crate::telemetry::RoleTickResult;
+    let batch = vec![
+        role_tick_outcome_envelope(RoleTickResult::SkippedPoolExhausted, Some("codex_accounts")),
+        role_tick_outcome_envelope(RoleTickResult::SkippedNoTokenPool, Some("claude_tokens")),
+        role_tick_outcome_envelope(RoleTickResult::Success, None),
+    ];
+    let request = build_logs_request(&batch).unwrap();
+    let log_records = &request.resource_logs[0].scope_logs[0].log_records;
+    assert_eq!(log_records.len(), 3);
+    let gated_pool = |record: &LogRecord| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "loom.gated_pool")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    assert_eq!(
+        gated_pool(&log_records[0]),
+        Some(any_value::Value::StringValue("codex_accounts".to_string()))
+    );
+    assert_eq!(
+        gated_pool(&log_records[1]),
+        Some(any_value::Value::StringValue("claude_tokens".to_string()))
+    );
+    assert_eq!(
+        gated_pool(&log_records[2]),
+        None,
+        "an unobserved field stays an ABSENT attribute"
+    );
+}
+
 #[test]
 fn mixed_batch_produces_both_a_logs_and_a_metrics_request() {
     let batch = vec![

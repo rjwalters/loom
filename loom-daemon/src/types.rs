@@ -2257,10 +2257,15 @@ pub struct RoleTickRecord {
     /// Short failure detail when `ok` is `false` (the failure reason / runtime
     /// rejection / `no-token-pool` sentinel), else `None`.
     pub detail: Option<String>,
-    /// `true` only for a
+    /// `true` only for a **self-healing**
     /// [`crate::role_runner::RoleTickOutcome::PoolExhausted`] tick (issue
     /// #7607) — the resolved token pool was present but had zero spawnable
-    /// accounts. `ok` is still `false` for this tick (it did not run), but
+    /// accounts, every one of them under a hold that ages out on its own.
+    /// `false` for the two permanent holds #8444 separates (nothing
+    /// provisioned, unreadable pool state): those cannot clear without an
+    /// operator, so they belong on the persistent/escalatable path with
+    /// `NoTokenPool` — see [`crate::role_runner::PoolHold`]. `ok` is still
+    /// `false` for either tick (it did not run), but
     /// this flag lets [`crate::health::summarize_role_ticks`] route it into
     /// [`crate::health::RoleTickSummary::pool_exhausted`] instead of
     /// `persistent`, so a fleet-wide exhausted shared pool's identical
