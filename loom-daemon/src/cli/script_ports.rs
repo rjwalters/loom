@@ -81,6 +81,14 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     WorktreeWip(super::worktree_wip::WorktreeWipCommand),
 
+    /// `worktree.sh remove <N>` (#8195, slice 3): the operator-facing
+    /// single-worktree removal verb, and the destructive half of that script —
+    /// `git worktree remove --force`, the #5177 `rm -rf` fallback, the #7239
+    /// cargo-target-dir reclaim and the squash-aware `git branch -D` all hang
+    /// off it. Exit 0 = removed or an idempotent no-op, 1 = refused (nothing
+    /// deleted) or the removal failed.
+    WorktreeRemove(super::worktree_remove::WorktreeRemoveArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -175,6 +183,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
+            ScriptPortCommand::WorktreeRemove(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),

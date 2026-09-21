@@ -1299,6 +1299,26 @@ jobs:
       # enrichment — needs the binary this job builds.
       - name: premise gate exit-code contract (#8396)
         run: bash defaults/scripts/tests/test-premise-check.sh
+      # Moved out of shell-suite-tests by #8195 slice 3: `worktree.sh remove`
+      # is now a thin stub over `loom-daemon worktree-remove`, so these three
+      # suites' 80 assertions — unchanged from the shell implementation, and
+      # the equivalence evidence for deleting the whole ~480-line removal
+      # section plus two sourced libs — need the binary this job builds. All
+      # three pin it via loom_test_require_daemon_bin and FAIL rather than skip
+      # without one.
+      #
+      # Three of the 19 test-worktree-*.sh suites are now here (snapshot,
+      # stash-baseline, remove) plus the two non-`test-worktree-*` suites that
+      # drive `worktree.sh remove`. The remaining 16 exercise the CREATE path,
+      # which this slice did not touch, and stay hermetic in shell-suite-tests
+      # — which is the whole point of porting one subcommand-shaped family at a
+      # time.
+      - name: worktree remove verb (#3769, #4449, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-remove.sh
+      - name: worktree remove squash-aware branch delete (#4889, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-remove-squash-merge.sh
+      - name: cargo target-dir reclaim on worktree removal (#7239, ported in #8195)
+        run: bash defaults/scripts/tests/test-cargo-target-dir-reclaim.sh
 
   installer-tests:
     name: Installer Integration Tests
