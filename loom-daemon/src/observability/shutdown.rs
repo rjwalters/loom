@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-struct Request {
+pub(super) struct Request {
     deadline: Instant,
     reply: oneshot::Sender<()>,
 }
@@ -18,7 +18,7 @@ pub(super) fn spawn_sender<E: Exporter + 'static>(
     interval: Duration,
     status: Arc<ExportStatus>,
 ) -> tokio::task::JoinHandle<()> {
-    let (tx, mut rx) = mpsc::channel::<Request>(1);
+    let (tx, rx) = mpsc::channel::<Request>(1);
     {
         let mut senders = SENDERS
             .lock()
@@ -31,22 +31,67 @@ pub(super) fn spawn_sender<E: Exporter + 'static>(
         }
     }
     tokio::spawn(async move {
-        let shutdown = async {
-            match rx.recv().await {
-                Some(request) => request,
-                None => std::future::pending().await,
-            }
-        };
-        tokio::select! {
-            _ = super::sender::run_sender(queue.clone(), &exporter, batch_size, interval, status.clone()) => {},
-            request = shutdown => {
-                if !drain_until(&queue, &exporter, batch_size, &status, request.deadline).await {
-                    log::warn!("observability: final drain incomplete; remaining queue retained for restart");
-                }
-                let _ = request.reply.send(());
-            }
-        }
+        super::sender::run_sender(queue, &exporter, batch_size, interval, status, rx).await;
     })
+}
+
+async fn request(rx: &mut mpsc::Receiver<Request>) -> Request {
+    match rx.recv().await {
+        Some(request) => request,
+        None => std::future::pending().await,
+    }
+}
+
+fn reply(request: Request, complete: bool) {
+    if !complete {
+        log::warn!("observability: final drain incomplete; remaining queue retained for restart");
+    }
+    let _ = request.reply.send(());
+}
+
+/// A sleeping sender is at a safe export boundary and can drain immediately.
+pub(super) async fn pause<E: Exporter>(
+    queue: &DurableQueue,
+    exporter: &E,
+    batch_size: usize,
+    status: &ExportStatus,
+    rx: &mut mpsc::Receiver<Request>,
+    delay: Duration,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        request = request(rx) => {
+            let complete = drain_until(queue, exporter, batch_size, status, request.deadline).await;
+            reply(request, complete);
+            false
+        }
+    }
+}
+
+/// Never cancel an in-flight request and immediately re-send its batch. Allow
+/// its acknowledged prefix to commit before draining the remainder. If the
+/// shared shutdown deadline expires first, stop without initiating a retry.
+pub(super) async fn flush<E: Exporter>(
+    queue: &DurableQueue,
+    exporter: &E,
+    batch_size: usize,
+    status: &ExportStatus,
+    rx: &mut mpsc::Receiver<Request>,
+) -> Option<super::sender::FlushOutcome> {
+    let pending = super::sender::try_flush(queue, exporter, batch_size, status);
+    tokio::pin!(pending);
+    tokio::select! {
+        outcome = &mut pending => Some(outcome),
+        request = request(rx) => {
+            let complete = match tokio::time::timeout_at(request.deadline, &mut pending).await {
+                Ok(super::sender::FlushOutcome::Sent(_) | super::sender::FlushOutcome::Empty) =>
+                    drain_until(queue, exporter, batch_size, status, request.deadline).await,
+                Ok(super::sender::FlushOutcome::Failed) | Err(_) => false,
+            };
+            reply(request, complete);
+            None
+        }
+    }
 }
 
 async fn drain_until<E: Exporter>(
@@ -131,7 +176,7 @@ mod tests {
     }
     #[tokio::test]
     #[serial_test::serial]
-    async fn shutdown_cancels_inflight_send_before_bounded_final_drain() {
+    async fn shutdown_deadline_cancels_inflight_send_without_starting_another() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct PendingSink {
             active: Arc<AtomicUsize>,

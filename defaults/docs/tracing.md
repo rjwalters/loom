@@ -20,7 +20,8 @@ The context directory is private and files are written atomically with fsync.
 An exclusive file lock serializes creators. A corrupt, busy, or full context
 store disables tracing for that launch with a diagnostic instead of delaying
 issue execution. The store admits at most 1024 active executions. Terminal
-instrumentation must queue the completed root before removing its context;
+instrumentation must successfully call `DurableQueue::push_durable` for the
+completed root before removing its context;
 unfinished work retains its identity across restart. This propagation hook does
 not imply that arbitrary third-party harness tools emit spans.
 
@@ -39,10 +40,14 @@ receives trace-only records; use OTLP for traces.
 
 Graceful daemon signal and IPC shutdown gives registered senders one shared
 two-second final-drain budget. Export failure or timeout leaves unsent records
-on disk. SIGKILL cannot flush and relies on persistence. Shutdown does not
+on disk. An in-flight send is allowed to commit its acknowledgment before the
+remaining queue is drained; expiration cancels it without immediately replaying
+the same batch. SIGKILL cannot flush and relies on persistence. Shutdown does not
 manufacture completion for active execution spans. Delivery can duplicate an
 accepted request when the sender loses the response; no exactly-once claim is
-made. Trace IDs allow backend correlation, not universal backend deduplication.
+made. An interrupted multi-signal request can also lose a not-yet-committed
+acknowledgment and replay on restart. Trace IDs allow backend correlation, not
+universal backend deduplication.
 
 ## Implementation boundary
 

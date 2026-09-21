@@ -103,16 +103,33 @@ pub(super) async fn run_sender<E: Exporter>(
     batch_size: usize,
     flush_interval: Duration,
     status: Arc<ExportStatus>,
+    mut shutdown: tokio::sync::mpsc::Receiver<super::shutdown::Request>,
 ) {
     let mut rng = Rng::from_entropy();
     let mut backoff = MIN_BACKOFF;
     loop {
-        tokio::time::sleep(jittered(flush_interval, &mut rng)).await;
+        if !super::shutdown::pause(
+            &queue,
+            exporter,
+            batch_size,
+            &status,
+            &mut shutdown,
+            jittered(flush_interval, &mut rng),
+        )
+        .await
+        {
+            return;
+        }
         // Drain every currently-queued batch before sleeping again, so a
         // burst that arrived between ticks does not wait a full extra
         // `flush_interval` per batch.
         loop {
-            match try_flush(&queue, exporter, batch_size, &status).await {
+            let Some(outcome) =
+                super::shutdown::flush(&queue, exporter, batch_size, &status, &mut shutdown).await
+            else {
+                return;
+            };
+            match outcome {
                 FlushOutcome::Empty => {
                     backoff = MIN_BACKOFF;
                     break;
@@ -122,7 +139,18 @@ pub(super) async fn run_sender<E: Exporter>(
                     // Loop again immediately — more may still be queued.
                 }
                 FlushOutcome::Failed => {
-                    tokio::time::sleep(jittered(backoff, &mut rng)).await;
+                    if !super::shutdown::pause(
+                        &queue,
+                        exporter,
+                        batch_size,
+                        &status,
+                        &mut shutdown,
+                        jittered(backoff, &mut rng),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
                     break;
                 }

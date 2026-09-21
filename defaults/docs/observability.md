@@ -148,6 +148,9 @@ Select it with `observability.exporter = "otlp"`
 (`LOOM_OBSERVABILITY_EXPORTER` env override; **env > config > default**,
 default `"https"`). Published artifacts include OTLP; local default Cargo builds
 still omit the optional feature. Export remains disabled until explicitly enabled.
+See [execution traces](tracing.md) for persisted trace identity, correlated logs,
+completed-span export, and bounded shutdown.
+
 See [OTLP transport and artifact verification](otlp-transport.md) for response
 classification, per-signal counters, retry/drop policy and the real Collector
 canary. Mapping details remain in `observability/otlp/mapping.rs`.

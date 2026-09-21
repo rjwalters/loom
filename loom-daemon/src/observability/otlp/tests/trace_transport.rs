@@ -80,3 +80,84 @@ async fn native_exporter_drops_trace_records_without_sending_or_counting_as_expo
     assert_eq!(outcome.signals["spans"].dropped, 1);
     assert!(sink.requests().is_empty());
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn shutdown_does_not_repost_partial_logs_while_metrics_are_in_flight() {
+    use crate::observability::{queue::DurableQueue, sender, shutdown, ExportStatus};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    // The sink accepts later requests while withholding the metrics response.
+    // A serial mock blocked inside metrics would hide an erroneous log replay.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let log_requests = Arc::new(AtomicUsize::new(0));
+    let entered_metrics = Arc::new(tokio::sync::Notify::new());
+    let server = {
+        let stop = stop.clone();
+        let logs = log_requests.clone();
+        let metrics = entered_metrics.clone();
+        std::thread::spawn(move || {
+            let mut held_metrics = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let Some((path, _)) = read_request(&mut stream) else {
+                            continue;
+                        };
+                        if path == "/v1/metrics" {
+                            held_metrics.push(stream);
+                            metrics.notify_one();
+                        } else {
+                            logs.fetch_add(1, Ordering::SeqCst);
+                            let body = r#"{"partialSuccess":{"rejectedLogRecords":"1"}}"#;
+                            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+    struct ServerGuard(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.1.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let _server = ServerGuard(stop, Some(server));
+    let exporter = OtlpExporter::new(endpoint.clone(), "key".into()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let queue = Arc::new(DurableQueue::open(dir.path().join("queue.jsonl"), 10));
+    queue.push(sweep_started_envelope());
+    queue.push(sweep_started_envelope());
+    queue.push(host_health_envelope());
+    let task = sender::spawn_task(
+        queue.clone(),
+        exporter,
+        10,
+        Duration::from_millis(1),
+        Arc::new(ExportStatus::started("host", &endpoint, "otlp", 1)),
+    );
+    tokio::time::timeout(Duration::from_secs(10), entered_metrics.notified())
+        .await
+        .unwrap();
+    shutdown::flush_before_shutdown(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(log_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(queue.len(), 3, "in-flight uncommitted outcome survives shutdown timeout");
+}
