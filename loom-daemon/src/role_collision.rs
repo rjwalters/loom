@@ -1293,6 +1293,50 @@ JSON
     #[test]
     #[serial(loom_config_env)]
     fn rest_queue_source_parses_the_live_listing_shape() {
+        // Holds the `loom_config_env` lock for `LOOM_GH_BIN` (#8465/#8480);
+        // the body below additionally holds the crate-default unnamed lock
+        // that every other `LOOM_REPO` writer uses (#8496). Both are needed
+        // and they cannot be expressed in one attribute — see the body's doc
+        // comment for why, and for the lock order that must not be inverted.
+        rest_queue_source_parses_the_live_listing_shape_body();
+    }
+
+    /// The body of [`rest_queue_source_parses_the_live_listing_shape`], run
+    /// while holding the crate-default (unnamed) `#[serial]` lock *in addition
+    /// to* the caller's `loom_config_env` lock.
+    ///
+    /// # Why two locks (#8496)
+    ///
+    /// This is the only test in the crate that mutates two process-global env
+    /// vars whose crate-wide writer groups are different `serial_test` keys:
+    ///
+    /// - `LOOM_GH_BIN` — every writer is `#[serial(loom_config_env)]`, and per
+    ///   the #8465 / #8480 invariants it must stay that way;
+    /// - `LOOM_REPO` — every *other* writer in the crate (`gh_repo_env`,
+    ///   `peer_claims`, `claim_reconciliation`, `quarantine_reconciliation`,
+    ///   and the `sweep_registry` test modules) is on the crate-default,
+    ///   unnamed key.
+    ///
+    /// `serial_test` only mutually excludes tests that share the *same* key, so
+    /// holding just one of the two leaves the other variable unprotected.
+    ///
+    /// # Why nesting rather than `#[serial(a, b)]`
+    ///
+    /// Multi-key `#[serial(a, b)]` is supported in `serial_test` 4.0, but it
+    /// cannot name the default group: `serial_test_derive`'s `get_config`
+    /// accepts key arguments only as **identifiers**, and the no-argument form
+    /// pushes `String::new()` — so the default group's key is the empty string,
+    /// which no attribute argument can spell. Nesting is the documented way to
+    /// hold both ("nested serialised tests … are supported"): a `#[serial]` fn
+    /// called from a `#[serial(loom_config_env)]` test takes both locks.
+    ///
+    /// # Lock order
+    ///
+    /// `loom_config_env` outside, default inside. This is the crate's only
+    /// nested acquisition, so no cycle exists; any future test that needs both
+    /// MUST nest in this same order.
+    #[serial]
+    fn rest_queue_source_parses_the_live_listing_shape_body() {
         // Exercises the real production path (gh api --include -> forge_listing
         // -> QueueItem), not just the pure classifier: an `updated_at` that
         // does not parse, or a missed `pull_request` marker, would silently
