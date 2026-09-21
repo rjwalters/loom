@@ -72,6 +72,10 @@ returned **200** for an empty OTLP request. Both application and collector
 readiness passed; Docker marked the container healthy with the revised probe
 allowance. The gateway was deliberately stopped during rotation and restarted
 against the new file-backed key, preserving its queue volume.
+One further three-signal submission through that gateway returned HTTP 200 and
+was indexed: totals became 16 trace rows / 4 unique spans, 4 fixture logs, and
+3 fixture gauge rows with value 3. This verifies delivery with the rotated key,
+in addition to receiver authentication and storage persistence.
 
 The pinned UI also displayed a transient `Expected string, received null` notice
 while changing sources; it did not prevent the observed log query/details.
