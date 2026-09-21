@@ -2538,7 +2538,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             tier.as_deref(),
             &runtime,
         ),
-        Commands::Telemetry(cmd) => cmd.run(),
+        Commands::Telemetry(cmd) => cmd.run().await,
         Commands::Checkpoint { action } => handle_checkpoint_command(action),
         Commands::Claim { command, args } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

@@ -78,9 +78,9 @@ impl TelemetryCommand {
     ///
     /// Propagates the subcommand's own failure. The `usage` arm never returns:
     /// it exits with the process code `check-usage.sh` branches on.
-    pub(crate) fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         match self {
-            TelemetryCommand::TelemetryExport(args) => args.run(),
+            TelemetryCommand::TelemetryExport(args) => args.run().await,
             TelemetryCommand::TelemetryCapabilities { require_otlp } => {
                 println!(
                     "{}",

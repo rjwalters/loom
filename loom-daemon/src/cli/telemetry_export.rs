@@ -18,12 +18,12 @@ pub(crate) struct TelemetryExportArgs {
 }
 impl TelemetryExportArgs {
     #[cfg(not(feature = "otlp"))]
-    pub(crate) fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         anyhow::bail!("this binary was built without the otlp feature")
     }
 
     #[cfg(feature = "otlp")]
-    pub(crate) fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         use loom_daemon::observability::{endpoint_policy, exporter::Exporter, otlp::OtlpExporter};
         use std::io::Read;
         anyhow::ensure!(
@@ -59,10 +59,7 @@ impl TelemetryExportArgs {
             std::fs::read_to_string(self.key_file).context("cannot read collector key file")?;
         anyhow::ensure!(!key.trim().is_empty(), "collector key file is empty");
         let exporter = OtlpExporter::new(self.endpoint, key.trim().to_string())?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let outcome = runtime.block_on(exporter.emit_batch_outcome(&envelopes));
+        let outcome = exporter.emit_batch_outcome(&envelopes).await;
         println!(
             "{}",
             serde_json::json!({"acknowledged_envelopes":outcome.acknowledged,"exported_envelopes":outcome.exported,"signals":outcome.signals})
