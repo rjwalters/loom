@@ -911,6 +911,21 @@ mod tests {
     /// Neither env nor a resolvable config with the key set -> `None`, the
     /// same "nothing configured" outcome `sign_daemon_binary` treats as
     /// "use ad-hoc signing" -- never a false positive finding.
+    ///
+    /// `LOOM_ROOT` alone does not fully sandbox
+    /// `resolve_configured_codesign_identity`: `resolve_effective_config`
+    /// also merges in a machine-level "private/shared defaults" tier
+    /// (`config_resolver::private_defaults_path`, normally
+    /// `~/.local/share/loom/config/defaults.json`) that is deliberately
+    /// *independent* of `repo_root` — it is meant to apply fleet-wide
+    /// regardless of which repo is being resolved. On a host that has
+    /// provisioned that file with a `codesign.identity` (the documented
+    /// "one file, fleet-wide" setup), this test's empty `LOOM_ROOT` tempdir
+    /// still resolves to that real identity instead of `None` (issue #8463).
+    /// Disable the tier for the duration of this test the same way
+    /// production does — `LOOM_CONFIG_DEFAULTS_FILE` set to an empty string
+    /// (see `config_resolver::private_defaults_path`'s doc comment) — rather
+    /// than relying on the host happening not to have one provisioned.
     #[test]
     #[serial_test::serial(codesign_identity_env)]
     fn resolve_configured_codesign_identity_is_none_when_unconfigured() {
@@ -918,8 +933,10 @@ mod tests {
 
         std::env::remove_var("LOOM_CODESIGN_IDENTITY");
         std::env::set_var("LOOM_ROOT", tmp.path());
+        std::env::set_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let resolved = resolve_configured_codesign_identity(None);
         std::env::remove_var("LOOM_ROOT");
+        std::env::remove_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV);
 
         assert_eq!(resolved, None);
     }
