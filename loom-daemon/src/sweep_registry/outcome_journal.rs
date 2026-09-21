@@ -130,6 +130,11 @@ impl SweepRegistry {
     ) {
         let path = self.config.resolve_outcomes_journal_path();
         let token_name = self.resolve_token_account(sweep_id, issue);
+        // Issue #8447: the API-key pool's equivalent attribution, read off the
+        // child's own `# LOOM_LAUNCH` record. Resolved once here and handed to
+        // the paired telemetry record below so the two journals can never
+        // disagree about which account a sweep ran on.
+        let credential = self.resolve_credential_attribution(sweep_id, issue);
         // Issue #8056: the single most-specific failure label for this
         // terminal transition, copied into the PAIRED `sweep.outcome`
         // telemetry record below so "real failure vs. <60s spawn death" is
@@ -160,6 +165,7 @@ impl SweepRegistry {
             death_class,
             crash_classification,
             token_name,
+            credential: credential.clone(),
             duration_sec,
         };
         if let Err(e) = sweep_outcomes::append_outcome(&path, &record) {
@@ -174,7 +180,42 @@ impl SweepRegistry {
         // `sweep_outcomes` module doc for why), carrying model/config/result
         // detail the #4644 journal was never meant to hold. Independent
         // best-effort side effect: never allowed to block reaping.
-        self.append_outcome_telemetry_journal(issue, sweep_id, duration_sec, result, failure_class);
+        self.append_outcome_telemetry_journal(
+            issue,
+            sweep_id,
+            duration_sec,
+            result,
+            failure_class,
+            credential,
+        );
+    }
+
+    /// The API-key pool account this sweep's native harness ran on (Issue
+    /// #8447), for both terminal journals' account attribution — the
+    /// provider-neutral counterpart of
+    /// [`resolve_token_account`](Self::resolve_token_account).
+    ///
+    /// Unlike the OAuth path there is no dispatch-time capture to prefer: the
+    /// `# LOOM_LAUNCH` record is written by the child itself (see
+    /// [`crate::launch_record`]), so the sweep's own log is the single source.
+    /// One bounded `read_to_string` at the terminal transition, never a forge
+    /// call. `None` — never a fabricated `"unknown"` account — for a
+    /// Claude/legacy-adapter spawn that writes no launch record, an
+    /// unreadable/rotated log, or a pre-#8401 binary.
+    pub(crate) fn resolve_credential_attribution(
+        &self,
+        sweep_id: &str,
+        issue: u32,
+    ) -> Option<crate::launch_record::CredentialAttribution> {
+        let log_path = self
+            .entries
+            .get(sweep_id)
+            .map_or_else(|| self.compute_log_path(issue), |i| i.log_path.clone());
+        let contents = std::fs::read_to_string(log_path).ok()?;
+        crate::launch_record::parse_launch_credential_after(
+            &contents,
+            &format!("sweep_id={sweep_id}"),
+        )
     }
 
     /// The OAuth/token account this sweep actually ran on (Issue #8056), for
@@ -235,6 +276,11 @@ impl SweepRegistry {
     /// same terminal transition (Issue #8056) — passed in rather than re-derived
     /// so the telemetry record and the sibling `sweep-outcomes.jsonl` record can
     /// never disagree about why a sweep died.
+    ///
+    /// `credential` is likewise the caller's already-resolved API-key-pool
+    /// attribution (Issue #8447), passed in for the same reason: one log read
+    /// per terminal transition, and two journals that cannot disagree.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_outcome_telemetry_journal(
         &self,
         issue: u32,
@@ -242,6 +288,7 @@ impl SweepRegistry {
         duration_sec: i64,
         result: telemetry::SweepResult,
         failure_class: Option<String>,
+        credential: Option<crate::launch_record::CredentialAttribution>,
     ) {
         let info = self.entries.get(sweep_id);
         let model = info.and_then(|i| i.model.clone());
@@ -258,6 +305,21 @@ impl SweepRegistry {
             config.insert("runtime".to_string(), runtime);
         }
         config.insert("token_account".to_string(), token_name);
+        // Issue #8447: the API-key pool's attribution beside the OAuth pool's,
+        // in the same free-form map (additive per #4703 — no schema bump).
+        // Names only, never key material. Keys are omitted rather than set to
+        // a placeholder when the spawn had no launch record or no pooled
+        // account, so "not a native pool spawn" stays distinguishable from
+        // "a pool spawn whose account is unknown".
+        if let Some(credential) = &credential {
+            config.insert("credential_source".to_string(), credential.source.clone());
+            if let Some(provider) = &credential.provider {
+                config.insert("credential_provider".to_string(), provider.clone());
+            }
+            if let Some(account) = &credential.account {
+                config.insert("credential_account".to_string(), account.clone());
+            }
+        }
         // Issue #4809: attribute this sweep to the model-cost A/B experiment's
         // arm from its OWN dispatched model — the same inference the #3725
         // harvest already applies to `observe`-mode records
@@ -666,3 +728,14 @@ mod tests;
     unused_imports
 )]
 mod timeline_tests;
+
+// API-key-pool credential attribution (#8447), in its own sibling module for
+// the same file-size reason as `timeline_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod credential_tests;

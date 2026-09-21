@@ -201,6 +201,27 @@ pub struct OutcomeRecord {
     /// Token account name selected by `spawn-claude.sh` for this run, or
     /// `"unknown"` when never surfaced (mirrors `SweepInfo::token_name`).
     pub token_name: String,
+    /// Secret-free credential attribution for a **native harness** spawn
+    /// (Issue #8447): where its credential came from (`pool`/`env`/`none`),
+    /// and — for a pool-sourced one — the API-key pool's provider namespace
+    /// plus the selected account's NAME. Never key material: it is read off
+    /// the child's own `# LOOM_LAUNCH` record, which carries names only (see
+    /// [`crate::launch_record`]).
+    ///
+    /// The API-key-pool counterpart of [`Self::token_name`], kept a separate
+    /// field rather than folded into it because the two describe different
+    /// pools with different identities — a Claude OAuth account name and a
+    /// `(provider, account)` pair — and a single column would make
+    /// per-account attribution ambiguous the moment both pools are in use on
+    /// one host.
+    ///
+    /// `None` for a Claude/legacy-adapter spawn (no launch record), for a
+    /// sweep whose log is gone, and for every journal line written before
+    /// this field existed — `#[serde(default)]` keeps those parsing, which
+    /// matters because [`read_all`] silently drops any line that fails to
+    /// deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<crate::launch_record::CredentialAttribution>,
     /// Elapsed wall-clock seconds from dispatch to this terminal outcome.
     pub duration_sec: i64,
 }
@@ -625,6 +646,7 @@ mod tests {
             death_class: Some("preflight-token-selection-failed".to_string()),
             crash_classification: None,
             token_name: "agent-1".to_string(),
+            credential: None,
             duration_sec: 1,
         }
     }

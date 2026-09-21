@@ -384,6 +384,20 @@ the 5s dispatch-time capture window closed before the wrapper logged its
 selection. `"unknown"` now means genuinely unknowable — no attribution
 anywhere — not "nobody looked twice".
 
+`config.credential_source` / `config.credential_provider` /
+`config.credential_account` (Issue #8447) are the API-key pool's counterpart of
+`config.token_account`, for a **native-harness** spawn. They are read back from
+the child's own `# LOOM_LAUNCH` record in the per-sweep log (the record
+`worker_spawn::run` writes, Issue #8401) — names only, never key material, and
+never a fabricated `"unknown"`: a Claude/legacy-adapter spawn writes no launch
+record, so all three keys are simply absent, keeping "not a native pool spawn"
+distinguishable from "a pool spawn whose account could not be recovered". An
+env-sourced or unpooled spawn records `credential_source` alone, with no
+provider and no account. The sibling `sweep-outcomes.jsonl` record carries the
+same three values under one optional `credential` object
+(`{source, provider?, account?}`, `#[serde(default)]` so every pre-#8447 line
+still parses). Additive per #4703 — no `schema_version` bump.
+
 `model` / `effort` likewise survive a daemon restart: the dispatch stamps both
 into the claim lock's `owner.json` (alongside the child pid and process
 group), and `reconstruct` restores them onto the adopted entry. A pre-#8056

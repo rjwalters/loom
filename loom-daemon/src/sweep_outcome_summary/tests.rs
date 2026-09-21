@@ -233,6 +233,7 @@ fn spawn_death_detection_covers_class_and_duration() {
             death_class: Some("preflight-token-selection-failed".into()),
             crash_classification: None,
             token_name: "acct".into(),
+            credential: None,
             duration_sec: 1200,
         },
         sweep_outcomes::OutcomeRecord {
@@ -245,6 +246,7 @@ fn spawn_death_detection_covers_class_and_duration() {
             death_class: None,
             crash_classification: Some("execution-error".into()),
             token_name: "acct".into(),
+            credential: None,
             duration_sec: 1200,
         },
     ]);
@@ -269,6 +271,7 @@ fn spawn_death_detection_covers_class_and_duration() {
         death_class: None,
         crash_classification: Some("account-exhausted:rate-limited".into()),
         token_name: "acct".into(),
+        credential: None,
         duration_sec: 900,
     }]);
     let exhausted = record("exhausted", "o/r", None, SweepResult::Failure, 900);
@@ -781,6 +784,7 @@ fn two_workspace_fixture_aggregates_across_both_journals() {
             death_class: Some("preflight-token-selection-failed".into()),
             crash_classification: None,
             token_name: "acct".into(),
+            credential: None,
             duration_sec: 900,
         }],
     );

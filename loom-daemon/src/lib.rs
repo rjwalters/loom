@@ -182,6 +182,7 @@ pub mod init;
 pub mod install_self_check;
 pub mod ipc;
 pub mod issue_creation_mutex;
+pub mod launch_record;
 pub mod launchd_env_drift;
 pub mod launchd_reload;
 pub mod limit_calibration;
