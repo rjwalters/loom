@@ -33,12 +33,17 @@
 //! | `disabled` | operator ran `api-keys disable` |
 //! | `exhausted` | an active bad-mark (rate/allowance), until its reset horizon |
 //! | `unusable` | the account file is malformed/unreadable |
-//! | `withheld` | a state file (`.disabled`/`.bad_accounts.json`) could not be read, so eligibility is unknown |
+//! | `at-capacity` | the account already has `max_concurrent` spawns in flight (#8424) |
+//! | `withheld` | a state file (`.disabled`/`.bad_accounts.json`/`.limits.json`) could not be read, so eligibility is unknown |
 //! | `unreadable` | the provider directory (or a whole pool root) exists but could not be read |
 //!
 //! The last two exist because the spawn path fails **closed** on them; a view
 //! that collapsed either into "no accounts" would tell the operator the
-//! opposite of what the spawn path is about to do.
+//! opposite of what the spawn path is about to do. `at-capacity` is the one
+//! transient state: it self-clears the moment an in-flight spawn exits, and is
+//! set only by the selection ladder (the only caller that counts leases), so a
+//! plain listing like this one reports it rarely — but collapsing it into
+//! `selectable` would claim a spawn could start when it could not.
 
 use std::path::{Path, PathBuf};
 
@@ -56,6 +61,7 @@ pub const STATE_SELECTABLE: &str = "selectable";
 pub const STATE_DISABLED: &str = "disabled";
 pub const STATE_EXHAUSTED: &str = "exhausted";
 pub const STATE_UNUSABLE: &str = "unusable";
+pub const STATE_AT_CAPACITY: &str = "at-capacity";
 pub const STATE_WITHHELD: &str = "withheld";
 pub const STATE_UNREADABLE: &str = "unreadable";
 
@@ -100,6 +106,7 @@ pub fn account_state(account: &ApiKeyAccount) -> &'static str {
         Some(Ineligible::Disabled) => STATE_DISABLED,
         Some(Ineligible::Exhausted) => STATE_EXHAUSTED,
         Some(Ineligible::Malformed) => STATE_UNUSABLE,
+        Some(Ineligible::AtCapacity) => STATE_AT_CAPACITY,
         Some(Ineligible::Unverifiable) => STATE_WITHHELD,
     }
 }
