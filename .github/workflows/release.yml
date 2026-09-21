@@ -327,6 +327,12 @@ jobs:
         if: ${{ !matrix.cross }}
         run: target/${{ matrix.target }}/release/loom-daemon telemetry-capabilities --require-otlp
 
+      - name: Decode released binary telemetry with the pinned Collector
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          LOOM_OTLP_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/loom-daemon
+        run: cargo test --package loom-daemon --release --features otlp --target ${{ matrix.target }} --test otlp_collector -- --ignored --nocapture
+
       - name: Package artifact
         run: |
           set -euo pipefail

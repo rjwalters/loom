@@ -77,5 +77,6 @@ Docker is required and absence is a failure when explicitly invoked. The regular
 suite marks this test ignored; the OTLP CI job explicitly runs it. To validate a
 release or installed artifact instead of Cargo's debug binary, set
 `LOOM_OTLP_TEST_BINARY` to its absolute path when invoking the same test. The
-release workflow also runs the capability command on each native target (the
-Linux arm64 cross-build cannot execute on its x86 runner).
+release workflow runs this Collector canary against the Linux x64 release binary
+and the capability command on each native target (the Linux arm64 cross-build
+cannot execute on its x86 runner).
