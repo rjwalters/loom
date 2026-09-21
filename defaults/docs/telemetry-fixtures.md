@@ -63,6 +63,11 @@ and required absences. Report missing, duplicate, unexpected and late records
 separately. A receiver HTTP response, Collector health check, or raw row total
 does not establish this result.
 
+Record backend timestamp precision explicitly. For example, a metric table that
+stores milliseconds requires truncating the source nanosecond timestamp to
+milliseconds before comparison. Keep trace/log nanoseconds where supported;
+never loosen identity or value comparisons to conceal timestamp conversion.
+
 Record the exact Loom commit, Collector/product versions, query text, time
 window, observation time and sanitized query results beside the manifest.
 Navigate the repair and incomplete graphs in each UI. Search all signal types
