@@ -16,6 +16,7 @@ services:
     depends_on:
       loom-signoz-signoz-0:
         condition: service_healthy
+        restart: true
       loom-signoz-telemetrystore-migrator:
         condition: service_completed_successfully
     deploy:
@@ -185,13 +186,17 @@ services:
     - bash
     - -c
     - |-
-      version="v0.0.1"
-      node_os=$$(uname -s | tr '[:upper:]' '[:lower:]')
-      node_arch=$$(uname -m | sed s/aarch64/arm64/ | sed s/x86_64/amd64/)
-      echo "Fetching histogram-binary for $${node_os}/$${node_arch}"
+      set -eu
+      node_arch=$$(uname -m)
+      case "$${node_arch}" in
+        aarch64|arm64) node_arch=arm64; expected=e5605ebffa82a450ebbcdf6cf19dad546e1e40d52dbf3e03cfd2d2d5b7394211 ;;
+        x86_64|amd64) node_arch=amd64; expected=33997073eb6d82b7be4f27f9fc8ec9e28a395e0f20674d5d54bb2fa28a75488d ;;
+        *) echo "Unsupported histogram helper architecture" >&2; exit 1 ;;
+      esac
       cd /tmp
-      wget -O histogram-quantile.tar.gz "https://github.com/SigNoz/signoz/releases/download/histogram-quantile%2F$${version}/histogram-quantile_$${node_os}_$${node_arch}.tar.gz"
-      tar -xvzf histogram-quantile.tar.gz
+      wget -O histogram-quantile.tar.gz "https://github.com/SigNoz/signoz/releases/download/histogram-quantile%2Fv0.0.1/histogram-quantile_linux_$${node_arch}.tar.gz"
+      printf '%s  histogram-quantile.tar.gz\n' "$${expected}" | sha256sum --check --strict
+      tar -xzf histogram-quantile.tar.gz
       mv histogram-quantile /var/lib/clickhouse/user_scripts/histogramQuantile
     container_name: loom-signoz-telemetrystore-clickhouse-user-scripts
     image: clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a

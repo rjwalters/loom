@@ -34,10 +34,12 @@ then render. `casting.yaml.lock` and `pours/` are committed reviewable outputs.
 Do not hand-edit generated configuration or run `cast` before inspecting it.
 All component images pin multi-platform index digests in the casting: SigNoz
 **v0.142.1**, its collector **v0.144.10**, ClickHouse and Keeper **25.12.5**,
-and PostgreSQL **16**. Each index includes Linux amd64 and arm64. Foundry's
-histogram helper init step separately downloads the upstream **v0.0.1** release;
-the generated command does not verify that archive's digest. Review that
-upstream dependency before adopting this local trial for a shared environment.
+and PostgreSQL **16**. Each index includes Linux amd64 and arm64. The upstream
+histogram helper **v0.0.1** init command is patched declaratively to verify SHA-256
+before extraction and reject unsupported architectures. Independent downloads
+matched the [upstream checksum manifest](https://github.com/SigNoz/signoz/releases/download/histogram-quantile%2Fv0.0.1/histogram-quantile_0.0.1_checksums.txt):
+Linux arm64 `e5605ebffa82a450ebbcdf6cf19dad546e1e40d52dbf3e03cfd2d2d5b7394211`,
+Linux amd64 `33997073eb6d82b7be4f27f9fc8ec9e28a395e0f20674d5d54bb2fa28a75488d`.
 
 ## Start and trust boundary
 
