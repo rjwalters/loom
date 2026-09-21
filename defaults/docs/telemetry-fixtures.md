@@ -88,7 +88,7 @@ winner or a claim that the comparison issue is complete.
 files, or making network calls. Add `--execute` only to run the paid attempts:
 
 ```console
-loom-daemon telemetry-live-canary --output ./live-001 --endpoint http://127.0.0.1:14318 --key-file /private/path/collector-ingress.key --guard-dir ./defaults/hooks --zshrc ~/.zshrc
+loom-daemon telemetry-live-canary --output "$HOME/.local/state/loom-trial/live-001" --endpoint http://127.0.0.1:14318 --key-file "$HOME/.local/state/loom-trial/collector-ingress.key" --guard-dir ./defaults/hooks --zshrc ~/.zshrc
 ```
 
 The executed run uses Pi and OpenCode with `zai-flash` / `glm-5.3-flash`, effort
@@ -96,7 +96,10 @@ The executed run uses Pi and OpenCode with `zai-flash` / `glm-5.3-flash`, effort
 or dollar cap. Credentials come from one literal `ZAI_API_KEY` assignment; the
 file is never sourced or evaluated. Unsupported syntax, duplicate assignments,
 an ambient-key mismatch, missing guards, or changed profile pins fail closed.
-Each worker has a private isolated home and no shared credential pool. The
+The output parent must already exist under the operator's home, outside every
+repository checkout. Each worker's isolated home and native-tool configuration
+are siblings of its tiny Git repository, never inside it; no shared credential
+pool is available. The
 Collector key is separate and is never passed to a model worker.
 
 The task is an isolated read-only curator smoke, not a real issue lifecycle:

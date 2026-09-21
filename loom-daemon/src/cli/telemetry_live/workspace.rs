@@ -17,7 +17,9 @@ impl Workspace {
     pub fn create(parent: &Path, runtime: &str, endpoint: &str) -> Result<Self> {
         let root = parent.join(runtime);
         std::fs::create_dir(&root)?;
-        let home = root.join("isolated-home");
+        // Harnesses may persist auth/session state. Keep it outside even this
+        // disposable Git repository, under the operator's private home tree.
+        let home = parent.join(format!("{runtime}-home"));
         std::fs::create_dir(&home)?;
         std::fs::create_dir_all(root.join(".loom/roles"))?;
         let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -80,6 +82,7 @@ impl Workspace {
             .env("LOOM_WORKSPACE", &self.root)
             .env("LOOM_RUNTIME", runtime)
             .env("LOOM_NATIVE_GUARD_DIR", guards)
+            .env("LOOM_NATIVE_TOOLS_DIR", self.home.join("native-tools"))
             .env("LOOM_DAEMON_BIN", binary)
             .env("LOOM_SHARED_API_KEYS_DIR", "")
             .env("ZAI_API_KEY", key)
@@ -101,6 +104,37 @@ pub(super) fn validate_guards(guards: &Path) -> Result<()> {
         "guard-loom-workflow.sh",
     ] {
         ensure!(guards.join(file).is_file(), "guard directory lacks a required installed hook");
+    }
+    Ok(())
+}
+
+pub(super) fn private_output_parent(output: &Path, zshrc: &Path, key_file: &Path) -> Result<()> {
+    let home = dirs::home_dir()
+        .context("operator home is unavailable")?
+        .canonicalize()?;
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .canonicalize()?;
+    ensure!(
+        parent.starts_with(&home),
+        "live canary output must be under the operator home directory"
+    );
+    ensure!(
+        zshrc.canonicalize()?.starts_with(&home) && key_file.canonicalize()?.starts_with(&home),
+        "canary credentials must remain under the operator home directory"
+    );
+    let mut git = Command::new("git");
+    git.args(["rev-parse", "--show-toplevel"])
+        .current_dir(&parent);
+    let state = loom_daemon::proc_exec::run_bounded(git, Duration::from_secs(10))?;
+    match state {
+        loom_daemon::proc_exec::Completion::Exited(output) => ensure!(
+            !output.status.success(),
+            "canary private state must be outside every repository checkout"
+        ),
+        _ => anyhow::bail!("cannot verify private canary output location"),
     }
     Ok(())
 }

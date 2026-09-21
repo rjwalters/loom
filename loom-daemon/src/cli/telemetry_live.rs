@@ -57,6 +57,7 @@ impl LiveArgs {
             "remove ambient LOOM_OBSERVABILITY overrides before this isolated canary"
         );
         workspace::validate_guards(&self.guard_dir)?;
+        workspace::private_output_parent(&self.output, &self.zshrc, &self.key_file)?;
         let guards = self.guard_dir.canonicalize()?;
         let key = helpers::key_from_zshrc(&self.zshrc)?;
         ensure!(
@@ -103,8 +104,8 @@ impl LiveArgs {
             .arg(&self.endpoint)
             .arg("--key-file")
             .arg(key_file);
-        let exported =
-            loom_daemon::proc_exec::run_bounded(export, Duration::from_secs(60))?.succeeded();
+        let exported = loom_daemon::proc_exec::run_bounded(export, Duration::from_secs(60))
+            .is_ok_and(|result| result.succeeded());
         let passed = reports.iter().all(|r| r["verified"] == true);
         let report = serde_json::json!({"schema":1,"synthetic":false,"task":"isolated read-only curator smoke","full_issue_lifecycle":false,"forge_contact":false,"checkpoint_issue_is_local_fixture":true,"profile":"zai-flash","model":"glm-5.3-flash","effort":"low","attempts":reports,"token_cap":null,"billing":"not-measured","envelopes":envelopes.len(),"collector_acknowledged":exported,"backend_verification":"not_performed","unproven":["backend indexing and UI","full issue acceptance","cost efficiency","provider internal HTTP spans"]});
         std::fs::write(output.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
@@ -126,7 +127,7 @@ impl LiveArgs {
     ) -> Result<(serde_json::Value, Vec<loom_daemon::telemetry::TelemetryEnvelope>)> {
         use loom_daemon::{
             observability::{lifecycle, queue::DurableQueue},
-            proc_exec::{run_bounded, run_bounded_observed, Completion},
+            proc_exec::{run_bounded, run_bounded_observed, Completion, ExecError},
             telemetry::trace::SpanName,
         };
         let root = &workspace.root;
@@ -172,9 +173,10 @@ impl LiveArgs {
                 (result, verified)
             }
             Ok(Completion::TimedOut { .. }) => ("timeout", false),
-            Err(_) => ("spawn_failed", false),
+            Err(ExecError::Spawn(_)) => ("spawn_failed", false),
+            Err(ExecError::Collect(_)) => ("exit_unobserved", false),
         };
-        if child_result != "spawn_failed" {
+        if !matches!(child_result, "spawn_failed" | "exit_unobserved") {
             lifecycle::child_exited(root, &execution, child_result);
         }
         let checkpoint = if verified {

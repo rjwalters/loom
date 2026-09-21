@@ -140,7 +140,7 @@ pub(super) fn verify_stream(
                     && event
                         .pointer("/part/state/status")
                         .and_then(Value::as_str)
-                        .is_none_or(|s| s == "completed")
+                        .is_some_and(|s| s == "completed")
                 {
                     read = true;
                 }
@@ -194,5 +194,26 @@ mod tests {
         correct.extend_from_slice(b"\n{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"CANARY_RESULT:abc\"}]}}\n");
         assert!(verify_stream("pi", &correct, provenance, "CANARY_RESULT:abc").is_ok());
         assert!(verify_stream("opencode", &correct, provenance, "CANARY_RESULT:abc").is_err());
+    }
+
+    #[test]
+    fn opencode_requires_an_observed_completed_guarded_read() {
+        let provenance = br#"# LOOM_LAUNCH {"runtime":"opencode","provider":"zai-coding-plan","model":"glm-5.3-flash","profile":"zai-flash","effort":"low","credentialSource":"env"}"#;
+        for status in [None, Some("error"), Some("running"), Some("completed")] {
+            let mut tool =
+                serde_json::json!({"type":"tool_use","part":{"tool":"loom_read","state":{}}});
+            if let Some(status) = status {
+                tool["part"]["state"]["status"] = status.into();
+            }
+            let events = format!(
+                "{tool}\n{}\n",
+                serde_json::json!({"type":"text","part":{"text":"CANARY_RESULT:abc"}})
+            );
+            assert_eq!(
+                verify_stream("opencode", events.as_bytes(), provenance, "CANARY_RESULT:abc")
+                    .is_ok(),
+                status == Some("completed")
+            );
+        }
     }
 }
