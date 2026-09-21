@@ -155,6 +155,21 @@ else
     fail "CODEX_HOME mount point is NOT empty: $CODEX_HOME_CONTENTS"
 fi
 
+# 6b. git trusts bind-mounted repositories regardless of their apparent owner
+# (issue #8518): Docker Desktop presents a bind mount as root-owned while the
+# image runs as uid 1000, and without safe.directory git reports "dubious
+# ownership", Codex sees "not a repository", and dispatch is refused.
+# Simulated here with a root-owned repo inside the container itself.
+SAFE_DIR_CHECK=$(docker exec -u root "$CONTAINER_NAME" bash -lc '
+    mkdir -p /tmp/root-owned-repo && cd /tmp/root-owned-repo && git init -q . 2>/dev/null && chmod -R a+rX /tmp/root-owned-repo
+    su -s /bin/bash loom -c "cd /tmp/root-owned-repo && git rev-parse --is-inside-work-tree" 2>&1
+' 2>&1 | tail -1)
+if [[ "$SAFE_DIR_CHECK" == "true" ]]; then
+    pass "git (as uid 1000) treats a root-owned repository as a work tree (safe.directory=*)"
+else
+    fail "git as uid 1000 refused a root-owned repository: $SAFE_DIR_CHECK"
+fi
+
 # 7. No secrets baked in. Best-effort docker-history scan, same pattern set
 # docker/worker/test-image.sh uses, plus Codex/CODEX_HOME-adjacent patterns
 # specific to this image (an OpenAI API key shape, a baked auth.json, or

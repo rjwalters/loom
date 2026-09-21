@@ -805,14 +805,25 @@ fi
 # account_lifecycle.rs's `codex login status` call uses — so a wedged CLI
 # cannot hang a spawn. Escape hatch: LOOM_CODEX_AUTH_MODE_CHECK=0.
 CODEX_DROP_PINNED_MODEL=false
+# For a session-managed profile the probe runs INSIDE the account's container
+# (issue #8518): a host-direct `codex login status` against an adopted
+# profile is exactly the host-side CODEX_HOME access the ownership rule
+# forbids, and it would read the host's default login state, not the
+# account's. Same read-only, bounded probe account_lifecycle.rs uses.
+_codex_login_status=(codex login status)
+_codex_probe_binary=codex
+if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
+    _codex_login_status=(docker exec "$CODEX_SESSION_CONTAINER" codex login status)
+    _codex_probe_binary=docker
+fi
 if [[ -n "$EFFECTIVE_MODEL" && -z "${LOOM_CODEX_NO_EXEC:-}" \
       && "${LOOM_CODEX_AUTH_MODE_CHECK:-1}" != "0" ]] \
-    && command -v codex >/dev/null 2>&1; then
+    && command -v "$_codex_probe_binary" >/dev/null 2>&1; then
     _auth_mode_bounded_run_lib="${_SCRIPT_DIR}/lib/bounded-run.sh"
     if [[ -f "$_auth_mode_bounded_run_lib" ]]; then
         # shellcheck source=./lib/bounded-run.sh
         source "$_auth_mode_bounded_run_lib"
-        _login_status_out="$(bounded_run 10 codex login status </dev/null 2>&1)"
+        _login_status_out="$(bounded_run 10 "${_codex_login_status[@]}" </dev/null 2>&1)"
         _login_status_rc=$?
         if [[ $_login_status_rc -eq 0 ]] \
             && printf '%s' "$_login_status_out" | grep -qi "logged in using chatgpt"; then
@@ -967,7 +978,26 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
     # state by the crate's absolute source path, so it is orphaned disk the
     # moment a worktree goes away. An inline `CARGO_INCREMENTAL=1 cargo …`
     # prefix still outranks it per-invocation.
-    CODEX_INVOKE=(docker exec -e CARGO_INCREMENTAL=0 "$CODEX_SESSION_CONTAINER" codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
+    #
+    # --workdir "$PWD" (issue #8518): `docker exec` also does NOT inherit
+    # this script's cwd — without it Codex starts in the image's WORKDIR
+    # (/home/loom), which is neither a repository nor a trusted project, and
+    # every dispatch dies with "Not inside a trusted directory". The mount
+    # contract (docker/worker/MOUNT-CONTRACT.md §1) guarantees the host path
+    # exists byte-identically inside the container, so $PWD is valid there.
+    # LOOM_WORKSPACE and the Loom context vars below are forwarded
+    # explicitly for the same reason; host HOME/PATH/CODEX_HOME and ambient
+    # provider credentials are deliberately NOT forwarded — the container
+    # owns its own CODEX_HOME (ADR-0017 Decision 1).
+    CODEX_INVOKE=(docker exec --workdir "$PWD" --env "LOOM_WORKSPACE=$WORKSPACE" -e CARGO_INCREMENTAL=0)
+    for _context_var in LOOM_ROLE LOOM_RUNTIME LOOM_TERMINAL_ID LOOM_SWEEP_ID \
+        LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT LOOM_PROJECT_ROOT \
+        LOOM_SWEEP_CLAIM_OWNED LOOM_ACCOUNT_NAME LOOM_ACCOUNT_PROVIDER; do
+        if [[ -n "${!_context_var:-}" ]]; then
+            CODEX_INVOKE+=(--env "$_context_var=${!_context_var}")
+        fi
+    done
+    CODEX_INVOKE+=("$CODEX_SESSION_CONTAINER" codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
 else
     CODEX_INVOKE=(codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
 fi

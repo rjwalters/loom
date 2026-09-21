@@ -2300,12 +2300,17 @@ enum SessionAction {
         /// `ghcr.io/rjwalters/loom-worker-session:latest`).
         #[arg(long, value_name = "IMAGE")]
         image: Option<String>,
-        /// Workspace root to bind-mount read-write at the identical
-        /// absolute host path (`docker/worker/MOUNT-CONTRACT.md` §1).
+        /// Directory to bind-mount read-write at the identical absolute
+        /// host path (`docker/worker/MOUNT-CONTRACT.md` §1) — normally the
+        /// parent directory holding every checkout the container will
+        /// serve, since dispatch execs with `--workdir` set to the repo.
         /// Defaults to the `--workspace` this `loom-daemon` invocation
-        /// itself resolved (issue #7389).
-        #[arg(long, value_name = "PATH")]
-        workspace: Option<PathBuf>,
+        /// itself resolved (issue #7389). Deliberately NOT named
+        /// `--workspace`: `accounts --workspace` is a global `String`
+        /// argument, and a nested arg under the same id with a different
+        /// type makes clap panic at access time (issue #8517).
+        #[arg(long = "mount-workspace", value_name = "PATH")]
+        mount_workspace: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -2346,9 +2351,10 @@ enum SessionAction {
         /// The account's short profile name, or its registered email.
         #[arg(value_name = "NAME")]
         name: String,
-        /// Workspace root, same default as `session start --workspace`.
-        #[arg(long, value_name = "PATH")]
-        workspace: Option<PathBuf>,
+        /// Directory to bind-mount, same default and same naming rationale
+        /// as `session start --mount-workspace` (issue #8517).
+        #[arg(long = "mount-workspace", value_name = "PATH")]
+        mount_workspace: Option<PathBuf>,
         /// Extra arguments passed to `codex` inside the tmux window, after
         /// a literal `--` (default when omitted: `--yolo`, the operator's
         /// own bare-metal invocation).
