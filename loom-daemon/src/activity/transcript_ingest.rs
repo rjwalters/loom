@@ -44,6 +44,21 @@
 //! running) is re-read in full and its previous rows are **replaced**, never
 //! appended to, so a repeated pass can neither double-count nor miss the tail
 //! of a live session.
+//!
+//! # On by default (issue #8477)
+//!
+//! Claude Code deletes a session transcript `cleanupPeriodDays` (default 30)
+//! after it was last touched. Until #8477 the background pass above was
+//! opt-in (`LOOM_TRANSCRIPT_INGEST=1`), so a host that never hand-set it lost
+//! its fleet token/cost history to that fuse permanently, silently, on every
+//! default install. [`resolve_enabled`] now defaults to **on**; a host opts
+//! *out* instead, via `LOOM_TRANSCRIPT_INGEST=0` or
+//! `autonomous.transcriptIngest.enabled: false` in `.loom/config.json` (see
+//! [`TranscriptIngestConfig`] / [`read_transcript_ingest_config`] for the
+//! full **env > config > default** knob set). [`collect_health_status`] feeds
+//! `loom-daemon health`'s `transcript_ingest` section
+//! (`health::transcript_ingest_section`), which warns when ingestion is off
+//! or has stopped keeping up with transcripts actually on disk.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -443,35 +458,127 @@ fn write_ledger(
 }
 
 // ---------------------------------------------------------------------------
-// Background maintenance pass (opt-in)
+// Background maintenance pass (on by default, issue #8477)
 // ---------------------------------------------------------------------------
 
-/// Interval and lookback window for the daemon's periodic ingestion pass, or
-/// `None` when it is not enabled.
+/// The subset of `.loom/config.json` -> `autonomous.transcriptIngest` this
+/// module consumes. Each field is `Option` so an absent key falls through to
+/// the env-var / built-in-default resolution — precedence is **env > config >
+/// default** for every knob, matching [`crate::work_finder::WorkFinderConfig`].
 ///
-/// **Default off**, per this repo's FLAGS-OFF daemon convention: ingestion
-/// writes rows to a database shared with the IPC path, so a host opts in
-/// deliberately with `LOOM_TRANSCRIPT_INGEST=1`. Tuning:
-/// `LOOM_TRANSCRIPT_INGEST_INTERVAL` (seconds between passes, default 900) and
-/// `LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS` (how far back each pass looks,
-/// default 24; `0` means no window — a full backfill each pass, which the
-/// unchanged-file ledger still makes cheap after the first one).
+/// Unlike most `autonomous.*` blocks, [`resolve_enabled`]'s *default* (when
+/// neither env nor config sets anything) is **on**, not off — see that
+/// function's doc for why (#8477).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TranscriptIngestConfig {
+    /// `autonomous.transcriptIngest.enabled`.
+    pub enabled: Option<bool>,
+    /// `autonomous.transcriptIngest.intervalSecs` (a zero/invalid value is
+    /// dropped to `None`).
+    pub interval_secs: Option<u64>,
+    /// `autonomous.transcriptIngest.windowHours`. `0` is meaningful (no
+    /// window — a full backfill each pass) and is kept, not dropped.
+    pub window_hours: Option<i64>,
+}
+
+/// Read `.loom/config.json` -> `autonomous.transcriptIngest`, soft-failing
+/// every field to `None` (env/default resolution) on a missing file,
+/// malformed JSON, or a missing `autonomous`/`transcriptIngest` block —
+/// mirrors [`crate::work_finder::read_work_finder_config`]'s soft-fail
+/// contract exactly.
 #[must_use]
-pub fn check_env_enabled() -> Option<(u64, i64)> {
-    let raw = std::env::var("LOOM_TRANSCRIPT_INGEST").ok()?;
-    if !matches!(raw.trim(), "1" | "true" | "yes" | "on") {
-        return None;
+pub fn read_transcript_ingest_config(repo_root: &Path) -> TranscriptIngestConfig {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let node = crate::config_resolver::get_path(&effective, "autonomous.transcriptIngest");
+
+    TranscriptIngestConfig {
+        enabled: node
+            .and_then(|n| n.get("enabled"))
+            .and_then(serde_json::Value::as_bool),
+        interval_secs: node
+            .and_then(|n| n.get("intervalSecs"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        window_hours: node
+            .and_then(|n| n.get("windowHours"))
+            .and_then(serde_json::Value::as_i64),
     }
-    let interval = std::env::var("LOOM_TRANSCRIPT_INGEST_INTERVAL")
+}
+
+/// Parse an env var's value as a loud on/off toggle, distinguishing "unset"
+/// from "explicitly set" so an explicit `0`/`false` can override a
+/// default-on feature — unrecognized values fall through to `None` ("defer to
+/// the next layer"), same as an unset var.
+fn parse_bool_env(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// `LOOM_TRANSCRIPT_INGEST`'s value, when it decides the outcome outright —
+/// `None` when unset (or set to something unrecognized), deferring to
+/// [`TranscriptIngestConfig::enabled`] / the built-in default.
+#[must_use]
+fn env_enabled_override() -> Option<bool> {
+    std::env::var("LOOM_TRANSCRIPT_INGEST")
+        .ok()
+        .and_then(|v| parse_bool_env(&v))
+}
+
+fn env_interval_secs() -> Option<u64> {
+    std::env::var("LOOM_TRANSCRIPT_INGEST_INTERVAL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(900);
-    let window_hours = std::env::var("LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS")
+}
+
+fn env_window_hours() -> Option<i64> {
+    std::env::var("LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(24);
-    Some((interval, window_hours))
+}
+
+/// Whether the background ingestion pass runs, with precedence **env >
+/// config > default(true)** (issue #8477).
+///
+/// This flips the polarity every other `autonomous.*` toggle in this repo
+/// uses (FLAGS-OFF, opt-in): Claude Code deletes session transcripts after
+/// `cleanupPeriodDays` (default 30), and `resource_usage` had no other
+/// dispatch-driven writer (see the module doc) — an install that never
+/// hand-sets `LOOM_TRANSCRIPT_INGEST=1` silently lost its fleet token/cost
+/// history to that fuse forever. Opting a host *out* (rather than in) is now
+/// the deliberate action: `LOOM_TRANSCRIPT_INGEST=0` (or
+/// `autonomous.transcriptIngest.enabled: false`) — both still work exactly as
+/// before for a host that already sets them.
+#[must_use]
+pub fn resolve_enabled(config: &TranscriptIngestConfig) -> bool {
+    if let Some(v) = env_enabled_override() {
+        return v;
+    }
+    config.enabled.unwrap_or(true)
+}
+
+/// Resolve the pass interval (seconds) with precedence **env > config >
+/// default(900)**.
+#[must_use]
+pub fn resolve_interval_secs(config: &TranscriptIngestConfig) -> u64 {
+    env_interval_secs().or(config.interval_secs).unwrap_or(900)
+}
+
+/// Resolve the lookback window (hours; `0` = full backfill) with precedence
+/// **env > config > default(24)**.
+#[must_use]
+pub fn resolve_window_hours(config: &TranscriptIngestConfig) -> i64 {
+    env_window_hours().or(config.window_hours).unwrap_or(24)
+}
+
+/// Resolve `(interval_secs, window_hours)`, or `None` when
+/// [`resolve_enabled`] says the pass is off.
+#[must_use]
+pub fn resolve_settings(config: &TranscriptIngestConfig) -> Option<(u64, i64)> {
+    resolve_enabled(config).then(|| (resolve_interval_secs(config), resolve_window_hours(config)))
 }
 
 /// Run one pass against `db_path`, returning what it did.
@@ -488,13 +595,19 @@ pub fn run_once(db_path: &Path, window_hours: i64) -> Result<IngestStats> {
     ingest(&db, &opts)
 }
 
-/// Start the periodic ingestion thread if this host opted in.
+/// Start the periodic ingestion thread unless this host opted out.
 ///
 /// Mirrors `metrics_collector::try_init_metrics_collector`: returns the
 /// `JoinHandle` (whose thread keeps running when the handle is dropped) or
-/// `None` when the feature is off.
-pub fn try_init_transcript_ingest(db_path: &Path) -> Option<std::thread::JoinHandle<()>> {
-    let (interval, window_hours) = check_env_enabled()?;
+/// `None` when the feature is off. `repo_root` is read only for
+/// [`read_transcript_ingest_config`] — ingestion itself is workspace-
+/// independent (see the module doc).
+pub fn try_init_transcript_ingest(
+    db_path: &Path,
+    repo_root: &Path,
+) -> Option<std::thread::JoinHandle<()>> {
+    let config = read_transcript_ingest_config(repo_root);
+    let (interval, window_hours) = resolve_settings(&config)?;
     let db_path = db_path.to_path_buf();
     log::info!(
         "📥 Transcript token ingestion enabled (every {}min, {} window)",
@@ -517,6 +630,87 @@ pub fn try_init_transcript_ingest(db_path: &Path) -> Option<std::thread::JoinHan
             Err(e) => log::error!("❌ Transcript ingestion failed: {e}"),
         }
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Health/status reporting (#8477)
+// ---------------------------------------------------------------------------
+
+/// A ledger entry older than this, while a newer transcript exists on disk,
+/// means the background pass has stopped keeping up (a crashed thread, a
+/// wedged database lock, …) rather than merely not having ticked yet — see
+/// [`collect_health_status`]. Comfortably above the 15-minute default
+/// interval so a busy host's normal jitter never trips it.
+pub const STALE_THRESHOLD_HOURS: f64 = 6.0;
+
+/// Health-check snapshot of the background ingestion pass, computed without a
+/// daemon IPC round-trip — the same "local, best-effort" shape
+/// `limit_calibration::compute_with_fallback` already feeds `loom-daemon
+/// health` (see `cli/health.rs`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct IngestHealthStatus {
+    /// [`resolve_enabled`]'s verdict for this host.
+    pub enabled: bool,
+    /// Age in hours of `MAX(transcript_ingest.ingested_at)`, when the ledger
+    /// has at least one row.
+    pub newest_ingested_age_hours: Option<f64>,
+    /// Age in hours of the newest transcript file on disk (by mtime), across
+    /// every project under `projects_dir`.
+    pub newest_transcript_age_hours: Option<f64>,
+}
+
+/// Collect [`IngestHealthStatus`] for `db_path`/`projects_dir` under `config`.
+/// Every I/O step is best-effort: an unopenable database or unreadable
+/// `projects_dir` degrades the corresponding field to `None` rather than
+/// failing the whole probe — a health check must never itself error out.
+#[must_use]
+pub fn collect_health_status(
+    db_path: &Path,
+    projects_dir: &Path,
+    config: &TranscriptIngestConfig,
+) -> IngestHealthStatus {
+    let now = Utc::now();
+
+    let newest_ingested_age_hours = ActivityDb::new(db_path.to_path_buf())
+        .ok()
+        .and_then(|db| {
+            db.conn
+                .query_row("SELECT MAX(ingested_at) FROM transcript_ingest", [], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .ok()
+                .flatten()
+        })
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| age_hours(dt.with_timezone(&Utc), now));
+
+    let newest_transcript_age_hours = collect_transcripts(projects_dir, None)
+        .into_iter()
+        .filter_map(|p| std::fs::metadata(&p).ok().and_then(|m| m.modified().ok()))
+        .map(DateTime::<Utc>::from)
+        .max()
+        .map(|mtime| age_hours(mtime, now));
+
+    IngestHealthStatus {
+        enabled: resolve_enabled(config),
+        newest_ingested_age_hours,
+        newest_transcript_age_hours,
+    }
+}
+
+/// Age of `then` as of `now`, in hours, **clamped at zero**.
+///
+/// A negative age is real and routinely observed: a transcript being written
+/// *right now* can carry an mtime a few seconds ahead of this process's clock
+/// (filesystem timestamp granularity, or a clock that has since stepped
+/// back), which surfaced live on a fleet host as `-0.0039` hours. Reporting
+/// "-0.0h old" in a health summary is noise, so a not-yet-aged timestamp is
+/// reported as `0.0` — an age can never meaningfully be negative, and the
+/// staleness rule in `health::transcript_ingest_section` only ever compares
+/// ages against a positive threshold and against each other, both of which
+/// the clamp preserves.
+fn age_hours(then: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
+    ((now - then).num_seconds() as f64 / 3600.0).max(0.0)
 }
 
 fn upsert_ledger(
@@ -909,34 +1103,205 @@ mod tests {
         assert_eq!(count(&db, "SELECT SUM(tokens_input) FROM resource_usage"), 87);
     }
 
+    /// Every env var this file's `#[serial]` tests mutate — cleared before and
+    /// after each one so they never leak into an unrelated test.
+    fn clear_ingest_env() {
+        for var in [
+            "LOOM_TRANSCRIPT_INGEST",
+            "LOOM_TRANSCRIPT_INGEST_INTERVAL",
+            "LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS",
+        ] {
+            std::env::remove_var(var);
+        }
+    }
+
     #[test]
     #[serial_test::serial]
-    fn the_background_pass_is_off_unless_explicitly_enabled() {
-        for var in [
-            "LOOM_TRANSCRIPT_INGEST",
-            "LOOM_TRANSCRIPT_INGEST_INTERVAL",
-            "LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS",
-        ] {
-            std::env::remove_var(var);
-        }
-        assert_eq!(check_env_enabled(), None, "FLAGS-OFF: writing to a shared database is opt-in");
+    fn the_background_pass_is_on_by_default_issue_8477() {
+        clear_ingest_env();
+        assert!(
+            resolve_enabled(&TranscriptIngestConfig::default()),
+            "#8477: fleet cost history must not require a hand-set env var to survive Claude \
+             Code's 30-day transcript retention fuse"
+        );
+        assert_eq!(
+            resolve_settings(&TranscriptIngestConfig::default()),
+            Some((900, 24)),
+            "documented defaults"
+        );
+        clear_ingest_env();
+    }
 
+    #[test]
+    #[serial_test::serial]
+    fn env_explicit_off_overrides_the_default_on() {
+        clear_ingest_env();
         std::env::set_var("LOOM_TRANSCRIPT_INGEST", "0");
-        assert_eq!(check_env_enabled(), None);
+        assert!(
+            !resolve_enabled(&TranscriptIngestConfig::default()),
+            "existing opt-out still works"
+        );
+        assert_eq!(resolve_settings(&TranscriptIngestConfig::default()), None);
+        clear_ingest_env();
+    }
 
+    #[test]
+    #[serial_test::serial]
+    fn env_explicit_on_still_tunes_interval_and_window() {
+        clear_ingest_env();
         std::env::set_var("LOOM_TRANSCRIPT_INGEST", "1");
-        assert_eq!(check_env_enabled(), Some((900, 24)), "documented defaults");
-
         std::env::set_var("LOOM_TRANSCRIPT_INGEST_INTERVAL", "300");
         std::env::set_var("LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS", "6");
-        assert_eq!(check_env_enabled(), Some((300, 6)));
+        assert_eq!(resolve_settings(&TranscriptIngestConfig::default()), Some((300, 6)));
+        clear_ingest_env();
+    }
 
-        for var in [
-            "LOOM_TRANSCRIPT_INGEST",
-            "LOOM_TRANSCRIPT_INGEST_INTERVAL",
-            "LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS",
-        ] {
-            std::env::remove_var(var);
-        }
+    #[test]
+    #[serial_test::serial]
+    fn config_can_opt_a_host_out_with_no_env_var_set() {
+        clear_ingest_env();
+        let config = TranscriptIngestConfig {
+            enabled: Some(false),
+            ..TranscriptIngestConfig::default()
+        };
+        assert!(!resolve_enabled(&config), "the config-tier opt-out this issue's AC requires");
+        assert_eq!(resolve_settings(&config), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_takes_precedence_over_a_conflicting_config_value() {
+        clear_ingest_env();
+        std::env::set_var("LOOM_TRANSCRIPT_INGEST", "1");
+        let config = TranscriptIngestConfig {
+            enabled: Some(false),
+            ..TranscriptIngestConfig::default()
+        };
+        assert!(resolve_enabled(&config), "env > config");
+        clear_ingest_env();
+    }
+
+    // The next two tests mutate `config_resolver::PRIVATE_DEFAULTS_ENV`, which
+    // `config_resolver.rs`'s own tests already serialize under the *named*
+    // `loom_config_env` key (see that file's comment on issue #6177: a bare
+    // `#[serial]` does NOT exclude a `#[serial(loom_config_env)]` test, so
+    // both sides must use the same named key or they race).
+
+    #[test]
+    #[serial_test::serial(loom_config_env)]
+    fn read_transcript_ingest_config_soft_fails_on_a_repo_with_no_config_at_all() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempfile::tempdir().unwrap();
+        let config = read_transcript_ingest_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(config, TranscriptIngestConfig::default());
+    }
+
+    #[test]
+    #[serial_test::serial(loom_config_env)]
+    fn read_transcript_ingest_config_reads_the_committed_block() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config_resolver::LEGACY_CONFIG_REL),
+            r#"{"autonomous": {"transcriptIngest": {"enabled": false, "intervalSecs": 120, "windowHours": 0}}}"#,
+        )
+        .unwrap();
+        let config = read_transcript_ingest_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            config,
+            TranscriptIngestConfig {
+                enabled: Some(false),
+                interval_secs: Some(120),
+                window_hours: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn collect_health_status_reports_disabled_without_touching_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let config = TranscriptIngestConfig {
+            enabled: Some(false),
+            ..TranscriptIngestConfig::default()
+        };
+        let status = collect_health_status(
+            &home.path().join("activity.db"),
+            &home.path().join("projects"),
+            &config,
+        );
+        assert!(!status.enabled);
+        assert_eq!(status.newest_ingested_age_hours, None);
+        assert_eq!(status.newest_transcript_age_hours, None);
+    }
+
+    #[test]
+    fn collect_health_status_reports_fresh_after_a_pass() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join("projects");
+        seed(
+            &projects,
+            "uuid-a",
+            &[assistant_line(
+                "msg_1",
+                "claude-sonnet-5",
+                "2026-09-18T04:00:00Z",
+                10,
+                20,
+            )],
+            &[],
+        );
+        let db_path = home.path().join("activity.db");
+        let db = open_db(home.path());
+        ingest(&db, &opts(&projects)).unwrap();
+        drop(db);
+
+        let status = collect_health_status(&db_path, &projects, &TranscriptIngestConfig::default());
+        assert!(status.enabled);
+        let ingested_age = status
+            .newest_ingested_age_hours
+            .expect("a ledger row exists after ingest()");
+        assert!(ingested_age < 1.0, "just ingested: {ingested_age}");
+        assert!(status.newest_transcript_age_hours.is_some());
+    }
+
+    #[test]
+    fn collect_health_status_is_none_when_nothing_was_ever_ingested() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join("projects");
+        seed(
+            &projects,
+            "uuid-a",
+            &[assistant_line(
+                "msg_1",
+                "claude-sonnet-5",
+                "2026-09-18T04:00:00Z",
+                10,
+                20,
+            )],
+            &[],
+        );
+        let status = collect_health_status(
+            &home.path().join("activity.db"),
+            &projects,
+            &TranscriptIngestConfig::default(),
+        );
+        assert!(status.enabled);
+        assert_eq!(status.newest_ingested_age_hours, None, "no pass has run yet");
+        assert!(status.newest_transcript_age_hours.is_some(), "the transcript is still on disk");
+    }
+
+    /// A transcript being written right now can carry an mtime a few seconds
+    /// *ahead* of this process's clock — observed live on a fleet host as
+    /// `newestTranscriptAgeHours: -0.0039`. An age is never negative.
+    #[test]
+    fn a_future_timestamp_reports_a_zero_age_not_a_negative_one() {
+        let now = Utc::now();
+        assert_eq!(age_hours(now + chrono::Duration::seconds(14), now), 0.0);
+        assert_eq!(age_hours(now, now), 0.0);
+        let past = age_hours(now - chrono::Duration::hours(3), now);
+        assert!((past - 3.0).abs() < 0.01, "an ordinary past timestamp is unaffected: {past}");
     }
 }

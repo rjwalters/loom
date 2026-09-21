@@ -548,6 +548,19 @@ pub struct HealthInputs {
     /// with no accounts both render **no section at all**, so a Claude-only
     /// host's report is unchanged.
     pub codex_accounts: Option<codex_accounts::CodexAccountsSnapshot>,
+    /// The collected transcript-ingest health snapshot (issue #8477):
+    /// whether the background pass is enabled and whether it is keeping up
+    /// with transcripts on disk. Computed by the `loom-daemon health` CLI
+    /// collector via
+    /// [`crate::activity::transcript_ingest::collect_health_status`] and
+    /// rendered by
+    /// [`transcript_ingest_section::assess_transcript_ingest`]. Unlike
+    /// [`Self::limit_calibration`], `None` here means only "a fixture never
+    /// set it" — the real collector always populates it, and (unlike an
+    /// optional companion tool) an *off* reading still renders a non-green
+    /// section rather than none at all, because ingestion being off is
+    /// itself the fact this issue exists to surface.
+    pub transcript_ingest: Option<crate::activity::transcript_ingest::IngestHealthStatus>,
 }
 
 // ============================================================================
@@ -2771,6 +2784,13 @@ mod calibration_section;
 
 pub use calibration_section::assess_limit_calibration;
 
+/// The `transcript_ingest` section (#8477): whether the background
+/// transcript-token-ingest pass is enabled and keeping up with transcripts on
+/// disk.
+mod transcript_ingest_section;
+
+pub use transcript_ingest_section::assess_transcript_ingest;
+
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2835,6 +2855,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     sections.extend(assess_observability(inputs));
     sections.extend(assess_codesign_identity(inputs));
     sections.extend(assess_limit_calibration(inputs));
+    sections.extend(assess_transcript_ingest(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {

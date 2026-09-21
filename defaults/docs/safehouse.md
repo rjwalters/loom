@@ -820,8 +820,10 @@ what feeds the public fleet feed. Loom is the producer:
     > looking for missing rollup rows.
     >
     > **Amended by #8059**: `resource_usage` now has a dispatch-path writer —
-    > `loom-daemon ingest-transcripts`, plus an opt-in periodic daemon pass
-    > (`LOOM_TRANSCRIPT_INGEST=1`), which ingests these same transcripts (see
+    > `loom-daemon ingest-transcripts`, plus a periodic daemon pass — **on by
+    > default since #8477**; `LOOM_TRANSCRIPT_INGEST=0` /
+    > `autonomous.transcriptIngest.enabled: false` opts a host out — which
+    > ingests these same transcripts (see
     > [`transcript-token-ingest.md`](transcript-token-ingest.md)). Source 1 is
     > unaffected either way: it is `get_cost_by_issue`, whose join also needs
     > `prompt_github`, which ingestion deliberately does not write. Source 2

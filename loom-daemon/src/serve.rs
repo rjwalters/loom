@@ -667,6 +667,11 @@ async fn handle_health(
         // daemon-authoritative sections only, so it threads `None` ("not
         // collected here") and no `limit_calibration` section renders.
         limit_calibration: None,
+        // #8477: likewise a CLI-collector-only input (activity-DB read plus a
+        // `~/.claude/projects` walk) — threaded as `None` here for the same
+        // reason as `limit_calibration` just above, so no `transcript_ingest`
+        // section renders on this route.
+        transcript_ingest: None,
         // #8163: corroborates (or refutes) an `indeterminate-busy` roll-up.
         // A `/proc/loadavg`-class read — cheap enough for this route's poll
         // cadence, and taken here rather than daemon-side-over-IPC precisely

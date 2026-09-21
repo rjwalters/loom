@@ -2003,9 +2003,9 @@ without parsing anything:
 
 Several sections, one line each (or the full structured payload with `--json`);
 the table below is not exhaustive — `peer_coordination` (#6157), `stale_sweeps`
-(#7529), `auto_update` (#7584), `worktree_reaper` (#7590), and `pool_hold`
-(#7708/#7990) also always render, each documented at its own point in this
-file:
+(#7529), `auto_update` (#7584), `worktree_reaper` (#7590), `pool_hold`
+(#7708/#7990), and `transcript_ingest` (#8477) also always render, each
+documented at its own point in this file:
 
 | section | what it reports | source |
 |---------|-----------------|--------|
@@ -4028,6 +4028,11 @@ concurrency ceiling 5" and share it with the team:
       "intervalSecs": 30,
       "reviewStall": true,
       "reviewStallTimeoutSecs": 2700
+    },
+    "transcriptIngest": {
+      "enabled": true,
+      "intervalSecs": 900,
+      "windowHours": 24
     }
   }
 }
@@ -4138,6 +4143,9 @@ knobs not yet audited here.
 | `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055). **Opt-in** (it rebuilds + restarts the daemon process). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
 | `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default |
+| `autonomous.transcriptIngest.enabled` | `LOOM_TRANSCRIPT_INGEST` | **`true`** | Periodic transcript token/cost ingestion into `~/.loom/activity.db` (#8059, flipped default-on by #8477). **The one `autonomous.*` knob that defaults ON against the FLAGS-OFF convention**, deliberately: it generates no work (a passive, ledgered, idempotent telemetry writer), while default-*off* silently destroyed data — Claude Code deletes transcripts after `cleanupPeriodDays` (default 30), so every host that never hand-set the env var lost its cost history permanently. Env `0`/`false`/`no`/`off` opts out; an unrecognized value falls through to config/default rather than silently disabling. **Restart required** — resolved once before the thread is spawned. See [`transcript-token-ingest.md`](transcript-token-ingest.md) |
+| `autonomous.transcriptIngest.intervalSecs` | `LOOM_TRANSCRIPT_INGEST_INTERVAL` | `900` | Seconds between ingestion passes. Zero/invalid → default. **Restart required** |
+| `autonomous.transcriptIngest.windowHours` | `LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS` | `24` | How far back each pass looks; `0` = full history (the unchanged-file ledger keeps that cheap after the first pass). **Restart required** |
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
 
 ### Idle exit for remote hosts (#4467)

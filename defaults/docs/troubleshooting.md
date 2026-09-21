@@ -1266,6 +1266,54 @@ git -C <target> restore --staged --worktree -- .loom .claude CLAUDE.md .gitignor
 git -C <target> stash list | grep loom-install   # changes the installer stashed, if any
 ```
 
+### `cost_by_role` / `cost_by_month` are empty, or token history stops ~30 days back (#8477)
+
+Token/cost history has a **30-day fuse**, and it is one-way: Claude Code
+deletes session transcripts `cleanupPeriodDays` (default 30) after they were
+last touched, and the cleanup runs at session start — so on a fleet host, where
+agents start constantly, transcripts are pruned continuously as they cross the
+line. **The transcripts are the only copy.** Anything not ingested before its
+transcript is deleted is gone permanently; there is no forge-side or API-side
+backfill.
+
+Diagnose in one call — the `transcript_ingest` health section always renders:
+
+```bash
+loom-daemon health --json | jq '.sections[] | select(.key == "transcript_ingest")'
+```
+
+| Verdict | Meaning | Fix |
+|---|---|---|
+| `Degraded`, summary says `OFF` | This host opted out — `LOOM_TRANSCRIPT_INGEST=0` in the daemon's environment, or `autonomous.transcriptIngest.enabled: false` in `.loom/config.json`. It is losing history right now | Remove the opt-out, then **restart the daemon** (the knob is resolved once at bring-up — "landed != effective", see [`fleet-config-lifecycle.md`](fleet-config-lifecycle.md)) |
+| `Degraded`, summary says `stuck` | Enabled, but the newest ledger entry is >6h old while a newer transcript sits on disk — a crashed thread, a wedged database lock, or a daemon that has been down | Restart the daemon; run `loom-daemon ingest-transcripts --since 48h` immediately to catch up before anything else ages out |
+| `Green`, `nothing ingested yet` | Enabled, no pass has completed — normal on a host that just started | Wait one interval (default 15 min), or force a pass with `loom-daemon ingest-transcripts` |
+
+Corroborate from the log and a dry run:
+
+```bash
+grep 'Transcript ingestion' ~/.loom/daemon.log | tail -1
+loom-daemon ingest-transcripts --dry-run --format json | jq '{transcripts_seen, skipped_unchanged}'
+```
+
+A healthy host reports `skipped_unchanged` ≈ `transcripts_seen`. **A
+`skipped_unchanged` of `0` means nothing has ever been ingested** — that is the
+exact reading that opened #8477 on a host carrying 100,942 transcripts.
+
+Before #8477 the periodic pass was opt-in and off by default, so every host
+that never hand-set `LOOM_TRANSCRIPT_INGEST=1` was silently in this state. It
+is on by default now; a host that still reads `OFF` has an explicit opt-out
+somewhere (check the daemon's unit/plist environment as well as config — an env
+var wins over config).
+
+**Widening the window** is a separate lever: raise `cleanupPeriodDays` in
+`~/.claude/settings.json` to keep the raw transcripts longer (~33 GB per 30
+days on the measured host; a `.tar.zst` of that set compressed 10.9:1). That is
+only needed for forensics or `claude --resume` — the cost views do not depend
+on the raw transcripts once the rows are ingested. **Any transcript archiving
+or pruning must exclude `~/.claude/projects/<project>/memory/`**, which holds
+persistent agent memory rather than session transcripts. Full reference:
+[`transcript-token-ingest.md`](transcript-token-ingest.md).
+
 ### Daemon won't start
 
 ```bash
