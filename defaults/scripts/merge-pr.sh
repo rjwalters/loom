@@ -261,11 +261,10 @@ Options:
                          The bypass is always logged as a warning and, on a
                          real (non-dry-run) merge, best-effort recorded as a
                          PR comment audit trail too.
-  --redate-stale-checks  When the #8248 freshness guard blocks the merge, push
-                         a tree-identical no-op commit so CI re-runs and
-                         re-dates every check, then exit 4 without merging
-                         (#8508). One push per head; a repeat block escalates
-                         to a loom:operator hold. The guard is never bypassed.
+  --redate-stale-checks  On an #8248 freshness block, push a tree-identical no-op
+                         commit so CI re-dates every check, then exit 4 without
+                         merging — never a bypass, one push per head, a repeat
+                         block escalates to a loom:operator hold (#8508).
   --no-cleanup-primary   Skip automatic primary-checkout branch cleanup (#5015).
                          When the merged branch is checked out in the PRIMARY
                          repo checkout (not a worktree), the script normally
@@ -328,8 +327,7 @@ Precedence (highest wins):
 Exit codes:
   0 = merged (or auto-merge enabled, or --help)
   1 = failed
-  4 = stale required checks were re-dated under --redate-stale-checks
-      (#8508) — not a failure; CI is re-running, retry on a later pass
+  4 = stale required checks were re-dated under --redate-stale-checks (#8508) — not a failure; CI is re-running, retry later
 
 Examples:
   ./.loom/scripts/merge-pr.sh 123
@@ -484,16 +482,14 @@ while [[ $# -gt 0 ]]; do
     --no-cleanup-worktree) CLEANUP_WORKTREE=false; shift ;;
     --cleanup-primary) shift ;;  # no-op, primary-checkout cleanup is now the default
     --no-cleanup-primary) CLEANUP_PRIMARY_CHECKOUT=false; shift ;;
-    --worktree-path)
-      [[ $# -lt 2 ]] && error "--worktree-path requires a value"
-      WORKTREE_PATH_OVERRIDE="$2"
-      shift 2
-      ;;
-    --worktree-path=*)
-      WORKTREE_PATH_OVERRIDE="${1#--worktree-path=}"
-      [[ -z "$WORKTREE_PATH_OVERRIDE" ]] && error "--worktree-path= requires a value"
-      shift
-      ;;
+    # The two --worktree-path arms are joined onto one line each (verbatim,
+    # behavior-preserving) to PAY for the portable-shell lines --redate-stale-checks
+    # adds below and in the help text — the shell-budget ratchet's option 2
+    # (.loom/docs/shell-language-policy.md), and the same offsetting convention
+    # _check_required_check_freshness already documents further down. The remedy's
+    # logic is Rust (loom-daemon/src/merge_pr/redate.rs); only this flag is shell.
+    --worktree-path) [[ $# -lt 2 ]] && error "--worktree-path requires a value"; WORKTREE_PATH_OVERRIDE="$2"; shift 2 ;;
+    --worktree-path=*) WORKTREE_PATH_OVERRIDE="${1#--worktree-path=}"; [[ -z "$WORKTREE_PATH_OVERRIDE" ]] && error "--worktree-path= requires a value"; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --auto) AUTO_MERGE=true; shift ;;
     --allow-stacked-children) ALLOW_STACKED_CHILDREN=true; shift ;;
