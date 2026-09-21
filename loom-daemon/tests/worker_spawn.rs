@@ -99,6 +99,9 @@ fn opencode_selects_coding_plan_and_preserves_nonzero_and_log_streams() {
     assert!(text.contains("zai-coding-plan/glm-5.3-flash"));
     assert!(text.contains("fixture stderr"));
     assert!(text.contains("LOOM_RUNTIME_RESOLVED runtime=opencode"));
+    // #8456: the env default rides native-harness dispatch too, not just the
+    // legacy shell adapters.
+    assert!(text.contains("CARGO_INCREMENTAL=0"), "{text}");
 }
 #[test]
 fn invalid_model_effort_and_unknown_flags_fail_before_launch() {
@@ -183,6 +186,7 @@ fn legacy_defaults_config_precedence_argv_and_isolation_are_preserved() {
         "arg=\"--unknown=literal\"",
         "LOOM_RUNTIME=claude",
         "LOOM_TEST_ALLOW_SYSTEMD=0",
+        "CARGO_INCREMENTAL=0",
         "loom-worker-isolation-",
     ] {
         assert!(text.contains(expected), "{text}");
@@ -203,6 +207,10 @@ fn legacy_defaults_config_precedence_argv_and_isolation_are_preserved() {
     assert!(text.contains("LOOM_RUNTIME=claude"));
     assert!(text.contains("LOOM_DAEMON_LOG=explicit.log"));
     assert!(text.contains("LOOM_TEST_ALLOW_SYSTEMD=1"));
+    // #8456: CARGO_INCREMENTAL is the one env default with no caller-override
+    // form — an inherited value would silently re-enable the orphaned
+    // incremental-state / non-cacheable-sccache failure this exists to stop.
+    assert!(text.contains("CARGO_INCREMENTAL=0"), "{text}");
 }
 #[test]
 fn models_are_independent_of_harness_and_profiles_can_be_extended_in_config() {

@@ -745,10 +745,9 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
 
     # --- Build-cache placement (MOUNT-CONTRACT.md §4, issue #6013/#6014) ---
     _containment_env=()
-    _containment_cargo_lib="${_script_dir}/lib/cargo-target-dir.sh"
-    if [[ -f "${WORKSPACE}/Cargo.toml" && -f "$_containment_cargo_lib" ]]; then
+    if [[ -f "${WORKSPACE}/Cargo.toml" && -f "${_script_dir}/lib/cargo-target-dir.sh" ]]; then
         # shellcheck source=./lib/cargo-target-dir.sh
-        source "$_containment_cargo_lib"
+        source "${_script_dir}/lib/cargo-target-dir.sh"
         _containment_target_dir="$(loom_resolve_cargo_target_dir "$WORKSPACE")"
         if [[ -n "$_containment_target_dir" ]]; then
             if [[ "$_containment_target_dir" != "${WORKSPACE}"/* ]]; then
@@ -758,6 +757,23 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
             _containment_env+=(-e "CARGO_TARGET_DIR=${_containment_target_dir}")
         fi
     fi
+
+    # --- sccache-effective worker builds (issue #8456, parent #8453 §1) ---
+    # CARGO_INCREMENTAL=0 rides the same docker boundary the build cache
+    # above does, as an explicit `-e KEY=VALUE` (NOT the by-name passthrough
+    # below, which matches only LOOM_*/CLAUDE_*/CODEX_*/… and would drop it):
+    # cargo keys a crate's incremental session state by its ABSOLUTE source
+    # path, so state written under one sweep's worktree is orphaned the
+    # moment that worktree goes away (213 GB / 6,402 session dirs measured on
+    # one shared-target-dir fleet host), and sccache cannot cache an
+    # incrementally-compiled crate at all — the host pays the disk AND loses
+    # the cache hit. The daemon-side dispatcher (worker_spawn::run) already
+    # injects this for bare-metal dispatch; this carries it across the
+    # container boundary this re-exec would otherwise strip. A worker that
+    # wants incremental for one command can still prefix it —
+    # `CARGO_INCREMENTAL=1 cargo …` outranks the ambient value for that
+    # invocation only.
+    _containment_env+=(-e "CARGO_INCREMENTAL=0")
 
     # --- Env passthrough ---
     # Every LOOM_*/CLAUDE_*/SAFEHOUSE*/CODEX_*/GH_TOKEN/GITHUB_TOKEN var

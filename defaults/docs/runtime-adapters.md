@@ -909,6 +909,22 @@ in `defaults/scripts/tests/lib/live-state-sandbox.sh`, whose
 `live_host_leak_snapshot` / `live_host_leak_assert_unchanged` pair
 `run-ci-suites.sh` wraps around every suite it runs.
 
+The dispatcher also sets one **build-environment** default (#8456):
+`CARGO_INCREMENTAL=0`, for every spawned worker on every runtime adapter —
+native harnesses and legacy shell adapters alike, containerized dispatch
+included (`spawn-claude.sh`'s containment env exports it alongside
+`CARGO_TARGET_DIR`; `spawn-codex.sh`'s session-exec wraps the CLI in
+`docker exec -e CARGO_INCREMENTAL=0`). Unlike the two variables above it is
+**unconditional**, not `${VAR:-default}`: an incrementally-compiled crate is
+non-cacheable by sccache, and cargo keys incremental session state by the
+crate's absolute source path, so on a shared-`target-dir` host it is orphaned
+disk the moment a worktree goes away (213 GB / 6,402 session dirs on one fleet
+host) — an inherited `CARGO_INCREMENTAL=1` would silently re-enable both.
+Spawn-time only: an operator's interactive shell is unaffected, and a worker
+can still opt a single command back in with an inline `CARGO_INCREMENTAL=1
+cargo …` prefix. Full rationale:
+[`build-gate.md` → Worker builds run with `CARGO_INCREMENTAL=0`](build-gate.md).
+
 ### Adapter observability markers
 
 Daemon-compatible runners emit a small, secret-free contract on stderr:

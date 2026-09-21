@@ -301,6 +301,24 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         command
     };
     command.env("LOOM_RUNTIME", &runtime);
+    // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
+    // item 1). Cargo keys a crate's incremental session state by the crate's
+    // ABSOLUTE source path, and every Loom worktree is a new path — so state
+    // written under a discarded worktree is never reused and never cleaned
+    // (213 GB across 6,402 orphaned session dirs on one shared-target-dir
+    // fleet host) — while sccache cannot cache an incrementally-compiled
+    // crate at all, so the same host pays the disk AND loses the cache hit.
+    // Unconditional by design (not `${VAR:-default}` semantics): this is the
+    // spawn-time default Loom owns, never the operator's interactive shell.
+    // A worker wanting incremental for one command can still prefix it —
+    // `CARGO_INCREMENTAL=1 cargo …` outranks the ambient value per-invocation.
+    // Every dispatch surface (sweep registry, role runner, manual
+    // spawn-worker.sh) converges on this seam for native harnesses and legacy
+    // adapters alike, and a containment container's re-exec'd spawn-worker.sh
+    // re-enters it inside the container, so one site covers all of them.
+    // Docker boundaries that bypass it (spawn-claude.sh's containment,
+    // spawn-codex.sh's session-exec) export it explicitly on their own.
+    command.env("CARGO_INCREMENTAL", "0");
     // Preserve #8077 isolation defaults without repointing live IPC/token paths.
     if nonempty_env("LOOM_DAEMON_LOG").is_none() {
         command.env(
