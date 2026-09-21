@@ -1060,6 +1060,13 @@ jobs:
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: merge-pr verdict-label contradiction guard (#8112, #8191 slice 2)
         run: bash defaults/scripts/tests/test-merge-pr-verdict-label-guard.sh
+      # #8458: the per-worktree cargo target dir. Its creation half
+      # (`cargo-target-dir provision|path`) and both removal-side predicates
+      # (`is-attributable`, `marker`) are loom-daemon subcommands, and the suite
+      # pins the working-tree binary via lib/require-daemon-bin.sh — so it needs
+      # the build this job does, not shell-suite-tests' toolchain-free runner.
+      - name: per-worktree cargo target dir (#8458)
+        run: bash defaults/scripts/tests/test-per-worktree-target-dir.sh
       - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
         run: bash defaults/scripts/tests/test-merge-pr-stale-required-checks.sh
       - name: merge-pr self-sync head re-read (#8164, #8191 slice 4)
