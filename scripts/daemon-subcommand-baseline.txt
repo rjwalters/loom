@@ -38,7 +38,6 @@ defaults/scripts/probe-tokens.sh	tokens
 defaults/scripts/recover-orphaned-shepherds.sh	recover-orphans
 defaults/scripts/resolve-model.sh	resolve-model
 defaults/scripts/resync-installed.sh	update-gitignore
-defaults/scripts/skip-labels.sh	skip-labels
 defaults/scripts/spawn-claude.sh	tokens
 defaults/scripts/spawn-codex.sh	tokens
 defaults/scripts/spawn-worker.sh	spawn-worker
