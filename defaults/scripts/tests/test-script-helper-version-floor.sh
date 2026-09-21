@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# test-script-helper-version-floor.sh — lib/script-helper.sh's marker-driven
-# daemon-version preflight (#8385, follow-up to #8285).
+# test-script-helper-version-floor.sh — the marker-driven daemon-version
+# preflight (#8385, follow-up to #8285), exercised through the two entry points
+# that carry it: `loom_exec_script_helper` (lib/script-helper.sh) and
+# `skip-labels.sh`'s standalone call. The preflight itself lives in
+# lib/locate-daemon-bin.sh, beside the resolver whose answer it interrogates;
+# this suite deliberately drives it from the OUTSIDE, through real stubs, so it
+# pins the contract a stub depends on rather than the function's current home.
 #
 # THE INCIDENT THIS CLOSES. On 2026-09-19 `skip-labels.sh` — a thin stub whose
 # only statement is an `exec` into `loom-daemon skip-labels` — met a host whose
@@ -12,8 +17,8 @@
 # which names neither the version to roll to nor the command to roll with.
 # #8285 gave merge-pr.sh an actionable refusal for exactly this class; every
 # other stub still had the bare clap error. This suite pins the shared fix:
-# `loom_exec_script_helper` reads the CALLING stub's own `# requires-daemon:`
-# marker and refuses with the same four facts merge-pr.sh's hint carries
+# the CALLING stub's own `# requires-daemon:` marker is read back, and the call
+# refuses with the same four facts merge-pr.sh's hint carries
 # (floor, what the binary actually is, the `--fetch` roll, the LOOM_DAEMON_BIN
 # pin) BEFORE exec'ing into a binary that cannot serve the call.
 #

@@ -828,15 +828,18 @@ bare `error: unrecognized subcommand '<sub>'`, which names neither the floor
 nor the fix. (`skip-labels.sh` met exactly that on 2026-09-19 against this
 repo's own installed 0.19.179.)
 
-`lib/script-helper.sh` now carries a shared preflight that produces the same
-actionable refusal — floor, what the resolved binary reports, the `--fetch`
-roll, the `LOOM_DAEMON_BIN` pin — **only when the calling stub declares a
-marker** for the subcommand it is about to run. The behaviour is identical
-whether the stub delegates its exec to `loom_exec_script_helper` or calls
-`loom_daemon_version_preflight <sub> "$BIN"` itself one line above its own
-`exec` (which is what a Shape-A `stub` in `scripts/shell-allowlist.txt` must
-do to keep that category — the cap requires the last code line to *be* the
-`exec`).
+`lib/locate-daemon-bin.sh` now carries a shared preflight that produces the
+same actionable refusal — floor, what the resolved binary reports, the
+`--fetch` roll, the `LOOM_DAEMON_BIN` pin — **only when the calling stub
+declares a marker** for the subcommand it is about to run. It lives beside the
+resolver because it answers a question about the binary that resolver just
+found, exactly like the `tokens select --model` capability probe next to it.
+The behaviour is identical whether the stub delegates its exec to
+`loom_exec_script_helper` (`lib/script-helper.sh`, which execs through
+`loom_daemon_exec_checked`) or calls `loom_daemon_version_preflight <sub>
+"$BIN"` itself one line above its own `exec` (which is what a Shape-A `stub`
+in `scripts/shell-allowlist.txt` must do to keep that category — the cap
+requires the last code line to *be* the `exec`).
 
 Two properties are worth knowing when you meet one:
 

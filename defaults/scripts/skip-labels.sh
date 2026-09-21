@@ -32,18 +32,20 @@
 #     error: unrecognized subcommand 'skip-labels'
 #
 # because the body below resolved a binary and exec'd it with no version guard
-# whatsoever. `loom_daemon_version_preflight` (lib/script-helper.sh) is the
-# shared fix: it reads the `# requires-daemon:` marker out of THIS file and
-# refuses with the floor, what the resolved binary actually reports, and the
-# `--fetch` roll command. The marker is also the string
-# scripts/check-daemon-subcommand-versions.sh enforces, so the version in the
-# refusal and the version the gate checks are one source, not two copies.
+# whatsoever. `loom_daemon_version_preflight` (lib/locate-daemon-bin.sh, beside
+# the resolver whose answer it is checking) is the shared fix: it reads the
+# `# requires-daemon:` marker out of THIS file and refuses with the floor, what
+# the resolved binary actually reports, and the `--fetch` roll command. The
+# marker is also the string scripts/check-daemon-subcommand-versions.sh
+# enforces, so the version in the refusal and the version the gate checks are
+# one source, not two copies.
 #
 # WHY THE PREFLIGHT CALL, not `loom_exec_script_helper`: this file is a
 # Shape-A `stub` in scripts/shell-allowlist.txt, a category machine-checked on
 # the requirement that its LAST code line IS the `exec`. Delegating the exec to
 # the helper would forfeit that category; calling the standalone preflight one
-# line above the exec keeps both.
+# line above the exec keeps both — and needs no second `source`, because the
+# preflight lives in the resolver library this stub already sources.
 #
 # 0.19.186 is where `loom-daemon skip-labels` first shipped: it landed in
 # 268777b7 (#8315, merged 2026-09-19) when VERSION read 0.19.185, and the
@@ -53,8 +55,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/locate-daemon-bin.sh
 source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
-# shellcheck source=lib/script-helper.sh
-source "$SCRIPT_DIR/lib/script-helper.sh"
 
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || pwd)"
 # $LOOM_DAEMON_SELF_BIN ("the binary that IMPLEMENTS this stub") first, then the
