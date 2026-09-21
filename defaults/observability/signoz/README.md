@@ -124,7 +124,22 @@ Community-edition limitations and missing usage separately from measured zeros.
 Set **seven days for logs, traces and metrics** in General Settings → Retention.
 The upstream default for metrics is 30 days, so a fresh render alone does not
 establish parity. Verify effective table DDL in ClickHouse after changing the
-setting, including derived tables; record it in `evidence.md`. TTL deletion uses
+setting, including derived tables; record it in `evidence.md`. The pinned API
+updates active signal tables and standard rollups, but leaves some metadata,
+reduced-metric and legacy tables at 15 or 30 days. For this isolated trial,
+apply the reviewed `retention.sql` after the API settings to shorten those
+existing TTLs, using the private bundled client:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < retention.sql
+```
+
+Re-run `queries.sql` after every upgrade or retention-setting change. Resource
+fingerprint tables retain the upstream **30-minute grace beyond seven days**;
+shorter buffer/usage TTLs remain unchanged. Schema migration records, metric
+reduction configuration and legacy metadata indexes have no signal TTL. This
+is a seven-day signal trial, not a claim that all metadata is erased at day seven.
+TTL deletion uses
 background merges and is not an exact deletion deadline or a disk quota.
 Accounts, dashboards and settings in PostgreSQL persist independently.
 Container stdout/stderr rotate separately at three 10 MiB files per service;

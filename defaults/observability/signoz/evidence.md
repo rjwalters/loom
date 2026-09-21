@@ -20,16 +20,42 @@ an intentional ClickStack observation gap; it cannot be used for a simultaneous
 backend latency comparison. Its volumes remain intact and it must be restored
 before the final #8529 comparison.
 
+The first cold bootstrap completed ClickHouse migrations after roughly 15
+minutes, followed by 126 PostgreSQL application migrations. Live startup exposed
+an unset session-signing secret in the upstream default and an empty active-query
+tracker path. The final casting requires the private secret (verified missing-key
+Compose rejection) and sets the writable tracker path using SigNoz's doubled-
+underscore environment-key escaping. The actual tracker directory exists and
+the missing-secret warning is absent. API health returned `{"status":"ok"}`;
+a synthetic local account was registered only after the secret was configured.
+The account and organization survived app recreation.
+
+App recreation also changed its private IP while the existing ingester kept
+retrying the old OpAMP address. Restarting the ingester is required; the casting
+now declares `depends_on` app health with `restart: true` for Compose-controlled
+updates. A container-running result alone is insufficient ingestion evidence.
+
+The histogram helper's two Linux archives independently matched the upstream
+SHA-256 manifest. The patched init job ran successfully in the pinned arm64 image
+and printed `histogram-quantile.tar.gz: OK` before extraction. Both architecture
+hashes are pinned in the casting; amd64 execution was not performed on this host.
+
+SigNoz's retention APIs accepted 168 hours for traces/metrics and seven days for
+logs. Actual DDL confirmed seven-day active signal tables and standard rollups;
+the API left some auxiliary/legacy TTLs at 15/30 days. The explicit trial
+`retention.sql` shortens those existing TTLs. Resource tables retain the upstream
+30-minute grace, and schema/configuration metadata is not subject to signal TTL.
+
 ## Acceptance ledger
 
 | Check | Status |
 | --- | --- |
 | Pinned Foundry render and configuration | Passed, including deterministic second render |
 | Keeper, PostgreSQL and ClickHouse readiness | Passed on the trial VM |
-| Schema migrations, app and ingester readiness | In progress |
+| Schema migrations and app readiness | Passed; receiver storage proof remains separate |
 | Three fixture signals with matching IDs/values | Pending actual query |
 | Actual Trace Explorer and correlated logs | Pending browser evidence |
-| Seven-day effective retention for all signals | Pending settings change and table DDL verification |
+| Seven-day effective retention | API and active-table DDL verified; auxiliary override verification in progress |
 | Restart persistence and shared receiver recovery | Pending live check |
 | Real Loom canary / real Judge-Doctor repair trace | Requires #8524/#8525 and #8529 |
 | Repeated latency/footprint comparison | Shared evaluation #8529 |
