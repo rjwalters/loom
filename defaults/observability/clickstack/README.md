@@ -19,7 +19,7 @@ for measured footprint and limitations.
 `supervisor.yaml` extends the bundled collector bootstrap deadline from the
 upstream three-second default to 120 seconds; a busy VM otherwise leaves the UI
 up while its collector has exited. Compose health checks both the application and
-collector. Allow up to ten minutes on a contended development VM; investigate
+collector. Allow up to twenty minutes on a contended development VM; investigate
 `/var/log/otel-collector.log` if readiness fails. The override is specific to this
 pinned all-in-one layout and must be rechecked when upgrading the image.
 

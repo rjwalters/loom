@@ -24,8 +24,8 @@ services:
     healthcheck:
       test: ['CMD', 'curl', '--fail', '--silent', '--fail-early', 'http://localhost:8080/api/health', 'http://localhost:13133']
       interval: 10s
-      timeout: 5s
-      start_period: 300s
+      timeout: 30s
+      start_period: 900s
       retries: 12
     logging:
       driver: json-file
