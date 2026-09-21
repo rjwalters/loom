@@ -52,4 +52,5 @@ if [[ -z "$DAEMON_BIN" ]]; then
     exit 1
 fi
 
+# requires-daemon: premise-check >= 0.19.238   #8396 — the premise-check gate; without it a resolved binary predating this subcommand refuses with clap's "unrecognized subcommand" (this thin stub itself fails closed above, exit 1, when no binary resolves at all)
 exec "$DAEMON_BIN" premise-check "$@"
