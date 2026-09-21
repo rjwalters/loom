@@ -18,7 +18,7 @@
 5701 defaults/.claude/commands/loom/builder-complexity.md
 12592 defaults/.claude/commands/loom/builder-pr.md
 3901 defaults/.claude/commands/loom/builder-worktree.md
-18649 defaults/.claude/commands/loom/builder.md
+18756 defaults/.claude/commands/loom/builder.md
 4803 defaults/.claude/commands/loom/bump.md
 7185 defaults/.claude/commands/loom/champion-common.md
 1971 defaults/.claude/commands/loom/champion-epic-guard-invariants.md
@@ -30,7 +30,7 @@
 3749 defaults/.claude/commands/loom/champion.md
 1100 defaults/.claude/commands/loom/comment-body-literal-path.md
 35440 defaults/.claude/commands/loom/curator.md
-22079 defaults/.claude/commands/loom/doctor.md
+22190 defaults/.claude/commands/loom/doctor.md
 131 defaults/.claude/commands/loom/driver.md
 2998 defaults/.claude/commands/loom/epic.md
 38648 defaults/.claude/commands/loom/guide.md
@@ -39,7 +39,7 @@
 5868 defaults/.claude/commands/loom/hermit.md
 4102 defaults/.claude/commands/loom/imagine.md
 2437 defaults/.claude/commands/loom/judge-reference.md
-42032 defaults/.claude/commands/loom/judge.md
+42142 defaults/.claude/commands/loom/judge.md
 316 defaults/.claude/commands/loom/loom-iteration.md
 254 defaults/.claude/commands/loom/loom-parent.md
 9385 defaults/.claude/commands/loom/loom.md

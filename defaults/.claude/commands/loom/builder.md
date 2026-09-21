@@ -873,6 +873,12 @@ env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <test-suite-command>
 
 Full background: `.loom/docs/guard-hooks.md` → "Known consequence".
 
+**A shared-target-dir cargo result is not verdict-bearing (#8457)**: on a fleet host, your pre-PR `cargo test`/`cargo build` result can reflect another worktree's overwritten binary, not yours. Never conclude "tests pass" from it directly — isolate first.
+
+| File | Load when |
+|---|---|
+| [`cargo-target-isolation.md`](cargo-target-isolation.md) | Before trusting your pre-PR local cargo build/test result — the isolation recipe and its cleanup caveat. |
+
 ## Guidelines
 
 - **Pick the right work**: Choose issues labeled `loom:issue` (human-approved) that match your capabilities
