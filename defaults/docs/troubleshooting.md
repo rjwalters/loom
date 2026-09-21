@@ -600,9 +600,9 @@ or `LOOM_PER_WORKTREE_TARGET_DIR=1` in the daemon's environment. Then:
   (`provision` / `path`), declared `requires-daemon: cargo-target-dir optional`
   in each script: a host whose binary predates the subcommand — or has none
   built yet — simply gets no per-worktree dir, which is the pre-#8458 behaviour.
-  The logic lives in the daemon per `.loom/docs/shell-language-policy.md`; the
-  bash library keeps only the marker read and the shape predicate, which the
-  removal paths need in-process.
+  The removal side consults the same binary (`is-attributable` / `marker`), so
+  every rule in the scheme is stated once, in the daemon; the shell scripts hold
+  only the call sites.
 - Every removal path reclaims it: `worktree.sh remove`, `merge-pr.sh`'s
   post-merge cleanup, `loom-daemon clean`, and the daemon's periodic reaper (so a
   worktree whose PR merged on another host is cleaned up here too).
