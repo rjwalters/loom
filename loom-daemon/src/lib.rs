@@ -239,6 +239,7 @@ pub mod sweep_outcomes;
 pub mod sweep_registry;
 pub mod telemetry;
 pub mod terminal;
+pub mod terminal_restore;
 /// Test-only capturing logger (see module docs) — single-sourced so the crate's
 /// one-per-process `log::set_boxed_logger` installation is shared by every test
 /// module that asserts on log severity.

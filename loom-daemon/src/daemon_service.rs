@@ -287,42 +287,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // Initialize terminal manager and clean up stale sessions
     let mut tm = TerminalManager::new();
 
-    // Skip both the tmux restore below AND the stale-session sweep that
-    // follows it when LOOM_NO_RESTORE=1 (issue #8463). This flag already
-    // suppresses the *lazy* restore-on-empty-list path in
-    // `TerminalManager::list_terminals` (and the pruning that accompanies
-    // it) — the isolation the integration-test harness relies on
-    // (`tests/common/mod.rs`) to keep a freshly-spawned test daemon from
-    // reading a live fleet's real terminals on the shared `-L loom` tmux
-    // socket. This startup path was a second, unguarded entry point to the
-    // same `restore_from_tmux*` call: with no workspace config present (the
-    // normal case for a throwaway test fixture) it fell through to the
-    // *unfiltered* "legacy" restore, silently importing every real `loom-*`
-    // session into the test daemon's registry regardless of the flag.
-    //
-    // Skipping `clean_stale_sessions()` too is required for safety, not just
-    // symmetry: that sweep kills every `loom-*` tmux session NOT present in
-    // the registry, so leaving it enabled while restore is skipped would
-    // treat a live fleet's real sessions as "stale" and destroy them.
-    if loom_daemon::terminal::no_restore_env() {
-        log::debug!("LOOM_NO_RESTORE=1 — skipping tmux restore and stale-session cleanup");
-    } else {
-        // Use config-based filtering if workspace config is available
-        if let Some(ref ids) = configured_ids {
-            tm.restore_from_tmux_with_filter(Some(ids))?;
-        } else {
-            // Fall back to legacy behavior (import all) when no config available
-            log::warn!("No workspace config found - using legacy restore (all sessions)");
-            tm.restore_from_tmux()?;
-        }
-        log::info!("Restored {} terminals", tm.list_terminals().len());
-
-        match tm.clean_stale_sessions() {
-            Ok(0) => log::debug!("No stale tmux sessions to clean"),
-            Ok(count) => log::info!("Cleaned {count} stale tmux session(s) from previous run"),
-            Err(e) => log::warn!("Failed to clean stale tmux sessions: {e}"),
-        }
-    }
+    // Restore surviving tmux sessions and sweep stale ones — both skipped
+    // together when LOOM_NO_RESTORE=1, which this startup path used to ignore
+    // (issue #8463). Lives in `terminal_restore` rather than inline here
+    // because both this file and `terminal.rs` are frozen at their current
+    // size by the File Size Ratchet; see that module's docs for the full
+    // rationale of the gate and of why the cleanup sweep must be skipped too.
+    loom_daemon::terminal_restore::restore_and_clean_at_startup(&mut tm, configured_ids.as_ref())?;
 
     let tm = Arc::new(Mutex::new(tm));
 

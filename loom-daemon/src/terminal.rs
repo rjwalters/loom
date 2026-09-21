@@ -1288,21 +1288,6 @@ pub fn claude_config_trust_at(state_path: &Path, project_dir: &Path) {
     claude_config::ensure_project_trusted(state_path, project_dir);
 }
 
-/// Whether `LOOM_NO_RESTORE=1` (or a case-insensitive `true`) is set in this
-/// process's environment.
-///
-/// Shared by every tmux-restore call site (issue #8463): originally this
-/// check lived only inside [`TerminalManager::list_terminals`]'s lazy
-/// restore-on-empty path, so a caller that invoked
-/// [`TerminalManager::restore_from_tmux`] / [`TerminalManager::
-/// restore_from_tmux_with_filter`] directly at daemon startup (see
-/// `daemon_service.rs`) never consulted it — silently importing every
-/// `loom-*` session on the shared `-L loom` tmux socket, including a live
-/// fleet's real terminals, into a supposedly-isolated test daemon.
-pub fn no_restore_env() -> bool {
-    std::env::var("LOOM_NO_RESTORE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-}
-
 pub struct TerminalManager {
     terminals: HashMap<TerminalId, TerminalInfo>,
 }
@@ -1708,8 +1693,10 @@ impl TerminalManager {
     pub fn list_terminals(&mut self) -> Vec<TerminalInfo> {
         // If registry is empty but tmux sessions exist, restore from tmux
         // Skip restore when LOOM_NO_RESTORE=1 is set (used in tests to prevent
-        // cross-test-binary contamination via shared tmux server)
-        let no_restore = no_restore_env();
+        // cross-test-binary contamination via shared tmux server). The
+        // predicate is single-sourced in `terminal_restore` so the daemon's
+        // startup restore path honors the same flag (issue #8463).
+        let no_restore = crate::terminal_restore::no_restore_env();
 
         if self.terminals.is_empty() && !no_restore {
             log::debug!("Registry empty, attempting to restore from tmux");
