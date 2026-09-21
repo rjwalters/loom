@@ -145,6 +145,11 @@
       "poolPressureMaxDeferSecs": 14400
     }
   },
+  "runtimes": {
+    "roles": {
+      "judge": "codex"
+    }
+  },
   "observability": {
     "enabled": false,
     "endpoint": "https://dashboard.example.com/ingest",
