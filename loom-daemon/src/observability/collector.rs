@@ -772,6 +772,32 @@ fn sample_role_tick_health(records: &[RoleTickRecord]) -> RoleTickHealth {
 /// passed its own `starvation_warn_secs` counts here — a brake holding while
 /// sweeps genuinely drain is healthy backpressure, and reporting *that* as a
 /// halt would flag every busy host in the fleet.
+///
+/// # Why `halt_reason` carries scalars ONLY — never the attribution
+///
+/// `halt_reason` is an unconditional member of `host.health`'s **public**
+/// allowlist (`RECORD_FIELD_ALLOWLIST` in `dashboard/src/redaction.ts`), copied
+/// verbatim into every unauthenticated fleet response. `top_cpu_consumers` is
+/// deliberately **not** in that allowlist — `redactAdmissionBrakeRow` drops it,
+/// because a list of executable basenames is workload detail that has no safe
+/// truncation (a command name IS the payload).
+///
+/// Interpolating the attribution into this free-text reason would therefore
+/// re-emit, byte for byte, the exact data the row redaction just removed —
+/// defeating the boundary through the other field. So the reason states only
+/// the duration, this host's own threshold, and the non-attributing verdict
+/// "suppressed by load Loom does not own"; [`AdmissionBrakeSummary`]'s
+/// `top_cpu_consumers` is the **sole** carrier of process attribution, and it
+/// stays behind the Access gate where an authenticated `/api/*` viewer reads it
+/// unchanged. The host-local `admission_brake` starvation log line
+/// ([`crate::admission_brake::global_observe`]) is unaffected — it never leaves
+/// the host, so it keeps the full clause.
+///
+/// Pinned end-to-end by
+/// `the_halt_reason_never_carries_process_attribution_past_the_public_boundary`
+/// below and by `dashboard/test/redactionAdmissionBrake.test.ts`'s
+/// "no process name survives" case, which assert the two halves of the same
+/// boundary (Judge finding on PR #8547).
 fn dispatch_halt_from_breaker(
     snapshot: Option<crate::host_breaker::BreakerSnapshot>,
     brake: Option<&AdmissionBrakeSummary>,
@@ -785,14 +811,10 @@ fn dispatch_halt_from_breaker(
             true,
             Some(format!(
                 "admission brake STARVING for {}s with 0 sweeps in flight (\u{2265} this host's \
-                 starvationWarnSecs {}); dispatch is suppressed by load Loom does not own{} \
+                 starvationWarnSecs {}); dispatch is suppressed by load Loom does not own \
                  (#8478)",
                 brake.starving_secs.unwrap_or_default(),
                 brake.starvation_warn_secs,
-                brake
-                    .top_cpu_consumers
-                    .as_deref()
-                    .map_or_else(String::new, str::to_string),
             )),
         ),
         _ => (false, None),

@@ -176,23 +176,94 @@ fn the_breaker_keeps_priority_over_the_brake_when_both_fire() {
     );
 }
 
+/// Every attribution token a real `ps`-derived clause can contain: the command
+/// basename, the parent command, and the structural markers that only ever
+/// appear in an attribution. Asserted absent from `halt_reason` as a set rather
+/// than one-by-one so that widening [`crate::foreign_load::format_clause`]
+/// cannot quietly reopen the leak through a token nobody thought to pin.
+const ATTRIBUTION_TOKENS: &[&str] = &[
+    "ngspice",
+    "launchd",
+    "TOP CPU",
+    "reparented",
+    "pid 1",
+    "ps` sample",
+];
+
+/// A realistic [`crate::foreign_load::attribution_clause`] output — the exact
+/// shape `sample_admission_brake` stores in `top_cpu_consumers` for the
+/// 2026-09-20 incident behind #8478.
+fn attribution_fixture() -> String {
+    " \u{2014} TOP CPU (best-effort host-wide `ps` sample, includes work Loom does not own): \
+     ngspice \u{d7}25 (1843% cpu, parent launchd[1], reparented to pid 1). A compute process \
+     reparented to pid 1 is owned by NO live Loom session \u{2014} see \
+     .loom/docs/long-running-compute.md (#8478)"
+        .to_string()
+}
+
+/// The privacy boundary this PR establishes, pinned from the emitting side
+/// (Judge finding on PR #8547).
+///
+/// `halt_reason` is an **unconditional** member of `host.health`'s public
+/// allowlist in `dashboard/src/redaction.ts`, copied verbatim to every
+/// unauthenticated viewer, while `admission_brake.top_cpu_consumers` is
+/// deliberately dropped by `redactAdmissionBrakeRow`. Interpolating the
+/// attribution into the free-text reason re-emitted the redacted data byte for
+/// byte through the allowlisted field — the two properties must therefore be
+/// asserted **together**, or a pair of tests can each pass while contradicting
+/// each other (which is exactly what shipped in the first cut of this PR: a
+/// Rust test asserting `halt_reason` contains `ngspice ×25`, and a dashboard
+/// test asserting the public view is never told which executables ran).
+///
+/// The TypeScript half of the same boundary — that no process name survives
+/// into the public projection of a payload carrying **both** a populated
+/// `halt_reason` and an `admission_brake` — lives in
+/// `dashboard/test/redactionAdmissionBrake.test.ts`.
 #[test]
-fn the_halt_reason_carries_the_foreign_load_attribution_when_one_was_sampled() {
+fn the_halt_reason_never_carries_process_attribution_past_the_public_boundary() {
     let now = Utc::now();
     let mut summary =
         brake_summary_from_snapshot(Some(brake_snapshot(true, Some(43_440), now)), now)
             .expect("registered");
-    summary.top_cpu_consumers = Some(
-        " \u{2014} TOP CPU (best-effort host-wide `ps` sample, includes work Loom does not \
-         own): ngspice \u{d7}25 (1843% cpu, parent launchd[1], reparented to pid 1)"
-            .to_string(),
+    let attribution = attribution_fixture();
+    summary.top_cpu_consumers = Some(attribution.clone());
+
+    let (halted, reason) = dispatch_halt_from_breaker(None, Some(&summary));
+    assert!(halted);
+    let reason = reason.expect("a halt must always say why");
+
+    // (a) The free-text, publicly-allowlisted field leaks nothing.
+    for token in ATTRIBUTION_TOKENS {
+        assert!(
+            !reason.contains(token),
+            "halt_reason is copied verbatim into every UNAUTHENTICATED fleet response \
+             (RECORD_FIELD_ALLOWLIST, dashboard/src/redaction.ts), so it must carry no \
+             process attribution — found {token:?} in: {reason}"
+        );
+    }
+
+    // (b) …and the attribution is not merely dropped: the structured field
+    // behind the Access gate is still its sole, intact carrier, so an
+    // authenticated operator loses nothing.
+    assert_eq!(
+        summary.top_cpu_consumers.as_deref(),
+        Some(attribution.as_str()),
+        "AdmissionBrakeSummary.top_cpu_consumers is the ONLY carrier of attribution"
     );
-    let (_, reason) = dispatch_halt_from_breaker(None, Some(&summary));
-    let reason = reason.expect("halted");
+
+    // The reason still answers the fleet-level question on its own.
+    assert!(reason.contains("43440s"), "reason was: {reason}");
     assert!(
-        reason.contains("ngspice \u{d7}25"),
-        "a fleet operator must be able to name the culprit without ssh-ing to the \
-         host; reason was: {reason}"
+        reason.contains("load Loom does not own"),
+        "the non-attributing verdict — whose load it is, not which binaries — must \
+         survive; reason was: {reason}"
+    );
+    // Nit from the same review: the clause used to append its own `(#8478)`
+    // after the template's, rendering `… (#8478) (#8478)`.
+    assert_eq!(
+        reason.matches("(#8478)").count(),
+        1,
+        "exactly one issue-number suffix; reason was: {reason}"
     );
 }
 

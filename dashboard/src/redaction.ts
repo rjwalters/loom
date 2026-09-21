@@ -320,6 +320,7 @@ interface RoleTickHealthRow {
   ok?: unknown;
   persistent?: unknown;
 }
+
 /** Truncate an absolute workspace path to its final component — mirrors the
  * daemon's `RoleFailure::label()` (`loom-daemon/src/health.rs`) and the
  * frontend's own `pathBasename` (`dashboard/web/src/format.ts`):
@@ -360,6 +361,25 @@ function pathBasename(root: string): string {
  * than copied through, so a raw path can never reach a public response by any
  * type-confusion path.
  */
+export function redactRoleTickHealth(roles: RoleTickHealthRow): Record<string, unknown> {
+  const redacted: Record<string, unknown> = {};
+  if ("total" in roles) redacted.total = roles.total;
+  if ("ok" in roles) redacted.ok = roles.ok;
+  if (Array.isArray(roles.persistent)) {
+    redacted.persistent = (roles.persistent as RoleTickFailureRow[]).map((row) => {
+      const entry: Record<string, unknown> = {};
+      if (row && typeof row === "object") {
+        if (typeof row.root === "string") entry.root = pathBasename(row.root);
+        if ("role" in row) entry.role = row.role;
+        if ("failures" in row) entry.failures = row.failures;
+        if ("last_at" in row) entry.last_at = row.last_at;
+        // `detail` is intentionally NOT copied here — see the doc comment.
+      }
+      return entry;
+    });
+  }
+  return redacted;
+}
 
 /** `host.health`'s `admission_brake` summary (#8478), as the daemon sends it
  * — the daemon always carries full detail (including a `ps`-sampled list of
@@ -394,6 +414,20 @@ interface AdmissionBrakeRow {
  * Access gate; the authenticated `/api/*` surface returns it unchanged, which
  * is where an operator diagnosing their own fleet reads it.
  *
+ * **Dropping it here is only half the boundary** (Judge finding on PR #8547).
+ * `halt_reason` sits in `RECORD_FIELD_ALLOWLIST` above and is copied verbatim
+ * for the same public viewer, and the daemon derives it from this same brake
+ * summary — so interpolating the attribution into that free-text field would
+ * re-emit, byte for byte, exactly what this function removed. The daemon's
+ * `dispatch_halt_from_breaker`
+ * (`loom-daemon/src/observability/collector.rs`) therefore keeps `halt_reason`
+ * to scalars and the non-attributing verdict, with this field as the sole
+ * carrier of process attribution. Both halves are pinned together by
+ * `dashboard/test/redactionAdmissionBrake.test.ts`'s "no process attribution
+ * survives anywhere in the public projection" case and by its Rust counterpart
+ * in `loom-daemon/src/observability/collector/admission_brake_tests.rs`
+ * (`the_halt_reason_never_carries_process_attribution_past_the_public_boundary`).
+ *
  * Like `redactRoleTickHealth`, a per-field pick (not a spread), so a future
  * field added to the brake summary is dropped from the public view by default
  * until this table is deliberately updated.
@@ -409,26 +443,6 @@ export function redactAdmissionBrakeRow(brake: AdmissionBrakeRow): Record<string
     redacted.dispatch_suppressed_by_foreign_load = brake.dispatch_suppressed_by_foreign_load;
   }
   // `top_cpu_consumers` is deliberately NOT copied here — see the doc comment.
-  return redacted;
-}
-
-export function redactRoleTickHealth(roles: RoleTickHealthRow): Record<string, unknown> {
-  const redacted: Record<string, unknown> = {};
-  if ("total" in roles) redacted.total = roles.total;
-  if ("ok" in roles) redacted.ok = roles.ok;
-  if (Array.isArray(roles.persistent)) {
-    redacted.persistent = (roles.persistent as RoleTickFailureRow[]).map((row) => {
-      const entry: Record<string, unknown> = {};
-      if (row && typeof row === "object") {
-        if (typeof row.root === "string") entry.root = pathBasename(row.root);
-        if ("role" in row) entry.role = row.role;
-        if ("failures" in row) entry.failures = row.failures;
-        if ("last_at" in row) entry.last_at = row.last_at;
-        // `detail` is intentionally NOT copied here — see the doc comment.
-      }
-      return entry;
-    });
-  }
   return redacted;
 }
 
