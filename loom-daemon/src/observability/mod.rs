@@ -1260,11 +1260,11 @@ mod tests {
     /// pre-existing `handles.is_none()` contract — same as the other three
     /// under-configured `spawn_task` tests above — for the OnceLock reason
     /// documented on `export_status_misconfigured_reports_a_distinct_sticky_state`.
-    /// No runtime is needed: reject before starting collectors or doing queue IO.
+    /// Reject before starting collectors or doing queue IO.
     #[cfg(not(feature = "otlp"))]
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn spawn_task_otlp_requested_without_the_feature_returns_none() {
+    async fn spawn_task_otlp_requested_without_the_feature_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
