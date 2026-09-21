@@ -145,6 +145,28 @@ pub enum WorktreeUseEvidence {
     /// A git operation is mid-flight (`index.lock` present) — precisely the
     /// `git commit` window in which #4449 lost an uncommitted fix.
     GitOperationInFlight(PathBuf),
+    /// A live `loom-daemon inflight` claim (#8268) is registered against this
+    /// worktree (Issue #8413). The string is the registration's own
+    /// `summary()` — command, tree, branch, age, claimant, pid.
+    ///
+    /// This is the signal an **in-session builder** can publish about itself:
+    /// it has no claim-lock, writes no `.loom-in-use` marker, and issues each
+    /// shell command as a one-shot subshell, so none of the four signals above
+    /// sees it between commands. Claiming before a long build/test run makes it
+    /// visible to every destructive path without a daemon sweep record.
+    InflightClaim(String),
+    /// Something wrote inside the worktree within the activity window
+    /// ([`crate::worktree_activity`], #8116) — an edit, a commit into the linked
+    /// gitdir, or a build writing into `target/` (Issue #8413).
+    ///
+    /// The **implicit** counterpart of [`Self::InflightClaim`], and the one
+    /// signal that needs no cooperation at all from the worker. It is also the
+    /// minimum-age floor the 2026-09-20 incident asked for: this watchdog only
+    /// ever looks at sweeps that have already *exited*, so a write landing after
+    /// that exit is by definition somebody the daemon does not track — most
+    /// likely an in-session builder mid-compile, whose output goes only into
+    /// `target/` and is invisible to every other signal here.
+    RecentWrite { age_secs: u64, window_secs: u64 },
 }
 
 impl std::fmt::Display for WorktreeUseEvidence {
@@ -162,6 +184,15 @@ impl std::fmt::Display for WorktreeUseEvidence {
             Self::GitOperationInFlight(path) => {
                 write!(f, "git operation in flight ({} exists)", path.display())
             }
+            Self::InflightClaim(summary) => write!(f, "live in-flight claim: {summary}"),
+            Self::RecentWrite {
+                age_secs,
+                window_secs,
+            } => write!(
+                f,
+                "filesystem write {age_secs}s ago (within the {}m activity window)",
+                window_secs / 60
+            ),
         }
     }
 }

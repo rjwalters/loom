@@ -1,4 +1,6 @@
-//! Filesystem-observed liveness for a worktree (Issue #8116).
+//! Filesystem-observed liveness for a worktree (Issue #8116), and the
+//! registry-independent veto destructive worktree passes apply to it
+//! (Issue #8413 — see "Destructive passes" at the bottom of this file).
 //!
 //! # Why this exists
 //!
@@ -62,6 +64,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::inflight::{self, Registration};
 use crate::worktree_ops::clean::WorktreeDecision;
 
 /// Default activity window: a worktree written within this long is live.
@@ -321,6 +324,245 @@ pub fn reclaim_skip_reason(
     }
 }
 
+// ============================================================================
+// Destructive passes: the registry-independent veto (Issue #8413)
+// ============================================================================
+//
+// Everything above gates the *artifact-reclaim* pass — deleting `target/` from
+// a worktree the reaper is keeping. The strictly more destructive passes
+// (removing the worktree outright; the mid-build watchdog's `git reset --hard`
+// + `git clean -fd`) still decided liveness purely from REGISTRY-VISIBLE
+// signals: a spawn-loop claim-lock, a `.loom-in-use` marker, an `index.lock`,
+// or a process whose cwd is inside the worktree.
+//
+// An in-session builder has none of the first three, and the fourth is only
+// true while one of its one-shot subshells happens to be alive. On 2026-09-20
+// that gap cost real work: a builder mid-way through a multi-minute `cargo`
+// compile in `.loom/worktrees/issue-8360` had the worktree hard-reset under it,
+// because a compile writes only into `target/` — which none of those signals
+// watch — so the worktree read as clean, idle and behind `main`.
+//
+// So the destructive passes get two registry-independent signals instead:
+//
+//   1. A **registered in-flight claim** (`crate::inflight`, #8268) whose `tree`
+//      is at or under the worktree. This is the explicit path, and the answer
+//      to "what can an in-session/operator build do to be seen?": run
+//      `loom-daemon inflight claim --command … --tree <worktree> --pid $$`
+//      before the long command. Builders are already told to claim before a
+//      long verification run, so this is a new *consumer* of an existing
+//      registration, not a new mechanism to remember.
+//   2. **Recent filesystem writes** — `probe_worktree_activity` above,
+//      including the depth-1 `target/` scan that makes a running `cargo`
+//      visible. This is the implicit path: it costs an agent nothing and
+//      covers the builder that never registered anything. It doubles as the
+//      minimum-age floor the incident asked for: a worktree created or written
+//      within the window is never destroyed, whatever else says it is idle.
+//
+// Either signal alone is sufficient, and both are properties of the host
+// filesystem rather than of the daemon's opinion about who owns the issue.
+//
+// # Failure direction (deliberately the OPPOSITE of `reclaim_skip_reason`)
+//
+// Positive evidence vetoes; absent evidence does not. An unreadable inflight
+// store, an unprobeable worktree, or a directory that is already gone yields NO
+// holders, so the reaper can still prune the stale `git worktree` registration
+// of a worktree somebody deleted by hand. Refusing to *reclaim* from a
+// directory we cannot inspect costs a little disk; refusing to *remove* a
+// directory that is not there costs a permanently stuck registration.
+
+/// One piece of registry-independent evidence that a live worker is inside a
+/// worktree (#8413).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveHolder {
+    /// A live `loom-daemon inflight` claim registered against this worktree (or
+    /// a path inside it). Boxed because [`Registration`] is much larger than
+    /// the other variant.
+    Inflight(Box<Registration>),
+    /// Something wrote inside the worktree within the activity window — an
+    /// edit, a commit into the linked gitdir, or a build writing into `target/`.
+    RecentWrite {
+        /// How long ago the most recent write was, in seconds.
+        age_secs: u64,
+        /// The window that write was judged against, in seconds.
+        window_secs: u64,
+    },
+}
+
+impl std::fmt::Display for LiveHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inflight(reg) => write!(f, "live in-flight claim: {}", reg.summary()),
+            Self::RecentWrite {
+                age_secs,
+                window_secs,
+            } => write!(
+                f,
+                "filesystem write {age_secs}s ago (within the {}m activity window)",
+                window_secs / 60
+            ),
+        }
+    }
+}
+
+/// Render a set of [`LiveHolder`]s as one `; `-joined log fragment, mirroring
+/// [`crate::sweep_registry::describe_worktree_use`]'s shape.
+#[must_use]
+pub fn describe_holders(holders: &[LiveHolder]) -> String {
+    holders
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Gather live-holder evidence with every input injected — the testing seam
+/// behind [`live_holders`].
+///
+/// `store` is the in-flight registry directory (`None` ⇒ the production one);
+/// `now`/`window` are [`probe_worktree_activity`]'s clock and window, and a zero
+/// `window` disables the filesystem leg (leaving the inflight leg, which has no
+/// window of its own).
+#[must_use]
+pub fn live_holders_in(
+    store: Option<&Path>,
+    worktree_path: &Path,
+    now: SystemTime,
+    window: Duration,
+    stale: Duration,
+) -> Vec<LiveHolder> {
+    // Cheapest first: the inflight store is a shallow directory of small JSON
+    // files, while the activity probe may walk a source tree.
+    let registrations = match store {
+        Some(dir) => inflight::holders_for_tree_in(dir, worktree_path, stale),
+        None => inflight::holders_for_tree(worktree_path),
+    };
+    let mut holders: Vec<LiveHolder> = registrations
+        .into_iter()
+        .map(|reg| LiveHolder::Inflight(Box::new(reg)))
+        .collect();
+
+    if let ActivityProbe::Recent { age_secs } = probe_worktree_activity(worktree_path, now, window)
+    {
+        holders.push(LiveHolder::RecentWrite {
+            age_secs,
+            window_secs: window.as_secs(),
+        });
+    }
+
+    holders
+}
+
+/// Every registry-independent signal that `worktree_path` is in live use right
+/// now, resolved against the production inflight store and the configured
+/// activity window ([`ACTIVITY_WINDOW_ENV`], default
+/// [`DEFAULT_ACTIVITY_WINDOW_MINUTES`]).
+#[must_use]
+pub fn live_holders(worktree_path: &Path) -> Vec<LiveHolder> {
+    live_holders_in(
+        None,
+        worktree_path,
+        SystemTime::now(),
+        resolve_activity_window(),
+        inflight::resolve_stale(),
+    )
+}
+
+/// [`live_holders`], rendered as the mid-build watchdog's own evidence type so
+/// it joins the four registry-visible signals as a peer rather than as a second
+/// gate bolted on beside them (#8413).
+///
+/// Both legs apply here, unlike [`removal_veto_in`]'s `Remove` arm: this
+/// watchdog only ever looks at a sweep that has **already exited**, so a write
+/// landing after that exit cannot be the dead sweep's own and is positive
+/// evidence of an untracked worker — which is exactly the in-session builder
+/// mid-`cargo` the incident behind #8413 destroyed. It doubles as the
+/// minimum-age floor that incident asked for: a worktree written within the
+/// window is never reset, however idle every other signal says it is.
+#[must_use]
+pub fn live_use_evidence(worktree_path: &Path) -> Vec<crate::sweep_registry::WorktreeUseEvidence> {
+    use crate::sweep_registry::WorktreeUseEvidence as Evidence;
+    live_holders(worktree_path)
+        .into_iter()
+        .map(|holder| match holder {
+            LiveHolder::Inflight(reg) => Evidence::InflightClaim(reg.summary()),
+            LiveHolder::RecentWrite {
+                age_secs,
+                window_secs,
+            } => Evidence::RecentWrite {
+                age_secs,
+                window_secs,
+            },
+        })
+        .collect()
+}
+
+/// Downgrade a **removal** decision to [`WorktreeDecision::SkipInUse`] when
+/// registry-independent evidence says a live worker is inside the worktree —
+/// the testing seam behind [`removal_veto`].
+///
+/// Only [`WorktreeDecision::Remove`] and
+/// [`WorktreeDecision::RemoveWithQuarantine`] are examined: every other arm is
+/// already a skip, so probing them would spend a filesystem walk per worktree
+/// per tick to change nothing.
+///
+/// # Why the two removal arms get different evidence
+///
+/// `RemoveWithQuarantine` is reached only for a worktree with **uncommitted
+/// changes** whose grace period has elapsed, so both legs apply: a write inside
+/// the window is evidence that a live worker is producing exactly the content
+/// at risk.
+///
+/// `Remove` is the opposite: under the reaper's own options (`safe: true,
+/// force: false`) [`crate::worktree_ops::clean::classify_worktree`] cannot
+/// return it for a dirty worktree — `SkipUncommitted` /
+/// `RemoveWithQuarantine` fire first — so the worktree is clean, its issue is
+/// closed, and its branch is on a remote. Nothing there is unrecoverable, and
+/// the freshest writes in such a worktree are usually the *merge* that made it
+/// eligible: gating it on mtime would fight the reclaim contract #4876 exists
+/// to keep (44 stale worktrees / 54G on one host) to protect a `target/` the
+/// reclaim pass already guards with this very probe. It is therefore vetoed
+/// only by the **explicit** signal — an in-flight claim someone deliberately
+/// registered against this tree.
+#[must_use]
+pub fn removal_veto_in(
+    store: Option<&Path>,
+    worktree_path: &Path,
+    decision: WorktreeDecision,
+    now: SystemTime,
+    window: Duration,
+    stale: Duration,
+) -> WorktreeDecision {
+    let window = match decision {
+        // `Duration::ZERO` short-circuits `probe_worktree_activity` to `Idle`,
+        // i.e. "inflight claims only" — see the doc comment above.
+        WorktreeDecision::Remove => Duration::ZERO,
+        WorktreeDecision::RemoveWithQuarantine => window,
+        _ => return decision,
+    };
+    let holders = live_holders_in(store, worktree_path, now, window, stale);
+    if holders.is_empty() {
+        return decision;
+    }
+    WorktreeDecision::SkipInUse(format!(
+        "live worker with no daemon registry record — {} (#8413)",
+        describe_holders(&holders)
+    ))
+}
+
+/// Production wrapper around [`removal_veto_in`]: the gate the reaper's removal
+/// passes apply to every classification before acting on it.
+#[must_use]
+pub fn removal_veto(worktree_path: &Path, decision: WorktreeDecision) -> WorktreeDecision {
+    removal_veto_in(
+        None,
+        worktree_path,
+        decision,
+        SystemTime::now(),
+        resolve_activity_window(),
+        inflight::resolve_stale(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +745,272 @@ mod tests {
             window(30)
         )
         .is_some_and(|r| r.contains("not readable")));
+    }
+
+    // -- removal_veto (#8413) ----------------------------------------------
+
+    /// Claim `tree` in `store` on behalf of `pid`, exactly as an in-session
+    /// builder's `loom-daemon inflight claim --tree <worktree> --pid $$` does.
+    fn claim(store: &Path, command: &str, tree: &Path, pid: u32) {
+        let tree = tree.to_string_lossy().to_string();
+        let reg = Registration {
+            fingerprint: inflight::fingerprint(command, &tree, "feature/issue-8413"),
+            command: command.to_string(),
+            tree: inflight::normalize_tree(&tree),
+            branch: "feature/issue-8413".to_string(),
+            pid,
+            agent: "in-session builder".to_string(),
+            started_at: chrono::Utc::now(),
+        };
+        assert!(matches!(
+            inflight::claim_in(store, &reg, Duration::from_secs(3600)),
+            inflight::ClaimOutcome::Claimed(_)
+        ));
+    }
+
+    fn store_of(tmp: &tempfile::TempDir) -> PathBuf {
+        tmp.path().join("inflight-store")
+    }
+
+    fn hour() -> Duration {
+        Duration::from_secs(3600)
+    }
+
+    /// AC (#8413): a worktree with a **registered in-flight claim** and no
+    /// recent writes at all is NOT removed. This is the in-session builder
+    /// path — no sweep registration, no claim-lock, no `.loom-in-use` marker.
+    #[test]
+    fn a_registered_inflight_claim_vetoes_removal_with_no_recent_write() {
+        let tmp = make_worktree();
+        let wt = worktree_path(&tmp);
+        let store = store_of(&tmp);
+        claim(&store, "cargo build --workspace", &wt, std::process::id());
+
+        // Two hours after every file was written ⇒ the filesystem leg finds
+        // nothing, so the registration is the only evidence in play.
+        let decision = removal_veto_in(
+            Some(&store),
+            &wt,
+            WorktreeDecision::Remove,
+            later(7200),
+            window(30),
+            hour(),
+        );
+        match decision {
+            WorktreeDecision::SkipInUse(reason) => {
+                assert!(reason.contains("in-flight claim"), "{reason}");
+                assert!(reason.contains("cargo build --workspace"), "{reason}");
+            }
+            other => panic!("a live inflight claim must veto removal, got {other:?}"),
+        }
+    }
+
+    /// AC (#8413): a **live compile** — writes landing in `target/` and nowhere
+    /// else, no tracked-file edits, no registration — vetoes the destruction of
+    /// a worktree that still holds uncommitted work. This is the 2026-09-20
+    /// incident's exact shape: the compile is invisible to every registry-based
+    /// signal, and the uncommitted layer is what a reset would destroy.
+    #[test]
+    fn a_live_compile_writing_only_into_target_vetoes_a_dirty_worktrees_reclaim() {
+        let tmp = make_worktree();
+        let wt = worktree_path(&tmp);
+        let store = store_of(&tmp);
+
+        // Baseline: everything 2h old against a 30m window ⇒ reclaimable.
+        assert_eq!(
+            removal_veto_in(
+                Some(&store),
+                &wt,
+                WorktreeDecision::RemoveWithQuarantine,
+                later(7200),
+                window(30),
+                hour()
+            ),
+            WorktreeDecision::RemoveWithQuarantine
+        );
+
+        fs::write(wt.join("target/debug/binary"), "rebuilt").unwrap();
+        let decision = removal_veto_in(
+            Some(&store),
+            &wt,
+            WorktreeDecision::RemoveWithQuarantine,
+            later(7200),
+            window(180),
+            hour(),
+        );
+        assert!(
+            matches!(&decision, WorktreeDecision::SkipInUse(r) if r.contains("filesystem write")),
+            "a running build must veto a dirty worktree's reclaim, got {decision:?}"
+        );
+    }
+
+    /// The documented asymmetry (see [`removal_veto_in`]): a **clean**,
+    /// closed-issue, merged-PR worktree — the only shape `Remove` is reachable
+    /// for under the reaper's options — is not held back by mtimes alone (a
+    /// just-merged worktree is always freshly written), but IS held back by an
+    /// explicit in-flight claim.
+    #[test]
+    fn mtimes_alone_do_not_veto_a_clean_removable_worktree() {
+        let tmp = make_worktree();
+        let wt = worktree_path(&tmp);
+        let store = store_of(&tmp);
+
+        // Everything in the worktree was written seconds ago…
+        assert_eq!(
+            removal_veto_in(
+                Some(&store),
+                &wt,
+                WorktreeDecision::Remove,
+                SystemTime::now(),
+                window(30),
+                hour()
+            ),
+            WorktreeDecision::Remove,
+            "a clean, merged worktree must still be reclaimable right after its merge"
+        );
+
+        // …but an explicit registration still fences it off.
+        claim(&store, "cargo test --workspace", &wt, std::process::id());
+        assert!(matches!(
+            removal_veto_in(
+                Some(&store),
+                &wt,
+                WorktreeDecision::Remove,
+                SystemTime::now(),
+                window(30),
+                hour()
+            ),
+            WorktreeDecision::SkipInUse(_)
+        ));
+    }
+
+    /// The other direction, or the gate would just disable the reaper: a
+    /// genuinely idle, unclaimed worktree is still removed.
+    #[test]
+    fn a_genuinely_idle_worktree_is_still_removed() {
+        let tmp = make_worktree();
+        assert_eq!(
+            removal_veto_in(
+                Some(&store_of(&tmp)),
+                &worktree_path(&tmp),
+                WorktreeDecision::Remove,
+                later(7200),
+                window(30),
+                hour(),
+            ),
+            WorktreeDecision::Remove
+        );
+    }
+
+    /// A dirty, past-grace worktree is reclaimed through the quarantine-stash
+    /// path — exactly as destructive as `Remove`, so it gets the same veto.
+    #[test]
+    fn remove_with_quarantine_is_vetoed_too() {
+        let tmp = make_worktree();
+        let wt = worktree_path(&tmp);
+        let store = store_of(&tmp);
+        claim(&store, "pnpm check:ci", &wt, std::process::id());
+        assert!(matches!(
+            removal_veto_in(
+                Some(&store),
+                &wt,
+                WorktreeDecision::RemoveWithQuarantine,
+                later(7200),
+                window(30),
+                hour(),
+            ),
+            WorktreeDecision::SkipInUse(_)
+        ));
+    }
+
+    /// A claim on a different tree — including a sibling whose path is a string
+    /// prefix of this one — says nothing about this worktree.
+    #[test]
+    fn a_claim_on_another_tree_does_not_veto() {
+        let tmp = make_worktree();
+        let store = store_of(&tmp);
+        // `issue-81` is a string prefix of the fixture's `issue-8116`, so a
+        // naive string-prefix containment check would wrongly match here.
+        let sibling = tmp.path().join("issue-81");
+        fs::create_dir_all(&sibling).unwrap();
+        claim(&store, "cargo test", &sibling, std::process::id());
+
+        assert_eq!(
+            removal_veto_in(
+                Some(&store),
+                &worktree_path(&tmp),
+                WorktreeDecision::Remove,
+                later(7200),
+                window(30),
+                hour(),
+            ),
+            WorktreeDecision::Remove
+        );
+    }
+
+    /// A claim whose owner process is gone is stale, not evidence — otherwise a
+    /// killed builder would fence its worktree off forever.
+    #[test]
+    fn a_dead_claimants_registration_does_not_veto() {
+        let tmp = make_worktree();
+        let wt = worktree_path(&tmp);
+        let store = store_of(&tmp);
+        claim(&store, "cargo build", &wt, u32::MAX - 1);
+
+        assert_eq!(
+            removal_veto_in(
+                Some(&store),
+                &wt,
+                WorktreeDecision::Remove,
+                later(7200),
+                window(30),
+                hour(),
+            ),
+            WorktreeDecision::Remove
+        );
+    }
+
+    /// Non-removal decisions pass through untouched (and, by construction,
+    /// unprobed).
+    #[test]
+    fn skip_decisions_pass_through_unchanged() {
+        let tmp = make_worktree();
+        let wt = worktree_path(&tmp);
+        let store = store_of(&tmp);
+        claim(&store, "cargo build", &wt, std::process::id());
+        for decision in [
+            WorktreeDecision::SkipUncommitted,
+            WorktreeDecision::SkipPrOpen,
+            WorktreeDecision::SkipUnmanaged,
+        ] {
+            assert_eq!(
+                removal_veto_in(
+                    Some(&store),
+                    &wt,
+                    decision.clone(),
+                    SystemTime::now(),
+                    window(30),
+                    hour(),
+                ),
+                decision
+            );
+        }
+    }
+
+    /// A worktree whose directory is already gone yields no evidence, so the
+    /// reaper can still prune its stale registration (see the failure-direction
+    /// note above — this is the one place the veto fails open).
+    #[test]
+    fn a_vanished_worktree_yields_no_evidence() {
+        let tmp = make_worktree();
+        assert!(live_holders_in(
+            Some(&store_of(&tmp)),
+            &tmp.path().join("issue-9999"),
+            SystemTime::now(),
+            window(30),
+            hour()
+        )
+        .is_empty());
     }
 
     #[test]
