@@ -321,3 +321,107 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
     }
     Ok(selection)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialize env mutation across these two tests — `resolve` reads
+    /// `missing()` against the process environment for a `Many` (required)
+    /// `credentialEnv`.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn profile_with_credentials(
+        credential_env: CredentialEnv,
+        credential_targets: BTreeMap<String, CredentialTargets>,
+    ) -> ModelProfile {
+        ModelProfile {
+            model: "test-model".to_string(),
+            providers: BTreeMap::from([("test-runtime".to_string(), "test-provider".to_string())]),
+            effort: None,
+            credential_env: Some(credential_env),
+            credential_targets,
+            provider_options: BTreeMap::new(),
+            provider_definition: BTreeMap::new(),
+            allowed_efforts: Vec::new(),
+        }
+    }
+
+    /// Regression test for #8454: #8421 replaced the old
+    /// `credential_env`/`credential_target` pair with `credentials` (the
+    /// mapped pairs only), which silently drops every declared source that
+    /// has no `credentialTargets` entry — including the DEFAULT bundled
+    /// `zai-flash` profile, whose `ZAI_API_KEY` has no target at all. #8437's
+    /// `credential_sources` fixes that by carrying every declared name
+    /// forward regardless of mapping, but nothing pinned it: a future
+    /// `Selection` refactor that keeps `credentials` and drops
+    /// `credential_sources` would compile clean and silently reintroduce this
+    /// bug. This asserts both fields directly off `resolve()`, not off a
+    /// hand-built fixture, so it fails the moment that wiring breaks.
+    #[test]
+    fn credential_sources_includes_every_declared_variable_even_when_unmapped() {
+        let _guard = env_lock();
+        // A `Many` (array-form) `credentialEnv` is a required set (see
+        // `CredentialEnv::required`) — `resolve()` fails closed if either is
+        // unset, so both must be present for this to reach the assertions.
+        std::env::set_var("LOOM_TEST_8454_CRED_A", "value-a");
+        std::env::set_var("LOOM_TEST_8454_CRED_B", "value-b");
+
+        let credential_targets = BTreeMap::from([(
+            "test-runtime".to_string(),
+            CredentialTargets::Map(BTreeMap::from([(
+                "LOOM_TEST_8454_CRED_A".to_string(),
+                "MAPPED_TARGET".to_string(),
+            )])),
+        )]);
+        let profile = profile_with_credentials(
+            CredentialEnv::Many(vec![
+                "LOOM_TEST_8454_CRED_A".to_string(),
+                "LOOM_TEST_8454_CRED_B".to_string(),
+            ]),
+            credential_targets,
+        );
+
+        let selection = resolve("test-runtime", "test-profile", &profile);
+
+        std::env::remove_var("LOOM_TEST_8454_CRED_A");
+        std::env::remove_var("LOOM_TEST_8454_CRED_B");
+
+        let selection = selection.expect("both required sources are set");
+        // Every declared source is carried forward, mapped or not — this is
+        // the field containment (#8437) chains ahead of `credentials` so an
+        // unmapped-but-required source still reaches the container.
+        assert_eq!(
+            selection.credential_sources,
+            vec!["LOOM_TEST_8454_CRED_A", "LOOM_TEST_8454_CRED_B"]
+        );
+        // Only the mapped source produces a (source, target) pair.
+        assert_eq!(
+            selection.credentials,
+            vec![("LOOM_TEST_8454_CRED_A".to_string(), "MAPPED_TARGET".to_string())]
+        );
+    }
+
+    /// Same regression, for the string form with no `credentialTargets` at
+    /// all — the exact shape of the bundled `zai-flash` profile the issue
+    /// names (`"credentialEnv": "ZAI_API_KEY"`, no `credentialTargets` key).
+    #[test]
+    fn credential_sources_string_form_with_no_targets_forwards_by_name_only() {
+        // The single-string form is optional (`CredentialEnv::required` is
+        // false for `One`), so `resolve()` does not fail closed on an unset
+        // variable here and no env mutation is needed.
+        let profile = profile_with_credentials(
+            CredentialEnv::One("ZAI_API_KEY".to_string()),
+            BTreeMap::new(),
+        );
+
+        let selection = resolve("test-runtime", "zai-flash", &profile)
+            .expect("optional credentialEnv resolves");
+
+        assert_eq!(selection.credential_sources, vec!["ZAI_API_KEY"]);
+        assert!(selection.credentials.is_empty());
+    }
+}
