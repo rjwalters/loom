@@ -92,6 +92,15 @@ pub async fn flush_before_shutdown(budget: Duration) {
     .await;
 }
 
+/// Intercept shutdown while still in the async IPC layer. The legacy request
+/// dispatcher is synchronous and cannot await a final drain.
+pub async fn intercept(request: &crate::types::Request) {
+    if matches!(request, crate::types::Request::Shutdown) {
+        log::info!("Shutdown requested; draining telemetry before exit");
+        exit(crate::ipc::EXIT_SHUTDOWN).await;
+    }
+}
+
 /// Signal/IPC shutdown preserves active work; it exports only already-completed
 /// queued spans. SIGKILL cannot run this path and relies on persisted state.
 pub async fn exit(code: i32) -> ! {

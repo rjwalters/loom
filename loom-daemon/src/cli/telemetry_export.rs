@@ -62,6 +62,13 @@ impl TelemetryExportArgs {
             return Err(error.into());
         }
         anyhow::ensure!(
+            outcome
+                .signals
+                .values()
+                .all(|counts| counts.dropped == 0 && counts.rejected == 0),
+            "fixture contains dropped or rejected signal items"
+        );
+        anyhow::ensure!(
             outcome.acknowledged == envelopes.len(),
             "fixture was not fully acknowledged"
         );

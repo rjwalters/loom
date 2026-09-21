@@ -1893,6 +1893,7 @@ async fn handle_client(
             continue;
         }
 
+        crate::observability::shutdown::intercept(&request).await;
         let response = handle_request(
             request,
             &terminal_manager,
@@ -4656,14 +4657,8 @@ fn handle_request(
 
         Request::RemoveWatch { id } => handle_remove_watch(&id),
 
-        Request::Shutdown => {
-            // Exit NON-ZERO (Issue #4054): an explicit shutdown means "stay
-            // down", so under launchd `KeepAlive:SuccessfulExit` this must not
-            // trip a relaunch. Only `RestartDaemon` (handled in `handle_client`)
-            // exits 0. See the EXIT_* constants at the top of this module.
-            log::info!("Shutdown requested (exiting {EXIT_SHUTDOWN}; not a supervised relaunch)");
-            crate::observability::shutdown::exit(EXIT_SHUTDOWN).await;
-        }
+        // Real IPC shutdown is intercepted asynchronously before this dispatcher.
+        Request::Shutdown => std::process::exit(EXIT_SHUTDOWN),
         Request::RestartDaemon => {
             // Structurally unreachable: `handle_client` intercepts
             // `RestartDaemon` before dispatching to `handle_request` (it must
