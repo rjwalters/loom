@@ -4,6 +4,7 @@
 use super::*;
 
 pub(crate) mod container_stop;
+pub(crate) mod no_progress;
 pub(crate) mod pid_identity;
 
 // ============================================================================
@@ -1864,67 +1865,31 @@ impl SweepRegistry {
                                     at: now,
                                 };
                             }
-                            // No-progress backstop (#4366): a headless child
-                            // that ends its turn parked on a monitored
-                            // background task (e.g. "cache download is
-                            // running... I'll pick this back up") exits 0 with
-                            // NO checkpoint and NO forward lifecycle progress
-                            // whatsoever. That shape is indistinguishable from
-                            // the legitimate #3823b self-skip / no-work exit
-                            // by exit code alone, so it must be conjunctive:
-                            // clean exit AND no open linked PR (excludes the
-                            // #4123 open-PR self-skip) AND the issue is still
-                            // open (excludes a legitimate curator
-                            // close-as-not-planned / already-done self-skip).
+                            // No-progress backstop (#4366). The PR probe is
+                            // hoisted into its own binding (#6350) so the
+                            // `Open(_)` verdict — a legitimate #4123 existing-PR
+                            // self-skip, deliberately EXEMPT from the
+                            // no-progress/quarantine tally below — can still be
+                            // read separately by `yielded_open_pr` just below,
+                            // without paying for a second forge round trip.
                             // Gated on `!skip_label_flip` like every other
                             // real-forge probe in this branch (the resume-path
                             // open-PR check above, `restore_label_to_ready`) —
                             // test fixtures without `gh` credentials never pay
-                            // for a forge round trip, and this path stays a
-                            // pure no-op with `no_progress` defaulting to
-                            // `false` (byte-identical to pre-#4366 behavior)
-                            // whenever label-flipping itself is disabled.
-                            //
-                            // Both forge probes below are FAIL-OPEN, so each arm
-                            // demands a POSITIVE verdict rather than accepting the
-                            // "probe failed" state:
-                            //
-                            // - The issue-state arm demands `== Some(false)` ("the
-                            //   issue is verifiably OPEN") rather than the weaker
-                            //   `!= Some(true)`: a timed-out / rate-limited `gh`
-                            //   probe returns `None`, and `None != Some(true)`
-                            //   would have been *satisfied*, turning a benign
-                            //   self-skip into a counted failed attempt and
-                            //   wrongly quarantining an issue during a forge
-                            //   outage.
-                            // - The open-PR arm (#4452) demands a VERIFIED
-                            //   `OpenPrProbe::NoneOpen` rather than the old
-                            //   `Option::is_none()`, which conflated "no open
-                            //   linked PR" with "the PR probe itself failed". That
-                            //   conflation meant a PARTIAL outage (PR probe fails
-                            //   while the issue probe answers OPEN) could still
-                            //   false-positive; matching `NoneOpen` closes that
-                            //   gap — a `ProbeFailed` yields `no_progress = false`.
-                            //
-                            // Consequently a probe failure on EITHER arm — and a
-                            // fortiori a full forge outage — yields
-                            // `no_progress == false` (the pre-#4366 behavior), so
-                            // an outage can never manufacture quarantine pressure.
-                            //
-                            // The PR probe is hoisted into its own binding (#6350)
-                            // so the `Open(_)` verdict — a legitimate #4123
-                            // existing-PR self-skip, deliberately EXEMPT from the
-                            // no-progress/quarantine tally below — can still be
-                            // read separately by `yielded_open_pr` just below,
-                            // without paying for a second forge round trip.
+                            // for a forge round trip, and the whole path stays a
+                            // pure no-op with `no_progress` defaulting to `false`
+                            // (byte-identical to pre-#4366 behavior) whenever
+                            // label-flipping itself is disabled.
                             let open_pr_probe =
                                 if !self.config.skip_label_flip && exit_code == Some(0) {
                                     Some(self.probe_open_linked_pr(issue))
                                 } else {
                                     None
                                 };
-                            let no_progress = open_pr_probe == Some(OpenPrProbe::NoneOpen)
-                                && self.issue_is_closed_or_pr(issue) == Some(false);
+                            // The predicate itself — every arm, and the whole
+                            // #4366/#4452/#6350/#8439 rationale for its exact
+                            // shape — lives in the `no_progress` sibling module.
+                            let no_progress = self.is_no_progress(issue, &sweep_id, open_pr_probe);
                             // #6350: a clean exit whose self-skip was a VERIFIED
                             // open linked PR (the #4123 guard's own signature) is
                             // deliberately exempt from `no_progress` above — see
