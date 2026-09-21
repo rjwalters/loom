@@ -207,7 +207,48 @@ fn scripts_dir(root: &Path) -> PathBuf {
 }
 
 pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
+    use crate::{
+        observability::lifecycle,
+        telemetry::trace::{SpanName, SpanStatus},
+    };
     let root = workspace(args.scripts_dir.as_deref())?;
+    let role = Options::parse(&args.args).ok().and_then(|o| {
+        o.prompt
+            .and_then(|p| prompt::role_invocation(&p).map(|(r, _)| r.to_owned()))
+    });
+    let attempt = role
+        .as_deref()
+        .and_then(|r| lifecycle::worker_attempt(&root, r));
+    let preflight = attempt
+        .as_ref()
+        .and_then(|a| a.child(SpanName::RuntimePreflight, Default::default()))
+        .or_else(|| lifecycle::inherited(&root, SpanName::RuntimePreflight, Default::default()));
+    let result = run_preflight(args, &root, preflight.as_ref(), attempt.as_ref());
+    if let Some(span) = preflight {
+        span.finish("rejected", SpanStatus::Error);
+    }
+    if let Some(span) = attempt {
+        let outcome = if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| matches!(error.code, 126 | 127))
+        {
+            "spawn_failed"
+        } else {
+            "rejected"
+        };
+        span.finish_attempt(outcome, SpanStatus::Error);
+    }
+    result
+}
+
+fn run_preflight(
+    args: WorkerArgs,
+    root: &Path,
+    preflight: Option<&crate::observability::lifecycle::Span>,
+    attempt: Option<&crate::observability::lifecycle::Span>,
+) -> Result<(), LaunchError> {
+    let mut trace_identity = crate::telemetry::trace::TraceAttributes::new();
     let config = crate::config_resolver::resolve_effective_config(&root);
     let (runtime, source) = if let Some(role) = nonempty_env("LOOM_ROLE") {
         let (runtime, source) = crate::runtime_admission::resolve_binding(&root, &role, None)
@@ -248,6 +289,12 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
                 .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
         let selection = profiles::select(&runtime, &options, &config)?;
+        trace_identity.insert("loom.provider".into(), selection.provider.clone());
+        trace_identity.insert("loom.model".into(), selection.model.clone());
+        if let Some(model) = &options.model {
+            trace_identity.insert("loom.configured_model".into(), model.clone());
+        }
+
         // Per-sweep ephemeral containment (issue #8403). Decided here, after
         // admission and profile selection (so a misconfigured launch still
         // fails fast on the host) but BEFORE prompt expansion and binding
@@ -365,7 +412,33 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
     }
     log.flush()
         .map_err(|e| LaunchError::config(e.to_string()))?;
-    exec(command)
+    trace_identity.insert("loom.runtime".into(), runtime.clone());
+    let mut runtime_span = None;
+    if let Some(preflight) = preflight {
+        let mut accepted = trace_identity.clone();
+        accepted.insert("loom.result".into(), "accepted".into());
+        preflight.finish_attributes(crate::telemetry::trace::SpanStatus::Ok, accepted);
+        if let Some(run) = attempt
+            .and_then(|a| {
+                a.child(crate::telemetry::trace::SpanName::RuntimeRun, trace_identity.clone())
+            })
+            .or_else(|| {
+                crate::observability::lifecycle::inherited(
+                    root,
+                    crate::telemetry::trace::SpanName::RuntimeRun,
+                    trace_identity.clone(),
+                )
+            })
+        {
+            run.command(&mut command);
+            runtime_span = Some(run);
+        }
+    }
+    let result = exec(command);
+    if let Some(span) = runtime_span {
+        span.finish("spawn_failed", crate::telemetry::trace::SpanStatus::Error);
+    }
+    result
 }
 
 #[cfg(unix)]

@@ -83,6 +83,7 @@ pub mod backfill;
 pub mod collector;
 pub mod endpoint_policy;
 pub mod exporter;
+pub mod lifecycle;
 #[cfg(feature = "otlp")]
 pub mod otlp;
 pub mod outcome;

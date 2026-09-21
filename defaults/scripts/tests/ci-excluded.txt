@@ -59,3 +59,5 @@ test-token-model-class.sh  Same constraint as test-spawn-claude.sh above, which 
 
 test-loom-dispatcher.sh  Wired through scripts/test-installer.sh in Installer Integration Tests; requires the Rust spawn-worker dispatcher (#8362).
 test-spawn-generic.sh  Wired in native-port equivalence job; requires the Rust spawn-worker dispatcher (#8362).
+
+test-sweep-checkpoint.sh  Native Rust checkpoint port (#8525); retained equivalence suite runs in Native Port Suites with a built binary.

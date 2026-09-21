@@ -15,8 +15,8 @@
 //!
 //! [`Event::SweepPhase`] / [`Event::SweepExited`] / [`Event::SweepCrashed`]
 //! carry an `issue` number but not the `sweep_id` the schema's lifecycle
-//! records require, so this module tracks a small in-memory `issue ->
-//! (sweep_id, started_at)` map ([`DispatchState`]), populated on
+//! records require, so this module tracks a small in-memory `(repo, issue) ->
+//! (sweep_id, started_at, trace_context)` map ([`DispatchState`]), populated on
 //! `sweep.global.dispatch` and consulted (then cleared) on the terminal
 //! event. Like every other in-process daemon tracker (e.g.
 //! `work_finder`'s per-root state maps), this resets across a daemon
@@ -52,6 +52,8 @@ use crate::types::{Event, RoleTickRecord, SweepKind};
 use crate::workspace_pool::WorkspacePool;
 
 use super::queue::DurableQueue;
+mod correlation;
+pub(crate) type DispatchKey = (String, u32);
 
 /// Timeout on the `gh repo view` slug lookup — generous but bounded so a
 /// wedged `gh` cannot stall the collector loop indefinitely.
@@ -64,6 +66,7 @@ const SLUG_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct DispatchState {
     sweep_id: String,
     started_at: DateTime<Utc>,
+    trace_context: Option<crate::telemetry::trace::TraceContext>,
 }
 
 /// Spawn the collector task on the shared daemon runtime. Subscribes to the
@@ -106,7 +109,7 @@ async fn run_collector(
     daemon_started_at: Instant,
     workspace_pool: Arc<WorkspacePool>,
 ) {
-    let mut dispatches: HashMap<u32, DispatchState> = HashMap::new();
+    let mut dispatches: HashMap<DispatchKey, DispatchState> = HashMap::new();
     let mut slug_cache: HashMap<String, String> = HashMap::new();
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
     snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -198,7 +201,7 @@ async fn handle_event(
     queue: &DurableQueue,
     default_workspace_root: &Path,
     host_id: &str,
-    dispatches: &mut HashMap<u32, DispatchState>,
+    dispatches: &mut HashMap<DispatchKey, DispatchState>,
     slug_cache: &mut HashMap<String, String>,
 ) {
     let Some(issue) = event_issue(&event) else {
@@ -214,8 +217,16 @@ async fn handle_event(
         return;
     };
     let visibility = resolve_visibility(&slug).await;
-    for record in map_event_to_records(&event, issue, &slug, visibility, dispatches) {
-        queue.push(TelemetryEnvelope::new(host_id, record));
+    for envelope in correlation::map_envelopes(
+        &event,
+        issue,
+        &slug,
+        visibility,
+        Path::new(&workspace_path),
+        host_id,
+        dispatches,
+    ) {
+        queue.push(envelope);
     }
 }
 
@@ -263,7 +274,7 @@ pub(crate) fn map_event_to_records(
     issue: u32,
     repo: &str,
     visibility: RepoVisibility,
-    dispatches: &mut HashMap<u32, DispatchState>,
+    dispatches: &mut HashMap<DispatchKey, DispatchState>,
 ) -> Vec<TelemetryRecord> {
     match event {
         Event::SweepGlobalDispatch {
@@ -273,10 +284,11 @@ pub(crate) fn map_event_to_records(
         } => {
             let started_at = Utc::now();
             dispatches.insert(
-                issue,
+                (repo.to_owned(), issue),
                 DispatchState {
                     sweep_id: sweep_id.clone(),
                     started_at,
+                    trace_context: None,
                 },
             );
             vec![TelemetryRecord::SweepStarted(SweepStartedRecord {
@@ -292,7 +304,7 @@ pub(crate) fn map_event_to_records(
         Event::SweepGlobalDispatch { .. } => Vec::new(),
         Event::SweepPhase { phase, .. } => {
             let sweep_id = dispatches
-                .get(&issue)
+                .get(&(repo.to_owned(), issue))
                 .map(|d| d.sweep_id.clone())
                 .unwrap_or_else(|| unknown_sweep_id(issue));
             vec![TelemetryRecord::SweepPhase(
@@ -311,7 +323,7 @@ pub(crate) fn map_event_to_records(
             duration_sec,
             ..
         } => {
-            let dispatch = dispatches.remove(&issue);
+            let dispatch = dispatches.remove(&(repo.to_owned(), issue));
             let sweep_id = dispatch
                 .as_ref()
                 .map(|d| d.sweep_id.clone())
@@ -324,7 +336,7 @@ pub(crate) fn map_event_to_records(
             terminal_records(repo, visibility, issue, sweep_id, result, *duration_sec, None)
         }
         Event::SweepCrashed { .. } => {
-            let dispatch = dispatches.remove(&issue);
+            let dispatch = dispatches.remove(&(repo.to_owned(), issue));
             let sweep_id = dispatch
                 .as_ref()
                 .map(|d| d.sweep_id.clone())

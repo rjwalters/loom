@@ -18,6 +18,9 @@ use anyhow::Result;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ScriptPortCommand {
+    /// Durable phase completion markers and trace observations (#8525).
+    SweepCheckpoint(super::sweep_checkpoint::SweepCheckpointArgs),
+
     /// Champion's dependency-classification family (PR 3):
     /// `classify-dependency-block`, `detect-dependency-cycle`,
     /// `detect-startable-subset`.
@@ -120,6 +123,7 @@ impl ScriptPortCommand {
     /// the stubs' callers branch on.
     pub(crate) fn run(self) -> Result<()> {
         match self {
+            ScriptPortCommand::SweepCheckpoint(args) => args.run(),
             ScriptPortCommand::DepClassify(cmd) => cmd.run(),
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
             ScriptPortCommand::ReleaseFetch(args) => args.run(),

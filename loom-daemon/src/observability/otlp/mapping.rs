@@ -2,6 +2,8 @@
 //! parent module's doc comment for the mapping table this file implements;
 //! this module is the field-by-field implementation plus its unit tests.
 
+mod metadata;
+
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -152,7 +154,7 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 /// become metrics instead (see [`metric_samples_for`]).
 fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     let time_unix_nano = nanos(envelope.emitted_at);
-    let (event_name, severity, body, attributes) = match &envelope.record {
+    let (event_name, severity, _body, attributes) = match &envelope.record {
         TelemetryRecord::SweepStarted(r) => {
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
@@ -193,35 +195,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
             ];
-            // Per-model token usage (Issue #6384) — mirrors `sweep.outcome`'s
-            // `loom.phase_durations` array-of-kvlist pattern below so a
-            // consumer walks both attributes the same way. Omitted entirely
-            // when absent, matching the schema's own "unknown != zero"
-            // contract — never an empty array attribute.
-            if let Some(rows) = r.tokens_by_model.as_ref().filter(|v| !v.is_empty()) {
-                let entries = rows
-                    .iter()
-                    .map(|row| AnyValue {
-                        value: Some(any_value::Value::KvlistValue(KeyValueList {
-                            values: vec![
-                                kv_string("model", row.model.clone()),
-                                kv_string("speed", row.speed.clone()),
-                                kv_string("service_tier", row.service_tier.clone()),
-                                kv_int("input", row.input),
-                                kv_int("cache_read", row.cache_read),
-                                kv_int("cache_write_5m", row.cache_write_5m),
-                                kv_int("cache_write_1h", row.cache_write_1h),
-                                kv_int("output", row.output),
-                            ],
-                        })),
-                    })
-                    .collect();
-                attributes.push(kv(
-                    "loom.tokens_by_model",
-                    AnyValue {
-                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
-                    },
-                ));
+            if let Some(usage) = metadata::usage(r.tokens_by_model.as_deref()) {
+                attributes.push(usage);
             }
             (
                 "sweep.completed",
@@ -253,9 +228,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(pr_number) = r.pr_number {
                 attributes.push(kv_int("loom.pr_number", i64::from(pr_number)));
             }
-            for (key, value) in &r.config {
-                attributes.push(kv_string(&format!("loom.config.{key}"), value.clone()));
-            }
+            attributes.extend(metadata::outcome(r));
             if !r.phase_durations.is_empty() {
                 let entries = r
                     .phase_durations
@@ -308,15 +281,17 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(effort) = &r.effort {
                 attributes.push(kv_string("loom.effort", effort.clone()));
             }
-            if let Some(detail) = &r.detail {
-                attributes.push(kv_string("loom.detail", detail.clone()));
-            }
+            // Arbitrary failure detail can contain credentials or workload text.
+            // The typed result and bounded observed metadata are sufficient here.
             // #8408: which credential pool gated a pre-spawn pool skip.
             if let Some(gated_pool) = &r.gated_pool {
                 attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
             }
-            if let Some(models_used) = &r.models_used {
-                attributes.push(kv_string("loom.models_used", models_used.join(",")));
+            if let Some(models) = metadata::models(r.models_used.as_deref()) {
+                attributes.push(models);
+            }
+            if let Some(usage) = metadata::usage(r.tokens_by_model.as_deref()) {
+                attributes.push(usage);
             }
             if let Some(actions) = &r.actions {
                 attributes
@@ -350,8 +325,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         observed_time_unix_nano: time_unix_nano,
         severity_number: severity as i32,
         severity_text: severity_text(severity).to_string(),
-        body: Some(any_string(body)),
-        attributes,
+        body: Some(any_string(event_name)),
+        attributes: metadata::bounded(attributes),
         event_name: event_name.to_string(),
         trace_id: envelope
             .trace_context

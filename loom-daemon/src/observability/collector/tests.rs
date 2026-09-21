@@ -67,7 +67,7 @@ fn dispatch_emits_sweep_started_and_tracks_state() {
         }
         other => panic!("expected SweepStarted, got {other:?}"),
     }
-    assert!(dispatches.contains_key(&42));
+    assert!(dispatches.contains_key(&("rjwalters/loom".to_owned(), 42)));
 }
 
 #[test]
@@ -144,7 +144,10 @@ fn clean_exit_zero_maps_to_success_and_clears_dispatch_state() {
         }
         other => panic!("expected SweepOutcome, got {other:?}"),
     }
-    assert!(!dispatches.contains_key(&7), "terminal event must clear tracked state");
+    assert!(
+        !dispatches.contains_key(&("rjwalters/loom".to_owned(), 7)),
+        "terminal event must clear tracked state"
+    );
 }
 
 #[test]
@@ -167,10 +170,11 @@ fn nonzero_exit_maps_to_failure() {
 fn crash_maps_to_failure_with_duration_from_tracked_dispatch() {
     let mut dispatches = HashMap::new();
     dispatches.insert(
-        5,
+        ("rjwalters/loom".to_owned(), 5),
         DispatchState {
             sweep_id: "sweep-issue-5-0".to_string(),
             started_at: Utc::now() - chrono::Duration::seconds(60),
+            trace_context: None,
         },
     );
     let records = map_event_to_records(
@@ -187,7 +191,7 @@ fn crash_maps_to_failure_with_duration_from_tracked_dispatch() {
         }
         other => panic!("expected SweepOutcome, got {other:?}"),
     }
-    assert!(!dispatches.contains_key(&5));
+    assert!(!dispatches.contains_key(&("rjwalters/loom".to_owned(), 5)));
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! Portable, content-free trace records. No exporter or task runs at construction.
 
 mod context;
+pub mod journal;
 mod span;
 pub mod store;
 

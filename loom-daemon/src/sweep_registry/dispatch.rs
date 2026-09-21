@@ -3147,9 +3147,12 @@ impl SweepRegistry {
             }
         }
 
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn {} -p '{}'", spawn_bin.display(), prompt))?;
+        let child = crate::observability::lifecycle::spawn_child(
+            &mut cmd,
+            &self.config.workspace_root,
+            sweep_id,
+        )
+        .with_context(|| format!("failed to spawn {} -p '{}'", spawn_bin.display(), prompt))?;
         // Issue #3801: we RETAIN the `Child` handle (returned to `dispatch`,
         // which stores it in `self.children`) instead of dropping it. The
         // reaper `try_wait()`s it each tick so an exited child is reaped

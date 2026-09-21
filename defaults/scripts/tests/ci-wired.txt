@@ -201,7 +201,6 @@ test-script-helper-version-floor.sh
 test-stale-claim-standdown-suppression.sh
 test-stop-hook-subcommand-skew.sh
 test-sweep-auto-stack.sh
-test-sweep-checkpoint.sh
 test-sweep-lease-convergence.sh
 test-sweep-experiment.sh
 test-sweep-lease-fence.sh
