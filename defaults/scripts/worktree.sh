@@ -977,6 +977,7 @@ remove_worktree_command() {
 # considered your tree and declined" rather than "this install is broken". The
 # explicit check below reports 2 instead — the one thing the exit codes must
 # never do is lie about which of those happened.
+# requires-daemon: worktree-wip >= 0.19.224  #8433 (#8195 slice 2) — the WIP-verb port; without it the stub exits 2 and the verbs refuse
 _worktree_wip_verb() {
     local verb="$1"
     shift

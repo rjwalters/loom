@@ -151,6 +151,7 @@ test-merge-pr-auto-queued-stacked-children.sh
 test-merge-pr-auto-reconcile.sh
 test-merge-pr-check-runs-404-fallback.sh
 test-merge-pr-closed-issue-cleanup.sh
+test-merge-pr-daemon-version-floor.sh
 test-merge-pr-defaults-version-bump-collision.sh
 test-merge-pr-dirty-worktree-guard.sh
 test-merge-pr-head-mismatch.sh

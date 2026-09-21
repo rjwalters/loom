@@ -158,9 +158,20 @@ source "$HELPERS_DIR/lib/forge-helpers.sh"
 #      post-merge reset/reopen pass.
 # Both spans contain only function definitions plus comments (harmless when
 # sourced).
+#
+# Two lines are pulled in from OUTSIDE both spans: the one-line
+# `_mp_daemon_roll_hint` (which `_mp_refs`'s refusal path calls, and which is
+# defined above span 1 because the verdict-label guard needs it earlier) and
+# every `# requires-daemon:` marker comment (which that function reads back out
+# of ${BASH_SOURCE[0]} — i.e. out of THIS extracted file, so the markers have to
+# travel with it). #8285's own suite,
+# test-merge-pr-daemon-version-floor.sh, is what asserts on that message; here
+# they exist only so the refusal path is not a dangling call.
 FUNCS_FILE="$(mktemp)"
 trap 'rm -rf "$FUNCS_FILE" "$STUB_DIR" 2>/dev/null || true' EXIT
 awk '
+  /^# requires-daemon:/                                  { print; next }
+  /^_mp_daemon_roll_hint\(\) \{/                         { print; next }
   /^_strip_fenced_code_blocks\(\) \{/                    { capture=1 }
   /^_check_partial_increment_close_conflict \|\| true/   { capture=0 }
   /^_reset_one_partial_issue\(\) \{/                    { capture=1 }
