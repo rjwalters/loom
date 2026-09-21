@@ -539,7 +539,7 @@ _worktree_dirty_lines() {
             path = substr($0, 4)
             gsub(/^"/, "", path); gsub(/"$/, "", path)
             if (path == ".loom-managed"      || path == ".loom-in-use" ||
-                path == ".loom-checkpoint"   || path == ".no-changes-needed") next
+                path == ".loom-checkpoint"   || path == ".no-changes-needed" || path == ".loom-cargo-target-dir") next
             print
         }
     ' || true
@@ -697,9 +697,10 @@ remove_worktree_command() {
     # whole reason `_rm_info`/`_rm_warning` exist.
     _rm_report_target_dir() {
         local record="$1" status path detail
-        status="$(printf '%s' "$record" | cut -f1)"
-        path="$(printf '%s' "$record" | cut -f2)"
-        detail="$(printf '%s' "$record" | cut -f3)"
+        # Size-ratchet-neutral offset for this issue's one added line above
+        # (#8458 / file-size-policy.md): one tab-split read replaces three `cut`
+        # subshells. `detail` is the last field, so it absorbs any trailing tabs.
+        IFS=$'\t' read -r status path detail <<<"$record"
         target_dir_status="$status"
         target_dir_path="$path"
         case "$status" in
@@ -2479,6 +2480,17 @@ if _try_worktree_add; then
             fi
         fi
     fi
+
+    # #8458: give this worktree its own Cargo target dir under the otherwise
+    # shared root and record it in the `.loom-cargo-target-dir` marker, so the
+    # removal paths (step 6c below, merge-pr.sh, `loom-daemon clean`, the reaper)
+    # can attribute and reclaim it. Off unless the repo opts in; a pure no-op on
+    # a host whose Cargo output is not redirected outside the worktree. Exports
+    # LOOM_WORKTREE_CARGO_TARGET_DIR for the post-worktree hook below — NOT
+    # CARGO_TARGET_DIR, which would make the hook's main-workspace binary lookup
+    # miss and reintroduce #6013/#6014's rebuild storm. See
+    # lib/cargo-target-dir.sh § "Per-worktree target dirs".
+    command -v loom_provision_worktree_target_dir >/dev/null 2>&1 && loom_provision_worktree_target_dir "$MAIN_WORKSPACE_DIR" "$ABS_WORKTREE_PATH" || true
 
     # Run project-specific post-worktree hook if it exists
     # This allows projects to add custom setup steps (e.g., pnpm install, lake exe cache get)

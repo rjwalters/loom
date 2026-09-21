@@ -545,6 +545,58 @@ if [[ -f "$_sleep_inhibit_config_lib" ]]; then
     fi
 fi
 
+# --- Per-worktree cargo target dir (issue #8458) ---
+#
+# When a repo opts in (`cargo.perWorktreeTargetDir`, env override
+# `LOOM_PER_WORKTREE_TARGET_DIR`) and this spawn owns a specific issue's sweep,
+# export that issue worktree's own `CARGO_TARGET_DIR` for the whole sweep. This is
+# the delivery half of the scheme `worktree.sh` provisions and the removal paths
+# reclaim — see `lib/cargo-target-dir.sh` § "Per-worktree target dirs".
+#
+# Why it has to be here rather than "wherever cargo runs": the agents whose test
+# verdicts #8453 recorded as FALSE (a Judge run with 12 failures that passed
+# 194/194 in isolation) invoke `cargo test` themselves, as ordinary subprocesses
+# of this spawn. The only place Loom can put a variable all of them inherit is
+# this process's environment. Cargo keys workspace artifacts by absolute source
+# path anyway, so nothing is lost by isolating them; what IS shared — third-party
+# crates — is shared through the `rustc-wrapper` (sccache) these hosts configure.
+#
+# Deliberately scoped to a claim-owning spawn (`LOOM_SWEEP_CLAIM_OWNED`): a
+# role-runner tick or an operator's interactive spawn has no single worktree to
+# attribute a target dir to, and must keep the host's own resolution.
+#
+# The value is computed, not read from the worktree: this runs BEFORE the sweep
+# creates the worktree. `loom_per_worktree_target_dir_path` is idempotent, so when
+# `worktree.sh` later re-resolves this exported value as its "root" it writes a
+# marker naming the same directory rather than nesting a second level.
+if [[ -n "${LOOM_SWEEP_CLAIM_OWNED:-}" && -z "${LOOM_SPAWN_CONTAINERIZED:-}" \
+    && -f "${WORKSPACE}/Cargo.toml" && -f "${_script_dir}/lib/cargo-target-dir.sh" ]]; then
+    # shellcheck source=./lib/cargo-target-dir.sh
+    source "${_script_dir}/lib/cargo-target-dir.sh"
+    if loom_per_worktree_target_dir_enabled "$WORKSPACE"; then
+        _pw_root="$(loom_resolve_cargo_target_dir "$WORKSPACE")"
+        _pw_worktree_root=""
+        if [[ -f "${_script_dir}/lib/worktree-root.sh" ]]; then
+            # shellcheck source=./lib/worktree-root.sh
+            source "${_script_dir}/lib/worktree-root.sh"
+            _pw_worktree_root="$(loom_worktree_root "$WORKSPACE" 2>/dev/null)" || _pw_worktree_root=""
+        fi
+        : "${_pw_worktree_root:=${WORKSPACE}/.loom/worktrees}"
+        _pw_worktree="${_pw_worktree_root}/issue-${LOOM_SWEEP_CLAIM_OWNED}"
+        # Same "only when Cargo would otherwise build OUTSIDE the worktree" gate
+        # the provisioning applies — an unredirected host already has per-worktree
+        # isolation and must not be moved onto a new path (that is a rebuild for
+        # no benefit, i.e. #6013/#6014's failure mode).
+        if [[ "${_pw_root%/}" != "${_pw_worktree}" && "${_pw_root%/}" != "${_pw_worktree}"/* ]]; then
+            _pw_dir="$(loom_per_worktree_target_dir_path "$_pw_root" "issue-${LOOM_SWEEP_CLAIM_OWNED}")"
+            if loom_is_per_worktree_target_dir "$_pw_worktree" "$_pw_dir" && mkdir -p "$_pw_dir" 2>/dev/null; then
+                export CARGO_TARGET_DIR="$_pw_dir"
+                log_info "spawn-claude: per-worktree CARGO_TARGET_DIR=${_pw_dir} (issue #8458)"
+            fi
+        fi
+    fi
+fi
+
 # --- Containerized dispatch mode (issue #7429, epic #6896 Phase 3) ---
 #
 # Config-selectable, initially OFF: `.loom/config.json` ->

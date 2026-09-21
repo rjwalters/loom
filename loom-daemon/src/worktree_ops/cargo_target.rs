@@ -78,6 +78,11 @@
 //! `defaults/scripts/tests/test-cargo-target-dir-reclaim.sh` there) so a change
 //! to one that is not made to the others fails CI.
 
+/// Per-worktree target dirs (issue #8458): the `<root>/wt/<name>` scheme,
+/// its in-worktree marker, and the structural attribution predicate.
+pub mod per_worktree;
+mod report;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -347,6 +352,16 @@ pub fn resolve_for_worktree_checked_with(
     env_override: Option<&str>,
     metadata: &dyn Fn(&Path) -> Option<String>,
 ) -> Option<PathBuf> {
+    // #8458: a Loom-provisioned per-worktree redirect wins outright, ahead of
+    // even the env var — it is the strongest available *per-worktree* statement,
+    // and the only source neither `cargo metadata` nor `CARGO_TARGET_DIR` can
+    // report (the marker is not a Cargo config; see [`per_worktree`]). Without
+    // it the daemon's reaper resolves such a worktree to the machine-global
+    // shared root, which gate 2f then correctly refuses to delete — leaking the
+    // per-worktree dir forever.
+    if let Some(marked) = per_worktree::marker_value(worktree_path) {
+        return Some(marked);
+    }
     if !redirect_possible_with(worktree_path, env_override) {
         return Some(worktree_path.join("target"));
     }
@@ -416,46 +431,6 @@ pub enum TargetDirOutcome {
     Reclaimed { path: PathBuf, size_human: String },
     /// Removal was attempted and failed.
     Failed { path: PathBuf, error: String },
-}
-
-impl TargetDirOutcome {
-    /// One operator-facing line, or `None` for the two uninteresting outcomes
-    /// that describe every unredirected host (`Inside` / `Absent`). Rendered
-    /// identically by the interactive `clean` pass and the unattended reaper's
-    /// log, so "why did disk not get freed?" has the same answer in both.
-    #[must_use]
-    pub fn report_line(&self) -> Option<String> {
-        match self {
-            Self::Inside(_) | Self::Absent(_) => None,
-            Self::Refused { path, reason } => {
-                Some(format!("Refusing to reclaim cargo target dir {} — {reason}", path.display()))
-            }
-            Self::Shared { path, by } => Some(format!(
-                "Keeping redirected cargo target dir {} — still used by {}",
-                path.display(),
-                by.display()
-            )),
-            Self::Protected { path, holders } => Some(format!(
-                "Keeping redirected cargo target dir {} — {} live process(es) [{}] still using \
-                 it; the reclaim is deferred, not lost",
-                path.display(),
-                holders.len(),
-                holders.join(", ")
-            )),
-            Self::WouldReclaim { path, size_human } => Some(format!(
-                "Would reclaim redirected cargo target dir: {} ({size_human})",
-                path.display()
-            )),
-            Self::Reclaimed { path, size_human } => Some(format!(
-                "Reclaimed redirected cargo target dir: {} ({size_human})",
-                path.display()
-            )),
-            Self::Failed { path, error } => Some(format!(
-                "Could not reclaim redirected cargo target dir {} — {error}",
-                path.display()
-            )),
-        }
-    }
 }
 
 /// Every external input [`plan_reclaim`] consults, injected so the whole
@@ -583,8 +558,22 @@ pub fn plan_reclaim(
     //     declines to resolve THROUGH an out-of-worktree config. This gate
     //     additionally catches a worktree-local config that names the very
     //     directory a machine-global one names.
+    //     #8458 EXEMPTION (`attributed`): a value carrying the Loom per-worktree
+    //     SHAPE — `<root>/wt/<the removed worktree's own directory name>` — is
+    //     per-worktree BY CONSTRUCTION, whichever variable holds it. The shape is
+    //     checked against `worktree_path`'s own basename, so matching it IS the
+    //     attribution: a machine-global shared root can never satisfy it, and the
+    //     only way an ambient `CARGO_TARGET_DIR` can is by naming exactly the
+    //     directory the spawn path provisioned for this worktree. Structural
+    //     rather than marker-reading because this runs after the worktree (and so
+    //     its marker) is off disk.
+    //
+    //     `attributed` relaxes two rules, here and in gate 4; both relaxations
+    //     are unreachable for any path without that shape.
+    let attributed = per_worktree::is_attributable(worktree_path, resolved)
+        || per_worktree::is_attributable(worktree_path, &resolved_real);
     for (path, source) in (probes.machine_global_target_dirs)(worktree_path) {
-        if realish(&path) == resolved_real {
+        if realish(&path) == resolved_real && !attributed {
             return refuse(&format!("{source} is machine-global, not exclusive to this worktree"));
         }
     }
@@ -603,6 +592,15 @@ pub fn plan_reclaim(
     //    treating the latter as "nobody else uses it" is precisely how a
     //    sibling's cache gets deleted mid-build. Mirrors the same rule
     //    `registered_worktree_paths`' own doc states for orphan removal.
+    //
+    //    #8458: when `attributed`, containment stops counting and only an EXACT
+    //    match does. The per-worktree dir lives *under* the otherwise-shared root
+    //    by design, so the primary checkout — which resolves to `<root>` itself
+    //    via the host's `~/.cargo/config.toml` — is always a containing "sharer",
+    //    and without this the scheme could never free a byte. Deleting
+    //    `<root>/wt/<name>` cannot harm a tree building into `<root>`: cargo
+    //    writes `debug/`, `release/`, `CACHEDIR.TAG` … directly under its own
+    //    target dir, never into a `wt/` subtree.
     let Some(others) = (probes.live_worktrees)() else {
         return refuse("could not enumerate live worktrees (git worktree list failed)");
     };
@@ -628,8 +626,9 @@ pub fn plan_reclaim(
         };
         let other_target = realish(&other_target);
         if other_target == resolved_real
-            || resolved_real.starts_with(&other_target)
-            || other_target.starts_with(&resolved_real)
+            || (!attributed
+                && (resolved_real.starts_with(&other_target)
+                    || other_target.starts_with(&resolved_real)))
         {
             return TargetDirOutcome::Shared {
                 path: resolved.to_path_buf(),
@@ -683,7 +682,24 @@ pub fn reclaim(
             .map(|set| set.into_iter().collect::<Vec<_>>())
     };
     let has_manifest = |p: &Path| p.join("Cargo.toml").is_file();
-    let resolve = |p: &Path| resolve_for_worktree_checked(p);
+    // #8458: when the dir being reclaimed is a Loom per-worktree dir, OTHER
+    // worktrees are resolved with the ambient `CARGO_TARGET_DIR` out of the way.
+    // An absolute env value resolves identically for every path on the host, so
+    // when this process's own environment holds this worktree's per-worktree
+    // value — exactly what the spawn path exports — every sibling AND the primary
+    // checkout "resolve" to it and look like sharers. That is an artifact of the
+    // variable, not evidence about the sibling; the per-worktree shape is itself
+    // the proof the value is worktree-specific, so siblings are judged on what
+    // THEY carry (their own marker, or their own in-worktree `.cargo/config.toml`).
+    let sibling_env_blind = per_worktree::is_attributable(worktree_path, resolved);
+    let resolve = |p: &Path| {
+        let env = if sibling_env_blind {
+            None
+        } else {
+            env_cargo_target_dir()
+        };
+        resolve_for_worktree_checked_with(p, env.as_deref(), &cargo_metadata_target_directory)
+    };
     let machine_global_target_dirs = |p: &Path| {
         machine_global_target_dirs_with(
             p,

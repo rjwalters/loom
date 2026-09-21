@@ -21,6 +21,31 @@
 # same way `scripts/cargo-target-dir.sh` does (CARGO_TARGET_DIR env ->
 # `cargo metadata` -> `<root>/target` fallback) instead of assuming the
 # default layout.
+#
+# Issue #8458 (per-worktree target dirs): the SOURCE and the DESTINATION are now
+# resolved by different rules, and conflating them is how this hook would break a
+# second time.
+#
+#   * DESTINATION: `worktree.sh` may have provisioned this worktree its own
+#     target dir (`<root>/wt/issue-N`), announced via
+#     `LOOM_WORKTREE_CARGO_TARGET_DIR` and recorded in the
+#     `.loom-cargo-target-dir` marker. Prefer either over resolution, because
+#     neither `scripts/cargo-target-dir.sh` nor `cargo metadata` knows about the
+#     marker -- they would resolve to the SHARED root and this hook would seed the
+#     wrong directory.
+#   * SOURCE: still `$MAIN_WORKSPACE`'s own resolved target dir, and it must be
+#     resolved with a per-worktree `CARGO_TARGET_DIR` OUT OF THE WAY. The spawn
+#     path exports that variable for the whole sweep, and since env beats config
+#     in Cargo, honoring it for the MAIN workspace would point the lookup at the
+#     brand-new (empty) per-worktree dir -- reporting the main binary "missing" on
+#     every worktree creation and falling through to a full release build. That is
+#     exactly #6013/#6014's rebuild storm, so the strip is narrowly conditional: a
+#     genuinely session-global `CARGO_TARGET_DIR` (an operator redirecting ALL
+#     builds, including the main workspace's) does NOT carry the per-worktree
+#     shape and is still honored, unchanged.
+#
+# `tests/hooks/test-post-worktree-target-dir.sh` covers both, including the
+# rebuild-storm regression under the per-worktree scheme.
 
 set -euo pipefail
 
@@ -45,17 +70,77 @@ CARGO_TARGET_DIR_SCRIPT="$MAIN_WORKSPACE/scripts/cargo-target-dir.sh"
 # the helper script itself is missing (e.g. a partial checkout) -- mirrors
 # cargo-target-dir.sh's own internal fallback, so this degrades exactly to
 # the old behavior rather than breaking a worktree creation outright.
+# `strip_env=1` runs the resolution with CARGO_TARGET_DIR removed from the
+# environment entirely (`env -u`, not an assignment prefix: the helper is an
+# external script and must not merely see an empty value it might still honor).
 resolve_target_dir() {
-    local workspace_root="$1"
-    if [[ -x "$CARGO_TARGET_DIR_SCRIPT" ]]; then
-        "$CARGO_TARGET_DIR_SCRIPT" "$workspace_root" 2>/dev/null || echo "$workspace_root/target"
-    else
+    local workspace_root="$1" strip_env="${2:-0}"
+    if [[ ! -x "$CARGO_TARGET_DIR_SCRIPT" ]]; then
         echo "$workspace_root/target"
+        return 0
+    fi
+    if [[ "$strip_env" == "1" ]]; then
+        env -u CARGO_TARGET_DIR "$CARGO_TARGET_DIR_SCRIPT" "$workspace_root" 2>/dev/null \
+            || echo "$workspace_root/target"
+    else
+        "$CARGO_TARGET_DIR_SCRIPT" "$workspace_root" 2>/dev/null || echo "$workspace_root/target"
     fi
 }
 
-WORKTREE_TARGET_DIR="$(resolve_target_dir "$WORKTREE_PATH")"
-MAIN_TARGET_DIR="$(resolve_target_dir "$MAIN_WORKSPACE")"
+# Per-worktree scheme helpers (#8458). Source the installed lib when it is there,
+# so `lib/cargo-target-dir.sh` stays the single authority.
+CARGO_TARGET_DIR_LIB="$MAIN_WORKSPACE/.loom/scripts/lib/cargo-target-dir.sh"
+[[ -f "$CARGO_TARGET_DIR_LIB" ]] || CARGO_TARGET_DIR_LIB="$MAIN_WORKSPACE/defaults/scripts/lib/cargo-target-dir.sh"
+if [[ -f "$CARGO_TARGET_DIR_LIB" ]]; then
+    # shellcheck source=/dev/null
+    source "$CARGO_TARGET_DIR_LIB" || true
+fi
+
+# Degraded twins for a partial checkout without the lib. These are NOT an
+# alternative resolution path: the per-worktree DIRECTORY is still whatever the
+# lib/worktree.sh chose (it arrives by env var or marker, never derived here).
+# They exist because the alternative -- silently skipping the strip below -- is
+# the #6013/#6014 rebuild storm, which is strictly worse than a 3-line structural
+# check duplicated for the no-lib case. Both paths are covered by
+# tests/hooks/test-post-worktree-target-dir.sh (test 5 with the lib, 5d without).
+if ! declare -F loom_is_per_worktree_target_dir >/dev/null 2>&1; then
+    loom_is_per_worktree_target_dir() {
+        local wt="${1%/}" candidate="${2%/}"
+        [[ "$candidate" == /* ]] || return 1
+        [[ "$candidate" == */wt/* ]] || return 1
+        [[ "$(basename "$candidate")" == "$(basename "$wt")" ]] || return 1
+        [[ "$(basename "$(dirname "$candidate")")" == "wt" ]]
+    }
+fi
+if ! declare -F loom_read_worktree_target_dir_marker >/dev/null 2>&1; then
+    loom_read_worktree_target_dir_marker() {
+        local wt="${1%/}" value
+        [[ -f "$wt/Cargo.toml" && -s "$wt/.loom-cargo-target-dir" ]] || return 1
+        value="$(head -n 1 "$wt/.loom-cargo-target-dir")"
+        value="${value%/}"
+        loom_is_per_worktree_target_dir "$wt" "$value" || return 1
+        printf '%s\n' "$value"
+    }
+fi
+
+# DESTINATION: what worktree.sh provisioned for THIS worktree, if anything.
+if [[ -n "${LOOM_WORKTREE_CARGO_TARGET_DIR:-}" ]]; then
+    WORKTREE_TARGET_DIR="${LOOM_WORKTREE_CARGO_TARGET_DIR%/}"
+elif MARKED_TARGET_DIR="$(loom_read_worktree_target_dir_marker "$WORKTREE_PATH")"; then
+    WORKTREE_TARGET_DIR="$MARKED_TARGET_DIR"
+else
+    WORKTREE_TARGET_DIR="$(resolve_target_dir "$WORKTREE_PATH")"
+fi
+
+# SOURCE: the main workspace's own target dir. A per-worktree CARGO_TARGET_DIR is
+# stripped for this resolution only -- see the header for why honoring it here is
+# #6013/#6014's rebuild storm.
+if [[ -n "${CARGO_TARGET_DIR:-}" ]] \
+    && loom_is_per_worktree_target_dir "$WORKTREE_PATH" "$CARGO_TARGET_DIR"; then
+    MAIN_TARGET_DIR="$(resolve_target_dir "$MAIN_WORKSPACE" 1)"
+else
+    MAIN_TARGET_DIR="$(resolve_target_dir "$MAIN_WORKSPACE")"
+fi
 
 WORKTREE_BINARY="$WORKTREE_TARGET_DIR/release/loom-daemon"
 MAIN_BINARY="$MAIN_TARGET_DIR/release/loom-daemon"
@@ -84,7 +169,12 @@ fi
 
 echo "  Building loom-daemon (release)..."
 echo "  (main workspace binary not found at $MAIN_BINARY)"
-if cargo build --release -p loom-daemon --manifest-path "$WORKTREE_PATH/Cargo.toml" 2>&1; then
+# CARGO_TARGET_DIR is pinned to the resolved DESTINATION rather than left to
+# cargo: under the per-worktree scheme (#8458) the marker, not the config
+# hierarchy, is what says where this worktree builds, and a rebuild that landed in
+# the shared root would both miss the binary check above on the next run and
+# re-create the cross-worktree uplift collision this scheme exists to remove.
+if CARGO_TARGET_DIR="$WORKTREE_TARGET_DIR" cargo build --release -p loom-daemon --manifest-path "$WORKTREE_PATH/Cargo.toml" 2>&1; then
     echo "  loom-daemon build complete"
 else
     echo "  loom-daemon build failed (non-fatal, worktree still usable)"

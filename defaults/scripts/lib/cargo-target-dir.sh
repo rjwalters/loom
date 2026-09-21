@@ -13,7 +13,7 @@
 # On one multi-agent host that accumulated tens of orphaned directories and
 # hundreds of GB before anyone noticed.
 #
-# ## Two halves
+# ## Three parts
 #
 #   1. `loom_resolve_cargo_target_dir <workspace_root>` — Cargo's resolution
 #      order (env → `cargo metadata` → `<root>/target`). This is a LIBRARY
@@ -29,6 +29,12 @@
 #      attributable to that worktree, is not shared with any other live
 #      worktree, is not held open by a running process, and is not one of the
 #      paths this pass must never touch.
+#
+#   3. `loom_provision_worktree_target_dir …` (issue #8458) — the CREATION-time
+#      counterpart: give the worktree its own target dir under the
+#      otherwise-shared root (`<root>/wt/<worktree name>`) and record it in a
+#      marker file INSIDE the worktree, so part 2 can attribute and reclaim it.
+#      See "Per-worktree target dirs" below.
 #
 # ## The attribution rule (the one that keeps costing data)
 #
@@ -166,6 +172,11 @@ loom_cargo_target_dir_redirect_possible() {
     # — so nothing looked shared and the shared cache was deleted.
     [[ -f "$root/Cargo.toml" ]] || return 1
 
+    # A Loom-provisioned per-worktree redirect (#8458). Read from a file INSIDE
+    # the worktree, so — exactly like the `.cargo/config.toml` case below — it is
+    # worktree-derived attribution evidence, not a machine-global source.
+    [[ -f "$root/$LOOM_WT_TARGET_MARKER" ]] && return 0
+
     # An ambient CARGO_TARGET_DIR still makes a redirect *possible* (Cargo
     # honors it), so resolution must not skip it — but the reclaim step refuses
     # to delete a path that is only ever that env value. See gate 2f.
@@ -201,6 +212,21 @@ loom_cargo_target_dir_redirect_possible() {
 # `loom_target_dir_shared_with` already applies to `git worktree list`.
 loom_resolve_worktree_target_dir_checked() {
     local worktree_path="$1"
+
+    # #8458: a Loom-provisioned per-worktree redirect wins outright, ahead of
+    # even the env var. It is the strongest available *per-worktree* statement:
+    # written into the worktree by `loom_provision_worktree_target_dir`, and the
+    # same value the spawn path exports as CARGO_TARGET_DIR for that worktree's
+    # builds — so in the normal case the two agree and the order is moot. When
+    # they disagree (an operator exported a private dir of their own over the
+    # top), preferring the marker reclaims only the directory Loom itself
+    # provisioned and leaves the operator's alone: the safe direction, and the
+    # only one of the two that is attributable to this worktree at all.
+    local marker
+    if marker="$(loom_read_worktree_target_dir_marker "$worktree_path")"; then
+        printf '%s\n' "$marker"
+        return 0
+    fi
 
     if ! loom_cargo_target_dir_redirect_possible "$worktree_path"; then
         printf '%s\n' "$worktree_path/target"
@@ -374,12 +400,46 @@ loom_target_dir_holders() {
 # silently degraded to `<root>/target` is indistinguishable from one that
 # genuinely builds elsewhere. Treating either as "nobody else uses it" is
 # precisely how a sibling's cache gets deleted mid-build.
+#
+# ## The one exception: a Loom-provisioned per-worktree dir (#8458)
+#
+# When `resolved` carries the per-worktree SHAPE for `worktree_path` —
+# `<root>/wt/<that worktree's own directory name>`, which only
+# `loom_provision_worktree_target_dir` ever writes — two of the rules above are
+# deliberately relaxed, because both of them otherwise veto EVERY reclaim of
+# such a dir and the feature can never free a byte:
+#
+#   * **Containment stops counting; only an exact match does.** The whole point
+#     of `<root>/wt/<name>` is that it lives *under* the otherwise-shared root,
+#     so the primary checkout (which resolves to `<root>` itself via the host's
+#     `~/.cargo/config.toml`) is always a containing "sharer". Deleting
+#     `<root>/wt/<name>` cannot harm a tree that builds into `<root>`: cargo
+#     writes `debug/`, `release/`, `CACHEDIR.TAG` … directly under its own target
+#     dir and never into a `wt/` subtree.
+#   * **Other worktrees are resolved with the ambient CARGO_TARGET_DIR ignored.**
+#     An absolute env value resolves identically for EVERY path on the host, so
+#     when the remover's own environment holds this worktree's per-worktree value
+#     (which is exactly what the spawn path exports), every sibling — and the
+#     primary checkout — "resolves" to it and looks like a sharer. That is an
+#     artifact of the env var, not evidence about the sibling. The per-worktree
+#     shape is itself the proof the value is worktree-specific, so the siblings
+#     are judged on what THEY carry: their own marker, or their own in-worktree
+#     `.cargo/config.toml`.
+#
+# Neither relaxation is reachable for a path without that shape, so the
+# machine-global shared cache this function exists to protect is untouched by it.
 loom_target_dir_shared_with() {
     local repo_root="$1" worktree_path="$2" resolved="$3"
     local resolved_real
     resolved_real="$(_loom_ctd_realpath "$resolved")"
     local worktree_real
     worktree_real="$(_loom_ctd_realpath "$worktree_path")"
+
+    local attributed=false
+    if loom_is_per_worktree_target_dir "$worktree_path" "$resolved" ||
+        loom_is_per_worktree_target_dir "$worktree_path" "$resolved_real"; then
+        attributed=true
+    fi
 
     local listing
     listing="$(git -C "$repo_root" worktree list --porcelain 2>/dev/null)" || return 2
@@ -402,10 +462,20 @@ loom_target_dir_shared_with() {
         # Cargo.toml, a conflicted merge) would otherwise stop this sibling
         # from counting as a sharer of the very directory we are about to
         # delete. Same rule as the `git worktree list` failure above.
-        other_target="$(loom_resolve_worktree_target_dir_checked "$other")" || return 3
+        if [[ "$attributed" == true ]]; then
+            # See "The one exception" above: judge the sibling on what IT
+            # carries, with the host-/session-global env value out of the way.
+            other_target="$(CARGO_TARGET_DIR="" loom_resolve_worktree_target_dir_checked "$other")" || return 3
+        else
+            other_target="$(loom_resolve_worktree_target_dir_checked "$other")" || return 3
+        fi
         other_target_real="$(_loom_ctd_realpath "$other_target")"
-        if [[ "$other_target_real" == "$resolved_real" || \
-              "$resolved_real" == "$other_target_real"/* || \
+        if [[ "$other_target_real" == "$resolved_real" ]]; then
+            printf '%s\n' "$other"
+            return 0
+        fi
+        if [[ "$attributed" != true ]] && \
+           [[ "$resolved_real" == "$other_target_real"/* || \
               "$other_target_real" == "$resolved_real"/* ]]; then
             printf '%s\n' "$other"
             return 0
@@ -499,10 +569,29 @@ loom_reclaim_worktree_target_dir() {
     #     already declines to resolve THROUGH an out-of-worktree config at all.
     #     This gate additionally catches a worktree-local config that names the
     #     same directory a machine-global one does.
+    #
+    #     #8458 EXEMPTION: a value carrying the Loom per-worktree SHAPE —
+    #     `<root>/wt/<the removed worktree's own directory name>` — is
+    #     per-worktree BY CONSTRUCTION, whichever variable happens to be holding
+    #     it. The shape is checked against `$worktree_path`'s own basename, so
+    #     matching it is itself the attribution: a machine-global shared root
+    #     (`/big/cargo-target`) can never satisfy it, and the only way an ambient
+    #     CARGO_TARGET_DIR can is by naming exactly the directory the spawn path
+    #     provisioned for this worktree. Without this, the per-worktree scheme
+    #     would be refused on every removal made from inside the very sweep that
+    #     owns the worktree — which is every removal that matters.
+    #
+    #     Structural rather than marker-reading on purpose: this gate runs AFTER
+    #     the worktree is off disk, so the in-worktree marker that produced the
+    #     value is already gone and cannot be consulted here.
     local mg_value mg_source
     while IFS=$'\t' read -r mg_value mg_source; do
         [[ -n "$mg_value" ]] || continue
         if [[ "$resolved_real" == "$(_loom_ctd_realpath "$mg_value")" ]]; then
+            if loom_is_per_worktree_target_dir "$worktree_path" "$resolved" ||
+                loom_is_per_worktree_target_dir "$worktree_path" "$resolved_real"; then
+                break
+            fi
             _loom_ctd_record "refused" "$resolved" \
                 "$mg_source is machine-global, not exclusive to this worktree"
             return 0
@@ -561,5 +650,275 @@ loom_reclaim_worktree_target_dir() {
     else
         _loom_ctd_record "failed" "$resolved" "${err:-rm failed}"
     fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# Per-worktree target dirs (issue #8458)
+# --------------------------------------------------------------------------
+#
+# ## What this buys
+#
+# Cargo keys a *workspace* crate's artifacts (and its incremental session) by
+# the crate's ABSOLUTE SOURCE PATH, so two worktrees never share workspace-crate
+# build output even inside one shared target dir — the sharing buys nothing for
+# the crates Loom actually rebuilds, and costs two things:
+#
+#   * unbounded growth (issue #8453: 213 GB of `debug/incremental/` and 231 GB of
+#     `debug/deps/` on one host, ~6400 orphaned session dirs — the output of
+#     every worktree ever built, which nothing prunes because it does not live
+#     under the worktree), and
+#   * WRONG TEST RESULTS. Cargo "uplifts" the final binary to one un-hashed path,
+#     `<target>/debug/loom-daemon`, overwritten by whichever worktree built last.
+#     Integration tests execute that path. #8453 records three incidents in a
+#     single day, including a Judge run with 12 false failures that passed
+#     194/194 in isolation.
+#
+# Giving each worktree `<root>/wt/<worktree name>` fixes both: the uplifted
+# binary is per-worktree, so a concurrent sibling cannot substitute its own, and
+# the directory is attributable so the removal paths above can reclaim it.
+#
+# ## Why a marker file and not `.cargo/config.toml`
+#
+# #7239's attribution rule is that ONLY a redirect derived from the worktree
+# itself can prove a directory belongs to it, and it names `build.target-dir` in
+# a `.cargo/config.toml` INSIDE the worktree as the way that happens. That
+# vehicle is unavailable in a repo that TRACKS `.cargo/config.toml` (Loom itself
+# does — it carries the CI-mirroring clippy `rustflags`): writing the redirect
+# there would leave every worktree with a modified tracked file, showing up in
+# `git status` and one careless `git add -A` away from being committed.
+#
+# So the per-worktree redirect is recorded in `$LOOM_WT_TARGET_MARKER`, a
+# gitignored Loom runtime marker in the same family as `.loom-managed`. It is
+# inside the worktree, so it is worktree-derived evidence in exactly the sense
+# #7239 requires; it is not a Cargo config, so it does not touch tracked state.
+# Cargo itself learns the redirect from `CARGO_TARGET_DIR`, exported by the spawn
+# path (spawn-claude.sh) and by `worktree.sh` for its own post-worktree hook.
+#
+# ## The shape is the attribution
+#
+# `<root>/wt/<worktree name>` is checked structurally by
+# `loom_is_per_worktree_target_dir`, against the basename of the worktree being
+# asked about. That predicate is what licenses the two relaxations documented at
+# `loom_target_dir_shared_with` and gate 2f, and it is deliberately narrow: a
+# machine-global root (`/big/cargo-target`, `$CARGO_HOME`-configured or
+# env-exported) cannot satisfy it, and a corrupted/hand-written marker can only
+# ever name `<something>/wt/<this worktree's own name>` — never a parent, never a
+# sibling's directory, never the shared root.
+
+# Loom runtime marker recording a worktree's provisioned target dir. Gitignored
+# via the loom-managed block (loom-daemon/src/init/post_init.rs) and filtered out
+# of worktree.sh's dirty-worktree guard, like every other marker in its family.
+LOOM_WT_TARGET_MARKER=".loom-cargo-target-dir"
+
+# The single path component that separates per-worktree dirs from whatever else
+# lives under the shared root. Load-bearing: it is half of the structural
+# attribution check.
+LOOM_WT_TARGET_SUBDIR="wt"
+
+# loom_per_worktree_target_dir_enabled <repo_root>
+#
+# Exit 0 when per-worktree target dirs are turned on for this repo.
+# `LOOM_PER_WORKTREE_TARGET_DIR` (env) > `cargo.perWorktreeTargetDir` (config) >
+# default OFF.
+#
+# Default OFF is deliberate, and is the #6013/#6014 lesson rather than timidity:
+# on a host with no redirect configured the scheme is a pure no-op anyway (see
+# `loom_provision_worktree_target_dir`), and on a host WITH one it trades
+# cross-worktree reuse of third-party `deps/` for isolation. That trade is
+# excellent when a `rustc-wrapper` (sccache) carries third-party crates — the
+# configuration #8453 measured — and is a fleet-wide rebuild storm when nothing
+# does, which is precisely the #6013/#6014 incident. So it is the operator's
+# switch, on the same host where the shared `build.target-dir` was configured.
+loom_per_worktree_target_dir_enabled() {
+    local repo_root="$1" value="${LOOM_PER_WORKTREE_TARGET_DIR:-}"
+
+    if [[ -z "$value" ]]; then
+        local resolver
+        resolver="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config-resolver.sh"
+        if [[ -f "$resolver" ]]; then
+            # shellcheck source=./config-resolver.sh
+            source "$resolver"
+            value="$(loom_config_get "$repo_root" "cargo.perWorktreeTargetDir" "" 2>/dev/null)" || value=""
+        fi
+    fi
+
+    case "$value" in
+        1 | true | yes | on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# loom_per_worktree_target_dir_path <target_root> <worktree_name>
+#
+# Derive `<target_root>/wt/<worktree_name>`. IDEMPOTENT: when `<target_root>` is
+# already this worktree's per-worktree dir it is returned unchanged rather than
+# nested a second level. That case is routine, not pathological — the spawn path
+# exports CARGO_TARGET_DIR for the sweep, so `worktree.sh`, running inside that
+# sweep, re-resolves the env value as its "root". Without this guard the second
+# invocation would provision `<root>/wt/issue-N/wt/issue-N`, and the marker and
+# the env var would then name different directories.
+loom_per_worktree_target_dir_path() {
+    local root="${1%/}" name="$2"
+    if [[ "$root" == *"/$LOOM_WT_TARGET_SUBDIR/$name" ]]; then
+        printf '%s\n' "$root"
+        return 0
+    fi
+    printf '%s/%s/%s\n' "$root" "$LOOM_WT_TARGET_SUBDIR" "$name"
+}
+
+# loom_is_per_worktree_target_dir <worktree_path> <candidate>
+#
+# Exit 0 when <candidate> has the Loom per-worktree shape FOR <worktree_path>:
+# an absolute path of at least three components ending in
+# `/wt/<basename of worktree_path>`. Purely structural — no disk access — so it
+# is still answerable after the worktree has been removed, which is what gate 2f
+# needs.
+#
+# This predicate licenses deletions, so it is written to be un-widenable: the
+# leaf must equal the worktree's own directory name, which ties the directory to
+# one worktree by name and makes it impossible for a truncated or hand-edited
+# value to name the shared root, a parent of it, or another worktree's dir.
+loom_is_per_worktree_target_dir() {
+    local worktree_path="${1%/}" candidate="${2%/}" name
+    name="$(basename "$worktree_path")"
+
+    [[ -n "$name" && "$name" != "/" && "$name" != "." ]] || return 1
+    [[ "$candidate" == /* ]] || return 1
+    [[ "$candidate" == *"/$LOOM_WT_TARGET_SUBDIR/$name" ]] || return 1
+
+    # `/wt/<name>` alone is two components; require a real root above it so the
+    # "suspiciously shallow path" family can never be reached through here.
+    local depth
+    depth="$(printf '%s' "${candidate#/}" | awk -F/ '{print NF}')"
+    [[ "${depth:-0}" -ge 3 ]]
+}
+
+# loom_read_worktree_target_dir_marker <worktree_path>
+#
+# Print the target dir recorded by `loom_provision_worktree_target_dir` for this
+# worktree, or exit 1 when there is no usable marker. MUST be called while the
+# worktree is still on disk.
+#
+# Every failure mode — absent marker, empty marker, a value that does not carry
+# the per-worktree shape, a tree with no Cargo manifest — exits 1, so a corrupt
+# marker degrades to "no per-worktree redirect" (the pre-#8458 behavior) rather
+# than to a path this library would then act on. The manifest requirement
+# deliberately mirrors `loom_cargo_target_dir_redirect_possible`'s first test:
+# a tree cargo never built in must resolve to its own in-worktree `target/`,
+# which is the #7239 regression the manifest-first ordering pins.
+loom_read_worktree_target_dir_marker() {
+    local worktree_path="${1%/}" value
+    local file="$worktree_path/$LOOM_WT_TARGET_MARKER"
+
+    [[ -f "$worktree_path/Cargo.toml" ]] || return 1
+    [[ -s "$file" ]] || return 1
+
+    value="$(head -n 1 "$file" 2>/dev/null)" || return 1
+    value="${value%$'\r'}"
+    value="${value%/}"
+    [[ -n "$value" ]] || return 1
+
+    loom_is_per_worktree_target_dir "$worktree_path" "$value" || return 1
+    printf '%s\n' "$value"
+}
+
+# _loom_ctd_provision_report <status> <path> <detail>
+#
+# One human line on STDERR. Stderr, not stdout, because `worktree.sh --json`
+# holds stdout for its JSON document and the provisioning call site sits inside
+# that flow; and a line rather than a machine record because — unlike the
+# reclaim — nothing downstream needs to branch on the outcome.
+_loom_ctd_provision_report() {
+    case "$1" in
+        provisioned) printf '  per-worktree cargo target dir: %s\n' "$2" >&2 ;;
+        existing) printf '  per-worktree cargo target dir (reused): %s\n' "$2" >&2 ;;
+        failed) printf '  could not provision a per-worktree cargo target dir: %s\n' "$3" >&2 ;;
+        *) : ;; # disabled / not-cargo / unredirected: silent, the common cases
+    esac
+}
+
+# loom_provision_worktree_target_dir <repo_root> <worktree_path>
+#
+# Give <worktree_path> its own Cargo target dir and record it, so that (a) the
+# builds Loom drives in that worktree cannot collide with a sibling's, and (b)
+# the removal paths can attribute and reclaim the directory.
+#
+# On success exports `LOOM_WORKTREE_CARGO_TARGET_DIR` into the CALLER's shell.
+# That variable, not `CARGO_TARGET_DIR`, is deliberately what gets exported here:
+# `worktree.sh` goes on to run the post-worktree hook, whose whole job is to find
+# the MAIN workspace's pre-built binary, and an ambient `CARGO_TARGET_DIR`
+# pointing at the brand-new (empty) per-worktree dir would make that binary look
+# missing on every single worktree creation — which is #6013/#6014's rebuild
+# storm, reintroduced by the fix for #8453. The hook reads the destination from
+# `LOOM_WORKTREE_CARGO_TARGET_DIR` (or from the marker) and keeps resolving the
+# SOURCE the way it always did.
+#
+# Always exits 0: a worktree must still be created when this cannot be done.
+# Statuses (reported to stderr, see above): `existing`, `not-cargo`, `disabled`,
+# `unredirected`, `refused`, `failed`, `provisioned`.
+loom_provision_worktree_target_dir() {
+    local repo_root="$1" worktree_path="${2%/}"
+    local name root dir existing worktree_real root_real
+
+    # An existing valid marker is authoritative: `worktree.sh <N>` is idempotent
+    # and re-run against live worktrees, and re-deriving could relocate the dir
+    # out from under build output that is already there.
+    if existing="$(loom_read_worktree_target_dir_marker "$worktree_path")"; then
+        mkdir -p "$existing" 2>/dev/null || true
+        export LOOM_WORKTREE_CARGO_TARGET_DIR="$existing"
+        _loom_ctd_provision_report "existing" "$existing" ""
+        return 0
+    fi
+
+    [[ -f "$worktree_path/Cargo.toml" ]] || { _loom_ctd_provision_report "not-cargo" "" ""; return 0; }
+    if ! loom_per_worktree_target_dir_enabled "$repo_root"; then
+        _loom_ctd_provision_report "disabled" "" ""
+        return 0
+    fi
+
+    # FULL resolution, not the cheap `loom_cargo_target_dir_redirect_possible`
+    # pre-check: this is the "what would Cargo do here" question, and the shared
+    # root that makes this feature worth having comes from `~/.cargo/config.toml`
+    # — a source the attribution pre-check deliberately refuses to look at. The
+    # `cargo metadata` subprocess is only paid when the feature is enabled, and
+    # only once per worktree creation.
+    root="$(loom_resolve_cargo_target_dir "$worktree_path")"
+    root="${root%/}"
+
+    # Act ONLY when Cargo's output would otherwise land outside the worktree.
+    # An unredirected host already has a per-worktree target dir (`<worktree>/
+    # target`, removed with the worktree), so there is nothing to fix and no
+    # reason to move its build cache onto a new path — and "no redirect
+    # configured" is exactly the population that a per-worktree split would cost
+    # a full rebuild for no benefit.
+    worktree_real="$(_loom_ctd_realpath "$worktree_path")"
+    root_real="$(_loom_ctd_realpath "$root")"
+    if [[ "$root_real" == "$worktree_real" || "$root_real" == "$worktree_real"/* ]]; then
+        _loom_ctd_provision_report "unredirected" "$root" ""
+        return 0
+    fi
+
+    name="$(basename "$worktree_path")"
+    dir="$(loom_per_worktree_target_dir_path "$root" "$name")"
+
+    # Self-check: never write a marker this library's own reclaim path would not
+    # recognize. A shape mismatch here would strand the directory forever.
+    if ! loom_is_per_worktree_target_dir "$worktree_path" "$dir"; then
+        _loom_ctd_provision_report "refused" "$dir" "derived path is not attributable to $name"
+        return 0
+    fi
+
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        _loom_ctd_provision_report "failed" "$dir" "could not create $dir"
+        return 0
+    fi
+    if ! printf '%s\n' "$dir" > "$worktree_path/$LOOM_WT_TARGET_MARKER" 2>/dev/null; then
+        _loom_ctd_provision_report "failed" "$dir" "could not write $worktree_path/$LOOM_WT_TARGET_MARKER"
+        return 0
+    fi
+
+    export LOOM_WORKTREE_CARGO_TARGET_DIR="$dir"
+    _loom_ctd_provision_report "provisioned" "$dir" ""
     return 0
 }

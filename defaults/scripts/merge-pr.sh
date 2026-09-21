@@ -3177,8 +3177,12 @@ _remove_loom_worktree() {
   # disk to be committed/pushed. The clean common case is unaffected — a
   # worktree that already committed+pushed the merged PR reports no changes, and
   # Loom's own gitignored runtime markers (.loom-managed / .loom-in-use /
-  # .loom-checkpoint / .no-changes-needed / .snapshots/) are filtered out so a
-  # bare/stale checkout that surfaces them as untracked is still removed.
+  # .loom-checkpoint / .no-changes-needed / .loom-cargo-target-dir / .snapshots/)
+  # are filtered out so a bare/stale checkout that surfaces them as untracked is
+  # still removed. `.loom-cargo-target-dir` (#8458) matters most here: it is born
+  # in EVERY opted-in worktree, so a consumer repo with a stale `.gitignore` block
+  # would otherwise see every post-merge cleanup refuse — turning the per-worktree
+  # target dir into the very leak the scheme exists to close.
   #
   # Not to be re-conflated in triage (distinct root causes):
   #   - #4463 (closed): same-HOST duplicate dispatch — fixed lock *ownership* so
@@ -3192,7 +3196,7 @@ _remove_loom_worktree() {
   #     meant to eventually quantify.
   local dirty
   dirty="$(git -C "$worktree_path" status --porcelain 2>/dev/null \
-    | grep -vE '[ /]\.loom-managed$|[ /]\.loom-in-use$|[ /]\.loom-checkpoint$|[ /]\.no-changes-needed$|[ /]\.snapshots/' \
+    | grep -vE '[ /]\.loom-managed$|[ /]\.loom-in-use$|[ /]\.loom-checkpoint$|[ /]\.no-changes-needed$|[ /]\.loom-cargo-target-dir$|[ /]\.snapshots/' \
     | grep -vE '^[[:space:]]*$' || true)"
   if [[ -n "$dirty" ]]; then
     local live_branch
