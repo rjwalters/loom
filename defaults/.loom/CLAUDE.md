@@ -11,6 +11,13 @@ This repository uses **Loom** for AI-powered development orchestration.
 > inlining it, so this file stays a manageable per-dispatch context cost.
 
 <!-- agents-md:include:start -->
+## Credential storage
+
+Secrets must stay outside every repository and worktree, including ignored
+`.env`, `.loom-local`, logs and artifacts. Use owner-only user credential files
+or an OS credential store; reference them without copying values. Never print
+secrets. `.gitignore` is insufficient. See [credential policy](.loom/docs/credential-storage.md).
+
 ## What is Loom?
 
 Loom is a CLI + daemon for AI-powered development orchestration. It coordinates
