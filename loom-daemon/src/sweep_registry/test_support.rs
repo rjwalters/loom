@@ -1198,6 +1198,13 @@ impl Drop for FakeSweep {
 mod git_worktree_fixture;
 pub(crate) use git_worktree_fixture::make_dirty_git_worktree;
 
+// `SweepRegistry::set_activity_window` — the test-only writer for the window
+// `make_quiet_dirty_git_worktree` pins below — lives in the child
+// `activity_window` module rather than in `sweep_registry/mod.rs`, which is
+// over the file-size ratchet's threshold (`.loom/docs/file-size-policy.md`).
+// It is an inherent method, so there is nothing to re-export here.
+mod activity_window;
+
 /// [`make_dirty_git_worktree`] plus the other half of what a fixture worktree
 /// has always meant: **dirty and QUIET** (Issue #8487).
 ///

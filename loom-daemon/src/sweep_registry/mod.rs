@@ -1065,56 +1065,16 @@ impl SweepRegistry {
     }
 
     /// Construct an empty registry with the given event bus pre-attached.
+    ///
+    /// Delegates to [`new`](Self::new) and attaches the bus, rather than
+    /// repeating its ~50-field initializer: the two differed only in `bus`,
+    /// and keeping a second copy meant every field added to the struct had to
+    /// be added in two places or the build broke (Issue #8487).
     #[must_use]
     pub fn with_event_bus(config: SweepRegistryConfig, bus: Arc<EventBus>) -> Self {
-        Self {
-            config,
-            entries: BTreeMap::new(),
-            children: BTreeMap::new(),
-            bus: Some(bus),
-            dispatch_stagger: Duration::ZERO,
-            last_spawn_at: None,
-            startup_proof_grace: Duration::from_secs(DEFAULT_STARTUP_PROOF_GRACE_SECS),
-            watchdog_retried: HashSet::new(),
-            watchdog_gaveup: HashSet::new(),
-            watchdog_progressed: HashSet::new(),
-            midbuild_retried: HashSet::new(),
-            midbuild_gaveup: HashSet::new(),
-            midbuild_inuse: HashSet::new(),
-            midbuild_liveclaim: HashSet::new(),
-            midbuild_lease_superseded: HashSet::new(),
-            review_stall_retried: HashSet::new(),
-            review_stall_gaveup: HashSet::new(),
-            quarantine_config: QuarantineConfig::default(),
-            insta_crash_counts: HashMap::new(),
-            resume_attempt_counts: HashMap::new(),
-            quarantined: HashMap::new(),
-            pending_quarantine_release: HashSet::new(),
-            detect_collisions: false,
-            collision_count: 0,
-            peer_claim_publisher: None,
-            peer_claims: None,
-            preflight_tripwire_config: PreflightTripwireConfig::default(),
-            preflight_death_streak: 0,
-            preflight_death_last_marker: None,
-            preflight_advisory_tripped: false,
-            preflight_probe_last_at: None,
-            preflight_advisory_changed_at: None,
-            dispatch_backoff_config: DispatchBackoffConfig::default(),
-            dispatch_backoff: HashMap::new(),
-            noop_cooldown_config: NoopCooldownConfig::default(),
-            noop_cooldown: HashMap::new(),
-            decline_cooldown_config: DeclineCooldownConfig::default(),
-            decline_cooldown: HashMap::new(),
-            open_pr_memo: Mutex::new(HashMap::new()),
-            token_selection_failures: HashMap::new(),
-            label_flip_log: HashMap::new(),
-            flap_warned_at: HashMap::new(),
-            phase_history: HashMap::new(),
-            sampled_loc: HashMap::new(),
-            pending_group_reaps: HashMap::new(),
-            activity_window: None,
-        }
+        let mut registry = Self::new(config);
+        registry.bus = Some(bus);
+        registry
     }
 
     /// Attach (or replace) the event bus used for lifecycle emission.
@@ -1129,18 +1089,6 @@ impl SweepRegistry {
     /// env > config > default value. `Duration::ZERO` disables the stagger.
     pub fn set_dispatch_stagger(&mut self, stagger: Duration) {
         self.dispatch_stagger = stagger;
-    }
-
-    /// Override the filesystem-activity window this registry's
-    /// [`worktree_in_use`](Self::worktree_in_use) judges mtimes against, or
-    /// `None` to resolve it from the environment per call (Issue #8487).
-    ///
-    /// Test-only: production leaves it `None` and reads
-    /// [`ACTIVITY_WINDOW_ENV`](crate::worktree_activity::ACTIVITY_WINDOW_ENV)
-    /// exactly as before. See the field's own doc comment for why it exists.
-    #[cfg(test)]
-    pub(crate) fn set_activity_window(&mut self, window: Option<Duration>) {
-        self.activity_window = window;
     }
 
     /// Read-only accessor for the configured dispatch stagger (Issue #3887).
