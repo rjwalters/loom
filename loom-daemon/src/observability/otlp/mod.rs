@@ -61,8 +61,8 @@
 //! and every attribute above).
 
 mod mapping;
-mod transport;
 mod traces;
+mod transport;
 
 use transport::{post, Signal};
 
@@ -187,17 +187,34 @@ impl Exporter for OtlpExporter {
                 }
                 Signal::Traces => {
                     let request = traces::build_traces_request(group);
-                    let items = request.as_ref().map_or(0, |request| request.resource_spans
-                        .iter().flat_map(|r| &r.scope_spans).map(|s| s.spans.len()).sum::<usize>());
+                    let items = request.as_ref().map_or(0, |request| {
+                        request
+                            .resource_spans
+                            .iter()
+                            .flat_map(|r| &r.scope_spans)
+                            .map(|s| s.spans.len())
+                            .sum::<usize>()
+                    });
                     exported_envelopes = items;
-                    outcome.signals.entry(signal.unit().to_string()).or_default().dropped += (count - items) as u64;
+                    outcome
+                        .signals
+                        .entry(signal.unit().to_string())
+                        .or_default()
+                        .dropped += (count - items) as u64;
                     let Some(request) = request else {
                         outcome.acknowledged += count;
                         offset += count;
                         continue;
                     };
-                    post(&self.client, &self.traces_endpoint, &self.ingest_key,
-                        signal, items as u64, &request).await
+                    post(
+                        &self.client,
+                        &self.traces_endpoint,
+                        &self.ingest_key,
+                        signal,
+                        items as u64,
+                        &request,
+                    )
+                    .await
                 }
             };
             let fully_accepted =
@@ -229,20 +246,6 @@ fn signal_for(envelope: &TelemetryEnvelope) -> Signal {
         | crate::telemetry::TelemetryRecord::TokensSnapshot(_) => Signal::Metrics,
         crate::telemetry::TelemetryRecord::Span(_) => Signal::Traces,
         _ => Signal::Logs,
-    }
-}
-
-fn signal_for(envelope: &TelemetryEnvelope) -> Signal {
-    match envelope.record {
-        crate::telemetry::TelemetryRecord::HostHealth(_)
-        | crate::telemetry::TelemetryRecord::TokensSnapshot(_) => Signal::Metrics,
-        _ => Signal::Logs,
-=======
-        if let Some(request) = traces::build_traces_request(envelopes) {
-            self.post(&self.traces_endpoint, &request).await?;
-        }
-        Ok(())
->>>>>>> 34823755 (feat(observability): persist execution trace context and export completed spans (#8524))
     }
 }
 
