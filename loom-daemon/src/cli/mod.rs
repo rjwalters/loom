@@ -23,6 +23,7 @@ pub(crate) mod lease_ensure;
 pub(crate) mod legacy_script_cmds;
 mod merge_pr_head_sync;
 mod merge_pr_labels;
+mod merge_pr_redate;
 mod merge_pr_refs;
 mod merge_pr_stale_checks;
 pub(crate) mod misc_cmds;

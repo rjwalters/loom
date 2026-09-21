@@ -1066,6 +1066,8 @@ jobs:
         run: bash defaults/scripts/tests/test-merge-pr-stale-required-checks.sh
       - name: merge-pr self-sync head re-read (#8164, #8191 slice 4)
         run: bash defaults/scripts/tests/test-merge-pr-head-sync-retry.sh
+      - name: merge-pr stale-check re-date remedy (#8508)
+        run: bash defaults/scripts/tests/test-merge-pr-stale-check-redate.sh
       # Split out of test-loom-daemon-update.sh by #7977: these assertions
       # now drive `loom-daemon release-resolve` through the stub's delegation,
       # so they need the binary this job builds. The parent suite stays in

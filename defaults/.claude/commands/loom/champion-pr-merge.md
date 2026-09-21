@@ -2058,27 +2058,32 @@ git checkout main 2>/dev/null || true
 # merge-pr.sh reads the PR's head SHA itself (a fresh, uncached read — see
 # "Cached forge reads" above) immediately before merging, and passes it
 # through to the forge's merge API as an optimistic-concurrency precondition
-# (#5579). Capture the exit code rather than using a bare `||`: exit 3 is a
-# DISTINCT outcome from exit 1 and must not be handled as a failure (below).
+# (#5579). Capture the exit code rather than using a bare `||`: exits 3 and 4
+# are DISTINCT outcomes from exit 1, never handled as failures (both below).
+# --redate-stale-checks (#8508) lets the script perform the #8248 freshness
+# guard's OWN documented remedy — a tree-identical no-op commit that re-dates
+# CI — rather than only naming it; exit 4 reports that, and bypasses nothing.
 MERGE_RC=0
-./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto || MERGE_RC=$?
+./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks || MERGE_RC=$?
 
-if [ "$MERGE_RC" -eq 3 ]; then
+if [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ]; then
   # #5579: the PR's head branch moved past the SHA this merge attempt gated
   # on — most commonly a session pushing new commits to an open, loom:pr
   # branch while Champion was running. This is NOT a merge failure: the PR
   # is still Judge-approved, its diff just changed underneath it.
   #
-  # Do NOT follow the failure steps below for this outcome — see the "Exit
-  # code 3" exception in "Error Handling".
+  # Exit 4 (#8508) needs the SAME handling for the same reason: the head moved
+  # because merge-pr.sh itself re-dated the stale required checks.
+  #
+  # Do NOT follow the failure steps below for either — see the "Exit codes 3
+  # and 4" exception in "Error Handling".
   #
   # Note: merge-pr.sh's output for this case now includes both the stale SHA
   # (the one the merge attempt gated on) and the current head SHA, making it
   # easier to diagnose which commits raced in. These values are in the
   # merge-pr.sh output and logged to stderr; they are NOT posted as a PR
-  # comment (that design decision is documented in the "Exit code 3" exception
-  # section below).
-  echo "PR #$PR_NUMBER head moved during merge attempt — re-queuing for a fresh pass instead of failing"
+  # comment (that design decision is documented in that exception below).
+  echo "PR #$PR_NUMBER head moved (raced in, or re-dated by #8508) — re-queuing for a fresh pass instead of failing"
 elif [ "$MERGE_RC" -ne 0 ]; then
   echo "Merge failed for PR #$PR_NUMBER"
   # Post failure comment (see Error Handling section)
@@ -2092,7 +2097,10 @@ fi
 - Branch deleted automatically after merge
 - **Head-moved guard (#5579)**: `merge-pr.sh` refuses to merge (exit 3, not a
   failure) if the PR's head branch advanced past the SHA it read immediately
-  before merging — see "Exit code 3" in "Error Handling" below
+  before merging — see "Exit codes 3 and 4" in "Error Handling" below
+- **Stale-check re-date (#8508)**: exit 4, also not a failure — the #8248
+  guard blocked the merge and `--redate-stale-checks` pushed a tree-identical
+  no-op commit so CI re-dates the stale check
 
 ### Step 4: Verify Issue Auto-Close
 
@@ -3304,14 +3312,23 @@ This PR met all safety criteria but the merge operation failed. A human will nee
 *Automated by Champion role*"
 ```
 
-### Exception: exit code 3 — head moved, re-queue, not a failure (#5579)
+### Exception: exit codes 3 and 4 — head moved, re-queue, not a failure (#5579, #8508)
 
 `merge-pr.sh` exits **3** (distinct from the generic failure exit **1**) when
 the PR's head branch changed between the fresh head-SHA read it took
 immediately before merging and the actual merge call — most commonly because
 a session pushed new commits to an open, `loom:pr`-labeled branch while
-Champion was running. **Do not follow the 5 failure steps above for this
-outcome:**
+Champion was running.
+
+Exit **4** is the same shape with a different cause: the #8248 required-check
+freshness guard blocked the merge, and `--redate-stale-checks` performed that
+guard's own documented remedy — a tree-identical no-op commit so CI re-runs
+with a current timestamp. Nothing merged, nothing bypassed. It is bounded to
+one push per head; a second block escalates the PR to a durable
+`loom:operator` hold and returns the ordinary exit 1 with the original
+refusal, which is then simply a held PR.
+
+**Do not follow the 5 failure steps above for either outcome:**
 
 - Do **not** post the "Merge Failed" comment — the PR is still Judge-approved,
   its diff just moved out from under the merge attempt.
@@ -3321,32 +3338,16 @@ outcome:**
   `updatedAt` and CI status) will naturally re-evaluate the new head before
   merging it.
 
-**Diagnostic output:** When this occurs, `merge-pr.sh` logs to stderr both the
-stale SHA (the one it gated the merge on) and the current head SHA, making it
-easy to see which commits raced in. These values appear in the merge-pr.sh
-output and Champion's run log. They are **not** posted as a PR comment; the
-no-comment design decision reflects the fact that an exit-3 re-queue is a normal
-operational event (a session pushing mid-merge) and posting a comment on every
-such occurrence would be noisy for an ordinary race condition.
-
 **Leaving `loom:pr` in place here does NOT mean the approval still applies to
 the new head (#5686).** The head moving is exactly the condition that
-invalidates a verdict — this exception only says "don't treat the failed merge
-as an error", not "the new tree is approved". The next pass's Verdict-State
-Janitor Part 2 is what resolves that: if the Judge's approval was stamped
-against the old SHA, it returns `12` (STALE), clears `loom:pr`, and re-queues
-the PR for review rather than merging the tree that raced in. Do not
-short-circuit that by re-merging on a later tick without re-running Part 2.
+invalidates a verdict; this exception only says "don't treat the failed merge
+as an error". The next pass's Verdict-State Janitor Part 2 resolves it —
+never short-circuit that by re-merging on a later tick without re-running it.
 
-**Squash-merge detection trap.** If you ever need to manually verify whether a
-re-queued (or, worse, an already-merged-before-this-fix) PR's commits actually
-landed vs. were silently stranded, `git merge-base --is-ancestor <commit>
-origin/main` is **not reliable evidence either way**: a squash merge produces
-a brand-new commit SHA on `main` that is not a git-ancestry descendant of any
-commit on the original PR branch, regardless of whether that commit's content
-made it into the squash or was left behind. There is no cheap ancestry check
-for "squashed-and-landed" vs. "stranded" — verification requires diffing the
-actual file content on `main` against the branch/commit in question.
+Exit 4's full rationale and bound, why neither outcome is commented on the PR,
+and the squash-merge ancestry trap that makes `git merge-base --is-ancestor`
+useless for checking whether a re-queued PR's commits landed:
+[`merge-pr-exit-code-exceptions.md`](../../../.loom/docs/merge-pr-exit-code-exceptions.md).
 
 ---
 
