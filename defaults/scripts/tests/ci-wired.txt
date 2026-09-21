@@ -197,6 +197,7 @@ test-run-ci-suites-serial-lane.sh
 test-run-job.sh
 test-safe-stash-pop.sh
 test-safehoused-service.sh
+test-script-helper-version-floor.sh
 test-stale-claim-standdown-suppression.sh
 test-stop-hook-subcommand-skew.sh
 test-sweep-auto-stack.sh

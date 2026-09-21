@@ -819,6 +819,81 @@ only at the moment someone moves the floor. Run
 `scripts/check-daemon-subcommand-versions.sh --help` for the full convention,
 and `--list` to see every daemon dependency in the tree.
 
+#### The same refusal, from any stub (#8385)
+
+`merge-pr.sh` is not the only script that acquires a version floor. Every thin
+stub over a `loom-daemon` subcommand does — and a stub whose whole body is
+`exec "$bin" <sub>` has no guard at all: against an older binary you get clap's
+bare `error: unrecognized subcommand '<sub>'`, which names neither the floor
+nor the fix. (`skip-labels.sh` met exactly that on 2026-09-19 against this
+repo's own installed 0.19.179.)
+
+`lib/script-helper.sh` now carries a shared preflight that produces the same
+actionable refusal — floor, what the resolved binary reports, the `--fetch`
+roll, the `LOOM_DAEMON_BIN` pin — **only when the calling stub declares a
+marker** for the subcommand it is about to run. The behaviour is identical
+whether the stub delegates its exec to `loom_exec_script_helper` or calls
+`loom_daemon_version_preflight <sub> "$BIN"` itself one line above its own
+`exec` (which is what a Shape-A `stub` in `scripts/shell-allowlist.txt` must
+do to keep that category — the cap requires the last code line to *be* the
+`exec`).
+
+Two properties are worth knowing when you meet one:
+
+- **It is inert without a marker.** No marker, an `optional` marker, or a
+  marker for a different subcommand ⇒ byte-identically today's behaviour. Stubs
+  adopt it one file at a time; nothing is enrolled by default.
+- **It fails OPEN, not closed** — the opposite of `merge-pr.sh`'s guards above,
+  on purpose. Those fail closed because an empty answer there would silently
+  mis-close an issue. This preflight is *not* a safety gate; its only job is to
+  replace an unactionable error with an actionable one. So an unreadable
+  `--version` proceeds to the exec rather than inventing a new failure mode on
+  a host whose binary is probably fine. `LOOM_SKIP_DAEMON_VERSION_PREFLIGHT=1`
+  disables it wholesale.
+
+The refusal exits `LOOM_SCRIPT_HELPER_MISSING_RC` — the code each entry point
+already reserves for "could not run" (2 where the subcommand uses non-zero
+codes as data, e.g. `detect-dependency-cycle`'s 1 = "cycle found"). It will
+never wear a code a caller reads as an answer.
+
+#### Why a version-floor refusal does NOT auto-roll the daemon (#8385)
+
+A `--roll-daemon` / `LOOM_MERGE_PR_AUTO_ROLL=1` option for `merge-pr.sh` — roll
+the host in-band, then continue the merge — was evaluated under #8385 and
+**deliberately not built**. The refusal tells you the exact command; run it
+yourself, out of band. The reason is not ergonomics, it is that the roll would
+frequently kill the very process performing the merge:
+
+- On Linux the daemon's unit sets `KillMode=mixed` (#4862, load-bearing for the
+  relaunch itself — `control-group` yields `Result=timeout`, which
+  `Restart=on-success` does not match, and the daemon then never comes back).
+  Per `kill(5)`, `mixed` SIGKILLs *all remaining processes in the cgroup* the
+  instant the main process exits — immediately, without waiting out
+  `TimeoutStopSec`. `loom-daemon/src/restart_verify.rs` documents this same
+  residual for the in-cgroup restart verifier, which is expected to lose that
+  race.
+- A merge normally runs inside a daemon-dispatched Champion/sweep child.
+  `Command::process_group(0)` moves a child between process *groups*, not
+  between *cgroups*, so that child is in the daemon's cgroup unless
+  `spawn-claude.sh` happened to wrap it in a `systemd-run --user --scope`
+  (`loom-agents.slice`) — which it only does when a CPU budget is configured
+  *and* the probe succeeds (#5111/#6129). Whether the merge survives its own
+  auto-roll therefore depends on an unrelated host knob, and `merge-pr.sh`
+  cannot soundly know which world it is in.
+- The kill would land at an arbitrary instant — including *after* the forge
+  merge call and *before* the post-merge bookkeeping (worktree cleanup, the
+  `loom:building` strip, closing-reference reconciliation). #8385's own safety
+  requirement, "re-verify the floor after the roll", is unsatisfiable when the
+  process that would re-verify no longer exists.
+
+Out-of-band rolling is also where this already belongs: the daemon's own
+auto-update loop and `loom-daemon-watchdog.sh` converge the host from *outside*
+any merge. A version-floor refusal is a **symptom** of that loop being behind
+(on 2026-09-18 it was deferring behind the build-stampede guard, #8252) — fix
+it there, not by restarting the daemon from inside its own child. The secondary
+argument, that `merge-pr.sh` is frozen at its file-size-ratchet ceiling, only
+reinforces a conclusion the process model already forces.
+
 ### `rm` of the installed `loom-daemon` binary is denied in an agent session (#5675)
 
 **Symptom**: a self-build/reinstall verification step run from an agent session
