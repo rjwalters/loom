@@ -10,16 +10,22 @@
 //!
 //! Every path splits three ways, not two:
 //!
-//! | situation | [`Outcome`] |
-//! |---|---|
-//! | `codesign`/`cosign` not installed | [`Outcome::Skipped`] |
-//! | no `.sig` asset published | [`Outcome::Skipped`] (silently — the shell made no call here either) |
-//! | macOS: unsigned (`code object is not signed at all`) | [`Outcome::Skipped`] |
-//! | keyless: signer identity underivable | [`Outcome::Skipped`] |
-//! | key mode: no resolvable public key | [`Outcome::Skipped`] |
-//! | macOS: embedded signature present but invalid | [`Outcome::Failed`] |
-//! | cosign: signature present and verification fails | [`Outcome::Failed`] |
-//! | verification actually ran and passed | [`Outcome::Verified`] |
+//! | situation | [`Outcome`] | [`SignatureState`] (reporting only) |
+//! |---|---|---|
+//! | `codesign`/`cosign` not installed | [`Outcome::Skipped`] | [`SignatureState::Unavailable`] |
+//! | no `.sig` asset published | [`Outcome::Skipped`] (silently — the shell made no call here either) | [`SignatureState::Skipped`] |
+//! | macOS: unsigned (`code object is not signed at all`) | [`Outcome::Skipped`] | [`SignatureState::Skipped`] |
+//! | keyless: signer identity underivable | [`Outcome::Skipped`] | [`SignatureState::Unavailable`] |
+//! | key mode: no resolvable public key | [`Outcome::Skipped`] | [`SignatureState::Unavailable`] |
+//! | macOS: embedded signature present but invalid | [`Outcome::Failed`] | none (aborts before any report) |
+//! | cosign: signature present and verification fails | [`Outcome::Failed`] | none (aborts before any report) |
+//! | verification actually ran and passed | [`Outcome::Verified`] | [`SignatureState::Verified`] |
+//!
+//! A `.sig` the release PUBLISHES but that will not download appears in
+//! neither column: [`super::fetch`] refuses the artifact outright before
+//! calling here (#8197), because a `sig_path: None` produced by a failed
+//! transfer is not the same fact as the "no `.sig` asset published" row above
+//! and must not be reported as it.
 //!
 //! A type that collapses `Skipped` into `Verified` accepts a tampered
 //! artifact whose signature does not validate. A type that collapses it into
@@ -66,10 +72,53 @@ pub enum Outcome {
     Failed,
 }
 
+/// How much signature assurance an artifact ended up carrying, as reported at
+/// the process boundary (`SIGNATURE=` in `cli/release_fetch.rs`'s `KEY=value`
+/// stdout contract, #8197).
+///
+/// A strictly finer split of the NON-blocking half of [`Outcome`], for
+/// REPORTING only — it never decides anything. [`Outcome`] alone cannot tell a
+/// caller whether a signature was checked, because it folds "there was nothing
+/// to verify" and "something was published and went unchecked" into the single
+/// [`Outcome::Skipped`] value. Both are legitimately non-blocking (#5054 ships
+/// no key and does not require `cosign`), but only the second means the
+/// artifact carries an unverified signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureState {
+    /// Verification actually ran and passed.
+    Verified,
+    /// There was nothing to verify: the release publishes no `.sig`, the macOS
+    /// binary is unsigned, or the target is unrecognized. Checksum-only, by
+    /// design — the #5054 case that must keep working.
+    Skipped,
+    /// Signature material IS present but could not be checked on this host: no
+    /// `cosign`/`codesign` installed, an underivable signer identity, no
+    /// resolvable public key. A loud skip, never a block.
+    Unavailable,
+}
+
+impl SignatureState {
+    /// The stdout-contract spelling (`verified` / `skipped` / `unavailable`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Skipped => "skipped",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// One verification's full result.
 #[derive(Debug, Clone)]
 pub struct VerifyResult {
     pub outcome: Outcome,
+    /// What to report at the process boundary — `None` exactly on
+    /// [`Outcome::Failed`], which aborts the update before anything is
+    /// reported. Set explicitly at every return site rather than derived from
+    /// `outcome`/`message`, so a future branch cannot silently inherit the
+    /// wrong reporting value.
+    pub state: Option<SignatureState>,
     /// A human-readable line worded like the shell's `ok`/`warn`/`err` call
     /// it replaces — empty exactly where the shell made no call at all (an
     /// absent `.sig`, or an unrecognized target).
@@ -111,6 +160,7 @@ pub fn verify(inputs: &VerifyInputs<'_>) -> VerifyResult {
     // shell's `*) return 0 ;;`.
     VerifyResult {
         outcome: Outcome::Verified,
+        state: Some(SignatureState::Skipped),
         message: String::new(),
         had_authority: None,
     }
@@ -131,6 +181,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
     if matches!(&dv_outcome, CmdOutcome::Unavailable(Unavailable::Spawn(_))) {
         return VerifyResult {
             outcome: Outcome::Skipped,
+            state: Some(SignatureState::Unavailable),
             message: "'codesign' not available -- skipping macOS signature verification \
                       (best-effort; checksum already verified)."
                 .to_string(),
@@ -154,6 +205,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
     if desc.contains("code object is not signed at all") {
         return VerifyResult {
             outcome: Outcome::Skipped,
+            state: Some(SignatureState::Skipped),
             message: "Downloaded artifact is unsigned (no Developer ID secrets were configured \
                       for this release) -- proceeding without signature verification, per design \
                       (checksum is unconditional; signature is optional)."
@@ -172,12 +224,14 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
     if verify_outcome.succeeded() {
         VerifyResult {
             outcome: Outcome::Verified,
+            state: Some(SignatureState::Verified),
             message: format!("macOS codesign verification passed for {name}."),
             had_authority: Some(had_authority),
         }
     } else {
         VerifyResult {
             outcome: Outcome::Failed,
+            state: None,
             message: format!(
                 "macOS codesign verification FAILED for {name} -- an embedded signature is \
                  present but invalid. This is NOT the 'unsigned' case; treating as tamper \
@@ -206,6 +260,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
     let Some(sig_path) = inputs.sig_path else {
         return VerifyResult {
             outcome: Outcome::Skipped,
+            state: Some(SignatureState::Skipped),
             message: String::new(),
             had_authority: None,
         };
@@ -215,6 +270,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
     if !cosign_available() {
         return VerifyResult {
             outcome: Outcome::Skipped,
+            state: Some(SignatureState::Unavailable),
             message: format!(
                 "A detached signature ({sig_name}) is present for this release but 'cosign' is \
                  not installed -- SKIPPING verification (loud skip, not a block; checksum \
@@ -236,6 +292,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
                     None => {
                         return VerifyResult {
                             outcome: Outcome::Skipped,
+                            state: Some(SignatureState::Unavailable),
                             message: format!(
                             "A detached signature ({sig_name}) and its signing certificate are \
                              present but the expected signer identity could not be derived (no \
@@ -264,6 +321,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
         return if outcome.succeeded() {
             VerifyResult {
                 outcome: Outcome::Verified,
+                state: Some(SignatureState::Verified),
                 message: format!(
                     "cosign keyless signature verification passed for {name} (signer identity \
                      {identity_desc}, issuer {issuer})."
@@ -273,6 +331,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
         } else {
             VerifyResult {
                 outcome: Outcome::Failed,
+                state: None,
                 message: format!(
                     "cosign keyless signature verification FAILED for {name} against \
                      {sig_name} + {cert_name} (expected signer identity {identity_desc}, issuer \
@@ -287,6 +346,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
     let Some(pubkey) = cosign::resolve_pubkey(inputs.repo_root, inputs.cosign_pubkey_env) else {
         return VerifyResult {
             outcome: Outcome::Skipped,
+            state: Some(SignatureState::Unavailable),
             message: format!(
                 "A detached signature ({sig_name}) is present without a signing certificate \
                  (key-signed release) and no cosign public key is resolvable (set \
@@ -309,12 +369,14 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
     if outcome.succeeded() {
         VerifyResult {
             outcome: Outcome::Verified,
+            state: Some(SignatureState::Verified),
             message: format!("cosign signature verification passed for {name}."),
             had_authority: None,
         }
     } else {
         VerifyResult {
             outcome: Outcome::Failed,
+            state: None,
             message: format!(
                 "cosign signature verification FAILED for {name} against {sig_name} using key \
                  {}.",
