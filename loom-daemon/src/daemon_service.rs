@@ -287,21 +287,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // Initialize terminal manager and clean up stale sessions
     let mut tm = TerminalManager::new();
 
-    // Use config-based filtering if workspace config is available
-    if let Some(ref ids) = configured_ids {
-        tm.restore_from_tmux_with_filter(Some(ids))?;
-    } else {
-        // Fall back to legacy behavior (import all) when no config available
-        log::warn!("No workspace config found - using legacy restore (all sessions)");
-        tm.restore_from_tmux()?;
-    }
-    log::info!("Restored {} terminals", tm.list_terminals().len());
-
-    match tm.clean_stale_sessions() {
-        Ok(0) => log::debug!("No stale tmux sessions to clean"),
-        Ok(count) => log::info!("Cleaned {count} stale tmux session(s) from previous run"),
-        Err(e) => log::warn!("Failed to clean stale tmux sessions: {e}"),
-    }
+    // Restore surviving tmux sessions and sweep stale ones — both skipped
+    // together when LOOM_NO_RESTORE=1, which this startup path used to ignore
+    // (issue #8463). Lives in `terminal_restore` rather than inline here
+    // because both this file and `terminal.rs` are frozen at their current
+    // size by the File Size Ratchet; see that module's docs for the full
+    // rationale of the gate and of why the cleanup sweep must be skipped too.
+    loom_daemon::terminal_restore::restore_and_clean_at_startup(&mut tm, configured_ids.as_ref())?;
 
     let tm = Arc::new(Mutex::new(tm));
 
