@@ -112,6 +112,12 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
 
 impl SpanRecord {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if [self.started_at, self.ended_at]
+            .iter()
+            .any(|at| at.timestamp_nanos_opt().is_none_or(|nanos| nanos < 0))
+        {
+            return Err("span timestamp is outside supported Unix nanosecond bounds");
+        }
         if self.ended_at < self.started_at {
             return Err("span ends before it starts");
         }

@@ -67,3 +67,18 @@ fn unsampled_and_invalid_spans_are_not_fabricated() {
     )])
     .is_none());
 }
+
+#[test]
+fn unrepresentable_timestamps_are_dropped_instead_of_rewritten_to_epoch() {
+    for timestamp in ["1969-12-31T23:59:59Z", "9999-01-01T00:00:00Z"] {
+        let mut invalid = span(TraceContext::root(true));
+        invalid.started_at = timestamp.parse().unwrap();
+        invalid.ended_at = invalid.started_at;
+        assert!(invalid.validate().is_err());
+        assert!(build_traces_request(&[TelemetryEnvelope::new(
+            "host",
+            TelemetryRecord::Span(invalid)
+        )])
+        .is_none());
+    }
+}
