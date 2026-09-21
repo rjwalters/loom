@@ -111,7 +111,7 @@ status unknown. Container PID namespaces and reused/live PIDs cannot establish
 that fact; authoritative parent/reaper observations remain necessary. Root IDs
 remain separate for identical issue numbers in different repository roots.
 
-Persistence has a measurable cost. A loaded-host fixture measured 100 durable
-start/completion pairs in 11.12 seconds, about 111 ms per span, excluding export.
-This is an observed test-host result, not a production latency guarantee. Measure
+Persistence has a measurable cost. Loaded-host fixtures measured 100 durable
+start/completion pairs in 11.12 and 18.63 seconds, about 111–186 ms per span,
+excluding export. These are observed test-host results, not production latency guarantees. Measure
 on the deployment filesystem and include this cost when evaluating a model run.

@@ -291,6 +291,9 @@ fn run_preflight(
         let selection = profiles::select(&runtime, &options, &config)?;
         trace_identity.insert("loom.provider".into(), selection.provider.clone());
         trace_identity.insert("loom.model".into(), selection.model.clone());
+        if let Some(effort) = &selection.effort {
+            trace_identity.insert("loom.effort".into(), effort.clone());
+        }
         if let Some(model) = &options.model {
             trace_identity.insert("loom.configured_model".into(), model.clone());
         }

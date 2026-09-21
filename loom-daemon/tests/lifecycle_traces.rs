@@ -73,6 +73,51 @@ fn spans(root: &Path) -> Vec<loom_daemon::telemetry::trace::SpanRecord> {
 }
 
 #[test]
+fn failed_spawn_completes_and_retires_the_prepared_root() {
+    let dir = root();
+    let root = dir.path();
+    let execution = "missing-executable";
+    let mut cmd = Command::new(root.join("does-not-exist"));
+    loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution);
+    assert!(TraceStore::new(root).path(root, execution).exists());
+    let error = lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    let records = spans(root);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].name, SpanName::Sweep);
+    assert_eq!(records[0].status, SpanStatus::Error);
+    assert_eq!(records[0].attributes["loom.result"], "spawn_failed");
+    assert!(!TraceStore::new(root).path(root, execution).exists());
+}
+
+#[test]
+fn successful_process_exit_does_not_imply_independent_task_acceptance() {
+    let dir = root();
+    let root = dir.path();
+    let execution = "independent-verification";
+    let sweep = lifecycle::begin(root, execution, SpanName::Sweep, Default::default()).unwrap();
+    let runtime = sweep
+        .child(SpanName::RuntimeRun, Default::default())
+        .unwrap();
+    lifecycle::child_spawned(root, execution, std::process::id());
+    lifecycle::child_exited(root, execution, "success");
+    lifecycle::finish_execution(root, execution, "verification_failed", Default::default());
+    let records = spans(root);
+    let observed_runtime = records
+        .iter()
+        .find(|s| s.context == *runtime.context())
+        .unwrap();
+    assert_eq!(observed_runtime.status, SpanStatus::Ok);
+    assert_eq!(observed_runtime.attributes["loom.result"], "success");
+    let observed_root = records
+        .iter()
+        .find(|s| s.context == *sweep.context())
+        .unwrap();
+    assert_eq!(observed_root.status, SpanStatus::Error);
+    assert_eq!(observed_root.attributes["loom.result"], "verification_failed");
+}
+
+#[test]
 fn pi_and_opencode_launch_and_native_read_preserve_authoritative_context() {
     for runtime in ["pi", "opencode"] {
         let dir = root();

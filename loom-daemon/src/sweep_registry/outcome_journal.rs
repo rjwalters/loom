@@ -512,6 +512,20 @@ impl SweepRegistry {
         if let Some(pr) = pr_number {
             metadata.insert("loom.pr_number".into(), pr.to_string());
         }
+        for (key, value) in [
+            ("loom.failure_class", outcome_record.failure_class.as_ref()),
+            ("loom.configured_model", outcome_record.model.as_ref()),
+            ("loom.effort", outcome_record.effort.as_ref()),
+            ("loom.runtime", outcome_record.config.get("runtime")),
+            ("loom.provider", outcome_record.config.get("provider")),
+        ] {
+            if let Some(value) = value {
+                metadata.insert(key.into(), value.clone());
+            }
+        }
+        if let Some(cycles) = outcome_record.doctor_cycles {
+            metadata.insert("loom.doctor_cycles".into(), cycles.to_string());
+        }
         let trace_context = crate::observability::lifecycle::finish_execution(
             &self.config.workspace_root,
             sweep_id,
