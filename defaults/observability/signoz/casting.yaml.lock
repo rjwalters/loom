@@ -392,6 +392,8 @@ spec:
     - op: add
       path: /services/ingester/depends_on
       value:
+        loom-signoz-signoz-0:
+          condition: service_healthy
         loom-signoz-telemetrystore-migrator:
           condition: service_completed_successfully
     - op: add
@@ -477,10 +479,13 @@ spec:
       enabled: true
       env:
         SIGNOZ_ANALYTICS_ENABLED: "false"
+        SIGNOZ_PROMETHEUS_ACTIVE__QUERY__TRACKER_PATH: /tmp/signoz-active-queries
         SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://signoz:signoz@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
         SIGNOZ_SQLSTORE_PROVIDER: postgres
         SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
         SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
+        SIGNOZ_TOKENIZER_JWT_SECRET: ${SIGNOZ_TOKENIZER_JWT_SECRET:?set a private
+          random session-signing secret}
       image: signoz/signoz:v0.142.1@sha256:49501b04d77a1e8328d31519c977dd4503b724c74425764a3ab83768db3ee8ff
       version: v0.142.1
     status:
@@ -502,10 +507,13 @@ spec:
       config: {}
       env:
         SIGNOZ_ANALYTICS_ENABLED: "false"
+        SIGNOZ_PROMETHEUS_ACTIVE__QUERY__TRACKER_PATH: /tmp/signoz-active-queries
         SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://signoz:signoz@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
         SIGNOZ_SQLSTORE_PROVIDER: postgres
         SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
         SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
+        SIGNOZ_TOKENIZER_JWT_SECRET: ${SIGNOZ_TOKENIZER_JWT_SECRET:?set a private
+          random session-signing secret}
   telemetrykeeper:
     kind: clickhousekeeper
     spec:

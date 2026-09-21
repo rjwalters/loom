@@ -13,6 +13,9 @@ spec:
       image: signoz/signoz:v0.142.1@sha256:49501b04d77a1e8328d31519c977dd4503b724c74425764a3ab83768db3ee8ff
       env:
         SIGNOZ_ANALYTICS_ENABLED: "false"
+        SIGNOZ_TOKENIZER_JWT_SECRET: "${SIGNOZ_TOKENIZER_JWT_SECRET:?set a private random session-signing secret}"
+        # SigNoz escapes literal underscores in configuration keys with "__".
+        SIGNOZ_PROMETHEUS_ACTIVE__QUERY__TRACKER_PATH: /tmp/signoz-active-queries
   ingester:
     spec:
       version: v0.144.10
@@ -95,6 +98,8 @@ spec:
           value:
             loom-signoz-telemetrystore-migrator:
               condition: service_completed_successfully
+            loom-signoz-signoz-0:
+              condition: service_healthy
         - op: add
           path: /services/loom-signoz-signoz-0/depends_on
           value:

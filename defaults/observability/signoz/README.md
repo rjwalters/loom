@@ -25,7 +25,7 @@ Run from this directory, with the verified binary on PATH:
 ```console
 foundryctl --no-ledger --no-updater gauge -f casting.yaml
 foundryctl --no-ledger --no-updater forge -f casting.yaml -p pours
-docker compose -f pours/deployment/compose.yaml config --quiet
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml config --quiet
 git diff -- casting.yaml.lock pours
 ```
 
@@ -48,6 +48,16 @@ total 3.75 GiB (ClickHouse 2 GiB, app 768 MiB, collector 512 MiB, PostgreSQL and
 Keeper 256 MiB each), plus 768 MiB for transient initialization/migration.
 These are trial limits, not capacity claims. Check `evidence.md` for observations.
 
+Before rendering Compose configuration or starting services, create a private
+mode-0600 env file outside the checkout containing
+`SIGNOZ_TOKENIZER_JWT_SECRET=<independent random session-signing secret>`.
+Keep this stable across restarts and include it in private backups. Missing it
+fails Compose interpolation rather than starting with an empty signing secret.
+Full `docker compose config` would expose it: use `config --quiet`.
+Docker administrators can inspect the app environment. This key is separate
+from provider keys, ingestion auth and the UI account password. Rotating it
+invalidates existing sessions; schedule rotation and sign in again afterward.
+
 Create the external `loom-observability` network once if absent. The project,
 containers, private network and persistent volumes all use the `loom-signoz`
 prefix. They do not reuse another SigNoz installation. Only the app is published:
@@ -64,12 +74,13 @@ Internet-facing credential or a production hardening recipe. No provider key,
 including `ZAI_API_KEY`, belongs in this deployment.
 
 ```console
-docker compose -f pours/deployment/compose.yaml up -d --wait --wait-timeout 1800
-docker compose -f pours/deployment/compose.yaml ps
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml up -d --wait --wait-timeout 1800
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml ps
 curl --fail http://127.0.0.1:18081/api/v1/health
 ```
 
-The migration job must complete before the ingester and app start. Readiness
+The migration job must complete before the app starts, and the ingester waits
+for app health before contacting its OpAMP service. Readiness
 budgets allow a busy development VM; a timeout still needs investigation.
 Inspect `docker compose ... logs` for the failing service, with credentials and
 workload content removed before sharing. Register the first local user at
@@ -117,7 +128,8 @@ Accounts, dashboards and settings in PostgreSQL persist independently.
 Container stdout/stderr rotate separately at three 10 MiB files per service;
 ClickHouse's own system tables and metadata also consume storage.
 
-`docker compose -f pours/deployment/compose.yaml stop` preserves all data.
+Use the same `--env-file` and `-f` arguments for every Compose command.
+`docker compose ... stop` preserves all data.
 Restart with the same rendered files and `up -d --wait --wait-timeout 1800`;
 verify an old trace, gauge and saved view before accepting restart persistence.
 For backup, stop this project and snapshot its four named volumes together:
@@ -129,8 +141,8 @@ another deployment's containers/volumes.
 Upgrade by changing explicit pins, rendering, inspecting the diff and testing
 schema migration/restore against a copy of trial data. Database migrations may
 prevent rollback by simply selecting an older image. To deliberately wipe only
-this disposable trial, stop it and use `docker compose -f
-pours/deployment/compose.yaml down --volumes`; this permanently removes its
+this disposable trial, stop it and use `docker compose ... down --volumes`
+with those same arguments; this permanently removes its
 stored signals, accounts and saved views. Do not use that command for routine stop.
 
 For a later [SigNoz Cloud trial](https://signoz.io/docs/ingestion/signoz-cloud/overview/),

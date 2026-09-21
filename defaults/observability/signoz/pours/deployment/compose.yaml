@@ -14,6 +14,8 @@ services:
       /signoz-otel-collector --config=/etc/otel-collector-config.yaml --manager-config=/etc/opamp-config.yaml --copy-path=/var/tmp/collector-config.yaml
     cpus: 1
     depends_on:
+      loom-signoz-signoz-0:
+        condition: service_healthy
       loom-signoz-telemetrystore-migrator:
         condition: service_completed_successfully
     deploy:
@@ -78,10 +80,13 @@ services:
         condition: service_completed_successfully
     environment:
     - SIGNOZ_ANALYTICS_ENABLED=false
+    - SIGNOZ_PROMETHEUS_ACTIVE__QUERY__TRACKER_PATH=/tmp/signoz-active-queries
     - SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:signoz@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
     - SIGNOZ_SQLSTORE_PROVIDER=postgres
     - SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN=tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
     - SIGNOZ_TELEMETRYSTORE_PROVIDER=clickhouse
+    - SIGNOZ_TOKENIZER_JWT_SECRET=${SIGNOZ_TOKENIZER_JWT_SECRET:?set a private random
+      session-signing secret}
     healthcheck:
       interval: 30s
       retries: 3
