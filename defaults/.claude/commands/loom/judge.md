@@ -2679,6 +2679,12 @@ When running quality checks (step 7), use **scoped test execution** — run only
 
 **Your environment is not a clean shell (#5388)**: a dispatched sweep/daemon child inherits `LOOM_FORCE_SCOPE=protected` and `LOOM_GUARD_DECISION_LOG=1`, which can flip a guard-hook suite (e.g. `test-guard-destructive*.sh`) away from the *factory-default* behavior it asserts. Before requesting changes on such a failure, re-run with `env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <command>` — see `.loom/docs/guard-hooks.md` → "Known consequence".
 
+**A shared-target-dir cargo result is not verdict-bearing (#8457)**: on a fleet host, a local `cargo test`/`cargo build` result can reflect another worktree's binary, not the PR's. Never approve or reject on it directly — isolate first.
+
+| File | Load when |
+|---|---|
+| [`cargo-target-isolation.md`](cargo-target-isolation.md) | Before trusting any local cargo build/test result as verdict evidence — the isolation recipe and its cleanup caveat. |
+
 ## Feedback Style
 
 - **Be specific**: Reference exact files and line numbers
