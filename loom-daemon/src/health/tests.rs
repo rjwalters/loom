@@ -1167,23 +1167,23 @@ fn an_incomparable_build_still_reports_a_dead_work_finder() {
 // -------------------------------------------------------------------
 
 fn log_now() -> chrono::NaiveDateTime {
-    chrono::NaiveDateTime::parse_from_str("2026-07-31T14:30:00.000", DAEMON_LOG_STAMP_FORMAT)
+    chrono::NaiveDateTime::parse_from_str("2026-07-31T14:30:00.000Z", DAEMON_LOG_STAMP_FORMAT)
         .unwrap()
 }
 
 #[test]
 fn log_probe_reads_the_newest_work_finder_line() {
     let log = "\
-[2026-07-31T14:20:00.000] [INFO] work_finder: tick — cap 16; 12 seen, 0 dispatched
-[2026-07-31T14:29:30.500] [INFO] work_finder: tick — cap 16; 12 seen, 2 dispatched
-[2026-07-31T14:29:59.000] [INFO] sweep_registry: reaped 1 finished sweep
+[2026-07-31T14:20:00.000Z] [INFO] work_finder: tick — cap 16; 12 seen, 0 dispatched
+[2026-07-31T14:29:30.500Z] [INFO] work_finder: tick — cap 16; 12 seen, 2 dispatched
+[2026-07-31T14:29:59.000Z] [INFO] sweep_registry: reaped 1 finished sweep
 ";
     assert_eq!(work_finder_log_tick_age_secs(log, log_now()), Some(29));
 }
 
 #[test]
 fn log_probe_returns_none_without_a_work_finder_line() {
-    let log = "[2026-07-31T14:29:59.000] [INFO] sweep_registry: reaped 1 finished sweep\n";
+    let log = "[2026-07-31T14:29:59.000Z] [INFO] sweep_registry: reaped 1 finished sweep\n";
     assert_eq!(work_finder_log_tick_age_secs(log, log_now()), None);
 }
 
@@ -1192,7 +1192,7 @@ fn log_probe_returns_none_without_a_work_finder_line() {
 #[test]
 fn log_probe_skips_an_unparseable_partial_first_line() {
     let log = "ck — cap 16; 12 seen, 0 dispatched  work_finder: partial\n\
-[2026-07-31T14:28:00.000] [INFO] work_finder: tick — cap 16; 12 seen, 1 dispatched\n";
+[2026-07-31T14:28:00.000Z] [INFO] work_finder: tick — cap 16; 12 seen, 1 dispatched\n";
     assert_eq!(work_finder_log_tick_age_secs(log, log_now()), Some(120));
 }
 
@@ -1200,9 +1200,14 @@ fn log_probe_skips_an_unparseable_partial_first_line() {
 /// an underflow.
 #[test]
 fn log_probe_clamps_a_future_stamp_to_zero() {
-    let log = "[2026-07-31T14:35:00.000] [INFO] work_finder: tick — cap 16\n";
+    let log = "[2026-07-31T14:35:00.000Z] [INFO] work_finder: tick — cap 16\n";
     assert_eq!(work_finder_log_tick_age_secs(log, log_now()), Some(0));
 }
+
+// Issue #8504's "stamp lacking the trailing Z must not parse" and
+// "DAEMON_LOG_STAMP_FORMAT always renders a Z" regressions live in the
+// sibling `log_format_tests` module (a NEW file, not here) so this
+// already-over-threshold file does not grow (#7711).
 
 #[test]
 fn dispatch_flags_a_halted_gate() {
@@ -3175,3 +3180,5 @@ mod auto_update_stale_repo;
 
 #[cfg(test)]
 mod model_class_tests;
+
+mod log_format_tests;
