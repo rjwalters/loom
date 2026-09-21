@@ -19,7 +19,7 @@ exists yet**, so a guarded launch on 2.x is refused before spawn; see
 | Native edits stay in managed worktrees | Every write/edit target is checked by the existing worktree policy before access. Shell commands use the existing shell-write policy. |
 | Protected branches and workflow rules | The same destructive and workflow guards used by the existing runtimes inspect each shell call. |
 | Broken guard cannot permit a tool | Missing guard files, malformed/unknown output, nonzero exit, and a 20-second policy timeout refuse the operation. |
-| Binding fails to load | Pi starts with builtin tools and extension discovery disabled. OpenCode uses a dedicated primary agent whose default permission is deny, with only the four named tools enabled. Missing bindings therefore leave no executable unguarded tool surface. *(OpenCode: verified on 1.18.31 only.)* |
+| Binding fails to load | Pi starts with builtin tools and extension discovery disabled. OpenCode uses a dedicated primary agent whose default permission is deny, with only the four named tools enabled. Missing bindings therefore leave no executable unguarded tool surface. *(OpenCode: verified on 1.18.31 only.)* A role tick that exits 0 having used no `loom_*` tool is additionally reported as a failed tick, not a success — see "Toolless launch detection". |
 | Concurrent file edits | File operations share a workspace mutation lock; an edit must match exactly one nonempty old-text occurrence. |
 | Large output and hung commands | Reads/output are bounded; shell execution uses the existing Rust bounded process executor and a maximum 600-second deadline. SIGTERM/SIGINT cancels the owned shell process group. |
 | Model/provider selection | Existing named profiles and explicit provider/model selections; no Claude token-pool preflight or implicit Sonnet default on native sweeps. |
@@ -56,6 +56,44 @@ closed" from "fell open". Still unverified on 2.x: the isolated
 `OPENCODE_CONFIG_DIR`, `plugins/loom.ts` discovery, the plugin SDK pin above,
 the agent/permission/tools config keys, and `OPENCODE_CONFIG_CONTENT` being read
 by the private server `--standalone` starts.
+
+A live guarded canary was run on **OpenCode 2.0.10** on 2026-09-20 (issue #8448)
+and **failed, safely**: the binding is never loaded, so the worker started with
+the deny-by-default agent and no tools at all, used zero tools, recorded zero
+policy denials, changed no protected bytes, did not do the task — and exited
+`0` in 9s. An identical control run on 1.18.31 passed (four `loom_*` tools
+offered, seven tool uses, three recorded denials, task completed). So on 2.x:
+the deny-by-default configuration **is** honored under `--auto` (it fails
+closed, it does not fall open), and what is broken is binding *discovery* — no
+`node_modules/` appears in the isolated config dir and `opencode plugin list`
+reports none, with or without an explicit `plugin` entry. The 2.x-native
+mechanism for loading a local, per-launch tool binding is still unknown, so
+`Major::guard_verified`'s `V2 => false` refusal stays until a passing 2.x
+receipt exists.
+
+## Toolless launch detection
+
+CLI exit zero is not acceptance evidence (see "Residual limits"), and since
+#8448 it is no longer *treated* as evidence either. The 2.x canary above and its
+passing 1.x control both exited `0`; nothing in the exit status distinguished
+"did the work with four guarded tools" from "had no tools and did nothing".
+
+A guarded native role tick is therefore classified from its own native event
+stream, not its exit code (`loom-daemon/src/role_runner/toolless_launch.rs`,
+built on `worker_spawn::launch_outcome`). A tick that exits 0 with **zero
+`loom_*` tool uses** in its own region of `.loom/logs/role-<role>.log` is
+reported as a `Failure`, counted and escalated like any other failed tick,
+rather than as a healthy `Success`. A tool call that the guard *denied* still
+counts as a use — the binding loaded, policy then said no; that is a working
+guard, not a toolless launch.
+
+The check deliberately stands down — leaving the pre-#8448 success verdict
+untouched — for any non-native runtime, a tick with no resolved runtime
+admission, a log whose per-tick anchor is missing, and a stream containing no
+events this classifier can parse. The last one matters most: an unparsed stream
+is a gap in Loom's own observation, never evidence about the launch, so a future
+harness release that renames its event types degrades the check to "no opinion"
+instead of failing every tick.
 
 Free-form trials without a Loom role retain the harness's ordinary tools.
 The guarded tool contract applies to role-tagged launches and `/loom:<role>`
@@ -121,8 +159,9 @@ some other way, or points a worker at a shared server, is outside this boundary.
 The initial guarded tool set deliberately excludes native task delegation,
 MCP tools, interactive stdin, and unclassified plugin tools. It uses the same
 small edit interface in both harnesses; this is not a benchmark of OpenCode's
-full native editing/tool ecosystem. CLI exit zero is not acceptance evidence.
-Record failed attempts and independently verify code and forge outcomes.
+full native editing/tool ecosystem. CLI exit zero is not acceptance evidence
+(see "Toolless launch detection" for the check that now enforces this on role
+ticks). Record failed attempts and independently verify code and forge outcomes.
 
 An OS-level backstop for exactly those residual limits is available, opt-in, as
 per-sweep ephemeral containment (`runtimes.containment.native: "ephemeral"`,

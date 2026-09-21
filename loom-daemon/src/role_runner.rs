@@ -1403,6 +1403,18 @@ fn run_role_with_timeout(
                     &tick_anchor,
                     status.code(),
                 );
+                // Issue #8448: exit 0 is not, by itself, evidence that a
+                // GUARDED NATIVE launch did anything. When this tick's own
+                // native event stream shows the `loom_*` binding was never
+                // offered, report the failed launch it actually was instead
+                // of a healthy `Success`. A no-opinion result (any non-native
+                // runtime, an unreadable log, an unparseable stream) leaves
+                // the pre-#8448 behaviour byte-identical — see
+                // `toolless_launch`'s module doc for the four conditions.
+                if let Some(detail) = toolless_launch::detect(&log_path, admission, &tick_anchor) {
+                    log::warn!("role_runner: {detail}");
+                    return RoleTickOutcome::Failure(detail);
+                }
                 return RoleTickOutcome::Success;
             }
             Ok(Some(status)) => {
@@ -4278,3 +4290,7 @@ mod runtime_preflight;
 // account health (issue #8443) — the role-tick analogue of
 // `sweep_registry::apply_provider_health_feedback`.
 mod provider_health_feedback;
+
+// Demotes an exit-0 guarded-native tick that never used a `loom_*` tool from
+// `Success` to `Failure` (issue #8448) — see `role_runner/toolless_launch.rs`.
+mod toolless_launch;

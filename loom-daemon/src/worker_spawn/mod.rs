@@ -3,6 +3,7 @@
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
 pub mod containment;
 mod harness;
+pub mod launch_outcome;
 mod opencode_version;
 mod profile_check;
 mod profiles;
