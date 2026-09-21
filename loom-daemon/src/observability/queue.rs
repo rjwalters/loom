@@ -141,9 +141,12 @@ impl DurableQueue {
         persist_to(&self.path, &state.items)?;
         if durable {
             std::fs::File::open(&self.path)?.sync_all()?;
-            if let Some(parent) = self.path.parent() {
-                std::fs::File::open(parent)?.sync_all()?;
-            }
+            let parent = self
+                .path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
         }
         Ok(())
     }
