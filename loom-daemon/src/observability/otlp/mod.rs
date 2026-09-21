@@ -92,15 +92,7 @@ impl OtlpExporter {
     /// tolerated and stripped), authenticating with `ingest_key`. Validates the
     /// URL and builds the HTTP client without touching the network.
     pub fn new(base_endpoint: String, ingest_key: String) -> Result<Self, ExportError> {
-        let url = reqwest::Url::parse(&base_endpoint)
-            .map_err(|_| ExportError::Transport("invalid OTLP base URL".to_string()))?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
+        if !super::endpoint_policy::valid_otlp_endpoint(&base_endpoint) {
             return Err(ExportError::Transport(
                 "OTLP base URL must be HTTP(S), without credentials, query or fragment".to_string(),
             ));

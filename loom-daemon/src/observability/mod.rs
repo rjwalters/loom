@@ -526,6 +526,14 @@ pub fn spawn_task(
         register_global_export_status(Arc::new(ExportStatus::misconfigured(None, detail)));
         return None;
     };
+    let exporter_kind = resolve_exporter(config);
+    if exporter_kind == ExporterKind::Otlp && !endpoint_policy::valid_otlp_endpoint(&endpoint) {
+        register_global_export_status(Arc::new(ExportStatus::misconfigured(
+            None,
+            "invalid OTLP base URL: use HTTP(S) without credentials, query or fragment".into(),
+        )));
+        return None;
+    }
     // Refuse reserved placeholder domains BEFORE the ingest key is read
     // (Issue #7815) — a placeholder is "not configured", not a destination,
     // and the key must never be loaded for one, let alone sent to it.
@@ -544,7 +552,6 @@ pub fn spawn_task(
         )));
         return None;
     }
-    let exporter_kind = resolve_exporter(config);
     #[cfg(not(feature = "otlp"))]
     if exporter_kind == ExporterKind::Otlp {
         let detail = "exporter=otlp requested but this daemon build was not compiled with the `otlp` Cargo feature".to_string();
@@ -1290,6 +1297,41 @@ mod tests {
             .path()
             .join(".loom/logs/observability-queue.jsonl")
             .exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn malformed_otlp_configuration_has_no_collector_or_queue_activity() {
+        clear_env();
+        for endpoint in [
+            "http://user:secret@example.com",
+            "http://localhost?key=secret",
+        ] {
+            let dir = tempdir().unwrap();
+            let bus = EventBus::new();
+            let config = ObservabilityConfig {
+                enabled: Some(true),
+                endpoint: Some(endpoint.into()),
+                exporter: Some("otlp".into()),
+                ingest_key_file: Some(
+                    dir.path()
+                        .join("missing-key")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            };
+            assert!(spawn_task(
+                &config,
+                dir.path().into(),
+                &bus,
+                Instant::now(),
+                test_workspace_pool()
+            )
+            .is_none());
+            assert_eq!(bus.receiver_count(), 0);
+            assert!(!dir.path().join(".loom").exists());
+        }
     }
 
     /// The `otlp`-feature counterpart of

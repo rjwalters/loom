@@ -30,14 +30,8 @@ impl TelemetryExportArgs {
             endpoint_policy::reserved_placeholder_host(&self.endpoint).is_none(),
             "placeholder telemetry endpoint refused"
         );
-        let url = reqwest::Url::parse(&self.endpoint).context("invalid collector URL")?;
         anyhow::ensure!(
-            matches!(url.scheme(), "http" | "https")
-                && url.host_str().is_some()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none(),
+            endpoint_policy::valid_otlp_endpoint(&self.endpoint),
             "collector URL must be HTTP(S), without credentials, query or fragment"
         );
         let mut input = Vec::new();
