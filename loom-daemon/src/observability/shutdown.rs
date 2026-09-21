@@ -121,6 +121,79 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_cancels_inflight_send_before_bounded_final_drain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct PendingSink {
+            active: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+            entered: Arc<tokio::sync::Notify>,
+        }
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        impl Exporter for PendingSink {
+            async fn emit_batch(
+                &self,
+                _: &[TelemetryEnvelope],
+            ) -> Result<(), super::super::exporter::ExportError> {
+                let count = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                let _active = Active(self.active.clone());
+                self.peak.fetch_max(count, Ordering::SeqCst);
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.jsonl");
+        let queue = Arc::new(DurableQueue::open(path.clone(), 5));
+        queue.push(TelemetryEnvelope::new(
+            "host",
+            TelemetryRecord::SweepStarted(SweepStartedRecord {
+                repo: "test/fixture".into(),
+                visibility: RepoVisibility::Private,
+                issue: 18,
+                sweep_id: "shutdown".into(),
+                started_at: chrono::Utc::now(),
+                model: None,
+                effort: None,
+            }),
+        ));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task = spawn_sender(
+            queue,
+            PendingSink {
+                active: active.clone(),
+                peak: peak.clone(),
+                entered: entered.clone(),
+            },
+            5,
+            Duration::from_millis(1),
+            Arc::new(ExportStatus::started("host", "http://localhost", "otlp", 30)),
+        );
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        flush_before_shutdown(Duration::from_millis(30)).await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "sender and final drain cannot consume concurrently"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(DurableQueue::open(path, 5).len(), 1);
+    }
+
+    #[tokio::test]
     async fn final_drain_is_bounded_and_retains_unsent_records() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queue.jsonl");

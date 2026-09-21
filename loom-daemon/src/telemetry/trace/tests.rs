@@ -148,3 +148,25 @@ fn span_content_is_allowlisted_and_bounded() {
     assert!(!json.contains("SECRET"));
     assert_eq!(bounded.attributes.get("loom.runtime").unwrap(), "pi");
 }
+
+#[test]
+fn terminal_context_is_retained_when_durable_queue_offer_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TraceStore::new(dir.path());
+    let execution = store.load_or_create(dir.path(), "pending").unwrap();
+    let blocked = dir.path().join("not-a-directory");
+    std::fs::write(&blocked, b"occupied").unwrap();
+    let queue = crate::observability::queue::DurableQueue::open(blocked.join("queue.jsonl"), 5);
+    let envelope = TelemetryEnvelope::new("host", TelemetryRecord::Span(span(execution.context)));
+    assert!(queue.push_durable(envelope.clone()).is_err());
+    assert!(store.path(dir.path(), "pending").exists());
+    let path = dir.path().join("queue.jsonl");
+    let queue = crate::observability::queue::DurableQueue::open(path.clone(), 5);
+    queue.push_durable(envelope.clone()).unwrap();
+    store.complete(dir.path(), "pending").unwrap();
+    assert_eq!(
+        crate::observability::queue::DurableQueue::open(path, 5).peek_batch(5),
+        vec![envelope]
+    );
+    assert!(!store.path(dir.path(), "pending").exists());
+}
