@@ -99,9 +99,11 @@ fn actual_propagation_hook_handles_enabled_disabled_and_invalid_configuration() 
             assert!(!output.status.success());
             assert!(output.stdout.is_empty());
             assert!(!dir.path().join(".loom/logs/trace-context").exists());
-            assert!(command
-                .get_envs()
-                .any(|(key, value)| key == CONTEXT_FILE_ENV && value.is_none()));
+            // With env_clear(), env_remove() may erase an explicit entry
+            // instead of retaining a None tombstone. Verify the child boundary.
+            let output = command.arg(CONTEXT_FILE_ENV).output().unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
         }
     }
 }
