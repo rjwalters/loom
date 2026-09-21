@@ -116,6 +116,7 @@ mod model;
 mod noop_cooldown;
 mod outcome_journal;
 mod quarantine;
+mod quarantine_escalation;
 mod reaper;
 mod stacking;
 #[cfg(test)]
@@ -145,8 +146,8 @@ pub use model::*;
 pub use noop_cooldown::*;
 #[allow(unused_imports)]
 pub use outcome_journal::*;
-#[allow(unused_imports)]
 pub use quarantine::*;
+pub use quarantine_escalation::*;
 #[allow(unused_imports)]
 pub use reaper::*;
 #[allow(unused_imports)]
@@ -468,10 +469,11 @@ pub struct SweepRegistry {
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value; the [`QuarantineConfig::default`] is the shipped-on default.
     quarantine_config: QuarantineConfig,
-    /// Consecutive insta-crash counts per issue (Issue #3939). Incremented by the
-    /// reaper on a checkpoint-less death inside the insta-crash window; reset to
-    /// zero on any terminal outcome that made real progress or exited cleanly.
-    insta_crash_counts: HashMap<u32, u32>,
+    /// All mutable insta-crash-quarantine bookkeeping (tallies, active
+    /// quarantines, escalation generations, pending label restores) — the
+    /// [`QuarantineState`] struct, consolidated vibesql#6639. Its fields carry
+    /// their own documentation.
+    quarantine_state: QuarantineState,
     /// Consecutive reaper-driven resume dispatches per issue (Issue #4256, Judge
     /// residual-risk backstop). Incremented each time [`reap_once`](Self::reap_once)
     /// resume-dispatches a crashed post-Builder sweep; reset to zero when a run
@@ -482,22 +484,6 @@ pub struct SweepRegistry {
     /// issue that reliably dies in the ~2s..stall window cannot resume forever.
     /// Keyed by issue like [`insta_crash_counts`](Self::insta_crash_counts).
     resume_attempt_counts: HashMap<u32, u32>,
-    /// Currently-quarantined issues → the instant they were quarantined (Issue
-    /// #3939). The work finder skips these until the entry ages past
-    /// [`QuarantineConfig::ttl`], at which point [`reap_once`](Self::reap_once)
-    /// releases it. Keyed by issue number; since each registry is scoped to one
-    /// workspace root, this is effectively a `(workspace, issue)` key.
-    quarantined: HashMap<u32, DateTime<Utc>>,
-    /// Issues whose `loom:blocked` -> `loom:issue` label restore failed at
-    /// least once (Issue #4110): [`release_quarantine_label`](Self::release_quarantine_label)
-    /// is a best-effort `gh` call, and a transient failure must not silently
-    /// strand the issue at `loom:blocked` forever — the in-memory quarantine
-    /// state is already gone by the time the label edit runs, so this set is
-    /// the only remaining record that a retry is owed. [`reap_once`](Self::reap_once)
-    /// retries every entry here on each tick until the flip succeeds (or the
-    /// operator fixes the forge state by hand, at which point the retried
-    /// `gh issue edit` is a harmless idempotent no-op).
-    pending_quarantine_release: HashSet<u32>,
     /// Whether cross-host dispatch-collision detection AND enforcement is
     /// enabled (Issue #4085, Phase 0 of #4028; upgraded from detection-only
     /// into enforcement by #5789). When `true`, [`dispatch`](Self::dispatch)
@@ -1017,10 +1003,8 @@ impl SweepRegistry {
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
-            insta_crash_counts: HashMap::new(),
+            quarantine_state: QuarantineState::default(),
             resume_attempt_counts: HashMap::new(),
-            quarantined: HashMap::new(),
-            pending_quarantine_release: HashSet::new(),
             detect_collisions: false,
             collision_count: 0,
             peer_claim_publisher: None,
@@ -1069,10 +1053,8 @@ impl SweepRegistry {
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
-            insta_crash_counts: HashMap::new(),
+            quarantine_state: QuarantineState::default(),
             resume_attempt_counts: HashMap::new(),
-            quarantined: HashMap::new(),
-            pending_quarantine_release: HashSet::new(),
             detect_collisions: false,
             collision_count: 0,
             peer_claim_publisher: None,
@@ -1339,7 +1321,8 @@ impl SweepRegistry {
     /// the derivations above would otherwise have done under the lock.
     #[must_use]
     pub fn snapshot(&self) -> RegistrySnapshot {
-        let mut quarantined_issues_sorted: Vec<u32> = self.quarantined.keys().copied().collect();
+        let mut quarantined_issues_sorted: Vec<u32> =
+            self.quarantine_state.quarantined.keys().copied().collect();
         quarantined_issues_sorted.sort_unstable();
         RegistrySnapshot {
             entries: self.entries.clone(),
