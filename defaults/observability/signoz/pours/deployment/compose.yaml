@@ -1,0 +1,239 @@
+name: loom-signoz
+networks:
+  loom-observability:
+    external: true
+    name: loom-observability
+  loom-signoz-network:
+    name: loom-signoz-network
+services:
+  ingester:
+    command:
+    - -c
+    - |
+      /signoz-otel-collector migrate sync check &&
+      /signoz-otel-collector --config=/etc/otel-collector-config.yaml --manager-config=/etc/opamp-config.yaml --copy-path=/var/tmp/collector-config.yaml
+    cpus: 1
+    depends_on:
+      loom-signoz-telemetrystore-migrator:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 1
+    entrypoint:
+    - /bin/sh
+    environment:
+    - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_DSN=tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
+    - SIGNOZ_OTEL_COLLECTOR_TIMEOUT=10m
+    image: signoz/signoz-otel-collector:v0.144.10@sha256:34ecb436b687cc23bef5f706904cdf005998ca4ebe543653a634055a9fe204f6
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    mem_limit: 512m
+    networks:
+      loom-observability:
+        aliases:
+        - signoz-otel-collector
+      loom-signoz-network:
+        aliases:
+        - loom-signoz-ingester
+    restart: unless-stopped
+    volumes:
+    - ./ingester/ingester.yaml:/etc/otel-collector-config.yaml:ro
+    - ./ingester/opamp.yaml:/etc/opamp-config.yaml:ro
+  loom-signoz-metastore-postgres-0:
+    container_name: loom-signoz-metastore-postgres-0
+    cpus: 0.5
+    environment:
+    - POSTGRES_DB=signoz
+    - POSTGRES_PASSWORD=signoz
+    - POSTGRES_USER=signoz
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 30s
+      test:
+      - CMD-SHELL
+      - pg_isready -U signoz -d signoz
+      timeout: 10s
+    image: postgres:16@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    mem_limit: 256m
+    networks:
+    - loom-signoz-network
+    restart: unless-stopped
+    volumes:
+    - loom-signoz-metastore-postgres-0-data:/var/lib/postgresql/data
+  loom-signoz-signoz-0:
+    container_name: loom-signoz-signoz-0
+    cpus: 1
+    depends_on:
+      loom-signoz-metastore-postgres-0:
+        condition: service_healthy
+      loom-signoz-telemetrystore-migrator:
+        condition: service_completed_successfully
+    environment:
+    - SIGNOZ_ANALYTICS_ENABLED=false
+    - SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:signoz@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
+    - SIGNOZ_SQLSTORE_PROVIDER=postgres
+    - SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN=tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
+    - SIGNOZ_TELEMETRYSTORE_PROVIDER=clickhouse
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 900s
+      test:
+      - CMD
+      - wget
+      - --spider
+      - -q
+      - http://localhost:8080/api/v1/health
+      timeout: 30s
+    image: signoz/signoz:v0.142.1@sha256:49501b04d77a1e8328d31519c977dd4503b724c74425764a3ab83768db3ee8ff
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    mem_limit: 768m
+    networks:
+    - loom-signoz-network
+    ports:
+    - 127.0.0.1:18081:8080
+    restart: unless-stopped
+  loom-signoz-telemetrykeeper-clickhousekeeper-0:
+    container_name: loom-signoz-telemetrykeeper-clickhousekeeper-0
+    cpus: 0.5
+    entrypoint:
+    - /usr/bin/clickhouse-keeper
+    - --config-file=/etc/clickhouse-keeper/keeper.yaml
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 300s
+      test:
+      - CMD
+      - clickhouse-keeper-client
+      - -h
+      - localhost
+      - -p
+      - "9181"
+      - -q
+      - ls
+      timeout: 30s
+    image: clickhouse/clickhouse-keeper:25.12.5@sha256:525b8b0f93ccb371131c46f22a066ea43d33d74aba314203e8044609945d8524
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    mem_limit: 256m
+    networks:
+    - loom-signoz-network
+    restart: unless-stopped
+    volumes:
+    - loom-signoz-telemetrykeeper-0-data:/var/lib/clickhouse-keeper
+    - ./telemetrykeeper/clickhousekeeper/keeper-0.yaml:/etc/clickhouse-keeper/keeper.yaml:ro
+  loom-signoz-telemetrystore-clickhouse-0-0:
+    container_name: loom-signoz-telemetrystore-clickhouse-0-0
+    cpus: 2
+    depends_on:
+      loom-signoz-telemetrykeeper-clickhousekeeper-0:
+        condition: service_healthy
+      loom-signoz-telemetrystore-clickhouse-user-scripts:
+        condition: service_completed_successfully
+    environment:
+    - CLICKHOUSE_SKIP_USER_SETUP=1
+    - CLICKHOUSE_CONFIG=/etc/clickhouse-server/config-0-0.yaml
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 600s
+      test:
+      - CMD
+      - wget
+      - --spider
+      - -q
+      - http://localhost:8123/ping
+      timeout: 30s
+    image: clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    mem_limit: 2g
+    networks:
+    - loom-signoz-network
+    restart: unless-stopped
+    volumes:
+    - loom-signoz-telemetrystore-0-0-data:/var/lib/clickhouse
+    - loom-signoz-telemetrystore-user-scripts:/var/lib/clickhouse/user_scripts:ro
+    - ./telemetrystore/clickhouse/config-0-0.yaml:/etc/clickhouse-server/config-0-0.yaml:ro
+    - ./telemetrystore/clickhouse/functions.yaml:/etc/clickhouse-server/functions.yaml:ro
+  loom-signoz-telemetrystore-clickhouse-user-scripts:
+    command:
+    - bash
+    - -c
+    - |-
+      version="v0.0.1"
+      node_os=$$(uname -s | tr '[:upper:]' '[:lower:]')
+      node_arch=$$(uname -m | sed s/aarch64/arm64/ | sed s/x86_64/amd64/)
+      echo "Fetching histogram-binary for $${node_os}/$${node_arch}"
+      cd /tmp
+      wget -O histogram-quantile.tar.gz "https://github.com/SigNoz/signoz/releases/download/histogram-quantile%2F$${version}/histogram-quantile_$${node_os}_$${node_arch}.tar.gz"
+      tar -xvzf histogram-quantile.tar.gz
+      mv histogram-quantile /var/lib/clickhouse/user_scripts/histogramQuantile
+    container_name: loom-signoz-telemetrystore-clickhouse-user-scripts
+    image: clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    mem_limit: 256m
+    networks:
+    - loom-signoz-network
+    restart: on-failure
+    volumes:
+    - loom-signoz-telemetrystore-user-scripts:/var/lib/clickhouse/user_scripts
+  loom-signoz-telemetrystore-migrator:
+    command:
+    - -c
+    - |
+      /signoz-otel-collector migrate ready &&
+      /signoz-otel-collector migrate bootstrap &&
+      /signoz-otel-collector migrate sync up &&
+      /signoz-otel-collector migrate async up
+    container_name: loom-signoz-telemetrystore-migrator
+    depends_on:
+      loom-signoz-telemetrystore-clickhouse-0-0:
+        condition: service_healthy
+    entrypoint:
+    - /bin/sh
+    environment:
+    - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_DSN=tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
+    - SIGNOZ_OTEL_COLLECTOR_TIMEOUT=10m
+    image: signoz/signoz-otel-collector:v0.144.10@sha256:34ecb436b687cc23bef5f706904cdf005998ca4ebe543653a634055a9fe204f6
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    mem_limit: 512m
+    networks:
+    - loom-signoz-network
+    restart: on-failure
+volumes:
+  loom-signoz-metastore-postgres-0-data:
+    name: loom-signoz-metastore-postgres-0-data
+  loom-signoz-telemetrykeeper-0-data:
+    name: loom-signoz-telemetrykeeper-0-data
+  loom-signoz-telemetrystore-0-0-data:
+    name: loom-signoz-telemetrystore-0-0-data
+  loom-signoz-telemetrystore-user-scripts:
+    name: loom-signoz-telemetrystore-user-scripts

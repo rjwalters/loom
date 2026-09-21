@@ -1,0 +1,811 @@
+apiVersion: v1alpha1
+kind: Installation
+metadata:
+  name: loom-signoz
+spec:
+  deployment:
+    flavor: compose
+    mode: docker
+  ingester:
+    spec:
+      cluster:
+        replicas: 1
+      config:
+        data:
+          ingester.yaml: |
+            connectors:
+              signozmeter:
+                metrics_flush_interval: 1h
+                dimensions:
+                  - name: service.name
+                  - name: deployment.environment
+                  - name: host.name
+            receivers:
+              otlp:
+                protocols:
+                  grpc:
+                    endpoint: "0.0.0.0:4317"
+                  http:
+                    endpoint: "0.0.0.0:4318"
+            processors:
+              batch:
+                send_batch_size: 50000
+                send_batch_max_size: 55000
+                timeout: 5s
+              batch/meter:
+                send_batch_size: 20000
+                send_batch_max_size: 25000
+                timeout: 5s
+              signozspanmetrics/delta:
+                metrics_exporter: signozclickhousemetrics
+                metrics_flush_interval: 60s
+                latency_histogram_buckets:
+                  - 100us
+                  - 1ms
+                  - 2ms
+                  - 6ms
+                  - 10ms
+                  - 50ms
+                  - 100ms
+                  - 250ms
+                  - 500ms
+                  - 1000ms
+                  - 1400ms
+                  - 2000ms
+                  - 5s
+                  - 10s
+                  - 20s
+                  - 40s
+                  - 60s
+                dimensions_cache_size: 100000
+                aggregation_temporality: AGGREGATION_TEMPORALITY_DELTA
+                enable_exp_histogram: true
+                dimensions:
+                  - name: service.namespace
+                    default: default
+                  - name: deployment.environment
+                    default: default
+                  - name: signoz.collector.id
+                  - name: service.version
+            exporters:
+              clickhousetraces:
+                datasource: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000/signoz_traces
+                low_cardinal_exception_grouping: ${env:LOW_CARDINAL_EXCEPTION_GROUPING}
+                use_new_schema: true
+                timeout: 45s
+                sending_queue:
+                  enabled: false
+              signozclickhousemetrics:
+                dsn: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000/signoz_metrics
+                timeout: 45s
+                sending_queue:
+                  enabled: false
+              clickhouselogsexporter:
+                dsn: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000/signoz_logs
+                use_new_schema: true
+                timeout: 45s
+                sending_queue:
+                  enabled: false
+              signozclickhousemeter:
+                dsn: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000/signoz_meter
+                timeout: 45s
+                sending_queue:
+                  enabled: false
+              metadataexporter:
+                enabled: true
+                dsn: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000/signoz_metadata
+                timeout: 45s
+                cache:
+                  provider: in_memory
+            extensions:
+              signoz_health_check:
+                endpoint: "0.0.0.0:13133"
+              pprof:
+                endpoint: "0.0.0.0:1777"
+            service:
+              telemetry:
+                logs:
+                  encoding: json
+              extensions:
+                - signoz_health_check
+                - pprof
+              pipelines:
+                traces:
+                  receivers:
+                    - otlp
+                  processors:
+                    - signozspanmetrics/delta
+                    - batch
+                  exporters:
+                    - clickhousetraces
+                    - signozmeter
+                    - metadataexporter
+                metrics:
+                  receivers:
+                    - otlp
+                  processors:
+                    - batch
+                  exporters:
+                    - signozclickhousemetrics
+                    - signozmeter
+                    - metadataexporter
+                logs:
+                  receivers:
+                    - otlp
+                  processors:
+                    - batch
+                  exporters:
+                    - clickhouselogsexporter
+                    - signozmeter
+                    - metadataexporter
+                metrics/meter:
+                  receivers:
+                    - signozmeter
+                  processors:
+                    - batch/meter
+                  exporters:
+                    - signozclickhousemeter
+          opamp.yaml: |
+            server_endpoint: ws://loom-signoz-metastore-postgres-0:4320/v1/opamp
+      enabled: true
+      env:
+        SIGNOZ_OTEL_COLLECTOR_TIMEOUT: 10m
+      image: signoz/signoz-otel-collector:v0.144.10@sha256:34ecb436b687cc23bef5f706904cdf005998ca4ebe543653a634055a9fe204f6
+      version: v0.144.10
+    status:
+      addresses:
+        otlp:
+        - tcp://loom-signoz-ingester:4318
+        - tcp://loom-signoz-ingester:4317
+      config:
+        data:
+          ingester.yaml: |
+            connectors:
+              signozmeter:
+                metrics_flush_interval: 1h
+                dimensions:
+                  - name: service.name
+                  - name: deployment.environment
+                  - name: host.name
+            receivers:
+              otlp:
+                protocols:
+                  grpc:
+                    endpoint: "0.0.0.0:4317"
+                  http:
+                    endpoint: "0.0.0.0:4318"
+            processors:
+              batch:
+                send_batch_size: 50000
+                send_batch_max_size: 55000
+                timeout: 5s
+              batch/meter:
+                send_batch_size: 20000
+                send_batch_max_size: 25000
+                timeout: 5s
+              signozspanmetrics/delta:
+                metrics_exporter: signozclickhousemetrics
+                metrics_flush_interval: 60s
+                latency_histogram_buckets:
+                  - 100us
+                  - 1ms
+                  - 2ms
+                  - 6ms
+                  - 10ms
+                  - 50ms
+                  - 100ms
+                  - 250ms
+                  - 500ms
+                  - 1000ms
+                  - 1400ms
+                  - 2000ms
+                  - 5s
+                  - 10s
+                  - 20s
+                  - 40s
+                  - 60s
+                dimensions_cache_size: 100000
+                aggregation_temporality: AGGREGATION_TEMPORALITY_DELTA
+                enable_exp_histogram: true
+                dimensions:
+                  - name: service.namespace
+                    default: default
+                  - name: deployment.environment
+                    default: default
+                  - name: signoz.collector.id
+                  - name: service.version
+            exporters:
+              clickhousetraces:
+                datasource: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000/signoz_traces
+                low_cardinal_exception_grouping: ${env:LOW_CARDINAL_EXCEPTION_GROUPING}
+                use_new_schema: true
+                timeout: 45s
+                sending_queue:
+                  enabled: false
+              signozclickhousemetrics:
+                dsn: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000/signoz_metrics
+                timeout: 45s
+                sending_queue:
+                  enabled: false
+              clickhouselogsexporter:
+                dsn: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000/signoz_logs
+                use_new_schema: true
+                timeout: 45s
+                sending_queue:
+                  enabled: false
+              signozclickhousemeter:
+                dsn: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000/signoz_meter
+                timeout: 45s
+                sending_queue:
+                  enabled: false
+              metadataexporter:
+                enabled: true
+                dsn: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000/signoz_metadata
+                timeout: 45s
+                cache:
+                  provider: in_memory
+            extensions:
+              signoz_health_check:
+                endpoint: "0.0.0.0:13133"
+              pprof:
+                endpoint: "0.0.0.0:1777"
+            service:
+              telemetry:
+                logs:
+                  encoding: json
+              extensions:
+                - signoz_health_check
+                - pprof
+              pipelines:
+                traces:
+                  receivers:
+                    - otlp
+                  processors:
+                    - signozspanmetrics/delta
+                    - batch
+                  exporters:
+                    - clickhousetraces
+                    - signozmeter
+                    - metadataexporter
+                metrics:
+                  receivers:
+                    - otlp
+                  processors:
+                    - batch
+                  exporters:
+                    - signozclickhousemetrics
+                    - signozmeter
+                    - metadataexporter
+                logs:
+                  receivers:
+                    - otlp
+                  processors:
+                    - batch
+                  exporters:
+                    - clickhouselogsexporter
+                    - signozmeter
+                    - metadataexporter
+                metrics/meter:
+                  receivers:
+                    - signozmeter
+                  processors:
+                    - batch/meter
+                  exporters:
+                    - signozclickhousemeter
+          opamp.yaml: |
+            server_endpoint: ws://loom-signoz-metastore-postgres-0:4320/v1/opamp
+      env:
+        SIGNOZ_OTEL_COLLECTOR_TIMEOUT: 10m
+  mcp:
+    spec:
+      cluster:
+        replicas: 1
+      config: {}
+      enabled: false
+      image: signoz/signoz-mcp-server:latest
+      version: latest
+    status:
+      addresses:
+        http: null
+      config: {}
+  metastore:
+    kind: postgres
+    spec:
+      cluster:
+        replicas: 1
+      config: {}
+      enabled: true
+      env:
+        POSTGRES_DB: signoz
+        POSTGRES_PASSWORD: signoz
+        POSTGRES_USER: signoz
+      image: postgres:16@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6
+      version: "16"
+    status:
+      addresses:
+        dsn:
+        - tcp://loom-signoz-metastore-postgres-0:5432
+      config: {}
+      env:
+        POSTGRES_DB: signoz
+        POSTGRES_PASSWORD: signoz
+        POSTGRES_USER: signoz
+  patches:
+  - operations:
+    - op: add
+      path: /networks/loom-observability
+      value:
+        external: true
+        name: loom-observability
+    - op: remove
+      path: /services/ingester/ports
+    - op: add
+      path: /services/ingester/networks/loom-observability
+      value:
+        aliases:
+        - signoz-otel-collector
+    - op: replace
+      path: /services/loom-signoz-signoz-0/ports
+      value:
+      - 127.0.0.1:18081:8080
+    - op: add
+      path: /services/ingester/mem_limit
+      value: 512m
+    - op: add
+      path: /services/ingester/cpus
+      value: 1
+    - op: add
+      path: /services/loom-signoz-signoz-0/mem_limit
+      value: 768m
+    - op: add
+      path: /services/loom-signoz-signoz-0/cpus
+      value: 1
+    - op: add
+      path: /services/loom-signoz-metastore-postgres-0/mem_limit
+      value: 256m
+    - op: add
+      path: /services/loom-signoz-metastore-postgres-0/cpus
+      value: 0.5
+    - op: add
+      path: /services/loom-signoz-telemetrykeeper-clickhousekeeper-0/mem_limit
+      value: 256m
+    - op: add
+      path: /services/loom-signoz-telemetrykeeper-clickhousekeeper-0/cpus
+      value: 0.5
+    - op: add
+      path: /services/loom-signoz-telemetrystore-clickhouse-0-0/mem_limit
+      value: 2g
+    - op: add
+      path: /services/loom-signoz-telemetrystore-clickhouse-0-0/cpus
+      value: 2
+    - op: add
+      path: /services/loom-signoz-telemetrystore-clickhouse-user-scripts/mem_limit
+      value: 256m
+    - op: add
+      path: /services/loom-signoz-telemetrystore-migrator/mem_limit
+      value: 512m
+    - op: add
+      path: /services/loom-signoz-telemetrystore-migrator/depends_on
+      value:
+        loom-signoz-telemetrystore-clickhouse-0-0:
+          condition: service_healthy
+    - op: add
+      path: /services/ingester/depends_on
+      value:
+        loom-signoz-telemetrystore-migrator:
+          condition: service_completed_successfully
+    - op: add
+      path: /services/loom-signoz-signoz-0/depends_on
+      value:
+        loom-signoz-metastore-postgres-0:
+          condition: service_healthy
+        loom-signoz-telemetrystore-migrator:
+          condition: service_completed_successfully
+    - op: replace
+      path: /services/loom-signoz-signoz-0/healthcheck/start_period
+      value: 900s
+    - op: replace
+      path: /services/loom-signoz-signoz-0/healthcheck/timeout
+      value: 30s
+    - op: replace
+      path: /services/loom-signoz-telemetrykeeper-clickhousekeeper-0/healthcheck/start_period
+      value: 300s
+    - op: replace
+      path: /services/loom-signoz-telemetrykeeper-clickhousekeeper-0/healthcheck/timeout
+      value: 30s
+    - op: replace
+      path: /services/loom-signoz-telemetrystore-clickhouse-0-0/healthcheck/start_period
+      value: 600s
+    - op: replace
+      path: /services/loom-signoz-telemetrystore-clickhouse-0-0/healthcheck/timeout
+      value: 30s
+    - op: add
+      path: /services/ingester/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 10m
+    - op: add
+      path: /services/loom-signoz-signoz-0/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 10m
+    - op: add
+      path: /services/loom-signoz-metastore-postgres-0/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 10m
+    - op: add
+      path: /services/loom-signoz-telemetrykeeper-clickhousekeeper-0/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 10m
+    - op: add
+      path: /services/loom-signoz-telemetrystore-clickhouse-0-0/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 10m
+    - op: add
+      path: /services/loom-signoz-telemetrystore-clickhouse-user-scripts/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 10m
+    - op: add
+      path: /services/loom-signoz-telemetrystore-migrator/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 10m
+    target: deployment/compose.yaml
+  signoz:
+    spec:
+      cluster:
+        replicas: 1
+      config: {}
+      enabled: true
+      env:
+        SIGNOZ_ANALYTICS_ENABLED: "false"
+        SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://signoz:signoz@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
+        SIGNOZ_SQLSTORE_PROVIDER: postgres
+        SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
+        SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
+      image: signoz/signoz:v0.142.1@sha256:49501b04d77a1e8328d31519c977dd4503b724c74425764a3ab83768db3ee8ff
+      version: v0.142.1
+    status:
+      addresses:
+        apiserver:
+        - tcp://loom-signoz-metastore-postgres-0:8080
+        - tcp://loom-signoz-signoz-0:8080
+        - tcp://loom-signoz-telemetrykeeper-clickhousekeeper-0:8080
+        - tcp://loom-signoz-telemetrystore-clickhouse-0-0:8080
+        - tcp://loom-signoz-telemetrystore-clickhouse-user-scripts:8080
+        - tcp://loom-signoz-telemetrystore-migrator:8080
+        opamp:
+        - ws://loom-signoz-metastore-postgres-0:4320
+        - ws://loom-signoz-signoz-0:4320
+        - ws://loom-signoz-telemetrykeeper-clickhousekeeper-0:4320
+        - ws://loom-signoz-telemetrystore-clickhouse-0-0:4320
+        - ws://loom-signoz-telemetrystore-clickhouse-user-scripts:4320
+        - ws://loom-signoz-telemetrystore-migrator:4320
+      config: {}
+      env:
+        SIGNOZ_ANALYTICS_ENABLED: "false"
+        SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://signoz:signoz@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
+        SIGNOZ_SQLSTORE_PROVIDER: postgres
+        SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
+        SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
+  telemetrykeeper:
+    kind: clickhousekeeper
+    spec:
+      cluster:
+        replicas: 1
+      config:
+        data:
+          keeper-0.yaml: |
+            listen_host: 0.0.0.0
+            logger:
+              level: information
+              console: true
+            keeper_server:
+              four_letter_word_white_list: "*"
+              coordination_settings:
+                operation_timeout_ms: 10000
+                raft_logs_level: warning
+                session_timeout_ms: 30000
+                force_sync: false
+                snapshot_distance: 100000
+                snapshots_to_keep: 3
+              log_storage_path: /var/lib/clickhouse-keeper/coordination/log
+              raft_configuration:
+                server:
+                - hostname: loom-signoz-telemetrykeeper-clickhousekeeper-0
+                  port: 9234
+                  id: 0
+              server_id: 0
+              snapshot_storage_path: /var/lib/clickhouse-keeper/coordination/snapshots
+              tcp_port: 9181
+      enabled: true
+      image: clickhouse/clickhouse-keeper:25.12.5@sha256:525b8b0f93ccb371131c46f22a066ea43d33d74aba314203e8044609945d8524
+      version: 25.12.5
+    status:
+      addresses:
+        client:
+        - tcp://loom-signoz-telemetrykeeper-clickhousekeeper-0:9181
+        raft:
+        - tcp://loom-signoz-telemetrykeeper-clickhousekeeper-0:9234
+      config:
+        data:
+          keeper-0.yaml: |
+            listen_host: 0.0.0.0
+            logger:
+              level: information
+              console: true
+            keeper_server:
+              four_letter_word_white_list: "*"
+              coordination_settings:
+                operation_timeout_ms: 10000
+                raft_logs_level: warning
+                session_timeout_ms: 30000
+                force_sync: false
+                snapshot_distance: 100000
+                snapshots_to_keep: 3
+              log_storage_path: /var/lib/clickhouse-keeper/coordination/log
+              raft_configuration:
+                server:
+                - hostname: loom-signoz-telemetrykeeper-clickhousekeeper-0
+                  port: 9234
+                  id: 0
+              server_id: 0
+              snapshot_storage_path: /var/lib/clickhouse-keeper/coordination/snapshots
+              tcp_port: 9181
+  telemetrystore:
+    kind: clickhouse
+    spec:
+      cluster:
+        replicas: 0
+        shards: 1
+      config:
+        data:
+          config-0-0.yaml: |
+            path: /var/lib/clickhouse/
+            tmp_path: /var/lib/clickhouse/tmp/
+            user_files_path: /var/lib/clickhouse/user_files/
+            format_schema_path: /var/lib/clickhouse/format_schemas/
+            dictionaries_config: '*_dictionary.xml'
+            display_name: cluster
+            distributed_ddl:
+                path: /clickhouse/task_queue/ddl
+            http_port: 8123
+            interserver_http_port: 9009
+            listen_host: 0.0.0.0
+            logger:
+                console: 1
+                count: 10
+                formatting:
+                    type: console
+                level: information
+                size: 1000M
+            macros:
+                replica: "00"
+                shard: "00"
+            profiles:
+                default:
+                    allow_simdjson: 0
+                    load_balancing: random
+                    log_queries: 1
+            quotas:
+                default:
+                    interval:
+                        duration: 3600
+                        errors: 0
+                        execution_time: 0
+                        queries: 0
+                        read_rows: 0
+                        result_rows: 0
+            user_directories:
+              users_xml:
+                path: config-0-0.yaml
+            remote_servers:
+              cluster:
+                shard:
+                - replica:
+                      - host: loom-signoz-telemetrystore-clickhouse-0-0
+                        port: 9000
+            zookeeper:
+              node:
+                - host: loom-signoz-telemetrykeeper-clickhousekeeper-0
+                  port: 9181
+            query_log:
+                flush_interval_milliseconds: 30000
+                partition_by: toYYYYMM(event_date)
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            query_thread_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            query_metric_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            query_views_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            part_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            metric_log:
+                flush_interval_milliseconds: 30000
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            asynchronous_metric_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            trace_log:
+                flush_interval_milliseconds: 30000
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            error_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            latency_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            processors_profile_log:
+                flush_interval_milliseconds: 30000
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            session_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            text_log:
+                flush_interval_milliseconds: 30000
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            zookeeper_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            tcp_port: 9000
+            user_defined_executable_functions_config: '*functions.yaml'
+            user_scripts_path: /var/lib/clickhouse/user_scripts/
+            users:
+                default:
+                    access_management: 1
+                    named_collection_control: 1
+                    networks:
+                        ip: ::/0
+                    password: ""
+                    profile: default
+                    quota: default
+                    show_named_collection: 1
+                    show_named_collection_secrets: 1
+          functions.yaml: |
+            functions:
+              argument:
+                  - name: buckets
+                    type: Array(Float64)
+                  - name: counts
+                    type: Array(Float64)
+                  - name: quantile
+                    type: Float64
+              command: ./histogramQuantile
+              format: CSV
+              name: histogramQuantile
+              return_type: Float64
+              type: executable
+      enabled: true
+      image: clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a
+      version: 25.12.5
+    status:
+      addresses:
+        tcp:
+        - tcp://loom-signoz-telemetrystore-clickhouse-0-0:9000
+      config:
+        data:
+          config-0-0.yaml: |
+            path: /var/lib/clickhouse/
+            tmp_path: /var/lib/clickhouse/tmp/
+            user_files_path: /var/lib/clickhouse/user_files/
+            format_schema_path: /var/lib/clickhouse/format_schemas/
+            dictionaries_config: '*_dictionary.xml'
+            display_name: cluster
+            distributed_ddl:
+                path: /clickhouse/task_queue/ddl
+            http_port: 8123
+            interserver_http_port: 9009
+            listen_host: 0.0.0.0
+            logger:
+                console: 1
+                count: 10
+                formatting:
+                    type: console
+                level: information
+                size: 1000M
+            macros:
+                replica: "00"
+                shard: "00"
+            profiles:
+                default:
+                    allow_simdjson: 0
+                    load_balancing: random
+                    log_queries: 1
+            quotas:
+                default:
+                    interval:
+                        duration: 3600
+                        errors: 0
+                        execution_time: 0
+                        queries: 0
+                        read_rows: 0
+                        result_rows: 0
+            user_directories:
+              users_xml:
+                path: config-0-0.yaml
+            remote_servers:
+              cluster:
+                shard:
+                - replica:
+                      - host: loom-signoz-telemetrystore-clickhouse-0-0
+                        port: 9000
+            zookeeper:
+              node:
+                - host: loom-signoz-telemetrykeeper-clickhousekeeper-0
+                  port: 9181
+            query_log:
+                flush_interval_milliseconds: 30000
+                partition_by: toYYYYMM(event_date)
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            query_thread_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            query_metric_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            query_views_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            part_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            metric_log:
+                flush_interval_milliseconds: 30000
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            asynchronous_metric_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            trace_log:
+                flush_interval_milliseconds: 30000
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            error_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            latency_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            processors_profile_log:
+                flush_interval_milliseconds: 30000
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            session_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            text_log:
+                flush_interval_milliseconds: 30000
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            zookeeper_log:
+                ttl: "event_date + INTERVAL 1 DAY DELETE"
+            tcp_port: 9000
+            user_defined_executable_functions_config: '*functions.yaml'
+            user_scripts_path: /var/lib/clickhouse/user_scripts/
+            users:
+                default:
+                    access_management: 1
+                    named_collection_control: 1
+                    networks:
+                        ip: ::/0
+                    password: ""
+                    profile: default
+                    quota: default
+                    show_named_collection: 1
+                    show_named_collection_secrets: 1
+          functions.yaml: |
+            functions:
+              argument:
+                  - name: buckets
+                    type: Array(Float64)
+                  - name: counts
+                    type: Array(Float64)
+                  - name: quantile
+                    type: Float64
+              command: ./histogramQuantile
+              format: CSV
+              name: histogramQuantile
+              return_type: Float64
+              type: executable

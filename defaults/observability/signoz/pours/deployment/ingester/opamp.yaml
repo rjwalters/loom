@@ -1,0 +1,1 @@
+server_endpoint: ws://loom-signoz-metastore-postgres-0:4320/v1/opamp
