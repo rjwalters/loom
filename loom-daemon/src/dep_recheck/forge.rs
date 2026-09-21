@@ -186,6 +186,14 @@ pub fn fetch_body(issue: i64, repo: Option<&str>, repo_root: &Path) -> Result<St
 /// The `## Dependencies` checklist entries, with each unchecked one's live
 /// state.
 ///
+/// `repo` is the *invoking* repo — where the issue whose checklist this is
+/// lives. A checklist item written `owner/repo#N` (#8502) names a different
+/// repo, and its state must be read **there**: looking it up in the invoking
+/// repo would answer a question nobody asked (a same-numbered issue that
+/// happens to exist locally) or fail outright, and a failed read is a hard
+/// error here, not a guess. So each entry's own `repo` takes precedence, with
+/// the invoking one as the fallback for a bare `#N`.
+///
 /// # Errors
 ///
 /// [`ReadError`] if the issue, or any unchecked reference, could not be read.
@@ -197,26 +205,23 @@ pub fn fetch_named_deps(
     let body = fetch_body(issue, repo, repo_root)?;
     named::parse_entries(&body)
         .into_iter()
-        .map(|(number, checked)| {
-            if checked {
+        .map(|entry| {
+            if entry.checked {
                 // No live lookup: whoever ticked the box said so, and the
                 // state is never consulted for a checked item.
-                return Ok(named::Dep {
-                    number,
-                    checked: true,
-                    state: None,
-                });
+                return Ok(entry);
             }
-            fetch_state(number, repo, repo_root)
+            let target = entry.repo.as_deref().or(repo);
+            fetch_state(entry.number, target, repo_root)
                 .map(|state| named::Dep {
-                    number,
-                    checked: false,
                     state: Some(state),
+                    ..entry.clone()
                 })
                 .ok_or_else(|| {
                     ReadError(format!(
-                        "could not read state for named dependency #{number} \
-                         (neither gh issue view nor gh pr view succeeded)"
+                        "could not read state for named dependency {} \
+                         (neither gh issue view nor gh pr view succeeded)",
+                        entry.reference()
                     ))
                 })
         })
