@@ -67,6 +67,19 @@
 #                      pre-port shell matched `-` only; `*` is valid GitHub
 #                      task-list syntax and missing it would produce a false
 #                      VERDICT=clear, the worse failure direction.
+#                      An item may carry, in this order, a dependency phrase
+#                      (`Blocked by`/`Depends on`/`Requires`/`**Epic**`,
+#                      #8119), a `PR `/`Issue ` token (#7501), and an
+#                      `owner/repo` prefix (#8502) - so
+#                      `- [ ] Blocked by PR owner/repo#7: ...` is one item.
+#                      A CROSS-REPO `owner/repo#N` reference has its state
+#                      read in THAT repo, not the invoking one, and renders in
+#                      DEPS as `owner/repo#N:<state>` (a bare `#N` still
+#                      renders as `N:<state>`, so no existing hash moves).
+#                      Same worse-failure-direction reasoning throughout:
+#                      before #8502 such a line matched nothing at all and
+#                      reported DEPS='' / VERDICT=clear for a still-open
+#                      upstream prerequisite.
 #   extract-refs       Reference extraction (#4963): the issue body always,
 #                      plus any comment NOT authored by the automation
 #                      identity and NOT carrying its own marker. That
