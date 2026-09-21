@@ -810,20 +810,15 @@ CODEX_DROP_PINNED_MODEL=false
 # profile is exactly the host-side CODEX_HOME access the ownership rule
 # forbids, and it would read the host's default login state, not the
 # account's. Same read-only, bounded probe account_lifecycle.rs uses.
-_codex_login_status=(codex login status)
-_codex_probe_binary=codex
-if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
-    _codex_login_status=(docker exec "$CODEX_SESSION_CONTAINER" codex login status)
-    _codex_probe_binary=docker
-fi
+_codex_bin=(codex); [[ "$CODEX_SESSION_EXEC" == "true" ]] && _codex_bin=(docker exec "$CODEX_SESSION_CONTAINER" codex)
 if [[ -n "$EFFECTIVE_MODEL" && -z "${LOOM_CODEX_NO_EXEC:-}" \
       && "${LOOM_CODEX_AUTH_MODE_CHECK:-1}" != "0" ]] \
-    && command -v "$_codex_probe_binary" >/dev/null 2>&1; then
+    && command -v "${_codex_bin[0]}" >/dev/null 2>&1; then
     _auth_mode_bounded_run_lib="${_SCRIPT_DIR}/lib/bounded-run.sh"
     if [[ -f "$_auth_mode_bounded_run_lib" ]]; then
         # shellcheck source=./lib/bounded-run.sh
         source "$_auth_mode_bounded_run_lib"
-        _login_status_out="$(bounded_run 10 "${_codex_login_status[@]}" </dev/null 2>&1)"
+        _login_status_out="$(bounded_run 10 "${_codex_bin[@]}" login status </dev/null 2>&1)"
         _login_status_rc=$?
         if [[ $_login_status_rc -eq 0 ]] \
             && printf '%s' "$_login_status_out" | grep -qi "logged in using chatgpt"; then
@@ -990,17 +985,10 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
     # provider credentials are deliberately NOT forwarded — the container
     # owns its own CODEX_HOME (ADR-0017 Decision 1).
     CODEX_INVOKE=(docker exec --workdir "$PWD" --env "LOOM_WORKSPACE=$WORKSPACE" -e CARGO_INCREMENTAL=0)
-    for _context_var in LOOM_ROLE LOOM_RUNTIME LOOM_TERMINAL_ID LOOM_SWEEP_ID \
-        LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT LOOM_PROJECT_ROOT \
-        LOOM_SWEEP_CLAIM_OWNED LOOM_ACCOUNT_NAME LOOM_ACCOUNT_PROVIDER; do
-        if [[ -n "${!_context_var:-}" ]]; then
-            CODEX_INVOKE+=(--env "$_context_var=${!_context_var}")
-        fi
-    done
-    CODEX_INVOKE+=("$CODEX_SESSION_CONTAINER" codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
-else
-    CODEX_INVOKE=(codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
+    for _v in LOOM_ROLE LOOM_RUNTIME LOOM_TERMINAL_ID LOOM_SWEEP_ID LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT LOOM_PROJECT_ROOT LOOM_SWEEP_CLAIM_OWNED LOOM_ACCOUNT_NAME LOOM_ACCOUNT_PROVIDER; do [[ -n "${!_v:-}" ]] && CODEX_INVOKE+=(--env "$_v=${!_v}"); done
+    CODEX_INVOKE+=("$CODEX_SESSION_CONTAINER")
 fi
+CODEX_INVOKE+=(codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
 
 # --- Test/CI hook: surface the resolved argv without touching the real CLI ---
 # Checked BEFORE the binary check so the mocked test can assert argv assembly on
@@ -1028,14 +1016,11 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
     # "missing session container".
     _session_running="$(docker inspect -f '{{.State.Running}}' "$CODEX_SESSION_CONTAINER" 2>/dev/null || true)"
     if [[ "$_session_running" != "true" ]]; then
-        log_error "Session container '$CODEX_SESSION_CONTAINER' for profile '$CODEX_PROFILE_NAME' is not running."
-        log_error "Start it with: loom-daemon accounts session start $CODEX_PROFILE_NAME"
+        log_error "Session container '$CODEX_SESSION_CONTAINER' for profile '$CODEX_PROFILE_NAME' is not running. Start it with: loom-daemon accounts session start $CODEX_PROFILE_NAME"
         exit 78  # EX_CONFIG
     fi
 elif ! command -v codex >/dev/null 2>&1; then
-    log_error "'codex' command not found in PATH."
-    log_error "Install the OpenAI Codex CLI (>= 0.146.0), e.g.:"
-    log_error "  npm install -g @openai/codex     # or: brew install codex"
+    log_error "'codex' command not found in PATH. Install the OpenAI Codex CLI (>= 0.146.0), e.g.: npm install -g @openai/codex  # or: brew install codex"
     exit 127
 fi
 
