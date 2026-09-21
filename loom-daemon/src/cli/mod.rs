@@ -8,6 +8,7 @@
 
 pub(crate) mod accounts;
 pub(crate) mod cancel;
+pub(crate) mod cargo_target_dir;
 pub(crate) mod cleanup_ops;
 pub(crate) mod common;
 pub(crate) mod dep_classify;

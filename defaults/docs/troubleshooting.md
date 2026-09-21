@@ -596,6 +596,13 @@ or `LOOM_PER_WORKTREE_TARGET_DIR=1` in the daemon's environment. Then:
 - `spawn-claude.sh` exports `CARGO_TARGET_DIR=<that dir>` for a sweep that owns a
   specific issue, so every `cargo test` an agent runs is hermetic. A role-runner
   tick or an interactive operator spawn is untouched.
+- Both reach the decision through **`loom-daemon cargo-target-dir`**
+  (`provision` / `path`), declared `requires-daemon: cargo-target-dir optional`
+  in each script: a host whose binary predates the subcommand — or has none
+  built yet — simply gets no per-worktree dir, which is the pre-#8458 behaviour.
+  The logic lives in the daemon per `.loom/docs/shell-language-policy.md`; the
+  bash library keeps only the marker read and the shape predicate, which the
+  removal paths need in-process.
 - Every removal path reclaims it: `worktree.sh remove`, `merge-pr.sh`'s
   post-merge cleanup, `loom-daemon clean`, and the daemon's periodic reaper (so a
   worktree whose PR merged on another host is cleaned up here too).

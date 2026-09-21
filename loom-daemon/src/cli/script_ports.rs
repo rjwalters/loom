@@ -65,6 +65,14 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     WorktreeLock(super::worktree_lock::WorktreeLockCommand),
 
+    /// `worktree.sh`/`spawn-claude.sh`'s per-worktree cargo target dir
+    /// (#8458): provision one and record its marker, or derive the path a
+    /// not-yet-created worktree would get. Both exit 0 always — "the feature
+    /// is off" is an answer, not an error, and must never abort a worktree
+    /// creation over a build-cache optimisation.
+    #[command(subcommand)]
+    CargoTargetDir(super::cargo_target_dir::CargoTargetDirCommand),
+
     /// `worktree.sh`'s WIP-shelving verbs (#8195, slice 2): `snapshot`,
     /// `stash-push`, `stash-pop`. The part of that script whose entire purpose
     /// is not losing somebody's uncommitted work — and whose `stash-push` runs
@@ -128,6 +136,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
+            ScriptPortCommand::CargoTargetDir(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),

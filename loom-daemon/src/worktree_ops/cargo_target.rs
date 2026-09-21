@@ -81,6 +81,9 @@
 /// Per-worktree target dirs (issue #8458): the `<root>/wt/<name>` scheme,
 /// its in-worktree marker, and the structural attribution predicate.
 pub mod per_worktree;
+/// Creation-time half of the per-worktree scheme (#8458): the opt-in, the
+/// derivation, and the marker write, behind `loom-daemon cargo-target-dir`.
+pub mod provision;
 mod report;
 
 use std::path::{Path, PathBuf};

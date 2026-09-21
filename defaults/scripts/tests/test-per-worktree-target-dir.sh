@@ -57,6 +57,16 @@ SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
 LIB_SH="$SCRIPTS_DIR/lib/cargo-target-dir.sh"
 
+# The CREATION half is `loom-daemon cargo-target-dir` (see lib/cargo-target-dir.sh
+# § "Why only the predicates live here"), so `worktree.sh` reaches for a daemon
+# binary here. Pin the one built from THIS working tree — otherwise a stale
+# machine-level install answers instead and the suite tests the wrong code.
+# FATAL rather than SKIP, per the helper: a silently-skipped suite is how the
+# provisioning could regress unnoticed.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "cargo-target-dir"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
