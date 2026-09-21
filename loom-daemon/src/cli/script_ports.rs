@@ -163,7 +163,9 @@ pub(crate) enum MergePrCommand {
     /// (#8508): push a tree-identical no-op commit so CI re-runs and re-dates
     /// every check, since the merge token lacks `actions:write` to re-run the
     /// stale one directly. Exit 0 = pushed, 3 = branch already moved (not a
-    /// failure, re-evaluate fresh), 1 = could not read/write forge state.
+    /// failure, re-evaluate fresh), 4 = remedy already spent on this head, so
+    /// the PR was escalated to a durable `loom:operator` hold, 1 = could not
+    /// read/write forge state.
     RedateChecks(super::merge_pr_redate::RedateChecksArgs),
 }
 

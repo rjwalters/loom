@@ -2058,38 +2058,32 @@ git checkout main 2>/dev/null || true
 # merge-pr.sh reads the PR's head SHA itself (a fresh, uncached read — see
 # "Cached forge reads" above) immediately before merging, and passes it
 # through to the forge's merge API as an optimistic-concurrency precondition
-# (#5579). Capture the exit code rather than using a bare `||`: exit 3 is a
-# DISTINCT outcome from exit 1 and must not be handled as a failure (below).
-#
-# Output is captured (not just streamed) as well as echoed here — MERGE_OUTPUT
-# is what the "required-check freshness guard blocked" exception (#8508, see
-# "Error Handling" below) greps to tell that specific refusal apart from any
-# other exit-1 failure.
+# (#5579). Capture the exit code rather than using a bare `||`: exits 3 and 4
+# are DISTINCT outcomes from exit 1, never handled as failures (both below).
+# --redate-stale-checks (#8508) lets the script perform the #8248 freshness
+# guard's OWN documented remedy — a tree-identical no-op commit that re-dates
+# CI — rather than only naming it; exit 4 reports that, and bypasses nothing.
 MERGE_RC=0
-MERGE_OUTPUT=$(./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto 2>&1) || MERGE_RC=$?
-echo "$MERGE_OUTPUT"
+./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks || MERGE_RC=$?
 
-if [ "$MERGE_RC" -eq 3 ]; then
+if [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ]; then
   # #5579: the PR's head branch moved past the SHA this merge attempt gated
   # on — most commonly a session pushing new commits to an open, loom:pr
   # branch while Champion was running. This is NOT a merge failure: the PR
   # is still Judge-approved, its diff just changed underneath it.
   #
-  # Do NOT follow the failure steps below for this outcome — see the "Exit
-  # code 3" exception in "Error Handling".
+  # Exit 4 (#8508) needs the SAME handling for the same reason: the head moved
+  # because merge-pr.sh itself re-dated the stale required checks.
+  #
+  # Do NOT follow the failure steps below for either — see the "Exit codes 3
+  # and 4" exception in "Error Handling".
   #
   # Note: merge-pr.sh's output for this case now includes both the stale SHA
   # (the one the merge attempt gated on) and the current head SHA, making it
   # easier to diagnose which commits raced in. These values are in the
   # merge-pr.sh output and logged to stderr; they are NOT posted as a PR
-  # comment (that design decision is documented in the "Exit code 3" exception
-  # section below).
-  echo "PR #$PR_NUMBER head moved during merge attempt — re-queuing for a fresh pass instead of failing"
-elif [ "$MERGE_RC" -eq 1 ] && grep -qF "its green result is evidence about a tree that no longer exists (#8248)" <<<"$MERGE_OUTPUT"; then
-  # The #8248 required-check freshness guard blocked this merge. Do NOT
-  # follow the generic failure steps below — see "Error Handling → Exception:
-  # required-check freshness guard blocked (#8508)".
-  echo "PR #$PR_NUMBER blocked by the #8248 required-check freshness guard — see the #8508 remedy in Error Handling"
+  # comment (that design decision is documented in that exception below).
+  echo "PR #$PR_NUMBER head moved (raced in, or re-dated by #8508) — re-queuing for a fresh pass instead of failing"
 elif [ "$MERGE_RC" -ne 0 ]; then
   echo "Merge failed for PR #$PR_NUMBER"
   # Post failure comment (see Error Handling section)
@@ -2103,7 +2097,10 @@ fi
 - Branch deleted automatically after merge
 - **Head-moved guard (#5579)**: `merge-pr.sh` refuses to merge (exit 3, not a
   failure) if the PR's head branch advanced past the SHA it read immediately
-  before merging — see "Exit code 3" in "Error Handling" below
+  before merging — see "Exit codes 3 and 4" in "Error Handling" below
+- **Stale-check re-date (#8508)**: exit 4, also not a failure — the #8248
+  guard blocked the merge and `--redate-stale-checks` pushed a tree-identical
+  no-op commit so CI re-dates the stale check
 
 ### Step 4: Verify Issue Auto-Close
 
@@ -3315,14 +3312,23 @@ This PR met all safety criteria but the merge operation failed. A human will nee
 *Automated by Champion role*"
 ```
 
-### Exception: exit code 3 — head moved, re-queue, not a failure (#5579)
+### Exception: exit codes 3 and 4 — head moved, re-queue, not a failure (#5579, #8508)
 
 `merge-pr.sh` exits **3** (distinct from the generic failure exit **1**) when
 the PR's head branch changed between the fresh head-SHA read it took
 immediately before merging and the actual merge call — most commonly because
 a session pushed new commits to an open, `loom:pr`-labeled branch while
-Champion was running. **Do not follow the 5 failure steps above for this
-outcome:**
+Champion was running.
+
+Exit **4** is the same shape with a different cause: the #8248 required-check
+freshness guard blocked the merge, and `--redate-stale-checks` performed that
+guard's own documented remedy — a tree-identical no-op commit so CI re-runs
+with a current timestamp. Nothing merged, nothing bypassed. It is bounded to
+one push per head; a second block escalates the PR to a durable
+`loom:operator` hold and returns the ordinary exit 1 with the original
+refusal, which is then simply a held PR.
+
+**Do not follow the 5 failure steps above for either outcome:**
 
 - Do **not** post the "Merge Failed" comment — the PR is still Judge-approved,
   its diff just moved out from under the merge attempt.
@@ -3332,154 +3338,16 @@ outcome:**
   `updatedAt` and CI status) will naturally re-evaluate the new head before
   merging it.
 
-**Diagnostic output:** When this occurs, `merge-pr.sh` logs to stderr both the
-stale SHA (the one it gated the merge on) and the current head SHA, making it
-easy to see which commits raced in. These values appear in the merge-pr.sh
-output and Champion's run log. They are **not** posted as a PR comment; the
-no-comment design decision reflects the fact that an exit-3 re-queue is a normal
-operational event (a session pushing mid-merge) and posting a comment on every
-such occurrence would be noisy for an ordinary race condition.
-
 **Leaving `loom:pr` in place here does NOT mean the approval still applies to
 the new head (#5686).** The head moving is exactly the condition that
-invalidates a verdict — this exception only says "don't treat the failed merge
-as an error", not "the new tree is approved". The next pass's Verdict-State
-Janitor Part 2 is what resolves that: if the Judge's approval was stamped
-against the old SHA, it returns `12` (STALE), clears `loom:pr`, and re-queues
-the PR for review rather than merging the tree that raced in. Do not
-short-circuit that by re-merging on a later tick without re-running Part 2.
+invalidates a verdict; this exception only says "don't treat the failed merge
+as an error". The next pass's Verdict-State Janitor Part 2 resolves it —
+never short-circuit that by re-merging on a later tick without re-running it.
 
-**Squash-merge detection trap.** If you ever need to manually verify whether a
-re-queued (or, worse, an already-merged-before-this-fix) PR's commits actually
-landed vs. were silently stranded, `git merge-base --is-ancestor <commit>
-origin/main` is **not reliable evidence either way**: a squash merge produces
-a brand-new commit SHA on `main` that is not a git-ancestry descendant of any
-commit on the original PR branch, regardless of whether that commit's content
-made it into the squash or was left behind. There is no cheap ancestry check
-for "squashed-and-landed" vs. "stranded" — verification requires diffing the
-actual file content on `main` against the branch/commit in question.
-
-### Exception: required-check freshness guard blocked — automated re-date, then a bounded hold (#8508)
-
-The #8248 guard (see "Safety Criteria" → its pre-merge check inside
-`merge-pr.sh`) is correct policy — a green required check whose evidence
-predates the base branch's current tip must not be trusted — but nothing
-re-triggers the stale check on its own. On PR #8493 (2026-09-21) neither
-`merge-pr.sh`'s internal re-run nor a direct `gh run rerun` could recover it:
-both failed with `Resource not accessible by integration` (the token has no
-`actions:write`), the PR's branch had no new commits to re-date it, and `main`
-kept advancing — three consecutive Champion ticks failed identically, with no
-durable record once the ordinary rejection comment's idempotency guard
-suppressed the third near-duplicate. This is that PR's automated remedy.
-
-**Trigger**: Step 3 set `MERGE_RC=1` and `MERGE_OUTPUT` contains the literal
-substring `its green result is evidence about a tree that no longer exists
-(#8248)` (`stale_checks::stale_message`'s own text — distinct from the
-"could not determine" fail-closed variant, which has no forward-progress
-remedy and falls through to the ordinary failure path instead).
-
-```bash
-PR_NUMBER=<number>
-# Fresh, uncached — this decides whether to write a new commit.
-CURRENT_HEAD=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
-BRANCH=$(gh pr view "$PR_NUMBER" --json headRefName --jq '.headRefName')
-
-# Has a redate already been attempted, and did it land THIS exact head?
-# `<!-- champion:redate-state to=<sha> -->` records the NEW sha the previous
-# attempt pushed — reused verbatim from the sticky-hold precheck's own
-# `hold-state head=<sha>` convention above. Plain `gh` — merge-gating.
-REDATE_MARKER="<!-- champion:stale-check-redate -->"
-LAST_REDATE_TO=$(gh pr view "$PR_NUMBER" --json comments --jq \
-  --arg m "$REDATE_MARKER" \
-  '[.comments[] | select(.body | startswith($m))] | last | .body // "" \
-   | (capture("champion:redate-state to=(?<sha>[0-9a-f]+)"; "g")? // {sha:""}) | .sha')
-
-if [ "$LAST_REDATE_TO" = "$CURRENT_HEAD" ]; then
-  # We already redated once and are STILL blocked on that exact head — a
-  # second no-op commit would only chase a `main` that is winning the race.
-  # This is "N=2 consecutive blocks with no forward progress" (#8508's bounded
-  # signal) — escalate to a durable hold instead of redating again.
-  ESCALATE=true
-  ESCALATE_REASON="an automated re-date commit was already pushed for this PR (to \`${CURRENT_HEAD:0:7}\`) and the #8248 guard is still blocking on that exact head — a second no-op commit would not out-race \`main\`"
-else
-  # Fresh head (never redated, or redated once and THAT push is what raced
-  # into a new stale block — forward progress happened, so one more attempt
-  # is warranted): try the remedy. `nameWithOwner` (not the `gh api`-only
-  # `{owner}/{repo}` template) — this argument goes to loom-daemon, a plain
-  # string, not a `gh api` path.
-  REPO_NWO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
-  REDATE_OUTPUT=$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr redate-checks \
-    --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$BRANCH" \
-    --expected-head-sha "$CURRENT_HEAD" 2>&1)
-  REDATE_RC=$?
-  ESCALATE=false
-  if [ "$REDATE_RC" -eq 0 ] && [[ "$REDATE_OUTPUT" == LOOM-REDATE-PUSHED* ]]; then
-    NEW_SHA=$(sed -n 's/^LOOM-REDATE-PUSHED sha=//p' <<<"$REDATE_OUTPUT")
-    gh pr comment "$PR_NUMBER" --body "$REDATE_MARKER
-<!-- champion:redate-state to=$NEW_SHA -->
-**Champion: Automated Re-Date Remedy (#8508)**
-
-The #8248 required-check-freshness guard blocked this merge — the required check's green result predates the current \`main\` tip, and this repo's merge token lacks \`actions:write\` to re-run it directly. Pushed a tree-identical no-op commit (\`${NEW_SHA:0:7}\`) instead, which re-triggers CI on the new head with a current timestamp.
-
-This moves the head SHA, which invalidates the standing Judge approval (#5686) — expect this PR to cycle back through \`loom:review-requested\` once CI on \`${NEW_SHA:0:7}\` completes, then merge normally once re-approved.
-
----
-*Automated by Champion role*"
-    "$GH_READ" --clear-cache
-    echo "Pushed re-date commit $NEW_SHA for #$PR_NUMBER — standing down this tick, Judge will re-review the new head"
-  elif [ "$REDATE_RC" -eq 3 ]; then
-    # HeadMoved: the branch already advanced past $CURRENT_HEAD between the
-    # read above and the push attempt (a human or another process acted).
-    # Not a failure — say nothing, let the next tick evaluate the new head
-    # fresh, exactly like Step 3's own exit-3 exception above.
-    echo "PR #$PR_NUMBER's branch moved before the re-date push landed — standing down, next tick re-evaluates fresh"
-  else
-    # The remedy itself could not run (old/missing loom-daemon, or the token
-    # also lacks contents:write) — no forward-progress path remains
-    # automated. Escalate immediately rather than silently repeating the
-    # unreachable remedy every tick.
-    ESCALATE=true
-    ESCALATE_REASON="the automated re-date remedy could not run: $REDATE_OUTPUT"
-  fi
-fi
-
-if [ "$ESCALATE" = true ]; then
-  HOLD_MARKER="<!-- champion:stale-check-freshness-hold -->"
-  # One notice per distinct head — mirrors every other hold's idempotency
-  # discipline. If the head later moves (a human pushes, or a further redate
-  # becomes possible), a fresh block at the new head produces a fresh notice.
-  ESCALATE_KEY="<!-- champion:stale-check-freshness-hold-state head=$CURRENT_HEAD -->"
-  if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(contains(\"$ESCALATE_KEY\"))")" = "true" ]; then
-    echo "Freshness-guard hold already posted for #$PR_NUMBER at this head — skipping duplicate"
-  else
-    gh pr comment "$PR_NUMBER" --body "$HOLD_MARKER
-$ESCALATE_KEY
-**Champion: Stuck on the Required-Check Freshness Guard (#8248) — Needs a Human**
-
-This PR is Judge-approved and clean on all 6 safety criteria, but the #8248 required-check-freshness guard has now blocked it with no automated forward progress available: $ESCALATE_REASON
-
-**Next steps (either resolves it):**
-- A human merges manually with a token that has \`actions:write\` (re-run the stale check) or elevated merge permission, or
-- Push any commit to this PR's branch (re-dates every check), then let Judge/Champion pick it back up automatically.
-
-Keeping \`loom:pr\` — Champion keeps retrying the merge every tick, and this resolves itself the moment the guard reports fresh (no separate release step needed, unlike a merge-risk hold).
-
----
-*Automated by Champion role*"
-    gh pr edit "$PR_NUMBER" --add-label "loom:operator" 2>/dev/null || true
-    "$GH_READ" --clear-cache
-    echo "Escalated #$PR_NUMBER to loom:operator — #8248 guard has no automated remedy left at head ${CURRENT_HEAD:0:7}"
-  fi
-fi
-```
-
-**Never remove `loom:pr` for this exception.** Unlike the stale-PR route, this
-condition is mechanical, not a judgment call, and it clears itself the instant
-a later merge attempt finds the guard fresh (either because a redate commit's
-CI landed in time, or because `main` simply stopped moving) — there is no
-sticky-release machinery to run, and no reversal comment is required. The
-`loom:operator` label (once applied) is removed by the merge itself completing
-normally on a later tick — nothing here removes it directly.
+Exit 4's full rationale and bound, why neither outcome is commented on the PR,
+and the squash-merge ancestry trap that makes `git merge-base --is-ancestor`
+useless for checking whether a re-queued PR's commits landed:
+[`merge-pr-exit-code-exceptions.md`](../../../.loom/docs/merge-pr-exit-code-exceptions.md).
 
 ---
 

@@ -37,7 +37,9 @@
 //! produces the fresh evidence it is waiting for when the merge token lacks
 //! `actions:write` to re-run the stale check directly. It pushes a
 //! tree-identical no-op commit instead, which re-triggers CI without
-//! weakening the guard itself.
+//! weakening the guard itself — bounded to one attempt per head, after which
+//! the PR is escalated to a durable `loom:operator` hold rather than pushed
+//! at forever.
 
 pub mod head_sync;
 pub mod labels;
