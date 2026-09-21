@@ -88,29 +88,45 @@ resolve_target_dir() {
 }
 
 # Per-worktree scheme helpers (#8458). Source the installed lib when it is there,
-# so `lib/cargo-target-dir.sh` stays the single authority.
-CARGO_TARGET_DIR_LIB="$MAIN_WORKSPACE/.loom/scripts/lib/cargo-target-dir.sh"
-[[ -f "$CARGO_TARGET_DIR_LIB" ]] || CARGO_TARGET_DIR_LIB="$MAIN_WORKSPACE/defaults/scripts/lib/cargo-target-dir.sh"
-if [[ -f "$CARGO_TARGET_DIR_LIB" ]]; then
+# so `lib/cargo-target-dir.sh` stays the single authority. Both of its
+# per-worktree predicates delegate to `loom-daemon cargo-target-dir`, so
+# `lib/locate-daemon-bin.sh` (which defines the resolver they call) is sourced
+# alongside it -- without it the lib's predicates would degrade to "no daemon"
+# and silently answer "not per-worktree" for everything.
+LOOM_SCRIPTS_LIB_DIR="$MAIN_WORKSPACE/.loom/scripts/lib"
+[[ -d "$LOOM_SCRIPTS_LIB_DIR" ]] || LOOM_SCRIPTS_LIB_DIR="$MAIN_WORKSPACE/defaults/scripts/lib"
+if [[ -f "$LOOM_SCRIPTS_LIB_DIR/locate-daemon-bin.sh" ]]; then
     # shellcheck source=/dev/null
-    source "$CARGO_TARGET_DIR_LIB" || true
+    source "$LOOM_SCRIPTS_LIB_DIR/locate-daemon-bin.sh" || true
+fi
+if [[ -f "$LOOM_SCRIPTS_LIB_DIR/cargo-target-dir.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$LOOM_SCRIPTS_LIB_DIR/cargo-target-dir.sh" || true
 fi
 
-# Degraded twins for a partial checkout without the lib. These are NOT an
+# Degraded twins for a partial checkout without the lib -- and for the case the
+# lib is present but no `loom-daemon` binary resolves, where its own predicates
+# correctly answer "no daemon, so nothing was ever provisioned". These are NOT an
 # alternative resolution path: the per-worktree DIRECTORY is still whatever the
 # lib/worktree.sh chose (it arrives by env var or marker, never derived here).
 # They exist because the alternative -- silently skipping the strip below -- is
-# the #6013/#6014 rebuild storm, which is strictly worse than a 3-line structural
+# the #6013/#6014 rebuild storm, which is strictly worse than a short structural
 # check duplicated for the no-lib case. Both paths are covered by
 # tests/hooks/test-post-worktree-target-dir.sh (test 5 with the lib, 5d without).
+#
+# The depth floor mirrors `per_worktree::is_attributable`'s
+# `components().count() < 4`: `/wt/<name>` alone has no real root above it, and
+# the shallow-path family must be unreachable through any of these twins.
+_pw_fallback_is_per_worktree_target_dir() {
+    local wt="${1%/}" candidate="${2%/}"
+    [[ "$candidate" == /* ]] || return 1
+    [[ "$candidate" == */wt/* ]] || return 1
+    [[ "$(basename "$candidate")" == "$(basename "$wt")" ]] || return 1
+    [[ "$(basename "$(dirname "$candidate")")" == "wt" ]] || return 1
+    [[ "$(printf '%s' "${candidate#/}" | awk -F/ '{print NF}')" -ge 3 ]]
+}
 if ! declare -F loom_is_per_worktree_target_dir >/dev/null 2>&1; then
-    loom_is_per_worktree_target_dir() {
-        local wt="${1%/}" candidate="${2%/}"
-        [[ "$candidate" == /* ]] || return 1
-        [[ "$candidate" == */wt/* ]] || return 1
-        [[ "$(basename "$candidate")" == "$(basename "$wt")" ]] || return 1
-        [[ "$(basename "$(dirname "$candidate")")" == "wt" ]]
-    }
+    loom_is_per_worktree_target_dir() { _pw_fallback_is_per_worktree_target_dir "$@"; }
 fi
 if ! declare -F loom_read_worktree_target_dir_marker >/dev/null 2>&1; then
     loom_read_worktree_target_dir_marker() {
@@ -135,8 +151,14 @@ fi
 # SOURCE: the main workspace's own target dir. A per-worktree CARGO_TARGET_DIR is
 # stripped for this resolution only -- see the header for why honoring it here is
 # #6013/#6014's rebuild storm.
+# The structural fallback is OR'd in deliberately: it is the same rule, and the
+# authoritative predicate answers "no" on a host where no `loom-daemon` binary
+# resolves. Failing to strip is the rebuild storm; over-stripping is impossible,
+# because both forms require the shape that only a provisioned per-worktree dir
+# has.
 if [[ -n "${CARGO_TARGET_DIR:-}" ]] \
-    && loom_is_per_worktree_target_dir "$WORKTREE_PATH" "$CARGO_TARGET_DIR"; then
+    && { loom_is_per_worktree_target_dir "$WORKTREE_PATH" "$CARGO_TARGET_DIR" \
+        || _pw_fallback_is_per_worktree_target_dir "$WORKTREE_PATH" "$CARGO_TARGET_DIR"; }; then
     MAIN_TARGET_DIR="$(resolve_target_dir "$MAIN_WORKSPACE" 1)"
 else
     MAIN_TARGET_DIR="$(resolve_target_dir "$MAIN_WORKSPACE")"

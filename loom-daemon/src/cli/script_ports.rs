@@ -65,11 +65,13 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     WorktreeLock(super::worktree_lock::WorktreeLockCommand),
 
-    /// `worktree.sh`/`spawn-claude.sh`'s per-worktree cargo target dir
-    /// (#8458): provision one and record its marker, or derive the path a
-    /// not-yet-created worktree would get. Both exit 0 always — "the feature
-    /// is off" is an answer, not an error, and must never abort a worktree
-    /// creation over a build-cache optimisation.
+    /// `worktree.sh`/`spawn-claude.sh`/`lib/cargo-target-dir.sh`'s per-worktree
+    /// cargo target dir (#8458): provision one and record its marker, derive
+    /// the path a not-yet-created worktree would get, or answer the two
+    /// removal-side predicates (`is-attributable`, `marker`). The two creation
+    /// verbs exit 0 always — "the feature is off" is an answer, not an error,
+    /// and must never abort a worktree creation over a build-cache
+    /// optimisation. The two predicates use their exit code as the answer.
     #[command(subcommand)]
     CargoTargetDir(super::cargo_target_dir::CargoTargetDirCommand),
 

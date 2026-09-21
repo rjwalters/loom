@@ -15,7 +15,7 @@
 //!
 //! The fix gives each worktree `<root>/wt/<worktree name>` under the otherwise
 //! shared root. `worktree.sh` provisions it (bash side,
-//! `loom_provision_worktree_target_dir`) and records it in a
+//! `loom-daemon cargo-target-dir provision`) and records it in a
 //! `.loom-cargo-target-dir` marker file **inside** the worktree.
 //!
 //! # Why the daemon needs to know

@@ -30,11 +30,12 @@
 #      worktree, is not held open by a running process, and is not one of the
 #      paths this pass must never touch.
 #
-#   3. `loom_provision_worktree_target_dir …` (issue #8458) — the CREATION-time
-#      counterpart: give the worktree its own target dir under the
-#      otherwise-shared root (`<root>/wt/<worktree name>`) and record it in a
-#      marker file INSIDE the worktree, so part 2 can attribute and reclaim it.
-#      See "Per-worktree target dirs" below.
+#   3. `loom_is_per_worktree_target_dir` / `loom_read_worktree_target_dir_marker`
+#      (issue #8458) — two thin wrappers over `loom-daemon cargo-target-dir`,
+#      consulted by parts 1 and 2 so they recognise a target dir the CREATION
+#      side (`loom-daemon cargo-target-dir provision`, called by `worktree.sh`)
+#      gave this worktree under the otherwise-shared root and recorded in a
+#      marker file INSIDE it. See "Per-worktree target dirs" below.
 #
 # ## The attribution rule (the one that keeps costing data)
 #
@@ -215,7 +216,7 @@ loom_resolve_worktree_target_dir_checked() {
 
     # #8458: a Loom-provisioned per-worktree redirect wins outright, ahead of
     # even the env var. It is the strongest available *per-worktree* statement:
-    # written into the worktree by `loom_provision_worktree_target_dir`, and the
+    # written into the worktree by `loom-daemon cargo-target-dir provision`, and the
     # same value the spawn path exports as CARGO_TARGET_DIR for that worktree's
     # builds — so in the normal case the two agree and the order is moot. When
     # they disagree (an operator exported a private dir of their own over the
@@ -223,10 +224,8 @@ loom_resolve_worktree_target_dir_checked() {
     # provisioned and leaves the operator's alone: the safe direction, and the
     # only one of the two that is attributable to this worktree at all.
     local marker
-    if marker="$(loom_read_worktree_target_dir_marker "$worktree_path")"; then
-        printf '%s\n' "$marker"
-        return 0
-    fi
+    marker="$(loom_read_worktree_target_dir_marker "$worktree_path" || true)"
+    [[ -z "$marker" ]] || { printf '%s\n' "$marker"; return 0; }
 
     if ! loom_cargo_target_dir_redirect_possible "$worktree_path"; then
         printf '%s\n' "$worktree_path/target"
@@ -405,7 +404,7 @@ loom_target_dir_holders() {
 #
 # When `resolved` carries the per-worktree SHAPE for `worktree_path` —
 # `<root>/wt/<that worktree's own directory name>`, which only
-# `loom_provision_worktree_target_dir` ever writes — two of the rules above are
+# `loom-daemon cargo-target-dir provision` ever writes — two of the rules above are
 # deliberately relaxed, because both of them otherwise veto EVERY reclaim of
 # such a dir and the feature can never free a byte:
 #
@@ -436,10 +435,7 @@ loom_target_dir_shared_with() {
     worktree_real="$(_loom_ctd_realpath "$worktree_path")"
 
     local attributed=false
-    if loom_is_per_worktree_target_dir "$worktree_path" "$resolved" ||
-        loom_is_per_worktree_target_dir "$worktree_path" "$resolved_real"; then
-        attributed=true
-    fi
+    if loom_is_per_worktree_target_dir "$worktree_path" "$resolved" "$resolved_real"; then attributed=true; fi
 
     local listing
     listing="$(git -C "$repo_root" worktree list --porcelain 2>/dev/null)" || return 2
@@ -470,13 +466,12 @@ loom_target_dir_shared_with() {
             other_target="$(loom_resolve_worktree_target_dir_checked "$other")" || return 3
         fi
         other_target_real="$(_loom_ctd_realpath "$other_target")"
-        if [[ "$other_target_real" == "$resolved_real" ]]; then
-            printf '%s\n' "$other"
-            return 0
-        fi
-        if [[ "$attributed" != true ]] && \
-           [[ "$resolved_real" == "$other_target_real"/* || \
-              "$other_target_real" == "$resolved_real"/* ]]; then
+        # An EXACT match always counts. CONTAINMENT counts only when `resolved`
+        # is NOT attributable — see "The one exception" above.
+        if [[ "$other_target_real" == "$resolved_real" ]] ||
+           { [[ "$attributed" != true ]] &&
+             [[ "$resolved_real" == "$other_target_real"/* ||
+                "$other_target_real" == "$resolved_real"/* ]]; }; then
             printf '%s\n' "$other"
             return 0
         fi
@@ -588,10 +583,7 @@ loom_reclaim_worktree_target_dir() {
     while IFS=$'\t' read -r mg_value mg_source; do
         [[ -n "$mg_value" ]] || continue
         if [[ "$resolved_real" == "$(_loom_ctd_realpath "$mg_value")" ]]; then
-            if loom_is_per_worktree_target_dir "$worktree_path" "$resolved" ||
-                loom_is_per_worktree_target_dir "$worktree_path" "$resolved_real"; then
-                break
-            fi
+            if loom_is_per_worktree_target_dir "$worktree_path" "$resolved" "$resolved_real"; then break; fi
             _loom_ctd_record "refused" "$resolved" \
                 "$mg_source is machine-global, not exclusive to this worktree"
             return 0
@@ -669,22 +661,29 @@ loom_reclaim_worktree_target_dir() {
 # overwrites, and integration tests execute that path. Giving each worktree
 # `<root>/wt/<worktree name>` fixes both.
 #
-# ## Why only the predicates live here
+# ## Why only two thin wrappers live here
 #
-# The CREATION half — the opt-in, the derivation, the `mkdir` and the marker
-# write — is `loom-daemon cargo-target-dir provision`, called by `worktree.sh`
-# and `spawn-claude.sh`. That is the language policy
-# (`.loom/docs/shell-language-policy.md`): `defaults/scripts/` is the shell
-# budget's `contract` (portable) pool, whose growth the ratchet refuses with no
-# `Shell-Budget-Growth:` override, and the first cut of this issue was refused
-# for adding 138 portable lines there.
+# Every bit of #8458's LOGIC is in the daemon — the opt-in, the derivation, the
+# `mkdir`, the marker write (`loom-daemon cargo-target-dir provision|path`), AND
+# the two predicates below (`… is-attributable`, `… marker`). That is the
+# language policy (`.loom/docs/shell-language-policy.md`): `defaults/scripts/`
+# is the shell budget's `contract` (portable) pool, whose growth the ratchet
+# refuses with no `Shell-Budget-Growth:` override.
 #
-# What CANNOT be delegated is the reading. `merge-pr.sh` and `worktree.sh
+# What could NOT move is the *call sites*. `merge-pr.sh` and `worktree.sh
 # remove` already resolve a target dir in bash, and marker-first resolution has
 # to happen INSIDE that existing resolver rather than beside it — a second
-# resolution path is exactly what this library exists to prevent. So the two
-# predicates below stay, and `loom-daemon/src/worktree_ops/cargo_target/` keeps
-# its own parallel copy for the repos where this library is not installed.
+# resolution path is exactly what this library exists to prevent. Delegating the
+# implementation keeps the single resolver and deletes the duplicate rules: the
+# functions below are now two-line calls into
+# `loom-daemon/src/worktree_ops/cargo_target/per_worktree.rs`, which is the one
+# place the shape rule and the marker grammar are written.
+#
+# Degradation is the `requires-daemon: cargo-target-dir optional` contract the
+# callers already declare: no resolvable daemon ⇒ both predicates answer "no" ⇒
+# no marker is ever read and neither attribution relaxation is ever reached ⇒
+# exactly the pre-#8458 behaviour. That is safe by construction, because a host
+# with no daemon also never *provisioned* a per-worktree dir to reclaim.
 #
 # ## Why a marker file and not `.cargo/config.toml`
 #
@@ -714,30 +713,40 @@ loom_reclaim_worktree_target_dir() {
 # of worktree.sh's dirty-worktree guard, like every other marker in its family.
 LOOM_WT_TARGET_MARKER=".loom-cargo-target-dir"
 
-# The single path component separating per-worktree dirs from anything else
-# under the shared root. Load-bearing: half of the structural attribution check.
-LOOM_WT_TARGET_SUBDIR="wt"
-
-# loom_is_per_worktree_target_dir <worktree_path> <candidate>
+# _loom_ctd_daemon <verb> [arg...] — run `loom-daemon cargo-target-dir <verb>`,
+# or exit 1 when no daemon binary resolves (the `optional` half of the callers'
+# `requires-daemon: cargo-target-dir optional` declaration: both predicates then
+# answer "no", which is the pre-#8458 behaviour).
 #
-# Exit 0 when <candidate> has the Loom per-worktree shape FOR <worktree_path>:
-# an absolute path of at least three components ending in
-# `/wt/<basename of worktree_path>`. Purely structural — no disk access — so it
-# is still answerable after the worktree has been removed, which is what gate 2f
-# needs. Twin of `per_worktree::is_attributable`.
+# `loom_locate_daemon_bin` comes from the sibling `lib/locate-daemon-bin.sh`,
+# which every consumer of this library already sources. It is called through a
+# `|| true` command substitution with stderr discarded, so a partial checkout
+# where it is NOT defined degrades to "no daemon" rather than erroring — the
+# same failure direction as a host with no binary. Quiet, because this resolves
+# once per predicate call inside loops and the #4997 resolution trace would
+# otherwise dominate a removal's stderr.
+#
+# The result is memoised per shell. Calls made from inside a command
+# substitution (`loom_read_worktree_target_dir_marker` is one) cannot write the
+# memo back to the parent, so they re-resolve; that is a PATH/`-x` probe, not a
+# build, and it is not in the per-sibling hot path.
+_loom_ctd_daemon() {
+    [[ -n "${_LOOM_CTD_DAEMON_BIN+x}" ]] || _LOOM_CTD_DAEMON_BIN="$(LOOM_LOCATE_DAEMON_BIN_QUIET=1 loom_locate_daemon_bin "$PWD" 2>/dev/null || true)"
+    [[ -n "$_LOOM_CTD_DAEMON_BIN" ]] || return 1
+    "$_LOOM_CTD_DAEMON_BIN" cargo-target-dir "$@" 2>/dev/null
+}
+
+# loom_is_per_worktree_target_dir <worktree_path> <candidate> [<candidate>...]
+#
+# Exit 0 when ANY <candidate> has the Loom per-worktree shape FOR
+# <worktree_path>. Purely structural — no disk access — so it is still
+# answerable after the worktree has been removed, which is what gate 2f needs.
+# Several candidates are accepted because every caller asks about a path and its
+# `realpath` together; one subprocess answers both.
+#
+# The rule itself is `per_worktree::is_attributable`, not a copy of it.
 loom_is_per_worktree_target_dir() {
-    local worktree_path="${1%/}" candidate="${2%/}" name
-    name="$(basename "$worktree_path")"
-
-    [[ -n "$name" && "$name" != "/" && "$name" != "." ]] || return 1
-    [[ "$candidate" == /* ]] || return 1
-    [[ "$candidate" == *"/$LOOM_WT_TARGET_SUBDIR/$name" ]] || return 1
-
-    # `/wt/<name>` alone is two components; require a real root above it so the
-    # "suspiciously shallow path" refusal can never be reached through here.
-    local depth
-    depth="$(printf '%s' "${candidate#/}" | awk -F/ '{print NF}')"
-    [[ "${depth:-0}" -ge 3 ]]
+    _loom_ctd_daemon is-attributable "$1" "${@:2}"
 }
 
 # loom_read_worktree_target_dir_marker <worktree_path>
@@ -748,22 +757,8 @@ loom_is_per_worktree_target_dir() {
 # Every failure mode — absent, empty, or a value without the per-worktree shape,
 # and a tree with no Cargo manifest — exits 1, so a corrupt marker degrades to
 # "no per-worktree redirect" (pre-#8458 behavior) rather than to a path this
-# library would then act on. The manifest requirement mirrors
-# `loom_cargo_target_dir_redirect_possible`'s first test: a tree cargo never
-# built in must resolve to its own in-worktree `target/` (the #7239 regression
-# that ordering pins). Twin of `per_worktree::marker_value`.
+# library would then act on. That validation chain is
+# `per_worktree::marker_value`, not a copy of it.
 loom_read_worktree_target_dir_marker() {
-    local worktree_path="${1%/}" value
-    local file="$worktree_path/$LOOM_WT_TARGET_MARKER"
-
-    [[ -f "$worktree_path/Cargo.toml" ]] || return 1
-    [[ -s "$file" ]] || return 1
-
-    value="$(head -n 1 "$file" 2>/dev/null)" || return 1
-    value="${value%$'\r'}"
-    value="${value%/}"
-    [[ -n "$value" ]] || return 1
-
-    loom_is_per_worktree_target_dir "$worktree_path" "$value" || return 1
-    printf '%s\n' "$value"
+    _loom_ctd_daemon marker "$1"
 }

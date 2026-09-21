@@ -573,32 +573,30 @@ fi
 # "root" it writes a marker naming this same directory rather than nesting a
 # second level.
 #
+# `--issue` rather than a pre-derived worktree path: resolving the worktree root
+# (env > `worktree.root` config > `.loom/worktrees`) is creation-time delivery
+# logic with a Rust twin (`worktree_root::worktree_root`) already inside the
+# binary this line invokes, so it belongs on that side of the boundary — there is
+# no removal path here that has to resolve it in bash.
+#
 # `cargo-target-dir path` exits 0 and prints nothing for every not-applicable
 # case (feature off, host not redirected, path not attributable), so an empty
 # answer is simply "leave the host's own resolution alone".
-if [[ -n "${LOOM_SWEEP_CLAIM_OWNED:-}" && -z "${LOOM_SPAWN_CONTAINERIZED:-}" \
-    && -f "${WORKSPACE}/Cargo.toml" ]]; then
-    _pw_worktree_root=""
-    if [[ -f "${_script_dir}/lib/worktree-root.sh" ]]; then
-        # shellcheck source=./lib/worktree-root.sh
-        source "${_script_dir}/lib/worktree-root.sh"
-        _pw_worktree_root="$(loom_worktree_root "$WORKSPACE" 2>/dev/null)" || _pw_worktree_root=""
-    fi
-    : "${_pw_worktree_root:=${WORKSPACE}/.loom/worktrees}"
-    # Sourced here rather than relying on the token-selection source further
-    # down: this block must run BEFORE the containerized-dispatch block (which
-    # re-resolves CARGO_TARGET_DIR to decide what to mount and re-execs), and
-    # that source is after it. Sourcing twice only redefines a function.
+#
+# locate-daemon-bin.sh is sourced here rather than relying on the token-selection
+# source further down: this block must run BEFORE the containerized-dispatch
+# block (which re-resolves CARGO_TARGET_DIR to decide what to mount and
+# re-execs), and that source is after it. Sourcing twice only redefines a
+# function.
+if [[ -n "${LOOM_SWEEP_CLAIM_OWNED:-}" && -z "${LOOM_SPAWN_CONTAINERIZED:-}" && -f "${WORKSPACE}/Cargo.toml" ]]; then
     # shellcheck source=lib/locate-daemon-bin.sh
     source "${_script_dir}/lib/locate-daemon-bin.sh"
     _pw_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null || true)"
-    if [[ -n "${_pw_bin:-}" ]]; then
-        _pw_dir="$("$_pw_bin" cargo-target-dir path --repo-root "$WORKSPACE" --create \
-            "${_pw_worktree_root}/issue-${LOOM_SWEEP_CLAIM_OWNED}" 2>/dev/null || true)"
-        if [[ -n "$_pw_dir" ]]; then
-            export CARGO_TARGET_DIR="$_pw_dir"
-            log_info "spawn-claude: per-worktree CARGO_TARGET_DIR=${_pw_dir} (issue #8458)"
-        fi
+    _pw_dir="$([[ -n "${_pw_bin:-}" ]] && "$_pw_bin" cargo-target-dir path --repo-root "$WORKSPACE" \
+        --create --issue "$LOOM_SWEEP_CLAIM_OWNED" 2>/dev/null || true)"
+    if [[ -n "$_pw_dir" ]]; then
+        export CARGO_TARGET_DIR="$_pw_dir"
+        log_info "spawn-claude: per-worktree CARGO_TARGET_DIR=${_pw_dir} (issue #8458)"
     fi
 fi
 

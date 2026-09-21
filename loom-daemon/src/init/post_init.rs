@@ -155,7 +155,7 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // ignored so a builder's `git add -A` doesn't sweep it into a commit (#3778).
     ".loom-managed",
     // Per-worktree cargo target dir marker (#8458): written into each issue
-    // worktree by `loom_provision_worktree_target_dir`, recording the
+    // worktree by `loom-daemon cargo-target-dir provision`, recording the
     // `<root>/wt/<worktree name>` directory that worktree builds into so every
     // removal path can attribute and reclaim it. Same family as `.loom-managed`
     // — Loom-owned runtime state, must never be swept into a commit by `git add

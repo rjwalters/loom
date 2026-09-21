@@ -3,7 +3,7 @@
 # worktree lifecycle (issue #8458, item 2 of #8453).
 #
 # Covers the CREATION half added to lib/cargo-target-dir.sh
-# (`loom_provision_worktree_target_dir`) and the two attribution relaxations it
+# (`loom-daemon cargo-target-dir provision`) and the two attribution relaxations it
 # licenses on the REMOVAL half, end to end through `worktree.sh`:
 #
 #   1. Opted in, on a host whose cargo output is redirected to ONE shared root:
@@ -35,6 +35,10 @@
 #      the issue names — both removes a worktree carrying the new marker (it is
 #      filtered from the dirty-worktree guard) and reclaims the dir. Runs the
 #      real `_remove_loom_worktree` body extracted from the live source.
+#  12. The `loom-daemon cargo-target-dir` query verbs the bash library delegates
+#      to — `is-attributable` and `marker` (exit code IS the answer) and
+#      `path --issue <N>` (worktree root resolved in Rust, not pre-derived in
+#      shell). Their contract is what the two predicates above are now made of.
 #
 # Harness: the throwaway-repo pattern from test-cargo-target-dir-reclaim.sh —
 # bare origin + working repo, worktree.sh and its lib/ copied in, a stub `cargo`
@@ -532,6 +536,69 @@ else
         fail "merge-pr cleanup deleted the shared root — data-loss regression"
     fi
 fi
+
+# ---------------------------------------------------------------------------
+# Test 12: the daemon query verbs the bash library now delegates to
+#
+# `lib/cargo-target-dir.sh`'s two predicates are thin wrappers over
+# `loom-daemon cargo-target-dir is-attributable|marker`, and `spawn-claude.sh`
+# derives its export through `path --issue <N>`. Pin the CLI contract all three
+# depend on directly, so a change to the exit codes or the worktree-root
+# resolution fails here rather than silently disabling a reclaim.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 12: the daemon query verbs (is-attributable / marker / path --issue)"
+(
+    D12="$TMP/verbs"
+    WT12="$D12/.loom/worktrees/issue-312"
+    mkdir -p "$WT12"
+    printf '[workspace]\n' >"$WT12/Cargo.toml"
+
+    "$LOOM_DAEMON_BIN" cargo-target-dir is-attributable "$WT12" /big/cargo-target/wt/issue-312
+) && pass "is-attributable: the provisioned shape exits 0" \
+  || fail "is-attributable: the provisioned shape should exit 0"
+(
+    WT12="$TMP/verbs/.loom/worktrees/issue-312"
+    # The shared root, a sibling's dir and a shallow path must all exit 1 — this
+    # is the predicate that licenses both attribution relaxations.
+    for bad in /big/cargo-target /big/cargo-target/wt/issue-311 /wt/issue-312 relative/wt/issue-312; do
+        if "$LOOM_DAEMON_BIN" cargo-target-dir is-attributable "$WT12" "$bad"; then
+            echo "  unexpectedly attributable: $bad"
+            exit 1
+        fi
+    done
+    # …and a candidate LIST exits 0 when any one member matches (the two-candidate
+    # form every bash call site uses).
+    "$LOOM_DAEMON_BIN" cargo-target-dir is-attributable "$WT12" \
+        /big/cargo-target /big/cargo-target/wt/issue-312
+) && pass "is-attributable: non-attributable values exit 1; a matching list exits 0" \
+  || fail "is-attributable: rejected a matching candidate list, or accepted a bad value"
+(
+    WT12="$TMP/verbs/.loom/worktrees/issue-312"
+    "$LOOM_DAEMON_BIN" cargo-target-dir marker "$WT12" 2>/dev/null && exit 1
+    printf '/big/cargo-target/wt/issue-312\n' >"$WT12/.loom-cargo-target-dir"
+    got="$("$LOOM_DAEMON_BIN" cargo-target-dir marker "$WT12")" || exit 1
+    [[ "$got" == "/big/cargo-target/wt/issue-312" ]] || exit 1
+    # A marker naming the shared root degrades to "no marker" (exit 1), never to
+    # a path the reclaim would then act on.
+    printf '/big/cargo-target\n' >"$WT12/.loom-cargo-target-dir"
+    ! "$LOOM_DAEMON_BIN" cargo-target-dir marker "$WT12" 2>/dev/null
+) && pass "marker: absent and corrupt exit 1, a well-shaped value prints and exits 0" \
+  || fail "marker: wrong exit code or wrong value"
+(
+    R12="$TMP/verbs-issue"
+    SHARED12="$TMP/verbs-issue-shared"
+    mkdir -p "$R12" "$SHARED12"
+    printf '[workspace]\n' >"$R12/Cargo.toml"
+    # `--issue N` must resolve the worktree root itself. LOOM_WORKTREE_ROOT is
+    # the highest-precedence tier, and namespaces by repo basename — so this also
+    # pins that the Rust resolver, not a bash `<repo>/.loom/worktrees` guess, is
+    # what answers.
+    got="$(CARGO_TARGET_DIR="$SHARED12" LOOM_PER_WORKTREE_TARGET_DIR=1 \
+        "$LOOM_DAEMON_BIN" cargo-target-dir path --repo-root "$R12" --issue 312)"
+    [[ "$got" == "$SHARED12/wt/issue-312" ]] || { echo "  got: $got"; exit 1; }
+) && pass "path --issue: derives <shared root>/wt/issue-N with the root resolved in Rust" \
+  || fail "path --issue: did not derive the expected directory"
 
 echo ""
 echo "Tests run: $TESTS_RUN, Passed: $TESTS_PASSED, Failed: $TESTS_FAILED"
