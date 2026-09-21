@@ -2517,7 +2517,7 @@ use cli::workspace_fleet::{
     handle_calibrate_command, handle_fleet_command, handle_workspace_command,
 };
 
-fn handle_cli_command(command: Commands) -> Result<()> {
+async fn handle_cli_command(command: Commands) -> Result<()> {
     match command {
         // Script helpers (epic #4081 Phase 3 family 5, issue #4275).
         Commands::StripAnsi { file } => handle_strip_ansi_command(file.as_deref()),

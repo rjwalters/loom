@@ -225,7 +225,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                         json,
                     },
             } => handle_fleet_roll_command(host, all, timeout, json).await,
-            other => handle_cli_command(other),
+            other => handle_cli_command(other).await,
         };
     }
 
