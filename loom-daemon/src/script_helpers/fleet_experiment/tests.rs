@@ -71,8 +71,18 @@ fn same_seed_yields_a_byte_identical_plan() {
 
 #[test]
 fn a_different_seed_yields_a_different_assignment() {
-    let dir = tempdir().unwrap();
-    let ws = inputs(dir.path(), 12);
+    // The root is a FIXED synthetic path, deliberately not `tempdir()` — do not
+    // "tidy" it back (#8489). `build_plan` is pure: it only stringifies and
+    // hashes `WorkspaceInput.path`, never touching the filesystem, so a temp dir
+    // buys nothing here but makes the assertion below probabilistic. With 2 arms
+    // and two 6-member strata each member's arm is fixed by its position parity
+    // in the stratum's `shuffle_key` ordering, so two seeds collide whenever both
+    // strata land on the same one of `C(6,3) = 20` patterns — 1/400 per run over
+    // OS-assigned temp paths, which is exactly how this test flaked in CI. A
+    // fixed root makes the outcome identical on every run; the seed pair below is
+    // verified to differ under it.
+    let root = Path::new("/fixture/workspaces");
+    let ws = inputs(root, 12);
     let a = build_plan(&ws, &arms(), &dims(&["kind"]), 1, now()).unwrap();
     let b = build_plan(&ws, &arms(), &dims(&["kind"]), 2, now()).unwrap();
     let arms_a: Vec<&str> = a.workspaces.iter().map(|w| w.arm.as_str()).collect();
