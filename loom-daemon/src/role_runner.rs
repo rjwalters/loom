@@ -1249,6 +1249,13 @@ fn run_role_with_timeout(
         ));
     }
     let log_path = role_log_path(&logs_dir, role);
+    // Issue #8443: this tick's own unique anchor into its per-role log — the
+    // timestamp opening this tick's header line below, reused after exit to
+    // scope `provider_health_feedback`'s terminal-result scan to only this
+    // dispatch, mirroring the sweep path's `sweep_id=` anchor (a fresh log
+    // line above the anchor never leaks into an OLDER tick's scan, and this
+    // tick's own scan never reads a STALE record left by a previous one).
+    let tick_anchor = chrono::Utc::now().to_rfc3339();
 
     {
         use std::io::Write;
@@ -1263,7 +1270,7 @@ fn run_role_with_timeout(
                 f,
                 "\n{}",
                 model_resolution::role_log_header(
-                    &chrono::Utc::now().to_rfc3339(),
+                    &tick_anchor,
                     role,
                     model,
                     model_source,
@@ -1390,7 +1397,20 @@ fn run_role_with_timeout(
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return RoleTickOutcome::Success,
+            Ok(Some(status)) if status.success() => {
+                // Issue #8443: feed this tick's own terminal record back into
+                // account health BEFORE reporting success — mirrors the
+                // sweep reaper calling `apply_provider_health_feedback`
+                // ahead of any re-dispatch decision.
+                provider_health_feedback::apply_role_tick_provider_health_feedback(
+                    workspace_root,
+                    &log_path,
+                    admission,
+                    &tick_anchor,
+                    status.code(),
+                );
+                return RoleTickOutcome::Success;
+            }
             Ok(Some(status)) => {
                 // Issues #6757/#8123: prefer a purpose-built failure sentinel
                 // (naming the real cause and the role's own log path) over an
@@ -1398,6 +1418,16 @@ fn run_role_with_timeout(
                 // present — see `describe_role_failure`.
                 let full_log = read_role_log(&log_path);
                 let detail = describe_role_failure(&full_log, &log_path);
+                // Issue #8443: same terminal-record feedback on a non-zero
+                // exit — this is the path a `TOKEN_EXHAUSTED` death actually
+                // takes.
+                provider_health_feedback::apply_role_tick_provider_health_feedback(
+                    workspace_root,
+                    &log_path,
+                    admission,
+                    &tick_anchor,
+                    status.code(),
+                );
                 return RoleTickOutcome::Failure(format!(
                     "`{}` exited with {status}: {detail}",
                     script.display()
@@ -4258,3 +4288,8 @@ pub use model_resolution::{
 mod tests;
 
 mod runtime_preflight;
+
+// Feeds a codex-runtime role tick's own `LOOM_TERMINAL_RESULT` record into
+// account health (issue #8443) — the role-tick analogue of
+// `sweep_registry::apply_provider_health_feedback`.
+mod provider_health_feedback;
