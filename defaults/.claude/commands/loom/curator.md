@@ -582,6 +582,25 @@ gh issue edit <number> --add-label "loom:curating"
 
 **Why this matters**: The `loom:curating` label prevents duplicate work by signaling to other Curators that you've claimed this issue. Skipping this step can cause coordination failures.
 
+### The premise gate runs BEFORE enrichment (#8396)
+
+```bash
+./.loom/scripts/premise-check.sh --issue <number>   # 0 ⇒ enrich as usual
+```
+
+Non-zero means **do not enrich yet** — enrichment is what made #7855 expensive.
+Fail closed: `1` (the gate could not run) is handled as `10`, never as `0`.
+
+| Exit | Instead of enriching |
+|---|---|
+| `10`/`12` | Do the premise check now and post the record its `REASON=`/`EVIDENCE-CANDIDATE=` lines point at; re-run. |
+| `11` | Comment the disagreement axis, then `--add-label "loom:operator-only,loom:operator-decision"` per "Applying `loom:operator-only`" below. |
+| `13` | Premise false — close or rescope per "Issues Are Suggestions" above. |
+
+Record format, scoped population, and why the gate sits one stage before you:
+`.loom/docs/premise-gate.md`. Under `/loom:sweep` the orchestrator already ran
+it before dispatching you; re-running is cheap and idempotent.
+
 ## Triage: Ready or Needs Enhancement?
 
 When you find an unlabeled issue, **first assess if it's already implementation-ready**:
@@ -2208,19 +2227,10 @@ gh issue edit 100 --remove-label "loom:curating" --remove-label "loom:triage" --
 Before: "app crashes sometimes"
 
 After:
-**Problem**: Application crashes when submitting form with empty required fields
-
-**Reproduction**:
-1. Open form at /settings
-2. Leave "Email" field empty
-3. Click "Save"
-4. → Crash with "Cannot read property 'trim' of undefined"
-
-**Expected**: Form validation error message
-
-**Stack trace**: [link to logs]
-
-**Related**: #123 (form validation refactor)
+**Problem**: crashes when submitting the form with an empty required field
+**Reproduction**: numbered steps ending in the observed failure text
+**Expected**: the behaviour that should have happened instead
+**Stack trace**: [link to logs]   **Related**: #123
 ```
 
 ### Feature Request → Scoped Issue
@@ -2229,50 +2239,19 @@ Before: "add notifications"
 
 After:
 **Feature**: Desktop notifications for terminal events
-
-**Use Case**: Users want to be notified when long-running terminal commands complete so they can switch tasks without polling.
-
-**Acceptance Criteria**:
-- [ ] Notification when terminal status changes from "busy" to "idle"
-- [ ] Notification on terminal errors
-- [ ] User preference to enable/disable per terminal
-- [ ] Respects OS notification permissions
-
-**Technical Approach**: Use macOS notification API via terminal-notifier or similar
-
-**Related**: #45 (terminal status tracking), #67 (user preferences)
-
-**Milestone**: v0.3.0
+**Use Case**: be told when a long command finishes, without polling
+**Acceptance Criteria**: one checkbox per observable behaviour (status change,
+error, per-terminal opt-out, OS permission handling)
+**Technical Approach**: the API/component you expect to use
+**Related**: #45, #67   **Milestone**: v0.3.0
 ```
 
 ### Planning Enhancement → Implementation Options
-```markdown
-Issue: "Add search functionality to terminal history"
 
-Added comment:
----
-## Implementation Options
-
-### Option 1: Client-side search (simplest)
-**Approach**: Filter terminal output buffer in frontend
-**Pros**: No backend changes, instant results, works offline
-**Cons**: Limited to current session, no persistence
-**Complexity**: Low (1-2 days)
-
-### Option 2: Daemon-side search with indexing
-**Approach**: Index tmux history, expose search API
-**Pros**: Search all history, faster for large buffers
-**Cons**: Requires daemon changes, index maintenance
-**Complexity**: Medium (3-5 days)
-**Dependencies**: #78 (daemon API refactor)
-
-### Recommendation
-Start with **Option 1** for v0.3.0 (quick win), then add **Option 2** in v0.4.0 if user feedback shows need for persistent search.
-
-### Related Work
-- #78: Daemon API refactor (required for option 2)
----
-```
+Post an `## Implementation Options` comment: one `### Option N` per approach
+with Approach / Pros / Cons / Complexity / Dependencies, then a
+`### Recommendation` naming which to start with and why, and `### Related Work`
+linking anything an option depends on.
 
 ### Missing Test Plan & File Refs → Complete Enhancement
 ```markdown

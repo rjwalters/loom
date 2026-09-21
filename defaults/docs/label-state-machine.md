@@ -590,6 +590,20 @@ This is narrow: it flags proposed *reversals* of existing, documented/tested
 behaviour, not autonomously-filed issues in general (see CLAUDE.md § "Issues
 Are Suggestions").
 
+**Since #8396 this rule has a mechanism, not only a prose statement.**
+`./.loom/scripts/premise-check.sh --issue N` (`loom-daemon premise-check`)
+runs **before** Curator enrichment — from the sweep orchestrator's Curator
+phase, and from `curator.md` § "Before Starting Curation" on every other
+path. For a scoped population (`loom:architect`/`loom:hermit`/`loom:auditor`,
+an incident-report heading, or an issue whose own text claims a reversal) it
+requires a recorded premise check, and it **refuses** the one combination this
+section names as the anti-pattern: a record saying `deliberate=yes
+reversal=yes` is admissible only with `verdict=operator-decision`, which is
+this exact routing. It invents no label and relaxes nothing above — exit `11`
+means "apply `loom:operator-only` + `loom:operator-decision`, with the
+disagreement-axis comment rule 4 already requires". Contract and design
+rationale: [`premise-gate.md`](premise-gate.md).
+
 ## `loom:needs-capability` — a narrower claim than `loom:operator-only` (#5817)
 
 A fleet-wide census (example-org/fleet-repo#301) found `loom:operator-only` carrying at
