@@ -27,9 +27,13 @@ use loom_daemon::script_helpers;
 mod telemetry_export;
 #[path = "telemetry_fixture.rs"]
 mod telemetry_fixture;
+#[path = "telemetry_live.rs"]
+mod telemetry_live;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
+    /// Plan or explicitly execute two bounded Pi/OpenCode GLM smoke runs.
+    TelemetryLiveCanary(telemetry_live::LiveArgs),
     /// Write deterministic synthetic telemetry and an independent-query manifest.
     TelemetryFixture(telemetry_fixture::FixtureArgs),
     /// Send a bounded JSONL fixture to an explicit OTLP Collector endpoint.
@@ -84,6 +88,7 @@ impl TelemetryCommand {
     /// it exits with the process code `check-usage.sh` branches on.
     pub(crate) async fn run(self) -> Result<()> {
         match self {
+            TelemetryCommand::TelemetryLiveCanary(args) => args.run(),
             TelemetryCommand::TelemetryFixture(args) => args.run(),
             TelemetryCommand::TelemetryExport(args) => args.run().await,
             TelemetryCommand::TelemetryCapabilities { require_otlp } => {

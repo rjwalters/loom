@@ -81,3 +81,35 @@ buffer saturation, UI usability, per-attempt inference usage, or paid inference
 cost. Those require the live
 trial protocol and a measured report. Never replace these gaps with a product
 winner or a claim that the comparison issue is complete.
+
+## Opt-in native harness canary
+
+`telemetry-live-canary` plans two attempts without reading credentials, creating
+files, or making network calls. Add `--execute` only to run the paid attempts:
+
+```console
+loom-daemon telemetry-live-canary --output ./live-001 --endpoint http://127.0.0.1:14318 --key-file /private/path/collector-ingress.key --guard-dir ./defaults/hooks --zshrc ~/.zshrc
+```
+
+The executed run uses Pi and OpenCode with `zai-flash` / `glm-5.3-flash`, effort
+`low`, and a maximum 180-second wall deadline per harness. This is not a token
+or dollar cap. Credentials come from one literal `ZAI_API_KEY` assignment; the
+file is never sourced or evaluated. Unsupported syntax, duplicate assignments,
+an ambient-key mismatch, missing guards, or changed profile pins fail closed.
+Each worker has a private isolated home and no shared credential pool. The
+Collector key is separate and is never passed to a model worker.
+
+The task is an isolated read-only curator smoke, not a real issue lifecycle:
+read a nonce with guarded `loom_read` and return its exact value. Independent
+code verifies the final assistant response, unchanged input, tool contract and
+actual launch provenance. A local fixture checkpoint is written only after
+verification. Actual child exit status remains separate from verifier success.
+The parent completes the journal and exports through the explicit Collector;
+workers never receive the Collector credential.
+
+`report.json` records the actual trace/span IDs, child outcomes, checkpoint and
+delivery status. Raw harness output is not copied into the report or telemetry.
+The private output directory retains local journals and queue evidence if
+delivery fails. Receiver acknowledgment still does not establish backend
+indexing: query both backends independently by those IDs. Billing, full issue
+acceptance, UI behavior, and provider-internal HTTP spans remain unproven.

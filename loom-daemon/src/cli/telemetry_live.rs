@@ -1,5 +1,7 @@
 //! Explicit paid smoke runs. Acceptance is independent of the worker's claims.
+#[path = "telemetry_live/helpers.rs"]
 mod helpers;
+#[path = "telemetry_live/workspace.rs"]
 mod workspace;
 
 use anyhow::{ensure, Context, Result};

@@ -37,3 +37,29 @@ fn offline_fixture_publishes_manifest_and_refuses_to_overwrite() {
     assert_eq!(std::fs::read(output.join("envelopes.jsonl")).unwrap(), original);
     assert!(!dir.path().join(".loom").exists());
 }
+
+#[test]
+fn live_canary_without_execute_never_reads_keys_or_creates_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("must-not-exist");
+    let result = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+        .args(["telemetry-live-canary", "--output"])
+        .arg(&output)
+        .args([
+            "--endpoint",
+            "http://127.0.0.1:1",
+            "--key-file",
+            "/does-not-exist/collector-key",
+            "--guard-dir",
+            "/does-not-exist/guards",
+            "--zshrc",
+            "/does-not-exist/zshrc",
+        ])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let plan: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(plan["executed"], false);
+    assert_eq!(plan["attempts"], 2);
+    assert!(!output.exists());
+}
