@@ -111,9 +111,17 @@
 #       is still Judge-approved, its diff just changed underneath it. Callers
 #       (notably champion-pr-merge.md Step 3) must treat this distinctly from
 #       exit 1 — re-queue the PR for a fresh pass rather than posting a
-#       failure comment. See "Squash-merge detection trap" in that file's
-#       Error Handling section for why ancestry checks can't verify this
-#       state after the fact.
+#       failure comment. See "Squash-merge detection trap" in
+#       defaults/docs/merge-pr-exit-code-exceptions.md for why ancestry checks
+#       can't verify this state after the fact.
+#   4 = stale required checks were re-dated under --redate-stale-checks
+#       (#8508): the #8248 freshness guard blocked the merge and this run
+#       pushed a tree-identical no-op commit so CI re-runs with a current
+#       timestamp. Nothing merged, nothing bypassed. Same caller contract as
+#       exit 3 — re-queue, never a failure comment. Bounded to one push per
+#       head; a repeat block escalates to a loom:operator hold and returns
+#       exit 1 with the original refusal. Full rationale:
+#       defaults/docs/merge-pr-exit-code-exceptions.md.
 
 set -euo pipefail
 

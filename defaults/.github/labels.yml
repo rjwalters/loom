@@ -226,6 +226,10 @@
 # still automatable"; loom:operator means "the engine has stopped and only a
 # human moves it forward." See .loom/docs/label-state-machine.md for the full
 # entry/exit model.
+# Applied by: Champion (merge-risk and critical-file holds), and by
+# merge-pr.sh's #8508 escalation when the #8248 required-check freshness guard
+# blocks a merge that its own automated re-date remedy could not unblock
+# (defaults/docs/merge-pr-exit-code-exceptions.md). Removed by a human.
 - name: loom:operator
   description: "Engine stops work on this item; human is the only transition out. Sweep/shepherd do not skip it."
   color: "EA580C"  # orange-600 - operator-action signal, one shade darker than operator-only
