@@ -400,6 +400,41 @@ pub fn release_in(store: &Path, fingerprint: &str, pid: Option<u32>, force: bool
     true
 }
 
+/// Every live registration in `store` whose `tree` is at or under `dir`
+/// (Issue #8413).
+///
+/// The registry's second consumer: besides "is this command already running?",
+/// an entry is *evidence that a live agent is working inside a directory* — the
+/// one liveness signal an in-session builder (no sweep record, no claim-lock,
+/// no long-lived process) can publish about itself.
+/// [`crate::worktree_activity`] turns that into a veto on destructive worktree
+/// operations, and [`crate::sweep_registry`]'s mid-build watchdog into
+/// `WorktreeUseEvidence::InflightClaim`.
+///
+/// Containment is compared **component-wise** (`Path::starts_with`), so
+/// `.loom/worktrees/issue-84` never matches a claim on
+/// `.loom/worktrees/issue-8413`. Stale entries are reaped by [`list_in`] as a
+/// side effect, so a dead claimant never fences a directory off forever.
+#[must_use]
+pub fn holders_for_tree_in(store: &Path, dir: &Path, stale: Duration) -> Vec<Registration> {
+    let root = PathBuf::from(normalize_tree(&dir.to_string_lossy()));
+    list_in(store, stale)
+        .into_iter()
+        .filter(|reg| PathBuf::from(normalize_tree(&reg.tree)).starts_with(&root))
+        .collect()
+}
+
+/// [`holders_for_tree_in`] against the production store ([`store_dir`]) and
+/// staleness threshold ([`resolve_stale`]). An unresolvable store yields an
+/// empty list — absent evidence, never an error.
+#[must_use]
+pub fn holders_for_tree(dir: &Path) -> Vec<Registration> {
+    match store_dir() {
+        Some(store) => holders_for_tree_in(&store, dir, resolve_stale()),
+        None => Vec::new(),
+    }
+}
+
 /// Every live entry in `store`, reaping stale ones as a side effect. Sorted
 /// oldest-first so a reader sees the longest-running command at the top.
 pub fn list_in(store: &Path, stale: Duration) -> Vec<Registration> {
@@ -566,6 +601,34 @@ mod tests {
         let mine = reg("cargo test", "/tree", "main", std::process::id());
         assert_eq!(claim_in(&store, &mine, Duration::from_secs(60)), ClaimOutcome::DegradedOpen);
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// #8413: containment is component-wise, and a claim on a path *inside* a
+    /// worktree still names that worktree.
+    #[test]
+    fn holders_for_tree_matches_only_real_containment() {
+        let store = tmp_store("holders");
+        let stale = Duration::from_secs(3600);
+        let root = std::env::temp_dir().join(format!("loom-wt-{}", std::process::id()));
+        let nested = root.join("issue-8413");
+        let twin = root.join("issue-84");
+        std::fs::create_dir_all(nested.join("src")).unwrap();
+        std::fs::create_dir_all(&twin).unwrap();
+
+        let pid = std::process::id();
+        let inside = reg("cargo build", &nested.join("src").to_string_lossy(), "b", pid);
+        let sibling = reg("cargo test", &twin.to_string_lossy(), "b", pid);
+        assert!(matches!(claim_in(&store, &inside, stale), ClaimOutcome::Claimed(_)));
+        assert!(matches!(claim_in(&store, &sibling, stale), ClaimOutcome::Claimed(_)));
+
+        let holders = holders_for_tree_in(&store, &nested, stale);
+        assert_eq!(holders.len(), 1, "only the claim inside the worktree counts: {holders:?}");
+        assert_eq!(holders[0].command, "cargo build");
+        // A path-prefix twin is a different directory, not a holder.
+        assert_eq!(holders_for_tree_in(&store, &twin, stale).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

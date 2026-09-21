@@ -624,6 +624,58 @@ things rather than one: the issue-open gate closes the one path that was
 *structurally capable* of it, and the ledger makes the next occurrence a single
 `grep` instead of another post-mortem.
 
+### A worktree was hard-reset mid-compile — recovering it, and fencing the next one (#8413)
+
+**Symptom**: the worktree is still there, but your uncommitted work is not — it
+reads as clean and behind `main`, as if a `git reset --hard` + `git clean -fd`
+had run under you. Reported on 2026-09-20 against `.loom/worktrees/issue-8360`:
+an in-session builder several minutes into a `cargo` compile lost the one layer
+it had not yet committed.
+
+**Root cause**: the destructive daemon passes inferred "idle" from
+*registry-visible* signals only — a claim-lock, a `.loom-in-use` marker, an
+`index.lock`, a process whose cwd is inside the worktree, or (for the mid-build
+watchdog) writes to the sweep's own log file. An **in-session builder** — a
+Task-tool or operator session rather than a daemon sweep — has none of the first
+three, and its shell commands are one-shot subshells that have already exited by
+the time the daemon looks. A long compile writes only into `target/`, which none
+of those signals watch. The worktree therefore looked clean, idle and behind
+`main`: resettable.
+
+**First move — recover the work.** Since #8413 the mid-build watchdog
+quarantine-stashes before it resets, and logs the recovery command with the
+stash's own sha:
+
+```bash
+grep 'clean-worktree:.*quarantined' ~/.loom/daemon.log | tail -5
+git -C .loom/worktrees/issue-<N> stash list          # → loom-quarantine: issue=<N> reason=midbuild-watchdog-reset
+git -C .loom/worktrees/issue-<N> stash apply <sha>   # non-destructive; keeps the entry
+```
+
+Outstanding quarantine stashes also surface in `loom-daemon status` and in
+`./.loom/scripts/check-quarantine-stashes.sh` (see "Finding outstanding
+quarantine stashes" below) until they are retired, so you do not need the log
+line to find one. A reset on a daemon build older than #8413 left only the
+`DISCARDING` forensic log line and no stash — that work is not recoverable.
+
+**Second move — fence the next one.** Two signals now veto a destructive pass,
+and neither needs a daemon sweep record:
+
+- **Recent filesystem writes** (`LOOM_WORKTREE_ACTIVITY_WINDOW_MINUTES`, default
+  30m — #8116) — including a depth-1 scan of `target/`, so a running compile is
+  visible. Free; nothing to run.
+- **An in-flight claim** (`loom-daemon inflight claim --tree <worktree>` —
+  #8268). Explicit, and the only signal that fences a worktree the daemon
+  believes is clean and finished, or that the mid-build watchdog's reset
+  honours. See
+  [`verification-ownership.md`](verification-ownership.md) → "Second consumer: a
+  claim also fences your worktree" for the exact invocation.
+
+A claim releases when you release it or when its process dies, so it cannot
+wedge the reaper permanently. If you need the *pre*-#8116 behaviour back for a
+one-off cleanup, `LOOM_WORKTREE_ACTIVITY_WINDOW_MINUTES=0` disables the
+filesystem leg (the claim leg has no window and stays in force).
+
 ### `loom-clean` / `cleanup.sh` / `loom-recover-orphans` fail on a stale binary (#4384)
 
 **Symptom**: one of the three commands below fails outright instead of doing

@@ -140,5 +140,19 @@ pub(crate) fn make_dirty_git_worktree(ws: &Path, issue: u32) -> PathBuf {
         String::from_utf8_lossy(&probe.stdout),
         String::from_utf8_lossy(&probe.stderr),
     );
+
+    // #8413: the mid-build watchdog now counts a filesystem write inside the
+    // activity window as live-use evidence — and every file above was written
+    // microseconds ago, so without this pin EVERY fixture worktree would read
+    // as "an untracked worker is inside it" and no test could reach the
+    // destructive path at all. Pinning the window to 0 here makes a fixture
+    // worktree mean "dirty and QUIET", which is what these tests have always
+    // meant; a test that wants the filesystem leg re-enables it explicitly
+    // afterwards (see `watchdog/liveness_tests.rs`). Setting a process-global
+    // env var is safe for exactly the reason the post-condition above already
+    // requires: these run one-process-per-test under `cargo nextest run`
+    // (#4385), and the mid-build tests are `#[serial]` besides.
+    std::env::set_var(crate::worktree_activity::ACTIVITY_WINDOW_ENV, "0");
+
     wt
 }

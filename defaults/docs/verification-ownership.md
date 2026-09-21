@@ -155,6 +155,50 @@ identical suite against the identical tree take two slots and produce one
 answer. `inflight` bounds *how many copies of the same answer* are being
 computed. Neither requires the other.
 
+### Second consumer: a claim also fences your worktree (#8413)
+
+A registration is not only "this command is already running" — it is **evidence
+that a live agent is working inside `--tree`**, and since #8413 the daemon's
+destructive worktree passes read it as exactly that:
+
+| Pass | What a live claim on the tree does |
+|---|---|
+| Worktree reaper (`#4876`) | Downgrades `Remove` / `RemoveWithQuarantine` to "skip: in use" |
+| Mid-build watchdog (`#4449`) | Resolves to `InUse` — no `git reset --hard`, and the single recovery retry is *not* consumed |
+
+This is the answer to the gap the 2026-09-20 incident exposed: an **in-session
+builder** (a Task-tool/operator session, not a daemon sweep) has no claim-lock,
+plants no `.loom-in-use` marker, and issues each shell command as a one-shot
+subshell, so between commands there is no process for the daemon to see. A
+multi-minute `cargo build` writes only into `target/`, which the registry-visible
+signals do not watch — so the worktree reads as idle and clean, and a reaper pass
+hard-reset one mid-compile, destroying an uncommitted layer.
+
+So if you are an in-session builder about to start a long compile in a worktree
+the daemon has no sweep record for, claim it — `--tree` is what fences it:
+
+```bash
+FP=$(loom-daemon inflight claim \
+      --command "cargo test --workspace" \
+      --tree "$WORKTREE_ABS" \
+      --branch "$(git -C "$WORKTREE_ABS" branch --show-current)" \
+      --agent "in-session builder/issue-<N>")
+cargo test --workspace; rc=$?
+loom-daemon inflight release "$FP"
+```
+
+Containment is component-wise, so a claim on a path *inside* the worktree fences
+the whole worktree, while `.loom/worktrees/issue-84` never matches a claim on
+`.loom/worktrees/issue-8413`. Releasing (or dying — see "Staleness") un-fences
+it, so a forgotten claim cannot wedge the reaper permanently.
+
+**You are not required to claim.** The reaper's removal passes also honour plain
+filesystem activity (`LOOM_WORKTREE_ACTIVITY_WINDOW_MINUTES`, default 30m,
+including a depth-1 `target/` scan — #8116), which costs an agent nothing and
+covers the builder that never registered anything. The claim is the *explicit*
+path: it is the only one that fences a worktree the daemon believes is clean and
+finished, and the only one the mid-build watchdog's reset honours.
+
 ## Reconciling the two background-work rules already in force
 
 A reader meeting `builder.md` and `sweep-execution-model.md` on the same day can

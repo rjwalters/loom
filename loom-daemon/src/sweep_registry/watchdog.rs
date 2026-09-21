@@ -3,6 +3,7 @@
 //! `StartupRaceConfig` timing knobs.
 
 mod dirty_probe;
+mod reset_quarantine;
 
 use super::*;
 
@@ -1309,7 +1310,13 @@ impl SweepRegistry {
         if !pids.is_empty() {
             evidence.push(WorktreeUseEvidence::LiveProcesses(pids));
         }
-
+        // 5+6. The two REGISTRY-INDEPENDENT signals (#8413): a live
+        //    `loom-daemon inflight` claim on this tree, and a filesystem write
+        //    inside the activity window. Between them they cover the in-session
+        //    builder — no claim-lock, no marker, one-shot subshells, output
+        //    going only into `target/` — that signals 1-4 cannot see at all.
+        //    See `worktree_activity`'s "Destructive passes" section.
+        evidence.extend(crate::worktree_activity::live_use_evidence(&wt));
         evidence
     }
 
@@ -1372,6 +1379,10 @@ impl SweepRegistry {
             return Ok(());
         }
         self.log_worktree_discard(&wt, issue);
+        // #8413: log-then-destroy is a forensic trace, not a recovery path.
+        // Push the same content onto a `loom-quarantine:` stash first so a
+        // wrong verdict is undoable (`git stash apply <sha>`, sha logged).
+        reset_quarantine::quarantine_before_reset(&wt, issue);
         let reset = Command::new("git")
             .arg("-C")
             .arg(&wt)
@@ -2328,3 +2339,14 @@ impl SweepRegistry {
     unused_imports
 )]
 mod tests;
+
+// #8413's own cases, in a sibling file because `tests.rs` is at its file-size
+// ratchet baseline (`.loom/docs/file-size-policy.md`).
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod liveness_tests;
