@@ -31,8 +31,16 @@
 //! refusing a merge whose green required-check results predate the base
 //! branch's current tip, which is how a ratchet baseline tightened under an
 //! in-flight PR red-lined main on 2026-09-18.
+//!
+//! [`redate`] is not a port — it is new functionality (#8508) closing the gap
+//! #8248 left open: once that guard blocks a merge, nothing automatically
+//! produces the fresh evidence it is waiting for when the merge token lacks
+//! `actions:write` to re-run the stale check directly. It pushes a
+//! tree-identical no-op commit instead, which re-triggers CI without
+//! weakening the guard itself.
 
 pub mod head_sync;
 pub mod labels;
+pub mod redate;
 pub mod refs;
 pub mod stale_checks;

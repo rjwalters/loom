@@ -158,6 +158,13 @@ pub(crate) enum MergePrCommand {
     /// freshly-read head. Exit 0 + sentinel = retry authorized, 1 = foreign
     /// head move (re-queue), 2 = attribution undeterminable (also re-queue).
     HeadSyncRetry(super::merge_pr_head_sync::HeadSyncRetryArgs),
+
+    /// The automated remedy for a merge the #8248 freshness guard blocked
+    /// (#8508): push a tree-identical no-op commit so CI re-runs and re-dates
+    /// every check, since the merge token lacks `actions:write` to re-run the
+    /// stale one directly. Exit 0 = pushed, 3 = branch already moved (not a
+    /// failure, re-evaluate fresh), 1 = could not read/write forge state.
+    RedateChecks(super::merge_pr_redate::RedateChecksArgs),
 }
 
 impl MergePrCommand {
@@ -166,6 +173,7 @@ impl MergePrCommand {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
+            MergePrCommand::RedateChecks(args) => args.run(),
         }
     }
 }
