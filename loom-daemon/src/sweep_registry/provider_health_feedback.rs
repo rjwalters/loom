@@ -1,12 +1,26 @@
-//! The Codex **provider health feedback** bridge: turning an adapter's
-//! `LOOM_TERMINAL_RESULT` record into a `tokens_pool::health` write.
+//! The **provider health feedback** bridge: after a sweep's child exits,
+//! read the log it already wrote and persist what it says about the account
+//! it spawned against — before any reaper retry/failover decision.
 //!
-//! Split out of `quarantine.rs` when #8277 threaded the in-flight model
-//! through this path. It is the only production caller of
+//! One seam, two runtimes:
+//!
+//! | Runtime | Reads | Writes |
+//! |---|---|---|
+//! | `codex` | the adapter's `LOOM_TERMINAL_RESULT` | `tokens_pool::health` (#8277) |
+//! | native (`pi`/`opencode`) | `# LOOM_LAUNCH` + the harness's error events | the API-key pool's bad marks (#8424 item 1) |
+//!
+//! Both halves are post-hoc readers of already-captured text, which for a
+//! native launch is the only possibility at all — it `exec`s, so no Loom
+//! process survives to watch the child (see [`crate::api_keys_pool::ingest`]
+//! for that design decision). Keeping them behind one call keeps the reaper's
+//! own call site unchanged, which matters twice over: `reaper.rs` sits one
+//! code line under the file-size ratchet's threshold, and `quarantine.rs`
+//! (this file's parent) is already over it and therefore frozen — see
+//! `.loom/docs/file-size-policy.md`.
+//!
+//! The Codex half is the only production caller of
 //! `tokens_pool::record_terminal_for_model`, and the sole producer for
-//! #8058 Phase 2's class-scoped `class_cooldowns` marks — a topic of its own,
-//! and `quarantine.rs` is over the file-size ratchet's threshold and
-//! therefore frozen (see `.loom/docs/file-size-policy.md`).
+//! #8058 Phase 2's class-scoped `class_cooldowns` marks.
 
 use super::*;
 
@@ -20,6 +34,12 @@ impl SweepRegistry {
         let Some(info) = self.entries.get(sweep_id) else {
             return;
         };
+        // A native-harness sweep has no `LOOM_TERMINAL_RESULT` and no Codex
+        // account; its credential came from the API-key pool instead.
+        if crate::worker_spawn::is_native(&info.runtime) {
+            self.apply_api_key_pool_feedback(sweep_id, &info.log_path, exit_code);
+            return;
+        }
         if info.runtime != "codex" || info.token_name == UNKNOWN_TOKEN_NAME {
             return;
         }
@@ -52,6 +72,32 @@ impl SweepRegistry {
                 "sweep_registry: failed to persist Codex terminal feedback for {sweep_id}: {error}"
             );
         }
+    }
+
+    /// The native-runtime half (#8424 item 1): ingest this sweep's own region
+    /// of its log — anchored on `sweep_id=<id>`, the same anchor the Codex
+    /// half and `containment_signal` use — and let
+    /// [`crate::api_keys_pool::ingest`] decide whether the account it spawned
+    /// against should be bad-marked.
+    ///
+    /// Every safety decision (pool-selected credentials only, never an exit-0
+    /// run, auth failures surfaced without a mark) lives in that module; this
+    /// is a call site and a log line.
+    fn apply_api_key_pool_feedback(
+        &self,
+        sweep_id: &SweepId,
+        log_path: &Path,
+        exit_code: Option<i32>,
+    ) {
+        let Some(feedback) = crate::api_keys_pool::ingest::ingest_launch_log_at(
+            &self.config.workspace_root,
+            log_path,
+            &format!("sweep_id={sweep_id}"),
+            exit_code,
+        ) else {
+            return;
+        };
+        log::warn!("sweep_registry: {sweep_id} {}", feedback.detail);
     }
 }
 

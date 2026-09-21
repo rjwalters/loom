@@ -1,29 +1,49 @@
-//! Exhaustion / rate-limit bad-marking for the API-key pool (issue #8401).
+//! Exhaustion / rate-limit bad-marking for the API-key pool (issues #8401,
+//! #8424).
 //!
-//! A minimal, provider-neutral analogue of [`crate::tokens_pool::bad_tokens`]:
-//! one JSON file per provider (`<pool>/<provider>/.bad_accounts.json`)
-//! holding marks with an optional reset horizon. [`super::classify`]
-//! recognises a harness's own quota/rate-limit error text and produces the
+//! A provider-neutral analogue of [`crate::tokens_pool::bad_tokens`]: one JSON
+//! file per provider (`<pool>/<provider>/.bad_accounts.json`) holding marks
+//! with an optional reset horizon. [`super::classify`] recognises a harness's
+//! own quota/rate-limit error text and produces the
 //! [`super::classify::Classification`] a caller passes to [`mark_bad`];
 //! nothing in this module parses provider HTTP responses itself.
 //!
-//! # What this slice covers, and what does not follow from it
+//! # Model-class scoping (#8424 item 3, reusing #8058's rule)
 //!
-//! The mechanism end to end — mark an account bad, have it drop out of
-//! [`super::select::select_api_key`] until its reset horizon, and become
-//! selectable again once that horizon passes — is implemented and tested
-//! here with a *simulated* classification (acceptance criterion: "Bad-marking
-//! a simulated exhausted account (classifier fixture) removes it from
-//! selection until its reset horizon").
+//! A mark may name a **model class** ([`BadMark::model_class`]). The rule is
+//! [`crate::tokens_pool::bad_tokens`]'s, verbatim, because the whole point is
+//! that the two pools behave the same way:
 //!
-//! Automatically calling [`mark_bad`] from a live, failed spawn is **not**
-//! wired up in this slice. Native harness spawns run under Unix `exec`
-//! (`worker_spawn::exec`) to preserve PID/signal parity for the role runner,
-//! so this process's own lifetime ends at the point of exec — there is no
-//! in-process hook left to observe the child's stdout/stderr and call
-//! [`mark_bad`] automatically. Wiring real captured Z.ai/OpenCode error text
-//! into that automatic call is tracked as a follow-up (#8424); until then,
-//! `mark-bad` is an operator/tooling-invoked CLI verb, not a self-healing loop.
+//! * A **class-less** mark blocks *every* class. Every mark written before
+//!   #8424, and every mark an operator records without `--model-class`, is
+//!   class-less, so nothing here ever narrows an existing mark.
+//! * A **class-scoped** mark blocks only the class it names — and only for a
+//!   caller that asked about a class ([`active_mark_for_class`] /
+//!   [`is_bad_for_class`]). [`active_mark`]'s class-less question keeps its
+//!   account-wide meaning: "is this account marked at all".
+//! * Each class-scoped mark is its own entry with its own horizon, so it ages
+//!   out independently of any account-wide mark on the same account.
+//!
+//! What counts as a class here is *not*
+//! [`crate::tokens_pool::bad_tokens::model_class_of`]'s Claude taxonomy
+//! (`haiku`/`sonnet`/`opus`/`fable`) — this pool is provider-neutral and no
+//! cross-provider tier taxonomy exists. The class is the **model id** the
+//! spawn asked for, normalized by [`normalize_model_class`]
+//! (`glm-5.3-flash#high` -> `glm-5.3-flash`), which is exactly what #8424
+//! asks for: an exhausted `glm-5.3-flash` allowance must not bad-mark the same
+//! account's `glm-5` allowance. A provider whose plan pools several model ids
+//! under one allowance should record the class-less (account-wide) mark
+//! instead — that is what class-less *means*.
+//!
+//! # Automatic marking is now wired, post-hoc
+//!
+//! #8401 left [`mark_bad`] as an operator/tooling-invoked verb because native
+//! harness spawns run under Unix `exec` (`worker_spawn::exec`), so the
+//! selecting process becomes the harness and has no in-process hook left to
+//! watch the child's output. #8424 resolves that by **not** trying to keep a
+//! supervisor alive across the exec: [`super::ingest`] classifies the launch's
+//! own retained log after the fact and calls in here. See that module for the
+//! design decision and its live call sites.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,6 +56,10 @@ use super::registry::{restrict_dir, write_secret};
 /// Per-provider file holding every recorded mark (expired ones included; the
 /// selection ladder filters on [`active_mark`] at read time).
 pub const BAD_MARKS_FILE: &str = ".bad_accounts.json";
+
+/// Longest accepted model class. Generous — provider model ids are long — but
+/// bounded, so a pasted error body can never become a class.
+const MAX_MODEL_CLASS_LEN: usize = 64;
 
 /// One exhaustion/rate-limit record against a single account.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -50,6 +74,76 @@ pub struct BadMark {
     /// Unix seconds after which the account is selectable again. `None`
     /// means "until an explicit [`unmark`]".
     pub resets_at: Option<u64>,
+    /// The model class this mark is scoped to (#8424 item 3). `None` — the
+    /// pre-#8424 shape, and what `serde` fills in for every mark written
+    /// before this field existed — blocks the account for **every** class.
+    ///
+    /// Skipped when absent, so a class-less mark serialises byte-identically
+    /// to the pre-#8424 file format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_class: Option<String>,
+}
+
+impl BadMark {
+    /// Whether this mark blocks a caller asking about `model_class`.
+    ///
+    /// `None` for `model_class` is the account-wide question and is blocked by
+    /// *any* mark — see the module docs for why that is not narrowed.
+    #[must_use]
+    pub fn blocks_class(&self, model_class: Option<&str>) -> bool {
+        match (self.model_class.as_deref(), model_class) {
+            // A class-less mark is account-wide: it blocks every class.
+            (None, _) => true,
+            // The class-less (account-wide) question: any mark answers yes.
+            (Some(_), None) => true,
+            (Some(marked), Some(asked)) => marked.eq_ignore_ascii_case(asked),
+        }
+    }
+
+    /// `true` when this mark has not yet reached its reset horizon at `now`.
+    #[must_use]
+    pub fn is_active_at(&self, now: u64) -> bool {
+        self.resets_at.is_none_or(|resets_at| resets_at > now)
+    }
+
+    /// Operator-facing suffix naming the mark's class, or `""` when it is
+    /// account-wide. Used by `list`/`health` detail strings.
+    #[must_use]
+    pub fn class_suffix(&self) -> String {
+        self.model_class
+            .as_deref()
+            .map_or_else(String::new, |class| format!(" [model-class:{class}]"))
+    }
+}
+
+/// Normalize a model id into the class a mark is scoped to, or `None` when
+/// there is nothing usable to scope by (#8424 item 3).
+///
+/// Lowercases, trims, and drops an `#effort` suffix (`glm-5.3-flash#high` and
+/// `glm-5.3-flash` are one allowance). Rejects anything that is not a plain
+/// model-id shape — an empty string, something over [`MAX_MODEL_CLASS_LEN`],
+/// or a value with whitespace/quotes/control characters — because `None`
+/// degrades safely to today's account-wide behaviour, whereas accepting junk
+/// would silently split one allowance into two unreachable halves.
+/// **Unrecognised is `None`, never an error**, the same contract
+/// [`crate::tokens_pool::bad_tokens::model_class_of`] states.
+#[must_use]
+pub fn normalize_model_class(raw: &str) -> Option<String> {
+    let base = raw
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if base.is_empty() || base.len() > MAX_MODEL_CLASS_LEN {
+        return None;
+    }
+    let ok = base.bytes().all(|b| {
+        b.is_ascii_lowercase()
+            || b.is_ascii_digit()
+            || matches!(b, b'-' | b'_' | b'.' | b':' | b'/')
+    });
+    ok.then_some(base)
 }
 
 #[must_use]
@@ -116,7 +210,7 @@ fn write_marks(root: &Path, provider: &str, marks: &[BadMark]) -> Result<(), Str
     write_secret(&path, &body)
 }
 
-/// Record (or replace) a bad mark for `name`.
+/// Record (or replace) an account-wide bad mark for `name`.
 ///
 /// `cooldown_secs = None` marks the account until an explicit [`unmark`];
 /// `Some(0)` is rejected (use [`unmark`] to clear immediately instead of a
@@ -128,6 +222,28 @@ pub fn mark_bad(
     reason: &str,
     cooldown_secs: Option<u64>,
 ) -> Result<BadMark, String> {
+    mark_bad_for_class(root, provider, name, reason, cooldown_secs, None)
+}
+
+/// [`mark_bad`], scoped to one model class (#8424 item 3).
+///
+/// `model_class = None` is exactly [`mark_bad`] — an account-wide mark. A
+/// class-scoped mark replaces only the previous mark for *that* class, so an
+/// account may hold one account-wide mark plus one per class, each with its
+/// own horizon.
+///
+/// The class is normalized through [`normalize_model_class`]; a value that
+/// normalizes to `None` is **rejected** rather than silently widened to an
+/// account-wide mark, because quietly marking a whole account when the caller
+/// asked to scope is the failure this pair exists to prevent.
+pub fn mark_bad_for_class(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    reason: &str,
+    cooldown_secs: Option<u64>,
+    model_class: Option<&str>,
+) -> Result<BadMark, String> {
     validate_provider(provider)?;
     validate_account(name)?;
     if cooldown_secs == Some(0) {
@@ -136,6 +252,14 @@ pub fn mark_bad(
                 .to_string(),
         );
     }
+    let model_class = match model_class {
+        None => None,
+        Some(raw) => Some(normalize_model_class(raw).ok_or_else(|| {
+            "model class must be a model id such as glm-5.3-flash (lowercase, no spaces); omit \
+             it for an account-wide mark"
+                .to_string()
+        })?),
+    };
     // Only a registered account can be marked. Marking a name that does not
     // exist used to `mkdir` the provider directory as a side effect, leaving a
     // phantom `0/0` provider in `health` — and a typo'd name silently marked
@@ -155,42 +279,89 @@ pub fn mark_bad(
     // `?`: refuse to rewrite an unusable file from an empty read, which would
     // permanently drop every other account's mark.
     let mut marks = read_marks(root, provider)?;
-    marks.retain(|m| m.name != name);
+    // Replace only the same (account, class) pair: a class-scoped mark must
+    // not clear the account-wide one, nor another class's.
+    marks.retain(|m| !(m.name == name && m.model_class == model_class));
     let mark = BadMark {
         name: name.to_string(),
         reason: reason.replace(['\n', '\r'], " "),
         marked_at: now,
         resets_at: cooldown_secs.map(|secs| now + secs),
+        model_class,
     };
     marks.push(mark.clone());
-    marks.sort_by(|a, b| a.name.cmp(&b.name));
+    marks.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.model_class.cmp(&b.model_class))
+    });
     write_marks(root, provider, &marks)?;
     Ok(mark)
 }
 
-/// Clear a mark early (an operator override, or a successful re-probe).
+/// Clear every mark for `provider/name` (an operator override, or a successful
+/// re-probe) — account-wide and class-scoped alike.
 ///
 /// # Errors
 /// Returns an error when no mark is currently recorded for `provider/name`.
 pub fn unmark(root: &Path, provider: &str, name: &str) -> Result<(), String> {
+    unmark_for_class(root, provider, name, None)
+}
+
+/// [`unmark`], optionally narrowed to one model class (#8424 item 3).
+///
+/// `model_class = None` clears **every** mark for the account (the widest,
+/// safest operator action — an account can never be left stuck by a class the
+/// operator forgot about). `Some(class)` clears only that class's mark and
+/// leaves the account-wide one, and any other class's, in place.
+///
+/// # Errors
+/// Returns an error when the narrowing found nothing to clear.
+pub fn unmark_for_class(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    model_class: Option<&str>,
+) -> Result<(), String> {
     validate_provider(provider)?;
     validate_account(name)?;
+    let model_class = match model_class {
+        None => None,
+        Some(raw) => Some(
+            normalize_model_class(raw)
+                .ok_or_else(|| format!("{raw:?} is not a usable model class"))?,
+        ),
+    };
     let dir = provider_dir(root, provider);
     if !dir.exists() {
-        return Err(format!("no bad mark recorded for {provider}/{name}"));
+        return Err(no_such_mark(provider, name, model_class.as_deref()));
     }
     let _lock = MkdirLock::acquire(&lock_path(root, provider))
         .map_err(|e| format!("cannot lock bad-marks file: {e}"))?;
     let mut marks = read_marks(root, provider)?;
     let before = marks.len();
-    marks.retain(|m| m.name != name);
+    marks.retain(|m| {
+        m.name != name
+            || model_class
+                .as_deref()
+                .is_some_and(|c| m.model_class.as_deref() != Some(c))
+    });
     if marks.len() == before {
-        return Err(format!("no bad mark recorded for {provider}/{name}"));
+        return Err(no_such_mark(provider, name, model_class.as_deref()));
     }
     write_marks(root, provider, &marks)
 }
 
-/// [`unmark`] for `registry::remove`: drop `name`'s mark if there is one, and
+fn no_such_mark(provider: &str, name: &str, model_class: Option<&str>) -> String {
+    match model_class {
+        Some(class) => {
+            format!("no bad mark recorded for {provider}/{name} on model class {class:?}")
+        }
+        None => format!("no bad mark recorded for {provider}/{name}"),
+    }
+}
+
+/// [`unmark`] for `registry::remove`: drop `name`'s marks if there are any, and
 /// treat "nothing recorded" as success.
 pub(super) fn forget(root: &Path, provider: &str, name: &str) -> Result<(), String> {
     if !marks_path(root, provider).exists() {
@@ -207,7 +378,8 @@ pub(super) fn forget(root: &Path, provider: &str, name: &str) -> Result<(), Stri
     write_marks(root, provider, &marks)
 }
 
-/// The active (not-yet-reset) mark for `name`, if any, at `now`.
+/// The active (not-yet-reset) mark for `name`, if any, at `now` — the
+/// account-wide question: *any* mark answers it.
 ///
 /// # Errors
 /// Propagates [`read_marks`]'s "exists but unusable" error; the caller must
@@ -218,156 +390,62 @@ pub fn active_mark(
     name: &str,
     now: u64,
 ) -> Result<Option<BadMark>, String> {
-    Ok(read_marks(root, provider)?
+    active_mark_for_class(root, provider, name, None, now)
+}
+
+/// [`active_mark`], narrowed to the marks that block `model_class` (#8424
+/// item 3). `None` for `model_class` is exactly [`active_mark`].
+///
+/// The asked-about class is normalized through [`normalize_model_class`], so a
+/// caller may pass the raw model it resolved (`glm-5.3-flash#high`) without
+/// pre-processing. A value that does not normalize degrades to the
+/// account-wide question — the *stricter* of the two readings, so an
+/// unrecognisable model can only ever withhold an account, never free one.
+///
+/// When both an account-wide and a matching class-scoped mark are active, the
+/// account-wide one is returned — it is the stronger statement, and the one an
+/// operator needs to clear.
+///
+/// # Errors
+/// As [`active_mark`]: an unreadable/unparsable marks file is an error, never
+/// "not marked".
+pub fn active_mark_for_class(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    model_class: Option<&str>,
+    now: u64,
+) -> Result<Option<BadMark>, String> {
+    let asked = model_class.and_then(normalize_model_class);
+    let mut blocking: Vec<BadMark> = read_marks(root, provider)?
         .into_iter()
-        .find(|m| m.name == name && m.resets_at.is_none_or(|resets_at| resets_at > now)))
+        .filter(|m| m.name == name && m.is_active_at(now) && m.blocks_class(asked.as_deref()))
+        .collect();
+    // Account-wide (class-less) first, then by class name for determinism.
+    blocking.sort_by(|a, b| a.model_class.cmp(&b.model_class));
+    Ok(blocking.into_iter().next())
+}
+
+/// `true` when `name` is currently bad-marked **for `model_class`** (#8424
+/// item 3) — the boolean projection of [`active_mark_for_class`], mirroring
+/// [`crate::tokens_pool::bad_tokens::is_bad_for_class`].
+///
+/// # Errors
+/// Unlike the Claude pool's `is_bad_for_class` (which returns a bare `bool`
+/// and degrades to "not bad" on an unreadable store), this pool **fails
+/// closed** on an unusable marks file — the whole #8401 design rests on
+/// "cannot read the state" never reading as "nothing is marked". Callers must
+/// treat an error as ineligible.
+pub fn is_bad_for_class(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    model_class: Option<&str>,
+    now: u64,
+) -> Result<bool, String> {
+    Ok(active_mark_for_class(root, provider, name, model_class, now)?.is_some())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A pool root with `names` registered under `zai` (obviously fake keys).
-    fn pool(names: &[&str]) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        for name in names {
-            crate::api_keys_pool::registry::add(
-                tmp.path(),
-                "zai",
-                name,
-                "ZAI_API_KEY",
-                "fake-key-not-a-real-credential",
-                false,
-            )
-            .unwrap();
-        }
-        tmp
-    }
-
-    fn active(root: &Path, provider: &str, name: &str, now: u64) -> Option<BadMark> {
-        active_mark(root, provider, name, now).unwrap()
-    }
-
-    #[test]
-    fn mark_bad_then_active_mark_reports_it_until_the_horizon() {
-        let tmp = pool(&["alpha"]);
-        let mark = mark_bad(tmp.path(), "zai", "alpha", "quota exceeded\nretry later", Some(3600))
-            .unwrap();
-        assert_eq!(mark.reason, "quota exceeded retry later");
-        let now = mark.marked_at;
-        assert!(active(tmp.path(), "zai", "alpha", now).is_some());
-        assert!(active(tmp.path(), "zai", "alpha", now + 3599).is_some());
-        assert!(active(tmp.path(), "zai", "alpha", now + 3601).is_none());
-    }
-
-    #[test]
-    fn a_permanent_mark_never_expires_until_unmark() {
-        let tmp = pool(&["alpha"]);
-        mark_bad(tmp.path(), "zai", "alpha", "permanent", None).unwrap();
-        assert!(active(tmp.path(), "zai", "alpha", epoch_now() + 10_000_000).is_some());
-        unmark(tmp.path(), "zai", "alpha").unwrap();
-        assert!(active(tmp.path(), "zai", "alpha", epoch_now()).is_none());
-    }
-
-    #[test]
-    fn zero_cooldown_is_rejected() {
-        let tmp = pool(&["alpha"]);
-        let err = mark_bad(tmp.path(), "zai", "alpha", "x", Some(0)).unwrap_err();
-        assert!(err.contains("unblock"), "{err}");
-    }
-
-    #[test]
-    fn unmark_on_an_unmarked_account_is_an_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let err = unmark(tmp.path(), "zai", "ghost").unwrap_err();
-        assert!(err.contains("no bad mark recorded"), "{err}");
-    }
-
-    #[test]
-    fn re_marking_replaces_the_previous_entry_rather_than_appending() {
-        let tmp = pool(&["alpha"]);
-        mark_bad(tmp.path(), "zai", "alpha", "first", Some(10)).unwrap();
-        mark_bad(tmp.path(), "zai", "alpha", "second", Some(20)).unwrap();
-        let marks = read_marks(tmp.path(), "zai").unwrap();
-        assert_eq!(marks.len(), 1);
-        assert_eq!(marks[0].reason, "second");
-    }
-
-    #[test]
-    fn marks_are_scoped_per_provider() {
-        let tmp = pool(&["alpha"]);
-        mark_bad(tmp.path(), "zai", "alpha", "x", Some(10)).unwrap();
-        assert!(active(tmp.path(), "openai", "alpha", epoch_now()).is_none());
-    }
-
-    /// Judge nit (#8428): marking a name that is not registered used to
-    /// succeed and `mkdir` the provider directory as a side effect.
-    #[test]
-    fn marking_an_unregistered_account_is_refused_and_creates_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let err = mark_bad(tmp.path(), "zai", "ghost", "x", Some(10)).unwrap_err();
-        assert!(err.contains("no such account zai/ghost"), "{err}");
-        assert!(!provider_dir(tmp.path(), "zai").exists());
-    }
-
-    /// Judge finding 2 (#8428). Each body is a state the Judge reproduced:
-    /// zero-length (what a reader saw between `O_TRUNC` and `write_all`, or
-    /// what `ENOSPC` leaves) and a torn JSON body. Before the fix both read as
-    /// "no marks" (`unwrap_or_default`), and the follow-up `mark_bad` rewrote
-    /// the file holding only `beta` — `alpha`'s mark was gone for good.
-    #[test]
-    fn an_unparsable_marks_file_fails_closed_and_is_never_clobbered() {
-        for torn in ["", "[{\"name\":\"alpha\",\"reason\":\"quota", "{}"] {
-            let tmp = pool(&["alpha", "beta"]);
-            mark_bad(tmp.path(), "zai", "alpha", "secret-ish reason text", Some(3600)).unwrap();
-            let path = marks_path(tmp.path(), "zai");
-            std::fs::write(&path, torn).unwrap();
-
-            let err = read_marks(tmp.path(), "zai").unwrap_err();
-            assert!(err.contains(&path.display().to_string()), "{err}");
-            assert!(!err.contains("secret-ish"), "parse error echoed contents: {err}");
-            assert!(active_mark(tmp.path(), "zai", "alpha", epoch_now()).is_err());
-
-            // Neither writer may rewrite it from an empty read.
-            assert!(mark_bad(tmp.path(), "zai", "beta", "x", Some(10)).is_err());
-            assert!(unmark(tmp.path(), "zai", "alpha").is_err());
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), torn, "file was clobbered");
-        }
-    }
-
-    #[test]
-    fn an_absent_marks_file_is_simply_no_marks() {
-        let tmp = pool(&["alpha"]);
-        assert_eq!(read_marks(tmp.path(), "zai").unwrap(), Vec::new());
-        assert_eq!(active_mark(tmp.path(), "zai", "alpha", epoch_now()), Ok(None));
-    }
-
-    /// The write itself: replaced by `rename`, never truncated in place, and no
-    /// staging file is left behind.
-    #[test]
-    fn marks_are_written_atomically_and_leave_no_temp_file() {
-        let tmp = pool(&["alpha", "beta"]);
-        mark_bad(tmp.path(), "zai", "alpha", "first", Some(3600)).unwrap();
-        let path = marks_path(tmp.path(), "zai");
-        #[cfg(unix)]
-        let inode_before = {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(&path).unwrap().ino()
-        };
-        mark_bad(tmp.path(), "zai", "beta", "second", Some(3600)).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let metadata = std::fs::metadata(&path).unwrap();
-            assert_ne!(metadata.ino(), inode_before, "marks file was rewritten in place");
-            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        }
-        assert_eq!(read_marks(tmp.path(), "zai").unwrap().len(), 2);
-        let stranded: Vec<_> = std::fs::read_dir(provider_dir(tmp.path(), "zai"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
-            .collect();
-        assert!(stranded.is_empty(), "{stranded:?}");
-    }
-}
+#[path = "bad_marks_tests.rs"]
+mod tests;

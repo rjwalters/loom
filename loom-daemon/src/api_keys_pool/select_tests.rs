@@ -1,9 +1,10 @@
-//! Selection-ladder tests (issue #8401).
+//! Selection-ladder tests (issues #8401, #8424).
 
 use super::*;
-use crate::api_keys_pool::bad_marks::{active_mark, mark_bad, unmark};
+use crate::api_keys_pool::bad_marks::{self, active_mark, mark_bad, unmark};
 use crate::api_keys_pool::classify::{classify, Classification};
-use crate::api_keys_pool::registry::{add, set_enabled, ALLOWLIST_FILE};
+use crate::api_keys_pool::registry::{self, add, set_enabled, ALLOWLIST_FILE};
+use crate::api_keys_pool::{inflight, limits};
 use std::fs;
 
 const FAKE_KEY: &str = "fake-key-must-never-be-echoed";
@@ -192,7 +193,7 @@ fn a_classifier_fixture_drives_a_bad_mark_that_removes_the_account_from_selectio
         "zai",
         "alpha",
         &format!("classified as {}", classification.unwrap().label()),
-        Some(classification.unwrap().default_cooldown_secs()),
+        classification.unwrap().default_cooldown_secs(),
     )
     .unwrap();
 
@@ -349,11 +350,12 @@ fn an_account_assigning_a_different_variable_is_withheld_from_that_profile() {
     let mut rng = Rng::seeded(5);
     for _ in 0..4 {
         let selected =
-            select_api_key_for(tmp.path(), "zai", Some("ZAI_API_KEY"), Some(&mut rng)).unwrap();
+            select_api_key_for(tmp.path(), "zai", Some("ZAI_API_KEY"), None, Some(&mut rng))
+                .unwrap();
         assert_eq!(selected.name, "alpha");
     }
     set_enabled(&root, "zai", "alpha", false).unwrap();
-    let text = select_api_key_for(tmp.path(), "zai", Some("ZAI_API_KEY"), None)
+    let text = select_api_key_for(tmp.path(), "zai", Some("ZAI_API_KEY"), None, None)
         .unwrap_err()
         .to_string();
     assert!(text.contains("assigns OPENAI_API_KEY"), "{text}");
@@ -379,4 +381,172 @@ fn an_unreadable_operator_pin_fails_closed() {
         .unwrap_err()
         .to_string()
         .contains("operator pin is unreadable"));
+}
+
+// ---- Per-account concurrency cap, tier 0 (#8424 item 4) ----
+
+/// The acceptance criterion: an account already at its cap is **skipped in
+/// favour of another eligible account**, not merely recorded.
+#[test]
+fn an_account_at_its_cap_is_skipped_in_favour_of_another_eligible_account() {
+    let tmp = workspace_with(&["alpha", "beta"]);
+    let root = super::super::paths::per_repo_api_keys_dir(tmp.path());
+    limits::set_max_concurrent(&root, "zai", "alpha", Some(1)).unwrap();
+    // One live spawn already holds `alpha`, filling its cap of 1.
+    let held = inflight::register(&root, "zai", "alpha").unwrap();
+
+    // The cursor would hand out `alpha` first; the cap sends every selection
+    // to `beta` instead.
+    seed_cursor(tmp.path(), "0");
+    let mut rng = Rng::seeded(3);
+    for _ in 0..4 {
+        let selected = select_api_key(tmp.path(), "zai", Some(&mut rng)).unwrap();
+        assert_eq!(selected.name, "beta");
+        selected.lease.unwrap().release();
+    }
+
+    // Once the holder exits, `alpha` is selectable again with no operator
+    // action — the cap is transient, unlike a bad mark.
+    held.release();
+    seed_cursor(tmp.path(), "0");
+    let mut rng = Rng::seeded(3);
+    let selected = select_api_key(tmp.path(), "zai", Some(&mut rng)).unwrap();
+    assert_eq!(selected.name, "alpha");
+}
+
+/// An account with no declared cap is unbounded — no regression for any
+/// registry entry predating #8424.
+#[test]
+fn an_account_without_a_declared_cap_is_unbounded() {
+    let tmp = workspace_with(&["alpha"]);
+    let root = super::super::paths::per_repo_api_keys_dir(tmp.path());
+    let mut leases = Vec::new();
+    for _ in 0..8 {
+        let selected = select_api_key(tmp.path(), "zai", None).unwrap();
+        assert_eq!(selected.name, "alpha");
+        leases.push(selected.lease);
+    }
+    assert_eq!(inflight::live_count(&root, "zai", "alpha"), 8);
+    assert_eq!(registry::describe_account(&root, "zai", "alpha").max_concurrent, None);
+}
+
+/// Every account at its cap fails closed at 78 with a diagnostic that names
+/// the cap — launching anyway would breach the ceiling the operator declared.
+#[test]
+fn a_fully_capped_pool_fails_closed_naming_the_cap() {
+    let tmp = workspace_with(&["alpha", "beta"]);
+    let root = super::super::paths::per_repo_api_keys_dir(tmp.path());
+    let mut held = Vec::new();
+    for name in ["alpha", "beta"] {
+        limits::set_max_concurrent(&root, "zai", name, Some(2)).unwrap();
+        held.push(inflight::register(&root, "zai", name).unwrap());
+        held.push(inflight::register(&root, "zai", name).unwrap());
+    }
+    let text = select_api_key(tmp.path(), "zai", None)
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("concurrency cap"), "{text}");
+    assert!(text.contains("2 in flight, maxConcurrent 2"), "{text}");
+    assert!(text.contains("api-keys limit zai"), "{text}");
+    assert!(!text.contains(FAKE_KEY), "{text}");
+}
+
+/// A selection registers exactly one lease, against the account it chose.
+#[test]
+fn selection_registers_one_lease_for_the_chosen_account() {
+    let tmp = workspace_with(&["alpha", "beta"]);
+    let root = super::super::paths::per_repo_api_keys_dir(tmp.path());
+    seed_cursor(tmp.path(), "0");
+    let mut rng = Rng::seeded(7);
+    let selected = select_api_key(tmp.path(), "zai", Some(&mut rng)).unwrap();
+    assert_eq!(selected.name, "alpha");
+    assert!(selected.lease.is_some());
+    assert_eq!(inflight::live_count(&root, "zai", "alpha"), 1);
+    assert_eq!(inflight::live_count(&root, "zai", "beta"), 0);
+}
+
+/// An unreadable `.limits.json` withholds the account (the operator's ceiling
+/// is unknown), rather than being read as "unbounded".
+#[cfg(unix)]
+#[test]
+fn an_unreadable_limits_file_fails_closed() {
+    let tmp = workspace_with(&["alpha"]);
+    let root = super::super::paths::per_repo_api_keys_dir(tmp.path());
+    limits::set_max_concurrent(&root, "zai", "alpha", Some(4)).unwrap();
+    let path = provider_dir(&root, "zai").join(limits::LIMITS_FILE);
+    chmod(&path, 0o000);
+    let as_root = fs::read_to_string(&path).is_ok();
+    let selected = select_api_key(tmp.path(), "zai", None);
+    chmod(&path, 0o600);
+    if as_root {
+        return;
+    }
+    let text = selected.unwrap_err().to_string();
+    assert!(text.contains("pool state unreadable"), "{text}");
+}
+
+// ---- Model-class-scoped selection (#8424 item 3) ----
+
+/// A class-scoped mark withholds the account only for that class; the same
+/// account stays selectable for another.
+#[test]
+fn a_class_scoped_mark_withholds_the_account_only_for_that_class() {
+    let tmp = workspace_with(&["alpha"]);
+    let root = super::super::paths::per_repo_api_keys_dir(tmp.path());
+    bad_marks::mark_bad_for_class(
+        &root,
+        "zai",
+        "alpha",
+        "flash allowance exhausted",
+        Some(3600),
+        Some("glm-5.3-flash"),
+    )
+    .unwrap();
+
+    let selected =
+        select_api_key_for(tmp.path(), "zai", Some("ZAI_API_KEY"), Some("glm-5"), None).unwrap();
+    assert_eq!(selected.name, "alpha");
+
+    let text = select_api_key_for(
+        tmp.path(),
+        "zai",
+        Some("ZAI_API_KEY"),
+        Some("glm-5.3-flash#high"),
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(text.contains("[model-class:glm-5.3-flash]"), "{text}");
+    assert!(!text.contains(FAKE_KEY), "{text}");
+}
+
+/// An account-wide mark still withholds the account for every class, and a
+/// class-less selection (`None`) is unchanged from pre-#8424 behaviour.
+#[test]
+fn an_account_wide_mark_withholds_every_class() {
+    let tmp = workspace_with(&["alpha"]);
+    let root = super::super::paths::per_repo_api_keys_dir(tmp.path());
+    mark_bad(&root, "zai", "alpha", "plan exhausted", Some(3600)).unwrap();
+    for class in [None, Some("glm-5"), Some("glm-5.3-flash")] {
+        assert!(
+            select_api_key_for(tmp.path(), "zai", Some("ZAI_API_KEY"), class, None).is_err(),
+            "{class:?}"
+        );
+    }
+}
+
+/// A model that does not normalize to a class degrades to the account-wide
+/// question — the stricter reading, so an unknown model can never free an
+/// account a mark was meant to withhold.
+#[test]
+fn an_unusable_model_degrades_to_the_account_wide_question() {
+    let tmp = workspace_with(&["alpha"]);
+    let root = super::super::paths::per_repo_api_keys_dir(tmp.path());
+    bad_marks::mark_bad_for_class(&root, "zai", "alpha", "x", Some(3600), Some("glm-5")).unwrap();
+    for junk in [Some("has space"), Some(""), None] {
+        assert!(
+            select_api_key_for(tmp.path(), "zai", Some("ZAI_API_KEY"), junk, None).is_err(),
+            "{junk:?}"
+        );
+    }
 }

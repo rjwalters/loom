@@ -170,13 +170,28 @@ pub fn resolve(root: &std::path::Path, selection: &Selection) -> Result<Resolved
     }
     // `source_var` is passed down so an account file assigning a different
     // variable is withheld rather than injected under this profile's target.
-    let selected = api_keys_pool::select_api_key_for(root, &provider, Some(source_var), None)
-        .map_err(|error| {
-            LaunchError::config(format!(
-                "no usable API-key account for provider {provider:?} (profile credential \
+    // `selection.model` is passed down so an exhausted allowance for ONE model
+    // class does not withhold an account whose other allowance is fine (#8424
+    // item 3), and so the per-account concurrency cap (#8424 item 4) is
+    // evaluated for the account this spawn would actually take.
+    let selected = api_keys_pool::select_api_key_for(
+        root,
+        &provider,
+        Some(source_var),
+        Some(&selection.model),
+        None,
+    )
+    .map_err(|error| {
+        LaunchError::config(format!(
+            "no usable API-key account for provider {provider:?} (profile credential \
              {source_var}). Export {source_var} for a one-off run, or fix the pool.\n{error}"
-            ))
-        })?;
+        ))
+    })?;
+    // The in-flight lease is deliberately dropped, not released: `worker_spawn::run`
+    // `exec`s the harness immediately after this, so this PID *becomes* the run
+    // the lease describes and the lease must outlive this handle. It is reaped
+    // when that PID dies — see `api_keys_pool::inflight`.
+    drop(selected.lease);
     injected.push((target.to_string(), OsString::from(selected.credential.value)));
     Ok(Resolved {
         source: Source::Pool,

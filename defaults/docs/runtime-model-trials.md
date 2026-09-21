@@ -130,6 +130,7 @@ loom-daemon api-keys add zai-metered team --env-var ZAI_API_KEY --shared --key-f
 loom-daemon api-keys list [--provider zai] [--json]
 loom-daemon api-keys disable zai alice
 loom-daemon api-keys enable zai alice
+loom-daemon api-keys limit zai alice --max-concurrent 2      # or --unlimited
 loom-daemon api-keys remove zai alice
 ```
 
@@ -199,32 +200,76 @@ discard that provider's marks. All pool files are written atomically (temp
 file + `rename`, `0600`), so Loom itself never leaves one half-written.
 
 **Exhaustion / bad-marking.** `loom-daemon api-keys mark-bad <provider>
-<name> --reason <text> [--cooldown-secs N]` removes an account from selection
-until its reset horizon (or indefinitely, until `api-keys unblock`); a bad
-mark self-heals once its horizon passes, with no operator action required.
-`loom_daemon::api_keys_pool::classify` recognises a harness's own
-quota/rate-limit error text (`insufficient balance`, HTTP `429`, …) and
-produces the classification `mark-bad` records — but the pattern table is
-currently built from Z.ai's **documented** error shapes, not yet a string
-captured from a live exhausted run, and nothing in this repository calls
-`classify` automatically from a live spawn's failure yet (native harness
-spawns `exec` the child to preserve PID/signal parity, so there is no
-in-process hook left to observe its output after that point). Both gaps are
-tracked as a follow-up (#8424); `mark-bad` today is an operator/tooling-invoked
-verb, and its own contract (a bad mark removes an account from selection
-until its horizon) is independently tested against simulated/fixture
-classifications.
+<name> --reason <text> [--cooldown-secs N] [--model-class <id>]` removes an
+account from selection until its reset horizon (or indefinitely, until
+`api-keys unblock`); a bad mark self-heals once its horizon passes, with no
+operator action required. `loom_daemon::api_keys_pool::classify` recognises a
+harness's own quota/rate-limit error text (`insufficient balance`, HTTP `429`,
+…) and produces the classification that is recorded.
+
+*Marks are automatic as well as operator-invoked (#8424).* After a native
+sweep or role tick exits, Loom re-reads that run's own retained log
+(`api_keys_pool::ingest`) and bad-marks the account the run used when the log
+says its allowance ran out. This is deliberately **post-hoc**, not live
+interception: a native harness spawn `exec`s the child to preserve PID/signal
+parity for the reaper and role runner, so no Loom process survives to watch
+the stream — the same shape `sweep_registry`'s Codex health bridge and
+`worker_spawn::launch_outcome` already use. The cost, stated plainly: the mark
+lands when the run exits rather than the moment it fails, and a run whose
+output Loom never retains is never ingested. Four guards keep it from marking
+a healthy account — only a pool-selected credential (never an operator's
+one-off `export`), only from Loom's own `# LOOM_LAUNCH` record, never from an
+exit-0 run, and never from an auth failure (below).
+
+*Auth failures are not exhaustion.* A `provider.auth` / HTTP 401 harness event
+is classified `credential-failure`: it is surfaced in the log and **never**
+bad-marked, and it carries no reset horizon at all. On OpenCode 2.x a 401 is
+also what a *correct* key looks like when the launch forgets `--standalone`
+(#8438), so marking on it would take a healthy account out of the pool for a
+launch-configuration bug.
+
+*Pattern provenance.* Each entry in the classifier's table records whether it
+was captured from real harness output or transcribed from provider
+documentation. The captured `provider.auth`/401 event above is real (OpenCode
+2.0.10, `run --format json`, observed 2026-09-20); **no live Z.ai coding-plan
+*exhaustion* string has been captured yet**, so those rows remain documented
+shapes and a unit test keeps that labelling honest. Fold each new capture in
+as it is observed.
+
+*Model-class scoping.* `--model-class <model-id>` (e.g. `glm-5.3-flash`, an
+`#effort` suffix is stripped) scopes a mark to one allowance, mirroring the
+Claude pool's `is_bad_for_class`: an exhausted `glm-5.3-flash` allowance
+leaves the same account selectable for `glm-5`. Omit it for an account-wide
+mark — which is what every pre-#8424 mark is, and what an automatic mark falls
+back to when the launch record names no usable model. `api-keys unblock` takes
+the same flag: with it, only that class's mark is cleared; without it, every
+mark for the account is.
+
+**Concurrency.** `loom-daemon api-keys limit <provider> <name>
+--max-concurrent <N>` (or `--unlimited` to clear it; `api-keys add` accepts
+`--max-concurrent` too) declares a provider-side concurrent-request ceiling
+for one account. Selection **enforces** it: an account already holding `N`
+live spawns is skipped in favour of another eligible account, and becomes
+selectable again the moment one of those spawns exits — no operator action,
+and no cooldown. A pool whose every account is at its cap fails closed at `78`
+with a diagnostic naming the cap. An account with no declared cap is
+unbounded, exactly as before #8424.
+
+In-flight holds are counted as one lease file per live spawn under
+`<provider>/.inflight/<account>/`, keyed on the spawning PID — which, because
+the spawn `exec`s, *is* the harness's PID for the whole run, so a lease is
+released by the process dying and there is nothing to forget. Stale leases are
+reaped on read (dead PID, or older than `LOOM_API_KEY_INFLIGHT_STALE_SECS`,
+default 4h). Unlike `.disabled`/`.bad_accounts.json`/`.limits.json` — which
+encode operator decisions and therefore fail *closed* — an unusable lease
+store degrades **open** and the spawn proceeds uncapped: a broken counter
+directory must not become an outage.
 
 **Health.** `loom-daemon api-keys health [--provider zai] [--json]` reports,
-per provider: total/selectable/disabled/malformed/exhausted/unverifiable
-counts, any `.allowlist` pin, accounts whose file permissions are looser than
-`0600`, and any provider directory that cannot be read (non-zero exit) —
-secret-free by construction, the same as `list`.
-
-**Concurrency.** A per-account concurrency cap (a Z.ai coding-plan key's
-provider-side concurrent-request ceiling) is not implemented in this slice;
-today the fleet's parallelism against a pooled provider is gated only by host
-disk/RAM/CPU, same as every other runtime. Tracked as a follow-up (#8424).
+per provider: total/selectable/disabled/malformed/exhausted/at-concurrency-cap/
+unverifiable counts, any `.allowlist` pin, accounts whose file permissions are
+looser than `0600`, and any provider directory that cannot be read (non-zero
+exit) — secret-free by construction, the same as `list`.
 
 ## More models
 
