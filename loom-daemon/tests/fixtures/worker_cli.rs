@@ -54,6 +54,7 @@ fn main() {
         "LOOM_MODEL",
         "LOOM_TEST_ALLOW_SYSTEMD",
         "LOOM_DAEMON_LOG",
+        "CARGO_INCREMENTAL",
     ] {
         println!("{key}={}", std::env::var(key).unwrap_or_default());
     }
