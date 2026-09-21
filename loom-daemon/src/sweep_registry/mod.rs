@@ -146,7 +146,6 @@ pub use model::*;
 pub use noop_cooldown::*;
 #[allow(unused_imports)]
 pub use outcome_journal::*;
-#[allow(unused_imports)]
 pub use quarantine::*;
 pub use quarantine_escalation::*;
 #[allow(unused_imports)]
