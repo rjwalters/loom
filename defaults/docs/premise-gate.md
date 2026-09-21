@@ -135,6 +135,15 @@ A citation resolves when it names a repo-relative path (optionally `:line` or
 `:line-line`) that exists, or an `ADR-NNNN` identifier resolving under
 `docs/adr/`.
 
+**Which tree it resolves against: the working tree you invoke from** (#8499).
+Run from `.loom/worktrees/issue-N`, a citation is checked against *that*
+worktree — not the primary clone it was created from, which sits on `main` and
+is routinely several commits behind. This is deliberately **not** the root
+`.loom/config.json` is read from: shared state is one-per-clone, file content is
+one-per-worktree. `--repo-root <path>` overrides both. When a citation does not
+resolve, `REASON=` names the tree it was resolved against, so a mismatch is
+readable from the output alone.
+
 **What this cannot do**, stated plainly: nothing stops an agent writing
 `deliberate=no` about a behaviour that is in fact deliberate. What the format
 does is force that claim to be written down, next to the paths it says it
