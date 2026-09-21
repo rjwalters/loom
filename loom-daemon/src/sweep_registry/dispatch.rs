@@ -1,6 +1,9 @@
 //! The dispatch call path: `SweepRegistry::dispatch`, dispatch-backoff
 //! bookkeeping, and peer-claim publishing.
 
+#[path = "log_paths.rs"]
+mod log_paths;
+
 use super::*;
 
 mod child_env_markers;
