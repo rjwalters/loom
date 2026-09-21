@@ -948,7 +948,48 @@ _check_loom_pr_label
 # said no" (a present, contradicting signal). Those are different acts, and
 # only the first has a documented override. The fix for a real block here is
 # a fresh Judge verdict, not a flag.
-_check_verdict_label_contradiction() { local msg rc=0; msg="$(printf '%s\n' "$PR_LABELS" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr verdict-contradiction --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" 2>/dev/null)" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-VERDICT-CLEAN" ]] && return 0; [[ $rc -eq 1 && "$msg" == "Merge blocked:"* ]] || msg="Merge blocked: PR #$PR_NUMBER's verdict-label contradiction guard (#8112) could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr verdict-contradiction' exited $rc without the LOOM-VERDICT-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'found nothing' from 'never ran', so only a positive clean signal is accepted. Build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; error "$msg"; }
+#
+# ---------------------------------------------------------------------------
+# DAEMON VERSION FLOOR (#8285)
+# ---------------------------------------------------------------------------
+# This script hard-requires two loom-daemon subcommands and fails CLOSED when
+# the resolved binary predates either. Failing closed is right — an empty
+# answer from the closing-reference analysis is indistinguishable from "no
+# closing refs", which would silently close an unfinished issue — but the
+# version floor has to be SAYABLE, or the refusal cannot tell an operator what
+# to roll to. These two markers are that declaration. They are the single
+# source of truth: `_mp_daemon_roll_hint` below reads them back out of
+# ${BASH_SOURCE[0]} at refusal time, and
+# scripts/check-daemon-subcommand-versions.sh enforces that no NEW daemon
+# dependency lands here (or in any other shell script) without one.
+#
+# On 2026-09-18 a host running 0.19.161 against a `main` that carried 0.19.170+
+# stopped every merge outright — `.loom/scripts` is a symlink into
+# `defaults/scripts` in the primary checkout, so the floor moved the instant
+# `main` was pulled, while the auto-update loop deferred ~4.5h behind the
+# build-stampede guard (#8252). The refusal named neither the version nor the
+# roll command. That is what these markers and the hint below fix.
+#
+# requires-daemon: merge-pr >= 0.19.172   verdict-contradiction guard (#8112, landed in #8124)
+# requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
+#
+# _mp_daemon_roll_hint <subcommand> [resolved-bin] -- the concrete, host-local
+# remediation for "your loom-daemon is too old for <subcommand>": the declared
+# floor, what the resolved binary actually reports, the artifact-first roll
+# command for THIS host, and the two fallbacks when no artifact carries the
+# floor yet. Written as a one-liner because merge-pr.sh is frozen by the
+# file-size ratchet (scripts/check-file-size-budget.sh) and may not grow.
+#
+# Both reads carry `|| true` deliberately. merge-pr.sh runs under `set -euo
+# pipefail`, and a bare `x="$(cmd)"` assignment adopts cmd's status — so an
+# unreadable ${BASH_SOURCE[0]} or a `--version` that exits non-zero would abort
+# THIS function partway, and the caller (an `error "… $(…)"` argument) would
+# print a refusal with the remediation silently truncated off the end. A
+# best-effort diagnostic must never be able to degrade the message it is
+# decorating. (The `if` over a `[[ … ]] && { … }` is for the same reason stated
+# defensively; bash exempts AND-lists from `set -e`, so that one is style.)
+_mp_daemon_roll_hint() { local sub="${1:-}" bin="${2:-}" min="" have=""; min="$(sed -n "/^# requires-daemon: ${sub} >= /{s|^# requires-daemon: ${sub} >= \\([0-9][0-9.]*\\).*|\\1|p;q;}" "${BASH_SOURCE[0]}" 2>/dev/null || true)"; if [[ -n "$bin" && -x "$bin" ]]; then have="$("$bin" --version 2>/dev/null || true)"; have="${have%%$'\n'*}"; fi; printf "REMEDIATION: this script requires loom-daemon >= %s for '%s'%s. Roll THIS host, artifact-first: %s/cli/loom-daemon-update.sh --fetch — it resolves the newest published release >= the installed version, verifies its checksum (and signature when present), provisions it and restarts the daemon under its supervisor; then re-run this merge. If no release artifact carries %s yet (releases are cut at fleet-rollable boundaries, not on every VERSION bump — see .loom/docs/release-cadence.md), either build it yourself — cargo build --release -p loom-daemon — and export LOOM_DAEMON_BIN=<repo>/target/release/loom-daemon, or pin LOOM_DAEMON_BIN to an existing build that already has '%s'. Confirm before re-running: %s --version && %s %s --help" "${min:-<undeclared>}" "$sub" "${have:+ (the resolved binary reports: $have)}" "${SCRIPT_DIR:-.loom/scripts}" "${min:-that version}" "$sub" "${bin:-loom-daemon}" "${bin:-loom-daemon}" "$sub"; }
+_check_verdict_label_contradiction() { local msg rc=0; msg="$(printf '%s\n' "$PR_LABELS" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr verdict-contradiction --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" 2>/dev/null)" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-VERDICT-CLEAN" ]] && return 0; [[ $rc -eq 1 && "$msg" == "Merge blocked:"* ]] || msg="Merge blocked: PR #$PR_NUMBER's verdict-label contradiction guard (#8112) could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr verdict-contradiction' exited $rc without the LOOM-VERDICT-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'found nothing' from 'never ran', so only a positive clean signal is accepted. $(_mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; error "$msg"; }
 _check_verdict_label_contradiction
 
 # ---------------------------------------------------------------------------
@@ -1101,13 +1142,13 @@ _mp_refs() {
     [[ -x "$bin" ]] || error "merge-pr.sh: LOOM_DAEMON_SELF_BIN/LOOM_DAEMON_BIN is set to '$bin', which is not executable. Refusing rather than silently falling back to a different loom-daemon."
   else
     bin="$(command -v loom-daemon 2>/dev/null || printf '%s' "$HOME/.local/bin/loom-daemon")"
-    [[ -x "$bin" ]] || error "merge-pr.sh needs loom-daemon for its closing-reference analysis (#8191) and could not resolve one. Refusing rather than proceeding with no answer: an empty result is indistinguishable from 'no references', which would close an unfinished issue or reopen a correctly closed one."
+    [[ -x "$bin" ]] || error "merge-pr.sh needs loom-daemon for its closing-reference analysis (#8191) and could not resolve one. Refusing rather than proceeding with no answer: an empty result is indistinguishable from 'no references', which would close an unfinished issue or reopen a correctly closed one. $(_mp_daemon_roll_hint merge-pr-refs)"
   fi
   # `|| rc=$?`, not `; rc=$?`: under `set -e` a failing command substitution in
   # a bare assignment aborts the script AT THAT LINE, so the check below never
   # ran and the refusal was silent — fail-closed, but with nothing said.
   out="$("$bin" merge-pr-refs "$@" 2>/dev/null)" || rc=$?
-  [[ "$rc" -eq 0 ]] || error "merge-pr.sh's closing-reference analysis failed: '$bin merge-pr-refs $*' exited $rc. A loom-daemon predating #8191 has no such subcommand -- update it, or pin LOOM_DAEMON_BIN to a build that has it. Refusing rather than treating an empty result as 'no references'."
+  [[ "$rc" -eq 0 ]] || error "merge-pr.sh's closing-reference analysis failed: '$bin merge-pr-refs $*' exited $rc. A loom-daemon predating #8191 has no such subcommand. Refusing rather than treating an empty result as 'no references'. $(_mp_daemon_roll_hint merge-pr-refs "$bin")"
   printf '%s' "$out"
 }
 
@@ -2944,8 +2985,7 @@ _find_worktree_by_branch() {
 #
 # Never fails the cleanup pipeline — always returns 0, warns on errors.
 _maybe_delete_local_branch() {
-  local branch="$1"
-  local expected_head_sha="${2:-}"
+  local branch="$1" expected_head_sha="${2:-}"
   if [[ -z "$branch" ]]; then
     return 0
   fi

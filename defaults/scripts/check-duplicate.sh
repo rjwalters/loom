@@ -376,6 +376,7 @@ search_similar_issues() {
 }
 
 # Search for similar recently merged PRs. Fetch here, scan in the daemon
+# requires-daemon: duplicate-scan >= 0.19.224  #8412 — the scan port; without it the helper exits 2 (pool incomplete) and create-issue fails open
 # (#8360) -- same split as search_similar_issues().
 search_merged_prs() {
     local title="$1"

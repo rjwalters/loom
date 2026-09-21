@@ -737,6 +737,88 @@ they find one — scoped to a symlink whose target resolves through a
 `loom-tools` path segment and no longer exists, so a same-named script you
 authored yourself is never touched. No manual action needed on either path.
 
+### `merge-pr.sh` refuses after a `git pull` — roll the daemon (#8285)
+
+**Symptom**: merges on ONE host stop dead, immediately after pulling `main`,
+with a refusal naming a `loom-daemon` subcommand:
+
+```
+merge-pr.sh's closing-reference analysis failed: '<bin> merge-pr-refs closing-refs' exited 2.
+A loom-daemon predating #8191 has no such subcommand.
+```
+
+Other hosts keep merging. Nothing about the PR is wrong.
+
+**Root cause**: `merge-pr.sh` hard-requires two `loom-daemon` subcommands and
+**fails closed** when the resolved binary predates either — correctly, because
+an empty answer from the closing-reference analysis is indistinguishable from
+"no closing refs", and acting on it would close an unfinished issue or reopen a
+correctly closed one. In the primary Loom checkout `.loom/scripts` is a
+**symlink** into `defaults/scripts`, so the version floor moves the instant you
+`git pull`, while the binary on the host does not. If the auto-update loop is
+deferring — e.g. behind the build-stampede guard (#8252), which held for ~4.5h
+on 2026-09-18 — the host stays stalled until someone rolls the daemon by hand.
+
+**The floor is declared in the script itself**, so you never have to guess it.
+The refusal now quotes it, and you can read it directly:
+
+```bash
+grep '^# requires-daemon:' .loom/scripts/merge-pr.sh
+loom-daemon --version          # what this host actually has
+```
+
+**Remedy — roll the daemon, artifact-first** (the 2026-09-18 recipe):
+
+```bash
+# 1. Is a release artifact published that carries the floor? (read-only)
+./.loom/scripts/cli/loom-daemon-update.sh --resolve-json | head -40
+
+# 2. Fetch + verify + provision + supervised restart. Hard-fails rather than
+#    silently falling back to a source build if no matching artifact resolves.
+./.loom/scripts/cli/loom-daemon-update.sh --fetch
+
+# 3. Now the pull is safe to take (or re-take).
+git pull --ff-only
+
+# 4. Confirm before re-running the real merge.
+loom-daemon --version
+./.loom/scripts/merge-pr.sh <PR> --dry-run
+```
+
+**If no artifact carries the floor yet** — releases are cut at fleet-rollable
+boundaries, not on every `VERSION` bump (see
+[`release-cadence.md`](release-cadence.md)), so `main` routinely runs ahead of
+the newest published release — you have two options, both of which keep the
+fail-closed guarantee:
+
+```bash
+# Build it yourself and pin merge-pr.sh at that binary:
+cargo build --release -p loom-daemon
+export LOOM_DAEMON_BIN="$PWD/target/release/loom-daemon"
+
+# …or pin an existing build you know already has the subcommand:
+export LOOM_DAEMON_BIN=/path/to/known-good/loom-daemon
+```
+
+Do **not** work around it by reverting the pull or by hand-editing the refusal
+out. The guard is the only thing standing between a stale binary and a silently
+mis-closed issue.
+
+**Preventing the next one**: `scripts/check-daemon-subcommand-versions.sh`
+fails CI when a shell script gains a NEW `loom-daemon <subcommand>` dependency
+without declaring its floor:
+
+```
+# requires-daemon: <subcommand> >= <version>   <which PR added it>
+# requires-daemon: <subcommand> optional       <how it degrades>
+```
+
+It is a one-way ratchet over `scripts/daemon-subcommand-baseline.txt` — every
+dependency that predates the convention is grandfathered, so the gate fires
+only at the moment someone moves the floor. Run
+`scripts/check-daemon-subcommand-versions.sh --help` for the full convention,
+and `--list` to see every daemon dependency in the tree.
+
 ### `rm` of the installed `loom-daemon` binary is denied in an agent session (#5675)
 
 **Symptom**: a self-build/reinstall verification step run from an agent session
