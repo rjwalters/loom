@@ -95,7 +95,9 @@ import type { ActiveSweepState, FleetSnapshot } from "./fleetState";
  * field on an existing kind does NOT appear in a public response until it is
  * added here on purpose. */
 const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
-  "sweep.started": ["kind", "started_at", "model", "effort"],
+  // `runtime` (the adapter the sweep ran on — `claude`/`codex`/…) is fleet
+  // capacity metadata like `model`: it names no repo, issue, or operator.
+  "sweep.started": ["kind", "started_at", "model", "effort", "runtime"],
   "sweep.phase": ["kind", "phase", "entered_at"],
   "sweep.completed": ["kind", "completed_at", "result"],
   "sweep.outcome": ["kind", "model", "effort", "config", "phase_durations", "total_duration_sec", "result"],
@@ -207,6 +209,7 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
  * unmeasurable probe is absent, never a fake `0`. */
 interface TokenAccountRow {
   account?: unknown;
+  provider?: unknown;
   rank?: unknown;
   usage_fraction?: unknown;
   limit_window_reset_at?: unknown;
@@ -226,6 +229,27 @@ export interface TokenPoolAggregate {
   /** Earliest limit-window reset across the pool — a fleet-level "capacity
    * returns at" that names no account. `null` when none reported one. */
   next_limit_window_reset_at: string | null;
+  /** The same aggregate, one entry per provider (`claude`, `codex`, …), in
+   * first-seen order. A row without a `provider` is a pre-per-provider
+   * daemon's Claude row, so it is folded into `"claude"`. Provider names are
+   * the daemon's own `AccountProvider` vocabulary, not account identifiers,
+   * so they are as public as `account_count` itself. */
+  providers: ProviderPoolAggregate[];
+}
+
+/** One provider's slice of {@link TokenPoolAggregate}. */
+export interface ProviderPoolAggregate {
+  provider: string;
+  account_count: number;
+  exhausted_count: number;
+  max_usage_fraction: number | null;
+  next_limit_window_reset_at: string | null;
+}
+
+/** The provider a `tokens.snapshot` row belongs to — `"claude"` when the
+ * emitting daemon predates per-provider pools and sent none. */
+function rowProvider(row: TokenAccountRow): string {
+  return typeof row.provider === "string" && row.provider.length > 0 ? row.provider : "claude";
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -263,12 +287,44 @@ export function deriveTokenPoolAggregate(payload: Record<string, unknown>): Toke
     .filter((value): value is string => typeof value === "string" && value.length > 0)
     .sort();
 
+  const providers: ProviderPoolAggregate[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const provider = rowProvider(row);
+    let slice = providers.find((entry) => entry.provider === provider);
+    if (!slice) {
+      slice = {
+        provider,
+        account_count: 0,
+        exhausted_count: 0,
+        max_usage_fraction: null,
+        next_limit_window_reset_at: null,
+      };
+      providers.push(slice);
+    }
+    slice.account_count += 1;
+    if (row.exhausted === true) slice.exhausted_count += 1;
+    if (isFiniteNumber(row.usage_fraction)) {
+      const usage = round4(row.usage_fraction);
+      slice.max_usage_fraction =
+        slice.max_usage_fraction === null ? usage : Math.max(slice.max_usage_fraction, usage);
+    }
+    const reset = row.limit_window_reset_at;
+    if (typeof reset === "string" && reset.length > 0) {
+      slice.next_limit_window_reset_at =
+        slice.next_limit_window_reset_at === null || reset < slice.next_limit_window_reset_at
+          ? reset
+          : slice.next_limit_window_reset_at;
+    }
+  }
+
   return {
     account_count: rows.length,
     exhausted_count: rows.filter((row) => row?.exhausted === true).length,
     mean_usage_fraction: usages.length ? round4(usages.reduce((sum, u) => sum + u, 0) / usages.length) : null,
     max_usage_fraction: usages.length ? round4(Math.max(...usages)) : null,
     next_limit_window_reset_at: resets[0] ?? null,
+    providers,
   };
 }
 
@@ -590,13 +646,14 @@ export interface PublicActiveSweep {
   enteredPhaseAt?: string;
   model?: string;
   effort?: string;
+  runtime?: string;
   updatedAt: string;
 }
 
 /** Redact one `ActiveSweepState` (the Durable Object's live per-sweep
  * entry). Mirrors `redactHistoryRecord`'s field selection: repo/issue/sweep
  * id are stripped for a private, unauthenticated view; every other field
- * (phase, timing, model/effort) is aggregate/lifecycle metadata, not
+ * (phase, timing, model/effort/runtime) is aggregate/lifecycle metadata, not
  * repo-identifying, and survives. */
 export function redactActiveSweep(sweep: ActiveSweepState, isAuthenticated: boolean): PublicActiveSweep {
   if (!isPrivateAndUnauthenticated(sweep.visibility, isAuthenticated)) {
@@ -610,6 +667,7 @@ export function redactActiveSweep(sweep: ActiveSweepState, isAuthenticated: bool
     enteredPhaseAt: sweep.enteredPhaseAt,
     model: sweep.model,
     effort: sweep.effort,
+    runtime: sweep.runtime,
     updatedAt: sweep.updatedAt,
   };
 }

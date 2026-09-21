@@ -29,6 +29,7 @@ fn sweep_started() -> TelemetryRecord {
         started_at: ts(),
         model: Some("opus".to_string()),
         effort: Some("high".to_string()),
+        runtime: Some("claude".to_string()),
     })
 }
 
@@ -121,6 +122,7 @@ fn tokens_snapshot() -> TelemetryRecord {
         accounts: vec![
             TokenAccountState {
                 account: "agent-1".to_string(),
+                provider: "claude".to_string(),
                 rank: Some(0),
                 usage_fraction: Some(0.42),
                 limit_window_reset_at: Some(ts()),
@@ -128,6 +130,7 @@ fn tokens_snapshot() -> TelemetryRecord {
             },
             TokenAccountState {
                 account: "agent-2".to_string(),
+                provider: "codex".to_string(),
                 rank: None,
                 usage_fraction: None,
                 limit_window_reset_at: None,

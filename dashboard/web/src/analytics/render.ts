@@ -51,6 +51,7 @@ import { parsePoolSamples, parseSweepWindows, parseTokenSamples } from "./parse.
 import type { HistoryEnvelope, PoolSample, SweepWindow, TokenSample } from "./types.js";
 import { fetchHistory } from "./api.js";
 import { formatDuration, formatInstant, formatPercent, formatRatePerHour, formatRelative, UNKNOWN } from "./format.js";
+import { providerDisplayName, providerMark } from "../providers.js";
 
 /** Which route surface the panel is being rendered on. */
 export type DashboardSurface = "authenticated" | "public";
@@ -210,9 +211,33 @@ function renderBurnCurves(curves: readonly AccountBurnCurve[]): HTMLElement {
     return block;
   }
 
-  const list = el("div", "burn-grid");
-  for (const curve of curves) list.appendChild(renderBurnCard(curve));
-  block.appendChild(list);
+  // One group per provider, in the order `buildBurnCurves` already sorted
+  // them: a Claude pool and a Codex pool are separate quotas, so they read as
+  // separate sections with their own availability count, not one mixed grid.
+  const groups = new Map<string, AccountBurnCurve[]>();
+  for (const curve of curves) {
+    const group = groups.get(curve.provider);
+    if (group) group.push(curve);
+    else groups.set(curve.provider, [curve]);
+  }
+  for (const [provider, group] of groups) {
+    const section = el("section", "burn-group");
+    section.setAttribute("data-testid", "burn-group");
+    section.setAttribute("data-provider", provider);
+
+    const heading = el("h4", "burn-group__heading");
+    heading.appendChild(providerMark(provider, true));
+    const available = group.filter((curve) => !curve.exhausted).length;
+    heading.appendChild(
+      el("span", "burn-group__count", `${available}/${group.length} available`),
+    );
+    section.appendChild(heading);
+
+    const list = el("div", "burn-grid");
+    for (const curve of group) list.appendChild(renderBurnCard(curve));
+    section.appendChild(list);
+    block.appendChild(section);
+  }
   return block;
 }
 
@@ -228,37 +253,64 @@ function renderBurnCard(curve: AccountBurnCurve): HTMLElement {
   const exhausted = curve.exhausted;
   const card = el("article", `burn-card${exhausted ? " burn-card--exhausted" : ""}`);
   card.setAttribute("data-account", curve.account);
+  card.setAttribute("data-provider", curve.provider);
   card.setAttribute("data-hosts", curve.hostIds.join(","));
   card.setAttribute("data-exhausted", String(exhausted));
 
+  // Two rows, neither allowed to overflow the card: the identity line (mark,
+  // name with ellipsis, host tag) and a badge line that wraps. The old
+  // single flex row clipped the badges off the right edge of every busy card.
   const head = el("header", "burn-card__head");
-  head.appendChild(el("span", "burn-card__account", curve.account));
+  const identity = el("div", "burn-card__identity");
+  identity.appendChild(providerMark(curve.provider));
+  const name = el("span", "burn-card__account", curve.account);
+  name.title = `${providerDisplayName(curve.provider)} account ${curve.account}`;
+  identity.appendChild(name);
   // Provenance, not identity: one account, however many hosts reported it.
-  head.appendChild(el("span", "burn-card__host", formatHosts(curve.hostIds)));
-  if (curve.divergentHosts.length > 0) {
-    // Same local name, contradictory readings — plausibly different upstream
-    // accounts merged into one series. Say so rather than quietly averaging
-    // two unrelated quotas (see burn.ts's findDivergentHosts).
-    const warn = el("span", "badge badge--divergent", "CONFLICTING");
-    warn.setAttribute("data-testid", "divergent-hosts");
-    warn.title = `Hosts disagree on this account's usage: ${curve.divergentHosts.join(", ")}. It may name different accounts on different hosts.`;
-    head.appendChild(warn);
-  }
+  const host = el("span", "burn-card__host", formatHosts(curve.hostIds));
+  host.title = curve.hostIds.join(", ");
+  identity.appendChild(host);
+  head.appendChild(identity);
+
+  const badges = el("div", "burn-card__badges");
   if (exhausted) {
     // The distinct visual flag AC4 requires: a badge, a card modifier class,
     // and a machine-readable data attribute — belt, braces, and a test hook.
     const badge = el("span", "badge badge--exhausted", "EXHAUSTED");
     badge.setAttribute("data-testid", "exhausted-badge");
     badge.setAttribute("role", "status");
-    head.appendChild(badge);
+    badges.appendChild(badge);
   } else if (curve.everExhausted) {
-    head.appendChild(el("span", "badge badge--recovered", "recovered"));
+    badges.appendChild(el("span", "badge badge--recovered", "recovered"));
   }
+  if (curve.divergentHosts.length > 0) {
+    // Same local name, contradictory readings — plausibly different upstream
+    // accounts merged into one series. Say so rather than quietly averaging
+    // two unrelated quotas (see burn.ts's findDivergentHosts).
+    const warn = el("span", "badge badge--divergent", "hosts disagree");
+    warn.setAttribute("data-testid", "divergent-hosts");
+    warn.title = `Hosts disagree on this account's usage: ${curve.divergentHosts.join(", ")}. It may name different accounts on different hosts.`;
+    badges.appendChild(warn);
+  }
+  if (badges.childElementCount > 0) head.appendChild(badges);
   card.appendChild(head);
 
-  card.appendChild(renderSparkline(curve));
-
   const latest = curve.points[curve.points.length - 1];
+  if (curve.points.length === 0) {
+    // No usage telemetry at all (a Codex account: the registry knows it is
+    // available or held, but nothing measures its burn). An empty sparkline
+    // would read as "0% forever"; say what is actually known instead.
+    const state = el(
+      "p",
+      "burn-card__state",
+      exhausted ? "Held — no usage telemetry for this pool" : "Available — no usage telemetry for this pool",
+    );
+    state.setAttribute("data-testid", "burn-card-state");
+    card.appendChild(state);
+  } else {
+    card.appendChild(renderSparkline(curve));
+  }
+
   const foot = el("footer", "burn-card__foot");
   foot.appendChild(el("span", "burn-card__usage", formatPercent(latest?.usageFraction)));
   foot.appendChild(el("span", "burn-card__at", formatInstant(curve.latestAt || undefined)));
@@ -519,7 +571,10 @@ function renderForecasts(forecasts: readonly AccountForecast[], now: number): HT
     if (forecast.status === "exhausted" || forecast.status === "projected-exhaustion") {
       row.className = "row--at-risk";
     }
-    cell(row, forecast.account, "cell--account");
+    row.setAttribute("data-provider", forecast.provider);
+    const account = cell(row, "", "cell--account");
+    account.appendChild(providerMark(forecast.provider));
+    account.appendChild(el("span", "cell--account-name", forecast.account));
     cell(row, formatHosts(forecast.hostIds), "cell--host");
     cell(row, formatRatePerHour(forecast.slopePerHour));
     cell(row, formatPercent(forecast.latestUsageFraction));
@@ -550,7 +605,11 @@ function renderForecasts(forecasts: readonly AccountForecast[], now: number): HT
   }
 
   table.appendChild(tbody);
-  block.appendChild(table);
+  // Eight columns of timestamps do not fit a narrow viewport; scroll the
+  // table inside its block rather than letting it push the page sideways.
+  const scroller = el("div", "table-scroll");
+  scroller.appendChild(table);
+  block.appendChild(scroller);
   block.appendChild(
     el(
       "p",

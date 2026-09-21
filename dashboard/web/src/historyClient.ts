@@ -24,6 +24,12 @@ import type { HistoryQueryResult } from "./types.js";
 export interface HistoryQueryFilter {
   host?: string;
   repo?: string;
+  /** Exact-match record kind (`sweep.completed`, `sweep.outcome`, …). The
+   * API takes one kind per query, so a caller wanting several issues one
+   * query per kind. Omitted ⇒ every kind, which on a live fleet is
+   * overwhelmingly `host.health`/`tokens.snapshot` samples — see
+   * `historicalChartsPanel.ts` for why the charts never do that. */
+  kind?: string;
   model?: string;
   result?: string;
   /** RFC 3339 datetime — inclusive lower bound on `emittedAt`. */
@@ -61,6 +67,7 @@ function buildUrl(basePath: string, filter: HistoryQueryFilter, cursor: number |
   const params = new URLSearchParams();
   if (filter.host) params.set("host", filter.host);
   if (filter.repo) params.set("repo", filter.repo);
+  if (filter.kind) params.set("kind", filter.kind);
   if (filter.model) params.set("model", filter.model);
   if (filter.result) params.set("result", filter.result);
   if (filter.since) params.set("since", filter.since);

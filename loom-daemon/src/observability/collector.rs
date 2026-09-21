@@ -48,6 +48,7 @@ use crate::telemetry::{
     SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord, TokenAccountState,
     TokenSnapshotRecord,
 };
+use crate::tokens_pool::{account_health, account_inventory, AccountProvider};
 use crate::types::{Event, RoleTickRecord, SweepKind};
 use crate::workspace_pool::WorkspacePool;
 
@@ -280,6 +281,7 @@ pub(crate) fn map_event_to_records(
         Event::SweepGlobalDispatch {
             kind: SweepKind::Issue(_),
             sweep_id,
+            runtime,
             ..
         } => {
             let started_at = Utc::now();
@@ -299,6 +301,10 @@ pub(crate) fn map_event_to_records(
                 started_at,
                 model: None,
                 effort: None,
+                // The dispatch event already names the admitted runtime
+                // adapter; carrying it here is what lets the dashboard say
+                // *which agent* is working each in-flight sweep.
+                runtime: runtime.clone(),
             })]
         }
         Event::SweepGlobalDispatch { .. } => Vec::new(),
@@ -505,7 +511,15 @@ async fn sample_snapshots(
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
 ) {
-    let token_record = sample_token_snapshot(workspace_root);
+    let mut token_record = sample_token_snapshot(workspace_root);
+    // The Claude pool comes from `.ranking`; every other provider's pool
+    // (`codex`, …) comes from the account registry + provider-health state.
+    // Joined here, not inside `sample_token_snapshot`, so the ranking reader
+    // stays a pure function of one file (and its tests stay hermetic on a
+    // host that has Codex profiles provisioned machine-wide).
+    token_record
+        .accounts
+        .extend(sample_registry_provider_accounts(workspace_root));
     queue.push(TelemetryEnvelope::new(host_id, TelemetryRecord::TokensSnapshot(token_record)));
     let health_record =
         sample_host_health(workspace_root, daemon_started_at, workspace_pool, slug_cache).await;
@@ -557,6 +571,7 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
             let exhausted = !crate::capacity::AccountHealth::parse(&row.status).is_healthy();
             accounts.push(TokenAccountState {
                 account: row.name,
+                provider: AccountProvider::Claude.to_string(),
                 rank: Some(u32::try_from(index).unwrap_or(u32::MAX)),
                 usage_fraction: row.util_5h,
                 limit_window_reset_at: parse_reset_instant(row.limit_reset.as_deref()),
@@ -568,6 +583,60 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
         captured_at: Utc::now(),
         accounts,
     }
+}
+
+/// The non-Claude providers' accounts (`codex`, …) from the multi-provider
+/// account registry, each with the account-wide eligibility verdict the
+/// daemon's own selector would give it right now.
+///
+/// These pools have no `.ranking` file: the registry knows *which* accounts
+/// exist and the provider-health state file knows whether each is currently
+/// held (`cooldown_until`, `ReauthRequired`), but neither measures a usage
+/// fraction. So `rank`/`usage_fraction` stay absent ("unknown, not zero"),
+/// `exhausted` is `!is_eligible_at(now)`, and `limit_window_reset_at` is the
+/// hold's deadline when there is one — the same "when does this account's
+/// constraint lift?" meaning the Claude rows carry. A disabled account is not
+/// part of the usable pool and is not reported; an unreadable registry or
+/// health file degrades to no rows for that provider rather than an error,
+/// matching the `.ranking` soft-fail above.
+fn sample_registry_provider_accounts(workspace_root: &Path) -> Vec<TokenAccountState> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut accounts = Vec::new();
+    for provider in AccountProvider::ALL {
+        if provider == AccountProvider::Claude {
+            continue;
+        }
+        let Ok(inventory) = account_inventory(workspace_root, provider) else {
+            continue;
+        };
+        for descriptor in inventory.into_iter().filter(|account| account.enabled) {
+            let health = account_health(workspace_root, &descriptor.id)
+                .ok()
+                .flatten();
+            let exhausted = health
+                .as_ref()
+                .is_some_and(|entry| !entry.is_eligible_at(now));
+            let limit_window_reset_at = health
+                .as_ref()
+                .filter(|_| exhausted)
+                .and_then(|entry| entry.cooldown_until)
+                .and_then(|deadline| {
+                    DateTime::<Utc>::from_timestamp(i64::try_from(deadline).ok()?, 0)
+                });
+            accounts.push(TokenAccountState {
+                account: descriptor.id.name,
+                provider: provider.to_string(),
+                rank: None,
+                usage_fraction: None,
+                limit_window_reset_at,
+                exhausted,
+            });
+        }
+    }
+    accounts
 }
 
 /// Sample host CPU/disk headroom into a [`HostHealthRecord`], stamped with the

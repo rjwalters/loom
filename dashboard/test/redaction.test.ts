@@ -90,6 +90,7 @@ describe("redactPayload — per-kind field allowlist", () => {
       started_at: "2026-07-30T12:00:00Z",
       model: "opus",
       effort: "high",
+      runtime: "codex",
       branch: "feature/issue-4703",
       issue_title: "Fix the thing",
     });
@@ -98,6 +99,7 @@ describe("redactPayload — per-kind field allowlist", () => {
       started_at: "2026-07-30T12:00:00Z",
       model: "opus",
       effort: "high",
+      runtime: "codex",
     });
   });
 
@@ -236,6 +238,17 @@ describe("redactPayload — per-kind field allowlist", () => {
       mean_usage_fraction: 0.44,
       max_usage_fraction: 0.9,
       next_limit_window_reset_at: "2026-08-02T03:00:00Z",
+      // Rows from a daemon that predates per-provider pools carry no
+      // `provider`; they are the Claude pool, and say so.
+      providers: [
+        {
+          provider: "claude",
+          account_count: 3,
+          exhausted_count: 1,
+          max_usage_fraction: 0.9,
+          next_limit_window_reset_at: "2026-08-02T03:00:00Z",
+        },
+      ],
     });
   });
 
@@ -889,7 +902,53 @@ describe("deriveTokenPoolAggregate", () => {
       mean_usage_fraction: null,
       max_usage_fraction: null,
       next_limit_window_reset_at: null,
+      providers: [
+        {
+          provider: "claude",
+          account_count: 1,
+          exhausted_count: 0,
+          max_usage_fraction: null,
+          next_limit_window_reset_at: null,
+        },
+      ],
     });
+  });
+
+  it("splits the aggregate per provider, in first-seen order, naming no account", () => {
+    const aggregate = deriveTokenPoolAggregate({
+      accounts: [
+        { account: "agent-1", provider: "claude", usage_fraction: 0.5, exhausted: false },
+        { account: "agent-2", provider: "claude", usage_fraction: 1, exhausted: true, limit_window_reset_at: "2026-08-02T03:00:00Z" },
+        { account: "cx-1", provider: "codex", exhausted: false },
+        { account: "cx-2", provider: "codex", exhausted: true, limit_window_reset_at: "2026-07-31T01:00:00Z" },
+        { account: "cx-3", provider: "codex", exhausted: true, limit_window_reset_at: "2026-07-30T20:00:00Z" },
+      ],
+    });
+    expect(aggregate.providers).toEqual([
+      {
+        provider: "claude",
+        account_count: 2,
+        exhausted_count: 1,
+        max_usage_fraction: 1,
+        next_limit_window_reset_at: "2026-08-02T03:00:00Z",
+      },
+      {
+        provider: "codex",
+        account_count: 3,
+        exhausted_count: 2,
+        // Codex accounts report no usage fraction — null, never 0.
+        max_usage_fraction: null,
+        next_limit_window_reset_at: "2026-07-30T20:00:00Z",
+      },
+    ]);
+    // Pool-wide totals still span every provider.
+    expect(aggregate.account_count).toBe(5);
+    expect(aggregate.exhausted_count).toBe(3);
+    expect(JSON.stringify(aggregate)).not.toMatch(/agent-|cx-/);
+  });
+
+  it("yields no provider slices at all for an empty pool", () => {
+    expect(deriveTokenPoolAggregate({ accounts: [] }).providers).toEqual([]);
   });
 
   it("averages only over accounts that reported a usage_fraction", () => {
@@ -924,6 +983,7 @@ describe("deriveTokenPoolAggregate", () => {
       mean_usage_fraction: null,
       max_usage_fraction: null,
       next_limit_window_reset_at: null,
+      providers: [],
     });
   });
 
