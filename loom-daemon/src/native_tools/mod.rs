@@ -3,7 +3,10 @@
 //! before execution. Unguarded harness tools are disabled independently of loading.
 mod cancellation;
 mod files;
-mod guard;
+/// `pub` so integration tests (and future telemetry consumers) can exercise
+/// the timeout-budget resolution and per-worker counter directly (#8451)
+/// without shelling out to the `runtime-tool` binary for every case.
+pub mod guard;
 pub mod provision;
 
 use anyhow::{bail, Context, Result};
