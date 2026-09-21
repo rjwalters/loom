@@ -2389,17 +2389,11 @@ mod tests {
     }
 
     // ---- repo_slug ----
-
-    #[test]
-    fn repo_slug_prefers_env_then_basename() {
-        // Env override wins.
-        std::env::set_var("LOOM_REPO", "rjwalters/loom");
-        assert_eq!(repo_slug(Path::new("/anything/here")), "rjwalters/loom");
-        std::env::remove_var("LOOM_REPO");
-        // Basename fallback is cross-host-stable for the same repo.
-        assert_eq!(repo_slug(Path::new("/Users/a/loom")), "loom");
-        assert_eq!(repo_slug(Path::new("/home/b/loom")), "loom");
-    }
+    //
+    // `repo_slug`'s coverage lives in the sibling `peer_claims/repo_slug_tests.rs`
+    // because it mutates the process-global `LOOM_REPO` and so must carry the
+    // crate-wide `#[serial]` key for that variable (#8496), and this file is
+    // frozen at its current size by scripts/file-size-baseline.txt.
 
     // ---- integration-shaped: two hosts, one issue, exactly one proceeds ----
 
@@ -2868,3 +2862,10 @@ mod tests {
         );
     }
 }
+
+// [`repo_slug`]'s coverage, in its own sibling file (#8496): it mutates the
+// process-global `LOOM_REPO` and therefore needs that variable's crate-wide
+// `#[serial]` key, which this over-threshold module has no line budget for
+// (scripts/file-size-baseline.txt).
+#[cfg(test)]
+mod repo_slug_tests;
