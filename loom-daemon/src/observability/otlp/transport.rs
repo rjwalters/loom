@@ -139,7 +139,9 @@ fn parse_response(signal: Signal, items: u64, bytes: &[u8]) -> ResponseOutcome {
     let Ok(serde_json::Value::Object(body)) = serde_json::from_slice(bytes) else {
         return invalid();
     };
-    let Some(partial) = body.get("partialSuccess") else {
+    // ProtoJSON null means unset, including message and scalar fields. OTLP's
+    // JSON deviations do not change that rule.
+    let Some(partial) = body.get("partialSuccess").filter(|value| !value.is_null()) else {
         return ResponseOutcome {
             counts: SignalCounts {
                 accepted: items,
@@ -153,21 +155,22 @@ fn parse_response(signal: Signal, items: u64, bytes: &[u8]) -> ResponseOutcome {
         return invalid();
     };
     let rejected = match partial.get(signal.rejected_field()) {
-        None => 0,
-        Some(serde_json::Value::String(s)) => match s.parse::<u64>() {
-            Ok(n) => n,
-            Err(_) => return invalid(),
-        },
-        Some(value) => match value.as_u64() {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(serde_json::Value::String(s)) => match integer_count(s) {
             Some(n) => n,
             None => return invalid(),
         },
+        Some(serde_json::Value::Number(value)) => match integer_count(&value.to_string()) {
+            Some(n) => n,
+            None => return invalid(),
+        },
+        Some(_) => return invalid(),
     };
     if rejected > items {
         return invalid();
     }
     let warning = match partial.get("errorMessage") {
-        None => false,
+        None | Some(serde_json::Value::Null) => false,
         Some(serde_json::Value::String(s)) => !s.is_empty(),
         Some(_) => return invalid(),
     };
@@ -186,6 +189,54 @@ fn parse_response(signal: Signal, items: u64, bytes: &[u8]) -> ResponseOutcome {
             ))
         }),
     }
+}
+
+/// ProtoJSON permits quoted/unquoted integer exponent notation. Parse decimal
+/// strings exactly: rounding a quoted fractional value through f64 would invent
+/// a whole rejected count. Response byte bounds also bound this parser's work.
+fn integer_count(text: &str) -> Option<u64> {
+    let (negative, text) = match text.strip_prefix('-') {
+        Some(text) => (true, text),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
+        None => (text, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{whole}{fraction}");
+    let mut digits = digits.trim_start_matches('0').to_owned();
+    if digits.is_empty() {
+        return Some(0);
+    }
+    if negative {
+        return None;
+    }
+    let mut scale = exponent.checked_sub(i32::try_from(fraction.len()).ok()?)?;
+    if scale < 0 {
+        let end = digits.len().checked_sub(scale.unsigned_abs() as usize)?;
+        if !digits.as_bytes()[end..].iter().all(|b| *b == b'0') {
+            return None;
+        }
+        digits.truncate(end);
+        scale = 0;
+    }
+    if digits.len().checked_add(scale as usize)? > 19 {
+        return None;
+    }
+    let value = digits
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(10_u64.checked_pow(scale as u32)?)?;
+    (value <= i64::MAX as u64).then_some(value)
 }
 
 #[cfg(test)]
@@ -220,7 +271,7 @@ mod tests {
             "",
             "not json",
             "[]",
-            r#"{"partialSuccess":null}"#,
+            r#"{"partialSuccess":[]}"#,
             r#"{"partialSuccess":{"rejectedLogRecords":"-1"}}"#,
             r#"{"partialSuccess":{"rejectedLogRecords":4}}"#,
         ] {
@@ -228,6 +279,61 @@ mod tests {
             assert!(!result.retry);
             assert_eq!(result.counts.dropped, 3);
             assert_eq!(result.counts.accepted, 0);
+        }
+    }
+
+    #[test]
+    fn protojson_null_fields_are_unset_for_every_signal() {
+        for (signal, field) in [
+            (Signal::Logs, "rejectedLogRecords"),
+            (Signal::Metrics, "rejectedDataPoints"),
+            (Signal::Traces, "rejectedSpans"),
+        ] {
+            for body in [
+                r#"{"partialSuccess":null}"#.to_owned(),
+                format!(r#"{{"partialSuccess":{{"{field}":null,"errorMessage":null}}}}"#),
+            ] {
+                let result = parse_response(signal, 3, body.as_bytes());
+                assert_eq!(result.counts.accepted, 3);
+                assert_eq!(result.counts.dropped, 0);
+                assert_eq!(result.counts.warnings, 0);
+                assert!(result.error.is_none());
+                assert!(!result.retry);
+            }
+            let body = format!(r#"{{"partialSuccess":{{"{field}":"2e0","errorMessage":null}}}}"#);
+            let result = parse_response(signal, 3, body.as_bytes());
+            assert_eq!(result.counts.accepted, 1);
+            assert_eq!(result.counts.rejected, 2);
+            assert_eq!(result.counts.warnings, 0);
+        }
+    }
+
+    #[test]
+    fn integer_exponents_preserve_counts_without_fractional_rounding() {
+        for value in ["2", "2.0", "2e0", "20e-1", r#""2e0""#, r#""0.2e1""#] {
+            let body = format!(r#"{{"partialSuccess":{{"rejectedLogRecords":{value}}}}}"#);
+            assert_eq!(
+                parse_response(Signal::Logs, 3, body.as_bytes())
+                    .counts
+                    .rejected,
+                2
+            );
+        }
+        assert_eq!(integer_count("9223372036854775807"), Some(i64::MAX as u64));
+        for value in [
+            "-1",
+            "1.5",
+            "1e100",
+            "1e-100",
+            "9223372036854775808",
+            "1.0000000000000001",
+            "NaN",
+            "Infinity",
+            "",
+            "2e",
+            "2e1e1",
+        ] {
+            assert_eq!(integer_count(value), None, "{value}");
         }
     }
 }
