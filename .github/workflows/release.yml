@@ -321,7 +321,11 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --package loom-daemon --release --target ${{ matrix.target }}
+        run: cargo build --package loom-daemon --release --features otlp --target ${{ matrix.target }}
+
+      - name: Verify released OTLP capability
+        if: ${{ !matrix.cross }}
+        run: target/${{ matrix.target }}/release/loom-daemon telemetry-capabilities --require-otlp
 
       - name: Package artifact
         run: |

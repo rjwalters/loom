@@ -85,6 +85,7 @@ pub mod endpoint_policy;
 pub mod exporter;
 #[cfg(feature = "otlp")]
 pub mod otlp;
+pub mod outcome;
 pub mod queue;
 pub mod sender;
 
@@ -394,113 +395,8 @@ pub fn global_host_id_mismatch() -> Option<crate::types::ObservabilityHostIdMism
 // Export liveness status (Issue #5083)
 // ============================================================================
 
-/// Live record of whether telemetry is actually *reaching* the backend, written
-/// by [`sender::try_flush`] on every attempt and read back by
-/// [`global_export_status`] for `loom-daemon status` / `health`.
-///
-/// The complement to [`HostIdStatus`], which is anomaly-only by design (#4830)
-/// and therefore cannot answer "is it working?" — only "is it working *wrong*
-/// in this one specific way?". This cell is always readable and always has an
-/// answer, including the answer #4830 could never give: *configured, running,
-/// and has never successfully exported anything*.
-///
-/// Unlike [`HostIdStatus`] this is **not** write-once: it is a rolling record,
-/// so `last_success_at` genuinely means "the last time data landed" and a watch
-/// loop can alert on its age.
-#[derive(Debug)]
-pub struct ExportStatus {
-    inner: std::sync::Mutex<crate::types::ObservabilityExportStatus>,
-}
-
-// Allow expect_used: a poisoned status mutex means another thread panicked
-// while holding it — unrecoverable, matching the crash-on-poison policy
-// `HostIdStatus` above (and `auto_update`/`ipc`) already use.
-#[allow(clippy::expect_used)]
-impl ExportStatus {
-    /// A status cell for an exporter that is starting *now* under `host_id`,
-    /// pushing to `endpoint` via `exporter` every `flush_interval_secs`.
-    #[must_use]
-    pub fn started(
-        host_id: &str,
-        endpoint: &str,
-        exporter: &str,
-        flush_interval_secs: u64,
-    ) -> Self {
-        ExportStatus {
-            inner: std::sync::Mutex::new(crate::types::ObservabilityExportStatus {
-                state: crate::types::ObservabilityExportState::Starting,
-                host_id: Some(host_id.to_string()),
-                ingest_host_id: None,
-                endpoint: Some(endpoint.to_string()),
-                exporter: Some(exporter.to_string()),
-                started_at: Some(chrono::Utc::now()),
-                last_success_at: None,
-                last_failure_at: None,
-                last_failure_detail: None,
-                records_exported: 0,
-                consecutive_failures: 0,
-                flush_interval_secs: Some(flush_interval_secs),
-            }),
-        }
-    }
-
-    /// Record `count` envelopes acked by the backend. Clears the consecutive-
-    /// failure run: the transport demonstrably works again.
-    pub fn record_success(&self, count: usize) {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("observability export status mutex poisoned");
-        guard.last_success_at = Some(chrono::Utc::now());
-        guard.records_exported = guard
-            .records_exported
-            .saturating_add(count.try_into().unwrap_or(u64::MAX));
-        guard.consecutive_failures = 0;
-    }
-
-    /// Record a failed flush attempt. `detail` is the exporter's own error
-    /// text; the previous `last_success_at` is deliberately preserved so the
-    /// surfaces can distinguish "used to work, broke 30s ago" from "never
-    /// worked at all".
-    pub fn record_failure(&self, detail: &str) {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("observability export status mutex poisoned");
-        guard.last_failure_at = Some(chrono::Utc::now());
-        guard.last_failure_detail = Some(detail.to_string());
-        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
-    }
-
-    /// A status cell for an exporter that never started because a required
-    /// piece of config could not be resolved (Issue #5337) — `enabled: true`
-    /// but no endpoint, no ingest key file, or an unreadable/empty ingest key
-    /// file. See [`crate::types::ObservabilityExportStatus::misconfigured`]
-    /// for the field semantics.
-    #[must_use]
-    pub fn misconfigured(endpoint: Option<String>, detail: String) -> Self {
-        ExportStatus {
-            inner: std::sync::Mutex::new(crate::types::ObservabilityExportStatus::misconfigured(
-                endpoint, detail,
-            )),
-        }
-    }
-
-    /// The current record, with [`crate::types::ObservabilityExportStatus::state`]
-    /// re-derived as of now. `ingest_host_id` is folded in from
-    /// [`global_host_id_mismatch`] by [`global_export_status`], not here — this
-    /// cell knows nothing about identity.
-    #[must_use]
-    pub fn snapshot(&self) -> crate::types::ObservabilityExportStatus {
-        let mut snapshot = self
-            .inner
-            .lock()
-            .expect("observability export status mutex poisoned")
-            .clone();
-        snapshot.state = snapshot.classify(chrono::Utc::now());
-        snapshot
-    }
-}
+mod status;
+pub use status::ExportStatus;
 
 /// Process-global export-status handle, registered by [`spawn_task`] when the
 /// exporter actually starts (a [`ExportStatus::started`] cell) **or** when it
@@ -648,6 +544,16 @@ pub fn spawn_task(
         )));
         return None;
     }
+    let exporter_kind = resolve_exporter(config);
+    #[cfg(not(feature = "otlp"))]
+    if exporter_kind == ExporterKind::Otlp {
+        let detail = "exporter=otlp requested but this daemon build was not compiled with the `otlp` Cargo feature".to_string();
+        register_global_export_status(Arc::new(ExportStatus::misconfigured(
+            Some(endpoint),
+            detail,
+        )));
+        return None;
+    }
     let Some(key_file) = resolve_ingest_key_file(config) else {
         let detail = "observability.ingestKeyFile not configured \
              (set observability.ingestKeyFile or $LOOM_OBSERVABILITY_INGEST_KEY_FILE)"
@@ -676,8 +582,6 @@ pub fn spawn_task(
     // than incidentally so — and the whole point of the check is that the two
     // halves being compared are the *same* identity the records are filed under.
     let host_id = crate::sweep_registry::host_identity();
-    let exporter_kind = resolve_exporter(config);
-
     let batch_size = resolve_batch_size(config);
     let flush_interval = Duration::from_secs(resolve_flush_interval_secs(config));
     let capacity = resolve_queue_capacity(config);
@@ -707,15 +611,6 @@ pub fn spawn_task(
         flush_interval.as_secs(),
     ));
 
-    let collector_handle = collector::spawn_task(
-        bus,
-        queue.clone(),
-        workspace_root,
-        host_id.clone(),
-        SNAPSHOT_INTERVAL,
-        daemon_started_at,
-        workspace_pool,
-    );
     // The two branches below construct different concrete `E: Exporter`
     // types and each call `sender::spawn_task` with their own — no
     // dyn/boxing needed, since both calls return the same
@@ -737,7 +632,7 @@ pub fn spawn_task(
             let exporter = match HttpsExporter::new(
                 endpoint.clone(),
                 ingest_key,
-                host_id,
+                host_id.clone(),
                 host_id_status,
             ) {
                 Ok(exporter) => exporter,
@@ -748,7 +643,13 @@ pub fn spawn_task(
                     return None;
                 }
             };
-            sender::spawn_task(queue, exporter, batch_size, flush_interval, export_status.clone())
+            sender::spawn_task(
+                queue.clone(),
+                exporter,
+                batch_size,
+                flush_interval,
+                export_status.clone(),
+            )
         }
         ExporterKind::Otlp => {
             // No `HostIdStatus` wiring here, deliberately (Issue #4830 vs.
@@ -785,7 +686,7 @@ pub fn spawn_task(
                     }
                 };
                 sender::spawn_task(
-                    queue,
+                    queue.clone(),
                     exporter,
                     batch_size,
                     flush_interval,
@@ -806,6 +707,15 @@ pub fn spawn_task(
             }
         }
     };
+    let collector_handle = collector::spawn_task(
+        bus,
+        queue.clone(),
+        workspace_root,
+        host_id.clone(),
+        SNAPSHOT_INTERVAL,
+        daemon_started_at,
+        workspace_pool,
+    );
     // Only reached when an exporter was constructed and its sender spawned —
     // every degrade-to-disabled path above returns early, so `disabled` on the
     // status wire stays truthful (Issue #5083).
@@ -1350,14 +1260,11 @@ mod tests {
     /// pre-existing `handles.is_none()` contract — same as the other three
     /// under-configured `spawn_task` tests above — for the OnceLock reason
     /// documented on `export_status_misconfigured_reports_a_distinct_sticky_state`.
-    /// `#[tokio::test]`, not a plain `#[test]`: `spawn_task` calls
-    /// `collector::spawn_task` (which needs a Tokio reactor) *before* it
-    /// branches on `exporter_kind`, so even the returns-`None` path must run
-    /// inside a runtime — same as the `#[cfg(feature = "otlp")]` sibling below.
+    /// No runtime is needed: reject before starting collectors or doing queue IO.
     #[cfg(not(feature = "otlp"))]
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn spawn_task_otlp_requested_without_the_feature_returns_none() {
+    fn spawn_task_otlp_requested_without_the_feature_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
@@ -1378,6 +1285,11 @@ mod tests {
             test_workspace_pool(),
         );
         assert!(handles.is_none());
+        assert_eq!(bus.receiver_count(), 0);
+        assert!(!dir
+            .path()
+            .join(".loom/logs/observability-queue.jsonl")
+            .exists());
     }
 
     /// The `otlp`-feature counterpart of

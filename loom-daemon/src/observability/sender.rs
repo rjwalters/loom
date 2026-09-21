@@ -32,7 +32,7 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 pub enum FlushOutcome {
     /// The queue was empty — nothing to send.
     Empty,
-    /// A batch of this many envelopes was exported and acked.
+    /// This many envelopes were resolved (exported or permanently dropped).
     Sent(usize),
     /// The export attempt failed; the batch remains queued for retry.
     Failed,
@@ -40,8 +40,8 @@ pub enum FlushOutcome {
 
 /// Attempt to send one batch (up to `batch_size` envelopes, peeked from the
 /// front of `queue`) via `exporter`. Only acks (removes) the batch from
-/// `queue` on a confirmed successful export — a failure leaves the queue
-/// untouched so the same envelopes are retried next time.
+/// `queue` for the prefix acknowledged by the exporter. A retryable failure
+/// preserves the suffix; permanent OTLP rejection/drop advances the prefix.
 ///
 /// Every decided attempt (sent or failed) is also recorded on `status` (Issue
 /// #5083) — this is the single point in the daemon that *knows* whether
@@ -56,27 +56,30 @@ pub async fn try_flush<E: Exporter>(
     batch_size: usize,
     status: &ExportStatus,
 ) -> FlushOutcome {
-    let batch = queue.peek_batch(batch_size);
+    let snapshot = queue.peek_snapshot(batch_size);
+    let batch = &snapshot.envelopes;
     if batch.is_empty() {
         return FlushOutcome::Empty;
     }
-    match exporter.emit_batch(&batch).await {
-        Ok(()) => {
-            let sent = batch.len();
-            queue.ack(sent);
-            status.record_success(sent);
-            FlushOutcome::Sent(sent)
-        }
-        Err(error) => {
-            log::warn!(
-                "observability: export failed, {} record(s) remain queued \
-                 (dropped_total={}): {error}",
-                queue.len(),
-                queue.dropped_total()
-            );
-            status.record_failure(&error.to_string());
-            FlushOutcome::Failed
-        }
+    let outcome = exporter.emit_batch_outcome(batch).await;
+    let acknowledged = outcome.acknowledged.min(batch.len());
+    queue.ack_snapshot(&snapshot, acknowledged);
+    status.record_signals(&outcome.signals);
+    if outcome.exported > 0 {
+        status.record_success(outcome.exported);
+    }
+    if let Some(error) = outcome.error {
+        log::warn!(
+            "observability: export diagnostic, {} envelope(s) remain queued: {error}",
+            queue.len()
+        );
+        status.record_failure(&error.to_string());
+    }
+    if acknowledged == batch.len() {
+        // Includes non-retryable drops: advance so a poison request cannot starve the queue.
+        FlushOutcome::Sent(acknowledged)
+    } else {
+        FlushOutcome::Failed
     }
 }
 
