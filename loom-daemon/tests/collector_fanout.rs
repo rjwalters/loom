@@ -92,7 +92,7 @@ impl Trial {
             ("loom_ingest_key", "fixture-loom-key"),
             ("clickstack_ingest_key", "fixture-clickstack-key"),
         ] {
-            fs::write(trial.dir.path().join(name), value).unwrap();
+            fs::write(trial.dir.path().join(name), format!("{value}\n")).unwrap();
         }
         trial
     }
@@ -285,7 +285,7 @@ fn three_signals_fan_out_auth_redact_and_survive_outage_restart() {
     ready(&trial.endpoint(&a, "4318"));
     ready(&trial.endpoint(&b, "4318"));
     let gateway = trial.start("gateway", &config, "gateway");
-    let endpoint = trial.endpoint(&gateway, "4318");
+    let mut endpoint = trial.endpoint(&gateway, "4318");
     ready(&endpoint);
     assert_eq!(send(&endpoint, "logs", "unauthorized-record", "wrong-key").status, 401);
     let rejected = send(&endpoint, "logs", "rejected", "reflected-secret-canary").body;
@@ -317,6 +317,8 @@ fn three_signals_fan_out_auth_redact_and_survive_outage_restart() {
         // Abrupt termination exercises persistent queues, not graceful draining.
         docker(&["kill", &gateway]);
         docker(&["start", &gateway]);
+        // Docker can reassign an ephemeral host port across stop/start.
+        endpoint = trial.endpoint(&gateway, "4318");
         ready(&endpoint);
         docker(&["start", down]);
         for signal in ["logs", "metrics", "traces"] {
@@ -387,7 +389,7 @@ fn queue_retry_storage_and_credentials_fail_visibly() {
     // Permanent backend 401 must show a send failure, not remain silently healthy.
     let sink = trial.start("authsink", &sink_config(true), "clickstack-collector");
     ready(&trial.endpoint(&sink, "4318"));
-    fs::write(trial.dir.path().join("clickstack_ingest_key"), "wrong-backend-key").unwrap();
+    fs::write(trial.dir.path().join("clickstack_ingest_key"), "wrong-backend-key\n").unwrap();
     let auth_gateway = trial.start("authfault", &config, "auth-gateway");
     let endpoint = trial.endpoint(&auth_gateway, "4318");
     ready(&endpoint);

@@ -48,7 +48,10 @@ the digest requires rerunning the Rust Docker contract tests.
 Host ingress is `http://127.0.0.1:14318`; authenticate with `Authorization:
 Bearer <Loom key>`. A daemon in another container must use gateway service DNS
 and container port 4318, not host loopback. ClickStack egress independently uses
-its **raw** `authorization` key. SigNoz community egress is unauthenticated on the
+its **raw** `authorization` key through a separate file-backed authenticator
+with an empty scheme. It trims LF/CRLF key-file endings; direct file-provider
+interpolation into headers does not. Both authenticators wait for readable key
+files and fail startup after a five-second retry budget. SigNoz community egress is unauthenticated on the
 private Docker network. Managed SigNoz requires a separate TLS endpoint and
 `signoz-ingestion-key` secret; change a local config copy and validate it. Never
 forward incoming client authorization to either backend.

@@ -2,6 +2,19 @@
 extensions:
   bearertokenauth/loom:
     filename: /run/secrets/loom_ingest_key
+    wait_for_token_file: true
+    retry_on_failure:
+      enabled: true
+      interval: 1s
+      max_retries: 5
+  bearertokenauth/clickstack:
+    filename: /run/secrets/clickstack_ingest_key
+    scheme: ""
+    wait_for_token_file: true
+    retry_on_failure:
+      enabled: true
+      interval: 1s
+      max_retries: 5
   file_storage/clickstack:
     directory: /var/lib/otelcol/clickstack
     create_directory: true
@@ -56,8 +69,8 @@ processors:
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318
-    headers:
-      authorization: ${file:/run/secrets/clickstack_ingest_key}
+    auth:
+      authenticator: bearertokenauth/clickstack
     timeout: 5s
     retry_on_failure:
       initial_interval: 1s
@@ -83,7 +96,7 @@ exporters:
       num_consumers: 2
       block_on_overflow: false
 service:
-  extensions: [bearertokenauth/loom, file_storage/clickstack, file_storage/signoz, health_check]
+  extensions: [bearertokenauth/loom, bearertokenauth/clickstack, file_storage/clickstack, file_storage/signoz, health_check]
   telemetry:
     logs:
       level: info
