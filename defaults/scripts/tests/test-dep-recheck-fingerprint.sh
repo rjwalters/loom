@@ -537,7 +537,7 @@ rm -f "$STUB_DIR/issue-100.json" "$STUB_DIR/issue-6333.json" "$STUB_DIR/issue-81
 # T15i (#8502 THE REGRESSION): a checklist item naming a CROSS-REPO
 # prerequisite as `owner/repo#N` - the shape a Curator in a consumer repo
 # naturally writes, because a bare `#N` would not resolve upstream. Live
-# repro: 2AMLogic/2am#532 named `rjwalters/loom#8257`, the pre-fix regex
+# repro: example-org/example-app#532 named `rjwalters/loom#8257`, the pre-fix regex
 # matched the line not at all (the character after `[ ]` is `r`, which is
 # neither a phrase, a `pr `/`issue ` token, nor a `#`), and the subcommand
 # reported DEPS='' / VERDICT=clear while #8257 was genuinely still OPEN.
@@ -580,7 +580,7 @@ jq -n '{state: "OPEN"}' >"$STUB_DIR/rjwalters__loom-issue-8257.json"
 jq -n '{body: "## Dependencies\n\n- [ ] rjwalters/loom#8257: upstream\n- [ ] #8257: local, same number on purpose\n"}' \
     >"$STUB_DIR/issue-532.json"
 out_mixed="$("$TARGET_SCRIPT" named-dependency --number 532 --repo owner/repo)"
-assert_eq "$(printf '8257:CLOSED\nrjwalters/loom#8257:OPEN')" "$(eval_var "$out_mixed" DEPS)" \
+assert_eq "$(printf '%s\n%s' '8257:CLOSED' 'rjwalters/loom#8257:OPEN')" "$(eval_var "$out_mixed" DEPS)" \
     "T15k: a bare #N and a cross-repo owner/repo#N with the SAME number are two distinct entries, each resolved in its own repo (#8502)"
 assert_eq "blocked" "$(field "$out_mixed" VERDICT)" \
     "T15k: the still-OPEN cross-repo half blocks even though the same-numbered local issue is CLOSED (#8502)"
