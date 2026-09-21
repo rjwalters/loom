@@ -25,9 +25,13 @@ use loom_daemon::script_helpers;
 
 #[path = "telemetry_export.rs"]
 mod telemetry_export;
+#[path = "telemetry_fixture.rs"]
+mod telemetry_fixture;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
+    /// Write deterministic synthetic telemetry and an independent-query manifest.
+    TelemetryFixture(telemetry_fixture::FixtureArgs),
     /// Send a bounded JSONL fixture to an explicit OTLP Collector endpoint.
     TelemetryExport(telemetry_export::TelemetryExportArgs),
     /// Report transport capabilities of this installed binary without reading configuration.
@@ -80,6 +84,7 @@ impl TelemetryCommand {
     /// it exits with the process code `check-usage.sh` branches on.
     pub(crate) async fn run(self) -> Result<()> {
         match self {
+            TelemetryCommand::TelemetryFixture(args) => args.run(),
             TelemetryCommand::TelemetryExport(args) => args.run().await,
             TelemetryCommand::TelemetryCapabilities { require_otlp } => {
                 println!(
