@@ -151,6 +151,7 @@ _fake_daemon() { # <path> <version-line-or-EMPTY> [serves-widget]
     chmod +x "$path"
 }
 
+_fake_daemon "$WORKDIR/daemon-0.16.0"   "loom-daemon 0.16.0 (commit 0160000, built 2026-07-29T00:00:00Z)"
 _fake_daemon "$WORKDIR/daemon-0.19.100" "loom-daemon 0.19.100 (commit deadbee, built 2026-09-01T00:00:00Z)"
 _fake_daemon "$WORKDIR/daemon-0.19.200" "loom-daemon 0.19.200 (commit cafebab, built 2026-09-20T00:00:00Z)" yes
 _fake_daemon "$WORKDIR/daemon-0.19.240" "loom-daemon 0.19.240 (commit f00ba12, built 2026-09-21T00:00:00Z)" yes
@@ -360,6 +361,130 @@ if [[ -f "$CHECKER" && -f "$SKIP_LABELS" ]]; then
 else
     echo "  SKIP: $CHECKER not present (consumer repo)"
 fi
+
+echo ""
+echo "Live adopters: the remaining eleven loom_exec_script_helper stubs (#8484)…"
+
+# One block per newly-adopting stub, mirroring the skip-labels.sh block above.
+# Four things are pinned per stub, and all four are properties of the STUB, not
+# of the preflight function (which the fixture tests above already cover):
+#
+#   1. the floor the file DECLARES is the one established from history — read
+#      back with the same sed grammar the preflight itself uses, so a marker
+#      that stops parsing fails here rather than silently going inert;
+#   2. that floor is semver and not above this repo's VERSION (a floor above it
+#      is a typo that would make every host refuse forever);
+#   3. against a binary BELOW the floor the stub really refuses, with the four
+#      actionable facts and WITHOUT clap's bare "unrecognized subcommand" —
+#      exercised through the real file, not a fixture copy of it;
+#   4. the refusal exits the code that entry point reserves for "could not run"
+#      — 2 where the subcommand uses 1 as DATA, 1 where it does not. This is
+#      the assertion that would catch a future `LOOM_SCRIPT_HELPER_MISSING_RC`
+#      deletion, which is otherwise invisible until a caller misreads a
+#      refusal as a verdict.
+#
+# …plus that check-daemon-subcommand-versions.sh now passes the file with an
+# EMPTY baseline, i.e. the declaration really did replace the grandfather row.
+: >"$WORKDIR/empty-baseline.txt"
+
+# assert_adopter <basename> <subcommand> <floor> <stale-bin> <want-rc> <gate-baseline> [args…]
+assert_adopter() {
+    local name="$1" sub="$2" want_floor="$3" bin="$4" want_rc="$5" gate_baseline="$6"
+    shift 6
+    local path="$SCRIPTS_DIR/$name" got_floor sorted gate_out gate_rc
+
+    if [[ ! -f "$path" ]]; then
+        echo "  SKIP: $path not present"
+        return 0
+    fi
+
+    got_floor="$(sed -n "/^[[:space:]]*#[[:space:]]*requires-daemon:[[:space:]]*${sub}[[:space:]][[:space:]]*>=/{s/^.*>=[[:space:]]*\([0-9][0-9.]*\).*\$/\1/p;q;}" "$path")"
+    assert_eq "$want_floor" "$got_floor" "$name declares '$sub >= $want_floor' (the version the subcommand actually landed in)"
+
+    TESTS_RUN=$((TESTS_RUN + 1))
+    sorted="$(sort -V <<<"$want_floor"$'\n'"$REPO_VERSION")"
+    if [[ "$want_floor" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+       && { [[ -z "$REPO_VERSION" ]] || [[ "${sorted%%$'\n'*}" == "$want_floor" ]]; }; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: $name's floor '$want_floor' is semver and <= VERSION ($REPO_VERSION)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: $name's floor '$want_floor' is not semver, or is above VERSION ($REPO_VERSION)"
+    fi
+
+    OUT="$(env LOOM_DAEMON_SELF_BIN="$bin" "$path" "$@" 2>&1)"; RC=$?
+    assert_eq "$want_rc" "$RC" "$name refuses on its reserved could-not-run code ($want_rc), never one the caller reads as an answer"
+    assert_contains "$OUT" "$want_floor" "$name's refusal names the floor"
+    assert_contains "$OUT" "cli/loom-daemon-update.sh --fetch" "$name's refusal names the roll command"
+    assert_contains "$OUT" "LOOM_DAEMON_BIN" "$name's refusal names the pin fallback"
+    assert_not_contains "$OUT" "unrecognized subcommand" "$name no longer surfaces the bare clap error"
+
+    if [[ -f "$CHECKER" ]]; then
+        gate_out="$(bash "$CHECKER" --baseline "$gate_baseline" "$path" 2>&1)"; gate_rc=$?
+        assert_eq "0" "$gate_rc" "check-daemon-subcommand-versions.sh passes $name against a baseline with no '$sub' row (declared, no longer grandfathered)"
+        [[ "$gate_rc" -eq 0 ]] || echo "    gate said: $gate_out"
+    fi
+}
+
+# agent-metrics.sh keeps a SECOND, still-grandfathered pair (`stats`), so its
+# gate baseline carries that row and only that row — an empty one would fail
+# for a dependency #8484 deliberately did not declare.
+printf '%s\t%s\n' "$SCRIPTS_DIR/agent-metrics.sh" "stats" >"$WORKDIR/agent-metrics-baseline.txt"
+
+# Champion's dependency-classification family — one commit, one floor
+# (91ebce3ea, #7952/#7953, merged at VERSION 0.19.98 → first shipped 0.19.99).
+# All three already reserved 2, because 1 is a finding here.
+assert_adopter detect-dependency-cycle.sh   detect-dependency-cycle   0.19.99 \
+    "$WORKDIR/daemon-0.19.9" 2 "$WORKDIR/empty-baseline.txt" --issue 1
+assert_adopter classify-dependency-block.sh classify-dependency-block 0.19.99 \
+    "$WORKDIR/daemon-0.19.9" 2 "$WORKDIR/empty-baseline.txt" --issue 1
+assert_adopter detect-startable-subset.sh   detect-startable-subset   0.19.99 \
+    "$WORKDIR/daemon-0.19.9" 2 "$WORKDIR/empty-baseline.txt" --issue 1
+
+# Curator's re-check fingerprints (71d1fbae3, #7961/#7969, merged at VERSION
+# 0.19.103 → first shipped 0.19.104). Driven from 0.19.100, which is ABOVE the
+# previous family's floor and below this one — so a lexicographic comparison
+# would get this pair exactly backwards.
+assert_adopter dep-recheck-fingerprint.sh   dep-recheck-fingerprint   0.19.104 \
+    "$WORKDIR/daemon-0.19.100" 2 "$WORKDIR/empty-baseline.txt" decide --hash deadbeef
+
+# The #4275/#4552 script-helper family — one commit (3f147e8f0), one floor.
+# It landed AFTER v0.16.0 was tagged, so 0.17.0 (3e5a9439e) is the first
+# version that shipped any of them, and 0.16.0 is the stale binary.
+assert_adopter check-usage.sh       usage            0.17.0 \
+    "$WORKDIR/daemon-0.16.0" 1 "$WORKDIR/empty-baseline.txt" --status
+assert_adopter checkpoint.sh        checkpoint       0.17.0 \
+    "$WORKDIR/daemon-0.16.0" 1 "$WORKDIR/empty-baseline.txt" stages
+assert_adopter resolve-model.sh     resolve-model    0.17.0 \
+    "$WORKDIR/daemon-0.16.0" 1 "$WORKDIR/empty-baseline.txt" opus
+assert_adopter strip-ansi.sh        strip-ansi       0.17.0 \
+    "$WORKDIR/daemon-0.16.0" 1 "$WORKDIR/empty-baseline.txt" --file /dev/null
+assert_adopter sweep-experiment.sh  sweep-experiment 0.17.0 \
+    "$WORKDIR/daemon-0.16.0" 1 "$WORKDIR/empty-baseline.txt" resolve-mode
+
+# validate-phase.sh is the one stub in that family whose exit 1 is an ANSWER
+# ("contract failed"), so #8484 set LOOM_SCRIPT_HELPER_MISSING_RC=2 on it at
+# the same time. want-rc 2 is therefore the point of this line, not a detail.
+assert_adopter validate-phase.sh    validate-phase   0.17.0 \
+    "$WORKDIR/daemon-0.16.0" 2 "$WORKDIR/empty-baseline.txt" builder 1
+
+# agent-metrics.sh declares `sweep-experiment` for its --model-experiment
+# branch only; the `stats` pair below it stays grandfathered.
+assert_adopter agent-metrics.sh     sweep-experiment 0.17.0 \
+    "$WORKDIR/daemon-0.16.0" 1 "$WORKDIR/agent-metrics-baseline.txt" --model-experiment
+
+echo ""
+echo "…and a binary AT each floor still execs, so the floors are not merely 'always refuse'…"
+
+# The mirror image of every block above: without this, a floor typo'd far into
+# the future would pass all of them (it refuses, actionably, every time) and
+# the suite would be measuring nothing but the refusal path.
+OUT="$(env LOOM_DAEMON_SELF_BIN="$WORKDIR/daemon-0.19.240" "$SCRIPTS_DIR/resolve-model.sh" opus 2>&1)"; RC=$?
+assert_not_contains "$OUT" "requires-daemon" "a binary above the 0.17.0 floor is not refused by resolve-model.sh"
+assert_contains "$OUT" "unrecognized subcommand" "…it reaches the exec, where the fixture binary's own error is what surfaces"
+
+OUT="$(env LOOM_DAEMON_SELF_BIN="$WORKDIR/daemon-0.19.240" "$SCRIPTS_DIR/dep-recheck-fingerprint.sh" decide --hash deadbeef 2>&1)"; RC=$?
+assert_not_contains "$OUT" "requires-daemon" "a binary above the 0.19.104 floor is not refused by dep-recheck-fingerprint.sh"
 
 echo ""
 echo "────────────────────────────────"
