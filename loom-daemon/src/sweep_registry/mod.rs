@@ -726,6 +726,22 @@ pub struct SweepRegistry {
     /// mutex, and blocking there is the 2026-07-26 wedge shape. Entries are
     /// removed as soon as the group drains, so this never accumulates.
     pending_group_reaps: HashMap<SweepId, PendingGroupReap>,
+    /// Explicit override for the filesystem-activity window
+    /// [`worktree_in_use`](Self::worktree_in_use) judges a worktree's mtimes
+    /// against (Issue #8487). `None` — the only value production ever holds —
+    /// means "resolve it per call from
+    /// [`ACTIVITY_WINDOW_ENV`](crate::worktree_activity::ACTIVITY_WINDOW_ENV),
+    /// else the default", i.e. byte-for-byte the pre-#8487 behavior.
+    ///
+    /// It exists because the *tests* need to say "this worktree is dirty and
+    /// QUIET" — every fixture worktree is written microseconds before the
+    /// assertion, so its mtimes always read as a live worker (#8413) unless the
+    /// filesystem leg is disabled. They used to say that by writing
+    /// `ACTIVITY_WINDOW_ENV=0` into the *process* environment and never
+    /// restoring it, which leaked "the gate is off" into every later test in
+    /// the same binary. Scoping the pin to one registry removes the shared
+    /// mutable global instead of adding another lock around it.
+    activity_window: Option<Duration>,
 }
 
 /// Resolve this host's identity string for collision records (Issue #4085) and
@@ -1044,59 +1060,21 @@ impl SweepRegistry {
             phase_history: HashMap::new(),
             sampled_loc: HashMap::new(),
             pending_group_reaps: HashMap::new(),
+            activity_window: None,
         }
     }
 
     /// Construct an empty registry with the given event bus pre-attached.
+    ///
+    /// Delegates to [`new`](Self::new) and attaches the bus, rather than
+    /// repeating its ~50-field initializer: the two differed only in `bus`,
+    /// and keeping a second copy meant every field added to the struct had to
+    /// be added in two places or the build broke (Issue #8487).
     #[must_use]
     pub fn with_event_bus(config: SweepRegistryConfig, bus: Arc<EventBus>) -> Self {
-        Self {
-            config,
-            entries: BTreeMap::new(),
-            children: BTreeMap::new(),
-            bus: Some(bus),
-            dispatch_stagger: Duration::ZERO,
-            last_spawn_at: None,
-            startup_proof_grace: Duration::from_secs(DEFAULT_STARTUP_PROOF_GRACE_SECS),
-            watchdog_retried: HashSet::new(),
-            watchdog_gaveup: HashSet::new(),
-            watchdog_progressed: HashSet::new(),
-            midbuild_retried: HashSet::new(),
-            midbuild_gaveup: HashSet::new(),
-            midbuild_inuse: HashSet::new(),
-            midbuild_liveclaim: HashSet::new(),
-            midbuild_lease_superseded: HashSet::new(),
-            review_stall_retried: HashSet::new(),
-            review_stall_gaveup: HashSet::new(),
-            quarantine_config: QuarantineConfig::default(),
-            insta_crash_counts: HashMap::new(),
-            resume_attempt_counts: HashMap::new(),
-            quarantined: HashMap::new(),
-            pending_quarantine_release: HashSet::new(),
-            detect_collisions: false,
-            collision_count: 0,
-            peer_claim_publisher: None,
-            peer_claims: None,
-            preflight_tripwire_config: PreflightTripwireConfig::default(),
-            preflight_death_streak: 0,
-            preflight_death_last_marker: None,
-            preflight_advisory_tripped: false,
-            preflight_probe_last_at: None,
-            preflight_advisory_changed_at: None,
-            dispatch_backoff_config: DispatchBackoffConfig::default(),
-            dispatch_backoff: HashMap::new(),
-            noop_cooldown_config: NoopCooldownConfig::default(),
-            noop_cooldown: HashMap::new(),
-            decline_cooldown_config: DeclineCooldownConfig::default(),
-            decline_cooldown: HashMap::new(),
-            open_pr_memo: Mutex::new(HashMap::new()),
-            token_selection_failures: HashMap::new(),
-            label_flip_log: HashMap::new(),
-            flap_warned_at: HashMap::new(),
-            phase_history: HashMap::new(),
-            sampled_loc: HashMap::new(),
-            pending_group_reaps: HashMap::new(),
-        }
+        let mut registry = Self::new(config);
+        registry.bus = Some(bus);
+        registry
     }
 
     /// Attach (or replace) the event bus used for lifecycle emission.
