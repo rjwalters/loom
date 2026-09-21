@@ -47,6 +47,27 @@ logs. Actual DDL confirmed seven-day active signal tables and standard rollups;
 the API left some auxiliary/legacy TTLs at 15/30 days. The explicit trial
 `retention.sql` shortens those existing TTLs. Resource tables retain the upstream
 30-minute grace, and schema/configuration metadata is not subject to signal TTL.
+All 16 override statements completed successfully; a subsequent local-table DDL
+query found no remaining 15-day, 30-day or one-month TTL among the three signal
+databases. Shorter buffer/accounting TTLs and configuration tables were preserved.
+
+## Stored fixture
+
+After the OpAMP correction, all three signals sent through the neutral gateway
+were actually indexed. Trace ID `85270000000000000000000000000001` has **4 rows /
+4 unique spans**: root `0000000000000001` (`loom.sweep`, Ok, five seconds), rejected
+Judge `...0002` (Error), Doctor `...0003` (Ok), and successful Judge `...0004` (Ok).
+All three children have the exact root parent ID and one-second duration.
+The ERROR log points to the rejected Judge and preserves timestamp
+`1790026033610216000` ns and body `Synthetic Judge rejection; no workload content`.
+The `loom.host.synthetic_capacity` gauge has value **3** at
+`1790026033610` milliseconds. SigNoz's metric schema truncates ns to ms; trace
+and log timestamps retain ns. No optional usage or fabricated zero was emitted.
+
+These values match the earlier ClickStack fixture verification. ClickStack was
+temporarily restored, then stopped again when host pressure caused queries and
+browser startup to take minutes. This establishes sequential storage parity;
+it does not establish simultaneous ingest latency or throughput.
 
 ## Acceptance ledger
 
@@ -55,9 +76,9 @@ the API left some auxiliary/legacy TTLs at 15/30 days. The explicit trial
 | Pinned Foundry render and configuration | Passed, including deterministic second render |
 | Keeper, PostgreSQL and ClickHouse readiness | Passed on the trial VM |
 | Schema migrations and app readiness | Passed; receiver storage proof remains separate |
-| Three fixture signals with matching IDs/values | Pending actual query |
+| Three fixture signals with matching IDs/values | Passed; metric timestamp precision conversion documented |
 | Actual Trace Explorer and correlated logs | Pending browser evidence |
-| Seven-day effective retention | API and active-table DDL verified; auxiliary override verification in progress |
+| Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
 | Restart persistence and shared receiver recovery | Pending live check |
 | Real Loom canary / real Judge-Doctor repair trace | Requires #8524/#8525 and #8529 |
 | Repeated latency/footprint comparison | Shared evaluation #8529 |
