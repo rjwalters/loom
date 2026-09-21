@@ -80,3 +80,14 @@ release or installed artifact instead of Cargo's debug binary, set
 release workflow runs this Collector canary against the Linux x64 release binary
 and the capability command on each native target (the Linux arm64 cross-build
 cannot execute on its x86 runner).
+
+For a contended development host, the same release workflow has a hosted-only
+full gate mode. Supply `gate_sha` (the complete immutable candidate commit) and
+`gate_issue` through `gh workflow run release.yml --ref <workflow-ref> -f
+gate_sha=<40-character-sha> -f gate_issue=<issue>`. This mode skips release and
+image jobs and runs the configured `bash .loom/scripts/build-gate.sh` in an
+exact-candidate managed worktree with a fresh target directory and nextest.
+It retains the actual command output plus candidate/base/path evidence as an
+Actions artifact. No cached or equivalent-suite verdict is substituted.
+The orchestrator still evaluates the separate real-change predicate; any
+explicitly authorized scope exception must be documented independently.
