@@ -314,14 +314,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // Note: metrics_handle is dropped here, but the thread keeps running if enabled
     }
 
-    // Start transcript token ingestion (Issue #8059, opt-in via
-    // LOOM_TRANSCRIPT_INGEST=1). This is the only writer `resource_usage` has
-    // on a dispatch-driven host — the IPC `GetTerminalOutput` path a
-    // `claude -p` sweep never traverses is the other one. Independent of the
-    // workspace: it reads every project's transcripts under
-    // `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`. Handle dropped, thread runs on.
-    let _ingest_handle = activity::transcript_ingest::try_init_transcript_ingest(&db_path);
-
     // Initialize the sweep registry (Issue #3452 — Phase A of #3449).
     // The registry tracks `/loom:sweep` children dispatched via the
     // `DispatchSweep` IPC request. It writes no daemon-side state file;
@@ -341,6 +333,17 @@ pub(crate) async fn run_daemon() -> Result<()> {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // Start transcript token ingestion (Issue #8059; on by default since
+    // #8477 — see that module's doc for why). This is the only writer
+    // `resource_usage` has on a dispatch-driven host — the IPC
+    // `GetTerminalOutput` path a `claude -p` sweep never traverses is the
+    // other one. `sweep_workspace` is read only to resolve
+    // `autonomous.transcriptIngest`; ingestion itself is independent of the
+    // workspace, reading every project's transcripts under
+    // `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`. Handle dropped, thread runs on.
+    let _ingest_handle =
+        activity::transcript_ingest::try_init_transcript_ingest(&db_path, &sweep_workspace);
 
     // #6499: a loud, top-of-boot-block diagnosis of the legacy
     // `.loom/config.json` tier — every existing repo's sole populated config

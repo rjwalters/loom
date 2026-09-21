@@ -39,16 +39,103 @@ with its previous rows **replaced**, never appended to. A repeated pass can
 therefore neither double-count nor miss a live session's tail. `--force`
 re-reads even unchanged files; it still replaces rather than appends.
 
-### In the daemon (opt-in, default off)
+### In the daemon (on by default since #8477)
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `LOOM_TRANSCRIPT_INGEST` | unset (off) | `1`/`true`/`yes`/`on` starts the periodic pass |
-| `LOOM_TRANSCRIPT_INGEST_INTERVAL` | `900` | Seconds between passes |
-| `LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS` | `24` | How far back each pass looks; `0` = full history |
+The daemon runs the pass itself every 15 minutes. **Precedence is `env var >
+config value > built-in default`**, the same rule every `autonomous.*` knob
+follows:
 
-Default-off follows the daemon's FLAGS-OFF convention: ingestion writes to a
-database the IPC path also writes to, so a host opts in deliberately.
+| Config key | Env override | Default | Meaning |
+|---|---|---|---|
+| `autonomous.transcriptIngest.enabled` | `LOOM_TRANSCRIPT_INGEST` | `true` | Master on/off. Env `0`/`false`/`no`/`off` opts this host **out**; `1`/`true`/`yes`/`on` forces it on over a config `false`. An unrecognized value falls through to config/default rather than silently disabling |
+| `autonomous.transcriptIngest.intervalSecs` | `LOOM_TRANSCRIPT_INGEST_INTERVAL` | `900` | Seconds between passes. Zero/invalid → default |
+| `autonomous.transcriptIngest.windowHours` | `LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS` | `24` | How far back each pass looks; `0` = full history (still cheap after the first pass, thanks to the ledger) |
+
+```json
+{
+  "autonomous": {
+    "transcriptIngest": { "enabled": false }
+  }
+}
+```
+
+**Restart required** for all three: they are resolved once, during daemon
+bring-up, and frozen for the life of the process (`try_init_transcript_ingest`
+is called before the loop is spawned). Landing the edit on disk changes
+nothing until the daemon restarts — see
+[`fleet-config-lifecycle.md`](fleet-config-lifecycle.md).
+
+#### Why this one defaults ON, against the FLAGS-OFF convention
+
+The daemon's FLAGS-OFF doctrine governs **work generation** — loops that spawn
+agents, spend tokens, and mutate the forge. This pass generates no work: it is
+a passive telemetry writer into Loom's own `~/.loom/activity.db`, incremental,
+ledgered, and idempotent (a repeat pass over unchanged files is a no-op).
+
+Default-*off* was actively destroying data, and silently. See "The 30-day fuse"
+below: every host that never hand-set `LOOM_TRANSCRIPT_INGEST=1` — which, as
+measured across the fleet on 2026-09-20, was all of them — was losing its
+token/cost history permanently as Claude Code pruned the transcripts it had
+never read. A knob whose "safe" position deletes the data it guards is the
+wrong polarity; opting *out* is now the deliberate act.
+
+## The 30-day fuse (#8477)
+
+**Claude Code deletes session transcripts after `cleanupPeriodDays` (default
+30), and the cleanup runs at session start.** On a fleet host, agents start
+constantly, so transcripts are pruned continuously as they cross the line —
+observed live on 2026-09-20: 43 transcripts dated Aug 21 vanished from
+`~/.claude/projects` within a few minutes.
+
+The transcripts are the **only** copy of this data. Once a transcript is gone,
+the tokens and cost it recorded are unrecoverable — there is no forge-side or
+API-side backfill. So the window in which ingestion can run is exactly
+`cleanupPeriodDays` wide, and anything that stops the pass for longer than that
+(daemon down, config opt-out, a wedged database) burns history that no later
+run can recover. The first run on that host wrote 100,652 rows spanning only
+the surviving ~30 days; everything older was already gone.
+
+Two levers, independently:
+
+- **Ingest** (this document) — keeps the *derived* token/cost rows forever in
+  `~/.loom/activity.db`, at a few hundred MB. On by default; verify with
+  `loom-daemon health` (below).
+- **Retain the raw transcripts** — raise `cleanupPeriodDays` in
+  `~/.claude/settings.json`, trading disk for retention (~33 GB per 30 days on
+  the measured host; a `.tar.zst` archive of the same set compressed 10.9:1,
+  25.4 GB → 2.33 GB, so a rolling archive is cheap). Only needed for forensics
+  or `claude --resume`; the cost/token views do not depend on it once the rows
+  are ingested. **Anything that archives or prunes transcripts must exclude
+  `~/.claude/projects/<project>/memory/`** — that holds persistent agent
+  memory, not session transcripts.
+
+### Checking it is actually running
+
+```bash
+loom-daemon health --json | jq '.sections[] | select(.key == "transcript_ingest")'
+```
+
+The `transcript_ingest` section always renders, and is **DEGRADED** when:
+
+- ingestion is off on this host (`LOOM_TRANSCRIPT_INGEST=0` or
+  `autonomous.transcriptIngest.enabled: false`) — deliberate or not, the host
+  is losing history right now; or
+- the newest `transcript_ingest` ledger entry is more than 6 hours old **while
+  a newer transcript exists on disk** — the pass is enabled but has stopped
+  keeping up (crashed thread, wedged database lock, daemon down). An old ledger
+  entry on a quiet host with no newer transcripts is *not* flagged: nothing has
+  arrived to ingest.
+
+A second corroborating check, from the daemon log and a dry run:
+
+```bash
+grep 'Transcript ingestion' ~/.loom/daemon.log | tail -1
+loom-daemon ingest-transcripts --dry-run --format json | jq '{transcripts_seen, skipped_unchanged}'
+```
+
+A healthy host reports `skipped_unchanged` ≈ `transcripts_seen`. A
+`skipped_unchanged` of **0** means nothing has ever been ingested — the
+symptom that opened #8477.
 
 ## What a row means
 
