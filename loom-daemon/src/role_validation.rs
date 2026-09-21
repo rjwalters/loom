@@ -299,6 +299,14 @@ pub fn validate_from_config(config: &serde_json::Value, mode: ValidationMode) ->
         result.errors.extend(runtime_errors);
     }
 
+    // #8436: the ordered preference list fails closed at resolution time, so
+    // surface a malformed one here too — before any launch runs into it.
+    let preference_errors = crate::runtime_preference::check_runtimes_preference_config(config);
+    if !preference_errors.is_empty() {
+        result.valid = false;
+        result.errors.extend(preference_errors);
+    }
+
     result
 }
 

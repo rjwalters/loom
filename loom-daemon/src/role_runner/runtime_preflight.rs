@@ -72,7 +72,10 @@ const CODEX_EXPLICIT_CREDENTIAL_ENV: [&str; 5] = [
 /// re-reads live state.
 const CODEX_CLEAR_ESTIMATE_CAP_SECS: i64 = 900;
 
-pub(super) fn check(
+/// `pub(crate)` since #8436 only so `runtime_preference`'s tests can pin this
+/// gate's verdict against the side-effect-free availability mapping that
+/// shares its reads; the role runner remains its only production caller.
+pub(crate) fn check(
     root: &Path,
     logs: &Path,
     role: &str,
@@ -136,8 +139,12 @@ fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> 
 }
 
 /// Snapshot of the codex account pool as the gate reads it.
+///
+/// `pub(crate)` since #8436: `runtime_preference::availability` answers the
+/// same question for a tap the ordered resolver is considering, and shares
+/// this read rather than forking the mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CodexPoolState {
+pub(crate) struct CodexPoolState {
     /// Enabled codex accounts in the workspace's inventory.
     pub enabled: usize,
     /// Enabled accounts not under an account-wide hold the selector could not
@@ -161,7 +168,7 @@ pub(super) struct CodexPoolState {
 /// per-account read this replaced re-parsed the file for every enabled
 /// account and left a window in which an account observed early and one
 /// observed late could disagree about the same tick's state.
-pub(super) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
+pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
     let mut state = CodexPoolState {
         enabled: 0,
         spawnable: 0,
@@ -249,19 +256,32 @@ fn adapter_account_provider(root: &Path, admitted: &ResolvedRuntime) -> String {
         .unwrap_or_else(|| "claude".to_string())
 }
 
+/// Whether the codex account pool is what actually decides this launch — the
+/// two stand-down conditions from the module doc, in one predicate: the
+/// adapter would select from a different account provider, or an explicit
+/// credential pin means it never reaches the selector at all.
+///
+/// Extracted for #8436 so `runtime_preference::availability` asks the exact
+/// same question (with the exact same environment reads and manifest lookup)
+/// that [`codex_gate`] asks, rather than re-deriving a second answer that
+/// could drift from this one.
+pub(crate) fn codex_pool_is_the_wall(root: &Path, admitted: &ResolvedRuntime) -> bool {
+    if adapter_account_provider(root, admitted) != "codex" {
+        return false;
+    }
+    let pinned = CODEX_EXPLICIT_CREDENTIAL_ENV
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+    !pinned
+}
+
 fn codex_gate(
     root: &Path,
     logs: &Path,
     role: &str,
     admitted: &ResolvedRuntime,
 ) -> Option<RoleTickOutcome> {
-    if adapter_account_provider(root, admitted) != "codex" {
-        return None;
-    }
-    let pinned = CODEX_EXPLICIT_CREDENTIAL_ENV
-        .iter()
-        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
-    if pinned {
+    if !codex_pool_is_the_wall(root, admitted) {
         return None;
     }
     let now = chrono::Utc::now();

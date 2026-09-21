@@ -2,12 +2,16 @@
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
 pub mod containment;
-mod credential;
+// `pub(crate)` rather than private since #8436: `runtime_preference::
+// availability` mirrors `credential::resolve`'s ladder to decide whether a
+// native tap's API-key pool is the wall, and must read the profile the launch
+// would actually use rather than re-deriving one.
+pub(crate) mod credential;
 mod harness;
 pub mod launch_outcome;
 mod opencode_version;
 mod profile_check;
-mod profiles;
+pub(crate) mod profiles;
 mod prompt;
 
 pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
