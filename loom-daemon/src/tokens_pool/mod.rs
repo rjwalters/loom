@@ -68,6 +68,7 @@ pub mod allowlist;
 pub mod bad_tokens;
 pub mod bootstrap;
 pub mod check;
+pub mod codex_check;
 pub mod failure_counts;
 pub mod health;
 pub mod locking;
@@ -86,11 +87,12 @@ pub use account_registry::{
     AccountId, AccountProvider, CredentialKind, InventoryProvenance, SelectedAccount,
 };
 pub use health::{
-    account_health, clear_reauth, health_snapshot, provider_capacity_at, record_probe_at,
-    record_terminal, record_terminal_for_class_at, record_terminal_for_model,
+    account_health, clear_reauth, health_snapshot, provider_capacity_at, record_availability_at,
+    record_probe_at, record_terminal, record_terminal_for_class_at, record_terminal_for_model,
     record_terminal_for_model_at, select_healthy_at, select_healthy_for_class_at,
-    select_healthy_for_model_at, AccountHealth, HealthReason, NoHealthyAccountError, ProbeEffect,
-    ProbeOutcome, ProviderCapacity, TerminalClassification,
+    select_healthy_for_model_at, AccountHealth, AvailabilityEffect, AvailabilityOutcome,
+    HealthReason, NoHealthyAccountError, ProbeEffect, ProbeOutcome, ProviderCapacity,
+    TerminalClassification,
 };
 pub use select::{EmptyTokenPoolError, SelectedToken, EX_CONFIG};
 

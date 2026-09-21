@@ -542,6 +542,12 @@ pub struct HealthInputs {
     /// absence of an optional signal), the same rule
     /// [`Self::codesign_preflight`] follows.
     pub limit_calibration: Option<crate::limit_calibration::CalibrationStatus>,
+    /// This host's Codex account reading (#8407), collected filesystem-only
+    /// by the `loom-daemon health` CLI collector. `None` — a fixture that
+    /// never set it, or a host with no resolvable workspace — and a snapshot
+    /// with no accounts both render **no section at all**, so a Claude-only
+    /// host's report is unchanged.
+    pub codex_accounts: Option<codex_accounts::CodexAccountsSnapshot>,
 }
 
 // ============================================================================
@@ -2766,6 +2772,15 @@ mod calibration_section;
 pub use calibration_section::assess_limit_calibration;
 
 // ============================================================================
+// Codex accounts (Issue #8407) — conditional
+// ============================================================================
+
+/// The conditional `codex` section: per-subscription Codex availability, the
+/// provider-scoped sibling of the Claude `tokens` section. Rendered only on a
+/// host that actually has Codex accounts.
+pub mod codex_accounts;
+
+// ============================================================================
 // Roll-up
 // ============================================================================
 
@@ -2816,6 +2831,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_worktree_reaper(inputs),
         assess_pool_hold(inputs),
     ];
+    sections.extend(codex_accounts::assess(inputs));
     sections.extend(assess_observability(inputs));
     sections.extend(assess_codesign_identity(inputs));
     sections.extend(assess_limit_calibration(inputs));

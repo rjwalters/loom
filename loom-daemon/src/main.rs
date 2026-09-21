@@ -2165,6 +2165,22 @@ enum AccountsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Report each account's **availability** — quota headroom and reset
+    /// horizon — the `tokens check` analogue for the Codex pool (issue
+    /// #8407). Reads each profile's own recorded rate-limit snapshot; makes
+    /// no API call and starts no `codex` process.
+    Check {
+        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
+        provider: String,
+        /// Persist what the probe learned: write the provider-namespaced
+        /// ranking file and feed each conclusive reading into account health,
+        /// where selection already consults it. Without this flag the command
+        /// is a pure read.
+        #[arg(long)]
+        ranking: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Probe one account's structural and login status.
     Status {
         #[arg(value_name = "PROVIDER")]

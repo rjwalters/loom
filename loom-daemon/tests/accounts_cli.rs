@@ -39,3 +39,72 @@ fn login_child_exit_status_is_preserved_by_cli() {
     assert!(!stderr.contains("auth.json"));
     assert!(!profiles.join("alice").exists());
 }
+
+/// Issue #8407 exit-code contract, end to end through the real binary.
+///
+/// A host with no Codex profiles **says so and exits 0** — an un-provisioned
+/// host is not an outage, and a fleet script gating dispatch on this must not
+/// read one as such.
+#[test]
+fn accounts_check_on_a_host_with_no_profiles_says_so_and_exits_zero() {
+    use std::process::Command;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let workspace = fixture.path().join("workspace");
+    let profiles = fixture.path().join("profiles");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&profiles).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+        .args([
+            "accounts",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "check",
+        ])
+        .env("LOOM_CODEX_PROFILE_ROOT", &profiles)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No Codex accounts registered"), "{stdout}");
+}
+
+/// The other half of the contract: accounts exist but none is selectable —
+/// every one disabled here — so the command reports them and exits 1.
+/// Nothing in the output may name a credential file.
+#[test]
+fn accounts_check_exits_one_when_no_account_is_selectable() {
+    use std::process::Command;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let workspace = fixture.path().join("workspace");
+    let profiles = fixture.path().join("profiles");
+    std::fs::create_dir_all(workspace.join(".loom")).unwrap();
+    std::fs::create_dir_all(profiles.join("alpha")).unwrap();
+    std::fs::write(profiles.join("alpha/auth.json"), "recognizable-secret").unwrap();
+    std::fs::write(
+        workspace.join(".loom/accounts.json"),
+        r#"{"version":1,"accounts":[{"provider":"codex","name":"alpha","credential_kind":"codex_home","credential_reference":"alpha","enabled":false}]}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+        .args([
+            "accounts",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "check",
+        ])
+        .env("LOOM_CODEX_PROFILE_ROOT", &profiles)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("alpha"), "{stdout}");
+    assert!(stdout.contains("skipped"), "{stdout}");
+    assert!(!stdout.contains("recognizable-secret"), "{stdout}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("recognizable-secret"));
+}
