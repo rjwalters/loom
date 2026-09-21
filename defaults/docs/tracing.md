@@ -107,8 +107,12 @@ Parent process completion, cancellation and reaping close observed work. An exit
 that Loom could not observe stays `exit_unobserved`; it does not inherit a
 successful sweep result. Recovery closes orphaned work only when all recorded
 host PIDs are demonstrably gone, labels the observation, and leaves execution
-status unknown. Container PID namespaces and reused/live PIDs cannot establish
-that fact; authoritative parent/reaper observations remain necessary. Root IDs
+status unknown. On Linux, an owner observation timestamp also lets Loom reuse its
+existing process-start identity check to recognize a recycled PID. This clock is
+updated when ownership transfers to the actual child, independently of phase
+start time. Older journals without that clock, unsupported process-start probes,
+and container PID namespaces remain conservative; authoritative parent/reaper
+observations remain necessary. Root IDs
 remain separate for identical issue numbers in different repository roots.
 
 Persistence has a measurable cost. Loaded-host fixtures measured 100 durable

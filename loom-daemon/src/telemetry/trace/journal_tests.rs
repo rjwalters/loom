@@ -144,6 +144,37 @@ fn slow_queue_acceptance_does_not_hold_the_worker_append_lock() {
 }
 
 #[test]
+fn owner_transfer_persists_its_own_time_independent_of_semantic_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("execution.json"));
+    let semantic_start = Utc::now() - chrono::Duration::hours(6);
+    let span = journal
+        .start(
+            TraceContext::root(true),
+            None,
+            SpanName::Sweep,
+            semantic_start,
+            Default::default(),
+        )
+        .unwrap();
+    let before_transfer = Utc::now();
+    journal.set_owner(&span.record.context, 42).unwrap();
+    let restored = Journal::for_context(&dir.path().join("execution.json"))
+        .active()
+        .unwrap();
+    assert_eq!(restored[0].record.started_at, semantic_start);
+    assert_eq!(restored[0].owner_pid, 42);
+    assert!(restored[0].owner_observed_at.unwrap() >= before_transfer);
+    // Old journals have no owner observation clock; decoding must not invent one.
+    let mut legacy = serde_json::to_value(&span).unwrap();
+    legacy.as_object_mut().unwrap().remove("owner_observed_at");
+    assert!(serde_json::from_value::<ActiveSpan>(legacy)
+        .unwrap()
+        .owner_observed_at
+        .is_none());
+}
+
+#[test]
 fn held_lock_has_a_bounded_production_retry_budget() {
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::for_context(&dir.path().join("execution.json"));

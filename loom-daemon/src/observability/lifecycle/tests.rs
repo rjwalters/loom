@@ -135,3 +135,51 @@ fn restart_closes_only_provably_gone_processes_with_unknown_execution_result() {
         .unwrap();
     assert!(!process_gone(0), "container/unknown PID namespaces cannot be guessed");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn recycled_owner_is_recovered_without_mistaking_delayed_spawn_for_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let semantic_start = Utc::now() - chrono::Duration::hours(6);
+    let span = journal
+        .start(
+            TraceContext::root(true),
+            None,
+            SpanName::Sweep,
+            semantic_start,
+            Default::default(),
+        )
+        .unwrap();
+    journal
+        .set_owner(&span.record.context, std::process::id())
+        .unwrap();
+    recover_orphans(&journal);
+    assert_eq!(journal.active().unwrap().len(), 1, "a delayed spawn is still its real owner");
+    // Replay an old journal whose former owner's PID now belongs to this much
+    // newer process. The persisted owner observation, not span time, proves reuse.
+    let mut records: Vec<serde_json::Value> = std::fs::read_to_string(journal.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for record in &mut records {
+        if record["event"] == "Owner" {
+            record["span"]["observed_at"] = serde_json::json!(semantic_start);
+        }
+    }
+    std::fs::write(journal.path(), records.iter().map(|r| format!("{r}\n")).collect::<String>())
+        .unwrap();
+    recover_orphans(&journal);
+    assert!(journal.active().unwrap().is_empty());
+    let mut results = Vec::new();
+    journal
+        .drain(|record| {
+            results.push(record);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].attributes["loom.result"], "process_lost");
+    assert_eq!(results[0].status, SpanStatus::Unset);
+}

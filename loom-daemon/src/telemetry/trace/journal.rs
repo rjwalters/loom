@@ -17,6 +17,8 @@ const MAX_ENTRY_BYTES: usize = 32 * 1024;
 pub struct ActiveSpan {
     pub record: SpanRecord,
     pub owner_pid: u32,
+    #[serde(default)]
+    pub owner_observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -24,7 +26,12 @@ pub struct ActiveSpan {
 enum Entry {
     Started(ActiveSpan),
     Completed(SpanRecord),
-    Owner { context: TraceContext, pid: u32 },
+    Owner {
+        context: TraceContext,
+        pid: u32,
+        #[serde(default)]
+        observed_at: Option<DateTime<Utc>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +168,7 @@ impl Journal {
         .bounded();
         let active = ActiveSpan {
             record,
+            owner_observed_at: Some(Utc::now()),
             // Container PIDs are not host PIDs. Zero prevents daemon orphan
             // probes from guessing; the authoritative parent/reaper closes them.
             owner_pid: if std::env::var_os("LOOM_SPAWN_CONTAINERIZED").is_some() {
@@ -200,6 +208,7 @@ impl Journal {
             &Entry::Owner {
                 context: context.clone(),
                 pid,
+                observed_at: Some(Utc::now()),
             },
         )
     }
@@ -218,9 +227,14 @@ impl Journal {
                 Entry::Completed(r) => {
                     active.remove(r.context.span_id.as_str());
                 }
-                Entry::Owner { context, pid } => {
+                Entry::Owner {
+                    context,
+                    pid,
+                    observed_at,
+                } => {
                     if let Some(span) = active.get_mut(context.span_id.as_str()) {
                         span.owner_pid = pid;
+                        span.owner_observed_at = observed_at;
                     }
                 }
             }

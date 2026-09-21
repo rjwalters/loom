@@ -566,11 +566,26 @@ fn process_gone(_: u32) -> bool {
     false
 }
 
+fn owner_gone(span: &ActiveSpan) -> bool {
+    if process_gone(span.owner_pid) {
+        return true;
+    }
+    if span.owner_pid == 0 || i32::try_from(span.owner_pid).is_err() {
+        return false;
+    }
+    span.owner_observed_at.is_some_and(|observed| {
+        crate::sweep_registry::pid_identity::pid_was_recycled(
+            crate::sweep_registry::pid_identity::pid_start_wallclock(span.owner_pid),
+            observed,
+        )
+    })
+}
+
 fn recover_orphans(journal: &Journal) {
     let Ok(active) = journal.active() else {
         return;
     };
-    if active.is_empty() || !active.iter().all(|s| process_gone(s.owner_pid)) {
+    if active.is_empty() || !active.iter().all(owner_gone) {
         return;
     }
     for span in active {
