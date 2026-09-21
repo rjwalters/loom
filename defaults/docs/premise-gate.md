@@ -14,6 +14,7 @@ invoke it by path and branch on its exit code.
 - [Why a stage before Curator](#why-a-stage-before-curator)
 - [What it gates, and what it does not](#what-it-gates-and-what-it-does-not)
 - [The record](#the-record)
+- [Filing-time emission (#8420)](#filing-time-emission-8420)
 - [Exit codes](#exit-codes)
 - [What to do with each code](#what-to-do-with-each-code)
 - [The evidence scan is advisory](#the-evidence-scan-is-advisory)
@@ -141,6 +142,45 @@ read, where Judge and Champion can see it — instead of being an unrecorded
 inference. That is the same trade `classify-ac-verification.sh`'s
 `loom:ac-verified` marker makes, for the same reason.
 
+## Filing-time emission (#8420)
+
+The `label:` trigger's whole population is written by three agents —
+`architect.md`, `hermit.md`, `auditor.md` — and each of them has *just read the
+code it is citing*. So each files the record with the proposal, in the issue
+body, rather than leaving the first Curator pass to reconstruct it:
+
+```text
+<!-- loom:premise-check exists=yes deliberate=yes reversal=no verdict=clear -->
+premise-evidence: loom-daemon/src/watchdog/mod.rs:902 — "No automatic kill/restart is attempted (#4398)"
+premise-extends: this adds a report-only diagnostic; the no-auto-restart posture is untouched
+```
+
+A record that arrives with the proposal exits `0` at the Curator boundary, so
+nothing about the gate's wiring changes — the boundary check still runs, and
+still catches the two triggers no proposing role can cover (an incident report
+has no proposing role; a human-filed `reversal-claim` has no filing agent). The
+proposing roles verify their own filing the same way any other caller does:
+
+```bash
+./.loom/scripts/premise-check.sh --issue "$N"   # 0 ⇒ ready for Curator
+```
+
+**Rule 1 is not relaxed for the author.** A proposing role that writes
+`deliberate=yes reversal=yes` must write `verdict=operator-decision`: it may
+route its own proposal to a human, it may never self-clear one. That is the
+same constraint the parser enforces on every other writer (exit `12`), and it
+is the reason filing-time emission cannot become self-approval — the most a
+proposal can say about itself is "a human must rule on this".
+
+The three role prompts are covered by the Role Prompt Prefix Ratchet and the
+Markdown Token Ratchet, so each carries only a compact block — the marker
+template, which citation line each `deliberate` value needs (rules 2 and 3),
+rule 1, and the verify command — and cites this section for the rest. The prose
+each added was offset by trimming duplicated text from the *same* file, so no
+baseline moved. Hermit's and Auditor's copy-paste filing templates each carry a
+placeholder line for the record too: the failure to design against is a role
+that reads the rule, then files from a template that never mentions it.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -223,8 +263,9 @@ best long-term home for the record: a proposal that already knows it reverses
 something should say so when filed. But it covers only one of the three
 triggers — an incident report has no proposing role, and a human-filed
 reversal has no filing agent to instrument — so it cannot be the gate on its
-own. **Deferred to a follow-up**, tracked in #8420, rather than widened into
-this change.
+own. **Deferred to a follow-up** rather than widened into this change, and
+shipped there: #8420 wired all three proposing roles, as an addition to the
+boundary check and not a replacement for it (see "Filing-time emission" above).
 
 **A fourth option, considered and rejected: a `PreToolUse` guard hook** on the
 `gh issue edit … --add-label loom:curating` claim. Structurally the strongest —
