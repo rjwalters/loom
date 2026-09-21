@@ -43,6 +43,7 @@ pub(crate) mod status;
 pub(crate) mod status_render;
 pub(crate) mod sweep_experiment;
 pub(crate) mod sweep_outcomes_cli;
+pub(crate) mod target_dir_gc;
 pub(crate) mod telemetry;
 pub(crate) mod tokens;
 pub(crate) mod tokens_weekly_points;

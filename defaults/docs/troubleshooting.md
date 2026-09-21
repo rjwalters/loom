@@ -509,6 +509,56 @@ Directories orphaned *before* this landed have no worktree left to resolve
 from, so they must be removed by hand — check them against `git worktree list`
 first, and stop anything still building into them.
 
+### Shared cargo target-dir GC — pruning stale `incremental`/`deps` caches (#8459)
+
+The section above reclaims a target dir **attributable to one removed
+worktree**. It explicitly does *not* touch a `~/.cargo/config.toml`-wide
+redirect that every worktree on the host shares (the `/repo:host-optimize`
+shape) — that directory only ever grows, since Cargo never prunes its own
+caches and no single worktree's removal can attribute ownership of it. One
+host measured `debug/incremental/` at 213 GB (6,402 session dirs — one per
+worktree path ever built) and `debug/deps/` at 231 GB, with roughly half of
+`incremental/` untouched for a week or more.
+
+`loom-daemon target-dir-gc` is the backstop for that directory: it prunes
+`incremental/` session entries and `deps/` files whose *newest mtime anywhere
+underneath them* (not a directory's own mtime, which does not move when an
+existing file is merely rewritten — see `loom_daemon::target_dir_gc`'s module
+docs) is older than a threshold (default 7 days).
+
+```bash
+# Sanity-check before ever running it for real on an unfamiliar host:
+loom-daemon target-dir-gc --target-dir "$(scripts/cargo-target-dir.sh)" --dry-run
+
+# The real run, once the dry-run estimate looks right:
+loom-daemon target-dir-gc --target-dir "$(scripts/cargo-target-dir.sh)"
+
+# A custom threshold, and machine-readable output for a cron wrapper:
+loom-daemon target-dir-gc --target-dir /Volumes/build/cargo-target --threshold-days 14 --json
+```
+
+**Safety**: the whole pass defers — removing nothing, dry-run or not — the
+instant it cannot prove no build is using the directory. It attempts a
+non-blocking exclusive `flock` on `<target-dir>/.cargo-lock`, the same
+advisory lock every `cargo` invocation holds for the duration of a build; if
+that lock is held (or its state can't be determined at all), the pass reports
+`build_in_progress` and touches nothing, however old the entries look by
+mtime. A `--threshold-days 0` prunes unconditionally (no age floor at all) —
+intentional, documented behavior for a deliberate full reclaim, not a
+special-cased refusal; an empty or not-yet-existing target dir is a clean
+no-op either way.
+
+**Not wired into the periodic worktree reaper (#4876), by design**: unlike
+`deep_clean`/`docker_image_clean` (which ride the reaper's per-registered-repo
+tick because their targets are each one thing the reaper already iterates —
+see `daemon-reference.md` §"Deep-clean" / §"Docker image retention"), a shared
+target dir is host-configured and can span every registered repo on the host
+at once — there is no single repo's tick to hang it off without re-deriving
+and de-duplicating the same path once per repo per tick. Run it by hand, or
+add a cron/launchd line calling `loom-daemon target-dir-gc` on whatever
+cadence suits the host (daily is a reasonable default given the 7-day
+threshold).
+
 ### A worktree vanished mid-session — who removed it? (#5950)
 
 **Symptom**: a Builder's worktree and/or its `feature/issue-N` branch disappears
