@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-20
+- **Issue #8403** (closed): run native-harness (OpenCode/Pi) sweeps in the per-sweep ephemeral container with isolated XDG/config dirs and env-only credentials — not the Codex session container
+- **PR #8437**: feat(containment): run native-harness sweeps in a per-sweep ephemeral container with isolated XDG dirs and env-only credentials
+- **Issue #8164** (closed): merge-pr.sh: main-sync step changes the head SHA, then the API merge fails 409 'Head branch was modified'
+- **PR #8429**: fix(merge-pr): re-read the head SHA after our own base-sync, retry once (#8164, #8191 slice 4)
+- **Issue #8435** (closed): cancel_sweep and the deadline reaper leak the container of a containerized sweep (both claude-ephemeral and native-ephemeral)
+- **PR #8446**: fix(cancel): stop a containerized sweep's container on cancel/reap (#8435)
 - **Issue #8438** (closed): OpenCode adapter cannot launch on OpenCode 2.x: --dir was removed, and the default background service never sees per-launch credentials (needs --standalone)
 - **PR #8445**: fix(opencode): launch on OpenCode 2.x via a pre-exec version probe; refuse guarded 2.x launches until a live canary exists
 - **Issue #8408** (closed): Role-runner pool-exhaustion gate is not runtime-aware: a codex-pinned role skips on an empty *Claude* pool
