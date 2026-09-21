@@ -15,15 +15,8 @@ pub fn enabled(root: &Path) -> bool {
 }
 
 fn valid_endpoint(endpoint: &str) -> bool {
-    reqwest::Url::parse(endpoint).is_ok_and(|url| {
-        matches!(url.scheme(), "http" | "https")
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && super::endpoint_policy::reserved_placeholder_host(endpoint).is_none()
-    })
+    super::endpoint_policy::valid_otlp_endpoint(endpoint)
+        && super::endpoint_policy::reserved_placeholder_host(endpoint).is_none()
 }
 
 /// Persist before spawn. A corrupt/busy/full store disables this execution's
