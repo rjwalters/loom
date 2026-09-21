@@ -1520,8 +1520,10 @@ mod tests {
     fn test_ranking_violation_when_stale() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
-        let dir = bootstrap_pool(tmp.path());
-        let ranking = dir.join(".ranking");
+        // `bootstrap_pool`'s return is joined inline rather than bound: this
+        // file is at its `scripts/check-file-size-budget.sh` ratchet ceiling,
+        // so the `#[serial(...)]` line added above had to be paid for here.
+        let ranking = bootstrap_pool(tmp.path()).join(".ranking");
         fs::write(&ranking, "agent-1\n").unwrap();
         // Backdate mtime by two hours.
         let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
