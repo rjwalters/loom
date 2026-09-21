@@ -72,6 +72,14 @@ fn main() {
             std::env::var("LOOM_TEST_HARNESS_SECRET").ok().as_deref() == Some(source.as_str())
         );
     }
+    // Pool-sourced credential: the source variable is deliberately absent from
+    // the environment, so the expected value is passed under its own name.
+    if let Ok(expected) = std::env::var("LOOM_TEST_EXPECTED_SECRET") {
+        println!(
+            "credential_pool_matches={}",
+            std::env::var("LOOM_TEST_HARNESS_SECRET").ok().as_deref() == Some(expected.as_str())
+        );
+    }
     if std::env::var("FIXTURE_NATIVE_CONFIG").is_ok() {
         println!("native_config={}", std::env::var("OPENCODE_CONFIG_CONTENT").unwrap());
         println!(

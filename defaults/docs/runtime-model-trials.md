@@ -99,6 +99,133 @@ When testing an uninstalled build, set `LOOM_DAEMON_SELF_BIN` to the newly built
 binary before invoking the stub. Existing Claude/Codex adapters still receive
 all their arguments unchanged.
 
+## API-key account pool (`loom-daemon api-keys`, #8401)
+
+A single exported `ZAI_API_KEY` (above) is the trial path — fine for one
+account. Running a **fleet** of API-key subscriptions (e.g. several Z.ai GLM
+coding-plan accounts) through OpenCode/Pi the way the fleet already rotates
+Claude OAuth accounts ([`token-pool.md`](token-pool.md)) needs a registry and
+per-spawn selection, which is what `loom-daemon api-keys` provides — the
+API-key analogue of `loom-daemon tokens` (Claude OAuth) and `loom-daemon
+accounts` (Codex `CODEX_HOME` profiles), implemented at
+`loom-daemon/src/api_keys_pool/`.
+
+**Registry.** One account is one file: `.loom/api-keys/<provider>/<account>.env`
+(gitignored, `0600`, per host — never in `.loom/config.json` or
+`model-profiles.json`), holding a single `KEY=value` assignment. `<provider>`
+is a pool namespace derived from the profile's `credentialEnv`
+(`ZAI_API_KEY` -> `zai`; override with a profile's `credentialPool` when two
+profiles must share one pool, or when two credential sources for the same
+model family — say a flat-rate subscription and a metered key — must be kept
+as **separate** pools). `KEY` must be `UPPER_SNAKE_CASE` and must equal the
+profile's `credentialEnv`: an account file that assigns any other variable is
+withheld from that profile rather than injected under its harness variable.
+`add` defaults `KEY` to `<PROVIDER>_API_KEY`, so an account for a
+`credentialPool`-named pool needs an explicit `--env-var <credentialEnv>`.
+Manage it with:
+
+```sh
+loom-daemon api-keys add zai alice --key-file /path/to/key   # or pipe on stdin
+loom-daemon api-keys add zai-metered team --env-var ZAI_API_KEY --shared --key-file /path/to/key
+loom-daemon api-keys list [--provider zai] [--json]
+loom-daemon api-keys disable zai alice
+loom-daemon api-keys enable zai alice
+loom-daemon api-keys remove zai alice
+```
+
+No verb accepts key material on the command line; `add` reads it from
+`--key-file` or stdin only. `list`/`health` render a secret-free account
+record that cannot carry a value — on a host with no pool, `list` says so and
+exits `0`. A hand-placed file whose left-hand side is not `UPPER_SNAKE_CASE`
+(a bare base64 key with `=` padding, for instance) is reported `unusable` with
+`variable=-`; its text is never echoed.
+
+**Per-repo and shared pools.** There are two pool roots, in precedence order:
+
+1. the per-repo pool, `<repo>/.loom/api-keys/` — what `add` writes by default;
+2. the shared machine-level pool, `~/.loom/api-keys/` — what `add --shared`
+   writes. `LOOM_SHARED_API_KEYS_DIR=<dir>` relocates it (`~` is expanded);
+   `LOOM_SHARED_API_KEYS_DIR=` (set but empty) disables it entirely.
+
+Precedence is resolved **per provider**, not per repo: a provider uses the
+per-repo root if that root holds at least one account *for that provider*,
+and the shared root otherwise. A repo with its own `zai` accounts therefore
+still gets `zai-metered` (or `openai`, …) from the shared pool. Within one
+provider the two roots are never merged — registering a per-repo account for
+`zai` takes `zai` over for that repo, and `add` prints a note when doing so
+puts shared accounts out of reach. `disable`/`enable`/`remove`/`mark-bad`/
+`unblock` act on whichever root is effective for the provider they name.
+
+**Selection at spawn.** When a profile's `credentialEnv` is set, the native
+dispatcher resolves it in this order: explicit environment (unchanged from
+the single-key trial path above) > pool selection for the profile's provider
+> fail closed. Pool selection excludes disabled and bad-marked accounts, then
+prefers a `.allowlist` pin (falling back to the full eligible set if the pin
+is stale), then round-robins across what remains using the same rotation
+cursor `spawn-claude.sh`'s selection ladder uses — consecutive spawns
+alternate accounts. The chosen account's **name** (never the key) is recorded
+in the `LOOM_LAUNCH` record's `credentialAccount`/`credentialProvider`/
+`credentialSource` fields and in the sweep log; a host with no accounts
+registered for the provider is not an error (the harness is left to its own
+auth store), but an *all-exhausted or all-disabled* pool for a provider that
+does have registered accounts fails closed at exit `78` (`EX_CONFIG`) with the
+same "which binary decided, and why each account was excluded" diagnostic
+shape an empty Claude pool produces.
+
+**One account supplies one variable.** An account file is a single
+`KEY=value`, so the pool fills at most **one** unset source variable of a
+profile's credential mapping; every variable that *is* exported passes through
+from the environment exactly as described under
+[Multi-variable credentials](#multi-variable-credentials-and-provider-options).
+In practice that means pooling is for the single-string `"credentialEnv":
+"VAR"` form. The array form is by definition a set that must already be present
+in the launching environment — that check runs first, so the pool is never
+reached for it — and a profile that sets `credentialPool` while leaving more
+than one variable unset is rejected at `78`.
+
+**"No pool" means the directory does not exist — nothing else.** A provider
+directory that exists but cannot be read (`EACCES` because it is `0700` and
+owned by a different uid, a uid-mismatched bind mount in a container, `EIO`,
+`ESTALE`) also fails closed at `78`, naming the path and the error: accounts
+may well be registered there, and all disabled to stop spend, so falling back
+to the harness's own auth store would run the spawn on a credential the
+operator did not choose. `list` and `health` report the unreadable directory
+and exit non-zero instead of printing "no accounts". The same rule covers the
+state files that decide eligibility: an unreadable `.disabled`/`.allowlist`, or
+a `.bad_accounts.json` that is empty or does not parse, **withholds** the
+provider's accounts (`health` counts them `unverifiable`) and `mark-bad`/
+`unblock` refuse to rewrite it. To recover, repair the file, or delete it to
+discard that provider's marks. All pool files are written atomically (temp
+file + `rename`, `0600`), so Loom itself never leaves one half-written.
+
+**Exhaustion / bad-marking.** `loom-daemon api-keys mark-bad <provider>
+<name> --reason <text> [--cooldown-secs N]` removes an account from selection
+until its reset horizon (or indefinitely, until `api-keys unblock`); a bad
+mark self-heals once its horizon passes, with no operator action required.
+`loom_daemon::api_keys_pool::classify` recognises a harness's own
+quota/rate-limit error text (`insufficient balance`, HTTP `429`, …) and
+produces the classification `mark-bad` records — but the pattern table is
+currently built from Z.ai's **documented** error shapes, not yet a string
+captured from a live exhausted run, and nothing in this repository calls
+`classify` automatically from a live spawn's failure yet (native harness
+spawns `exec` the child to preserve PID/signal parity, so there is no
+in-process hook left to observe its output after that point). Both gaps are
+tracked as a follow-up (#8424); `mark-bad` today is an operator/tooling-invoked
+verb, and its own contract (a bad mark removes an account from selection
+until its horizon) is independently tested against simulated/fixture
+classifications.
+
+**Health.** `loom-daemon api-keys health [--provider zai] [--json]` reports,
+per provider: total/selectable/disabled/malformed/exhausted/unverifiable
+counts, any `.allowlist` pin, accounts whose file permissions are looser than
+`0600`, and any provider directory that cannot be read (non-zero exit) —
+secret-free by construction, the same as `list`.
+
+**Concurrency.** A per-account concurrency cap (a Z.ai coding-plan key's
+provider-side concurrent-request ceiling) is not implemented in this slice;
+today the fleet's parallelism against a pooled provider is gated only by host
+disk/RAM/CPU, same as every other runtime. Tracked as a follow-up (#8424).
+
 ## More models
 
 Use `--model provider/model` for a one-off selection using the selected CLI's

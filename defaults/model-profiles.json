@@ -6,6 +6,7 @@
       "opencode": "zai-coding-plan"
     },
     "credentialEnv": "ZAI_API_KEY",
+    "credentialPool": "zai",
     "effort": "max",
     "allowedEfforts": [
       "low",

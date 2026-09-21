@@ -2,6 +2,7 @@
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
 pub mod containment;
+mod credential;
 mod harness;
 pub mod launch_outcome;
 mod opencode_version;
@@ -265,6 +266,9 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
                 .map_err(|e| LaunchError::config(e.to_string()))?;
             return exec(command);
         }
+        // Fails closed (78) only when this host has a pool for the profile's
+        // credential provider and none of its accounts is usable (#8401).
+        let credential = credential::resolve(&root, &selection)?;
         let expanded = options
             .prompt
             .as_deref()
@@ -273,12 +277,14 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         let mut command = harness.command(
             &options,
             &selection,
+            &credential,
             expanded.as_deref(),
             &root,
             role.is_some() || prompt_role.is_some(),
         )?;
         log = attach_log(&mut command, options.log.as_deref())?;
-        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"usage":"native-json-events","billing":"not-measured"})).map_err(|e| LaunchError::config(e.to_string()))?;
+        // `credentialAccount` is an account NAME, never key material (#8401).
+        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured"})).map_err(|e| LaunchError::config(e.to_string()))?;
         command
     } else {
         let runner = scripts.join(format!("spawn-{runtime}.sh"));

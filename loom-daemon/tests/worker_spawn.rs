@@ -25,6 +25,8 @@ fn worker(root: &std::path::Path, runtime: &str) -> Command {
         .env_remove("LOOM_MODEL")
         .env_remove("LOOM_MODEL_PROFILE")
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        // Never let a test reach the operator's real `~/.loom/api-keys` (#8401).
+        .env("LOOM_SHARED_API_KEYS_DIR", "")
         .env(
             "LOOM_NATIVE_GUARD_DIR",
             concat!(env!("CARGO_MANIFEST_DIR"), "/../defaults/hooks"),

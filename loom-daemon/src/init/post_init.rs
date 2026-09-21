@@ -227,6 +227,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // hold OAuth keys and must never be committed.
     ".loom/tokens/",
     ".loom/accounts.env",
+    // Per-host API-key account pool (#8401): `<provider>/<account>.env` files
+    // holding provider subscription keys (e.g. Z.ai GLM coding plans). Same
+    // never-commit contract as `.loom/tokens/` above, and per-host for the
+    // same reason — a lapsed key on one machine must not poison another.
+    ".loom/api-keys/",
     // Codex/token-pool per-repo health cache + its sibling `mkdir` lock, written
     // atomically by the daemon token pool (#5014). Machine-local runtime state
     // that surfaced as untracked dirt in 0.17.0. Not secret-bearing (account

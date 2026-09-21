@@ -1,5 +1,7 @@
 //! Harness-specific command construction. No provider HTTP client, shell parsing or retries.
-use super::{opencode_version::Major, profiles::Selection, LaunchError, Options};
+use super::{
+    credential::Resolved, opencode_version::Major, profiles::Selection, LaunchError, Options,
+};
 use std::{path::PathBuf, process::Command};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +27,7 @@ impl Harness {
         self,
         options: &Options,
         selection: &Selection,
+        credential: &Resolved,
         prompt: Option<&str>,
         root: &std::path::Path,
         guarded: bool,
@@ -41,13 +44,9 @@ impl Harness {
         let cwd = std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?;
         command.env("PWD", &cwd);
         command.env("LOOM_NATIVE_WORKER_PID", std::process::id().to_string());
-        // Secrets travel only as environment variables the child inherits: the
-        // mapping renames them, it never reads or copies a value elsewhere.
-        for (source, target) in &selection.credentials {
-            if let Some(value) = std::env::var_os(source).filter(|v| !v.is_empty()) {
-                command.env(target, value);
-            }
-        }
+        // Explicit env > API-key pool > nothing; resolved upstream so the
+        // secret has exactly one consumer (#8401).
+        credential.apply(&mut command);
         let provider = crate::native_tools::provision::ProviderConfig {
             id: &selection.provider,
             options: selection.provider_options.as_ref(),
