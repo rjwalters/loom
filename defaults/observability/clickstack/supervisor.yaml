@@ -1,0 +1,19 @@
+# Based on the pinned ClickStack supervisor template. Local HTTP only.
+# Upstream defaults to a 3-second agent bootstrap, which fails on a busy VM.
+server:
+  endpoint: http://127.0.0.1:4320/v1/opamp
+capabilities:
+  reports_effective_config: true
+  reports_own_metrics: true
+  reports_own_logs: true
+  reports_own_traces: true
+  reports_health: true
+  accepts_remote_config: true
+  reports_remote_config: true
+agent:
+  executable: /otelcontribcol
+  bootstrap_timeout: 120s
+  config_files:
+    - /etc/otelcol-contrib/config.yaml
+storage:
+  directory: /etc/otel/supervisor-data/

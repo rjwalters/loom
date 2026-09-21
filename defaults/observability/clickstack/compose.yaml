@@ -1,0 +1,45 @@
+name: loom-clickstack
+services:
+  clickstack:
+    # Multi-platform index: linux/amd64 and linux/arm64; verified 2026-09-21.
+    image: clickhouse/clickstack-all-in-one:2.39.1@sha256:b3ff85e093f8dd9da458a2d0c770c6dbafe776adca755c7b91de33528c3b9553
+    restart: unless-stopped
+    mem_limit: 3g
+    cpus: 4.0
+    environment:
+      # Bootstrap key works before UI signup; never use a model-provider key here.
+      INGESTION_API_KEY: ${CLICKSTACK_INGESTION_API_KEY:?Set a private ClickStack ingestion key}
+      FRONTEND_URL: http://localhost:18080
+      HYPERDX_OTEL_EXPORTER_TABLES_TTL: ${CLICKSTACK_RETENTION:-168h}
+      HYPERDX_OTEL_EXPORTER_CREATE_LEGACY_SCHEMA: 'true'
+      USAGE_STATS_ENABLED: 'false'
+    ports:
+      - '127.0.0.1:18080:8080'
+    volumes:
+      - ./supervisor.yaml:/etc/otel/supervisor.yaml.tmpl:ro
+
+      - metadata:/data/db
+      - telemetry:/var/lib/clickhouse
+      - server_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ['CMD', 'curl', '--fail', '--silent', '--fail-early', 'http://localhost:8080/api/health', 'http://localhost:13133']
+      interval: 10s
+      timeout: 5s
+      start_period: 300s
+      retries: 12
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    networks:
+      trial:
+        aliases: [clickstack-collector]
+volumes:
+  metadata:
+  telemetry:
+  server_logs:
+networks:
+  trial:
+    external: true
+    name: loom-observability
