@@ -9286,12 +9286,14 @@ loom-daemon serve --peers http://host2:7420,http://host3:7420   # multihost flee
 | `GET /api/events` | `text/event-stream` (SSE) tail of the daemon's event bus |
 | `GET /api/pipeline` | Forge-side queue counts per managed repo (same source `status --pipeline` uses, including the #8091 operator-attention bucket — `operator_held`/`operator_held_conflicting`/`operator_held_oldest_days`/`operator_only_issues`), fronted by a 20s in-process cache |
 | `GET /api/tokens` | Per-account rows (name / status / 5h utilization) read from the resolved token pool's `.ranking` file |
+| `GET /api/api-keys` | Per-account rows for the provider-neutral **API-key** pool (#8447): provider namespace, account **name**, eligibility state (`selectable`/`disabled`/`exhausted`/`unusable`/`withheld`/`unreadable`) and the pool directory it resolved from. Built from the same secret-free `api_keys_pool::health` call `api-keys health --json` renders, so it can never carry key material; a provider directory that exists but cannot be read renders as `unreadable`, never as an empty pool |
 | `GET /api/peers` | The configured `--peers` list, verbatim — this daemon never fetches a peer itself; the browser fetches each peer's own `/api/status`/`/api/events` directly |
 
 The dashboard page renders: the in-flight sweep registry, the dynamic
-concurrency cap/capacity breakdown, per-token usage bars, the per-repo
-main-health gate state, per-repo pipeline queue counts, configured fleet
-peers, and a live event tail — each panel backed by one of the routes above.
+concurrency cap/capacity breakdown, per-token usage bars, the API-key pool's
+per-provider account rows, the per-repo main-health gate state, per-repo
+pipeline queue counts, configured fleet peers, and a live event tail — each
+panel backed by one of the routes above.
 
 ### Event tail topics
 

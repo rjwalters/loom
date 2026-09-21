@@ -146,6 +146,11 @@
     <div id="tokens-body"><p class="muted">loading&hellip;</p></div>
   </section>
 
+  <section class="panel" id="panel-api-keys">
+    <h2>API-key pool accounts</h2>
+    <div id="api-keys-body"><p class="muted">loading&hellip;</p></div>
+  </section>
+
   <section class="panel wide" id="panel-gate">
     <h2>Main-health gate (per repo)</h2>
     <div id="gate-body"><p class="muted">loading&hellip;</p></div>
@@ -343,6 +348,74 @@ function renderTokens(rows) {
       el("td", { text: "5h " + (pct === null ? "?" : fmtPct(pct)) }),
       el("td", { style: "width:40%" }, [bar]),
     ]));
+  });
+  table.appendChild(tbody);
+  body.appendChild(table);
+}
+
+// ---------------------------------------------------------------------
+// API-key pool panel (Issue #8447)
+//
+// The per-token panel above covers the Claude OAuth pool only. This one covers
+// the provider-neutral API-key pool, whose identity is a (provider, account)
+// PAIR — hence the provider column: one host routinely holds accounts for
+// several providers, resolved from different pool roots (per-repo pool, then
+// the shared machine-level pool), so an account name alone does not identify
+// an account.
+// ---------------------------------------------------------------------
+
+function apiKeyStatePillClass(state) {
+  switch (state) {
+    case "selectable": return "green";
+    // Disabled is an operator's own deliberate act, not a fault.
+    case "disabled": return "muted-pill";
+    case "exhausted": return "red";
+    case "unusable": return "red";
+    // Withheld / unreadable are states the spawn path FAILS CLOSED on: the
+    // pool may be full of good accounts that simply cannot be verified.
+    case "withheld": return "amber";
+    case "unreadable": return "red";
+    default: return "muted-pill";
+  }
+}
+
+function renderApiKeys(rows) {
+  var body = document.getElementById("api-keys-body");
+  body.innerHTML = "";
+  if (!rows || rows.length === 0) {
+    body.appendChild(el("p", { "class": "muted", text: "no API-key accounts registered" }));
+    return;
+  }
+  var table = el("table", {}, [
+    el("thead", {}, [el("tr", {}, [
+      el("th", { text: "provider" }), el("th", { text: "account" }),
+      el("th", { text: "state" }), el("th", { text: "pool dir" }),
+    ])]),
+  ]);
+  var tbody = el("tbody");
+  rows.forEach(function (row) {
+    // A row for an unreadable directory names no account (nothing could be
+    // listed) — say that explicitly rather than leaving a blank cell that
+    // would read as "an account with no name".
+    var account = row.account || "(none listed)";
+    var stateCell = el("td", {}, [
+      el("span", { "class": "pill " + apiKeyStatePillClass(row.state), text: row.state }),
+    ]);
+    if (row.insecurePermissions) {
+      stateCell.appendChild(document.createTextNode(" "));
+      stateCell.appendChild(el("span", { "class": "pill amber", text: "perms" }));
+    }
+    tbody.appendChild(el("tr", {}, [
+      el("td", { text: row.provider }),
+      el("td", { text: account }),
+      stateCell,
+      el("td", { "class": "muted", text: row.dir, title: row.workspace || "" }),
+    ]));
+    if (row.detail) {
+      tbody.appendChild(el("tr", {}, [
+        el("td", { "class": "muted", colspan: "4", text: row.detail }),
+      ]));
+    }
   });
   table.appendChild(tbody);
   body.appendChild(table);
@@ -555,6 +628,10 @@ function refreshTokens() {
   fetchJson("/api/tokens", 8000).then(renderTokens).catch(function () {});
 }
 
+function refreshApiKeys() {
+  fetchJson("/api/api-keys", 8000).then(renderApiKeys).catch(function () {});
+}
+
 function refreshPeerList() {
   fetchJson("/api/peers", 8000).then(function (data) {
     refreshPeers(data.peers || []);
@@ -603,12 +680,14 @@ function connectEvents() {
 refreshStatus();
 refreshPipeline();
 refreshTokens();
+refreshApiKeys();
 refreshPeerList();
 connectEvents();
 
 setInterval(refreshStatus, 5000);
 setInterval(refreshPipeline, 20000);
 setInterval(refreshTokens, 15000);
+setInterval(refreshApiKeys, 30000);
 setInterval(refreshPeerList, 15000);
 </script>
 </body>
