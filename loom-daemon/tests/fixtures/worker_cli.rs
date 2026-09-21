@@ -78,6 +78,29 @@ fn main() {
             std::env::var("LOOM_NATIVE_WORKER_PID").unwrap() == std::process::id().to_string()
         );
     }
+    // Simulates a native `--format json` event stream (#8448), so a test can
+    // capture the guarded launch's full output through the real `spawn-worker`
+    // seam and feed it to `worker_spawn::launch_outcome::classify_native_stream`
+    // — "toolless" reproduces #8448's live OpenCode 2.0.10 receipt exactly
+    // (one step_start, one text event, no tool_use, no step_finish); "used"
+    // is an ordinary completion that actually calls a loom_* tool.
+    match std::env::var("FIXTURE_NATIVE_STREAM").as_deref() {
+        Ok("toolless") => {
+            println!("{{\"type\":\"step_start\"}}");
+            println!(
+                "{{\"type\":\"text\",\"text\":\"I do not have tools named loom_write, loom_bash, or loom_edit\"}}"
+            );
+        }
+        Ok("used") => {
+            println!("{{\"type\":\"step_start\"}}");
+            println!("{{\"type\":\"tool_use\",\"tool\":\"loom_write\",\"input\":{{\"path\":\"a.txt\"}}}}");
+            println!(
+                "{{\"type\":\"tool_result\",\"tool\":\"loom_write\",\"output\":\"Wrote 3 bytes\"}}"
+            );
+            println!("{{\"type\":\"step_finish\"}}");
+        }
+        _ => {}
+    }
     eprintln!("fixture stderr");
     std::process::exit(
         std::env::var("FIXTURE_EXIT")

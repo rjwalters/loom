@@ -968,3 +968,40 @@ fn guarded_opencode_pins_auxiliary_models_preserves_provider_and_worker_identity
     assert_eq!(config["permission"]["*"], "deny");
     assert!(text.contains("native_worker_pid_matches=true"));
 }
+
+/// #8448: a guarded launch whose native JSON stream never actually used a
+/// `loom_*` tool must be classified as a failed launch, independent of exit
+/// code — exercised through the real `spawn-worker` seam via the fake-CLI
+/// fixture, not just a unit test of the classifier in isolation. The
+/// role-runner side of the same verdict (exit-0 `Success` demoted to
+/// `Failure`) is covered by `role_runner::toolless_launch::tests`.
+#[test]
+fn a_toolless_guarded_completion_is_classified_as_a_failed_launch() {
+    use loom_daemon::worker_spawn::launch_outcome::classify_native_stream;
+    let d = tempfile::tempdir().unwrap();
+    let roles = d.path().join(".loom/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::write(roles.join("builder.json"), "{}").unwrap();
+    let run = |stream: &str| {
+        let log = d.path().join(format!("{stream}.log"));
+        let out = worker(d.path(), "pi")
+            .env("LOOM_ROLE", "builder")
+            .env("FIXTURE_NATIVE_STREAM", stream)
+            .args(["--log", log.to_str().unwrap(), "-p", "hello"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        std::fs::read_to_string(log).unwrap()
+    };
+    // The exact receipt: exit 0, yet the classifier must still call it failed
+    // — and it must be the ACTIONABLE form of the verdict (the stream was
+    // read: `events > 0`), not the trivially-true "no opinion" one.
+    let toolless = classify_native_stream(&run("toolless"));
+    assert_eq!(toolless.loom_tool_uses, 0);
+    assert_eq!(toolless.step_finishes, 0);
+    assert!(toolless.observed_a_toolless_run());
+    // Control: an otherwise-identical launch that DID use a loom_* tool is not.
+    let used = classify_native_stream(&run("used"));
+    assert_eq!(used.loom_tool_uses, 1);
+    assert!(!used.observed_a_toolless_run());
+}
