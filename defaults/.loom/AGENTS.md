@@ -101,15 +101,9 @@ decision — route it to `loom:blocked` or `loom:operator-only` instead.
 ## Git Worktree Workflow
 
 Loom uses git worktrees to isolate agent work. **Issue Worktrees**
-(`.loom/worktrees/issue-N`) hold issue-specific work for Builder agents.
-
-```bash
-gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"
-./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42
-# ... work, commit ...
-git push -u origin feature/issue-42
-gh pr create --label "loom:review-requested"
-```
+(`.loom/worktrees/issue-N`) hold issue-specific work for Builder agents. The
+guard-to-PR recipe lives in exactly one place — "Builder Workflow" below — so no
+second copy can go missing its pre-claim guard.
 
 - Always use `./.loom/scripts/worktree.sh <issue-number>` (writes a
   `.loom-managed` sentinel that authorizes cleanup). **Never run `git worktree`
