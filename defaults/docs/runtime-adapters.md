@@ -1264,6 +1264,33 @@ name host filesystem paths (`LOOM_PI_BIN`, `LOOM_OPENCODE_BIN`, `LOOM_DAEMON_BIN
 container has no business holding a Claude token, and the Claude token pool is
 not mounted into it at all.
 
+**Known limitation: file-path credentials are not mounted (#8454).** The
+by-name forwarding above assumes a credential's VALUE is the secret itself —
+correct for every API-key profile that ships bundled today. It is wrong for a
+credential whose value names a HOST FILE the provider's SDK then reads: the
+two `example-*` templates (`REPLACE_WITH_*` model IDs, so neither runs as-is)
+declare exactly that shape —
+
+- `example-vertex`'s `GOOGLE_APPLICATION_CREDENTIALS` is a path to a
+  service-account JSON file.
+- `example-bedrock`'s `AWS_PROFILE` is a profile name resolved against
+  `~/.aws/credentials`.
+
+`-e VAR` sets the variable correctly inside the container, but `extra_mounts`
+(`containment.rs`) mounts only the workspace, `~/.gitconfig`, `~/.config/gh`,
+an out-of-workspace log directory, and an out-of-workspace
+`CARGO_TARGET_DIR` — never the file such a variable points at (or, for
+`AWS_PROFILE`, the fixed `~/.aws/credentials` its *value* does not even name
+directly). The failure inside the container reads as a provider auth error,
+not a missing mount, which is confusing to debug from that vantage point.
+This is deliberately documentation, not a `docker_command`-time detector:
+`GOOGLE_APPLICATION_CREDENTIALS`'s value is a literal path, but
+`AWS_PROFILE`'s is an opaque name that only *indirectly* requires a host
+file at a fixed, provider-specific location — a generic check that only
+catches the first shape would give false confidence that both are handled.
+Copying either template today means either adding a matching bind mount by
+hand (extending `extra_mounts`) or running that profile uncontained.
+
 **Resource limits and teardown** are inherited from #7430's shape, not
 reinvented: `--cpus` resolves `LOOM_SWEEP_CONTAINER_CPUS` → `runtimes.containment.cpus`
 → the same host-wide `LOOM_SWEEP_CPU_BUDGET_CORES` budget bare-metal dispatch
