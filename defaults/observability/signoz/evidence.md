@@ -69,6 +69,22 @@ temporarily restored, then stopped again when host pressure caused queries and
 browser startup to take minutes. This establishes sequential storage parity;
 it does not establish simultaneous ingest latency or throughput.
 
+The actual authenticated Trace Explorer displayed **four spans and one error**,
+with the failed Judge, Doctor and successful retry beneath the root. Selecting
+the failed Judge exposed its exact parent/span IDs and Error status. Its **Logs**
+tab displayed `Synthetic Judge rejection; no workload content` at the matching
+timestamp, establishing actual UI correlation rather than merely compatible
+database fields. Sanitized screenshots contain only the synthetic fixture:
+[waterfall](evidence/trace-waterfall.png) and
+[selected span with correlated log](evidence/correlated-logs.png).
+
+A point-in-time sample after ingestion measured approximately **1.24 GiB** across
+the five steady-state SigNoz containers (ClickHouse 1.03 GiB, app 105.7 MiB,
+Keeper 50.87 MiB, PostgreSQL 30.16 MiB and ingester 27.7 MiB). Active parts in the
+three signal databases totaled **77,373 bytes**. These small-fixture observations
+exclude PostgreSQL, system tables, images and total volume usage; they are not a
+capacity or comparative cost benchmark. The host was heavily contended.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -77,7 +93,7 @@ it does not establish simultaneous ingest latency or throughput.
 | Keeper, PostgreSQL and ClickHouse readiness | Passed on the trial VM |
 | Schema migrations and app readiness | Passed; receiver storage proof remains separate |
 | Three fixture signals with matching IDs/values | Passed; metric timestamp precision conversion documented |
-| Actual Trace Explorer and correlated logs | Pending browser evidence |
+| Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
 | Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
 | Restart persistence and shared receiver recovery | Pending live check |
 | Real Loom canary / real Judge-Doctor repair trace | Requires #8524/#8525 and #8529 |
