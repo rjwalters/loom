@@ -528,8 +528,16 @@ if [[ -n "$WORKTREE_PATH_OVERRIDE" ]]; then
   fi
 fi
 
-# Fetch PR state
-PR_JSON=$(forge_get_pr "$REPO_NWO" "$PR_NUMBER" "$GH") || \
+# Fetch PR state — UNCACHED (#8550). $GH may be the `gh-cached` wrapper, whose
+# short TTL made this read return the PR's PRE-change label set for anything
+# started inside the cache window. That is exactly the window an operator hold
+# release lands in (remove `loom:operator`, merge immediately), and the #8112
+# verdict-contradiction guard below — whose ONLY input is $PR_LABELS derived
+# from this fetch — then correctly refused a merge on labels that no longer
+# existed. Labels here are verdict-gating/merge-gating data, i.e. the
+# deliberately-uncached class in docs/gh-cached.md, the same class the 15+
+# `forge_get_pr_nocache` rechecks further down already belong to.
+PR_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH") || \
   error "Could not fetch PR #$PR_NUMBER"
 
 # Combined onto two lines (net code-line offset for the #8112 guard added
