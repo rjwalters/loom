@@ -1036,6 +1036,30 @@ pub fn format_dry_run_orphans_found_stderr(orphaned_count: usize) -> String {
     )
 }
 
+/// # Test-isolation invariant (#8480)
+///
+/// Every test below that mutates `LOOM_GH_BIN` — directly, or through
+/// [`tests::install_fake_gh`] and its `_with_lease` / `_with_failing_lease_probe`
+/// / `_pr` variants — MUST use the `#[serial(loom_config_env)]` lock key, never
+/// the bare, unnamed `#[serial]`. `serial_test` only mutually excludes tests
+/// that share the *same* key, so two keys are two independent groups that run
+/// concurrently with each other. `role_collision.rs` and `forge_cmd.rs` (#8465)
+/// already mutate `LOOM_GH_BIN` under `loom_config_env`; leaving these on the
+/// bare key let a [`tests::FakeGh`] drop (which clears `LOOM_GH_BIN`) land
+/// between another module's `set_var` and its read, making that module shell
+/// out to the real `gh`.
+///
+/// The bare `#[serial]` tests that remain in this module are deliberate, not
+/// oversights — they mutate a *different* process-global and must stay grouped
+/// with that variable's own writers:
+///
+/// - the [`tests::with_isolated_journal_path`] tests mutate
+///   [`crate::sweep_journal::JOURNAL_PATH_ENV`], which `sweep_journal.rs`,
+///   `claim_reconciliation`, and `cli::status` all mutate under the bare key —
+///   moving them to `loom_config_env` would *create* the very race this
+///   invariant removes;
+/// - the `worktree_only_has_build_artifact_dirt_*` / `cleanup_stale_worktree_*`
+///   tests mutate no environment at all (temp-dir git repos only).
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1205,7 +1229,7 @@ mod tests {
     /// instead of returning silently (which read as "nothing is orphaned").
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn check_untracked_building_records_error_when_gh_query_fails() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1265,6 +1289,9 @@ mod tests {
     /// Returns a [`FakeGh`] guard that clears `LOOM_GH_BIN` on drop, carrying
     /// the path of a log file recording every `gh` invocation so a test can
     /// assert that `issue edit` was — or was NOT — reached.
+    ///
+    /// Callers MUST be `#[serial(loom_config_env)]`, never bare `#[serial]` —
+    /// see the module-level test-isolation invariant (#8480).
     #[cfg(unix)]
     fn install_fake_gh(dir: &Path, graphql_payload: &str, graphql_exit: i32) -> FakeGh {
         use std::os::unix::fs::PermissionsExt;
@@ -1332,7 +1359,7 @@ mod tests {
     /// however absent its claim lock / journal entry.
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn open_linked_pr_is_never_flagged_orphaned() {
         let dir = tempdir().unwrap();
         let _gh =
@@ -1360,7 +1387,7 @@ mod tests {
     /// own when an open linked PR exists.
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn recover_issue_refuses_to_reset_an_issue_with_an_open_linked_pr() {
         let dir = tempdir().unwrap();
         let gh = install_fake_gh(dir.path(), &closes_graph(r#"{"number":5507,"state":"OPEN"}"#), 0);
@@ -1380,7 +1407,7 @@ mod tests {
     /// recovery proceed exactly as before.
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn no_linked_pr_still_orphans_and_resets() {
         let dir = tempdir().unwrap();
         let gh = install_fake_gh(dir.path(), &closes_graph(""), 0);
@@ -1413,7 +1440,7 @@ mod tests {
     /// verified absence, so it must block the reset rather than greenlight it.
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn pr_probe_failure_blocks_recovery() {
         let dir = tempdir().unwrap();
         let gh = install_fake_gh(dir.path(), "gh: rate limit exceeded", 1);
@@ -1446,7 +1473,7 @@ mod tests {
     /// already merged.
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn merged_linked_pr_does_not_block_recovery() {
         let dir = tempdir().unwrap();
         let gh =
@@ -1539,7 +1566,7 @@ mod tests {
     /// proceed.
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn fresh_lease_blocks_recovery_even_with_no_linked_pr() {
         let dir = tempdir().unwrap();
         // Renewed 2 minutes ago -- well within the 15-minute default TTL.
@@ -1575,7 +1602,7 @@ mod tests {
     /// lease must not block the pre-existing recovery flow.
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn expired_lease_does_not_block_recovery() {
         let dir = tempdir().unwrap();
         // Last renewed 30 minutes ago -- well past the 15-minute default TTL.
@@ -1658,7 +1685,7 @@ mod tests {
     /// look orphaned.
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn lease_probe_read_failure_blocks_recovery_even_with_no_linked_pr() {
         let dir = tempdir().unwrap();
         let gh = install_fake_gh_with_failing_lease_probe(dir.path(), &closes_graph(""), 0);
@@ -1770,7 +1797,7 @@ mod tests {
     /// `recover-orphans` dry-run contract).
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn check_stale_pr_claims_dry_run_reports_without_mutating() {
         let dir = tempdir().unwrap();
         let old = (chrono::Utc::now() - chrono::Duration::minutes(90)).to_rfc3339();
@@ -1806,7 +1833,7 @@ mod tests {
     /// `forge::reclaim_pr`'s safety net (AC1 recovery).
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn check_stale_pr_claims_recover_reclaims_and_backfills() {
         let dir = tempdir().unwrap();
         let old = (chrono::Utc::now() - chrono::Duration::minutes(90)).to_rfc3339();
@@ -1842,7 +1869,7 @@ mod tests {
     /// backstop and judge.md's own check already share.
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn check_stale_pr_claims_never_reclaims_a_fresh_claim() {
         let dir = tempdir().unwrap();
         let fresh = chrono::Utc::now().to_rfc3339();
