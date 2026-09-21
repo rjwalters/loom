@@ -3002,40 +3002,12 @@ pub struct RepoStatus {
     pub sweep_command_missing: bool,
 }
 
-/// One active insta-crash quarantine (Issue #4215), as surfaced by
-/// `loom-daemon quarantine list` / [`Request::ListQuarantines`]. Joins the
-/// three pieces of quarantine state [`crate::sweep_registry::SweepRegistry`]
-/// already tracks in-memory (`quarantined`, `insta_crash_counts`,
-/// `quarantine_config.ttl`) into one read-only row.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct QuarantineEntry {
-    /// The quarantined issue number.
-    pub issue: u32,
-    /// The workspace whose registry this quarantine lives in — meaningful once
-    /// `ListQuarantines` enumerates across every registered workspace.
-    pub workspace_root: PathBuf,
-    /// When the quarantine was applied.
-    pub quarantined_at: DateTime<Utc>,
-    /// The consecutive-insta-crash tally that triggered (or is at) quarantine.
-    pub insta_crash_count: u32,
-    /// The consecutive-insta-crash threshold configured for this issue's
-    /// workspace, so the CLI can render "tally / threshold" instead of a bare
-    /// count. Read from the same per-workspace [`crate::sweep_registry::
-    /// QuarantineConfig`] the reaper enforces against — different managed
-    /// workspaces may configure different thresholds.
-    pub insta_crash_threshold: u32,
-    /// The quarantine **generation** this entry is serving (vibesql#6639): 1
-    /// for a first quarantine, N for the (N-1)th relapse without an
-    /// intervening healthy outcome or operator clear. Drives the escalated
-    /// TTL (`ttl * 2^(generation-1)`, capped at `ttl_max`) the reaper
-    /// enforces and `ttl_remaining_secs` reflects.
-    pub generation: u32,
-    /// Seconds remaining before TTL auto-release, clamped to `0` — the TTL is
-    /// enforced only by [`crate::sweep_registry::SweepRegistry::reap_once`], so
-    /// an entry can be momentarily past-TTL between reaper ticks; a negative
-    /// remainder would be a confusing thing to render.
-    pub ttl_remaining_secs: u64,
-}
+// The quarantine-list wire row (`QuarantineEntry`) moved to
+// `crate::sweep_registry::quarantine_escalation` when the vibesql#6639
+// escalation landed (file-size ratchet on this file); re-exported here so the
+// existing `crate::types::QuarantineEntry` paths — the IPC surface and the
+// CLI renderer — stay stable.
+pub use crate::sweep_registry::QuarantineEntry;
 
 /// The token-capacity section of [`DaemonStatusReport`] (#3902).
 ///

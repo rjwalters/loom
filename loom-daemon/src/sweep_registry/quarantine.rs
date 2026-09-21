@@ -3,6 +3,20 @@
 
 use super::*;
 
+// Quarantine *policy* (config resolution, the generation-escalated TTL ladder,
+// the consolidated per-registry state, and the `quarantine list` wire row)
+// lives in `quarantine_escalation.rs` since vibesql#6639 — this file is over
+// the file-size ratchet's frozen threshold and may only shrink
+// (`.loom/docs/file-size-policy.md`). Everything here is *mechanics*:
+// tallying deaths, applying/releasing quarantines, and the forge labels.
+
+/// Marker substring embedded in every quarantine comment body posted by
+/// [`SweepRegistry::apply_quarantine_label`] (Issue #3939). Used by
+/// [`crate::quarantine_reconciliation`] (Issue #4110) to distinguish a
+/// daemon-applied `loom:blocked` from one a human deliberately applied by
+/// hand — only the former is safe to auto-release at startup.
+pub const QUARANTINE_COMMENT_MARKER: &str = "Auto-quarantined by loom-daemon (#3939)";
+
 // ============================================================================
 // Insta-crash quarantine (Issue #3939)
 // ============================================================================
@@ -48,84 +62,6 @@ pub const QUARANTINE_TTL_MAX_ENV: &str = "LOOM_WORK_FINDER_QUARANTINE_TTL_MAX_SE
 /// terminal transition within this wall-clock window of dispatch counts as an
 /// insta-crash. A zero/invalid value falls through to config/default.
 pub const QUARANTINE_INSTA_CRASH_ENV: &str = "LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS";
-
-/// Default consecutive-insta-crash threshold before quarantine (#3939).
-pub const DEFAULT_QUARANTINE_THRESHOLD: u32 = 3;
-
-/// Default quarantine TTL: a quarantined issue is auto-released after this window
-/// so a transient breakage (e.g. a token pool that was re-provisioned) recovers
-/// without operator action (#3939). This is the **generation-1** TTL: a
-/// quarantine that relapses after its TTL release serves an escalated TTL
-/// (vibesql#6639) — see [`effective_quarantine_ttl_secs`].
-pub const DEFAULT_QUARANTINE_TTL_SECS: u64 = 3600;
-
-/// Default ceiling on the escalated quarantine TTL (vibesql#6639): generation N
-/// serves `ttl * 2^(N-1)` capped here, so a persistently-broken issue's
-/// crash-pause-repeat flap decays toward at-most-daily retries instead of
-/// cycling every TTL forever. 24h: an operator running
-/// `loom-daemon quarantine list` on any working day still sees the entry.
-pub const DEFAULT_QUARANTINE_TTL_MAX_SECS: u64 = 86400;
-
-/// Default insta-crash window (#3939): a checkpoint-less terminal transition
-/// within this many seconds of dispatch counts toward the insta-crash tally. A
-/// real build that reaches even the Curator checkpoint, or a slow death past this
-/// window, is a *different* failure mode (handled by the mid-build watchdog) and
-/// never counts here.
-pub const DEFAULT_QUARANTINE_INSTA_CRASH_SECS: i64 = 60;
-
-/// Marker substring embedded in every quarantine comment body posted by
-/// [`SweepRegistry::apply_quarantine_label`] (Issue #3939). Used by
-/// [`crate::quarantine_reconciliation`] (Issue #4110) to distinguish a
-/// daemon-applied `loom:blocked` from one a human deliberately applied by
-/// hand — only the former is safe to auto-release at startup.
-pub const QUARANTINE_COMMENT_MARKER: &str = "Auto-quarantined by loom-daemon (#3939)";
-
-/// Resolved insta-crash-quarantine parameters (Issue #3939), set on the registry
-/// at construction so [`SweepRegistry::reap_once`] can enforce them without a
-/// per-tick config read. Defaults mirror the shipped constants (enabled — it is a
-/// safety backstop).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QuarantineConfig {
-    /// Whether insta-crash quarantine is active. When `false` the reaper neither
-    /// counts insta-crashes nor quarantines (byte-for-byte the pre-#3939 path).
-    pub enabled: bool,
-    /// Consecutive insta-crashes before an issue is quarantined.
-    pub threshold: u32,
-    /// How long a quarantine entry persists before auto-release.
-    pub ttl: Duration,
-    /// Ceiling on the escalated (per-generation) TTL (vibesql#6639).
-    pub ttl_max: Duration,
-    /// The insta-crash wall-clock window: a checkpoint-less terminal transition
-    /// within this many seconds of dispatch counts as an insta-crash.
-    pub insta_crash_secs: i64,
-}
-
-impl Default for QuarantineConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            threshold: DEFAULT_QUARANTINE_THRESHOLD,
-            ttl: Duration::from_secs(DEFAULT_QUARANTINE_TTL_SECS),
-            ttl_max: Duration::from_secs(DEFAULT_QUARANTINE_TTL_MAX_SECS),
-            insta_crash_secs: DEFAULT_QUARANTINE_INSTA_CRASH_SECS,
-        }
-    }
-}
-
-/// The escalated TTL, in seconds, a **generation-N** quarantine serves
-/// (vibesql#6639): `min(ttl * 2^(N-1), ttl_max)` with saturating arithmetic.
-/// Generation 1 is the plain configured TTL; every relapse without an
-/// intervening healthy outcome or operator clear doubles the pause.
-#[must_use]
-pub fn effective_quarantine_ttl_secs(config: &QuarantineConfig, generation: u32) -> u64 {
-    let shift = generation.saturating_sub(1).min(31);
-    config
-        .ttl
-        .as_secs()
-        .saturating_mul(1u64 << shift)
-        .min(config.ttl_max.as_secs())
-        .max(config.ttl.as_secs())
-}
 
 // ============================================================================
 // Claude-wrapper pre-flight-death workspace tripwire (Issue #4386)
@@ -252,121 +188,6 @@ pub fn resolve_preflight_tripwire_config(repo_root: &Path) -> PreflightTripwireC
     }
 }
 
-// ============================================================================
-// Insta-crash quarantine config resolution (Issue #3939)
-// ============================================================================
-
-/// The subset of `.loom/config.json → autonomous.workFinder.quarantine` this
-/// module consumes (Issue #3939). Each field is `Option` so an absent key falls
-/// through to the env-var / built-in-default resolution — precedence
-/// **env > config > default** for every knob, matching the rest of the module.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct QuarantineFileConfig {
-    /// `autonomous.workFinder.quarantine.enabled` — whether quarantine runs.
-    pub enabled: Option<bool>,
-    /// `autonomous.workFinder.quarantine.threshold` — consecutive insta-crashes
-    /// before quarantine (zero/invalid dropped to `None`).
-    pub threshold: Option<u32>,
-    /// `autonomous.workFinder.quarantine.ttlSecs` — quarantine TTL, in seconds
-    /// (zero/invalid dropped to `None`).
-    pub ttl_secs: Option<u64>,
-    /// `autonomous.workFinder.quarantine.ttlMaxSecs` — ceiling on the
-    /// escalated per-generation TTL (vibesql#6639; zero/invalid dropped to
-    /// `None`).
-    pub ttl_max_secs: Option<u64>,
-    /// `autonomous.workFinder.quarantine.instaCrashSecs` — insta-crash window, in
-    /// seconds (zero/invalid dropped to `None`).
-    pub insta_crash_secs: Option<u64>,
-}
-
-/// Read `.loom/config.json → autonomous.workFinder.quarantine` (Issue #3939),
-/// soft-failing every field to `None` on a missing file, malformed JSON, or an
-/// absent `autonomous` / `workFinder` / `quarantine` block. Mirrors
-/// [`read_startup_race_config`].
-#[must_use]
-pub fn read_quarantine_file_config(repo_root: &Path) -> QuarantineFileConfig {
-    let effective = crate::config_resolver::resolve_effective_config(repo_root);
-    let Some(q) = crate::config_resolver::get_path(&effective, "autonomous.workFinder.quarantine")
-    else {
-        return QuarantineFileConfig::default();
-    };
-    QuarantineFileConfig {
-        enabled: q.get("enabled").and_then(serde_json::Value::as_bool),
-        threshold: q
-            .get("threshold")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&n| n > 0)
-            .and_then(|n| u32::try_from(n).ok()),
-        ttl_secs: q
-            .get("ttlSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-        ttl_max_secs: q
-            .get("ttlMaxSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-        insta_crash_secs: q
-            .get("instaCrashSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-    }
-}
-
-/// Resolve the full [`QuarantineConfig`] for `repo_root` with precedence
-/// **env > config > default** for every knob (Issue #3939). Reads the file
-/// config internally, then layers env overrides on top, then the shipped
-/// defaults. Enabled defaults **on** — it is a safety backstop.
-#[must_use]
-pub fn resolve_quarantine_config(repo_root: &Path) -> QuarantineConfig {
-    let file = read_quarantine_file_config(repo_root);
-
-    let enabled = if let Ok(v) = std::env::var(QUARANTINE_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(true)
-    };
-
-    let threshold = std::env::var(QUARANTINE_THRESHOLD_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .or(file.threshold)
-        .unwrap_or(DEFAULT_QUARANTINE_THRESHOLD);
-
-    let ttl_secs = std::env::var(QUARANTINE_TTL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .or(file.ttl_secs)
-        .unwrap_or(DEFAULT_QUARANTINE_TTL_SECS);
-
-    let ttl_max_secs = std::env::var(QUARANTINE_TTL_MAX_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .or(file.ttl_max_secs)
-        .unwrap_or(DEFAULT_QUARANTINE_TTL_MAX_SECS)
-        // The ceiling only ever *extends* the pause; a ceiling below the base
-        // TTL would silently shorten generation 1 — clamp instead.
-        .max(ttl_secs);
-
-    let insta_crash_secs = std::env::var(QUARANTINE_INSTA_CRASH_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .or(file.insta_crash_secs)
-        .and_then(|s| i64::try_from(s).ok())
-        .unwrap_or(DEFAULT_QUARANTINE_INSTA_CRASH_SECS);
-
-    QuarantineConfig {
-        enabled,
-        threshold,
-        ttl: Duration::from_secs(ttl_secs),
-        ttl_max: Duration::from_secs(ttl_max_secs),
-        insta_crash_secs,
-    }
-}
-
 impl SweepRegistry {
     /// The set of issue numbers currently quarantined for insta-crashing (Issue
     /// #3939). Consumed by the work finder to skip re-dispatch. TTL expiry is
@@ -375,14 +196,14 @@ impl SweepRegistry {
     /// plain read of the pruned map.
     #[must_use]
     pub fn quarantined_issues(&self) -> HashSet<u32> {
-        self.quarantined.keys().copied().collect()
+        self.quarantine_state.quarantined.keys().copied().collect()
     }
 
     /// Sorted view of the currently-quarantined issues (Issue #3939), for the
     /// `loom-daemon status` per-repo breakdown.
     #[must_use]
     pub fn quarantined_issues_sorted(&self) -> Vec<u32> {
-        let mut v: Vec<u32> = self.quarantined.keys().copied().collect();
+        let mut v: Vec<u32> = self.quarantine_state.quarantined.keys().copied().collect();
         v.sort_unstable();
         v
     }
@@ -391,13 +212,17 @@ impl SweepRegistry {
     /// issue (Issue #3939). `0` when the issue has no recorded insta-crashes.
     #[must_use]
     pub fn insta_crash_count(&self, issue: u32) -> u32 {
-        self.insta_crash_counts.get(&issue).copied().unwrap_or(0)
+        self.quarantine_state
+            .insta_crash_counts
+            .get(&issue)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Whether `issue` is currently quarantined (Issue #3939).
     #[must_use]
     pub fn is_quarantined(&self, issue: u32) -> bool {
-        self.quarantined.contains_key(&issue)
+        self.quarantine_state.quarantined.contains_key(&issue)
     }
 
     /// Manually clear an issue's quarantine + insta-crash tally (Issue #3939),
@@ -414,13 +239,13 @@ impl SweepRegistry {
     /// so the background reaper keeps retrying the flip until it succeeds,
     /// instead of leaving the issue permanently stranded at `loom:blocked`.
     pub fn clear_quarantine(&mut self, issue: u32) -> bool {
-        self.insta_crash_counts.remove(&issue);
+        self.quarantine_state.insta_crash_counts.remove(&issue);
         // vibesql#6639: the operator's clear is a vote of confidence — it also
         // clears the probation generation, so the next quarantine (if the
         // operator was wrong and it insta-crashes again) serves the
         // generation-1 TTL with the full 3-strike runway rather than resuming
         // the escalated ladder the operator just cut short.
-        self.quarantine_generations.remove(&issue);
+        self.quarantine_state.generations.remove(&issue);
         // #4485: the operator's "let this run now" action also clears any
         // dispatch-backoff window — otherwise a cleared quarantine could still
         // be held back for up to `DispatchBackoffConfig::max`, making the
@@ -430,7 +255,7 @@ impl SweepRegistry {
         // operator clearing a quarantine wants the issue dispatchable NOW,
         // not still held by an unrelated cooldown window.
         self.clear_noop_cooldown(issue);
-        let was_quarantined = self.quarantined.remove(&issue).is_some();
+        let was_quarantined = self.quarantine_state.quarantined.remove(&issue).is_some();
         if was_quarantined {
             self.attempt_quarantine_release(issue);
         }
@@ -451,6 +276,7 @@ impl SweepRegistry {
     #[must_use]
     pub fn quarantine_entries(&self, now: DateTime<Utc>) -> Vec<crate::types::QuarantineEntry> {
         let mut entries: Vec<crate::types::QuarantineEntry> = self
+            .quarantine_state
             .quarantined
             .iter()
             .map(|(&issue, &quarantined_at)| {
@@ -458,16 +284,18 @@ impl SweepRegistry {
                 // generation-escalated effective TTL, so `quarantine list`
                 // shows the pause an operator is actually waiting on.
                 let generation = self
-                    .quarantine_generations
+                    .quarantine_state
+                    .generations
                     .get(&issue)
                     .copied()
                     .unwrap_or(1);
-                let effective_ttl = Duration::from_secs(effective_quarantine_ttl_secs(
+                let elapsed = (now - quarantined_at).to_std().unwrap_or_default();
+                let ttl_remaining_secs = Duration::from_secs(effective_quarantine_ttl_secs(
                     &self.quarantine_config,
                     generation,
-                ));
-                let elapsed = (now - quarantined_at).to_std().unwrap_or_default();
-                let ttl_remaining_secs = effective_ttl.saturating_sub(elapsed).as_secs();
+                ))
+                .saturating_sub(elapsed)
+                .as_secs();
                 crate::types::QuarantineEntry {
                     issue,
                     workspace_root: self.config.workspace_root.clone(),
@@ -488,8 +316,9 @@ impl SweepRegistry {
     /// `ClearQuarantine` path without driving the full insta-crash accrual.
     #[cfg(test)]
     pub fn seed_quarantine_for_test(&mut self, issue: u32) {
-        self.quarantined.insert(issue, Utc::now());
-        self.insta_crash_counts
+        self.quarantine_state.quarantined.insert(issue, Utc::now());
+        self.quarantine_state
+            .insta_crash_counts
             .insert(issue, self.quarantine_config.threshold);
     }
 
@@ -504,8 +333,12 @@ impl SweepRegistry {
         quarantined_at: DateTime<Utc>,
         insta_crash_count: u32,
     ) {
-        self.quarantined.insert(issue, quarantined_at);
-        self.insta_crash_counts.insert(issue, insta_crash_count);
+        self.quarantine_state
+            .quarantined
+            .insert(issue, quarantined_at);
+        self.quarantine_state
+            .insta_crash_counts
+            .insert(issue, insta_crash_count);
     }
 
     /// Issues currently awaiting a retried `loom:blocked` -> `loom:issue` label
@@ -513,7 +346,7 @@ impl SweepRegistry {
     /// tests and `loom-daemon status`-style diagnostics.
     #[must_use]
     pub fn pending_quarantine_release_issues(&self) -> HashSet<u32> {
-        self.pending_quarantine_release.clone()
+        self.quarantine_state.pending_release.clone()
     }
 
     // ------------------------------------------------------------------------
@@ -911,15 +744,16 @@ impl SweepRegistry {
             // existing quarantine entry untouched — a quarantined issue is never
             // dispatched, so it cannot reach here; this only clears the runway for
             // an issue that has NOT yet been quarantined.
-            self.insta_crash_counts.remove(&issue);
+            self.quarantine_state.insta_crash_counts.remove(&issue);
             // vibesql#6639: a healthy outcome also clears the probation — the
             // issue proved the breakage was transient, so the next quarantine
             // (if any) starts again from generation 1 with the full 3-strike
             // runway rather than insta-re-quarantining on one crash.
-            self.quarantine_generations.remove(&issue);
+            self.quarantine_state.generations.remove(&issue);
             return;
         }
         let count = self
+            .quarantine_state
             .insta_crash_counts
             .entry(issue)
             .and_modify(|c| *c += 1)
@@ -933,26 +767,26 @@ impl SweepRegistry {
         // evidence the breakage persisted through the pause; making it cost
         // three more wasted dispatches per flap cycle is how #6639's
         // 8-cycle loop accreted.
-        let effective_threshold = if self.quarantine_generations.contains_key(&issue) {
+        let effective_threshold = if self.quarantine_state.generations.contains_key(&issue) {
             1
         } else {
             self.quarantine_config.threshold
         };
-        if count >= effective_threshold && !self.quarantined.contains_key(&issue) {
-            let generation = self
-                .quarantine_generations
+        if count >= effective_threshold && !self.quarantine_state.quarantined.contains_key(&issue) {
+            let generation = *self
+                .quarantine_state
+                .generations
                 .entry(issue)
                 .and_modify(|g| *g += 1)
                 .or_insert(1);
-            let generation = *generation;
-            let ttl_secs = effective_quarantine_ttl_secs(&self.quarantine_config, generation);
-            self.quarantined.insert(issue, Utc::now());
+            self.quarantine_state.quarantined.insert(issue, Utc::now());
             log::warn!(
                 "sweep_registry: issue #{issue} QUARANTINED (generation {generation}) after \
                  {count} consecutive insta-crash(es) (each <{}s with no checkpoint) — pausing \
-                 re-dispatch for {ttl_secs}s so it stops starving the shared queue (#3939, \
-                 escalation vibesql#6639). Clear via operator action or wait for the TTL.",
+                 re-dispatch for {}s so it stops starving the shared queue (#3939, escalation \
+                 vibesql#6639). Clear via operator action or wait for the TTL.",
                 self.quarantine_config.insta_crash_secs,
+                effective_quarantine_ttl_secs(&self.quarantine_config, generation),
             );
             self.apply_quarantine_label(issue, count);
         } else {
@@ -973,7 +807,7 @@ impl SweepRegistry {
     /// subsequent ticks via [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
     /// if the first attempt fails (Issue #4110).
     pub(crate) fn expire_quarantine(&mut self) {
-        if self.quarantined.is_empty() {
+        if self.quarantine_state.quarantined.is_empty() {
             return;
         }
         let now = Utc::now();
@@ -991,23 +825,28 @@ impl SweepRegistry {
         // relapsed quarantine serves a doubling pause rather than the flat
         // base TTL every cycle.
         let expired: Vec<(u32, DateTime<Utc>)> = self
+            .quarantine_state
             .quarantined
             .iter()
             .filter(|(issue, at)| {
                 let generation = self
-                    .quarantine_generations
+                    .quarantine_state
+                    .generations
                     .get(*issue)
                     .copied()
                     .unwrap_or(1);
-                let ttl_secs = effective_quarantine_ttl_secs(&self.quarantine_config, generation);
-                let ttl_secs = i64::try_from(ttl_secs).unwrap_or(i64::MAX);
-                (now - **at).num_seconds() >= ttl_secs
+                (now - **at).num_seconds()
+                    >= i64::try_from(effective_quarantine_ttl_secs(
+                        &self.quarantine_config,
+                        generation,
+                    ))
+                    .unwrap_or(i64::MAX)
             })
             .map(|(issue, at)| (*issue, *at))
             .collect();
         for (issue, quarantined_at) in expired {
-            self.quarantined.remove(&issue);
-            self.insta_crash_counts.remove(&issue);
+            self.quarantine_state.quarantined.remove(&issue);
+            self.quarantine_state.insta_crash_counts.remove(&issue);
             // The generation entry is deliberately KEPT (vibesql#6639): it is
             // the probation marker that makes the first post-release
             // insta-crash re-quarantine immediately at an escalated TTL, and
@@ -1035,7 +874,8 @@ impl SweepRegistry {
             }
 
             let generation = self
-                .quarantine_generations
+                .quarantine_state
+                .generations
                 .get(&issue)
                 .copied()
                 .unwrap_or(1);
@@ -1087,10 +927,15 @@ impl SweepRegistry {
     /// pending. Idempotent — re-running the flip on an issue that a human
     /// already restored by hand is a harmless no-op `gh` call.
     pub(crate) fn retry_pending_quarantine_releases(&mut self) {
-        if self.pending_quarantine_release.is_empty() {
+        if self.quarantine_state.pending_release.is_empty() {
             return;
         }
-        let pending: Vec<u32> = self.pending_quarantine_release.iter().copied().collect();
+        let pending: Vec<u32> = self
+            .quarantine_state
+            .pending_release
+            .iter()
+            .copied()
+            .collect();
         for issue in pending {
             self.attempt_quarantine_release(issue);
         }
@@ -1104,9 +949,9 @@ impl SweepRegistry {
     /// the default log level.
     pub(crate) fn attempt_quarantine_release(&mut self, issue: u32) {
         if self.release_quarantine_label(issue) {
-            self.pending_quarantine_release.remove(&issue);
+            self.quarantine_state.pending_release.remove(&issue);
         } else {
-            let first_attempt = self.pending_quarantine_release.insert(issue);
+            let first_attempt = self.quarantine_state.pending_release.insert(issue);
             log::warn!(
                 "sweep_registry: quarantine release for #{issue} failed — `loom:blocked` may \
                  remain stranded on the forge; retrying on the next reaper tick (#4110){}",
@@ -1132,10 +977,10 @@ impl SweepRegistry {
     /// `warn` and left for the reconciliation pass to pick up at the next
     /// restart. Returns the number of quarantines flushed (attempted).
     pub fn flush_quarantines_for_eviction(&mut self) -> usize {
-        let issues: Vec<u32> = self.quarantined.keys().copied().collect();
+        let issues: Vec<u32> = self.quarantine_state.quarantined.keys().copied().collect();
         for issue in &issues {
-            self.quarantined.remove(issue);
-            self.insta_crash_counts.remove(issue);
+            self.quarantine_state.quarantined.remove(issue);
+            self.quarantine_state.insta_crash_counts.remove(issue);
             if !self.release_quarantine_label(*issue) {
                 log::warn!(
                     "sweep_registry: eviction release for #{issue} failed — `loom:blocked` may \
@@ -1193,7 +1038,8 @@ impl SweepRegistry {
         }
 
         let generation = self
-            .quarantine_generations
+            .quarantine_state
+            .generations
             .get(&issue)
             .copied()
             .unwrap_or(1);
@@ -2118,9 +1964,10 @@ mod tests {
 
         // Quarantine #44 with a timestamp two hours in the past (past the 1h TTL).
         registry
+            .quarantine_state
             .quarantined
             .insert(44, Utc::now() - chrono::Duration::seconds(7200));
-        registry.insta_crash_counts.insert(44, 3);
+        registry.quarantine_state.insta_crash_counts.insert(44, 3);
         assert!(registry.is_quarantined(44));
 
         // reap_once runs expire_quarantine at the top of the tick.
@@ -2141,6 +1988,7 @@ mod tests {
 
         // Quarantined 10s ago — well inside the 1h TTL.
         registry
+            .quarantine_state
             .quarantined
             .insert(45, Utc::now() - chrono::Duration::seconds(10));
         registry.reap_once();
@@ -2176,7 +2024,7 @@ mod tests {
         registry.reap_once();
         assert!(!registry.is_quarantined(61), "zero-TTL entry releases on the next reap");
         assert_eq!(
-            registry.quarantine_generations.get(&61),
+            registry.quarantine_state.generations.get(&61),
             Some(&1),
             "probation generation survives the TTL release (vibesql#6639)"
         );
@@ -2189,37 +2037,10 @@ mod tests {
             "a post-release relapse re-quarantines on the FIRST insta-crash, not the third"
         );
         assert_eq!(
-            registry.quarantine_generations.get(&61),
+            registry.quarantine_state.generations.get(&61),
             Some(&2),
             "the relapse increments the escalation generation"
         );
-    }
-
-    /// vibesql#6639: the escalation math itself. Generation N serves
-    /// `ttl * 2^(N-1)` capped at `ttl_max`; a ceiling below the base TTL clamps
-    /// UP to the base (the cap may only extend the pause, never shorten gen 1).
-    #[test]
-    fn quarantine_ttl_escalates_by_generation_and_caps() {
-        let config = QuarantineConfig {
-            ttl: Duration::from_secs(3600),
-            ttl_max: Duration::from_secs(86400),
-            ..QuarantineConfig::default()
-        };
-        assert_eq!(effective_quarantine_ttl_secs(&config, 1), 3600);
-        assert_eq!(effective_quarantine_ttl_secs(&config, 2), 7200);
-        assert_eq!(effective_quarantine_ttl_secs(&config, 3), 14400);
-        assert_eq!(effective_quarantine_ttl_secs(&config, 5), 57600);
-        // 3600 << 5 = 115200 > 86400: capped.
-        assert_eq!(effective_quarantine_ttl_secs(&config, 6), 86400);
-        assert_eq!(effective_quarantine_ttl_secs(&config, 40), 86400, "saturates, never overflows");
-        // A misconfigured ceiling below the base TTL never shortens generation 1.
-        let clamped = QuarantineConfig {
-            ttl: Duration::from_secs(3600),
-            ttl_max: Duration::from_secs(60),
-            ..QuarantineConfig::default()
-        };
-        assert_eq!(effective_quarantine_ttl_secs(&clamped, 1), 3600);
-        assert_eq!(effective_quarantine_ttl_secs(&clamped, 4), 3600);
     }
 
     /// vibesql#6639: `quarantine_entries` surfaces the generation and reports
@@ -2234,9 +2055,9 @@ mod tests {
             ..QuarantineConfig::default()
         });
 
-        registry.quarantined.insert(62, Utc::now());
-        registry.quarantine_generations.insert(62, 2);
-        registry.insta_crash_counts.insert(62, 1);
+        registry.quarantine_state.quarantined.insert(62, Utc::now());
+        registry.quarantine_state.generations.insert(62, 2);
+        registry.quarantine_state.insta_crash_counts.insert(62, 1);
 
         let entries = registry.quarantine_entries(Utc::now());
         let entry = entries
@@ -2261,12 +2082,12 @@ mod tests {
     fn healthy_outcome_resets_quarantine_generation() {
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
-        registry.quarantine_generations.insert(63, 2);
+        registry.quarantine_state.generations.insert(63, 2);
 
         registry.record_terminal_outcome(63, false);
 
         assert!(
-            !registry.quarantine_generations.contains_key(&63),
+            !registry.quarantine_state.generations.contains_key(&63),
             "a healthy outcome clears the probation generation"
         );
         // And the restored runway: one insta-crash alone no longer quarantines.
@@ -2285,12 +2106,12 @@ mod tests {
     fn clear_quarantine_resets_escalation_generation() {
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
-        registry.quarantined.insert(64, Utc::now());
-        registry.quarantine_generations.insert(64, 3);
-        registry.insta_crash_counts.insert(64, 1);
+        registry.quarantine_state.quarantined.insert(64, Utc::now());
+        registry.quarantine_state.generations.insert(64, 3);
+        registry.quarantine_state.insta_crash_counts.insert(64, 1);
 
         assert!(registry.clear_quarantine(64));
-        assert!(!registry.quarantine_generations.contains_key(&64));
+        assert!(!registry.quarantine_state.generations.contains_key(&64));
         assert!(!registry.is_quarantined(64));
     }
 
@@ -2300,8 +2121,8 @@ mod tests {
     fn clear_quarantine_releases_entry() {
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
-        registry.quarantined.insert(46, Utc::now());
-        registry.insta_crash_counts.insert(46, 3);
+        registry.quarantine_state.quarantined.insert(46, Utc::now());
+        registry.quarantine_state.insta_crash_counts.insert(46, 3);
 
         assert!(registry.clear_quarantine(46), "returns true when an entry existed");
         assert!(!registry.is_quarantined(46));
@@ -2320,10 +2141,10 @@ mod tests {
         let now = Utc::now();
         // Insert out of order to verify the accessor sorts, not just echoes
         // insertion order.
-        registry.quarantined.insert(200, now);
-        registry.insta_crash_counts.insert(200, 3);
-        registry.quarantined.insert(100, now);
-        registry.insta_crash_counts.insert(100, 7);
+        registry.quarantine_state.quarantined.insert(200, now);
+        registry.quarantine_state.insta_crash_counts.insert(200, 3);
+        registry.quarantine_state.quarantined.insert(100, now);
+        registry.quarantine_state.insta_crash_counts.insert(100, 7);
 
         let entries = registry.quarantine_entries(now);
         assert_eq!(entries.len(), 2);
@@ -2349,10 +2170,13 @@ mod tests {
         let now = Utc::now();
         let half_ttl_ago = now - chrono::Duration::seconds((ttl_secs / 2) as i64);
         let past_ttl = now - chrono::Duration::seconds((ttl_secs * 2) as i64);
-        registry.quarantined.insert(1, half_ttl_ago);
-        registry.insta_crash_counts.insert(1, 3);
-        registry.quarantined.insert(2, past_ttl);
-        registry.insta_crash_counts.insert(2, 3);
+        registry
+            .quarantine_state
+            .quarantined
+            .insert(1, half_ttl_ago);
+        registry.quarantine_state.insta_crash_counts.insert(1, 3);
+        registry.quarantine_state.quarantined.insert(2, past_ttl);
+        registry.quarantine_state.insta_crash_counts.insert(2, 3);
 
         let entries = registry.quarantine_entries(now);
         let e1 = entries.iter().find(|e| e.issue == 1).unwrap();
@@ -2390,8 +2214,8 @@ mod tests {
         config.gh_bin = Some(fake_gh);
         config.skip_label_flip = false; // exercise the real restore path
         let mut registry = SweepRegistry::new(config);
-        registry.quarantined.insert(52, Utc::now());
-        registry.insta_crash_counts.insert(52, 3);
+        registry.quarantine_state.quarantined.insert(52, Utc::now());
+        registry.quarantine_state.insta_crash_counts.insert(52, 3);
 
         assert!(registry.clear_quarantine(52));
         assert!(!registry.is_quarantined(52));
@@ -2458,9 +2282,10 @@ mod tests {
             ..QuarantineConfig::default()
         });
         registry
+            .quarantine_state
             .quarantined
             .insert(60, Utc::now() - chrono::Duration::seconds(7200));
-        registry.insta_crash_counts.insert(60, 3);
+        registry.quarantine_state.insta_crash_counts.insert(60, 3);
 
         registry.reap_once();
 
@@ -2529,9 +2354,10 @@ exit 0
             ..QuarantineConfig::default()
         });
         registry
+            .quarantine_state
             .quarantined
             .insert(4206, Utc::now() - chrono::Duration::seconds(7200));
-        registry.insta_crash_counts.insert(4206, 3);
+        registry.quarantine_state.insta_crash_counts.insert(4206, 3);
 
         registry.reap_once();
 
@@ -2610,9 +2436,10 @@ exit 0
             ..QuarantineConfig::default()
         });
         registry
+            .quarantine_state
             .quarantined
             .insert(61, Utc::now() - chrono::Duration::seconds(7200));
-        registry.insta_crash_counts.insert(61, 3);
+        registry.quarantine_state.insta_crash_counts.insert(61, 3);
 
         // First tick: both the `expire_quarantine` attempt and the same-tick
         // `retry_pending_quarantine_releases` pass hit the fake gh's two
@@ -2662,8 +2489,8 @@ exit 0
         config.gh_bin = Some(fake_gh);
         config.skip_label_flip = false;
         let mut registry = SweepRegistry::new(config);
-        registry.quarantined.insert(62, Utc::now());
-        registry.insta_crash_counts.insert(62, 3);
+        registry.quarantine_state.quarantined.insert(62, Utc::now());
+        registry.quarantine_state.insta_crash_counts.insert(62, 3);
 
         let flushed = registry.flush_quarantines_for_eviction();
         assert_eq!(flushed, 1);
