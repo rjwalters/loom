@@ -8,7 +8,7 @@ not Loom instrumentation.
 
 ## Pinned distribution and host budget
 
-`compose.yaml` pins the official all-in-one **2.39.1** multi-platform index to
+`Dockerfile` pins the official all-in-one **2.39.1** multi-platform base index to
 `sha256:b3ff85e093f8dd9da458a2d0c770c6dbafe776adca755c7b91de33528c3b9553`.
 The index has Linux amd64 and arm64 images. Docker Desktop on macOS runs these
 inside its Linux VM. The recipe caps the container at 3 GiB RAM and four CPUs;
@@ -24,8 +24,11 @@ collector. Allow up to twenty minutes on a contended development VM; investigate
 pinned all-in-one layout and must be rechecked when upgrading the image.
 
 Upstream supports the all-in-one distribution for demos and local testing. Its
-components share one resource limit and the bundled startup script fixes the
-session secret. Keep it local on a trusted machine. Production or a shared server
+components share one resource limit. The small derived-image Dockerfile asserts
+the pinned startup script's single fixed-session-secret assignment and removes
+it; otherwise that script silently overrides a private environment value.
+The API must receive the required external session secret. Keep the trial local
+on a trusted machine. Production or a shared server
 needs the upstream separated deployment and its authentication hardening.
 The application UI and Docker socket require a trusted host. ClickHouse is not
 published to the host; use the bundled client through Compose exec for read-only
@@ -40,8 +43,11 @@ external `loom-observability` network once if it does not already exist:
 docker network create loom-observability
 ```
 
-Create a private env file outside the checkout, mode `0600`, containing
-`CLICKSTACK_INGESTION_API_KEY=<random independent secret>`. Also save the same raw
+Create a private env file outside every checkout, mode `0600`, containing
+`CLICKSTACK_INGESTION_API_KEY=<random independent secret>` and
+`CLICKSTACK_SESSION_SECRET=<different random session-signing secret>`.
+Never store credentials, browser state or token/session responses in a repository,
+including ignored paths and managed worktrees. Also save the raw ingestion
 secret (without `Bearer `) to a separate private key file. Point the neutral
 collector's `LOOM_CLICKSTACK_INGEST_KEY_FILE` at that key file. These are ingestion
 credentials, never `ZAI_API_KEY` or UI passwords. Set `CLICKSTACK_RETENTION=168h`
@@ -49,7 +55,7 @@ in the env file if you want to make the default seven-day retention explicit.
 
 ```console
 docker compose --env-file /absolute/private/clickstack.env config --quiet
-docker compose --env-file /absolute/private/clickstack.env up -d --wait
+docker compose --env-file /absolute/private/clickstack.env up -d --build --wait
 docker compose --env-file /absolute/private/clickstack.env ps
 curl --fail http://localhost:18080/api/health
 docker compose --env-file /absolute/private/clickstack.env exec -T clickstack clickhouse-client --query "SELECT 1"
@@ -59,6 +65,11 @@ Use `config --quiet`: full rendered Compose configuration contains the key.
 Docker administrators can inspect container environment variables. This upstream
 bootstrap does not support an ingestion-key file setting. Do not put the env file
 in source control or attach it to an issue.
+
+Keep the session secret stable across restarts. Rotating it invalidates existing
+browser cookies and requires signing in again; it does not rotate ingestion auth.
+Copy the Dockerfile and `.dockerignore` with the Compose deployment before building outside a managed
+worktree. The derived image remains based on the exact upstream digest above.
 
 The shared collector sends OTLP HTTP to `http://clickstack-collector:4318` using
 raw `authorization`. Ingest is not published to the host. The UI is

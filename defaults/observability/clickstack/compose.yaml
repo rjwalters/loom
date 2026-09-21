@@ -1,14 +1,17 @@
 name: loom-clickstack
 services:
   clickstack:
-    # Multi-platform index: linux/amd64 and linux/arm64; verified 2026-09-21.
-    image: clickhouse/clickstack-all-in-one:2.39.1@sha256:b3ff85e093f8dd9da458a2d0c770c6dbafe776adca755c7b91de33528c3b9553
+    # Dockerfile pins the multi-platform upstream index and removes its fixed
+    # session-secret assignment so the required machine secret reaches the API.
+    build: .
+    image: loom-clickstack-trial:2.39.1-session-secret-v1
     restart: unless-stopped
     mem_limit: 3g
     cpus: 4.0
     environment:
       # Bootstrap key works before UI signup; never use a model-provider key here.
       INGESTION_API_KEY: ${CLICKSTACK_INGESTION_API_KEY:?Set a private ClickStack ingestion key}
+      EXPRESS_SESSION_SECRET: ${CLICKSTACK_SESSION_SECRET:?Set a private ClickStack session-signing secret}
       FRONTEND_URL: http://localhost:18080
       HYPERDX_OTEL_EXPORTER_TABLES_TTL: ${CLICKSTACK_RETENTION:-168h}
       HYPERDX_OTEL_EXPORTER_CREATE_LEGACY_SCHEMA: 'true'

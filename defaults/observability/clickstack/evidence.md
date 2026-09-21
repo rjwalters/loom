@@ -2,7 +2,7 @@
 
 ## Reproduction identity
 
-Validation on 2026-09-21 used the Compose-pinned ClickStack all-in-one 2.39.1
+Validation on 2026-09-21 used the pinned ClickStack all-in-one 2.39.1
 multiarch digest on Docker Desktop Linux arm64, with 8 VM CPUs and 7.65 GiB RAM.
 Existing unrelated workloads were left running. Queried bundled versions:
 ClickHouse **26.8.7.19**, HyperDX **2.39.1**, collector **0.155.0**, MongoDB **4.0.5**.
@@ -79,6 +79,32 @@ in addition to receiver authentication and storage persistence.
 
 The pinned UI also displayed a transient `Expected string, received null` notice
 while changing sources; it did not prevent the observed log query/details.
+
+## Machine-private session credentials
+
+The credential audit confirmed that the upstream entry script unconditionally
+overwrites `EXPRESS_SESSION_SECRET` with a public constant. Setting only a Compose
+environment value is ineffective. The derived-image Dockerfile asserts exactly
+one expected assignment before removing it with JSON exec-form tools; its base
+remains the pinned official digest. The image built successfully on Linux arm64.
+Compose now refuses to run without the independent machine-private session key,
+and `.dockerignore` excludes all local context files from the image build.
+
+A boolean-only inspection found exactly one API process and confirmed that its
+actual environment value matched the private machine key. App and collector
+health passed. The old signed cookie received **401** from `/api/sources` after
+rotation. Stored fixture data survived: **36 trace rows / 4 unique spans,
+6 logs and 5 gauges with value 3**. Additional rows reflect deliberate replays and
+outage/retry delivery, not new trace identities or a throughput measurement.
+Signing in again with the existing account produced a new session and an
+authenticated **200** from the same protected sources endpoint; no account or
+source recreation was needed.
+
+Private key, env, password, cookie and browser-state files live outside every
+checkout with mode 0600. Filename-only scans of known trial secret/token/cookie
+values found no matches in repository source or managed worktrees. Concurrent
+local backend startup caused probe timeouts on this occupied host without OOM
+flags; final checks therefore ran sequentially with persistent volumes retained.
 
 | Remaining check | Status |
 | --- | --- |
