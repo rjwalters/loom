@@ -4284,7 +4284,10 @@ pub use model_resolution::{
 #[allow(clippy::unwrap_used)]
 mod tests;
 
-mod runtime_preflight;
+// `pub(crate)` since #8436: `runtime_preference::availability` asks the same
+// "which pool does this runtime consume" question without the skip side
+// effects, and reuses this module's codex reads rather than forking them.
+pub(crate) mod runtime_preflight;
 
 // Feeds a codex-runtime role tick's own `LOOM_TERMINAL_RESULT` record into
 // account health (issue #8443) — the role-tick analogue of

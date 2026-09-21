@@ -1075,6 +1075,93 @@ Add to `.loom/config.json`:
 must have a matching `spawn-<value>.sh` runner on disk (e.g. `"claude"` →
 `spawn-claude.sh`).
 
+### Ordered runtime preference with fall-through (issue #8436)
+
+The precedence chain above is **static**: it picks a runtime without asking
+whether that runtime's credentials can serve a launch. Exhaustion is handled per
+runtime and the only response is to stop — the #7708 host-level pool-exhaustion
+hold for sweeps, the #8408 pre-spawn skip for role ticks. A host with a dead
+Claude pool, valid Codex seats, and a working pay-per-use endpoint therefore sits
+idle.
+
+`runtimes.preference` expresses an **ordered preference with fall-through**
+instead: prefer the subscription accounts whenever they can serve the work; use a
+metered pay-per-use endpoint only as a backstop. Setting `runtimes.default:
+"opencode"` cannot express that — it sends *all* work to the metered endpoint and
+strands the seats already paid for.
+
+```jsonc
+{
+  "runtimes": {
+    "preference": ["claude", "codex", {"runtime": "opencode", "modelProfile": "zai-metered"}],
+    "rolePreference": { "judge": ["codex", "claude", "opencode"] }
+  }
+}
+```
+
+An entry is either a bare runtime id or an object with `runtime` plus an optional
+`modelProfile`. The unit being ordered is a **tap** — `(runtime, credential
+source)` — not a bare runtime id: the same model family is reachable through a
+flat-rate subscription and through a metered endpoint, under different provider
+ids and with completely different economics, so `modelProfile` is what
+distinguishes them. A bare runtime name is shorthand for "that runtime with
+whatever profile it would have chosen anyway".
+
+**Resolution, per launch**: walk the list and take the first tap that is
+**(a)** admitted for the role and **(b)** has a spawnable credential right now.
+`rolePreference.<role>` outranks `preference`; an empty list means "unset, fall
+through", matching `runtimes.roles.<role>: ""`.
+
+| Guarantee | Meaning |
+|---|---|
+| **Absent key ⇒ no behaviour change** | With no `preference`/`rolePreference`, resolution is byte-identical to the static chain above, and no credential pool is read at all. |
+| **An operator pin wins outright** | `LOOM_RUNTIME`, `LOOM_RUNTIME_<ROLE>`, or an explicit per-dispatch runtime short-circuits to static resolution and **disables fall-through**. A pin is a deliberate act; routing around it would make it useless for the debugging it exists for. |
+| **Preference is never an admission override** | A runtime the role cannot be admitted onto is skipped, never forced. |
+| **Fail-closed stays fail-closed** | When *every* listed tap is skipped the caller holds/skips exactly as before; the #7708 hold becomes "hold when the whole list is exhausted". |
+| **Malformed config fails closed** | A non-array value, an unknown `rolePreference` role key, a malformed entry, or a duplicated tap is an error (surfaced by `loom-daemon validate`), not a silently different order. |
+
+**Builder/Codex admission caveat.** `defaults/runtimes/codex.json` declares
+`worktreeIsolation: "partial"` and `defaults/roles/builder.json` /
+`doctor.json` require that capability, so **Codex is never selected for Builder
+or Doctor**, however high it sits in the list. For build work
+`["claude","codex","opencode"]` is effectively `claude → opencode`; the Codex
+entry is recorded as skipped with reason `not-admitted(worktreeIsolation)`, which
+is materially different from "Codex had no credential" and should be read that
+way.
+
+**Judge independence.** A native sweep runs every phase in **one session with no
+subagents**, so a preference list that lands Builder and Judge on the same
+single-session runtime weakens review independence — the reviewer is the same
+process that wrote the change. Use `rolePreference.judge` to keep Judge on a
+different tap from the one that built it; prefer that over relying on the
+fleet-wide order.
+
+**One sweep, one runtime.** Fall-through is decided at **dispatch**, never
+mid-sweep (see `guardrail-parity-native.md`). A sweep that exhausts its runtime
+in flight fails and is re-dispatched, where it re-resolves. Hysteresis follows
+for free: once a higher-preference pool recovers, new spawns return to it while
+in-flight backstop sweeps finish where they are. No pinning mechanism exists or
+is needed.
+
+**Observability.** A preference-resolved launch logs a marker recording the
+chosen tier and every higher tier's skip reason:
+
+```text
+# LOOM_RUNTIME_PREFERENCE order=claude,codex,opencode:zai-metered tier=2 tap=opencode:zai-metered skipped=claude:unavailable(claude_tokens: 0/21 spawnable),codex:not-admitted(worktreeIsolation) source=preference
+```
+
+This is a **sibling** of `# LOOM_RUNTIME_RESOLVED`, not extra fields on it: the
+crash-signal reader takes the entire rest of that line as the runtime name, so
+appending to it would report a runtime called `"opencode tier=2"`. "How much work
+is going to the backstop" reduces to counting markers whose `tier` is not `0`.
+
+> **Status.** As of this writing the resolver, its shared credential-availability
+> mapping, and config parsing/validation are implemented
+> (`loom-daemon/src/runtime_preference/`), but **dispatch is not yet wired to
+> it** — neither the work finder nor the role runner calls it, so no launch
+> changes until the wiring lands. The metered-tier concurrency ceiling is
+> likewise still to come. See the follow-up issues on #8436.
+
 ### Adding a runtime adapter
 
 Drop a `spawn-<runtime>.sh` runner next to `spawn-claude.sh` (same directory,

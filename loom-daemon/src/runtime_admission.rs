@@ -20,6 +20,14 @@ pub enum RuntimeSource {
     GlobalEnvironment,
     RoleConfig,
     DefaultConfig,
+    /// The ordered runtime preference list picked this runtime (Issue #8436):
+    /// `runtimes.rolePreference.<role>` or `runtimes.preference`, resolved at
+    /// dispatch time against live credential availability. Distinct from
+    /// [`Self::Explicit`] on purpose — an explicit per-dispatch runtime is an
+    /// operator pin that disables fall-through, whereas this value means the
+    /// walk chose among several candidates and recorded why it passed over
+    /// the ones above.
+    Preference,
     BuiltIn,
 }
 

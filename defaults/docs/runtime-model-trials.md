@@ -362,6 +362,43 @@ never the shipped Claude `sonnet` alias. Its authentication does not require
 a Claude token pool. `/loom:<role> arguments` expands the installed role text
 and repository instructions, and checks admission before launch.
 
+## Backstopping a trial tap behind the subscriptions (#8436)
+
+A trial profile is usually a *second* way to reach a model, not a replacement
+for the Claude/Codex seats already paid for. `runtimes.preference` orders those
+taps and falls through only when a higher one has nothing spawnable, so a metered
+endpoint stays a backstop rather than becoming the default:
+
+```jsonc
+"runtimes": {
+  "preference": ["claude", "codex", {"runtime": "opencode", "modelProfile": "zai-metered"}]
+}
+```
+
+Three things to know before pointing a trial at this:
+
+- **A tap is (runtime, credential source), not a runtime id.** The same model is
+  reachable through a flat-rate coding-plan subscription and through a metered
+  serverless endpoint, under different provider ids. Name the `modelProfile` when
+  the distinction matters — that is what makes "which tap did this run use"
+  answerable from the launch record.
+- **Exhaustion means different things per tap.** A flat-rate tap exhausts on plan
+  limits and recovers on a clock, which is what the #8401 API-key pool's bad-mark
+  model describes. A metered tap effectively never exhausts; its limiter is a
+  **spend ceiling**, and it must not be modelled as a cooldown. A harness cost
+  estimate is at least directionally meaningful for a metered tap and is not a
+  charge at all for a flat-rate one.
+- **Codex is not admitted for Builder/Doctor**
+  (`worktreeIsolation: "partial"`), so a build-role chain is effectively
+  `claude → <native tap>` whatever the list says; and because a native sweep runs
+  every phase in one session with no subagents, set `rolePreference.judge` to keep
+  review off the tap that produced the change.
+
+Full semantics, the operator-pin rule, and the
+`# LOOM_RUNTIME_PREFERENCE` observability marker: `runtime-adapters.md` §
+"Ordered runtime preference with fall-through". Dispatch is not yet wired to the
+resolver — see the follow-up issues on #8436.
+
 ## Evidence and limits
 
 `--log` appends both streams, launch identity and native JSON events to a file.

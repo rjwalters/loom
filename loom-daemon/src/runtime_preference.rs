@@ -1,0 +1,392 @@
+//! Ordered runtime preference with fall-through (Issue #8436).
+//!
+//! Runtime selection used to be **static**: `LOOM_RUNTIME` >
+//! `runtimes.roles.<role>` / `runtimes.default` > built-in `claude`, decided
+//! with no reference to whether the chosen runtime's credentials can actually
+//! serve a launch. Exhaustion was handled per runtime and the only response
+//! was to stop — the #7708 host-level pool-exhaustion hold for sweeps, the
+//! #6201/#8408 pre-spawn skip for role ticks. A host with a dead Claude pool,
+//! valid Codex seats, and a working pay-per-use endpoint therefore sat idle.
+//!
+//! Operator direction (2026-09-20): **prefer the Claude and Codex subscription
+//! accounts whenever they can serve the work; use a pay-per-use
+//! OpenAI-compatible endpoint through a native runtime only as a backstop.**
+//! That is an ordered preference with fall-through, which the static model
+//! cannot express — `runtimes.default: "opencode"` would send *all* work to
+//! the metered endpoint and strand the seats already paid for.
+//!
+//! ```jsonc
+//! "runtimes": {
+//!   "preference": ["claude", "codex", {"runtime": "opencode", "modelProfile": "zai-metered"}],
+//!   "rolePreference": { "judge": ["codex", "claude"] }
+//! }
+//! ```
+//!
+//! # What this module is, and is not
+//!
+//! It is the **resolution half** of #8436: config parsing, the shared
+//! availability mapping ([`availability`]), and the pure ordered walk
+//! ([`resolve`]). It is deliberately **not wired into dispatch yet** — neither
+//! the work finder's `uses_native_sweep` seam nor the role runner calls
+//! [`resolve_runtime`], so on today's `main` this module changes no launch.
+//! Wiring, the metered-tier concurrency ceiling, and the docs are tracked
+//! separately; see the follow-up issues linked from #8436.
+//!
+//! # Invariants
+//!
+//! - **Absent config is byte-identical.** With no `preference`/`rolePreference`
+//!   key, [`resolve_runtime`] returns exactly what
+//!   [`crate::runtime_admission::resolve_and_admit`] returns, having consulted
+//!   no pool at all.
+//! - **An operator pin wins outright and disables fall-through.** An explicit
+//!   per-dispatch runtime, `LOOM_RUNTIME_<ROLE>`, or `LOOM_RUNTIME` short-
+//!   circuits to static resolution even when a preference list is configured.
+//!   A pin is a deliberate act; silently routing around it would make it
+//!   useless for the debugging it exists for.
+//! - **Preference is never an admission override.** A runtime a role cannot be
+//!   admitted onto is skipped, never forced. `defaults/runtimes/codex.json`
+//!   declares `worktreeIsolation: "partial"` and `builder.json`/`doctor.json`
+//!   require it, so for build work `["claude","codex","opencode"]` is
+//!   effectively `claude -> opencode`.
+//! - **Fail-closed stays fail-closed.** When every listed tap is skipped the
+//!   result carries no choice, and the caller holds/skips exactly as it does
+//!   today. The #7708 hold becomes "hold when the *whole list* is exhausted".
+//!
+//! # One sweep, one runtime
+//!
+//! `guardrail-parity-native.md` already states a sweep uses one runtime
+//! throughout. Fall-through is therefore decided at **dispatch**, never
+//! mid-sweep: a sweep that exhausts its runtime in flight fails and is
+//! re-dispatched, where it re-resolves. Hysteresis falls out of that for free
+//! — once a higher-preference pool recovers, new spawns return to it while
+//! in-flight backstop sweeps finish where they are. No pinning mechanism is
+//! needed, and none is provided.
+//!
+//! # Judge independence
+//!
+//! A native sweep runs every phase in one session with no subagents, so a
+//! preference list that lands Builder and Judge on the same single-session
+//! runtime weakens review independence. `rolePreference.judge` exists to keep
+//! Judge on a different tap from the one that built the change; prefer
+//! configuring it over relying on the fleet-wide order.
+
+pub mod availability;
+pub mod resolve;
+
+pub use availability::{availability, Availability, CredentialSource};
+pub use resolve::{ChosenTap, Resolution, SkipReason, SkippedTap, Tap, PREFERENCE_LOG_MARKER};
+
+use crate::runtime_admission::{canonical_role, ResolvedRuntime, RuntimeRejection, RuntimeSource};
+use serde_json::Value;
+use std::path::Path;
+
+/// Which config key supplied the preference list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreferenceSource {
+    /// `runtimes.rolePreference.<role>` — the per-role override.
+    RolePreference,
+    /// `runtimes.preference` — the fleet-wide default order.
+    FleetPreference,
+}
+
+impl PreferenceSource {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RolePreference => "role-preference",
+            Self::FleetPreference => "preference",
+        }
+    }
+}
+
+/// Why resolution stayed on the pre-#8436 static path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaticReason {
+    /// No `preference`/`rolePreference` key applies to this role.
+    NoPreferenceConfigured,
+    /// An operator pin is in force; the named source disables fall-through.
+    OperatorPin(RuntimeSource),
+}
+
+/// The result of asking "what runtime should this launch use?".
+#[derive(Debug)]
+pub enum Decision {
+    /// Static resolution, byte-identical to pre-#8436 behaviour. No credential
+    /// pool was read.
+    Static {
+        reason: StaticReason,
+        result: Result<ResolvedRuntime, RuntimeRejection>,
+    },
+    /// The ordered preference list decided. `resolution.chosen == None` means
+    /// every listed tap was skipped: fail closed, exactly as today.
+    Preference {
+        source: PreferenceSource,
+        resolution: Resolution<ResolvedRuntime>,
+    },
+}
+
+impl Decision {
+    /// The admitted runtime, when one was chosen.
+    #[must_use]
+    pub fn admitted(&self) -> Option<&ResolvedRuntime> {
+        match self {
+            Self::Static { result, .. } => result.as_ref().ok(),
+            Self::Preference { resolution, .. } => {
+                resolution.chosen.as_ref().map(|chosen| &chosen.admitted)
+            }
+        }
+    }
+
+    /// The `# LOOM_RUNTIME_PREFERENCE …` marker for this decision, or `None`
+    /// on the static path (which has no tiers to report and whose log output
+    /// must not change).
+    #[must_use]
+    pub fn marker_line(&self) -> Option<String> {
+        match self {
+            Self::Static { .. } => None,
+            Self::Preference { source, resolution } => {
+                Some(format!("{} source={}", resolution.marker_line(), source.as_str()))
+            }
+        }
+    }
+}
+
+/// Parse one preference-list entry: a bare runtime id, or an object naming the
+/// runtime and the model profile that binds its provider + credential source.
+fn parse_tap(entry: &Value, path: &str, index: usize) -> Result<Tap, String> {
+    let nonempty = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    match entry {
+        Value::String(runtime) => nonempty(Some(runtime))
+            .map(|runtime| Tap {
+                runtime,
+                model_profile: None,
+            })
+            .ok_or_else(|| format!("{path}[{index}] is an empty runtime name")),
+        Value::Object(map) => {
+            let runtime = nonempty(map.get("runtime").and_then(Value::as_str))
+                .ok_or_else(|| format!("{path}[{index}] must name a non-empty \"runtime\""))?;
+            let model_profile = match map.get("modelProfile") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(profile)) => Some(
+                    nonempty(Some(profile))
+                        .ok_or_else(|| format!("{path}[{index}] has an empty \"modelProfile\""))?,
+                ),
+                Some(_) => {
+                    return Err(format!("{path}[{index}] \"modelProfile\" must be a string"))
+                }
+            };
+            let unknown: Vec<&str> = map
+                .keys()
+                .map(String::as_str)
+                .filter(|key| !matches!(*key, "runtime" | "modelProfile"))
+                .collect();
+            if !unknown.is_empty() {
+                return Err(format!(
+                    "{path}[{index}] has unknown key(s): {} (known: runtime, modelProfile)",
+                    unknown.join(", ")
+                ));
+            }
+            Ok(Tap {
+                runtime,
+                model_profile,
+            })
+        }
+        _ => Err(format!(
+            "{path}[{index}] must be a runtime name or an object with a \"runtime\" key"
+        )),
+    }
+}
+
+/// Parse a JSON array of preference entries. An **empty** array is `Ok(None)`
+/// — "unset, fall through to the next tier" — matching the established
+/// empty-value semantics of `runtimes.roles.<role>: ""`.
+fn parse_list(value: &Value, path: &str) -> Result<Option<Vec<Tap>>, String> {
+    let Some(entries) = value.as_array() else {
+        return Err(format!("{path} must be an array of runtime names"));
+    };
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let taps = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_tap(entry, path, index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen = std::collections::BTreeSet::new();
+    for tap in &taps {
+        if !seen.insert(tap.to_string()) {
+            return Err(format!(
+                "{path} lists {tap} more than once; a duplicate entry can never be reached and \
+                 is more likely a typo than an intent"
+            ));
+        }
+    }
+    Ok(taps.into())
+}
+
+/// The preference list that applies to `role`, if any:
+/// `runtimes.rolePreference.<role>` first, then `runtimes.preference`.
+///
+/// Fail-closed shape validation, in the spirit of `runtimes.roles` (#4494): an
+/// unknown `rolePreference` key, a non-array value, a malformed entry, or a
+/// duplicated tap is an **error**, not a silently-ignored entry. A
+/// misconfigured preference list that degraded silently would strand work on
+/// the very tier the operator was trying to route around.
+///
+/// # Errors
+/// A formatted message naming the offending key, for the caller to surface as
+/// a [`RuntimeRejection`] or a `loom-daemon validate` finding.
+pub fn preference_for(
+    config: &Value,
+    role: &str,
+) -> Result<Option<(PreferenceSource, Vec<Tap>)>, String> {
+    if let Some(per_role) = crate::config_resolver::get_path(config, "runtimes.rolePreference") {
+        let Some(map) = per_role.as_object() else {
+            return Err(
+                "runtimes.rolePreference must be an object mapping role names to preference lists"
+                    .to_string(),
+            );
+        };
+        let mut unknown: Vec<String> = map
+            .keys()
+            .filter(|key| canonical_role(key).is_none())
+            .cloned()
+            .collect();
+        unknown.sort();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "unknown role name(s) in runtimes.rolePreference: {}",
+                unknown.join(", ")
+            ));
+        }
+        // Validate EVERY list, not just the requested role's — the same
+        // whole-map discipline `validate_runtimes_roles_shape` applies, so a
+        // typo in a sibling role's list surfaces on the next launch of any
+        // role rather than only when that role happens to tick.
+        for (key, value) in map {
+            parse_list(value, &format!("runtimes.rolePreference.{key}"))?;
+        }
+        if let Some(value) = map.get(role) {
+            if let Some(taps) = parse_list(value, &format!("runtimes.rolePreference.{role}"))? {
+                return Ok(Some((PreferenceSource::RolePreference, taps)));
+            }
+        }
+    }
+    let Some(fleet) = crate::config_resolver::get_path(config, "runtimes.preference") else {
+        return Ok(None);
+    };
+    Ok(parse_list(fleet, "runtimes.preference")?
+        .map(|taps| (PreferenceSource::FleetPreference, taps)))
+}
+
+/// Proactively check a resolved config's preference keys for the same
+/// fail-closed problems [`preference_for`] rejects at resolution time, so
+/// `loom-daemon validate` can surface them before any launch hits them — the
+/// counterpart of
+/// [`crate::runtime_admission::check_runtimes_roles_config`].
+#[must_use]
+pub fn check_runtimes_preference_config(config: &Value) -> Vec<String> {
+    // `sweep-lifecycle` is only a probe role here: `preference_for` validates
+    // the whole `rolePreference` map plus `runtimes.preference` regardless of
+    // which role is asked about.
+    match preference_for(config, "sweep-lifecycle") {
+        Ok(_) => Vec::new(),
+        Err(message) => vec![format!("runtimes preference: {message}")],
+    }
+}
+
+/// The operator pin in force for `role`, if any — the three tiers that
+/// outrank a preference list and disable fall-through.
+fn operator_pin(canonical: &str, explicit: Option<&str>) -> Option<RuntimeSource> {
+    let set = |value: Option<String>| value.is_some_and(|v| !v.trim().is_empty());
+    if set(explicit.map(str::to_string)) {
+        return Some(RuntimeSource::Explicit);
+    }
+    let role_env = format!("LOOM_RUNTIME_{}", canonical.replace('-', "_").to_ascii_uppercase());
+    if set(std::env::var(role_env).ok()) {
+        return Some(RuntimeSource::RoleEnvironment);
+    }
+    if set(std::env::var("LOOM_RUNTIME").ok()) {
+        return Some(RuntimeSource::GlobalEnvironment);
+    }
+    None
+}
+
+/// Resolve the runtime for `role`, walking the configured preference list
+/// against live admission and credential availability.
+///
+/// `now` is epoch seconds, threaded through to the codex pool's cooldown
+/// arithmetic so a test can pin it.
+///
+/// # Errors
+/// A [`RuntimeRejection`] when the preference configuration itself is
+/// malformed — resolution fails closed rather than degrading to a silently
+/// different order.
+pub fn resolve_runtime(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    now: u64,
+) -> Result<Decision, RuntimeRejection> {
+    let Some(canonical) = canonical_role(role) else {
+        // Unknown roles are not this module's error to shape: hand straight
+        // back the rejection `resolve_and_admit` already produces for them.
+        return Ok(Decision::Static {
+            reason: StaticReason::NoPreferenceConfigured,
+            result: crate::runtime_admission::resolve_and_admit(root, role, explicit),
+        });
+    };
+    if let Some(pin) = operator_pin(canonical, explicit) {
+        return Ok(Decision::Static {
+            reason: StaticReason::OperatorPin(pin),
+            result: crate::runtime_admission::resolve_and_admit(root, role, explicit),
+        });
+    }
+    let config = crate::config_resolver::resolve_effective_config(root);
+    let listed = preference_for(&config, canonical).map_err(|reason| RuntimeRejection {
+        role: canonical.to_string(),
+        runtime: String::new(),
+        source: RuntimeSource::Preference,
+        unmet_capabilities: vec![],
+        reason,
+    })?;
+    let Some((source, taps)) = listed else {
+        return Ok(Decision::Static {
+            reason: StaticReason::NoPreferenceConfigured,
+            result: crate::runtime_admission::resolve_and_admit(root, role, None),
+        });
+    };
+    let resolution = resolve::resolve(
+        &taps,
+        |tap| {
+            crate::runtime_admission::resolve_and_admit(root, canonical, Some(&tap.runtime))
+                .map(|mut admitted| {
+                    // The walk chose among candidates; it is not the operator
+                    // pin `Explicit` denotes, even though each candidate was
+                    // offered to admission as an explicit runtime.
+                    admitted.source = RuntimeSource::Preference;
+                    admitted
+                })
+                .map_err(|rejection| SkipReason::NotAdmitted {
+                    unmet: rejection.unmet_capabilities.clone(),
+                    detail: rejection.reason.clone(),
+                })
+        },
+        |tap, admitted| match availability::availability(root, tap, admitted, now) {
+            state if state.is_spawnable() => Ok(()),
+            state => Err(state
+                .skip_reason()
+                .expect("a non-spawnable availability always yields a skip reason")),
+        },
+    );
+    Ok(Decision::Preference { source, resolution })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests;
