@@ -185,6 +185,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
                 }],
             },
             protection: None,
+            admission_brake: None,
         }),
     )
 }
@@ -500,6 +501,7 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         managed_repos: Vec::new(),
         roles: crate::telemetry::RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     };
     let batch = vec![envelope(
         "host-c",

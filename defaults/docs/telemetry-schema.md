@@ -655,6 +655,81 @@ consumer MUST treat that absence as "not reported", never as "unprotected":
 synthesizing a false negative from a missing field would be worse than no
 signal at all.
 
+**Saturation admission-brake state (`admission_brake`, #8478).** An optional
+object carrying whether this host is holding new sweep admissions, and — the
+point of the field — **for how long it has been doing so with nothing of Loom's
+own running to relieve it**:
+
+```json
+{
+  "held": true,
+  "starving_since": "2026-09-20T02:00:00Z",
+  "starving_secs": 43440,
+  "starvation_warn_secs": 300,
+  "escape_hatch_grants": 47,
+  "dispatch_suppressed_by_foreign_load": true,
+  "top_cpu_consumers": "ngspice ×25 (1843% cpu, parent launchd[1], reparented to pid 1)"
+}
+```
+
+- `held` — whether **new** sweep admissions are currently held. In-flight
+  sweeps are never affected; the brake has no path to running work.
+- `starving_since` / `starving_secs` — when the current starvation streak began
+  (held with **zero** sweeps in flight, continuously) and how long it has run,
+  as measured on the emitting host's own clock at capture time. Both are
+  omitted when the host is not starving, including a brake held while sweeps
+  genuinely drain — healthy backpressure never starves, however long it holds.
+  The duration is sent pre-computed on purpose: a consumer subtracting a remote
+  timestamp from its own clock gets skew, and `starving_ticks` (which
+  `loom-daemon status --json` also carries) is not a duration at all — it
+  scales with the work-finder interval, so the same count means minutes on one
+  host and an hour on another.
+- `starvation_warn_secs` — **this host's own** resolved warn threshold
+  (`admissionBrake.starvationWarnSecs`, default 300), so "starving longer than
+  it considers alarming" is evaluated against the emitting host's configuration
+  rather than a hardcoded fleet constant.
+- `escape_hatch_grants` — cumulative #5715 escape-hatch grants this daemon
+  process's lifetime. `0` on a healthy host forever; nonzero means the brake
+  has had to force at least one admission through a still-saturated host.
+- `dispatch_suppressed_by_foreign_load` — `held` **and** starving for at least
+  `starvation_warn_secs`. **This is the single field a fleet-level check should
+  alert on**; the rest are for the diagnosis that follows. When it is true the
+  daemon also reports `dispatch_halted: true` with a `halt_reason` naming the
+  duration, so a consumer already keyed to those two (the dashboard's
+  `distressReason` is) surfaces the host as degraded with no change.
+- `top_cpu_consumers` — a best-effort `ps` attribution of the top host-wide CPU
+  consumers by command, instance count, and parent process. Sampled **only**
+  while `dispatch_suppressed_by_foreign_load` is true (a healthy host never
+  pays for the subprocess) and **omitted** whenever the probe could not answer
+  — no `ps`, a timeout, unparseable output. An absent attribution MUST NOT be
+  read as "no foreign load". A process whose parent is pid 1 was reparented to
+  `launchd`/`init`, i.e. no live Loom session owns it — the signature of the
+  detached job [`long-running-compute.md`](long-running-compute.md) forbids.
+
+The whole `admission_brake` object is **omitted** on a record from a pre-#8478
+daemon, or on a host where no brake was ever registered (no work-finder loop),
+which is distinct from `held: false` (a brake exists and is admitting). A
+consumer MUST treat that absence as "not reported", never as "not suppressed" —
+the same contract `protection` holds, and reading it the other way is exactly
+the fleet-wide blind spot #8478 closed.
+
+Additive, so no `schema_version` bump. Unlike the fields above it does **not**
+pass through public redaction unchanged: the scalars do, but
+`top_cpu_consumers` is dropped for `/public/*` viewers because a list of
+executable basenames is *workload* detail — `ngspice ×25` says the host runs
+analog EDA simulation — the category `sweep.outcome`'s `tokens_in`/`models_used`
+are held back for. See `redactAdmissionBrakeRow` in
+`dashboard/src/redaction.ts`. The authenticated `/api/*` surface returns it
+unchanged, which is where an operator diagnosing their own fleet reads it.
+
+`top_cpu_consumers` is therefore the **sole** carrier of process attribution.
+In particular `halt_reason` — which *is* public-allowlisted and copied verbatim
+— states only the duration, this host's own `starvation_warn_secs`, and the
+non-attributing verdict "dispatch is suppressed by load Loom does not own"; it
+never interpolates the `ps` clause, which would re-emit the redacted list
+through an allowlisted field and defeat the boundary. Any future free-text
+`host.health` field is bound by the same rule.
+
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 
 The daemon durably records one `sweep.outcome` [`TelemetryEnvelope`] per

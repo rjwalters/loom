@@ -164,6 +164,7 @@ pub mod errors;
 pub mod event_bus;
 pub mod filing_lock;
 pub mod fleet;
+pub mod foreign_load;
 pub mod forge_cached_list;
 pub mod forge_cmd;
 pub mod forge_listing;

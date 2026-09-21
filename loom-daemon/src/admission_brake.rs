@@ -497,6 +497,19 @@ pub struct BrakeSnapshot {
     pub starving_ticks: u32,
     /// Cumulative escape-hatch grants this process lifetime.
     pub escape_hatch_grants: u32,
+    /// This host's resolved [`AdmissionBrakeConfig::starvation_warn_secs`]
+    /// (Issue #8478). Carried on the snapshot so an off-host consumer can ask
+    /// "has this host been starving longer than **it** considers alarming"
+    /// without hardcoding a fleet-wide constant that any host may have
+    /// overridden via env or config. Not mapped into
+    /// [`crate::types::AdmissionBrakeStatus`]: `loom-daemon status` already
+    /// prints the thresholds in force, and the wire type is frozen by its own
+    /// file-size ratchet.
+    pub starvation_warn_secs: i64,
+    /// This host's resolved [`AdmissionBrakeConfig::starvation_escape_secs`]
+    /// (Issue #8478) — the companion to `starvation_warn_secs`, so a consumer
+    /// can also say how close the host is to its next forced admission.
+    pub starvation_escape_secs: i64,
 }
 
 impl BrakeSnapshot {
@@ -730,6 +743,8 @@ impl SharedAdmissionBrake {
             starving_since: guard.starving_since,
             starving_ticks: guard.starving_ticks,
             escape_hatch_grants: guard.escape_hatch_grants,
+            starvation_warn_secs: self.config.starvation_warn_secs,
+            starvation_escape_secs: self.config.starvation_escape_secs,
         }
     }
 }
@@ -818,6 +833,26 @@ pub fn global_is_holding() -> bool {
 /// A no-op returning `false` when no brake is registered — the work-finder loop
 /// calls this unconditionally, exactly as it does
 /// [`crate::host_breaker::global_is_suppressed`].
+///
+/// # Where the non-Loom load attribution happens (Issue #8478)
+///
+/// A starvation edge (`Starving` / `StarvationEscape`) is the one moment the
+/// brake knows the load is not its own — held, with **zero** sweeps in flight —
+/// and, before #8478, the one moment it could not say whose it was. The
+/// [`crate::foreign_load`] `ps` probe that answers that is invoked **here**, not
+/// inside [`SharedAdmissionBrake::observe`], for two reasons that are both
+/// load-bearing:
+///
+/// 1. **Never under the brake's mutex.** `observe` holds
+///    `SharedAdmissionBrake::inner` for its whole body. Spawning a subprocess
+///    there would serialize every other brake reader behind an external
+///    program.
+/// 2. **Never on a hot tick.** These edges fire at most once per starvation
+///    streak (the `StarvationPhase` bookkeeping in `observe` guarantees it), so
+///    the probe cost is paid once per incident rather than once per tick.
+///
+/// [`SharedAdmissionBrake::observe`] therefore stays pure w.r.t. the host's
+/// process table, and its unit tests need no `ps`.
 pub fn global_observe(
     loadavg_1m: Option<f64>,
     ncpu: usize,
@@ -838,11 +873,24 @@ pub fn global_observe(
             TransitionKind::Released => {
                 log::info!("admission_brake: released — {}", t.reason);
             }
+            // Both starvation kinds get the foreign-load attribution appended.
+            // `attribution_clause` is empty on ANY probe failure, so the line
+            // below degrades to the exact pre-#8478 message rather than being
+            // suppressed or delayed — the escalation must fire whether or not
+            // `ps` answered.
             TransitionKind::Starving => {
-                log::warn!("admission_brake: {}", t.reason);
+                log::warn!(
+                    "admission_brake: {}{}",
+                    t.reason,
+                    crate::foreign_load::attribution_clause()
+                );
             }
             TransitionKind::StarvationEscape => {
-                log::error!("admission_brake: {}", t.reason);
+                log::error!(
+                    "admission_brake: {}{}",
+                    t.reason,
+                    crate::foreign_load::attribution_clause()
+                );
             }
         }
     }

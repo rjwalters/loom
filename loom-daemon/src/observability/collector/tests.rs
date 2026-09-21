@@ -670,13 +670,13 @@ fn breaker_snapshot(
 
 #[test]
 fn dispatch_halt_from_breaker_reports_not_halted_when_no_breaker_registered() {
-    assert_eq!(dispatch_halt_from_breaker(None), (false, None));
+    assert_eq!(dispatch_halt_from_breaker(None, None), (false, None));
 }
 
 #[test]
 fn dispatch_halt_from_breaker_reports_not_halted_when_closed() {
     let snapshot = breaker_snapshot(crate::host_breaker::BreakerPhase::Closed, None);
-    assert_eq!(dispatch_halt_from_breaker(Some(snapshot)), (false, None));
+    assert_eq!(dispatch_halt_from_breaker(Some(snapshot), None), (false, None));
 }
 
 #[test]
@@ -686,7 +686,7 @@ fn dispatch_halt_from_breaker_reports_halted_with_reason_when_open() {
         Some("load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)"),
     );
     assert_eq!(
-        dispatch_halt_from_breaker(Some(snapshot)),
+        dispatch_halt_from_breaker(Some(snapshot), None),
         (
             true,
             Some("load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)".to_string())
@@ -700,7 +700,7 @@ fn dispatch_halt_from_breaker_reports_halted_during_cooldown() {
         crate::host_breaker::BreakerPhase::CoolDown,
         Some("load-per-core 1.10 < 2.50; cooling down for 300s"),
     );
-    let (halted, reason) = dispatch_halt_from_breaker(Some(snapshot));
+    let (halted, reason) = dispatch_halt_from_breaker(Some(snapshot), None);
     assert!(halted, "CoolDown still suppresses dispatch, so it must count as halted");
     assert!(reason.is_some());
 }
@@ -1001,6 +1001,7 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         managed_repos: vec![],
         roles: roles_health,
         protection: None,
+        admission_brake: None,
     };
     assert_eq!(
         host_health.roles.persistent.len(),

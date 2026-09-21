@@ -5,6 +5,7 @@
 
 use super::*;
 
+mod admission_brake;
 mod role_tick;
 use role_tick::role_tick_outcome;
 
@@ -173,6 +174,7 @@ fn host_health() -> TelemetryRecord {
             state: "protected".to_string(),
             watchdog_provisioned: Some(true),
         }),
+        admission_brake: None,
     })
 }
 
@@ -722,6 +724,7 @@ fn host_health_omits_built_at_when_unknown() {
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -815,6 +818,7 @@ fn host_health_omits_managed_repos_when_empty() {
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -910,6 +914,7 @@ fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
             persistent: Vec::new(),
         },
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     let roles = value.get("roles").unwrap();
@@ -1001,6 +1006,7 @@ fn host_health_omits_worktree_root_total_gb_when_unmeasurable() {
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -1033,6 +1039,7 @@ fn host_health_omits_protection_when_absent() {
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -1066,6 +1073,7 @@ fn host_health_free_without_total_serializes_with_no_fabricated_denominator() {
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(
@@ -1106,6 +1114,7 @@ fn host_health_omits_watchdog_provisioned_when_the_probe_could_not_answer() {
             state: "unknown".to_string(),
             watchdog_provisioned: None,
         }),
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     let protection = value.get("protection").unwrap();
