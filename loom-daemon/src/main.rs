@@ -740,6 +740,38 @@ enum Commands {
         aggressive_min_age: u64,
     },
 
+    /// Prune stale `incremental/`/`deps/` cache entries out of a shared,
+    /// cross-worktree cargo target directory (issue #8459). A standalone
+    /// manual/cron backstop, NOT wired into the periodic worktree reaper —
+    /// see `loom_daemon::target_dir_gc`'s module docs for why. Safe against a
+    /// build in progress: the whole pass defers (removes nothing) whenever
+    /// the target dir's `.cargo-lock` advisory lock is held, or its state is
+    /// unmeasurable.
+    TargetDirGc {
+        /// The shared cargo target directory to scan (its `debug`/`release`/
+        /// target-triple subdirectories are found automatically) — e.g. the
+        /// value `scripts/cargo-target-dir.sh` prints, or a `CARGO_TARGET_DIR`
+        /// you already export.
+        #[arg(long, value_name = "PATH")]
+        target_dir: String,
+
+        /// Prune entries whose newest mtime (recursive — see the module
+        /// docs) is at least this many days old. `0` prunes unconditionally
+        /// (no age floor) — see `PruneCandidate::is_stale`'s documented
+        /// behavior before using it outside a deliberate full reclaim.
+        #[arg(long, default_value_t = loom_daemon::target_dir_gc::DEFAULT_THRESHOLD_DAYS)]
+        threshold_days: u64,
+
+        /// Report what would be removed and its size, without deleting
+        /// anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Emit the report as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Native port of `loom-cleanup` (Issue #4272): log archival, the only
     /// cleanup.py functionality that survived the daemon-brain retirement
     /// (#3396). Purely file-based; does not require a running daemon.
@@ -2625,6 +2657,17 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             daemon,
             aggressive,
             aggressive_min_age,
+        ),
+        Commands::TargetDirGc {
+            target_dir,
+            threshold_days,
+            dry_run,
+            json,
+        } => cli::target_dir_gc::handle_target_dir_gc_command(
+            &target_dir,
+            threshold_days,
+            dry_run,
+            json,
         ),
         Commands::Cleanup { action } => handle_cleanup_command(action),
         Commands::RecoverOrphans {
