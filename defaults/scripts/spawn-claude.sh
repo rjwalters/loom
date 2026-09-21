@@ -745,10 +745,9 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
 
     # --- Build-cache placement (MOUNT-CONTRACT.md §4, issue #6013/#6014) ---
     _containment_env=()
-    _containment_cargo_lib="${_script_dir}/lib/cargo-target-dir.sh"
-    if [[ -f "${WORKSPACE}/Cargo.toml" && -f "$_containment_cargo_lib" ]]; then
+    if [[ -f "${WORKSPACE}/Cargo.toml" && -f "${_script_dir}/lib/cargo-target-dir.sh" ]]; then
         # shellcheck source=./lib/cargo-target-dir.sh
-        source "$_containment_cargo_lib"
+        source "${_script_dir}/lib/cargo-target-dir.sh"
         _containment_target_dir="$(loom_resolve_cargo_target_dir "$WORKSPACE")"
         if [[ -n "$_containment_target_dir" ]]; then
             if [[ "$_containment_target_dir" != "${WORKSPACE}"/* ]]; then
