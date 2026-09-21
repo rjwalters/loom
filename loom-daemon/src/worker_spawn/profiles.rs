@@ -43,8 +43,14 @@ pub struct ModelProfile {
     /// Provider IDs are harness vocabulary (Pi `zai`, OpenCode `zai-coding-plan`).
     pub providers: BTreeMap<String, String>,
     pub effort: Option<String>,
-    /// Names only. Secrets remain in the inherited environment or CLI auth store.
+    /// Names only. Secrets remain in the inherited environment, this host's
+    /// API-key account pool (`.loom/api-keys/`, #8401), or the CLI auth store.
     pub credential_env: Option<CredentialEnv>,
+    /// Pool namespace this profile's credential belongs to. Optional: it
+    /// defaults to the slug derived from `credential_env` (`ZAI_API_KEY` ->
+    /// `zai`). Set it explicitly when two profiles must share one pool, or
+    /// when the derivation would pick a misleading name.
+    pub credential_pool: Option<String>,
     #[serde(default)]
     pub credential_targets: BTreeMap<String, CredentialTargets>,
     /// Non-secret provider options (region, project) merged into the harness's
@@ -84,6 +90,8 @@ pub struct Selection {
     pub credential_sources: Vec<String>,
     pub provider_options: Option<Map<String, Value>>,
     pub provider_definition: Option<Map<String, Value>>,
+    /// API-key pool namespace override (#8401); see [`ModelProfile::credential_pool`].
+    pub credential_pool: Option<String>,
 }
 
 fn check_name(value: &str) -> Result<(), LaunchError> {
@@ -159,7 +167,20 @@ pub fn credentials(
         check_name(name)?;
     }
     let pairs = match profile.credential_targets.get(runtime) {
-        None => Vec::new(),
+        // No explicit target for this harness. A single-string credentialEnv
+        // still has an implicit target: the harness reads the source variable
+        // under its own name (Pi reads ZAI_API_KEY as ZAI_API_KEY) — exactly
+        // what unset-variable inheritance would have delivered had the value
+        // been exported instead of pooled. Keying the pool decision on
+        // "does a rename pair exist" silently skipped the pool for every
+        // profile that omits an explicit target; treating it as (VAR, VAR)
+        // keeps this in the same one-variable ladder as the pool. The array
+        // form is a required-in-environment set with no single implicit
+        // target, so it stays unmapped here.
+        None => match declared {
+            CredentialEnv::One(name) => vec![(name.clone(), name.clone())],
+            CredentialEnv::Many(_) => Vec::new(),
+        },
         Some(CredentialTargets::Alias(target)) => {
             check_name(target)?;
             if sources.len() != 1 {
@@ -251,6 +272,18 @@ pub fn resolve(
         })?
         .clone();
     let mapping = credentials(profile, runtime)?;
+    if let Some(pool) = &profile.credential_pool {
+        crate::api_keys_pool::paths::validate_provider(pool).map_err(|_| {
+            LaunchError::config("model profile credentialPool is not a valid pool name")
+        })?;
+        if matches!(profile.credential_env, Some(CredentialEnv::Many(_))) {
+            return Err(LaunchError::config(
+                "model profile credentialPool applies only to a single-string credentialEnv; \
+                 an array-form credentialEnv declares a required set of variables that one \
+                 pooled account (a single KEY=value) cannot satisfy",
+            ));
+        }
+    }
     let unset = missing(&mapping.required);
     if !unset.is_empty() {
         return Err(LaunchError::config(format!(
@@ -280,6 +313,7 @@ pub fn resolve(
         credential_sources: declared.iter().map(|s| (*s).to_string()).collect(),
         provider_options,
         provider_definition,
+        credential_pool: profile.credential_pool.clone(),
     })
 }
 
@@ -299,6 +333,7 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
                 credential_sources: Vec::new(),
                 provider_options: None,
                 provider_definition: None,
+                credential_pool: None,
             });
         }
     }
@@ -344,6 +379,7 @@ mod tests {
             effort: None,
             credential_env: Some(credential_env),
             credential_targets,
+            credential_pool: None,
             provider_options: BTreeMap::new(),
             provider_definition: BTreeMap::new(),
             allowed_efforts: Vec::new(),
@@ -422,6 +458,13 @@ mod tests {
             .expect("optional credentialEnv resolves");
 
         assert_eq!(selection.credential_sources, vec!["ZAI_API_KEY"]);
-        assert!(selection.credentials.is_empty());
+        // PR #8428's pool-bypass fix: no explicit target still means an
+        // implicit (VAR, VAR) pair, the same name inheritance would have
+        // used — otherwise `credential::resolve` never consults the pool for
+        // an untargeted profile (it sees zero pairs and returns early).
+        assert_eq!(
+            selection.credentials,
+            vec![("ZAI_API_KEY".to_string(), "ZAI_API_KEY".to_string())]
+        );
     }
 }

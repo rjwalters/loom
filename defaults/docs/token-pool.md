@@ -30,6 +30,7 @@ points here.
 - [Codex provider health](#codex-provider-health)
 - [Session-managed Codex accounts: auth-state probe + re-auth runbook (#6927)](#session-managed-codex-accounts-auth-state-probe--re-auth-runbook-6927)
 - [Codex availability probe (`loom-daemon accounts check`, #8407)](#codex-availability-probe-loom-daemon-accounts-check-8407)
+- [API-key account pool for native harnesses (Z.ai/OpenCode, Pi — #8401)](#api-key-account-pool-for-native-harnesses-zaiopencode-pi--8401)
 <!-- toc:end -->
 
 ## Provider-aware account inventory
@@ -2132,3 +2133,21 @@ only from Claude pool reads, so a dry codex pool cannot hold Claude work; the
 converse (holding codex-runtime dispatch) needs the work finder to resolve each
 sweep's runtime first. The role-tick side of that question already landed as
 #8408 (see "The gate follows the admitted runtime").
+
+## API-key account pool for native harnesses (Z.ai/OpenCode, Pi — #8401)
+
+A third, provider-neutral pool exists alongside this Claude OAuth pool and the
+Codex `accounts` pool above: `loom-daemon api-keys` rotates a fleet of
+API-key-based subscriptions (e.g. a fleet of Z.ai GLM coding-plan accounts)
+through the native OpenCode/Pi dispatcher, at `.loom/api-keys/<provider>/`
+(gitignored, `0600`, per host — same never-committed contract as
+`.loom/tokens/` above). It is a separate module
+(`loom-daemon/src/api_keys_pool/`) rather than a new `AccountProvider` on this
+pool, because an API-key subscription's shape (an opaque static secret plus a
+provider-side allowance) fits neither this pool's OAuth-token/`.ranking`
+probes nor the Codex pool's mutable `auth.json` refresh chain.
+
+Full reference, including the registry format, the selection ladder
+(explicit env > pool > fail-closed 78), bad-marking/exhaustion state, and the
+`loom-daemon api-keys {add,list,disable,enable,remove,mark-bad,unblock,health}`
+CLI: [`runtime-model-trials.md` § "API-key account pool"](runtime-model-trials.md#api-key-account-pool-loom-daemon-api-keys-8401).

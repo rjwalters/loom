@@ -540,6 +540,23 @@ enum Commands {
         action: TokensAction,
     },
 
+    /// Manage the per-host API-key account pool at `.loom/api-keys/` (issue
+    /// #8401) — the API-key analogue of `tokens` (Claude OAuth) and
+    /// `accounts` (Codex `CODEX_HOME` profiles), used by native harness
+    /// profiles whose `credentialEnv` names a provider key (e.g. a fleet of
+    /// Z.ai GLM coding-plan subscriptions rotated through OpenCode/Pi). No
+    /// verb accepts key material on the command line; `list`/`health` are
+    /// secret-free by construction. Purely file-based; does not require a
+    /// running daemon.
+    ApiKeys {
+        #[command(subcommand)]
+        action: ApiKeysAction,
+
+        /// Loom workspace whose API-key pool is read or updated.
+        #[arg(long, value_name = "PATH", default_value = ".", global = true)]
+        workspace: String,
+    },
+
     /// Manage secret-safe machine-level AI account profiles.
     Accounts {
         #[command(subcommand)]
@@ -2485,6 +2502,7 @@ async fn main() {
 }
 
 use cli::accounts::handle_accounts_command;
+use cli::api_keys::{handle_api_keys_command, ApiKeysAction};
 use cli::cleanup_ops::{
     handle_clean_command, handle_cleanup_command, handle_recover_orphans_command,
 };
@@ -2591,6 +2609,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Fleet { action } => handle_fleet_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
+        Commands::ApiKeys { action, workspace } => handle_api_keys_command(action, &workspace),
         Commands::Accounts { action, workspace } => handle_accounts_command(action, &workspace),
         Commands::ClaudeConfig { action } => handle_claude_config_command(action),
         Commands::SpawnWorker(args) => loom_daemon::worker_spawn::cli(args),
