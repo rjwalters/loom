@@ -49,8 +49,9 @@
 //! not need. The API-key account pool (#8401) is the countable credential
 //! source a native gate can be built on once it lands.
 use super::*;
+use crate::role_runner::outcome::{PoolHold, PoolStateFile};
 use crate::runtime_admission::{ResolvedRuntime, RuntimeRejection};
-use crate::tokens_pool::{account_health, account_inventory, AccountProvider, HealthReason};
+use crate::tokens_pool::{account_inventory_quiet, health_snapshot, AccountProvider, HealthReason};
 
 /// Environment variables under which `spawn-codex.sh` never reaches the
 /// provider-aware account selector: the three explicit profile pins (auth
@@ -124,6 +125,11 @@ fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> 
             total: pool.total,
             next_clear_at,
             pool: CredentialPool::ClaudeTokens,
+            // `pool.total > 0` is the guard above, and an unreadable Claude
+            // pool is not a state this gate can observe, so the Claude arm
+            // only ever reports the self-healing hold — the "no pool at all"
+            // case is `RoleTickOutcome::NoTokenPool`, checked before it.
+            hold: PoolHold::SelfHealing,
         });
     }
     None
@@ -142,12 +148,19 @@ pub(super) struct CodexPoolState {
     /// blocked accounts, when any has one.
     pub earliest_clear: Option<u64>,
     /// Set when the inventory or the health state could not be read; the
-    /// selector fails closed on the same read, so the gate does too.
-    pub read_error: Option<String>,
+    /// selector fails closed on the same read, so the gate does too. Names
+    /// WHICH file failed (#8444) — the gate used to blame the inventory even
+    /// when it was `account-health.json` that would not parse.
+    pub read_error: Option<(PoolStateFile, String)>,
 }
 
 /// Read the codex account pool for `root` at `now` (epoch seconds). Pure file
 /// reads — no selection cursor is advanced and no probe is run.
+///
+/// `account-health.json` is read and parsed **once** per call (#8444). The
+/// per-account read this replaced re-parsed the file for every enabled
+/// account and left a window in which an account observed early and one
+/// observed late could disagree about the same tick's state.
 pub(super) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
     let mut state = CodexPoolState {
         enabled: 0,
@@ -155,24 +168,30 @@ pub(super) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
         earliest_clear: None,
         read_error: None,
     };
-    let inventory = match account_inventory(root, AccountProvider::Codex) {
+    // The quiet read (#8444): the loud variant's "registered but its profile
+    // directory was not found" warning fires per unprovisioned registry entry
+    // and this runs on every codex-role tick, so it is the one caller that
+    // must not own that stderr line.
+    let inventory = match account_inventory_quiet(root, AccountProvider::Codex) {
         Ok(inventory) => inventory,
         Err(e) => {
-            state.read_error = Some(format!("{e:#}"));
+            state.read_error = Some((PoolStateFile::Inventory, format!("{e:#}")));
+            return state;
+        }
+    };
+    let health_state = match health_snapshot(root) {
+        Ok(health) => health,
+        Err(e) => {
+            // Count the pool first: `enabled` is what the skip reports as
+            // `0/N`, and the inventory read that produced it did succeed.
+            state.enabled = inventory.iter().filter(|account| account.enabled).count();
+            state.read_error = Some((PoolStateFile::HealthState, format!("{e:#}")));
             return state;
         }
     };
     for account in inventory.iter().filter(|account| account.enabled) {
         state.enabled += 1;
-        let health = match account_health(root, &account.id) {
-            Ok(health) => health,
-            Err(e) => {
-                state.read_error = Some(format!("{e:#}"));
-                state.spawnable = 0;
-                return state;
-            }
-        };
-        let Some(health) = health else {
+        let Some(health) = health_state.get(&account.id) else {
             state.spawnable += 1;
             continue;
         };
@@ -196,9 +215,19 @@ pub(super) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
 }
 
 /// The account provider `spawn-codex.sh` will select from for `admitted`'s
-/// runtime — the same lookup, in the same order, as that script's
+/// runtime — the same manifest lookup, in the same order, as that script's
 /// `_loom_account_provider_for_runtime`: the workspace's installed manifest,
 /// else the one beside the adapter, else (missing file or key) `claude`.
+///
+/// **One deliberate divergence** (#8444): the script parses the manifest with
+/// `jq` and falls open to `claude` when `jq` is not on `PATH`; this reader
+/// parses the JSON natively and so still answers `codex` there. On such a
+/// host the script would select from the *Claude* pool, making a dry codex
+/// pool the wrong wall to gate on. It is left as a known gap rather than
+/// mirrored, because probing `PATH` for `jq` would make this gate — and every
+/// test of it — depend on a tool that is a de-facto prerequisite of the whole
+/// `.loom/scripts/` surface anyway: a host missing `jq` cannot run a Loom
+/// spawn adapter at all, so the divergence is unreachable in practice.
 fn adapter_account_provider(root: &Path, admitted: &ResolvedRuntime) -> String {
     let file = format!("{}.json", admitted.runtime);
     let beside_adapter = admitted
@@ -248,10 +277,22 @@ fn codex_gate(
         .and_then(|deadline| i64::try_from(deadline).ok())
         .and_then(|deadline| chrono::DateTime::from_timestamp(deadline, 0))
         .map_or(cap, |deadline| deadline.clamp(now, cap));
-    let why = match &state.read_error {
-        Some(error) => format!("the account inventory could not be read: {error}"),
-        None if state.enabled == 0 => "no enabled codex account is provisioned".to_string(),
-        None => "every enabled account is cooling down or needs re-auth".to_string(),
+    // #8444: which of the three states this is decides both the operator
+    // text and — through `hold` — whether the skip is reported as the
+    // self-healing hold `PoolExhausted` documents or as the permanent
+    // misconfiguration the stuck-role path escalates.
+    let (hold, why) = match &state.read_error {
+        Some((file, error)) => (
+            PoolHold::Unreadable(*file),
+            format!("{} could not be read: {error}", file.as_str()),
+        ),
+        None if state.enabled == 0 => {
+            (PoolHold::Unprovisioned, "no enabled codex account is provisioned".to_string())
+        }
+        None => (
+            PoolHold::SelfHealing,
+            "every enabled account is cooling down or needs re-auth".to_string(),
+        ),
     };
     note_pre_spawn_skip(
         logs,
@@ -269,6 +310,7 @@ fn codex_gate(
         total: state.enabled,
         next_clear_at,
         pool: CredentialPool::CodexAccounts,
+        hold,
     })
 }
 

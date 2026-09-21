@@ -458,6 +458,7 @@ fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
             total: 4,
             next_clear_at: at(9_000),
             pool: crate::role_runner::CredentialPool::ClaudeTokens,
+            hold: crate::role_runner::PoolHold::SelfHealing,
         },
         None,
     );
@@ -496,6 +497,7 @@ fn classify_maps_every_outcome_variant_to_its_own_result() {
                 total: 2,
                 next_clear_at: at(10),
                 pool: crate::role_runner::CredentialPool::ClaudeTokens,
+                hold: crate::role_runner::PoolHold::SelfHealing,
             },
             RoleTickResult::SkippedPoolExhausted,
         ),
@@ -547,6 +549,7 @@ fn a_pool_skip_record_names_the_pool_that_gated_it() {
         total: 4,
         next_clear_at: at(900),
         pool: crate::role_runner::CredentialPool::CodexAccounts,
+        hold: crate::role_runner::PoolHold::SelfHealing,
     };
     let (result, detail) = classify(&codex);
     assert_eq!(result, RoleTickResult::SkippedPoolExhausted);

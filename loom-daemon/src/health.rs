@@ -634,9 +634,14 @@ pub struct RoleTickSummary {
     /// stays escalated.
     pub escalated: Vec<RoleFailure>,
     /// `(root, role)` pairs whose **latest** record in the window is a
-    /// [`crate::role_runner::RoleTickOutcome::PoolExhausted`] skip (issue
-    /// #7607) — the resolved token pool was present but had zero spawnable
-    /// accounts. Deliberately **disjoint** from `persistent`/`transient`:
+    /// **self-healing** [`crate::role_runner::RoleTickOutcome::PoolExhausted`]
+    /// skip (issue #7607) — the resolved pool was present but every account in
+    /// it was under a hold that ages out on its own. A pool that is empty
+    /// because nothing was ever provisioned, or whose state file will not
+    /// parse, is NOT here (#8444): those never clear without an operator, so
+    /// they stay in `persistent` (and escalate) like `NoTokenPool` —
+    /// see [`crate::role_runner::PoolHold`]. Deliberately **disjoint** from
+    /// `persistent`/`transient`:
     /// this is a self-healing, fleet-wide-shared-resource condition, not a
     /// per-role/per-repo defect, so it must never inflate the "N PERSISTENT
     /// failure(s)" count an operator reads as "N broken roles" (the exact
@@ -755,13 +760,15 @@ pub fn summarize_role_ticks(records: &[RoleTickRecord], since: DateTime<Utc>) ->
         if latest.ok {
             summary.transient.push(failure);
         } else if latest.pool_exhausted {
-            // Issue #7607: a pool-exhausted skip is deliberately routed into
-            // its own disjoint bucket rather than `persistent` — see
-            // `RoleTickSummary::pool_exhausted`'s doc comment. Never
+            // Issue #7607: a SELF-HEALING pool-exhausted skip is deliberately
+            // routed into its own disjoint bucket rather than `persistent` —
+            // see `RoleTickSummary::pool_exhausted`'s doc comment. Never
             // considered for `escalated` either: the detail is intentionally
             // volatile tick to tick (see `record_role_tick_at`'s doc
             // comment), so it could not build a byte-identical streak even
-            // if it were.
+            // if it were. #8444: the flag is `false` for a pool skip that can
+            // never self-heal, so those fall through to the branch below and
+            // escalate on their (deliberately stable) detail.
             summary.pool_exhausted.push(failure);
         } else {
             // Escalated pairs stay in `persistent` (they are persistent) AND are
@@ -1760,12 +1767,19 @@ impl StaleRole {
 /// (`ModelRuntimeMismatch`, `NoTokenPool`, `RuntimeRejected`) that can never
 /// self-recover without an operator config/code change, and that #6201's
 /// staleness check alone reads as perfectly alive because it never stops
-/// ticking. Deliberately excludes
-/// [`crate::role_runner::RoleTickOutcome::PoolExhausted`] (#7607): that
+/// ticking. Deliberately excludes the **self-healing**
+/// [`crate::role_runner::RoleTickOutcome::PoolExhausted`] hold (#7607): that
 /// state's `detail` is intentionally volatile tick to tick (the spawnable
 /// count and next-clear estimate change every check), so it can never build
 /// a byte-identical streak here — correctly, since pool exhaustion is
 /// expected to self-heal, unlike the three states above.
+///
+/// The two pool holds that are NOT self-healing (#8444 — no account
+/// provisioned at all, or a pool state file that will not parse) are
+/// deliberately *included*: they are the same "can never succeed as
+/// configured" shape as the three states above, and their `detail` is
+/// stable by construction so the streak forms. See
+/// [`crate::role_runner::PoolHold`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StuckRole {
     /// The workspace root this role ticks for.

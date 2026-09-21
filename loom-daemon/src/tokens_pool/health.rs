@@ -784,6 +784,23 @@ pub fn account_health(workspace: &Path, id: &AccountId) -> Result<Option<Account
         .find(|entry| entry.id() == *id))
 }
 
+/// Every health record in the workspace's `account-health.json`, keyed by
+/// account (Issue #8444) — **one** read and parse of the file.
+///
+/// [`account_health`] answers the same question for a single account, but a
+/// caller asking it in a loop re-reads and re-parses the whole file per
+/// account and can observe two different versions of it within one logical
+/// pass (the role runner's pre-spawn codex gate did exactly that). Fails the
+/// same way `account_health` does — an unreadable or malformed state file is
+/// an error, never an empty snapshot, so callers keep failing closed on it.
+pub fn health_snapshot(workspace: &Path) -> Result<HashMap<AccountId, AccountHealth>> {
+    Ok(read_state(workspace)?
+        .accounts
+        .into_iter()
+        .map(|entry| (entry.id(), entry))
+        .collect())
+}
+
 /// Select a healthy account for `provider` — the account-wide question, whose
 /// meaning is unchanged by #8058 Phase 2 (a live class-scoped hold still
 /// excludes the account). Callers that know which model they are about to run
