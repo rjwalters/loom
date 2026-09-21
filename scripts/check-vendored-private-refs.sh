@@ -71,9 +71,7 @@ ALLOWED_HOST_SUFFIXES=(
   biomejs.dev workers.dev
   developercertificate.org
   percy.io
-  ghcr.io
-  # Public documentation for the OpenTelemetry backend trials (#8522).
-  clickhouse.com signoz.io opentelemetry.io
+  ghcr.io clickhouse.com signoz.io opentelemetry.io
   # Package/source origins the fleet bootstrap plan fetches from (#7814).
   tailscale.com
   sf.net
