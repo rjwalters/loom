@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   hosted-build-gate:
@@ -21,6 +22,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+      pull-requests: read
     env:
       LOOM_GATE_SHA: ${{ inputs.candidate_sha }}
       LOOM_GATE_ISSUE: ${{ inputs.issue }}
@@ -46,6 +48,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - name: Create exact-candidate managed worktree
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git branch hosted-gate-base "$LOOM_GATE_SHA"
           bash .loom/scripts/worktree.sh "$LOOM_GATE_ISSUE" "hosted-gate-$GITHUB_RUN_ID" --base hosted-gate-base
@@ -77,6 +81,10 @@ jobs:
         working-directory: .loom/worktrees/issue-${{ inputs.issue }}
         shell: bash
         run: bash .loom/scripts/build-gate.sh 2>&1 | tee "$RUNNER_TEMP/hosted-gate.log"
+      - name: Run additional OTLP feature unit tests
+        working-directory: .loom/worktrees/issue-${{ inputs.issue }}
+        shell: bash
+        run: cargo nextest run --package loom-daemon --features otlp --lib --bins --profile ci 2>&1 | tee "$RUNNER_TEMP/hosted-otlp-tests.log"
       - name: Retain actual gate output and immutable candidate evidence
         if: always()
         uses: actions/upload-artifact@v7
@@ -85,5 +93,5 @@ jobs:
           path: |
             ${{ runner.temp }}/hosted-gate.log
             ${{ runner.temp }}/hosted-gate-evidence.json
+            ${{ runner.temp }}/hosted-otlp-tests.log
           if-no-files-found: warn
-

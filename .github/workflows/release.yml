@@ -130,6 +130,7 @@ jobs:
     uses: ./.github/workflows/hosted-build-gate.yml
     permissions:
       contents: read
+      pull-requests: read
     with:
       candidate_sha: ${{ inputs.gate_sha }}
       issue: ${{ inputs.gate_issue }}
