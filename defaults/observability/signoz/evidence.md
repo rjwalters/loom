@@ -77,6 +77,9 @@ timestamp, establishing actual UI correlation rather than merely compatible
 database fields. Sanitized screenshots contain only the synthetic fixture:
 [waterfall](evidence/trace-waterfall.png) and
 [selected span with correlated log](evidence/correlated-logs.png).
+The standard pinned self-hosted image reports the `enterprise` build variant;
+no license was supplied, and this proof uses the working base trace/log views.
+It does not assert availability of paid features or a complete edition matrix.
 
 A point-in-time sample after ingestion measured approximately **1.24 GiB** across
 the five steady-state SigNoz containers (ClickHouse 1.03 GiB, app 105.7 MiB,
@@ -84,6 +87,22 @@ Keeper 50.87 MiB, PostgreSQL 30.16 MiB and ingester 27.7 MiB). Active parts in t
 three signal databases totaled **77,373 bytes**. These small-fixture observations
 exclude PostgreSQL, system tables, images and total volume usage; they are not a
 capacity or comparative cost benchmark. The host was heavily contended.
+
+## Restart and recovery
+
+The complete project was stopped without removing volumes, then started from
+the final stable deployment copy outside the managed worktree. The checksummed
+helper and migration jobs exited successfully; Compose readiness and the actual
+ingester receiver both recovered. Before sending anything new, stored counts
+remained **4 span rows / 4 unique spans, 1 log and 1 gauge with value 3**. The
+existing account authenticated successfully (HTTP 200), and effective DDL still
+had no 15-day, 30-day or one-month signal TTL.
+
+Replaying the same three-signal fixture through the still-running neutral gateway
+then produced **8 span rows / 4 unique spans, 2 logs and 2 gauges with value 3**.
+This verifies receiver recovery and preserves honest duplicate accounting; a
+gateway HTTP success alone was not used as the delivery criterion. This was a
+normal stop/start, not a volume-loss backup restoration or crash-recovery test.
 
 ## Acceptance ledger
 
@@ -95,7 +114,7 @@ capacity or comparative cost benchmark. The host was heavily contended.
 | Three fixture signals with matching IDs/values | Passed; metric timestamp precision conversion documented |
 | Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
 | Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
-| Restart persistence and shared receiver recovery | Pending live check |
+| Restart persistence and shared receiver recovery | Passed for signals, account and effective TTL; fresh three-signal replay indexed |
 | Real Loom canary / real Judge-Doctor repair trace | Requires #8524/#8525 and #8529 |
 | Repeated latency/footprint comparison | Shared evaluation #8529 |
 
