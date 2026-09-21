@@ -327,6 +327,7 @@ mod tests {
                 managed_repos: Vec::new(),
                 roles: crate::telemetry::RoleTickHealth::default(),
                 protection: None,
+                admission_brake: None,
             }),
         )
     }

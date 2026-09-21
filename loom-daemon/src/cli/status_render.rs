@@ -631,6 +631,13 @@ pub(crate) fn build_status_json_value(
             // relieve it) for a scripted consumer, mirroring the human line.
             "starving_since": b.starving_since,
             "starving_ticks": b.starving_ticks,
+            // Issue #8478: the DURATION, pre-computed. `starving_since` alone
+            // required every consumer to subtract it from its own clock, and
+            // the tick count is not a duration at all (it scales with the
+            // work-finder interval). The 12-hour incident behind #8478 was a
+            // duration question — "how long has this been held" — that no
+            // machine-readable field answered.
+            "starving_secs": b.starving_since.map(|s| (Utc::now() - s).num_seconds().max(0)),
             "escape_hatch_grants": b.escape_hatch_grants,
         })),
         "rate_limit_breaker": report.rate_limit_breaker.as_ref().map(|r| serde_json::json!({
@@ -4414,6 +4421,41 @@ mod admission_brake_render_tests {
         );
         assert_eq!(healthy["admission_brake"]["starving_ticks"], 0);
         assert!(healthy["admission_brake"]["starving_since"].is_null());
+    }
+
+    /// #8478: the incident behind this field was a *duration* question ("how
+    /// long has dispatch been held?"). `starving_since` forced a consumer to do
+    /// clock arithmetic, and `starving_ticks` is not a duration at all — it
+    /// scales with the work-finder interval, so the same count means minutes on
+    /// one host and an hour on another.
+    #[test]
+    fn json_carries_the_starvation_duration_in_seconds() {
+        // `starving_brake` stamps `starving_since` 400s in the past.
+        let value = build_status_json_value(
+            &report_with(Some(starving_brake(Some(1.81), 5, 1))),
+            None,
+            &no_update(),
+            None,
+            None,
+            None,
+        );
+        let secs = value["admission_brake"]["starving_secs"]
+            .as_i64()
+            .expect("a starving brake must report its duration");
+        assert!((395..=405).contains(&secs), "expected ~400s of starvation, got {secs}");
+
+        let healthy = build_status_json_value(
+            &report_with(Some(brake(true, true, Some(1.10)))),
+            None,
+            &no_update(),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            healthy["admission_brake"]["starving_secs"].is_null(),
+            "a brake that is not starving has no duration to report — null, never 0"
+        );
     }
 
     #[test]

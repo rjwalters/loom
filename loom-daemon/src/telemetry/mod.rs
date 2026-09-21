@@ -838,6 +838,69 @@ pub struct HostProtectionSummary {
     pub watchdog_provisioned: Option<bool>,
 }
 
+/// `host.health`'s saturation admission-brake summary (Issue #8478) — a narrow
+/// wire projection of [`crate::admission_brake::BrakeSnapshot`], carrying the
+/// facts a *fleet-level* consumer needs to tell "this host is quiet" apart from
+/// "this host's dispatch has been suppressed for hours by load Loom does not
+/// own".
+///
+/// # Why the existing fields were not enough
+///
+/// `dispatch_halted`/`halt_reason` (#4975) already report the host-distress
+/// **breaker**, and #8478 extends them to cover a sustained-starving brake too
+/// — that is what makes such a host render as degraded in the existing fleet
+/// view with no consumer change. But a boolean plus a prose reason cannot answer
+/// the question the 12-hour incident actually raised: *how long*. That duration
+/// existed only in the host-local `status --json` payload
+/// ([`crate::types::AdmissionBrakeStatus::starving_since`], #5715); nothing
+/// pushed it off-host, so a fleet check could not distinguish a brake that
+/// engaged this minute from one wedged since yesterday.
+///
+/// # Every field is a fact, never a verdict
+///
+/// `starving_secs` is computed at capture time against the emitting host's own
+/// clock so a consumer never has to subtract a remote timestamp from its own
+/// (clock skew across a fleet would otherwise make short streaks negative).
+/// `starvation_warn_secs` is that host's own resolved threshold, so
+/// "longer than N minutes" is evaluated against what *this* host considers
+/// alarming rather than a hardcoded fleet constant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdmissionBrakeSummary {
+    /// Whether new sweep admissions are currently held. In-flight sweeps are
+    /// never affected — the brake has no path to running work.
+    pub held: bool,
+    /// When the current starvation streak began (held with **zero** sweeps in
+    /// flight, continuously). `None` whenever the host is not starving,
+    /// including a brake held while sweeps genuinely drain (healthy
+    /// backpressure never starves, however long it holds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starving_since: Option<DateTime<Utc>>,
+    /// Seconds the current starvation streak has run, as measured on the
+    /// emitting host at capture time. `None` when not starving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starving_secs: Option<i64>,
+    /// This host's resolved starvation **warn** threshold in seconds — the
+    /// duration past which it logs `STARVING` locally.
+    pub starvation_warn_secs: i64,
+    /// Cumulative starvation-escape-hatch grants this daemon process's
+    /// lifetime. `0` on a healthy host forever; nonzero means the brake has
+    /// had to force at least one admission through a still-saturated host.
+    pub escape_hatch_grants: u32,
+    /// `true` once this host has been starving for at least its own
+    /// `starvation_warn_secs` — i.e. dispatch is suppressed and **nothing Loom
+    /// admitted** is producing the load. This is the single field a fleet-level
+    /// check should alert on; the rest are for the diagnosis that follows.
+    pub dispatch_suppressed_by_foreign_load: bool,
+    /// Which processes the CPU actually belongs to, as
+    /// [`crate::foreign_load::attribution_clause`] renders it. Sampled **only**
+    /// while `dispatch_suppressed_by_foreign_load` is true, so an ordinary
+    /// healthy host never pays for a `ps` shellout, and `None` whenever the
+    /// probe could not answer (no `ps`, a timeout, unparseable output) — an
+    /// absent attribution must never be read as "no foreign load".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_cpu_consumers: Option<String>,
+}
+
 /// `host.health` — host CPU/disk headroom plus the emitting binary's identity
 /// (version + build commit + build time) and uptime.
 /// Host-level: it references no repository, so it carries no visibility tag.
@@ -978,6 +1041,18 @@ pub struct HostHealthRecord {
     /// (as `None`) rather than failing the whole envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protection: Option<HostProtectionSummary>,
+    /// This host's saturation admission-brake state (Issue #8478) — see
+    /// [`AdmissionBrakeSummary`]. `None` when no brake has been registered on
+    /// this host at all (no work-finder loop running), which is distinct from
+    /// `Some(..)` with `held: false` (a brake exists and is admitting). Both
+    /// must degrade gracefully on the consuming side: absent means "not
+    /// reported", never "not suppressed".
+    ///
+    /// `#[serde(default)]` so a record from a pre-#8478 daemon still decodes
+    /// (as `None`) rather than failing the whole envelope — the same
+    /// backward-compatibility contract `protection` established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_brake: Option<AdmissionBrakeSummary>,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —

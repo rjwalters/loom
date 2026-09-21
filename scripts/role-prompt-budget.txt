@@ -18,7 +18,7 @@
 # .loom/docs/file-size-policy.md.
 architect      14795        -
 auditor        20260        -
-builder        30114        -
+builder        30371        -
 champion       14114        -
 curator        46905    30000
 doctor         33544    30000

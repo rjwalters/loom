@@ -125,7 +125,13 @@ export interface HostHealthRecord {
   dispatch_halted?: boolean;
   /** Human-readable reason for the halt (e.g. `"load-per-core 4.24 >= 2.50
    * sustained for 3 consecutive tick(s)"`), naming the specific breaker/gate
-   * that tripped. Absent when `dispatch_halted` is absent/`false`. */
+   * that tripped. Absent when `dispatch_halted` is absent/`false`.
+   *
+   * Since #8478 a second cause can produce this pair: a saturation admission
+   * brake that has been STARVING (held with zero sweeps in flight) past the
+   * emitting host's own `starvationWarnSecs`. That reason names the duration
+   * and, when a `ps` probe answered, the processes the CPU belongs to. The
+   * breaker keeps priority when both fire. */
   halt_reason?: string;
   /** This host's managed-repository roster (#4976) — sourced from the
    * daemon's workspace registry, not inferred from in-flight sweeps, so an

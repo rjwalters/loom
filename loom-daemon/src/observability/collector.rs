@@ -43,9 +43,10 @@ use chrono::{DateTime, Utc};
 
 use crate::event_bus::{EventBus, RecvError};
 use crate::telemetry::{
-    visibility::derive_visibility, HostHealthRecord, HostProtectionSummary, ManagedRepoEntry,
-    PhaseDuration, RepoVisibility, RoleTickFailureEntry, RoleTickHealth, SweepResult,
-    SweepStartedRecord, TelemetryEnvelope, TelemetryRecord, TokenAccountState, TokenSnapshotRecord,
+    visibility::derive_visibility, AdmissionBrakeSummary, HostHealthRecord, HostProtectionSummary,
+    ManagedRepoEntry, PhaseDuration, RepoVisibility, RoleTickFailureEntry, RoleTickHealth,
+    SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord, TokenAccountState,
+    TokenSnapshotRecord,
 };
 use crate::types::{Event, RoleTickRecord, SweepKind};
 use crate::workspace_pool::WorkspacePool;
@@ -571,8 +572,15 @@ async fn sample_host_health(
     // re-derived (#4975). `None` (no work-finder loop ever registered a
     // breaker on this host) reads as "not known to be halted", matching every
     // other unmeasurable field's "unknown != zero" contract.
-    let (dispatch_halted, halt_reason) =
-        dispatch_halt_from_breaker(crate::host_breaker::global_snapshot());
+    // #8478: the admission brake is the SECOND way this host can be refusing
+    // dispatch, and the incident behind #8478 was invisible fleet-wide because
+    // only the breaker fed `dispatch_halted`. Sampled before the halt pair so
+    // the latter can fold it in.
+    let admission_brake = sample_admission_brake(crate::admission_brake::global_snapshot()).await;
+    let (dispatch_halted, halt_reason) = dispatch_halt_from_breaker(
+        crate::host_breaker::global_snapshot(),
+        admission_brake.as_ref(),
+    );
     // Free AND total (#5356) come from the SAME `df -Pk` sample — one
     // subprocess spawn, not two — so the pair can never disagree about which
     // filesystem or point in time they describe.
@@ -599,7 +607,74 @@ async fn sample_host_health(
         managed_repos: collect_managed_repos(workspace_pool, slug_cache).await,
         roles: sample_role_tick_health(&crate::role_runner::role_tick_records()),
         protection: sample_host_protection().await,
+        admission_brake,
     }
+}
+
+/// Project this host's [`crate::admission_brake::BrakeSnapshot`] onto the wire
+/// [`AdmissionBrakeSummary`] (Issue #8478), attaching foreign-load attribution
+/// only when the host is actually starving past its own warn threshold.
+///
+/// The `ps` shellout is the reason this is `async` and split from the pure
+/// [`brake_summary_from_snapshot`] below: it runs under `spawn_blocking` (the
+/// same pattern `sample_host_protection` uses for `launchctl`/`systemctl`) and
+/// **only** on a host whose dispatch is already suppressed by load Loom does not
+/// own. A healthy host pays nothing — no subprocess, no `ps` — on every
+/// `host.health` sample, which is the whole reason the gate is on
+/// `dispatch_suppressed_by_foreign_load` rather than on `held`.
+async fn sample_admission_brake(
+    snapshot: Option<crate::admission_brake::BrakeSnapshot>,
+) -> Option<AdmissionBrakeSummary> {
+    let mut summary = brake_summary_from_snapshot(snapshot, Utc::now())?;
+    if summary.dispatch_suppressed_by_foreign_load {
+        summary.top_cpu_consumers = tokio::task::spawn_blocking(|| {
+            let clause = crate::foreign_load::attribution_clause();
+            // `attribution_clause` returns "" on ANY probe failure; an absent
+            // attribution must stay absent rather than becoming an empty
+            // string a consumer would render as a blank answer.
+            (!clause.is_empty()).then_some(clause)
+        })
+        .await
+        .ok()
+        .flatten();
+    }
+    Some(summary)
+}
+
+/// Pure projection of a brake snapshot onto the wire summary — split out of
+/// [`sample_admission_brake`] so the duration arithmetic and the
+/// suppressed-by-foreign-load verdict are unit-testable with a fixed `now` and
+/// no process-global brake registration (the `OnceLock` every other test in
+/// this binary shares can only be set once).
+///
+/// `now` is the emitting host's own clock, so `starving_secs` is computed
+/// locally and a consumer never subtracts a remote timestamp from its own.
+/// Clamped at `0`: a snapshot whose `starving_since` is momentarily ahead of
+/// `now` (a clock adjustment mid-tick) must report "just started", never a
+/// negative duration.
+fn brake_summary_from_snapshot(
+    snapshot: Option<crate::admission_brake::BrakeSnapshot>,
+    now: DateTime<Utc>,
+) -> Option<AdmissionBrakeSummary> {
+    let snapshot = snapshot?;
+    let starving_secs = snapshot
+        .starving_since
+        .map(|since| (now - since).num_seconds().max(0));
+    // Held AND starving at least as long as THIS host considers alarming. Both
+    // conjuncts matter: `starving_since` is only ever set on a held tick, but
+    // stating `held` explicitly keeps the field honest if that ever changes.
+    let dispatch_suppressed_by_foreign_load =
+        snapshot.held && starving_secs.is_some_and(|secs| secs >= snapshot.starvation_warn_secs);
+    Some(AdmissionBrakeSummary {
+        held: snapshot.held,
+        starving_since: snapshot.starving_since,
+        starving_secs,
+        starvation_warn_secs: snapshot.starvation_warn_secs,
+        escape_hatch_grants: snapshot.escape_hatch_grants,
+        dispatch_suppressed_by_foreign_load,
+        // Filled in by `sample_admission_brake` only when suppressed.
+        top_cpu_consumers: None,
+    })
 }
 
 /// Sample this host's watchdog/crash-protection state (Issue #5352) via
@@ -667,10 +742,10 @@ fn sample_role_tick_health(records: &[RoleTickRecord]) -> RoleTickHealth {
 }
 
 /// Derive `host.health`'s `(dispatch_halted, halt_reason)` pair from a
-/// [`crate::host_breaker::BreakerSnapshot`] (Issue #4975). Pure — takes the
-/// snapshot as a value rather than reading the process-global directly — so
-/// it is unit-testable for both the `Open`/`CoolDown` (halted) and
-/// `Closed`/unregistered (not halted) cases without mutating the one-shot
+/// [`crate::host_breaker::BreakerSnapshot`] (Issue #4975) **or** a
+/// sustained-starving admission brake (Issue #8478). Pure — takes both as
+/// values rather than reading the process-globals directly — so it is
+/// unit-testable for every combination without mutating the one-shot
 /// [`crate::host_breaker::GLOBAL`] handle that every other test in this
 /// binary shares.
 ///
@@ -678,11 +753,48 @@ fn sample_role_tick_health(records: &[RoleTickRecord]) -> RoleTickHealth {
 /// (`Open` or `CoolDown`) — reused verbatim rather than re-derived from
 /// `phase` here, so this can never drift from the breaker's own definition of
 /// "refusing work".
+///
+/// # Why the brake belongs in the same pair (#8478)
+///
+/// `dispatch_halted` is consumed as *the* "is this host refusing new work"
+/// signal — the dashboard's `distressReason` renders it generically as
+/// `dispatch halted: <reason>`, never breaker-specifically. But before #8478
+/// only the breaker fed it, so the 2026-09-20 incident — 12 hours of held
+/// admission from foreign load, with the breaker never tripping — presented
+/// fleet-wide as a *healthy idle host*. Folding the brake in makes that host
+/// render as degraded through the consumer path that already exists, with no
+/// dashboard change; [`AdmissionBrakeSummary`] then carries the duration and
+/// the attribution that this boolean-plus-prose pair structurally cannot.
+///
+/// The breaker keeps priority when both fire: it is the stickier, more severe
+/// condition (sustained distress across a cool-down vs. a point-in-time hold),
+/// so its reason is the more actionable one to lead with. Only a brake that has
+/// passed its own `starvation_warn_secs` counts here — a brake holding while
+/// sweeps genuinely drain is healthy backpressure, and reporting *that* as a
+/// halt would flag every busy host in the fleet.
 fn dispatch_halt_from_breaker(
     snapshot: Option<crate::host_breaker::BreakerSnapshot>,
+    brake: Option<&AdmissionBrakeSummary>,
 ) -> (bool, Option<String>) {
     match snapshot {
-        Some(snapshot) if snapshot.suppressed => (true, snapshot.reason),
+        Some(snapshot) if snapshot.suppressed => return (true, snapshot.reason),
+        _ => {}
+    }
+    match brake {
+        Some(brake) if brake.dispatch_suppressed_by_foreign_load => (
+            true,
+            Some(format!(
+                "admission brake STARVING for {}s with 0 sweeps in flight (\u{2265} this host's \
+                 starvationWarnSecs {}); dispatch is suppressed by load Loom does not own{} \
+                 (#8478)",
+                brake.starving_secs.unwrap_or_default(),
+                brake.starvation_warn_secs,
+                brake
+                    .top_cpu_consumers
+                    .as_deref()
+                    .map_or_else(String::new, str::to_string),
+            )),
+        ),
         _ => (false, None),
     }
 }
@@ -794,6 +906,9 @@ fn collect_active_sweep_ids(workspace_pool: &WorkspacePool) -> Vec<String> {
     ids
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod admission_brake_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
