@@ -119,6 +119,14 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             }
             Ok(())
         }
+        AccountsAction::Check {
+            provider,
+            ranking,
+            json,
+        } => {
+            require_codex(&provider)?;
+            run_availability_check(&workspace, ranking, json)
+        }
         AccountsAction::Status {
             provider,
             name,
@@ -192,6 +200,89 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             print_status(&service.adopt(&name)?, json)
         }
     }
+}
+
+/// `loom-daemon accounts check [--ranking]` (issue #8407) — the Codex
+/// availability probe, the `tokens check --ranking` analogue.
+///
+/// # Exit-code contract
+///
+/// | Exit | Meaning |
+/// |---|---|
+/// | `0` | A report was produced. **Includes a host with no Codex profiles**, which says so and exits `0` — "no pool" is not a pool failure, and a script gating on this must not treat an un-provisioned host as an outage. |
+/// | `1` | Codex accounts exist but **none is dispatchable right now** — every one is rate-limited, exhausted, blocked, disabled, or errored. This is the pre-dispatch signal that routing codex work here will fail at selection. |
+/// | other | The ordinary CLI error path (unreadable registry, unwritable ranking file). |
+///
+/// This is deliberately stricter than `tokens check`, which exits `1` only
+/// when every row is `error`/`skipped`: that command's consumers re-derive
+/// selectability from `.ranking` themselves, whereas this one exists
+/// precisely to answer "can this host take codex work right now".
+///
+/// Output is secret-free by construction: every field comes from the account
+/// registry, `account-health.json`, or the numeric `rate_limits` snapshot —
+/// `auth.json` is never opened.
+fn run_availability_check(workspace: &std::path::Path, ranking: bool, json: bool) -> Result<()> {
+    use loom_daemon::tokens_pool::codex_check::{self, CheckOptions};
+
+    eprintln!("Resolved workspace: {}", workspace.display());
+    let (report, effects) = codex_check::run_check(
+        workspace,
+        CheckOptions {
+            write_ranking: ranking,
+        },
+        chrono::Utc::now(),
+    )?;
+
+    if report.accounts.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "workspace": workspace.display().to_string(),
+                    "accounts": [],
+                    "ranking_path": serde_json::Value::Null,
+                }))?
+            );
+        } else {
+            println!(
+                "No Codex accounts registered on this host; nothing to probe. Add one with \
+                 `loom-daemon accounts add codex <name>`."
+            );
+        }
+        return Ok(());
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "workspace": workspace.display().to_string(),
+                "report": report.to_json(),
+                "ranking_path": effects
+                    .ranking_written
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                "marked_exhausted": effects.marked_exhausted,
+                "cleared": effects.cleared,
+            }))?
+        );
+    } else {
+        println!("{}", codex_check::format_table(&report));
+        if let Some(path) = &effects.ranking_written {
+            println!("Ranking written to {}", path.display());
+        }
+        for name in &effects.marked_exhausted {
+            println!("Held codex/{name} from selection until its window rolls over.");
+        }
+        for name in &effects.cleared {
+            println!("Released codex/{name}'s exhaustion hold — measured headroom is newer.");
+        }
+    }
+
+    if !codex_check::has_usable_account(&report) {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn handle_session_command(action: SessionAction, workspace: std::path::PathBuf) -> Result<()> {

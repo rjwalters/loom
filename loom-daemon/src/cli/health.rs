@@ -396,6 +396,53 @@ async fn collect(window: Duration) -> HealthReport {
         codesign_preflight,
         load_per_core,
         limit_calibration,
+        codex_accounts: probe_codex_accounts(),
+    })
+}
+
+/// This host's Codex account reading (#8407): inventory + health counts, one
+/// read-only availability pass, and the provider-namespaced ranking file's
+/// freshness.
+///
+/// Filesystem-only and read-only, like every other input this collector
+/// gathers — `CheckOptions::default()` writes no ranking file and records no
+/// health state, so rendering the health report can never change what the
+/// next dispatch selects. `None` on any host with no resolvable workspace or
+/// an unreadable registry: an optional signal's absence never becomes a
+/// non-green line (the same rule `codesign_preflight` follows).
+fn probe_codex_accounts() -> Option<health::codex_accounts::CodexAccountsSnapshot> {
+    use loom_daemon::tokens_pool::{codex_check, provider_capacity_at, AccountProvider};
+
+    let workspace = super::tokens::resolve_tokens_workspace(".").ok()?;
+    let inventory =
+        loom_daemon::tokens_pool::account_inventory(&workspace, AccountProvider::Codex).ok()?;
+    if inventory.is_empty() {
+        return None;
+    }
+    let now = chrono::Utc::now();
+    let capacity = provider_capacity_at(
+        &workspace,
+        AccountProvider::Codex,
+        &inventory,
+        u64::try_from(now.timestamp()).unwrap_or(0),
+    )
+    .ok()?;
+    let statuses = codex_check::run_check(&workspace, codex_check::CheckOptions::default(), now)
+        .map(|(report, _)| {
+            let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+            for account in &report.accounts {
+                *counts.entry(account.status.clone()).or_insert(0) += 1;
+            }
+            counts
+        })
+        .unwrap_or_default();
+    let (ranking_present, ranking_age_secs) = codex_check::ranking_file_state(&workspace);
+    Some(health::codex_accounts::CodexAccountsSnapshot {
+        workspace,
+        capacity,
+        statuses,
+        ranking_present,
+        ranking_age_secs,
     })
 }
 

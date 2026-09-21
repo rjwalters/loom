@@ -672,6 +672,10 @@ async fn handle_health(
         // cadence, and taken here rather than daemon-side-over-IPC precisely
         // because the verdict it guards is the one reported when IPC failed.
         load_per_core: crate::cpu_headroom::load_per_core(),
+        // #8407: same rule as `limit_calibration` above — a CLI-collected,
+        // filesystem-only input this daemon-authoritative route does not
+        // gather, so no `codex` section renders here.
+        codex_accounts: None,
     });
 
     let mut body = serde_json::to_value(&health)?;

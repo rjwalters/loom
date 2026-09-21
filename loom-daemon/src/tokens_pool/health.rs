@@ -757,6 +757,129 @@ pub fn record_probe_at(
     })
 }
 
+/// Conclusive result of a proactive **availability** probe (issue #8407) —
+/// the quota-headroom sibling of [`ProbeOutcome`], which establishes only
+/// auth validity.
+///
+/// As with [`ProbeOutcome`], only states a measurement can actually establish
+/// are representable. "No reading", "a reading whose own window already rolled
+/// over", and "a schema this reader does not understand" are all absences of
+/// evidence and must never reach this API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityOutcome {
+    /// The subscription is at (or over) its plan ceiling until `until`
+    /// (epoch seconds) — the instant the binding window rolls over.
+    Exhausted { until: u64 },
+    /// The subscription measurably had headroom when the reading was taken at
+    /// `observed_at` (epoch seconds).
+    Available { observed_at: u64 },
+}
+
+/// What [`record_availability_at`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvailabilityEffect {
+    /// A plan-exhaustion cooldown was armed (or extended) from the reading.
+    MarkedExhausted,
+    /// A plan-exhaustion cooldown was released by a *newer* reading showing
+    /// headroom.
+    ClearedExhaustionHold,
+    /// Health already agreed with the reading; only the probe stamp moved.
+    Unchanged,
+}
+
+/// Apply a proactive availability measurement to an account's health record.
+///
+/// The selection-time counterpart of [`record_terminal_at`]'s reactive
+/// `TOKEN_EXHAUSTED` arm: it writes the *same* [`HealthReason::PlanExhausted`]
+/// cooldown [`select_healthy_at`] already honours, but from a reading taken
+/// before any work is dispatched rather than from a dispatch that already
+/// died.
+///
+/// Three guardrails keep a measurement from ever widening or narrowing more
+/// than the evidence supports:
+///
+/// * **A re-auth hold outranks it.** A broken credential is not a quota fact,
+///   and an availability reading is not the independent verification a
+///   re-auth release requires ([`record_probe_at`] is).
+/// * **A hold is never shortened.** An `Exhausted` reading takes the *later*
+///   of the existing deadline and its own, so a reactive hold recorded from a
+///   real dispatch failure can never be cut short by a measurement.
+/// * **A release requires strictly newer evidence.** `Available` clears a
+///   plan-exhaustion cooldown only when the reading post-dates the record it
+///   would release; a reading taken before that hold was written says nothing
+///   about it. Transient backoffs, session-limit holds and class-scoped credit
+///   holds are never touched — they are not plan-exhaustion facts.
+pub fn record_availability_at(
+    workspace: &Path,
+    id: &AccountId,
+    outcome: AvailabilityOutcome,
+    provenance: &str,
+    now: u64,
+) -> Result<AvailabilityEffect> {
+    if id.name.is_empty() || provenance.is_empty() {
+        bail!("account identity and signal provenance are required");
+    }
+    with_state(workspace, |state| {
+        let index = state.accounts.iter().position(|entry| entry.id() == *id);
+        let mut entry = index.map_or_else(
+            || AccountHealth {
+                provider: id.provider,
+                name: id.name.clone(),
+                reason: HealthReason::Healthy,
+                updated_at: now,
+                signal_provenance: provenance.to_string(),
+                cooldown_until: None,
+                consecutive_transient_failures: 0,
+                last_success: None,
+                last_probe: None,
+                class_cooldowns: HashMap::new(),
+            },
+            |index| state.accounts.remove(index),
+        );
+        entry.last_probe = Some(now);
+        let effect = if entry.reason == HealthReason::ReauthRequired {
+            AvailabilityEffect::Unchanged
+        } else {
+            match outcome {
+                AvailabilityOutcome::Exhausted { until } => {
+                    let deadline = entry.cooldown_until.map_or(until, |held| held.max(until));
+                    let changed = entry.reason != HealthReason::PlanExhausted
+                        || entry.cooldown_until != Some(deadline);
+                    entry.reason = HealthReason::PlanExhausted;
+                    entry.cooldown_until = Some(deadline);
+                    entry.updated_at = now;
+                    entry.signal_provenance = provenance.to_string();
+                    if changed {
+                        AvailabilityEffect::MarkedExhausted
+                    } else {
+                        AvailabilityEffect::Unchanged
+                    }
+                }
+                AvailabilityOutcome::Available { observed_at } => {
+                    if entry.reason == HealthReason::PlanExhausted
+                        && entry.cooldown_until.is_some()
+                        && observed_at > entry.updated_at
+                    {
+                        entry.reason = HealthReason::Healthy;
+                        entry.cooldown_until = None;
+                        entry.updated_at = now;
+                        entry.signal_provenance = provenance.to_string();
+                        AvailabilityEffect::ClearedExhaustionHold
+                    } else {
+                        AvailabilityEffect::Unchanged
+                    }
+                }
+            }
+        };
+        state.accounts.push(entry);
+        state
+            .accounts
+            .sort_by(|a, b| (a.provider as u8, &a.name).cmp(&(b.provider as u8, &b.name)));
+        Ok(effect)
+    })
+}
+
 /// Clear an auth hold only after the caller has independently verified reauth.
 pub fn clear_reauth(workspace: &Path, id: &AccountId, provenance: &str) -> Result<()> {
     with_state(workspace, |state| {

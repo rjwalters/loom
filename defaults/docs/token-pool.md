@@ -29,6 +29,7 @@ points here.
 - [Tests](#tests)
 - [Codex provider health](#codex-provider-health)
 - [Session-managed Codex accounts: auth-state probe + re-auth runbook (#6927)](#session-managed-codex-accounts-auth-state-probe--re-auth-runbook-6927)
+- [Codex availability probe (`loom-daemon accounts check`, #8407)](#codex-availability-probe-loom-daemon-accounts-check-8407)
 <!-- toc:end -->
 
 ## Provider-aware account inventory
@@ -1944,3 +1945,190 @@ selection with `LOOM_CODEX_SESSION_PROBE_TTL_SECS=0`.
 ends the pane the entrypoint created. The container survives (it blocks on
 its own `sleep infinity`), but a later `attach` has no session to attach to
 until the container is restarted.
+
+## Codex availability probe (`loom-daemon accounts check`, #8407)
+
+`tokens check --ranking` answers, for Claude, the question selection actually
+needs: *which accounts can take work right now, and for how long*. Until #8407
+the Codex pool had no equivalent — `codex login status` (#6927) reports auth
+validity only, and the cooldowns in `.loom/account-health.json` are
+failure-driven, so a subscription was known-exhausted only *after* a dispatch
+had already died on it. `accounts check` is the proactive half.
+
+### The signal: what a ChatGPT-plan subscription exposes (research finding)
+
+A ChatGPT-plan Codex subscription **does** expose its own rate-limit state, and
+it does so in a form Loom can read **without making an API call at all**.
+
+The backend returns two rate-limit windows on every `codex exec` turn, and the
+CLI records them as a `rate_limits` object with a `primary` (short, ~5h) and a
+`secondary` (long, ~weekly) window:
+
+| Field | Meaning |
+|---|---|
+| `used_percent` | `0..100` — how much of that window is consumed |
+| `window_minutes` | the window's own length (`300` ≈ 5h, `10080` ≈ 7d) |
+| `resets_in_seconds` | seconds from *this observation* until the window rolls over |
+
+Crucially, the CLI **persists every one of those snapshots**: each turn's event
+is appended to that profile's session rollout log under
+`$CODEX_HOME/sessions/**/rollout-*.jsonl`. So the freshest reading of a
+subscription's real headroom is already on disk inside the account's own
+`CODEX_HOME`.
+
+That is what the probe reads. It costs no tokens, starts no `codex` process,
+needs no running session container, and — unlike a synthetic probe prompt — the
+numbers are the backend's own.
+
+**Reproduce it on a host that has a Codex account** (this is the capture
+recipe; run it against the profile directory `loom-daemon accounts list`
+reports):
+
+```bash
+CODEX_HOME=~/.loom/codex-profiles/<name>
+# The raw artifact: the newest recorded rate-limit snapshot for that account.
+grep -h rate_limits $(ls -t "$CODEX_HOME"/sessions/**/rollout-*.jsonl | head -1) | tail -1 | jq .
+# Loom's reading of the same artifact, for every account:
+loom-daemon accounts check --json
+```
+
+**Verification status, stated honestly.** The parser is pinned by fixtures
+(`loom-daemon/src/tokens_pool/codex_check/tests.rs`) covering the event shape
+above, the alternate nesting the CLI has shipped (`rate_limits` inside `info`),
+and an absolute `resets_at` instead of a countdown. It was **not** captured
+from a live run on the build host, which has neither the Codex CLI nor a
+ChatGPT-plan credential — the recipe above is the operator-runnable
+confirmation step, and the probe is written to fail open (below) precisely so
+that a shape it does not recognize costs availability information rather than
+availability.
+
+**Why this is not an ADR-0017 ownership violation** for a session-managed
+(adopted) profile: reading a rollout log never runs `codex`, never opens
+`auth.json`, and never writes inside the profile. It reads one append-only log
+file the owning container itself wrote. The ownership rule constrains *process*
+access to the credential chain; this touches none of it.
+
+### Fail-open, always
+
+Every unknown is reported as "no evidence", never as a refusal:
+
+| Situation | Result |
+|---|---|
+| No rollout log, unparseable lines, unrecognized schema | `available`, no utilization — the account keeps its place in selection |
+| A reading whose own window **already rolled over** | discarded, not carried forward (the Codex form of #7420's overdue-reset trap: a week-old `100%` must never pin a healthy subscription out of rotation) |
+| A recorded hold in `account-health.json` | outranks the measurement — reporting `available` for an account the selector will skip is the dishonest direction |
+
+### Which window is binding
+
+The long window dominates, exactly as it does for Claude
+(`status_from_utilization` promotes a 429 to `exhausted` only when the **7d**
+utilization clears the threshold) — reused rather than re-invented, so
+`check::limit_reset` picks the right horizon for each status with no
+Codex-specific rule:
+
+| Measurement | Status | Reported reset |
+|---|---|---|
+| secondary (~weekly) at/over the ceiling | `exhausted` | the weekly reset |
+| primary (~5h) at/over it, weekly below | `rate_limited` | the 5h reset |
+| both below | `available` | — |
+
+One derivation feeds both the reported row and the health hold it arms, so a
+row can never advertise one horizon while the hold uses another — the bug that
+would otherwise report "back on Thursday" for an account returning in two
+hours. An account at the ceiling whose reset instant is **unknown** arms no
+hold at all: an invented deadline is worse than none.
+
+### The command
+
+```bash
+loom-daemon accounts check                 # read-only: report, write nothing
+loom-daemon accounts check --ranking       # persist: ranking file + account health
+loom-daemon accounts check --json          # machine-readable
+```
+
+`--ranking` is the "persist what I learned" mode. It writes the
+provider-namespaced ranking file **and** feeds each conclusive reading into
+`.loom/account-health.json`, where selection already consults it. Without the
+flag the command is a pure read.
+
+**Exit codes:**
+
+| Exit | Meaning |
+|---|---|
+| `0` | A report was produced. **Includes a host with no Codex profiles**, which says so and exits `0` — an un-provisioned host is not an outage. |
+| `1` | Codex accounts exist but **none is dispatchable right now** — every one is rate-limited, exhausted, blocked, disabled, or errored — the pre-dispatch signal that routing codex work here will fail at selection. |
+
+This is deliberately stricter than `tokens check` (exit `1` only when every row
+is `error`/`skipped`): that command's consumers re-derive selectability from
+`.ranking` themselves, whereas this one exists to answer "can this host take
+codex work **right now**". `rate_limited` therefore counts as *not* usable —
+it self-clears within hours, which makes it a recoverable refusal, not an
+available account.
+
+### The provider-namespaced ranking file
+
+`--ranking` writes `<workspace>/.loom/account-ranking.codex`, next to the
+provider-aware `account-health.json` this pool already keys on. Its **contents
+are the byte-identical format Claude's `.ranking` uses**:
+
+```text
+name|status|5h_util|limit_reset
+alpha|available|0.03
+beta|exhausted|1.00|2026-09-22T10:00:00Z
+```
+
+One format, one parser, every provider — so a dashboard (and the API-key
+account pool of #8401) reads them all the same way. Statuses come from the same
+vocabulary (`available`, `rate_limited`, `exhausted`, `blocked`, `skipped`,
+`error`); no Codex-only status word was invented.
+
+The file is secret-free by construction: every field is a name, a status word,
+a number, or a timestamp. `auth.json` is never opened.
+
+### How the reading reaches selection
+
+`--ranking` mode feeds each *live* measurement into account health through
+`record_availability_at`, the proactive sibling of the reactive
+`TOKEN_EXHAUSTED` arm — so an account measured at its ceiling is skipped
+*before* a dispatch is burned on it, by the same
+`select_healthy_at` filter every Codex selection already goes through.
+
+Three guardrails bound what a measurement may do:
+
+- **A re-auth hold outranks it.** A broken credential is not a quota fact, and
+  an availability reading is not the independent verification a re-auth release
+  requires (`record_probe_at` is).
+- **A hold is never shortened.** An exhausted reading takes the *later* of the
+  existing deadline and its own, so a hold recorded from a real dispatch
+  failure cannot be cut short by a measurement.
+- **A release requires strictly newer evidence.** A headroom reading clears a
+  plan-exhaustion cooldown only when it post-dates the record it would release.
+  Transient backoffs, session-limit holds, and class-scoped credit holds are
+  never touched.
+
+### `loom-daemon health`'s `codex` section
+
+A host with Codex accounts gains a `codex` section alongside the Claude
+`tokens` table:
+
+```text
+codex       green     2/3 healthy [2 available, 1 exhausted] (1 cooling down), ranking 4m old
+```
+
+It is **conditional**: a host with no Codex accounts renders no section at all,
+so a Claude-only host's report is byte-identical to its pre-#8407 form. It goes
+Degraded on zero healthy accounts, every account disabled, or any account
+awaiting re-auth. Ranking freshness is reported as detail only, never as a
+verdict input — nothing yet refreshes the Codex ranking on a cadence, so
+alarming on its absence would paint every codex host amber for not running a
+command by hand.
+
+### Not in scope here
+
+The per-provider variant of the #7708 sweep-dispatch hold — so an all-codex
+exhaustion never holds Claude work and vice versa — is **not** part of this
+surface. Today's hold is keyed on the resolved Claude pool directory and arms
+only from Claude pool reads, so a dry codex pool cannot hold Claude work; the
+converse (holding codex-runtime dispatch) needs the work finder to resolve each
+sweep's runtime first. The role-tick side of that question already landed as
+#8408 (see "The gate follows the admitted runtime").
