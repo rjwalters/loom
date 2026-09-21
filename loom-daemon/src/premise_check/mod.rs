@@ -115,8 +115,13 @@ pub struct Decision {
 
 /// Run stages 1 and 2. The evidence scan is the caller's, because it needs a
 /// repo root and is skippable (`--no-scan`).
+///
+/// `content_root` is the **working tree the citations are resolved against**,
+/// not the shared clone root: a citation is a claim about file content, which
+/// differs per worktree (issue #8499). See
+/// [`crate::repo_root::find_worktree_root`].
 #[must_use]
-pub fn decide(inputs: &Inputs, repo_root: &std::path::Path) -> Decision {
+pub fn decide(inputs: &Inputs, content_root: &std::path::Path) -> Decision {
     let Some(trigger) = scope::trigger(&inputs.title, &inputs.body, &inputs.labels) else {
         return Decision {
             trigger: None,
@@ -150,7 +155,7 @@ pub fn decide(inputs: &Inputs, repo_root: &std::path::Path) -> Decision {
             exit_code: exit::RECORD_MALFORMED,
         },
         Ok(rec) => {
-            let outcome = record::check(&rec, repo_root);
+            let outcome = record::check(&rec, content_root);
             let exit_code = match outcome {
                 Outcome::Proceed => exit::PROCEED,
                 Outcome::RouteOperator => exit::ROUTE_OPERATOR,

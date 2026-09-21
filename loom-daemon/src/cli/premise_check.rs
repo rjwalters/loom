@@ -38,7 +38,8 @@ pub(crate) struct PremiseCheckArgs {
     record_file: Option<PathBuf>,
 
     /// Root the evidence scan and every citation resolves against. Defaults to
-    /// the checkout containing the cwd.
+    /// the WORKING TREE containing the cwd — a linked worktree resolves
+    /// against itself, not the main checkout it was created from (#8499).
     #[arg(long = "repo-root", value_name = "PATH")]
     repo_root: Option<PathBuf>,
 
