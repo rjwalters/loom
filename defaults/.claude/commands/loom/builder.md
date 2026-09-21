@@ -387,7 +387,7 @@ workflow) that require maintainer approval before being worked on.
 
 - **Find work**: Use the three-tier priority order in "Finding Work: Priority System" below (urgent → curated → approved-only). FIFO (oldest-first) is only the tiebreak **within** a single tier — not a top-level rule.
 - **Check dependencies**: Verify all task list items are checked before claiming
-- **Claim issue**: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
+- **Guard, then claim**: `loom-daemon forge check-open-pr <number>` must not exit 0 (exit 0 = an open linked PR already exists — take another issue), then `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
 - **Do the work**: Implement, test, commit, create PR
 - **Mark PR for review**: `./.loom/scripts/create-pr.sh --label "loom:review-requested"` — never a bare `gh pr create` (#6074). MUST use the structured body template — canonical in builder-pr.md § "Creating the PR"
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
@@ -808,7 +808,8 @@ gh issue view 100 --comments
 # If you see unchecked dependencies, mark as blocked instead
 gh issue edit 100 --remove-label "loom:issue" --add-label "loom:blocked"
 
-# Otherwise, claim normally
+# Otherwise, run the step-4 open-PR guard, then claim
+loom-daemon forge check-open-pr 100    # exit 0 => open PR exists, do NOT claim
 gh issue edit 100 --remove-label "loom:issue" --add-label "loom:building"
 ```
 
@@ -1107,6 +1108,14 @@ gh issue list --label="loom:issue" --state=open --json number,title,labels \
 ```
 
 **Why allow this**: Work can proceed even if Curator hasn't run yet. Builder can implement based on human approval alone if needed.
+
+**Step 4 (every tier): guard the claim before you flip the label**
+
+```bash
+loom-daemon forge check-open-pr <number>   # exit 0 PRINTS an open linked PR
+```
+
+**Exit 0 means an open linked PR already exists — do NOT claim; take the next candidate.** Exit 1 (verified "none open") is the only safe-to-claim answer; any other code means the probe could not answer (rate limit, `gh` failure, Gitea) and is **not** an all-clear. Same #4123 probe the daemon's dispatch refuses on, so a hand-claim cannot race past a guard a dispatched sweep would have honored — skipping it once burned a verification pass re-doing already-shipped PR #8462 (#8551).
 
 ### Priority Guidelines
 

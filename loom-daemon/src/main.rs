@@ -1791,6 +1791,21 @@ enum ForgeAction {
         )]
         args: Vec<String>,
     },
+    /// `forge check-open-pr <issue>` — the #4123 open-linked-PR guard as a
+    /// **pre-claim** check for the manual/in-session Builder path (#8551).
+    ///
+    /// Exits `0` and prints the PR number when an open linked PR already
+    /// exists (**do not claim**), `1` on a verified absence (safe to claim),
+    /// and `5` when the probe could not answer (fail closed — NOT an
+    /// absence). Reuses the same closes-graph ∪ timeline probe the daemon's
+    /// own dispatch guard uses.
+    #[command(name = "check-open-pr")]
+    CheckOpenPr {
+        /// Issue number you are about to claim.
+        #[arg(value_name = "ISSUE")]
+        issue: u32,
+    },
+
     /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]` —
     /// enable auto-merge for a PR (formerly `loom-auto-merge`). GitHub:
     /// `enablePullRequestAutoMerge` GraphQL mutation. Gitea: declines (exit
