@@ -48,7 +48,7 @@ processors:
           - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id"])
       - context: log
         statements:
-          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name", "loom.duration_sec", "loom.total_duration_sec", "loom.phase_durations", "loom.models_used", "loom.tokens_by_model", "loom.gated_pool", "loom.actions.comments_posted", "loom.actions.issues_labeled", "loom.actions.prs_merged"])
+          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name", "loom.duration_sec", "loom.total_duration_sec", "loom.phase_durations", "loom.models_used", "loom.tokens_by_model", "loom.judge_verdicts", "loom.tokens_in", "loom.tokens_out", "loom.lines_added", "loom.lines_deleted", "loom.config.runtime", "loom.config.provider", "loom.config.configured_model", "loom.config.arm", "loom.gated_pool", "loom.actions.comments_posted", "loom.actions.issues_labeled", "loom.actions.prs_merged"])
     trace_statements:
       - context: resource
         statements:

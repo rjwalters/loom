@@ -115,3 +115,10 @@ Persistence has a measurable cost. Loaded-host fixtures measured 100 durable
 start/completion pairs in 11.12 and 18.63 seconds, about 111–186 ms per span,
 excluding export. These are observed test-host results, not production latency guarantees. Measure
 on the deployment filesystem and include this cost when evaluating a model run.
+
+When upgrading lifecycle instrumentation, refresh the gateway deployment’s
+`config.yaml` from `defaults/observability/collector/config.yaml` and recreate
+only that Collector service, retaining its persistent queue directory. The
+updated log allowlist preserves measured token/line counts, ordered Judge
+verdicts, and bounded runtime/provider/model experiment settings. An older
+gateway drops those additional fields even though Loom exports them.

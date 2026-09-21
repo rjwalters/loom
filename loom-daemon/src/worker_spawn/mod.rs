@@ -212,9 +212,11 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         telemetry::trace::{SpanName, SpanStatus},
     };
     let root = workspace(args.scripts_dir.as_deref())?;
-    let role = Options::parse(&args.args).ok().and_then(|o| {
-        o.prompt
-            .and_then(|p| prompt::role_invocation(&p).map(|(r, _)| r.to_owned()))
+    let role = nonempty_env("LOOM_ROLE").or_else(|| {
+        Options::parse(&args.args).ok().and_then(|o| {
+            o.prompt
+                .and_then(|p| prompt::role_invocation(&p).map(|(r, _)| r.to_owned()))
+        })
     });
     let attempt = role
         .as_deref()
@@ -249,9 +251,9 @@ fn run_preflight(
     attempt: Option<&crate::observability::lifecycle::Span>,
 ) -> Result<(), LaunchError> {
     let mut trace_identity = crate::telemetry::trace::TraceAttributes::new();
-    let config = crate::config_resolver::resolve_effective_config(&root);
+    let config = crate::config_resolver::resolve_effective_config(root);
     let (runtime, source) = if let Some(role) = nonempty_env("LOOM_ROLE") {
-        let (runtime, source) = crate::runtime_admission::resolve_binding(&root, &role, None)
+        let (runtime, source) = crate::runtime_admission::resolve_binding(root, &role, None)
             .map_err(|e| LaunchError::config(e.diagnostic()))?;
         (runtime, source.to_string())
     } else if let Some(runtime) = nonempty_env("LOOM_RUNTIME") {
@@ -272,7 +274,7 @@ fn run_preflight(
     {
         return Err(LaunchError::config("invalid runtime name"));
     }
-    let scripts = args.scripts_dir.unwrap_or_else(|| scripts_dir(&root));
+    let scripts = args.scripts_dir.unwrap_or_else(|| scripts_dir(root));
     let mut log: Box<dyn Write> = Box::new(std::io::stderr());
     let mut command = if let Some(harness) = Harness::parse(&runtime) {
         let options = Options::parse(&args.args)?;
@@ -285,7 +287,7 @@ fn run_preflight(
             .and_then(prompt::role_invocation)
             .map(|(r, _)| r);
         for role in role.as_deref().into_iter().chain(prompt_role) {
-            crate::runtime_admission::resolve_and_admit(&root, role, Some(&runtime))
+            crate::runtime_admission::resolve_and_admit(root, role, Some(&runtime))
                 .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
         let selection = profiles::select(&runtime, &options, &config)?;
@@ -323,7 +325,7 @@ fn run_preflight(
                 .collect();
             let mut command = containment::docker_command(
                 &profile,
-                &root,
+                root,
                 &std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?,
                 options.log.as_deref(),
                 &args.args,
@@ -337,18 +339,18 @@ fn run_preflight(
         }
         // Fails closed (78) only when this host has a pool for the profile's
         // credential provider and none of its accounts is usable (#8401).
-        let credential = credential::resolve(&root, &selection)?;
+        let credential = credential::resolve(root, &selection)?;
         let expanded = options
             .prompt
             .as_deref()
-            .map(|p| prompt::expand(&root, p))
+            .map(|p| prompt::expand(root, p))
             .transpose()?;
         let mut command = harness.command(
             &options,
             &selection,
             &credential,
             expanded.as_deref(),
-            &root,
+            root,
             role.is_some() || prompt_role.is_some(),
         )?;
         log = attach_log(&mut command, options.log.as_deref())?;
