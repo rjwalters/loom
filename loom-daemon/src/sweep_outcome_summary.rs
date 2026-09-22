@@ -42,7 +42,7 @@
 //!   output), and buckets everything else under `unknown` rather than dropping
 //!   it.
 //!
-//! # Two honest caveats, surfaced in the output rather than hidden
+//! # Three honest caveats, surfaced in the output rather than hidden
 //!
 //! * **The rate card is stale.** Weighted tokens price through
 //!   [`ModelPricing::for_model`], whose rates are commented "as of Jan 2025"
@@ -56,6 +56,13 @@
 //!   so every envelope read from one host's own workspaces carries the same
 //!   `host_id`. The grouping is real only over a pooled/exported corpus; the
 //!   report says so in its `notes`.
+//! * **`--group-by tap` can split one tap across the stamping boundary**
+//!   (#8634). [`resolve_tap`] never invents a profile for a record written
+//!   before the `config["tap"]` stamp (#8556, landed in #8625), so that
+//!   record's bare-runtime key cannot merge with the stamped
+//!   `runtime:profile` key of what is probably the same tap. Merging them
+//!   would be a guess; instead [`split_tap_keys`] detects the pairing and the
+//!   report names the affected keys in its `notes`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -264,6 +271,53 @@ pub fn resolve_tap(record: &SweepOutcomeRecord) -> String {
         },
     };
     format!("{runtime}@{credential}")
+}
+
+/// Whether a record carries the explicit `config["tap"]` stamp, i.e. whether
+/// [`resolve_tap`] read its key rather than reconstructing it.
+fn tap_is_stamped(record: &SweepOutcomeRecord) -> bool {
+    record
+        .config
+        .get("tap")
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Split one tap key into `(runtime, profile, credential)` — `None` for a key
+/// with no `@` (nothing this module produces, but the parse stays total).
+fn tap_halves(key: &str) -> Option<(&str, Option<&str>, &str)> {
+    let (tap, credential) = key.split_once('@')?;
+    let (runtime, profile) = tap
+        .split_once(':')
+        .map_or((tap, None), |(r, p)| (r, Some(p)));
+    Some((runtime, profile, credential))
+}
+
+/// The `<bare> vs <stamped>` pairs where a **reconstructed** bare-runtime row
+/// sits next to a profile-stamped row over the same runtime and credential —
+/// one logical tap reported as two rows across the #8556/#8625 stamping
+/// boundary (Issue #8634).
+///
+/// `reconstructed` names the group keys holding at least one unstamped
+/// record, so a *stamped* bare-runtime tap (a runtime with no profile half) is
+/// never flagged: that row is a tap in its own right, not a boundary artifact,
+/// and adding it to a profile row would merge unrelated spend.
+fn split_tap_keys(group_keys: &[&str], reconstructed: &BTreeSet<String>) -> Vec<String> {
+    let mut pairs = Vec::new();
+    for bare in group_keys.iter().filter(|k| reconstructed.contains(**k)) {
+        let Some((runtime, None, credential)) = tap_halves(bare) else {
+            continue;
+        };
+        for stamped in group_keys {
+            if let Some((r, Some(_), c)) = tap_halves(stamped) {
+                if r == runtime && c == credential {
+                    pairs.push(format!("{bare} vs {stamped}"));
+                }
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    pairs
 }
 
 // ============================================================================
@@ -988,6 +1042,9 @@ pub fn summarize(
     let mut groups: BTreeMap<String, Accum> = BTreeMap::new();
     let mut any_inferred_arm = false;
     let mut merge_degraded = false;
+    // Tap group keys holding at least one record with no `config["tap"]`
+    // stamp — the input to the #8634 boundary-split caveat below.
+    let mut reconstructed_taps: BTreeSet<String> = BTreeSet::new();
 
     for entry in in_window {
         let record = &entry.record;
@@ -1023,7 +1080,13 @@ pub fn summarize(
                 (host.to_string(), None)
             }
             GroupBy::Day => (entry.emitted_at.format("%Y-%m-%d").to_string(), None),
-            GroupBy::Tap => (resolve_tap(record), None),
+            GroupBy::Tap => {
+                let tap = resolve_tap(record);
+                if !tap_is_stamped(record) {
+                    reconstructed_taps.insert(tap.clone());
+                }
+                (tap, None)
+            }
         };
 
         let acc = groups.entry(key).or_default();
@@ -1180,6 +1243,20 @@ pub fn summarize(
              counts still sum to records_grouped."
                 .to_string(),
         );
+    }
+    if opts.group_by == GroupBy::Tap {
+        let keys: Vec<&str> = rows.iter().map(|r| r.group.as_str()).collect();
+        let split = split_tap_keys(&keys, &reconstructed_taps);
+        if !split.is_empty() {
+            notes.push(format!(
+                "at least one tap straddles the profile-stamping boundary (#8556, landed in \
+                 #8625): records predating the stamp reconstruct a BARE-RUNTIME key — a profile \
+                 is never invented for them — so they form their own row beside the stamped rows \
+                 for what is probably the same tap. Add the rows together before reading a \
+                 per-tap total. Affected: {}.",
+                split.join(", ")
+            ));
+        }
     }
     if !opts.merge_join_attempted {
         notes.push(

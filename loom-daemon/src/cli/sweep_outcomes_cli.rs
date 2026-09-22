@@ -129,7 +129,10 @@ pub(crate) enum SweepOutcomesAction {
         /// that answers "how much went to the metered backstop vs. the
         /// subscriptions". A record with no explicit tap stamp is placed from
         /// the credential keys it does carry; see
-        /// `sweep_outcome_summary::resolve_tap`.
+        /// `sweep_outcome_summary::resolve_tap`. Such a record keeps a bare
+        /// runtime key (no profile is invented for it), so one tap can show up
+        /// as two rows across the #8625 stamping boundary — the report emits a
+        /// note naming the affected keys when it does (#8634).
         #[arg(long, value_name = "DIM", default_value = "model")]
         group_by: String,
 

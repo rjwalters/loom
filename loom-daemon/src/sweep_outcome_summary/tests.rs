@@ -200,6 +200,88 @@ fn grouping_by_tap_separates_the_metered_backstop_from_the_subscriptions() {
     assert_eq!(row(&format!("{UNKNOWN_GROUP}@{UNKNOWN_GROUP}")).sweeps, 1);
 }
 
+/// Issue #8634: one logical tap can straddle the profile-stamping boundary
+/// (#8556, landed in #8625) — its pre-stamp records reconstruct a
+/// BARE-RUNTIME key while its post-stamp records carry the profile half — so
+/// `--group-by tap` shows two rows for what is really one tap. Merging them
+/// would mean inventing a profile for the older records, so the report ships
+/// a caveat instead of changing the placement rule.
+#[test]
+fn tap_grouping_flags_a_tap_split_across_the_stamping_boundary() {
+    // Post-#8625: stamped, so the profile half is known.
+    let mut stamped = record("s1", "o/r", None, SweepResult::Success, 100);
+    stamped
+        .config
+        .insert("tap".into(), "opencode:zai-metered@api_keys:zai".into());
+    // Pre-#8625: no stamp, so the key is reconstructed to the bare runtime.
+    let mut pre = record("s2", "o/r", None, SweepResult::Success, 100);
+    for (k, v) in [
+        ("runtime", "opencode"),
+        ("credential_source", "pool"),
+        ("credential_provider", "zai"),
+    ] {
+        pre.config.insert(k.into(), v.into());
+    }
+    let report = summarize(
+        &[entry(stamped, day(10), "h1"), entry(pre, day(10), "h1")],
+        &SpawnDeathIndex::default(),
+        opts(GroupBy::Tap),
+        &mut NoneMerged,
+        vec!["/ws".into()],
+    );
+    // Both rows survive — nothing is merged and no profile is invented.
+    assert_eq!(report.rows.len(), 2);
+    let note = report
+        .notes
+        .iter()
+        .find(|n| n.contains("profile-stamping boundary"))
+        .unwrap_or_else(|| panic!("missing tap-split caveat: {:?}", report.notes));
+    assert!(
+        note.contains("opencode@api_keys:zai vs opencode:zai-metered@api_keys:zai"),
+        "caveat should name the split pair: {note}"
+    );
+    // The caveat reaches the human renderer too, not just --json.
+    assert!(render_text(&report).contains("profile-stamping boundary"));
+}
+
+/// The same caveat must stay quiet when nothing straddles the boundary: two
+/// stamped rows sharing a runtime and credential are two real taps (a
+/// stamped key with no profile half is not a reconstruction), and a
+/// reconstructed row with no stamped counterpart is just one tap.
+#[test]
+fn tap_grouping_ships_no_split_caveat_without_a_reconstructed_bare_row() {
+    let tapped = |sweep: &str, tap: &str| {
+        let mut r = record(sweep, "o/r", None, SweepResult::Success, 100);
+        r.config.insert("tap".into(), tap.into());
+        entry(r, day(10), "h1")
+    };
+    let mut reconstructed = record("s3", "o/r", None, SweepResult::Success, 100);
+    reconstructed.config.insert("runtime".into(), "pi".into());
+    let report = summarize(
+        &[
+            // Stamped, bare runtime (this runtime has no profile half)…
+            tapped("s1", "opencode@api_keys:zai"),
+            // …alongside a stamped profile on the same credential.
+            tapped("s2", "opencode:zai-metered@api_keys:zai"),
+            // Reconstructed, but no stamped row shares its runtime.
+            entry(reconstructed, day(10), "h1"),
+        ],
+        &SpawnDeathIndex::default(),
+        opts(GroupBy::Tap),
+        &mut NoneMerged,
+        vec!["/ws".into()],
+    );
+    assert_eq!(report.rows.len(), 3);
+    assert!(
+        !report
+            .notes
+            .iter()
+            .any(|n| n.contains("profile-stamping boundary")),
+        "unexpected tap-split caveat: {:?}",
+        report.notes
+    );
+}
+
 #[test]
 fn since_accepts_relative_and_absolute_forms() {
     let now = day(20);
