@@ -80,7 +80,13 @@ fn resolve_from_current_exe(
 /// If `path`'s final component ends with the kernel's ` (deleted)` marker,
 /// return the path with that suffix stripped (the original, now-unlinked
 /// filesystem path). `None` for an ordinary (non-deleted) path.
-fn strip_deleted_suffix(path: &Path) -> Option<PathBuf> {
+///
+/// `pub(crate)` so tests elsewhere in the crate that compare a resolved
+/// binary against a raw [`std::env::current_exe`] read can normalise the
+/// marker out the same way this module does, instead of asserting on a raw
+/// read that the kernel may have suffixed out from under them (issue #8532 —
+/// see `token_ranking_refresh::tests::test_resolve_bin_defaults_to_current_exe`).
+pub(crate) fn strip_deleted_suffix(path: &Path) -> Option<PathBuf> {
     let file_name = path.file_name()?.to_str()?;
     let stripped_name = file_name.strip_suffix(DELETED_SUFFIX)?;
     Some(path.with_file_name(stripped_name))
@@ -139,6 +145,34 @@ mod tests {
 
         let resolved = resolve_from_current_exe(&deleted_path, |_| None).unwrap();
         assert_eq!(resolved, real_bin, "must resolve to the replacement binary, not the fallback");
+    }
+
+    /// Issue #8532 regression guard. `token_ranking_refresh::tests::
+    /// test_resolve_bin_defaults_to_current_exe` compares `resolve_bin()`
+    /// against a raw [`std::env::current_exe`] read, which the kernel
+    /// suffixes with ` (deleted)` the moment a concurrent rebuild unlinks the
+    /// running test binary — so it has to normalise that read the same way
+    /// this resolver does, or it fails for the very scenario this module
+    /// exists to survive. Pin the two behaviours together here: if the
+    /// resolver's strategy ever changes, this fails loudly and names the
+    /// dependent test, instead of that test re-emerging as an unexplained
+    /// full-suite flake.
+    #[test]
+    fn test_deleted_marker_normalisation_matches_the_resolver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_bin = tmp.path().join("loom-daemon");
+        touch_executable(&real_bin);
+        let raw = tmp.path().join("loom-daemon (deleted)");
+
+        let resolved = resolve_from_current_exe(&raw, |_| None).unwrap();
+        // …the exact normalisation the dependent test applies:
+        let expected = strip_deleted_suffix(&raw)
+            .filter(|stripped| stripped.is_file())
+            .unwrap_or_else(|| raw.clone());
+
+        assert_eq!(resolved, expected);
+        assert_eq!(resolved, real_bin);
+        assert_ne!(resolved, raw, "a raw current_exe() comparison is what #8532 flaked on");
     }
 
     #[test]
