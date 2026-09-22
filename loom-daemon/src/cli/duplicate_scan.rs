@@ -53,11 +53,30 @@
 //! Near-match rows are **not** written to stdout: that channel is a verdict
 //! channel the script splices across pools, and a context-only block riding
 //! it would end up inside a `DUPLICATE_FOUND` list. They go to the file named
-//! by `--near-file`, as a JSON array of `{number, title, similarity}`, and
-//! only when there are any (the script reads the file's existence as the
-//! signal). Degenerate results suppress the band: when the scorer is not
-//! separating anything, more low-confidence rows are the last thing a caller
-//! needs.
+//! by `--near-file`, as a JSON array of `{number, title, similarity}` (plus
+//! `title_similarity` on a demoted row, see below), and only when there are
+//! any (the script reads the file's existence as the signal). Degenerate
+//! results suppress the band: when the scorer is not separating anything,
+//! more low-confidence rows are the last thing a caller needs.
+//!
+//! # Title corroboration at low block scores (#8591)
+//!
+//! A full-text score *just over* the block line is the noisiest region of the
+//! scale: two long issues in the same subsystem share enough jargon to reach
+//! it without being about the same thing. On 2026-09-21 `create-issue.sh`
+//! refused #8561 (a Kimi CLI harness adapter) as a duplicate of #8505 (an
+//! OpenCode metered-runtime budget bug) at *exactly* the 18% floor — the two
+//! share one title keyword, `runtime`. A block that cheap trains every caller
+//! to pass `--force`, at which point the backstop protects nothing.
+//!
+//! So an open-issue candidate scoring in `[--threshold, --corroborate-below)`
+//! must clear a **second, independent** signal before it blocks: the
+//! **title-only** Jaccard, against `--title-threshold`. Uncorroborated
+//! candidates are *demoted* to near-match rows (carrying the
+//! `title_similarity` that fell short) rather than dropped — the caller still
+//! sees what it nearly collided with, it just is not stopped. At or above
+//! `--corroborate-below` the body overlap stands on its own, as before.
+//! `--corroborate-below <= --threshold` disables the rule entirely.
 //!
 //! Exit codes: 0 and 1 are the answers above; 2 means "could not run"
 //! (unreadable stdin, bad arguments) — never a verdict. The script maps an
@@ -73,6 +92,29 @@ use serde::Deserialize;
 /// below 4 scanned candidates, ">50% matched" is not a meaningful signal (one
 /// real match out of one candidate is trivially ">50%").
 const MIN_SCANNED_FOR_DEGENERATE: usize = 4;
+
+/// The default block threshold, on the true-Jaccard scale: the #4409
+/// calibration against this repo's own history (confirmed duplicate pairs at
+/// 19%/13%, unrelated richly-worded issues at 4-13%).
+pub(crate) const DEFAULT_THRESHOLD: u32 = 18;
+
+/// Ceiling of the low-confidence block region (#8591). A full-text score in
+/// `[DEFAULT_THRESHOLD, DEFAULT_CORROBORATION_CEILING)` is not trustworthy on
+/// its own — it is reachable by any two long issues in the same subsystem —
+/// so it must be corroborated by title overlap. Chosen at 25 because that is
+/// where body overlap is roughly double the calibrated floor: measured across
+/// this repo's 92 open issues on 2026-09-22, every pair at/above 25% was a
+/// genuine family (an epic and its children), while the 18-24% region was 27
+/// unrelated pairs to 7 related ones.
+pub(crate) const DEFAULT_CORROBORATION_CEILING: u32 = 25;
+
+/// The title-only Jaccard a low-confidence block must reach to be
+/// corroborated (#8591). Deliberately the SAME 18% line as the block
+/// threshold: one calibration, applied to a second, independent field. This
+/// repo's confirmed duplicate pair #3550/#3551 scores 26% on titles alone
+/// (19% on bodies) and still blocks; the #8561/#8505 false positive scores 3%
+/// and no longer does.
+pub(crate) const DEFAULT_TITLE_THRESHOLD: u32 = 18;
 
 /// The stop-word list `check-duplicate.sh`'s `extract_keywords` filtered on,
 /// carried over verbatim (including the duplicate `both` the shell list
@@ -158,8 +200,20 @@ pub(crate) struct DuplicateScanArgs {
 
     /// Block threshold: similarity at/above this is a match, on the true
     /// Jaccard scale (default 18, check-duplicate.sh's #4409 calibration).
-    #[arg(long, value_name = "N", default_value_t = 18)]
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_THRESHOLD)]
     threshold: u32,
+
+    /// Corroboration ceiling (#8591): an OPEN-issues candidate whose
+    /// full-text score lands in [--threshold, N) blocks only when its
+    /// TITLE-only Jaccard also reaches --title-threshold; otherwise it is
+    /// demoted to a near-match row. N <= --threshold disables the rule.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_CORROBORATION_CEILING)]
+    corroborate_below: u32,
+
+    /// The title-only Jaccard floor a low-confidence block must reach to be
+    /// corroborated (#8591). Same scale, same calibration as --threshold.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_TITLE_THRESHOLD)]
+    title_threshold: u32,
 
     /// Near-match band floor (#8289): OPEN-issues candidates scoring in
     /// [N, --threshold) are reported to --near-file as context. Never a
@@ -206,6 +260,14 @@ pub(crate) struct NearMatch {
     pub(crate) number: u64,
     pub(crate) title: String,
     pub(crate) similarity: u32,
+    /// Present **only** on a row DEMOTED out of the block band for want of
+    /// title corroboration (#8591): the title-only Jaccard that fell short.
+    /// Its absence is what distinguishes an ordinary warn-band row (scored
+    /// below `--threshold`) from a demoted one (scored at/above it), so the
+    /// caller can word the two differently. Omitted, not null, so the JSON a
+    /// pre-#8591 reader sees is byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) title_similarity: Option<u32>,
 }
 
 /// The scan's answer: everything the caller prints or branches on.
@@ -269,20 +331,56 @@ pub(crate) fn jaccard_percent(a: &[String], b: &[String]) -> u32 {
         .unwrap_or(0)
 }
 
+/// The threshold set a scan runs under. A struct rather than five positional
+/// parameters so a call site cannot silently transpose two `u32`s that mean
+/// very different things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanThresholds {
+    /// Similarity at/above this is a block match (subject to corroboration).
+    pub(crate) threshold: u32,
+    /// Near-match band floor (#8289); `None`/0/`>= threshold` disables it.
+    pub(crate) warn_threshold: Option<u32>,
+    /// Corroboration ceiling (#8591); `<= threshold` disables the rule.
+    pub(crate) corroborate_below: u32,
+    /// Title-only Jaccard floor for corroboration (#8591).
+    pub(crate) title_threshold: u32,
+}
+
+impl Default for ScanThresholds {
+    fn default() -> Self {
+        Self {
+            threshold: DEFAULT_THRESHOLD,
+            warn_threshold: None,
+            corroborate_below: DEFAULT_CORROBORATION_CEILING,
+            title_threshold: DEFAULT_TITLE_THRESHOLD,
+        }
+    }
+}
+
 /// The banding decision, pure: given query keywords and candidates (already
 /// parsed), produce the outcome the caller prints. The probed issue itself
 /// (when given) is skipped before scoring (#4662).
+///
+/// `query_title_keywords` is the query's **title alone**, the second signal
+/// the low-confidence corroboration rule (#8591) scores against; pass an
+/// empty slice to opt out (the rule then cannot fire, so every in-band match
+/// blocks exactly as it did before).
 #[must_use]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan(
     pool: Pool,
     query_keywords: &[String],
+    query_title_keywords: &[String],
     candidates: &[Candidate],
-    threshold: u32,
-    warn_threshold: Option<u32>,
+    thresholds: ScanThresholds,
     self_issue: Option<u64>,
     rest_fallback: bool,
 ) -> ScanOutcome {
+    let ScanThresholds {
+        threshold,
+        warn_threshold,
+        corroborate_below,
+        title_threshold,
+    } = thresholds;
     let mut outcome = ScanOutcome::default();
 
     // The band is open-issues only, and only when 0 < warn < threshold —
@@ -291,6 +389,16 @@ pub(crate) fn scan(
     // band by a future caller.
     let band_active =
         pool == Pool::OpenIssues && warn_threshold.is_some_and(|w| w > 0 && w < threshold);
+
+    // Title corroboration (#8591) is likewise open-issues only — it exists to
+    // stop a cheap BLOCK, and only the open pool's matches block. It needs a
+    // non-empty region above `threshold` to act on, and a query title with at
+    // least one keyword to score against; without either it stays inert and
+    // every in-band match blocks as before (fail-CLOSED: an inconclusive
+    // second signal must never be read as "not a duplicate").
+    let corroboration_active = pool == Pool::OpenIssues
+        && corroborate_below > threshold
+        && !query_title_keywords.is_empty();
 
     let mut scanned = 0usize;
     let mut matched_rows: Vec<String> = Vec::new();
@@ -314,6 +422,26 @@ pub(crate) fn scan(
         let existing = extract_keywords(&format!("{} {}", c.title, c.body));
         let similarity = jaccard_percent(query_keywords, &existing);
         if similarity >= threshold {
+            // #8591: a block from the low-confidence region needs the title
+            // to agree too. A candidate whose own title yields no keywords
+            // cannot answer the question, so it keeps its block (fail-closed,
+            // as above).
+            if corroboration_active && similarity < corroborate_below {
+                let candidate_title_keywords = extract_keywords(&c.title);
+                if !candidate_title_keywords.is_empty() {
+                    let title_similarity =
+                        jaccard_percent(query_title_keywords, &candidate_title_keywords);
+                    if title_similarity < title_threshold {
+                        near.push(NearMatch {
+                            number: c.number,
+                            title: c.title.clone(),
+                            similarity,
+                            title_similarity: Some(title_similarity),
+                        });
+                        continue;
+                    }
+                }
+            }
             matched_rows.push(format!(
                 "{}{}: {} (similarity: {similarity}%)",
                 pool.row_prefix(),
@@ -325,6 +453,7 @@ pub(crate) fn scan(
                 number: c.number,
                 title: c.title.clone(),
                 similarity,
+                title_similarity: None,
             });
         }
     }
@@ -412,12 +541,21 @@ impl DuplicateScanArgs {
         }
 
         let query_keywords = extract_keywords(&format!("{} {}", self.title, self.body));
+        // The title alone is the corroborating signal (#8591) — scored
+        // against candidate titles, never against their bodies, so a long
+        // body cannot dilute or manufacture the agreement.
+        let query_title_keywords = extract_keywords(&self.title);
         let outcome = scan(
             self.pool,
             &query_keywords,
+            &query_title_keywords,
             &candidates,
-            self.threshold,
-            self.warn_threshold,
+            ScanThresholds {
+                threshold: self.threshold,
+                warn_threshold: self.warn_threshold,
+                corroborate_below: self.corroborate_below,
+                title_threshold: self.title_threshold,
+            },
             self.self_issue,
             self.rest_fallback,
         );
@@ -474,6 +612,37 @@ mod tests {
             body: body.to_string(),
         }
     }
+
+    /// The block/warn edges under test, with #8591's corroboration constants
+    /// left at their shipped defaults. Every call site below that uses this
+    /// also passes `&[]` for the query's title keywords, which keeps the
+    /// corroboration rule inert — so these stay exactly the pre-#8591
+    /// banding regressions they were written as. The corroboration tests
+    /// further down supply real title keywords on purpose.
+    fn thr(threshold: u32, warn_threshold: Option<u32>) -> ScanThresholds {
+        ScanThresholds {
+            threshold,
+            warn_threshold,
+            ..Default::default()
+        }
+    }
+
+    /// One of the frozen issue snapshots under `duplicate_scan_fixtures/`,
+    /// as `(full-text keywords, title-only keywords, candidate)`. They are
+    /// checked-in copies of real `gh issue view --json number,title,body`
+    /// output, so the scores asserted against them can never drift with the
+    /// live corpus.
+    fn fixture(raw: &str) -> (Vec<String>, Vec<String>, Candidate) {
+        let c: Candidate = serde_json::from_str(raw).expect("fixture parses");
+        let full = extract_keywords(&format!("{} {}", c.title, c.body));
+        let title = extract_keywords(&c.title);
+        (full, title, c)
+    }
+
+    const FIXTURE_8561: &str = include_str!("duplicate_scan_fixtures/issue-8561.json");
+    const FIXTURE_8505: &str = include_str!("duplicate_scan_fixtures/issue-8505.json");
+    const FIXTURE_3550: &str = include_str!("duplicate_scan_fixtures/issue-3550.json");
+    const FIXTURE_3551: &str = include_str!("duplicate_scan_fixtures/issue-3551.json");
 
     /// Keyword extraction parity with the shell's `extract_keywords`:
     /// lowercase, alnum-split, stop-word filtered, >=3 chars, deduped.
@@ -563,9 +732,9 @@ mod tests {
         let near = scan(
             Pool::OpenIssues,
             &q,
+            &[],
             &[cand(1, &in_band.join(" "), "")],
-            18,
-            Some(13),
+            thr(18, Some(13)),
             None,
             false,
         );
@@ -574,17 +743,24 @@ mod tests {
         assert_eq!(near.near_matches.len(), 1);
         assert_eq!(near.near_matches[0].similarity, 16);
 
-        let block =
-            scan(Pool::OpenIssues, &q, &[cand(1, &over.join(" "), "")], 18, Some(13), None, false);
+        let block = scan(
+            Pool::OpenIssues,
+            &q,
+            &[],
+            &[cand(1, &over.join(" "), "")],
+            thr(18, Some(13)),
+            None,
+            false,
+        );
         assert_eq!(block.exit_code, 1);
         assert_eq!(block.stdout_lines[0], "DUPLICATE_FOUND");
 
         let quiet = scan(
             Pool::OpenIssues,
             &q,
+            &[],
             &[cand(1, &silent.join(" "), "")],
-            18,
-            Some(13),
+            thr(18, Some(13)),
             None,
             false,
         );
@@ -611,9 +787,9 @@ mod tests {
         let near = scan(
             Pool::OpenIssues,
             &q,
+            &[],
             &[cand(7, &at_floor.join(" "), "")],
-            18,
-            Some(13),
+            thr(18, Some(13)),
             None,
             false,
         );
@@ -624,9 +800,9 @@ mod tests {
         let block = scan(
             Pool::OpenIssues,
             &q,
+            &[],
             &[cand(7, &at_ceiling.join(" "), "")],
-            18,
-            Some(13),
+            thr(18, Some(13)),
             None,
             false,
         );
@@ -655,7 +831,7 @@ mod tests {
             cand(603, "Completely unrelated banana fruit basket", ""),
             cand(604, "Core module driver suite", ""),
         ];
-        let out = scan(Pool::OpenIssues, &q, &cands, 18, Some(1), None, false);
+        let out = scan(Pool::OpenIssues, &q, &[], &cands, thr(18, Some(1)), None, false);
         assert_eq!(out.exit_code, 1);
         assert_eq!(out.stdout_lines.len(), 1, "degenerate prints only its marker line");
         assert!(out.stdout_lines[0].starts_with("NON_DISCRIMINATIVE (open issues): "));
@@ -679,7 +855,7 @@ mod tests {
             cand(705, "Alpha Bravo Echo Foxtrot Golf India", ""), // 25 NEAR
             cand(706, "Alpha Bravo Echo Foxtrot Golf Juliet", ""), // 25 NEAR
         ];
-        let out = scan(Pool::OpenIssues, &q, &cands, 30, Some(20), None, false);
+        let out = scan(Pool::OpenIssues, &q, &[], &cands, thr(30, Some(20)), None, false);
         assert_eq!(out.exit_code, 1);
         assert_eq!(out.stdout_lines[0], "DUPLICATE_FOUND");
         assert_eq!(out.near_matches.len(), 3);
@@ -695,7 +871,7 @@ mod tests {
     fn self_issue_is_skipped() {
         let q = kws(&["alpha", "bravo", "charlie"]);
         let cands = vec![cand(42, "alpha bravo charlie", "")];
-        let out = scan(Pool::OpenIssues, &q, &cands, 18, None, Some(42), false);
+        let out = scan(Pool::OpenIssues, &q, &[], &cands, thr(18, None), Some(42), false);
         assert_eq!(out.exit_code, 0);
         assert!(out.stdout_lines.is_empty());
     }
@@ -707,18 +883,18 @@ mod tests {
     fn pool_prefixes_and_exit_codes() {
         let q = kws(&["alpha", "bravo", "charlie", "delta"]);
         let cands = vec![cand(9, "Alpha Bravo Echo Foxtrot", "")];
-        let merged = scan(Pool::MergedPrs, &q, &cands, 18, Some(13), None, false);
+        let merged = scan(Pool::MergedPrs, &q, &[], &cands, thr(18, Some(13)), None, false);
         assert_eq!(merged.exit_code, 0);
         assert_eq!(merged.stdout_lines, vec!["PR #9: Alpha Bravo Echo Foxtrot (similarity: 33%)"]);
 
-        let closed = scan(Pool::ClosedIssues, &q, &cands, 18, Some(13), None, false);
+        let closed = scan(Pool::ClosedIssues, &q, &[], &cands, thr(18, Some(13)), None, false);
         assert_eq!(closed.exit_code, 0);
         assert_eq!(
             closed.stdout_lines,
             vec!["Closed #9: Alpha Bravo Echo Foxtrot (similarity: 33%)"]
         );
 
-        let open = scan(Pool::OpenIssues, &q, &cands, 18, Some(13), None, false);
+        let open = scan(Pool::OpenIssues, &q, &[], &cands, thr(18, Some(13)), None, false);
         assert_eq!(open.exit_code, 1);
         assert_eq!(
             open.stdout_lines,
@@ -736,12 +912,12 @@ mod tests {
     fn rest_fallback_labels_output() {
         let q = kws(&["alpha", "bravo", "charlie", "delta"]);
         let cands = vec![cand(9, "Alpha Bravo Echo Foxtrot", "")];
-        let open = scan(Pool::OpenIssues, &q, &cands, 18, None, None, true);
+        let open = scan(Pool::OpenIssues, &q, &[], &cands, thr(18, None), None, true);
         assert_eq!(
             open.stdout_lines[0],
             "DUPLICATE_FOUND (REST fallback -- similarity ranking basis differs from GraphQL)"
         );
-        let merged = scan(Pool::MergedPrs, &q, &cands, 18, None, None, true);
+        let merged = scan(Pool::MergedPrs, &q, &[], &cands, thr(18, None), None, true);
         assert_eq!(merged.stdout_lines[0], "RATE_LIMIT_FALLBACK");
         assert_eq!(merged.stdout_lines[1], "PR #9: Alpha Bravo Echo Foxtrot (similarity: 33%)");
     }
@@ -765,7 +941,7 @@ mod tests {
             cand(603, "Completely unrelated banana fruit basket", ""),
             cand(604, "Core module driver suite", ""),
         ];
-        let out = scan(Pool::MergedPrs, &q, &cands, 18, None, None, false);
+        let out = scan(Pool::MergedPrs, &q, &[], &cands, thr(18, None), None, false);
         assert_eq!(out.exit_code, 0);
         assert!(out.stdout_lines[0].starts_with("NON_DISCRIMINATIVE (merged PRs): "));
         assert!(out.stdout_lines[0].ends_with("fall back to manual review."));
@@ -777,13 +953,13 @@ mod tests {
     fn band_is_open_pool_only_and_never_inverted() {
         let q = kws(&["alpha", "bravo", "charlie", "delta"]);
         let cands = vec![cand(702, "Alpha Bravo Echo Foxtrot Golf Hotel", "")]; // 25%
-        let merged = scan(Pool::MergedPrs, &q, &cands, 30, Some(20), None, false);
+        let merged = scan(Pool::MergedPrs, &q, &[], &cands, thr(30, Some(20)), None, false);
         assert!(merged.near_matches.is_empty(), "merged pool never reports near rows");
 
-        let inverted = scan(Pool::OpenIssues, &q, &cands, 30, Some(30), None, false);
+        let inverted = scan(Pool::OpenIssues, &q, &[], &cands, thr(30, Some(30)), None, false);
         assert!(inverted.near_matches.is_empty(), "warn == threshold disables the band");
 
-        let zero = scan(Pool::OpenIssues, &q, &cands, 30, Some(0), None, false);
+        let zero = scan(Pool::OpenIssues, &q, &[], &cands, thr(30, Some(0)), None, false);
         assert!(zero.near_matches.is_empty(), "warn 0 disables the band");
     }
 
@@ -796,9 +972,9 @@ mod tests {
         let out = scan(
             Pool::OpenIssues,
             &q,
+            &[],
             &[cand(1, "anything at all", "")],
-            18,
-            Some(13),
+            thr(18, Some(13)),
             None,
             false,
         );
@@ -821,5 +997,262 @@ mod tests {
             .collect();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].number, 5);
+    }
+
+    /// #8591 regression, the reported false positive. On 2026-09-21
+    /// `create-issue.sh` refused #8561 (a Kimi Code CLI harness adapter) as a
+    /// duplicate of #8505 (an OpenCode metered-runtime budget bug) at exactly
+    /// the 18% block floor. The pair shares only generic runtime/harness
+    /// vocabulary — one title keyword, `runtime`.
+    #[test]
+    fn issue_8561_is_not_blocked_as_a_duplicate_of_issue_8505() {
+        let (q_full, q_title, _) = fixture(FIXTURE_8561);
+        let (c_full, c_title, c) = fixture(FIXTURE_8505);
+
+        let body_similarity = jaccard_percent(&q_full, &c_full);
+        let title_similarity = jaccard_percent(&q_title, &c_title);
+        assert_eq!(body_similarity, 17, "frozen snapshots: shared subsystem jargon only");
+        assert_eq!(title_similarity, 3, "the only shared title keyword is `runtime`");
+        assert!(
+            body_similarity < DEFAULT_CORROBORATION_CEILING,
+            "inside the band the rule guards"
+        );
+        assert!(title_similarity < DEFAULT_TITLE_THRESHOLD, "the second signal does not agree");
+
+        // Re-create the reported condition — a match sitting EXACTLY on the
+        // block floor — by dropping the floor onto the pair's own score.
+        // Asserting that way rather than against a hard 18 means a later
+        // re-snapshot moving the score by a point cannot quietly turn this
+        // into a test of nothing.
+        let at_floor = ScanThresholds {
+            threshold: body_similarity,
+            warn_threshold: Some(13),
+            ..Default::default()
+        };
+        let out = scan(
+            Pool::OpenIssues,
+            &q_full,
+            &q_title,
+            std::slice::from_ref(&c),
+            at_floor,
+            None,
+            false,
+        );
+        assert_eq!(out.exit_code, 0, "no verdict: the title signal refuses to corroborate");
+        assert!(out.stdout_lines.is_empty(), "and therefore no DUPLICATE_FOUND header");
+        assert_eq!(out.near_matches.len(), 1, "demoted to context, never silently dropped");
+        assert_eq!(out.near_matches[0].number, 8505);
+        assert_eq!(out.near_matches[0].similarity, body_similarity);
+        assert_eq!(
+            out.near_matches[0].title_similarity,
+            Some(title_similarity),
+            "a demoted row reports the signal that fell short"
+        );
+
+        // The same scan with the rule switched off is the behaviour that
+        // refused the filing — i.e. this test fails without #8591's change.
+        let without_rule = ScanThresholds {
+            threshold: body_similarity,
+            corroborate_below: 0,
+            ..Default::default()
+        };
+        let old = scan(
+            Pool::OpenIssues,
+            &q_full,
+            &q_title,
+            std::slice::from_ref(&c),
+            without_rule,
+            None,
+            false,
+        );
+        assert_eq!(old.exit_code, 1, "pre-#8591: an uncorroborated floor score blocked");
+        assert_eq!(old.stdout_lines[0], "DUPLICATE_FOUND");
+
+        // And at the shipped defaults the pair does not even reach the floor.
+        let shipped = ScanThresholds {
+            warn_threshold: Some(13),
+            ..Default::default()
+        };
+        let now = scan(
+            Pool::OpenIssues,
+            &q_full,
+            &q_title,
+            std::slice::from_ref(&c),
+            shipped,
+            None,
+            false,
+        );
+        assert_eq!(now.exit_code, 0);
+    }
+
+    /// The other half of #8591's acceptance criteria: a calibration, not a
+    /// disable. #3550/#3551 — the confirmed duplicate pair the whole 18% line
+    /// is drawn from — scores 19% on bodies and 26% on titles, so the title
+    /// corroborates and it still blocks at the shipped defaults.
+    #[test]
+    fn confirmed_duplicate_pair_3550_3551_still_blocks_at_the_default() {
+        let (q_full, q_title, _) = fixture(FIXTURE_3551);
+        let (c_full, c_title, c) = fixture(FIXTURE_3550);
+
+        let body_similarity = jaccard_percent(&q_full, &c_full);
+        let title_similarity = jaccard_percent(&q_title, &c_title);
+        assert_eq!(body_similarity, 19, "the #4409 calibration pair, on full bodies");
+        assert_eq!(title_similarity, 26, "and its titles agree far more strongly");
+        assert!(body_similarity < DEFAULT_CORROBORATION_CEILING, "so it IS in the guarded band");
+        assert!(
+            title_similarity >= DEFAULT_TITLE_THRESHOLD,
+            "and the second signal corroborates"
+        );
+
+        let out = scan(
+            Pool::OpenIssues,
+            &q_full,
+            &q_title,
+            std::slice::from_ref(&c),
+            ScanThresholds {
+                warn_threshold: Some(13),
+                ..Default::default()
+            },
+            None,
+            false,
+        );
+        assert_eq!(out.exit_code, 1, "a true positive must keep blocking");
+        assert_eq!(out.stdout_lines[0], "DUPLICATE_FOUND");
+        assert!(out.stdout_lines[1].starts_with("#3550: "));
+        assert!(out.near_matches.is_empty(), "a block is not also a near match");
+    }
+
+    /// Above the ceiling the body score stands on its own: the same
+    /// uncorroborated pair blocks once its score is no longer "low".
+    #[test]
+    fn corroboration_applies_only_below_the_ceiling() {
+        let (q_full, q_title, _) = fixture(FIXTURE_8561);
+        let (_, _, c) = fixture(FIXTURE_8505);
+        let out = scan(
+            Pool::OpenIssues,
+            &q_full,
+            &q_title,
+            std::slice::from_ref(&c),
+            ScanThresholds {
+                threshold: 10,
+                corroborate_below: 12,
+                ..Default::default()
+            },
+            None,
+            false,
+        );
+        assert_eq!(out.exit_code, 1, "17% clears a 12% ceiling -- no second signal needed");
+        assert!(out.near_matches.is_empty());
+    }
+
+    /// Fail CLOSED: when the second signal cannot be evaluated at all — no
+    /// query-title keywords, or a candidate title that yields none — the
+    /// block stands. An inconclusive corroboration check must never read as
+    /// "not a duplicate".
+    #[test]
+    fn corroboration_fails_closed_when_a_title_yields_no_keywords() {
+        let (q_full, _, _) = fixture(FIXTURE_8561);
+        let (_, _, c) = fixture(FIXTURE_8505);
+        let at_floor = ScanThresholds {
+            threshold: 17,
+            ..Default::default()
+        };
+        let no_query_title =
+            scan(Pool::OpenIssues, &q_full, &[], std::slice::from_ref(&c), at_floor, None, false);
+        assert_eq!(no_query_title.exit_code, 1, "nothing to corroborate against -> block stands");
+
+        // Candidate side: an all-stop-word title, with the body carrying the
+        // 18% overlap (9 keywords, 2 shared with the 4-keyword query).
+        let q = kws(&["alpha", "bravo", "charlie", "delta"]);
+        let q_title = kws(&["alpha", "bravo"]);
+        let titleless =
+            cand(901, "the a an is of", "alpha bravo kilo lima mike november oscar papa quebec");
+        let out = scan(
+            Pool::OpenIssues,
+            &q,
+            &q_title,
+            std::slice::from_ref(&titleless),
+            thr(18, Some(13)),
+            None,
+            false,
+        );
+        assert_eq!(out.exit_code, 1, "a candidate with no title keywords keeps its block");
+        assert_eq!(out.stdout_lines[0], "DUPLICATE_FOUND");
+    }
+
+    /// A demotion is reported whether or not the warn band is switched on —
+    /// otherwise turning the band off would silently delete the finding
+    /// instead of merely declining to block on it.
+    #[test]
+    fn a_demoted_row_surfaces_even_with_the_warn_band_off() {
+        let (q_full, q_title, _) = fixture(FIXTURE_8561);
+        let (_, _, c) = fixture(FIXTURE_8505);
+        let out = scan(
+            Pool::OpenIssues,
+            &q_full,
+            &q_title,
+            std::slice::from_ref(&c),
+            ScanThresholds {
+                threshold: 17,
+                warn_threshold: None,
+                ..Default::default()
+            },
+            None,
+            false,
+        );
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.near_matches.len(), 1);
+        assert!(out.near_matches[0].title_similarity.is_some());
+    }
+
+    /// The context pools are untouched: their rows never block, so there is
+    /// nothing for corroboration to protect against there.
+    #[test]
+    fn corroboration_never_touches_the_context_pools() {
+        let (q_full, q_title, _) = fixture(FIXTURE_8561);
+        let (_, _, c) = fixture(FIXTURE_8505);
+        for pool in [Pool::MergedPrs, Pool::ClosedIssues] {
+            let out = scan(
+                pool,
+                &q_full,
+                &q_title,
+                std::slice::from_ref(&c),
+                ScanThresholds {
+                    threshold: 17,
+                    ..Default::default()
+                },
+                None,
+                false,
+            );
+            assert_eq!(out.exit_code, 0);
+            assert_eq!(out.stdout_lines.len(), 1, "{pool:?} still lists the row as context");
+            assert!(out.near_matches.is_empty(), "{pool:?} never demotes");
+        }
+    }
+
+    /// `title_similarity` is omitted (not null) on an ordinary warn-band row,
+    /// so the `--near-file` JSON a pre-#8591 reader sees is unchanged.
+    #[test]
+    fn title_similarity_is_omitted_on_ordinary_near_rows() {
+        let plain = NearMatch {
+            number: 1,
+            title: "t".to_string(),
+            similarity: 16,
+            title_similarity: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"number":1,"title":"t","similarity":16}"#
+        );
+        let demoted = NearMatch {
+            number: 2,
+            title: "t".to_string(),
+            similarity: 19,
+            title_similarity: Some(3),
+        };
+        assert_eq!(
+            serde_json::to_string(&demoted).unwrap(),
+            r#"{"number":2,"title":"t","similarity":19,"title_similarity":3}"#
+        );
     }
 }
