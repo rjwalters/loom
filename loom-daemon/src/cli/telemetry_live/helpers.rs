@@ -109,7 +109,7 @@ pub(super) fn verify_stream(
             }
             if kind == "tool_execution_end"
                 && event["toolName"] == "loom_read"
-                && event["isError"] != true
+                && event["isError"] == false
             {
                 read = true;
             }
@@ -194,6 +194,32 @@ mod tests {
         correct.extend_from_slice(b"\n{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"CANARY_RESULT:abc\"}]}}\n");
         assert!(verify_stream("pi", &correct, provenance, "CANARY_RESULT:abc").is_ok());
         assert!(verify_stream("opencode", &correct, provenance, "CANARY_RESULT:abc").is_err());
+    }
+
+    #[test]
+    fn pi_requires_explicit_success_on_guarded_read() {
+        let provenance = br#"# LOOM_LAUNCH {"runtime":"pi","provider":"zai","model":"glm-5.3-flash","profile":"zai-flash","effort":"low","credentialSource":"env"}"#;
+        for status in [
+            None,
+            Some(Value::Null),
+            Some(true.into()),
+            Some("false".into()),
+            Some(0.into()),
+            Some(false.into()),
+        ] {
+            let mut tool = serde_json::json!({"type":"tool_execution_end","toolName":"loom_read"});
+            if let Some(status) = &status {
+                tool["isError"] = status.clone();
+            }
+            let events = format!(
+                "{tool}\n{}\n",
+                serde_json::json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"CANARY_RESULT:abc"}]}})
+            );
+            assert_eq!(
+                verify_stream("pi", events.as_bytes(), provenance, "CANARY_RESULT:abc").is_ok(),
+                status == Some(false.into())
+            );
+        }
     }
 
     #[test]
