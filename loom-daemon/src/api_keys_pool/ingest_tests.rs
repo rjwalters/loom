@@ -396,3 +396,82 @@ fn the_detail_line_never_carries_key_material() {
     assert!(!feedback.detail.contains("fake-key"), "{}", feedback.detail);
     assert!(!format!("{feedback:?}").contains("fake-key"), "{feedback:?}");
 }
+
+/// #8563 acceptance criterion: a Kimi credential failure/exhaustion must
+/// never bad-mark a Claude or Codex account. The three pools are
+/// structurally separate stores keyed by provider (this pool's own
+/// `<provider>/.bad_accounts.json`, Claude's `.loom/tokens/.bad_tokens`,
+/// Codex's `.loom/account-health.json`) and `ingest_launch_log`'s only
+/// filesystem write is [`bad_marks::mark_bad_for_class`] scoped to whatever
+/// `credentialProvider` the launch record names — so this pins that in one
+/// test rather than leaving it to hold only by inspection. The Kimi account
+/// and the (never-created) Claude/Codex accounts deliberately share a name,
+/// so a name collision across pools cannot masquerade as isolation.
+#[test]
+fn a_kimi_failure_never_touches_the_claude_or_codex_pools() {
+    use crate::api_keys_pool::classify::{
+        CAPTURED_KIMI_NO_MODEL_CONFIGURED, CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED,
+    };
+    use crate::tokens_pool::account_registry::{AccountId, AccountProvider};
+
+    const KIMI: &str = "kimi";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = paths::per_repo_api_keys_dir(tmp.path());
+    registry::add(&root, KIMI, "alpha", "KIMI_MODEL_API_KEY", "fake-kimi-secret", false).unwrap();
+
+    let launch_kimi = |harness_output: &str| {
+        format!(
+            "{ANCHOR}\n{LAUNCH_RECORD_PREFIX}{}\n{harness_output}\n",
+            serde_json::json!({
+                "schema": 1,
+                "runtime": "kimi",
+                "provider": "moonshot",
+                "model": "kimi-k2",
+                "profile": "example-kimi-moonshot-api",
+                "effort": null,
+                "credentialSource": "pool",
+                "credentialProvider": KIMI,
+                "credentialAccount": "alpha",
+                "usage": "native-json-events",
+                "billing": "not-measured",
+            })
+        )
+    };
+
+    // Both real Kimi captures — the credential failure and the exhausted
+    // rate-limit ladder — are ingested against the same account name.
+    for output in [
+        CAPTURED_KIMI_NO_MODEL_CONFIGURED,
+        CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED,
+    ] {
+        let contents = launch_kimi(output);
+        let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1));
+        assert!(feedback.is_some(), "{output:?} should classify");
+    }
+
+    // The only write landed in this pool's own per-provider file...
+    assert!(bad_marks::read_marks(&pool_root(tmp.path()), KIMI).is_ok());
+    // ...and nothing ever reached Claude's or Codex's separate stores, which
+    // this isolated workspace never had a reason to create.
+    assert!(!tmp
+        .path()
+        .join(".loom")
+        .join("tokens")
+        .join(".bad_tokens")
+        .exists());
+    assert!(!tmp
+        .path()
+        .join(".loom")
+        .join("account-health.json")
+        .exists());
+    assert!(!crate::tokens_pool::bad_tokens::is_bad(tmp.path(), "alpha"));
+    assert!(crate::tokens_pool::health::account_health(
+        tmp.path(),
+        &AccountId {
+            provider: AccountProvider::Codex,
+            name: "alpha".to_string()
+        }
+    )
+    .unwrap()
+    .is_none());
+}

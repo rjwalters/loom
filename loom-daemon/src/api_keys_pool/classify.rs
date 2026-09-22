@@ -41,8 +41,67 @@
 //! [`Provenance::DocumentedShape`] and the gap stays open; fold each new
 //! capture in as it is observed, replacing that row's provenance. A test keeps
 //! the labelling honest rather than pretending the gap is closed.
+//!
+//! ## Kimi (issue #8563), and a corrected premise
+//!
+//! #8563 assumed the Kimi Code CLI (`@moonshot-ai/kimi-code`) splits its exit
+//! codes `0`/`1`/`75` (success/permanent/transient) the way some other
+//! harnesses do. A credential-free probe of the real, pinned 2.0.2 binary
+//! (`docs/experiments/kimi-harness-probe-2026-09-22.json`, observation
+//! `"exit-codes-the-vendor-75-does-not-exist"`) found that premise **false**:
+//! the bundle's own process-exit call sites are `0, 1, 2, 129, 143` — there is
+//! no `75`. Kimi absorbs a rate limit in-process (a 10-attempt exponential
+//! backoff over ~150s) and, on exhausting that ladder, exits plain `1` with a
+//! prose line, the same exit code a missing credential also produces. So exit
+//! code carries no signal here (unchanged from `classify`'s existing
+//! `_exit_code` stance) and the only way to split "no credential" from
+//! "rate-limited" is the two live-captured needles below — [`Pattern`]s,
+//! exactly like every other provider in this table, not a new Kimi-specific
+//! exit-code branch.
+//!
+//! No live Kimi/Moonshot **exhaustion** (a billing-period allowance actually
+//! used up, as opposed to a transient 429) has been captured — the generic
+//! `insufficient balance` / `quota exceeded` rows below are `DocumentedShape`
+//! and apply here too (this table is provider-neutral), but no Kimi-specific
+//! exhaustion row exists yet; fold one in once observed, same as the Z.ai gap
+//! above.
 
 use serde_json::Value;
+
+/// Captured verbatim from Kimi Code CLI 2.0.2, `kimi -p <prompt>
+/// --output-format stream-json` with `KIMI_CODE_HOME` pointed at a
+/// config-free scratch directory (no credentials, no `config.toml`) —
+/// observed 2026-09-22 (`docs/experiments/kimi-harness-probe-2026-09-22.json`,
+/// observation `"no-credential-permanent-failure"`), folded in here for #8563:
+///
+/// ```text
+/// error: failed to run prompt: No model configured. Run `kimi` and use /login to sign in, then retry; or set default_model in config.toml.
+/// ```
+pub const CAPTURED_KIMI_NO_MODEL_CONFIGURED: &str = "error: failed to run prompt: No model \
+     configured. Run `kimi` and use /login to sign in, then retry; or set default_model in \
+     config.toml.";
+
+/// Citation used by every row taken from [`CAPTURED_KIMI_NO_MODEL_CONFIGURED`].
+const KIMI_2_0_2_NO_CREDENTIAL: &str = "kimi 2.0.2 (@moonshot-ai/kimi-code) `-p --output-format \
+     stream-json` with no credential/config, observed 2026-09-22 (#8561/#8563, \
+     docs/experiments/kimi-harness-probe-2026-09-22.json)";
+
+/// Captured verbatim from the same probe's rate-limit simulation — a local
+/// HTTP stub answering `429 {"error":{"message":"rate limit
+/// exceeded","type":"rate_limit_error"}}` as the `KIMI_MODEL_BASE_URL`
+/// provider. Kimi 2.0.2 exhausts its own 10-attempt in-process retry ladder
+/// (~150s, `APIProviderRateLimitError` on each attempt) before surfacing this
+/// on stderr at exit `1`:
+///
+/// ```text
+/// error: failed to run prompt: provider.rate_limit: 429 rate limit exceeded
+/// ```
+pub const CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED: &str =
+    "error: failed to run prompt: provider.rate_limit: 429 rate limit exceeded";
+
+/// Citation used by every row taken from [`CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED`].
+const KIMI_2_0_2_RATE_LIMIT: &str = "kimi 2.0.2 (@moonshot-ai/kimi-code) rate-limit-stub probe, \
+     observed 2026-09-22 (#8561/#8563, docs/experiments/kimi-harness-probe-2026-09-22.json)";
 
 /// What a harness's error text was recognised as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +227,20 @@ pub const PATTERNS: &[Pattern] = &[
         classification: Classification::CredentialFailure,
         provenance: Provenance::DocumentedShape,
     },
+    // Kimi Code CLI 2.0.2's own no-credential shape (#8563) — see
+    // `CAPTURED_KIMI_NO_MODEL_CONFIGURED`. Two needles from the one capture,
+    // so either half of the sentence still classifies if an adapter wraps or
+    // truncates the line.
+    Pattern {
+        needle: "no model configured",
+        classification: Classification::CredentialFailure,
+        provenance: Provenance::LiveCapture(KIMI_2_0_2_NO_CREDENTIAL),
+    },
+    Pattern {
+        needle: "use /login to sign in",
+        classification: Classification::CredentialFailure,
+        provenance: Provenance::LiveCapture(KIMI_2_0_2_NO_CREDENTIAL),
+    },
     // ---- Allowance exhausted ----
     Pattern {
         needle: "insufficient balance",
@@ -215,6 +288,17 @@ pub const PATTERNS: &[Pattern] = &[
         needle: "concurrency limit",
         classification: Classification::RateLimited,
         provenance: Provenance::DocumentedShape,
+    },
+    Pattern {
+        // Kimi Code CLI 2.0.2's own error-code prefix for a provider rate
+        // limit, surfaced only after its in-process retry ladder gives up
+        // (#8563) — see `CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED`. The generic
+        // `rate_limit` row above already matches this text too; this entry
+        // exists so the row's own provenance can honestly say `LiveCapture`
+        // rather than borrowing another pattern's `DocumentedShape` one.
+        needle: "provider.rate_limit",
+        classification: Classification::RateLimited,
+        provenance: Provenance::LiveCapture(KIMI_2_0_2_RATE_LIMIT),
     },
 ];
 
@@ -483,6 +567,48 @@ mod tests {
         assert_eq!(classify(mixed_text, 1), Some(Classification::CredentialFailure));
     }
 
+    /// #8563: both real Kimi Code CLI 2.0.2 captures classify correctly, and
+    /// — the point of the whole exercise — exit code carries no signal: both
+    /// captures were observed at exit `1`, exactly like a healthy exit-0 run
+    /// exits `0`, and the vendor never emits the `75` #8563 was filed
+    /// expecting (see the module docs' "corrected premise" section).
+    #[test]
+    fn the_real_captured_kimi_events_classify_and_exit_code_is_not_the_signal() {
+        assert_eq!(
+            classify(CAPTURED_KIMI_NO_MODEL_CONFIGURED, 1),
+            Some(Classification::CredentialFailure)
+        );
+        assert_eq!(
+            classify(CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED, 1),
+            Some(Classification::RateLimited)
+        );
+        // Interleaved in a real retained log, among Loom's own marker lines.
+        let log = format!(
+            "# LOOM_LAUNCH {{\"schema\":1}}\n# LOOM_CLI_START runtime=kimi\n\
+             {CAPTURED_KIMI_NO_MODEL_CONFIGURED}\n"
+        );
+        assert_eq!(classify(&log, 1), Some(Classification::CredentialFailure));
+        // Neither capture depends on the exit code the harness happened to
+        // return: 75, which #8563 assumed existed, never occurs on the
+        // pinned 2.0.2 binary (bundle exit sites are 0, 1, 2, 129, 143).
+        assert_eq!(
+            classify(CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED, 75),
+            Some(Classification::RateLimited)
+        );
+    }
+
+    /// #8563's own scope: "exit 1 must be split by output into
+    /// `CredentialFailure` ... vs exhaustion". Kimi returns plain `1` for
+    /// both, so the split has to come entirely from the two needles above —
+    /// this pins that a credential failure still outranks a rate-limit signal
+    /// even though both are real Kimi output, not a fabricated mix.
+    #[test]
+    fn a_kimi_credential_failure_outranks_a_kimi_rate_limit_signal_at_the_same_exit_code() {
+        let mixed =
+            format!("{CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED}\n{CAPTURED_KIMI_NO_MODEL_CONFIGURED}\n");
+        assert_eq!(classify(&mixed, 1), Some(Classification::CredentialFailure));
+    }
+
     #[test]
     fn structured_error_events_are_read_before_prose() {
         assert_eq!(
@@ -572,6 +698,13 @@ mod tests {
     /// rows are still the documented-shape gap #8424 item 2 records.
     #[test]
     fn the_pattern_table_is_lowercase_and_honestly_labelled() {
+        // Every capture any `LiveCapture` row may cite. A new capture is
+        // added here, not by relaxing this check to skip it.
+        let live_captures = [
+            CAPTURED_OPENCODE_AUTH_EVENT,
+            CAPTURED_KIMI_NO_MODEL_CONFIGURED,
+            CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED,
+        ];
         for pattern in PATTERNS {
             assert_eq!(
                 pattern.needle,
@@ -582,10 +715,10 @@ mod tests {
             assert!(!pattern.needle.is_empty());
             if let Provenance::LiveCapture(citation) = pattern.provenance {
                 assert!(
-                    CAPTURED_OPENCODE_AUTH_EVENT
-                        .to_ascii_lowercase()
-                        .contains(pattern.needle),
-                    "{:?} claims a live capture but does not appear in one",
+                    live_captures
+                        .iter()
+                        .any(|capture| capture.to_ascii_lowercase().contains(pattern.needle)),
+                    "{:?} claims a live capture but does not appear in any of {live_captures:?}",
                     pattern.needle
                 );
                 assert!(

@@ -81,6 +81,7 @@
       "kimi": "moonshot"
     },
     "credentialEnv": "KIMI_API_KEY",
+    "credentialPool": "kimi",
     "credentialTargets": {
       "kimi": "KIMI_MODEL_API_KEY"
     },
