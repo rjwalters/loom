@@ -11,6 +11,13 @@
 //! to purchase more credits or try again at September 25, 2026 3:00 PM.
 //! ```
 //!
+//! That refusal is **one physical line** on the wire — it is wrapped above only
+//! to fit this comment's width. The distinction is load-bearing:
+//! [`usage_limit_reset_in`] scans line by line and requires the needle phrase
+//! and `try again at` on the *same* line, so a genuinely wrapped refusal would
+//! parse to `None` (and degrade to the configured cooldown). The unwrapped form
+//! is [`CAPTURED_USAGE_LIMIT_REFUSAL`], which is what the tests assert against.
+//!
 //! `classify-error.sh`'s codex table already classified that text as
 //! `TOKEN_EXHAUSTED`, and both dispatch surfaces already turned that category
 //! into an account-health hold — but the hold's deadline was always a blind

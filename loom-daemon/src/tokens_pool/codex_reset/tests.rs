@@ -187,3 +187,65 @@ fn horizon_is_interpreted_in_host_local_time() {
         (2026, 9, 25, 15, 0),
     );
 }
+
+/// The entry point both dispatch surfaces actually call reads the horizon for
+/// the two exhaustion arms.
+#[test]
+fn the_exhaustion_arms_consult_the_horizon() {
+    let contents = format!("anchor\n{CAPTURED_USAGE_LIMIT_REFUSAL}\n");
+    let expected = Some(
+        u64::try_from(local(2026, 9, 25, 15, 0).timestamp()).expect("a 2026 instant is positive"),
+    );
+    for category in [
+        TerminalClassification::TokenExhausted,
+        TerminalClassification::ModelCreditsExhausted,
+    ] {
+        assert_eq!(
+            exhaustion_reset_horizon(&contents, "anchor", category),
+            expected,
+            "{category:?} is an exhaustion and must honour the refusal's own horizon",
+        );
+    }
+}
+
+/// The negative half of the gate: every *other* classification reads no
+/// horizon, even from a region that plainly carries one. This is what makes
+/// module-docs point 1 true — the transcript refines *when* an already-decided
+/// hold ends, and may never leak a deadline onto a failure that is not an
+/// exhaustion at all (a `Fatal` crash whose transcript quotes a refusal, say).
+#[test]
+fn no_other_classification_consults_the_horizon() {
+    let contents = format!("anchor\n{CAPTURED_USAGE_LIMIT_REFUSAL}\n");
+    for category in [
+        TerminalClassification::Success,
+        TerminalClassification::TokenExpired,
+        TerminalClassification::Recoverable,
+        TerminalClassification::Timeout,
+        TerminalClassification::Fatal,
+        TerminalClassification::CwdDeleted,
+        TerminalClassification::ModelRefusal,
+        TerminalClassification::SessionLimit,
+    ] {
+        assert_eq!(
+            exhaustion_reset_horizon(&contents, "anchor", category),
+            None,
+            "{category:?} is not an exhaustion and must not read a horizon",
+        );
+    }
+}
+
+/// The gate is not a substitute for the region scoping: an exhaustion whose
+/// own dispatch region carries no refusal still reads nothing, rather than
+/// falling back to an earlier run's horizon in the same log.
+#[test]
+fn an_exhaustion_outside_its_own_region_reads_nothing() {
+    let contents = format!("sweep_id=old\n{CAPTURED_USAGE_LIMIT_REFUSAL}\nsweep_id=current\n");
+    assert_eq!(
+        exhaustion_reset_horizon(
+            &contents,
+            "sweep_id=current",
+            TerminalClassification::TokenExhausted,
+        ),
+        None,
+    );
+}
