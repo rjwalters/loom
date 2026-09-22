@@ -709,6 +709,11 @@ pub enum ForgeCmd {
     Pr(Vec<String>),
     /// `forge auth <args…>` — passthrough to `gh auth` on GitHub.
     Auth(Vec<String>),
+    /// `forge check-open-pr <issue>` — the #4123 open-linked-PR guard as a
+    /// pre-claim check (#8551). Implemented in
+    /// [`crate::forge_check_open_pr`]; see that module for the exit-code
+    /// contract.
+    CheckOpenPr { issue: u32 },
     /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]`.
     AutoMerge {
         pr: u32,
@@ -739,6 +744,7 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::Issue(args) => gh_passthrough("issue", &args),
         ForgeCmd::Pr(args) => gh_passthrough("pr", &args),
         ForgeCmd::Auth(args) => gh_passthrough("auth", &args),
+        ForgeCmd::CheckOpenPr { issue } => crate::forge_check_open_pr::handle(issue),
         ForgeCmd::AutoMerge {
             pr,
             method,
