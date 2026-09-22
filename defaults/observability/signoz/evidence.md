@@ -141,10 +141,12 @@ absence checks; present-zero versus absent token usage; and a required-zero sear
 for the fixture's privacy sentinel across all three signals. `queries.sql` is left
 untouched as the live-verified record of what actually ran.
 
-**Not executed against a live backend.** The change that added it ran on a sweep
-host with no Docker access and the trial deployment stopped, so its column names
-follow the pinned v0.142.1 schema and are confirmed by its own query 0. Nothing in
-this section is an observation.
+**Not executed against a live backend by the change that added it** — that
+change ran on a sweep host with no Docker access and the trial deployment
+stopped, so its column names followed the pinned v0.142.1 schema and were only
+confirmed by its own query 0's design, not by running it. A later session did
+execute it live; see "Shared fixture manifest, executed live" below for the
+actual results. Nothing in *this* section is itself an observation.
 
 What *is* verified is the artifact's vocabulary rather than its results.
 `loom-daemon/tests/signoz_trial_artifacts.rs` runs in ordinary CI, with no Docker,
@@ -159,22 +161,108 @@ drift is exactly what produced the stale artifact above, and it does not raise a
 error when it happens — the query simply returns zero rows, which on a trial host
 is indistinguishable from the backend having lost the data.
 
+## Shared fixture manifest, executed live (2026-09-22)
+
+The gap the previous section leaves open — `fixture-queries.sql` written but
+never run — is closed here on a second, independent Foundry deployment (same
+pins: Foundry v0.2.17, SigNoz v0.142.1, collector v0.144.10, ClickHouse/Keeper
+25.12.5, PostgreSQL 16), this time on macOS arm64 Docker Desktop with the trial
+host actually available. `gauge`, a fresh `forge` render into a scratch
+directory and `diff -rq` against the committed `pours/` reconfirmed the
+deterministic-render acceptance row on this independent host: byte-identical
+output, no lock diff. `docker compose ... config --quiet` validated cleanly and
+`up -d --wait --wait-timeout 1800` reported all five services healthy well
+inside budget. The shared collector gateway (`defaults/observability/collector`)
+was also started for the first time against a live SigNoz ingester: its own
+`--profile trial run --rm collector validate` and `up -d` succeeded, and
+`loom-observability` network inspection confirmed both the gateway and the
+SigNoz ingester as the only attached containers, with the ingester reachable at
+its documented `signoz-otel-collector:4318` alias.
+
+`loom-daemon telemetry-fixture --run-id 8528a --start-time 2026-09-22T09:00:00Z`
+produced the expected 52-envelope bundle (37 spans, 14 logs, 3 metric points).
+`loom-daemon telemetry-export` through the gateway at `127.0.0.1:14318`
+acknowledged all 52 with zero rejected/dropped, and the gateway's own
+Prometheus endpoint (`127.0.0.1:18888/metrics`) independently confirmed
+`otelcol_exporter_sent_{spans,log_records,metric_points}` at exactly
+37/14/3 for `exporter="otlp_http/signoz"` — the delivery-health check the
+README describes as the only place this is visible, since it is not exported
+into SigNoz through the OTLP pipeline itself.
+
+`fixture-queries.sql` then ran against the live backend with
+`--param_run='loom-synthetic-8528a'`. Full output is preserved for review.
+Every assertion the query file documents held on the first pass:
+
+- Query 0 (schema preflight): the pinned v0.142.1 attribute/resource column
+  names matched exactly, no reconciliation needed.
+- Query 1 (totals): **37 rows, 37 unique spans, 8 traces** — matching the
+  manifest exactly, with `rows == unique_spans` confirming no duplicate
+  delivery on the first pass.
+- Query 2 (full graph): all 8 traces' parent/child structure round-tripped by
+  ID, including the deliberate same-timestamp `synthetic/alpha` /
+  `synthetic/beta` issue-18 collision the fixture uses to prove parentage is
+  never inferred from issue number.
+- Query 3 (failure/duration grouping): correct per-repo/role/runtime/model
+  aggregation, including the one row with an empty role/runtime/model (the
+  fixture's deliberately unlabeled `loom.runtime.preflight` case) staying
+  distinct rather than merging into a labeled bucket.
+- Query 4 (repair chain): the exact five-span Judge → Doctor → Judge → Merge
+  waterfall for trace `16f86ffb55adebac780ef7e1038c75ee`, with the rejected
+  Judge attempt (`Error`) and the succeeding retry (`Ok`) both present.
+- Query 5 (root-less traces): exactly one match —
+  `90a543d371aafafa445e3fa0d4504114`, the fixture's deliberate two-child,
+  no-`loom.sweep`-root in-progress/crashed case.
+- Query 6 (log correlation): 14/14 logs matched to their span's trace/span ID,
+  all `INFO`, spanning `preflight`/`builder`/`judge`/`doctor`/`merge`.
+- Query 7 (gauges): `synthetic-zero` has both `loom.tokens.exhausted` and
+  `loom.tokens.usage_fraction` at value `0`; `synthetic-unknown` has only
+  `loom.tokens.exhausted` — no `usage_fraction` series at all. Absent stayed
+  absent; zero stayed a stored zero. Metric timestamps confirmed millisecond
+  truncation (`1790067600000`) against the RFC3339 `09:00:00Z` anchor.
+- Query 8 (privacy sentinel): **zero** rows across logs, traces and metrics —
+  the gateway's `keep_keys` allowlist dropped `prompt.content` before any
+  signal reached storage.
+
+A timed replay of the same fixture (duplicate delivery, same `run_id`) then
+produced **74 rows / still 37 unique spans / 8 traces** on re-query — at-least-
+once delivery counted honestly rather than silently deduplicated. Round-trip
+`telemetry-export` wall time for 52 envelopes was 0.57s; the ClickHouse
+`clickhouse-client` totals query via `docker compose exec` was 1.15s
+(dominated by `exec` overhead, not query execution). A point-in-time
+`docker stats` sample after ingestion: ClickHouse 1.45 GiB, ClickHouse Keeper
+176 MiB, PostgreSQL 33.5 MiB, SigNoz app 43.5 MiB, ingester 46.4 MiB, gateway
+collector 49.7 MiB — consistent with the independent sample in the section
+above.
+
+This closes the "written but not executed" gap for the shared fixture
+manifest. It does **not** establish the real Loom canary (needs #8525's own
+live-run acceptance) or the side-by-side #8529 comparison (needs both trials
+up simultaneously, which this session did not attempt since ClickStack was not
+deployed here) — both remain open below. Retention was not independently
+re-applied on this second deployment; the prior section's seven-day DDL
+verification stands and is not repeated here since it is orthogonal to fixture
+query execution. UI Trace Explorer / correlated-log screenshots for this
+specific run were not captured (no browser automation in this session); the
+ad-hoc probe's authenticated UI screenshots above already establish that
+acceptance row, and query 2/4/6 above establish the shared-fixture graph and
+log correlation are equally queryable.
+
 ## Acceptance ledger
 
 | Check | Status |
 | --- | --- |
-| Pinned Foundry render and configuration | Passed, including deterministic second render |
+| Pinned Foundry render and configuration | Passed, including deterministic second render (reconfirmed independently above) |
 | Keeper, PostgreSQL and ClickHouse readiness | Passed on the trial VM |
 | Schema migrations and app readiness | Passed; receiver storage proof remains separate |
 | Three fixture signals with matching IDs/values | Passed for the ad-hoc probe; metric timestamp precision conversion documented |
 | Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
 | Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
 | Restart persistence and shared receiver recovery | Passed for signals, account and effective TTL; fresh three-signal replay indexed |
-| Saved query artifacts for the shared fixture manifest | Written and vocabulary-verified in CI; **not** executed on a backend |
-| Shared fixture manifest observed in SigNoz | Open — needs the trial host; see #8529 |
+| Saved query artifacts for the shared fixture manifest | **Passed** — executed live above; matches the generated manifest exactly |
+| Shared fixture manifest observed in SigNoz | **Passed** — see "Shared fixture manifest, executed live" above: 37/14/3 signals, exact totals, graph, grouping, root-less detection, absence-vs-zero and privacy-sentinel queries all verified |
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
-| Repeated latency/footprint comparison | Open — shared evaluation #8529, and the trial host could not hold both backends up at once |
+| Repeated latency/footprint comparison | Open — shared evaluation #8529; this session did not deploy ClickStack alongside SigNoz, so no simultaneous comparison was attempted |
 
-Synthetic fixture success will establish transport/schema behavior only. It
-cannot substitute for a real Loom lifecycle or independent correctness judgment.
-Keep #8528 open until the remaining criteria are recorded.
+Synthetic fixture success establishes transport/schema/query behavior, not a
+real Loom lifecycle. Keep #8528 open until the real-canary and #8529
+comparison rows are recorded.
