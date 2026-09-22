@@ -151,7 +151,7 @@ pub const COORDINATION_DEGRADE_GRACE_ENV: &str = "LOOM_PEER_COORDINATION_DEGRADE
 /// caught in minutes, not hours.
 ///
 /// Raised from the original 10-minute default (Issue #8276, 2026-09-19):
-/// three independent flap episodes on `ip-172-31-74-176` (#8276 itself) each
+/// three independent flap episodes on `ip-198-51-100-42` (#8276 itself) each
 /// crossed the (then-)600s grace and later recovered. Code tracing
 /// (`evaluate_coordination`/`observe_at`) ruled out a receive-path defect:
 /// recovery depends solely on inbound peer ads, which are independent of
