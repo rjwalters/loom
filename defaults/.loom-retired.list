@@ -37,3 +37,14 @@ scripts/status.sh
 # validate-toolchain.sh wrapper that exec'd this file is removed in the same
 # change (repo-only, not a defaults/ payload — not listed here).
 scripts/validate-toolchain.sh
+
+# #8588 — the label-preflight library (loom_label_exists,
+# loom_apply_issue_label, loom_apply_pr_label) and its unit test. Landed via
+# #6716 as a shared mechanism role prompts were meant to converge on
+# incrementally; the retrofit of the `--add-label` call sites never happened,
+# so both files sat with zero production callers for a month. Retired rather
+# than wired: a role prompt that needs create-then-apply semantics already has
+# epic.md's "Ensure Epic Labels Exist" pattern, and sync-labels.sh remains the
+# remediation for a missing label.
+scripts/lib/label-preflight.sh
+scripts/tests/test-label-preflight.sh
