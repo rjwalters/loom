@@ -7,6 +7,7 @@ pub mod containment;
 // native tap's API-key pool is the wall, and must read the profile the launch
 // would actually use rather than re-deriving one.
 pub(crate) mod credential;
+pub mod egress_proxy;
 mod harness;
 pub mod launch_outcome;
 mod opencode_version;
@@ -323,6 +324,13 @@ fn run_preflight(
                         .flat_map(|(source, target)| [source.as_str(), target.as_str()]),
                 )
                 .collect();
+            // #8674: with credential substitution on, the real credential is
+            // resolved HERE, on the host, and the container is given a
+            // per-launch placeholder plus a base URL pointing at a host-side
+            // proxy. `prepare` fails closed — it never silently reverts to
+            // forwarding the real value — and returns `None` only when the
+            // feature is off or the profile opts out.
+            let prepared = egress_proxy::prepare(root, &selection, &config)?;
             let mut command = containment::docker_command(
                 &profile,
                 root,
@@ -330,10 +338,18 @@ fn run_preflight(
                 options.log.as_deref(),
                 &args.args,
                 &credentials,
+                prepared.as_ref().map(|p| &p.injection),
             )?;
             let mut log = attach_log(&mut command, options.log.as_deref())?;
             writeln!(log, "{}", profile.dispatch_marker())
-                .and_then(|()| log.flush())
+                .map_err(|e| LaunchError::config(e.to_string()))?;
+            if let Some(prepared) = prepared {
+                writeln!(log, "{}", prepared.dispatch_marker())
+                    .and_then(|()| log.flush())
+                    .map_err(|e| LaunchError::config(e.to_string()))?;
+                return egress_proxy::run_with_proxy(prepared, command);
+            }
+            log.flush()
                 .map_err(|e| LaunchError::config(e.to_string()))?;
             return exec(command);
         }

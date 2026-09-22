@@ -218,6 +218,7 @@ mod tests {
             effort: None,
             credential_env: None,
             credential_pool: credential_pool.map(str::to_string),
+            credential_proxy: None,
             credential_targets: std::collections::BTreeMap::new(),
             provider_options: std::collections::BTreeMap::new(),
             provider_definition: std::collections::BTreeMap::new(),
