@@ -29,6 +29,8 @@ mod telemetry_export;
 mod telemetry_fixture;
 #[path = "telemetry_live.rs"]
 mod telemetry_live;
+#[path = "telemetry_overhead.rs"]
+mod telemetry_overhead;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
@@ -36,6 +38,8 @@ pub(crate) enum TelemetryCommand {
     TelemetryLiveCanary(telemetry_live::LiveArgs),
     /// Write deterministic synthetic telemetry and an independent-query manifest.
     TelemetryFixture(telemetry_fixture::FixtureArgs),
+    /// Measure what lifecycle instrumentation costs on a representative run.
+    TelemetryOverhead(telemetry_overhead::OverheadArgs),
     /// Send a bounded JSONL fixture to an explicit OTLP Collector endpoint.
     TelemetryExport(telemetry_export::TelemetryExportArgs),
     /// Report transport capabilities of this installed binary without reading configuration.
@@ -98,6 +102,7 @@ impl TelemetryCommand {
         match self {
             TelemetryCommand::TelemetryLiveCanary(args) => args.run(),
             TelemetryCommand::TelemetryFixture(args) => args.run(),
+            TelemetryCommand::TelemetryOverhead(args) => args.run(),
             TelemetryCommand::TelemetryExport(args) => args.run().await,
             TelemetryCommand::TelemetryCapabilities { require_otlp } => {
                 println!(

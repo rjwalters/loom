@@ -87,6 +87,7 @@ pub mod lifecycle;
 #[cfg(feature = "otlp")]
 pub mod otlp;
 pub mod outcome;
+pub mod overhead;
 pub mod queue;
 pub mod sender;
 pub mod shutdown;
