@@ -279,10 +279,10 @@ impl SweepRegistry {
     /// The runtime/provider/profile this sweep's native harness actually
     /// launched on (Issue #8507), for `sweep.outcome`'s top-level
     /// `runtime`/`provider`/`profile` fields — the runtime-neutral counterpart
-    /// of [`resolve_credential_attribution`](Self::resolve_credential_attribution),
+    /// of [`resolve_launch_attribution`](Self::resolve_launch_attribution),
     /// reading the SAME `# LOOM_LAUNCH` record for a second, independent set
     /// of keys. `None` under the identical conditions
-    /// `resolve_credential_attribution` documents: a Claude/legacy-adapter
+    /// `resolve_launch_attribution` documents: a Claude/legacy-adapter
     /// spawn writes no launch record at all.
     pub(crate) fn resolve_runtime_attribution(
         &self,
