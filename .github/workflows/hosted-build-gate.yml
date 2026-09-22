@@ -85,6 +85,40 @@ jobs:
         working-directory: .loom/worktrees/issue-${{ inputs.issue }}
         shell: bash
         run: cargo nextest run --package loom-daemon --features otlp --lib --bins --profile ci 2>&1 | tee "$RUNNER_TEMP/hosted-otlp-tests.log"
+      - name: Run available lifecycle and native isolation integration tests
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const {spawn} = require('child_process');
+            const cwd = path.join(process.env.GITHUB_WORKSPACE, '.loom/worktrees', `issue-${process.env.LOOM_GATE_ISSUE}`);
+            const targets = ['lifecycle_traces', 'native_private_state', 'worker_spawn']
+              .filter(name => fs.existsSync(path.join(cwd, 'loom-daemon/tests', `${name}.rs`)));
+            const log = path.join(process.env.RUNNER_TEMP, 'hosted-integration-tests.log');
+            fs.writeFileSync(log, `Selected existing integration targets: ${JSON.stringify(targets)}\n`);
+            if (targets.length === 0) {
+              core.info('No selected integration targets exist in this candidate; none run.');
+              return;
+            }
+            const args = ['nextest', 'run', '--package', 'loom-daemon', '--features', 'otlp', '--profile', 'ci',
+              ...targets.flatMap(name => ['--test', name])];
+            core.info(`cargo ${args.join(' ')}`);
+            const run = (program, args, env) => new Promise((resolve, reject) => {
+              const child = spawn(program, args, {cwd, env});
+              child.stdout.on('data', data => { fs.appendFileSync(log, data); process.stdout.write(data); });
+              child.stderr.on('data', data => { fs.appendFileSync(log, data); process.stderr.write(data); });
+              child.on('error', reject);
+              child.on('close', code => code === 0 ? resolve() : reject(new Error(`${program} integration checks exited ${code}`)));
+            });
+            await run('cargo', args, process.env);
+            if (targets.includes('lifecycle_traces')) {
+              const binary = path.join(process.env.CARGO_TARGET_DIR, 'debug/loom-daemon');
+              if (!fs.existsSync(binary)) throw new Error('integration tests did not produce the candidate daemon');
+              core.info('Running retained sweep-checkpoint suite against the candidate daemon');
+              await run('bash', ['defaults/scripts/tests/test-sweep-checkpoint.sh'],
+                {...process.env, LOOM_DAEMON_SELF_BIN:binary, LOOM_DAEMON_BIN:binary});
+            }
       - name: Retain actual gate output and immutable candidate evidence
         if: always()
         uses: actions/upload-artifact@v7
@@ -94,4 +128,5 @@ jobs:
             ${{ runner.temp }}/hosted-gate.log
             ${{ runner.temp }}/hosted-gate-evidence.json
             ${{ runner.temp }}/hosted-otlp-tests.log
+            ${{ runner.temp }}/hosted-integration-tests.log
           if-no-files-found: warn
