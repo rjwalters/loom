@@ -1,10 +1,13 @@
 //! Token-cost telemetry subcommands: what a fleet's agents actually spent.
 //!
-//! Three members: `usage` (what the Anthropic OAuth API reports for the
+//! Five members: `usage` (what the Anthropic OAuth API reports for the
 //! current credential, live), `ingest-transcripts` (Issue #8059: persist
-//! what the local transcripts record into `activity.db`), and `usage-report`
+//! what the local transcripts record into `activity.db`), `usage-report`
 //! (Issue #8062: the role/model/repo/day cost breakdown over the rows
-//! ingestion writes).
+//! ingestion writes), `opencode-usage` (Issue #8507: the same question asked
+//! of OpenCode's own session store), and `archive-transcripts` (Issue #8494:
+//! a verified `.tar.zst` backstop for the *raw* transcripts, which
+//! ingestion's derived data does not cover).
 //!
 //! They are gathered into one **flattened** enum, exactly as
 //! [`super::script_ports`] is and for the same second reason: `main.rs` is over
@@ -89,6 +92,20 @@ pub(crate) enum TelemetryCommand {
     /// and window. Read-only — one query, naming `session` alone, never the
     /// `credential`/`account` tables in the same file.
     OpencodeUsage(super::opencode_usage_cli::OpencodeUsageArgs),
+
+    /// Roll raw Claude Code transcripts into a verified, incremental
+    /// `.tar.zst` archive before Claude Code's `cleanupPeriodDays` fuse
+    /// deletes them (#8494, split from #8477's item 5).
+    ///
+    /// #8477 (`ingest-transcripts`, above) preserves the *derived* token/cost
+    /// data, not the raw transcripts themselves. This covers those: excludes
+    /// `~/.claude/projects/<project>/memory/` (persistent agent memory, never
+    /// a transcript), records a manifest (path/size/mtime/sha256) per
+    /// archived file, reads the archive back to confirm it matches before
+    /// recording anything, and skips a transcript already archived with a
+    /// matching size/mtime on a later run. Opt-in and operator-driven — never
+    /// started automatically.
+    ArchiveTranscripts(super::transcript_archive_cli::ArchiveTranscriptsArgs),
 }
 
 impl TelemetryCommand {
@@ -120,6 +137,7 @@ impl TelemetryCommand {
             TelemetryCommand::IngestTranscripts(args) => args.run(),
             TelemetryCommand::UsageReport(args) => args.run(),
             TelemetryCommand::OpencodeUsage(args) => args.run(),
+            TelemetryCommand::ArchiveTranscripts(args) => args.run(),
         }
     }
 }

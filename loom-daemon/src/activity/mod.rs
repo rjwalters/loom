@@ -51,6 +51,7 @@ pub mod resource_usage;
 mod schema;
 pub mod stats;
 pub mod test_parser;
+pub mod transcript_archive;
 pub mod transcript_ingest;
 pub mod transcript_parse;
 pub mod tuning;
@@ -88,6 +89,11 @@ pub use schema::init_schema;
 // for `resource_usage`, which the managed-terminal-only IPC path never reached.
 pub use transcript_ingest::{ingest, IngestOptions, IngestStats};
 pub use transcript_parse::{attribute_role, parse_transcript, ParsedTranscript, UsageBucket};
+
+// Rolling compressed transcript archive (Issue #8494) — a verified `.tar.zst`
+// backstop for raw transcripts, which `transcript_ingest`'s derived-data
+// preservation does not cover.
+pub use transcript_archive::{archive, ArchiveOptions, ArchiveStats, Manifest, ManifestEntry};
 
 // Re-export resource usage parsing and cost calculation
 // Used internally by db.rs for terminal output parsing
