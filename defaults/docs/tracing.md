@@ -105,8 +105,14 @@ rows; count distinct execution/trace identities when comparing accepted issues.
 
 Parent process completion, cancellation and reaping close observed work. An exit
 that Loom could not observe stays `exit_unobserved`; it does not inherit a
-successful sweep result. Recovery closes orphaned work only when all recorded
-host PIDs are demonstrably gone, labels the observation, and leaves execution
+successful sweep result. A separately persisted supervisor identity protects
+execution results between worker exit, reaping, and independent verification.
+Lock-based restart adoption renews that supervisor using the authoritative sweep
+ID before exposing the registry to telemetry. Recovery checks identities and
+records completion under the same journal lock as supervisor transfers, so a
+stale recovery snapshot cannot override adoption or a terminal result.
+Recovery closes orphaned work only when all recorded worker and supervisor
+identities are demonstrably gone, labels the observation, and leaves execution
 status unknown. On Linux, an owner observation timestamp also lets Loom reuse its
 existing process-start identity check to recognize a recycled PID. This clock is
 updated when ownership transfers to the actual child, independently of phase

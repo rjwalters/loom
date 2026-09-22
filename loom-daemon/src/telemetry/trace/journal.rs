@@ -19,6 +19,12 @@ pub struct ActiveSpan {
     pub owner_pid: u32,
     #[serde(default)]
     pub owner_observed_at: Option<DateTime<Utc>>,
+    /// The process responsible for recording the authoritative terminal result.
+    /// Worker ownership may change without releasing this supervisor's claim.
+    #[serde(default)]
+    pub supervisor_pid: Option<u32>,
+    #[serde(default)]
+    pub supervisor_observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -26,6 +32,11 @@ pub struct ActiveSpan {
 enum Entry {
     Started(ActiveSpan),
     Completed(SpanRecord),
+    Supervisor {
+        context: TraceContext,
+        pid: u32,
+        observed_at: DateTime<Utc>,
+    },
     Owner {
         context: TraceContext,
         pid: u32,
@@ -166,16 +177,20 @@ impl Journal {
             links,
         }
         .bounded();
+        // Container PIDs are not host PIDs. Zero prevents daemon orphan probes
+        // from guessing; the authoritative parent/reaper closes them.
+        let pid = if std::env::var_os("LOOM_SPAWN_CONTAINERIZED").is_some() {
+            0
+        } else {
+            std::process::id()
+        };
+        let observed_at = Some(Utc::now());
         let active = ActiveSpan {
             record,
-            owner_observed_at: Some(Utc::now()),
-            // Container PIDs are not host PIDs. Zero prevents daemon orphan
-            // probes from guessing; the authoritative parent/reaper closes them.
-            owner_pid: if std::env::var_os("LOOM_SPAWN_CONTAINERIZED").is_some() {
-                0
-            } else {
-                std::process::id()
-            },
+            owner_observed_at: observed_at,
+            owner_pid: pid,
+            supervisor_pid: Some(pid),
+            supervisor_observed_at: observed_at,
         };
         Self::append(&mut file, &Entry::Started(active.clone()))?;
         Ok(active)
@@ -212,20 +227,52 @@ impl Journal {
             },
         )
     }
+    /// Adoption transfers only supervision, never the observed worker identity.
+    pub fn set_supervisor(&self, context: &TraceContext, pid: u32) -> Result<()> {
+        let mut file = self.lock()?;
+        Self::entries(&mut file)?;
+        Self::append(
+            &mut file,
+            &Entry::Supervisor {
+                context: context.clone(),
+                pid,
+                observed_at: Utc::now(),
+            },
+        )
+    }
     pub fn has_checkpoint_observations(&self) -> Result<bool> {
         let mut file = self.lock()?;
         Ok(Self::entries(&mut file)?.iter().any(|entry| matches!(entry, Entry::Completed(span) if span.attributes.get("loom.timing_source").is_some_and(|v| matches!(v.as_str(), "checkpoint_write_observed" | "owned_start_checkpoint_completion")))))
     }
     pub fn active(&self) -> Result<Vec<ActiveSpan>> {
         let mut file = self.lock()?;
+        Ok(Self::active_entries(Self::entries(&mut file)?))
+    }
+    fn active_entries(entries: Vec<Entry>) -> Vec<ActiveSpan> {
         let mut active = BTreeMap::new();
-        for entry in Self::entries(&mut file)? {
+        for entry in entries {
             match entry {
-                Entry::Started(a) => {
+                Entry::Started(mut a) => {
+                    // Legacy journals already persisted the original creator in
+                    // Started, before any Owner transfer. Preserve that identity.
+                    if a.supervisor_pid.is_none() {
+                        a.supervisor_pid = Some(a.owner_pid);
+                        a.supervisor_observed_at = a.owner_observed_at;
+                    }
                     active.insert(a.record.context.span_id.as_str().to_owned(), a);
                 }
                 Entry::Completed(r) => {
                     active.remove(r.context.span_id.as_str());
+                }
+                Entry::Supervisor {
+                    context,
+                    pid,
+                    observed_at,
+                } => {
+                    if let Some(span) = active.get_mut(context.span_id.as_str()) {
+                        span.supervisor_pid = Some(pid);
+                        span.supervisor_observed_at = Some(observed_at);
+                    }
                 }
                 Entry::Owner {
                     context,
@@ -239,7 +286,29 @@ impl Journal {
                 }
             }
         }
-        Ok(active.into_values().collect())
+        active.into_values().collect()
+    }
+    /// Recovery and supervisor adoption serialize on the same journal lock.
+    /// Never complete from a stale snapshot taken before an adoption or finish.
+    pub fn finish_abandoned(
+        &self,
+        abandoned: impl Fn(&ActiveSpan) -> bool,
+        attributes: TraceAttributes,
+    ) -> Result<()> {
+        let mut file = self.lock()?;
+        let active = Self::active_entries(Self::entries(&mut file)?);
+        if active.is_empty() || !active.iter().all(abandoned) {
+            return Ok(());
+        }
+        let now = Utc::now();
+        for span in active {
+            let mut record = span.record;
+            record.ended_at = now.max(record.started_at);
+            record.status = SpanStatus::Unset;
+            record.attributes.extend(attributes.clone());
+            Self::append(&mut file, &Entry::Completed(record.bounded()))?;
+        }
+        Ok(())
     }
     fn drain_lock(&self) -> Result<File> {
         let mut options = OpenOptions::new();
@@ -271,7 +340,7 @@ impl Journal {
                     active.remove(span.context.span_id.as_str());
                     completed_root |= span.parent_span_id.is_none();
                 }
-                Entry::Owner { .. } => {}
+                Entry::Owner { .. } | Entry::Supervisor { .. } => {}
             }
         }
         let cursor_path = self.path.with_extension("cursor");

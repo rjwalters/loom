@@ -490,6 +490,20 @@ pub fn child_spawned(root: &Path, execution: &str, pid: u32) {
     }
 }
 
+/// Called only when a surviving execution is adopted under its authoritative ID.
+pub fn execution_adopted(root: &Path, execution: &str) {
+    let store = TraceStore::new(root);
+    if let Ok(saved) = TraceStore::load(&store.path(root, execution)) {
+        let journal = Journal::for_context(&store.path(root, execution));
+        if journal
+            .set_supervisor(&saved.context, std::process::id())
+            .is_err()
+        {
+            log::warn!("observability: adopted trace supervisor could not be persisted");
+        }
+    }
+}
+
 pub fn child_exited(root: &Path, execution: &str, result: &str) {
     let store = TraceStore::new(root);
     if let Ok(saved) = TraceStore::load(&store.path(root, execution)) {
@@ -566,40 +580,37 @@ fn process_gone(_: u32) -> bool {
     false
 }
 
-fn owner_gone(span: &ActiveSpan) -> bool {
-    if process_gone(span.owner_pid) {
+fn identity_gone(pid: u32, observed_at: Option<chrono::DateTime<Utc>>) -> bool {
+    if process_gone(pid) {
         return true;
     }
-    if span.owner_pid == 0 || i32::try_from(span.owner_pid).is_err() {
+    if pid == 0 || i32::try_from(pid).is_err() {
         return false;
     }
-    span.owner_observed_at.is_some_and(|observed| {
+    observed_at.is_some_and(|observed| {
         crate::sweep_registry::pid_identity::pid_was_recycled(
-            crate::sweep_registry::pid_identity::pid_start_wallclock(span.owner_pid),
+            crate::sweep_registry::pid_identity::pid_start_wallclock(pid),
             observed,
         )
     })
 }
 
 fn recover_orphans(journal: &Journal) {
-    let Ok(active) = journal.active() else {
-        return;
-    };
-    if active.is_empty() || !active.iter().all(owner_gone) {
-        return;
-    }
-    for span in active {
-        let _ = journal.finish(
-            &span,
-            Utc::now(),
-            SpanStatus::Unset,
-            attributes(&[
-                ("loom.result", "process_lost"),
-                ("loom.recovered", "true"),
-                ("loom.timing_source", "recovery_observed"),
-            ]),
-        );
-    }
+    // A worker exit precedes authoritative reaping/verification. The live
+    // supervisor still owns that gap, even when every worker PID is gone.
+    let _ = journal.finish_abandoned(
+        |span| {
+            identity_gone(span.owner_pid, span.owner_observed_at)
+                && span
+                    .supervisor_pid
+                    .is_some_and(|pid| identity_gone(pid, span.supervisor_observed_at))
+        },
+        attributes(&[
+            ("loom.result", "process_lost"),
+            ("loom.recovered", "true"),
+            ("loom.timing_source", "recovery_observed"),
+        ]),
+    );
 }
 
 pub fn backfill(root: &Path, queue: &super::queue::DurableQueue) -> usize {

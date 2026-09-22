@@ -936,6 +936,10 @@ impl SweepRegistry {
                         repo,
                     },
                 );
+                crate::observability::lifecycle::execution_adopted(
+                    &self.config.workspace_root,
+                    &owner.sweep_id,
+                );
                 admitted += 1;
             }
         }

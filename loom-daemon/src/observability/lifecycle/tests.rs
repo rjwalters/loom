@@ -122,6 +122,7 @@ fn restart_closes_only_provably_gone_processes_with_unknown_execution_result() {
     child.wait().unwrap();
     assert!(process_gone(pid));
     journal.set_owner(&context, pid).unwrap();
+    journal.set_supervisor(&context, pid).unwrap();
     recover_orphans(&journal);
     assert!(journal.active().unwrap().is_empty());
     journal
@@ -166,6 +167,8 @@ fn recycled_owner_is_recovered_without_mistaking_delayed_spawn_for_reuse() {
     for record in &mut records {
         if record["event"] == "Owner" {
             record["span"]["observed_at"] = serde_json::json!(semantic_start);
+        } else if record["event"] == "Started" {
+            record["span"]["supervisor_observed_at"] = serde_json::json!(semantic_start);
         }
     }
     std::fs::write(journal.path(), records.iter().map(|r| format!("{r}\n")).collect::<String>())

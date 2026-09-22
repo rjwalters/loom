@@ -117,6 +117,69 @@ fn successful_process_exit_does_not_imply_independent_task_acceptance() {
     assert_eq!(observed_root.attributes["loom.result"], "verification_failed");
 }
 
+#[cfg(unix)]
+#[test]
+fn backfill_after_worker_exit_preserves_the_supervisors_authoritative_result() {
+    for adopted in [false, true] {
+        let dir = root();
+        let root = dir.path();
+        let execution = "supervised-exit";
+        let sweep = lifecycle::begin(root, execution, SpanName::Sweep, Default::default()).unwrap();
+        let runtime = sweep
+            .child(SpanName::RuntimeRun, Default::default())
+            .unwrap();
+        let mut child =
+            lifecycle::spawn_child(&mut Command::new("/usr/bin/true"), root, execution).unwrap();
+        let context_path = TraceStore::new(root).path(root, execution);
+        let journal = loom_daemon::telemetry::trace::journal::Journal::for_context(&context_path);
+        journal.set_owner(runtime.context(), child.id()).unwrap();
+        assert!(child.wait().unwrap().success());
+        if adopted {
+            // A previous supervisor is gone; the new authoritative supervisor
+            // must renew protection without replacing the observed worker PID.
+            journal.set_supervisor(sweep.context(), child.id()).unwrap();
+            journal
+                .set_supervisor(runtime.context(), child.id())
+                .unwrap();
+            lifecycle::execution_adopted(root, execution);
+        }
+        let queue = DurableQueue::open(root.join("supervised-queue.jsonl"), 1000);
+        assert_eq!(lifecycle::backfill(root, &queue), 0);
+        assert!(context_path.exists(), "backfill must not retire supervised work");
+        assert_eq!(journal.active().unwrap().len(), 2);
+        lifecycle::child_exited(root, execution, "success");
+        // Independent verification can take time after the child was reaped.
+        lifecycle::backfill(root, &queue);
+        assert!(context_path.exists());
+        lifecycle::finish_execution(root, execution, "verification_failed", Default::default());
+        lifecycle::backfill(root, &queue);
+        let records: Vec<_> = queue
+            .peek_batch(1000)
+            .into_iter()
+            .filter_map(|e| match e.record {
+                TelemetryRecord::Span(span) => Some(span),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records.len(), 2);
+        let child_record = records
+            .iter()
+            .find(|s| s.context == *runtime.context())
+            .unwrap();
+        assert_eq!(child_record.status, SpanStatus::Ok);
+        let result = records
+            .iter()
+            .find(|s| s.context == *sweep.context())
+            .unwrap();
+        assert_eq!(result.status, SpanStatus::Error);
+        assert_eq!(result.attributes["loom.result"], "verification_failed");
+        assert!(records
+            .iter()
+            .all(|s| !s.attributes.contains_key("loom.recovered")));
+        assert!(!context_path.exists(), "retirement follows the actual terminal result");
+    }
+}
+
 #[test]
 fn pi_and_opencode_launch_and_native_read_preserve_authoritative_context() {
     for runtime in ["pi", "opencode"] {

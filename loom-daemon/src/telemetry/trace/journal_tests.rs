@@ -308,3 +308,38 @@ fn terminal_context_is_retired_only_after_durable_acceptance_and_all_children_fi
     assert!(!path.exists());
     assert!(!journal.path().exists());
 }
+
+#[test]
+fn supervisor_transfer_and_legacy_creator_survive_worker_owner_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("execution.json"));
+    let span = start(&journal, &TraceContext::root(true));
+    journal.set_owner(&span.record.context, 42).unwrap();
+    let active = journal.active().unwrap().remove(0);
+    assert_eq!(active.owner_pid, 42);
+    assert_eq!(active.supervisor_pid, Some(std::process::id()));
+    assert_eq!(active.supervisor_observed_at, span.owner_observed_at);
+    let mut entries: Vec<serde_json::Value> = std::fs::read_to_string(journal.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let started = entries[0]["span"].as_object_mut().unwrap();
+    started.remove("supervisor_pid");
+    started.remove("supervisor_observed_at");
+    std::fs::write(journal.path(), entries.iter().map(|e| format!("{e}\n")).collect::<String>())
+        .unwrap();
+    let legacy = journal.active().unwrap().remove(0);
+    assert_eq!(legacy.owner_pid, 42);
+    assert_eq!(legacy.supervisor_pid, Some(std::process::id()));
+    assert_eq!(legacy.supervisor_observed_at, span.owner_observed_at);
+    let before_adoption = Utc::now();
+    journal.set_supervisor(&span.record.context, 43).unwrap();
+    let adopted = Journal::for_context(&dir.path().join("execution.json"))
+        .active()
+        .unwrap()
+        .remove(0);
+    assert_eq!(adopted.owner_pid, 42);
+    assert_eq!(adopted.supervisor_pid, Some(43));
+    assert!(adopted.supervisor_observed_at.unwrap() >= before_adoption);
+}
