@@ -116,6 +116,14 @@ pub(crate) enum ScriptPortCommand {
     /// false, 1 could not run — and 1 must be treated as 10, never as 0. Not
     /// a port either: same frozen-`main.rs` reason as `shell-budget` above.
     PremiseCheck(super::premise_check::PremiseCheckArgs),
+
+    /// `reconcile-stack.sh`'s rebase planner and executor (#8583): fetch and
+    /// PIN the remote default-branch tip, route to the worktree holding the
+    /// child branch, resolve the parent ref (with the #7982 pin fallback and
+    /// its #8010 ancestry check), then replay only the child's own commits
+    /// onto the pinned commit. Exit 0 planned/rebased, 1 a prerequisite
+    /// refused with nothing mutated, 2 the rebase itself failed.
+    ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
 }
 
 impl ScriptPortCommand {
@@ -139,6 +147,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
             ScriptPortCommand::PremiseCheck(args) => args.run(),
+            ScriptPortCommand::ReconcileStack(args) => args.run(),
         }
     }
 }

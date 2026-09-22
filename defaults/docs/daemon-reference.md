@@ -2691,8 +2691,17 @@ api` read):
 
 - **Safe** (child issue not `loom:building`): invokes
   `./.loom/scripts/reconcile-stack.sh <child-pr> feature/issue-<parent>`
-  (`git rebase --onto <default> <parent-branch> <child-branch>` +
-  `--force-with-lease` + `gh pr edit --base <default>`).
+  (`git rebase --onto <the FETCHED default-branch commit> <parent-ref>
+  <child-branch>` + `--force-with-lease` + `gh pr edit --base <default>`).
+  The destination is the commit that run fetched from the remote, never the
+  local branch of the same name: the local default branch is normally stale at
+  exactly this moment (the parent merged on the forge), and rebasing onto it
+  silently dropped the just-merged parent's implementation whenever the child's
+  files did not overlap the parent's (#8583). That resolution — fetch, pin,
+  route to the worktree holding the child branch, resolve the parent ref with
+  the #7982 pin fallback and its #8010 ancestry check, then rebase — is
+  `loom-daemon reconcile-stack`; a failed fetch or an unresolvable target
+  refuses (exit 1, nothing mutated) rather than degrading to the stale branch.
 - **Unsafe** (child issue still `loom:building`): a live Builder likely holds
   the child branch checked out, so the auto-rebase is **skipped** and a comment
   is posted on the child PR flagging deferred reconciliation. A later
