@@ -1,0 +1,14 @@
+{
+  "runtime": "kimi",
+  "tier": 2,
+  "tierLabel": "native harness, unguarded (no loom_* tool binding yet)",
+  "capabilities": {
+    "mcp": "no",
+    "subagents": "no",
+    "hooks": "no",
+    "skills": "no",
+    "worktreeIsolation": "no",
+    "loomControl": "no"
+  },
+  "note": "Rust native adapter (issue #8561): headless launch, model-profile binding and exit-code mapping are implemented, but Loom provisions no guarded loom_* tool binding for Kimi Code CLI yet (tracked in #8562). Every capability is declared 'no' EXPLICITLY, not 'partial' -- there is no gapped-but-present mechanism to record. Consequence: admitted only for roles that declare no runtimeRequirements (Curator, Guide, Auditor); Builder/Doctor/Judge fail closed at exit 78 via check-runtime-capabilities.sh, the same mechanism that already keeps Codex's 'partial' worktreeIsolation and the aider tier-3 example out of those roles. A role-tagged (guarded) launch additionally fails closed inside native_tools::provision::configure with a diagnostic naming #8562, rather than silently running with Kimi's own unguarded builtin tools -- this catches Curator/Guide/Auditor too, none of which require any capability this manifest could gate on. See defaults/docs/runtime-model-trials.md for setup, the config-alias vs API-key model-profile shapes, and the live canary receipt."
+}
