@@ -44,15 +44,27 @@
 //! and the verification status of this finding live in
 //! `defaults/docs/token-pool.md` § "Codex availability probe".
 //!
-//! # Fail-open, always
+//! # Fail-open, never fail-silent (issue #8539)
 //!
-//! Every unknown is reported as "no evidence", never as a refusal. A profile
-//! with no rollout log, an unparseable line, a schema this parser does not
-//! recognize, or a snapshot whose own window has already rolled over all
-//! produce `available` with **no** utilization — the account keeps its place
-//! in selection. Proactive availability may only ever *add* information; a
-//! probe that cannot read the signal must never take a working subscription
-//! out of rotation.
+//! Every unknown is reported as "no evidence", never as a refusal — and never
+//! as health either. A profile with no rollout log, an unparseable line, a
+//! schema this parser does not recognize, or a snapshot whose own window has
+//! already rolled over all produce [`STATUS_UNKNOWN`] with **no** utilization.
+//! The account keeps its place in selection (fail-open: it is not a refusal,
+//! [`has_usable_account`] still counts it, and the codex selector reads
+//! `account-health.json` rather than this status at all) — but the row says
+//! "nothing measured here" instead of claiming `available`.
+//!
+//! That distinction is the first half of issue #8539. Before it, a host where
+//! **every** Codex account was at its provider-side usage limit — and nothing
+//! had ever run an interactive session that would record a snapshot — rendered
+//! an all-dashes table in which every row read `available`: a fully walled
+//! pool that looked perfectly healthy. `unknown` cannot be misread that way,
+//! and [`check::status_rank`] ranks it strictly below a known-good reading so
+//! it can never outrank a measured `available` in the ranking file either.
+//!
+//! Proactive availability may only ever *add* information; a probe that cannot
+//! read the signal must never take a working subscription out of rotation.
 
 use std::path::{Path, PathBuf};
 
@@ -83,6 +95,28 @@ const MAX_WALK_DEPTH: usize = 8;
 
 /// Provenance recorded on any account-health record this module writes.
 pub const AVAILABILITY_PROVENANCE: &str = "codex-availability-probe";
+
+/// Status word for an enabled account this probe has **no current reading
+/// for** (issue #8539): no rollout snapshot was ever recorded, or the only one
+/// found measures a window that has since rolled over.
+///
+/// Deliberately not `available`: that word is a claim about headroom, and this
+/// module has no evidence for it. It is equally deliberately not a refusal —
+/// see the module docs — so [`has_usable_account`] counts it as dispatchable
+/// and [`check::is_reprobe_gated_status`] leaves it selectable.
+pub const STATUS_UNKNOWN: &str = "unknown";
+
+/// [`AccountResult::error`] detail for an enabled account with no rollout
+/// snapshot at all — the exact state that made a walled pool read as healthy
+/// before #8539. Stable, secret-free, and the string the operator-facing
+/// footer keys its `codex exec` hint on.
+pub const NO_SNAPSHOT_DETAIL: &str = "no_rate_limit_snapshot";
+
+/// [`AccountResult::error`] detail for an account whose only snapshot measures
+/// an already-rolled-over window. Distinct from [`NO_SNAPSHOT_DETAIL`] because
+/// the remedy differs: this profile *does* write snapshots, it simply has not
+/// been used recently, so nothing needs provisioning.
+pub const STALE_SNAPSHOT_DETAIL: &str = "snapshot_window_rolled_over";
 
 /// Where this workspace's Codex ranking file lives.
 #[must_use]
@@ -406,6 +440,11 @@ fn epoch_to_utc(secs: u64) -> Option<DateTime<Utc>> {
 /// reading is a fact about the subscription. When both exist the hold wins,
 /// because reporting `available` for an account the selector will skip is the
 /// dishonest direction.
+///
+/// The starting status is [`STATUS_UNKNOWN`], not `available` (issue #8539):
+/// `available` is only ever *earned*, by a live reading with measurable
+/// headroom. Without one the row reports that nothing is known rather than
+/// asserting health this module cannot see.
 #[must_use]
 pub fn assess_account(
     account: &AccountDescriptor,
@@ -426,7 +465,8 @@ pub fn assess_account(
     }
 
     let now_epoch = u64::try_from(now.timestamp()).unwrap_or(0);
-    let mut row = AccountResult::new(name, "available");
+    let mut row = AccountResult::new(name, STATUS_UNKNOWN);
+    row.error = Some(NO_SNAPSHOT_DETAIL.to_string());
 
     // Measurement first, so the utilization fields are populated even when a
     // hold below overrides the status.
@@ -439,8 +479,17 @@ pub fn assess_account(
             row.s7d_utilization = Some(secondary.used_fraction);
             row.s7d_reset = secondary.resets_at.map(iso);
         }
+        // A snapshot that exists but measures only rolled-over windows is
+        // still no evidence about *now* (see [`RateLimitWindow::is_live_at`]),
+        // so it stays `unknown` — with the detail that says which unknown it
+        // is, since the two have different remedies.
+        row.error = Some(STALE_SNAPSHOT_DETAIL.to_string());
         if let Some((constraint, _)) = snapshot.constraint_at(now) {
             row.status = constraint.status().to_string();
+            row.error = None;
+        } else if snapshot.has_headroom_at(now) {
+            row.status = "available".to_string();
+            row.error = None;
         }
     }
 
@@ -663,23 +712,44 @@ pub fn format_table(report: &ProbeReport) -> String {
         .join(", ");
     lines.push(String::new());
     lines.push(format!("Total {}: {summary}", report.accounts.len()));
+    // Issue #8539: an all-dashes row is now `unknown`, and the one question an
+    // operator asks next — "why does it not know?" — is answered here rather
+    // than left to be inferred from a table of dashes.
+    if counts.contains_key(STATUS_UNKNOWN) {
+        lines.push(format!(
+            "`{STATUS_UNKNOWN}` = no live rate-limit snapshot in that profile's own \
+             `sessions/rollout-*.jsonl`; it is NOT a health claim. One `codex exec` turn on the \
+             account records one. A walled account still reports `exhausted` once a dispatch \
+             refusal is fed back (`loom-daemon accounts status codex <name>`)."
+        ));
+    }
     lines.join("\n")
 }
 
 /// Whether any account in `report` is dispatchable **right now**. Drives
 /// `accounts check`'s exit-code contract.
 ///
-/// `available` only: every other status — `rate_limited` (the 5h window is
-/// full), `exhausted`, `blocked`, `skipped`, `error` — names an account a
-/// dispatch would bounce off at this instant. `rate_limited` is the
-/// deliberate inclusion-looking exclusion: it self-clears within hours, which
-/// makes it a *recoverable* refusal, not a usable account.
+/// `available` and [`STATUS_UNKNOWN`] only: every other status —
+/// `rate_limited` (the 5h window is full), `exhausted`, `blocked`, `skipped`,
+/// `error` — names an account a dispatch would bounce off at this instant.
+/// `rate_limited` is the deliberate inclusion-looking exclusion: it
+/// self-clears within hours, which makes it a *recoverable* refusal, not a
+/// usable account.
+///
+/// `unknown` counts (issue #8539) because it is the *absence* of a refusal,
+/// not a refusal: nothing holds the account, so the selector will hand it to
+/// the next codex dispatch, and this predicate's whole job is predicting what
+/// selection will do. Treating "no snapshot recorded yet" as unusable would
+/// make `accounts check` exit `1` on every correctly-provisioned host that
+/// simply has not written a rollout log yet — the fail-*closed* direction this
+/// module's header rules out. The honesty the issue asked for lives in the
+/// status word and the table footer, not in this exit code.
 #[must_use]
 pub fn has_usable_account(report: &ProbeReport) -> bool {
     report
         .accounts
         .iter()
-        .any(|account| account.status == "available")
+        .any(|account| account.status == "available" || account.status == STATUS_UNKNOWN)
 }
 
 /// `(present, age_secs)` for this workspace's Codex ranking file — the codex
