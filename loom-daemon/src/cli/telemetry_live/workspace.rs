@@ -137,6 +137,10 @@ fn outside_checkout(path: &Path) -> Result<()> {
     // Both regular .git directories and linked-worktree .git files count. Do
     // not follow or read their contents, and fail closed on unreadable ancestry.
     for ancestor in path.ancestors() {
+        let bare = ancestor.join("HEAD").is_file()
+            && ancestor.join("objects").is_dir()
+            && (ancestor.join("config").is_file() || ancestor.join("refs").is_dir());
+        ensure!(!bare, "canary credentials and private state must be outside every repository");
         match std::fs::symlink_metadata(ancestor.join(".git")) {
             Ok(_) => anyhow::bail!(
                 "canary credentials and private state must be outside every repository checkout"
@@ -185,6 +189,21 @@ mod private_path_tests {
                 validate_private_paths(home.path(), &repo.join("output"), &zshrc, &key).is_err()
             );
         }
+    }
+
+    #[test]
+    fn rejects_bare_repository_credentials_and_output() {
+        let (home, output, zshrc, key) = fixture();
+        let repo = home.path().join("bare.git");
+        std::fs::create_dir_all(repo.join("objects")).unwrap();
+        std::fs::create_dir(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::write(repo.join("config"), "[core]\nbare = true\n").unwrap();
+        let credential = repo.join("credential");
+        std::fs::write(&credential, "fixture only").unwrap();
+        assert!(validate_private_paths(home.path(), &output, &credential, &key).is_err());
+        assert!(validate_private_paths(home.path(), &output, &zshrc, &credential).is_err());
+        assert!(validate_private_paths(home.path(), &repo.join("output"), &zshrc, &key).is_err());
     }
 
     #[cfg(unix)]
