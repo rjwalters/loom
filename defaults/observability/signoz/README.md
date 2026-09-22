@@ -224,6 +224,29 @@ privacy-sentinel drop. See `evidence.md`'s "Shared fixture manifest, executed
 live" section for the full results. Query 0 remains a schema preflight in case
 a future SigNoz pin renames these columns.
 
+## Cycle-time analytics (Issue #8665)
+
+`cycle-time-extract.sql` is this backend's half of the shared cycle-time
+artifact set — one view, `loom_analytics.raw_ship_outcome`, mapping
+`signoz_logs.distributed_logs_v2` rows onto the normalized ship columns that
+[`../cycle-time-rollup.sql`](../cycle-time-rollup.sql) ingests and
+[`../cycle-time-queries.sql`](../cycle-time-queries.sql) answers CT1–CT8 from.
+The questions and their definitions are in
+[`../cycle-time-questions.md`](../cycle-time-questions.md); ClickStack uses the
+same three shared files with only its own extraction view swapped in, which is
+what makes the two backends comparable under #8529.
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < cycle-time-extract.sql
+```
+
+**Not yet executed live here.** The ClickStack side is verified end to end in CI
+against a real pinned ClickHouse; this view's column contract is checked by
+`loom-daemon/tests/cycle_time_artifacts.rs`, but no number produced by it has
+been compared against the ClickStack answers on the same fixture yet. Treat it
+as unproven until that comparison is recorded in `evidence.md`, exactly as the
+trial treats every other unexecuted claim.
+
 ## Retention and operation
 
 Set **seven days for logs, traces and metrics** in General Settings → Retention.

@@ -94,6 +94,14 @@ jobs:
             backend:
               - 'loom-daemon/**'
               - 'loom-api/**'
+              # The observability artifacts are Rust-tested seams, not inert
+              # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs
+              # and cycle_time_artifacts.rs all `include_str!` these files and
+              # fail on drift, and cycle_time_clickhouse.rs executes the SQL
+              # verbatim against a real ClickHouse. An artifact-only PR must
+              # re-run those, or the only tests that can catch the regression
+              # are skipped on exactly the PRs that cause one (#8665).
+              - 'defaults/observability/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
@@ -214,6 +222,12 @@ jobs:
         run: cargo nextest run --package loom-daemon --features otlp --profile ci
       - name: Verify OTLP with a real pinned Collector
         run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
+      # #8665: executes the committed cycle-time SQL verbatim against a real
+      # pinned ClickHouse, on rows written by the real ClickHouse exporter.
+      # Static contract checks cannot see how a nested attribute is serialized,
+      # nor whether the rollup still answers once the raw rows expire.
+      - name: Verify the cycle-time artifacts against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test cycle_time_clickhouse -- --ignored --nocapture
 
   mcp-build:
     name: MCP Server Build

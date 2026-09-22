@@ -1,0 +1,27 @@
+# `sweep.outcome` fixture for the cycle-time live proof (Issue #8665). Lines
+# beginning with `#` are stripped by the test; `{{hours_ago:N}}` is replaced
+# with an RFC3339 instant N hours before the run.
+#
+# Timestamps are RELATIVE on purpose. The raw ClickHouse table is created with
+# the ClickStack deployment's real 168h TTL, and ClickHouse applies row TTL at
+# insert time -- a fixture with fixed 2026-09-15 timestamps silently lost six of
+# its seven rows the first time this ran, which is precisely the data loss this
+# whole artifact set exists to survive. Every ship here therefore lands inside
+# the raw retention window, and expiry is simulated later by deleting the raw
+# rows outright rather than by racing a background merge.
+#
+# The seven envelopes, in order:
+#   1. ship-alpha-101  slow, dominated by `builder` (3000s of 3600s)
+#   2. ship-alpha-102  repair loop: `judge` twice (800+700) outranks `builder`
+#   3. ship-beta-103   slowest overall, but carries NO phase breakdown at all
+#   4. ship-beta-104   a failure, with a failure_class and no PR -- not a ship
+#   5. ship-alpha-105  fast, different runtime/provider/model/effort
+#   6. (duplicate of 1) at-least-once delivery; must NOT double-count
+#   7. ship-alpha-106  one day old, so the window spans two ISO weeks
+{"schema_version":2,"emitted_at":"{{hours_ago:144}}","host_id":"loom-cycle-time-canary","record":{"kind":"sweep.outcome","repo":"synthetic/alpha","visibility":"public","issue":101,"sweep_id":"ship-alpha-101","model":"synthetic-model-no-inference","effort":"high","config":{"runtime":"synthetic-runtime","provider":"synthetic-provider","configured_model":"synthetic-configured-model"},"phase_durations":[{"phase":"curator","duration_sec":120},{"phase":"builder","duration_sec":3000},{"phase":"judge","duration_sec":300},{"phase":"merge","duration_sec":180}],"total_duration_sec":3600,"result":"success","pr_number":201,"doctor_cycles":0}}
+{"schema_version":2,"emitted_at":"{{hours_ago:143}}","host_id":"loom-cycle-time-canary","record":{"kind":"sweep.outcome","repo":"synthetic/alpha","visibility":"public","issue":102,"sweep_id":"ship-alpha-102","model":"synthetic-model-no-inference","effort":"high","config":{"runtime":"synthetic-runtime","provider":"synthetic-provider","configured_model":"synthetic-configured-model"},"phase_durations":[{"phase":"curator","duration_sec":60},{"phase":"builder","duration_sec":900},{"phase":"judge","duration_sec":800},{"phase":"doctor","duration_sec":400},{"phase":"judge","duration_sec":700},{"phase":"merge","duration_sec":100}],"total_duration_sec":2960,"result":"success","pr_number":202,"doctor_cycles":1}}
+{"schema_version":2,"emitted_at":"{{hours_ago:142}}","host_id":"loom-cycle-time-canary","record":{"kind":"sweep.outcome","repo":"synthetic/beta","visibility":"private","issue":103,"sweep_id":"ship-beta-103","total_duration_sec":5400,"result":"success","pr_number":203}}
+{"schema_version":2,"emitted_at":"{{hours_ago:141}}","host_id":"loom-cycle-time-canary","record":{"kind":"sweep.outcome","repo":"synthetic/beta","visibility":"private","issue":104,"sweep_id":"ship-beta-104","model":"synthetic-model-no-inference","config":{"runtime":"synthetic-runtime","provider":"synthetic-provider"},"phase_durations":[{"phase":"builder","duration_sec":1200}],"total_duration_sec":1200,"result":"failure","failure_class":"synthetic-failure-class"}}
+{"schema_version":2,"emitted_at":"{{hours_ago:140}}","host_id":"loom-cycle-time-canary","record":{"kind":"sweep.outcome","repo":"synthetic/alpha","visibility":"public","issue":105,"sweep_id":"ship-alpha-105","model":"synthetic-other-model","effort":"low","config":{"runtime":"synthetic-other-runtime","provider":"synthetic-other-provider"},"phase_durations":[{"phase":"curator","duration_sec":10},{"phase":"builder","duration_sec":200},{"phase":"judge","duration_sec":50},{"phase":"merge","duration_sec":5}],"total_duration_sec":265,"result":"success","pr_number":205,"doctor_cycles":0}}
+{"schema_version":2,"emitted_at":"{{hours_ago:144}}","host_id":"loom-cycle-time-canary","record":{"kind":"sweep.outcome","repo":"synthetic/alpha","visibility":"public","issue":101,"sweep_id":"ship-alpha-101","model":"synthetic-model-no-inference","effort":"high","config":{"runtime":"synthetic-runtime","provider":"synthetic-provider","configured_model":"synthetic-configured-model"},"phase_durations":[{"phase":"curator","duration_sec":120},{"phase":"builder","duration_sec":3000},{"phase":"judge","duration_sec":300},{"phase":"merge","duration_sec":180}],"total_duration_sec":3600,"result":"success","pr_number":201,"doctor_cycles":0}}
+{"schema_version":2,"emitted_at":"{{hours_ago:24}}","host_id":"loom-cycle-time-canary","record":{"kind":"sweep.outcome","repo":"synthetic/alpha","visibility":"public","issue":106,"sweep_id":"ship-alpha-106","model":"synthetic-model-no-inference","effort":"high","config":{"runtime":"synthetic-runtime","provider":"synthetic-provider"},"phase_durations":[{"phase":"builder","duration_sec":420},{"phase":"judge","duration_sec":60}],"total_duration_sec":480,"result":"success","pr_number":206,"doctor_cycles":0}}

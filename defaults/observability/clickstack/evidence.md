@@ -189,6 +189,38 @@ values found no matches in repository source or managed worktrees. Concurrent
 local backend startup caused probe timeouts on this occupied host without OOM
 flags; final checks therefore ran sequentially with persistent volumes retained.
 
+## Cycle-time artifacts, executed live (Issue #8665)
+
+Run on 2026-09-22 against the pinned ClickHouse **25.12.5.44** (the same digest
+the SigNoz trial's telemetry store uses) with the pinned Collector **0.139.0**
+and its ClickHouse exporter, fed by real `loom-daemon telemetry-export` output.
+Reproduced by `loom-daemon/tests/cycle_time_clickhouse.rs`, which CI runs with
+`--ignored`; this is not the all-in-one ClickStack image, so it establishes the
+artifacts and the exporter's schema, not HyperDX's UI behaviour.
+
+| Observation | Result |
+| --- | --- |
+| Envelopes exported / rows indexed | 7 / 7, `Body = 'sweep.outcome'` |
+| Created log-table retention | `TTL TimestampTime + toIntervalDay(7)` — the 168h the artifacts reason about |
+| Event-kind column | **None.** The created schema has no event-name column, so the committed queries filter on `Body` |
+| Nested attribute serialization | `loom.phase_durations` → `[{"duration_sec":420,"phase":"builder"},{"duration_sec":60,"phase":"judge"}]` — JSON with **alphabetical** keys, not declaration order |
+| Ships after rollup | 6 from 7 raw rows: the deliberately replayed duplicate collapsed on the ReplacingMergeTree key |
+| Dominant phase, repair scenario | `judge` at 1500s (800 + 700 across two attempts) outranking a single 900s `builder` |
+| Rollup retention | `TTL toDateTime(finished_at) + toIntervalDay(400)` |
+| Hourly refresh | `system.view_refreshes` reports `loom_analytics.ship_cycle_time_refresh` `Scheduled` |
+| After deleting every raw row | CT1 returned a byte-identical answer; CT8 reported `0 / 6 / 0 / 6 / 0` (raw, rolled up, missing, beyond-raw, mismatched) |
+| Backfill re-run over an empty raw window | Rollup unchanged at 6 ships |
+
+The alphabetical key order is why the extraction reads a **named** tuple: a
+positional read would have parsed durations as phase names and produced
+plausible nonsense rather than an error.
+
+**The fixture's first draft lost six of its seven rows.** It used fixed
+2026-09-15 timestamps, which were already outside the 168h TTL at insert time,
+so ClickHouse dropped them immediately and the first run saw a single row. That
+is the same seven-day loss the rollup exists to survive, observed by accident
+before it was engineered around; the fixture is relative-time now.
+
 | Remaining check | Status |
 | --- | --- |
 | Log-to-trace waterfall and correlated log rows | Passed in the actual HyperDX browser UI |
