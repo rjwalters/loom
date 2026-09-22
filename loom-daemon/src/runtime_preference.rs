@@ -24,13 +24,38 @@
 //!
 //! # What this module is, and is not
 //!
-//! It is the **resolution half** of #8436: config parsing, the shared
-//! availability mapping ([`availability`]), and the pure ordered walk
-//! ([`resolve`]). It is deliberately **not wired into dispatch yet** — neither
-//! the work finder's `uses_native_sweep` seam nor the role runner calls
-//! [`resolve_runtime`], so on today's `main` this module changes no launch.
-//! Wiring, the metered-tier concurrency ceiling, and the docs are tracked
+//! It started as only the **resolution half** of #8436: config parsing, the
+//! shared availability mapping ([`availability`]), and the pure ordered walk
+//! ([`resolve`]). Issue #8554 wired it into dispatch, so a configured
+//! `runtimes.preference` now changes real launches at three seams:
+//!
+//! - `sweep_registry::dispatch` resolves a sweep's runtime through
+//!   [`resolve_for_dispatch`] — a one-for-one substitution for
+//!   [`crate::runtime_admission::resolve_and_admit`].
+//! - `work_finder::pool_preflight`'s #7708 host-level hold arms only when the
+//!   **whole** list is unavailable, instead of whenever the Claude pool is dry.
+//! - `role_runner::runtime_preflight` lets the list choose a role tick's tap,
+//!   keeping the #6201/#8408 pre-spawn gate as the fail-closed reporter.
+//!
+//! The metered-tier concurrency ceiling, and carrying the chosen tier into the
+//! `role_tick.outcome` record / per-sweep launch record (#8599), are tracked
 //! separately; see the follow-up issues linked from #8436.
+//!
+//! **Known gap: a tap's `modelProfile` gates but does not pin.** [`Tap`]'s
+//! optional profile is honoured when [`availability`] decides whether the tap
+//! can serve (it reads exactly that profile's provider + credential pool), but
+//! nothing carries it to the child: [`Decision::into_admission`] collapses to
+//! [`ResolvedRuntime`], which has no profile field, and neither `cmd.env`
+//! launch site pins `LOOM_MODEL_PROFILE`. A profile-pinned tap therefore
+//! launches on whatever profile the runtime would have resolved anyway, which
+//! for two profiles on different providers is not the tap whose pool was just
+//! checked. Bare-runtime entries — every tap in the shipped examples that is
+//! not the metered backstop — are unaffected, because their profile *is* the
+//! default resolution. Pinning it needs `LOOM_MODEL_PROFILE` set at the same
+//! two `cmd.env("LOOM_RUNTIME", …)` sites #8599 has to touch (and which the
+//! file-size ratchet says should be collapsed into one helper before either
+//! adds a field), so it is tracked in #8602 behind that, not done half-way
+//! here.
 //!
 //! # Invariants
 //!
@@ -54,8 +79,8 @@
 //!
 //! # One sweep, one runtime
 //!
-//! `guardrail-parity-native.md` already states a sweep uses one runtime
-//! throughout. Fall-through is therefore decided at **dispatch**, never
+//! A sweep uses one runtime throughout (`runtime_admission`'s own module
+//! doc). Fall-through is therefore decided at **dispatch**, never
 //! mid-sweep: a sweep that exhausts its runtime in flight fails and is
 //! re-dispatched, where it re-resolves. Hysteresis falls out of that for free
 //! — once a higher-preference pool recovers, new spawns return to it while
@@ -149,6 +174,72 @@ impl Decision {
             }
         }
     }
+
+    /// Collapse this decision into the ordinary admission shape every
+    /// existing dispatch call site already expects, so wiring the preference
+    /// resolver in is a straight substitution for
+    /// [`crate::runtime_admission::resolve_and_admit`] (#8554).
+    ///
+    /// The static path's `result` passes through unchanged — including its
+    /// `Err` shape — preserving the "absent config is byte-identical"
+    /// invariant all the way to the error a caller sees. The preference
+    /// path's fail-closed case (every tap skipped) is reported as a
+    /// [`RuntimeRejection`] whose `reason` is
+    /// [`Resolution::exhausted_diagnostic`], naming every skipped tap and
+    /// why, so a refused dispatch stays as diagnosable as the single-runtime
+    /// rejection it replaces.
+    ///
+    /// # Errors
+    /// The static path's own rejection, or — on the preference path, when
+    /// every listed tap was skipped — the fail-closed rejection built from
+    /// [`Resolution::exhausted_diagnostic`].
+    pub fn into_admission(self, role: &str) -> Result<ResolvedRuntime, RuntimeRejection> {
+        match self {
+            Self::Static { result, .. } => result,
+            Self::Preference { resolution, .. } => match resolution.chosen {
+                Some(chosen) => Ok(chosen.admitted),
+                None => Err(RuntimeRejection {
+                    role: role.to_string(),
+                    runtime: String::new(),
+                    source: RuntimeSource::Preference,
+                    unmet_capabilities: vec![],
+                    reason: resolution.exhausted_diagnostic(role),
+                }),
+            },
+        }
+    }
+}
+
+/// Resolve the runtime for one dispatch and collapse the answer to the
+/// ordinary admission shape, logging the `# LOOM_RUNTIME_PREFERENCE` marker
+/// on the way when a preference list actually decided (#8554).
+///
+/// The whole point of this wrapper is that a dispatch call site swaps
+/// [`crate::runtime_admission::resolve_and_admit`] for it **one-for-one** —
+/// same arity, same return type, same `Err` shape on the static path — so
+/// wiring preference into a call site adds no branching there and cannot
+/// drift from the marker/collapse handling every other call site does.
+///
+/// `now` is read here rather than taken as a parameter because every
+/// production caller wants the wall clock; a test that needs a pinned clock
+/// calls [`resolve_runtime`] directly, which is the seam that takes one.
+///
+/// # Errors
+/// The static path's own rejection, a malformed-preference rejection, or —
+/// when every listed tap was skipped — the fail-closed rejection
+/// [`Decision::into_admission`] builds from
+/// [`Resolution::exhausted_diagnostic`].
+pub fn resolve_for_dispatch(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+) -> Result<ResolvedRuntime, RuntimeRejection> {
+    let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+    let decision = resolve_runtime(root, role, explicit, now)?;
+    if let Some(marker) = decision.marker_line() {
+        log::info!("runtime_preference: {role} resolved by preference list — {marker} (#8554)");
+    }
+    decision.into_admission(role)
 }
 
 /// Parse one preference-list entry: a bare runtime id, or an object naming the

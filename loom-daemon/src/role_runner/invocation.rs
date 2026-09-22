@@ -21,16 +21,25 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // gate reads the pool the admitted runtime draws from, never Claude's
                 // by default. Claude keeps its old ordering (pool gate ahead of an
                 // admission rejection), including on incomplete installations.
-                let admission_result = self.spawn_bin.is_none().then(|| {
+                let mut admission_result = self.spawn_bin.is_none().then(|| {
                     crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None)
                 });
-                if let Some(outcome) = runtime_preflight::check(
+                match runtime_preflight::check(
                     &self.workspace_root,
                     &self.logs_dir(),
                     role,
                     admission_result.as_ref(),
                 ) {
-                    return outcome;
+                    Ok(None) => {}
+                    // #8554: a configured `runtimes.preference` /
+                    // `rolePreference.<role>` list decided this tick's tap —
+                    // launch with THAT runtime, not the one static admission
+                    // named. Re-pointed here (before model resolution) so
+                    // #7894's reconciliation and #5028's mismatch refusal
+                    // both judge the model against the runtime that will
+                    // actually run.
+                    Ok(Some(chosen)) => admission_result = Some(Ok(chosen)),
+                    Err(outcome) => return outcome,
                 }
                 // Issue #5028 (follow-up to #5001 AC2/AC3): runtime admission now
                 // resolves BEFORE the model, because the runtime is a per-role INPUT
