@@ -789,6 +789,31 @@ enum Commands {
         json: bool,
     },
 
+    /// Reclaim orphaned Loom-named scratch directories parked on a `tmpfs`/
+    /// `ramfs` mount (e.g. `/dev/shm/cargo-target-*`), issue #8512. A manual
+    /// front-end for `loom_daemon::tmpfs_reclaim`, also wired into the
+    /// periodic worktree reaper as a host-wide sibling pass — see that
+    /// module's docs for the deliberately narrower safety model this uses
+    /// relative to the worktree-attribution-based cargo-target reclaim.
+    TmpfsScratchGc {
+        /// Reclaim a directory whose newest mtime (recursive) is at least
+        /// this many seconds old and which no live process holds open.
+        /// Omitted: resolved from `autonomous.tmpfsScratchGc.stalenessSecs`
+        /// (env > config > 21600, i.e. 6h), the same value the daemon's own
+        /// reaper pass uses.
+        #[arg(long)]
+        staleness_secs: Option<u64>,
+
+        /// Report what would be removed and its size, without deleting
+        /// anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Emit the report as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Native port of `loom-cleanup` (Issue #4272): log archival, the only
     /// cleanup.py functionality that survived the daemon-brain retirement
     /// (#3396). Purely file-based; does not require a running daemon.
@@ -2719,6 +2744,11 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             dry_run,
             json,
         ),
+        Commands::TmpfsScratchGc {
+            staleness_secs,
+            dry_run,
+            json,
+        } => cli::tmpfs_scratch_gc::handle_tmpfs_scratch_gc_command(staleness_secs, dry_run, json),
         Commands::Cleanup { action } => handle_cleanup_command(action),
         Commands::RecoverOrphans {
             workspace,

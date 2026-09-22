@@ -251,6 +251,11 @@ pub mod terminal_restore;
 /// module that asserts on log severity.
 #[cfg(test)]
 pub mod test_log_capture;
+/// Host-wide reclaim of orphaned Loom-named scratch directories parked on a
+/// `tmpfs`/`ramfs` mount (issue #8512) — see the module docs for the
+/// deliberately different, narrower safety model this needs relative to the
+/// worktree-attribution-based cargo-target reclaim (#7239).
+pub mod tmpfs_reclaim;
 pub mod token_ranking_refresh;
 pub mod tokens;
 pub mod tokens_pool;
