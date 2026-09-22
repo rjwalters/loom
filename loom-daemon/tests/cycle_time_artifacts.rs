@@ -229,13 +229,25 @@ fn the_documented_question_set_is_the_implemented_one() {
 
 #[test]
 fn every_question_binds_its_window_instead_of_hardcoding_one() {
-    let statements = QUERIES.matches("{since:DateTime}").count();
-    assert_eq!(
-        statements,
-        QUESTION_IDS.len(),
-        "every canonical question must bind its window as a parameter; editing a date literal \
-         into the SQL is the hand-written-SQL habit these artifacts replace"
-    );
+    // Cut on the `-- CTn. ` markers rather than counting occurrences globally:
+    // CT8 legitimately binds `{since:DateTime}` twice (once per side of its
+    // `FULL OUTER JOIN`), which is still a bound parameter reused twice, not a
+    // hand-edited literal — a global count-equals-question-count check would
+    // reject that as if it were under-parameterized.
+    let mut markers: Vec<usize> = QUESTION_IDS
+        .iter()
+        .map(|id| QUERIES.find(&format!("-- {id}. ")).unwrap())
+        .collect();
+    markers.push(QUERIES.len());
+    for window in QUESTION_IDS.iter().zip(markers.windows(2)) {
+        let (id, bounds) = window;
+        let body = &QUERIES[bounds[0]..bounds[1]];
+        assert!(
+            body.contains("{since:DateTime}"),
+            "{id} does not bind its window as a parameter; editing a date literal into the SQL \
+             is the hand-written-SQL habit these artifacts replace"
+        );
+    }
     let date_literal = Regex::new(r"(?m)^[^-].*'20\d\d-\d\d-\d\d").unwrap();
     assert!(
         date_literal.find(QUERIES).is_none(),
