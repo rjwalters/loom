@@ -271,6 +271,27 @@ fn validate_auth_format(bytes: &[u8], runtime: &str) -> Result<()> {
 }
 
 impl State {
+    /// Pin `TMPDIR` to a private directory inside this launch's own state
+    /// (#8650).
+    ///
+    /// Without this, a `bun --compile` harness (OpenCode) falls back to the OS
+    /// default (`$TMPDIR`, else `/tmp`) and extracts its ~5.5 MB embedded
+    /// native addon there on **every** launch, under a fresh
+    /// `.<hash>-0000000N.{so,node}` name that nothing ever removes — measured
+    /// at 7.6 GB across 1,382 files in 40 hours of scheduled role ticks on one
+    /// worker, which contributed to a live ENOSPC outage. Relocating the
+    /// writes into `<launch state>/tmp` makes them reclaimable by
+    /// [`crate::native_state_reclaim`], which removes the whole per-launch
+    /// directory once it is old enough; a bare `/tmp` extract is
+    /// unattributable and would have to be matched by filename pattern
+    /// instead (see that module's docs for why this direction was chosen).
+    fn pin_tmpdir(&self, command: &mut Command) -> Result<()> {
+        let path = self.directory.join("tmp");
+        private_directory(&path)?;
+        command.env("TMPDIR", path);
+        Ok(())
+    }
+
     pub(super) fn configure(&self, command: &mut Command, runtime: &str) -> Result<()> {
         if runtime == "kimi" {
             // `KIMI_CODE_HOME` is relocated by `provision::write_kimi_bindings`
@@ -285,11 +306,15 @@ impl State {
                 "LOOM_NATIVE_AUTH_FILE is not supported for the kimi harness; use the model \
                  profile's credentialEnv mapping (KIMI_MODEL_API_KEY) instead"
             );
-            return Ok(());
+            // `TMPDIR` is still pinned: every guarded harness is a self-extracting
+            // single-file binary of some shape, and none of them may scatter
+            // per-launch extracts into the shared OS `/tmp`.
+            return self.pin_tmpdir(command);
         }
         if let Some(auth) = &self.auth {
             validate_auth_format(auth, runtime)?;
         }
+        self.pin_tmpdir(command)?;
         // Guarded launches own these paths; ambient harness config cannot move
         // auth/session writes back into a checkout or another worker's state.
         if runtime == "pi" {

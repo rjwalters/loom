@@ -977,6 +977,14 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // cargo-target reclaim.
     let _ = crate::tmpfs_reclaim::run_for(repo_root);
 
+    // #8650: per-launch guarded-native-harness state under
+    // `~/.local/state/loom/native-tools/<hash>/<uuid>` — host-level like the
+    // two passes above, own host-wide cooldown. Nothing else can remove it:
+    // the launch chain `exec()`s all the way into the harness binary, so no
+    // process survives to clean up after a session. See
+    // `crate::native_state_reclaim`'s module docs.
+    let _ = crate::native_state_reclaim::run_for(repo_root);
+
     report
 }
 

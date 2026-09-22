@@ -154,6 +154,55 @@ fn harness_auth_and_session_paths_are_private_and_auth_snapshot_never_changes_so
     }
 }
 
+/// #8650: a `bun --compile` harness extracts its embedded native addon into
+/// the OS temp directory on every launch, so an unpinned `TMPDIR` leaks ~5.5
+/// MB into the shared `/tmp` per launch that nothing can attribute or remove.
+/// Both halves of the fix are asserted together here — pinning alone would
+/// only relocate the leak, since nothing ever removed a per-launch directory
+/// either.
+#[test]
+fn every_guarded_runtime_pins_tmpdir_into_launch_state_whose_extract_is_reclaimed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = workspace(temp.path(), "repo");
+    let base = temp.path().join("native-state");
+    for runtime in ["pi", "opencode", "kimi"] {
+        let state = create(&root, Some(&base), None, None).unwrap();
+        let mut command = Command::new("fixture-harness");
+        state.configure(&mut command, runtime).unwrap();
+
+        let tmpdir = command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("TMPDIR"))
+            .and_then(|(_, value)| value)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("{runtime} launch must pin TMPDIR"));
+        assert_eq!(tmpdir, state.directory.join("tmp"));
+        assert!(tmpdir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&tmpdir).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+
+        // The extract the harness would write, under the name the incident
+        // reported (`.<hash>-0000000N.node`).
+        let extract = tmpdir.join(".c0ffee1234567890-00000001.node");
+        fs::write(&extract, vec![0u8; 2048]).unwrap();
+
+        // The reclaim pass removes the whole launch directory once it is past
+        // the age floor — proving the extracted file is actually gone, not
+        // merely written somewhere else.
+        let launch_base = state.directory.parent().unwrap().parent().unwrap();
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(48);
+        let (removed, bytes) =
+            crate::native_state_reclaim::sweep(launch_base, 24 * 3600, far_future);
+        assert_eq!(removed, 1, "{runtime} launch state must be reclaimable");
+        assert!(bytes >= 2048);
+        assert!(!extract.exists(), "{runtime} native extract must be removed");
+        assert!(!state.directory.exists());
+    }
+}
+
 #[test]
 fn unsafe_or_malformed_auth_source_has_no_provisioning_side_effects_or_content_in_error() {
     let temp = tempfile::tempdir().unwrap();

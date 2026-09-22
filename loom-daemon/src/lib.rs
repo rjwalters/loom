@@ -572,4 +572,5 @@ mod tests {
 }
 
 pub mod native_readiness;
+pub mod native_state_reclaim;
 pub mod native_tools;

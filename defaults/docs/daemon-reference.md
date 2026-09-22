@@ -6171,6 +6171,64 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
 
 See `loom-daemon/src/scratch_reclaim.rs`.
 
+#### Guarded native-harness launch state reclaim (#8650)
+
+**What was leaking.** Every guarded native harness launch (pi / opencode /
+kimi) gets a fresh UUID-named state directory under
+`~/.local/state/loom/native-tools/<workspace-hash>/<launch-uuid>` (or under
+`$LOOM_NATIVE_TOOLS_DIR`), and nothing ever removed one: `State` has no `Drop`,
+and the launch chain `exec()`s all the way into the harness binary — no parent
+process survives to clean up after a session. On top of that, a `bun --compile`
+harness (OpenCode) extracts its ~5.5 MB embedded native addon into the OS temp
+directory on every launch under a fresh `.<hash>-0000000N.{so,node}` name. One
+worker accumulated **7.6 GB across 1,382 files in 40 hours** of scheduled
+role-runner ticks, contributing to a live ENOSPC outage.
+
+**The fix is two halves, and both are required.** `State::configure` now pins
+`TMPDIR` at `<launch-uuid>/tmp` for every guarded harness, which converts an
+unattributable `/tmp` extract into a file inside a directory the daemon
+created; this pass then removes the whole per-launch directory once it is stale.
+Pinning alone would only relocate the leak, and a `/tmp` filename-pattern sweep
+alone would have the daemon deleting from a namespace it does not own — the
+rule everywhere else in this section is that the daemon reclaims only what it
+created and can attribute.
+
+**Safety.** Two gates, both mandatory: a path must be literally
+`<base>/<64-hex-sha256>/<uuid>` (never the base, never a workspace-hash
+directory, never a deeper path, never a foreign name at either level), and its
+age must be at least `maxAgeHours` measured against the **newest mtime anywhere
+underneath it** — not the directory's own mtime, which freezes at launch time.
+A live harness writing session state or native extracts keeps its whole subtree
+fresh, so an in-flight launch is never a candidate. There is no process-liveness
+probe: the age floor is the entire safety boundary, as in `scratchReclaim` above.
+
+**Cadence.** A host-level sibling pass on the 15-minute `worktree_reaper` tick,
+alongside the docker-image and tmpfs passes, with a **host-wide** (not
+per-repo) 30-minute cooldown — per-launch state is keyed by workspace hash
+under one shared base, so a multi-repo host must not re-walk it once per repo.
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "nativeStateReclaim": {
+        "enabled": true,
+        "maxAgeHours": 24,
+        "minIntervalSecs": 1800
+      }
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_NATIVE_STATE_RECLAIM` | `autonomous.worktreeReaper.nativeStateReclaim.enabled` | env > config > default | `true` (on) |
+| `LOOM_NATIVE_STATE_RECLAIM_MAX_AGE_HOURS` | `autonomous.worktreeReaper.nativeStateReclaim.maxAgeHours` | env > config > default | `24` |
+| `LOOM_NATIVE_STATE_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.nativeStateReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
+
+See `loom-daemon/src/native_state_reclaim.rs`.
+
 #### `pr-<N>` worktrees are reaped too (#5939)
 
 Through v0.18.11 every automatic reclaim path was scoped to the `issue-<N>`
