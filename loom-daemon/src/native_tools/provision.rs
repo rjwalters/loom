@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::{fs, io::Write, path::Path, process::Command};
 
+pub mod reap;
+mod shared;
 mod state;
 
 pub use state::{outside_every_repository, private_directory};
@@ -160,8 +162,12 @@ pub fn configure(
     } else if runtime == "kimi" {
         write_kimi_bindings(command, root, directory, &binary)?;
     } else {
-        let config_dir = directory.join("opencode");
-        write_opencode_bindings(&config_dir)?;
+        // Shared per (workspace, binding content), NOT per launch (#8663): the
+        // CLI installs ~126 MB of pinned plugin dependencies beside these two
+        // files, and a per-launch copy of that leaked 30+ GB a day per host.
+        // Only this immutable tree is shared; every mutable XDG/auth/session
+        // path stays inside `state.directory` above.
+        let config_dir = shared::opencode_config_dir(&state.workspace)?;
         command.env("OPENCODE_CONFIG_DIR", &config_dir);
         let mut config = inherited_config()?;
         let object = config
