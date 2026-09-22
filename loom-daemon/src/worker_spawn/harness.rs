@@ -2,7 +2,31 @@
 use super::{
     credential::Resolved, opencode_version::Major, profiles::Selection, LaunchError, Options,
 };
-use std::{path::PathBuf, process::Command};
+use std::{
+    io::{Seek, SeekFrom, Write as _},
+    path::PathBuf,
+    process::{Command, Stdio},
+};
+
+/// Hand the CLI the expanded prompt through its own stdin rather than as an
+/// `argv` element (issue #8506 — Linux's `MAX_ARG_STRLEN` caps a single argv
+/// element at 128 KiB, which the judge/curator role expansion routinely
+/// exceeds). `tempfile::tempfile()` opens an already-unlinked file (no
+/// directory entry ever exists for it on Unix), so the prompt never appears
+/// anywhere `ps`/`/proc/<pid>/cmdline` can see and there is nothing left to
+/// clean up once the child exits. Writing the whole prompt before `exec`
+/// (rather than streaming through a live pipe) is required by `exec()`
+/// itself replacing this process image — there is no parent process left to
+/// keep writing to a pipe once the harness starts.
+fn prompt_stdin(prompt: &str) -> Result<Stdio, LaunchError> {
+    let mut file = tempfile::tempfile()
+        .map_err(|e| LaunchError::config(format!("cannot create prompt transfer file: {e}")))?;
+    file.write_all(prompt.as_bytes())
+        .map_err(|e| LaunchError::config(format!("cannot write prompt transfer file: {e}")))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| LaunchError::config(format!("cannot rewind prompt transfer file: {e}")))?;
+    Ok(Stdio::from(file))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Harness {
@@ -83,8 +107,12 @@ impl Harness {
                     }
                     command.args(["--thinking", effort]);
                 }
-                if let Some(prompt) = prompt {
-                    command.args(["--print", "--mode", "json", "--", prompt]);
+                if prompt.is_some() {
+                    // #8506: the prompt is delivered on stdin (below), never as an
+                    // argv element — Pi reads the message from stdin when no
+                    // positional message/`@file` argument is given, verified
+                    // against Pi 0.85.1.
+                    command.args(["--print", "--mode", "json"]);
                 }
             }
             Self::OpenCode => {
@@ -142,13 +170,14 @@ impl Harness {
                     }
                     command.arg("--auto");
                 }
-                if let Some(prompt) = prompt {
-                    command.args(["--", prompt]);
-                }
+                // #8506: no positional message argument — the prompt rides on
+                // stdin (below). OpenCode `run` reads the message from stdin
+                // when no `message` positional is given, verified against
+                // OpenCode 1.18.31.
             }
         }
-        if prompt.is_some() {
-            command.stdin(std::process::Stdio::null());
+        if let Some(prompt) = prompt {
+            command.stdin(prompt_stdin(prompt)?);
         }
         command.env("LOOM_MODEL", &selection.model);
         Ok(command)

@@ -1,24 +1,39 @@
 //! Native fake harness: tests argv, streams, exit status and exec identity.
 //! Std-only: the test compiles this file with bare `rustc`.
 
-/// Whether fd 0 is the null device, by `fstat` rather than by path, so a pipe,
-/// a TTY and an inherited file are all told apart from `/dev/null`.
+/// Classify fd 0 by `fstat` rather than by path, so a pipe, a TTY, a regular
+/// file and `/dev/null` are all told apart (issue #8506: the native harnesses
+/// now receive the prompt as a regular, already-fully-written file handed to
+/// stdin, never `/dev/null` and never the parent's own pipe).
 #[cfg(unix)]
-fn stdin_is_dev_null() -> bool {
+fn stdin_kind() -> &'static str {
     use std::os::fd::AsFd;
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let Ok(null) = std::fs::metadata("/dev/null") else {
-        return false;
-    };
-    std::io::stdin()
+    let Ok(meta) = std::io::stdin()
         .as_fd()
         .try_clone_to_owned()
         .and_then(|fd| std::fs::File::from(fd).metadata())
-        .is_ok_and(|stdin| stdin.file_type().is_char_device() && stdin.rdev() == null.rdev())
+    else {
+        return "unknown";
+    };
+    let file_type = meta.file_type();
+    if file_type.is_char_device() {
+        if std::fs::metadata("/dev/null").is_ok_and(|null| meta.rdev() == null.rdev()) {
+            "null"
+        } else {
+            "char_device"
+        }
+    } else if file_type.is_fifo() {
+        "pipe"
+    } else if file_type.is_file() {
+        "regular"
+    } else {
+        "other"
+    }
 }
 #[cfg(not(unix))]
-fn stdin_is_dev_null() -> bool {
-    false
+fn stdin_kind() -> &'static str {
+    "unknown"
 }
 
 fn main() {
@@ -45,7 +60,10 @@ fn main() {
     }
     println!("pid={}", std::process::id());
     println!("cwd={:?}", std::env::current_dir().unwrap_or_default());
-    println!("stdin_is_dev_null={}", stdin_is_dev_null());
+    let kind = stdin_kind();
+    println!("stdin_kind={kind}");
+    // Legacy compatibility with pre-#8506 assertions.
+    println!("stdin_is_dev_null={}", kind == "null");
     for arg in std::env::args_os().skip(1) {
         println!("arg={arg:?}");
     }
@@ -109,6 +127,25 @@ fn main() {
             println!("{{\"type\":\"step_finish\"}}");
         }
         _ => {}
+    }
+    // #8506: the harness now delivers the prompt on stdin instead of argv.
+    // Reading is safe here ONLY because it is gated on the fd kind: a
+    // "regular" file (our unlinked prompt-transfer tempfile) or "null" both
+    // hit EOF immediately with no writer to wait on. A "pipe" is
+    // deliberately left unread — one test holds a live, unwritten,
+    // never-closed pipe open across the whole run specifically to prove a
+    // launch never blocks on it, and reading here would hang that case
+    // forever.
+    if kind != "pipe" {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf).unwrap();
+        println!("stdin_len={}", buf.len());
+        // Printed last, on its own marker line, with the raw bytes following
+        // verbatim (not `Debug`-escaped) so a test can assert byte-for-byte
+        // delivery of an arbitrarily large prompt via a single split.
+        print!("STDIN_BEGIN\n");
+        std::io::Write::write_all(&mut std::io::stdout(), &buf).unwrap();
     }
     eprintln!("fixture stderr");
     std::process::exit(
