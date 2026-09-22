@@ -277,8 +277,10 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
         // environment-only (or refuses at launch with its own diagnostic).
         return ungated(CredentialSource::Unobservable);
     };
-    let Some(provider) = crate::worker_spawn::credential::pool_provider(&selection, source_var)
-    else {
+    let Some(provider) = crate::worker_spawn::credential::pool_provider(
+        selection.credential_pool.as_deref(),
+        source_var,
+    ) else {
         return ungated(CredentialSource::Unobservable);
     };
     let source = CredentialSource::ApiKeys {
