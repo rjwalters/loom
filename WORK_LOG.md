@@ -464,7 +464,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #8366**: feat(health): surface $-eq-per-weekly-point calibration signal, warn on step change
 - **Issue #8362** (closed): Add Rust Pi and OpenCode runtime adapters for GLM-5.3-Flash trials
 - **PR #8363**: feat: add Rust Pi/OpenCode adapters and reusable model profiles
-- **Issue #8361** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #8361** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #8253** (closed): dep-recheck-fingerprint: an already-MERGED PR's transient UNKNOWN mergeability still moves CONCLUSION_HASH (churns curator dep-recheck comments)
 - **PR #8356**: fix(dep-recheck): gate the merge-state bucket on state == "OPEN" (#8253)
 - **Issue #8346** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
@@ -518,7 +518,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #8283**: fix(champion): stop the proposal escalation ladder from re-fighting a human ruling (#8245)
 - **Issue #8241** (closed): [#8058 Phase 2] health.rs: class-scoped ModelCreditsExhausted marks for non-Claude providers
 - **PR #8278**: feat(tokens): class-scoped ModelCreditsExhausted marks in health.rs (#8058 Phase 2)
-- **Issue #8276** (closed): peer-claim coordination is DEGRADED on ip-172-31-74-176 (#6157 Layer 3)
+- **Issue #8276** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-42 (#6157 Layer 3)
 - **Issue #8173** (closed): test-loom-daemon-start.sh's #6568 control cases fail when the suite runs inside a Loom agent session (si_run does not strip LOOM_SWEEP_*/LOOM_TERMINAL_ID/LOOM_ROLE)
 - **PR #8274**: fix(tests): strip ambient agent-session env in test-loom-daemon-start.sh's si_run (#8173)
 - **Issue #8056** (closed): telemetry: outcome journal lacks judge verdicts, doctor cycles, failure class, effort, token account — and role-runner ticks emit no record at all
@@ -723,7 +723,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #8022**: fix(sweep-registry): pair tracked pids with a start-time identity so a recycled pid reads as dead (#7935)
 - **Issue #7977** (closed): [epic #7810 PR 5] Resolve release artifacts natively; auto_update.rs stops shelling out to --resolve-json
 - **PR #8017**: feat(daemon): resolve release artifacts natively; auto_update stops shelling out (#7977)
-- **Issue #8030** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #8030** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7923** (closed): Index guard: distinguish inert read-tree documentation from executable shell wrappers
 - **PR #8003**: fix(guard): distinguish inert documentation from executable index mutation
 - **Issue #7915** (closed): test-isolation: pr_set_dispatch_exports_no_lease_renewal_marker fails when run from inside a sweep (ambient LOOM_SWEEP_LEASE_RENEW_DISPATCHED leaks into the child)
@@ -916,7 +916,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #7733**: fix: make sync-labels.sh --check work on macOS stock bash 3.2
 - **PR #7682**: fix(merge-pr): guard hold_head assignment against pipefail abort
 - **PR #7714**: feat(ci): ratchet oversized source files instead of refactor-on-touch (#7711)
-- **Issue #7851** (closed): peer-claim coordination is DEGRADED on ip-172-31-74-176 (#6157 Layer 3)
+- **Issue #7851** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-42 (#6157 Layer 3)
 - **Issue #7832** (closed): Dangling Link Check fails fleet-wide: .loom/docs/ installed copies never resynced after PR #7806's anchor fix
 - **Issue #7831** (closed): 3 dangling doc anchors remain broken on main after #7806's 15-anchor fix
 - **Issue #7835** (closed): CI red on main: Dangling Link Check fails — .loom/docs/ anchor copies drifted from defaults/docs/
@@ -1018,7 +1018,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #7706** (closed): merge-pr.sh silently exits 1 on any loom:pr PR with comments but no champion:hold-state marker (pipefail + set -e bug)
 - **Issue #7515** (closed): Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292
 - **PR #7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
-- **Issue #7713** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7713** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **PR #7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 - **Issue #7530** (closed): Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip
 - **PR #7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
@@ -1100,10 +1100,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #7641**: fix(leases): preserve publisher yield exclusion through resync
 - **Issue #7520** (closed): peer-claim coordination is DEGRADED on robb-studio (#6157 Layer 3)
 - **Issue #7620** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
-- **Issue #7634** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7634** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7617** (closed): Curator's blocked-issue re-check claims/unclaims loom:curating on every pass instead of checking the fingerprint first
 - **PR #7630**: fix(curator): compute dep-recheck fingerprint before claiming loom:curating
-- **Issue #7628** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7628** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7567** (closed): Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries)
 - **PR #7623**: chore(activity): remove dead task/quality-metrics query API from ActivityDb
 - **Issue #7607** (closed): role_runner: pre-flight the token pool's spawnable count before each role tick — ~600 ticks/host/day spawn a 10 s process that exits 78 at token selection
@@ -1116,7 +1116,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #7616**: docs: correct CONTRIBUTING.md's Dependabot PR claim to match dependabot.yml
 - **Issue #7613** (closed): Champion Tier 3 backlog cap counts loom:operator-only/loom:blocked issues, permanently pinning the cap
 - **PR #7614**: fix: exclude operator-only/blocked issues from Tier 3 backlog cap
-- **Issue #7604** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7604** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7603** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
 - **Issue #7596** (closed): recover-orphans CLI path shares #7591's lease-probe read-failure/absence conflation
 - **PR #7598**: fix: recover-orphans lease-probe read-failure/absence conflation (#7596)
@@ -1128,18 +1128,18 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #7586** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
 - **PR #7138**: chore(deps): bump fast-uri from 3.1.4 to 3.1.7 in /mcp-loom
 - **PR #7137**: chore(deps): bump qs from 6.15.3 to 6.16.0 in /mcp-loom
-- **Issue #7585** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7585** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7577** (closed): Dependabot PRs for npm-workspace subdirectories (/mcp-loom, /dashboard/web) don't inherit loom:review-requested and sit inert
 - **PR #7579**: fix(dependabot): cover every package manifest with a labeled entry (#7577)
 - **Issue #7575** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
 - **Issue #7573** (closed): CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom: labels
 
 ### 2026-09-12
-- **Issue #7568** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7568** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7564** (closed): Curator: port provenance-aware dependency extraction upstream so resync preserves the heartbeat-loop fix
 - **PR #7565**: fix(curator): port provenance-aware extract-refs upstream to defaults/
 - **PR #6891**: docs: note that Dependabot PRs are inert to Loom automation
-- **Issue #7561** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7561** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7558** (closed): Guard false positive: loom:gh-pr-merge-redirect denies a positional arg whose confinement is broken by an earlier literal $(...) fragment
 - **PR #7559**: fix(guard): distinguish escaped from live $(/backtick in positional-arg masking
 - **Issue #7553** (closed): reaper: decline-cooldown clear fires on forge-probe failure, not just genuine label-absence
@@ -1148,7 +1148,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #7539**: fix(daemon): stop re-dispatching an issue the sweep declines on a hard-exclusion label
 - **Issue #7540** (closed): CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471
 - **PR #7543**: fix: replace printf|head first-line pipelines with param expansion to avoid SIGPIPE race
-- **Issue #7549** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7549** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7516** (closed): guard: mask_ask_positional_args() double-quote scan is still not escape-aware (ASK-tier sibling of the #7515 / #7363 fixes)
 - **PR #7524**: fix(guard): make mask_ask_positional_args() double-quote scan escape-aware
 - **Issue #7532** (closed): Guard friction: force-op:detached false-positive from $(cat <file>) cwd-capture shapes post-#6724
@@ -1166,7 +1166,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 ### 2026-09-11
 - **Issue #7513** (closed): daemon: status --json and health IPC round-trips exceed the 5s budget on every fleet host since the workspace-count bump — status path appears to scale with registered workspaces
 - **PR #7525**: daemon: instrument status/health build with per-phase timing
-- **Issue #7521** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7521** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **PR #6624**: ci: run the five heavy jobs on the dedicated CI runner (2am#29)
 - **PR #7510**: fix: escalate_peer_coordination_degraded() heredoc breaks bash 3.2 parser
 - **Issue #7508** (closed): loom-daemon-watchdog.sh peer-coordination escalation silently fails on macOS system /bin/bash (3.2): heredoc parse error, 1099x since 2026-08-16, zero issues ever filed from robb-studio
@@ -1347,7 +1347,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #7269**: fix(guide): has_superseding_block() misses PR merge-state/operator-hold
 - **Issue #7256** (closed): Flaky test: emit_batch_skips_the_metrics_post_for_an_all_lifecycle_batch races on MockSink's push-after-response ordering
 - **PR #7264**: test(otlp): record MockSink requests before writing the HTTP response
-- **Issue #7258** (closed): Peer-claim coordination watchdog alert flaps hourly on ip-172-31-76-7, driving issue-tracker and WORK_LOG churn
+- **Issue #7258** (closed): Peer-claim coordination watchdog alert flaps hourly on ip-198-51-100-23, driving issue-tracker and WORK_LOG churn
 - **PR #7262**: fix(watchdog): cooldown for peer-coordination escalation to stop flap-filing
 - **Issue #7252** (closed): find_processes_lsof() filters TYPE field for a value that only appears in the FD field, so it never matches on non-Linux
 - **PR #7259**: fix(worktree): check lsof FD field, not TYPE field, for cwd matches
@@ -1364,123 +1364,123 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #7241**: fix(health): compare role_liveness against the resolved role-runner interval
 - **Issue #6898** (closed): [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
 - **PR #6904**: docs(docker): normative container mount contract + worktree-correctness test
-- **Issue #7235** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7234** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7232** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7230** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7227** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7226** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7224** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7222** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7220** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7218** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7216** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7235** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7234** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7232** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7230** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7227** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7226** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7224** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7222** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7220** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7218** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7216** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-09-04
 - **Issue #7201** (closed): test-loom-daemon-update.sh: '--help documents --check/--dry-run/--no-restart' flaked on PR #6405 CI, unrelated to the PR's diff
 - **PR #7207**: fix(daemon): harden loom-daemon-update.sh --help against a same-path-rewrite race
-- **Issue #7209** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7209** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7205** (closed): No test coverage for uninstall-loom.sh's permissions.allow/deny cleanup logic
-- **Issue #7203** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7199** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7197** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7195** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7192** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7203** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7199** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7197** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7195** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7192** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7188** (closed): champion-epic.md: Phase Progression has no idempotency guard — near-duplicate 'Phase progress update' comments accumulate indefinitely
 - **PR #7191**: fix(champion): add idempotency guard to phase-progression status comments
-- **Issue #7189** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7186** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7184** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7182** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7179** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7189** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7186** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7184** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7182** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7179** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-09-03
-- **Issue #7178** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7176** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7173** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7170** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7178** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7176** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7173** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7170** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7168** (closed): version-bump tooling silently skips .loom/install-metadata.json sync, breaking Installer Integration Tests on every open PR
 - **PR #7171**: fix: gate Doctor's rebase-conflict push on version.sh sync
-- **Issue #7158** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7156** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7153** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7151** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7149** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7147** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7158** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7156** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7153** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7151** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7149** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7147** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-09-02
-- **Issue #7140** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7144** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7143** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7135** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7140** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7144** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7143** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7135** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7132** (closed): Flaky: test-loom-daemon-start.sh AD8 'refusal names the explicit-flag escape hatch' fails intermittently in CI
 - **PR #7136**: fix(tests): close AD8 decoy-kill reap race in test-loom-daemon-start.sh
 - **PR #7130**: fix: update stale FROZEN/future-tense peer-coordination wording
 - **Issue #7117** (closed): loom-daemon-watchdog.sh's peer-coordination DEGRADED issue template asserts stale FROZEN reclamation behavior
-- **Issue #7133** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7128** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7126** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7124** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7122** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7120** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7119** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7116** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7114** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7113** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7111** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7108** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7107** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7105** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7102** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7100** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7099** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7133** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7128** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7126** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7124** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7122** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7120** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7119** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7116** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7114** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7113** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7111** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7108** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7107** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7105** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7102** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7100** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7099** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-09-01
 - **Issue #7095** (closed): Guard: --search/--body value redaction breaks on escaped inner double-quotes (exact-phrase gh search), still hard-denies safe read-only lookups
 - **PR #7097**: fix(guard): DQSPAN models backslash-escaped inner quotes in strip_literal_text()
-- **Issue #7096** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7094** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7092** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7090** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7088** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7096** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7094** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7092** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7090** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7088** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7083** (closed): WORK_PLAN.md Ready section never excludes issues with an open loom:pr-labeled linked PR
 - **PR #7087**: fix(guide): exclude issues with an open loom:pr-linked PR from WORK_PLAN Ready
-- **Issue #7084** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7082** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7080** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7078** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7076** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7084** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7082** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7080** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7078** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7076** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-31
 - **PR #7072**: fix: exclude loom:blocked from WORK_PLAN Ready section and urgent-eligibility
 - **Issue #7071** (closed): WORK_PLAN Ready section and urgent-eligibility never exclude loom:blocked (only operator-only was fixed in #7008)
-- **Issue #7069** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7067** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7069** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7067** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-30
 - **PR #7063**: fix: feed crash/timeout fixture payloads via process substitution
 - **Issue #7060** (closed): Recurring flake in test-guard-codex-bridge.sh: printf broken pipe on 'bridge crashing before a decision' case
 - **PR #7052**: chore(deps): bump the all-dependencies group with 2 updates
-- **Issue #7053** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7051** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7053** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7051** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-29
 - **Issue #7048** (closed): Merge-risk hold re-forms after manual release: bot re-applied loom:operator to 17 released PRs within hours (#6720 recurrence)
 - **PR #7049**: fix: Champion respects a manual loom:operator release instead of silently re-holding (#7048)
-- **Issue #7047** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7045** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7044** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7047** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7045** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7044** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6165** (closed): Complete #4028: give the forge claim a liveness dimension (a lease), so cross-host correctness stops depending on the safehouse channel
 - **Issue #6514** (closed): judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
 - **PR #6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator (#6514)
 - **Issue #6317** (closed): [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **PR #6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4) (#6317)
-- **Issue #7039** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7037** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7039** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7037** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-28
-- **Issue #7035** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7033** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7035** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7033** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7021** (closed): Operator-hold clearance re-queue leaves stale loom:pr/loom:changes-requested label on PR
 - **PR #7031**: feat(champion): track per-PR conflict duration in the merge-risk hold digest (#7020)
 - **Issue #7020** (closed): Operator-held PRs rot to CONFLICTING with no freshness maintenance — hold-keeper: rebase trivial drift or at least flag rot in the hold digest
@@ -1488,18 +1488,18 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #7025** (closed): list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst still flakes after #6664's load-proportional bound (recurrence)
 - **PR #7027**: fix(deps): bump chacha20 0.10.1 -> 0.10.2 (yanked release breaking Security Scan CI) (#7024)
 - **Issue #7024** (closed): Security Scan CI fails fleet-wide: chacha20 0.10.1 (via rand) was yanked from crates.io
-- **Issue #7022** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7017** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7014** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7022** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7017** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7014** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7008** (closed): Guide's WORK_PLAN Ready section includes operator-only/blocked/building issues, causing repeated churn
 - **PR #7012**: fix(guide): exclude loom:operator-only from WORK_PLAN Ready/In Progress (#7008)
-- **Issue #7011** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #7009** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7011** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7009** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-27
-- **Issue #6987** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6989** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6990** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6987** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6989** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6990** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6978** (closed): merge-pr.sh: emit _recheck_mergeable_before_refusal() outcomes durably (follow-up from #6156)
 - **PR #6996**: feat(merge-pr): emit durable telemetry for the mergeable-recheck outcome (#6978)
 - **Issue #6994** (closed): loom-daemon: cross-host double-dispatch races specifically at quarantine-TTL expiry (4th occurrence, sg13g2-bandgap#4)
@@ -1553,15 +1553,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6919**: fix(capability-markers): anchor extraction on closing delimiter (no-space marker form)
 - **Issue #6893** (closed): [Parent #6885] Part 2: Capability-aware dispatch path with dry-run-by-default (AC1, AC3, AC4)
 - **PR #6915**: feat(dispatch): capability-aware loom:operator-mechanical lane, propose-only (#6893)
-- **Issue #6916** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6916** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-24
 
 - **Issue #6909** (closed): [Epic #6896] Phase 1: Container mount contract
 - **Issue #6910** (closed): [Epic #6896] Phase 1: loom-worker-session image layer
 - **Issue #6908** (closed): [Epic #6896] Phase 1: ADR — session-container architecture
-- **Issue #6912** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6905** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6912** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6905** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6899** (closed): [Epic #6896] loom-worker-session image layer: Codex CLI + tmux-server entrypoint FROM loom-worker
 - **PR #6911**: feat(docker): add loom-worker-session image layer (Codex CLI + tmux entrypoint)
 - **Issue #6883** (closed): Champion closes an issue on a merged PR without checking the issue's own acceptance criteria
@@ -1601,12 +1601,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6865**: fix(champion): key stale-pr-notice marker per staleness episode
 - **Issue #6768** (closed): check-verified-corrections-preserved.sh: pipefail + early-exit grep -q causes false-positive FAIL on large sections
 - **PR #6864**: fix: avoid pipefail SIGPIPE false-positive FAIL in check-verified-corrections-preserved.sh
-- **Issue #6857** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6857** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6828** (closed): Champion: stale loom:evaluating claims are permanently invisible to discovery — the staleness reconciliation in champion-issue-promo.md is unreachable
 - **PR #6845**: fix(champion): reclaim stale loom:evaluating claims via a self-healing rescan
 - **Issue #6816** (closed): loom-daemon: work-finder double-dispatched /loom:sweep for the same issue 8 seconds apart (race, not cadence)
 - **PR #6846**: fix(daemon): retry lease-order read-back before failing open on own comment missing
-- **Issue #6854** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6854** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6843** (closed): Champion's own held-PR comments reset criterion #5's recency clock, permanently blocking the stale-PR route to Doctor
 - **PR #6844**: fix(champion): criterion #5 recency check no longer resets on Champion's own PR comments
 - **Issue #6779** (closed): MCP self-repair assumes npm — 'npm ci' against a pnpm-managed server breaks the build it was meant to fix
@@ -1616,7 +1616,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #6825** (closed): verdict-staleness-guard.sh: invalid 'merged' JSON field crashes every invocation
 - **PR #6838**: feat(champion): port Dependency-Defer Fast Path to defaults/
 - **Issue #6775** (closed): Port 2AMLogic/2am#484's Champion Dependency-Defer Fast Path to defaults/
-- **Issue #6836** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6836** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **PR #6834**: docs: dead lock-holder PID is not evidence a dispatched agent is dead
 - **Issue #6765** (closed): A dead lock PID is not a dead agent: an orchestrator has no liveness signal for a subagent it dispatched
 - **PR #6835**: docs(docker): add top-level docker/README.md
@@ -1647,7 +1647,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #6740** (closed): Wire a first in-repo call site for `loom-daemon noop-cooldown record` (follow-up to #6670)
 - **Issue #6730** (closed): Builder version-bump commits repeatedly miss .loom/install-metadata.json
 - **PR #6810**: fix(scripts): enforce version.sh check automatically in create-pr.sh
-- **Issue #6812** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6812** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6736** (closed): test-forge-helpers-rate-limit-fallback.sh's forge_cmd.rs check (#5047) fails structurally in every installed consumer repo
 - **PR #6811**: fix(tests): SKIP forge_cmd.rs doc-string check when loom-daemon/src is absent
 - **Issue #6808** (closed): Guard catastrophic:aws s3 rb false-positives on substring matches inside quoted jq/string literals
@@ -1701,7 +1701,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 - **PR #6754**: test: raise test-random-file.sh sample count to eliminate CI flake
 - **Issue #6749** (closed): test-random-file.sh: negated re-inclusion assertion flaky/failing on CI (unrelated to PR #6737 diff)
-- **Issue #6753** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6753** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **PR #6756**: fix(forge): route native loom-daemon forge auto-merge through the App-token permission ladder
 - **Issue #6752** (closed): merge-pr.sh: native loom-daemon forge auto-merge has no App-token-permission fallback (unlike forge_gh_perm_safe)
 - **PR #6751**: fix(worktree-reaper): resolve PR status correctly when a branch has multiple PRs
@@ -1760,7 +1760,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #6688** (closed): loom-daemon status/health IPC round-trips take 8-22s+ under normal role-runner/work-finder load (repeated 5s timeouts)
 - **PR #6689**: fix(curator): sort issue-selection queries oldest-first
 - **Issue #6642** (closed): curator: select oldest-first so raw-issue age is bounded — an active curator currently ages 3-day-old issues past newer ones, mimicking curator-death
-- **Issue #6686** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6686** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **PR #6680**: loom-daemon: forward the build-cache env group into sweep children (#6667)
 - **Issue #6667** (closed): loom-daemon: forward RUSTC_WRAPPER/SCCACHE_BUCKET into dispatched sweep children
 - **PR #6679**: fix(daemon): name the uncommitted-files consequence of workspace add's auto-init
@@ -1814,26 +1814,26 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6598**: fix(daemon): name PrSet alternative in open-PR guard refusal; fix stale sweep.md claims
 - **Issue #6594** (closed): pr-worktree.sh leaves a stray pr-<N> worktree when its checkout collides with an existing builder worktree
 - **PR #6599**: fix(pr-worktree): detect branch-collision up front and clean up stray worktrees
-- **Issue #6591** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6590** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6588** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6584** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6587** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6586** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6585** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6582** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6581** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6580** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6579** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6591** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6590** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6588** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6584** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6587** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6586** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6585** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6582** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6581** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6580** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6579** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6577** (closed): check-defaults-version-bump.sh no-surface-change marker unreliable under CI's shallow merge-ref checkout
 - **PR #6578**: fix(ci): make no-surface-change marker detection reliable under CI's shallow checkout
 - **Issue #6574** (closed): defaults/roles/builder.md: troubleshooting link escapes the consumer repo (../../../ instead of ../)
 - **PR #6576**: docs(builder): use plain code-span for troubleshooting.md cross-reference
-- **Issue #6573** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6572** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6570** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6567** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #6563** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6573** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6572** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6570** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6567** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #6563** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6552** (closed): Guard: resolve_stash_cwd() cd-tracking splits on whitespace, so #5176's cd-prefix threading silently fails for any repo path containing a space
 - **PR #6564**: fix(guard): mask embedded spaces in quoted cd args for resolve_stash_cwd()
 - **Issue #6537** (closed): random-file.sh: hand-rolled gitignore parser mis-anchors top-level dirs and drops negation lines
@@ -1841,10 +1841,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-19
 
-- **Issue #6561** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6561** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6541** (closed): sweep-lease-renew.sh renew-once doesn't escalate on App-token 403, fails silently for entire lease lifetime
 - **PR #6562**: fix(sweep-lease-renew): route lease renewal through the escalation-ladder gh wrapper
-- **Issue #6558** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6558** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6549** (closed): guard: mktemp same-command rm-scope escape hatch (#6545) bypassable via decoy heredoc assignment
 - **PR #6553**: fix(guard): mask heredoc bodies before rm-scope mktemp same-command scan
 - **Issue #6554** (closed): npm run check:all / pnpm test runs cargo test on daemon-integration binaries with NO live-daemon guard (3rd unguarded entry point, cf #6386/#6528)
@@ -1863,7 +1863,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6539**: fix(daemon): make watchdog_provisioning_guard tests hermetic against ambient LOOM_AUTONOMY_MARKER
 - **Issue #6504** (closed): config: migrate host-specific absolute paths off the tracked .loom/config.json onto the local tier
 - **PR #6512**: feat(config): guard against host-specific absolute paths in tracked config.json
-- **Issue #6535** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6535** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #6528** (closed): cargo nextest run --workspace has no live-daemon guard: integration_security.rs/integration_factory_reset.rs kill every real tmux session on a fleet host
 - **PR #6533**: fix(tests): add live-daemon guard for the Rust daemon-integration nextest group
 - **Issue #6523** (closed): claim_reconciliation anchors PR-claim staleness on any comment, not claimant activity (#6514 follow-up)
@@ -1903,7 +1903,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6482**: fix(daemon): log role_runner disabled boot state at info with named source
 - **Issue #6471** (closed): auto_update: a refused/deferred roll leaves the running daemon spawning 'loom-daemon (deleted)' — every token_ranking_refresh probe fails until the restart lands
 - **PR #6481**: fix: survive a deleted-inode current_exe() when self-spawning helpers
-- **Issue #6478** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6478** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **PR #6477**: fix(guide): fully qualify the #1784 reference in the docs-maintenance PR body
 - **Issue #6377** (closed): loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted
 - **PR #6468**: fix(daemon): match live-process exe path against canonical directory in find_processes_executing_within
@@ -2054,7 +2054,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #6172** (closed): Redesign the variable-rooted write-target analysis in the worktree-isolation guard — #5397's carve-out approach produced three distinct bypasses
 - **PR #6267**: fix(guard): make COMMAND_NO_COMMENT quote-aware, closing a write-confinement bypass
 - **Issue #6252** (closed): [Epic #6172] Fix COMMAND_NO_COMMENT quote-unawareness and audit write idioms sharing COMMAND_ASK_SCAN
-- **Issue #6271** (closed): peer-claim coordination is DEGRADED on ip-172-31-74-176 (#6157 Layer 3)
+- **Issue #6271** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-42 (#6157 Layer 3)
 - **PR #6233**: fix(tests): make test-verify-install-scope.sh resolve its subject in installed repos
 - **Issue #6194** (closed): test-verify-install-scope.sh ships to consumer repos but cannot run there
 - **PR #6238**: feat(warn-operator-gated): match the "Operator task — requires human action" phrasing
@@ -2619,7 +2619,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #4993** (closed): operator: mint Developer ID Application cert and provision signing secrets for release CI
 - **Issue #4992** (closed): operator: enroll 2AM Logic in the Apple Developer Program (org account)
 - **Issue #4996** (closed): operator: provision gf180 clones + workspaces on robb-pro to absorb sim-heavy load (18 cores mostly idle)
-- **Issue #5062** (closed): loom-worker-1 telemetry ingest key is bound to ip-172-31-74-176 while filing under loom-worker-1 (~35h unactioned)
+- **Issue #5062** (closed): loom-worker-1 telemetry ingest key is bound to ip-198-51-100-42 while filing under loom-worker-1 (~35h unactioned)
 - **PR #4972**: chore(deps): bump libc from 0.2.186 to 0.2.189 in the all-dependencies group
 - **PR #5132**: fix(daemon): make the restart primitive supervisor-aware and self-healing
 - **Issue #4933** (closed): Bash-tool write-confinement is bypassed by quoting the `cd` argument

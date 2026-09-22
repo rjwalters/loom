@@ -75,7 +75,7 @@ describe("validateAccessJwt", () => {
     expiresIn?: string;
     email?: string;
   } = {}): Promise<string> {
-    return new SignJWT({ email: overrides.email ?? "operator@2amlogic.com" })
+    return new SignJWT({ email: overrides.email ?? "operator@example.com" })
       .setProtectedHeader({ alg: "RS256" })
       .setIssuedAt()
       .setIssuer(overrides.iss ?? `https://${TEAM_DOMAIN}`)
@@ -89,7 +89,7 @@ describe("validateAccessJwt", () => {
   it("accepts a validly signed token with the correct aud/iss, resolving the identity", async () => {
     const token = await signToken();
     const result = await validateAccessJwt(`CF_Authorization=${token}`, env, jwksResolver);
-    expect(result).toEqual({ email: "operator@2amlogic.com", sub: undefined });
+    expect(result).toEqual({ email: "operator@example.com", sub: undefined });
   });
 
   it("rejects (falls back to public — returns null) a token with the wrong aud", async () => {
@@ -154,13 +154,13 @@ describe("validateAccessJwt", () => {
 
     const loginToken = await signToken();
     await expect(validateAccessJwt(`CF_Authorization=${loginToken}`, multiAudEnv, jwksResolver)).resolves.toEqual({
-      email: "operator@2amlogic.com",
+      email: "operator@example.com",
       sub: undefined,
     });
 
     const apiToken = await signToken({ aud: "api-app-aud-tag" });
     await expect(validateAccessJwt(`CF_Authorization=${apiToken}`, multiAudEnv, jwksResolver)).resolves.toEqual({
-      email: "operator@2amlogic.com",
+      email: "operator@example.com",
       sub: undefined,
     });
   });
@@ -234,7 +234,7 @@ describe("validateAccessJwt", () => {
   });
 
   it("resolves the sub claim when the token carries one", async () => {
-    const token = await new SignJWT({ email: "operator@2amlogic.com", sub: "user-123" })
+    const token = await new SignJWT({ email: "operator@example.com", sub: "user-123" })
       .setProtectedHeader({ alg: "RS256" })
       .setIssuedAt()
       .setIssuer(`https://${TEAM_DOMAIN}`)
@@ -243,6 +243,6 @@ describe("validateAccessJwt", () => {
       .setSubject("user-123")
       .sign(privateKey);
     const result = await validateAccessJwt(`CF_Authorization=${token}`, env, jwksResolver);
-    expect(result).toEqual({ email: "operator@2amlogic.com", sub: "user-123" });
+    expect(result).toEqual({ email: "operator@example.com", sub: "user-123" });
   });
 });
