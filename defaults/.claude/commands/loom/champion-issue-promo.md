@@ -647,7 +647,10 @@ A criterion 6/8 failure is `premise-false` only when the proposal's central
 factual claim is **conclusively false** on current `main` — a cited file
 doesn't exist, a "tracked" file isn't tracked, a cited line range doesn't
 exist, a quoted string isn't present. Mere imprecision ("near line 40, not
-exactly 12") is an ordinary finding, not this kind.
+exactly 12") is an ordinary finding, not this kind — and **a count mismatch is
+premise-false only when the correct count is zero** (#8313): an undercount of
+a still-true problem ("26 files lack the marker", re-count 38) is imprecision,
+and the premise holds.
 
 Tag it `[premise-false]` and cite the literal mechanical check + output, not a
 paraphrase:
@@ -658,11 +661,28 @@ paraphrase:
   grep -Fx src/does/not/exist.rs` → (no output, exit 1)
 ```
 
-Other acceptable checks: `git ls-files '<pattern>'` ("tracked" claims), `wc -l
-<path>` (line-range claims), `grep -c '<string>' <path>` ("string appears"
-claims) — always against `origin/main`, always with literal output. This tag
-and citation are what Step 4's premise-false close gate reads back on the N=2
-pass — an untagged or uncited finding never triggers that gate.
+The other acceptable checks — "tracked", line-range and "string appears"
+claims — are the evidence table in
+[`champion-premise-false-evidence.md`](champion-premise-false-evidence.md),
+always against `origin/main`, always with literal output. This tag and
+citation are what Step 4's premise-false close gate reads back on the N=2 pass
+— an untagged or uncited finding never triggers that gate.
+
+##### Three rules that make a cited check citable (#8593)
+
+The resolver snippet, the full evidence table and the #8494 incident behind
+them: [`champion-premise-false-evidence.md`](champion-premise-false-evidence.md).
+
+1. **Resolve symlinks first.** A path whose `origin/main` tree entry is mode
+   `120000` (every `.loom/docs/*.md` since #7842) reads back through git as
+   its link-target string, so any `grep`/`wc` over it is empty whatever the
+   document says — that is how #8494 was closed on two true premises. Resolve
+   with `resolve_main_path`, check **that** path, and cite it in the finding.
+2. **Counting form only** (`grep -c`, `wc -l`), so a false premise produces a
+   *non-empty* output.
+3. **An empty result is "check inconclusive", never "premise false"** — on a
+   path that exists on `main` it cannot be told apart from a check that could
+   not read the file at all, so it is not citable evidence.
 
 ---
 
@@ -1315,17 +1335,28 @@ PREMISE_FALSE_FINDINGS=$(printf '%s\n' "$RECURRING_FINDINGS_TEXT" | grep -c '^- 
 
 if [ "$TOTAL_FINDINGS" -gt 0 ] && [ "$TOTAL_FINDINGS" -eq "$PREMISE_FALSE_FINDINGS" ]; then
   # Every recurring finding is premise-false. Re-run EACH cited mechanical
-  # check verbatim against CURRENT origin/main before closing -- never trust
-  # the prior verdict's captured output, since the repo may have changed:
-  #   git fetch origin main
-  #   <re-run every "verified via: <command>" from the findings list above,
-  #    exactly as cited>
-  # If ANY re-run check now shows the premise IS true after all (the path now
-  # exists, the string is now present, the count now matches), this gate does
-  # NOT apply -- the world changed under the proposal, and only a fresh
-  # evaluation is correct: go to Step 1, not to closing or escalating on a
+  # check against CURRENT origin/main (`git fetch origin main` first) -- never
+  # trust the prior verdict's captured output, since the repo may have changed.
+  #
+  # RESOLVE, THEN CHECK, THEN SCORE (#8593). "Verbatim" is not enough: if the
+  # cited path is a symlink (mode 120000 -- every .loom/docs/*.md is one), a
+  # verbatim re-run reads the link-target string and reproduces the SAME false
+  # negative, so the escape hatch below can never fire. For each cited path:
+  #   P=$(resolve_main_path "$p")   # champion-premise-false-evidence.md
+  # re-run the check against "$P" in a counting form, quote "$P" in the close
+  # comment, and score each result per that file's evidence table:
+  #   false        -- positive evidence (absent from `git ls-tree`; `grep -c`
+  #                   = 0, or `wc -l` below the cited range, on a regular blob)
+  #   inconclusive -- no output on a path that exists on main, an error, or an
+  #                   unresolved 120000 read
+  #   true         -- the premise now holds (path present, string found, ...)
+  # ANY inconclusive => CLOSE_PREMISE_FALSE=no, fall through to the ordinary
+  # escalation branch: an operator reading an unreadable check is cheap, and a
+  # close on a check that cannot match is what #8494 cost. ANY true => this
+  # gate does not apply at all -- the world changed under the proposal, so go
+  # to Step 1 for a fresh evaluation rather than closing or escalating on a
   # now-stale finding.
-  CLOSE_PREMISE_FALSE=yes
+  CLOSE_PREMISE_FALSE=yes   # only if EVERY re-run scored `false`
 else
   CLOSE_PREMISE_FALSE=no
 fi
@@ -1333,8 +1364,9 @@ fi
 
 | `CLOSE_PREMISE_FALSE` | Re-run outcome | What to do |
 |---|---|---|
-| `yes` | every re-run check still confirms false | **Close** — use the template below. Do not apply `loom:operator-only` |
+| `yes` | every re-run check still confirms false, on resolved paths, with positive evidence | **Close** — use the template below. Do not apply `loom:operator-only` |
 | `yes` | a re-run check now contradicts the prior finding | Premise no longer false — do not close or escalate on it; go to Step 1 instead (like the dependency gate's `REEVALUATE`) |
+| `yes` | any re-run check is **inconclusive** — no output on a path that exists on `main`, or a read of an unresolved `120000` entry | Do **not** close. Re-run it against `resolve_main_path`'s output in a counting form first; if it is still inconclusive, fall through to the ordinary escalation branch (#8593) |
 | `no` | mixed premise-false + ordinary finding, or none at all | Fall through to the ordinary escalation branch below, unchanged |
 
 **Closing (`CLOSE_PREMISE_FALSE=yes`, re-verified false):**
@@ -1346,9 +1378,10 @@ gh issue comment <number> --body "$CLOSE_MARKER
 **Champion: Closing — Premise Verified False**
 
 [One-paragraph rationale: name the finding(s), the exact mechanical check(s)
-re-run against \`origin/main\` @ \`$MAIN_SHA\`, and their output, so a human
-skimming the closed issue can see for themselves why no operator decision was
-needed. Implemented per #7657.]
+re-run against \`origin/main\` @ \`$MAIN_SHA\` — quoting the RESOLVED path for
+any symlinked citation (#8593) — and their literal output, so a human skimming
+the closed issue can see for themselves why no operator decision was needed.
+Implemented per #7657.]
 
 ---
 *Automated by Champion role*" \

@@ -24,10 +24,11 @@
 1971 defaults/.claude/commands/loom/champion-epic-guard-invariants.md
 1836 defaults/.claude/commands/loom/champion-epic-standdown.md
 13864 defaults/.claude/commands/loom/champion-epic.md
-24447 defaults/.claude/commands/loom/champion-issue-promo.md
+25068 defaults/.claude/commands/loom/champion-issue-promo.md
 1059 defaults/.claude/commands/loom/champion-merge-risk-shadow.md
 47272 defaults/.claude/commands/loom/champion-pr-merge.md
-12846 defaults/.claude/commands/loom/champion-reference.md
+1072 defaults/.claude/commands/loom/champion-premise-false-evidence.md
+12873 defaults/.claude/commands/loom/champion-reference.md
 3749 defaults/.claude/commands/loom/champion.md
 1100 defaults/.claude/commands/loom/comment-body-literal-path.md
 35434 defaults/.claude/commands/loom/curator.md
