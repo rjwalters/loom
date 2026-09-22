@@ -1,0 +1,178 @@
+loom-daemon-start.sh - Safe start wrapper for the RAW loom-daemon process
+(the autonomous work-finder + main-health-gate host — epic #3809, Phase D
+#3813).
+
+This is NOT the tmux agent pool. `.loom/bin/loom start` (loom-start.sh)
+manages the Manual-Orchestration-Mode tmux pool; THIS script backgrounds the
+`loom-daemon` binary itself, which hosts the autonomous forge-polling work
+finder (#3810) and the reactive main-health gate (#3812). The two process
+models are independent and can coexist.
+
+It:
+  - locates the loom-daemon binary,
+  - runs the (advisory, never-blocking) host-sleep check (#3350),
+  - starts a plain reliability daemon with BOTH autonomous loops OFF by
+    default (matching the ecosystem-wide opt-in / default-off contract:
+    LOOM_WORK_FINDER unset => off, LOOM_MAIN_HEALTH_GATE unset => off). Opt in
+    explicitly with --work-finder / --health-gate, or hand control to
+    .loom/config.json -> autonomous with --from-config (#3911),
+  - on macOS, backgrounds the daemon as a launchd LaunchAgent (#3972) in the
+    resolved per-user domain (`gui/<uid>` when a GUI login is active, else
+    `user/<uid>` — #4130, so it can also be (re)started headlessly over SSH)
+    so it survives the launching session's death instead of a plain `nohup ...
+    &`; on a systemd Linux host, installs + enables a `systemd --user` service
+    (#4268) that mirrors the launchd contract (Restart=on-success,
+    disable-on-stop, LOOM_DAEMON_SUPERVISOR=systemd) — see --no-systemd for the
+    escape hatch; on a non-systemd Linux host (or with --no-systemd) it stays a
+    plain nohup background job,
+  - arms the autonomy-loss watchdog (#4011): on Darwin a SECOND launchd
+    StartInterval job, on a systemd Linux host a `<unit>-watchdog.timer` +
+    `.service` pair (#4260 sub-issue D) — both drive the SAME
+    loom-daemon-watchdog.sh payload on a recurring interval, independent of
+    the daemon job/unit, so a wedged or dead daemon still gets checked,
+  - self-heals a watchdog-provisioning GAP (#5343): if the daemon was armed
+    by a path other than a fresh start here (e.g. `fleet add-worker`'s
+    hand-rolled systemd unit install, or the daemon's own startup marker
+    healing, #4331) the autonomy-desired marker can end up present with NO
+    watchdog ever provisioned. Re-running this script against an
+    ALREADY-RUNNING daemon now provisions the missing watchdog before
+    exiting (rather than a bare "already running" no-op), or — on a
+    platform tier with no scheduled-job mechanism at all — files ONE
+    tracking issue instead of leaving the gap as a status line nobody reads,
+  - backgrounds the daemon and writes a PID file (.loom/.daemon.pid),
+  - persists the resolved invocation flags to .loom/.daemon.flags so
+    `loom-daemon-update.sh` (#3968) can restart with EXACTLY the same
+    autonomy flags after a rebuild — never wider,
+  - surfaces the singleton-guard refusal (#3806) legibly instead of leaving a
+    silently-exited background process.
+
+Default is FLAGS-OFF: a bare `loom-daemon-start.sh` does NOT auto-dispatch
+sweeps. This is a deliberate safe default — enable autonomy explicitly.
+
+macOS session-bootstrap hazard (#3972): a plain `nohup "$DAEMON_BIN" &`
+leaves the process wired into the LAUNCHING SESSION's Mach bootstrap
+namespace. When that session dies (a Claude Code session crash, a closed
+terminal, a dropped SSH connection) the daemon and every child it spawns
+start failing XPC lookups to trustd (cert verification -- `gh` TLS errors)
+and opendirectoryd (`getpwuid` -- "No user exists for uid N" from `git`),
+with NO crash and no obvious log signal beyond those downstream errors. This
+is why "start it from a terminal that might die" is unsafe on macOS. This
+script defaults to loading the daemon as a `launchd` LaunchAgent on Darwin
+specifically to avoid that failure mode; see --no-launchd below for the
+escape hatch and daemon-reference.md Operability for the incident writeup.
+
+launchd domain (#4130): the LaunchAgent is loaded into the domain
+resolve_launchd_domain() (lib/launchd-domain.sh) picks — `gui/<uid>` when a
+GUI (Aqua) login session is active (byte-for-byte the pre-#4130 behavior),
+else the background per-user `user/<uid>` domain that sshd instantiates, so a
+headless / SSH-only start no longer fails with `error 125: Domain does not
+support specified action`. Override with LOOM_LAUNCHD_DOMAIN.
+
+Usage:
+  ./.loom/scripts/cli/loom-daemon-start.sh                 Reliability daemon (both loops OFF)
+  ./.loom/scripts/cli/loom-daemon-start.sh --work-finder   Enable the autonomous work finder
+  ./.loom/scripts/cli/loom-daemon-start.sh --health-gate   Enable the main-health gate
+  ./.loom/scripts/cli/loom-daemon-start.sh --work-finder --health-gate   Both loops ON
+  ./.loom/scripts/cli/loom-daemon-start.sh --from-config   Enable per .loom/config.json only
+  ./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder    Force work finder OFF (explicit)
+  ./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate    Force health gate OFF (explicit)
+  ./.loom/scripts/cli/loom-daemon-start.sh --from-config --work-finder   Config-driven, but FORCE the work finder on (#4353)
+  ./.loom/scripts/cli/loom-daemon-start.sh --from-config --no-health-gate   Config-driven, but FORCE the health gate off (#4353)
+  ./.loom/scripts/cli/loom-daemon-start.sh --foreground    Run in the foreground (no PID file)
+  ./.loom/scripts/cli/loom-daemon-start.sh --no-launchd    macOS only: use legacy nohup instead of a LaunchAgent
+  ./.loom/scripts/cli/loom-daemon-start.sh --no-systemd    Linux only: use legacy nohup instead of a systemd --user service
+  ./.loom/scripts/cli/loom-daemon-start.sh --print-plist   Print the LaunchAgent plist that WOULD be installed and exit (no side effects)
+  ./.loom/scripts/cli/loom-daemon-start.sh --print-unit    Print the systemd --user unit that WOULD be installed and exit (no side effects)
+  ./.loom/scripts/cli/loom-daemon-start.sh --force-env     Acknowledge an intentional narrower re-render (#4522) -- actually DROPS env keys missing from this invocation's env; without it, dropped keys are carried forward from the installed unit/plist by default (#5344)
+  ./.loom/scripts/cli/loom-daemon-start.sh --heal-watchdog-only   Re-provision a missing watchdog job/timer (#5343's heal_watchdog_provisioning_gap) and exit -- never touches the PID file or attempts to start/stop a daemon (#5405)
+  ./.loom/scripts/cli/loom-daemon-start.sh --help
+
+Environment:
+  LOOM_DAEMON_BIN     Path to the loom-daemon binary (else auto-detected)
+  LOOM_SOCKET_PATH    Override the daemon socket (default ~/.loom/loom-daemon.sock)
+  LOOM_PID_FILE       OUTPUT, not input (#6420). This script is the EXPORTER of
+                       the pid-file path -- it derives "<state home>/.daemon.pid"
+                       and exports/bakes it into the plist/unit for the daemon
+                       and every reader (loom-daemon-stop.sh, -update.sh,
+                       -watchdog.sh, daemon_pidfile.rs), all of which DO honor an
+                       inbound value as tier 1 (#6386/#5118). An inbound value is
+                       deliberately ignored HERE; to place the pid file elsewhere,
+                       move the state home (LOOM_MACHINE_CHECKOUT / the repo root
+                       $PWD resolves to). See the rationale at the export site.
+  LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE  Respected when already exported
+                       (always wins, even under --from-config -- #4353)
+  LOOM_DAEMON_LAUNCHD  macOS only: 0/false/no forces the legacy nohup path (same as --no-launchd)
+  LOOM_DAEMON_SYSTEMD  Linux only: 0/false/no forces the legacy nohup path (same as --no-systemd)
+  LOOM_SYSTEMD_UNIT    Linux only: override the systemd --user unit name (default loom-daemon.service)
+  LOOM_WATCHDOG_LABEL  Override the watchdog job identifier (macOS: LaunchAgent
+                       label, default <daemon label>-watchdog; systemd Linux:
+                       service/timer unit basename, default <daemon unit>-watchdog)
+  LOOM_WATCHDOG_INTERVAL_SECS  Watchdog check cadence in seconds (default 300) —
+                       macOS StartInterval / systemd OnUnitActiveSec+OnBootSec
+  LOOM_LAUNCHD_LABEL   macOS only: override the LaunchAgent label (default com.rjwalters.loom-daemon)
+  LOOM_ALLOW_SESSION_DAEMON_START  Acknowledge a deliberate PRODUCTION start
+                       from inside a Loom agent session (#6568). By default,
+                       a shell exporting agent-session vars
+                       (LOOM_SWEEP_*/LOOM_TERMINAL_ID/LOOM_ROLE) is REFUSED a
+                       real start that would write the DEFAULT supervisor
+                       identity (com.rjwalters.loom-daemon /
+                       loom-daemon.service) -- the 2026-08-17 incident, where
+                       a sweep's start-path test overwrote the production
+                       LaunchAgent on both operator Macs with its own
+                       session env. Scope the identity instead
+                       (LOOM_LAUNCHD_LABEL / LOOM_SYSTEMD_UNIT) for a test;
+                       set this to 1 only for a genuine operator start.
+                       --print-plist/--print-unit are never refused (warn
+                       only). Independently of this refusal, the session-
+                       scoped keys themselves (LOOM_SWEEP_*,
+                       LOOM_TERMINAL_ID, LOOM_ROLE, LOOM_RUNTIME) are ALWAYS
+                       stripped from the rendered plist/unit and are never
+                       carried forward from an installed one.
+  LOOM_LAUNCHD_DOMAIN  macOS only: pin the launchd domain (e.g. gui/$(id -u) or
+                       user/$(id -u)); honored verbatim, else auto-resolved
+                       gui→user (#4130). A pinned domain that does not resolve
+                       fails loudly at bootstrap rather than falling back.
+  LOOM_DAEMON_PATH        Full override for the rendered plist's PATH (#4172).
+                       Used verbatim -- no canonical fallback is appended. For
+                       a host that needs a wholly custom PATH.
+  LOOM_DAEMON_PATH_EXTRA  Extra dir(s) to prepend onto the canonical minimal
+                       PATH (#4172) instead of overriding it entirely -- for
+                       a host that needs one or two additional dirs (e.g. a
+                       project-local toolchain) without inheriting the WHOLE
+                       invoking shell's interactive PATH.
+  LOOM_DAEMON_BOOTOUT_SETTLE_SECS  macOS/launchd only (#5081): max seconds to
+                       poll `launchctl print` after a `bootout`, waiting for
+                       the old job to actually leave the bootstrap namespace,
+                       before attempting `bootstrap` (default 5). `bootout`
+                       is asynchronous; an immediate `bootstrap` can race it
+                       and fail with "Bootstrap failed: 5: Input/output
+                       error" even against a valid plist.
+  LOOM_DAEMON_BOOTSTRAP_RETRY_ATTEMPTS  macOS/launchd only (#5081): max
+                       `launchctl bootstrap` attempts when it keeps failing
+                       with that same async-race I/O error (default 4).
+                       Never retries on any OTHER bootstrap failure (a
+                       genuinely bad plist/permission problem a retry cannot
+                       fix).
+  LOOM_DAEMON_BOOTSTRAP_RETRY_SECS  macOS/launchd only (#5081): seconds to
+                       sleep between bootstrap retries (default 2).
+  LOOM_MACHINE_CHECKOUT  Machine mode (Epic #3835 Phase 3b, #4229): set by
+                       the `scripts/loom` dispatcher to the resolved
+                       ~/.local/share/loom checkout before it execs this
+                       script. When set, the plist's WorkingDirectory and the
+                       pid/flags home resolve from THIS path -- not from
+                       $PWD -- so `loom start` manages the SAME machine-wide
+                       singleton daemon no matter which repo it is run from.
+                       Direct invocation of this script (the existing dev
+                       workflow) never sets it and is unaffected: $PWD-based
+                       find_repo_root() stays the fallback. See
+                       defaults/docs/machine-dispatcher.md.
+
+Exit codes:
+  0  daemon started (or already running)
+  1  usage error / binary not found / daemon failed to start / (#5409) a
+     DETECTED autonomy downgrade on a real start, refused pending an
+     explicit --work-finder / --no-work-finder / --health-gate /
+     --no-health-gate / --from-config / (#6568) a real start from a shell
+     carrying agent-session context that would write the DEFAULT supervisor
+     identity, refused pending an explicit LOOM_LAUNCHD_LABEL /
+     LOOM_SYSTEMD_UNIT or LOOM_ALLOW_SESSION_DAEMON_START=1

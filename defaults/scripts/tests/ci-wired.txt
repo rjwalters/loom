@@ -134,10 +134,7 @@ test-judge-tdd-merge-base.sh
 test-land-resync-commit.sh
 test-live-state-sandbox.sh
 test-locate-daemon-bin.sh
-test-loom-daemon-launchd-plist.sh
 test-loom-daemon-quiesce.sh
-test-loom-daemon-start.sh
-test-loom-daemon-update.sh
 test-loom-daemon-stop.sh
 test-loom-status.sh
 test-mcp-config.sh

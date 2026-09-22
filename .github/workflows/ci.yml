@@ -1147,6 +1147,39 @@ jobs:
       # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
       - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
         run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
+      # Moved out of shell-suite-tests by #8087, the same move #8086 made for
+      # the watchdog one line above and for the same reason: cli/
+      # loom-daemon-start.sh is now a thin stub over `loom-daemon
+      # daemon-start`, so these three suites need the binary this job builds.
+      # Each pins it via loom_test_require_daemon_bin --self-only, which leaves
+      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this caller starts or
+      # probes" — the fake-daemon seam every launch-path case drives — and each
+      # FAILS (never SKIPs) without a binary, so this job cannot report green
+      # while running nothing.
+      #
+      # All three, not just the start suite: test-loom-daemon-launchd-plist.sh
+      # renders every plist by invoking the real start script, and
+      # test-loom-daemon-update.sh builds its fixtures from
+      # lib/daemon-update-fixtures.sh, which copies that script in and execs it
+      # on the restart / --relaunch / full-update flows.
+      #
+      # Running them here rather than in shell-suite-tests also means the
+      # live-daemon guard (#6386) no longer covers the two that are
+      # LIVE_DAEMON_GUARDED_SUITES members. Same reasoning as the watchdog
+      # above: safe on THIS runner and only here — a GitHub runner has no
+      # daemon, no pid file and nothing to bootout. On a developer host, run
+      # them through run-ci-suites.sh, which still names both in that guard.
+      #
+      # This job's steps are sequential, so the pair also gets the isolation
+      # run-ci-suites.sh's SERIAL_LANE_SUITES pin (#6622 AC5, #6639/#7391) was
+      # giving them inside its concurrent pool — by construction rather than by
+      # quarantine list.
+      - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
+        run: bash defaults/scripts/tests/test-loom-daemon-start.sh
+      - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
+        run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
+      - name: loom-daemon-update (#4078, #6639, #8087)
+        run: bash defaults/scripts/tests/test-loom-daemon-update.sh
       - name: generic runtime adapter through native worker dispatcher (#8362)
         run: bash defaults/scripts/tests/test-spawn-generic.sh
       # #8255: skip-labels.sh is a thin stub over `loom-daemon skip-labels`,

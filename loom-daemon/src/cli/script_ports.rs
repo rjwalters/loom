@@ -85,6 +85,14 @@ pub(crate) enum ScriptPortCommand {
     /// `StartInterval` cadence, so it owns no long-lived process.
     DaemonWatchdog(super::watchdog::WatchdogArgs),
 
+    /// Safe start wrapper for the raw `loom-daemon` process (#8087), backing
+    /// `loom-daemon-start.sh`. Unlike every other port here it STARTS A
+    /// PROCESS, and it must bring that process up with byte-identical
+    /// autonomy flags to what the shell computed — see
+    /// `daemon_start`'s module doc for why "did it start?" is not a test of
+    /// that.
+    DaemonStart(super::daemon_start::DaemonStartArgs),
+
     /// The combined "not a work item" label list for a role prompt's
     /// unfiltered fallback query (#8255): the fleet-wide hard exclusions
     /// (`hard-exclusion-labels.sh`'s list) plus this workspace's configured
@@ -143,6 +151,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
+            ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
