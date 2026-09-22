@@ -50,11 +50,12 @@ fn allowlist_contains_no_token_that_could_reach_a_model() {
 
 #[test]
 fn readiness_argv_is_allowlisted_and_a_refusal_never_echoes_the_token() {
-    assert_eq!(validate_readiness(&[]).unwrap(), vec!["--version".to_owned()]);
     assert_eq!(
-        validate_readiness(&["debug".into(), "config".into()]).unwrap(),
-        vec!["debug".to_owned(), "config".to_owned()]
+        validate_readiness(&[]).unwrap(),
+        vec!["debug".to_owned(), "config".to_owned()],
+        "the default must be the argv shown to reach the plugin loader, not --version (#8600)"
     );
+    assert_eq!(validate_readiness(&["--version".into()]).unwrap(), vec!["--version".to_owned()]);
     // Every refusal produces a byte-identical message, whatever was rejected:
     // the message carries zero information about the input, which is the only
     // way a pasted secret in a mistyped flag cannot end up in a log.
@@ -143,6 +144,14 @@ fn the_child_environment_is_built_from_scratch_and_holds_no_credential() {
             "CI",
             "HOME",
             "LOOM_NATIVE_READINESS_PROBE",
+            // Plugin-load receipt path + the two variables the guarded
+            // binding requires to initialize without throwing (#8600).
+            // Neither is credential-shaped: the receipt path and workspace
+            // are this attempt's own private scratch root, and the tool
+            // binary path is inert without an assistant turn to invoke it.
+            "LOOM_NATIVE_READINESS_RECEIPT",
+            "LOOM_NATIVE_TOOL_BIN",
+            "LOOM_WORKSPACE",
             "NO_COLOR",
             "OPENCODE_CONFIG_DIR",
             "OPENCODE_DISABLE_AUTOUPDATE",
@@ -200,7 +209,7 @@ fn a_timeout_reports_the_stage_and_byte_counts_but_no_child_output() {
     let cli = fake_cli(tmp.path(), "hang", &format!("printf '%s\\n' 'token={secret}'\nsleep 30"));
     let state = state(tmp.path());
     let probe = probe(cli, 1, NetworkMode::Allowed);
-    let observation = probe.readiness(&state);
+    let (observation, plugin_loaded) = probe.readiness(&state);
     let Observation::Failed {
         classification,
         stdout_bytes,
@@ -218,6 +227,7 @@ fn a_timeout_reports_the_stage_and_byte_counts_but_no_child_output() {
         mode: Mode::Cold,
         cache: CacheOutcome::Bypassed,
         total_millis: 1000,
+        plugin_load_observed: plugin_loaded,
         stages: vec![StageObservation {
             stage: Stage::ServerSessionReady,
             observation,
@@ -246,7 +256,7 @@ fn a_timed_out_probe_leaves_no_descendant_running() {
     );
     let state = state(tmp.path());
     let probe = probe(cli, 1, NetworkMode::Allowed);
-    let observation = probe.readiness(&state);
+    let (observation, plugin_loaded) = probe.readiness(&state);
     assert!(matches!(
         observation,
         Observation::Failed {
@@ -254,6 +264,7 @@ fn a_timed_out_probe_leaves_no_descendant_running() {
             ..
         }
     ));
+    assert_eq!(plugin_loaded, None, "a timed-out invocation observed nothing either way");
     let settled = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
     assert!(settled > 0, "the grandchild must have run before the deadline");
     std::thread::sleep(Duration::from_millis(400));
@@ -352,4 +363,57 @@ fn isolated_state_is_private_and_provisions_the_production_bindings() {
         "the measured manifest must be byte-identical to what a launch provisions"
     );
     assert!(state.config_dir.join("plugins/loom.ts").is_file());
+}
+
+#[test]
+fn readiness_observes_plugin_load_from_the_receipt_file_not_the_exit_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A fake CLI standing in for the real binding's factory: it writes the
+    // receipt the moment it "runs", then exits 0 — exactly the shape a
+    // zero-exit help/version answer must NOT produce.
+    let cli = fake_cli(
+        tmp.path(),
+        "loads-plugin",
+        &format!("printf loaded > \"${PLUGIN_LOAD_RECEIPT_ENV}\"\nexit 0"),
+    );
+    let state = state(tmp.path());
+    let probe = probe(cli, 5, NetworkMode::Allowed);
+    let (observation, plugin_loaded) = probe.readiness(&state);
+    assert!(matches!(observation, Observation::Measured { .. }), "{observation:?}");
+    assert_eq!(
+        plugin_loaded,
+        Some(true),
+        "a receipt file must be read as evidence of load, never inferred from exit 0 alone"
+    );
+}
+
+#[test]
+fn readiness_reports_no_plugin_load_when_the_invocation_completes_without_a_receipt() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Stands in for `--version`/`--help`: answers instantly and successfully,
+    // but never reaches the plugin loader.
+    let cli = fake_cli(tmp.path(), "answers-without-loading", "exit 0");
+    let state = state(tmp.path());
+    let probe = probe(cli, 5, NetworkMode::Allowed);
+    let (observation, plugin_loaded) = probe.readiness(&state);
+    assert!(matches!(observation, Observation::Measured { .. }), "{observation:?}");
+    assert_eq!(
+        plugin_loaded,
+        Some(false),
+        "a successful invocation that never wrote the receipt did not load the plugin"
+    );
+}
+
+#[test]
+fn readiness_clears_a_stale_receipt_from_an_earlier_boundary_before_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cli = fake_cli(tmp.path(), "does-not-load", "exit 0");
+    let state = state(tmp.path());
+    // Plant a receipt as if a previous boundary of this same attempt had
+    // written one — it must not be mistaken for this invocation's own evidence.
+    std::fs::write(state.plugin_load_receipt(), "stale").unwrap();
+    let probe = probe(cli, 5, NetworkMode::Allowed);
+    let (observation, plugin_loaded) = probe.readiness(&state);
+    assert!(matches!(observation, Observation::Measured { .. }), "{observation:?}");
+    assert_eq!(plugin_loaded, Some(false), "a stale receipt must be cleared before the run");
 }

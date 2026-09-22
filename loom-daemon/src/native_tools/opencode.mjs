@@ -1,7 +1,14 @@
 // No policy or shell interpolation in the harness binding.
 import { tool } from "@opencode-ai/plugin";
 import { execFile } from "node:child_process";
+import { writeFileSync } from "node:fs";
 export default async function () {
+  // Plugin-load receipt for the provider-free readiness probe (#8600): written
+  // before anything can throw, only when the probe names a path, and never in a
+  // production launch (the variable is absent there). A CLI that never loads
+  // this binding cannot produce it, which is what makes it evidence.
+  const receipt = process.env.LOOM_NATIVE_READINESS_RECEIPT;
+  if (receipt) { try { writeFileSync(receipt, "loaded"); } catch {} }
   const workspace = process.env.LOOM_WORKSPACE;
   const cwd = process.cwd();
   const binary = process.env.LOOM_NATIVE_TOOL_BIN;

@@ -255,6 +255,11 @@ pub struct AttemptReport {
     pub mode: Mode,
     pub cache: CacheOutcome,
     pub total_millis: u64,
+    /// Whether this attempt's readiness invocation loaded the guarded plugin,
+    /// observed from the receipt the binding writes rather than inferred from
+    /// an exit status. `None` when the invocation did not complete, so nothing
+    /// was observable. See [`probe::Probe::readiness`].
+    pub plugin_load_observed: Option<bool>,
     pub stages: Vec<StageObservation>,
 }
 
@@ -424,9 +429,14 @@ pub struct ReadinessReport {
     /// The provider-free readiness argv actually used. Every token is drawn
     /// from [`probe::READINESS_ALLOWLIST`], so it cannot carry a secret.
     pub readiness_command: Vec<String>,
-    /// Whether this probe shape is *proven* to load the guarded plugin set
-    /// against the pinned installed CLI. `None` until a live receipt exists —
-    /// never `true` on the strength of a help/config command returning 0.
+    /// Whether this probe shape loaded the guarded plugin set against the CLI
+    /// that was actually probed.
+    ///
+    /// Derived from [`plugin_load_verdict`] over the attempts' own receipts —
+    /// never from an exit status, and never from a constant flipped by hand.
+    /// A run against OpenCode 1.18.31 with the default `debug config` argv
+    /// reports `true`; the same run with `--version`, or any run against a CLI
+    /// that does not load the binding, reports `false`.
     pub plugin_load_proven: Option<bool>,
     /// The CLI's own reported version line, sanitized and bounded.
     pub cli_version: Option<String>,
@@ -469,6 +479,29 @@ impl PhaseReport {
     }
 }
 
+/// Whether every readiness invocation this run could observe loaded the
+/// guarded plugin.
+///
+/// `None` when no attempt produced an observation at all — a run whose
+/// readiness boundary never completed has no opinion on plugin load, and must
+/// not report one. A mixed run (some attempts loaded it, some did not) is
+/// `Some(false)`: "this probe shape loads the guarded plugin" is a claim about
+/// every invocation of it, and one counterexample refutes it.
+#[must_use]
+pub fn plugin_load_verdict(phases: &[PhaseReport]) -> Option<bool> {
+    let mut seen = false;
+    let mut all = true;
+    for observed in phases
+        .iter()
+        .flat_map(|phase| phase.attempts.iter())
+        .filter_map(|attempt| attempt.plugin_load_observed)
+    {
+        seen = true;
+        all &= observed;
+    }
+    seen.then_some(all)
+}
+
 impl ReadinessReport {
     /// Assemble the report, filling in the unknown-boundary ledger and the
     /// standing disclosures.
@@ -489,6 +522,7 @@ impl ReadinessReport {
             })
             .collect();
         let host_conditions_comparable = comparable_load(&phases);
+        let plugin_load_proven = plugin_load_verdict(&phases);
         Self {
             schema: 1,
             model_calls: 0,
@@ -497,7 +531,7 @@ impl ReadinessReport {
             speedup_claimed: false,
             network,
             readiness_command,
-            plugin_load_proven: None,
+            plugin_load_proven,
             cli_version,
             cache_base,
             phases,
@@ -507,6 +541,7 @@ impl ReadinessReport {
                 "Durations are wall times on one uncontrolled host; they are not a benchmark and no speedup is claimed.",
                 "The historical ~157s cold run in issue #8529 is a single observation and is not reused as a baseline here.",
                 "A provider-free readiness probe returning successfully does not prove inference readiness.",
+                "plugin_load_proven comes from a receipt the guarded binding writes, not from the exit status: OpenCode 1.18.31 logs `failed to load plugin` and still exits 0 (issue #8600).",
                 "Guarded launches allocate a fresh per-launch state directory (native_tools::provision::state), so XDG_CACHE_HOME is empty on every launch, not only for canaries.",
             ],
         }
