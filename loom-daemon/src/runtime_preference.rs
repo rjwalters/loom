@@ -18,7 +18,8 @@
 //! ```jsonc
 //! "runtimes": {
 //!   "preference": ["claude", "codex", {"runtime": "opencode", "modelProfile": "zai-metered"}],
-//!   "rolePreference": { "judge": ["codex", "claude"] }
+//!   "rolePreference": { "judge": ["codex", "claude"] },
+//!   "backstopCeiling": { "maxConcurrent": 2, "appliesFrom": 2 }
 //! }
 //! ```
 //!
@@ -37,9 +38,13 @@
 //! - `role_runner::runtime_preflight` lets the list choose a role tick's tap,
 //!   keeping the #6201/#8408 pre-spawn gate as the fail-closed reporter.
 //!
-//! The metered-tier concurrency ceiling, and carrying the chosen tier into the
-//! `role_tick.outcome` record / per-sweep launch record (#8599), are tracked
-//! separately; see the follow-up issues linked from #8436.
+//! Issue #8555 added the fourth piece: the per-host admission bound on the
+//! metered backstop tier ([`ceiling`]), asked during the same walk and applied
+//! at the first two of those seams — `resolve_for_dispatch` hands the sweep
+//! path a [`ceiling::Reservation`] to attach to the child it spawns. Carrying
+//! the chosen tier into the `role_tick.outcome` record / per-sweep launch
+//! record (#8599) is still tracked separately; see the follow-up issues linked
+//! from #8436.
 //!
 //! **Known gap: a tap's `modelProfile` gates but does not pin.** [`Tap`]'s
 //! optional profile is honoured when [`availability`] decides whether the tap
@@ -73,6 +78,12 @@
 //!   declares `worktreeIsolation: "partial"` and `builder.json`/`doctor.json`
 //!   require it, so for build work `["claude","codex","opencode"]` is
 //!   effectively `claude -> opencode`.
+//! - **The backstop ceiling bounds spend, it never gates on a human.** A
+//!   governed tap that is at its per-host ceiling (or that this work is not
+//!   eligible for) is skipped with a recorded reason exactly like an
+//!   unavailable tap; the walk continues, a recovered higher tap is still
+//!   preferred, and nothing waits for approval. Absent config touches no state
+//!   at all.
 //! - **Fail-closed stays fail-closed.** When every listed tap is skipped the
 //!   result carries no choice, and the caller holds/skips exactly as it does
 //!   today. The #7708 hold becomes "hold when the *whole list* is exhausted".
@@ -96,10 +107,14 @@
 //! configuring it over relying on the fleet-wide order.
 
 pub mod availability;
+pub mod ceiling;
 pub mod resolve;
 
 pub use availability::{availability, Availability, CredentialSource};
-pub use resolve::{ChosenTap, Resolution, SkipReason, SkippedTap, Tap, PREFERENCE_LOG_MARKER};
+pub use ceiling::{BackstopCeiling, ComplexityTier, Reservation};
+pub use resolve::{
+    CeilingSkip, ChosenTap, Resolution, SkipReason, SkippedTap, Tap, PREFERENCE_LOG_MARKER,
+};
 
 use crate::runtime_admission::{canonical_role, ResolvedRuntime, RuntimeRejection, RuntimeSource};
 use serde_json::Value;
@@ -147,10 +162,30 @@ pub enum Decision {
     Preference {
         source: PreferenceSource,
         resolution: Resolution<ResolvedRuntime>,
+        /// The backstop slot this decision holds (#8555), present only when
+        /// the chosen tap is a governed backstop tier **and** a concurrency
+        /// ceiling is configured.
+        ///
+        /// **The launch path must [`ceiling::Reservation::attach`] it to the
+        /// spawned worker's PID.** Until it does, the slot is owned by *this*
+        /// process and is released when the `Decision` is dropped — so a
+        /// caller that resolves and then does not launch cannot leak it, and a
+        /// caller that launches without attaching runs uncounted rather than
+        /// pinning a slot forever.
+        backstop: Option<ceiling::Reservation>,
     },
 }
 
 impl Decision {
+    /// Take the backstop reservation out of this decision, for the launch path
+    /// to attach to the worker it spawns.
+    pub fn take_backstop(&mut self) -> Option<ceiling::Reservation> {
+        match self {
+            Self::Static { .. } => None,
+            Self::Preference { backstop, .. } => backstop.take(),
+        }
+    }
+
     /// The admitted runtime, when one was chosen.
     #[must_use]
     pub fn admitted(&self) -> Option<&ResolvedRuntime> {
@@ -169,8 +204,19 @@ impl Decision {
     pub fn marker_line(&self) -> Option<String> {
         match self {
             Self::Static { .. } => None,
-            Self::Preference { source, resolution } => {
-                Some(format!("{} source={}", resolution.marker_line(), source.as_str()))
+            Self::Preference {
+                source,
+                resolution,
+                backstop,
+            } => {
+                let mut line = format!("{} source={}", resolution.marker_line(), source.as_str());
+                // How much of the metered ceiling this launch consumed, so
+                // "the fleet is pinned at its backstop ceiling" is greppable
+                // from the same marker that records the fall-through itself.
+                if let Some(reservation) = backstop {
+                    line.push_str(&format!(" backstop={}", reservation.summary()));
+                }
+                Some(line)
             }
         }
     }
@@ -385,10 +431,27 @@ pub fn check_runtimes_preference_config(config: &Value) -> Vec<String> {
     // `sweep-lifecycle` is only a probe role here: `preference_for` validates
     // the whole `rolePreference` map plus `runtimes.preference` regardless of
     // which role is asked about.
-    match preference_for(config, "sweep-lifecycle") {
+    let mut findings = match preference_for(config, "sweep-lifecycle") {
         Ok(_) => Vec::new(),
         Err(message) => vec![format!("runtimes preference: {message}")],
-    }
+    };
+    findings.extend(ceiling::check_config(config));
+    findings
+}
+
+/// What dispatch knows about the *work* being launched, as opposed to the role
+/// launching it.
+///
+/// Only the backstop ceiling's optional eligibility filter reads this today
+/// (#8555): "low-value work never reaches the metered tap" is a property of the
+/// issue, not of the role. It is a struct rather than a bare argument so a
+/// later admission question can be added without re-churning every call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DispatchContext<'a> {
+    /// The issue's `<!-- loom:complexity=<tier> -->` stratum, as the work
+    /// finder already carries it through `dispatch(issue, complexity)`.
+    /// `None` ⇒ treated as `routine`.
+    pub complexity: Option<&'a str>,
 }
 
 /// The operator pin in force for `role`, if any — the three tiers that
@@ -424,6 +487,30 @@ pub fn resolve_runtime(
     explicit: Option<&str>,
     now: u64,
 ) -> Result<Decision, RuntimeRejection> {
+    resolve_runtime_for(root, role, explicit, now, DispatchContext::default())
+}
+
+/// [`resolve_runtime`] with what dispatch knows about the work itself — the
+/// form the work finder and role runner call once they carry a
+/// [`DispatchContext`].
+///
+/// # Side effect
+/// Unlike the rest of this module, choosing a **governed backstop tap** under a
+/// configured ceiling *takes a slot* (a lease file under
+/// [`ceiling::lease_dir`]): the count and the choice have to be atomic or two
+/// concurrent dispatches both admit at `limit - 1`. The slot rides on the
+/// returned [`Decision`] and is released when it drops, so a caller that
+/// resolves without launching cannot leak it.
+///
+/// # Errors
+/// As [`resolve_runtime`].
+pub fn resolve_runtime_for(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    now: u64,
+    context: DispatchContext<'_>,
+) -> Result<Decision, RuntimeRejection> {
     let Some(canonical) = canonical_role(role) else {
         // Unknown roles are not this module's error to shape: hand straight
         // back the rejection `resolve_and_admit` already produces for them.
@@ -452,6 +539,18 @@ pub fn resolve_runtime(
             result: crate::runtime_admission::resolve_and_admit(root, role, None),
         });
     };
+    let backstop_ceiling = ceiling::configured(&config).map_err(|reason| RuntimeRejection {
+        role: canonical.to_string(),
+        runtime: String::new(),
+        source: RuntimeSource::Preference,
+        unmet_capabilities: vec![],
+        reason,
+    })?;
+    // Filled in by the availability closure below when — and only when — the
+    // walk settles on a governed backstop tap. `resolve` short-circuits on the
+    // first `Ok`, so at most one slot is ever taken per walk, and it always
+    // belongs to the tap actually chosen.
+    let mut reservation: Option<ceiling::Reservation> = None;
     let resolution = resolve::resolve(
         &taps,
         |tap| {
@@ -468,14 +567,37 @@ pub fn resolve_runtime(
                     detail: rejection.reason.clone(),
                 })
         },
-        |tap, admitted| match availability::availability(root, tap, admitted, now) {
-            state if state.is_spawnable() => Ok(()),
-            state => Err(state
-                .skip_reason()
-                .expect("a non-spawnable availability always yields a skip reason")),
+        |tier, tap, admitted| {
+            match availability::availability(root, tap, admitted, now) {
+                state if state.is_spawnable() => {}
+                state => {
+                    return Err(state
+                        .skip_reason()
+                        .expect("a non-spawnable availability always yields a skip reason"))
+                }
+            }
+            // The ceiling is asked LAST, and only for the tiers it governs:
+            // credentials first means a tap that could not have run anyway is
+            // never charged a metered slot, and asking last means the slot is
+            // taken only for a tap the walk is about to return.
+            let Some(bound) = backstop_ceiling.as_ref().filter(|c| c.governs(tier)) else {
+                return Ok(());
+            };
+            match ceiling::admit(bound, canonical, tap, context.complexity) {
+                ceiling::Verdict::Unbounded => Ok(()),
+                ceiling::Verdict::Admitted(slot) => {
+                    reservation = Some(slot);
+                    Ok(())
+                }
+                ceiling::Verdict::Refused(reason) => Err(reason),
+            }
         },
     );
-    Ok(Decision::Preference { source, resolution })
+    Ok(Decision::Preference {
+        source,
+        resolution,
+        backstop: reservation,
+    })
 }
 
 #[cfg(test)]

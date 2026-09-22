@@ -6,6 +6,7 @@
 //! `defaults/` fixture and drive [`resolve_runtime`].
 
 use super::availability::{availability, Availability, CredentialSource};
+use super::ceiling;
 use super::resolve::{resolve, SkipReason, Tap};
 use super::{
     check_runtimes_preference_config, preference_for, resolve_runtime, Decision, PreferenceSource,
@@ -110,7 +111,7 @@ fn a_healthy_first_tap_short_circuits_the_whole_list() {
             admitted_for.push(tap.runtime.clone());
             Ok::<_, SkipReason>("admitted")
         },
-        |tap, _| {
+        |_, tap, _| {
             asked_for.push(tap.runtime.clone());
             Ok(())
         },
@@ -137,7 +138,7 @@ fn an_exhausted_first_tap_falls_through_and_records_the_reason() {
             Tap::with_profile("opencode", "zai-metered"),
         ],
         |_| Ok::<_, SkipReason>("admitted"),
-        |tap, _| {
+        |_, tap, _| {
             if tap.runtime == "claude" {
                 Err(unavailable("claude_tokens"))
             } else {
@@ -173,7 +174,7 @@ fn a_tap_refused_by_admission_never_has_its_credential_source_read() {
                 Ok("admitted")
             }
         },
-        |tap, _| {
+        |_, tap, _| {
             asked_for.push(tap.runtime.clone());
             Ok(())
         },
@@ -190,7 +191,7 @@ fn an_entirely_unavailable_list_yields_no_choice_and_names_every_reason() {
     let resolution = resolve(
         &taps(&["claude", "codex"]),
         |_| Ok::<_, SkipReason>("admitted"),
-        |tap, _| Err(unavailable(&format!("{}_pool", tap.runtime))),
+        |_, tap, _| Err(unavailable(&format!("{}_pool", tap.runtime))),
     );
     assert!(resolution.chosen.is_none());
     assert!(!resolution.fell_through());
@@ -221,7 +222,7 @@ fn the_marker_line_records_the_chosen_tier_and_every_skip_reason() {
                 Ok("admitted")
             }
         },
-        |tap, _| {
+        |_, tap, _| {
             if tap.runtime == "claude" {
                 Err(unavailable("claude_tokens"))
             } else {
@@ -246,7 +247,7 @@ fn the_marker_line_records_the_chosen_tier_and_every_skip_reason() {
 #[test]
 fn the_preference_marker_does_not_collide_with_the_resolved_runtime_marker() {
     let resolution =
-        resolve(&taps(&["opencode"]), |_| Ok::<_, SkipReason>("admitted"), |_, _| Ok(()));
+        resolve(&taps(&["opencode"]), |_| Ok::<_, SkipReason>("admitted"), |_, _, _| Ok(()));
     let line = resolution.marker_line();
     assert!(!line.contains("LOOM_RUNTIME_RESOLVED"), "{line}");
     assert!(super::PREFERENCE_LOG_MARKER.starts_with("# LOOM_RUNTIME_PREFERENCE"));
@@ -492,7 +493,10 @@ fn a_healthy_claude_pool_keeps_the_work_on_claude() {
         &serde_json::json!({"runtimes": {"preference": ["claude", "opencode"]}}),
     );
     let decision = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
-    let Decision::Preference { source, resolution } = decision else {
+    let Decision::Preference {
+        source, resolution, ..
+    } = decision
+    else {
         panic!("a configured preference list must take the preference path");
     };
     assert_eq!(source, PreferenceSource::FleetPreference);
@@ -548,6 +552,7 @@ fn an_exhausted_claude_pool_falls_through_instead_of_holding() {
     let marker = Decision::Preference {
         source: PreferenceSource::FleetPreference,
         resolution,
+        backstop: None,
     }
     .marker_line()
     .unwrap();
@@ -890,4 +895,262 @@ fn credential_source_wire_names_are_stable_and_pool_qualified() {
         CredentialSource::CodexAccounts.wire(),
         crate::role_runner::CredentialPool::CodexAccounts.as_str()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The per-host backstop ceiling, end to end through the resolver (#8555)
+// ---------------------------------------------------------------------------
+
+/// Points the machine-wide backstop lease dir at a tempdir for the scope of a
+/// test and restores whatever was there, including across a panic. Mandatory
+/// for any ceiling test: the real store is machine-wide by design, so without
+/// it a test would count (and reap) the host's real leases.
+struct ScopedLeaseDir {
+    _dir: tempfile::TempDir,
+    prior: Option<std::ffi::OsString>,
+}
+
+impl ScopedLeaseDir {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let prior = std::env::var_os(ceiling::LEASE_DIR_ENV);
+        std::env::set_var(ceiling::LEASE_DIR_ENV, dir.path().join("backstop"));
+        Self { _dir: dir, prior }
+    }
+}
+
+impl Drop for ScopedLeaseDir {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(value) => std::env::set_var(ceiling::LEASE_DIR_ENV, value),
+            None => std::env::remove_var(ceiling::LEASE_DIR_ENV),
+        }
+    }
+}
+
+/// A fixture whose Claude pool is unprovisioned (so the walk falls through to
+/// the backstop tap) with a ceiling of `max` concurrent backstop dispatches.
+fn ceiling_fixture(max: u32) -> tempfile::TempDir {
+    let dir = fixture();
+    write_config(
+        dir.path(),
+        &serde_json::json!({
+            "runtimes": {
+                "preference": ["claude", "opencode"],
+                "backstopCeiling": {"maxConcurrent": max}
+            }
+        }),
+    );
+    dir
+}
+
+/// **The acceptance criterion of #8555**: with a ceiling of N, the N+1th
+/// *concurrent* backstop dispatch is passed over — recorded as a skip, exactly
+/// like an unavailable tap — and, with nothing below it to take, the walk fails
+/// closed. No approval step, no wait: just a dispatch that does not go to the
+/// metered endpoint.
+#[test]
+#[serial_test::serial]
+fn the_n_plus_first_concurrent_backstop_dispatch_is_passed_over() {
+    let _env = ClearedRuntimeEnv::new();
+    let _leases = ScopedLeaseDir::new();
+    let dir = ceiling_fixture(1);
+
+    // N = 1: the first dispatch falls through to the backstop and takes the
+    // host's only metered slot.
+    let first = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    let Decision::Preference {
+        ref resolution,
+        ref backstop,
+        ..
+    } = first
+    else {
+        panic!("expected the preference path");
+    };
+    let chosen = resolution.chosen.as_ref().unwrap();
+    assert_eq!(chosen.tier, 1);
+    assert_eq!(chosen.admitted.runtime, "opencode");
+    assert!(resolution.fell_through());
+    assert_eq!(backstop.as_ref().unwrap().summary(), "1/1");
+    // The marker records the slot alongside the fall-through it paid for.
+    let marker = first.marker_line().unwrap();
+    assert!(marker.contains("tier=1 tap=opencode"), "{marker}");
+    assert!(marker.contains("backstop=1/1"), "{marker}");
+
+    // N+1: while that slot is held, the next dispatch is passed over.
+    let second = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    let Decision::Preference {
+        resolution: second_resolution,
+        backstop: second_backstop,
+        ..
+    } = second
+    else {
+        panic!("expected the preference path");
+    };
+    assert!(second_backstop.is_none(), "a refused dispatch must hold no slot");
+    // Fail closed: nothing below the backstop qualifies, so there is no
+    // choice — precisely the pre-#8436 hold, reached for a new reason.
+    assert!(second_resolution.chosen.is_none(), "{second_resolution:?}");
+    assert_eq!(second_resolution.skipped.len(), 2);
+    let refusal = &second_resolution.skipped[1];
+    assert_eq!(refusal.tap.runtime, "opencode");
+    assert_eq!(refusal.reason.kind(), "ceiling-at-capacity");
+    assert!(refusal.reason.summary().contains("1/1"), "{}", refusal.reason.summary());
+    let diagnostic = second_resolution.exhausted_diagnostic("builder");
+    assert!(diagnostic.contains("ceiling-at-capacity"), "{diagnostic}");
+
+    // Releasing the first dispatch's slot frees the host immediately — the
+    // bound is concurrency, not a cooldown, so nothing waits on a clock.
+    drop(first);
+    let third = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    let Decision::Preference { resolution, .. } = third else {
+        panic!("expected the preference path");
+    };
+    assert_eq!(resolution.chosen.as_ref().unwrap().tier, 1);
+}
+
+/// The other half of the acceptance criterion: a higher tap that recovers is
+/// still preferred, ceiling or no ceiling. The bound applies to the metered
+/// tier only — it must never throttle the subscription capacity the fleet
+/// already pays for, and while tier 0 serves the work the ceiling is not even
+/// consulted (no slot is taken).
+#[test]
+#[serial_test::serial]
+fn a_recovered_higher_tap_is_still_preferred_while_the_backstop_is_at_its_ceiling() {
+    let _env = ClearedRuntimeEnv::new();
+    let _leases = ScopedLeaseDir::new();
+    let dir = ceiling_fixture(1);
+
+    // Hold the host's only backstop slot.
+    let held = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    assert!(matches!(
+        &held,
+        Decision::Preference {
+            backstop: Some(_),
+            ..
+        }
+    ));
+
+    // Claude comes back. Every subsequent dispatch returns to tier 0 even
+    // though the backstop is pinned at its ceiling.
+    provision_claude_pool(dir.path(), 3);
+    for _ in 0..3 {
+        let decision = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+        let Decision::Preference {
+            resolution,
+            backstop,
+            ..
+        } = decision
+        else {
+            panic!("expected the preference path");
+        };
+        let chosen = resolution.chosen.as_ref().unwrap();
+        assert_eq!(chosen.tier, 0);
+        assert_eq!(chosen.admitted.runtime, "claude");
+        assert!(!resolution.fell_through());
+        assert!(resolution.skipped.is_empty());
+        assert!(backstop.is_none(), "tier 0 must not consume a metered slot");
+    }
+    drop(held);
+}
+
+/// The optional eligibility filter, through the resolver: low-value work never
+/// reaches the metered tap, while the work the operator considers worth paying
+/// for still does. Unmarked work is `routine`, the daemon's existing default
+/// for a missing `<!-- loom:complexity= -->` marker.
+#[test]
+#[serial_test::serial]
+fn the_eligibility_filter_keeps_low_value_work_off_the_metered_tap() {
+    let _env = ClearedRuntimeEnv::new();
+    let _leases = ScopedLeaseDir::new();
+    let dir = fixture();
+    write_config(
+        dir.path(),
+        &serde_json::json!({
+            "runtimes": {
+                "preference": ["claude", "opencode"],
+                "backstopCeiling": {"maxConcurrent": 4, "minComplexity": "complex"}
+            }
+        }),
+    );
+
+    let context = super::DispatchContext {
+        complexity: Some("mechanical"),
+    };
+    let decision = super::resolve_runtime_for(dir.path(), "builder", None, 0, context).unwrap();
+    let Decision::Preference { resolution, .. } = decision else {
+        panic!("expected the preference path");
+    };
+    assert!(resolution.chosen.is_none());
+    assert_eq!(resolution.skipped[1].reason.kind(), "ceiling-ineligible");
+
+    let context = super::DispatchContext {
+        complexity: Some("complex"),
+    };
+    let decision = super::resolve_runtime_for(dir.path(), "builder", None, 0, context).unwrap();
+    let Decision::Preference {
+        resolution,
+        backstop,
+        ..
+    } = decision
+    else {
+        panic!("expected the preference path");
+    };
+    assert_eq!(resolution.chosen.as_ref().unwrap().tier, 1);
+    assert!(backstop.is_some());
+}
+
+/// The no-ceiling edge case, end to end: with no `backstopCeiling` key the
+/// resolution is byte-identical to a build without the bound, and the lease
+/// store is never even created.
+#[test]
+#[serial_test::serial]
+fn an_unconfigured_ceiling_touches_no_state_and_bounds_nothing() {
+    let _env = ClearedRuntimeEnv::new();
+    let _leases = ScopedLeaseDir::new();
+    let dir = fixture();
+    write_config(
+        dir.path(),
+        &serde_json::json!({"runtimes": {"preference": ["claude", "opencode"]}}),
+    );
+    let store = ceiling::lease_dir().unwrap();
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        let decision = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+        let Decision::Preference {
+            resolution,
+            backstop,
+            ..
+        } = decision
+        else {
+            panic!("expected the preference path");
+        };
+        assert_eq!(resolution.chosen.as_ref().unwrap().tier, 1);
+        assert!(backstop.is_none(), "an unconfigured ceiling must take no slot");
+        held.push(resolution);
+    }
+    assert!(!store.exists(), "no ceiling ⇒ no lease store at {}", store.display());
+}
+
+/// A malformed ceiling fails the launch closed at the resolution seam, not
+/// only in `loom-daemon validate` — a typo must never silently mean
+/// "unbounded metered spend".
+#[test]
+#[serial_test::serial]
+fn a_malformed_ceiling_rejects_the_launch() {
+    let _env = ClearedRuntimeEnv::new();
+    let _leases = ScopedLeaseDir::new();
+    let dir = fixture();
+    write_config(
+        dir.path(),
+        &serde_json::json!({
+            "runtimes": {
+                "preference": ["claude", "opencode"],
+                "backstopCeiling": {"maxConcurrent": 1, "appliesFrom": 0}
+            }
+        }),
+    );
+    let rejection = resolve_runtime(dir.path(), "builder", None, 0).unwrap_err();
+    assert_eq!(rejection.source, RuntimeSource::Preference);
+    assert!(rejection.reason.contains("appliesFrom"), "{}", rejection.reason);
 }
