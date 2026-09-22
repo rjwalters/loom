@@ -1742,9 +1742,9 @@ DIGEST_MARKER="<!-- champion:merge-risk-hold-digest -->"
 #
 # Marker-tagged matches always win over marker-less ones, whatever the
 # issue-number ordering. When NO title match carries the marker — e.g. a
-# digest issue predating the marker convention — fall back to the oldest
-# (lowest-numbered) open title match instead of returning empty and letting a
-# duplicate get created (#7338).
+# digest issue predating the marker convention — fall back to
+# the oldest (lowest-numbered) open title match instead of returning empty
+# and letting a duplicate get created (#7338).
 DIGEST_ISSUE=$("$GH_READ" issue list --search "\"$DIGEST_TITLE\" in:title" \
   --state open --json number,body --limit 10 \
   --jq "([.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] as \$tagged | if (\$tagged | length) > 0 then (\$tagged | min_by(.number)) else min_by(.number) end) | .number // empty")
