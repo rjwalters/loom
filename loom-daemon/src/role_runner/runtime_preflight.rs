@@ -72,10 +72,107 @@ const CODEX_EXPLICIT_CREDENTIAL_ENV: [&str; 5] = [
 /// re-reads live state.
 const CODEX_CLEAR_ESTIMATE_CAP_SECS: i64 = 900;
 
-/// `pub(crate)` since #8436 only so `runtime_preference`'s tests can pin this
-/// gate's verdict against the side-effect-free availability mapping that
-/// shares its reads; the role runner remains its only production caller.
+/// Decide what — if anything — this role tick launches on, before it spawns.
+///
+/// **Preference-resolving since #8554.** [`static_check`] alone only ever
+/// answers "is the runtime static resolution picked exhausted?" — exactly the
+/// pre-#8554 behaviour, and all this function does when no preference list
+/// applies. When one DOES apply (`runtimes.rolePreference.<role>`, else
+/// `runtimes.preference`), the list decides the tap **for every tick, not
+/// only for a tick that would otherwise skip**: `resolve_runtime` walks it
+/// against live admission and credential availability, and the first tap that
+/// can serve the work is the one this tick launches on. That is what makes
+/// `rolePreference.judge` do the job it exists for — keeping Judge off the tap
+/// that built the change (a native sweep reviews in the same session that
+/// wrote it) — which a gate consulted only on exhaustion could not, since a
+/// healthy top-of-chain pool would silently ignore the list.
+///
+/// The gate is then the **fail-closed reporter**, never bypassed: the chosen
+/// tap is still put through [`static_check`], so no launch skips its own
+/// pre-spawn gate, and when the whole list is unavailable the tick reports the
+/// statically-admitted runtime's own skip — the same self-healing
+/// [`RoleTickOutcome::PoolExhausted`] shape #7607 keeps out of the stuck-role
+/// streak, not a new failure class.
+///
+/// - `Ok(None)`: proceed with the `admission` already passed in, unchanged.
+/// - `Ok(Some(runtime))`: the preference list chose `runtime` — the caller
+///   MUST launch with it instead of whatever `admission` named (it may be the
+///   same runtime; it is always one whose own gate just passed).
+/// - `Err(outcome)`: do not spawn. No list applies and the static gate
+///   skipped (byte-identical to before #8554), the chosen tap's own gate
+///   skipped, or every listed tap is unavailable (fail closed).
 pub(crate) fn check(
+    root: &Path,
+    logs: &Path,
+    role: &str,
+    admission: Option<&Result<ResolvedRuntime, RuntimeRejection>>,
+) -> Result<Option<ResolvedRuntime>, RoleTickOutcome> {
+    // `None` ⇒ the caller opted out of admission (a test `spawn_bin`), and
+    // with it out of the pool gate AND out of preference resolution: there is
+    // no admitted runtime to pin, so there is nothing to re-point either.
+    if admission.is_none() {
+        return Ok(None);
+    }
+    let gate = |admitted: Option<&Result<ResolvedRuntime, RuntimeRejection>>| match static_check(
+        root, logs, role, admitted,
+    ) {
+        Some(outcome) => Err(outcome),
+        None => Ok(()),
+    };
+    let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+    let Ok(crate::runtime_preference::Decision::Preference { source, resolution }) =
+        crate::runtime_preference::resolve_runtime(root, role, None, now)
+    else {
+        // No preference list applies to this role, an operator pin is in
+        // force (a pin disables fall-through by design), or the preference
+        // config itself is malformed: byte-identical to before #8554.
+        gate(admission)?;
+        return Ok(None);
+    };
+    let marker = resolution.marker_line();
+    let exhausted = resolution.exhausted_diagnostic(role);
+    let Some(chosen) = resolution.chosen else {
+        // Every listed tap was skipped. Fail closed, reporting the
+        // statically-admitted runtime's own gate outcome when it has one, so
+        // a fleet-wide dry list still reads as the self-healing pool skip it
+        // is. `RuntimeRejected` is the remainder: a list that excludes the
+        // statically-admitted runtime entirely cannot borrow that runtime's
+        // verdict, and launching the unlisted runtime anyway would route
+        // around the operator's configuration.
+        gate(admission)?;
+        note_pre_spawn_skip(logs, role, &exhausted);
+        return Err(RoleTickOutcome::RuntimeRejected(RuntimeRejection {
+            role: role.to_string(),
+            runtime: String::new(),
+            source: crate::runtime_admission::RuntimeSource::Preference,
+            unmet_capabilities: vec![],
+            reason: exhausted,
+        }));
+    };
+    log::info!(
+        "role_runner: {role} runtime chosen by the ordered preference list — {marker} source={} \
+         (#8554)",
+        source.as_str()
+    );
+    // `Ok` by construction, so the chosen tap can be put through its OWN
+    // pre-spawn gate in the shape `static_check` reads before being handed
+    // back to the caller to launch.
+    let chosen_admission = Ok(chosen.admitted);
+    gate(Some(&chosen_admission))?;
+    Ok(chosen_admission.ok())
+}
+
+/// The pre-#8554 pool gate: is the admitted runtime's OWN credential source
+/// exhausted right now? Never consults the preference list — [`check`] is the
+/// preference-aware wrapper around it.
+///
+/// `pub(crate)` for the same single reason [`check`] was before #8554:
+/// `runtime_preference`'s tests pin **this** verdict against the
+/// side-effect-free availability mapping that shares its reads, which is the
+/// anti-drift guarantee behind "one mapping, two renderings". That comparison
+/// has to run against the gate itself, not the wrapper that consults the
+/// mapping. The role runner remains the only production caller of either.
+pub(crate) fn static_check(
     root: &Path,
     logs: &Path,
     role: &str,

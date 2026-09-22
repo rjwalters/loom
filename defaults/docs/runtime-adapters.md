@@ -1114,6 +1114,16 @@ ids and with completely different economics, so `modelProfile` is what
 distinguishes them. A bare runtime name is shorthand for "that runtime with
 whatever profile it would have chosen anyway".
 
+> **A `modelProfile` currently gates but does not pin.** Availability is read
+> against exactly the named profile's provider and credential pool, but nothing
+> carries the name to the launched child — the launch resolves whatever profile
+> that runtime would have used anyway, so for two profiles on *different*
+> providers the tap that ran is not the tap whose pool was checked. Bare-runtime
+> entries are unaffected (their profile is that default resolution). Pinning it
+> needs `LOOM_MODEL_PROFILE` set at the same launch sites #8599 has to touch, so
+> it is tracked behind that in #8602; until it lands, prefer bare entries unless
+> the named profile *is* the runtime's default.
+
 **Resolution, per launch**: walk the list and take the first tap that is
 **(a)** admitted for the role and **(b)** has a spawnable credential right now.
 `rolePreference.<role>` outranks `preference`; an empty list means "unset, fall
@@ -1143,9 +1153,9 @@ process that wrote the change. Use `rolePreference.judge` to keep Judge on a
 different tap from the one that built it; prefer that over relying on the
 fleet-wide order.
 
-**One sweep, one runtime.** Fall-through is decided at **dispatch**, never
-mid-sweep (see `guardrail-parity-native.md`). A sweep that exhausts its runtime
-in flight fails and is re-dispatched, where it re-resolves. Hysteresis follows
+**One sweep, one runtime.** A sweep uses one runtime throughout, so
+fall-through is decided at **dispatch**, never mid-sweep. A sweep that exhausts
+its runtime in flight fails and is re-dispatched, where it re-resolves. Hysteresis follows
 for free: once a higher-preference pool recovers, new spawns return to it while
 in-flight backstop sweeps finish where they are. No pinning mechanism exists or
 is needed.
@@ -1162,12 +1172,25 @@ crash-signal reader takes the entire rest of that line as the runtime name, so
 appending to it would report a runtime called `"opencode tier=2"`. "How much work
 is going to the backstop" reduces to counting markers whose `tier` is not `0`.
 
-> **Status.** As of this writing the resolver, its shared credential-availability
-> mapping, and config parsing/validation are implemented
-> (`loom-daemon/src/runtime_preference/`), but **dispatch is not yet wired to
-> it** — neither the work finder nor the role runner calls it, so no launch
-> changes until the wiring lands. The metered-tier concurrency ceiling is
-> likewise still to come. See the follow-up issues on #8436.
+Today each dispatch seam emits that marker to the **daemon log**
+(`loom-daemon logs`), which is where all three resolve. Writing it into the
+per-sweep launch record, beside that record's own `# LOOM_RUNTIME_RESOLVED`
+line, additionally requires teaching `crash_signals::log_has_progress` not to
+read it as child progress — tracked in #8599 rather than done half-way.
+
+> **Status.** The resolver, its shared credential-availability mapping, config
+> parsing/validation, and the dispatch wiring (issue #8554) are all implemented,
+> so a configured `runtimes.preference` changes real launches at three seams:
+> sweep dispatch resolves the sweep's runtime through the list
+> (`sweep_registry::dispatch`), the work finder's #7708 pool-exhaustion hold
+> arms only when the *whole* list is unavailable (`work_finder::pool_preflight`),
+> and a role tick's runtime is chosen by the list with the #6201/#8408 pre-spawn
+> gate kept as its fail-closed reporter (`role_runner::runtime_preflight`).
+> Still to come: the metered-tier concurrency ceiling; carrying the chosen tier
+> into the `role_tick.outcome`/launch-record surfaces (#8599 — today the chosen
+> tier is logged by the daemon, not written into the per-sweep log); and the
+> `modelProfile` launch pin noted above (#8602), which shares those same sites.
+> See also the other follow-up issues on #8436.
 
 ### Adding a runtime adapter
 

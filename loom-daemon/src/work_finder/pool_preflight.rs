@@ -156,16 +156,63 @@ impl PoolHoldState {
     /// never once per tick. That is the "logs one hold line" the issue asks
     /// for, and it is what keeps a multi-hour outage from producing one log
     /// line per tick per root.
+    ///
+    /// **Preference-aware since #8554.** When `runtimes.preference` /
+    /// `runtimes.rolePreference.sweep-lifecycle` is configured (and no
+    /// operator pin disables it), the verdict is no longer "is the Claude
+    /// pool dry" but "is the WHOLE ordered list unavailable" — a lower tap
+    /// being spawnable must dispatch on that tap instead of holding, which
+    /// `sweep_registry::dispatch` then resolves onto through
+    /// [`crate::runtime_preference::resolve_for_dispatch`]. With no
+    /// preference configured this is byte-identical to the pre-#8554
+    /// Claude-only check below.
+    ///
+    /// Two deliberate conservatisms remain, both in the **over**-hold (safe)
+    /// direction, because an under-hold costs the label flip + lease comment
+    /// #7708 exists to prevent:
+    ///
+    /// - A **post-mortem** hold (`wrapper_observed`, armed by a real
+    ///   token-selection death) still outranks a spawnable lower tap for its
+    ///   bounded TTL. The wrapper proved *that pool* cannot select an
+    ///   account; re-deciding that verdict per tap is not something this
+    ///   pre-flight can do from a pool-keyed hold.
+    /// - The hold set stays keyed by **pool directory**, not by (root, list).
+    ///   Two roots resolving to one pool with *different* preference lists
+    ///   therefore share one hold key, so one root's list recovering clears
+    ///   (and the other's re-arms) the shared key. Only the per-root return
+    ///   value gates dispatch, so this affects the edge-logging, never
+    ///   whether a root with a spawnable tap is dispatched.
     pub fn observe_root(&self, root: &Path, now: DateTime<Utc>) -> bool {
-        if crate::worker_spawn::uses_native_sweep(root) {
+        let now_epoch = u64::try_from(now.timestamp()).unwrap_or(0);
+        let preference =
+            crate::runtime_preference::resolve_runtime(root, "sweep-lifecycle", None, now_epoch);
+        let preference_resolution = match &preference {
+            Ok(crate::runtime_preference::Decision::Preference { resolution, .. }) => {
+                Some(resolution)
+            }
+            // No preference configured, an operator pin is in force, or the
+            // preference config itself is malformed: byte-identical to
+            // before #8554 — native runtimes never touch the Claude pool,
+            // everything else is gated on it exactly as before.
+            _ => None,
+        };
+        if preference_resolution.is_none() && crate::worker_spawn::uses_native_sweep(root) {
             return false;
         }
         let pool = spawnable_pool_state(root);
-        // `total == 0` is the ABSENT-pool condition (#4642), not this one —
-        // see the module doc. Falling through to the clear path below is
-        // deliberate: a pool that was drained to empty should not keep a
-        // pre-flight hold alive under a stale key.
-        let exhausted = pool.total > 0 && pool.usable == 0;
+        let (exhausted, preference_diagnostic) = match preference_resolution {
+            Some(resolution) => match &resolution.chosen {
+                Some(_) => (false, None),
+                // Every tap in the list was skipped — the #7708 hold now
+                // covers the whole preference list, not just Claude (#8554).
+                None => (true, Some(resolution.exhausted_diagnostic("sweep-lifecycle"))),
+            },
+            // `total == 0` is the ABSENT-pool condition (#4642), not this
+            // one — see the module doc. Falling through to the clear path
+            // below is deliberate: a pool that was drained to empty should
+            // not keep a pre-flight hold alive under a stale key.
+            None => (pool.total > 0 && pool.usable == 0, None),
+        };
         let mut holds = self.lock();
 
         if exhausted {
@@ -177,18 +224,29 @@ impl PoolHoldState {
                     hold.next_clear_at = next_clear_at;
                 }
                 Entry::Vacant(slot) => {
-                    log::warn!(
-                        "work_finder: token pool {} is EXHAUSTED — 0/{} accounts spawnable \
-                         (every account bad-marked in .bad_tokens or hard-excluded by \
-                         .ranking). Holding ALL sweep dispatch for every workspace resolving \
-                         to this pool until at least one account returns (~{}); no claim label \
-                         will be flipped and no lease comment posted while held. Run \
-                         `loom-daemon tokens check --ranking` or `loom-daemon tokens unblock \
-                         <name>` (#7708)",
-                        pool.dir.display(),
-                        pool.total,
-                        next_clear_at.to_rfc3339()
-                    );
+                    if let Some(diagnostic) = &preference_diagnostic {
+                        log::warn!(
+                            "work_finder: every runtime in the sweep-lifecycle preference list \
+                             is UNAVAILABLE. Holding ALL sweep dispatch for every workspace \
+                             resolving to this pool until at least one tap recovers (~{}); no \
+                             claim label will be flipped and no lease comment posted while held \
+                             (#7708/#8554).\n{diagnostic}",
+                            next_clear_at.to_rfc3339()
+                        );
+                    } else {
+                        log::warn!(
+                            "work_finder: token pool {} is EXHAUSTED — 0/{} accounts spawnable \
+                             (every account bad-marked in .bad_tokens or hard-excluded by \
+                             .ranking). Holding ALL sweep dispatch for every workspace resolving \
+                             to this pool until at least one account returns (~{}); no claim \
+                             label will be flipped and no lease comment posted while held. Run \
+                             `loom-daemon tokens check --ranking` or `loom-daemon tokens unblock \
+                             <name>` (#7708)",
+                            pool.dir.display(),
+                            pool.total,
+                            next_clear_at.to_rfc3339()
+                        );
+                    }
                     slot.insert(PoolExhaustionHold {
                         dir: pool.dir.clone(),
                         total: pool.total,
