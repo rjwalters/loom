@@ -25,13 +25,32 @@ use std::path::Path;
 /// session exports `LOOM_RUNTIME` (see `runtime_admission`'s own guard, #4739),
 /// and here an ambient value does not merely outrank config — it takes the
 /// *operator-pin* branch and disables the fall-through under test entirely.
-struct ClearedRuntimeEnv(Vec<(&'static str, Option<String>)>);
+///
+/// It also repoints the **Codex profile root** at an owned empty directory,
+/// which is what makes "codex has no accounts" a property of the fixture
+/// rather than of the host. Without it these tests read the developer's real
+/// `~/.loom/codex-profiles`, so every assertion that a codex tap is skipped
+/// passes in CI (no profiles) and fails on any fleet host that actually has
+/// Codex seats provisioned — the shape
+/// `codex_is_never_selected_for_builder_however_high_it_is_listed` hit on
+/// robb-studio. `role_runner::runtime_preflight`, `provider_health_feedback`
+/// and `work_finder::pool_preflight` all isolate the same var in their own
+/// guards; this file was the one that did not.
+struct ClearedRuntimeEnv {
+    prior: Vec<(&'static str, Option<String>)>,
+    /// Held only so the empty profile root outlives the guard. Never read.
+    _profile_root: tempfile::TempDir,
+}
 
-const PIN_VARS: [&str; 4] = [
+const PIN_VARS: [&str; 8] = [
     "LOOM_RUNTIME",
     "LOOM_RUNTIME_BUILDER",
     "LOOM_RUNTIME_JUDGE",
     "LOOM_RUNTIME_CURATOR",
+    "LOOM_CODEX_PROFILE_ROOT",
+    "LOOM_CODEX_PROFILE",
+    "LOOM_CODEX_HOME",
+    "CODEX_HOME",
 ];
 
 impl ClearedRuntimeEnv {
@@ -44,13 +63,18 @@ impl ClearedRuntimeEnv {
                 (*key, prior)
             })
             .collect();
-        Self(prior)
+        let profile_root = tempfile::tempdir().unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root.path());
+        Self {
+            prior,
+            _profile_root: profile_root,
+        }
     }
 }
 
 impl Drop for ClearedRuntimeEnv {
     fn drop(&mut self) {
-        for (key, value) in self.0.drain(..) {
+        for (key, value) in self.prior.drain(..) {
             match value {
                 Some(value) => std::env::set_var(key, value),
                 None => std::env::remove_var(key),
@@ -632,6 +656,110 @@ fn a_malformed_preference_list_rejects_the_launch() {
 }
 
 // ---------------------------------------------------------------------------
+// `Decision::into_admission` — the #8554 dispatch-seam collapse
+// ---------------------------------------------------------------------------
+
+/// The static path's `result` passes straight through `into_admission`,
+/// unchanged in either arm — this is what keeps a dispatch call site that
+/// swaps `runtime_admission::resolve_and_admit` for
+/// `resolve_runtime(..).and_then(|d| d.into_admission(role))` byte-identical
+/// when no preference is configured (#8554).
+#[test]
+#[serial_test::serial]
+fn into_admission_passes_the_static_result_through_unchanged() {
+    let _env = ClearedRuntimeEnv::new();
+    let dir = fixture();
+    write_config(dir.path(), &serde_json::json!({"runtimes": {"default": "claude"}}));
+    let decision = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    let baseline = resolve_and_admit(dir.path(), "builder", None).unwrap();
+    assert_eq!(decision.into_admission("builder").unwrap(), baseline);
+
+    // The static Err arm too — an admission genuinely rejected outright
+    // (not merely unavailable), never a preference-shaped diagnostic.
+    let unknown_role_decision = resolve_runtime(dir.path(), "not-a-role", None, 0).unwrap();
+    let unknown_role_baseline = resolve_and_admit(dir.path(), "not-a-role", None).unwrap_err();
+    let error = unknown_role_decision
+        .into_admission("not-a-role")
+        .unwrap_err();
+    assert_eq!(error, unknown_role_baseline);
+}
+
+/// The preference path's happy case: the chosen tap's admission comes
+/// through as `Ok`.
+#[test]
+#[serial_test::serial]
+fn into_admission_unwraps_the_chosen_tap_on_the_preference_path() {
+    let _env = ClearedRuntimeEnv::new();
+    let dir = fixture();
+    provision_claude_pool(dir.path(), 2);
+    write_config(
+        dir.path(),
+        &serde_json::json!({"runtimes": {"preference": ["claude", "opencode"]}}),
+    );
+    let decision = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    let admitted = decision.into_admission("builder").unwrap();
+    assert_eq!(admitted.runtime, "claude");
+    assert_eq!(admitted.source, RuntimeSource::Preference);
+}
+
+/// The preference path's fail-closed case: every tap skipped becomes a
+/// `RuntimeRejection` naming the role and carrying the same
+/// `exhausted_diagnostic` text an operator would read off `Resolution`
+/// directly — never a silent `Ok` and never the empty-string/`Unobservable`
+/// shape a caller might mistake for a real (if unhelpful) admission.
+#[test]
+#[serial_test::serial]
+fn into_admission_reports_a_wholly_unavailable_list_as_a_rejection() {
+    let _env = ClearedRuntimeEnv::new();
+    let dir = fixture();
+    write_config(dir.path(), &serde_json::json!({"runtimes": {"preference": ["claude"]}}));
+    // No Claude pool provisioned at all: the sole listed tap is unavailable.
+    let decision = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    let rejection = decision.into_admission("builder").unwrap_err();
+    assert_eq!(rejection.role, "builder");
+    assert_eq!(rejection.source, RuntimeSource::Preference);
+    assert!(rejection.unmet_capabilities.is_empty());
+    assert!(rejection.reason.contains("preference order: claude"), "{}", rejection.reason);
+    assert!(rejection.reason.contains("claude_tokens"), "{}", rejection.reason);
+}
+
+/// `resolve_for_dispatch` is the function `sweep_registry::dispatch` actually
+/// calls, so the "absent config is byte-identical" invariant is pinned at
+/// *that* seam too, not only at `resolve_runtime`/`into_admission`: with no
+/// preference key it must return exactly what `resolve_and_admit` returns, in
+/// both the `Ok` and the `Err` arm (#8554).
+#[test]
+#[serial_test::serial]
+fn resolve_for_dispatch_is_a_one_for_one_substitution_when_unconfigured() {
+    let _env = ClearedRuntimeEnv::new();
+    let dir = fixture();
+    write_config(dir.path(), &serde_json::json!({"runtimes": {"default": "claude"}}));
+    assert_eq!(
+        super::resolve_for_dispatch(dir.path(), "sweep-lifecycle", None).unwrap(),
+        resolve_and_admit(dir.path(), "sweep-lifecycle", None).unwrap()
+    );
+    assert_eq!(
+        super::resolve_for_dispatch(dir.path(), "not-a-role", None).unwrap_err(),
+        resolve_and_admit(dir.path(), "not-a-role", None).unwrap_err()
+    );
+}
+
+/// The dispatch seam's fail-closed half: a configured list whose every tap is
+/// unavailable refuses the launch (which `dispatch` turns into a
+/// `SweepGlobalRuntimeRejected` event), never an `Ok` onto a dry tap.
+#[test]
+#[serial_test::serial]
+fn resolve_for_dispatch_fails_closed_on_a_wholly_unavailable_list() {
+    let _env = ClearedRuntimeEnv::new();
+    let dir = fixture();
+    write_config(dir.path(), &serde_json::json!({"runtimes": {"preference": ["claude"]}}));
+    // No Claude pool provisioned at all: the sole listed tap is unavailable.
+    let rejection = super::resolve_for_dispatch(dir.path(), "sweep-lifecycle", None).unwrap_err();
+    assert_eq!(rejection.source, RuntimeSource::Preference);
+    assert!(rejection.reason.contains("preference order: claude"), "{}", rejection.reason);
+}
+
+// ---------------------------------------------------------------------------
 // The shared availability mapping
 // ---------------------------------------------------------------------------
 
@@ -651,7 +779,10 @@ fn claude_availability_agrees_with_the_preflight_gate() {
 
     for accounts in [0_usize, 2] {
         provision_claude_pool(dir.path(), accounts);
-        let gate_skips = crate::role_runner::runtime_preflight::check(
+        // `static_check`, not the preference-aware `check` wrapper (#8554):
+        // the guarantee under test is that the MAPPING agrees with the GATE,
+        // and the wrapper's job is to consult the mapping.
+        let gate_skips = crate::role_runner::runtime_preflight::static_check(
             dir.path(),
             &logs,
             "builder",

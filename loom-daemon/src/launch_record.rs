@@ -31,7 +31,12 @@
 use serde::{Deserialize, Serialize};
 
 /// The marker `worker_spawn::run` prefixes the launch record's JSON with.
-pub const LAUNCH_RECORD_MARKER: &str = "# LOOM_LAUNCH ";
+///
+/// A re-export, not a second definition (issue #8541): `api_keys_pool::ingest`
+/// already owns the canonical constant (as `LAUNCH_RECORD_PREFIX`) and the
+/// tested line-anchored parser that goes with it. Aliasing here means the two
+/// modules can never drift onto different marker strings.
+pub use crate::api_keys_pool::ingest::LAUNCH_RECORD_PREFIX as LAUNCH_RECORD_MARKER;
 
 /// Where a native-harness spawn's credential came from, and (when the pool
 /// decided) which account — never the key itself.
@@ -202,14 +207,32 @@ pub fn sweep_runtime_attribution(
 /// the region the **last** record wins — a containment re-exec writes its own
 /// launch record inside the container, and the last one written is the one the
 /// harness actually ran on.
+///
+/// Composes [`crate::api_keys_pool::ingest::region_after`] and
+/// [`crate::api_keys_pool::ingest::parse_launch_record`] rather than
+/// re-deriving the anchor/marker scan (issue #8541): those helpers scan lines
+/// in reverse and require each candidate to *start with* the marker after
+/// trim, falling back to an earlier candidate line rather than giving up — so
+/// a log line that merely *mentions* `# LOOM_LAUNCH ` mid-line (e.g. an agent
+/// transcript echoing it) can never suppress attribution of the real,
+/// earlier, line-start record the way an unanchored substring search could.
 #[must_use]
 pub fn parse_launch_credential_after(
     contents: &str,
     header_anchor: &str,
 ) -> Option<CredentialAttribution> {
-    let region = &contents[contents.rfind(header_anchor)?..];
-    let body_start = region.rfind(LAUNCH_RECORD_MARKER)? + LAUNCH_RECORD_MARKER.len();
-    parse_launch_credential(region[body_start..].lines().next()?)
+    let region = crate::api_keys_pool::ingest::region_after(contents, header_anchor)?;
+    let record = crate::api_keys_pool::ingest::parse_launch_record(region)?;
+    // Mirrors parse_launch_credential's "no reading of silence" contract: an
+    // empty/missing credentialSource yields None, not a fabricated source.
+    if record.credential_source.is_empty() {
+        return None;
+    }
+    Some(CredentialAttribution {
+        source: record.credential_source,
+        provider: record.provider,
+        account: record.account,
+    })
 }
 
 #[cfg(test)]
@@ -293,6 +316,27 @@ mod tests {
         );
         let attribution = parse_launch_credential_after(&log, "sweep_id=new").unwrap();
         assert_eq!(attribution.account.as_deref(), Some("fresh-account"));
+    }
+
+    /// Issue #8541: a log line that merely *mentions* the marker mid-line
+    /// (e.g. an agent transcript echoing it, not `worker_spawn::run`'s own
+    /// line-start write) must not suppress attribution of the real, earlier,
+    /// line-start record. An unanchored `rfind` of the marker substring would
+    /// match inside the transcript line, take everything after it as the
+    /// "record", fail to parse it as JSON, and return `None` — silently
+    /// dropping attribution of a launch that really did happen.
+    #[test]
+    fn a_marker_merely_mentioned_mid_line_does_not_suppress_the_real_record() {
+        let log = format!(
+            "==== loom-daemon dispatch: sweep_id=s1 issue=42 ====\n{}\nagent transcript: I \
+             noticed a line starting with \"{}\" earlier in the log while summarizing it\n",
+            launch_line("pool", "zai", "alpha"),
+            LAUNCH_RECORD_MARKER,
+        );
+        let attribution = parse_launch_credential_after(&log, "sweep_id=s1").unwrap();
+        assert_eq!(attribution.source, "pool");
+        assert_eq!(attribution.provider.as_deref(), Some("zai"));
+        assert_eq!(attribution.account.as_deref(), Some("alpha"));
     }
 
     #[test]

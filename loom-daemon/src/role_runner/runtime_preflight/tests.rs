@@ -735,3 +735,276 @@ fn a_dry_codex_pool_never_feeds_the_sweep_dispatch_brake() {
     );
     assert_eq!(observer.0.load(Ordering::Relaxed), 1);
 }
+
+// ---- #8554: the preference list decides the tap, and fails closed ----
+
+/// A workspace with NO per-role runtime pin — `judge` resolves to the
+/// built-in default (`claude`) exactly as an unconfigured install would —
+/// so `config_extra` is free to install `runtimes.preference` /
+/// `runtimes.rolePreference` instead. Otherwise identical to
+/// `codex_judge_workspace`: a real (if minimal) `judge` role manifest, a
+/// `codex` runtime manifest, and executable adapter stubs for **both**
+/// runtimes — so `claude` is genuinely admitted and a skip of it is the
+/// pool-exhaustion shape under test, never the materially different
+/// `not-admitted(...)` a missing adapter would produce. No
+/// `.loom/runtimes/claude.json` is written: #4688's bundled zero-config
+/// fallback covers it, exactly as on a real install.
+///
+/// The fake `spawn-worker.sh` records `$LOOM_RUNTIME` rather than merely
+/// touching a marker, so a test can assert **which** tap the tick launched
+/// on — the difference between "a spawn happened" and "the preference list
+/// actually re-pointed the launch".
+fn preference_judge_workspace(
+    root: &Path,
+    config_extra: &serde_json::Value,
+    claude_pool_exhausted: bool,
+) -> PathBuf {
+    for sub in [
+        ".loom/roles",
+        ".loom/runtimes",
+        ".loom/scripts",
+        ".loom/tokens",
+    ] {
+        fs::create_dir_all(root.join(sub)).unwrap();
+    }
+    fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
+    if claude_pool_exhausted {
+        fs::write(
+            root.join(".loom/tokens/.bad_tokens"),
+            format!("{} fake auth failure\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        .unwrap();
+    }
+    fs::write(root.join(".loom/config.json"), config_extra.to_string()).unwrap();
+    fs::write(root.join(".loom/roles/judge.json"), r#"{"runtimeRequirements":["mcp"]}"#).unwrap();
+    fs::write(root.join(".loom/runtimes/codex.json"), CODEX_MANIFEST).unwrap();
+    write_executable(&root.join(".loom/scripts/spawn-codex.sh"), "#!/bin/sh\nexit 0\n");
+    write_executable(&root.join(".loom/scripts/spawn-claude.sh"), "#!/bin/sh\nexit 0\n");
+    let marker = root.join("script-ran");
+    write_executable(
+        &root.join(".loom/scripts/spawn-worker.sh"),
+        &format!("#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" >'{}'\nexit 0\n", marker.display()),
+    );
+    marker
+}
+
+/// The genuine fall-through: `claude` is listed FIRST and admitted, its pool
+/// is dry, so the walk records `unavailable(claude_tokens: …)` for it and
+/// lands on the codex tap below — the shape a fleet with
+/// `preference: ["claude", "codex", …]` actually runs.
+#[test]
+#[serial]
+fn a_dry_first_tap_falls_through_to_the_next_listed_tap() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let marker = preference_judge_workspace(
+        workspace.path(),
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+        true,
+    );
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
+    assert_eq!(fs::read_to_string(&marker).unwrap_or_default(), "codex");
+}
+
+/// …and the same list with a HEALTHY first tap stays on it: the fleet-wide
+/// `preference` key must not move work off a subscription seat that can serve
+/// it (the "never pass over a tap that could have served" half of the
+/// availability contract).
+#[test]
+#[serial]
+fn a_healthy_first_tap_keeps_the_tick_on_it() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let marker = preference_judge_workspace(
+        workspace.path(),
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+        false,
+    );
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
+    assert_eq!(fs::read_to_string(&marker).unwrap_or_default(), "claude");
+}
+
+/// The core #8554 acceptance criterion: Claude (the static default, no
+/// `runtimes.roles.judge` pin at all) is dry, but `rolePreference.judge`
+/// names a codex tap with a healthy account — the tick must reach the spawn
+/// on codex, not skip as `PoolExhausted` over a Claude pool it no longer
+/// needs. It is also the `rolePreference.judge` acceptance criterion: the key
+/// that resolves is the role-scoped one, which outranks (and here exists
+/// without) the fleet-wide `runtimes.preference`.
+#[test]
+#[serial]
+fn an_exhausted_claude_pool_falls_through_via_role_preference_instead_of_skipping() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let marker = preference_judge_workspace(
+        workspace.path(),
+        &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex"]}}}),
+        true,
+    );
+
+    let before = pool_exhausted_skip_count();
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap_or_default(),
+        "codex",
+        "the tick must fall through to codex and actually spawn"
+    );
+    assert_eq!(pool_exhausted_skip_count(), before, "no pool skip may be counted");
+    let log = judge_log(workspace.path());
+    assert!(!log.contains("SKIPPED BEFORE SPAWN"), "{log}");
+}
+
+/// `rolePreference.judge` is honoured on a **healthy** Claude pool too — the
+/// whole point of the key (Judge independence: a native sweep reviews in the
+/// same session that wrote the change, so Judge must be able to run on a
+/// different tap than the builder). A list consulted only when the top tap is
+/// exhausted would silently ignore this configuration for as long as the
+/// Claude pool stayed healthy, i.e. almost always.
+#[test]
+#[serial]
+fn role_preference_decides_the_tap_even_when_the_static_pool_is_healthy() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let marker = preference_judge_workspace(
+        workspace.path(),
+        &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex", "claude"]}}}),
+        false,
+    );
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap_or_default(),
+        "codex",
+        "a healthy Claude pool must not override the operator's ordering"
+    );
+}
+
+/// With **no** preference list the same fixture is byte-identical to
+/// pre-#8554 behaviour: static resolution picks `claude`, the healthy pool
+/// gate passes, and the launch goes to claude even though a perfectly
+/// spawnable codex seat exists. The control for the test above — it is the
+/// preference key that moves the tap, not the fixture.
+#[test]
+#[serial]
+fn no_preference_list_leaves_the_static_runtime_in_charge() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let marker = preference_judge_workspace(workspace.path(), &serde_json::json!({}), false);
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
+    assert_eq!(fs::read_to_string(&marker).unwrap_or_default(), "claude");
+}
+
+/// The fail-closed half: every tap in the list is unavailable too (here,
+/// zero codex accounts), so resolution yields no tap and the tick reports the
+/// statically-admitted runtime's own Claude-pool skip — byte-identical to the
+/// pre-#8554 outcome (self-healing, kept out of #7607's stuck-role streak),
+/// not a new failure class.
+#[test]
+#[serial]
+fn a_wholly_unavailable_role_preference_list_still_skips_pre_spawn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    // No codex profile directories created: the codex pool is provisioned
+    // (the manifest/adapter exist) but has zero enabled accounts.
+    let marker = preference_judge_workspace(
+        workspace.path(),
+        &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex"]}}}),
+        true,
+    );
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    let RoleTickOutcome::PoolExhausted { pool, hold, .. } = outcome else {
+        panic!("expected PoolExhausted, got {outcome:?}");
+    };
+    assert_eq!(pool, CredentialPool::ClaudeTokens, "the ORIGINAL skip stands, unchanged");
+    assert_eq!(hold, PoolHold::SelfHealing);
+    assert!(!marker.exists(), "a doomed spawn must never run");
+}
+
+/// The fail-closed remainder: the list (`["codex"]`, unavailable) excludes
+/// the statically-admitted runtime, whose pool is **healthy** — so there is
+/// no pool skip to borrow. The tick must still refuse, reporting the
+/// preference list's own exhausted diagnostic, and must NOT quietly launch
+/// the unlisted-but-healthy runtime, which would route around the operator's
+/// configuration.
+#[test]
+#[serial]
+fn an_unavailable_list_refuses_rather_than_launching_an_unlisted_runtime() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    // No codex profile directories: the only listed tap is unavailable. The
+    // Claude pool is deliberately HEALTHY (no `.bad_tokens`).
+    let marker = preference_judge_workspace(
+        workspace.path(),
+        &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex"]}}}),
+        false,
+    );
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    let RoleTickOutcome::RuntimeRejected(rejection) = &outcome else {
+        panic!("expected a fail-closed RuntimeRejected, got {outcome:?}");
+    };
+    assert_eq!(
+        rejection.source,
+        crate::runtime_admission::RuntimeSource::Preference,
+        "{rejection:?}"
+    );
+    assert!(rejection.reason.contains("preference order: codex"), "{}", rejection.reason);
+    assert!(!marker.exists(), "no tap could serve the work, so nothing may spawn");
+    assert!(judge_log(workspace.path()).contains("SKIPPED BEFORE SPAWN"));
+}
+
+/// A role-scoped operator pin (`LOOM_RUNTIME_JUDGE`) outranks
+/// `rolePreference.judge` and disables fall-through, exactly as
+/// `runtime_preference`'s own invariant states — a pin is a deliberate
+/// operator act, and silently routing around it at the pre-spawn gate would
+/// make it useless for the debugging it exists for.
+#[test]
+#[serial]
+fn an_operator_pin_disables_preference_fall_through_at_the_pre_spawn_gate() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let marker = preference_judge_workspace(
+        workspace.path(),
+        &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex"]}}}),
+        true,
+    );
+    std::env::set_var("LOOM_RUNTIME_JUDGE", "claude");
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    let RoleTickOutcome::PoolExhausted { pool, .. } = outcome else {
+        panic!("expected PoolExhausted, got {outcome:?}");
+    };
+    assert_eq!(pool, CredentialPool::ClaudeTokens, "the pin must keep the tick on claude");
+    assert!(!marker.exists(), "a pinned-but-dry launch must still skip, never fall through");
+}

@@ -14,9 +14,11 @@ use super::*;
 
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::Result;
+use serial_test::serial;
 use tempfile::TempDir;
 
 use crate::work_finder::{tick, TickReport, WorkDispatcher, WorkItem, WorkSource};
@@ -348,4 +350,169 @@ fn all_four_hosts_resume_on_the_tick_after_the_pool_recovers() {
         );
         assert_eq!(host.held_pool_count(), 0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// #8554: preference-aware hold — arms on the WHOLE list, not just Claude
+// ---------------------------------------------------------------------------
+
+/// Every env var that can pin a runtime or repoint the codex account reader.
+/// Cleared for the scope of a test and restored on drop, mirroring
+/// `role_runner::runtime_preflight::tests::EnvGuard`.
+const PREFERENCE_ENV: [&str; 8] = [
+    "LOOM_RUNTIME",
+    "LOOM_RUNTIME_SWEEP_LIFECYCLE",
+    "LOOM_CODEX_HOME",
+    "CODEX_HOME",
+    "LOOM_CODEX_PROFILE",
+    "LOOM_SPAWN_NO_EXPORT",
+    "LOOM_CODEX_NO_EXEC",
+    "LOOM_CODEX_PROFILE_ROOT",
+];
+
+struct PreferenceEnvGuard(Vec<(&'static str, Option<String>)>);
+
+impl PreferenceEnvGuard {
+    fn new(profile_root: &Path) -> Self {
+        let prior = PREFERENCE_ENV
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        for key in PREFERENCE_ENV {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root);
+        Self(prior)
+    }
+}
+
+impl Drop for PreferenceEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.0.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// A workspace with BOTH a Claude token pool (`workspace_with_pool`) and the
+/// on-disk role/runtime manifests plus an executable `codex` adapter stub
+/// that `runtime_preference::resolve_runtime("sweep-lifecycle", ...)` needs
+/// to admit a fallback tap for real, instead of failing closed on missing
+/// files. `sweep-lifecycle`'s role-manifest lookup substitutes `builder.json`
+/// (`runtime_admission`'s own fallback), so that is the file written here.
+fn workspace_with_pool_and_preference(names: &[&str], config: &serde_json::Value) -> TempDir {
+    let dir = workspace_with_pool(names);
+    for sub in ["roles", "runtimes", "scripts"] {
+        fs::create_dir_all(dir.path().join(".loom").join(sub)).unwrap();
+    }
+    fs::write(dir.path().join(".loom/config.json"), config.to_string()).unwrap();
+    fs::write(
+        dir.path().join(".loom/roles/builder.json"),
+        r#"{"runtimeRequirements":["mcp"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(".loom/runtimes/codex.json"),
+        r#"{"runtime":"codex","accountProvider":"codex","capabilities":{"mcp":"yes"}}"#,
+    )
+    .unwrap();
+    // Both adapters, so the `claude` tap is genuinely ADMITTED and its skip
+    // (when it is skipped) is `unavailable(claude_tokens: …)` — the #7708
+    // pool-exhaustion shape this hold exists for — and never the materially
+    // different `not-admitted(...)` a missing adapter would produce.
+    for runtime in ["codex", "claude"] {
+        let adapter = dir.path().join(format!(".loom/scripts/spawn-{runtime}.sh"));
+        fs::write(&adapter, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+/// The core #8554 acceptance criterion: the Claude pool is fully bad-marked
+/// (the exact #7708 shape), but `runtimes.preference` names a codex fallback
+/// with a healthy account — the hold must NOT arm; dispatch belongs on codex
+/// instead of holding every workspace resolving to this pool.
+#[test]
+#[serial]
+fn a_spawnable_lower_tap_keeps_the_hold_from_arming() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(
+        !host.observe_root(ws.path(), chrono::Utc::now()),
+        "a spawnable fallback tap must keep the hold from arming"
+    );
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// The other half: every tap in the list is unavailable too (here, zero
+/// codex accounts) — the hold still arms, exactly as the Claude-only check
+/// did before #8554.
+#[test]
+#[serial]
+fn a_wholly_unavailable_preference_list_still_arms_the_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    // No codex profile directories created: the codex pool is provisioned
+    // (manifest + adapter exist) but has zero enabled accounts.
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.held_pool_count(), 1);
+}
+
+/// A healthy Claude pool with a preference list configured never holds —
+/// tier 0 serves the work, exactly as the no-preference case does.
+#[test]
+#[serial]
+fn a_healthy_claude_pool_never_arms_even_with_a_preference_list() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(
+        &["a", "b"],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+
+    let host = PoolHoldState::new();
+    assert!(!host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// An operator pin (`LOOM_RUNTIME=claude`) disables fall-through at the hold
+/// too: a dry Claude pool still arms the hold even with a spawnable codex
+/// fallback configured, because the pin is a deliberate act that a silent
+/// route-around would defeat.
+#[test]
+#[serial]
+fn an_operator_pin_disables_fall_through_at_the_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+    bad_mark_all(ws.path(), &["a"]);
+    std::env::set_var("LOOM_RUNTIME", "claude");
+
+    let host = PoolHoldState::new();
+    assert!(
+        host.observe_root(ws.path(), chrono::Utc::now()),
+        "a pin must keep the hold on Claude even with a spawnable fallback"
+    );
 }

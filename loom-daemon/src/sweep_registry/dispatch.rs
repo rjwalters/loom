@@ -1714,7 +1714,17 @@ impl SweepRegistry {
         let runtime_admission = if self.config.skip_label_flip {
             None // hermetic unit fixtures do not install runtime manifests
         } else {
-            match crate::runtime_admission::resolve_and_admit(
+            // #8554: `runtime_preference::resolve_for_dispatch` is a
+            // one-for-one substitution for
+            // `runtime_admission::resolve_and_admit` — same arity, same
+            // return type, and byte-identical (including its `Err` shape,
+            // and reading no credential pool at all) when no
+            // `runtimes.preference` / `rolePreference.sweep-lifecycle` is
+            // configured. When one IS configured and the top tap's pool is
+            // dry, it resolves onto a lower tap instead of failing, which is
+            // exactly why the #7708 work-finder hold
+            // (`work_finder::pool_preflight`) no longer held dispatch here.
+            match crate::runtime_preference::resolve_for_dispatch(
                 &self.config.workspace_root,
                 "sweep-lifecycle",
                 None,
