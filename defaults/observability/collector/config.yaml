@@ -1,0 +1,123 @@
+# Pinned Collector 0.161.0. Secrets are files, never incoming client metadata.
+extensions:
+  bearertokenauth/loom:
+    filename: /run/secrets/loom_ingest_key
+    wait_for_token_file: true
+    retry_on_failure:
+      enabled: true
+      interval: 1s
+      max_retries: 5
+  bearertokenauth/clickstack:
+    filename: /run/secrets/clickstack_ingest_key
+    scheme: ""
+    wait_for_token_file: true
+    retry_on_failure:
+      enabled: true
+      interval: 1s
+      max_retries: 5
+  file_storage/clickstack:
+    directory: /var/lib/otelcol/clickstack
+    create_directory: true
+    fsync: true
+  file_storage/signoz:
+    directory: /var/lib/otelcol/signoz
+    create_directory: true
+    fsync: true
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        max_request_body_size: 1048576
+        auth:
+          authenticator: bearertokenauth/loom
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 384
+    spike_limit_mib: 96
+  # Allow only Loom's structured operational attributes. Source-side privacy
+  # enforcement still owns free-text bodies, span names and nested values.
+  transform/privacy:
+    error_mode: propagate
+    log_statements:
+      - context: resource
+        statements:
+          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id"])
+      - context: log
+        statements:
+          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name", "loom.duration_sec", "loom.total_duration_sec", "loom.phase_durations", "loom.models_used", "loom.tokens_by_model", "loom.gated_pool", "loom.actions.comments_posted", "loom.actions.issues_labeled", "loom.actions.prs_merged"])
+    trace_statements:
+      - context: resource
+        statements:
+          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id"])
+      - context: span
+        statements:
+          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name"])
+      - context: spanevent
+        statements:
+          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name"])
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id"])
+      - context: datapoint
+        statements:
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state"])
+exporters:
+  otlp_http/clickstack:
+    endpoint: http://clickstack-collector:4318
+    auth:
+      authenticator: bearertokenauth/clickstack
+    timeout: 5s
+    retry_on_failure:
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 600s
+    sending_queue:
+      storage: file_storage/clickstack
+      sizer: requests
+      queue_size: 1000
+      num_consumers: 2
+      block_on_overflow: false
+  otlp_http/signoz:
+    endpoint: http://signoz-otel-collector:4318
+    timeout: 5s
+    retry_on_failure:
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 600s
+    sending_queue:
+      storage: file_storage/signoz
+      sizer: requests
+      queue_size: 1000
+      num_consumers: 2
+      block_on_overflow: false
+service:
+  extensions: [bearertokenauth/loom, bearertokenauth/clickstack, file_storage/clickstack, file_storage/signoz, health_check]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/privacy]
+      exporters: [otlp_http/clickstack, otlp_http/signoz]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/privacy]
+      exporters: [otlp_http/clickstack, otlp_http/signoz]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/privacy]
+      exporters: [otlp_http/clickstack, otlp_http/signoz]
