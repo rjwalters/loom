@@ -132,6 +132,14 @@ pub(crate) enum ScriptPortCommand {
     /// onto the pinned commit. Exit 0 planned/rebased, 1 a prerequisite
     /// refused with nothing mutated, 2 the rebase itself failed.
     ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
+
+    /// Generate `.agents/skills/loom-<name>/SKILL.md` from every
+    /// `defaults/roles/<name>.md` role prompt (#8673) — the cross-vendor
+    /// skill-discovery surface Codex, Kimi Code, Mistral Vibe, and Grok read
+    /// natively. Not a port either: brand-new logic, native from the start
+    /// per the shell-language policy, backing
+    /// `generate-agent-skills.sh`'s Shape-A stub.
+    GenerateAgentSkills(super::agent_skills::AgentSkillsArgs),
 }
 
 impl ScriptPortCommand {
@@ -157,6 +165,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DuplicateScan(args) => args.run(),
             ScriptPortCommand::PremiseCheck(args) => args.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
+            ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
         }
     }
 }
