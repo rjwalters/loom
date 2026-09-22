@@ -61,3 +61,4 @@ test-loom-dispatcher.sh  Wired through scripts/test-installer.sh in Installer In
 test-spawn-generic.sh  Wired in native-port equivalence job; requires the Rust spawn-worker dispatcher (#8362).
 
 test-sweep-checkpoint.sh  Native Rust checkpoint port (#8525); retained equivalence suite runs in Native Port Suites with a built binary.
+test-reconcile-stack.sh  Needs a built loom-daemon since #8583 moved reconcile-stack.sh's planning/execution (fetch + pin the remote default-branch tip, worktree routing, parent-ref/ancestry resolution, the rebase itself) into `loom-daemon reconcile-stack`; wired in the "Native Port Suites" job, which builds one first. Its scenarios predate the port apart from J/K and the two rebase-target assertions the fix changed, so it is the equivalence evidence and FAILS rather than skips without a binary.

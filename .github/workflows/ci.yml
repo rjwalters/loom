@@ -1122,6 +1122,16 @@ jobs:
         run: bash defaults/scripts/tests/test-check-duplicate.sh
       - name: create-issue duplicate backstop graduation (#7971, #8289, #8360)
         run: bash defaults/scripts/tests/test-create-issue-duplicate-check.sh
+      # Moved out of shell-suite-tests by #8583: reconcile-stack.sh's rebase
+      # planning/execution (fetch + PIN the remote default-branch tip, worktree
+      # routing, parent-ref resolution and its ancestry check, the rebase
+      # itself) is now `loom-daemon reconcile-stack`, so this suite's
+      # require-daemon-bin harness needs the binary this job builds. Its
+      # scenarios were written against the shell implementation and run
+      # unchanged against the port apart from J/K (the #8583 regression itself)
+      # and the two rebase-target assertions the fix necessarily changed.
+      - name: reconcile-stack rebase target + worktree routing (#3776, #7982, #8010, #8583)
+        run: bash defaults/scripts/tests/test-reconcile-stack.sh
       # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
       # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
       # (188 + 27 assertions, unchanged from the shell implementation apart

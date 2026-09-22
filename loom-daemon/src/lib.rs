@@ -207,6 +207,7 @@ pub mod quarantine_stash_status;
 pub mod ram_headroom;
 pub mod rate_limit_breaker;
 pub mod reclaim_pr_warning;
+pub mod reconcile_stack;
 pub mod release_fetch;
 pub mod release_resolve;
 pub mod repo_root;

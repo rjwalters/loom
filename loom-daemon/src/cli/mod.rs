@@ -32,6 +32,7 @@ pub(crate) mod opencode_usage_cli;
 pub(crate) mod peer_claims_cmd;
 pub(crate) mod premise_check;
 pub(crate) mod quarantine;
+pub(crate) mod reconcile_stack;
 pub(crate) mod release_fetch;
 pub(crate) mod release_resolve;
 pub(crate) mod restart;
