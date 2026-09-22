@@ -96,6 +96,25 @@ pub fn provider_only(command: &mut Command, provider: &ProviderConfig) -> Result
     Ok(())
 }
 
+/// Whether a **live guarded canary receipt** exists for Kimi Code CLI.
+///
+/// This is evidence tracking, not a setting — the same contract
+/// `opencode_version::Major::guard_verified` establishes for OpenCode
+/// majors (`.loom/docs/guardrail-parity-native.md` § "OpenCode major
+/// versions"). There is deliberately no configuration key and no
+/// environment override: the binding below is complete and unit-tested
+/// against shapes read out of the pinned CLI's own bundle, but a fixture
+/// test can only prove Loom *writes* that configuration, never that a real
+/// CLI *honours* it. Only a live canary — including the
+/// deliberately-broken-binding case, whose pass condition is "no file
+/// written and no unguarded tool used", not the exit code — distinguishes
+/// "failed closed" from "fell open".
+///
+/// Flipped to `true` by the change that also lands the dated receipt in
+/// `.loom/docs/guardrail-parity-native.md` and flips
+/// `defaults/runtimes/kimi.json`'s `worktreeIsolation`/`loomControl`.
+pub const KIMI_GUARD_VERIFIED: bool = false;
+
 pub fn configure(
     command: &mut Command,
     root: &Path,
@@ -103,20 +122,21 @@ pub fn configure(
     model: &str,
     provider: &ProviderConfig,
 ) -> Result<()> {
-    // Issue #8561/#8562: Kimi has no guarded `loom_*` tool binding yet — no
-    // extension, no plugin, nothing to write. Fail closed here, before ANY
-    // provisioning (`super::guard::ready` included) runs, rather than let a
-    // role-tagged launch fall through to Kimi's own unguarded builtin tools.
+    // Issue #8562: the Kimi binding below has no live canary receipt yet.
+    // Fail closed here, before ANY provisioning (`super::guard::ready`
+    // included) runs, rather than let a role-tagged launch reach a binding
+    // no live run has confirmed the CLI honours.
     // `harness::Harness::Kimi::command` is the only caller that reaches this
     // with `runtime == "kimi"`, and only when the launch is role-tagged
     // (`guarded`) — an ordinary free-form trial never calls `configure` at
     // all.
-    if runtime == "kimi" {
+    if runtime == "kimi" && !KIMI_GUARD_VERIFIED {
         anyhow::bail!(
-            "Kimi has no guarded loom_* tool binding yet; a role-tagged launch would otherwise \
-             run with Kimi's own unguarded builtin tools instead of Loom's worktree/workflow/ \
-             destructive policies. Tracked in issue #8562. Unguarded free-form trials (no \
-             --role tag and no /loom:<role> prompt) remain supported."
+            "Kimi's guarded loom_* tool binding has no live canary receipt yet, so a role-tagged \
+             launch is refused rather than run against an unverified boundary. Tracked in issue \
+             #8562; see .loom/docs/guardrail-parity-native.md for the receipt this waits on. \
+             Unguarded free-form trials (no --role tag and no /loom:<role> prompt) remain \
+             supported."
         );
     }
     super::guard::ready(root)?;
@@ -137,6 +157,8 @@ pub fn configure(
         command
             .args(["--no-builtin-tools", "--no-extensions", "--extension"])
             .arg(extension);
+    } else if runtime == "kimi" {
+        write_kimi_bindings(command, root, directory, &binary)?;
     } else {
         let config_dir = directory.join("opencode");
         write_opencode_bindings(&config_dir)?;
@@ -157,6 +179,39 @@ pub fn configure(
         command.env("OPENCODE_CONFIG_CONTENT", config.to_string());
         command.args(["--agent", "loom-worker"]);
     }
+    Ok(())
+}
+
+/// Relocate `KIMI_CODE_HOME` into this launch's private state directory and
+/// write the three generated bindings into it (#8562).
+///
+/// Relocating the whole home — rather than dropping a `.kimi-code/` overlay
+/// into the worktree — is what makes this per-launch and unreachable from
+/// repository content: `[tools]` and `[[hooks]]` have no project-level file
+/// at all, so an overlay could not carry the allowlist, and anything written
+/// inside the worktree is content the model may edit or commit.
+fn write_kimi_bindings(
+    command: &mut Command,
+    root: &Path,
+    directory: &Path,
+    binary: &Path,
+) -> Result<()> {
+    let home = directory.join("kimi");
+    state::private_directory(&home)?;
+    let cwd = std::env::current_dir().context("cannot resolve the launch working directory")?;
+    let server = super::kimi::server_name(directory);
+    let hook = super::kimi::hook_command(binary, root, &cwd)?;
+    write_binding(&home.join("config.toml"), &super::kimi::config_toml(&server, &hook))?;
+    write_binding(
+        &home.join("mcp.json"),
+        &super::kimi::mcp_json(&server, binary, root, &cwd, &super::guard::directory(root))?,
+    )?;
+    let agent = home.join("loom-worker.md");
+    write_binding(&agent, &super::kimi::agent_file(&server))?;
+    command
+        .env("KIMI_CODE_HOME", &home)
+        .arg("--agent-file")
+        .arg(agent);
     Ok(())
 }
 

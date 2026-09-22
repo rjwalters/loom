@@ -1,4 +1,4 @@
-# Guardrail parity: Pi and OpenCode
+# Guardrail parity: Pi, OpenCode and Kimi
 
 Loom-managed native roles use four tools: `loom_read`, `loom_write`,
 `loom_edit`, and `loom_bash`. Their small harness bindings call the Rust
@@ -10,7 +10,10 @@ Tested versions and live outcomes: [verification receipt](native-runtime-verific
 — Pi 0.85.1 and OpenCode **1.18.31**. Everything this page says about OpenCode's
 guard was verified on OpenCode 1.x only. **No OpenCode 2.x guarded receipt
 exists yet**, so a guarded launch on 2.x is refused before spawn; see
-"OpenCode major versions" below.
+"OpenCode major versions" below. Kimi's binding (#8562) is implemented and
+unit-tested but has **no live guarded canary receipt at all yet** — every
+capability in `defaults/runtimes/kimi.json` stays `"no"` and Builder/Doctor/
+Judge stay refused on Kimi until one lands; see "Kimi" below.
 
 ## Enforcement boundary
 
@@ -105,6 +108,73 @@ reports none, with or without an explicit `plugin` entry. The 2.x-native
 mechanism for loading a local, per-launch tool binding is still unknown, so
 `Major::guard_verified`'s `V2 => false` refusal stays until a passing 2.x
 receipt exists.
+
+## Kimi
+
+Kimi Code CLI has no extension point Loom can point at a local file the way
+Pi's `--extension` or OpenCode's plugin loader do; its only route for adding
+tools at all is an MCP server entry. The binding (#8562) is therefore shaped
+differently from Pi/OpenCode's, though the boundary intent is the same:
+
+- **`loom-daemon native-mcp`** (`loom-daemon/src/native_tools/mcp.rs`) is a
+  stdio JSON-RPC MCP server exposing exactly `loom_read`, `loom_write`,
+  `loom_edit` and `loom_bash`. Every `tools/call` is normalized into the same
+  `native_tools::execute` request Pi/OpenCode use — no policy decision is made
+  in the MCP server itself, so it reaches the same guard bridge, worktree
+  policy, destructive-command policy, mutation lock, bounded executor and
+  64 KiB truncation.
+- **A relocated, per-launch `KIMI_CODE_HOME`** (`native_tools::kimi`,
+  wired from `provision::configure`) holds a generated `config.toml`
+  (`[tools] enabled = ["mcp__<server>__*"]`, every unguarded builtin —
+  `Agent`, `AgentSwarm`, `Bash`, `Edit`, `Write` — also listed in `disabled`
+  as belt-and-braces), a generated `mcp.json` naming the `native-mcp` server
+  with `LOOM_WORKSPACE`/`LOOM_NATIVE_TOOL_BIN`/`LOOM_NATIVE_GUARD_DIR` in its
+  env, and a generated `--agent-file` (`tools: [mcp__<server>__*]`,
+  `subagents: []`) — so a binding that fails to load leaves no executable
+  tool, guarded or not, rather than falling through to Kimi's own unguarded
+  `Bash`/`Write`/`Edit`. The MCP server name carries a per-launch nonce
+  (a hash of the launch's private state directory) rather than a fixed
+  `loom` name: Kimi resolves `mcp.json` in three layers, `$KIMI_CODE_HOME`
+  (Loom's) plus two the worktree can carry (`<gitWorkTreeRoot>/.mcp.json`,
+  `<cwd>/.kimi-code/mcp.json`), and a later layer overwrites a same-named
+  entry from an earlier one — so a fixed name would let repository content
+  shadow Loom's server for a *later* launch in that worktree. A relocated
+  home was chosen over a project-level `.kimi-code/` overlay because
+  `[tools]` and `[[hooks]]` have no project-level file at all — an overlay
+  could carry the MCP server entry but not the allowlist that makes it the
+  only tool, and everything written inside the worktree is content a guarded
+  model may itself edit or commit.
+- **A `[[hooks]] PreToolUse` entry** (`native-mcp --pretooluse-guard`) denies
+  any tool call whose name is not `mcp__<server>__loom_*`. This is
+  belt-and-braces only, not part of the guarantee: Kimi's hook contract is
+  documented fail-**open** — any crashed, timed-out or non-2-exit hook
+  defaults to allow — so it can only ever narrow what `[tools] enabled`
+  already decided, never widen it.
+- **Toolless detection** (#8448) is extended to Kimi's own event shape:
+  `worker_spawn::launch_outcome::classify_native_stream` now recognizes the
+  OpenAI-style chat messages Kimi's `--output-format stream-json` emits
+  (`{"role":"assistant","tool_calls":[{"function":{"name":…}}]}`), stripping
+  the `mcp__<server>__` prefix before matching `loom_*` so a role tick that
+  exits 0 having reached zero guarded tools — the deliberately-broken-binding
+  case — is still reported as a `Failure`, not a false success.
+- A guarded launch requires a model profile with a `credentialEnv` mapping
+  (the `KIMI_MODEL_*` env family): relocating `KIMI_CODE_HOME` hides the
+  operator's own `config.toml`, so the config-alias route (`-m <alias>`)
+  cannot resolve under a guarded launch and the adapter refuses before spawn
+  rather than launch a worker that cannot pick a model.
+
+**No live guarded canary receipt exists yet, so nothing above is admission
+evidence.** `native_tools::provision::KIMI_GUARD_VERIFIED` is `false`, and
+`configure()` fails closed for `runtime == "kimi"` whenever a launch is
+role-tagged, independent of the binding's own fixture tests passing — the
+same "fixture tests prove Loom *writes* the configuration, never that a real
+CLI *honors* it" gap the OpenCode 2.x section above documents, for exactly
+the same reason: only a live run, including the deliberately-broken-binding
+case (pass condition is "no file written and no unguarded tool used", not the
+exit code), can distinguish "failed closed" from "fell open" on the real CLI.
+`defaults/runtimes/kimi.json` stays `worktreeIsolation: "no"` /
+`loomControl: "no"` — so Builder, Doctor and Judge stay refused on Kimi — until
+a passing receipt lands beside a flip of `KIMI_GUARD_VERIFIED` to `true`.
 
 ## Toolless launch detection
 

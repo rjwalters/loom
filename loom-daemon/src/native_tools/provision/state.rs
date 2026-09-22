@@ -28,6 +28,7 @@ pub(super) fn prepare(root: &Path) -> Result<State> {
         "PI_CODING_AGENT_DIR",
         "PI_CODING_AGENT_SESSION_DIR",
         "OPENCODE_CONFIG_DIR",
+        "KIMI_CODE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",
@@ -271,6 +272,21 @@ fn validate_auth_format(bytes: &[u8], runtime: &str) -> Result<()> {
 
 impl State {
     pub(super) fn configure(&self, command: &mut Command, runtime: &str) -> Result<()> {
+        if runtime == "kimi" {
+            // `KIMI_CODE_HOME` is relocated by `provision::write_kimi_bindings`
+            // and holds config, MCP registry, sessions and credentials in one
+            // directory, so there is nothing further to pin here. An external
+            // auth snapshot is refused rather than guessed at: Kimi's
+            // credential file format has no verified shape in
+            // `validate_auth_format`, and writing an unvalidated blob into a
+            // relocated home could silently authenticate the wrong account.
+            ensure!(
+                self.auth.is_none(),
+                "LOOM_NATIVE_AUTH_FILE is not supported for the kimi harness; use the model \
+                 profile's credentialEnv mapping (KIMI_MODEL_API_KEY) instead"
+            );
+            return Ok(());
+        }
         if let Some(auth) = &self.auth {
             validate_auth_format(auth, runtime)?;
         }

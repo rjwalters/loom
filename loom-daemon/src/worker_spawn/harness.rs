@@ -211,13 +211,27 @@ impl Harness {
                         "providerDefinition is not supported by the kimi harness",
                     ));
                 }
-                // #8562: Kimi has no guarded `loom_*` tool binding yet. A
-                // role-tagged launch must fail closed here — inside
-                // `configure` — rather than fall through to Kimi's own
-                // unguarded builtin tools. This also catches Curator/Guide/
-                // Auditor, none of which require a capability the manifest
-                // could gate on, since `guarded` is set from the presence of
-                // a role tag, independent of that role's own requirements.
+                // #8562: a guarded launch relocates `KIMI_CODE_HOME` into
+                // per-launch private state, so the operator's own
+                // `config.toml` — and therefore every `[models.<alias>]`
+                // entry and the login store beside it — is not visible to
+                // the child. The config-alias route below (`-m <alias>`)
+                // cannot resolve under that relocation, so a guarded launch
+                // requires the config-free env family instead of silently
+                // launching a worker that cannot pick a model.
+                if guarded && selection.credential_sources.is_empty() {
+                    return Err(LaunchError::config(
+                        "a guarded kimi launch requires a model profile with a credentialEnv \
+                         mapping (the KIMI_MODEL_* env family): the guarded launch relocates \
+                         KIMI_CODE_HOME, so a `providers.kimi` config alias cannot resolve",
+                    ));
+                }
+                // A role-tagged launch must fail closed inside `configure`
+                // rather than fall through to Kimi's own unguarded builtin
+                // tools. This also catches Curator/Guide/Auditor, none of
+                // which require a capability the manifest could gate on,
+                // since `guarded` is set from the presence of a role tag,
+                // independent of that role's own requirements.
                 if guarded {
                     crate::native_tools::provision::configure(
                         &mut command,

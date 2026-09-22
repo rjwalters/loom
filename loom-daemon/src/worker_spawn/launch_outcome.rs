@@ -94,23 +94,68 @@ pub fn classify_native_stream(text: &str) -> LaunchOutcome {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let Some(kind) = event.get("type").and_then(Value::as_str) else {
+        let kind = event.get("type").and_then(Value::as_str);
+        // Kimi's `--output-format stream-json` (2.0.2) is a chat transcript,
+        // not a typed event stream: its assistant/tool messages are keyed by
+        // `role` and carry no `type` at all, while only its `role:"meta"`
+        // lines have one. Counting a `role`-keyed line as an event is what
+        // keeps a Kimi launch from degrading to "no opinion" (`events == 0`)
+        // and silently keeping its exit-0 success verdict.
+        let role = event.get("role").and_then(Value::as_str);
+        if kind.is_none() && role.is_none() {
             continue;
-        };
+        }
         outcome.events += 1;
-        if STEP_FINISH_TYPES.contains(&kind) {
+        if kind.is_some_and(|kind| STEP_FINISH_TYPES.contains(&kind)) {
             outcome.step_finishes += 1;
         }
-        if TOOL_USE_TYPES.contains(&kind)
-            && tool_name(&event).is_some_and(|n| n.starts_with("loom_"))
+        if kind.is_some_and(|kind| TOOL_USE_TYPES.contains(&kind))
+            && tool_name(&event).is_some_and(is_loom_tool)
         {
             outcome.loom_tool_uses += 1;
         }
+        outcome.loom_tool_uses += chat_tool_calls(&event, role);
         if is_denial(&event) {
             outcome.denials += 1;
         }
     }
     outcome
+}
+
+/// Whether a harness-reported tool name is one of Loom's guarded tools.
+///
+/// A harness that namespaces MCP-provided tools reports
+/// `mcp__<server>__loom_bash` rather than `loom_bash` (Kimi's
+/// `MCP_NAME_PREFIX`), and Loom's own server name carries a per-launch nonce
+/// — so the server segment is stripped rather than matched.
+fn is_loom_tool(name: &str) -> bool {
+    let bare = match name.rsplit_once("__") {
+        Some((prefix, bare)) if prefix.starts_with("mcp") => bare,
+        _ => name,
+    };
+    bare.starts_with("loom_")
+}
+
+/// Count guarded tool calls carried inside an OpenAI-style assistant
+/// message (`{"role":"assistant","tool_calls":[{"function":{"name":…}}]}`),
+/// the shape Kimi's stream-json emits. Lenient about where the name sits so
+/// a `{"name":…}` variant is recognised too.
+fn chat_tool_calls(event: &Value, role: Option<&str>) -> usize {
+    if role != Some("assistant") {
+        return 0;
+    }
+    let Some(calls) = event.get("tool_calls").and_then(Value::as_array) else {
+        return 0;
+    };
+    calls
+        .iter()
+        .filter(|call| {
+            call.get("function")
+                .and_then(tool_name)
+                .or_else(|| tool_name(call))
+                .is_some_and(is_loom_tool)
+        })
+        .count()
 }
 
 fn tool_name(event: &Value) -> Option<&str> {
@@ -219,6 +264,69 @@ mod tests {
         let outcome = classify_native_stream(stream);
         assert_eq!(outcome.loom_tool_uses, 1);
         assert_eq!(outcome.step_finishes, 1);
+    }
+
+    #[test]
+    fn kimi_stream_json_tool_calls_are_recognized_through_their_mcp_prefix() {
+        // The exact shapes `@moonshot-ai/kimi-code` 2.0.2's `PromptJsonWriter`
+        // emits under `--output-format stream-json`: `role`-keyed chat
+        // messages, with tool calls nested under `tool_calls[].function.name`
+        // and namespaced by the MCP server's per-launch name (#8562).
+        let stream = "\
+            # LOOM_LAUNCH {\"schema\":1,\"runtime\":\"kimi\"}\n\
+            {\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.0.2\"}\n\
+            {\"role\":\"assistant\",\"content\":\"Writing the file.\",\"tool_calls\":[{\"type\":\"function\",\"id\":\"c1\",\"function\":{\"name\":\"mcp__loom-0123456789abcdef__loom_write\",\"arguments\":\"{}\"}}]}\n\
+            {\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"Wrote 3 bytes\"}\n\
+            {\"role\":\"assistant\",\"content\":\"Done.\"}\n\
+        ";
+        let outcome = classify_native_stream(stream);
+        assert_eq!(outcome.loom_tool_uses, 1);
+        assert_eq!(outcome.events, 4, "meta, two assistant messages and the tool result");
+        assert!(!outcome.is_toolless_failure());
+    }
+
+    #[test]
+    fn a_kimi_run_that_never_reached_a_loom_tool_is_an_observed_toolless_failure() {
+        // The deliberately-broken-binding case: the MCP server never loads,
+        // so the allowlists leave the model with no tools. It still exits 0
+        // and still emits a readable stream — which is exactly why the
+        // verdict must come from the stream, not the exit code.
+        let stream = "\
+            {\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.0.2\"}\n\
+            {\"role\":\"assistant\",\"content\":\"I have no tools available.\"}\n\
+        ";
+        let outcome = classify_native_stream(stream);
+        assert_eq!(outcome.loom_tool_uses, 0);
+        assert_eq!(outcome.events, 2);
+        assert!(outcome.observed_a_toolless_run());
+    }
+
+    #[test]
+    fn a_kimi_run_using_only_its_own_builtin_tools_is_still_a_toolless_failure() {
+        // If the allowlists ever fell open, Kimi would report its OWN tools
+        // ("Bash"/"Write"), or another MCP server's. Neither counts.
+        let stream = "\
+            {\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"name\":\"Bash\"}}]}\n\
+            {\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"name\":\"mcp__other__loom_write\"}}]}\n\
+        ";
+        let outcome = classify_native_stream(stream);
+        assert_eq!(outcome.loom_tool_uses, 1, "only the loom-prefixed server's tool counts");
+        let only_builtin = classify_native_stream(
+            "{\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"name\":\"Write\"}}]}\n",
+        );
+        assert!(only_builtin.observed_a_toolless_run());
+    }
+
+    #[test]
+    fn a_denied_kimi_tool_result_still_counts_as_a_working_binding() {
+        let stream = "\
+            {\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"name\":\"mcp__loom-ab__loom_bash\"}}]}\n\
+            {\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"denied by Loom policy: protected branch\"}\n\
+        ";
+        let outcome = classify_native_stream(stream);
+        assert_eq!(outcome.loom_tool_uses, 1);
+        assert_eq!(outcome.denials, 1);
+        assert!(!outcome.is_toolless_failure());
     }
 
     #[test]

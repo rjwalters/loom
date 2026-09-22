@@ -120,15 +120,21 @@ CLI](https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html
 Node ≥ 22.19; `kimi --version`). Put it on `PATH`, or set `LOOM_KIMI_BIN` to
 its executable.
 
-**Unguarded only, for now.** `defaults/runtimes/kimi.json` declares every
-capability `"no"` — there is no `loom_*` guarded-tool binding for Kimi yet
-(tracked in #8562). Kimi is therefore admitted only for roles that declare no
-`runtimeRequirements` (Curator, Guide, Auditor); Builder, Doctor and Judge fail
-closed at exit 78. A role-tagged launch (`LOOM_ROLE` set, or a `/loom:<role>`
-prompt) fails closed a second way, inside `native_tools::provision::configure`,
-naming #8562 — this also catches Curator/Guide/Auditor, since none of them
-require a capability the manifest alone could gate on. Free-form trials with no
-role tag are unaffected.
+**Unguarded only, for now.** `defaults/runtimes/kimi.json` still declares every
+capability `"no"`. The guarded `loom_*` tool binding itself — a Rust
+`loom-daemon native-mcp` stdio MCP server, a relocated per-launch
+`KIMI_CODE_HOME`, and the same guard bridge/worktree/destructive-command
+policies Pi and OpenCode use — landed in #8562, but the manifest flip stays
+gated on a live guarded canary receipt (`native_tools::provision::KIMI_GUARD_VERIFIED`,
+`false` today); see [guardrail-parity-native.md](guardrail-parity-native.md)
+§ "Kimi" for why a fixture-tested binding is not admission evidence. Kimi is
+therefore still admitted only for roles that declare no `runtimeRequirements`
+(Curator, Guide, Auditor); Builder, Doctor and Judge fail closed at exit 78. A
+role-tagged launch (`LOOM_ROLE` set, or a `/loom:<role>` prompt) fails closed a
+second way, inside `native_tools::provision::configure`, naming #8562 — this
+also catches Curator/Guide/Auditor, since none of them require a capability
+the manifest alone could gate on. Free-form trials with no role tag are
+unaffected.
 
 **Two model-selection routes**, mirroring Kimi's own config precedence (CLI
 flags > env > `config.toml`):

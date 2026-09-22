@@ -11,6 +11,7 @@ pub(crate) mod api_keys;
 pub(crate) mod cancel;
 pub(crate) mod cleanup_ops;
 pub(crate) mod common;
+mod daemon_start;
 pub(crate) mod dep_classify;
 pub(crate) mod dep_recheck;
 pub(crate) mod dispatch;
