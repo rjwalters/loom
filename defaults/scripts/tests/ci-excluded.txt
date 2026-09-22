@@ -73,6 +73,7 @@ test-spawn-claude-credential-proxy.sh  Same constraint as test-spawn-claude.sh a
 
 test-loom-dispatcher.sh  Wired through scripts/test-installer.sh in Installer Integration Tests; requires the Rust spawn-worker dispatcher (#8362).
 test-spawn-generic.sh  Wired in native-port equivalence job; requires the Rust spawn-worker dispatcher (#8362).
+test-spawn-generic-launch.sh  Wired in the "Native Port Suites" job alongside test-spawn-generic.sh; spawn-generic-launch.sh resolves a tier-3 runtime's launch shape via `loom-daemon runtime-launch-env` (#8671), so this suite needs the binary that job builds. It pins one via loom_test_require_daemon_bin and FAILS rather than skips without it.
 
 test-sweep-checkpoint.sh  Native Rust checkpoint port (#8525); retained equivalence suite runs in Native Port Suites with a built binary.
 test-reconcile-stack.sh  Needs a built loom-daemon since #8583 moved reconcile-stack.sh's planning/execution (fetch + pin the remote default-branch tip, worktree routing, parent-ref/ancestry resolution, the rebase itself) into `loom-daemon reconcile-stack`; wired in the "Native Port Suites" job, which builds one first. Its scenarios predate the port apart from J/K and the two rebase-target assertions the fix changed, so it is the equivalence evidence and FAILS rather than skips without a binary.
