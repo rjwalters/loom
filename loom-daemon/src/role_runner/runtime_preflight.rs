@@ -120,8 +120,21 @@ pub(crate) fn check(
         None => Ok(()),
     };
     let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
-    let Ok(crate::runtime_preference::Decision::Preference { source, resolution }) =
-        crate::runtime_preference::resolve_runtime(root, role, None, now)
+    // Dispatch intent: a tick that settles on a governed backstop tap takes a
+    // metered slot (#8555). It is parked for this thread and `role_runner`
+    // attaches it to the child it spawns; every early return below — including
+    // the chosen tap's own pre-spawn gate refusing — drops the `Decision`, and
+    // with it releases the slot, so a tick that does not launch never holds
+    // one.
+    let context = crate::runtime_preference::DispatchContext {
+        complexity: None,
+        intent: crate::runtime_preference::Intent::Dispatch,
+    };
+    let Ok(crate::runtime_preference::Decision::Preference {
+        source,
+        resolution,
+        backstop,
+    }) = crate::runtime_preference::resolve_runtime_for(root, role, None, now, context)
     else {
         // No preference list applies to this role, an operator pin is in
         // force (a pin disables fall-through by design), or the preference
@@ -159,6 +172,11 @@ pub(crate) fn check(
     // back to the caller to launch.
     let chosen_admission = Ok(chosen.admitted);
     gate(Some(&chosen_admission))?;
+    // Past every gate: this tick IS launching, so the metered slot (if the
+    // chosen tap took one) is handed to the caller's spawn via the thread-keyed
+    // park. `?` above returns before this, dropping `backstop` and releasing
+    // the slot, which is exactly what a skipped tick should do.
+    crate::runtime_preference::handoff::park(backstop);
     Ok(chosen_admission.ok())
 }
 

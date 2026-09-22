@@ -108,10 +108,11 @@
 
 pub mod availability;
 pub mod ceiling;
+pub mod handoff;
 pub mod resolve;
 
 pub use availability::{availability, Availability, CredentialSource};
-pub use ceiling::{BackstopCeiling, ComplexityTier, Reservation};
+pub use ceiling::{BackstopCeiling, ComplexityTier, Intent, Reservation};
 pub use resolve::{
     CeilingSkip, ChosenTap, Resolution, SkipReason, SkippedTap, Tap, PREFERENCE_LOG_MARKER,
 };
@@ -270,6 +271,20 @@ impl Decision {
 /// production caller wants the wall clock; a test that needs a pinned clock
 /// calls [`resolve_runtime`] directly, which is the seam that takes one.
 ///
+/// # Side effect
+/// This is the **dispatch-intent** entry point ([`Intent::Dispatch`]), so
+/// settling on a governed backstop tap takes a metered slot (#8555). Because
+/// the collapse to `ResolvedRuntime` has nowhere to carry it, the slot is
+/// parked for this thread with [`handoff::park`]; the launch site **must**
+/// call [`handoff::attach`] with the spawned child's PID. Failing to is
+/// bounded, not catastrophic — the unattached lease ages out in
+/// [`ceiling::DEFAULT_RESERVATION_STALE_SECS`] — but it makes the launch
+/// uncounted. See [`handoff`] for why the park is thread-keyed.
+///
+/// A resolution that took no slot parks `None`, which *clears* the key: a
+/// stale reservation from a launch that resolved and then never spawned can
+/// never be attached to a later child's PID.
+///
 /// # Errors
 /// The static path's own rejection, a malformed-preference rejection, or —
 /// when every listed tap was skipped — the fail-closed rejection
@@ -281,10 +296,15 @@ pub fn resolve_for_dispatch(
     explicit: Option<&str>,
 ) -> Result<ResolvedRuntime, RuntimeRejection> {
     let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
-    let decision = resolve_runtime(root, role, explicit, now)?;
+    let context = DispatchContext {
+        complexity: None,
+        intent: Intent::Dispatch,
+    };
+    let mut decision = resolve_runtime_for(root, role, explicit, now, context)?;
     if let Some(marker) = decision.marker_line() {
         log::info!("runtime_preference: {role} resolved by preference list — {marker} (#8554)");
     }
+    handoff::park(decision.take_backstop());
     decision.into_admission(role)
 }
 
@@ -452,6 +472,13 @@ pub struct DispatchContext<'a> {
     /// finder already carries it through `dispatch(issue, complexity)`.
     /// `None` ⇒ treated as `routine`.
     pub complexity: Option<&'a str>,
+    /// Whether this resolution precedes a real launch (and so may take a
+    /// metered slot) or is a read-only probe. Defaults to
+    /// [`Intent::Probe`] — `work_finder::pool_preflight` re-resolves on every
+    /// tick for every workspace purely to decide whether to hold, and a probe
+    /// that consumed capacity would refuse the very dispatch it was asked
+    /// about.
+    pub intent: Intent,
 }
 
 /// The operator pin in force for `role`, if any — the three tiers that
@@ -583,10 +610,9 @@ pub fn resolve_runtime_for(
             let Some(bound) = backstop_ceiling.as_ref().filter(|c| c.governs(tier)) else {
                 return Ok(());
             };
-            match ceiling::admit(bound, canonical, tap, context.complexity) {
-                ceiling::Verdict::Unbounded => Ok(()),
+            match ceiling::admit(bound, canonical, tap, context.complexity, context.intent) {
                 ceiling::Verdict::Admitted(slot) => {
-                    reservation = Some(slot);
+                    reservation = slot;
                     Ok(())
                 }
                 ceiling::Verdict::Refused(reason) => Err(reason),

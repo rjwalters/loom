@@ -1255,6 +1255,21 @@ launching — or panicking between the two — cannot leak a slot. Dead owners'
 leases are reaped lazily by the next count; no explicit release step is needed
 when a sweep dies.
 
+The daemon *selects* and then spawns a child that outlives the selection, so
+those two steps are different places in the code: the slot is parked for the
+resolving thread (`runtime_preference::handoff`) and claimed at the spawn site —
+`sweep_registry::dispatch`'s `finish_issue_dispatch` / PR-set spawn, and the
+role runner's own. Nothing else has to carry it.
+
+**Probing does not consume.** `work_finder::pool_preflight` re-resolves the list
+every tick for every workspace purely to decide whether to hold dispatch. That
+path resolves with **probe** intent: it reports the ceiling honestly (a host at
+its metered ceiling with a dry Claude pool really does have nothing to dispatch
+onto) but takes no slot, creates no store, and writes no lease. Only a real
+launch reserves — otherwise a tick loop would churn a lease per root per tick
+and, far worse, could transiently occupy the very slot the dispatch it was asked
+about was about to claim.
+
 **Observability.** A launch that consumed a slot appends it to the same
 preference marker that records the fall-through it paid for:
 

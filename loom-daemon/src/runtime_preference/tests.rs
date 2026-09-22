@@ -938,6 +938,19 @@ impl Drop for ScopedLeaseDir {
     }
 }
 
+/// Resolve the way a real launch does — [`ceiling::Intent::Dispatch`], so a
+/// governed tap actually takes a metered slot. `resolve_runtime` itself is the
+/// *probe* seam (`work_finder::pool_preflight` calls it every tick and must
+/// consume nothing), so a ceiling test that used it would assert against a
+/// count that is never incremented.
+fn dispatch_resolve(root: &Path, role: &str, complexity: Option<&str>) -> Decision {
+    let context = super::DispatchContext {
+        complexity,
+        intent: ceiling::Intent::Dispatch,
+    };
+    super::resolve_runtime_for(root, role, None, 0, context).unwrap()
+}
+
 /// A fixture whose Claude pool is unprovisioned (so the walk falls through to
 /// the backstop tap) with a ceiling of `max` concurrent backstop dispatches.
 fn ceiling_fixture(max: u32) -> tempfile::TempDir {
@@ -968,7 +981,7 @@ fn the_n_plus_first_concurrent_backstop_dispatch_is_passed_over() {
 
     // N = 1: the first dispatch falls through to the backstop and takes the
     // host's only metered slot.
-    let first = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    let first = dispatch_resolve(dir.path(), "builder", None);
     let Decision::Preference {
         ref resolution,
         ref backstop,
@@ -988,7 +1001,7 @@ fn the_n_plus_first_concurrent_backstop_dispatch_is_passed_over() {
     assert!(marker.contains("backstop=1/1"), "{marker}");
 
     // N+1: while that slot is held, the next dispatch is passed over.
-    let second = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    let second = dispatch_resolve(dir.path(), "builder", None);
     let Decision::Preference {
         resolution: second_resolution,
         backstop: second_backstop,
@@ -1012,7 +1025,7 @@ fn the_n_plus_first_concurrent_backstop_dispatch_is_passed_over() {
     // Releasing the first dispatch's slot frees the host immediately — the
     // bound is concurrency, not a cooldown, so nothing waits on a clock.
     drop(first);
-    let third = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    let third = dispatch_resolve(dir.path(), "builder", None);
     let Decision::Preference { resolution, .. } = third else {
         panic!("expected the preference path");
     };
@@ -1032,7 +1045,7 @@ fn a_recovered_higher_tap_is_still_preferred_while_the_backstop_is_at_its_ceilin
     let dir = ceiling_fixture(1);
 
     // Hold the host's only backstop slot.
-    let held = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+    let held = dispatch_resolve(dir.path(), "builder", None);
     assert!(matches!(
         &held,
         Decision::Preference {
@@ -1045,7 +1058,7 @@ fn a_recovered_higher_tap_is_still_preferred_while_the_backstop_is_at_its_ceilin
     // though the backstop is pinned at its ceiling.
     provision_claude_pool(dir.path(), 3);
     for _ in 0..3 {
-        let decision = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+        let decision = dispatch_resolve(dir.path(), "builder", None);
         let Decision::Preference {
             resolution,
             backstop,
@@ -1084,20 +1097,14 @@ fn the_eligibility_filter_keeps_low_value_work_off_the_metered_tap() {
         }),
     );
 
-    let context = super::DispatchContext {
-        complexity: Some("mechanical"),
-    };
-    let decision = super::resolve_runtime_for(dir.path(), "builder", None, 0, context).unwrap();
+    let decision = dispatch_resolve(dir.path(), "builder", Some("mechanical"));
     let Decision::Preference { resolution, .. } = decision else {
         panic!("expected the preference path");
     };
     assert!(resolution.chosen.is_none());
     assert_eq!(resolution.skipped[1].reason.kind(), "ceiling-ineligible");
 
-    let context = super::DispatchContext {
-        complexity: Some("complex"),
-    };
-    let decision = super::resolve_runtime_for(dir.path(), "builder", None, 0, context).unwrap();
+    let decision = dispatch_resolve(dir.path(), "builder", Some("complex"));
     let Decision::Preference {
         resolution,
         backstop,
@@ -1126,7 +1133,7 @@ fn an_unconfigured_ceiling_touches_no_state_and_bounds_nothing() {
     let store = ceiling::lease_dir().unwrap();
     let mut held = Vec::new();
     for _ in 0..5 {
-        let decision = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+        let decision = dispatch_resolve(dir.path(), "builder", None);
         let Decision::Preference {
             resolution,
             backstop,
@@ -1163,4 +1170,82 @@ fn a_malformed_ceiling_rejects_the_launch() {
     let rejection = resolve_runtime(dir.path(), "builder", None, 0).unwrap_err();
     assert_eq!(rejection.source, RuntimeSource::Preference);
     assert!(rejection.reason.contains("appliesFrom"), "{}", rejection.reason);
+}
+
+/// `work_finder::pool_preflight` re-resolves on **every tick for every
+/// workspace** just to decide whether to hold dispatch. It goes through
+/// `resolve_runtime`, whose default intent is a probe: it must answer the same
+/// question — is the whole list unavailable? — while consuming nothing. A probe
+/// that reserved would churn a lease per tick and, worse, could occupy the very
+/// slot the dispatch it was asked about is about to claim.
+#[test]
+#[serial_test::serial]
+fn the_probe_seam_the_work_finder_ticks_on_consumes_no_metered_capacity() {
+    let _env = ClearedRuntimeEnv::new();
+    let _leases = ScopedLeaseDir::new();
+    let dir = ceiling_fixture(1);
+    let store = ceiling::lease_dir().unwrap();
+
+    for _ in 0..10 {
+        let decision = resolve_runtime(dir.path(), "builder", None, 0).unwrap();
+        let Decision::Preference {
+            resolution,
+            backstop,
+            ..
+        } = decision
+        else {
+            panic!("expected the preference path");
+        };
+        // The probe still reports what a launch would do — fall through to the
+        // backstop — it simply does not pay for it.
+        assert_eq!(resolution.chosen.as_ref().unwrap().tier, 1);
+        assert!(backstop.is_none(), "a probe must never hold a metered slot");
+    }
+    assert_eq!(ceiling::live_count(&store).unwrap(), 0);
+
+    // And after all that probing the host's single slot is still there to be
+    // taken by a real dispatch.
+    let dispatched = dispatch_resolve(dir.path(), "builder", None);
+    assert!(matches!(
+        dispatched,
+        Decision::Preference {
+            backstop: Some(_),
+            ..
+        }
+    ));
+}
+
+/// The production path end to end: `resolve_for_dispatch` — the one-for-one
+/// substitution `sweep_registry::dispatch` and the role runner call — parks the
+/// slot it took, `handoff::attach` binds it to the spawned child, and the next
+/// dispatch sees the host at its ceiling. Without the park the `Decision` would
+/// be dropped on collapse to `ResolvedRuntime`, the lease released, and the
+/// configured ceiling would silently never count anything.
+#[test]
+#[serial_test::serial]
+fn resolve_for_dispatch_hands_the_slot_to_the_launch_and_the_next_dispatch_sees_it() {
+    let _env = ClearedRuntimeEnv::new();
+    let _leases = ScopedLeaseDir::new();
+    let dir = ceiling_fixture(1);
+    let store = ceiling::lease_dir().unwrap();
+
+    let admitted = super::resolve_for_dispatch(dir.path(), "builder", None).unwrap();
+    assert_eq!(admitted.runtime, "opencode");
+    // Parked, not dropped: the slot survives the collapse to `ResolvedRuntime`.
+    assert_eq!(ceiling::live_count(&store).unwrap(), 1);
+    super::handoff::attach(std::process::id());
+    assert_eq!(ceiling::live_count(&store).unwrap(), 1);
+
+    // The host is now at its ceiling, so the next dispatch is refused the
+    // metered tap and — with nothing below it — fails closed, exactly as an
+    // unavailable tap would. No approval step, no wait.
+    let rejection = super::resolve_for_dispatch(dir.path(), "builder", None).unwrap_err();
+    assert_eq!(rejection.source, RuntimeSource::Preference);
+    assert!(rejection.reason.contains("ceiling-at-capacity"), "{}", rejection.reason);
+    // The refused dispatch parked nothing, so the count is unchanged.
+    assert_eq!(ceiling::live_count(&store).unwrap(), 1);
+
+    for entry in std::fs::read_dir(&store).unwrap().filter_map(Result::ok) {
+        let _ = std::fs::remove_file(entry.path());
+    }
 }

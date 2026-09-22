@@ -492,14 +492,38 @@ impl Drop for Reservation {
     }
 }
 
+/// Whether the caller is about to **launch** on the tap it is asking about, or
+/// is merely **probing** what a launch would decide.
+///
+/// The distinction exists because one caller asks every tick for every
+/// workspace: `work_finder::pool_preflight` re-derives "is the whole preference
+/// list unavailable?" on each pass, and it must get the ceiling's verdict
+/// (a host at its metered ceiling with a dry Claude pool genuinely has nothing
+/// to dispatch onto) **without** taking a slot. A probe that reserved would
+/// write and delete a lease per tick per root, and — far worse — would
+/// transiently occupy the very slot a concurrent real dispatch was about to
+/// claim, refusing metered work the host had room for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Intent {
+    /// Count, decide, and take **no** slot. The default, so a caller that says
+    /// nothing cannot accidentally consume metered capacity. It creates no
+    /// store and writes no lease; the only state it touches is the lazy reap
+    /// of already-dead leases that counting performs anyway.
+    #[default]
+    Probe,
+    /// A real launch: count and reserve atomically, returning the slot to
+    /// attach to the spawned worker.
+    Dispatch,
+}
+
 /// The outcome of asking the ceiling about one governed tap.
 #[derive(Debug)]
 pub enum Verdict {
-    /// No count applies (no `maxConcurrent`), so no slot is held and nothing
-    /// was written.
-    Unbounded,
-    /// Admitted; the reservation holds a slot until attached or dropped.
-    Admitted(Reservation),
+    /// Admitted. Carries a reservation only when a slot was actually taken —
+    /// i.e. [`Intent::Dispatch`] under a configured `maxConcurrent`. A
+    /// count-less ceiling (eligibility filter only) and every [`Intent::Probe`]
+    /// admit with `None`, having written nothing.
+    Admitted(Option<Reservation>),
     /// Passed over, with the reason to record on the skipped tap.
     Refused(SkipReason),
 }
@@ -516,13 +540,16 @@ fn refuse(skip: CeilingSkip, detail: String) -> Verdict {
 ///
 /// Counting and reserving happen under a `mkdir` control lock so two
 /// concurrent dispatches on the same host cannot both read `live == limit - 1`
-/// and both admit.
+/// and both admit. An [`Intent::Probe`] counts **outside** the lock and never
+/// writes: it holds nothing, so there is nothing for a peer to race it for, and
+/// its answer is a snapshot by nature.
 #[must_use]
 pub fn admit(
     ceiling: &BackstopCeiling,
     role: &str,
     tap: &Tap,
     complexity: Option<&str>,
+    intent: Intent,
 ) -> Verdict {
     if let Some(minimum) = ceiling.min_complexity {
         let tier = ComplexityTier::of(complexity);
@@ -538,7 +565,7 @@ pub fn admit(
         }
     }
     let Some(limit) = ceiling.max_concurrent else {
-        return Verdict::Unbounded;
+        return Verdict::Admitted(None);
     };
     if limit == 0 {
         return refuse(
@@ -552,6 +579,19 @@ pub fn admit(
             format!("no home directory to resolve the backstop lease dir (set {LEASE_DIR_ENV})"),
         );
     };
+    // A probe reads whatever store already exists and stops there: an absent
+    // directory counts as zero (`live_count`'s own contract), so probing a host
+    // that has never dispatched metered work creates nothing.
+    if intent == Intent::Probe {
+        return match live_count(&dir) {
+            Err(detail) => refuse(CeilingSkip::Unknown, detail),
+            Ok(live) if live >= limit => refuse(
+                CeilingSkip::AtCapacity { live, limit },
+                format!("{live}/{limit} concurrent backstop dispatches already held on this host"),
+            ),
+            Ok(_) => Verdict::Admitted(None),
+        };
+    }
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return refuse(
             CeilingSkip::Unknown,
@@ -591,12 +631,12 @@ pub fn admit(
             format!("cannot write the backstop lease {}: {e}", path.display()),
         );
     }
-    Verdict::Admitted(Reservation {
+    Verdict::Admitted(Some(Reservation {
         path,
         attached: false,
         live: live + 1,
         limit,
-    })
+    }))
 }
 
 #[cfg(test)]

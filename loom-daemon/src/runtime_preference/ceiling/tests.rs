@@ -66,7 +66,13 @@ fn bound(max: Option<u32>) -> BackstopCeiling {
 }
 
 fn admit_one(ceiling: &BackstopCeiling) -> Verdict {
-    admit(ceiling, "builder", &Tap::runtime("opencode"), Some("complex"))
+    admit(ceiling, "builder", &Tap::runtime("opencode"), Some("complex"), Intent::Dispatch)
+}
+
+/// The same question asked the way `work_finder::pool_preflight` asks it every
+/// tick: decide, but take nothing.
+fn probe_one(ceiling: &BackstopCeiling) -> Verdict {
+    admit(ceiling, "builder", &Tap::runtime("opencode"), Some("complex"), Intent::Probe)
 }
 
 // ---------------------------------------------------------------------------
@@ -206,11 +212,11 @@ fn the_n_plus_first_concurrent_dispatch_is_refused() {
     let store = Store::new();
     let ceiling = bound(Some(2));
     let first = match admit_one(&ceiling) {
-        Verdict::Admitted(slot) => slot,
+        Verdict::Admitted(Some(slot)) => slot,
         other => panic!("first dispatch must be admitted, got {other:?}"),
     };
     let second = match admit_one(&ceiling) {
-        Verdict::Admitted(slot) => slot,
+        Verdict::Admitted(Some(slot)) => slot,
         other => panic!("second dispatch must be admitted, got {other:?}"),
     };
     assert_eq!(second.summary(), "2/2");
@@ -234,7 +240,7 @@ fn the_n_plus_first_concurrent_dispatch_is_refused() {
     // Releasing one frees exactly one slot.
     first.release();
     assert_eq!(live_count(&store.path()).unwrap(), 1);
-    assert!(matches!(admit_one(&ceiling), Verdict::Admitted(_)));
+    assert!(matches!(admit_one(&ceiling), Verdict::Admitted(Some(_))));
     drop(second);
 }
 
@@ -276,7 +282,7 @@ fn concurrent_admissions_never_exceed_the_ceiling() {
 
     let (granted, refused): (Vec<_>, Vec<_>) = admitted
         .into_iter()
-        .partition(|verdict| matches!(verdict, Verdict::Admitted(_)));
+        .partition(|verdict| matches!(verdict, Verdict::Admitted(Some(_))));
     assert_eq!(
         granted.len(),
         LIMIT as usize,
@@ -298,7 +304,7 @@ fn concurrent_admissions_never_exceed_the_ceiling() {
     let mut seen: Vec<u32> = granted
         .iter()
         .map(|verdict| match verdict {
-            Verdict::Admitted(slot) => slot.usage().0,
+            Verdict::Admitted(Some(slot)) => slot.usage().0,
             _ => unreachable!(),
         })
         .collect();
@@ -337,22 +343,26 @@ fn the_complexity_filter_excludes_work_below_the_configured_tier() {
     };
     let tap = Tap::runtime("opencode");
     for low in [Some("routine"), Some("mechanical"), None, Some("bogus")] {
-        let Verdict::Refused(reason) = admit(&ceiling, "builder", &tap, low) else {
+        let Verdict::Refused(reason) = admit(&ceiling, "builder", &tap, low, Intent::Dispatch)
+        else {
             panic!("{low:?} must not reach the metered tap under minComplexity=complex");
         };
         assert_eq!(reason.kind(), "ceiling-ineligible");
         assert!(reason.summary().contains("complex"), "{}", reason.summary());
     }
     assert!(matches!(
-        admit(&ceiling, "builder", &tap, Some("complex")),
-        Verdict::Admitted(_)
+        admit(&ceiling, "builder", &tap, Some("complex"), Intent::Dispatch),
+        Verdict::Admitted(Some(_))
     ));
     // An unmarked dispatch is `routine`, which a `routine` minimum admits.
     let routine_minimum = BackstopCeiling {
         min_complexity: Some(ComplexityTier::Routine),
         ..ceiling
     };
-    assert!(matches!(admit(&routine_minimum, "builder", &tap, None), Verdict::Admitted(_)));
+    assert!(matches!(
+        admit(&routine_minimum, "builder", &tap, None, Intent::Dispatch),
+        Verdict::Admitted(Some(_))
+    ));
 }
 
 /// A filter with no count bounds eligibility only — no slot is taken and the
@@ -367,10 +377,52 @@ fn an_eligibility_only_ceiling_takes_no_slot() {
         min_complexity: Some(ComplexityTier::Routine),
     };
     assert!(matches!(
-        admit(&ceiling, "builder", &Tap::runtime("opencode"), Some("complex")),
-        Verdict::Unbounded
+        admit(
+            &ceiling,
+            "builder",
+            &Tap::runtime("opencode"),
+            Some("complex"),
+            Intent::Dispatch
+        ),
+        Verdict::Admitted(None)
     ));
     assert!(!store.path().exists());
+}
+
+/// `work_finder::pool_preflight` re-resolves every tick for every workspace to
+/// decide whether to hold. If that probe took a slot it would write and delete
+/// a lease per tick per root, and — the real defect — would transiently occupy
+/// the slot a concurrent *dispatch* was about to claim, refusing metered work
+/// on a host that had room for it.
+#[test]
+#[serial_test::serial]
+fn a_probe_answers_the_same_question_without_consuming_capacity() {
+    let store = Store::new();
+    let ceiling = bound(Some(1));
+
+    // Probing a host that has never dispatched metered work creates nothing.
+    assert!(matches!(probe_one(&ceiling), Verdict::Admitted(None)));
+    assert!(!store.path().exists(), "a probe must not create the lease store");
+
+    // Probing while a real dispatch holds the host's only slot reports the
+    // ceiling honestly — a probe is a read of the same truth, not a bypass.
+    let Verdict::Admitted(Some(held)) = admit_one(&ceiling) else {
+        panic!("expected admission");
+    };
+    let Verdict::Refused(reason) = probe_one(&ceiling) else {
+        panic!("a probe must see the ceiling a dispatch is holding");
+    };
+    assert_eq!(reason.kind(), "ceiling-at-capacity");
+
+    // …and however many times it is asked, the dispatch's slot is the only one
+    // on the host: the probe never added (or reaped) one of its own.
+    for _ in 0..5 {
+        drop(probe_one(&ceiling));
+    }
+    assert_eq!(live_count(&store.path()).unwrap(), 1);
+    drop(held);
+    assert!(matches!(probe_one(&ceiling), Verdict::Admitted(None)));
+    assert_eq!(live_count(&store.path()).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +437,7 @@ fn an_eligibility_only_ceiling_takes_no_slot() {
 fn an_unattached_reservation_is_released_on_drop() {
     let store = Store::new();
     let path = {
-        let Verdict::Admitted(slot) = admit_one(&bound(Some(1))) else {
+        let Verdict::Admitted(Some(slot)) = admit_one(&bound(Some(1))) else {
             panic!("expected admission");
         };
         slot.path().to_path_buf()
@@ -403,7 +455,7 @@ fn an_unattached_reservation_is_released_on_drop() {
 fn attaching_hands_the_slot_to_the_spawned_worker() {
     let store = Store::new();
     let path = {
-        let Verdict::Admitted(slot) = admit_one(&bound(Some(1))) else {
+        let Verdict::Admitted(Some(slot)) = admit_one(&bound(Some(1))) else {
             panic!("expected admission");
         };
         let path = slot.path().to_path_buf();
@@ -416,7 +468,7 @@ fn attaching_hands_the_slot_to_the_spawned_worker() {
     // A lease attached to a PID that is gone is not counted, and is reaped —
     // no release step is needed when a sweep dies.
     std::fs::remove_file(&path).unwrap();
-    let Verdict::Admitted(slot) = admit_one(&bound(Some(1))) else {
+    let Verdict::Admitted(Some(slot)) = admit_one(&bound(Some(1))) else {
         panic!("expected admission");
     };
     let dead = slot.path().to_path_buf();

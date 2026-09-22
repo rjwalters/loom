@@ -1270,6 +1270,10 @@ fn run_role_with_timeout(
         }
     };
     let pid = child.id();
+    // #8555: hand this tick's metered backstop slot (if `runtime_preflight`
+    // parked one) to the child that will spend it. No-op when no ceiling is
+    // configured or the tick did not fall through to a governed tap.
+    crate::runtime_preference::handoff::attach(pid);
     crate::observability::lifecycle::role_child_spawned(pid);
 
     let start = Instant::now();

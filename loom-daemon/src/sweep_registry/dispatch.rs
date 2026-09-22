@@ -2492,6 +2492,15 @@ impl SweepRegistry {
         }
 
         let pid = child.id();
+        // Issue #8555: hand this dispatch's metered backstop slot (if
+        // `resolve_for_dispatch` parked one back in `begin_issue_dispatch`) to
+        // the child that will spend it, so the per-host ceiling counts live
+        // sweeps rather than resolutions. Placed AFTER the #4689 preflight-death
+        // branch above, which returns `Err` for a child that is already dead:
+        // attaching there would pin a slot to a pid that no longer exists. A
+        // no-op when no ceiling is configured or the walk never fell through to
+        // a governed tap — which is every pre-#8555 fleet.
+        crate::runtime_preference::handoff::attach(pid);
         // Issue #4980: capture the child's process group NOW, while it is alive
         // — `getpgid` cannot answer for a dead pid, so a group handle acquired
         // any later is unavailable in exactly the crash case that needs it most.
@@ -2745,6 +2754,9 @@ impl SweepRegistry {
         }
 
         let pid = child.id();
+        // #8555: hand this dispatch's metered backstop slot (if
+        // `resolve_for_dispatch` parked one) to the child that will spend it.
+        crate::runtime_preference::handoff::attach(pid);
         let pgid = spawned_leader_pgid(pid);
         self.children.insert(sweep_id.clone(), child);
 
