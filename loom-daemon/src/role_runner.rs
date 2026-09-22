@@ -1037,8 +1037,13 @@ mod invocation;
 
 /// The per-role log file every invocation — real or skipped — writes to:
 /// `<logs_dir>/role-<role>.log`.
+///
+/// `pub(crate)` since Issue #8507: `role_tick_telemetry` derives the same
+/// path to read a just-finished tick's own `# LOOM_LAUNCH` record back off
+/// its log, and a second private copy of this join would be free to drift
+/// from this one.
 #[must_use]
-fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
+pub(crate) fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
     logs_dir.join(format!("role-{role}.log"))
 }
 

@@ -79,6 +79,119 @@ pub fn parse_launch_credential(record_json: &str) -> Option<CredentialAttributio
     })
 }
 
+/// Where a native-harness spawn actually ran (Issue #8507), independent of
+/// credentials: the runtime adapter, its resolved provider namespace, and the
+/// resolved model profile — read off the SAME `# LOOM_LAUNCH` record
+/// [`parse_launch_credential`] reads, so a `runtime`/`provider`/`profile`
+/// consumer can never disagree with a `credentialSource`/`credentialProvider`
+/// consumer about which launch they are describing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAttribution {
+    /// The runtime adapter (`"pi"`, `"opencode"`, …). Always present when the
+    /// record parses at all — `worker_spawn::run` sets this key on every
+    /// `# LOOM_LAUNCH` line it writes, unconditionally.
+    pub runtime: String,
+    /// The runtime's resolved provider namespace (`"zai-coding-plan"`,
+    /// `"friendli"`, …), when the launch resolved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The resolved model profile name, when one was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+/// Parse one `# LOOM_LAUNCH {…}` record body's runtime attribution (Issue
+/// #8507) — the [`RuntimeAttribution`] counterpart of
+/// [`parse_launch_credential`].
+///
+/// `None` when the body is not an object or carries no non-empty `runtime` —
+/// a record from a binary that predates this key (there is none today; kept
+/// for the same "never fabricate a reading of silence" contract
+/// [`parse_launch_credential`] documents).
+#[must_use]
+pub fn parse_launch_runtime(record_json: &str) -> Option<RuntimeAttribution> {
+    let value: serde_json::Value = serde_json::from_str(record_json.trim()).ok()?;
+    let string = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let runtime = string("runtime")?;
+    Some(RuntimeAttribution {
+        runtime,
+        provider: string("provider"),
+        profile: string("profile"),
+    })
+}
+
+/// [`parse_launch_runtime`] scoped to the region at/after `header_anchor`,
+/// taking the LAST record in that region — the anchored counterpart of
+/// [`parse_launch_credential_after`], for a caller (a sweep) that has a
+/// `sweep_id=`-shaped anchor to scope by.
+#[must_use]
+pub fn parse_launch_runtime_after(
+    contents: &str,
+    header_anchor: &str,
+) -> Option<RuntimeAttribution> {
+    let region = &contents[contents.rfind(header_anchor)?..];
+    let body_start = region.rfind(LAUNCH_RECORD_MARKER)? + LAUNCH_RECORD_MARKER.len();
+    parse_launch_runtime(region[body_start..].lines().next()?)
+}
+
+/// [`parse_launch_runtime`] over the WHOLE of `contents`, taking the last
+/// `# LOOM_LAUNCH` record in the file with no anchor scoping at all (Issue
+/// #8507).
+///
+/// Only safe where the caller's own concurrency contract already guarantees
+/// at most one live writer to this log at a time — a role tick's per-role log
+/// has no `sweep_id=`-shaped anchor the way a sweep's does (a role tick has no
+/// per-invocation id at all), but `role_runner`'s per-`(root, role)` run guard
+/// makes two concurrent ticks of the same role impossible, so "the last record
+/// in the file, read right after this tick's child exited" cannot belong to
+/// any tick but this one. A caller without that guarantee must use
+/// [`parse_launch_runtime_after`] instead.
+#[must_use]
+pub fn last_launch_runtime(contents: &str) -> Option<RuntimeAttribution> {
+    let body_start = contents.rfind(LAUNCH_RECORD_MARKER)? + LAUNCH_RECORD_MARKER.len();
+    parse_launch_runtime(contents[body_start..].lines().next()?)
+}
+
+/// A sweep's per-issue log path, derived from the workspace root alone
+/// (Issue #8507).
+///
+/// `SweepRegistry::compute_log_path` delegates here, and safehouse's
+/// completion narration — which holds a workspace root and an issue number but
+/// no registry handle — calls it directly, so the two can never disagree about
+/// where a sweep's log (and therefore its `# LOOM_LAUNCH` record) lives.
+#[must_use]
+pub fn sweep_log_path(workspace_root: &std::path::Path, issue: u32) -> std::path::PathBuf {
+    workspace_root
+        .join(".loom")
+        .join("logs")
+        .join(format!("sweep-issue-{issue}.log"))
+}
+
+/// The runtime attribution of the most recent launch recorded in issue
+/// `issue`'s own sweep log under `workspace_root` (Issue #8507).
+///
+/// Unanchored, unlike [`parse_launch_runtime_after`]: a caller here has no
+/// `sweep_id` to scope by. The log is per-issue, so the last record in it is
+/// the most recent launch **for that issue** — which is the launch whose work
+/// a completion narrated now is reporting. `None` for a Claude/legacy-adapter
+/// spawn (writes no launch record at all), a missing or rotated log, or a
+/// record with no usable `runtime`.
+#[must_use]
+pub fn sweep_runtime_attribution(
+    workspace_root: &std::path::Path,
+    issue: u32,
+) -> Option<RuntimeAttribution> {
+    let contents = std::fs::read_to_string(sweep_log_path(workspace_root, issue)).ok()?;
+    last_launch_runtime(&contents)
+}
+
 /// Parse the credential attribution out of a per-sweep log's `contents`,
 /// scanning only the region at/after this dispatch's header (`header_anchor`,
 /// e.g. `sweep_id=<id>`).
@@ -229,5 +342,114 @@ mod tests {
         let rendered = serde_json::to_string(&attribution).unwrap();
         assert!(!rendered.contains("sk-fake-secret-material"), "{rendered}");
         assert_eq!(rendered, r#"{"source":"pool","provider":"zai","account":"alpha"}"#);
+    }
+
+    // --- RuntimeAttribution (Issue #8507) -------------------------------
+
+    #[test]
+    fn parse_launch_runtime_after_reads_runtime_provider_and_profile() {
+        let log = log_with("sweep_id=s1", &launch_line("pool", "zai", "alpha"));
+        let attribution = parse_launch_runtime_after(&log, "sweep_id=s1").unwrap();
+        assert_eq!(attribution.runtime, "pi");
+        assert_eq!(attribution.provider.as_deref(), Some("zai-coding-plan"));
+        assert_eq!(attribution.profile.as_deref(), Some("zai-flash"));
+    }
+
+    #[test]
+    fn parse_launch_runtime_after_omits_absent_provider_and_profile() {
+        let line =
+            format!("# LOOM_LAUNCH {}", serde_json::json!({"schema": 1, "runtime": "opencode"}));
+        let log = log_with("sweep_id=s1", &line);
+        let attribution = parse_launch_runtime_after(&log, "sweep_id=s1").unwrap();
+        assert_eq!(attribution.runtime, "opencode");
+        assert_eq!(attribution.provider, None);
+        assert_eq!(attribution.profile, None);
+    }
+
+    #[test]
+    fn parse_launch_runtime_after_respects_the_same_anchor_and_last_record_rules() {
+        // A missing anchor: not this dispatch.
+        let log = log_with("sweep_id=other", &launch_line("pool", "zai", "alpha"));
+        assert_eq!(parse_launch_runtime_after(&log, "sweep_id=s1"), None);
+
+        // A previous dispatch's record in a reused log is not attributed here.
+        let reused = format!(
+            "{}{}",
+            log_with(
+                "sweep_id=old",
+                &format!(
+                    "# LOOM_LAUNCH {}",
+                    serde_json::json!({"schema": 1, "runtime": "pi", "profile": "stale"})
+                )
+            ),
+            log_with(
+                "sweep_id=new",
+                &format!(
+                    "# LOOM_LAUNCH {}",
+                    serde_json::json!({"schema": 1, "runtime": "opencode", "profile": "fresh"})
+                )
+            ),
+        );
+        let attribution = parse_launch_runtime_after(&reused, "sweep_id=new").unwrap();
+        assert_eq!(attribution.runtime, "opencode");
+        assert_eq!(attribution.profile.as_deref(), Some("fresh"));
+    }
+
+    #[test]
+    fn parse_launch_runtime_yields_nothing_for_a_missing_or_empty_runtime() {
+        assert_eq!(parse_launch_runtime(r#"{"provider":"zai"}"#), None);
+        assert_eq!(parse_launch_runtime(r#"{"runtime":""}"#), None);
+        assert_eq!(parse_launch_runtime("{not json"), None);
+    }
+
+    #[test]
+    fn last_launch_runtime_scans_the_whole_log_with_no_anchor() {
+        let log = format!(
+            "some earlier prose\n# LOOM_LAUNCH {}\nmore prose\n# LOOM_LAUNCH {}\ntail\n",
+            serde_json::json!({"schema": 1, "runtime": "pi", "profile": "first"}),
+            serde_json::json!({"schema": 1, "runtime": "opencode", "profile": "second"}),
+        );
+        let attribution = last_launch_runtime(&log).unwrap();
+        assert_eq!(attribution.runtime, "opencode");
+        assert_eq!(attribution.profile.as_deref(), Some("second"));
+
+        assert_eq!(last_launch_runtime("no launch record here"), None);
+    }
+
+    #[test]
+    fn sweep_runtime_attribution_reads_the_issues_own_sweep_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let issue = 8507;
+        let path = sweep_log_path(root, issue);
+        assert!(path.ends_with(".loom/logs/sweep-issue-8507.log"), "{}", path.display());
+
+        // No log at all (and no launch record in one) ⇒ no attribution, never
+        // a fabricated default.
+        assert_eq!(sweep_runtime_attribution(root, issue), None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "ordinary sweep prose\n").unwrap();
+        assert_eq!(sweep_runtime_attribution(root, issue), None);
+
+        std::fs::write(
+            &path,
+            format!(
+                "==== dispatch ====\n# LOOM_LAUNCH {}\nprose\n",
+                serde_json::json!({
+                    "schema": 1,
+                    "runtime": "opencode",
+                    "provider": "friendli",
+                    "profile": "glm-coding",
+                }),
+            ),
+        )
+        .unwrap();
+        let attribution = sweep_runtime_attribution(root, issue).unwrap();
+        assert_eq!(attribution.runtime, "opencode");
+        assert_eq!(attribution.provider.as_deref(), Some("friendli"));
+        assert_eq!(attribution.profile.as_deref(), Some("glm-coding"));
+
+        // A DIFFERENT issue's log is never consulted.
+        assert_eq!(sweep_runtime_attribution(root, 8508), None);
     }
 }

@@ -368,6 +368,13 @@ to mark an account bad or merely re-select. Durable cost recovery comes from the
 runtime's per-session **transcript** (Claude Code writes per-message `usage` +
 `model` to a JSONL transcript; the #3726 archiver and #3725 harvest read it).
 
+OpenCode's equivalent is its own SQLite session store, wired up in #8507 —
+along with first-class `runtime`/`provider`/`profile` fields on every outcome
+record, so a non-Claude completion is identifiable even with no usage numbers
+at all. See [`native-runtime-usage-attribution.md`](native-runtime-usage-attribution.md)
+for the reader, its credential-isolation contract, and the
+`loom-daemon opencode-usage` backfill path.
+
 An adapter must expose the equivalent for its runtime: a way to attribute a
 session to an account, a limit/exhaustion signal (via the error categories
 above), and — for tier-1 cost parity — a transcript or usage stream with

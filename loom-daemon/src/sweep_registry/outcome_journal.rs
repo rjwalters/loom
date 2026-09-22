@@ -218,6 +218,27 @@ impl SweepRegistry {
         )
     }
 
+    /// The runtime/provider/profile this sweep's native harness actually
+    /// launched on (Issue #8507), for `sweep.outcome`'s top-level
+    /// `runtime`/`provider`/`profile` fields — the runtime-neutral counterpart
+    /// of [`resolve_credential_attribution`](Self::resolve_credential_attribution),
+    /// reading the SAME `# LOOM_LAUNCH` record for a second, independent set
+    /// of keys. `None` under the identical conditions
+    /// `resolve_credential_attribution` documents: a Claude/legacy-adapter
+    /// spawn writes no launch record at all.
+    pub(crate) fn resolve_runtime_attribution(
+        &self,
+        sweep_id: &str,
+        issue: u32,
+    ) -> Option<crate::launch_record::RuntimeAttribution> {
+        let log_path = self
+            .entries
+            .get(sweep_id)
+            .map_or_else(|| self.compute_log_path(issue), |i| i.log_path.clone());
+        let contents = std::fs::read_to_string(log_path).ok()?;
+        crate::launch_record::parse_launch_runtime_after(&contents, &format!("sweep_id={sweep_id}"))
+    }
+
     /// The OAuth/token account this sweep actually ran on (Issue #8056), for
     /// both terminal journals' account attribution.
     ///
@@ -299,6 +320,13 @@ impl SweepRegistry {
         let token_name = self.resolve_token_account(sweep_id, issue);
         let latest_phase = info.and_then(|i| i.latest_phase.clone());
         let started_at = info.map(|i| i.started_at);
+        // Issue #8507: the launch's own runtime/provider/profile, read off the
+        // SAME `# LOOM_LAUNCH` record `credential` above already reads — the
+        // ground truth of what actually ran, independent of the dispatch-time
+        // `config["runtime"]` string above (which can only ever hold what was
+        // *requested*, e.g. absent for an entry reconstructed after a daemon
+        // restart). `None` for a Claude/legacy-adapter spawn, same as `credential`.
+        let runtime_attribution = self.resolve_runtime_attribution(sweep_id, issue);
 
         let mut config = BTreeMap::new();
         if let Some(runtime) = runtime {
@@ -432,15 +460,22 @@ impl SweepRegistry {
             })
             .map_or((None, None), |(tin, tout)| (Some(tin), Some(tout)));
 
-        // Per-model token breakdown (Issue #6384): same source transcripts
-        // and same wall-clock window as `tokens_in`/`tokens_out` above, but
-        // grouped by `(model, speed, service_tier)` instead of flattened —
-        // see `ModelUsageTotals`'s own doc for why a flat sum cannot be
-        // priced. Same best-effort/never-fabricated-zero contract.
+        // Per-model token breakdown (Issue #6384): same wall-clock window as
+        // `tokens_in`/`tokens_out` above, but grouped by
+        // `(model, speed, service_tier)` instead of flattened — see
+        // `ModelUsageTotals`'s own doc for why a flat sum cannot be priced.
+        // Same best-effort/never-fabricated-zero contract.
+        //
+        // Issue #8507: the SOURCE is runtime-dispatched through
+        // `crate::usage_source`. The Claude on-disk JSONL transcripts stay the
+        // default for every runtime that seam cannot identify (including the
+        // `None` a Claude/legacy spawn yields), so this is byte-identical to
+        // the pre-#8507 behavior for every Claude sweep; an `opencode` launch
+        // instead reads OpenCode's own session store, scoped to this sweep's
+        // directories and the same wall-clock window.
         let tokens_by_model = started_at.and_then(|started_at| {
-            let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
-            crate::transcript_tokens::sum_sweep_tokens_by_model(
-                &projects_dir,
+            crate::usage_source::sweep_tokens_by_model(
+                runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
                 &self.config.workspace_root,
                 issue,
                 Some((started_at, Utc::now())),
@@ -492,6 +527,11 @@ impl SweepRegistry {
             models_used,
             doctor_cycles,
             judge_verdicts,
+            runtime: runtime_attribution.as_ref().map(|r| r.runtime.clone()),
+            provider: runtime_attribution
+                .as_ref()
+                .and_then(|r| r.provider.clone()),
+            profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
         };
         let result_name = serde_json::to_value(result)
             .ok()
@@ -786,3 +826,15 @@ mod timeline_tests;
     unused_imports
 )]
 mod credential_tests;
+
+// Runtime/provider/profile attribution + the OpenCode `tokens_by_model`
+// dispatch seam (Issue #8507), in its own sibling module for the same
+// file-size reason as `credential_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod runtime_tests;

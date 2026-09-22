@@ -77,6 +77,14 @@ pub(crate) enum TelemetryCommand {
     /// `--status` flag, unchanged) so `check-usage.sh`'s contract is never at
     /// risk of a parse ambiguity — see `usage_report_cli`'s module doc.
     UsageReport(super::usage_report_cli::UsageReportArgs),
+
+    /// Per-model token usage from OpenCode's own session store (Issue #8507).
+    ///
+    /// The backfill and verification path for non-Claude runtimes: the same
+    /// reader a sweep's `tokens_by_model` now uses, pointed at any directory
+    /// and window. Read-only — one query, naming `session` alone, never the
+    /// `credential`/`account` tables in the same file.
+    OpencodeUsage(super::opencode_usage_cli::OpencodeUsageArgs),
 }
 
 impl TelemetryCommand {
@@ -106,6 +114,7 @@ impl TelemetryCommand {
             TelemetryCommand::Usage(args) => args.run(),
             TelemetryCommand::IngestTranscripts(args) => args.run(),
             TelemetryCommand::UsageReport(args) => args.run(),
+            TelemetryCommand::OpencodeUsage(args) => args.run(),
         }
     }
 }

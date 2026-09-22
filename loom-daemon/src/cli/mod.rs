@@ -28,6 +28,7 @@ mod merge_pr_refs;
 mod merge_pr_stale_checks;
 pub(crate) mod misc_cmds;
 pub(crate) mod noop_cooldown;
+pub(crate) mod opencode_usage_cli;
 pub(crate) mod peer_claims_cmd;
 pub(crate) mod premise_check;
 pub(crate) mod quarantine;
