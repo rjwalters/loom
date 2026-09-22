@@ -129,8 +129,34 @@ fn opencode_judge_workspace(root: &Path, stream: &str) {
     );
 }
 
+/// Both end-to-end cases drive a real `fork`/`exec` of the fake
+/// `spawn-worker.sh` and assert on an exact [`RoleTickOutcome`] variant, so
+/// they are the two most host-timing-sensitive tests in this module. Issue
+/// #8532 reported both of them failing together in one full `cargo test -p
+/// loom-daemon --lib` run on a saturated host, while adjacent clean runs
+/// passed — and the two knobs below are what make a *saturated* host produce
+/// the same verdict a quiet one does:
+///
+/// - **`with_timeout`** — the script under test is a single `printf` + `exit
+///   0`, so any budget at all is generous in the happy path and the value only
+///   ever matters when the host cannot schedule the child promptly. 60s buys
+///   headroom over the previous 30s at zero cost to a passing run (the timer
+///   is a ceiling, never a sleep).
+/// - **`with_load_per_core_override(0.0)`** — without it, a ceiling hit on a
+///   genuinely saturated host is *deliberately* reclassified from
+///   [`RoleTickOutcome::Failure`] to [`RoleTickOutcome::LoadSkipped`]
+///   (issue #6637), a third variant neither case below handles: the toolless
+///   case would report "must not be Success" and the control would report "not
+///   Success", both pointing at the verdict logic rather than at the host.
+///   Pinning the reading makes the fallback deterministic — same reason
+///   #7242 pinned it for `test_invoke_times_out_on_hung_script`.
+///
+/// Neither knob can mask a real regression: a child that runs and exits 0
+/// still gets the full verdict, and a genuinely wrong verdict still fails.
 fn judge_runner(root: &Path) -> ScriptRoleInvocationRunner {
-    ScriptRoleInvocationRunner::new(root.to_path_buf()).with_timeout(Duration::from_secs(30))
+    ScriptRoleInvocationRunner::new(root.to_path_buf())
+        .with_timeout(Duration::from_secs(60))
+        .with_load_per_core_override(0.0)
 }
 
 /// AC3/AC4: a guarded native role tick that exits 0 having never used a

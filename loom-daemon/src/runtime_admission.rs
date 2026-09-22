@@ -628,6 +628,7 @@ pub fn resolve_and_admit(
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::time::Duration;
 
     /// RAII guard that clears the ambient `LOOM_RUNTIME` env var for the
     /// scope of a test and restores whatever value (if any) it previously
@@ -847,22 +848,77 @@ mod tests {
     /// decision plus its exit code. Panics (rather than degrading) if the
     /// script does not produce parseable JSON — a silent parse failure is
     /// exactly the drift blindness this checker exists to prevent.
+    ///
+    /// **Timing sensitivity (issue #8532).**
+    /// `native_and_shell_conformance_for_every_shipped_pair` calls this once
+    /// per shipped (role, runtime) pair — dozens of real `bash` spawns in a
+    /// single test. That makes it, per run, the most fork/exec-dependent test
+    /// in the `--lib` suite, and the two ways a saturated host breaks it are
+    /// *both* host conditions rather than admission drift:
+    ///
+    /// 1. **`Command::output()` returns `Err`** — the fork/exec never
+    ///    happened (`EAGAIN`/`ENOMEM` under concurrent `cargo build`s on a
+    ///    host with no swap). Retried below, bounded; this cannot mask drift,
+    ///    because a checker that *did* run and answered wrongly still fails
+    ///    immediately via the caller's own assertions.
+    /// 2. **The child ran but produced no parseable JSON** — e.g. it was
+    ///    OOM-killed, or `bash` itself failed to start up (`ENOSPC` on the
+    ///    filesystem holding the temp/worktree). Deliberately **not** retried
+    ///    (silence there is exactly the drift blindness the checker exists to
+    ///    prevent), but the panic below reports the exit status and stderr,
+    ///    not just stdout, so a repeat flake report is triageable from the
+    ///    failure text alone instead of being re-investigated from scratch.
+    ///
+    /// The original #8532 report captured only the four test names, with no
+    /// failure messages — which is why (2) exists.
     fn shell_decision(
         checker: &Path,
         dir: &Path,
         role: &str,
         runtime: &str,
     ) -> (ShellDecision, i32) {
-        let out = Command::new("bash")
-            .arg(checker)
-            .args(["--role", role, "--runtime", runtime, "--json", "--dir"])
-            .arg(dir)
-            .output()
-            .unwrap();
+        const SPAWN_ATTEMPTS: u32 = 3;
+        let mut last_err = None;
+        let mut out = None;
+        for attempt in 0..SPAWN_ATTEMPTS {
+            match Command::new("bash")
+                .arg(checker)
+                .args(["--role", role, "--runtime", runtime, "--json", "--dir"])
+                .arg(dir)
+                .output()
+            {
+                Ok(o) => {
+                    out = Some(o);
+                    break;
+                }
+                Err(e) if attempt + 1 < SPAWN_ATTEMPTS => {
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let out = out.unwrap_or_else(|| {
+            panic!(
+                "could not spawn checker for role={role} runtime={runtime} after \
+                 {SPAWN_ATTEMPTS} attempts: {last_err:?}"
+            )
+        });
         let stdout = String::from_utf8_lossy(&out.stdout);
         let json = stdout.lines().last().unwrap_or_default();
         let parsed: ShellDecision = serde_json::from_str(json).unwrap_or_else(|e| {
-            panic!("checker --json output for role={role} runtime={runtime} unparseable ({e}): {stdout:?}")
+            // Issue #8532: status + stderr, not just stdout. A signal-killed
+            // child (`status.code() == None`, e.g. the OOM killer) and a
+            // checker that genuinely emitted malformed JSON are
+            // indistinguishable from stdout alone, and the difference is the
+            // whole triage decision: host condition vs. real drift.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            panic!(
+                "checker --json output for role={role} runtime={runtime} unparseable ({e}): \
+                 status={status:?} (code={code:?}) stdout={stdout:?} stderr={stderr:?}",
+                status = out.status,
+                code = out.status.code(),
+            )
         });
         (parsed, out.status.code().unwrap_or(-1))
     }
