@@ -52,13 +52,44 @@
 //! spellings and field names are matched permissively, and **`agent_end` is
 //! deliberately excluded**: Pi repeats the same usage there, and counting it
 //! would double every Pi run's tokens.
+//!
+//! # One region can hold several launches, and they need not share a tap
+//!
+//! An anchored region is one dispatch's slice of a log, not one launch's:
+//! [`crate::api_keys_pool::ingest::parse_launch_record`] already records that a
+//! region may hold more than one `# LOOM_LAUNCH` record (a re-dispatch inside
+//! one sweep, a containment re-exec that re-announces itself inside the
+//! container), and an orchestrated sweep whose phases spawn their own workers
+//! adds another: `runtimes.rolePreference` / `LOOM_RUNTIME_<ROLE>` can pin one
+//! phase to a different tap from the rest, so two records in one region may
+//! name different taps.
+//!
+//! Attributing such a region wholesale to its last record's tap (Issue #8633)
+//! is therefore **not** safely conservative. The tempting argument — "the last
+//! launch is the metered backstop, so folding an earlier launch onto it only
+//! overcounts the tap that is already metered" — does not hold: nothing orders
+//! a region's records by tier. `runtime_preference`'s own module doc fixes
+//! fall-through at **dispatch** ("one sweep, one runtime"), so a region's
+//! second record comes from a per-phase pin or a re-exec, and a metered
+//! builder followed by a subscription-pinned judge charges metered spend to a
+//! flat-rate tap — the direction a fleet spend ceiling must never be wrong in.
+//!
+//! So usage is **sliced per record**: each `# LOOM_LAUNCH` line opens a block,
+//! and only the usage events after it (up to the next record) are charged to
+//! the tap it names. [`account_launch_logs`] returns every block;
+//! [`account_launch_log`] keeps the one-row contract its callers have, which
+//! is the region's **last** record — the launch the region's outcome belongs
+//! to. Usage appearing *before* the first record in a region is charged to
+//! nobody: no tap had announced itself yet, and "no opinion" beats a
+//! fabricated reading here exactly as it does everywhere else in this module.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::launch_record::{parse_launch_tap_after, TapAttribution};
+use crate::api_keys_pool::ingest::LAUNCH_RECORD_PREFIX;
+use crate::launch_record::{parse_launch_tap, TapAttribution};
 
 /// Event types that carry a launch's usage exactly once.
 ///
@@ -205,25 +236,27 @@ impl TapAccounting {
 #[must_use]
 pub fn accumulate_usage(text: &str) -> TapUsage {
     let mut total = TapUsage::default();
-    for line in text.lines() {
-        let line = line.trim();
-        if !line.starts_with('{') {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(kind) = event.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        if !USAGE_EVENT_TYPES.contains(&kind) {
-            continue;
-        }
-        if let Some(usage) = read_event_usage(&event) {
-            total.absorb(&usage);
-        }
+    for usage in text.lines().filter_map(line_usage) {
+        total.absorb(&usage);
     }
     total
+}
+
+/// The usage one log line reports, or `None` when the line is not a
+/// usage-bearing event at all — the per-line half of [`accumulate_usage`],
+/// shared with the per-record slicing in [`launch_blocks`] so the two can
+/// never disagree about what counts as a reading.
+fn line_usage(line: &str) -> Option<TapUsage> {
+    let line = line.trim();
+    if !line.starts_with('{') {
+        return None;
+    }
+    let event = serde_json::from_str::<Value>(line).ok()?;
+    let kind = event.get("type").and_then(Value::as_str)?;
+    if !USAGE_EVENT_TYPES.contains(&kind) {
+        return None;
+    }
+    read_event_usage(&event)
 }
 
 /// The counters on one usage-bearing event, or `None` when it carried none —
@@ -278,24 +311,80 @@ fn read_f64(scope: &Value, field: &str) -> Option<f64> {
     scope.get(field)?.as_f64().filter(|v| v.is_finite())
 }
 
+/// The region at/after `header_anchor`, split into one block per
+/// `# LOOM_LAUNCH` record: the tap that record names (`None` when it is
+/// unattributable — a pre-#8401 record, or one naming no runtime) and the
+/// usage reported after it, up to the next record.
+///
+/// `None` only when the anchor is absent, so a previous dispatch's output can
+/// never be read as this one's — the same `rfind` anchoring every other reader
+/// of these logs applies. An anchored region with no launch record at all is
+/// an empty `Vec`, not `None`.
+///
+/// Record lines are matched **line-anchored** (trim, then
+/// `strip_prefix`), exactly as
+/// [`crate::api_keys_pool::ingest::parse_launch_record`] matches them, so a
+/// line that merely *mentions* the marker mid-line — an agent transcript
+/// echoing it — cannot open a phantom block.
+fn launch_blocks(
+    contents: &str,
+    header_anchor: &str,
+) -> Option<Vec<(Option<TapAttribution>, TapUsage)>> {
+    let region = &contents[contents.rfind(header_anchor)?..];
+    let mut blocks: Vec<(Option<TapAttribution>, TapUsage)> = Vec::new();
+    for line in region.lines() {
+        if let Some(record) = line.trim().strip_prefix(LAUNCH_RECORD_PREFIX) {
+            blocks.push((parse_launch_tap(record), TapUsage::default()));
+            continue;
+        }
+        let usage = line_usage(line);
+        // Usage ahead of the first record belongs to no launch in this region
+        // — `blocks` is still empty, so it is charged to nobody.
+        if let (Some(block), Some(usage)) = (blocks.last_mut(), usage) {
+            block.1.absorb(&usage);
+        }
+    }
+    Some(blocks)
+}
+
 /// Attribute the usage in `contents` to the tap its own `# LOOM_LAUNCH` record
 /// names, scanning only the region at/after `header_anchor`.
 ///
+/// The region's **last** record, carrying **only its own** usage (Issue
+/// #8633): a region may hold several launches on different taps, and the last
+/// one is the launch the region's outcome belongs to — but not the one that
+/// paid for an earlier launch's tokens. Use [`account_launch_logs`] when every
+/// launch in the region matters rather than just the last.
+///
 /// `None` when the region carries no attributable launch record — the same
 /// "no opinion rather than a fabricated reading" contract
-/// [`parse_launch_tap_after`] has. The usage half never gates the result: an
-/// attributable launch whose stream reported nothing yields a row with
-/// [`TapUsage::is_measured`] `false`, which is exactly the distinction a
-/// spend-governance reader needs to make ("this tap ran and we cannot see what
-/// it cost" is not "this tap ran for free").
+/// [`crate::launch_record::parse_launch_tap`] has. The usage half never gates
+/// the result: an attributable launch whose stream reported nothing yields a
+/// row with [`TapUsage::is_measured`] `false`, which is exactly the
+/// distinction a spend-governance reader needs to make ("this tap ran and we
+/// cannot see what it cost" is not "this tap ran for free").
 #[must_use]
 pub fn account_launch_log(contents: &str, header_anchor: &str) -> Option<TapAccounting> {
-    let tap = parse_launch_tap_after(contents, header_anchor)?;
-    let region = &contents[contents.rfind(header_anchor)?..];
-    Some(TapAccounting {
-        tap,
-        usage: accumulate_usage(region),
-    })
+    let (tap, usage) = launch_blocks(contents, header_anchor)?.pop()?;
+    Some(TapAccounting { tap: tap?, usage })
+}
+
+/// Every attributable launch in the region at/after `header_anchor`, in log
+/// order, each carrying only the usage its own block reported (Issue #8633).
+///
+/// The lossless counterpart of [`account_launch_log`], for a reader summing a
+/// region's spend rather than naming the launch its outcome belongs to: feed
+/// it straight to [`fold_by_tap`] and a re-dispatched or phase-pinned region
+/// reports each tap's share separately instead of piling all of it onto one.
+/// Unattributable records contribute no row at all, so their usage is dropped
+/// rather than charged to a neighbouring tap.
+#[must_use]
+pub fn account_launch_logs(contents: &str, header_anchor: &str) -> Vec<TapAccounting> {
+    launch_blocks(contents, header_anchor)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(tap, usage)| Some(TapAccounting { tap: tap?, usage }))
+        .collect()
 }
 
 /// Filesystem wrapper for a caller holding a log *path*. An unreadable log is

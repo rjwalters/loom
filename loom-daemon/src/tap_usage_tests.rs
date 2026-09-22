@@ -227,6 +227,148 @@ fn a_previous_dispatchs_usage_in_a_reused_log_is_not_attributed_to_this_one() {
     assert_eq!(row.usage.usage_events, 1);
 }
 
+/// Issue #8633: a region may hold more than one launch record (a re-dispatch
+/// inside one sweep, a containment re-exec, a phase pinned to its own tap by
+/// `rolePreference`/`LOOM_RUNTIME_<ROLE>`), and the last record's tap must not
+/// be handed the whole region's usage.
+///
+/// Here the metered launch is the **earlier** one, which is why folding a
+/// region onto its last tap is not safely conservative: the untouched
+/// behaviour charged 9007 input tokens of metered spend to a flat-rate
+/// subscription tap.
+#[test]
+fn a_multi_record_regions_usage_is_sliced_per_record_not_folded_onto_the_last() {
+    let log = log_with(
+        "sweep_id=s1",
+        &format!(
+            "{}\n{}\n{}\n{}",
+            launch_line("opencode:zai-metered", "pool", Some("zai")),
+            "{\"type\":\"step_finish\",\"tokens\":{\"input\":9000,\"output\":800},\"cost\":0.25}",
+            launch_line("codex", "env", None),
+            "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}"
+        ),
+    );
+
+    // The one-row contract still names the LAST launch — but with only its own
+    // usage.
+    let row = account_launch_log(&log, "sweep_id=s1").unwrap();
+    assert_eq!(row.key(), "codex@env");
+    assert_eq!(
+        row.usage.input,
+        Some(7),
+        "the earlier launch's 9000 input tokens belong to the metered tap, not to codex"
+    );
+    assert_eq!(row.usage.output, None);
+    assert_eq!(row.usage.cost_estimate, None, "a metered cost estimate must not follow the tap");
+    assert_eq!(row.usage.usage_events, 1);
+
+    // The lossless read: both launches, each with its own block's usage.
+    let rows = account_launch_logs(&log, "sweep_id=s1");
+    assert_eq!(
+        rows.iter().map(TapAccounting::key).collect::<Vec<_>>(),
+        vec![
+            "opencode:zai-metered@api_keys:zai".to_string(),
+            "codex@env".to_string()
+        ],
+        "rows come back in log order"
+    );
+    assert_eq!(rows[0].usage.input, Some(9000));
+    assert_eq!(rows[0].usage.output, Some(800));
+    assert!((rows[0].usage.cost_estimate.unwrap() - 0.25).abs() < 1e-9);
+
+    let folded = fold_by_tap(&rows);
+    assert_eq!(folded["opencode:zai-metered@api_keys:zai"].input, Some(9000));
+    assert_eq!(folded["codex@env"].input, Some(7));
+}
+
+/// A single-record region — the overwhelmingly common shape — is unchanged by
+/// the slicing: one row, all of the region's usage, and `account_launch_logs`
+/// agrees with `account_launch_log`.
+#[test]
+fn a_single_record_region_is_unaffected_by_per_record_slicing() {
+    let log = log_with(
+        "sweep_id=s1",
+        &format!(
+            "{}\n{}\n{}",
+            launch_line("opencode:zai-metered", "pool", Some("zai")),
+            "{\"type\":\"step_finish\",\"tokens\":{\"input\":100,\"output\":20},\"cost\":0.25}",
+            "{\"type\":\"step_finish\",\"tokens\":{\"input\":50}}"
+        ),
+    );
+    let row = account_launch_log(&log, "sweep_id=s1").unwrap();
+    assert_eq!(row.usage.input, Some(150));
+    assert_eq!(row.usage.output, Some(20));
+    assert_eq!(row.usage.usage_events, 2);
+    assert_eq!(account_launch_logs(&log, "sweep_id=s1"), vec![row]);
+}
+
+/// Usage ahead of a region's first launch record had no tap announced yet, so
+/// it is charged to nobody rather than to the launch that started afterwards.
+#[test]
+fn usage_before_the_first_launch_record_is_charged_to_nobody() {
+    let log = log_with(
+        "sweep_id=s1",
+        &format!(
+            "{}\n{}\n{}",
+            "{\"type\":\"step_finish\",\"tokens\":{\"input\":9000}}",
+            launch_line("pi", "env", None),
+            "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}"
+        ),
+    );
+    let row = account_launch_log(&log, "sweep_id=s1").unwrap();
+    assert_eq!(row.key(), "pi@env");
+    assert_eq!(row.usage.input, Some(7));
+    assert_eq!(account_launch_logs(&log, "sweep_id=s1").len(), 1);
+}
+
+/// The marker is matched line-anchored, exactly as
+/// `api_keys_pool::ingest::parse_launch_record` matches it, so an agent
+/// transcript echoing `# LOOM_LAUNCH ` mid-line opens no phantom block and
+/// cannot suppress the real record's attribution.
+#[test]
+fn a_mid_line_mention_of_the_marker_opens_no_block() {
+    let log = log_with(
+        "sweep_id=s1",
+        &format!(
+            "{}\n{}\n{}",
+            launch_line("pi", "env", None),
+            "agent transcript: the record is written as # LOOM_LAUNCH {\"schema\":1} by the child",
+            "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}"
+        ),
+    );
+    let rows = account_launch_logs(&log, "sweep_id=s1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key(), "pi@env");
+    assert_eq!(rows[0].usage.input, Some(7));
+}
+
+/// An unattributable record (no runtime to key a tap on) contributes no row,
+/// and its usage is dropped rather than charged to a neighbouring tap.
+#[test]
+fn an_unattributable_record_absorbs_its_own_usage_and_yields_no_row() {
+    let log = log_with(
+        "sweep_id=s1",
+        &format!(
+            "{}\n{}\n{}\n{}",
+            launch_line("pi", "env", None),
+            "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}",
+            r#"# LOOM_LAUNCH {"schema":1,"credentialSource":"env"}"#,
+            "{\"type\":\"step_finish\",\"tokens\":{\"input\":9000}}"
+        ),
+    );
+    // The last record is unattributable, so the one-row read declines — the
+    // same "no opinion" it has always returned for that record.
+    assert!(account_launch_log(&log, "sweep_id=s1").is_none());
+    let rows = account_launch_logs(&log, "sweep_id=s1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key(), "pi@env");
+    assert_eq!(
+        rows[0].usage.input,
+        Some(7),
+        "the unattributable record's 9000 tokens must not land on the pi launch"
+    );
+}
+
 // ============================================================================
 // fold_by_tap — the #8556 query
 // ============================================================================
