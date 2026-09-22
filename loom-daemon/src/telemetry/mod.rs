@@ -56,6 +56,7 @@ use std::path::PathBuf;
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
 mod envelope;
+pub mod fixture;
 pub mod trace;
 pub mod visibility;
 pub use envelope::TelemetryEnvelope;
