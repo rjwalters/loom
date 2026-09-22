@@ -950,7 +950,16 @@ pub struct PreparedIssueDispatch {
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
     pub(crate) depends_on: Option<u32>,
-    pub(crate) runtime_admission: Option<crate::runtime_admission::ResolvedRuntime>,
+    /// What this dispatch resolved onto, and the metered backstop slot that
+    /// choosing it took (#8555). Carried here — rather than parked in shared
+    /// state keyed on the resolving thread — because this box is precisely the
+    /// value that crosses the resolve→spawn seam on EVERY dispatch path,
+    /// including the two that do not stay on one thread: `ipc.rs`'s
+    /// `spawn_blocking(...).await` between begin and finish, and the reaper's
+    /// batch of pending resumes prepared in one pass and finished in another.
+    /// Dropping this box releases the slot, so an abandoned dispatch cannot
+    /// leak one. See `runtime_preference::handoff`.
+    pub(crate) admission: crate::runtime_preference::DispatchAdmission,
 }
 
 /// Result of the lock-scoped [`begin_cancel`](SweepRegistry::begin_cancel)

@@ -1117,6 +1117,7 @@ fn run_role_with_timeout(
     effort_source: &str,
     admission: Option<&crate::runtime_admission::ResolvedRuntime>,
     load_per_core_override: Option<f64>,
+    backstop: Option<crate::runtime_preference::Reservation>,
 ) -> RoleTickOutcome {
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
         return RoleTickOutcome::Failure(format!(
@@ -1270,10 +1271,11 @@ fn run_role_with_timeout(
         }
     };
     let pid = child.id();
-    // #8555: hand this tick's metered backstop slot (if `runtime_preflight`
-    // parked one) to the child that will spend it. No-op when no ceiling is
-    // configured or the tick did not fall through to a governed tap.
-    crate::runtime_preference::handoff::attach(pid);
+    // #8555: hand this tick's metered backstop slot (the one `runtime_preflight`
+    // took, carried here by value) to the child that will spend it. No-op when
+    // no ceiling is configured or the tick did not fall through to a governed
+    // tap; every bail-out before this point dropped it, releasing it.
+    crate::runtime_preference::handoff::attach(backstop, pid);
     crate::observability::lifecycle::role_child_spawned(pid);
 
     let start = Instant::now();

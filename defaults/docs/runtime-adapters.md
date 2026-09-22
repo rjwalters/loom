@@ -1256,10 +1256,17 @@ leases are reaped lazily by the next count; no explicit release step is needed
 when a sweep dies.
 
 The daemon *selects* and then spawns a child that outlives the selection, so
-those two steps are different places in the code: the slot is parked for the
-resolving thread (`runtime_preference::handoff`) and claimed at the spawn site —
-`sweep_registry::dispatch`'s `finish_issue_dispatch` / PR-set spawn, and the
-role runner's own. Nothing else has to carry it.
+those two steps are different places in the code. The reservation is carried
+**by value** between them, on the value that already crosses that seam — the
+`PreparedIssueDispatch` box on the sweep path, the role tick's own local on the
+role-runner path — and attached at the spawn site
+(`runtime_preference::handoff::attach`). Nothing is stored in shared state, so
+no dispatch can lose or delete another's slot, whichever thread each happens to
+run on: the IPC handler `.await`s a `spawn_blocking` poll between the two
+steps, and the reaper prepares a whole batch of pending resumes before
+finishing any of them. Dropping the carried value instead of attaching it
+releases the slot, so a dispatch that is refused or fails to spawn between
+resolution and launch holds nothing.
 
 **Probing does not consume.** `work_finder::pool_preflight` re-resolves the list
 every tick for every workspace purely to decide whether to hold dispatch. That

@@ -257,15 +257,52 @@ impl Decision {
     }
 }
 
+/// One resolution's answer to "what does this launch run on, and what did
+/// choosing it cost?" — the admitted runtime together with the metered
+/// backstop slot that settling on it took (#8555).
+///
+/// The two travel together, by value, because the slot has to reach the
+/// spawned child's PID and the runtime has to reach the spawn arguments: they
+/// are the same journey. A caller moves this whole value along whatever
+/// intermediate already crosses its own resolve→spawn seam
+/// (`PreparedIssueDispatch` on the sweep path, the role tick's local on the
+/// role-runner path) and calls [`handoff::attach`] at the far end. **Dropping
+/// it releases the slot**, so every early return between resolution and spawn
+/// is correct with no unwinding code — see [`handoff`] for why this is carried
+/// rather than parked in shared state.
+///
+/// `admitted` is `Option` because a caller may have no runtime to name at all:
+/// `sweep_registry`'s hermetic fixtures skip admission entirely, and
+/// `role_runner::runtime_preflight` reports "keep the admission you already
+/// had" the same way. Neither can hold a backstop slot, so an absent runtime
+/// always comes with an absent reservation.
+#[derive(Debug, Default)]
+pub struct DispatchAdmission {
+    /// The runtime this launch should use, when this resolution named one.
+    pub admitted: Option<ResolvedRuntime>,
+    /// The metered slot the choice consumed, present only when the chosen tap
+    /// is a governed backstop tier **and** a ceiling is configured.
+    pub backstop: Option<ceiling::Reservation>,
+}
+
+impl DispatchAdmission {
+    /// "No runtime named here, and nothing metered" — the shape a caller that
+    /// opted out of admission gets back.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
 /// Resolve the runtime for one dispatch and collapse the answer to the
 /// ordinary admission shape, logging the `# LOOM_RUNTIME_PREFERENCE` marker
 /// on the way when a preference list actually decided (#8554).
 ///
-/// The whole point of this wrapper is that a dispatch call site swaps
-/// [`crate::runtime_admission::resolve_and_admit`] for it **one-for-one** —
-/// same arity, same return type, same `Err` shape on the static path — so
-/// wiring preference into a call site adds no branching there and cannot
-/// drift from the marker/collapse handling every other call site does.
+/// The point of this wrapper is that a dispatch call site swaps
+/// [`crate::runtime_admission::resolve_and_admit`] for it with no branching of
+/// its own — same arity, same `Err` shape on the static path — so wiring
+/// preference into a call site cannot drift from the marker/collapse handling
+/// every other call site does.
 ///
 /// `now` is read here rather than taken as a parameter because every
 /// production caller wants the wall clock; a test that needs a pinned clock
@@ -273,17 +310,12 @@ impl Decision {
 ///
 /// # Side effect
 /// This is the **dispatch-intent** entry point ([`Intent::Dispatch`]), so
-/// settling on a governed backstop tap takes a metered slot (#8555). Because
-/// the collapse to `ResolvedRuntime` has nowhere to carry it, the slot is
-/// parked for this thread with [`handoff::park`]; the launch site **must**
-/// call [`handoff::attach`] with the spawned child's PID. Failing to is
-/// bounded, not catastrophic — the unattached lease ages out in
-/// [`ceiling::DEFAULT_RESERVATION_STALE_SECS`] — but it makes the launch
-/// uncounted. See [`handoff`] for why the park is thread-keyed.
-///
-/// A resolution that took no slot parks `None`, which *clears* the key: a
-/// stale reservation from a launch that resolved and then never spawned can
-/// never be attached to a later child's PID.
+/// settling on a governed backstop tap takes a metered slot (#8555). That is
+/// why the return type is [`DispatchAdmission`] rather than a bare
+/// [`ResolvedRuntime`]: the slot rides back to the caller, which **must** hand
+/// it to the spawned child with [`handoff::attach`]. A caller that drops it
+/// instead releases the slot — correct for a dispatch that never launches,
+/// and merely uncounted for one that does.
 ///
 /// # Errors
 /// The static path's own rejection, a malformed-preference rejection, or —
@@ -294,7 +326,7 @@ pub fn resolve_for_dispatch(
     root: &Path,
     role: &str,
     explicit: Option<&str>,
-) -> Result<ResolvedRuntime, RuntimeRejection> {
+) -> Result<DispatchAdmission, RuntimeRejection> {
     let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
     let context = DispatchContext {
         complexity: None,
@@ -304,8 +336,11 @@ pub fn resolve_for_dispatch(
     if let Some(marker) = decision.marker_line() {
         log::info!("runtime_preference: {role} resolved by preference list — {marker} (#8554)");
     }
-    handoff::park(decision.take_backstop());
-    decision.into_admission(role)
+    let backstop = decision.take_backstop();
+    Ok(DispatchAdmission {
+        admitted: Some(decision.into_admission(role)?),
+        backstop,
+    })
 }
 
 /// Parse one preference-list entry: a bare runtime id, or an object naming the

@@ -1711,25 +1711,28 @@ impl SweepRegistry {
         // before idempotency/account selection, claim lock, forge mutation,
         // log header, or child spawn. A full sweep remains one runtime and is
         // checked against Builder's (strongest lifecycle) requirements.
-        let runtime_admission = if self.config.skip_label_flip {
-            None // hermetic unit fixtures do not install runtime manifests
+        let admission = if self.config.skip_label_flip {
+            // hermetic unit fixtures do not install runtime manifests
+            crate::runtime_preference::DispatchAdmission::none()
         } else {
-            // #8554: `runtime_preference::resolve_for_dispatch` is a
-            // one-for-one substitution for
-            // `runtime_admission::resolve_and_admit` — same arity, same
-            // return type, and byte-identical (including its `Err` shape,
-            // and reading no credential pool at all) when no
-            // `runtimes.preference` / `rolePreference.sweep-lifecycle` is
-            // configured. When one IS configured and the top tap's pool is
-            // dry, it resolves onto a lower tap instead of failing, which is
-            // exactly why the #7708 work-finder hold
-            // (`work_finder::pool_preflight`) no longer held dispatch here.
+            // #8554: `runtime_preference::resolve_for_dispatch` substitutes
+            // for `runtime_admission::resolve_and_admit` — same arity, same
+            // `Err` shape, and byte-identical (reading no credential pool at
+            // all) when no `runtimes.preference` /
+            // `rolePreference.sweep-lifecycle` is configured. When one IS
+            // configured and the top tap's pool is dry, it resolves onto a
+            // lower tap instead of failing, which is exactly why the #7708
+            // work-finder hold (`work_finder::pool_preflight`) no longer held
+            // dispatch here. #8555: it also returns the metered backstop slot
+            // the choice consumed, which rides on `PreparedIssueDispatch` to
+            // `finish_issue_dispatch` and is attached to the child there —
+            // dropped, and so released, by every early return in between.
             match crate::runtime_preference::resolve_for_dispatch(
                 &self.config.workspace_root,
                 "sweep-lifecycle",
                 None,
             ) {
-                Ok(admitted) => Some(admitted),
+                Ok(admission) => admission,
                 Err(rejection) => {
                     // Refused work still gets an event representation (#4494):
                     // `sweep.global.dispatch` describes admitted work only, so
@@ -1779,7 +1782,7 @@ impl SweepRegistry {
                     idempotency_key,
                     model,
                     effort,
-                    runtime_admission,
+                    admission,
                 )));
             }
         };
@@ -2341,7 +2344,7 @@ impl SweepRegistry {
             model,
             effort,
             depends_on,
-            runtime_admission.as_ref(),
+            admission.admitted.as_ref(),
         ) {
             Ok(spawned) => spawned,
             Err(e) => {
@@ -2387,7 +2390,7 @@ impl SweepRegistry {
             model: model.filter(|m| !m.is_empty()).map(String::from),
             effort: effort.filter(|e| !e.is_empty()).map(String::from),
             depends_on,
-            runtime_admission,
+            admission,
         })))
     }
 
@@ -2422,7 +2425,7 @@ impl SweepRegistry {
             model,
             effort,
             depends_on,
-            runtime_admission,
+            mut admission,
         } = prepared;
 
         // Issue #4689: the child already died — synchronously observed,
@@ -2492,15 +2495,17 @@ impl SweepRegistry {
         }
 
         let pid = child.id();
-        // Issue #8555: hand this dispatch's metered backstop slot (if
-        // `resolve_for_dispatch` parked one back in `begin_issue_dispatch`) to
-        // the child that will spend it, so the per-host ceiling counts live
-        // sweeps rather than resolutions. Placed AFTER the #4689 preflight-death
-        // branch above, which returns `Err` for a child that is already dead:
-        // attaching there would pin a slot to a pid that no longer exists. A
-        // no-op when no ceiling is configured or the walk never fell through to
-        // a governed tap — which is every pre-#8555 fleet.
-        crate::runtime_preference::handoff::attach(pid);
+        // Issue #8555: hand this dispatch's metered backstop slot (the one
+        // `resolve_for_dispatch` took back in `begin_issue_dispatch`, carried
+        // here on `PreparedIssueDispatch`) to the child that will spend it, so
+        // the per-host ceiling counts live sweeps rather than resolutions.
+        // Placed AFTER the #4689 preflight-death branch above, which returns
+        // `Err` for a child that is already dead: attaching there would pin a
+        // slot to a pid that no longer exists — and returning there drops the
+        // reservation, which releases it. A no-op when no ceiling is configured
+        // or the walk never fell through to a governed tap — which is every
+        // pre-#8555 fleet.
+        crate::runtime_preference::handoff::attach(admission.backstop.take(), pid);
         // Issue #4980: capture the child's process group NOW, while it is alive
         // — `getpgid` cannot answer for a dead pid, so a group handle acquired
         // any later is unavailable in exactly the crash case that needs it most.
@@ -2583,7 +2588,7 @@ impl SweepRegistry {
             pgid,
             token_name: token_name.clone(),
             runtime,
-            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
+            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             log_path: log_path.clone(),
             idempotency_key,
             started_at: Utc::now(),
@@ -2631,8 +2636,8 @@ impl SweepRegistry {
         self.emit_event(Event::SweepGlobalDispatch {
             sweep_id: sweep_id.clone(),
             kind: kind.clone(),
-            runtime: runtime_admission.as_ref().map(|a| a.runtime.clone()),
-            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
+            runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
+            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             // Stamped by `emit_event` -> `set_repo_if_absent` below (#4201),
             // matching the pattern already used for SweepPhase/Blocker/Exited/
             // Crashed — leave it `None` at construction.
@@ -2679,7 +2684,7 @@ impl SweepRegistry {
         idempotency_key: Option<String>,
         model: Option<&str>,
         effort: Option<&str>,
-        runtime_admission: Option<crate::runtime_admission::ResolvedRuntime>,
+        mut admission: crate::runtime_preference::DispatchAdmission,
     ) -> Result<DispatchOutcome> {
         if prs.is_empty() {
             return Err(anyhow!(
@@ -2724,7 +2729,7 @@ impl SweepRegistry {
             model,
             effort,
             None, // depends_on: stacked-PR chaining is Issue-only (#3729).
-            runtime_admission.as_ref(),
+            admission.admitted.as_ref(),
         ) {
             Ok(spawned) => spawned,
             Err(e) => {
@@ -2754,9 +2759,11 @@ impl SweepRegistry {
         }
 
         let pid = child.id();
-        // #8555: hand this dispatch's metered backstop slot (if
-        // `resolve_for_dispatch` parked one) to the child that will spend it.
-        crate::runtime_preference::handoff::attach(pid);
+        // #8555: hand this dispatch's metered backstop slot (the one
+        // `resolve_for_dispatch` took, carried down from `begin_issue_dispatch`)
+        // to the child that will spend it. Every `return` above drops it, which
+        // releases it — a refused PR-set dispatch holds nothing.
+        crate::runtime_preference::handoff::attach(admission.backstop.take(), pid);
         let pgid = spawned_leader_pgid(pid);
         self.children.insert(sweep_id.clone(), child);
 
@@ -2776,7 +2783,7 @@ impl SweepRegistry {
             pgid,
             token_name: token_name.clone(),
             runtime,
-            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
+            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             log_path: log_path.clone(),
             idempotency_key,
             started_at: Utc::now(),
@@ -2799,8 +2806,8 @@ impl SweepRegistry {
         self.emit_event(Event::SweepGlobalDispatch {
             sweep_id: sweep_id.clone(),
             kind: kind.clone(),
-            runtime: runtime_admission.as_ref().map(|a| a.runtime.clone()),
-            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
+            runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
+            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             repo: None,
         });
 

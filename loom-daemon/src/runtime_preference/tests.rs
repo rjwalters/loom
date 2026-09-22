@@ -741,18 +741,21 @@ fn into_admission_reports_a_wholly_unavailable_list_as_a_rejection() {
 /// `resolve_for_dispatch` is the function `sweep_registry::dispatch` actually
 /// calls, so the "absent config is byte-identical" invariant is pinned at
 /// *that* seam too, not only at `resolve_runtime`/`into_admission`: with no
-/// preference key it must return exactly what `resolve_and_admit` returns, in
-/// both the `Ok` and the `Err` arm (#8554).
+/// preference key the runtime it admits must be exactly what
+/// `resolve_and_admit` returns, in both the `Ok` and the `Err` arm (#8554) —
+/// and it must hold no metered slot, since no tap was fallen through to.
 #[test]
 #[serial_test::serial]
 fn resolve_for_dispatch_is_a_one_for_one_substitution_when_unconfigured() {
     let _env = ClearedRuntimeEnv::new();
     let dir = fixture();
     write_config(dir.path(), &serde_json::json!({"runtimes": {"default": "claude"}}));
+    let admission = super::resolve_for_dispatch(dir.path(), "sweep-lifecycle", None).unwrap();
     assert_eq!(
-        super::resolve_for_dispatch(dir.path(), "sweep-lifecycle", None).unwrap(),
+        admission.admitted.unwrap(),
         resolve_and_admit(dir.path(), "sweep-lifecycle", None).unwrap()
     );
+    assert!(admission.backstop.is_none());
     assert_eq!(
         super::resolve_for_dispatch(dir.path(), "not-a-role", None).unwrap_err(),
         resolve_and_admit(dir.path(), "not-a-role", None).unwrap_err()
@@ -1215,12 +1218,13 @@ fn the_probe_seam_the_work_finder_ticks_on_consumes_no_metered_capacity() {
     ));
 }
 
-/// The production path end to end: `resolve_for_dispatch` — the one-for-one
-/// substitution `sweep_registry::dispatch` and the role runner call — parks the
-/// slot it took, `handoff::attach` binds it to the spawned child, and the next
-/// dispatch sees the host at its ceiling. Without the park the `Decision` would
-/// be dropped on collapse to `ResolvedRuntime`, the lease released, and the
-/// configured ceiling would silently never count anything.
+/// The production path end to end: `resolve_for_dispatch` — the function
+/// `sweep_registry::dispatch` and the role runner call — hands the slot it took
+/// back to the caller, `handoff::attach` binds it to the spawned child, and the
+/// next dispatch sees the host at its ceiling. Were the slot not carried out of
+/// the resolution, the `Decision` would be dropped on collapse to
+/// `ResolvedRuntime`, the lease released, and the configured ceiling would
+/// silently never count anything.
 #[test]
 #[serial_test::serial]
 fn resolve_for_dispatch_hands_the_slot_to_the_launch_and_the_next_dispatch_sees_it() {
@@ -1229,11 +1233,12 @@ fn resolve_for_dispatch_hands_the_slot_to_the_launch_and_the_next_dispatch_sees_
     let dir = ceiling_fixture(1);
     let store = ceiling::lease_dir().unwrap();
 
-    let admitted = super::resolve_for_dispatch(dir.path(), "builder", None).unwrap();
-    assert_eq!(admitted.runtime, "opencode");
-    // Parked, not dropped: the slot survives the collapse to `ResolvedRuntime`.
+    let admission = super::resolve_for_dispatch(dir.path(), "builder", None).unwrap();
+    assert_eq!(admission.admitted.as_ref().unwrap().runtime, "opencode");
+    // Carried out, not dropped: the slot survives the collapse to
+    // `ResolvedRuntime`.
     assert_eq!(ceiling::live_count(&store).unwrap(), 1);
-    super::handoff::attach(std::process::id());
+    super::handoff::attach(admission.backstop, std::process::id());
     assert_eq!(ceiling::live_count(&store).unwrap(), 1);
 
     // The host is now at its ceiling, so the next dispatch is refused the
@@ -1242,7 +1247,7 @@ fn resolve_for_dispatch_hands_the_slot_to_the_launch_and_the_next_dispatch_sees_
     let rejection = super::resolve_for_dispatch(dir.path(), "builder", None).unwrap_err();
     assert_eq!(rejection.source, RuntimeSource::Preference);
     assert!(rejection.reason.contains("ceiling-at-capacity"), "{}", rejection.reason);
-    // The refused dispatch parked nothing, so the count is unchanged.
+    // The refused dispatch took nothing, so the count is unchanged.
     assert_eq!(ceiling::live_count(&store).unwrap(), 1);
 
     for entry in std::fs::read_dir(&store).unwrap().filter_map(Result::ok) {
