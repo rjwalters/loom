@@ -247,6 +247,65 @@ provisioning, verifying telemetry lands — is
 This is **your own infrastructure**; nothing in Loom points at a shared
 backend by default.
 
+## 4b. The gateway collector: multi-sink fanout + runtime session tails (issue #8664)
+
+The OTLP exporter (§3) posts to **one** endpoint, and everything above it is
+a `loom-daemon` host. Two real gaps follow, and both land on the same
+component — a hardened **gateway collector** an operator runs on a host,
+between the emitters and the backends:
+
+1. **Multi-sink fanout.** The collector receives one authenticated OTLP
+   stream and fans every signal out to *several* backends simultaneously —
+   e.g. SigNoz Cloud *and* a managed ClickHouse/ClickStack service — each
+   with its own durable file-buffered sending queue, so one sink's outage
+   never drops data for the other (#8522's side-by-side trial is exactly
+   this shape; #8529 verifies both backends index the same records).
+2. **Non-daemon emitters.** A lot of agent work never passes through
+   `loom-daemon` at all: interactive `claude` / `codex` / `pi` sessions,
+   subagents inside a single runtime session, hosts with daemon autonomy
+   disabled. §5d covered hostless *emitters speaking the Loom envelope*;
+   these are different — they speak OTLP natively (Claude Code) or not at
+   all (session stores on disk).
+
+The collector config template lives in
+[`examples/observability-gateway/`](https://github.com/rjwalters/loom/blob/main/examples/observability-gateway/)
+with its own README (layout, IaC contract, canary verification recipe).
+Shape, in brief:
+
+- **Ingress**: OTLP/HTTP on localhost only, bearer-authenticated with the
+  same per-host ingest key discipline as every other emitter
+  (`deploy-runbook.md` step 9a's key, reused — one key per reporting host).
+- **Claude Code**: exports metrics + logs (tool calls, token usage, agent
+  names) natively over OTLP — pointing the `OTEL_*` env block at the
+  gateway is pure configuration, no Loom code.
+- **Codex / pi / Claude transcripts**: `filelog` receivers tail the
+  runtimes' own session stores (`~/.codex/sessions`,
+  `~/.pi/agent/sessions`, `~/.claude/projects`), parse each JSON line,
+  move the handful of useful fields into allowlisted `loom.*` attributes
+  (`loom.runtime`, `loom.model`, `loom.session_id`, subagent lineage), and
+  **drop the raw body**.
+- **Privacy**: a `transform/privacy` processor keep-keys every signal down
+  to the resource identity plus the allowlisted `loom.*` attributes before
+  anything is exported — the same private-by-default posture as the wire
+  schema's `visibility` contract (§2), enforced at the last hop. Dotted
+  stanza target paths create *nested* maps (use `attributes["loom.key"]`),
+  which is what makes the keep-keys allowlist load-bearing rather than
+  advisory.
+- **Deployment**: one Docker Compose service — read-only rootfs, cap-drop
+  ALL, non-root, localhost-only ports, image pinned by digest. All
+  host-specific values (endpoints, paths, host identity) are `${env:}`
+  placeholders fed by a private env file; the committed files carry no
+  secrets and nothing operator-specific, so the template stays
+  copy-deployable.
+
+This is deliberately an **example**, not a Loom component: Loom never
+phones home and ships no collector, the same way §4 ships no backend. The
+template exists so an operator provisioning the §4 backend for a fleet
+doesn't re-derive the fanout, the filelog tails, or the privacy transform
+from scratch.
+
+
+
 ## 5. Authenticated vs. public: two views, one redaction policy
 
 Every query route exists twice — `/api/*` (authenticated, full detail) and
@@ -445,4 +504,5 @@ capture, and why) so you can produce the equivalent for your own instance.
 | `defaults/scripts/merge-admission-telemetry.sh` | Local merge-admission-recheck outcome telemetry (§5c) — record + report, no daemon/Cloudflare involvement |
 | `dashboard/migrations/0003_ephemeral_compute.sql` | `ephemeral_compute` schema decision + hostless-ingest provisioning rationale (§5d) |
 | `dashboard/docs/reference-deployment.md` | Generic guidance/template for recording your own instance's deployment identity in your own infrastructure repo — carries no operator identity here |
+| `examples/observability-gateway/` | Gateway collector template (§4b) — hardened OTLP landing zone, multi-sink fanout, runtime session tails, privacy allowlist; deploy-your-own, no operator identity |
 | `loom-daemon/src/observability/mod.rs` | Config resolution, collector/queue/exporter/sender source of truth |

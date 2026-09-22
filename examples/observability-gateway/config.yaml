@@ -1,0 +1,316 @@
+extensions:
+  bearertokenauth/loom:
+    filename: /run/secrets/loom_ingest_key
+    wait_for_token_file: true
+    retry_on_failure:
+      enabled: true
+      interval: 1s
+      max_retries: 5
+  file_storage/signoz:
+    directory: /var/lib/otelcol/signoz
+    create_directory: true
+    fsync: true
+  health_check:
+    endpoint: 0.0.0.0:13133
+  bearertokenauth/signoz:
+    filename: /run/secrets/signoz_ingest_key
+    header: signoz-ingestion-key
+    scheme: ''
+    wait_for_token_file: true
+    retry_on_failure:
+      enabled: true
+      interval: 1s
+      max_retries: 5
+  file_storage/clickhouse:
+    directory: /var/lib/otelcol/clickhouse
+    create_directory: true
+    fsync: true
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        max_request_body_size: 1048576
+        auth:
+          authenticator: bearertokenauth/loom
+  # Live tails of the interactive runtimes' own session stores (issue #8664):
+  # work that never passes through loom-daemon. Bodies are dropped and only
+  # loom.*-allowlisted fields survive the transform/privacy processor, so no
+  # conversation content leaves the host.
+  filelog/codex:
+    include:
+      - /hostsessions/codex/**/*.jsonl
+    start_at: end
+    poll_interval: 3s
+    operators:
+      - type: json_parser
+        on_error: drop_quiet
+      - type: move
+        from: attributes.type
+        to: attributes["loom.event_type"]
+        on_error: send
+      - type: move
+        from: attributes.payload.model
+        to: attributes["loom.model"]
+        on_error: send
+      - type: move
+        from: attributes.payload.id
+        to: attributes["loom.session_id"]
+        on_error: send
+      - type: move
+        from: attributes.payload.originator
+        to: attributes["loom.tool"].name
+        on_error: send
+      - type: remove
+        field: body
+      - type: add
+        field: resource["service.name"]
+        value: codex
+      - type: add
+        field: resource["host.id"]
+        value: ${env:LOOM_HOST_ID}
+      - type: add
+        field: attributes.loom.runtime
+        value: codex
+  filelog/pi:
+    include:
+      - /hostsessions/pi/**/*.jsonl
+    start_at: end
+    poll_interval: 3s
+    operators:
+      - type: json_parser
+        on_error: drop_quiet
+      - type: move
+        from: attributes.type
+        to: attributes["loom.event_type"]
+        on_error: send
+      - type: move
+        from: attributes.provider
+        to: attributes["loom.provider"]
+        on_error: send
+      - type: move
+        from: attributes.modelId
+        to: attributes["loom.model"]
+        on_error: send
+      - type: move
+        from: attributes.id
+        to: attributes["loom.agent_id"]
+        on_error: send
+      - type: move
+        from: attributes.parentId
+        to: attributes["loom.parent_agent_id"]
+        on_error: send
+      - type: move
+        from: attributes.cwd
+        to: attributes["loom.repo"]
+        on_error: send
+      - type: remove
+        field: body
+      - type: add
+        field: resource["service.name"]
+        value: pi
+      - type: add
+        field: resource["host.id"]
+        value: ${env:LOOM_HOST_ID}
+      - type: add
+        field: attributes.loom.runtime
+        value: pi
+  filelog/claude:
+    include:
+      - /hostsessions/claude/**/*.jsonl
+    start_at: end
+    poll_interval: 3s
+    operators:
+      - type: json_parser
+        on_error: drop_quiet
+      - type: move
+        from: attributes.type
+        to: attributes["loom.event_type"]
+        on_error: send
+      - type: move
+        from: attributes.sessionId
+        to: attributes["loom.session_id"]
+        on_error: send
+      - type: move
+        from: attributes.message.model
+        to: attributes["loom.model"]
+        on_error: send
+      - type: move
+        from: attributes.message.role
+        to: attributes["loom.role"]
+        on_error: send
+      - type: move
+        from: attributes.durationMs
+        to: attributes["loom.duration_ms"]
+        on_error: send
+      - type: move
+        from: attributes.parentUuid
+        to: attributes["loom.parent_agent_id"]
+        on_error: send
+      - type: remove
+        field: body
+      - type: add
+        field: resource["service.name"]
+        value: claude-code
+      - type: add
+        field: resource["host.id"]
+        value: ${env:LOOM_HOST_ID}
+      - type: add
+        field: attributes.loom.runtime
+        value: claude-code
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 384
+    spike_limit_mib: 96
+  transform/privacy:
+    error_mode: propagate
+    log_statements:
+    - context: resource
+      statements:
+      - keep_keys(attributes, ["service.name", "service.version", "service.instance.id",
+        "host.id"])
+    - context: log
+      statements:
+      - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id",
+        "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt",
+        "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result",
+        "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict",
+        "loom.recovered", "loom.timing_source", "loom.tool.name", "loom.duration_sec",
+        "loom.total_duration_sec", "loom.phase_durations", "loom.models_used", "loom.tokens_by_model",
+        "loom.judge_verdicts", "loom.tokens_in", "loom.tokens_out", "loom.lines_added",
+        "loom.lines_deleted", "loom.config.runtime", "loom.config.provider", "loom.config.configured_model",
+        "loom.config.arm", "loom.gated_pool", "loom.actions.comments_posted", "loom.actions.issues_labeled",
+        "loom.actions.prs_merged",
+        "loom.session_id", "loom.event_type", "loom.duration_ms", "loom.agent_id",
+        "loom.parent_agent_id"])
+    trace_statements:
+    - context: resource
+      statements:
+      - keep_keys(attributes, ["service.name", "service.version", "service.instance.id",
+        "host.id"])
+    - context: span
+      statements:
+      - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id",
+        "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt",
+        "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result",
+        "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict",
+        "loom.recovered", "loom.timing_source", "loom.tool.name"])
+    - context: spanevent
+      statements:
+      - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id",
+        "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt",
+        "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result",
+        "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict",
+        "loom.recovered", "loom.timing_source", "loom.tool.name"])
+    metric_statements:
+    - context: resource
+      statements:
+      - keep_keys(attributes, ["service.name", "service.version", "service.instance.id",
+        "host.id"])
+    - context: datapoint
+      statements:
+      - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window",
+        "state"])
+exporters:
+  otlp_http/signoz:
+    endpoint: ${env:LOOM_SIGNOZ_OTLP_ENDPOINT}
+    timeout: 5s
+    retry_on_failure:
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 600s
+    sending_queue:
+      storage: file_storage/signoz
+      sizer: requests
+      queue_size: 1000
+      num_consumers: 2
+      block_on_overflow: false
+    auth:
+      authenticator: bearertokenauth/signoz
+  clickhouse/managed:
+    endpoint: ${env:LOOM_CLICKHOUSE_ENDPOINT}
+    username: ${env:LOOM_CLICKHOUSE_USERNAME}
+    password: ${file:/run/secrets/clickhouse_password}
+    database: loom_otel
+    ttl: 168h
+    create_schema: true
+    logs_table_name: otel_logs
+    traces_table_name: otel_traces
+    metrics_tables:
+      gauge:
+        name: otel_metrics_gauge
+      sum:
+        name: otel_metrics_sum
+      histogram:
+        name: otel_metrics_histogram
+      exponential_histogram:
+        name: otel_metrics_exp_histogram
+      summary:
+        name: otel_metrics_summary
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 600s
+    sending_queue:
+      storage: file_storage/clickhouse
+      sizer: requests
+      queue_size: 1000
+      num_consumers: 2
+      block_on_overflow: false
+      batch:
+        sizer: items
+        min_size: 512
+        max_size: 2048
+        flush_timeout: 1s
+service:
+  extensions:
+  - bearertokenauth/loom
+  - file_storage/signoz
+  - health_check
+  - bearertokenauth/signoz
+  - file_storage/clickhouse
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      readers:
+      - pull:
+          exporter:
+            prometheus:
+              host: 0.0.0.0
+              port: 8888
+  pipelines:
+    logs:
+      receivers:
+      - otlp
+      - filelog/codex
+      - filelog/pi
+      - filelog/claude
+      processors:
+      - memory_limiter
+      - transform/privacy
+      exporters:
+      - otlp_http/signoz
+      - clickhouse/managed
+    metrics:
+      receivers:
+      - otlp
+      processors:
+      - memory_limiter
+      - transform/privacy
+      exporters:
+      - otlp_http/signoz
+      - clickhouse/managed
+    traces:
+      receivers:
+      - otlp
+      processors:
+      - memory_limiter
+      - transform/privacy
+      exporters:
+      - otlp_http/signoz
+      - clickhouse/managed
