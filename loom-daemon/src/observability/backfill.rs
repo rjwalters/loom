@@ -343,6 +343,7 @@ mod tests {
                 runtime: None,
                 provider: None,
                 profile: None,
+                complexity: None,
             }),
         )
     }
@@ -386,6 +387,7 @@ mod tests {
             runtime: None,
             provider: None,
             profile: None,
+            complexity: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));
@@ -431,6 +433,7 @@ mod tests {
             runtime: None,
             provider: None,
             profile: None,
+            complexity: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));

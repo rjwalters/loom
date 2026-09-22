@@ -146,6 +146,21 @@ pub enum GroupBy {
     /// (Issue #8556). See [`resolve_tap`] for how a record with no explicit
     /// `config["tap"]` stamp is placed.
     Tap,
+    /// The Curator's complexity tier (Issue #8542): `mechanical` / `routine` /
+    /// `complex`, `unknown` for a record with no marker observed — see
+    /// [`SweepOutcomeRecord::complexity`]. This is the routing-evaluation cut:
+    /// each row's `first_pass_approval_rate` answers "does this tier's
+    /// dispatch hold the Judge first-pass rate?".
+    #[serde(rename = "complexity")]
+    Complexity,
+    /// The `model × complexity` cross-tab (Issue #8542): the compound key
+    /// `"<model>/<complexity>"`, each side defaulting exactly as its own
+    /// single-dimension grouping does (`default` / `unknown`). Answers
+    /// "within one tier, does a cheaper model hold the approval rate?" —
+    /// the question `--group-by model` and `--group-by complexity` can each
+    /// only approximate alone.
+    #[serde(rename = "model-complexity")]
+    ModelComplexity,
 }
 
 impl GroupBy {
@@ -158,9 +173,11 @@ impl GroupBy {
             "host" => Ok(Self::Host),
             "day" => Ok(Self::Day),
             "tap" => Ok(Self::Tap),
+            "complexity" => Ok(Self::Complexity),
+            "model-complexity" => Ok(Self::ModelComplexity),
             other => bail!(
                 "unknown --group-by value {other:?} (expected one of: arm, model, repo, host, \
-                 day, tap)"
+                 day, tap, complexity, model-complexity)"
             ),
         }
     }
@@ -174,6 +191,8 @@ impl GroupBy {
             Self::Host => "host",
             Self::Day => "day",
             Self::Tap => "tap",
+            Self::Complexity => "complexity",
+            Self::ModelComplexity => "model-complexity",
         }
     }
 }
@@ -202,6 +221,28 @@ impl ArmSource {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Resolve a record's complexity-tier group label (Issue #8542): the tier
+/// verbatim when the marker was read, else [`UNKNOWN_GROUP`] — never dropped,
+/// matching [`resolve_arm`]'s "nothing is dropped for want of a group" rule.
+#[must_use]
+pub fn resolve_complexity(record: &SweepOutcomeRecord) -> String {
+    record
+        .complexity
+        .clone()
+        .unwrap_or_else(|| UNKNOWN_GROUP.to_string())
+}
+
+/// Resolve a record's `model` group label — `default` for a record with no
+/// explicit model, exactly as `GroupBy::Model` resolves it. Factored out so
+/// [`GroupBy::ModelComplexity`]'s compound key reuses the identical fold.
+#[must_use]
+pub fn resolve_model_label(record: &SweepOutcomeRecord) -> String {
+    record
+        .model
+        .clone()
+        .unwrap_or_else(|| "default".to_string())
 }
 
 /// Resolve a record's arm and where that arm came from. Never returns an
@@ -884,6 +925,17 @@ pub struct GroupRow {
     /// stated rather than implied, because `lines_added`/`lines_deleted` are
     /// `Option` and a partial denominator is not the same as a full one.
     pub lines_per_merged_pr_denominator: usize,
+    /// How many of this group's sweeps had an observed (non-empty)
+    /// `judge_verdicts` (Issue #8542) — the denominator behind
+    /// `first_pass_approval_rate`. A sweep whose PR was never judged (died
+    /// before Judge, or the timeline was never read) does not count here.
+    pub first_pass_judged: usize,
+    /// Fraction of `first_pass_judged` whose FIRST verdict (`attempt: 1`) was
+    /// `"pass"` — the routing-evaluation headline: "does this tier/model
+    /// dispatch hold the Judge first-pass rate?" `None` for a group with no
+    /// judged sweeps, never a fabricated `0.0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_pass_approval_rate: Option<f64>,
 }
 
 /// The whole report.
@@ -1016,6 +1068,12 @@ struct Accum {
     lines_deleted_merged: i64,
     lines_denominator: usize,
     arm_sources: BTreeSet<&'static str>,
+    /// Records whose `judge_verdicts` was observed non-empty (Issue #8542) —
+    /// the denominator for `first_pass_approval_rate`.
+    first_pass_judged: usize,
+    /// Of `first_pass_judged`, how many had `judge_verdicts[0].verdict ==
+    /// "pass"`.
+    first_pass_approved: usize,
 }
 
 /// Aggregate `records` into a [`SummaryReport`].
@@ -1062,13 +1120,11 @@ pub fn summarize(
                 }
                 (arm, Some(source))
             }
-            GroupBy::Model => (
-                record
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
-                None,
-            ),
+            GroupBy::Model => (resolve_model_label(record), None),
+            GroupBy::Complexity => (resolve_complexity(record), None),
+            GroupBy::ModelComplexity => {
+                (format!("{}/{}", resolve_model_label(record), resolve_complexity(record)), None)
+            }
             GroupBy::Repo => {
                 let repo = record.repo.trim();
                 let repo = if repo.is_empty() { UNKNOWN_GROUP } else { repo };
@@ -1110,6 +1166,23 @@ pub fn summarize(
         }
         if doctor_engaged(record) {
             acc.doctor += 1;
+        }
+        // First-pass Judge approval rate (Issue #8542): the routing-evaluation
+        // metric a `complexity`/`model-complexity` grouping exists to surface.
+        // `judge_verdicts` is `Some([])` for an observed-but-unjudged PR (a
+        // sweep that died before Judge) — that counts as "not judged", the
+        // same "unknown != zero" contract as `judge_verdicts` itself, so it
+        // must not deflate the denominator. Only a non-empty verdict list
+        // counts, and only its FIRST entry (attempt 1) settles the fold.
+        if let Some(first) = record
+            .judge_verdicts
+            .as_ref()
+            .and_then(|verdicts| verdicts.first())
+        {
+            acc.first_pass_judged += 1;
+            if first.verdict == "pass" {
+                acc.first_pass_approved += 1;
+            }
         }
         if let Some(usd) = weighted_tokens_usd(record) {
             acc.weighted_usd += usd;
@@ -1213,6 +1286,10 @@ pub fn summarize(
                 lines_added_per_merged_pr: added_per,
                 lines_deleted_per_merged_pr: deleted_per,
                 lines_per_merged_pr_denominator: acc.lines_denominator,
+                first_pass_judged: acc.first_pass_judged,
+                #[allow(clippy::cast_precision_loss)]
+                first_pass_approval_rate: (acc.first_pass_judged > 0)
+                    .then(|| acc.first_pass_approved as f64 / acc.first_pass_judged as f64),
             }
         })
         .collect();
@@ -1257,6 +1334,15 @@ pub fn summarize(
                 split.join(", ")
             ));
         }
+    }
+    if matches!(opts.group_by, GroupBy::Complexity | GroupBy::ModelComplexity)
+        && rows.iter().any(|r| r.group.contains(UNKNOWN_GROUP))
+    {
+        notes.push(
+            "records with no Curator complexity marker observed are bucketed as 'unknown' \
+             rather than dropped (issue #8542) — group counts still sum to records_grouped."
+                .to_string(),
+        );
     }
     if !opts.merge_join_attempted {
         notes.push(
@@ -1375,15 +1461,16 @@ pub fn render_text(report: &SummaryReport) -> String {
     let arm = report.group_by == GroupBy::Arm;
     if arm {
         out.push_str(&format!(
-            "{:<16} {:<9} {:>6} {:>5} {:>5} {:>5} {:>5} {:>9} {:>7} {:>7} {:>8} {:>7} {:>9} {:>9} {:>8} {:>8}\n",
+            "{:<16} {:<9} {:>6} {:>5} {:>5} {:>5} {:>5} {:>9} {:>7} {:>7} {:>8} {:>7} {:>9} {:>9} {:>8} {:>8} {:>7} {:>6}\n",
             "GROUP", "ARM_SRC", "SWEEPS", "SUCC", "FAIL", "CANC", "BLKD", "REALFAIL", "MED_S",
-            "P75_S", "DOCTOR%", "MERGED", "WTOK_USD", "MERGE/USD", "+L/PR", "-L/PR"
+            "P75_S", "DOCTOR%", "MERGED", "WTOK_USD", "MERGE/USD", "+L/PR", "-L/PR", "JDG1%",
+            "JDG_N"
         ));
     } else {
         out.push_str(&format!(
-            "{:<26} {:>6} {:>5} {:>5} {:>5} {:>5} {:>9} {:>7} {:>7} {:>8} {:>7} {:>9} {:>9} {:>8} {:>8}\n",
+            "{:<26} {:>6} {:>5} {:>5} {:>5} {:>5} {:>9} {:>7} {:>7} {:>8} {:>7} {:>9} {:>9} {:>8} {:>8} {:>7} {:>6}\n",
             "GROUP", "SWEEPS", "SUCC", "FAIL", "CANC", "BLKD", "REALFAIL", "MED_S", "P75_S",
-            "DOCTOR%", "MERGED", "WTOK_USD", "MERGE/USD", "+L/PR", "-L/PR"
+            "DOCTOR%", "MERGED", "WTOK_USD", "MERGE/USD", "+L/PR", "-L/PR", "JDG1%", "JDG_N"
         ));
     }
 
@@ -1391,8 +1478,11 @@ pub fn render_text(report: &SummaryReport) -> String {
         let merged = row
             .merged_prs
             .map_or_else(|| "n/a".to_string(), |m| m.to_string());
+        let first_pass = row
+            .first_pass_approval_rate
+            .map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r * 100.0));
         let tail = format!(
-            "{:>6} {:>5} {:>5} {:>5} {:>5} {:>8.1}% {:>7} {:>7} {:>7.1}% {:>7} {:>9} {:>9} {:>8} {:>8}",
+            "{:>6} {:>5} {:>5} {:>5} {:>5} {:>8.1}% {:>7} {:>7} {:>7.1}% {:>7} {:>9} {:>9} {:>8} {:>8} {:>7} {:>6}",
             row.sweeps,
             row.success,
             row.failure,
@@ -1407,6 +1497,8 @@ pub fn render_text(report: &SummaryReport) -> String {
             fmt_opt_f64(row.merges_per_weighted_token, 3),
             fmt_opt_f64(row.lines_added_per_merged_pr, 0),
             fmt_opt_f64(row.lines_deleted_per_merged_pr, 0),
+            first_pass,
+            row.first_pass_judged,
         );
         if arm {
             out.push_str(&format!(
@@ -1424,6 +1516,11 @@ pub fn render_text(report: &SummaryReport) -> String {
     out.push_str(
         "Doctor% is approximate: derived from sampled phase_durations until doctor_cycles lands \
          (#8056).\n",
+    );
+    out.push_str(
+        "JDG1% is the first-pass Judge approval rate (judge_verdicts[0].verdict == \"pass\") \
+         over JDG_N judged sweeps in the group; '-' means no sweep in the group was judged \
+         (#8542).\n",
     );
     for note in &report.notes {
         out.push_str(&format!("Note: {note}\n"));

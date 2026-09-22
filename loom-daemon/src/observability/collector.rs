@@ -483,6 +483,7 @@ fn terminal_records(
             runtime: None,
             provider: None,
             profile: None,
+            complexity: None,
         }),
     ]
 }
