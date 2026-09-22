@@ -63,8 +63,19 @@ Both are ordinary `docker exec` — there is no separate control plane.
 Phase 2's session lifecycle CLI actually runs):
 
 ```bash
-docker exec <container> codex exec "do the thing"
+docker exec --workdir "$PWD" --env "LOOM_WORKSPACE=$WORKSPACE" <container> codex exec "do the thing"
 ```
+
+`--workdir` is load-bearing (issue #8518): `docker exec` does not inherit
+the caller's cwd, and Codex started in the image's `WORKDIR` (`/home/loom`)
+refuses every prompt with "Not inside a trusted directory". Path parity
+(`docker/worker/MOUNT-CONTRACT.md` §1) is what makes the host cwd valid
+inside the container — which is also why the mount root handed to
+`loom-daemon accounts session start --mount-workspace` should be the
+directory that holds *every* checkout the container will serve, not one
+repo. The image sets `git config --system safe.directory '*'` so a bind
+mount that Docker Desktop presents as root-owned is still a repository to
+git (and therefore to Codex) as uid 1000.
 
 Exit codes, stdout/stderr, and the Codex `exec` transcript are exactly what
 they would be running `codex exec` directly on a bare-metal host — nothing

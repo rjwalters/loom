@@ -319,7 +319,7 @@ fn handle_session_command(action: SessionAction, workspace: std::path::PathBuf) 
         SessionAction::Start {
             name,
             image,
-            workspace: workspace_arg,
+            mount_workspace: workspace_arg,
             json,
         } => {
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image);
@@ -346,7 +346,7 @@ fn handle_session_command(action: SessionAction, workspace: std::path::PathBuf) 
         }
         SessionAction::Shell {
             name,
-            workspace: workspace_arg,
+            mount_workspace: workspace_arg,
             args,
         } => {
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);

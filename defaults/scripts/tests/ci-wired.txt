@@ -193,6 +193,7 @@ test-run-job.sh
 test-safe-stash-pop.sh
 test-safehoused-service.sh
 test-script-helper-version-floor.sh
+test-spawn-codex-session-exec.sh
 test-stale-claim-standdown-suppression.sh
 test-stop-hook-subcommand-skew.sh
 test-sweep-auto-stack.sh

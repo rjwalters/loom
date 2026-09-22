@@ -1405,8 +1405,8 @@ printf '{"schema_version":1,"container_name":"loom-codex-session-session-acct","
 out="$(run_auth "LOOM_CODEX_HOME=$SESSION_PROFILE" -- -p "hi")"
 assert_contains "profile 'session-acct' is session-managed" "$out" \
     "a session-managed profile is detected via the on-disk marker"
-assert_contains "would-exec: docker exec -e CARGO_INCREMENTAL=0 loom-codex-session-session-acct codex exec" "$out" \
-    "session-exec mode dispatches via docker exec into the account's container, with CARGO_INCREMENTAL=0 carried across the boundary (#6926, #8456)"
+assert_contains "-e CARGO_INCREMENTAL=0 loom-codex-session-session-acct codex exec" "$out" \
+    "session-exec mode dispatches via docker exec into the account's container, with CARGO_INCREMENTAL=0 carried across the boundary (#6926, #8456; the --workdir/--env prefix is asserted in test-spawn-codex-session-exec.sh, #8518)"
 would_exec_line="$(printf '%s\n' "$out" | grep '^spawn-codex would-exec:' || true)"
 assert_not_contains "tmux" "$would_exec_line" \
     "the resolved dispatch invocation itself never mentions tmux (docker exec only, no send-keys)"
@@ -1436,7 +1436,7 @@ NO_MARKER_PROFILE="$TMPROOT/profiles/forced"
 mkdir -p "$NO_MARKER_PROFILE"
 printf '{"token":"stub"}\n' > "$NO_MARKER_PROFILE/auth.json"
 out="$(run_auth "LOOM_CODEX_HOME=$NO_MARKER_PROFILE" LOOM_CODEX_SESSION_EXEC=1 -- -p "hi")"
-assert_contains "would-exec: docker exec -e CARGO_INCREMENTAL=0 loom-codex-session-forced codex exec" "$out" \
+assert_contains "-e CARGO_INCREMENTAL=0 loom-codex-session-forced codex exec" "$out" \
     "LOOM_CODEX_SESSION_EXEC=1 forces session-exec even without the marker file"
 assert_contains "forces session-exec mode though" "$out" \
     "LOOM_CODEX_SESSION_EXEC=1 warns that the profile was never adopted"
@@ -1557,10 +1557,12 @@ fi
 if [[ "\$1" == "exec" ]]; then
     shift
     # Options precede the container name (real docker exec is clap-parsed);
-    # -e KEY=VALUE pairs are exported so the exec'd process sees them, the
-    # way real docker exec seeds its environment (#8456's CARGO_INCREMENTAL=0
-    # rides this path).
-    while [[ "\$1" == "-e" ]]; do export "\$2"; shift 2; done
+    # -e/--env KEY=VALUE pairs are exported so the exec'd process sees them,
+    # the way real docker exec seeds its environment (#8456's
+    # CARGO_INCREMENTAL=0 and #8518's LOOM_WORKSPACE ride this path), and
+    # --workdir DIR is honoured with a cd, the way real docker exec starts
+    # the process in that directory (#8518).
+    while [[ "\$1" == -* ]]; do if [[ "\$1" == "--workdir" ]]; then cd "\$2"; else export "\$2"; fi; shift 2; done
     _container="\$1"
     shift
     printf '%s\n' "\$_container \$*" > "$SESSION_DOCKER_EXEC_ARGV"
