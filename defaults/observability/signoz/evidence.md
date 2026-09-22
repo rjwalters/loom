@@ -247,11 +247,51 @@ ad-hoc probe's authenticated UI screenshots above already establish that
 acceptance row, and query 2/4/6 above establish the shared-fixture graph and
 log correlation are equally queryable.
 
+## Rendered-deployment contract (2026-09-22)
+
+Every deployment property recorded above is an observation of one render at one
+moment. `casting.yaml` is meant to be edited and re-rendered, so each of them can
+be undone later by a `forge` run, an upstream default change or a hand-edit of the
+generated output — with no error raised anywhere, on a host nobody is watching.
+Two are security properties: the published-port surface (self-hosted SigNoz's OTLP
+receiver is unauthenticated by design) and the `loom-signoz` namespacing that keeps
+`down --volumes` away from the trial host's separately-owned SigNoz installation.
+
+`loom-daemon/tests/signoz_deployment_contract.rs` converts eight of them from
+one-time observations into CI-enforced invariants, read back out of the committed
+`pours/deployment/compose.yaml`. It uses no Docker, network or credential, so
+unlike the observations above it re-runs on every commit. The full table is in the
+README's "Rendered-deployment contract" section. As with
+`signoz_trial_artifacts.rs`, the authorities are derived rather than restated: the
+shared-network alias comes from the gateway config's `otlp_http/signoz` endpoint,
+the image digests from `casting.yaml`, and the README's memory budget is re-summed
+from the rendered `mem_limit`s.
+
+Each assertion was verified to fail on a deliberately mutated render before being
+committed: an added `0.0.0.0:4318:4318` mapping on the ingester, a renamed network
+alias, a hand-edited image digest, `tar -xzf` moved ahead of the `sha256sum
+--check`, a literal `SIGNOZ_TOKENIZER_JWT_SECRET`, a volume renamed outside the
+project prefix, a raised ClickHouse `mem_limit`, and a dropped log-rotation cap.
+Every mutation failed exactly the intended test with an accurate message, and none
+of the eight is vacuous. All mutations were reverted; the committed render is
+unchanged by this section.
+
+This closes the "verified once, by hand, unguarded afterwards" gap for the
+deployment's trust boundary and supply chain. It is a static contract and
+deliberately asserts nothing about a running backend: readiness, ingestion,
+retention and query results remain the live sections above.
+
+**Not run on this sweep host**: `docker` returns `permission denied while trying to
+connect to the docker API at unix:///var/run/docker.sock`, and no trial volumes
+exist here, so nothing in this section is a live observation and no live check was
+repeated. That is also why the two open ledger rows below did not advance.
+
 ## Acceptance ledger
 
 | Check | Status |
 | --- | --- |
-| Pinned Foundry render and configuration | Passed, including deterministic second render (reconfirmed independently above) |
+| Pinned Foundry render and configuration | Passed, including deterministic second render (reconfirmed independently above); digest pinning, casting/render agreement and the README version table are now CI-enforced |
+| Private receiver exposure and project isolation | Passed on the trial host, and now continuously enforced against the committed render — see "Rendered-deployment contract" |
 | Keeper, PostgreSQL and ClickHouse readiness | Passed on the trial VM |
 | Schema migrations and app readiness | Passed; receiver storage proof remains separate |
 | Three fixture signals with matching IDs/values | Passed for the ad-hoc probe; metric timestamp precision conversion documented |
