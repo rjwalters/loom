@@ -26,6 +26,12 @@
 # The full behavioural reference — every flag, every knob, and the incident
 # behind each one — is `loom-daemon daemon-start --help`, rendered from
 # `loom-daemon/src/daemon_start/help.txt`.
+#
+# requires-daemon: daemon-start >= 0.19.285   #8087 — the port itself, declared in the same PR that adds the subcommand. Hard, not `optional`: this stub only execs, it never probes or degrades. The number is the HIGHEST this PR may legally name, not the true first-shipping version: `daemon-start` first ships in the post-merge VERSION bump, which a PR may never write (#7743) and which check-daemon-subcommand-versions.sh rejects as a floor above VERSION. So this floor errs PERMISSIVE by however many bumps land between this line and the merge — a host inside that window still gets clap's bare "unrecognized subcommand", exactly the status quo for an undeclared stub, while every host below it gets the actionable roll command (#8385). On a rebase, raise it to the new VERSION; never lower it.
+# LOOM_SCRIPT_HELPER_MISSING_RC is left at its default 1 on purpose: 1 is
+# already this script's documented code for "binary not found" (see the exit
+# codes above), so an unresolvable or below-floor daemon cannot be mistaken for
+# data — none of this entry point's exit codes carry any.
 
 set -uo pipefail
 
