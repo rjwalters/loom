@@ -496,6 +496,7 @@ fn a_cargo_cache_inside_the_workspace_is_not_mounted_twice() {
 fn host_only_paths_are_not_forwarded_into_the_container() {
     assert!(!forwarded_by_name("LOOM_OPENCODE_BIN"));
     assert!(!forwarded_by_name("LOOM_PI_BIN"));
+    assert!(!forwarded_by_name("LOOM_KIMI_BIN"));
     assert!(!forwarded_by_name("LOOM_DAEMON_BIN"));
     assert!(!forwarded_by_name("LOOM_SPAWN_CONTAINERIZED"));
     assert!(!forwarded_by_name("PATH"));

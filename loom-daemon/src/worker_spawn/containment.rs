@@ -287,6 +287,7 @@ fn is_isolated_dir(name: &str) -> bool {
 const HOST_ONLY_ENV: &[&str] = &[
     "LOOM_PI_BIN",
     "LOOM_OPENCODE_BIN",
+    "LOOM_KIMI_BIN",
     "LOOM_DAEMON_BIN",
     "LOOM_DAEMON_SELF_BIN",
     "LOOM_NATIVE_TOOL_BIN",
