@@ -192,6 +192,13 @@ pub(crate) enum ScriptPortCommand {
     /// singleton's schedule wrapper used to hand-roll. Not a port: brand-new
     /// logic, native from the start per the shell-language policy.
     FleetCaptain(super::fleet_captain_cmd::FleetCaptainArgs),
+
+    /// Tier-3 "generic passthrough" launch-shape resolution (#8671): reads a
+    /// runtime capability manifest's `launch` object and renders it as
+    /// eval-ready shell defaults. Backs `spawn-generic-launch.sh`. Exit 0
+    /// resolved, 1 no manifest reachable (soft), 78 (`EX_CONFIG`) malformed
+    /// manifest or an unrecognized `launch` key.
+    RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
 }
 
 impl ScriptPortCommand {
@@ -225,6 +232,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
+            ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
         }
     }
 }
