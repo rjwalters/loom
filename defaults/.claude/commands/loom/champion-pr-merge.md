@@ -27,8 +27,6 @@ This file contains PR auto-merge instructions for the Champion role. **Read this
 
 Auto-merge Judge-approved PRs that are safe, routine, and low-risk.
 
-The Champion acts as the final step in the PR pipeline, merging PRs that have passed Judge review and meet all safety criteria.
-
 ---
 
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
@@ -294,7 +292,7 @@ echo "PASS: Label check"
 - [ ] The PR is green on **all four risk axes** below — or carries `loom:auto-merge-ok` (an explicit human/Judge override)
 - [ ] **No prior merge-risk hold is still in force** — if an earlier tick held this PR, a durable release signal exists (see "Sticky holds" below). A fresh green re-read of the same diff is **not** a release signal.
 
-**This criterion is a judgment call you make by reading the PR, not an arithmetic check.** You already have the diff, the PR body, and the Judge's review in front of you; use them. **Line count is not a criterion** — there is no numeric ceiling any more (the `champion.auto_merge_max_lines` knob is retired; see the migration note below), and a hold must never be justified by a line count.
+**This criterion is a judgment call you make by reading the PR, not an arithmetic check.** You already have the diff, the PR body, and the Judge's review in front of you; use them. **Line count is not a criterion** — there is no numeric ceiling any more (the `champion.auto_merge_max_lines` knob is retired, see below), and a hold must never be justified by a line count.
 
 **Run the sticky-hold precheck FIRST** (below) — it decides what a green re-read of this PR is even allowed to do. Then gather the evidence and judge the axes.
 
@@ -601,6 +599,8 @@ four-axis judgment below.
 - Merging a PR that ever carried a hold marker -> **PASS + mandatory reversal comment** (Step 2 must state what changed; see "Sticky holds").
 
 **Size is not a proxy for any axis.** An 886-line PR that is 700 lines of new tests plus one self-contained module is green on all four; a 12-line change to `merge-pr.sh`'s ordering guard is red on blast radius *and* revertability. Never hold a PR because it is large, and never merge a PR because it is small.
+
+**Optional shadow pre-score (#8545).** Only with `TYPESAFE_API_KEY` set, and only *after* your verdict above is final, log a score per [`champion-merge-risk-shadow.md`](champion-merge-risk-shadow.md) — telemetry about this rubric, never an input to it. Unset: skip; nothing changes.
 
 #### Sticky holds — a hold does NOT clear on a re-read alone (#4742)
 
@@ -1006,7 +1006,7 @@ its critical-file caveat, or its role as sticky-hold release path (a).
 
 **Rationale**: A raw line count is a poor risk proxy. Every substantive change-plus-tests PR exceeds any tolerable numeric threshold, so a ceiling holds *all* real work while letting through small changes to exactly the high-blast-radius files that most need human eyes (on 2026-07-30 the 200-line ceiling stalled four consecutive Judge-approved, CI-green PRs: #4551, #4558, #4560, #4562). Champion is an LLM agent that has already read the diff and the Judge's review — it can assess actual risk directly. The four axes keep that judgment concrete and checkable rather than a vague "use your best judgment".
 
-**Migration note (retired config knob)**: `champion.auto_merge_max_lines` is **no longer read**. If your repo's `.loom/config.json` sets it, the key is now inert — delete it (leaving it does no harm, but it no longer has any effect). Repos that used a low value to keep Champion conservative should instead rely on this criterion's conservative bias, hold individual PRs by removing `loom:pr`, or stop running Champion's auto-merge pass. Repos that set a high value to work *around* the ceiling can simply drop the key.
+**Migration note (retired config knob)**: `champion.auto_merge_max_lines` is **no longer read** — an existing key in `.loom/config.json` is inert and can be deleted. A repo that used a low value to keep Champion conservative should rely instead on this criterion's conservative bias, hold individual PRs by removing `loom:pr`, or stop running the auto-merge pass.
 
 ### 3. Critical File Exclusion Check
 - [ ] No changes to critical configuration or infrastructure files, **except** a version-only diff hunk in one of the 6 version-bearing files (see "Version-only diff carve-out" below)

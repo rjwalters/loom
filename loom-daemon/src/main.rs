@@ -844,6 +844,17 @@ enum Commands {
         action: ForgeAction,
     },
 
+    /// Shadow-mode Jev (TypeSafe) pre-score for Champion's PR auto-merge
+    /// criterion #2 (issue #8545) — read-only telemetry, never a merge
+    /// decision. Prints a JSON object with four calibrated
+    /// probability/confidence pairs (diff composition, blast radius, Judge
+    /// review depth, revertability) to stdout; exits non-zero with no stdout
+    /// output on any failure, including a missing `TYPESAFE_API_KEY`.
+    JevMergeRisk {
+        /// The PR number to score.
+        pr: u64,
+    },
+
     // ---------------------------------------------------------------------
     // Script helpers (epic #4081 Phase 3 family 5, issue #4275) — native
     // replacements for the `loom_tools` modules that existed only to back a
@@ -2744,7 +2755,8 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             unreachable!("PeerClaims is handled in main() before handle_cli_command")
         }
         // Async commands are dispatched by main before reaching this sync handler.
-        Commands::Quarantine { .. }
+        Commands::JevMergeRisk { .. }
+        | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }
         | Commands::NoopCooldown { .. }
         | Commands::Dispatch { .. }
