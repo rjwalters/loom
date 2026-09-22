@@ -9,7 +9,7 @@
 //! an error: the daemon's tick falls back to its source path on it.
 
 use anyhow::Result;
-use loom_daemon::release_resolve::{emit, resolve, Inputs};
+use loom_daemon::release_resolve::{build_time_repo, emit, resolve, Inputs};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -57,6 +57,13 @@ impl ReleaseResolveArgs {
             repo_override: self
                 .repo
                 .or_else(|| std::env::var("LOOM_DAEMON_UPDATE_GH_REPO").ok()),
+            // Same priority order as `auto_update::native_probe` (#8513): a
+            // dedicated Loom checkout on this host, then the repo compiled
+            // into this binary at build time.
+            machine_checkout: std::env::var("LOOM_MACHINE_CHECKOUT")
+                .ok()
+                .map(PathBuf::from),
+            build_time_repo: build_time_repo(),
             installed_bin: self.installed_bin,
             fetch_disabled: self.no_fetch
                 || std::env::var("LOOM_DAEMON_UPDATE_FETCH")

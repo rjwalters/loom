@@ -2473,6 +2473,11 @@ pub fn assess_stale_sweeps(inputs: &HealthInputs) -> HealthSection {
 // Auto-update section (Issue #7584) — unconditional
 // ============================================================================
 
+/// The wrong-repo-resolution escalation (Issue #8513) this section applies
+/// on top of the staleness rules below — a sibling module so this file, over
+/// `.loom/docs/file-size-policy.md`'s threshold, does not grow to hold it.
+mod auto_update_stale_repo;
+
 /// Assess the auto_update section: the autonomous self-update loop's own
 /// state ([`DaemonStatusReport::auto_update_enabled`] and friends, Issue
 /// #4055) plus this CLI process's own staleness magnitude
@@ -2509,7 +2514,11 @@ pub fn assess_stale_sweeps(inputs: &HealthInputs) -> HealthSection {
 ///   intervention (clean the tree) or represents repeated failure (backoff)
 ///   does. The summary names the block reason **verbatim** from
 ///   `auto_update_note` — never a generic "stale" message — because that
-///   verbatim reason is the whole point of this issue (#7584).
+///   verbatim reason is the whole point of this issue (#7584). Also
+///   [`Verdict::Degraded`] when
+///   [`auto_update_stale_repo::stalled_summary`] fires (#8513) — a distinct
+///   hard finding from the staleness checks above, since it can fire even
+///   while the SOURCE checkout is perfectly current.
 #[must_use]
 pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
     let Some(status) = &inputs.status else {
@@ -2544,6 +2553,11 @@ pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
                 "published_at": status.auto_update_artifact_published_at,
             })
         }),
+        // Issue #8513: the wrong-repo-resolution streak, next to the fields
+        // above so an operator sees the "which repo?" answer in the same
+        // place as everything else this section already reports.
+        "stale_repo_ticks": status.auto_update_stale_repo_ticks,
+        "stale_repo": status.auto_update_stale_repo,
     });
 
     if !status.auto_update_enabled {
@@ -2565,6 +2579,14 @@ pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
             ),
             detail,
         );
+    }
+
+    // Issue #8513: a persisting stale-repo resolution is a hard finding in
+    // its own right, independent of the staleness-magnitude checks below —
+    // those compare against the SOURCE checkout's HEAD, which says nothing
+    // about a release-artifact-path wrong-repo resolution.
+    if let Some(summary) = auto_update_stale_repo::stalled_summary(status) {
+        return HealthSection::new("auto_update", Verdict::Degraded, summary, detail);
     }
 
     // A block that requires operator intervention (a dirty tree) or reflects
