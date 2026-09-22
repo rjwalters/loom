@@ -109,32 +109,110 @@ pub(super) fn validate_guards(guards: &Path) -> Result<()> {
 }
 
 pub(super) fn private_output_parent(output: &Path, zshrc: &Path, key_file: &Path) -> Result<()> {
-    let home = dirs::home_dir()
-        .context("operator home is unavailable")?
-        .canonicalize()?;
+    let home = dirs::home_dir().context("operator home is unavailable")?;
+    validate_private_paths(&home, output, zshrc, key_file)
+}
+
+fn validate_private_paths(home: &Path, output: &Path, zshrc: &Path, key_file: &Path) -> Result<()> {
+    let home = home.canonicalize()?;
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-        .canonicalize()?;
-    ensure!(
-        parent.starts_with(&home),
-        "live canary output must be under the operator home directory"
-    );
-    ensure!(
-        zshrc.canonicalize()?.starts_with(&home) && key_file.canonicalize()?.starts_with(&home),
-        "canary credentials must remain under the operator home directory"
-    );
-    let mut git = Command::new("git");
-    git.args(["rev-parse", "--show-toplevel"])
-        .current_dir(&parent);
-    let state = loom_daemon::proc_exec::run_bounded(git, Duration::from_secs(10))?;
-    match state {
-        loom_daemon::proc_exec::Completion::Exited(output) => ensure!(
-            !output.status.success(),
-            "canary private state must be outside every repository checkout"
-        ),
-        _ => anyhow::bail!("cannot verify private canary output location"),
+        .unwrap_or(Path::new("."));
+    for path in [parent, zshrc, key_file] {
+        // Inspect the caller's spelling before resolving symlinks. A repo-local
+        // alias to a private external file is still a prohibited checkout path.
+        outside_checkout(&std::path::absolute(path)?)?;
+        let resolved = path.canonicalize()?;
+        ensure!(
+            resolved.starts_with(&home),
+            "canary credentials and private state must remain under the operator home directory"
+        );
+        outside_checkout(&resolved)?;
     }
     Ok(())
+}
+
+fn outside_checkout(path: &Path) -> Result<()> {
+    // Both regular .git directories and linked-worktree .git files count. Do
+    // not follow or read their contents, and fail closed on unreadable ancestry.
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => anyhow::bail!(
+                "canary credentials and private state must be outside every repository checkout"
+            ),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod private_path_tests {
+    use super::*;
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let zshrc = home.path().join("zshrc");
+        let key = home.path().join("ingest.key");
+        std::fs::write(&zshrc, "fixture only").unwrap();
+        std::fs::write(&key, "fixture only").unwrap();
+        let output = home.path().join("new-output");
+        (home, output, zshrc, key)
+    }
+
+    #[test]
+    fn accepts_private_paths_but_rejects_home_checkouts_and_gitfiles() {
+        let (home, output, zshrc, key) = fixture();
+        assert!(validate_private_paths(home.path(), &output, &zshrc, &key).is_ok());
+        for gitfile in [false, true] {
+            let repo = home.path().join(if gitfile { "linked" } else { "repo" });
+            std::fs::create_dir(&repo).unwrap();
+            if gitfile {
+                std::fs::write(repo.join(".git"), "gitdir: fixture").unwrap();
+            } else {
+                std::fs::create_dir(repo.join(".git")).unwrap();
+            }
+            let credential = repo.join("credential");
+            std::fs::write(&credential, "fixture only").unwrap();
+            assert!(validate_private_paths(home.path(), &output, &credential, &key).is_err());
+            assert!(validate_private_paths(home.path(), &output, &zshrc, &credential).is_err());
+            assert!(
+                validate_private_paths(home.path(), &repo.join("output"), &zshrc, &key).is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_repository_aliases_in_both_directions_before_reading_credentials() {
+        use std::os::unix::fs::symlink;
+        let (home, output, zshrc, key) = fixture();
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join(".git"), "gitdir: fixture").unwrap();
+        let alias = repo.join("external-key");
+        symlink(&key, &alias).unwrap();
+        assert!(validate_private_paths(home.path(), &output, &alias, &key).is_err());
+        assert!(validate_private_paths(home.path(), &output, &zshrc, &alias).is_err());
+        let output_alias = repo.join("external-home");
+        symlink(home.path(), &output_alias).unwrap();
+        assert!(
+            validate_private_paths(home.path(), &output_alias.join("new"), &zshrc, &key).is_err()
+        );
+        let inside = repo.join("credential");
+        std::fs::write(&inside, "fixture only").unwrap();
+        let reverse_alias = home.path().join("key-alias");
+        symlink(&inside, &reverse_alias).unwrap();
+        assert!(validate_private_paths(home.path(), &output, &zshrc, &reverse_alias).is_err());
+        let reverse_output = home.path().join("repo-alias");
+        symlink(&repo, &reverse_output).unwrap();
+        assert!(
+            validate_private_paths(home.path(), &reverse_output.join("new"), &zshrc, &key).is_err()
+        );
+    }
 }
