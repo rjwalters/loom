@@ -32,6 +32,9 @@ git diff -- casting.yaml.lock pours
 `casting.yaml` is the source of truth; edit its component specs or JSON patches,
 then render. `casting.yaml.lock` and `pours/` are committed reviewable outputs.
 Do not hand-edit generated configuration or run `cast` before inspecting it.
+After any render, run `cargo test --test signoz_deployment_contract`: it re-reads
+the committed `pours/` output and fails if a regenerated deployment stops matching
+what this README promises — see [Rendered-deployment contract](#rendered-deployment-contract).
 All component images pin multi-platform index digests in the casting: SigNoz
 **v0.142.1**, its collector **v0.144.10**, ClickHouse and Keeper **25.12.5**,
 and PostgreSQL **16**. Each index includes Linux amd64 and arm64. The upstream
@@ -107,6 +110,27 @@ Keep deployment copies and volumes outside Loom-managed worktrees for a running
 trial: those worktrees are removed on merge. Copy the complete rendered directory
 tree to a private stable directory before starting it; all bind paths are relative
 to the rendered Compose file. Never mix paths from two renders.
+
+## Rendered-deployment contract
+
+Everything above was established once, by hand, on a trial host — but all of it
+is a property of *generated* files, so a later `forge` run, an upstream default
+change or a hand-edit can undo any of it silently. `cargo test --test
+signoz_deployment_contract` re-derives these from the committed `pours/` output
+in ordinary CI, with no Docker, network or credential:
+
+| Guarded property | Why a silent regression matters |
+| --- | --- |
+| Exactly one published host port, loopback-bound, and never a private container port | Self-hosted SigNoz's OTLP receiver is unauthenticated; publishing 4317/4318, or binding the UI to `0.0.0.0`, turns the trial host into open ingress |
+| Only the ingester joins `loom-observability`, aliased to the hostname the gateway's `otlp_http/signoz` exporter actually resolves, and that network stays `external: true` | An alias or network rename breaks delivery in a way visible only in the gateway's own metrics, never in SigNoz |
+| Project name, container names, volume names and the private network all stay under the `loom-signoz` prefix | This is what keeps `down --volumes` from reaching the host's separately-owned SigNoz installation |
+| Every site that consumes a credential — env key, and the `user:password@host` userinfo of the Postgres DSN — holds a `${VAR:?…}` required interpolation, in the casting, the lock and the render alike | A committed literal is a leaked secret; a non-required interpolation starts the stack with an empty signing secret |
+| Every image is digest-pinned and byte-identical to the casting, and its version tag is still the one this README lists | Catches a floating tag, a hand-edited render, and a stale version table |
+| The histogram helper's SHA-256 check runs *before* `tar -xzf`, pins both architectures, refuses unknown ones, and matches the digests above | It is the one component fetched at start-up rather than pinned by digest, so ordering is the whole integrity property |
+| The documented 3.75 GiB steady-state / 768 MiB transient budget is the sum of the rendered `mem_limit`s, and every service caps logs at three 10 MiB files | Sizing figures an operator provisions a host against, and the disk claim below |
+
+It deliberately asserts nothing about a *running* deployment: readiness, storage
+and retention stay `evidence.md`'s job.
 
 ## Repeatable investigations
 

@@ -247,11 +247,80 @@ ad-hoc probe's authenticated UI screenshots above already establish that
 acceptance row, and query 2/4/6 above establish the shared-fixture graph and
 log correlation are equally queryable.
 
+## Rendered-deployment contract (2026-09-22)
+
+Every deployment property recorded above is an observation of one render at one
+moment. `casting.yaml` is meant to be edited and re-rendered, so each of them can
+be undone later by a `forge` run, an upstream default change or a hand-edit of the
+generated output — with no error raised anywhere, on a host nobody is watching.
+Two are security properties: the published-port surface (self-hosted SigNoz's OTLP
+receiver is unauthenticated by design) and the `loom-signoz` namespacing that keeps
+`down --volumes` away from the trial host's separately-owned SigNoz installation.
+
+`loom-daemon/tests/signoz_deployment_contract.rs` converts eight of them from
+one-time observations into CI-enforced invariants, read back out of the committed
+`pours/deployment/compose.yaml`. It uses no Docker, network or credential, so
+unlike the observations above it re-runs on every commit. The full table is in the
+README's "Rendered-deployment contract" section. As with
+`signoz_trial_artifacts.rs`, the authorities are derived rather than restated: the
+shared-network alias comes from the gateway config's `otlp_http/signoz` endpoint,
+the image digests from `casting.yaml`, and the README's memory budget is re-summed
+from the rendered `mem_limit`s.
+
+Each assertion was verified to fail on a deliberately mutated render before being
+committed: an added `0.0.0.0:4318:4318` mapping on the ingester, a renamed network
+alias, a hand-edited image digest, `tar -xzf` moved ahead of the `sha256sum
+--check`, a literal `SIGNOZ_TOKENIZER_JWT_SECRET`, a volume renamed outside the
+project prefix, a raised ClickHouse `mem_limit`, and a dropped log-rotation cap.
+Every mutation failed exactly the intended test with an accurate message. All
+mutations were reverted; the committed render is unchanged by this section.
+
+One of those eight mutations was not enough. Review found the credential
+assertion vacuous in almost every case it existed for. It scanned for the
+secret's own variable name followed by `=` — a string that occurs exactly once
+across all three files (`SIGNOZ_TOKENIZER_JWT_SECRET=` in the render), while the
+files between them hold **15** sites that actually consume a credential. The
+casting and the lock are YAML *mappings* and never spell `VAR=` at all, so a
+password pasted into `casting.yaml` — the one file here that is *meant* to be
+hand-edited — passed.
+
+The scan is now keyed on the consumption site: a key named
+`*password*`/`*secret*` in either the `KEY: value` or `KEY=value` form, plus the
+`user:password@host` userinfo of any URL, which is how
+`SIGNOZ_SQLSTORE_POSTGRES_DSN` carries the database password under a key that
+names neither. Values are normalised first — Foundry's percent-escaped patch
+form decoded, the YAML dumper's line wrapping folded back, and each *required*
+interpolation collapsed to an opaque marker so a non-required spelling (`$VAR`,
+`${VAR}`, `${VAR:-default}`) survives as itself and fails. That finds all 15
+sites: 3 in the render, 4 in the casting, 8 in the lock.
+
+Re-mutation-tested across 15 cases: a committed literal at 11 sites covering
+every (file × secret × form) combination — mapping, env assignment, plain DSN
+userinfo and percent-encoded DSN userinfo, in all three files — both
+non-required interpolation spellings, a literal at one of the two exempted
+ClickHouse settings, and a credential line deleted outright. The old assertion
+caught 3 of the 15; the current one catches all 15. Because a regex scan's
+realistic failure is finding *nothing* rather than finding the wrong thing, the
+test also asserts a minimum site count per file and that each file consumes each
+secret, so a re-render that changes the files' shape fails loudly instead of
+silently enforcing nothing.
+
+This closes the "verified once, by hand, unguarded afterwards" gap for the
+deployment's trust boundary and supply chain. It is a static contract and
+deliberately asserts nothing about a running backend: readiness, ingestion,
+retention and query results remain the live sections above.
+
+**Not run on this sweep host**: `docker` returns `permission denied while trying to
+connect to the docker API at unix:///var/run/docker.sock`, and no trial volumes
+exist here, so nothing in this section is a live observation and no live check was
+repeated. That is also why the two open ledger rows below did not advance.
+
 ## Acceptance ledger
 
 | Check | Status |
 | --- | --- |
-| Pinned Foundry render and configuration | Passed, including deterministic second render (reconfirmed independently above) |
+| Pinned Foundry render and configuration | Passed, including deterministic second render (reconfirmed independently above); digest pinning, casting/render agreement and the README version table are now CI-enforced |
+| Private receiver exposure and project isolation | Passed on the trial host, and now continuously enforced against the committed render — see "Rendered-deployment contract" |
 | Keeper, PostgreSQL and ClickHouse readiness | Passed on the trial VM |
 | Schema migrations and app readiness | Passed; receiver storage proof remains separate |
 | Three fixture signals with matching IDs/values | Passed for the ad-hoc probe; metric timestamp precision conversion documented |
