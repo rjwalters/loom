@@ -111,13 +111,16 @@ jobs:
               child.on('error', reject);
               child.on('close', code => code === 0 ? resolve() : reject(new Error(`${program} integration checks exited ${code}`)));
             });
-            await run('cargo', args, process.env);
+            // Action inputs include its read-only GitHub token; tests need no service credential.
+            const testEnv = Object.fromEntries(Object.entries(process.env)
+              .filter(([key]) => !key.startsWith('INPUT_') && !['GH_TOKEN', 'GITHUB_TOKEN'].includes(key)));
+            await run('cargo', args, testEnv);
             if (targets.includes('lifecycle_traces')) {
               const binary = path.join(process.env.CARGO_TARGET_DIR, 'debug/loom-daemon');
               if (!fs.existsSync(binary)) throw new Error('integration tests did not produce the candidate daemon');
               core.info('Running retained sweep-checkpoint suite against the candidate daemon');
               await run('bash', ['defaults/scripts/tests/test-sweep-checkpoint.sh'],
-                {...process.env, LOOM_DAEMON_SELF_BIN:binary, LOOM_DAEMON_BIN:binary});
+                {...testEnv, LOOM_DAEMON_SELF_BIN:binary, LOOM_DAEMON_BIN:binary});
             }
       - name: Retain actual gate output and immutable candidate evidence
         if: always()
