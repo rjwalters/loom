@@ -25,6 +25,13 @@ pub(crate) struct PhaseObservation {
     /// name its PR without a forge round trip — the checkpoint itself is
     /// deleted on success, before the record is written.
     pr_number: Option<u32>,
+    /// The checkpoint's `(jev_tier, jev_confidence)` pair, when the sweep
+    /// skill's Tier-2.5 dispatch step wrote one (Issue #8543) — a shadow-mode
+    /// Jev complexity classification, present only when `TYPESAFE_API_KEY`
+    /// was set for the run. Captured the same opportunistic, per-tick way as
+    /// `pr_number` (see [`SweepRegistry::sample_phase_transition`]), since it
+    /// too must survive the checkpoint's deletion on success.
+    jev: Option<(String, f64)>,
 }
 
 /// Cap on retained [`PhaseObservation`]s per sweep (Issue #4704). A normal
@@ -76,6 +83,22 @@ pub(crate) fn models_used_from(
     models.sort_unstable();
     models.dedup();
     (!models.is_empty()).then_some(models)
+}
+
+/// Best-effort extraction of the `jev_tier`/`jev_confidence` pair from a
+/// sweep checkpoint JSON file (Issue #8543), mirroring
+/// [`read_checkpoint_pr_number`]'s opaque-file, one-shot-read discipline.
+/// `None` unless BOTH fields are present and well-typed — a checkpoint
+/// carrying a tier with no confidence (or vice versa) is not one this reads,
+/// since the pair is always written together by the sweep skill's Tier-2.5
+/// step.
+#[must_use]
+fn read_checkpoint_jev(path: &Path) -> Option<(String, f64)> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let tier = v.get("jev_tier")?.as_str()?.to_string();
+    let confidence = v.get("jev_confidence")?.as_f64()?;
+    Some((tier, confidence))
 }
 
 impl SweepRegistry {
@@ -155,6 +178,13 @@ impl SweepRegistry {
             .clone()
             .or_else(|| crash_classification.clone())
             .filter(|class| !class.is_empty());
+        // Issue #8543: whatever Tier-2.5 sampled for this sweep, or `(None,
+        // None)` when `TYPESAFE_API_KEY` was never set / the call never
+        // completed — the keyless case this keeps byte-identical to before
+        // #8543 (no fields serialized; see `OutcomeRecord::jev_tier`).
+        let (jev_tier, jev_confidence) = self
+            .sampled_jev(sweep_id)
+            .map_or((None, None), |(tier, confidence)| (Some(tier), Some(confidence)));
         let record = sweep_outcomes::OutcomeRecord {
             timestamp: Utc::now(),
             repo: self.config.workspace_root.display().to_string(),
@@ -166,6 +196,8 @@ impl SweepRegistry {
             crash_classification,
             token_name,
             credential: credential.clone(),
+            jev_tier,
+            jev_confidence,
             duration_sec,
         };
         if let Err(e) = sweep_outcomes::append_outcome(&path, &record) {
@@ -665,14 +697,22 @@ impl SweepRegistry {
         }
 
         let pr_number = read_checkpoint_pr_number(&checkpoint);
+        // Issue #8543: sampled on the same per-tick read as `pr_number`, for
+        // the identical reason — the checkpoint is gone by the time a
+        // successful sweep's terminal record is written.
+        let jev = read_checkpoint_jev(&checkpoint);
         let history = self.phase_history.entry(sweep_id.to_string()).or_default();
         if history.last().map(|o| o.phase.as_str()) == Some(phase.as_str()) {
             // Unchanged phase since the previous tick — the common case. Still
-            // absorb a `pr_number` that appeared after the transition was first
-            // observed, so a PR opened mid-phase is not lost.
+            // absorb a `pr_number`/`jev` pair that appeared after the
+            // transition was first observed, so a PR opened (or a Tier-2.5
+            // Jev call completed) mid-phase is not lost.
             if let Some(last) = history.last_mut() {
                 if last.pr_number.is_none() {
                     last.pr_number = pr_number;
+                }
+                if last.jev.is_none() {
+                    last.jev = jev;
                 }
             }
             return;
@@ -691,6 +731,7 @@ impl SweepRegistry {
             phase: phase.clone(),
             at: Utc::now(),
             pr_number,
+            jev,
         });
         // Genuine transition — publish it (see the "Bus emission" doc section
         // above). Ordered after the history push so the dedupe state is already
@@ -712,6 +753,19 @@ impl SweepRegistry {
             .iter()
             .rev()
             .find_map(|o| o.pr_number)
+    }
+
+    /// The most recent `(jev_tier, jev_confidence)` pair observed on this
+    /// sweep's checkpoint (Issue #8543), or `None` when no Tier-2.5 Jev call
+    /// was ever sampled (no `TYPESAFE_API_KEY`, or the call failed/never
+    /// completed). Free (no forge/network call), mirrors
+    /// [`Self::sampled_pr_number`] exactly.
+    pub(crate) fn sampled_jev(&self, sweep_id: &str) -> Option<(String, f64)> {
+        self.phase_history
+            .get(sweep_id)?
+            .iter()
+            .rev()
+            .find_map(|o| o.jev.clone())
     }
 
     /// The most recently opportunistically-sampled `(lines_added,

@@ -150,6 +150,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // TypeSafe, issue #8545), so it needs the async runtime for the
             // same reason `status`/`health` do.
             Commands::JevMergeRisk { pr } => loom_daemon::jev_merge_risk::run(pr).await,
+            // `jev-tier` POSTs to the same external Jev endpoint as
+            // `jev-merge-risk` (issue #8543), so it needs the async runtime
+            // for the same reason.
+            Commands::JevTier { issue } => loom_daemon::jev_tier::run(issue).await,
             // `quarantine` connects to the running daemon over its Unix socket
             // (the quarantine state is in-memory), so it needs the async runtime.
             Commands::Quarantine { action } => handle_quarantine_command(action).await,

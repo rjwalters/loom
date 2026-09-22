@@ -222,6 +222,23 @@ pub struct OutcomeRecord {
     /// deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<crate::launch_record::CredentialAttribution>,
+    /// Shadow-mode Jev (TypeSafe) complexity classification, sampled from the
+    /// sweep's checkpoint at Builder dispatch (issue #8543) — a calibrated
+    /// second opinion beside the Curator's own `<!-- loom:complexity=<tier>
+    /// -->` marker, never a routing input itself. One of `mechanical` /
+    /// `routine` / `complex`. `None` when `TYPESAFE_API_KEY` was unset for
+    /// this sweep (the common case today — a keyless dispatch is
+    /// byte-identical to one from before #8543) or when the Jev call failed;
+    /// either way a missing key here never blocks the sweep.
+    /// `#[serde(default)]` so a journal line written before this field
+    /// existed still parses — see [`Self::crash_classification`]'s doc for
+    /// why every reader here needs that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jev_tier: Option<String>,
+    /// Jev's confidence in [`Self::jev_tier`] (0.0-1.0), paired with it and
+    /// under the same `None` conditions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jev_confidence: Option<f64>,
     /// Elapsed wall-clock seconds from dispatch to this terminal outcome.
     pub duration_sec: i64,
 }
@@ -647,6 +664,8 @@ mod tests {
             crash_classification: None,
             token_name: "agent-1".to_string(),
             credential: None,
+            jev_tier: None,
+            jev_confidence: None,
             duration_sec: 1,
         }
     }
@@ -699,6 +718,39 @@ mod tests {
             Some("account-exhausted:model-credits-exhausted")
         );
         assert_ne!(records[0].crash_classification, records[1].crash_classification);
+    }
+
+    /// Issue #8543: `jev_tier`/`jev_confidence` round-trip through the
+    /// journal, and are omitted (not written as `null`) when absent — the
+    /// keyless-dispatch byte-identity requirement from the issue's AC.
+    #[test]
+    fn jev_tier_and_confidence_round_trip_and_are_omitted_when_absent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sweep-outcomes.jsonl");
+
+        let mut with_jev = record(1, "exited");
+        with_jev.jev_tier = Some("routine".to_string());
+        with_jev.jev_confidence = Some(0.62);
+        let without_jev = record(2, "exited");
+
+        append_outcome(&path, &with_jev).unwrap();
+        append_outcome(&path, &without_jev).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert!(lines[0].contains("\"jev_tier\":\"routine\""));
+        assert!(lines[0].contains("\"jev_confidence\":0.62"));
+        assert!(
+            !lines[1].contains("jev_tier"),
+            "a record with no Jev classification must omit the key, not emit null: {}",
+            lines[1]
+        );
+
+        let records = read_all(&path);
+        assert_eq!(records[0].jev_tier.as_deref(), Some("routine"));
+        assert!((records[0].jev_confidence.unwrap() - 0.62).abs() < 1e-12);
+        assert_eq!(records[1].jev_tier, None);
+        assert_eq!(records[1].jev_confidence, None);
     }
 
     /// Issue #5697: a journal line written before `crash_classification`

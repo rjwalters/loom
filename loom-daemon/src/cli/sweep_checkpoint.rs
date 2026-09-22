@@ -98,12 +98,18 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
         }
         return Ok(());
     }
-    if !matches!(command, "write" | "read" | "phase" | "attempt" | "model" | "exists" | "delete") {
-        return Err(invalid("usage: sweep-checkpoint write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; read/phase/attempt/model/exists/delete ISSUE; list"));
+    if !matches!(
+        command,
+        "write" | "read" | "phase" | "attempt" | "model" | "exists" | "delete" | "jev"
+    ) {
+        return Err(invalid("usage: sweep-checkpoint write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; read/phase/attempt/model/exists/delete ISSUE; jev ISSUE TIER CONFIDENCE; list"));
     }
     let issue_text = args.get(1).ok_or_else(|| invalid("issue is required"))?;
     let issue = number(issue_text)?;
     let target = dir.join(format!("issue-{issue_text}.json"));
+    if command == "jev" {
+        return patch_jev(&dir, &target, args.get(2), args.get(3));
+    }
     if command == "write" {
         let record = parse_write(&args[2..])?;
         persist(&dir, &target, &record)?;
@@ -213,6 +219,49 @@ fn parse_write(args: &[String]) -> Result<Value> {
         return Err(invalid("judge-rejected requires --pr-number for resume routing"));
     }
     Ok(record)
+}
+
+/// `sweep-checkpoint jev <issue> <tier> <confidence>` (Issue #8543) — patches
+/// a shadow-mode Jev complexity classification onto an ALREADY-EXISTING
+/// checkpoint, without disturbing `phase`/`task_id`/`pr_number`/`attempt`/
+/// `model`. Deliberately a merge, not a `write` (which always rebuilds the
+/// whole record): the Tier-2.5 dispatch step that calls this does not know —
+/// and must not need to know — the current phase/task-id, and calling
+/// `write` here would silently drop them.
+///
+/// Best-effort by design, matching the subcommand's own failure contract
+/// (`jev-tier` never blocks a sweep): a missing checkpoint (nothing written
+/// yet, or already deleted) is a silent no-op, exactly like the `phase`/
+/// `attempt`/`model` readers' own missing-file handling above — never an
+/// error that could make a shadow classification hold up dispatch.
+fn patch_jev(
+    dir: &Path,
+    target: &Path,
+    tier: Option<&String>,
+    confidence: Option<&String>,
+) -> Result<()> {
+    let tier = tier
+        .map(String::as_str)
+        .ok_or_else(|| invalid("tier is required"))?;
+    if !matches!(tier, "mechanical" | "routine" | "complex") {
+        return Err(invalid("tier must be mechanical, routine, or complex"));
+    }
+    let confidence: f64 = confidence
+        .ok_or_else(|| invalid("confidence is required"))?
+        .parse()
+        .map_err(|_| invalid("confidence must be a number"))?;
+    if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+        return Err(invalid("confidence must be between 0 and 1"));
+    }
+    let bytes = match std::fs::read(target) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error(error)),
+    };
+    let mut record: Value = serde_json::from_slice(&bytes).map_err(io_error)?;
+    record["jev_tier"] = json!(tier);
+    record["jev_confidence"] = json!(confidence);
+    persist(dir, target, &record)
 }
 
 fn persist(dir: &Path, target: &Path, record: &Value) -> Result<()> {

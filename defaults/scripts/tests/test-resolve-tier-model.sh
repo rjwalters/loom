@@ -233,6 +233,25 @@ assert_contains "wrong-repo credential signature persisted through the escalatio
 assert_contains "-> routine" "$err" "wrong-repo signature still degrades to routine (non-breaking)"
 assert_not_contains "likely API quota" "$err" "wrong-repo signature does not also emit the generic quota message"
 
+# -------- Test 11: TYPESAFE_API_KEY-gated shadow Jev call never disturbs
+# -------- this script's own tier/model resolution (#8543) --------
+# Unset (the default): byte-identical to every case above -- no new output at
+# all is the assertion, since the block is gated before it can produce any.
+# Set: forced to a deterministic, hermetic `$LOOM_DAEMON_BIN=/bin/false` (the
+# highest-precedence override `loom_locate_daemon_bin` honors) rather than
+# relying on whatever `loom-daemon` install this host happens to have on
+# PATH/in ~/.local/bin -- `/bin/false` always fails instantly, so the shadow
+# block's `|| exit 0` fallback is exercised deterministically, and
+# `$tier`/`$model` resolution plus the exit code stay unaffected either way.
+echo "Test 11: TYPESAFE_API_KEY-gated shadow Jev call is best-effort and never affects resolution"
+err="$(TYPESAFE_API_KEY="" run_resolve 9001 2>&1 1>/dev/null)"
+assert_contains "tier=mechanical" "$err" "unset key: resolution unchanged"
+err="$(TYPESAFE_API_KEY="sk-fake" LOOM_DAEMON_BIN=/bin/false run_resolve 9001 2>&1 1>/dev/null)"
+assert_contains "tier=mechanical" "$err" "key set, daemon binary fails: resolution still unchanged"
+rc=0
+TYPESAFE_API_KEY="sk-fake" LOOM_DAEMON_BIN=/bin/false run_resolve 9001 >/dev/null 2>&1 || rc=$?
+assert_contains "3" "$rc" "key set: exit code still 3 (no tierModels configured), unaffected by the shadow block"
+
 # -------- Summary --------
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

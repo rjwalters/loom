@@ -880,6 +880,17 @@ enum Commands {
         pr: u64,
     },
 
+    /// Shadow-mode Jev (TypeSafe) complexity-tier classifier, run beside the
+    /// Curator's `<!-- loom:complexity=<tier> -->` marker (issue #8543) — a
+    /// calibrated second opinion, never a routing decision. Prints a JSON
+    /// object with a probability per tier (`mechanical`/`routine`/`complex`)
+    /// plus a confidence to stdout; exits non-zero with no stdout output on
+    /// any failure, including a missing `TYPESAFE_API_KEY`.
+    JevTier {
+        /// The issue number to classify.
+        issue: u64,
+    },
+
     // ---------------------------------------------------------------------
     // Script helpers (epic #4081 Phase 3 family 5, issue #4275) — native
     // replacements for the `loom_tools` modules that existed only to back a
@@ -2786,6 +2797,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
+        | Commands::JevTier { .. }
         | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }
         | Commands::NoopCooldown { .. }

@@ -28,6 +28,13 @@
 #      therefore dispatches byte-identically to today.
 #
 # Prints ONLY the model id on stdout; diagnostics go to stderr.
+#
+# Side effect (#8543, load-gated on TYPESAFE_API_KEY, off by default): also
+# fires a shadow-mode Jev (TypeSafe) complexity classification for the same
+# issue (`loom-daemon jev-tier`) and patches it onto the issue's checkpoint
+# (`sweep-checkpoint.sh jev`) for later comparison against the Curator's own
+# `$tier` above — never a routing input, never able to change this script's
+# `$tier`/`$model` resolution or exit code. See `jev_tier.rs`'s module doc.
 set -uo pipefail
 
 ISSUE="${1:-}"
@@ -146,6 +153,29 @@ case "$tier" in
     tier="routine"
     ;;
 esac
+
+# Shadow-mode Jev complexity classification (#8543) — a calibrated second
+# opinion beside the Curator marker just resolved above, logged for later
+# comparison, NEVER a routing input: `$tier` (already decided) is untouched
+# by anything below. Load-gated on `TYPESAFE_API_KEY` (absent by default, in
+# which case this block is a true no-op: no network call, no checkpoint
+# write, byte-identical to before #8543) and best-effort end to end — any
+# failure (no daemon binary, `gh`/network/parse error, no checkpoint written
+# yet for this issue) is swallowed with `|| true`, never allowed to affect
+# this script's own `$tier`/`$model` resolution or exit code.
+if [[ -n "${TYPESAFE_API_KEY:-}" ]]; then
+  (
+    # shellcheck source=./lib/locate-daemon-bin.sh
+    source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
+    daemon_bin="$(loom_locate_daemon_bin "$ROOT")"
+    [[ -n "$daemon_bin" ]] || exit 0
+    jev_json="$("$daemon_bin" jev-tier "$ISSUE" 2>/dev/null)" || exit 0
+    jev_tier="$(jq -r '.tier // empty' <<<"$jev_json" 2>/dev/null)"
+    jev_confidence="$(jq -r '.confidence // empty' <<<"$jev_json" 2>/dev/null)"
+    [[ -n "$jev_tier" && -n "$jev_confidence" ]] || exit 0
+    "$SCRIPT_DIR/sweep-checkpoint.sh" jev "$ISSUE" "$jev_tier" "$jev_confidence" >/dev/null 2>&1 || true
+  ) || true
+fi
 
 # --tier mode returns "" + exit 3 when the runtime/tier has no mapping.
 if model="$("$SCRIPT_DIR/resolve-model.sh" \
