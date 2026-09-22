@@ -121,6 +121,44 @@ limitation of the occupied trial host, not an ingest-latency result. Volumes are
 preserved for sequential checks; the intended permanent Cloud destinations need
 separate endpoint/credential configuration before any live comparison.
 
+## Shared fixture query artifact
+
+The deployment proof above predates the shared fixture generator. `telemetry-fixture`
+(#8578), the durable span export path (#8524, PR #8577) and the owned lifecycle
+boundaries (#8525, PR #8579) all merged after this trial's own PR #8574, so the
+saved `queries.sql` could only address the ad-hoc single-trace probe: it hardcoded
+trace `85270000000000000000000000000001` and the gauge
+`loom.host.synthetic_capacity`, neither of which the shared manifest emits. It
+therefore could not answer the scope's grouped-failure, grouped-duration,
+missing-versus-zero, incomplete-root or privacy questions at all.
+
+`fixture-queries.sql` adds those, run-scoped through the generator's
+`host.id = loom-synthetic-<run-id>` resource, covering the manifest's 37 spans, 14
+logs and 3 metric data points; failure and duration grouped by
+`loom.repo`/`loom.role`/`loom.runtime`/`loom.model`; the repair chain's distinct
+retry span IDs; traces with children but no `loom.sweep` root; `mapContains`
+absence checks; present-zero versus absent token usage; and a required-zero search
+for the fixture's privacy sentinel across all three signals. `queries.sql` is left
+untouched as the live-verified record of what actually ran.
+
+**Not executed against a live backend.** The change that added it ran on a sweep
+host with no Docker access and the trial deployment stopped, so its column names
+follow the pinned v0.142.1 schema and are confirmed by its own query 0. Nothing in
+this section is an observation.
+
+What *is* verified is the artifact's vocabulary rather than its results.
+`loom-daemon/tests/signoz_trial_artifacts.rs` runs in ordinary CI, with no Docker,
+and derives its expectations instead of restating them: span names, metric names
+and span attributes come from a generated fixture manifest, and the forwarding
+allowlist is parsed out of the gateway `config.yaml` the deployment mounts. It
+fails if a saved query reads an attribute or resource key the gateway's `keep_keys`
+strips, filters a span name the fixture never emits, queries a metric name outside
+the manifest, quotes an expected span/log/metric total the manifest no longer
+reports, or stops asserting that `prompt.content` is dropped. That class of
+drift is exactly what produced the stale artifact above, and it does not raise an
+error when it happens — the query simply returns zero rows, which on a trial host
+is indistinguishable from the backend having lost the data.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -128,12 +166,14 @@ separate endpoint/credential configuration before any live comparison.
 | Pinned Foundry render and configuration | Passed, including deterministic second render |
 | Keeper, PostgreSQL and ClickHouse readiness | Passed on the trial VM |
 | Schema migrations and app readiness | Passed; receiver storage proof remains separate |
-| Three fixture signals with matching IDs/values | Passed; metric timestamp precision conversion documented |
+| Three fixture signals with matching IDs/values | Passed for the ad-hoc probe; metric timestamp precision conversion documented |
 | Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
 | Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
 | Restart persistence and shared receiver recovery | Passed for signals, account and effective TTL; fresh three-signal replay indexed |
-| Real Loom canary / real Judge-Doctor repair trace | Requires #8524/#8525 and #8529 |
-| Repeated latency/footprint comparison | Shared evaluation #8529 |
+| Saved query artifacts for the shared fixture manifest | Written and vocabulary-verified in CI; **not** executed on a backend |
+| Shared fixture manifest observed in SigNoz | Open — needs the trial host; see #8529 |
+| Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
+| Repeated latency/footprint comparison | Open — shared evaluation #8529, and the trial host could not hold both backends up at once |
 
 Synthetic fixture success will establish transport/schema behavior only. It
 cannot substitute for a real Loom lifecycle or independent correctness judgment.
