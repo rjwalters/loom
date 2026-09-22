@@ -260,6 +260,10 @@ pub mod test_log_capture;
 /// deliberately different, narrower safety model this needs relative to the
 /// worktree-attribution-based cargo-target reclaim (#7239).
 pub mod tmpfs_reclaim;
+/// tmpfs/`shared`-RAM and kernel OOM-kill visibility (issue #8572, split from
+/// #8512) — the read-only counterpart to [`tmpfs_reclaim`]'s write path,
+/// consumed by `loom-daemon health` and the work finder's bounded warning.
+pub mod tmpfs_visibility;
 pub mod token_ranking_refresh;
 pub mod tokens;
 pub mod tokens_pool;

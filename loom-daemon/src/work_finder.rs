@@ -3328,6 +3328,9 @@ pub fn spawn_multi_work_finder_task(
             // axis alongside disk, folded into the same `min(...)`. Read
             // BEFORE disk since #7512 — see the single-workspace loop above.
             let ram = crate::ram_headroom::ram_headroom_limit();
+            // Bounded tmpfs-fraction warning (#8572, split from #8512) — logs
+            // only, never gates dispatch; see `tmpfs_warning`'s module doc.
+            tmpfs_warning::check_and_warn(&fallback_root);
             let mut disk = disk_headroom_limit(&fallback_root);
             // Eager, out-of-cycle reclaim (#7512): on the tick the disk axis
             // FIRST becomes the term that binds the cap down, run the existing
@@ -4264,6 +4267,11 @@ pub mod pool_preflight;
 // (#8121). Lives in its own file because this one is over the file-size
 // ratchet threshold (.loom/docs/file-size-policy.md) and may not grow.
 mod registry_refresh;
+
+/// The bounded, non-spammy tmpfs-fraction warning (issue #8572, split from
+/// #8512) — logs, never gates dispatch. Lives in its own file for the same
+/// file-size-ratchet reason as [`registry_refresh`].
+mod tmpfs_warning;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

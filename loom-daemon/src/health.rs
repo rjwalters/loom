@@ -561,6 +561,15 @@ pub struct HealthInputs {
     /// section rather than none at all, because ingestion being off is
     /// itself the fact this issue exists to surface.
     pub transcript_ingest: Option<crate::activity::transcript_ingest::IngestHealthStatus>,
+    /// The collected tmpfs/`shared`-RAM + kernel OOM-kill snapshot (issue
+    /// #8572, split from #8512). Computed by the `loom-daemon health` CLI
+    /// collector via [`crate::tmpfs_visibility::collect`] and rendered by
+    /// [`tmpfs_visibility_section::assess_tmpfs_visibility`]. `None` only
+    /// means "a fixture never set it" — the real collector always populates
+    /// it; the section itself renders nothing when the collected snapshot has
+    /// nothing measurable (e.g. macOS, which has no `/proc` at all), the same
+    /// silent-degrade contract [`crate::tmpfs_visibility`] documents.
+    pub tmpfs_visibility: Option<crate::tmpfs_visibility::TmpfsVisibilitySnapshot>,
 }
 
 // ============================================================================
@@ -2813,6 +2822,12 @@ mod transcript_ingest_section;
 
 pub use transcript_ingest_section::assess_transcript_ingest;
 
+/// The `tmpfs_visibility` section (issue #8572, split from #8512): tmpfs/
+/// `shared`-RAM usage and the cumulative kernel OOM-kill count.
+mod tmpfs_visibility_section;
+
+pub use tmpfs_visibility_section::assess_tmpfs_visibility;
+
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2838,10 +2853,11 @@ mod busy;
 /// exit code is `2` rather than a misleading `1`.
 ///
 /// Every section is unconditional except `observability` (#4830),
-/// `codesign_identity` (#7605) and `limit_calibration` (#8063/#8349), each of
-/// which is appended only when there is something to report — see
-/// [`assess_observability`], [`assess_codesign_identity`] and
-/// [`assess_limit_calibration`].
+/// `codesign_identity` (#7605), `limit_calibration` (#8063/#8349), `codex`
+/// (#8407) and `tmpfs_visibility` (#8572), each of which is appended only
+/// when there is something to report — see [`assess_observability`],
+/// [`assess_codesign_identity`], [`assess_limit_calibration`],
+/// [`codex_accounts::assess`] and [`assess_tmpfs_visibility`].
 ///
 /// # `IndeterminateBusy` (#6191, #8163)
 ///
@@ -2878,6 +2894,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     sections.extend(assess_codesign_identity(inputs));
     sections.extend(assess_limit_calibration(inputs));
     sections.extend(assess_transcript_ingest(inputs));
+    sections.extend(assess_tmpfs_visibility(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {
