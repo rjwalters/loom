@@ -116,15 +116,51 @@ alone does not prove either backend indexed the data. Use the same fixture
 manifest/time window for both products, and compare unique `(trace_id, span_id)`
 alongside row counts because replay can duplicate data.
 
+### Workloads
+
+Three inputs exist, and they are not interchangeable. Only the third establishes
+a real Loom lifecycle; the first two establish transport and schema behaviour.
+
+| Input | Command | Establishes |
+| --- | --- | --- |
+| Ad-hoc three-signal probe | the original single-trace check behind `queries.sql` | Deployment proof already recorded in `evidence.md` |
+| Shared fixture manifest | `loom-daemon telemetry-fixture --run-id <id> --start-time <ts> --output <dir>` then `loom-daemon telemetry-export --input <dir>/envelopes.jsonl --endpoint <gateway> --key-file <private key>` | Identity/parentage/absence parity with ClickStack, per `fixture-queries.sql` |
+| Real Loom canary | `loom-daemon telemetry-live-canary …` (plans by default; `--execute` runs paid attempts) | Actual instrumented execution — still not a full issue lifecycle |
+
+The shared fixture is the artifact the cross-backend comparison (#8529) consumes.
+It sets `host.id` and `service.instance.id` to `loom-synthetic-<run-id>`, so bind
+that value once and isolate a trial without guessing a time window:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery --param_run='loom-synthetic-<run-id>' < fixture-queries.sql
+```
+
+Its version-1 manifest expects **37 distinct spans, 14 correlated logs and 3
+metric data points**, and it deliberately carries a privacy sentinel under a
+prohibited `prompt.content` attribute that the gateway must drop. Both the
+expected counts and that assertion are covered by `fixture-queries.sql`.
+Generation and the full expected-distinction table are documented in
+[telemetry fixtures](../../docs/telemetry-fixtures.md); the span-name enumeration
+and attribute vocabulary are documented in [execution traces](../../docs/tracing.md).
+`loom-daemon/tests/signoz_trial_artifacts.rs` fails in ordinary CI if either saved
+query file drifts from that vocabulary or from the gateway's `keep_keys` allowlist,
+because such a query returns zero rows rather than an error — which is
+indistinguishable from the backend having lost the data. The same test re-derives
+the counts quoted above and in `fixture-queries.sql` from the generated manifest,
+so a later fixture version cannot leave a stale total here for an observation to
+be compared against.
+
+### Saved views
+
 | Saved view | Procedure |
 | --- | --- |
-| Loom issue waterfall | Trace Explorer: filter the observed trace ID, open the trace, inspect parent IDs and failed Judge → Doctor → successful Judge attempts |
-| Failed attempts | Trace Explorer: error status, group by observed `loom.repo`, `loom.role`, `loom.runtime` and `loom.model`; keep missing labels missing |
-| Phase duration | Trace Explorer: duration of the observed phase name, grouped by role/runtime/model, with the same time range as ClickStack |
-| Correlated logs | Logs Explorer: exact trace ID and span ID; follow the trace link and inspect related logs from the selected span |
-| Host/token gauges | Metrics Explorer: actual `loom.host.*` / `loom.tokens.*` names and units; an absent series is not a measured zero |
-| Delivery health | Query the neutral collector's queue, failure and drop series if explicitly collected; backend readiness is insufficient |
-| In-progress sweep | Compare partial child spans before the root completes, then query again after completion; do not infer success from a missing root/end span |
+| Loom issue waterfall | Trace Explorer: filter the observed trace ID, open the trace, inspect parent IDs and failed Judge → Doctor → successful Judge attempts (`fixture-queries.sql` 2 and 4) |
+| Failed attempts | Trace Explorer: error status on `loom.role_attempt`, group by observed `loom.repo`, `loom.role`, `loom.runtime` and `loom.model`; keep missing labels missing (`fixture-queries.sql` 3 and 8) |
+| Phase duration | Trace Explorer: duration of the observed `loom.phase` / `loom.role_attempt` spans, grouped by role/runtime/model, with the same time range as ClickStack (`fixture-queries.sql` 3) |
+| Correlated logs | Logs Explorer: exact trace ID and span ID; follow the trace link and inspect related logs from the selected span (`fixture-queries.sql` 6) |
+| Host/token gauges | Metrics Explorer: the actual emitted names and units — the shared fixture emits `loom.tokens.usage_fraction` and `loom.tokens.exhausted` only, labelled by `account`. An absent series is not a measured zero: the fixture's `synthetic-unknown` account intentionally has no `usage_fraction` point while `synthetic-zero` has `0.0` (`fixture-queries.sql` 7) |
+| Delivery health | Scrape the neutral gateway's own Prometheus endpoint (`config.yaml` publishes `detailed` telemetry on port 8888) and read `otelcol_exporter_*` series filtered to `exporter="otlp_http/signoz"` — queue size, sent, send-failed and enqueue-failed. These series are **not** exported into SigNoz through the OTLP pipeline, so they are unavailable in the UI and must be captured beside it. Backend readiness is not delivery evidence |
+| In-progress sweep | Compare partial child spans before the root completes, then query again after completion; do not infer success from a missing root/end span (`fixture-queries.sql` 5, which lists every trace with children but no `loom.sweep` root) |
 
 Save these searches/dashboards through the installed UI and retain sanitized
 exports where supported. These precise steps avoid asserting that mutable
@@ -132,6 +168,12 @@ organization-specific dashboard IDs are portable. Loom uses operational spans,
 not fabricated HTTP requests. Trace Explorer is the acceptance surface; an empty
 HTTP service-map/APM page does not establish a missing trace. Record actual
 Community-edition limitations and missing usage separately from measured zeros.
+
+`fixture-queries.sql` has not been executed against a live backend: the change
+that added it ran on a sweep host without Docker access, with the trial
+deployment stopped. Its column names follow the pinned v0.142.1 schema and its
+query 0 confirms them. Run it on the trial host and record the observations in
+`evidence.md` before ticking the shared-fixture acceptance criteria.
 
 ## Retention and operation
 
