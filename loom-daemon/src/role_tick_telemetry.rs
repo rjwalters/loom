@@ -42,9 +42,10 @@
 //!   `"opencode"`. An `opencode` launch instead sources `tokens_by_model`
 //!   from [`crate::opencode_usage`], filtered by this workspace's directory
 //!   and the tick's own window; `actions` has no OpenCode-native source
-//!   today, so an opencode tick's `actions` reads as an *observed* zero
-//!   rather than the Claude scan's genuine per-command tally (tracked as
-//!   follow-up work, not silently misrepresented as "not observed").
+//!   today, so an opencode tick **omits** `actions` entirely — unmeasured, not
+//!   an observed zero (a zeroed tally would be indistinguishable from a
+//!   genuinely quiet Claude tick; deriving the real per-command counts from
+//!   OpenCode's event stream is tracked follow-up work).
 //!
 //! # Attribution is time-and-role scoped, and says so
 //!
@@ -300,8 +301,18 @@ pub struct TranscriptScan {
     /// Per-`(model, speed, service_tier)` token totals, in the deterministic
     /// tuple order [`ModelUsageTotals`] callers already expect.
     pub tokens_by_model: Vec<ModelUsageTotals>,
-    /// Forge-mutating commands observed.
-    pub actions: RoleTickActions,
+    /// Forge-mutating commands observed — `None` when this scan had no
+    /// transcript to read them from at all.
+    ///
+    /// Optional for the same reason [`RoleTickActions`] is optional on the
+    /// record itself: absent means "no scanner ran over an attributable
+    /// transcript", a present zero means "a transcript was read and no such
+    /// command appeared". A token source that answers `tokens_by_model`
+    /// *without* a transcript — [`crate::usage_source::UsageSource::OpenCodeSessionDb`]
+    /// — must leave this `None` rather than synthesize
+    /// `RoleTickActions::default()`, which would publish an unmeasured tick as
+    /// a genuine zero.
+    pub actions: Option<RoleTickActions>,
 }
 
 /// Classify one shell command into the [`RoleTickActions`] buckets it
@@ -408,9 +419,11 @@ pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
     // That is the difference between "this tick did nothing observable" and
     // "nothing about this tick was observable", which the record's optional
     // fields exist to preserve.
+    // `actions` is `Some` on this path by construction: reaching here means at
+    // least one transcript was read, so a zero count is an *observation*.
     read_any.then_some(TranscriptScan {
         tokens_by_model: totals.into_values().collect(),
-        actions,
+        actions: Some(actions),
     })
 }
 
@@ -466,7 +479,11 @@ pub fn build_record(
     let (tokens_by_model, actions) = match scan {
         Some(scan) => {
             let tokens = (!scan.tokens_by_model.is_empty()).then_some(scan.tokens_by_model);
-            (tokens, Some(scan.actions))
+            // A scan that measured tokens without reading a transcript carries
+            // `actions: None`, and that absence propagates verbatim — never
+            // rewritten into a zeroed `RoleTickActions` (see the field's doc
+            // comment and [`RoleTickActions`]'s own).
+            (tokens, scan.actions)
         }
         None => (None, None),
     };
@@ -566,11 +583,13 @@ fn emit_correlated(
         if source == crate::usage_source::UsageSource::OpenCodeSessionDb {
             // OpenCode's session store answers `tokens_by_model` but has no
             // transcript for this scanner to derive forge-mutating `actions`
-            // from. `actions` therefore reads as an *observed* zero for an
-            // OpenCode tick — the same value a genuinely quiet Claude tick
-            // reports — rather than being silently misrepresented; deriving
-            // real per-command actions from the native JSON event stream is
-            // follow-up work (see `crate::opencode_usage`'s module doc).
+            // from. `actions` is therefore `None` — *unmeasured*, not an
+            // observed zero: publishing `{issues_labeled: 0, …}` here would be
+            // indistinguishable from a genuinely quiet Claude tick and would
+            // make a GLM/OpenCode trial's role ticks read as real zeroes
+            // (#8507). Deriving real per-command actions from the native JSON
+            // event stream is follow-up work (see `crate::opencode_usage`'s
+            // module doc).
             crate::opencode_usage::tokens_by_model(
                 &crate::usage_source::role_tick_directories(&tick.root),
                 Some((tick.started_at, tick.ended_at)),
@@ -578,7 +597,7 @@ fn emit_correlated(
             )
             .map(|tokens_by_model| TranscriptScan {
                 tokens_by_model,
-                actions: RoleTickActions::default(),
+                actions: None,
             })
         } else {
             let projects_dir = crate::transcript_tokens::claude_projects_dir()?;

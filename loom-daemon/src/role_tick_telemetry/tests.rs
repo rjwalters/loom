@@ -172,9 +172,12 @@ fn scan_transcripts_folds_tokens_and_actions_in_one_pass() {
     fs::write(&path, text).unwrap();
 
     let scan = scan_transcripts(&[path]).expect("a readable transcript yields a scan");
-    assert_eq!(scan.actions.issues_labeled, 1);
-    assert_eq!(scan.actions.comments_posted, 1);
-    assert_eq!(scan.actions.prs_merged, 0);
+    let actions = scan
+        .actions
+        .expect("a read transcript always yields measured actions");
+    assert_eq!(actions.issues_labeled, 1);
+    assert_eq!(actions.comments_posted, 1);
+    assert_eq!(actions.prs_merged, 0);
     let models: Vec<&str> = scan
         .tokens_by_model
         .iter()
@@ -203,7 +206,11 @@ fn scan_transcripts_distinguishes_observed_zero_from_unobserved() {
     // A real session that did nothing forge-mutating and reported no usage.
     fs::write(&path, role_head("guide")).unwrap();
     let scan = scan_transcripts(&[path]).expect("a readable transcript is an observation");
-    assert_eq!(scan.actions, RoleTickActions::default());
+    assert_eq!(
+        scan.actions,
+        Some(RoleTickActions::default()),
+        "a transcript WAS read, so a zero count is an observation, not an absence"
+    );
     assert!(scan.tokens_by_model.is_empty());
 }
 
@@ -218,11 +225,11 @@ fn build_record_carries_every_observed_field() {
             totals("claude-opus-5", 1, 2),
             totals("claude-sonnet-5", 3, 4),
         ],
-        actions: RoleTickActions {
+        actions: Some(RoleTickActions {
             issues_labeled: 2,
             prs_merged: 1,
             comments_posted: 3,
-        },
+        }),
     };
     let record = build_record(
         &tick(RoleTickResult::Success),
@@ -273,7 +280,10 @@ fn build_record_keeps_an_observed_zero_action_count() {
         &tick(RoleTickResult::Success),
         "rjwalters/loom".to_string(),
         RepoVisibility::Private,
-        Some(TranscriptScan::default()),
+        Some(TranscriptScan {
+            actions: Some(RoleTickActions::default()),
+            ..TranscriptScan::default()
+        }),
     );
     // Observed-and-empty: the actions object is present with zeros, and the
     // token list — genuinely empty — is still omitted (it follows
@@ -284,6 +294,37 @@ fn build_record_keeps_an_observed_zero_action_count() {
     assert_eq!(json["actions"]["issues_labeled"], 0);
 }
 
+/// Issue #8507: a source that measures tokens **without** a transcript — the
+/// OpenCode session-store shape — carries `actions: None`, and that absence
+/// must reach the record as an ABSENT key. A zeroed `RoleTickActions` here
+/// would be indistinguishable from a genuinely quiet Claude tick, i.e. exactly
+/// the "synthesize the absent from the present-zero" that `RoleTickActions`'s
+/// own doc comment forbids.
+#[test]
+fn build_record_omits_actions_for_a_token_only_scan_with_no_transcript() {
+    let record = build_record(
+        &tick(RoleTickResult::Success),
+        "rjwalters/loom".to_string(),
+        RepoVisibility::Private,
+        Some(TranscriptScan {
+            tokens_by_model: vec![totals("glm-5.3", 11, 22)],
+            actions: None,
+        }),
+    );
+    // Tokens WERE measured, so they are present …
+    assert_eq!(record.tokens_by_model.as_ref().map(Vec::len), Some(1));
+    assert_eq!(record.models_used, Some(vec!["glm-5.3".to_string()]));
+    // … while `actions` was never measured, so it is absent, not zeroed.
+    assert_eq!(record.actions, None);
+    let json = serde_json::to_value(&record).unwrap();
+    assert!(
+        json.get("actions").is_none(),
+        "an unmeasured actions must be an ABSENT key — a present zero would read \
+         as a genuine 'this tick labeled/merged/commented nothing'"
+    );
+    assert!(json.get("tokens_by_model").is_some());
+}
+
 /// Issue #8056 test plan: a tick that skipped before spawning must report the
 /// right `result` and must NOT fabricate token counts — even if a stale
 /// transcript for the same role happens to sit inside the slack window.
@@ -291,11 +332,11 @@ fn build_record_keeps_an_observed_zero_action_count() {
 fn build_record_never_fabricates_tokens_for_a_pre_spawn_skip() {
     let poisoned = TranscriptScan {
         tokens_by_model: vec![totals("claude-sonnet-5", 999, 999)],
-        actions: RoleTickActions {
+        actions: Some(RoleTickActions {
             issues_labeled: 9,
             prs_merged: 9,
             comments_posted: 9,
-        },
+        }),
     };
     for result in [
         RoleTickResult::SkippedNoTokenPool,
@@ -329,7 +370,7 @@ fn build_record_attributes_a_load_skipped_tick_which_did_spawn() {
         RepoVisibility::Private,
         Some(TranscriptScan {
             tokens_by_model: vec![totals("claude-sonnet-5", 7, 8)],
-            actions: RoleTickActions::default(),
+            actions: Some(RoleTickActions::default()),
         }),
     );
     assert_eq!(record.models_used, Some(vec!["claude-sonnet-5".to_string()]));
@@ -633,6 +674,17 @@ fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
     assert_eq!(rows[0].model, "zai-org/GLM-5.3");
     assert_eq!(rows[0].input, 500);
     assert_eq!(rows[0].output, 40);
+    // #8507: the session DB answers tokens but holds no transcript, so
+    // `actions` is UNMEASURED and must be absent. A present
+    // `{issues_labeled: 0, prs_merged: 0, comments_posted: 0}` here would make
+    // this trial's role ticks read as a genuine "did nothing to the forge" —
+    // the exact conflation `RoleTickActions`'s doc comment forbids.
+    assert_eq!(records[0].actions, None);
+    let json = serde_json::to_value(&records[0]).unwrap();
+    assert!(
+        json.get("actions").is_none(),
+        "an opencode tick must omit the actions key, not serialize a zeroed tally"
+    );
 }
 
 #[test]
