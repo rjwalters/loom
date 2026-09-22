@@ -23,6 +23,10 @@ extensions:
     directory: /var/lib/otelcol/signoz
     create_directory: true
     fsync: true
+  file_storage/filelog:
+    directory: /var/lib/otelcol/filelog
+    create_directory: true
+    fsync: true
   health_check:
     endpoint: 0.0.0.0:13133
 receivers:
@@ -33,6 +37,106 @@ receivers:
         max_request_body_size: 1048576
         auth:
           authenticator: bearertokenauth/loom
+  # Interactive-runtime session-store tails (#8664 item 2 / #8669). Each parses
+  # its JSONL lines to reach a handful of structural fields, moves ONLY those
+  # into loom.* attributes, then discards everything else — including the
+  # parsed body itself via `remove: body` — before the record ever reaches
+  # transform/privacy below. `retain` is an explicit allowlist of attribute
+  # keys: it drops the raw parsed fields (prompts, tool output, model
+  # completions) that json_parser produced, not just the ones we did not name.
+  # transform/privacy's keep_keys is therefore a second, independent
+  # enforcement layer on top of this receiver-level one, not the only one.
+  # Schema assumptions for each source are recorded in README.md and are NOT
+  # yet verified against a real on-disk session file — see the README section
+  # before enabling any of these in a live deployment.
+  file_log/codex:
+    include: ["/var/lib/loom-sessions/codex/**/*.jsonl"]
+    start_at: beginning
+    storage: file_storage/filelog
+    operators:
+      - type: json_parser
+        parse_from: body
+        parse_to: attributes
+        on_error: send_quiet
+      - type: add
+        field: attributes["loom.runtime"]
+        value: "codex"
+      - type: move
+        from: attributes.payload.id
+        to: attributes["loom.session_id"]
+        if: 'attributes.type == "session_meta"'
+      - type: move
+        from: attributes.payload.model
+        to: attributes["loom.model"]
+        if: 'attributes.type == "turn_context"'
+      - type: retain
+        fields: ["attributes[\"loom.runtime\"]", "attributes[\"loom.session_id\"]", "attributes[\"loom.model\"]"]
+      - type: remove
+        field: body
+  file_log/pi:
+    include: ["/var/lib/loom-sessions/pi/**/*.jsonl"]
+    start_at: beginning
+    storage: file_storage/filelog
+    operators:
+      - type: json_parser
+        parse_from: body
+        parse_to: attributes
+        on_error: send_quiet
+      - type: add
+        field: attributes["loom.runtime"]
+        value: "pi"
+      - type: move
+        from: attributes.sessionId
+        to: attributes["loom.session_id"]
+        if: 'attributes.sessionId != nil'
+      - type: move
+        from: attributes.provider
+        to: attributes["loom.provider"]
+        if: 'attributes.type == "model_change"'
+      - type: move
+        from: attributes.modelId
+        to: attributes["loom.model"]
+        if: 'attributes.type == "model_change"'
+      - type: move
+        from: attributes.agentId
+        to: attributes["loom.agent_id"]
+        if: 'attributes.type == "agent_change"'
+      - type: move
+        from: attributes.parentAgentId
+        to: attributes["loom.parent_agent_id"]
+        if: 'attributes.type == "agent_change" && attributes.parentAgentId != nil'
+      - type: retain
+        fields: ["attributes[\"loom.runtime\"]", "attributes[\"loom.session_id\"]", "attributes[\"loom.provider\"]", "attributes[\"loom.model\"]", "attributes[\"loom.agent_id\"]", "attributes[\"loom.parent_agent_id\"]"]
+      - type: remove
+        field: body
+  # Retroactive-only (#8668 covers the live path). toolUseResult and message
+  # content are Claude transcript fields that hold raw tool output / model
+  # text; they are deliberately never referenced by a move/copy operator here,
+  # so `retain` drops them unconditionally.
+  file_log/claude:
+    include: ["/var/lib/loom-sessions/claude/**/*.jsonl"]
+    start_at: beginning
+    storage: file_storage/filelog
+    operators:
+      - type: json_parser
+        parse_from: body
+        parse_to: attributes
+        on_error: send_quiet
+      - type: add
+        field: attributes["loom.runtime"]
+        value: "claude"
+      - type: move
+        from: attributes.sessionId
+        to: attributes["loom.session_id"]
+        if: 'attributes.sessionId != nil'
+      - type: add
+        field: attributes["loom.duration_sec"]
+        value: 'EXPR(attributes.durationMs / 1000)'
+        if: 'attributes.durationMs != nil'
+      - type: retain
+        fields: ["attributes[\"loom.runtime\"]", "attributes[\"loom.session_id\"]", "attributes[\"loom.duration_sec\"]"]
+      - type: remove
+        field: body
 processors:
   memory_limiter:
     check_interval: 1s
@@ -48,7 +152,10 @@ processors:
           - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id"])
       - context: log
         statements:
-          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name", "loom.duration_sec", "loom.total_duration_sec", "loom.phase_durations", "loom.models_used", "loom.tokens_by_model", "loom.judge_verdicts", "loom.tokens_in", "loom.tokens_out", "loom.lines_added", "loom.lines_deleted", "loom.config.runtime", "loom.config.provider", "loom.config.configured_model", "loom.config.arm", "loom.gated_pool", "loom.actions.comments_posted", "loom.actions.issues_labeled", "loom.actions.prs_merged"])
+          # loom.session_id / loom.agent_id / loom.parent_agent_id (#8669): the
+          # interactive-session filelog receivers above are the only current
+          # producers of these three keys.
+          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name", "loom.duration_sec", "loom.total_duration_sec", "loom.phase_durations", "loom.models_used", "loom.tokens_by_model", "loom.judge_verdicts", "loom.tokens_in", "loom.tokens_out", "loom.lines_added", "loom.lines_deleted", "loom.config.runtime", "loom.config.provider", "loom.config.configured_model", "loom.config.arm", "loom.gated_pool", "loom.actions.comments_posted", "loom.actions.issues_labeled", "loom.actions.prs_merged", "loom.session_id", "loom.agent_id", "loom.parent_agent_id"])
     trace_statements:
       - context: resource
         statements:
@@ -96,7 +203,7 @@ exporters:
       num_consumers: 2
       block_on_overflow: false
 service:
-  extensions: [bearertokenauth/loom, bearertokenauth/clickstack, file_storage/clickstack, file_storage/signoz, health_check]
+  extensions: [bearertokenauth/loom, bearertokenauth/clickstack, file_storage/clickstack, file_storage/signoz, file_storage/filelog, health_check]
   telemetry:
     logs:
       level: info
@@ -110,7 +217,7 @@ service:
                 port: 8888
   pipelines:
     logs:
-      receivers: [otlp]
+      receivers: [otlp, file_log/codex, file_log/pi, file_log/claude]
       processors: [memory_limiter, transform/privacy]
       exporters: [otlp_http/clickstack, otlp_http/signoz]
     metrics:
