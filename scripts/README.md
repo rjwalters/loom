@@ -7,8 +7,8 @@ This directory contains shell scripts for managing the daemon during development
 ### dev-daemon.sh
 **Interactive development mode** - Starts daemon and provides live monitoring dashboard.
 
-- **PID file**: `.daemon.pid` (in project root)
-- **Log file**: `.daemon.log` (in project root)
+- **PID file**: `.loom/.daemon.pid`
+- **Log file**: `.loom/.daemon.log`
 - **Interactive**: Keeps terminal active with colored log streaming
 - **Metrics**: Shows uptime, connections, terminals, errors, warnings
 - **Auto-cleanup**: Stops daemon on Ctrl+C
@@ -32,8 +32,8 @@ pnpm run daemon:dev
 ### start-daemon.sh
 Starts the daemon in the background silently and stores its PID.
 
-- **PID file**: `.daemon.pid` (in project root)
-- **Log file**: `.daemon.log` (in project root)
+- **PID file**: `.loom/.daemon.pid`
+- **Log file**: `.loom/.daemon.log`
 - **Idempotent**: Won't start if already running
 - **Verification**: Checks that process started successfully
 
@@ -45,7 +45,7 @@ Usage:
 ### stop-daemon.sh
 Stops the daemon gracefully (or force kills if needed).
 
-- Reads PID from `.daemon.pid`
+- Reads PID from `.loom/.daemon.pid`
 - Sends SIGTERM first (graceful)
 - Waits up to 5 seconds for process to die
 - Force kills with SIGKILL if still running
@@ -144,6 +144,15 @@ Flags:
 - `--deep` — Include build artifacts (target/, node_modules/)
 - `--dry-run` — Show what would be cleaned without making changes
 - `--safe` — Only remove worktrees with merged PRs
+- `--aggressive` — Enumerate **all** `git worktree` entries (not just
+  `.loom/worktrees/issue-*`) and remove vestigial ones reachable from
+  `origin/main`. Respects open PRs, active spawn-loop tasks, the
+  `.loom-managed` sentinel, and uncommitted changes; `--safe` narrows it
+  further. Preview with `--dry-run` before running it for real.
+- `--aggressive-min-age <seconds>` — Minimum worktree age before `--aggressive`
+  will remove it (default: 24h)
+
+Full flag list: `./clean.sh --help` (delegates to `loom-daemon clean --help`).
 
 Usage:
 ```bash
@@ -152,6 +161,7 @@ Usage:
 ./clean.sh --deep           # Include build artifacts
 ./clean.sh --dry-run        # Preview only
 ./clean.sh --safe --force   # Safe mode, non-interactive
+./clean.sh --aggressive --dry-run   # Preview vestigial-worktree cleanup
 loom-clean                  # Direct invocation (PATH shim to `loom-daemon clean`, no venv required)
 ```
 

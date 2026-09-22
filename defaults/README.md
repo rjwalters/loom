@@ -11,14 +11,22 @@ This directory contains default configuration files and templates for Loom works
 - `scripts/` - Helper scripts installed to `.loom/scripts/`
 - `hooks/` - Guard hooks installed to `.loom/hooks/`
 - `runtimes/` - Runtime adapter manifests
+- `observability/` - Fleet observability assets (see `docs/observability.md`)
 - `optional/` - Opt-in extras (e.g. GitHub workflow templates)
+- `model-profiles.json` - Named model profiles (model id, per-runtime provider
+  mapping, credential pool, effort levels) used for runtime/model selection
+- `pricing.json` - Model price table used for cost attribution
 - `.loom/CLAUDE.md` - AI development context template (copied to workspace root as `CLAUDE.md`)
 - `.claude/` - Claude Code configuration template (copied to workspace root)
 - `.github/` - GitHub labels and issue templates (copied to workspace root)
   - `ISSUE_TEMPLATE/task.yml` - Development task template
   - `ISSUE_TEMPLATE/config.yml` - Issue template configuration
 - `.loom-README.md` - README template for `.loom/` directory
-- `loom.sh` / `package.json` / `.loom-internal.list` - Install plumbing
+- `loom.sh` / `package.json` - Install plumbing
+- `.loom-internal.list` - Paths under `defaults/` the installer must **not** copy
+  into a consumer repo
+- `.loom-retired.list` - Paths that used to ship under `defaults/` and are now
+  deleted; `resync-installed.sh` removes each one from already-installed repos
 
 ## Purpose
 

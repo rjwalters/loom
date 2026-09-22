@@ -84,10 +84,14 @@ When you use these templates, you should **commit the `.loom/` directory** to ve
 ✅ **Commit these** (shared with team):
 ```
 .loom/
-├── config.json          # Terminal configurations
-├── roles/               # Custom role definitions
-└── README.md           # Documentation
+└── config.json          # Terminal configurations
 ```
+
+That is all either template actually ships — `.loom/config.json` and nothing
+else. A real Loom install (`./install.sh` / `loom-daemon init`) additionally
+populates `.loom/roles/`, `.loom/scripts/`, `.loom/hooks/`, `.loom/docs/`,
+`.loom/runtimes/`, `.loom/config/`, and `.loom/README.md`; those are
+installer-managed, not part of these templates.
 
 ❌ **Don't commit these** (automatically gitignored):
 ```
@@ -102,7 +106,11 @@ When you use these templates, you should **commit the `.loom/` directory** to ve
 
 Note: Production daemon logs are written to `~/.loom/daemon.log` (home directory).
 
-Each template includes a `.gitignore` file with the correct patterns.
+Only the [`quickstart/`](quickstart/) template ships a `.gitignore` with these
+patterns; [`full-stack/`](full-stack/) contains just `.loom/config.json`. Copying
+either template does **not** give you the ignore rules — a real Loom install
+writes them into your repo's own `.gitignore` (the `>>> loom-managed` block), so
+run the installer, or copy `quickstart/.gitignore`'s patterns by hand.
 
 ## Customizing Templates
 
