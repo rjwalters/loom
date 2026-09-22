@@ -308,7 +308,8 @@ pub struct TranscriptScan {
     /// record itself: absent means "no scanner ran over an attributable
     /// transcript", a present zero means "a transcript was read and no such
     /// command appeared". A token source that answers `tokens_by_model`
-    /// *without* a transcript — [`crate::usage_source::UsageSource::OpenCodeSessionDb`]
+    /// *without* a transcript — every source for which
+    /// [`crate::usage_source::UsageSource::is_native_store`] is true
     /// — must leave this `None` rather than synthesize
     /// `RoleTickActions::default()`, which would publish an unmeasured tick as
     /// a genuine zero.
@@ -580,20 +581,24 @@ fn emit_correlated(
         runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
     );
     let scan = tick.result.spawned().then(|| {
-        if source == crate::usage_source::UsageSource::OpenCodeSessionDb {
-            // OpenCode's session store answers `tokens_by_model` but has no
-            // transcript for this scanner to derive forge-mutating `actions`
-            // from. `actions` is therefore `None` — *unmeasured*, not an
-            // observed zero: publishing `{issues_labeled: 0, …}` here would be
-            // indistinguishable from a genuinely quiet Claude tick and would
-            // make a GLM/OpenCode trial's role ticks read as real zeroes
-            // (#8507). Deriving real per-command actions from the native JSON
-            // event stream is follow-up work (see `crate::opencode_usage`'s
-            // module doc).
-            crate::opencode_usage::tokens_by_model(
-                &crate::usage_source::role_tick_directories(&tick.root),
+        if source.is_native_store() {
+            // A native harness's own session store answers `tokens_by_model`
+            // but has no transcript for this scanner to derive forge-mutating
+            // `actions` from. `actions` is therefore `None` — *unmeasured*,
+            // not an observed zero: publishing `{issues_labeled: 0, …}` here
+            // would be indistinguishable from a genuinely quiet Claude tick
+            // and would make a GLM/OpenCode (or Kimi) trial's role ticks read
+            // as real zeroes (#8507, #8564). Deriving real per-command actions
+            // from the native JSON event stream is follow-up work (see
+            // `crate::opencode_usage`'s and `crate::kimi_usage`'s module docs).
+            //
+            // The predicate is `is_native_store()`, NOT an equality test
+            // against one variant: an `== OpenCodeSessionDb` test would have
+            // routed Kimi silently back onto the Claude transcript reader.
+            crate::usage_source::role_tick_tokens_by_model(
+                runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+                &tick.root,
                 Some((tick.started_at, tick.ended_at)),
-                None,
             )
             .map(|tokens_by_model| TranscriptScan {
                 tokens_by_model,

@@ -375,9 +375,22 @@ runtime's per-session **transcript** (Claude Code writes per-message `usage` +
 OpenCode's equivalent is its own SQLite session store, wired up in #8507 —
 along with first-class `runtime`/`provider`/`profile` fields on every outcome
 record, so a non-Claude completion is identifiable even with no usage numbers
-at all. See [`native-runtime-usage-attribution.md`](native-runtime-usage-attribution.md)
-for the reader, its credential-isolation contract, and the
+at all. Kimi Code CLI's is its per-agent `wire.jsonl` durable event log, wired
+up in #8564. See [`native-runtime-usage-attribution.md`](native-runtime-usage-attribution.md)
+for both readers, their secret-isolation contracts, and the
 `loom-daemon opencode-usage` backfill path.
+
+| Runtime | Store | Selected by |
+|---|---|---|
+| Claude | `~/.claude/projects/<slug>/*.jsonl` transcripts | no launch record (the default) |
+| OpenCode | `opencode.db`, table `session` | `runtime: "opencode"` |
+| Kimi | `$KIMI_CODE_HOME/session_index.jsonl` → `<sessionDir>/agents/<agentId>/wire.jsonl` (`usage.record` + `llm.request`) | `runtime: "kimi"` |
+| Pi, Codex | *(not wired)* — labels but no numbers | falls through to the Claude reader |
+
+Two rules the seam enforces on every one of these, and on any adapter that adds
+the next: **unknown is not zero** (a store with nothing to report returns "no
+totals", never a zeroed breakdown), and **never guess a model id** (an
+unresolved alias is carried verbatim rather than mapped to a plausible name).
 
 An adapter must expose the equivalent for its runtime: a way to attribute a
 session to an account, a limit/exhaustion signal (via the error categories
