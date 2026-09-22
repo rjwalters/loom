@@ -132,6 +132,7 @@ loom-daemon api-keys disable zai alice
 loom-daemon api-keys enable zai alice
 loom-daemon api-keys limit zai alice --max-concurrent 2      # or --unlimited
 loom-daemon api-keys remove zai alice
+loom-daemon api-keys sync --from cmd:'…' [--shared] [--prune] [--dry-run]
 ```
 
 No verb accepts key material on the command line; `add` reads it from
@@ -265,11 +266,69 @@ encode operator decisions and therefore fail *closed* — an unusable lease
 store degrades **open** and the spawn proceeds uncapped: a broken counter
 directory must not become an outage.
 
+**Syncing from an external secret source (#8511).** Everything above is a
+*per-host* registry an operator populates by running `add` on that host. That
+does not survive a fleet that is mostly ephemeral cloud workers: a rebuilt Spot
+instance boots with an empty pool, and each new account otherwise has to be
+hand-registered on every machine — exactly the drift the Claude OAuth pool had
+before it grew a fleet-level sync. `sync` converges a host on a source of truth
+the operator already keeps:
+
+```sh
+loom-daemon api-keys sync --from cmd:'aws ssm get-parameters-by-path \
+  --path /loom/api-keys --recursive --with-decryption \
+  --query "Parameters[].[Name,Value]" --output text | sed …'
+loom-daemon api-keys sync --from cmd:/opt/loom/fetch-keys.sh --dry-run
+loom-daemon api-keys sync --from cmd:/opt/loom/fetch-keys.sh --shared --prune
+```
+
+The source is **pluggable by scheme** — `cmd:<command>` is the one backend
+today, and a native `ssm:/path/prefix` is the obvious next; an unknown scheme is
+refused rather than handed to a shell. `cmd:` runs the command (a bare string
+with no `<scheme>:` prefix is treated as one too) and reads its **stdout**:
+
+```text
+<provider>/<account><TAB><KEY>=<value>
+```
+
+one account per line, `#` comments and blank lines ignored. That covers AWS SSM,
+Vault, the 1Password CLI, `age -d`, or a `curl` to anything, without Loom
+linking a provider SDK. Key material comes off that pipe only — never argv,
+never a log line: a parse error names a **line number and a shape**, never any
+part of the line, and a plan names **accounts**, never values. The command's own
+stderr goes straight to the terminal (so a failing `aws` still explains itself)
+and is never captured into Loom's own errors, logs or `--json`.
+
+Three properties make it safe to run on a cron:
+
+- **Fail-safe.** The source is fetched and fully parsed before a single file is
+  touched. An unreachable source, a non-zero exit, or one malformed line exits
+  non-zero and leaves the pool **byte-for-byte** unchanged — a transient
+  secret-store outage must never empty a working pool.
+- **Idempotent.** An account whose stored value already matches is not rewritten
+  at all, so its `.disabled` entry, `.allowlist` pin, `.bad_accounts.json` mark
+  and `.limits.json` cap survive every sync. Only a *changed* value (or variable
+  name) is replaced, through the same atomic temp-file + `rename` as every other
+  pool write.
+- **`--prune` is scoped to the providers the source names.** Convergence means
+  "this provider's accounts are exactly what the source says", not "delete
+  anything the source did not mention": a host that syncs `zai` from SSM and
+  holds a hand-registered `openai` key keeps the `openai` key. A source that
+  emits nothing therefore prunes nothing.
+
+`--dry-run` prints the intended adds/updates/removals by account name and writes
+nothing; `--shared` converges the machine-level pool instead of this repo's,
+with the same meaning it has on `add`. A successful run records **when** and
+**from where** in `<root>/.sync_state.json`, which `health` surfaces (below) —
+so a host whose sync has been failing for days shows a stale timestamp rather
+than a pool that merely looks small.
+
 **Health.** `loom-daemon api-keys health [--provider zai] [--json]` reports,
 per provider: total/selectable/disabled/malformed/exhausted/at-concurrency-cap/
 unverifiable counts, any `.allowlist` pin, accounts whose file permissions are
-looser than `0600`, and any provider directory that cannot be read (non-zero
-exit) — secret-free by construction, the same as `list`.
+looser than `0600`, the last successful `sync` (timestamp, age, and source, when
+this host syncs at all), and any provider directory that cannot be read
+(non-zero exit) — secret-free by construction, the same as `list`.
 
 ## More models
 
