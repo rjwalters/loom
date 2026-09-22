@@ -281,6 +281,23 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_transcript_ingest_session ON transcript_ingest(session_id);
             CREATE INDEX IF NOT EXISTS idx_transcript_ingest_input_id ON transcript_ingest(input_id);
 
+            -- Transcript archive ledger (Issue #8494)
+            -- One row per Claude Code transcript already rolled into a
+            -- verified `.tar.zst` archive. `file_size`/`file_mtime` make an
+            -- unarchived-since-last-time file a cheap skip, mirroring
+            -- `transcript_ingest` above; `archive_file` names which archive
+            -- currently holds it, for selective restore.
+            CREATE TABLE IF NOT EXISTS transcript_archive (
+                transcript_path TEXT PRIMARY KEY,
+                file_size INTEGER NOT NULL,
+                file_mtime INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                archive_file TEXT NOT NULL,
+                archived_at DATETIME NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transcript_archive_file ON transcript_archive(archive_file);
+
             -- Budget configuration for cost tracking (Issue #1064)
             -- Allows setting budget limits per period with alert thresholds
             CREATE TABLE IF NOT EXISTS budget_config (

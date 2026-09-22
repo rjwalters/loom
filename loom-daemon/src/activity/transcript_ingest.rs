@@ -167,7 +167,11 @@ pub fn collect_transcripts(projects_dir: &Path, workspace: Option<&Path>) -> Vec
 
 /// Key a transcript is remembered by in the `transcript_ingest` ledger:
 /// its path relative to `projects_dir` when possible, else the absolute path.
-fn ledger_key(projects_dir: &Path, path: &Path) -> String {
+///
+/// `pub(crate)` since #8494: `activity::transcript_archive` keys its own
+/// `transcript_archive` ledger by the exact same relative path, so a second
+/// private copy of this derivation would be free to drift from this one.
+pub(crate) fn ledger_key(projects_dir: &Path, path: &Path) -> String {
     path.strip_prefix(projects_dir)
         .unwrap_or(path)
         .to_string_lossy()

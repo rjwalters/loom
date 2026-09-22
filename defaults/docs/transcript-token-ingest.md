@@ -95,19 +95,27 @@ API-side backfill. So the window in which ingestion can run is exactly
 run can recover. The first run on that host wrote 100,652 rows spanning only
 the surviving ~30 days; everything older was already gone.
 
-Two levers, independently:
+Three levers, independently:
 
 - **Ingest** (this document) — keeps the *derived* token/cost rows forever in
   `~/.loom/activity.db`, at a few hundred MB. On by default; verify with
   `loom-daemon health` (below).
-- **Retain the raw transcripts** — raise `cleanupPeriodDays` in
-  `~/.claude/settings.json`, trading disk for retention (~33 GB per 30 days on
-  the measured host; a `.tar.zst` archive of the same set compressed 10.9:1,
-  25.4 GB → 2.33 GB, so a rolling archive is cheap). Only needed for forensics
-  or `claude --resume`; the cost/token views do not depend on it once the rows
-  are ingested. **Anything that archives or prunes transcripts must exclude
-  `~/.claude/projects/<project>/memory/`** — that holds persistent agent
-  memory, not session transcripts.
+- **Archive the raw transcripts** — `loom-daemon archive-transcripts` (#8494)
+  rolls them into a verified, incremental `.tar.zst` + manifest before the fuse
+  fires. On the measured host that set compressed **10.9:1** (25.4 GB →
+  2.33 GB), so it buys the same forensic retention for roughly a tenth of the
+  disk that raising `cleanupPeriodDays` costs. Opt-in and operator-driven — see
+  ["Archiving the raw transcripts"](#archiving-the-raw-transcripts-8494) below
+  for how to run it and how to restore from an archive.
+- **Retain the raw transcripts in place** — raise `cleanupPeriodDays` in
+  `~/.claude/settings.json`, trading disk for retention linearly (~33 GB per 30
+  days on the measured host). Only needed for forensics or `claude --resume`;
+  the cost/token views do not depend on it once the rows are ingested.
+
+**Anything that archives or prunes transcripts must exclude
+`~/.claude/projects/<project>/memory/`** — that holds persistent agent memory,
+not session transcripts. `archive-transcripts` never visits it, and a test
+asserts that rather than a comment claiming it.
 
 ### Checking it is actually running
 
@@ -136,6 +144,91 @@ loom-daemon ingest-transcripts --dry-run --format json | jq '{transcripts_seen, 
 A healthy host reports `skipped_unchanged` ≈ `transcripts_seen`. A
 `skipped_unchanged` of **0** means nothing has ever been ingested — the
 symptom that opened #8477.
+
+## Archiving the raw transcripts (#8494)
+
+Ingestion preserves the *derived* rows. `loom-daemon archive-transcripts`
+preserves the *raw* transcripts themselves — the only artifact that supports
+forensics on a surprising row total, `claude --resume` on an older session, and
+**re-ingestion under a corrected method** (the pricing table and the dedupe
+method have both needed fixing after the fact; a fix can only be re-applied to
+transcripts that still exist).
+
+```bash
+loom-daemon archive-transcripts                       # every eligible transcript
+loom-daemon archive-transcripts --dry-run             # report, write nothing
+loom-daemon archive-transcripts --format json         # machine-readable summary
+loom-daemon archive-transcripts --workspace ~/GitHub/loom   # one repo's transcripts
+loom-daemon archive-transcripts --archive-dir /Volumes/big/transcripts
+```
+
+**Opt-in and operator-driven.** Unlike ingestion, nothing starts this on its
+own: it consumes real disk, and the derived data it backstops is already
+preserved. Run it by hand, or from your own cron/launchd/systemd timer — often
+enough that a transcript is archived before `cleanupPeriodDays` deletes it (a
+daily timer against a 30-day fuse has ample margin).
+
+What one pass does, and the guarantees worth knowing:
+
+| Behaviour | Detail |
+|---|---|
+| Output | One dated `transcripts-<UTC-stamp>.tar.zst` plus a sibling `.manifest.json` under `--archive-dir` (default `~/.loom/transcript-archives`) |
+| Manifest | One record per file: path (relative to the projects dir, the same key ingestion's ledger uses), size, mtime, SHA-256 — so an archive can be **audited or selectively restored without unpacking it whole** |
+| Verified | The archive is **read back** after writing and every entry re-hashed against the manifest. An archive that is not read back is not a backup. A mismatch fails the run *before* the ledger is touched, so the same files are retried next run rather than being recorded as done |
+| Incremental | A `transcript_archive` ledger row per archived transcript (size + mtime), mirroring `transcript_ingest`. An unchanged file is skipped on later runs; `--force` re-archives anyway |
+| Leaves live sessions alone | `--min-age-hours` (default 24) skips a transcript modified more recently than that, so a still-growing session is snapshotted on a later pass instead of mid-write |
+| `memory/` | Never visited. `~/.claude/projects/<project>/memory/` holds persistent agent memory, not session transcripts |
+| Empty host | A pass with nothing eligible is a **no-op, not an error** |
+
+`--level` sets the zstd level (default 19); `--projects-dir` and `--db`
+override the transcript and database locations, as with ingestion.
+
+### Restoring from an archive
+
+The manifest is the index — read it first, and unpack only what you need.
+
+```bash
+ARCHIVES=~/.loom/transcript-archives
+
+# 1. Which archive holds the session you want? Ask the ledger...
+sqlite3 ~/.loom/activity.db \
+  "SELECT transcript_path, archive_file, archived_at FROM transcript_archive
+   WHERE transcript_path LIKE '%<session-uuid>%';"
+
+# ...or grep the manifests directly, if the database is gone too.
+jq -r '.entries[].path' "$ARCHIVES"/transcripts-*.manifest.json | grep <session-uuid>
+
+# 2. Extract exactly that one transcript (no need to unpack the archive whole).
+#    Paths inside the archive are relative to the projects dir. The `--` is
+#    load-bearing: a project slug is the workspace path with `/` replaced by
+#    `-`, so it ALWAYS begins with `-` and tar would otherwise read the member
+#    name as a bundle of options (BSD tar: "Invalid replacement string").
+mkdir -p /tmp/restored
+zstd -dc "$ARCHIVES/transcripts-20260922T041500Z.tar.zst" \
+  | tar -xv -C /tmp/restored -f - -- '<project-slug>/<session-uuid>.jsonl'
+
+# 3. Confirm the bytes are what was archived.
+shasum -a 256 /tmp/restored/<project-slug>/<session-uuid>.jsonl
+jq -r '.entries[] | select(.path | endswith("<session-uuid>.jsonl")) | .sha256' \
+  "$ARCHIVES/transcripts-20260922T041500Z.manifest.json"
+```
+
+To **re-ingest** a restored set — the case that matters after a pricing-table or
+method correction — point ingestion at the restore directory instead of the live
+projects directory. `--force` is what makes it re-read files whose ledger rows
+already exist; ingestion **replaces** a transcript's rows rather than appending,
+so a re-ingest cannot double-count:
+
+```bash
+mkdir -p /tmp/restored
+zstd -dc "$ARCHIVES/transcripts-20260922T041500Z.tar.zst" | tar -x -C /tmp/restored -f -
+loom-daemon ingest-transcripts --projects-dir /tmp/restored --force --since all
+```
+
+To restore transcripts for `claude --resume`, extract into the live
+`${CLAUDE_CONFIG_DIR:-~/.claude}/projects` directory instead of `/tmp/restored`.
+Note that Claude Code's cleanup will prune them again once they cross
+`cleanupPeriodDays`, so treat that as a working copy, not storage.
 
 ## What a row means
 

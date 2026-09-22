@@ -53,6 +53,7 @@ pub(crate) mod telemetry;
 pub(crate) mod tmpfs_scratch_gc;
 pub(crate) mod tokens;
 pub(crate) mod tokens_weekly_points;
+pub(crate) mod transcript_archive_cli;
 pub(crate) mod transcript_ingest_cli;
 pub(crate) mod usage_report_cli;
 pub(crate) mod watch;
