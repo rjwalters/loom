@@ -14,17 +14,29 @@ const DEAD_PID: u32 = u32::MAX;
 
 /// Points the machine-wide lease dir at a tempdir for the scope of a test and
 /// restores whatever was there before, including across a panic.
+///
+/// It also clears [`LEASE_STALE_SECS_ENV`] for the same scope: the age
+/// thresholds are `env > default`, so an operator who had shortened them on
+/// this host would otherwise reap fixtures the age tests expect to still be
+/// live. Hermetic by construction, not by luck.
 struct Store {
     dir: tempfile::TempDir,
-    prior: Option<std::ffi::OsString>,
+    prior_dir: Option<std::ffi::OsString>,
+    prior_stale: Option<std::ffi::OsString>,
 }
 
 impl Store {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let prior = std::env::var_os(LEASE_DIR_ENV);
+        let prior_dir = std::env::var_os(LEASE_DIR_ENV);
+        let prior_stale = std::env::var_os(LEASE_STALE_SECS_ENV);
         std::env::set_var(LEASE_DIR_ENV, dir.path().join("backstop"));
-        Self { dir, prior }
+        std::env::remove_var(LEASE_STALE_SECS_ENV);
+        Self {
+            dir,
+            prior_dir,
+            prior_stale,
+        }
     }
 
     fn path(&self) -> PathBuf {
@@ -34,9 +46,13 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        match self.prior.take() {
+        match self.prior_dir.take() {
             Some(value) => std::env::set_var(LEASE_DIR_ENV, value),
             None => std::env::remove_var(LEASE_DIR_ENV),
+        }
+        match self.prior_stale.take() {
+            Some(value) => std::env::set_var(LEASE_STALE_SECS_ENV, value),
+            None => std::env::remove_var(LEASE_STALE_SECS_ENV),
         }
     }
 }
@@ -220,6 +236,77 @@ fn the_n_plus_first_concurrent_dispatch_is_refused() {
     assert_eq!(live_count(&store.path()).unwrap(), 1);
     assert!(matches!(admit_one(&ceiling), Verdict::Admitted(_)));
     drop(second);
+}
+
+/// The race the `mkdir` control lock exists to close, and the one a green suite
+/// most easily misses: without it, peers that all read `live == limit - 1`
+/// before any of them writes would *all* admit, and the ceiling would be
+/// breached by exactly the concurrency it was configured to bound. Sequential
+/// admission cannot detect that — only contention can.
+///
+/// Threads rather than processes because the lock is filesystem-level, so it
+/// serialises either equally, and the count is file-based rather than
+/// in-memory: nothing here shares state through the process except the store
+/// the lock guards.
+#[test]
+#[serial_test::serial]
+fn concurrent_admissions_never_exceed_the_ceiling() {
+    const LIMIT: u32 = 3;
+    const PEERS: usize = 12;
+
+    let store = Store::new();
+    let ceiling = bound(Some(LIMIT));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(PEERS));
+
+    let admitted: Vec<Verdict> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..PEERS)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let ceiling = ceiling.clone();
+                // Every peer counts-and-reserves in the same instant, which is
+                // precisely when a check-then-act without a lock over-admits.
+                scope.spawn(move || {
+                    barrier.wait();
+                    admit_one(&ceiling)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let (granted, refused): (Vec<_>, Vec<_>) = admitted
+        .into_iter()
+        .partition(|verdict| matches!(verdict, Verdict::Admitted(_)));
+    assert_eq!(
+        granted.len(),
+        LIMIT as usize,
+        "exactly {LIMIT} of {PEERS} contending peers may hold a metered slot"
+    );
+    assert_eq!(refused.len(), PEERS - LIMIT as usize);
+    for verdict in &refused {
+        let Verdict::Refused(reason) = verdict else {
+            unreachable!()
+        };
+        assert_eq!(reason.kind(), "ceiling-at-capacity", "{reason:?}");
+    }
+    // The store agrees with the verdicts: no peer wrote a lease it was then
+    // refused for, and none of the granted slots was lost to a racing reap.
+    assert_eq!(live_count(&store.path()).unwrap(), LIMIT);
+
+    // `summary()` numbers the slots 1..=LIMIT with no duplicates — each peer
+    // saw its own reservation counted, so none of them read a stale total.
+    let mut seen: Vec<u32> = granted
+        .iter()
+        .map(|verdict| match verdict {
+            Verdict::Admitted(slot) => slot.usage().0,
+            _ => unreachable!(),
+        })
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen, (1..=LIMIT).collect::<Vec<_>>());
+
+    drop(granted);
+    assert_eq!(live_count(&store.path()).unwrap(), 0);
 }
 
 /// A ceiling of zero switches the metered tier off without the operator having

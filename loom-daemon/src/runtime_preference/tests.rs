@@ -37,13 +37,21 @@ use std::path::Path;
 /// robb-studio. `role_runner::runtime_preflight`, `provider_health_feedback`
 /// and `work_finder::pool_preflight` all isolate the same var in their own
 /// guards; this file was the one that did not.
+///
+/// It also clears the backstop ceiling's own overrides (#8555). Those are
+/// `env > config` by design, so an operator who has bounded this host would
+/// otherwise silently impose that bound on every test here — including
+/// `an_unconfigured_ceiling_touches_no_state_and_bounds_nothing`, whose entire
+/// claim is that *nothing* is configured. The lease **directory** override is
+/// deliberately not in this list: `ScopedLeaseDir` sets it, and the two guards
+/// coexist in the same tests.
 struct ClearedRuntimeEnv {
     prior: Vec<(&'static str, Option<String>)>,
     /// Held only so the empty profile root outlives the guard. Never read.
     _profile_root: tempfile::TempDir,
 }
 
-const PIN_VARS: [&str; 8] = [
+const ISOLATED_VARS: [&str; 10] = [
     "LOOM_RUNTIME",
     "LOOM_RUNTIME_BUILDER",
     "LOOM_RUNTIME_JUDGE",
@@ -52,11 +60,13 @@ const PIN_VARS: [&str; 8] = [
     "LOOM_CODEX_PROFILE",
     "LOOM_CODEX_HOME",
     "CODEX_HOME",
+    ceiling::MAX_CONCURRENT_ENV,
+    ceiling::LEASE_STALE_SECS_ENV,
 ];
 
 impl ClearedRuntimeEnv {
     fn new() -> Self {
-        let prior = PIN_VARS
+        let prior = ISOLATED_VARS
             .iter()
             .map(|key| {
                 let prior = std::env::var(key).ok();
