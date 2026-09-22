@@ -239,6 +239,29 @@ pub struct OutcomeRecord {
     /// under the same `None` conditions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jev_confidence: Option<f64>,
+    /// Tap-attributed usage accounting for a **native harness** spawn (Issue
+    /// #8556): the `(runtime, credential source)` tap this sweep ran on, plus
+    /// whatever its native event stream reported consuming.
+    ///
+    /// The prerequisite #8556 names for *any* fleet-wide metered spend ceiling:
+    /// a metered API key is one credential shared across every host, so "how
+    /// much went to the metered backstop vs. the subscriptions" must be a query
+    /// over a key that names the credential — see [`crate::tap_usage`] and
+    /// `docs/adr/0020-fleet-metered-spend-ceiling.md`.
+    ///
+    /// Strictly a **superset** of [`Self::credential`], not a replacement: that
+    /// field's readers (#8447) keep their exact shape, and both are resolved
+    /// from the same single log read so the two can never disagree.
+    ///
+    /// Counters inside are individually optional — a missing counter means
+    /// unmeasured, never zero — and the cost figure is the harness's own
+    /// estimate, never a measured charge. `None` for a Claude/legacy-adapter
+    /// spawn (no launch record), a sweep whose log is gone, and every journal
+    /// line written before this field existed; `#[serde(default)]` keeps those
+    /// parsing, which matters because [`read_all`] silently drops any line that
+    /// fails to deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_usage: Option<crate::tap_usage::TapAccounting>,
     /// Elapsed wall-clock seconds from dispatch to this terminal outcome.
     pub duration_sec: i64,
 }
@@ -666,6 +689,7 @@ mod tests {
             credential: None,
             jev_tier: None,
             jev_confidence: None,
+            tap_usage: None,
             duration_sec: 1,
         }
     }

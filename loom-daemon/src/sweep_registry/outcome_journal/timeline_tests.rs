@@ -166,6 +166,7 @@ fn records_judge_verdicts_and_doctor_cycles_from_the_label_timeline() {
         telemetry::SweepResult::Success,
         None,
         None,
+        None,
     );
 
     let path = registry.config().resolve_outcome_telemetry_path();
@@ -207,6 +208,7 @@ fn a_first_pass_approval_is_readable_off_the_record_alone() {
         telemetry::SweepResult::Success,
         None,
         None,
+        None,
     );
 
     let path = registry.config().resolve_outcome_telemetry_path();
@@ -235,6 +237,7 @@ fn a_failing_timeline_fetch_omits_both_fields_and_still_writes_the_record() {
         420,
         telemetry::SweepResult::Failure,
         Some("preflight-no-cli-start".to_string()),
+        None,
         None,
     );
 
@@ -273,6 +276,7 @@ fn a_sweep_with_no_pr_omits_both_fields() {
         telemetry::SweepResult::Failure,
         None,
         None,
+        None,
     );
 
     let raw = raw_record(&registry, issue);
@@ -298,6 +302,7 @@ fn an_observed_timeline_with_no_verdict_reports_empty_not_absent() {
         &sweep_id,
         90,
         telemetry::SweepResult::Failure,
+        None,
         None,
         None,
     );
@@ -339,6 +344,7 @@ fn a_loom_repo_override_is_passed_as_the_gh_repo_env_var() {
         telemetry::SweepResult::Success,
         None,
         None,
+        None,
     );
     std::env::remove_var("LOOM_REPO");
 
@@ -372,6 +378,7 @@ fn skip_label_flip_makes_the_fetch_a_no_op() {
         &sweep_id,
         60,
         telemetry::SweepResult::Success,
+        None,
         None,
         None,
     );

@@ -672,7 +672,10 @@ resolver — see the follow-up issues on #8436.
 
 `--log` appends both streams, launch identity and native JSON events to a file.
 Without it, events stream to stdout and launch diagnostics to stderr. The
-`LOOM_LAUNCH` record names the harness, provider, model, profile and effort.
+`LOOM_LAUNCH` record names the harness, provider, model, profile, effort and —
+since #8556 — the **tap** (`<runtime>[:<profile>]`, the same string the
+`# LOOM_RUNTIME_PREFERENCE` marker renders), so one grep finds an identity across
+both markers and the accounting read back off them.
 The process uses Unix exec, preserving PID, signal death and exit status;
 Loom's existing role runner owns timeout and descendant termination.
 
@@ -681,6 +684,26 @@ inside `agent_end`. OpenCode reports usage on `step_finish`. Retain input,
 output, reasoning, cache counters and tool failures. Missing counters mean
 unmeasured, not zero. The existing Claude transcript/cost dashboard is not a
 generic evaluator and should not be used to infer these trials' billed cost.
+
+**Tap-attributed accounting landed (#8556).** That paragraph's rules are now
+mechanised rather than a convention for a human reader: `loom-daemon`'s
+`tap_usage` module folds those events into per-launch counters keyed by the tap
+that paid — `(runtime, credential source)` — and writes them to both terminal
+journals (`config.tap` and `config.tap_*` on the `sweep.outcome` telemetry
+record, `tap_usage` on `sweep-outcomes.jsonl`; see `telemetry-schema.md`). Every
+counter stays optional, so a missing one is reported as unmeasured rather than as
+zero, and the cost field is named `tap_cost_estimate` so this section's
+estimate-is-not-a-charge rule cannot be lost downstream. The query the
+attribution exists for is
+`loom-daemon sweep-outcomes summary --group-by tap` — *how much went to the
+metered backstop vs. the subscriptions*.
+
+This is deliberately the **accounting** prerequisite only, not a spend ceiling.
+A metered key is one credential shared across every fleet host, so no per-host
+mechanism can bound its aggregate spend; the decision on how that ceiling is
+imposed (provider-side hard ceiling first, observability-backend aggregation as a
+scoped fallback) is recorded in
+[`ADR-0020`](https://github.com/rjwalters/loom/blob/main/docs/adr/0020-fleet-metered-spend-ceiling.md).
 
 For full issues measure cost per independently accepted issue, with identical
 base commits, dependencies, task text and reviewer. Include failed attempts and

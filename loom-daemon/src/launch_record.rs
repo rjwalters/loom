@@ -30,6 +30,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::runtime_preference::Tap;
+
 /// The marker `worker_spawn::run` prefixes the launch record's JSON with.
 ///
 /// A re-export, not a second definition (issue #8541): `api_keys_pool::ingest`
@@ -233,6 +235,165 @@ pub fn parse_launch_credential_after(
         provider: record.provider,
         account: record.account,
     })
+}
+
+// ============================================================================
+// Tap attribution (Issue #8556)
+// ============================================================================
+
+/// Wire name of the credential half of a tap key when the launch record says
+/// the key came from an operator-exported environment variable rather than any
+/// Loom-managed pool. Its own bucket on purpose: an `env` key is real spend on
+/// a credential Loom never selected and cannot govern.
+pub const CREDENTIAL_WIRE_ENV: &str = "env";
+
+/// Wire name for a launch that resolved no Loom-visible credential at all and
+/// fell through to the harness's own auth store — spend Loom cannot attribute
+/// to an account it knows, and must not silently fold into a pool's bucket.
+pub const CREDENTIAL_WIRE_HARNESS_OWN: &str = "harness-own";
+
+/// The **accounting identity** of one launch: the tap it ran on.
+///
+/// The operator's framing (2026-09-20, #8436) is that the unit whose economics
+/// differ is the **tap** — `(runtime, credential source)` — not the runtime and
+/// not the model. Issue #8556 is the consequence for accounting: a metered
+/// OpenAI-compatible key is one credential shared across every fleet host, so
+/// "how much went to the metered backstop vs. the subscriptions" has to be a
+/// *query* over a key that names the credential, not a reconstruction from
+/// runtime names and a mental model of which profile binds which provider.
+///
+/// Two axes, deliberately kept separate and both rendered into [`Self::key`]:
+///
+/// * the **configured** identity — [`Tap`] (`runtime`, optional model profile);
+///   the profile is what binds *which* provider and credential source, so
+///   `opencode` alone cannot distinguish a flat-rate coding plan from a metered
+///   endpoint reached through the same runtime;
+/// * the **realized** credential — what `worker_spawn::credential` actually
+///   resolved, as the launch record's `credentialSource` / `credentialProvider`
+///   / `credentialAccount` report it (names only, never key material).
+///
+/// Secret-free by construction, exactly like [`CredentialAttribution`], which
+/// it embeds rather than re-derives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TapAttribution {
+    /// The runtime id (`claude`, `pi`, `opencode`, …).
+    pub runtime: String,
+    /// The model profile that bound this launch's provider + credential
+    /// source, when one did. `None` ⇒ the runtime's own default resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
+    /// Where the credential came from, and which account — never the key.
+    pub credential: CredentialAttribution,
+}
+
+impl TapAttribution {
+    /// The configured half as the resolver's own [`Tap`], so a launch record
+    /// and a `# LOOM_RUNTIME_PREFERENCE` marker render the same identity.
+    #[must_use]
+    pub fn tap(&self) -> Tap {
+        match &self.model_profile {
+            Some(profile) => Tap::with_profile(&self.runtime, profile),
+            None => Tap::runtime(&self.runtime),
+        }
+    }
+
+    /// The credential half's stable wire name, matching
+    /// [`crate::runtime_preference::CredentialSource::wire`] where the two
+    /// overlap (`api_keys:<provider>`) so one grep finds a credential source
+    /// across the preference marker, the launch record and this key.
+    ///
+    /// The two remaining launch-record sources have no `CredentialSource`
+    /// counterpart because the resolver never selects them:
+    /// [`CREDENTIAL_WIRE_ENV`] (an operator-exported key) and
+    /// [`CREDENTIAL_WIRE_HARNESS_OWN`] (the harness's own auth store). Both get
+    /// their own bucket rather than being folded into a pool's — spend on a
+    /// credential Loom did not select is exactly the spend a fleet ceiling
+    /// cannot govern, so it must stay visibly separate.
+    #[must_use]
+    pub fn credential_wire(&self) -> String {
+        match (self.credential.source.as_str(), &self.credential.provider) {
+            ("pool", Some(provider)) => format!("api_keys:{provider}"),
+            ("pool", None) => "api_keys".to_string(),
+            ("env", _) => CREDENTIAL_WIRE_ENV.to_string(),
+            ("none", _) => CREDENTIAL_WIRE_HARNESS_OWN.to_string(),
+            (other, _) => other.to_string(),
+        }
+    }
+
+    /// The accounting key: `<tap>@<credential wire>`, e.g. `claude@env`,
+    /// `opencode:zai-metered@api_keys:zai`, `pi@harness-own`.
+    ///
+    /// One string, so folding usage by tap is a `BTreeMap` insert and an
+    /// operator grep is one token — and so the *account* stays out of the key.
+    /// Per-account attribution already has a home
+    /// ([`CredentialAttribution::account`], `config.credential_account`); a
+    /// fleet spend ceiling is per-**credential**, and the metered case #8556
+    /// describes is one key shared by every host, so keying spend by account
+    /// would split exactly the number a ceiling has to add up.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!("{}@{}", self.tap(), self.credential_wire())
+    }
+}
+
+/// Parse the tap attribution out of one `# LOOM_LAUNCH {…}` record body.
+///
+/// `None` when the record carries no credential attribution at all (a
+/// pre-#8401 binary — see [`parse_launch_credential`]) or names no runtime:
+/// a tap key whose runtime half was fabricated would silently merge unrelated
+/// spend, which is worse for this purpose than reporting nothing.
+///
+/// The `tap` field a post-#8556 binary writes is preferred as the configured
+/// identity, but `runtime` + `profile` are the fallback so a record written by
+/// an older binary still attributes — the same forward/backward-compatible
+/// discipline every other reader of this record applies.
+#[must_use]
+pub fn parse_launch_tap(record_json: &str) -> Option<TapAttribution> {
+    let credential = parse_launch_credential(record_json)?;
+    let value: serde_json::Value = serde_json::from_str(record_json.trim()).ok()?;
+    let stamped = value
+        .get("tap")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // `tap` renders as `<runtime>[:<profile>]` (`Tap`'s Display), so splitting
+    // on the first `:` recovers both halves. A record without it falls back to
+    // #8507's own reader of the same record, so the two never drift in what
+    // they consider a usable `runtime`/`profile`.
+    let (runtime, model_profile) = match stamped {
+        Some(tap) => match tap.split_once(':') {
+            Some((runtime, profile)) => (
+                runtime.trim().to_string(),
+                Some(profile.trim().to_string()).filter(|p| !p.is_empty()),
+            ),
+            None => {
+                let profile = parse_launch_runtime(record_json).and_then(|r| r.profile);
+                (tap.to_string(), profile)
+            }
+        },
+        None => {
+            let attribution = parse_launch_runtime(record_json)?;
+            (attribution.runtime, attribution.profile)
+        }
+    };
+    if runtime.is_empty() {
+        return None;
+    }
+    Some(TapAttribution {
+        runtime,
+        model_profile,
+        credential,
+    })
+}
+
+/// [`parse_launch_tap`] over a whole per-sweep log, anchored exactly as
+/// [`parse_launch_credential_after`] anchors: only at/after this dispatch's
+/// header, and within that region the **last** record wins.
+#[must_use]
+pub fn parse_launch_tap_after(contents: &str, header_anchor: &str) -> Option<TapAttribution> {
+    let region = &contents[contents.rfind(header_anchor)?..];
+    let body_start = region.rfind(LAUNCH_RECORD_MARKER)? + LAUNCH_RECORD_MARKER.len();
+    parse_launch_tap(region[body_start..].lines().next()?)
 }
 
 #[cfg(test)]
@@ -495,5 +656,118 @@ mod tests {
 
         // A DIFFERENT issue's log is never consulted.
         assert_eq!(sweep_runtime_attribution(root, 8508), None);
+    }
+
+    // ========================================================================
+    // Tap attribution (Issue #8556)
+    // ========================================================================
+
+    /// A launch record shaped exactly as `worker_spawn::run` writes it after
+    /// #8556 — `tap` present alongside `runtime`/`profile`.
+    fn tap_launch_line(
+        tap: Option<&str>,
+        runtime: &str,
+        profile: Option<&str>,
+        source: &str,
+        provider: Option<&str>,
+    ) -> String {
+        let mut record = serde_json::json!({
+            "schema": 1,
+            "runtime": runtime,
+            "model": "glm-5.3",
+            "credentialSource": source,
+            "credentialAccount": "alpha",
+        });
+        let map = record.as_object_mut().unwrap();
+        if let Some(tap) = tap {
+            map.insert("tap".to_string(), tap.into());
+        }
+        if let Some(profile) = profile {
+            map.insert("profile".to_string(), profile.into());
+        }
+        if let Some(provider) = provider {
+            map.insert("credentialProvider".to_string(), provider.into());
+        }
+        format!("# LOOM_LAUNCH {record}")
+    }
+
+    #[test]
+    fn a_metered_pool_tap_keys_on_its_provider_not_its_account() {
+        let log = log_with(
+            "sweep_id=s1",
+            &tap_launch_line(
+                Some("opencode:zai-metered"),
+                "opencode",
+                Some("zai-metered"),
+                "pool",
+                Some("zai"),
+            ),
+        );
+        let tap = parse_launch_tap_after(&log, "sweep_id=s1").unwrap();
+        assert_eq!(tap.runtime, "opencode");
+        assert_eq!(tap.model_profile.as_deref(), Some("zai-metered"));
+        assert_eq!(tap.tap().to_string(), "opencode:zai-metered");
+        assert_eq!(tap.credential_wire(), "api_keys:zai");
+        // The account is deliberately NOT in the key: a fleet ceiling adds up
+        // one shared credential's spend, and keying by account would split it.
+        assert_eq!(tap.key(), "opencode:zai-metered@api_keys:zai");
+        assert!(!tap.key().contains("alpha"));
+    }
+
+    #[test]
+    fn an_env_sourced_and_an_unpooled_launch_each_get_their_own_bucket() {
+        for (source, expected) in [("env", "env"), ("none", "harness-own")] {
+            let log =
+                log_with("sweep_id=s1", &tap_launch_line(Some("pi"), "pi", None, source, None));
+            let tap = parse_launch_tap_after(&log, "sweep_id=s1").unwrap();
+            assert_eq!(tap.credential_wire(), expected, "{source}");
+            assert_eq!(tap.key(), format!("pi@{expected}"), "{source}");
+        }
+    }
+
+    /// A record from a binary that predates the `tap` field still attributes:
+    /// `runtime` + `profile` reconstruct the same identity.
+    #[test]
+    fn a_record_without_a_tap_field_falls_back_to_runtime_plus_profile() {
+        let log = log_with(
+            "sweep_id=s1",
+            &tap_launch_line(None, "opencode", Some("zai-metered"), "pool", Some("zai")),
+        );
+        let tap = parse_launch_tap_after(&log, "sweep_id=s1").unwrap();
+        assert_eq!(tap.key(), "opencode:zai-metered@api_keys:zai");
+    }
+
+    #[test]
+    fn a_record_with_no_credential_attribution_or_no_runtime_yields_nothing() {
+        // Pre-#8401: no credential fields at all.
+        let log = log_with(
+            "sweep_id=s1",
+            r#"# LOOM_LAUNCH {"schema":1,"runtime":"pi","model":"glm-5.3"}"#,
+        );
+        assert_eq!(parse_launch_tap_after(&log, "sweep_id=s1"), None);
+        // Credential present but no runtime to key on — never fabricated.
+        let log = log_with(
+            "sweep_id=s1",
+            r#"# LOOM_LAUNCH {"credentialSource":"pool","credentialProvider":"zai"}"#,
+        );
+        assert_eq!(parse_launch_tap_after(&log, "sweep_id=s1"), None);
+    }
+
+    #[test]
+    fn tap_attribution_renders_no_key_material() {
+        let line = format!(
+            "# LOOM_LAUNCH {}",
+            serde_json::json!({
+                "tap": "opencode:zai-metered",
+                "credentialSource": "pool",
+                "credentialProvider": "zai",
+                "credentialAccount": "alpha",
+                "credentialValue": "sk-fake-secret-material",
+            })
+        );
+        let log = log_with("sweep_id=s1", &line);
+        let tap = parse_launch_tap_after(&log, "sweep_id=s1").unwrap();
+        let rendered = serde_json::to_string(&tap).unwrap();
+        assert!(!rendered.contains("sk-fake-secret-material"), "{rendered}");
     }
 }

@@ -104,6 +104,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Records the settled architecture for epic #6896 (Session containers): two container lifetimes behind one dispatch seam, headless `docker exec` dispatch with tmux as an operator-only re-auth surface, docker-requiring nested compute routed through a remote-execution `run-job` seam (never docker-in-docker, never docker.sock passthrough), and a soak-then-fleet-default rollout posture — plus the #5119 drain-vs-hard-stop contract's extension to per-sweep containers
   - **Key Decision**: Per-account persistent session containers for mutable-auth runtimes (Codex) and per-sweep ephemeral containers for stateless-auth runtimes (Claude), both dispatched through the existing `spawn-worker.sh` seam with no new dispatch path; nested docker workloads never get a docker socket, routing instead through a host-level `run-job` executor; containment becomes the Linux-fleet default after a soak period while bare-metal stays available config-selectably
 
+- [ADR-0020: Govern a Shared Metered API Key With a Provider-Side Spend Ceiling, Not Fleet Aggregation](0020-fleet-metered-spend-ceiling.md)
+  - **Status**: Accepted
+  - **Summary**: Records the #8556 decision for a metered OpenAI-compatible key shared across every fleet host, where no per-host mechanism can bound aggregate spend (N hosts × a local ceiling of K is not a spend cap): a provider-side hard ceiling that *fails the launch* is the primary mechanism, observability-backend aggregation is a scoped fallback promoted only if a chosen provider offers alerting rather than a hard stop, and tap-attributed usage accounting — `(runtime, credential source)` — lands first because both options consume it and it answers the backstop-vs-subscription spend question on its own
+  - **Key Decision**: The authoritative mechanism is the only one that can be authoritative (the provider refuses the request) over a fleet-side counter that is eventually consistent by construction, couples dispatch to backend uptime when fail-closed, and defeats its own purpose when fail-open; if the fallback is ever built it fails closed on the **metered tap only**, with a bounded staleness window rather than indefinite trust in a last-known-good counter
+
 ## Creating a New ADR
 
 When making a significant architectural decision:
