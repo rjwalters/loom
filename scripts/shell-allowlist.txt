@@ -218,7 +218,6 @@ defaults/scripts/lib/reap-process-group.sh                                     c
 defaults/scripts/lib/run-job-exec.sh                                           contract    Shell library `source`d by name from the scripts above it; evaporates as its consumers port (#7758).
 defaults/scripts/lib/script-helper.sh                                          contract    Shell library `source`d by name from the scripts above it; evaporates as its consumers port (#7758).
 defaults/scripts/lib/systemd-user.sh                                           settled     Settled (#8237): deliberately kept shell — zero fix-commits in the trailing six months and no irreversible operations, both machine-re-checked on every run. Descoped from the port target; may shrink, never grow.
-defaults/scripts/lib/watchdog-peer-coord-dedup.sh                              contract    Shell library `source`d by name from the scripts above it; evaporates as its consumers port (#7758).
 defaults/scripts/lib/worktree-forge-pr-check.sh                                contract    Shell library `source`d by name from the scripts above it; evaporates as its consumers port (#7758).
 defaults/scripts/lib/worktree-race-rescue.sh                                   contract    Shell library `source`d by name from the scripts above it; evaporates as its consumers port (#7758).
 defaults/scripts/lib/worktree-removal-log.sh                                   contract    Shell library `source`d by name from the scripts above it; evaporates as its consumers port (#7758).
@@ -378,7 +377,6 @@ defaults/scripts/tests/test-loom-daemon-quiesce.sh                             t
 defaults/scripts/tests/test-loom-daemon-start.sh                               test        Tests `loom-daemon-start` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-loom-daemon-stop.sh                                test        Tests `loom-daemon-stop` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-loom-daemon-update.sh                              test        Tests `loom-daemon-update` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
-defaults/scripts/tests/test-loom-daemon-watchdog-dedup.sh                      test        Tests `loom-daemon-watchdog-dedup` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-loom-daemon-watchdog.sh                            test        Tests `loom-daemon-watchdog` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-loom-dispatcher.sh                                 test        Tests `loom-dispatcher` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-loom-status.sh                                     test        Tests `loom-status` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
