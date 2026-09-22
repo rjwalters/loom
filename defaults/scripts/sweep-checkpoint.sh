@@ -87,4 +87,5 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/script-helper.sh"
 # Missing binary is an operational failure, never a missing checkpoint (1).
 export LOOM_SCRIPT_HELPER_MISSING_RC=3
+# requires-daemon: sweep-checkpoint >= 0.19.255  #8525 development floor: requires a build containing the Rust checkpoint port; first published release is unassigned. Version alone does not establish capability.
 loom_exec_script_helper sweep-checkpoint "$@"

@@ -126,3 +126,11 @@ only that Collector service, retaining its persistent queue directory. The
 updated log allowlist preserves measured token/line counts, ordered Judge
 verdicts, and bounded runtime/provider/model experiment settings. An older
 gateway drops those additional fields even though Loom exports them.
+
+The Rust checkpoint port requires a binary built with #8525. Its declared
+`0.19.255` minimum is the development baseline, not a claim that the published
+release with that number contains the command. Until the first containing
+release is identified, pin a verified matching build and check
+`loom-daemon sweep-checkpoint --help` before using the shell helper. Missing or
+older binaries remain operational failures, never evidence of a missing
+checkpoint; do not mark this dependency optional.
