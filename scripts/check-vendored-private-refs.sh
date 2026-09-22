@@ -65,7 +65,14 @@ ALLOWED_HOST_SUFFIXES=(
   test.com t.com
   github.com githubusercontent.com
   anthropic.com claude.com
-  openai.com opentelemetry.io
+  # `kimi.com` / `moonshot.ai` are Moonshot AI's public endpoints, added with
+  # the Kimi Code CLI native harness (#8561): the former hosts the CLI docs
+  # `defaults/docs/runtime-model-trials.md` cites, the latter the platform API
+  # endpoint its example model profile names. Same category as anthropic.com /
+  # openai.com on these two lines — a vendor Loom drives, not an
+  # operator-owned deployment. Folded onto the existing lines rather than
+  # given their own so this stays a zero-line change to the shell budget.
+  openai.com opentelemetry.io kimi.com moonshot.ai
   apple.com
   npmjs.org crates.io
   biomejs.dev workers.dev
