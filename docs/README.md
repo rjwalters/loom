@@ -9,9 +9,10 @@ as `.loom/docs/`).
 
 | Path | Contents |
 |------|----------|
-| [`adr/`](adr/) | Architecture Decision Records (0001–0016) plus a [template](adr/template.md). Start at the [ADR index](adr/README.md). |
+| [`adr/`](adr/) | Architecture Decision Records (0001–0019) plus a [template](adr/template.md). Numbering is sparse — some numbers were never used. Start at the [ADR index](adr/README.md), which is authoritative for the current set. |
 | [`api/`](api/) | API surface reference. |
 | [`design/`](design/) | Design notes for specific subsystems — config resolution tiers, the label state machine, the supervised restart primitive, Architect/Hermit cadence, [token pool provider identity](design/token-pool-provider-identity.md), [code-intel-lite](design/code-intel-lite.md) (blast-radius helper evaluation for Judge/Hermit), [repo knowledge digest](design/repo-knowledge-digest.md), [retrospective pattern mining](design/retrospective-pattern-mining.md), [fleet cross-repo summary](design/fleet-cross-repo-summary.md) (decides the multi-repo dashboard rollup is already solved). |
+| [`experiments/`](experiments/) | Dated machine-readable receipts from one-off experiment runs (e.g. the native-harness canary and the Kimi harness probe) — evidence artifacts, not prose. |
 | [`guides/`](guides/) | How-to guides: getting started, quickstart tutorial, development, dev workflow, git workflow, testing, code quality, CI/CD setup, CLI reference, daemon dev mode, fork drift, troubleshooting, styling, TypeScript conventions, common tasks. |
 | [`mcp/`](mcp/) | MCP server documentation — see the [MCP README](mcp/README.md) and [loom-terminals](mcp/loom-terminals.md). |
 | [`migration/`](migration/) | Completed-migration history: the [v0.10.0 shepherd deprecation](migration/v0.10.0-shepherd-deprecation.md), the [v0.10.0 daemon rebuild](migration/v0.10.0-daemon-rebuild.md), and [daemon-state consumers](migration/daemon-state-consumers.md). |

@@ -45,12 +45,31 @@ cargo test -- --test-threads=1
 
 ## Test Structure
 
+This directory holds several dozen top-level `*.rs` integration binaries (each
+compiles and runs as its own test target) plus shared support modules. It is
+described by **category** rather than enumerated file-by-file, because a literal
+listing goes stale on the next suite added — use `ls loom-daemon/tests/*.rs` for
+the current set.
+
 ```
 tests/
-├── common/
-│   └── mod.rs           # TestDaemon and TestClient helpers
-├── integration_basic.rs # IPC and terminal lifecycle tests
-└── README.md            # This file
+├── common/mod.rs           # TestDaemon / TestClient helpers (see "Test Helpers")
+├── support/                # Shared non-daemon helpers (e.g. worker CLI harness)
+├── doc_lint_support/       # Shared helpers for the *_doc_lint suites
+├── fixtures/               # Static inputs: shell oracles, retired-script snapshots,
+│                           #   OTLP transport captures, compiled-in .rs fixtures
+├── integration_*.rs        # Full-daemon integration suites — spawn a real daemon and
+│                           #   touch the host-global `tmux -L loom` server. Serialized
+│                           #   by the `daemon-integration` nextest group (see above).
+├── *_cli.rs                # Subcommand-surface suites — drive one `loom-daemon <cmd>`
+│                           #   CLI (accounts, tokens check/unblock, forge check-open-pr,
+│                           #   gh api repo flag …) without a running daemon.
+├── *_doc_lint.rs           # Markdown contract checks over `defaults/.claude/commands/loom/`
+│                           #   and `defaults/roles/` — read the rule below before adding to these.
+└── <subject>.rs            # One-subject suites named for what they pin: worktree locking
+                            #   and WIP verbs, clean/aggressive behavior, epic state
+                            #   invariants, worker spawn, telemetry/collector fan-out,
+                            #   model pricing, shell budget ratchet, and so on.
 ```
 
 ## Markdown Doc-Lint Tests: No New Prose-Existence Assertions
