@@ -2005,7 +2005,9 @@ Several sections, one line each (or the full structured payload with `--json`);
 the table below is not exhaustive — `peer_coordination` (#6157), `stale_sweeps`
 (#7529), `auto_update` (#7584), `worktree_reaper` (#7590), `pool_hold`
 (#7708/#7990), and `transcript_ingest` (#8477) also always render, each
-documented at its own point in this file:
+documented at its own point in this file. `tmpfs_visibility` (#8572, split
+from #8512) is **conditional** — see "tmpfs/`shared`-RAM + OOM-kill
+visibility" below:
 
 | section | what it reports | source |
 |---------|-----------------|--------|
@@ -5988,6 +5990,59 @@ loom-daemon tmpfs-scratch-gc                    # the real run
 to not park build scratch in RAM at all — see `troubleshooting.md` →
 "tmpfs/ramfs scratch reclaim" for the sanctioned on-disk location. See
 `loom-daemon/src/tmpfs_reclaim.rs`.
+
+#### tmpfs/`shared`-RAM + OOM-kill visibility (#8572, split from #8512)
+
+**The gap this closes.** The #8512 incident above was invisible for 2.5 days
+to every signal the fleet already had: `health` reported a low RAM-headroom
+number with no attribution, the work finder's `ram=` budget looked exactly
+like a smaller host, and nothing counted `Out of memory: Killed process …`.
+[`loom_daemon::tmpfs_visibility`] is the read-only counterpart to the reclaim
+pass above — it never deletes anything, it only surfaces the two numbers that
+would have named the problem immediately: `Shmem` from `/proc/meminfo` (the
+same figure `free -h`'s `shared` column reports) and the cumulative kernel
+OOM-kill count from `/proc/vmstat`'s `oom_kill` line.
+
+**`loom-daemon health` gains a conditional `tmpfs_visibility` section** — a
+memory-detail line with total/available/`shared` bytes, the per-mount tmpfs
+breakdown (reusing [`crate::tmpfs_reclaim::ram_backed_mount_points`] rather
+than re-parsing `/proc/mounts`, filtered to mounts holding at least 64 MiB),
+and the OOM-kill count. Degrades **silently** — no section at all, never a
+fabricated `0` — on a host with nothing measurable (macOS, which has no
+`/proc` at all); a `Degraded` verdict fires only on a non-zero cumulative
+OOM-kill count, the single most diagnostic number in the #8512 incident.
+
+**The work finder emits a bounded, non-spammy `WARN`** when `shmem / total`
+crosses a configured fraction (default 15%), naming the largest offending
+mount and the `tmpfs-scratch-gc --dry-run` recipe. **Warning only — it never
+gates dispatch**, unlike the disk/RAM headroom axes above: a host with a
+legitimately large tmpfs (a shared-memory-heavy workload) must not be starved
+of work, and the reclaim pass already removes the Loom-caused case on its own.
+A process-global cooldown (`LOOM_TMPFS_VISIBILITY_WARN_INTERVAL_SECS`, default
+1800s, host-wide like the reclaim pass's own cooldown) bounds the repeat rate
+independent of the 60s work-finder tick interval.
+
+```json
+{
+  "autonomous": {
+    "tmpfsVisibility": {
+      "warnEnabled": true,
+      "warnFractionPercent": 15
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_TMPFS_VISIBILITY_WARN` | `autonomous.tmpfsVisibility.warnEnabled` | env > config > default | `true` (on) — gates the work-finder warning only; `health`'s memory-detail line is unconditional |
+| `LOOM_TMPFS_VISIBILITY_WARN_FRACTION_PERCENT` | `autonomous.tmpfsVisibility.warnFractionPercent` | env > config > default | `15` (percent) |
+| `LOOM_TMPFS_VISIBILITY_WARN_INTERVAL_SECS` | — | env > default | `1800` (30 min) — repeat-rate cooldown, not exposed as a config knob (there is no legitimate reason to want a *noisier* warning) |
+| `LOOM_TMPFS_VISIBILITY_MEMINFO_FILE` / `LOOM_TMPFS_VISIBILITY_VMSTAT_FILE` | — | env only | `/proc/meminfo` / `/proc/vmstat` — test-fixture overrides, mirrors `tmpfs_reclaim`'s own `LOOM_TMPFS_RECLAIM_MOUNTS_FILE` |
+
+See `loom-daemon/src/tmpfs_visibility.rs`,
+`loom-daemon/src/health/tmpfs_visibility_section.rs`, and
+`loom-daemon/src/work_finder/tmpfs_warning.rs`.
 
 #### Eager (out-of-cycle) reclaim from the dispatch loop (#7512)
 

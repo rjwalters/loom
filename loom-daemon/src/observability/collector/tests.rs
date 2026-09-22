@@ -893,6 +893,10 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         // added — `None` (not collected) is fine here since this fixture is
         // not about the `transcript_ingest` axis.
         transcript_ingest: None,
+        // `HealthInputs` gained this field in #8572 after this fixture was
+        // added — `None` (not collected) is fine here since this fixture is
+        // not about the `tmpfs_visibility` axis.
+        tmpfs_visibility: None,
     }
 }
 
