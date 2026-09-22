@@ -147,7 +147,9 @@ pub struct Reference {
     pub p90_seconds: i64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+// No `Eq`: `overhead_fraction_of_p50` is a derived ratio, and a float has no
+// total equality. `PartialEq` is all a report comparison needs or should claim.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Report {
     /// Always true: no provider, forge, or network call occurs in this harness.
     pub offline: bool,
@@ -179,6 +181,12 @@ pub struct Report {
 }
 
 /// Percentiles of this host's own recorded sweep durations.
+///
+/// Nearest-rank selection over the sorted sample, never interpolation, so every
+/// reported percentile is a duration this host actually recorded. Over ten
+/// records p90 is therefore the ninth value, not the maximum — the maximum is
+/// p100, and reporting it as p90 would flatter `overhead_fraction_of_p50`'s
+/// sibling reading by inflating the denominator.
 ///
 /// Returns `None` for an absent or empty journal rather than substituting a
 /// default: the point of the denominator is that it was observed.

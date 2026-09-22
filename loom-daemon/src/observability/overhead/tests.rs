@@ -201,8 +201,43 @@ fn the_denominator_comes_from_observed_durations_and_ignores_zero_length_records
     // The zero-length record is excluded: it is an unmeasured run, not a
     // zero-second sweep, and including it would deflate the denominator.
     assert_eq!(reference.sample_size, 10);
+    // Nearest-rank selection over the sorted sample, never interpolation: the
+    // denominator must be a duration this host actually recorded, so every
+    // percentile is one of the observed values. Over 10 records p90 is the 9th
+    // (90), not the maximum — 100 is p100, and reporting the maximum as p90
+    // would flatter the overhead fraction by inflating its denominator.
     assert_eq!(reference.p50_seconds, 60);
-    assert_eq!(reference.p90_seconds, 100);
+    assert_eq!(reference.p90_seconds, 90);
+    let observed = [10_i64, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+    assert!(observed.contains(&reference.p50_seconds));
+    assert!(observed.contains(&reference.p90_seconds));
+}
+
+#[test]
+fn a_single_observed_run_is_its_own_p50_and_p90() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = crate::sweep_outcomes::default_outcomes_path(dir.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n",
+            json!({
+                "timestamp": "2026-09-21T00:00:00Z",
+                "repo": "rjwalters/loom",
+                "issue": 8525,
+                "sweep_id": "s1",
+                "outcome": "exited",
+                "token_name": "unknown",
+                "duration_sec": 1234,
+            })
+        ),
+    )
+    .unwrap();
+    let reference = observed_reference(dir.path()).expect("one observed run is history");
+    assert_eq!(reference.sample_size, 1);
+    assert_eq!(reference.p50_seconds, 1234);
+    assert_eq!(reference.p90_seconds, 1234);
 }
 
 #[test]
