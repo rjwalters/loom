@@ -42,6 +42,7 @@ pub(super) fn prepare(root: &Path) -> Result<State> {
 }
 
 fn validate_override(root: &Path, path: &Path) -> Result<()> {
+    outside_repositories(root, path)?;
     outside_repositories(root, &canonical_destination(path)?)
 }
 
@@ -138,6 +139,7 @@ fn validate_private_directory(path: &Path) -> Result<()> {
 }
 
 fn auth_snapshot(root: &Path, path: &Path) -> Result<Vec<u8>> {
+    outside_repositories(root, path)?;
     let path = canonical_destination(path)?;
     outside_repositories(root, &path)?;
     validate_private_directory(
@@ -181,6 +183,7 @@ fn create(
             .context("native state requires a home directory or LOOM_NATIVE_TOOLS_DIR")?
             .join(".local/state/loom/native-tools"),
     };
+    outside_repositories(&root, &base)?;
     let base = canonical_destination(&base)?;
     outside_repositories(&root, &base)?;
     // Validate and read an explicitly requested external snapshot before any

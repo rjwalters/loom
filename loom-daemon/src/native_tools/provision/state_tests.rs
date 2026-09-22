@@ -97,6 +97,10 @@ fn symlink_aliases_into_checkouts_are_rejected_but_external_aliases_work() {
     assert!(!root.join("ignored").exists());
     let external = temp.path().join("external");
     fs::create_dir(&external).unwrap();
+    let inside_alias = root.join("secret-alias");
+    symlink(&external, &inside_alias).unwrap();
+    assert!(create(&root, Some(&inside_alias), None, None).is_err());
+    assert!(validate_override(&root.canonicalize().unwrap(), &inside_alias).is_err());
     let good = temp.path().join("external-alias");
     symlink(&external, &good).unwrap();
     assert!(create(&root, Some(&good), None, None)
