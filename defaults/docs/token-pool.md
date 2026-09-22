@@ -2132,7 +2132,8 @@ Four properties keep a parser reading an agent's own transcript honest:
 
 The parse happens in `loom-daemon`, not in `spawn-codex.sh`, for two reasons:
 date parsing is new executable logic and belongs in the daemon
-(`.loom/docs/shell-language-policy.md`), and a new `LOOM_TERMINAL_RESULT` field
+([shell-language-policy.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md)),
+and a new `LOOM_TERMINAL_RESULT` field
 would be dropped wholesale by an older daemon on a mixed-version host, losing
 the bad-mark along with the horizon. Parsing text the adapter already writes
 cannot regress an existing path.
