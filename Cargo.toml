@@ -8,7 +8,7 @@ resolver = "2"
 # hardcoded its own version, so every bump edited two files that could drift
 # apart independently -- the "the bump missed a file" class of #6536/#6730.
 [workspace.package]
-version = "0.19.272"
+version = "0.19.273"
 # The repo this workspace is built from — compiled into `loom-daemon` via
 # `repository.workspace = true` + `env!("CARGO_PKG_REPOSITORY")` (#8513). This
 # is the build-time fallback `auto_update`'s release resolver falls back to
