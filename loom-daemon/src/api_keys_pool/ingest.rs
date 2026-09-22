@@ -48,7 +48,7 @@
 //! limits of the post-hoc choice, not bugs; the alternative was the dispatch
 //! core.
 //!
-//! # Four guards keep this from bad-marking a healthy account
+//! # Five guards keep this from bad-marking a healthy account
 //!
 //! Bad-marking wrongly is worse than not marking at all — the pool is small,
 //! and a 6h cooldown on a working key can idle a fleet. So:
@@ -67,6 +67,15 @@
 //!    ([`Classification::CredentialFailure`]) is surfaced and **not** marked —
 //!    see [`super::classify`], and #8438 for the launch-configuration bug that
 //!    makes a correct key produce one.
+//! 5. **The agent's own words are not the provider's** (#8521). The anchored
+//!    region is a whole run's transcript, and the exhaustion needles are
+//!    ordinary English an agent emits routinely (`judge.md`'s own rate-limit
+//!    signature table quotes three of them verbatim). So this path classifies
+//!    through [`classify_launch_region`], whose prose table sees only the
+//!    lines the provider/harness wrote — never the model's own event
+//!    payloads. Guards 1-4 all held while the matched text came from the
+//!    agent, which is why this one had to be its own guard rather than a
+//!    tightening of another.
 //!
 //! # Marks are class-scoped when the record names a model
 //!
@@ -82,7 +91,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::bad_marks::{self, BadMark};
-use super::classify::{classify, Classification};
+use super::classify::{classify_launch_region, Classification};
 
 /// Prefix of the line `worker_spawn::run` writes before handing off to a
 /// native harness. Everything after it is one JSON object.
@@ -174,9 +183,10 @@ pub fn parse_launch_record(region: &str) -> Option<LaunchRecord> {
 /// Pure half: what `contents` says about the launch anchored at `anchor`,
 /// with no filesystem writes. `None` means "no opinion" — the ordinary case.
 ///
-/// Applies guards 1-3 from the module docs (pool-selected, Loom's own record,
-/// never an exit-0 run). Guard 4 is a property of the returned
-/// [`Classification`] and is applied by [`ingest_launch_log`].
+/// Applies guards 1-3 and 5 from the module docs (pool-selected, Loom's own
+/// record, never an exit-0 run, and never the agent's own transcript). Guard 4
+/// is a property of the returned [`Classification`] and is applied by
+/// [`ingest_launch_log`].
 #[must_use]
 pub fn classify_launch_log(
     contents: &str,
@@ -193,7 +203,9 @@ pub fn classify_launch_log(
     if !record.is_pool_selected() || record.provider.is_none() || record.account.is_none() {
         return None;
     }
-    let classification = classify(region, exit_code.unwrap_or(1))?;
+    // Guard 5: the region is a whole transcript, so the prose table is shown
+    // only the lines the provider/harness wrote — never the agent's own.
+    let classification = classify_launch_region(region, exit_code.unwrap_or(1))?;
     Some((record, classification))
 }
 
