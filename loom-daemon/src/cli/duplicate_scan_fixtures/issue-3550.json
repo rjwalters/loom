@@ -1,0 +1,5 @@
+{
+  "body": "Claude Code's hook output schema now requires hookSpecificOutput.hookEventName. defaults/hooks/guard-destructive.sh omits it in all four emit paths (jq + raw fallback, deny() and ask()), so the harness rejects the JSON and the guard becomes a silent no-op — deny/ask decisions are discarded and the guarded command executes anyway. Fix verified in rjwalters/vibesql @ fab7afcdd: add hookEventName: 'PreToolUse' to all four emit sites. Also worth auditing skill-router.sh / methodology-inject.sh for the same schema drift.",
+  "number": 3550,
+  "title": "guard-destructive.sh: hookSpecificOutput missing required hookEventName — deny/ask decisions silently discarded"
+}
