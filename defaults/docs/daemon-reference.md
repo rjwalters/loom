@@ -5903,6 +5903,83 @@ image for this reaper to reclaim on its next tick, or run `docker image prune
 -f` for immediate reclaim — it only removes dangling (untagged) images and is
 not gated by the guard.
 
+#### tmpfs scratch reclaim (#8512)
+
+**The leak this doesn't share with either pass above.** Both reclaim passes so
+far free **disk**. A build or agent that redirects its scratch onto a
+RAM-backed mount — `CARGO_TARGET_DIR=/dev/shm/cargo-target-<issue>`,
+`TMPDIR=/dev/shm/tmp-issue<N>` — is instead consuming **memory**, and nothing
+in-tree had ever looked at `/dev/shm` or any other `tmpfs`/`ramfs` mount. A
+fleet worker measured **6.2 GB pinned in RAM for 2.5 days** after the owning
+worktree was removed (2026-09-19 → 21): `free` reported `shared 6487 MB` on a
+15.7 GiB host with no swap, and the kernel OOM-killed unrelated `rustc`/
+`pytest` processes on a loop — every one of them a sweep that failed for a
+reason unrelated to its own issue. `df`/`du` over the repo tree showed nothing
+wrong, because the bytes never touched disk.
+
+**Why nothing existing could reclaim it.** The per-worktree cargo-target
+reclaim (#7239, see `troubleshooting.md` → "Redirected cargo target dirs are
+reclaimed with their worktree") deliberately **never** deletes on a
+name/pattern match: a `CARGO_TARGET_DIR` exported only inside a build
+environment cannot be proven to belong to the worktree being removed. That
+invariant is load-bearing and stays — but it is exactly why an orphan whose
+worktree is already gone has nothing left to attribute it to.
+
+**What it does.** As a third sibling pass from the same reaper tick, the daemon
+enumerates every `tmpfs`/`ramfs` mount from `/proc/mounts` (never a hardcoded
+`/dev/shm` prefix), lists the **direct children** of each one whose name
+matches a recognized Loom scratch pattern (`cargo-target-*`, `tmp-issue*`), and
+removes those that satisfy **all four** signals:
+
+1. a recognized Loom scratch-name pattern (a symlink never qualifies — only a
+   real directory),
+2. a mount this pass already classified `tmpfs`/`ramfs`,
+3. no live process holding a file open underneath it (the same
+   `find_processes_using_directory` evidence check the worktree reaper uses),
+   and
+4. a newest recursive mtime at least `stalenessSecs` (default 6h) old.
+
+Failing to establish any one of them keeps the directory. An unreadable
+`/proc/mounts` (non-Linux host, unusual sandbox) yields an empty mount list —
+a clean no-op, never an error. Like the Docker pass, the `minIntervalSecs`
+cooldown is **host-wide**, since a tmpfs mount is not scoped to any one
+registered repo.
+
+**Manual/cron front-end** — `loom-daemon tmpfs-scratch-gc`, which resolves the
+same config the reaper does (so a manual run can never act on a broader
+pattern set than the configured automatic one):
+
+```bash
+loom-daemon tmpfs-scratch-gc --dry-run          # report candidates + sizes, delete nothing
+loom-daemon tmpfs-scratch-gc --dry-run --json   # same, machine-readable
+loom-daemon tmpfs-scratch-gc                    # the real run
+```
+
+```json
+{
+  "autonomous": {
+    "tmpfsScratchGc": {
+      "enabled": true,
+      "stalenessSecs": 21600,
+      "minIntervalSecs": 1800,
+      "namePatterns": ["cargo-target-*", "tmp-issue*"]
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_TMPFS_SCRATCH_GC` | `autonomous.tmpfsScratchGc.enabled` | env > config > default | `true` (on) |
+| `LOOM_TMPFS_SCRATCH_GC_STALENESS_SECS` | `autonomous.tmpfsScratchGc.stalenessSecs` | env > config > default | `21600` (6h) |
+| `LOOM_TMPFS_SCRATCH_GC_MIN_INTERVAL_SECS` | `autonomous.tmpfsScratchGc.minIntervalSecs` | env > config > default | `1800` (30 min) |
+| — | `autonomous.tmpfsScratchGc.namePatterns` | config > default | `cargo-target-*`, `tmp-issue*` |
+
+**This is a backstop, not a licence.** The fix for the underlying behaviour is
+to not park build scratch in RAM at all — see `troubleshooting.md` →
+"tmpfs/ramfs scratch reclaim" for the sanctioned on-disk location. See
+`loom-daemon/src/tmpfs_reclaim.rs`.
+
 #### Eager (out-of-cycle) reclaim from the dispatch loop (#7512)
 
 **The gap this closes.** Every reclaim pass above runs on the **worktree
