@@ -396,6 +396,21 @@ ranking/rotation remains deferred to #4493. The lifecycle CLI treats
 `auth.json` as opaque mutable canonical state, enforces `0700`/`0600`
 permissions, and emits only bounded secret-free diagnostics.
 
+**Kimi (#8563).** Like Pi/OpenCode, Kimi has no transcript this layer reads —
+usage accounting for its Moonshot-platform API-key route rides the same
+`api_keys_pool` signals every other API-key provider uses: the `# LOOM_LAUNCH`
+record's `credentialProvider`/`credentialAccount` identify the session, and
+`api_keys_pool::ingest` classifies the retained launch log after the fact
+(`classify.rs`'s two live-captured Kimi rows — a no-credential failure and an
+exhausted in-process rate-limit ladder, see
+[`token-pool.md` § Kimi's Moonshot-platform API-key route](token-pool.md#kimis-moonshot-platform-api-key-route-8563))
+to decide whether to bad-mark the account. No per-message token/model stream
+exists for this route, so cost fidelity is the aggregate-log tier. Kimi's
+**other** credential shape — the OAuth subscription (`kimi login`, a
+per-account `KIMI_CODE_HOME`) — has no usage-accounting story yet at all; it
+needs its own account-lifecycle foundation first (an `AccountProvider::Kimi`
+analogous to the Codex paragraph above), tracked as follow-up #8628.
+
 ### 5. Instruction format
 
 **Contract:** declare which instruction files the runtime reads, and generate

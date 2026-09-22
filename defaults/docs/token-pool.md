@@ -33,7 +33,7 @@ it does not change runtime resolution or migrate existing credentials.
 - [Codex provider health](#codex-provider-health)
 - [Session-managed Codex accounts: auth-state probe + re-auth runbook (#6927)](#session-managed-codex-accounts-auth-state-probe--re-auth-runbook-6927)
 - [Codex availability probe (`loom-daemon accounts check`, #8407)](#codex-availability-probe-loom-daemon-accounts-check-8407)
-- [API-key account pool for native harnesses (Z.ai/OpenCode, Pi — #8401)](#api-key-account-pool-for-native-harnesses-zaiopencode-pi--8401)
+- [API-key account pool for native harnesses (Z.ai/OpenCode, Pi, Kimi — #8401/#8563)](#api-key-account-pool-for-native-harnesses-zaiopencode-pi-kimi--84018563)
 <!-- toc:end -->
 
 ## Provider-aware account inventory
@@ -2109,12 +2109,12 @@ converse (holding codex-runtime dispatch) needs the work finder to resolve each
 sweep's runtime first. The role-tick side of that question already landed as
 #8408 (see "The gate follows the admitted runtime").
 
-## API-key account pool for native harnesses (Z.ai/OpenCode, Pi — #8401)
+## API-key account pool for native harnesses (Z.ai/OpenCode, Pi, Kimi — #8401/#8563)
 
 A third, provider-neutral pool exists alongside this Claude OAuth pool and the
 Codex `accounts` pool above: `loom-daemon api-keys` rotates a fleet of
 API-key-based subscriptions (e.g. a fleet of Z.ai GLM coding-plan accounts)
-through the native OpenCode/Pi dispatcher, at `.loom/api-keys/<provider>/`
+through the native OpenCode/Pi/Kimi dispatcher, at `.loom/api-keys/<provider>/`
 (gitignored, `0600`, per host — same never-committed contract as
 `.loom/tokens/` above). It is a separate module
 (`loom-daemon/src/api_keys_pool/`) rather than a new `AccountProvider` on this
@@ -2134,3 +2134,35 @@ CLI: [`runtime-model-trials.md` § "API-key account pool"](runtime-model-trials.
 [`tokens import-from-monitor`](#importing-live-tokens-from-claude-monitor-4006): a **pull**-based
 convergence on an operator-maintained source of truth, so an ephemeral or
 autoscaled host that nobody runs `add` on still boots with the fleet's accounts.
+
+### Kimi's Moonshot-platform API-key route (#8563)
+
+Kimi Code CLI has **two** distinct credential shapes, and only one of them is
+this pool's concern. A Moonshot platform API key (`KIMI_MODEL_API_KEY`, the
+`example-kimi-moonshot-api` entry in `defaults/model-profiles.json`) is an
+opaque static secret exactly like a Z.ai coding-plan key, so it needs no new
+code here: `loom-daemon api-keys add kimi <account> --key-file <path>`
+registers it (the provider is positional, not a `--provider` flag; the
+default env-var name, `<PROVIDER>_API_KEY` = `KIMI_API_KEY`, is already the
+profile's `credentialEnv`, so no `--env-var` is needed), and
+`credentialEnv: "KIMI_API_KEY"` in the profile already derives
+`credentialPool: "kimi"` automatically (`provider_from_credential_env` strips
+the `_API_KEY` suffix the same way it derives `zai` from `ZAI_API_KEY`) — the
+profile sets it explicitly anyway, for the same self-documentation reason
+`zai-flash` does. The Kimi Code **subscription** route (OAuth, `kimi login`, a
+per-account `KIMI_CODE_HOME` with a mutable refresh chain much closer to the
+Codex pool's `auth.json` than to this one) is a separate, larger piece of
+work, tracked as its own follow-up (#8628) rather than folded in here.
+
+`classify.rs`'s pattern table gained two live-captured Kimi rows from a
+credential-free probe of the pinned 2.0.2 CLI
+(`docs/experiments/kimi-harness-probe-2026-09-22.json`): a no-credential
+failure (`"No model configured... use /login to sign in"`,
+`CredentialFailure`, never bad-marked) and an exhausted in-process rate-limit
+retry ladder (`"provider.rate_limit: 429 rate limit exceeded"`,
+`RateLimited`). That probe also **corrected** the exit-code premise the
+tracking issue was filed under: the pinned CLI's own process-exit call sites
+are `0, 1, 2, 129, 143` — it never exits `75`, and both captures above were
+observed at exit `1`. Exit code therefore carries no classification signal for
+Kimi, same as every other provider in this table; the split between a
+credential failure and an exhaustion comes entirely from the output text.
