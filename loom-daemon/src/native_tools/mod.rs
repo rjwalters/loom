@@ -4,6 +4,8 @@
 mod cancellation;
 mod files;
 mod guard;
+pub mod kimi;
+pub mod mcp;
 pub mod provision;
 
 use anyhow::{bail, Context, Result};

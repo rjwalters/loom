@@ -62,6 +62,8 @@ enum Commands {
     Worker(loom_daemon::worker_spawn::WorkerCommand),
     /// Execute one guarded native harness tool request from stdin.
     RuntimeTool(loom_daemon::native_tools::ToolArgs),
+    /// Serve the guarded native tool surface to an MCP client over stdio.
+    NativeMcp(loom_daemon::native_tools::mcp::McpArgs),
     /// Initialize a Loom workspace in a target repository
     Init {
         /// Target workspace directory (must be a git repository)
@@ -2677,6 +2679,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::SpawnWorker(args) => loom_daemon::worker_spawn::cli(args),
         Commands::Worker(args) => loom_daemon::worker_spawn::profile_cli(args),
         Commands::RuntimeTool(args) => loom_daemon::native_tools::cli(args),
+        Commands::NativeMcp(args) => loom_daemon::native_tools::mcp::serve(args),
         Commands::AgentSpawn {
             role,
             name,

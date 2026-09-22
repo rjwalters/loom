@@ -255,10 +255,49 @@ fn kimi_missing_binary_is_127_and_unknown_worker_option_is_78() {
 
 #[test]
 fn kimi_role_tagged_launch_fails_closed_naming_the_guarded_tools_follow_up() {
-    // #8562: Kimi has no guarded loom_* tool binding yet, so a role-tagged
-    // launch must be refused rather than silently run with Kimi's own
-    // unguarded builtin tools — even for Curator, which requires no
-    // capability the runtime manifest could otherwise gate on.
+    // #8562: the guarded loom_* tool binding has no live canary receipt yet
+    // (`KIMI_GUARD_VERIFIED = false`), so a role-tagged launch must be
+    // refused rather than silently run with Kimi's own unguarded builtin
+    // tools — even for Curator, which requires no capability the runtime
+    // manifest could otherwise gate on. Uses the credentialEnv profile
+    // (rather than [`kimi_alias_profile`]) so this reaches that refusal
+    // instead of the earlier, separate "guarded launch needs credentialEnv"
+    // check exercised by
+    // `kimi_guarded_launch_without_credential_env_fails_closed_first`.
+    let d = tempfile::tempdir().unwrap();
+    kimi_api_key_profile(d.path());
+    let roles = d.path().join(".loom/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::write(roles.join("curator.json"), "{}").unwrap();
+    let out = worker(d.path(), "kimi")
+        .env("LOOM_ROLE", "curator")
+        .env("LOOM_TEST_KIMI_KEY", "fake-moonshot-secret-key")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(78), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty(), "the harness must never have started");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("8562"), "{stderr}");
+    assert!(stderr.contains("guarded"), "{stderr}");
+    assert!(!stderr.contains("fake-moonshot-secret-key"), "{stderr}");
+    // The unguarded free-form trial (no role tag) is unaffected.
+    let out = worker(d.path(), "kimi")
+        .env("LOOM_TEST_KIMI_KEY", "fake-moonshot-secret-key")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn kimi_guarded_launch_without_credential_env_fails_closed_first() {
+    // A guarded launch relocates KIMI_CODE_HOME, so the config-alias route
+    // (`-m <alias>`, resolved from the operator's own config.toml) cannot
+    // resolve under it. That check runs — and refuses — before the launch
+    // ever reaches the separate #8562 "no live canary receipt" refusal
+    // inside `configure()`, so [`kimi_alias_profile`] (no `credentialEnv`)
+    // must fail with THIS diagnostic, not the #8562 one.
     let d = tempfile::tempdir().unwrap();
     kimi_alias_profile(d.path());
     let roles = d.path().join(".loom/roles");
@@ -272,9 +311,10 @@ fn kimi_role_tagged_launch_fails_closed_naming_the_guarded_tools_follow_up() {
     assert_eq!(out.status.code(), Some(78), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(out.stdout.is_empty(), "the harness must never have started");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("8562"), "{stderr}");
-    assert!(stderr.contains("guarded"), "{stderr}");
-    // The unguarded free-form trial (no role tag) is unaffected.
+    assert!(stderr.contains("credentialEnv"), "{stderr}");
+    assert!(!stderr.contains("8562"), "{stderr} (must not be the configure()-level refusal)");
+    // The unguarded free-form trial (no role tag) is unaffected: it never
+    // calls `configure` and never reaches this check either.
     let out = worker(d.path(), "kimi")
         .args(["-p", "hello"])
         .output()
