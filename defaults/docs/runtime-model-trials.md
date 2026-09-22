@@ -9,6 +9,7 @@ stub. No background daemon or MCP server is needed for a free-form trial.
 
 - [Separate the choices](#separate-the-choices)
 - [First profile: Z.ai Coding Plan](#first-profile-zai-coding-plan)
+- [Kimi Code CLI (issue #8561)](#kimi-code-cli-issue-8561)
 - [API-key account pool (`loom-daemon api-keys`, #8401)](#api-key-account-pool-loom-daemon-api-keys-8401)
 - [More models](#more-models)
 - [Backstopping a trial tap behind the subscriptions (#8436)](#backstopping-a-trial-tap-behind-the-subscriptions-8436)
@@ -109,6 +110,140 @@ The compatibility entry point accepts the same worker options:
 When testing an uninstalled build, set `LOOM_DAEMON_SELF_BIN` to the newly built
 binary before invoking the stub. Existing Claude/Codex adapters still receive
 all their arguments unchanged.
+
+## Kimi Code CLI (issue #8561)
+
+A third native harness, alongside Pi and OpenCode: [Kimi Code
+CLI](https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html)
+(Moonshot AI's terminal agent, npm package `@moonshot-ai/kimi-code`, binary
+`kimi`). Tested version: **2.0.2** (`npm install -g @moonshot-ai/kimi-code`,
+Node ≥ 22.19; `kimi --version`). Put it on `PATH`, or set `LOOM_KIMI_BIN` to
+its executable.
+
+**Unguarded only, for now.** `defaults/runtimes/kimi.json` declares every
+capability `"no"` — there is no `loom_*` guarded-tool binding for Kimi yet
+(tracked in #8562). Kimi is therefore admitted only for roles that declare no
+`runtimeRequirements` (Curator, Guide, Auditor); Builder, Doctor and Judge fail
+closed at exit 78. A role-tagged launch (`LOOM_ROLE` set, or a `/loom:<role>`
+prompt) fails closed a second way, inside `native_tools::provision::configure`,
+naming #8562 — this also catches Curator/Guide/Auditor, since none of them
+require a capability the manifest alone could gate on. Free-form trials with no
+role tag are unaffected.
+
+**Two model-selection routes**, mirroring Kimi's own config precedence (CLI
+flags > env > `config.toml`):
+
+- **Config alias** (`example-kimi-subscription`) — no `credentialEnv` at all.
+  `providers.kimi` names a `[models.<alias>]` entry in the operator's own
+  `$KIMI_CODE_HOME/config.toml`, populated via interactive `kimi login`
+  (device-code OAuth) or a hand-written config. The adapter passes `-m
+  <alias>`; Kimi resolves the model and auth from its own store — the
+  credential ladder's "no pool" case (`worker_spawn::credential::Source::None`).
+- **Moonshot platform API key** (`example-kimi-moonshot-api`) — a declared
+  `credentialEnv` (`KIMI_API_KEY` by convention) switches the adapter to
+  Kimi's config-free env family: `KIMI_MODEL_NAME` (the profile's `model`),
+  `KIMI_MODEL_API_KEY` (via `credentialTargets.kimi`), and
+  `KIMI_MODEL_PROVIDER_TYPE` / `KIMI_MODEL_BASE_URL` translated from the
+  profile's `providerOptions.kimi.providerType` / `.baseUrl`. 2.0.2 accepts
+  exactly three provider types — `kimi`, `anthropic`, `openai` — and validates
+  the variable itself (`KIMI_MODEL_PROVIDER_TYPE must be one of kimi,
+  anthropic, openai, got "…"`), so the adapter forwards it unchanged rather
+  than duplicating that check. No `-m` flag in this route. As with Pi/OpenCode,
+  the key travels only in the child's environment — never argv, the launch
+  record, or a log.
+
+`KIMI_MODEL_THINKING_EFFORT` is set from `--effort`/the profile's `effort` and
+validated **by the adapter** against Kimi's five levels — `low`, `medium`,
+`high`, `xhigh`, `max` (no `off`, unlike Pi) — failing closed at 78 on anything
+else. Loom validates rather than delegating because 2.0.2 does *not*: the
+variable binds to an unconstrained optional string, and an observed
+`KIMI_MODEL_THINKING_EFFORT=bogus` launch was accepted and went on to contact
+the provider, so a typo would otherwise silently consume a whole sweep.
+`KIMI_DISABLE_TELEMETRY=1` and
+`KIMI_CODE_NO_AUTO_UPDATE=1` are set unconditionally, the same reasoning as
+`OPENCODE_DISABLE_AUTOUPDATE=1` in `docker/native/Dockerfile`.
+
+Run in a disposable checkout, with either a config alias already set up via
+`kimi login`, or `KIMI_API_KEY` exported:
+
+```sh
+LOOM_RUNTIME=kimi loom-daemon spawn-worker -- --profile example-kimi-subscription \
+  --log /tmp/kimi-trial.log -p 'Read the task, implement it, and run its tests.'
+LOOM_RUNTIME=kimi loom-daemon spawn-worker -- --profile example-kimi-moonshot-api \
+  --log /tmp/kimi-trial.log -p 'Read the task, implement it, and run its tests.'
+```
+
+(Both example profiles carry placeholder model/alias ids — copy into
+`runtimes.modelProfiles` and edit, they are not usable as shipped.)
+
+**`-p` is mutually exclusive with `--yolo`, `--auto` and `--plan`** — observed
+on 2.0.2, one message per flag: `error: Cannot combine --prompt with --yolo.`
+(likewise `--auto.`, `--plan.`). `-p` already implies auto-approval, so the
+adapter never emits any of them. Loom's own `--dangerously-skip-permissions` is
+therefore a **silent no-op** for Kimi, exactly as it already is for Pi — and it
+is dropped rather than forwarded, because Kimi does not have that flag either
+(`error: unknown option '--dangerously-skip-permissions'`, exit 1).
+
+**`KIMI_CODE_HOME`** relocates Kimi's whole data root (`~/.kimi-code` by
+default) — config, sessions, logs and OAuth credentials all move with it.
+Useful for isolating one operator's config-alias login from another's without
+touching the shared default, but this adapter does not set it (that is the
+account-pool follow-up's job, #8563 — per-account `KIMI_CODE_HOME` rotation).
+
+**No stdin-delivery route (#8506 finding).** Pi and OpenCode deliver the
+expanded role prompt on stdin instead of argv, to stay under Linux's
+`MAX_ARG_STRLEN` (issue #8506). The pinned Kimi CLI (2.0.2) has **no**
+`--input-format` flag at all — only `--output-format` — so there is nothing to
+prefer over argv: the prompt travels as `-p`'s own argv value, and stdin is
+left untouched. A sufficiently large expanded role prompt can still hit
+`E2BIG` on Kimi; that gap is recorded on #8506 rather than worked around here,
+since no mitigation exists on the CLI's current surface.
+
+**Exit codes — the vendor's `75` does not exist on 2.0.2.** Issue #8561 was
+filed against a documented print-mode contract of `0` success / `1` permanent
+(config, auth, quota) / **`75` transient** (rate limit, 5xx, timeout). Probing
+the pinned CLI contradicts the last of those:
+
+| Observed on 2.0.2 | Exit | Evidence |
+|---|---|---|
+| no model configured | `1` | `error: failed to run prompt: No model configured.` |
+| unknown flag | `1` | `error: unknown option '--dangerously-skip-permissions'` |
+| HTTP 429 from the provider, **retries exhausted** | `1` | `error: failed to run prompt: provider.rate_limit: 429 rate limit exceeded` |
+| SIGTERM / SIGHUP | `143` / `129` | standard signal exits |
+
+`75` is emitted nowhere in the shipped bundle (`process.exit` sites are `0`,
+`1`, `2`, `129`, `143`). Kimi 2.0.2 instead **absorbs transients itself**: a
+429 is retried in-process up to 10 times with exponential backoff, each attempt
+announced on the NDJSON stream as `{"role":"meta","type":"turn.step.retrying",
+…,"status_code":429}`, and only the *exhaustion* of that ladder surfaces as a
+process exit — as `1`, not `75`. So there is nothing for Loom to map: no
+`_classify_error_kimi` table is added, and **no** special-casing of `75`.
+
+That is the correct outcome rather than a gap. `classify_error`'s generic,
+provider-independent transient table already classifies the exhaustion text
+above as `RECOVERABLE` (it matches both the `429` and the `rate.limit`
+patterns), which is exactly the retry-with-backoff verdict the `75` mapping was
+meant to produce. `defaults/scripts/tests/test-classify-error.sh` pins that
+with the captured strings so a future table addition cannot silently regress
+it. Splitting the remaining `1`s into `TOKEN_EXPIRED` / `TOKEN_EXHAUSTED` /
+`FATAL` needs real credentialled output this issue cannot capture — per the
+Codex-table rule in `runtime-adapters.md` § "3. Error classification", leave a
+category unimplemented rather than guess it — and is #8563's job.
+
+**Live canary: NOT performed.** No Kimi/Moonshot credential exists in the
+environment this adapter was built in, so the read/edit/test canary against a
+real model — #8561's last acceptance criterion — was **not** run, and no
+receipt of one was fabricated. It is tracked in **#8606**; the receipt it must
+produce has the same shape as
+[`native-harness-canary-2026-09-19.json`](https://github.com/rjwalters/loom/blob/main/docs/experiments/native-harness-canary-2026-09-19.json).
+
+What *was* done instead is a **credential-free harness probe** of the real
+2.0.2 binary, recorded verbatim in
+[`docs/experiments/kimi-harness-probe-2026-09-22.json`](https://github.com/rjwalters/loom/blob/main/docs/experiments/kimi-harness-probe-2026-09-22.json):
+every claim this section makes about the CLI's flag surface, env family,
+model-selection routes and exit codes is an observation in that file. It is
+deliberately *not* filed as a canary — it proves the adapter targets the CLI
+correctly, and proves nothing about a model actually completing a task.
 
 ## API-key account pool (`loom-daemon api-keys`, #8401)
 

@@ -8,10 +8,13 @@ so that Loom can drive Claude Code, OpenAI Codex CLI, Amp, oh-my-pi (omp), and
 future tools through **one** interface instead of a growing pile of per-runtime
 special cases.
 
-Pi and OpenCode have experimental **native Rust** adapters behind the same
-worker entry point. Harness selection, model profiles and trial evidence are
-separate: see [Native harness and model trials](runtime-model-trials.md).
-Guarded issue roles and sweeps: [native guardrail parity](guardrail-parity-native.md).
+Pi, OpenCode and Kimi Code CLI have experimental **native Rust** adapters
+behind the same worker entry point. Harness selection, model profiles and
+trial evidence are separate: see [Native harness and model
+trials](runtime-model-trials.md). Guarded issue roles and sweeps: [native
+guardrail parity](guardrail-parity-native.md) — Kimi is not covered there yet:
+it has no guarded `loom_*` tool binding (#8562), so it is admitted only for
+roles with no `runtimeRequirements`.
 
 > **Path convention.** This doc lives at `defaults/docs/runtime-adapters.md` in
 > the Loom source repo and cites `defaults/` paths throughout. A consumer
@@ -72,6 +75,7 @@ them but does not decide them.
 | Claude Code | `defaults/scripts/spawn-claude.sh` | **1** (default) | n/a — Loom's guards *are* the Claude implementation | the whole existing suite | Zero-regression default; no `LOOM_RUNTIME` needed. |
 | OpenAI Codex CLI | `defaults/scripts/spawn-codex.sh` | **2** | [`guardrail-parity-codex.md`](guardrail-parity-codex.md) | `codex-adapter-smoke` in `.github/workflows/ci.yml` (mocked; no live calls) | **Shipped** by epic #4167 Phase 2 (#4468), ported from the gpeyton fork. Requires Codex CLI ≥ 0.146.0. Capability manifest `defaults/runtimes/codex.json` declares `worktreeIsolation: partial`, so `check-runtime-capabilities.sh` fails Builder+codex closed while Judge+codex passes. |
 | Amp, oh-my-pi (omp), … | — | — | — | — | Not started (tier-2 candidates; still need a parity doc + CI leg). |
+| Pi, OpenCode, Kimi Code CLI | native Rust, `loom-daemon/src/worker_spawn/harness.rs` | **2** | [`guardrail-parity-native.md`](guardrail-parity-native.md) (Pi/OpenCode only — Kimi is not covered) | none dedicated (`worker_spawn.rs`/`worker_spawn_kimi.rs` integration tests) | Setup, model profiles and live-canary evidence live in [`runtime-model-trials.md`](runtime-model-trials.md), not here. Kimi (#8561) declares every `defaults/runtimes/kimi.json` capability `"no"` — no guarded `loom_*` tool binding exists yet (#8562) — so it is admitted only for roles with no `runtimeRequirements` (Curator, Guide, Auditor); Pi/OpenCode's `worktreeIsolation`/`loomControl` are `"yes"`. |
 | Aider ([aider.chat](https://aider.chat)) | `defaults/scripts/spawn-aider.sh` (thin wrapper over `defaults/scripts/spawn-generic.sh`) | **3** (generic passthrough, unverified) | n/a — tier-3 does not require one | none (no CI leg is required for tier-3; the checker assertion below is a plain `test-*.sh`, not an adapter-admission gate) | **Worked example** for issue #4780 — proves the tier-3 mechanism end-to-end, not a vetted integration. Capability manifest `defaults/runtimes/aider.json` declares every capability `"no"`, including `worktreeIsolation: "no"` EXPLICITLY (not `"partial"`). |
 
 ### Tier 3: generic passthrough
