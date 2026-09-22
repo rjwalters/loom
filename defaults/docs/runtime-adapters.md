@@ -1333,8 +1333,9 @@ install; see [`docker/native/README.md`](https://github.com/rjwalters/loom/blob/
 
 ### Native-harness ephemeral containment (issue #8403, epic #6896 Phase 3)
 
-Native-harness sweeps (Pi, OpenCode — admitted by #8363/#8400) run **uncontained
-on the host by default**, exactly as before. Opt in per workspace:
+Native-harness sweeps (Pi, OpenCode — admitted by #8363/#8400; Kimi — #8561,
+contained by #8565) run **uncontained on the host by default**, exactly as
+before. Opt in per workspace:
 
 ```json
 {
@@ -1397,12 +1398,27 @@ writable layer:
 | `XDG_CONFIG_HOME` | XDG-honouring config, including `gh`'s (bind-mounted *into* this path, not the host's `~/.config/gh`, so `gh` can still find it) |
 | `XDG_CACHE_HOME`, `XDG_STATE_HOME` | the remaining XDG bases, relocated for completeness rather than left to leak |
 | `OPENCODE_CONFIG_DIR` | the injected deny-by-default `loom-worker` agent config; `OPENCODE_CONFIG_CONTENT` itself is unchanged |
+| `KIMI_CODE_HOME` | Kimi's **whole** state in one variable (#8565) — config, `mcp.json`, session store, `logs/kimi-code.log`, credential store, plugins, and the `rg`/`fd` binaries it downloads into `$KIMI_CODE_HOME/bin/` on first use. Unset it is `~/.kimi-code`, i.e. one shared home for every worker; the image bakes no value, so this assignment is the only thing standing between N Kimi workers and one session store. A *guarded* launch relocates it again, into `native_tools::provision`'s 0700 directory under the per-launch `LOOM_NATIVE_TOOLS_DIR` below — resolving inside the container, as `OPENCODE_CONFIG_DIR` does |
 | `LOOM_NATIVE_TOOLS_DIR` | the generated guarded-tool bindings (`native_tools::provision`), which otherwise default to the *shared*, parity-mounted `<workspace>/.loom/native-tools` |
 
 Two concurrent contained workers are therefore disjoint twice over: different
 containers, **and** different paths within them. The per-launch id is not
 redundant — it makes the disjointness inspectable (`docker exec <id> ls
 /home/loom/.loom-native`) rather than merely implied by the container boundary.
+
+A name in that table is **never** forwarded by the by-name passthrough below,
+even when a model profile's `credentialTargets` names one: `-e NAME` with no
+`=value` is read from the *host* and, coming later on the command line, would
+beat the assignment that established the per-launch path. The exclusion is
+derived from the same `ISOLATED_DIRS` constant that emits the assignments, so
+the two cannot drift.
+
+The image also bakes `OPENCODE_DISABLE_AUTOUPDATE=1`,
+`KIMI_CODE_NO_AUTO_UPDATE=1` and `KIMI_DISABLE_TELEMETRY=1`, and the dispatch
+passes the same three at `docker run` time — the first two are the runtime half
+of the image's version pins (a pinned install is worth nothing if the CLI
+updates itself on first launch), the third keeps a dispatched worker from
+phoning home.
 
 **Credential shape.** The selected model profile's `credentialEnv` and its
 per-harness `credentialTargets` entry are forwarded **by name only** (`-e VAR`,
@@ -1476,7 +1492,14 @@ check that tests what the *CLI* writes, not only what the dispatcher passes),
 and **#8435** is `cancel_sweep`'s container teardown, which is owed to the
 *Claude* ephemeral path identically (killing the `docker run` client does not
 stop the container dockerd owns) and so is fixed once for both shapes rather
-than branched per runtime.
+than branched per runtime. #8434 stays open and Pi/OpenCode-scoped — Kimi got
+its own live containment run when Docker happened to be available in the
+builder worktree that added it (#8565):
+[`kimi-containment-verification-2026-09-22.md`](kimi-containment-verification-2026-09-22.md)
+covers the image build, the version-pin assertions, two-worker
+disjointness, and the writable-layer credential scan, but — like #8434's own
+still-open canary item — **not** a credentialed functional run (no Kimi
+account was available either).
 
 ### Containerized dispatch mode for Claude sweeps (issue #7429, epic #6896 Phase 3)
 

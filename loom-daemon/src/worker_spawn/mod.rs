@@ -337,6 +337,10 @@ fn run_preflight(
                 .map_err(|e| LaunchError::config(e.to_string()))?;
             return exec(command);
         }
+        // Inside the container, the re-exec'd copy falls through to here (the
+        // sentinel made `resolve` return `None`). Materialize the per-launch
+        // directories the outer half only NAMED — a no-op on the host (#8565).
+        containment::materialize_launch_dirs();
         // Fails closed (78) only when this host has a pool for the profile's
         // credential provider and none of its accounts is usable (#8401).
         let credential = credential::resolve(root, &selection)?;

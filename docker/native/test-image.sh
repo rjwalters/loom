@@ -24,6 +24,9 @@ set -uo pipefail
 IMAGE="${1:?usage: test-image.sh <image-tag>}"
 OPENCODE_VERSION="${OPENCODE_VERSION:-1.18.31}"
 PI_VERSION="${PI_VERSION:-0.85.1}"
+KIMI_CODE_VERSION="${KIMI_CODE_VERSION:-2.0.2}"
+# @moonshot-ai/kimi-code's own engines.node floor (#8565).
+KIMI_NODE_FLOOR="${KIMI_NODE_FLOOR:-22.19.0}"
 
 FAILURES=0
 fail() {
@@ -56,7 +59,7 @@ else
     fail "image architecture ($IMAGE_ARCH) does not match host ($HOST_ARCH_RAW -> $HOST_ARCH) — built under emulation, or with the wrong --platform?"
 fi
 
-# 2. Both native CLIs are present at the EXACT pinned versions
+# 2. All three native CLIs are present at the EXACT pinned versions
 # .loom/docs/guardrail-parity-native.md records as tested. Equality, not a
 # floor: the parity doc records a tested version, and "newer" is not
 # "verified" (that doc's own "CLI exit zero is not acceptance evidence").
@@ -74,21 +77,60 @@ else
     fail "pi reports '$PI_ACTUAL', expected the pinned $PI_VERSION (.loom/docs/guardrail-parity-native.md)"
 fi
 
+# `kimi -V` is the version command the #8561 harness probe recorded against
+# 2.0.2 (docs/experiments/kimi-harness-probe-2026-09-22.json).
+KIMI_ACTUAL="$(in_image 'kimi -V' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+if [[ "$KIMI_ACTUAL" == "$KIMI_CODE_VERSION" ]]; then
+    pass "kimi is pinned at the tested version: $KIMI_ACTUAL"
+else
+    fail "kimi reports '$KIMI_ACTUAL', expected the pinned $KIMI_CODE_VERSION (.loom/docs/guardrail-parity-native.md)"
+fi
+
+# 2b. Node meets Kimi's engines.node floor. The Dockerfile asserts this at
+# build time; re-asserting it here catches an image built from an older
+# Dockerfile or with an overridden NODE_VERSION.
+NODE_ACTUAL="$(in_image 'node --version' | tr -d 'v' | tr -d '\r')"
+# `sort` consumes its whole input, so this pipeline has no early-exit consumer
+# to SIGPIPE the producer under `pipefail` (scripts/check-pipefail-early-exit.sh);
+# the lowest version is taken with a parameter expansion, not `head -1`.
+NODE_SORTED="$(printf '%s\n%s\n' "$KIMI_NODE_FLOOR" "$NODE_ACTUAL" | sort -V)"
+if [[ "${NODE_SORTED%%$'\n'*}" == "$KIMI_NODE_FLOOR" ]]; then
+    pass "node $NODE_ACTUAL meets Kimi's engines.node floor ($KIMI_NODE_FLOOR)"
+else
+    fail "node $NODE_ACTUAL is below Kimi's engines.node floor ($KIMI_NODE_FLOOR)"
+fi
+
 # 3. The runtime half of the pin: the CLI must not be able to update itself
 # past the tested version on first launch inside a container.
-if [[ "$(in_image 'echo "${OPENCODE_DISABLE_AUTOUPDATE:-unset}"')" == "1" ]]; then
-    pass "OPENCODE_DISABLE_AUTOUPDATE=1 is baked into the image"
+for hygiene in OPENCODE_DISABLE_AUTOUPDATE KIMI_CODE_NO_AUTO_UPDATE KIMI_DISABLE_TELEMETRY; do
+    if [[ "$(in_image "echo \"\${${hygiene}:-unset}\"")" == "1" ]]; then
+        pass "$hygiene=1 is baked into the image"
+    else
+        fail "$hygiene is not 1 in the image environment"
+    fi
+done
+
+# 3b. KIMI_CODE_HOME must NOT be baked in: `worker_spawn::containment` points
+# it at a per-launch path, and an image-level value would hand every worker in
+# a container one shared home again (#8565).
+KIMI_HOME_BAKED="$(in_image 'echo "${KIMI_CODE_HOME:-unset}"')"
+if [[ "$KIMI_HOME_BAKED" == "unset" ]]; then
+    pass "KIMI_CODE_HOME is not baked into the image (the dispatcher relocates it per launch)"
 else
-    fail "OPENCODE_DISABLE_AUTOUPDATE is not 1 in the image environment"
+    fail "KIMI_CODE_HOME is baked in as '$KIMI_HOME_BAKED' — every worker in a container would share one home"
 fi
 
 # 4. The ephemeral per-launch state root exists, is owned by uid 1000, is
 # writable, and is EMPTY — it is a writable-layer location, never a mount
 # point and never baked content.
+# The `probe/kimi/bin` leaf is not decoration: Kimi downloads `rg`/`fd` into
+# `$KIMI_CODE_HOME/bin/` on first use, so a per-launch home that cannot be
+# created and written under is a broken Kimi launch, not merely untidy (#8565).
 STATE_CHECK=$(in_image '
     root=/home/loom/.loom-native
     echo "OWNER_UID=$(stat -c %u "$root" 2>/dev/null)"
-    mkdir -p "$root/probe/data" 2>/dev/null && echo WRITABLE=1
+    mkdir -p "$root/probe/data" "$root/probe/kimi/bin" 2>/dev/null \
+        && touch "$root/probe/kimi/bin/rg" 2>/dev/null && echo WRITABLE=1
 ')
 if [[ "$STATE_CHECK" == *"OWNER_UID=1000"* && "$STATE_CHECK" == *"WRITABLE=1"* ]]; then
     pass "/home/loom/.loom-native exists, is owned by uid 1000, and is writable"
@@ -132,6 +174,7 @@ for pattern in \
     OPENAI_API_KEY \
     ZAI_API_KEY \
     ZHIPU_API_KEY \
+    KIMI_MODEL_API_KEY \
     'sk-[A-Za-z0-9]{20,}' \
     'accounts\.env' \
     '\.loom/tokens/.*\.token' \
@@ -151,7 +194,7 @@ fi
 # 7. Core toolchain inherited from the base image is still present (sanity
 # check that this layer did not shadow or break anything), plus the Node
 # runtime OpenCode needs at LAUNCH time to install its own plugin package.
-for bin in git gh jq curl claude node npm opencode pi; do
+for bin in git gh jq curl claude node npm opencode pi kimi; do
     if in_image "command -v $bin >/dev/null 2>&1"; then
         pass "$bin present on PATH"
     else

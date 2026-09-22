@@ -1,13 +1,14 @@
 # `loom-worker-native` image
 
 `ghcr.io/rjwalters/loom-worker-native:<version>` (+ `:latest`) is the image
-that **per-sweep ephemeral containers for native-harness (Pi / OpenCode)
-sweeps** run in — published by `.github/workflows/release.yml` FROM the
+that **per-sweep ephemeral containers for native-harness (Pi / OpenCode /
+Kimi) sweeps** run in — published by `.github/workflows/release.yml` FROM the
 same-version `ghcr.io/rjwalters/loom-worker:<version>` base image, so the two
 versions stay in lockstep by construction, exactly like
 [`loom-worker-session`](../session/README.md) does.
 
-Filed as issue #8403 (epic #6896 Phase 3). Full architecture context:
+Filed as issue #8403 (epic #6896 Phase 3); Kimi added by #8565. Full
+architecture context:
 **ADR-0017**,
 [`docs/adr/0017-session-container-architecture.md`](../../docs/adr/0017-session-container-architecture.md).
 
@@ -18,7 +19,7 @@ ADR-0017 specifies **two container lifetimes**, not two CLIs:
 | Lifetime | Image | Runtime | Why that lifetime |
 |---|---|---|---|
 | Per-account, **persistent** | `loom-worker-session` | Codex | `CODEX_HOME/auth.json` is a mutable OAuth **refresh chain**. A refresh rotates the stored credential, so exactly one process may own it; a second concurrent owner invalidates the first. Persistence is what gives that chain an owner. |
-| Per-sweep, **ephemeral** | `loom-worker` (Claude), **`loom-worker-native`** (Pi/OpenCode) | Claude, Pi, OpenCode | Stateless credential. Nothing on the container's filesystem needs to survive the sweep, so the container is created fresh and destroyed at the end. |
+| Per-sweep, **ephemeral** | `loom-worker` (Claude), **`loom-worker-native`** (Pi/OpenCode/Kimi) | Claude, Pi, OpenCode, Kimi | Stateless credential. Nothing on the container's filesystem needs to survive the sweep, so the container is created fresh and destroyed at the end. |
 
 A native harness on an API-key subscription is squarely in the second row:
 **an API key has no refresh chain**, so there is nothing for a persistent
@@ -39,17 +40,18 @@ than another CLI bolted into that one.
 The base image's `FROM` contract (Ubuntu 24.04, `loom-daemon`, Claude Code CLI,
 `git`/`gh`/`jq`/`tmux`/build-essential, non-root `loom` user uid/gid `1000`,
 `/workspace`) is unchanged — see [`docker/worker/README.md`](../worker/README.md).
-This layer adds exactly four things:
+This layer adds exactly five things:
 
 | Addition | Detail |
 |---|---|
-| Node.js + npm | npm is the only distribution channel for both native CLIs, and OpenCode additionally installs its own `@opencode-ai/plugin` package into its config directory **at launch time**, so npm must be present at run time too. Installed from the official upstream tarball (checksum-verified), identical pins to `docker/session/Dockerfile`. |
+| Node.js + npm | npm is the only distribution channel for all three native CLIs, and OpenCode additionally installs its own `@opencode-ai/plugin` package into its config directory **at launch time**, so npm must be present at run time too. Installed from the official upstream tarball (checksum-verified), identical pins to `docker/session/Dockerfile`. |
 | OpenCode CLI | `opencode-ai`, pinned to `OPENCODE_VERSION` (default `1.18.31`). |
 | Pi CLI | `@earendil-works/pi-coding-agent`, pinned to `PI_VERSION` (default `0.85.1`). |
-| `OPENCODE_DISABLE_AUTOUPDATE=1` | The runtime half of the pin — a pinned install is not enough if the CLI can update *itself* past the tested version on first launch. |
+| Kimi Code CLI | `@moonshot-ai/kimi-code`, pinned to `KIMI_CODE_VERSION` (default `2.0.2`). Its `engines.node` floor (`KIMI_NODE_FLOOR`, default `22.19.0`) is asserted **before** any package is fetched — npm only *warns* on an engine mismatch, so a future Node downgrade would otherwise ship a Kimi that fails at first launch instead of failing this build. The image's Node (`24.19.0`) already clears it; no bump was needed. |
+| `OPENCODE_DISABLE_AUTOUPDATE=1`, `KIMI_CODE_NO_AUTO_UPDATE=1`, `KIMI_DISABLE_TELEMETRY=1` | The runtime half of the pin — a pinned install is not enough if the CLI can update *itself* past the tested version on first launch. Kimi's telemetry switch rides along: a dispatched worker must not phone home either. |
 
 **The pins are equality-checked at build time, not floor-checked.**
-`1.18.31` / `0.85.1` are the exact versions
+`1.18.31` / `0.85.1` / `2.0.2` are the exact versions
 [`.loom/docs/guardrail-parity-native.md`](../../.loom/docs/guardrail-parity-native.md)
 and its [verification receipt](../../.loom/docs/native-runtime-verification-2026-09-19.md)
 record as *tested*. A version floor would be the wrong check here: the parity
@@ -66,8 +68,8 @@ persistence of any kind in this image.
 
 **Zero secrets in this image**, same guarantee as the base image — verified by
 [`test-image.sh`](test-image.sh)'s `docker history` scan, extended with
-native-credential shapes (`ZAI_API_KEY`, `ZHIPU_API_KEY`, a stray `auth.json`)
-on top of the base set.
+native-credential shapes (`ZAI_API_KEY`, `ZHIPU_API_KEY`, `KIMI_MODEL_API_KEY`,
+a stray `auth.json`) on top of the base set.
 
 ## The ephemeral state root
 
@@ -77,7 +79,7 @@ on top of the base set.
 
 `loom_daemon::worker_spawn::containment` points every one of
 `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`,
-`OPENCODE_CONFIG_DIR`, and `LOOM_NATIVE_TOOLS_DIR` at
+`OPENCODE_CONFIG_DIR`, `KIMI_CODE_HOME`, and `LOOM_NATIVE_TOOLS_DIR` at
 `/home/loom/.loom-native/<per-launch-id>/…` inside this tree. Guarded uncontained
 launches now also isolate auth/session state outside repositories (#8568).
 Containment additionally places it in an ephemeral container layer; it does not
@@ -93,6 +95,28 @@ container boundary.
 
 This directory is a **writable-layer location, never a mount point**. Nothing
 is bind-mounted over it, and nothing in it survives the container.
+
+### Kimi's home is one variable, and it is not baked in
+
+Kimi keeps *everything* under `KIMI_CODE_HOME` — `config.toml`, `mcp.json`,
+the session store, `logs/kimi-code.log`, its credential store, plugins, and the
+`rg`/`fd` binaries it downloads into `$KIMI_CODE_HOME/bin/` on first use
+(unset ⇒ `~/.kimi-code`). The image therefore **does not set it**: an
+image-level value would hand every worker in a container one shared home again,
+which is the collision the relocation exists to prevent. `test-image.sh`
+asserts it is unset for exactly that reason.
+
+Two consequences worth stating plainly:
+
+- **`rg`/`fd` are fetched per launch.** A fresh home means a fresh download.
+  That is the accepted cost of per-launch isolation; it is also why this tree
+  is ordinary writable layer and why nothing runs the container `--read-only`.
+- **A guarded launch relocates it a second time.** `native_tools::provision`
+  points `KIMI_CODE_HOME` at its own 0700 per-launch directory under
+  `LOOM_NATIVE_TOOLS_DIR` (itself per-launch, in this same tree) and writes the
+  generated `config.toml` / `mcp.json` / `--agent-file` there — resolving
+  *inside* the container, exactly as `OPENCODE_CONFIG_DIR` does. The value set
+  at `docker run` time is what an **unguarded** free-form trial gets.
 
 ## Build
 

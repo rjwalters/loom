@@ -34,6 +34,9 @@ fn clear_env() {
         "LOOM_SWEEP_CONTAINER_RESERVED_MEMORY_MB",
         "LOOM_SWEEP_CLAIM_OWNED",
         "CARGO_TARGET_DIR",
+        "KIMI_CODE_HOME",
+        "KIMI_MODEL_API_KEY",
+        "LOOM_NATIVE_CONTAINMENT",
     ] {
         std::env::remove_var(key);
     }
@@ -229,14 +232,7 @@ fn every_isolated_directory_is_inside_the_ephemeral_layer() {
     std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
     let p = profile(None, Some("1g"));
     let args = build(&p, &[]);
-    for key in [
-        "XDG_DATA_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_STATE_HOME",
-        "OPENCODE_CONFIG_DIR",
-        "LOOM_NATIVE_TOOLS_DIR",
-    ] {
+    for (key, _) in ISOLATED_DIRS {
         let assignment = args
             .iter()
             .find(|a| a.starts_with(&format!("{key}=")))
@@ -252,6 +248,159 @@ fn every_isolated_directory_is_inside_the_ephemeral_layer() {
         );
     }
     std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+/// #8565: Kimi keeps config, sessions, logs, credentials, plugins AND its
+/// downloaded `rg`/`fd` binaries under one `KIMI_CODE_HOME`, defaulting to
+/// `$HOME/.kimi-code`. Left unset, every contained Kimi worker would land on
+/// the container home's single `.kimi-code` — disjoint between containers, but
+/// not inspectably per-launch, and identical in shape to the uncontained
+/// shared-home bug this module exists to close.
+#[test]
+fn kimi_code_home_is_relocated_per_launch_and_is_not_the_container_home() {
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    let p = profile(None, Some("1g"));
+    let args = build(&p, &[]);
+    let home = args
+        .iter()
+        .find(|a| a.starts_with("KIMI_CODE_HOME="))
+        .unwrap_or_else(|| panic!("KIMI_CODE_HOME must be set: {args:?}"));
+    let value = home.split_once('=').unwrap().1;
+    assert_eq!(value, format!("{}/kimi", p.ephemeral_root()), "{args:?}");
+    assert!(
+        !value.starts_with(&format!("{CONTAINER_HOME}/.kimi-code")),
+        "the default shared home is exactly what the relocation avoids: {value}"
+    );
+
+    // Two launches differ by PATH, not only by container.
+    let other = Profile {
+        launch_id: "feedface".to_string(),
+        ..p.clone()
+    };
+    let other_args = build(&other, &[]);
+    let other_home = other_args
+        .iter()
+        .find(|a| a.starts_with("KIMI_CODE_HOME="))
+        .expect("KIMI_CODE_HOME");
+    assert_ne!(
+        home, other_home,
+        "two concurrent Kimi workers must not share a session store, log or credential file"
+    );
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+/// The runtime half of the image's version pin, for Kimi as for OpenCode: a
+/// pinned install is worth nothing if the CLI can update itself, and a
+/// dispatched worker must not phone home.
+#[test]
+fn autoupdate_and_telemetry_are_disabled_for_every_pinned_cli() {
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    let args = build(&profile(None, Some("1g")), &[]);
+    for expected in [
+        "OPENCODE_DISABLE_AUTOUPDATE=1",
+        "KIMI_CODE_NO_AUTO_UPDATE=1",
+        "KIMI_DISABLE_TELEMETRY=1",
+    ] {
+        assert!(args.iter().any(|a| a == expected), "missing {expected}: {args:?}");
+    }
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+/// A credential NAME that collides with a relocated directory must not be
+/// forwarded: `-e NAME` (no `=`) re-reads the host's value and, coming later
+/// on the command line, would beat the assignment that established the
+/// per-launch path.
+#[test]
+fn a_credential_name_cannot_override_a_per_launch_directory() {
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    std::env::set_var("KIMI_CODE_HOME", "/host/shared/.kimi-code");
+    let p = profile(None, Some("1g"));
+    let args = build(&p, &["KIMI_CODE_HOME", "XDG_DATA_HOME"]);
+    assert!(
+        !args
+            .iter()
+            .any(|a| a == "KIMI_CODE_HOME" || a == "XDG_DATA_HOME"),
+        "a bare -e for a relocated directory would reinstate the host value: {args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|a| a == &format!("KIMI_CODE_HOME={}/kimi", p.ephemeral_root())),
+        "the per-launch assignment must survive: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.contains("/host/shared")),
+        "no host state path may reach the container: {args:?}"
+    );
+    std::env::remove_var("KIMI_CODE_HOME");
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+/// The credential-by-name contract is runtime-agnostic, but Kimi's own key
+/// name is the one an API-key Kimi profile forwards (`credentialTargets.kimi`
+/// → `KIMI_MODEL_API_KEY`), so pin it explicitly alongside the generic case.
+#[test]
+fn a_kimi_api_key_is_forwarded_by_name_and_never_by_value() {
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    std::env::set_var("KIMI_MODEL_API_KEY", "sk-kimi-super-secret-value");
+    let args = build(&profile(None, Some("1g")), &["KIMI_MODEL_API_KEY"]);
+    assert!(
+        args.iter().any(|a| a == "KIMI_MODEL_API_KEY"),
+        "the key must be forwarded by bare name: {args:?}"
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|a| a.contains("sk-kimi-super-secret-value")),
+        "no argv element may carry the key's VALUE (it would land in `ps`): {args:?}"
+    );
+    std::env::remove_var("KIMI_MODEL_API_KEY");
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+/// The container-side half: the outer dispatch can only NAME the per-launch
+/// directories, and the image's `.loom-native` tree is deliberately empty, so
+/// the re-exec'd copy has to create them. Kimi's home is a download target
+/// (`$KIMI_CODE_HOME/bin/rg`), not merely a config root, so "the CLI will
+/// mkdir it" is not a safe assumption to carry.
+#[test]
+fn the_reexeced_copy_materializes_the_named_directories_and_nothing_else() {
+    let _g = env_lock();
+    clear_env();
+    let root = std::env::temp_dir().join(format!("loom-8565-{}", uuid::Uuid::new_v4().simple()));
+    let home = root.join("kimi");
+    std::env::set_var("KIMI_CODE_HOME", &home);
+
+    // Host dispatch (no containment marker) must not touch the filesystem.
+    materialize_launch_dirs();
+    assert!(!home.exists(), "a host launch must be byte-for-byte unchanged");
+
+    std::env::set_var("LOOM_NATIVE_CONTAINMENT", KIND);
+    materialize_launch_dirs();
+    assert!(home.is_dir(), "the relocated home must exist before the CLI runs");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&home)
+            .expect("home metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "per-launch state is private, got {mode:o}");
+    }
+    // Idempotent: a second pass over an existing tree is not an error.
+    materialize_launch_dirs();
+    assert!(home.is_dir());
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("LOOM_NATIVE_CONTAINMENT");
+    clear_env();
 }
 
 #[test]
