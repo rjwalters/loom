@@ -2815,6 +2815,8 @@ pub fn build_daemon_status(
         auto_update_note: au.note,
         auto_update_artifact_version: au.artifact_version,
         auto_update_artifact_published_at: au.artifact_published_at,
+        auto_update_stale_repo_ticks: au.stale_repo_ticks,
+        auto_update_stale_repo: au.stale_repo,
         // Host-distress circuit breaker (#4235) — read from the process-global
         // handle the work-finder loop registers/updates each tick, mirroring the
         // auto-update global-snapshot pattern above. `None` (no breaker

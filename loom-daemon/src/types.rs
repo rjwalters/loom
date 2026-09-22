@@ -1387,6 +1387,19 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_artifact_published_at: Option<String>,
+    /// Consecutive auto-update ticks whose resolved release was OLDER than
+    /// the installed version (Issue #8513) — the symptom of a *wrong-repo*
+    /// resolution (e.g. a workspace whose `origin` is a consumer repo with
+    /// its own, lower-versioned releases). Resets to `0` the moment a tick
+    /// resolves anything else. `#[serde(default)]` keeps pre-#8513 wire data
+    /// compatible.
+    #[serde(default)]
+    pub auto_update_stale_repo_ticks: u32,
+    /// The repo queried on the most recent such tick, or `None` once the
+    /// streak has reset (Issue #8513). `#[serde(default)]` keeps pre-#8513
+    /// wire data compatible.
+    #[serde(default)]
+    pub auto_update_stale_repo: Option<String>,
     /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
     /// has been registered this process (the work-finder loop is running and the
     /// breaker is enabled); `None` when no breaker is active — which the status
