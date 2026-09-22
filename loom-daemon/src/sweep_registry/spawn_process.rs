@@ -230,36 +230,12 @@ impl SweepRegistry {
             &mut cmd,
             &self.config.workspace_root,
         );
-        if let Some(admission) = runtime_admission {
-            cmd.env("LOOM_RUNTIME", &admission.runtime);
-            // Issue #4768: pin the ALREADY-ADMITTED role alongside the runtime
-            // it was admitted for. Without this, a Codex-runtime sweep child
-            // reaches `spawn-codex.sh` with no `LOOM_ROLE` at all (bash env
-            // vars only propagate what the parent process actually set — this
-            // `Command` never set one), which `spawn-codex.sh` treats as an
-            // ambiguous/unknown role and silently takes the READ-ONLY
-            // sandbox-fallback path instead of the mutable-role hook-trust
-            // preflight. `admission.role` is always `"sweep-lifecycle"` here
-            // (a full sweep is modelled as one launch, admitted against
-            // Builder's requirements — see runtime_admission.rs's module
-            // doc), which `spawn-codex.sh` maps onto `builder` for its own
-            // mutable-role check.
-            cmd.env("LOOM_ROLE", &admission.role);
-            log::info!(
-                "sweep_registry: admitted role={} runtime={} source={}",
-                admission.role,
-                admission.runtime,
-                admission.source
-            );
-            // #6201: same loud, at-selection divergence diagnostic as
-            // `role_runner`'s standalone role ticks — see
-            // `suggested_worker_type_mismatch_warning`'s doc comment.
-            if let Some(msg) =
-                crate::runtime_admission::suggested_worker_type_mismatch_warning(admission)
-            {
-                log::warn!("{msg}");
-            }
-        }
+        // Pin the admitted runtime/role (and, since #8599, the
+        // ordered-preference marker when a walk chose this launch's tap) on
+        // the child, log the admission, and warn on a `suggestedWorkerType`
+        // divergence. Shared with `role_runner::launch`'s identical block —
+        // the rationale for each pin lives in `launch_env`'s module doc.
+        crate::launch_env::apply_launch_env(&mut cmd, runtime_admission, "sweep_registry");
 
         // Issue #3800: put the sweep child in its OWN process group
         // (`setpgid(0, 0)` runs post-fork/pre-exec via `process_group(0)`,

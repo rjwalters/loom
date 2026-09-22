@@ -319,6 +319,13 @@ pub fn log_has_progress(contents: &str) -> bool {
             && !t.contains("spawn-codex:")
             && !t.contains("spawn-worker:")
             && !t.starts_with("# LOOM_RUNTIME_RESOLVED")
+            // #8599: the preference marker is a launch-record preamble line
+            // written by `worker_spawn::launch` before the child harness even
+            // starts, exactly like the two lines above it. Counting it as
+            // progress would make every preference-resolved hung sweep look
+            // alive to stall detection. Keyed off the resolver's own constant
+            // so the two cannot drift.
+            && !t.starts_with(crate::runtime_preference::PREFERENCE_LOG_MARKER.trim_end())
             && !t.starts_with("# LOOM_ACCOUNT")
     })
 }
@@ -1659,6 +1666,21 @@ spawn-claude: using OAuth account 'stale-account' (mode=random)
     #[test]
     fn log_has_progress_empty_log_is_false() {
         assert!(!log_has_progress(""));
+    }
+
+    /// #8599: the preference marker `worker_spawn::launch` now writes into the
+    /// per-sweep log is preamble, not progress. Without the exclusion, EVERY
+    /// hung preference-resolved sweep would read as alive to stall detection.
+    #[test]
+    fn log_has_progress_ignores_the_runtime_preference_marker() {
+        let log = "==== loom-daemon dispatch: t sweep_id=s issue=7 ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=opencode\n\
+# LOOM_RUNTIME_PREFERENCE order=claude,codex,opencode:zai-metered tier=2 \
+tap=opencode:zai-metered skipped=claude:unavailable(claude_tokens: 0/21 spawnable) \
+source=preference\n\
+[ts] spawn-worker: runtime=opencode\n";
+        assert!(!log_has_progress(log));
+        assert!(log_has_progress(&format!("{log}Stage 0: resolving backend...\n")));
     }
 
     // --- #4449 helpers: truncate_lines / describe_worktree_use ---

@@ -114,7 +114,8 @@ pub mod resolve;
 pub use availability::{availability, Availability, CredentialSource};
 pub use ceiling::{BackstopCeiling, ComplexityTier, Intent, Reservation};
 pub use resolve::{
-    CeilingSkip, ChosenTap, Resolution, SkipReason, SkippedTap, Tap, PREFERENCE_LOG_MARKER,
+    CeilingSkip, ChosenTap, PreferenceStamp, Resolution, SkipReason, SkippedTap, Tap,
+    PREFERENCE_LOG_MARKER,
 };
 
 use crate::runtime_admission::{canonical_role, ResolvedRuntime, RuntimeRejection, RuntimeSource};
@@ -219,6 +220,20 @@ impl Decision {
                 }
                 Some(line)
             }
+        }
+    }
+
+    /// The [`PreferenceStamp`] to carry on the admitted runtime (#8599), or
+    /// `None` on the static path (no tiers to report) and in the fail-closed
+    /// case (no chosen tap). Stamping the admission is what gets the chosen
+    /// tier out of the daemon log and into the per-launch records: the launch
+    /// surfaces read it off [`ResolvedRuntime::preference`] rather than
+    /// re-resolving anything.
+    #[must_use]
+    pub fn stamp(&self) -> Option<PreferenceStamp> {
+        match self {
+            Self::Static { .. } => None,
+            Self::Preference { source, resolution } => resolution.stamp(source.as_str()),
         }
     }
 
@@ -336,9 +351,16 @@ pub fn resolve_for_dispatch(
     if let Some(marker) = decision.marker_line() {
         log::info!("runtime_preference: {role} resolved by preference list — {marker} (#8554)");
     }
+    // #8599: stamp the decision onto the admission so the launch surfaces can
+    // report the chosen tier without re-resolving it. `None` on the static
+    // path keeps "absent config is byte-identical" intact all the way to the
+    // child's environment.
+    let stamp = decision.stamp();
     let backstop = decision.take_backstop();
+    let mut admitted = decision.into_admission(role)?;
+    admitted.preference = stamp;
     Ok(DispatchAdmission {
-        admitted: Some(decision.into_admission(role)?),
+        admitted: Some(admitted),
         backstop,
     })
 }

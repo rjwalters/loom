@@ -292,7 +292,7 @@ fn role_runner_probe() {
     let mut runner = ScriptRoleInvocationRunner::new(root.into());
     let result = runner.invoke("curator", "/loom:curator");
     assert!(result.is_success(), "{result:?}");
-    assert_eq!(runner.resolved_model_effort().unwrap().0, "");
+    assert_eq!(runner.resolved_launch().unwrap().model, "");
 }
 #[test]
 fn native_role_runner_does_not_require_claude_tokens_or_inherit_sonnet() {

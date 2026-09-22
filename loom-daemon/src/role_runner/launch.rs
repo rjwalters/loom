@@ -146,32 +146,13 @@ pub(super) fn run_role_with_timeout(
     // single-owner fleet or the root owner's own repos — see
     // `apply_gh_config_for_root`'s doc comment.
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, workspace_root);
-    if let Some(admission) = admission {
-        // Pin the already-admitted choice so spawn-worker cannot re-resolve a
-        // different runtime after the pre-spawn decision.
-        cmd.env("LOOM_RUNTIME", &admission.runtime);
-        // Issue #4768: pin the admitted role too, mirroring
-        // `sweep_registry::spawn_child`. Without it, a Codex-runtime role
-        // child (e.g. `LOOM_ROLE` unset for a champion/curator/judge/auditor/
-        // guide tick) reaches `spawn-codex.sh` with no role signal at all,
-        // which is indistinguishable from an unrecognized role there.
-        cmd.env("LOOM_ROLE", &admission.role);
-        log::info!(
-            "role_runner: admitted role={} runtime={} source={}",
-            admission.role,
-            admission.runtime,
-            admission.source
-        );
-        // #6201: loud, at-selection diagnostic when the admitted runtime
-        // diverges from the role's own declared `suggestedWorkerType` — the
-        // signal the filed incident (curator declared `claude`, silently
-        // ran on Codex for 9 days) had nowhere to surface.
-        if let Some(msg) =
-            crate::runtime_admission::suggested_worker_type_mismatch_warning(admission)
-        {
-            log::warn!("{msg}");
-        }
-    }
+    // Pin the already-admitted runtime/role (and, since #8599, the
+    // ordered-preference marker when a walk chose this tick's tap) so
+    // spawn-worker cannot re-resolve a different runtime after the pre-spawn
+    // decision, log the admission, and warn on a `suggestedWorkerType`
+    // divergence. Shared with `sweep_registry::spawn_process`'s identical
+    // block — the rationale for each pin lives in `launch_env`'s module doc.
+    crate::launch_env::apply_launch_env(&mut cmd, admission, "role_runner");
 
     // Run the child as its own process-group leader so a timeout can tear
     // down the whole subtree (the `claude` session's tool-call

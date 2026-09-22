@@ -20,6 +20,8 @@ fn tick(result: RoleTickResult) -> RoleTickTelemetry {
         effort: Some("high".to_string()),
         detail: None,
         gated_pool: None,
+        preference_tier: None,
+        preference_tap: None,
     }
 }
 
@@ -449,7 +451,7 @@ fn a_successful_tick_writes_a_self_sufficient_journal_record() {
         "judge",
         Utc::now(),
         &RoleTickOutcome::Success,
-        Some(("claude-sonnet-5".to_string(), "high".to_string())),
+        Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
     );
 
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
@@ -566,7 +568,7 @@ fn a_successful_tick_carries_runtime_provider_and_profile_from_its_own_log() {
         "judge",
         Utc::now(),
         &RoleTickOutcome::Success,
-        Some(("claude-sonnet-5".to_string(), "high".to_string())),
+        Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
     );
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
     clear_tick_env();
@@ -658,7 +660,7 @@ fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
         "judge",
         Utc::now() - chrono::Duration::seconds(30),
         &RoleTickOutcome::Success,
-        Some(("zai-org/GLM-5.3".to_string(), String::new())),
+        Some(ResolvedLaunch::new("zai-org/GLM-5.3", "")),
     );
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
     clear_tick_env();
@@ -781,4 +783,68 @@ fn a_pool_skip_record_names_the_pool_that_gated_it() {
         .unwrap()
         .get("gated_pool")
         .is_none());
+}
+
+/// Issue #8599: the tier a preference walk chose reaches the durable record —
+/// the whole point of the field, since it previously existed only as a line in
+/// `loom-daemon logs`. Tier `0` (nothing fell through) is reported as `0`, not
+/// elided.
+#[test]
+#[serial_test::serial]
+fn a_preference_resolved_tick_records_the_chosen_tier_and_tap() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+
+    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    emit_for_tick(
+        &root,
+        "judge",
+        Utc::now(),
+        &RoleTickOutcome::Success,
+        Some(
+            ResolvedLaunch::new("glm-5.3", "").with_preference(Some(
+                crate::runtime_preference::PreferenceStamp {
+                    tier: 2,
+                    tap: "opencode:zai-metered".to_string(),
+                    marker: "# LOOM_RUNTIME_PREFERENCE order=claude,codex,opencode:zai-metered \
+                         tier=2 tap=opencode:zai-metered source=preference"
+                        .to_string(),
+                },
+            )),
+        ),
+    );
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].preference_tier, Some(2));
+    assert_eq!(records[0].preference_tap.as_deref(), Some("opencode:zai-metered"));
+}
+
+/// The static path (no `runtimes.preference`, an operator pin, or a tick that
+/// skipped before resolving a launch) reports no tier at all — absent, never a
+/// fabricated `0`, which would read as "chose the most-preferred tap".
+#[test]
+#[serial_test::serial]
+fn an_unconfigured_tick_records_no_preference_tier() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+
+    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    emit_for_tick(
+        &root,
+        "judge",
+        Utc::now(),
+        &RoleTickOutcome::Success,
+        Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
+    );
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(records[0].preference_tier, None);
+    assert_eq!(records[0].preference_tap, None);
 }
