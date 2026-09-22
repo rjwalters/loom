@@ -176,3 +176,151 @@ fn session_start_and_shell_parse_mount_workspace_without_panicking() {
         );
     }
 }
+
+// =========================================================================
+// Which registry a verb acts on (issue #8540)
+// =========================================================================
+
+/// One account named in a registry file, in the on-disk v1 shape.
+fn registry_json(name: &str, enabled: bool) -> String {
+    format!(
+        r#"{{"version":1,"accounts":[{{"provider":"codex","name":"{name}","credential_kind":"codex_home","credential_reference":"{name}","enabled":{enabled}}}]}}"#
+    )
+}
+
+/// A fixture whose layout mirrors the one #8540 was reported on: a shared
+/// machine-level root (the stand-in for `$HOME`) that *contains* the Codex
+/// profile root, exactly the containment that used to make every verb run
+/// from there fail with "Codex profile root must not be repository-local".
+struct RegistryFixture {
+    _dir: tempfile::TempDir,
+    shared_root: std::path::PathBuf,
+    profiles: std::path::PathBuf,
+}
+
+impl RegistryFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let shared_root = dir.path().join("home");
+        let profiles = shared_root.join(".loom").join("codex-profiles");
+        std::fs::create_dir_all(profiles.join("alpha")).unwrap();
+        std::fs::write(profiles.join("alpha/auth.json"), "{}").unwrap();
+        std::fs::write(
+            shared_root.join(".loom").join("accounts.json"),
+            registry_json("alpha", true),
+        )
+        .unwrap();
+        Self {
+            _dir: dir,
+            shared_root,
+            profiles,
+        }
+    }
+
+    fn command(&self, cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+            .arg("accounts")
+            .args(args)
+            .current_dir(cwd)
+            .env("LOOM_CODEX_PROFILE_ROOT", &self.profiles)
+            .env("LOOM_SHARED_ACCOUNTS_ROOT", &self.shared_root)
+            .output()
+            .unwrap()
+    }
+
+    fn shared_registry(&self) -> String {
+        std::fs::read_to_string(self.shared_root.join(".loom").join("accounts.json")).unwrap()
+    }
+}
+
+/// Acceptance criterion 1 + 2: from a cwd inside no Loom workspace, `list`
+/// reads the **shared** machine-level registry (rather than erroring, and
+/// rather than inventing `<cwd>/.loom/accounts.json`), says so, and reports
+/// the rows it found as shared rather than repo-local.
+#[test]
+fn accounts_list_from_a_non_repo_cwd_uses_the_shared_registry() {
+    let fixture = RegistryFixture::new();
+    let elsewhere = tempfile::tempdir().unwrap();
+
+    let output = fixture.command(elsewhere.path(), &["list"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("codex/alpha"), "{stdout}");
+    // Provenance names the registry the row came from, not the file shape.
+    assert!(stdout.contains("Shared"), "{stdout}");
+    assert!(
+        stderr.contains(&format!(
+            "Registry: shared: {}",
+            fixture
+                .shared_root
+                .join(".loom")
+                .join("accounts.json")
+                .display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("repository-local"), "{stderr}");
+}
+
+/// The original #8540 reproduction: run from the shared root itself (`$HOME`
+/// in the report), whose `.loom/codex-profiles` the profile root lives under.
+/// That containment used to be read as "the profile root is inside the
+/// workspace" and failed every verb.
+#[test]
+fn accounts_list_from_the_shared_root_itself_does_not_claim_a_repo_local_profile_root() {
+    let fixture = RegistryFixture::new();
+
+    let output = fixture.command(&fixture.shared_root.clone(), &["list"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("repository-local"), "{stderr}");
+    assert!(stderr.contains("Registry: shared: "), "{stderr}");
+}
+
+/// Acceptance criteria 2 + 3 + 4: a `disable` run from a repo cwd acts on the
+/// repo-local registry **only** — the shared entry of the same name stays
+/// enabled — and the command says both that it was repo-scoped and that the
+/// shared entry it shadows was left alone.
+#[test]
+fn accounts_disable_from_a_repo_cwd_is_repo_scoped_and_says_so() {
+    let fixture = RegistryFixture::new();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join(".loom")).unwrap();
+    let repo_registry = repo.path().join(".loom").join("accounts.json");
+    std::fs::write(&repo_registry, registry_json("alpha", true)).unwrap();
+
+    let output = fixture.command(repo.path(), &["disable", "codex", "alpha"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Registry: repo: {}",
+            repo.path()
+                .canonicalize()
+                .unwrap()
+                .join(".loom")
+                .join("accounts.json")
+                .display()
+        )),
+        "{stderr}"
+    );
+    // The shadow note names the account whose shared entry this did not touch.
+    assert!(stderr.contains("shadows the shared machine-level registry"), "{stderr}");
+    assert!(stderr.contains("alpha"), "{stderr}");
+
+    assert!(
+        std::fs::read_to_string(&repo_registry)
+            .unwrap()
+            .contains("\"enabled\": false"),
+        "the repo-local entry must be disabled"
+    );
+    assert!(
+        fixture.shared_registry().contains("\"enabled\":true"),
+        "the shared entry must be untouched: {}",
+        fixture.shared_registry()
+    );
+}

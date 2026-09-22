@@ -63,6 +63,7 @@
 
 pub mod account_lifecycle;
 pub mod account_registry;
+pub mod account_scope;
 pub mod affinity;
 pub mod allowlist;
 pub mod bad_tokens;
