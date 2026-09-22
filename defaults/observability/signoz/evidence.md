@@ -219,7 +219,7 @@ Every assertion the query file documents held on the first pass:
   `loom.tokens.exhausted` — no `usage_fraction` series at all. Absent stayed
   absent; zero stayed a stored zero. Metric timestamps confirmed millisecond
   truncation (`1790067600000`) against the RFC3339 `09:00:00Z` anchor.
-- Query 8 (privacy sentinel): **zero** rows across logs, traces and metrics —
+- Query 9 (privacy sentinel): **zero** rows across logs, traces and metrics —
   the gateway's `keep_keys` allowlist dropped `prompt.content` before any
   signal reached storage.
 
