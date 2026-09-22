@@ -173,15 +173,9 @@ decision — route it to `loom:blocked` or `loom:operator-only` instead.
 ## Git Worktree Workflow
 
 Loom uses git worktrees to isolate agent work. **Issue Worktrees**
-(`.loom/worktrees/issue-N`) hold issue-specific work for Builder agents.
-
-```bash
-gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"
-./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42
-# ... work, commit ...
-git push -u origin feature/issue-42
-gh pr create --label "loom:review-requested"
-```
+(`.loom/worktrees/issue-N`) hold issue-specific work for Builder agents. The
+guard-to-PR recipe lives in exactly one place — "Builder Workflow" below — so no
+second copy can go missing its pre-claim guard.
 
 - Always use `./.loom/scripts/worktree.sh <issue-number>` (writes a
   `.loom-managed` sentinel that authorizes cleanup). **Never run `git worktree`
@@ -245,11 +239,17 @@ verifiable by a command, not by judgment, **and** (2) the diff is confined to
 non-executing files (`.md`, `.txt`, and similar). Anything touching `.sh`, `.rs`,
 `.ts`, a role prompt, `.github/labels.yml`, or `.loom/config.json` is out of the
 lane, **unconditionally**. This is a predicate on the *change* (evaluated by
-whoever files), not a config toggle, opt-out, or human-approval gate. **Judge and
-Champion are unaffected** — both run unmodified; only Curator may be skipped.
+whoever files), not a config toggle, opt-out, or human-approval gate. **Judge,
+Champion, and step 0's open-PR guard are unaffected** — all three still apply to
+a hand-claim, which duplicates in-flight work as readily as a dispatched one;
+only Curator may be skipped.
 
 ### Builder Workflow
 
+0. Guard: `loom-daemon forge check-open-pr 42` — **exit 0 prints an already-open
+   linked PR, so do NOT claim**; 1 = none; anything else = unanswered, not an
+   all-clear (`--help` has the contract). Same probe the daemon's dispatch
+   refuses on, and a hand-claim is not exempt.
 1. Find issue: `gh issue list --label="loom:issue"`
 2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`
 3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
