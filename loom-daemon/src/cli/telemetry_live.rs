@@ -152,7 +152,7 @@ impl LiveArgs {
             run_bounded_observed(command, Duration::from_secs(self.timeout_seconds), |pid| {
                 lifecycle::child_spawned(root, &execution, pid)
             });
-        let (child_result, verified) = match completion {
+        let (child_result, verification_error) = match completion {
             Ok(Completion::Exited(output)) => {
                 let result = if output.status.success() {
                     "success"
@@ -161,21 +161,34 @@ impl LiveArgs {
                 } else {
                     "failure"
                 };
-                let verified = output.status.success()
-                    && workspace.input_unchanged()
-                    && helpers::verify_stream(
+                let error = if !output.status.success() {
+                    Some("child did not exit successfully".to_owned())
+                } else if !workspace.input_unchanged() {
+                    Some("canary input changed".to_owned())
+                } else {
+                    // verify_stream uses fixed diagnostic messages, never raw native output.
+                    helpers::verify_stream(
                         runtime,
                         &output.stdout,
                         &output.stderr,
                         &workspace.expected,
                     )
-                    .is_ok();
-                (result, verified)
+                    .err()
+                    .map(|error| error.to_string())
+                };
+                (result, error)
             }
-            Ok(Completion::TimedOut { .. }) => ("timeout", false),
-            Err(ExecError::Spawn(_)) => ("spawn_failed", false),
-            Err(ExecError::Collect(_)) => ("exit_unobserved", false),
+            Ok(Completion::TimedOut { .. }) => {
+                ("timeout", Some("child exceeded wall time limit".to_owned()))
+            }
+            Err(ExecError::Spawn(_)) => {
+                ("spawn_failed", Some("child could not be spawned".to_owned()))
+            }
+            Err(ExecError::Collect(_)) => {
+                ("exit_unobserved", Some("child exit was not observed".to_owned()))
+            }
         };
+        let verified = verification_error.is_none();
         if !matches!(child_result, "spawn_failed" | "exit_unobserved") {
             lifecycle::child_exited(root, &execution, child_result);
         }
@@ -198,6 +211,8 @@ impl LiveArgs {
         } else {
             false
         };
+        let verification_error = verification_error
+            .or_else(|| (!checkpoint).then(|| "checkpoint completion failed".to_owned()));
         let verified = verified && checkpoint;
         lifecycle::finish_execution(
             root,
@@ -223,7 +238,7 @@ impl LiveArgs {
             loom_daemon::telemetry::TelemetryRecord::Span(s) => Some(serde_json::json!({"trace_id":s.context.trace_id.as_str(),"span_id":s.context.span_id.as_str(),"parent_span_id":s.parent_span_id.as_ref().map(|v|v.as_str()),"name":s.name.as_str(),"status":s.status})), _ => None
         }).collect();
         Ok((
-            serde_json::json!({"runtime":runtime,"trace_id":trace_id,"execution_id":execution,"child_result":child_result,"verified":verified,"checkpoint_written":checkpoint,"wall_milliseconds":started.elapsed().as_millis(),"expected_spans":ids}),
+            serde_json::json!({"runtime":runtime,"trace_id":trace_id,"execution_id":execution,"child_result":child_result,"verified":verified,"verification_error":verification_error,"checkpoint_written":checkpoint,"wall_milliseconds":started.elapsed().as_millis(),"expected_spans":ids}),
             records,
         ))
     }
