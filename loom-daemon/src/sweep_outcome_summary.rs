@@ -65,6 +65,7 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::activity::resource_usage::ModelPricing;
+use crate::runtime_preference::CredentialSource;
 use crate::sweep_outcomes;
 use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryRecord};
 
@@ -134,6 +135,10 @@ pub enum GroupBy {
     Host,
     /// UTC calendar day of the envelope's `emitted_at`.
     Day,
+    /// The **tap** — `(runtime, credential source)` — that paid for the sweep
+    /// (Issue #8556). See [`resolve_tap`] for how a record with no explicit
+    /// `config["tap"]` stamp is placed.
+    Tap,
 }
 
 impl GroupBy {
@@ -145,8 +150,10 @@ impl GroupBy {
             "repo" => Ok(Self::Repo),
             "host" => Ok(Self::Host),
             "day" => Ok(Self::Day),
+            "tap" => Ok(Self::Tap),
             other => bail!(
-                "unknown --group-by value {other:?} (expected one of: arm, model, repo, host, day)"
+                "unknown --group-by value {other:?} (expected one of: arm, model, repo, host, \
+                 day, tap)"
             ),
         }
     }
@@ -159,6 +166,7 @@ impl GroupBy {
             Self::Repo => "repo",
             Self::Host => "host",
             Self::Day => "day",
+            Self::Tap => "tap",
         }
     }
 }
@@ -207,6 +215,55 @@ pub fn resolve_arm(record: &SweepOutcomeRecord) -> (String, ArmSource) {
         return (value.trim().to_string(), ArmSource::Inferred);
     }
     (UNKNOWN_GROUP.to_string(), ArmSource::Unknown)
+}
+
+/// The tap a record's spend belongs to — `<runtime>@<credential source>`
+/// (Issue #8556).
+///
+/// Prefers the explicit `config["tap"]` stamp a post-#8556 native-harness spawn
+/// writes (see `sweep_registry::outcome_journal`), which is the only source that
+/// can name the *model profile* half — and therefore the only source that can
+/// tell a flat-rate coding plan apart from a metered endpoint reached through
+/// the same runtime.
+///
+/// Without that stamp the tap is **reconstructed** from the credential keys
+/// #8447 already writes, so pre-#8556 history and the Claude/legacy-adapter
+/// path (which writes no `# LOOM_LAUNCH` record at all) still land in a tap
+/// bucket rather than being dropped from the report. Reconstruction never
+/// invents a profile: a reconstructed key is always the bare runtime, and a
+/// credential half nothing in the record names falls to [`UNKNOWN_GROUP`]
+/// instead of being guessed at.
+#[must_use]
+pub fn resolve_tap(record: &SweepOutcomeRecord) -> String {
+    let field = |key: &str| {
+        record
+            .config
+            .get(key)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(tap) = field("tap") {
+        return tap.to_string();
+    }
+    let runtime = field("runtime").unwrap_or(UNKNOWN_GROUP);
+    let credential = match field("credential_source") {
+        Some("pool") => field("credential_provider")
+            .map_or_else(|| "api_keys".to_string(), |p| format!("api_keys:{p}")),
+        Some(crate::launch_record::CREDENTIAL_WIRE_ENV) => {
+            crate::launch_record::CREDENTIAL_WIRE_ENV.to_string()
+        }
+        Some("none") => crate::launch_record::CREDENTIAL_WIRE_HARNESS_OWN.to_string(),
+        Some(other) => other.to_string(),
+        // No API-key-pool attribution: the two subscription pools are a
+        // property of the runtime itself, so naming them here is a reading of
+        // the record rather than a guess.
+        None => match runtime {
+            "claude" => CredentialSource::ClaudeTokens.wire(),
+            "codex" => CredentialSource::CodexAccounts.wire(),
+            _ => UNKNOWN_GROUP.to_string(),
+        },
+    };
+    format!("{runtime}@{credential}")
 }
 
 // ============================================================================
@@ -966,6 +1023,7 @@ pub fn summarize(
                 (host.to_string(), None)
             }
             GroupBy::Day => (entry.emitted_at.format("%Y-%m-%d").to_string(), None),
+            GroupBy::Tap => (resolve_tap(record), None),
         };
 
         let acc = groups.entry(key).or_default();

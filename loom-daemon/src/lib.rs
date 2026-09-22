@@ -246,6 +246,7 @@ pub mod sweep_journal;
 pub mod sweep_outcome_summary;
 pub mod sweep_outcomes;
 pub mod sweep_registry;
+pub mod tap_usage;
 pub mod target_dir_gc;
 pub mod telemetry;
 pub mod terminal;

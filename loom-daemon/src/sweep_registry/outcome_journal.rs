@@ -157,7 +157,11 @@ impl SweepRegistry {
         // child's own `# LOOM_LAUNCH` record. Resolved once here and handed to
         // the paired telemetry record below so the two journals can never
         // disagree about which account a sweep ran on.
-        let credential = self.resolve_credential_attribution(sweep_id, issue);
+        // Issue #8556 adds tap-attributed usage accounting for the same launch,
+        // resolved in the SAME single pass over the log so the two attributions
+        // cannot disagree and a terminal transition still costs exactly one
+        // `read_to_string`.
+        let (credential, tap_usage) = self.resolve_launch_attribution(sweep_id, issue);
         // Issue #8056: the single most-specific failure label for this
         // terminal transition, copied into the PAIRED `sweep.outcome`
         // telemetry record below so "real failure vs. <60s spawn death" is
@@ -198,6 +202,7 @@ impl SweepRegistry {
             credential: credential.clone(),
             jev_tier,
             jev_confidence,
+            tap_usage: tap_usage.clone(),
             duration_sec,
         };
         if let Err(e) = sweep_outcomes::append_outcome(&path, &record) {
@@ -219,35 +224,56 @@ impl SweepRegistry {
             result,
             failure_class,
             credential,
+            tap_usage,
         );
     }
 
-    /// The API-key pool account this sweep's native harness ran on (Issue
-    /// #8447), for both terminal journals' account attribution — the
-    /// provider-neutral counterpart of
-    /// [`resolve_token_account`](Self::resolve_token_account).
+    /// Both launch attributions off **one** read of the sweep's own log: the
+    /// API-key pool account this sweep's native harness ran on (Issue #8447,
+    /// the provider-neutral counterpart of
+    /// [`resolve_token_account`](Self::resolve_token_account)) and the #8556
+    /// tap-attributed usage accounting.
     ///
     /// Unlike the OAuth path there is no dispatch-time capture to prefer: the
     /// `# LOOM_LAUNCH` record is written by the child itself (see
     /// [`crate::launch_record`]), so the sweep's own log is the single source.
     /// One bounded `read_to_string` at the terminal transition, never a forge
-    /// call. `None` — never a fabricated `"unknown"` account — for a
-    /// Claude/legacy-adapter spawn that writes no launch record, an
+    /// call. Both halves are `None` — never a fabricated `"unknown"` account —
+    /// for a Claude/legacy-adapter spawn that writes no launch record, an
     /// unreadable/rotated log, or a pre-#8401 binary.
-    pub(crate) fn resolve_credential_attribution(
+    ///
+    /// They are resolved together rather than by two calls because they are two
+    /// readings of the same `# LOOM_LAUNCH` record in the same anchored region.
+    /// One read keeps the terminal transition's cost exactly where #8447 left it
+    /// (one `read_to_string`, never a forge call) and makes it impossible for
+    /// the two journals to disagree about which credential a sweep ran on.
+    ///
+    /// The credential half is returned even when the tap half declines — a
+    /// record carrying credential fields but no runtime to key a tap on is
+    /// "no tap opinion", never a reason to lose the attribution #8447 already
+    /// reported.
+    pub(crate) fn resolve_launch_attribution(
         &self,
         sweep_id: &str,
         issue: u32,
-    ) -> Option<crate::launch_record::CredentialAttribution> {
+    ) -> (
+        Option<crate::launch_record::CredentialAttribution>,
+        Option<crate::tap_usage::TapAccounting>,
+    ) {
         let log_path = self
             .entries
             .get(sweep_id)
             .map_or_else(|| self.compute_log_path(issue), |i| i.log_path.clone());
-        let contents = std::fs::read_to_string(log_path).ok()?;
-        crate::launch_record::parse_launch_credential_after(
-            &contents,
-            &format!("sweep_id={sweep_id}"),
-        )
+        let Ok(contents) = std::fs::read_to_string(log_path) else {
+            return (None, None);
+        };
+        let anchor = format!("sweep_id={sweep_id}");
+        let tap_usage = crate::tap_usage::account_launch_log(&contents, &anchor);
+        let credential = tap_usage
+            .as_ref()
+            .map(|accounting| accounting.tap.credential.clone())
+            .or_else(|| crate::launch_record::parse_launch_credential_after(&contents, &anchor));
+        (credential, tap_usage)
     }
 
     /// The runtime/provider/profile this sweep's native harness actually
@@ -333,6 +359,11 @@ impl SweepRegistry {
     /// `credential` is likewise the caller's already-resolved API-key-pool
     /// attribution (Issue #8447), passed in for the same reason: one log read
     /// per terminal transition, and two journals that cannot disagree.
+    ///
+    /// `tap_usage` is the tap-attributed accounting off that same read (Issue
+    /// #8556), which is what makes "how much went to the metered backstop vs.
+    /// the subscriptions" answerable from this journal — see
+    /// [`crate::tap_usage`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_outcome_telemetry_journal(
         &self,
@@ -342,6 +373,7 @@ impl SweepRegistry {
         result: telemetry::SweepResult,
         failure_class: Option<String>,
         credential: Option<crate::launch_record::CredentialAttribution>,
+        tap_usage: Option<crate::tap_usage::TapAccounting>,
     ) {
         let info = self.entries.get(sweep_id);
         let model = info.and_then(|i| i.model.clone());
@@ -378,6 +410,37 @@ impl SweepRegistry {
             }
             if let Some(account) = &credential.account {
                 config.insert("credential_account".to_string(), account.clone());
+            }
+        }
+        // Issue #8556: the tap this sweep's spend belongs to, plus whatever its
+        // native stream reported consuming. Additive in the same free-form map
+        // (per #4703 — no schema bump), and `config["tap"]` is what
+        // `sweep_outcome_summary`'s `--group-by tap` folds on.
+        //
+        // Counters are written ONLY when the harness actually reported them: a
+        // missing counter means unmeasured, not zero, and a key absent from the
+        // map is how that stays distinguishable from a reported `0`. The cost
+        // key is spelled `tap_cost_estimate` so no reader can mistake a harness
+        // estimate for a measured charge.
+        if let Some(accounting) = &tap_usage {
+            config.insert("tap".to_string(), accounting.key());
+            let usage = &accounting.usage;
+            for (key, value) in [
+                ("tap_input_tokens", usage.input),
+                ("tap_output_tokens", usage.output),
+                ("tap_reasoning_tokens", usage.reasoning),
+                ("tap_cache_read_tokens", usage.cache_read),
+                ("tap_cache_write_tokens", usage.cache_write),
+            ] {
+                if let Some(value) = value {
+                    config.insert(key.to_string(), value.to_string());
+                }
+            }
+            if let Some(cost) = usage.cost_estimate {
+                config.insert("tap_cost_estimate".to_string(), cost.to_string());
+            }
+            if usage.is_measured() {
+                config.insert("tap_usage_events".to_string(), usage.usage_events.to_string());
             }
         }
         // Issue #4809: attribute this sweep to the model-cost A/B experiment's
@@ -892,3 +955,14 @@ mod credential_tests;
     unused_imports
 )]
 mod runtime_tests;
+
+// Tap-attributed usage accounting (#8556) end-to-end across both terminal
+// journals, in its own sibling module for the same file-size reason.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod tap_usage_tests;

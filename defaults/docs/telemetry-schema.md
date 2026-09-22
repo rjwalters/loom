@@ -398,6 +398,40 @@ same three values under one optional `credential` object
 (`{source, provider?, account?}`, `#[serde(default)]` so every pre-#8447 line
 still parses). Additive per #4703 — no `schema_version` bump.
 
+`config.tap` and the `config.tap_*` usage keys (Issue #8556) are the
+**tap-attributed** layer over those credential keys: `tap` is
+`<runtime>[:<model profile>]@<credential source>` — e.g. `claude@claude_tokens`,
+`opencode:zai-metered@api_keys:zai`, `pi@harness-own` — the one composite
+identity whose economics actually differ, since the same model family is
+reachable through a flat-rate subscription and through a metered pay-per-token
+endpoint under different providers. It is what
+`loom-daemon sweep-outcomes summary --group-by tap` folds on, and therefore what
+makes *"how much went to the metered backstop vs. the subscriptions"* a query
+rather than a reconstruction. The credential half reuses
+`runtime_preference::CredentialSource::wire()`'s spellings where the two overlap
+(`api_keys:<provider>`), plus two the resolver never selects and which get their
+own buckets rather than being folded into a pool's: `env` (an operator-exported
+key) and `harness-own` (the harness's own auth store).
+
+The counters — `tap_input_tokens`, `tap_output_tokens`, `tap_reasoning_tokens`,
+`tap_cache_read_tokens`, `tap_cache_write_tokens`, `tap_cost_estimate`,
+`tap_usage_events` — are read off the launch's own native event stream (Pi's
+assistant `message_end`, OpenCode's `step_finish`; `agent_end` is deliberately
+excluded because Pi repeats the same usage there and counting it would double
+every Pi run). **Each key is written only when the harness actually reported it**
+— a missing counter means *unmeasured*, not zero, and an absent key is how that
+stays distinguishable from a reported `0`. `tap_cost_estimate` is spelled
+"estimate" on purpose: per `runtime-model-trials.md` a harness cost figure is
+directionally meaningful for a metered tap and is **not a charge at all** for a
+flat-rate one, so it is a visibility instrument and never a billing
+reconciliation. The sibling `sweep-outcomes.jsonl` record carries the same
+reading under one optional `tap_usage` object (`{tap, usage}`,
+`#[serde(default)]`), resolved from the **same single log read** as `credential`
+so the two journals cannot disagree. Additive per #4703 — no `schema_version`
+bump. Full rationale, and why this is a prerequisite of every fleet-wide spend
+ceiling rather than one:
+[`ADR-0020`](https://github.com/rjwalters/loom/blob/main/docs/adr/0020-fleet-metered-spend-ceiling.md).
+
 `model` / `effort` likewise survive a daemon restart: the dispatch stamps both
 into the claim lock's `owner.json` (alongside the child pid and process
 group), and `reconstruct` restores them onto the adopted entry. A pre-#8056

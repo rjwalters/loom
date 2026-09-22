@@ -357,7 +357,21 @@ fn run_preflight(
         // `credentialAccount` is an account NAME, never key material (#8401).
         // `promptBytes` (#8506) is the expanded prompt's size, so an E2BIG-class
         // failure or a slow launch is diagnosable from the log alone.
-        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
+        // `tap` (#8556) is the ordered-preference resolver's own identity for
+        // this launch — `<runtime>[:<profile>]`, rendered through
+        // `runtime_preference::Tap` so one grep finds the same string in the
+        // `# LOOM_RUNTIME_PREFERENCE` marker, this record, and the tap-attributed
+        // usage accounting read back off it (`crate::tap_usage`). Derivable from
+        // `runtime` + `profile`, and emitted anyway so the accounting key is
+        // stated rather than reconstructed by every reader; the profile is what
+        // binds *which* provider and credential source, which is why a bare
+        // runtime id cannot distinguish a flat-rate coding plan from a metered
+        // endpoint reached through the same harness.
+        let tap = match selection.profile.as_deref() {
+            Some(profile) => crate::runtime_preference::Tap::with_profile(&runtime, profile),
+            None => crate::runtime_preference::Tap::runtime(&runtime),
+        };
+        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
         command
     } else {
         let runner = scripts.join(format!("spawn-{runtime}.sh"));
