@@ -56,7 +56,7 @@ Two things follow, and they are deliberately separable:
    an account-level control configured at the metered provider and verified to
    reject a launch past the limit. That makes it an operator/mechanical task
    against a live credential, not a `loom-daemon` feature — which is why it is
-   tracked as its own issue rather than bundled with the accounting.
+   tracked as its own issue (**#8609**) rather than bundled with the accounting.
 
 **Verification bar for Option 1, stated so it cannot be quietly weakened**: the
 ceiling must be observed to *fail the launch*, not to alert after the fact. A
@@ -96,7 +96,8 @@ they are not re-litigated under time pressure:
 - **Option 1 is contingent on the provider.** If a chosen metered provider
   exposes only alerting, this decision degrades to "detect after the fact" until
   Option 2 is built. The mitigation is the explicit verification bar above plus
-  the pre-filed fallback issue, not optimism.
+  the pre-filed fallback issue (#8609 carries both the configuration and the
+  "alerting only ⇒ file the Option 2 issue" trigger), not optimism.
 - **Option 1 lives outside the repository.** A provider-side setting is not in
   version control, has no test, and can be changed or lost without a diff. Its
   only in-repo trace is the verification record on its issue.
@@ -138,7 +139,8 @@ they are not re-litigated under time pressure:
 
 ## References
 
-- Related GitHub Issues: #8556 (this decision), #8436 (ordered runtime
+- Related GitHub Issues: #8556 (this decision + the accounting prerequisite),
+  #8609 (Option 1's configuration and its fail-the-launch verification), #8436 (ordered runtime
   preference and the operator clarification behind it), #8555 (the per-host
   concurrency ceiling that scopes the fleet-wide case out of itself), #8401 /
   #8447 (the API-key account pool and its secret-free credential attribution)
