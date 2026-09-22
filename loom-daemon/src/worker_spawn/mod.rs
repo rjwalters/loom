@@ -114,6 +114,21 @@ impl LaunchError {
             message: message.into(),
         }
     }
+    /// A pre-exec failure discovered one step before `exec` would have hit
+    /// the same wall itself — the oversized-prompt check in `prompt.rs`
+    /// (issue #8506) is the first caller. Carries exit code `126`, matching
+    /// `exec`'s own "cannot execute" code (below), rather than the `78`
+    /// (`EX_CONFIG`) an ordinary startup-config error gets: this failure
+    /// class is "the launch could never have succeeded", identical in kind
+    /// to a genuine OS `exec` failure, just caught earlier with a much
+    /// clearer message. `role_runner` and any backoff must be able to treat
+    /// the two identically.
+    fn launch_failure(message: impl Into<String>) -> Self {
+        Self {
+            code: 126,
+            message: message.into(),
+        }
+    }
 }
 fn nonempty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
@@ -288,7 +303,9 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         )?;
         log = attach_log(&mut command, options.log.as_deref())?;
         // `credentialAccount` is an account NAME, never key material (#8401).
-        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured"})).map_err(|e| LaunchError::config(e.to_string()))?;
+        // `promptBytes` (#8506) is the expanded prompt's size, so an E2BIG-class
+        // failure or a slow launch is diagnosable from the log alone.
+        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
         command
     } else {
         let runner = scripts.join(format!("spawn-{runtime}.sh"));
@@ -355,13 +372,25 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
 fn exec(mut command: Command) -> Result<(), LaunchError> {
     use std::os::unix::process::CommandExt;
     let error = command.exec();
+    // #8506: E2BIG (`os error 7`, "Argument list too long") is a distinct
+    // launch-class failure — the argv itself was too big for the kernel to
+    // accept, never a runtime/config fault — so `role_runner` and any
+    // backoff from #8505 can key off the message instead of lumping it in
+    // with an arbitrary "cannot execute" failure. The exit code stays `126`
+    // either way (unchanged classification for every existing caller); only
+    // the message gains a named class prefix.
+    let message = if error.raw_os_error() == Some(libc::E2BIG) {
+        format!("cannot execute worker harness: argument list too long ({error}); an argv element exceeded the kernel's MAX_ARG_STRLEN")
+    } else {
+        format!("cannot execute worker harness: {error}")
+    };
     Err(LaunchError {
         code: if error.kind() == std::io::ErrorKind::NotFound {
             127
         } else {
             126
         },
-        message: format!("cannot execute worker harness: {error}"),
+        message,
     })
 }
 #[cfg(not(unix))]
