@@ -2127,5 +2127,10 @@ Full reference, including the registry format, the selection ladder
 (model-class-scoped the same way [`bad_tokens::is_bad_for_class`](#model-class-scoped-entries-8058)
 scopes this pool's, and applied automatically from a finished run's own log),
 the per-account concurrency cap, and the
-`loom-daemon api-keys {add,list,disable,enable,limit,remove,mark-bad,unblock,health}`
+`loom-daemon api-keys {add,list,disable,enable,limit,remove,mark-bad,unblock,sync,health}`
 CLI: [`runtime-model-trials.md` § "API-key account pool"](runtime-model-trials.md#api-key-account-pool-loom-daemon-api-keys-8401).
+
+`sync --from <source>` (#8511) is the API-key pool's answer to this pool's
+[`tokens import-from-monitor`](#importing-live-tokens-from-claude-monitor-4006): a **pull**-based
+convergence on an operator-maintained source of truth, so an ephemeral or
+autoscaled host that nobody runs `add` on still boots with the fleet's accounts.

@@ -19,7 +19,8 @@
 //! | Capability | Where |
 //! |---|---|
 //! | Registry (`.loom/api-keys/<provider>/<account>.env`, `0600`, per-host) | [`registry`] |
-//! | `loom-daemon api-keys {add,list,disable,enable,remove,limit,mark-bad,unblock,health}` | `cli::api_keys` |
+//! | `loom-daemon api-keys {add,list,disable,enable,remove,limit,mark-bad,unblock,sync,health}` | `cli::api_keys` |
+//! | Pull-based convergence on an external secret source, for hosts nobody seeds by hand (#8511) | [`sync`] |
 //! | Spawn-time ladder: explicit env > pool > fail-closed 78 | [`select`], `worker_spawn::credential` |
 //! | Per-provider root resolution (per-repo pool, then shared machine pool) | [`paths::resolve_provider_root`] |
 //! | Unreadable pool / unparsable state file fails **closed**, never "no pool" | [`paths::PoolReadError`], [`bad_marks::read_marks`] |
@@ -44,6 +45,7 @@ pub mod limits;
 pub mod paths;
 pub mod registry;
 pub mod select;
+pub mod sync;
 
 pub use bad_marks::{
     is_bad_for_class, mark_bad, mark_bad_for_class, unmark, unmark_for_class, BadMark,
@@ -57,3 +59,4 @@ pub use select::{
     health, is_pooled, list_accounts, select_api_key, select_api_key_for, EmptyApiKeyPoolError,
     ProviderHealth, SelectedApiKey, EX_CONFIG,
 };
+pub use sync::{sync, SyncOptions, SyncOutcome, SyncPlan, SyncState};

@@ -347,6 +347,15 @@ pub struct ProviderHealth {
     /// Accounts whose file permissions are looser than `0600`.
     pub insecure_permissions: Vec<String>,
     pub pinned: Vec<String>,
+    /// Last successful `api-keys sync --from …` into the root that serves this
+    /// provider (#8511), or `None` on a host that has never synced (or whose
+    /// state file is damaged). Informational only — unlike `.disabled` or
+    /// `.bad_accounts.json` it decides nothing about eligibility, so an
+    /// unreadable one degrades to `None` here instead of withholding accounts.
+    /// Its purpose is the opposite of a gate: a host whose sync has been failing
+    /// for days shows a stale timestamp rather than a quietly shrinking pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sync: Option<super::sync::SyncState>,
     pub accounts: Vec<ApiKeyAccount>,
 }
 
@@ -430,6 +439,7 @@ pub fn health(
                     .collect(),
                 pinned: super::registry::read_list(&root, &provider, ALLOWLIST_FILE)
                     .unwrap_or_default(),
+                last_sync: super::sync::read_state(&root).ok().flatten(),
                 accounts,
                 provider,
             }
