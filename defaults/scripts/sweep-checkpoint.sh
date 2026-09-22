@@ -23,11 +23,14 @@
 #   }
 #
 # The "jev_tier"/"jev_confidence" pair (#8543) is a shadow-mode Jev (TypeSafe)
-# complexity classification, patched onto an ALREADY-EXISTING checkpoint by
-# `jev <issue> <tier> <confidence>` — a merge, unlike `write`, so the Tier-2.5
-# dispatch step that calls it never needs the current phase/task-id. Present
-# only when `TYPESAFE_API_KEY` was set for the run; absent otherwise (the
-# common case today). Never fed back into model selection.
+# complexity classification, merged onto an ALREADY-EXISTING checkpoint rather
+# than written with the rest of the record: the Tier-2.5 dispatch step that
+# produces it does not know the sweep's current phase/task-id, which a `write`
+# would overwrite. Normally recorded in-process by `loom-daemon resolve-model
+# --tier` (see `jev_tier::shadow_sample_from_env`); `jev <issue> <tier>
+# <confidence>` below is the same merge exposed for a manual/out-of-band
+# sample. Present only when `TYPESAFE_API_KEY` was set for the run; absent
+# otherwise (the common case today). Never fed back into model selection.
 #
 # The "task_id" field (#3768) identifies the sweep RUN that wrote the checkpoint.
 # It must be a STABLE per-sweep-run id (generated once at sweep start — see

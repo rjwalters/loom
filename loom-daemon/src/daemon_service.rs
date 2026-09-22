@@ -233,6 +233,21 @@ pub(crate) async fn run_daemon() -> Result<()> {
                         json,
                     },
             } => handle_fleet_roll_command(host, all, timeout, json).await,
+            // `resolve-model --tier` IS the Tier-2.5 dispatch step — the one
+            // place the Curator's `<!-- loom:complexity=<tier> -->` marker
+            // becomes a model — so it is where a calibrated second opinion
+            // about the SAME issue is worth recording (issue #8543), and the
+            // only reason this otherwise-sync command is routed through the
+            // async runtime. Strictly telemetry: the resolution itself is
+            // `handle_cli_command`'s, below, byte-for-byte unchanged and
+            // unable to observe either the sample or whether it ran. A
+            // two-env-var no-op unless BOTH `LOOM_JEV_SHADOW_ISSUE` (exported
+            // by `resolve-tier-model.sh`) and `TYPESAFE_API_KEY` are set —
+            // i.e. nothing happens on a keyless host, which is the default.
+            cmd @ Commands::ResolveModel { tier: Some(_), .. } => {
+                loom_daemon::jev_tier::shadow_sample_from_env().await;
+                handle_cli_command(cmd).await
+            }
             other => handle_cli_command(other).await,
         };
     }

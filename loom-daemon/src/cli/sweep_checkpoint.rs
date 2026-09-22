@@ -108,7 +108,7 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
     let issue = number(issue_text)?;
     let target = dir.join(format!("issue-{issue_text}.json"));
     if command == "jev" {
-        return patch_jev(&dir, &target, args.get(2), args.get(3));
+        return patch_jev(&target, args.get(2), args.get(3));
     }
     if command == "write" {
         let record = parse_write(&args[2..])?;
@@ -234,12 +234,12 @@ fn parse_write(args: &[String]) -> Result<Value> {
 /// yet, or already deleted) is a silent no-op, exactly like the `phase`/
 /// `attempt`/`model` readers' own missing-file handling above — never an
 /// error that could make a shadow classification hold up dispatch.
-fn patch_jev(
-    dir: &Path,
-    target: &Path,
-    tier: Option<&String>,
-    confidence: Option<&String>,
-) -> Result<()> {
+///
+/// Argument validation lives here (this is the CLI surface, and a bad
+/// argument must still exit non-zero); the merge itself is
+/// [`loom_daemon::jev_tier::patch_checkpoint_at`], shared with the in-process
+/// Tier-2.5 shadow sample so the two writers cannot drift.
+fn patch_jev(target: &Path, tier: Option<&String>, confidence: Option<&String>) -> Result<()> {
     let tier = tier
         .map(String::as_str)
         .ok_or_else(|| invalid("tier is required"))?;
@@ -253,15 +253,9 @@ fn patch_jev(
     if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
         return Err(invalid("confidence must be between 0 and 1"));
     }
-    let bytes = match std::fs::read(target) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(io_error(error)),
-    };
-    let mut record: Value = serde_json::from_slice(&bytes).map_err(io_error)?;
-    record["jev_tier"] = json!(tier);
-    record["jev_confidence"] = json!(confidence);
-    persist(dir, target, &record)
+    loom_daemon::jev_tier::patch_checkpoint_at(target, tier, confidence)
+        .map(|_| ())
+        .map_err(io_error)
 }
 
 fn persist(dir: &Path, target: &Path, record: &Value) -> Result<()> {

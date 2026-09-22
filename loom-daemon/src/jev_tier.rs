@@ -394,11 +394,11 @@ async fn call_jev(endpoint: &str, api_key: &str, model: &str, state: &str) -> Re
     })
 }
 
-/// Entry point for `loom-daemon jev-tier <issue>`.
-///
-/// On success, prints the [`JevTierOutput`] JSON to stdout and returns
-/// `Ok(())`. On any failure, prints nothing to stdout and returns `Err`.
-pub async fn run(issue: u64) -> Result<()> {
+/// Classify one issue. Shared by [`run`] (which prints the result) and
+/// [`shadow_sample_from_env`] (which records it on the sweep checkpoint), so
+/// the two paths can never drift in what they ask Jev or how strictly they
+/// validate the answer.
+async fn classify(issue: u64) -> Result<JevTierOutput> {
     // Checked FIRST, before any forge read: with the key absent this is a
     // pure no-op that never touches `gh` or the network (#8543 AC).
     let api_key = std::env::var("TYPESAFE_API_KEY")
@@ -410,7 +410,7 @@ pub async fn run(issue: u64) -> Result<()> {
     let (state, truncated) = build_state(ctx.number, &ctx.title, &ctx.body, STATE_BUDGET_BYTES);
     let result = call_jev(&jev_endpoint(), &api_key, &jev_model(), &state).await?;
 
-    let output = JevTierOutput {
+    Ok(JevTierOutput {
         issue: ctx.number,
         truncated,
         model: result.model,
@@ -418,11 +418,175 @@ pub async fn run(issue: u64) -> Result<()> {
         probabilities: result.probabilities,
         confidence: result.confidence,
         usage: result.usage,
-    };
+    })
+}
 
-    println!("{}", serde_json::to_string(&output)?);
+/// Entry point for `loom-daemon jev-tier <issue>`.
+///
+/// On success, prints the [`JevTierOutput`] JSON to stdout and returns
+/// `Ok(())`. On any failure, prints nothing to stdout and returns `Err`.
+pub async fn run(issue: u64) -> Result<()> {
+    println!("{}", serde_json::to_string(&classify(issue).await?)?);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Shadow sample at Tier-2.5 dispatch (#8543)
+// ---------------------------------------------------------------------------
+
+/// Names the issue whose Tier-2.5 model resolution is in flight, so
+/// `loom-daemon resolve-model --tier …` — the native backend of
+/// `resolve-tier-model.sh`, the one place that turns the Curator's marker into
+/// a model — can take a shadow sample for the same issue (#8543).
+///
+/// An **environment variable rather than a flag**, deliberately. This value is
+/// read by exactly one caller (`resolve-tier-model.sh`) and must be invisible
+/// everywhere else, including on a host whose `loom-daemon` predates this
+/// feature: an unknown *flag* is a fatal clap argument error there, which would
+/// make the shadow wiring able to break the very model resolution it is
+/// forbidden to touch (the flag-level floor caveat in `resolve-model.sh`'s own
+/// `requires-daemon:` marker, #8484). An unknown *env var* is ignored by every
+/// binary ever built, so an old daemon degrades to "no shadow sample" with
+/// byte-identical resolution instead.
+pub const SHADOW_ISSUE_ENV: &str = "LOOM_JEV_SHADOW_ISSUE";
+
+/// Take a shadow-mode Jev tier sample for the issue named by
+/// [`SHADOW_ISSUE_ENV`], and record it on that issue's sweep checkpoint for
+/// the daemon's outcome journal to pick up (issue #8543).
+///
+/// **Never observable by its caller.** It returns `()`, not a `Result`: the
+/// model resolution this runs beside is forbidden to change because of a
+/// shadow classification, so there is nothing for a caller to branch on. Every
+/// failure mode — no key, no issue in the environment, an unreadable issue, a
+/// Jev/network/parse failure, no checkpoint on disk yet, even a panic inside
+/// the classification — ends as a `log::debug!` line and nothing else. The
+/// panic case is why the work runs in a `tokio::spawn`ed task: a panic there
+/// surfaces as a `JoinError` rather than unwinding through the caller.
+///
+/// It writes **nothing** to stdout — stdout on this path belongs to the
+/// resolved model id, and a second line there would corrupt
+/// `resolve-tier-model.sh`'s contract.
+///
+/// With `TYPESAFE_API_KEY` unset (the default) this returns after two
+/// environment reads: no task is spawned, no `gh` call is made, no network
+/// call is made, and no file is written.
+pub async fn shadow_sample_from_env() {
+    let Some(issue) = std::env::var(SHADOW_ISSUE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    else {
+        return;
+    };
+    if std::env::var("TYPESAFE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .is_none()
+    {
+        return;
+    }
+    if let Err(e) = tokio::spawn(async move { shadow_sample(issue).await }).await {
+        log::debug!("jev-tier: shadow sample for #{issue} did not complete: {e}");
+    }
+}
+
+/// The body of [`shadow_sample_from_env`], split out so the spawned task has a
+/// single fallible expression to log.
+async fn shadow_sample(issue: u64) {
+    let output = match classify(issue).await {
+        Ok(output) => output,
+        Err(e) => {
+            log::debug!("jev-tier: shadow classification for #{issue} failed: {e}");
+            return;
+        }
+    };
+    let Some(root) = crate::repo_root::find_repo_root_from_cwd() else {
+        log::debug!("jev-tier: no repo root from the cwd — shadow sample for #{issue} dropped");
+        return;
+    };
+    match patch_checkpoint(&root, issue, &output.tier, output.confidence) {
+        Ok(true) => log::debug!(
+            "jev-tier: shadow sample for #{issue} recorded ({} @ {:.2})",
+            output.tier,
+            output.confidence
+        ),
+        Ok(false) => {
+            log::debug!("jev-tier: no sweep checkpoint for #{issue} yet — shadow sample dropped")
+        }
+        Err(e) => log::debug!("jev-tier: could not record the shadow sample for #{issue}: {e}"),
+    }
+}
+
+/// Merge `jev_tier`/`jev_confidence` into an ALREADY-EXISTING sweep checkpoint
+/// under `<root>/.loom/sweep-checkpoint/` (issue #8543), leaving every other
+/// field (`phase`, `task_id`, `pr_number`, `attempt`, `model`) untouched.
+///
+/// A merge, never a rewrite: the Tier-2.5 dispatch step that produces a shadow
+/// sample does not know — and must not need to know — the sweep's current
+/// phase or task id, which a full `sweep-checkpoint write` would overwrite.
+///
+/// Returns `Ok(false)` when no checkpoint exists for `issue` (nothing written
+/// yet for this sweep, or it was already deleted on success) — a normal,
+/// non-error outcome for a best-effort sample, matching
+/// `sweep-checkpoint`'s own readers.
+///
+/// # Errors
+/// When the checkpoint exists but cannot be read, parsed, or replaced. The
+/// write is atomic (temp file in the same directory, `fsync`, rename) so a
+/// concurrent reader never observes a partial record.
+pub fn patch_checkpoint(
+    root: &Path,
+    issue: u64,
+    tier: &str,
+    confidence: f64,
+) -> std::io::Result<bool> {
+    let target = root
+        .join(".loom/sweep-checkpoint")
+        .join(format!("issue-{issue}.json"));
+    patch_checkpoint_at(&target, tier, confidence)
+}
+
+/// [`patch_checkpoint`] against an explicit checkpoint path, for
+/// `sweep-checkpoint jev`, whose CLI derives the filename from the issue
+/// argument's raw text (so `007` stays `issue-007.json`) rather than from a
+/// parsed number.
+///
+/// # Errors
+/// Same as [`patch_checkpoint`].
+pub fn patch_checkpoint_at(target: &Path, tier: &str, confidence: f64) -> std::io::Result<bool> {
+    use std::io::Write as _;
+
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let bytes = match std::fs::read(target) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut record: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    record["jev_tier"] = serde_json::json!(tier);
+    record["jev_confidence"] = serde_json::json!(confidence);
+
+    let mut out = serde_json::to_vec_pretty(&record)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    out.push(b'\n');
+    if out.len() > CHECKPOINT_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint exceeds 64 KiB",
+        ));
+    }
+    std::fs::create_dir_all(dir)?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.write_all(&out)?;
+    temp.as_file().sync_all()?;
+    temp.persist(target)?;
+    std::fs::File::open(dir).and_then(|file| file.sync_all())?;
+    Ok(true)
+}
+
+/// The `sweep-checkpoint` size cap, shared with its CLI so the two writers
+/// cannot disagree about what fits in a checkpoint.
+pub const CHECKPOINT_MAX_BYTES: usize = 65536;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -570,6 +734,99 @@ mod tests {
         std::env::remove_var("TYPESAFE_API_KEY");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("TYPESAFE_API_KEY"), "got: {err}");
+    }
+
+    // --- shadow sample at Tier-2.5 dispatch (#8543) -------------------------
+
+    /// The keyless default: `resolve-tier-model.sh` always exports
+    /// `LOOM_JEV_SHADOW_ISSUE`, so the *key* is what must gate the work. With
+    /// it unset, nothing runs — proven by pointing both `gh` and the endpoint
+    /// at addresses that would fail loudly (and slowly) if they were reached.
+    #[test]
+    #[serial(jev_merge_risk_env)]
+    fn shadow_sample_without_api_key_touches_nothing() {
+        std::env::remove_var("TYPESAFE_API_KEY");
+        std::env::set_var(SHADOW_ISSUE_ENV, "8543");
+        std::env::set_var("LOOM_GH_BIN", "/nonexistent/gh-should-not-be-run");
+        std::env::set_var("LOOM_JEV_TIER_ENDPOINT", "http://127.0.0.1:1/v1/systemone");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(shadow_sample_from_env());
+        std::env::remove_var(SHADOW_ISSUE_ENV);
+        std::env::remove_var("LOOM_GH_BIN");
+        std::env::remove_var("LOOM_JEV_TIER_ENDPOINT");
+    }
+
+    /// The other half of the gate: a key with no issue in the environment (any
+    /// `resolve-model` caller that is not `resolve-tier-model.sh`) is equally
+    /// a no-op, including when the variable is present but unparseable.
+    #[test]
+    #[serial(jev_merge_risk_env)]
+    fn shadow_sample_without_a_parseable_issue_touches_nothing() {
+        std::env::set_var("TYPESAFE_API_KEY", "sk-test");
+        std::env::set_var("LOOM_GH_BIN", "/nonexistent/gh-should-not-be-run");
+        std::env::set_var("LOOM_JEV_TIER_ENDPOINT", "http://127.0.0.1:1/v1/systemone");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        std::env::remove_var(SHADOW_ISSUE_ENV);
+        runtime.block_on(shadow_sample_from_env());
+        for bogus in ["", "  ", "not-a-number", "-1"] {
+            std::env::set_var(SHADOW_ISSUE_ENV, bogus);
+            runtime.block_on(shadow_sample_from_env());
+        }
+        std::env::remove_var(SHADOW_ISSUE_ENV);
+        std::env::remove_var("TYPESAFE_API_KEY");
+        std::env::remove_var("LOOM_GH_BIN");
+        std::env::remove_var("LOOM_JEV_TIER_ENDPOINT");
+    }
+
+    #[test]
+    fn patch_checkpoint_merges_into_an_existing_record_only() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".loom/sweep-checkpoint");
+
+        // No checkpoint yet: a silent, non-error no-op that creates nothing.
+        assert!(!patch_checkpoint(root.path(), 42, "routine", 0.62).unwrap());
+        assert!(!dir.join("issue-42.json").exists());
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("issue-42.json"),
+            r#"{"phase":"curator-done","task_id":"run-1","pr_number":7}"#,
+        )
+        .unwrap();
+        assert!(patch_checkpoint(root.path(), 42, "complex", 0.91).unwrap());
+
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("issue-42.json")).unwrap())
+                .unwrap();
+        assert_eq!(record["jev_tier"], "complex");
+        assert!((record["jev_confidence"].as_f64().unwrap() - 0.91).abs() < 1e-12);
+        // Every pre-existing field survives the merge.
+        assert_eq!(record["phase"], "curator-done");
+        assert_eq!(record["task_id"], "run-1");
+        assert_eq!(record["pr_number"], 7);
+        // No temp file left behind by the atomic replace.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .filter(|n| n != "issue-42.json")
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
+    }
+
+    #[test]
+    fn patch_checkpoint_reports_an_unparseable_checkpoint_rather_than_clobbering_it() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".loom/sweep-checkpoint");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("issue-42.json"), "not json").unwrap();
+        assert!(patch_checkpoint(root.path(), 42, "routine", 0.5).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("issue-42.json")).unwrap(), "not json");
     }
 
     #[test]
