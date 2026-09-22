@@ -90,6 +90,20 @@ fn main() {
             std::env::var("LOOM_TEST_HARNESS_SECRET").ok().as_deref() == Some(source.as_str())
         );
     }
+    if std::env::var_os("FIXTURE_WRITE_NATIVE_STATE").is_some() {
+        let runtime = std::env::var("LOOM_RUNTIME").unwrap();
+        let directory = std::path::PathBuf::from(
+            std::env::var_os(if runtime == "pi" {
+                "PI_CODING_AGENT_DIR"
+            } else {
+                "XDG_DATA_HOME"
+            })
+            .expect("isolated harness state"),
+        );
+        for name in ["fixture-auth.json", "fixture-session.json"] {
+            std::fs::write(directory.join(name), "{\"fixture\":true}").unwrap();
+        }
+    }
     // Pool-sourced credential: the source variable is deliberately absent from
     // the environment, so the expected value is passed under its own name.
     if let Ok(expected) = std::env::var("LOOM_TEST_EXPECTED_SECRET") {

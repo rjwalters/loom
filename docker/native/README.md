@@ -78,11 +78,12 @@ on top of the base set.
 `loom_daemon::worker_spawn::containment` points every one of
 `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`,
 `OPENCODE_CONFIG_DIR`, and `LOOM_NATIVE_TOOLS_DIR` at
-`/home/loom/.loom-native/<per-launch-id>/…` inside this tree. That is the fix
-for the concrete problem #8403 opens with: uncontained, `XDG_DATA_HOME` is not
-relocated per launch, so N concurrent native workers on one host share **one**
-`~/.local/share/opencode` session store and **one** `auth.json`, and a
-`/connect`-style login by one worker is visible to all.
+`/home/loom/.loom-native/<per-launch-id>/…` inside this tree. Guarded uncontained
+launches now also isolate auth/session state outside repositories (#8568).
+Containment additionally places it in an ephemeral container layer; it does not
+mount host harness auth stores. Contained launches keep environment/pool
+credential injection; the host-only `LOOM_NATIVE_AUTH_FILE` snapshot option does
+not implicitly mount a credential file into a container.
 
 Contained, two concurrent workers are disjoint twice over — different
 containers *and* different paths within them. The per-launch id is not

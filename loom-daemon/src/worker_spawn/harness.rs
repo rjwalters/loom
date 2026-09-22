@@ -1,6 +1,9 @@
 //! Harness-specific command construction. No provider HTTP client, shell parsing or retries.
 use super::{
-    credential::Resolved, opencode_version::Major, profiles::Selection, LaunchError, Options,
+    credential::{Resolved, Source},
+    opencode_version::Major,
+    profiles::Selection,
+    LaunchError, Options,
 };
 use std::{
     io::{Seek, SeekFrom, Write as _},
@@ -71,6 +74,12 @@ impl Harness {
         // Explicit env > API-key pool > nothing; resolved upstream so the
         // secret has exactly one consumer (#8401).
         credential.apply(&mut command);
+        if guarded
+            && credential.source == Source::None
+            && std::env::var_os("LOOM_NATIVE_AUTH_FILE").is_none_or(|value| value.is_empty())
+        {
+            eprintln!("Loom guarded native launches use isolated auth state; configure profile credentials or an external 0600 LOOM_NATIVE_AUTH_FILE for providers requiring login. Unauthenticated local providers remain supported.");
+        }
         let provider = crate::native_tools::provision::ProviderConfig {
             id: &selection.provider,
             options: selection.provider_options.as_ref(),

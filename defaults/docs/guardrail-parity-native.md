@@ -23,10 +23,45 @@ exists yet**, so a guarded launch on 2.x is refused before spawn; see
 | Concurrent file edits | File operations share a workspace mutation lock; an edit must match exactly one nonempty old-text occurrence. |
 | Large output and hung commands | Reads/output are bounded; shell execution uses the existing Rust bounded process executor and a maximum 600-second deadline. SIGTERM/SIGINT cancels the owned shell process group. |
 | Model/provider selection | Existing named profiles and explicit provider/model selections; no Claude token-pool preflight or implicit Sonnet default on native sweeps. |
-| Credentials | The existing harness credential store or profile environment mapping; keys are never embedded in binding source or arguments. |
+| Credentials | Profile environment/pool mapping, or an explicitly selected external auth snapshot; keys are never embedded in binding source or arguments. |
 
-Bindings are generated from the binary under `.loom/native-tools/`, which is
-machine-local ignored state. The OpenCode binding depends on the matching
+Bindings and mutable harness state are generated outside repositories under
+`~/.local/state/loom/native-tools/<workspace-hash>/<launch-id>/`. Every launch
+has its own private directory (0700), including concurrent launches in one
+workspace. `LOOM_NATIVE_TOOLS_DIR` selects an alternative **external base**,
+including the existing container-private base; it no longer selects a shared
+binding directory. Pi's agent/auth and session directories, and OpenCode's
+config/data/state/cache directories are pinned beneath the launch directory.
+Absolute paths are required. Paths inside this workspace or another Git
+checkout, including symlink aliases, are refused before binding provisioning;
+unsafe inherited HOME, Pi, OpenCode and XDG directory overrides also refuse
+launch. The workspace mutation lock remains operational repository state.
+
+Profile environment and API-key pool injection keep their existing precedence.
+Guarded launches no longer implicitly reuse a harness's global auth store.
+For an uncontained OAuth or existing-login launch, set `LOOM_NATIVE_AUTH_FILE` to that
+harness's external JSON auth file (owned by you, mode 0600, in a 0700 directory,
+at most 1 MiB). Its credential type and required fields must match the selected
+harness; wrong formats fail with a fixed diagnostic that omits credential values.
+Loom copies it into the private launch directory; the original is never changed,
+moved or deleted. Container launches retain environment/pool injection; this
+host snapshot option does not add a secret mount. Refreshes affect only the
+launch copy. This is a snapshot, not persistent login synchronization: later
+launches may need renewed authentication, and concurrent refresh behavior depends
+on the provider. Prefer profile environment/API-key pool injection for repeated
+workers. Renew the external source separately and use the matching harness's
+auth format. With no
+injected credentials or snapshot, Loom emits migration guidance; unauthenticated
+local providers still work and remote providers report their own missing-auth
+error. Provider/model selection and fallback policy are unchanged.
+
+The private launch state is retained for inspection and may contain credentials,
+sessions and logs: treat it as secret, keep its directories private, and remove
+completed launch directories when no longer needed. There is no automatic
+migration or deletion of existing repository-local state. Direct unguarded
+launches and interactive harness sessions keep their previous behavior.
+
+The OpenCode binding depends on the matching
 `@opencode-ai/plugin` package; OpenCode installs it into that isolated config
 directory. That package is pinned to 1.18.31 and was verified against an
 OpenCode 1.18.31 host only; whether a 2.x host loads it is unverified. No
