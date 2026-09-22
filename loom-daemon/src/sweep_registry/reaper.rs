@@ -7,6 +7,7 @@ pub(crate) mod container_stop;
 mod liveness;
 pub(crate) mod no_progress;
 pub(crate) mod pid_identity;
+pub(crate) mod pr_park;
 
 // ============================================================================
 // Constants
@@ -1588,6 +1589,53 @@ impl SweepRegistry {
                                             dispatched: false,
                                             repo: None, // stamped by emit_event (#3929)
                                         });
+                                    } else if let Some(label) = self.linked_pr_park_label(pr) {
+                                        // PR-side park (Issue #8689). The
+                                        // checkpoint DID advance — a
+                                        // cap-exhausted Doctor block writes
+                                        // `doctor-done` and then leaves it in
+                                        // place on purpose — so the #5614
+                                        // clean-exit guard above cannot see
+                                        // this shape, and the #4444 park guard
+                                        // reads the ISSUE's labels, never the
+                                        // PR's. Without this arm every
+                                        // cap-exhausted block costs one
+                                        // guaranteed no-op resume: a full agent
+                                        // spawn and a rotated token spent
+                                        // re-verifying byte-identical forge
+                                        // state. A parked PR is a considered
+                                        // terminal state, same class as the
+                                        // engine-stop hold #5614 cites.
+                                        //
+                                        // Like that guard, this does NOT
+                                        // consume a resume attempt: lifting the
+                                        // park is not a failed attempt, so the
+                                        // full #4256 runway survives for the
+                                        // Champion-lifted resume the retained
+                                        // `doctor-done` checkpoint exists to
+                                        // serve. `restore_label_to_ready` above
+                                        // already returned the issue to
+                                        // `loom:issue` (the park is on the PR,
+                                        // not the issue), where the #4123
+                                        // open-PR guard refuses ordinary
+                                        // re-dispatch and the periodic
+                                        // Judge/Champion roles own the PR.
+                                        log::info!(
+                                            "issue #{issue}: linked PR #{pr} carries `{label}` — a \
+                                             deliberate park (e.g. a Doctor-cycle-cap block) that \
+                                             the #4444 issue-side guard cannot see; NOT resuming \
+                                             at checkpoint phase {resume_phase_check:?} (#8689). \
+                                             The issue is back at loom:issue with the #4123 \
+                                             open-PR guard in force; the parked PR is the periodic \
+                                             Judge/Champion roles' remit."
+                                        );
+                                        events_to_emit.push(Event::SweepResumeDispatched {
+                                            issue,
+                                            pr,
+                                            checkpoint_phase: resume_phase_check.clone(),
+                                            dispatched: false,
+                                            repo: None, // stamped by emit_event (#3929)
+                                        });
                                     } else {
                                         // Count the attempt regardless of whether
                                         // the dispatch call itself succeeds, so a
@@ -2328,3 +2376,14 @@ mod tests;
     unused_imports
 )]
 mod claim_restore_tests;
+
+// The PR-side park family (#8689) likewise lives in its own sibling module,
+// for the same file-size-ratchet reason as `claim_restore_tests`.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod pr_park_tests;
