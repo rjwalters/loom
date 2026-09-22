@@ -7,7 +7,20 @@ Rust normalizes requests through the existing shared guard bridge and its
 workflow, destructive-command, and worktree policies.
 
 Tested versions and live outcomes: [verification receipt](native-runtime-verification-2026-09-19.md)
-— Pi 0.85.1 and OpenCode **1.18.31**. Everything this page says about OpenCode's
+— Pi 0.85.1 and OpenCode **1.18.31**.
+
+| Harness | Pinned version | What that pin rests on |
+| --- | --- | --- |
+| Pi | 0.85.1 | Guarded live canary — [verification receipt](native-runtime-verification-2026-09-19.md). |
+| OpenCode | 1.18.31 | Guarded live canary (1.x only) — same receipt; see "OpenCode major versions". |
+| Kimi | 2.0.2 | **No guarded canary yet.** Credential-free harness probe only — [`docs/experiments/kimi-harness-probe-2026-09-22.json`](https://github.com/rjwalters/loom/blob/main/docs/experiments/kimi-harness-probe-2026-09-22.json) (#8561). The pin names the CLI the adapter and the container image were built against, *not* a verified guard boundary; see "Kimi". |
+
+`docker/native/Dockerfile` equality-checks all three at build time (`ARG
+OPENCODE_VERSION` / `PI_VERSION` / `KIMI_CODE_VERSION`), so a drifted pin fails
+the image build rather than shipping silently. Bump a pin, this table and a
+fresh run together; never one without the others.
+
+Everything this page says about OpenCode's
 guard was verified on OpenCode 1.x only. **No OpenCode 2.x guarded receipt
 exists yet**, so a guarded launch on 2.x is refused before spawn; see
 "OpenCode major versions" below. Kimi's binding (#8562) is implemented and
@@ -175,6 +188,47 @@ exit code), can distinguish "failed closed" from "fell open" on the real CLI.
 `defaults/runtimes/kimi.json` stays `worktreeIsolation: "no"` /
 `loomControl: "no"` — so Builder, Doctor and Judge stay refused on Kimi — until
 a passing receipt lands beside a flip of `KIMI_GUARD_VERIFIED` to `true`.
+
+### Kimi under ephemeral containment (#8565)
+
+The opt-in per-sweep container ("Residual limits" below) covers Kimi on the
+same terms as Pi/OpenCode, with one harness-specific relocation:
+`KIMI_CODE_HOME` is a *single* variable carrying Kimi's whole state — config,
+`mcp.json`, session store, `logs/kimi-code.log`, credential store, plugins, and
+the `rg`/`fd` binaries it downloads into `$KIMI_CODE_HOME/bin/` on first use.
+Unset, it is `~/.kimi-code`, so N uncontained Kimi workers on one host share
+one session store, one log and one credential store.
+
+`worker_spawn::containment` therefore points it at
+`/home/loom/.loom-native/<per-launch-id>/kimi` alongside the XDG bases,
+`OPENCODE_CONFIG_DIR` and `LOOM_NATIVE_TOOLS_DIR`, and the image deliberately
+bakes no value for it. A *guarded* launch relocates it a second time, to
+`native_tools::provision`'s own 0700 per-launch directory under the (also
+per-launch) `LOOM_NATIVE_TOOLS_DIR` — so the guarded-binding directory resolves
+inside the container exactly the way OpenCode's `OPENCODE_CONFIG_DIR` does. The
+container-level value is what an unguarded free-form trial gets.
+
+Credentials keep the by-name-only contract: an API-key profile's
+`KIMI_MODEL_API_KEY` is forwarded as `-e KIMI_MODEL_API_KEY` with no `=value`,
+so it never enters the dispatch's argv or any file in the container. A name
+that collides with one of the relocated directories is dropped rather than
+forwarded — a bare `-e NAME` is read from the host and, coming later on the
+command line, would otherwise beat the per-launch assignment.
+
+**This changes nothing about the missing canary above.** Containment bounds the
+blast radius of an unverified guard; it is not evidence the guard holds.
+`KIMI_GUARD_VERIFIED` stays `false` until #8636's live receipt lands, contained
+or not.
+
+The *containment* mechanism itself — as opposed to the guard — has its own
+live receipt:
+[`kimi-containment-verification-2026-09-22.md`](kimi-containment-verification-2026-09-22.md)
+records a real `docker build` + `docker/native/test-image.sh` pass, two
+concurrent contained workers with disjoint `KIMI_CODE_HOME`s, and a
+post-run writable-layer scan showing no credential value reached disk. It is
+not a substitute for #8434 (still open, Pi/OpenCode-scoped) or for a
+credentialed Kimi task run, which no account in this environment could
+provide.
 
 ## Toolless launch detection
 
