@@ -149,6 +149,13 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       publish: ${{ steps.resolve.outputs.publish }}
+      # `true` only on the path that CREATES the Release here (a VERSION bump
+      # on main). That Release is created with `--latest=false` (#8515), so
+      # something has to promote it once every asset has landed — see the
+      # `promote-release` job. Every other path (a hand-created Release, a
+      # workflow_dispatch dry run, a Release that already existed) leaves the
+      # repository's "Latest" pointer exactly where it found it.
+      promote: ${{ steps.resolve.outputs.promote }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -168,12 +175,22 @@ jobs:
           set -euo pipefail
           case "$EVENT_NAME" in
             release)
-              echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-              echo "publish=true" >> "$GITHUB_OUTPUT"
+              # A human/`/repo:release` created this Release themselves and
+              # GitHub already applied their "Latest" choice to it. Re-deciding
+              # that here would be this workflow overriding an explicit act, so
+              # promote=false (#8515).
+              {
+                echo "tag=$RELEASE_TAG"
+                echo "publish=true"
+                echo "promote=false"
+              } >> "$GITHUB_OUTPUT"
               ;;
             workflow_dispatch)
-              echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
-              echo "publish=false" >> "$GITHUB_OUTPUT"
+              {
+                echo "tag=$INPUT_TAG"
+                echo "publish=false"
+                echo "promote=false"
+              } >> "$GITHUB_OUTPUT"
               ;;
             push)
               version="$(./scripts/version.sh)"
@@ -181,11 +198,30 @@ jobs:
               if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
                 echo "::notice::Release $tag already exists — this push publishes nothing."
                 echo "- SKIPPED: Release \`$tag\` already exists." >> "$GITHUB_STEP_SUMMARY"
-                echo "tag=$tag" >> "$GITHUB_OUTPUT"
-                echo "publish=skip" >> "$GITHUB_OUTPUT"
+                # promote=false: nothing was built or uploaded by this run, so
+                # it has no standing to move the "Latest" pointer (#8515).
+                {
+                  echo "tag=$tag"
+                  echo "publish=skip"
+                  echo "promote=false"
+                } >> "$GITHUB_OUTPUT"
               else
                 # --target creates the tag at this exact commit when it does not
                 # exist yet; --generate-notes diffs against the previous tag.
+                #
+                # --latest=false is load-bearing (#8515): this Release is
+                # created BEFORE `build-daemon` has uploaded a single asset, so
+                # without it `releases/latest` would name an asset-less Release
+                # for the whole duration of the build matrix — minutes during
+                # which every updater on every platform correctly concludes
+                # "this release has no artifact for my target" and either
+                # rebuilds from source (soft path) or hard-fails (`--fetch`).
+                # The Release, its tag and its notes are all still published
+                # immediately and fetchable BY TAG; only the repository's
+                # "Latest" pointer waits, and it is moved by the
+                # `promote-release` job once every matrix leg has uploaded.
+                # A matrix failure therefore leaves "Latest" on the previous,
+                # complete Release rather than advancing it onto a broken one.
                 #
                 # Bounded retry (#8290): a one-off HTTP 403/5xx from the
                 # releases API (observed once, "Resource not accessible by
@@ -208,7 +244,7 @@ jobs:
                   # (0) on the false branch, not the failed command's.
                   create_status=0
                   create_output="$(gh release create "$tag" --repo "$REPO" --target "$SHA" \
-                    --title "$tag" --generate-notes 2>&1)" || create_status=$?
+                    --title "$tag" --generate-notes --latest=false 2>&1)" || create_status=$?
                   if [ "$create_status" -eq 0 ]; then
                     echo "$create_output"
                     break
@@ -236,9 +272,12 @@ jobs:
                     exit "$create_status"
                   fi
                 done
-                echo "- Created Release \`$tag\` at \`${SHA:0:12}\` (VERSION bump on main)." >> "$GITHUB_STEP_SUMMARY"
-                echo "tag=$tag" >> "$GITHUB_OUTPUT"
-                echo "publish=true" >> "$GITHUB_OUTPUT"
+                echo "- Created Release \`$tag\` at \`${SHA:0:12}\` (VERSION bump on main), NOT yet marked Latest (#8515)." >> "$GITHUB_STEP_SUMMARY"
+                {
+                  echo "tag=$tag"
+                  echo "publish=true"
+                  echo "promote=true"
+                } >> "$GITHUB_OUTPUT"
               fi
               ;;
             *)
@@ -681,6 +720,108 @@ jobs:
             dist/loom-daemon-${{ matrix.target }}*.sig
             dist/loom-daemon-${{ matrix.target }}*.pem
           retention-days: 7
+
+  promote-release:
+    name: Promote the Release to Latest
+    # #8515: `resolve` creates the Release with `--latest=false`, so between
+    # then and here `releases/latest` still names the PREVIOUS, complete
+    # Release instead of one whose per-platform uploads are still in flight.
+    # This job moves the pointer, and it is the only thing that does.
+    #
+    # The "every expected asset for every target has uploaded" guarantee is
+    # `needs: build-daemon` itself, not a list re-derived here: each matrix leg
+    # ends in a retry-until-complete upload step that fails loudly unless the
+    # Release carries every file THAT leg produced, and a job depending on a
+    # matrix job runs only when EVERY leg succeeded. Restating the target
+    # triples here would add a second list that could silently disagree with
+    # the matrix (a fourth platform added there and forgotten here would be
+    # promoted over) — exactly the "one mechanism per behaviour" rule in
+    # `.loom/docs/ci-principles.md`. `build-worker-image` below derives its own
+    # completeness guarantee from the same `needs:` edge, for the same reason.
+    #
+    # Consequence, and the reason this is safer than the draft-release variant
+    # of #8515: if any platform's build or upload fails, this job is skipped
+    # (an `if:` with no status-check function keeps the implicit `success()`),
+    # the workflow is red, and "Latest" simply stays where it was — on a
+    # Release that does have every artifact. Nothing is left invisible: the new
+    # Release is published, tagged and fetchable by exact tag throughout.
+    needs: [resolve, build-daemon]
+    if: needs.resolve.outputs.promote == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Mark the Release as Latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Floor check (not a substitute for the `needs:` guarantee above):
+          # the Release must carry at least one binary + `.sha256` PAIR before
+          # it is worth pointing the fleet at. This catches the degenerate
+          # "every leg reported success but the Release is empty" case — an
+          # asset wipe, a tag recreated underneath us — without duplicating the
+          # per-target list.
+          assets="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')"
+          pairs=0
+          while IFS= read -r name; do
+            case "$name" in
+              ""|*.sha256|*.sig|*.pem) continue ;;
+              loom-daemon-*)
+                if grep -qxF "${name}.sha256" <<<"$assets"; then
+                  pairs=$((pairs + 1))
+                fi
+                ;;
+            esac
+          done <<<"$assets"
+
+          if [ "$pairs" -eq 0 ]; then
+            echo "::error::Release ${TAG} carries no complete loom-daemon binary + .sha256 pair — refusing to mark it Latest (#8515)." >&2
+            echo "- REFUSED: \`$TAG\` was not promoted to Latest — no complete binary/checksum pair on the Release." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Bounded retry on a transient forge failure, mirroring the
+          # `gh release create` loop in `resolve` (#8290): the whole point of
+          # this job is that the pointer advances, so a one-off 403/5xx here
+          # must not be what leaves the fleet pinned to the previous release.
+          max_attempts=3
+          attempt=1
+          while :; do
+            edit_status=0
+            edit_output="$(gh release edit "$TAG" --repo "$REPO" --latest 2>&1)" || edit_status=$?
+            if [ "$edit_status" -eq 0 ]; then
+              echo "$edit_output"
+              break
+            fi
+            echo "::warning::gh release edit --latest for $TAG failed on attempt $attempt/$max_attempts: $edit_output"
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::gh release edit --latest for $TAG failed after $max_attempts attempts — the Release is complete but NOT marked Latest. Last output: $edit_output" >&2
+              exit "$edit_status"
+            fi
+            if printf '%s' "$edit_output" | grep -qE 'HTTP (403|5[0-9]{2})'; then
+              backoff=$((attempt * 5))
+              echo "Transient-looking failure (403/5xx) — retrying in ${backoff}s (attempt $((attempt + 1))/$max_attempts)..."
+              sleep "$backoff"
+              attempt=$((attempt + 1))
+            else
+              echo "::error::gh release edit --latest for $TAG failed with a non-retryable error: $edit_output" >&2
+              exit "$edit_status"
+            fi
+          done
+
+          # Read back what the forge actually believes, rather than trusting
+          # our own write: `releases/latest` is the exact endpoint every
+          # updater resolves against (`gh release view` with no tag).
+          latest_tag="$(gh release view --repo "$REPO" --json tagName --jq '.tagName' 2>/dev/null || true)"
+          if [ "$latest_tag" != "$TAG" ]; then
+            echo "::error::after promotion, releases/latest names '${latest_tag:-<none>}', not ${TAG}." >&2
+            exit 1
+          fi
+          echo "- Promoted \`$TAG\` to Latest with ${pairs} complete binary/checksum pair(s) uploaded (#8515)." >> "$GITHUB_STEP_SUMMARY"
 
   build-worker-image:
     name: Build and publish loom-worker image

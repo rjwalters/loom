@@ -106,6 +106,69 @@ to revisit this decision (e.g. add a periodic reconciliation job that lists
 tags with no matching Release) — not something to build preemptively for a
 single observed incident.
 
+## A release is visible before its assets are (#8515)
+
+`release.yml` publishes the Release **first** (the `resolve` job's `gh release
+create`) and uploads the per-target assets afterwards, from independent
+`build-daemon` matrix legs. For the whole duration of that matrix — minutes —
+the Release exists with **no artifact for your platform**, and a single `gh
+release view` snapshot cannot tell that apart from a platform that will never
+have one. Until #8515, `releases/latest` — the exact endpoint every updater
+resolves against — named that Release from the instant it was created, so every
+host that ticked during the window concluded its platform was unbuilt (soft
+path: a needless source rebuild; forced `--fetch`: a hard failure whose message
+was identical to a genuinely missing artifact).
+
+### The Latest pointer waits for the uploads
+
+The Release is now created with **`--latest=false`**, and a `promote-release`
+job — `needs: [resolve, build-daemon]`, so it runs only once *every* matrix leg
+has uploaded successfully — marks it Latest afterwards. During the window
+`releases/latest` therefore keeps naming the previous, **complete** Release, and
+an updater that ticks mid-matrix resolves that one, finds it is not newer than
+what it already runs, and no-ops.
+
+Deliberately **not** a draft Release: the new Release, its tag and its notes are
+published and fetchable by exact tag the whole time — only the repository's
+Latest pointer waits. And if a platform's build or upload fails, the promotion
+is skipped (the workflow is red), which leaves Latest on the previous complete
+Release instead of advancing it onto a broken one. A draft would instead risk a
+Release that is never published at all, invisible to everyone, on any single-leg
+failure.
+
+### The resolver still says which case it is in
+
+Promotion closes the window for *this* repo's own automated releases. It does
+not cover a hand-cut Release (`/repo:release`, the `release` event — the
+author's own Latest choice is honoured, never overridden here), a consumer repo
+on an older workflow, or a platform that is genuinely unbuilt. So the daemon's
+resolver (`loom-daemon/src/release_resolve/resolve.rs`) still reads the
+release's `publishedAt` and asset count on the failure path and reports which
+case it is in:
+
+- Inside the upload window (`ASSET_UPLOAD_GRACE_MINUTES`, 60m): *"… the release
+  was published 4m ago and it publishes no assets at all yet — its per-target
+  assets are most likely STILL UPLOADING"*.
+- Outside it: *"… published 3d 4h ago and it publishes 6 asset(s), none matching
+  this target, well past the 60m upload window — this platform looks genuinely
+  unbuilt rather than mid-upload"*.
+- Publish time unreadable (an older `gh`): said as unknown. An unknown age is
+  **never** reported as transient — nothing would bound the claim.
+- Asset list unreadable: reported as unreadable, which is a different fact from
+  "the release publishes nothing yet".
+
+Resolution still fails in every one of those cases, so the tick falls back to a
+source build exactly as before and an over-generous window cannot mask a
+genuinely unbuilt platform — the window changes only the **wording** of a
+refusal, never its outcome.
+
+`loom-daemon-update.sh`'s own resolver (the shell twin `--fetch` uses) still
+emits the flat, pre-#8515 wording: it is a `contract`-category script, frozen by
+both the file-size ratchet and the portable shell budget, so the classification
+cannot be added there without first porting the resolution behind the daemon.
+Tracked separately in
+[#8654](https://github.com/rjwalters/loom/issues/8654).
+
 ## See also
 
 - `CLAUDE.md` § "Forge Authentication & Releasing" — how `/repo:release` works
@@ -115,6 +178,9 @@ single observed incident.
   they fit the update lifecycle.
 - Issue [#6010](https://github.com/rjwalters/loom/issues/6010) — the incident
   and acceptance criteria this doc satisfies.
+- Issue [#8515](https://github.com/rjwalters/loom/issues/8515) — the
+  create-before-upload visibility race, the deferred Latest pointer, and the
+  age/asset-count reporting above.
 - Issue [#8290](https://github.com/rjwalters/loom/issues/8290) — the one-off
   `gh release create` HTTP 403 that motivated the retry logic and the
   "accepted gap" decision above.
