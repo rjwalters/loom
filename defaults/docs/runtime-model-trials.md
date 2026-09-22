@@ -126,7 +126,7 @@ capability `"no"`. The guarded `loom_*` tool binding itself — a Rust
 `KIMI_CODE_HOME`, and the same guard bridge/worktree/destructive-command
 policies Pi and OpenCode use — landed in #8562, but the manifest flip stays
 gated on a live guarded canary receipt (`native_tools::provision::KIMI_GUARD_VERIFIED`,
-`false` today); see [guardrail-parity-native.md](../../.loom/docs/guardrail-parity-native.md)
+`false` today); see [guardrail-parity-native.md](guardrail-parity-native.md)
 § "Kimi" for why a fixture-tested binding is not admission evidence. Kimi is
 therefore still admitted only for roles that declare no `runtimeRequirements`
 (Curator, Guide, Auditor); Builder, Doctor and Judge fail closed at exit 78. A
