@@ -33,6 +33,7 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str) {
         Ok(saved) => {
             command.env(TRACEPARENT_ENV, saved.context.traceparent());
             command.env(CONTEXT_FILE_ENV, store.path(root, execution));
+            super::lifecycle::prepare_execution(command, root, execution);
         }
         Err(error) => {
             log::warn!("observability: trace context unavailable; child is untraced: {error}")

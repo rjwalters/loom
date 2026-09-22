@@ -31,11 +31,36 @@ fn reconstruct_admits_live_lock_owners() {
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 
+    let root = &registry.config.workspace_root;
+    let store = crate::telemetry::trace::store::TraceStore::new(root);
+    let saved = store.load_or_create(root, &owner.sweep_id).unwrap();
+    let journal =
+        crate::telemetry::trace::journal::Journal::for_context(&store.path(root, &owner.sweep_id));
+    journal
+        .start(
+            saved.context.clone(),
+            None,
+            crate::telemetry::trace::SpanName::Sweep,
+            Utc::now(),
+            Default::default(),
+        )
+        .unwrap();
+    journal
+        .set_supervisor(&saved.context, 2_147_483_640)
+        .unwrap();
+
     let admitted = registry.reconstruct().unwrap();
     assert!(admitted >= 1);
     let info = registry.get("sweep-issue-77-reconstruct").unwrap();
     assert_eq!(info.pid, std::process::id());
     assert!(matches!(info.state, SweepState::Running));
+    let restored = journal.active().unwrap();
+    assert_eq!(
+        restored[0].supervisor_pid,
+        Some(std::process::id()),
+        "lock-based adoption must renew trace supervision before collector exposure"
+    );
+    assert_eq!(restored[0].owner_pid, owner.owner_pid);
 }
 
 /// Issue #4214: a live-locked issue with **no** matching registry entry at

@@ -178,22 +178,36 @@ pub fn emit_for_tick(
     outcome: &RoleTickOutcome,
     resolved_model_effort: Option<(String, String)>,
 ) {
+    emit_for_tick_correlated(root, role, started_at, outcome, resolved_model_effort, None);
+}
+
+pub fn emit_for_tick_correlated(
+    root: &Path,
+    role: &str,
+    started_at: DateTime<Utc>,
+    outcome: &RoleTickOutcome,
+    resolved_model_effort: Option<(String, String)>,
+    trace_context: Option<crate::telemetry::trace::TraceContext>,
+) {
     let (result, detail) = classify(outcome);
     let (model, effort) = match resolved_model_effort {
         Some((model, effort)) => (Some(model), Some(effort)),
         None => (None, None),
     };
-    emit(&RoleTickTelemetry {
-        root: root.to_path_buf(),
-        role: role.to_string(),
-        started_at,
-        ended_at: Utc::now(),
-        result,
-        model,
-        effort,
-        detail,
-        gated_pool: outcome.gated_pool().map(str::to_string),
-    });
+    emit_correlated(
+        &RoleTickTelemetry {
+            root: root.to_path_buf(),
+            role: role.to_string(),
+            started_at,
+            ended_at: Utc::now(),
+            result,
+            model,
+            effort,
+            detail,
+            gated_pool: outcome.gated_pool().map(str::to_string),
+        },
+        trace_context,
+    );
 }
 
 /// Whether `head` — the leading bytes of a Claude Code session transcript —
@@ -473,6 +487,13 @@ pub fn build_record(
 /// `append_outcome_telemetry_journal`: any failure is logged and swallowed,
 /// because a telemetry write must never change whether a role keeps ticking.
 pub fn emit(tick: &RoleTickTelemetry) {
+    emit_correlated(tick, None);
+}
+
+fn emit_correlated(
+    tick: &RoleTickTelemetry,
+    trace_context: Option<crate::telemetry::trace::TraceContext>,
+) {
     let (repo, visibility) = resolve_repo(&tick.root);
     let scan = tick.result.spawned().then(|| {
         let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
@@ -487,10 +508,11 @@ pub fn emit(tick: &RoleTickTelemetry) {
     });
     let record = build_record(tick, repo, visibility, scan.flatten());
     let path = crate::sweep_outcomes::default_role_tick_telemetry_path(&tick.root);
-    let envelope = TelemetryEnvelope::new(
+    let mut envelope = TelemetryEnvelope::new(
         crate::sweep_registry::host_identity(),
         TelemetryRecord::RoleTickOutcome(record),
     );
+    envelope.trace_context = trace_context;
     if let Err(e) = crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope) {
         log::warn!(
             "role_tick_telemetry: failed to append {} tick record for {} at {}: {e} — \

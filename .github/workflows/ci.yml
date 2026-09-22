@@ -1145,6 +1145,8 @@ jobs:
       # the shell-facing union of the fixed hard-exclusion list and a repo's
       # configured `autonomous.workFinder.extraSkipLabels` — needs the
       # binary this job builds.
+      - name: sweep-checkpoint (#8525)
+        run: bash defaults/scripts/tests/test-sweep-checkpoint.sh
       - name: skip-labels (#8255)
         run: bash defaults/scripts/tests/test-skip-labels.sh
       # Moved out of shell-suite-tests by #8195 slice 2: worktree.sh's three

@@ -493,10 +493,50 @@ impl SweepRegistry {
             doctor_cycles,
             judge_verdicts,
         };
-        let envelope = telemetry::TelemetryEnvelope::new(
+        let result_name = serde_json::to_value(result)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        let mut metadata = crate::observability::lifecycle::attributes(&[
+            ("loom.repo", &outcome_record.repo),
+            ("loom.issue", &issue.to_string()),
+            (
+                "loom.repo.visibility",
+                if visibility == telemetry::RepoVisibility::Public {
+                    "public"
+                } else {
+                    "private"
+                },
+            ),
+        ]);
+        if let Some(pr) = pr_number {
+            metadata.insert("loom.pr_number".into(), pr.to_string());
+        }
+        for (key, value) in [
+            ("loom.failure_class", outcome_record.failure_class.as_ref()),
+            ("loom.configured_model", outcome_record.model.as_ref()),
+            ("loom.effort", outcome_record.effort.as_ref()),
+            ("loom.runtime", outcome_record.config.get("runtime")),
+            ("loom.provider", outcome_record.config.get("provider")),
+        ] {
+            if let Some(value) = value {
+                metadata.insert(key.into(), value.clone());
+            }
+        }
+        if let Some(cycles) = outcome_record.doctor_cycles {
+            metadata.insert("loom.doctor_cycles".into(), cycles.to_string());
+        }
+        let trace_context = crate::observability::lifecycle::finish_execution(
+            &self.config.workspace_root,
+            sweep_id,
+            &result_name,
+            metadata,
+        );
+        let mut envelope = telemetry::TelemetryEnvelope::new(
             host_identity(),
             telemetry::TelemetryRecord::SweepOutcome(outcome_record),
         );
+        envelope.trace_context = trace_context;
         let path = self.config.resolve_outcome_telemetry_path();
         if let Err(e) = sweep_outcomes::append_outcome_telemetry(&path, &envelope) {
             log::warn!(
@@ -600,6 +640,13 @@ impl SweepRegistry {
         if history.len() >= MAX_PHASE_OBSERVATIONS {
             return;
         }
+        crate::observability::lifecycle::phase_transition(
+            &self.config.workspace_root,
+            sweep_id,
+            &phase,
+            *issue,
+            pr_number,
+        );
         history.push(PhaseObservation {
             phase: phase.clone(),
             at: Utc::now(),

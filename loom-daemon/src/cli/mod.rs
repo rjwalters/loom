@@ -43,6 +43,7 @@ pub(crate) mod stashes;
 pub(crate) mod stats;
 pub(crate) mod status;
 pub(crate) mod status_render;
+mod sweep_checkpoint;
 pub(crate) mod sweep_experiment;
 pub(crate) mod sweep_outcomes_cli;
 pub(crate) mod target_dir_gc;
