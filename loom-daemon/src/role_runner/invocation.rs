@@ -24,21 +24,32 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 let mut admission_result = self.spawn_bin.is_none().then(|| {
                     crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None)
                 });
+                // #8555: the metered backstop slot this tick's resolution took,
+                // if any. It is carried by value from here to the spawn site —
+                // never parked in shared state — so the several pre-spawn
+                // bail-outs below release it simply by dropping it, and no
+                // concurrent role tick or sweep dispatch can collide with it.
+                let backstop;
                 match runtime_preflight::check(
                     &self.workspace_root,
                     &self.logs_dir(),
                     role,
                     admission_result.as_ref(),
                 ) {
-                    Ok(None) => {}
                     // #8554: a configured `runtimes.preference` /
                     // `rolePreference.<role>` list decided this tick's tap —
                     // launch with THAT runtime, not the one static admission
                     // named. Re-pointed here (before model resolution) so
                     // #7894's reconciliation and #5028's mismatch refusal
                     // both judge the model against the runtime that will
-                    // actually run.
-                    Ok(Some(chosen)) => admission_result = Some(Ok(chosen)),
+                    // actually run. An absent `admitted` means no list applied:
+                    // proceed with the admission already resolved, unchanged.
+                    Ok(chosen) => {
+                        if let Some(runtime) = chosen.admitted {
+                            admission_result = Some(Ok(runtime));
+                        }
+                        backstop = chosen.backstop;
+                    }
                     Err(outcome) => return outcome,
                 }
                 // Issue #5028 (follow-up to #5001 AC2/AC3): runtime admission now
@@ -138,6 +149,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                     &effort_source,
                     admission.as_ref(),
                     self.load_per_core_override,
+                    backstop,
                 )
             });
         self.trace_context = context;

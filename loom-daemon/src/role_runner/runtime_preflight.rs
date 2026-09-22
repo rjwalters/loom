@@ -94,24 +94,31 @@ const CODEX_CLEAR_ESTIMATE_CAP_SECS: i64 = 900;
 /// [`RoleTickOutcome::PoolExhausted`] shape #7607 keeps out of the stuck-role
 /// streak, not a new failure class.
 ///
-/// - `Ok(None)`: proceed with the `admission` already passed in, unchanged.
-/// - `Ok(Some(runtime))`: the preference list chose `runtime` — the caller
-///   MUST launch with it instead of whatever `admission` named (it may be the
-///   same runtime; it is always one whose own gate just passed).
+/// - `Ok(admitted: None)`: proceed with the `admission` already passed in,
+///   unchanged.
+/// - `Ok(admitted: Some(runtime))`: the preference list chose `runtime` — the
+///   caller MUST launch with it instead of whatever `admission` named (it may
+///   be the same runtime; it is always one whose own gate just passed).
 /// - `Err(outcome)`: do not spawn. No list applies and the static gate
 ///   skipped (byte-identical to before #8554), the chosen tap's own gate
 ///   skipped, or every listed tap is unavailable (fail closed).
+///
+/// The returned [`DispatchAdmission`](crate::runtime_preference::DispatchAdmission)
+/// also carries the metered backstop slot the choice consumed (#8555). The
+/// caller **must** hand it to the child it spawns
+/// (`runtime_preference::handoff::attach`); dropping it instead releases the
+/// slot, which is exactly right for a tick that ends up not launching.
 pub(crate) fn check(
     root: &Path,
     logs: &Path,
     role: &str,
     admission: Option<&Result<ResolvedRuntime, RuntimeRejection>>,
-) -> Result<Option<ResolvedRuntime>, RoleTickOutcome> {
+) -> Result<crate::runtime_preference::DispatchAdmission, RoleTickOutcome> {
     // `None` ⇒ the caller opted out of admission (a test `spawn_bin`), and
     // with it out of the pool gate AND out of preference resolution: there is
     // no admitted runtime to pin, so there is nothing to re-point either.
     if admission.is_none() {
-        return Ok(None);
+        return Ok(crate::runtime_preference::DispatchAdmission::none());
     }
     let gate = |admitted: Option<&Result<ResolvedRuntime, RuntimeRejection>>| match static_check(
         root, logs, role, admitted,
@@ -120,14 +127,26 @@ pub(crate) fn check(
         None => Ok(()),
     };
     let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
-    let Ok(crate::runtime_preference::Decision::Preference { source, resolution }) =
-        crate::runtime_preference::resolve_runtime(root, role, None, now)
+    // Dispatch intent: a tick that settles on a governed backstop tap takes a
+    // metered slot (#8555). It is handed back to the caller, which attaches it
+    // to the child it spawns; every early return below — including the chosen
+    // tap's own pre-spawn gate refusing — drops the reservation, and with it
+    // releases the slot, so a tick that does not launch never holds one.
+    let context = crate::runtime_preference::DispatchContext {
+        complexity: None,
+        intent: crate::runtime_preference::Intent::Dispatch,
+    };
+    let Ok(crate::runtime_preference::Decision::Preference {
+        source,
+        resolution,
+        backstop,
+    }) = crate::runtime_preference::resolve_runtime_for(root, role, None, now, context)
     else {
         // No preference list applies to this role, an operator pin is in
         // force (a pin disables fall-through by design), or the preference
         // config itself is malformed: byte-identical to before #8554.
         gate(admission)?;
-        return Ok(None);
+        return Ok(crate::runtime_preference::DispatchAdmission::none());
     };
     let marker = resolution.marker_line();
     let exhausted = resolution.exhausted_diagnostic(role);
@@ -159,7 +178,14 @@ pub(crate) fn check(
     // back to the caller to launch.
     let chosen_admission = Ok(chosen.admitted);
     gate(Some(&chosen_admission))?;
-    Ok(chosen_admission.ok())
+    // Past every gate: this tick IS launching, so the metered slot (if the
+    // chosen tap took one) travels back to the caller, which attaches it to
+    // the child it spawns. `?` above returns before this, dropping `backstop`
+    // and releasing the slot, which is exactly what a skipped tick should do.
+    Ok(crate::runtime_preference::DispatchAdmission {
+        admitted: chosen_admission.ok(),
+        backstop,
+    })
 }
 
 /// The pre-#8554 pool gate: is the admitted runtime's OWN credential source

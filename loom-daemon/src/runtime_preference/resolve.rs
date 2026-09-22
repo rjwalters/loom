@@ -80,6 +80,26 @@ impl fmt::Display for Tap {
     }
 }
 
+/// Which form of backstop-ceiling refusal passed a tap over (#8555).
+///
+/// Three kinds rather than one, because they call for three different operator
+/// responses: "the host is at its metered ceiling" is working as designed,
+/// "this work is below the eligibility tier" is a policy verdict on *this*
+/// dispatch, and "the ceiling state could not be read" is a host fault that
+/// must be repaired before the metered tier can be used again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CeilingSkip {
+    /// The configured per-host concurrency ceiling is already held.
+    AtCapacity { live: u32, limit: u32 },
+    /// The work is below the configured eligibility tier, so it never reaches
+    /// the metered tap at all.
+    Ineligible,
+    /// The ceiling is configured but its live count could not be established
+    /// (no resolvable lease directory, an unwritable store, an unreadable
+    /// one). Fail closed: an unknown count must never read as "there is room".
+    Unknown,
+}
+
 /// Why a higher-preference tap was passed over.
 ///
 /// Recorded per skipped tap rather than collapsed into a count, because
@@ -96,6 +116,11 @@ pub enum SkipReason {
     /// Admitted, but its credential source has nothing spawnable right now.
     /// `source` is the wire name of the pool that was read.
     Unavailable { source: String, detail: String },
+    /// Admitted and spawnable, but the backstop-tier admission bound (#8555)
+    /// passed it over. **This is a resource bound, never an approval gate**:
+    /// nothing waits for a human, the walk simply continues to the next tap
+    /// and fails closed if nothing below qualifies.
+    Ceiling { skip: CeilingSkip, detail: String },
 }
 
 impl SkipReason {
@@ -105,6 +130,11 @@ impl SkipReason {
         match self {
             Self::NotAdmitted { .. } => "not-admitted",
             Self::Unavailable { .. } => "unavailable",
+            Self::Ceiling { skip, .. } => match skip {
+                CeilingSkip::AtCapacity { .. } => "ceiling-at-capacity",
+                CeilingSkip::Ineligible => "ceiling-ineligible",
+                CeilingSkip::Unknown => "ceiling-unknown",
+            },
         }
     }
 
@@ -116,6 +146,7 @@ impl SkipReason {
             Self::NotAdmitted { unmet, detail } if unmet.is_empty() => detail.clone(),
             Self::NotAdmitted { unmet, .. } => unmet.join("+"),
             Self::Unavailable { source, detail } => format!("{source}: {detail}"),
+            Self::Ceiling { detail, .. } => detail.clone(),
         }
     }
 }
@@ -257,6 +288,16 @@ pub const PREFERENCE_LOG_MARKER: &str = "# LOOM_RUNTIME_PREFERENCE ";
 /// admission result so it can consult the admitted runtime's own manifest
 /// without re-resolving it.
 ///
+/// `available` also receives the tap's **tier** — its 0-based position in the
+/// list — because one admission question is positional: the backstop-tier
+/// concurrency ceiling (#8555) governs only the taps *below* the most-
+/// preferred one, which is the same "did this fall through" predicate
+/// [`Resolution::fell_through`] answers after the fact. It is asked inside
+/// `available` rather than as a fourth walk stage so a tap that takes a
+/// ceiling slot is, by construction, the tap the walk then returns: `available`
+/// returning `Ok` short-circuits the loop, so no slot can be taken for a tap
+/// that is subsequently passed over.
+///
 /// An empty `taps` yields `chosen: None` with no skips — the caller must treat
 /// that identically to "every tap was skipped", i.e. fail closed. Callers are
 /// expected never to produce it: an empty configured list is parsed as *unset*
@@ -264,7 +305,7 @@ pub const PREFERENCE_LOG_MARKER: &str = "# LOOM_RUNTIME_PREFERENCE ";
 pub fn resolve<T, A, V>(taps: &[Tap], mut admit: A, mut available: V) -> Resolution<T>
 where
     A: FnMut(&Tap) -> Result<T, SkipReason>,
-    V: FnMut(&Tap, &T) -> Result<(), SkipReason>,
+    V: FnMut(usize, &Tap, &T) -> Result<(), SkipReason>,
 {
     let mut skipped = Vec::new();
     for (tier, tap) in taps.iter().enumerate() {
@@ -279,7 +320,7 @@ where
                 continue;
             }
         };
-        if let Err(reason) = available(tap, &admitted) {
+        if let Err(reason) = available(tier, tap, &admitted) {
             skipped.push(SkippedTap {
                 tier,
                 tap: tap.clone(),
