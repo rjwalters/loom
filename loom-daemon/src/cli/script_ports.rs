@@ -99,6 +99,14 @@ pub(crate) enum ScriptPortCommand {
     /// that.
     DaemonStart(super::daemon_start::DaemonStartArgs),
 
+    /// Fetch-or-rebuild, provision and restart the daemon (#8088), backing
+    /// `loom-daemon-update.sh` — epic #7810's last and highest-risk port,
+    /// because the file it provisions over is very often the binary
+    /// executing right now. See `daemon_update::selfrepl` for the
+    /// self-replacement design and why `resolve_daemon_bin()` is the wrong
+    /// helper for the post-roll version check.
+    DaemonUpdate(super::daemon_update::DaemonUpdateArgs),
+
     /// The combined "not a work item" label list for a role prompt's
     /// unfiltered fallback query (#8255): the fleet-wide hard exclusions
     /// (`hard-exclusion-labels.sh`'s list) plus this workspace's configured
@@ -178,6 +186,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
+            ScriptPortCommand::DaemonUpdate(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
