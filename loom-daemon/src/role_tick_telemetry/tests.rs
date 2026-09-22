@@ -483,6 +483,158 @@ fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
     assert_eq!(r.actions, None);
 }
 
+// ------------------------------------------------------------------------
+// Runtime/provider/profile attribution + the OpenCode `tokens_by_model`
+// dispatch seam (Issue #8507)
+// ------------------------------------------------------------------------
+
+/// The `# LOOM_LAUNCH` record a native spawn's own log carries, verbatim in
+/// shape (see `worker_spawn::run`).
+fn launch_line(runtime: &str, provider: &str, profile: &str) -> String {
+    format!(
+        "# LOOM_LAUNCH {}\n",
+        serde_json::json!({
+            "schema": 1,
+            "runtime": runtime,
+            "provider": provider,
+            "model": "zai-org/GLM-5.3",
+            "profile": profile,
+        })
+    )
+}
+
+/// Write `<root>/.loom/logs/role-<role>.log` with `body` — the file
+/// `resolve_runtime_attribution` reads back.
+fn write_role_log(root: &Path, role: &str, body: &str) {
+    let logs_dir = root.join(".loom").join("logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    fs::write(crate::role_runner::role_log_path(&logs_dir, role), body).unwrap();
+}
+
+#[test]
+#[serial_test::serial]
+fn a_successful_tick_carries_runtime_provider_and_profile_from_its_own_log() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    write_role_log(&root, "judge", &launch_line("pi", "zai-coding-plan", "zai-flash"));
+
+    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    emit_for_tick(
+        &root,
+        "judge",
+        Utc::now(),
+        &RoleTickOutcome::Success,
+        Some(("claude-sonnet-5".to_string(), "high".to_string())),
+    );
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].runtime.as_deref(), Some("pi"));
+    assert_eq!(records[0].provider.as_deref(), Some("zai-coding-plan"));
+    assert_eq!(records[0].profile.as_deref(), Some("zai-flash"));
+}
+
+#[test]
+#[serial_test::serial]
+fn a_tick_with_no_launch_record_leaves_runtime_provider_profile_absent() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    // No role log at all — mirrors a Claude-runtime tick, which writes none.
+
+    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    emit_for_tick(&root, "judge", Utc::now(), &RoleTickOutcome::Success, None);
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].runtime, None);
+    assert_eq!(records[0].provider, None);
+    assert_eq!(records[0].profile, None);
+}
+
+/// A pre-spawn skip must never resolve a runtime attribution even if a
+/// PREVIOUS tick's launch record still sits in the role log — mirroring the
+/// module's own never-borrow-a-neighbour's-transcript contract for tokens.
+#[test]
+#[serial_test::serial]
+fn a_pre_spawn_skip_never_borrows_a_previous_ticks_runtime_attribution() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    write_role_log(&root, "champion", &launch_line("opencode", "friendli", "glm-flash"));
+
+    let journal = stage_tick_env(dir.path(), &root, "champion", &role_head("champion"));
+    emit_for_tick(&root, "champion", Utc::now(), &RoleTickOutcome::NoTokenPool, None);
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].runtime, None, "a skip never spawned, so it has nothing to attribute");
+}
+
+/// AC: an `opencode`-runtime tick's `tokens_by_model` comes from the
+/// OpenCode session-store database, filtered by this workspace's directory
+/// and the tick's own window — not from (in this test, absent) Claude
+/// transcripts.
+#[test]
+#[serial_test::serial]
+fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    write_role_log(&root, "judge", &launch_line("opencode", "friendli", "glm-flash"));
+
+    let db_dir = tempdir().unwrap();
+    let db_path = db_dir.path().join("opencode.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                 model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+                 tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+                 tokens_cache_write INTEGER, directory TEXT, time_created INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES (?1, 500, 40, 0, 10, 2, ?2, ?3)",
+            rusqlite::params![
+                serde_json::json!({"id": "zai-org/GLM-5.3", "providerID": "friendli"}).to_string(),
+                root.to_string_lossy().into_owned(),
+                Utc::now().timestamp_millis(),
+            ],
+        )
+        .unwrap();
+    }
+    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db_path);
+
+    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    emit_for_tick(
+        &root,
+        "judge",
+        Utc::now() - chrono::Duration::seconds(30),
+        &RoleTickOutcome::Success,
+        Some(("zai-org/GLM-5.3".to_string(), String::new())),
+    );
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].runtime.as_deref(), Some("opencode"));
+    let rows = records[0]
+        .tokens_by_model
+        .as_ref()
+        .expect("opencode session attributed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].model, "zai-org/GLM-5.3");
+    assert_eq!(rows[0].input, 500);
+    assert_eq!(rows[0].output, 40);
+}
+
 #[test]
 fn classify_maps_every_outcome_variant_to_its_own_result() {
     use crate::role_runner::ModelRuntimeMismatch;

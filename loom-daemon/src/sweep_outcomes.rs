@@ -839,6 +839,9 @@ mod tests {
                 models_used: None,
                 doctor_cycles: None,
                 judge_verdicts: None,
+                runtime: None,
+                provider: None,
+                profile: None,
             }),
         )
     }
@@ -1041,6 +1044,9 @@ mod tests {
                 effort: None,
                 detail: None,
                 gated_pool: None,
+                runtime: None,
+                provider: None,
+                profile: None,
                 tokens_by_model: None,
                 models_used: None,
                 actions: None,

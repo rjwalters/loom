@@ -900,33 +900,7 @@ fn to_normalization_folds_hyphens_and_rejects_garbage() {
 
 // ---- completion envelopes + completion-v1 meta (#4426) ----
 
-/// A valid `completion-v1` source, tweaked per-test.
-fn sample_completion_meta() -> CompletionMeta {
-    CompletionMeta {
-        agent: "loom_daemon".to_owned(),
-        repo_slug: "rjwalters/loom".to_owned(),
-        pr_url: "https://github.com/rjwalters/loom/pull/4321".to_owned(),
-        result: CompletionResult::Success,
-        started_at: "2026-07-29T10:00:00Z".to_owned(),
-        completed_at: "2026-07-29T10:12:30Z".to_owned(),
-        issue: Some(4321),
-        tokens: Some(791_000),
-        tokens_by_model: Some(vec![ModelUsageTotals {
-            model: "claude-sonnet-5".to_owned(),
-            speed: "standard".to_owned(),
-            service_tier: "standard".to_owned(),
-            input: 1_000,
-            cache_read: 700_000,
-            cache_write_5m: 1_000,
-            cache_write_1h: 89_000,
-            output: 30_000,
-        }]),
-        title: Some("Add repo-qualified task_id".to_owned()),
-        additions: Some(214),
-        deletions: Some(37),
-        visibility: Some(RepoVisibility::Public),
-    }
-}
+use super::completion_runtime::sample_completion_meta;
 
 #[test]
 fn completion_is_a_known_type() {
@@ -1161,6 +1135,9 @@ fn completion_meta_omits_absent_optional_fields() {
         additions: None,
         deletions: None,
         visibility: None,
+        runtime: None,
+        provider: None,
+        profile: None,
         ..sample_completion_meta()
     }
     .to_meta_value()
@@ -1178,6 +1155,12 @@ fn completion_meta_omits_absent_optional_fields() {
         meta.get("visibility").is_none(),
         "an undetermined visibility must be omitted, never guessed as public (#6596)"
     );
+    for key in ["runtime", "provider", "profile"] {
+        assert!(
+            meta.get(key).is_none(),
+            "an unattributed {key} must be omitted, never defaulted to \"claude\" (#8507)"
+        );
+    }
     // With every extension absent, the envelope is exactly the required
     // completion-v1 object — no new keys, so no new failure modes (#4497).
     assert_eq!(

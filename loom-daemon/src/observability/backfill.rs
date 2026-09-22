@@ -330,6 +330,9 @@ mod tests {
                 models_used: None,
                 doctor_cycles: None,
                 judge_verdicts: None,
+                runtime: None,
+                provider: None,
+                profile: None,
             }),
         )
     }
@@ -370,6 +373,9 @@ mod tests {
             models_used: None,
             doctor_cycles: None,
             judge_verdicts: None,
+            runtime: None,
+            provider: None,
+            profile: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));
@@ -412,6 +418,9 @@ mod tests {
             models_used: None,
             doctor_cycles: None,
             judge_verdicts: None,
+            runtime: None,
+            provider: None,
+            profile: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));

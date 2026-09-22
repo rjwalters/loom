@@ -122,6 +122,11 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             lines_added: None,
             lines_deleted: None,
             tokens_by_model: None,
+            // Issue #8507: this fixture is a Claude sweep, which writes no
+            // launch record — so all three stay absent.
+            runtime: None,
+            provider: None,
+            profile: None,
             failure_class: None,
             models_used: None,
             doctor_cycles: None,
@@ -628,6 +633,10 @@ fn role_tick_outcome_envelope(
             effort: None,
             detail: Some("codex-account-pool-exhausted: no account provisioned".to_string()),
             gated_pool: gated_pool.map(str::to_string),
+            // Issue #8507: a Claude tick writes no launch record.
+            runtime: None,
+            provider: None,
+            profile: None,
             tokens_by_model: None,
             models_used: None,
             actions: None,

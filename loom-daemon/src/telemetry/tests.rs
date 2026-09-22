@@ -109,6 +109,9 @@ fn sweep_outcome() -> TelemetryRecord {
             attempt: 1,
             verdict: "pass".to_string(),
         }]),
+        runtime: Some("opencode".to_string()),
+        provider: Some("friendli".to_string()),
+        profile: Some("zai-flash".to_string()),
     })
 }
 
@@ -248,6 +251,9 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         models_used: None,
         doctor_cycles: None,
         judge_verdicts: None,
+        runtime: None,
+        provider: None,
+        profile: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for field in [
@@ -257,6 +263,9 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         "lines_deleted",
         "pr_number",
         "tokens_by_model",
+        "runtime",
+        "provider",
+        "profile",
     ] {
         assert!(
             value.get(field).is_none(),
@@ -359,6 +368,9 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
                 verdict: "pass".to_string(),
             },
         ]),
+        runtime: None,
+        provider: None,
+        profile: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(value["failure_class"], "account-exhausted:model-credits-exhausted");
@@ -402,6 +414,9 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         models_used: None,
         doctor_cycles: None,
         judge_verdicts: None,
+        runtime: None,
+        provider: None,
+        profile: None,
     };
 
     let unobserved = serde_json::to_value(&base).unwrap();

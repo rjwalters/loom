@@ -513,6 +513,24 @@ pub struct SweepOutcomeRecord {
     /// an unobserved sweep as a judged-zero-times one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_verdicts: Option<Vec<JudgeVerdict>>,
+    /// Runtime adapter this sweep actually launched on (Issue #8507) —
+    /// `"claude"`, `"pi"`, `"opencode"`, … — read off the launch's own
+    /// `# LOOM_LAUNCH` record (`crate::launch_record::RuntimeAttribution`),
+    /// never re-derived from dispatch-time config. Omitted (never a fabricated
+    /// `"claude"` default) when no launch record was found — a Claude/legacy
+    /// spawn writes none, so the historical, byte-identical case for every
+    /// Claude sweep is simply "these three keys absent".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// The runtime's resolved provider namespace (`"zai-coding-plan"`,
+    /// `"friendli"`, …), when the launch resolved one. Same source and same
+    /// omission contract as `runtime`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The resolved model profile name, when one was selected. Same source
+    /// and same omission contract as `runtime`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// One Judge verdict on a PR, as reconstructed from the forge label timeline
@@ -665,6 +683,20 @@ pub struct RoleTickOutcomeRecord {
     /// optional field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_pool: Option<String>,
+    /// Runtime adapter this tick actually launched on (Issue #8507), read off
+    /// the tick's own `# LOOM_LAUNCH` record — same source and the same
+    /// "absent, never a fabricated `claude` default" contract as
+    /// [`SweepOutcomeRecord::runtime`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// The runtime's resolved provider namespace, when the launch resolved
+    /// one — same source and contract as [`SweepOutcomeRecord::provider`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The resolved model profile name, when one was selected — same source
+    /// and contract as [`SweepOutcomeRecord::profile`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     /// Per-`(model, speed, service_tier)` token totals for this tick, summed
     /// from the `/loom:<role>` Claude Code transcripts whose mtime falls in
     /// this tick's own window — the same grouped shape, and the same raw

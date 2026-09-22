@@ -57,6 +57,12 @@ use crate::peer_claims::{ClaimAd, PeerClaimView};
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::types::{Event, SweepKind};
 
+/// Runtime attribution on a `completion-v1` payload (Issue #8507): the
+/// `runtime`/`provider`/`profile` label emit + validation, and the
+/// runtime-dispatched per-model token lookup. A sibling module because this
+/// file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
+mod completion_runtime;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -743,6 +749,26 @@ pub struct CompletionMeta {
     /// is one: no caller can invent a third visibility the feed would have to
     /// guess about.
     pub visibility: Option<RepoVisibility>,
+    /// Runtime adapter the work actually ran on (Issue #8507) — `"opencode"`,
+    /// `"pi"`, … — read off the sweep's own `# LOOM_LAUNCH` record
+    /// ([`crate::launch_record::sweep_runtime_attribution`]), never re-derived
+    /// from dispatch-time config.
+    ///
+    /// Independent of [`Self::tokens_by_model`] on purpose: it is the field
+    /// that lets the feed label a non-Claude completion **even when no usage
+    /// numbers were found at all**, which was the whole failure #8507
+    /// reported. Omitted — never a fabricated `"claude"` default — when no
+    /// launch record was found, which is exactly the Claude/legacy case, so
+    /// every pre-#8507 payload stays byte-identical.
+    pub runtime: Option<String>,
+    /// The runtime's resolved provider namespace (`"friendli"`,
+    /// `"zai-coding-plan"`, …), when the launch resolved one. Same source and
+    /// same omission contract as [`Self::runtime`]. **Never** a credential,
+    /// endpoint or key — the launch record carries none.
+    pub provider: Option<String>,
+    /// The resolved model-profile name, when the launch selected one. Same
+    /// source and same omission contract as [`Self::runtime`].
+    pub profile: Option<String>,
 }
 
 impl CompletionMeta {
@@ -811,6 +837,8 @@ impl CompletionMeta {
         if let Some(visibility) = self.visibility {
             obj.insert("visibility".into(), json!(visibility.as_str()));
         }
+        // Runtime attribution (#8507) — see `completion_runtime`.
+        completion_runtime::insert_runtime_labels(obj, self);
         validate_completion_meta(&meta)?;
         Ok(meta)
     }
@@ -951,6 +979,8 @@ pub fn validate_completion_meta(meta: &Value) -> Result<()> {
             }
         }
     }
+    // `runtime`/`provider`/`profile` (#8507) — see `completion_runtime`.
+    completion_runtime::validate_runtime_labels(obj)?;
     // `visibility` (#6596) is an optional closed enum. A consumer gates public
     // egress on it, so a third value (or a non-string) must never reach the
     // wire, where it would have to be guessed about: refuse the envelope
@@ -2187,33 +2217,6 @@ async fn fetch_issue_tokens(
     fetch_transcript_tokens(workspace_root, issue, window).await
 }
 
-/// Per-`(model, speed, service_tier)` token totals for a `completion`
-/// envelope (#5740). Unlike [`fetch_issue_tokens`]'s flat `tokens`, this has
-/// only one source — the activity DB's rollup does not carry per-model
-/// granularity — so it degrades straight to `None` whenever the transcript
-/// scan itself comes up empty: opted out via
-/// `LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS=0`, no matching transcripts found, or the
-/// lookup timed out. Runs on the blocking pool under the same
-/// [`TOKEN_LOOKUP_TIMEOUT`] as every other token lookup.
-async fn fetch_transcript_tokens_by_model(
-    workspace_root: &str,
-    issue: u32,
-    window: (DateTime<Utc>, DateTime<Utc>),
-) -> Option<Vec<ModelUsageTotals>> {
-    if !transcript_tokens_enabled() {
-        return None;
-    }
-    let projects = crate::transcript_tokens::claude_projects_dir()?;
-    let root = PathBuf::from(workspace_root);
-    let scan = tokio::task::spawn_blocking(move || {
-        crate::transcript_tokens::sum_sweep_tokens_by_model(&projects, &root, issue, Some(window))
-    });
-    tokio::time::timeout(TOKEN_LOOKUP_TIMEOUT, scan)
-        .await
-        .ok()?
-        .ok()?
-}
-
 /// Bundles what [`build_and_narrate_completion`] needs to consult and update
 /// the **fleet-wide** completion dedup (Issue #6352), on top of the
 /// per-host-only `already_narrated`/persisted-file dedup that already existed
@@ -2433,11 +2436,23 @@ async fn build_and_narrate_completion(
     // completion, so it must be computed before the lookup.
     let tokens =
         fetch_issue_tokens(activity_db, issue, workspace_root, (started_at, exited_at)).await;
+    // Issue #8507: what this sweep actually launched on, read off its own
+    // `# LOOM_LAUNCH` record. Resolved BEFORE the per-model lookup because it
+    // also selects that lookup's source — and published in its own right, so a
+    // non-Claude completion is labelled even when no usage numbers exist.
+    // `None` for a Claude/legacy spawn (writes no record).
+    let runtime_attribution =
+        crate::launch_record::sweep_runtime_attribution(Path::new(workspace_root), issue);
     // Per-model breakdown (#5740) — a second, independent lookup: it shares
-    // the transcript scan's window but not `tokens`' activity-DB fast path,
-    // since that rollup has no per-model granularity to offer.
-    let tokens_by_model =
-        fetch_transcript_tokens_by_model(workspace_root, issue, (started_at, exited_at)).await;
+    // the completion's window but not `tokens`' activity-DB fast path, since
+    // that rollup has no per-model granularity to offer.
+    let tokens_by_model = completion_runtime::fetch_tokens_by_model(
+        runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+        workspace_root,
+        issue,
+        (started_at, exited_at),
+    )
+    .await;
     let meta = CompletionMeta {
         agent: persona.to_owned(),
         repo_slug: identity.slug,
@@ -2456,6 +2471,14 @@ async fn build_and_narrate_completion(
         // #6596: the public-feed egress gate's input. Unknown ⇒ omitted, and a
         // correct consumer then declines to publish rather than guessing.
         visibility: identity.visibility,
+        // #8507: the runtime/provider/profile badge inputs, straight from the
+        // launch record. All three absent ⇒ byte-identical to a pre-#8507
+        // payload, which is the Claude case.
+        runtime: runtime_attribution.as_ref().map(|r| r.runtime.clone()),
+        provider: runtime_attribution
+            .as_ref()
+            .and_then(|r| r.provider.clone()),
+        profile: runtime_attribution.and_then(|r| r.profile),
     };
     match build_completion_envelope(Some(workspace_root), issue, merged.number, duration_sec, &meta)
     {

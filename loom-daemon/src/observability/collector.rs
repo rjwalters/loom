@@ -415,6 +415,11 @@ fn terminal_records(
             models_used: None,
             doctor_cycles: None,
             judge_verdicts: None,
+            // Issue #8507: same deferral as `tokens_by_model` above — this
+            // live event-bus path has no launch-record log path in scope.
+            runtime: None,
+            provider: None,
+            profile: None,
         }),
     ]
 }

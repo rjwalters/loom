@@ -39,6 +39,9 @@ fn record(
         models_used: None,
         doctor_cycles: None,
         judge_verdicts: None,
+        runtime: None,
+        provider: None,
+        profile: None,
     }
 }
 
