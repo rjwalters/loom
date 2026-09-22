@@ -31,16 +31,32 @@ fn prompt_stdin(prompt: &str) -> Result<Stdio, LaunchError> {
     Ok(Stdio::from(file))
 }
 
+/// Kimi's own five reasoning-effort levels for `KIMI_MODEL_THINKING_EFFORT`,
+/// read out of `@moonshot-ai/kimi-code` 2.0.2's own bundle
+/// (`THINKING_EFFORTS = ["low","medium","high","xhigh","max"]`). No `"off"`:
+/// unlike Pi, Kimi's env-family model resolver has no disable value here.
+///
+/// Validating this **here** is not belt-and-braces. 2.0.2 binds the variable
+/// through a `string().optional()` schema field (`thinking.forcedEffort`) and
+/// does **not** reject an unrecognised value at startup — an observed
+/// `KIMI_MODEL_THINKING_EFFORT=bogus` launch proceeded to contact the provider
+/// instead of failing. A typo would therefore burn a whole sweep at whatever
+/// the harness silently fell back to, so an unsupported level fails closed
+/// (78) at launch construction rather than being passed through.
+const KIMI_THINKING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Harness {
     Pi,
     OpenCode,
+    Kimi,
 }
 impl Harness {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "pi" => Some(Self::Pi),
             "opencode" => Some(Self::OpenCode),
+            "kimi" => Some(Self::Kimi),
             _ => None,
         }
     }
@@ -48,6 +64,7 @@ impl Harness {
         match self {
             Self::Pi => "pi",
             Self::OpenCode => "opencode",
+            Self::Kimi => "kimi",
         }
     }
     pub fn command(
@@ -62,6 +79,7 @@ impl Harness {
         let bin_key = match self {
             Self::Pi => "LOOM_PI_BIN",
             Self::OpenCode => "LOOM_OPENCODE_BIN",
+            Self::Kimi => "LOOM_KIMI_BIN",
         };
         let bin = std::env::var_os(bin_key)
             .filter(|s| !s.is_empty())
@@ -184,9 +202,124 @@ impl Harness {
                 // when no `message` positional is given, verified against
                 // OpenCode 1.18.31.
             }
+            Self::Kimi => {
+                // `providerDefinition` has no Kimi equivalent: there is no
+                // "whole provider block" concept, only the two fixed
+                // KIMI_MODEL_* fields translated from `providerOptions` below.
+                if provider.definition.is_some() {
+                    return Err(LaunchError::config(
+                        "providerDefinition is not supported by the kimi harness",
+                    ));
+                }
+                // #8562: Kimi has no guarded `loom_*` tool binding yet. A
+                // role-tagged launch must fail closed here — inside
+                // `configure` — rather than fall through to Kimi's own
+                // unguarded builtin tools. This also catches Curator/Guide/
+                // Auditor, none of which require a capability the manifest
+                // could gate on, since `guarded` is set from the presence of
+                // a role tag, independent of that role's own requirements.
+                if guarded {
+                    crate::native_tools::provision::configure(
+                        &mut command,
+                        root,
+                        self.name(),
+                        &format!("{}/{}", selection.provider, selection.model),
+                        &provider,
+                    )
+                    .map_err(|e| LaunchError::config(e.to_string()))?;
+                }
+                if let Some(effort) = &selection.effort {
+                    if !KIMI_THINKING_EFFORTS.contains(&effort.as_str()) {
+                        return Err(LaunchError::config(format!(
+                            "unsupported Kimi thinking effort {effort:?}; expected one of {}",
+                            KIMI_THINKING_EFFORTS.join(", ")
+                        )));
+                    }
+                    command.env("KIMI_MODEL_THINKING_EFFORT", effort);
+                }
+                // The model profile's own shape decides which of Kimi's two
+                // model-selection routes this launch uses (issue #8561):
+                // `credential_sources` carries every variable the profile
+                // DECLARED in `credentialEnv`, independent of whether it
+                // resolved at runtime, so this branches on the profile's
+                // shape rather than on today's credential state.
+                if selection.credential_sources.is_empty() {
+                    // No `credentialEnv` at all: `providers.kimi` names a
+                    // `[models.<alias>]` entry in the operator's own
+                    // `config.toml`, and Kimi resolves the model/auth from
+                    // its own config/login store (the credential ladder's
+                    // "no pool" case, `worker_spawn::credential::Source::None`).
+                    command.args(["-m", &selection.provider]);
+                } else {
+                    // A declared `credentialEnv`: the config-free env family.
+                    // `credential.apply()` (called above) already injected
+                    // the mapped `KIMI_MODEL_API_KEY`; only the two fixed
+                    // `providerOptions.kimi` keys need translating here.
+                    command.env("KIMI_MODEL_NAME", &selection.model);
+                    if let Some(options) = provider.options {
+                        for (key, value) in options {
+                            let value = value.as_str().ok_or_else(|| {
+                                LaunchError::config("providerOptions.kimi values must be strings")
+                            })?;
+                            match key.as_str() {
+                                "providerType" => {
+                                    command.env("KIMI_MODEL_PROVIDER_TYPE", value);
+                                }
+                                "baseUrl" => {
+                                    command.env("KIMI_MODEL_BASE_URL", value);
+                                }
+                                other => {
+                                    return Err(LaunchError::config(format!(
+                                        "providerOptions.kimi does not support {other:?}; \
+                                         supported keys are providerType, baseUrl"
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                }
+                // Same reasoning as OPENCODE_DISABLE_AUTOUPDATE=1 in
+                // docker/native/Dockerfile: a Loom-managed launch must never
+                // silently self-update or phone home mid-run.
+                command.env("KIMI_DISABLE_TELEMETRY", "1");
+                command.env("KIMI_CODE_NO_AUTO_UPDATE", "1");
+                // `-p` implies auto-approval and REJECTS `--yolo`/`--auto`
+                // outright, so neither is ever emitted here —
+                // `--dangerously-skip-permissions` is therefore a no-op for
+                // Kimi, exactly like Pi ignores it (`options.skip_permissions`
+                // is never read in this arm). Observed verbatim on 2.0.2:
+                //   $ kimi -p hi --yolo
+                //   error: Cannot combine --prompt with --yolo.
+                //   $ kimi -p hi --auto
+                //   error: Cannot combine --prompt with --auto.
+                // Forwarding the Loom flag itself is not an option either: it
+                // is not a Kimi flag, and commander rejects it with
+                // `error: unknown option '--dangerously-skip-permissions'`
+                // (exit 1) before the prompt ever runs.
+                //
+                // #8506: the pinned CLI (2.0.2) has no `--input-format` flag
+                // at all — `kimi --help` lists only `--output-format
+                // <text|stream-json>` — so there is no stdin-delivery route to
+                // prefer over argv, unlike Pi/OpenCode. The prompt travels as
+                // `-p`'s own argv value; a large enough expanded role prompt
+                // can therefore still hit `E2BIG` here. Finding recorded on
+                // #8506; nothing on this CLI's surface can work around it.
+                if let Some(prompt) = prompt {
+                    command.args(["-p", prompt, "--output-format", "stream-json"]);
+                }
+                // With no stdin route to use, stdin is pinned to `null` rather
+                // than inherited: a daemon-dispatched child must never end up
+                // holding the dispatcher's TTY (or an unrelated pipe) on an
+                // fd the harness may still decide to read.
+                command.stdin(Stdio::null());
+            }
         }
-        if let Some(prompt) = prompt {
-            command.stdin(prompt_stdin(prompt)?);
+        // Pi/OpenCode take the expanded prompt on stdin (#8506); Kimi has no
+        // such route and pinned its own stdin to `null` in its arm above.
+        if !matches!(self, Self::Kimi) {
+            if let Some(prompt) = prompt {
+                command.stdin(prompt_stdin(prompt)?);
+            }
         }
         command.env("LOOM_MODEL", &selection.model);
         Ok(command)

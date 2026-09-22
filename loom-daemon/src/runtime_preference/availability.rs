@@ -12,7 +12,7 @@
 //! |---|---|---|
 //! | `claude` | [`CredentialSource::ClaudeTokens`] | `.loom/tokens/` (else the shared pool) |
 //! | `codex` | [`CredentialSource::CodexAccounts`] | enabled `loom-daemon accounts` codex profiles |
-//! | `pi`, `opencode` | [`CredentialSource::ApiKeys`] or [`CredentialSource::Unobservable`] | the profile's credential ladder (#8401/#8428) |
+//! | `pi`, `opencode`, `kimi` | [`CredentialSource::ApiKeys`] or [`CredentialSource::Unobservable`] | the profile's credential ladder (#8401/#8428) |
 //! | anything else | [`CredentialSource::Unobservable`] | nothing |
 //!
 //! # The one rule, restated for selection
@@ -238,7 +238,7 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
     }
 }
 
-/// A native harness tap (`pi`, `opencode`), gated on the API-key account pool
+/// A native harness tap (`pi`, `opencode`, `kimi`), gated on the API-key account pool
 /// **only where `worker_spawn::credential::resolve`'s ladder would actually
 /// consult it** — see that module for the ladder this mirrors step for step:
 ///
