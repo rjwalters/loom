@@ -180,15 +180,22 @@ pub fn mount_usages(mounts: &[MountEntry], floor_bytes: u64) -> Vec<TmpfsMountUs
             })
         })
         .collect();
-    usages.sort_by(|a, b| b.used_bytes.cmp(&a.used_bytes));
+    usages.sort_by_key(|b| std::cmp::Reverse(b.used_bytes));
     usages
 }
 
 /// The largest reported mount, if any — the "biggest contributor" both the
 /// health line and the work-finder warning name.
+///
+/// Finds the maximum itself rather than trusting the slice to be sorted
+/// (#8572 review): [`mount_usages`] does sort descending, but nothing in the
+/// type system says a caller must come through it, and a silently-wrong
+/// "biggest contributor" is worse than no line at all. `max_by_key` returns
+/// the LAST maximum on a tie, which is immaterial here — a tie means two
+/// mounts hold the same number of bytes, so either names the size correctly.
 #[must_use]
 pub fn largest_mount(mounts: &[TmpfsMountUsage]) -> Option<&TmpfsMountUsage> {
-    mounts.first()
+    mounts.iter().max_by_key(|m| m.used_bytes)
 }
 
 // ============================================================================

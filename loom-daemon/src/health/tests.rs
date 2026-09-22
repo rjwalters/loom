@@ -582,7 +582,7 @@ fn exporting_inputs(
 ) -> HealthInputs {
     let mut inputs = healthy_inputs();
     let mut export = crate::types::ObservabilityExportStatus {
-        state: ObservabilityExportState::Starting,
+        state: crate::types::ObservabilityExportState::Starting,
         host_id: Some("robb-studio".to_string()),
         ingest_host_id: None,
         endpoint: Some("https://dashboard.example/ingest".to_string()),
@@ -726,7 +726,7 @@ fn a_mismatch_still_wins_and_now_carries_the_export_facts() {
     let mut inputs = mismatched_inputs(3600);
     inputs.status.as_mut().unwrap().observability_export =
         Some(crate::types::ObservabilityExportStatus {
-            state: ObservabilityExportState::HostIdMismatch,
+            state: crate::types::ObservabilityExportState::HostIdMismatch,
             host_id: Some("robb-studio".to_string()),
             ingest_host_id: Some("robb-pro".to_string()),
             last_success_at: Some(now() - chrono::Duration::seconds(12)),
