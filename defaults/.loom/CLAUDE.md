@@ -1,16 +1,19 @@
 # Loom Orchestration - Repository Guide
 
-This repository uses **Loom** for AI-powered development orchestration.
+This repository uses **Loom** for development orchestration.
 
 **Installation Date**: {{INSTALL_DATE}}
 
-> **This file is the operating core** — only what an agent must know to act
-> correctly *right now*. Reference-tier detail (daemon internals, build-gate
-> schema, forge auth, troubleshooting) lives in `.loom/docs/*`, installed
-> alongside this file. Sections below link to the specific doc rather than
-> inlining it, so this file stays a manageable per-dispatch context cost.
+> **Operating core:** dispatch instructions here; reference details in `.loom/docs/*`.
 
 <!-- agents-md:include:start -->
+## Credential storage
+
+Secrets must stay outside every repository and worktree, including ignored
+`.env`, `.loom-local`, logs and artifacts. Use owner-only user credential files
+or an OS credential store; reference them without copying values. Never print
+secrets. `.gitignore` is insufficient. See [credential policy](.loom/docs/credential-storage.md).
+
 ## What is Loom?
 
 Loom is a CLI + daemon for AI-powered development orchestration. It coordinates
@@ -152,13 +155,9 @@ credentials, infra, hardware; skipped by autonomous dispatch), `loom:abort`
 
 ### REST vs GraphQL for forge queries
 
-Prefer forge REST calls over GraphQL-backed convenience commands when GraphQL is
-rate-limited or exhausted (they share separate hourly budgets). In practice:
-read and mutate issues/labels via `gh api repos/:owner/:repo/issues/:number`
-(and the `--method PATCH`/`POST` forms) rather than GraphQL-backed
-`gh issue list --label` / `gh issue view` queries when GraphQL quota is tight.
-The REST path stays available after GraphQL is exhausted, so it is the reliable
-fallback for issue reads, edits, and label changes during heavy dispatch.
+When GitHub GraphQL is rate-limited, use the separate REST quota: read issues
+with `gh api repos/:owner/:repo/issues/:number`; mutate via `--method PATCH`
+or `POST`. Prefer this fallback over `gh issue list` / `gh issue view`.
 
 ### Issues Are Suggestions (Role Autonomy)
 
@@ -322,8 +321,8 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
 ### Multi-Account Token Pool
 
 For Pro/Max plans, Loom rotates among multiple Claude OAuth accounts so one
-weekly limit does not stall the pipeline. Provision `.loom/tokens/` with
-`loom-daemon tokens bootstrap` (or `import-from-monitor --force` on a host running
+weekly limit does not stall the pipeline. Provision external `~/.loom/tokens/` with
+`loom-daemon tokens bootstrap --shared` (or `import-from-monitor --shared --force` on a host running
 [claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor))
 plus `loom-daemon tokens check --ranking` to rank accounts by remaining capacity.
 Agents spawn through `.loom/scripts/spawn-claude.sh` (never `claude` directly),
