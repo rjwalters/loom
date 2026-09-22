@@ -589,11 +589,10 @@ fn exporting_inputs(
         exporter: Some("https".to_string()),
         started_at: Some(now() - chrono::Duration::hours(4)),
         last_success_at: None,
-        last_failure_at: None,
-        last_failure_detail: None,
         records_exported: 0,
         consecutive_failures: 0,
         flush_interval_secs: Some(30),
+        ..Default::default()
     };
     mutate(&mut export);
     inputs.status.as_mut().unwrap().observability_export = Some(export);

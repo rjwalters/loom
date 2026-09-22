@@ -1,0 +1,135 @@
+name: Full configured hosted build gate
+
+# Reusable execution of the existing command; no substitute suite or cached verdict.
+on:
+  workflow_call:
+    inputs:
+      candidate_sha:
+        required: true
+        type: string
+      issue:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  hosted-build-gate:
+    name: Full configured build gate (immutable candidate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      LOOM_GATE_SHA: ${{ inputs.candidate_sha }}
+      LOOM_GATE_ISSUE: ${{ inputs.issue }}
+      CARGO_BUILD_JOBS: '2'
+      LOOM_BUILD_GATE_TIER: full
+    steps:
+      - name: Validate immutable candidate inputs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('CARGO_TARGET_DIR', require('path').join(process.env.RUNNER_TEMP, 'loom-hosted-gate-target'));
+            if (!/^[0-9a-f]{40}$/.test(process.env.LOOM_GATE_SHA)) {
+              throw new Error('gate_sha must be a full lowercase immutable commit SHA');
+            }
+            if (!/^[1-9][0-9]{0,9}$/.test(process.env.LOOM_GATE_ISSUE)) {
+              throw new Error('gate_issue must be a positive issue number');
+            }
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - name: Create exact-candidate managed worktree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git branch hosted-gate-base "$LOOM_GATE_SHA"
+          bash .loom/scripts/worktree.sh "$LOOM_GATE_ISSUE" "hosted-gate-$GITHUB_RUN_ID" --base hosted-gate-base
+      - name: Verify worktree and record gate predicates
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const {execFileSync} = require('child_process');
+            const cwd = path.join(process.env.GITHUB_WORKSPACE, '.loom/worktrees', `issue-${process.env.LOOM_GATE_ISSUE}`);
+            const git = (...args) => execFileSync('git', args, {cwd, encoding:'utf8'}).trim();
+            const sha = git('rev-parse', 'HEAD');
+            if (sha !== process.env.LOOM_GATE_SHA) throw new Error('managed worktree does not match candidate SHA');
+            const config = JSON.parse(fs.readFileSync(path.join(cwd, '.loom/config.json'), 'utf8'));
+            if (config.buildGate?.enabled !== true || config.buildGate.command !== 'bash .loom/scripts/build-gate.sh') {
+              throw new Error('candidate does not configure the expected enabled full gate');
+            }
+            const commitsAhead = Number(git('rev-list', '--count', 'origin/main..HEAD'));
+            if (!(commitsAhead > 0)) throw new Error('candidate has no commits ahead of origin/main');
+            const evidence = {sha, issue:process.env.LOOM_GATE_ISSUE, originMain:git('rev-parse','origin/main'), commitsAhead,
+              changedFiles:git('diff','--name-only','origin/main...HEAD').split('\n').filter(Boolean),
+              realChangeGlobs:config.buildGate.realChangeGlobs, command:config.buildGate.command,
+              realChangeDecision:'orchestrator must verify matching deliverables or record an explicit scope exception',
+              host:process.env.RUNNER_OS, target:process.env.CARGO_TARGET_DIR};
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP,'hosted-gate-evidence.json'), JSON.stringify(evidence,null,2));
+            core.info(JSON.stringify(evidence));
+      - name: Run the configured full build gate
+        working-directory: .loom/worktrees/issue-${{ inputs.issue }}
+        shell: bash
+        run: bash .loom/scripts/build-gate.sh 2>&1 | tee "$RUNNER_TEMP/hosted-gate.log"
+      - name: Run additional OTLP feature unit tests
+        working-directory: .loom/worktrees/issue-${{ inputs.issue }}
+        shell: bash
+        run: cargo nextest run --package loom-daemon --features otlp --lib --bins --profile ci 2>&1 | tee "$RUNNER_TEMP/hosted-otlp-tests.log"
+      - name: Run available lifecycle and native isolation integration tests
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const {spawn} = require('child_process');
+            const cwd = path.join(process.env.GITHUB_WORKSPACE, '.loom/worktrees', `issue-${process.env.LOOM_GATE_ISSUE}`);
+            const targets = ['lifecycle_traces', 'native_private_state', 'worker_spawn']
+              .filter(name => fs.existsSync(path.join(cwd, 'loom-daemon/tests', `${name}.rs`)));
+            const log = path.join(process.env.RUNNER_TEMP, 'hosted-integration-tests.log');
+            fs.writeFileSync(log, `Selected existing integration targets: ${JSON.stringify(targets)}\n`);
+            if (targets.length === 0) {
+              core.info('No selected integration targets exist in this candidate; none run.');
+              return;
+            }
+            const args = ['nextest', 'run', '--package', 'loom-daemon', '--features', 'otlp', '--profile', 'ci',
+              ...targets.flatMap(name => ['--test', name])];
+            core.info(`cargo ${args.join(' ')}`);
+            const run = (program, args, env) => new Promise((resolve, reject) => {
+              const child = spawn(program, args, {cwd, env});
+              child.stdout.on('data', data => { fs.appendFileSync(log, data); process.stdout.write(data); });
+              child.stderr.on('data', data => { fs.appendFileSync(log, data); process.stderr.write(data); });
+              child.on('error', reject);
+              child.on('close', code => code === 0 ? resolve() : reject(new Error(`${program} integration checks exited ${code}`)));
+            });
+            // Action inputs include its read-only GitHub token; tests need no service credential.
+            const testEnv = Object.fromEntries(Object.entries(process.env)
+              .filter(([key]) => !key.startsWith('INPUT_') && !['GH_TOKEN', 'GITHUB_TOKEN'].includes(key)));
+            await run('cargo', args, testEnv);
+            if (targets.includes('lifecycle_traces')) {
+              const binary = path.join(process.env.CARGO_TARGET_DIR, 'debug/loom-daemon');
+              if (!fs.existsSync(binary)) throw new Error('integration tests did not produce the candidate daemon');
+              core.info('Running retained sweep-checkpoint suite against the candidate daemon');
+              await run('bash', ['defaults/scripts/tests/test-sweep-checkpoint.sh'],
+                {...testEnv, LOOM_DAEMON_SELF_BIN:binary, LOOM_DAEMON_BIN:binary});
+            }
+      - name: Retain actual gate output and immutable candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hosted-gate-${{ inputs.candidate_sha }}
+          path: |
+            ${{ runner.temp }}/hosted-gate.log
+            ${{ runner.temp }}/hosted-gate-evidence.json
+            ${{ runner.temp }}/hosted-otlp-tests.log
+            ${{ runner.temp }}/hosted-integration-tests.log
+          if-no-files-found: warn

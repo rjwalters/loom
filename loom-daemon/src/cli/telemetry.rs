@@ -23,8 +23,20 @@ use anyhow::Result;
 
 use loom_daemon::script_helpers;
 
+#[path = "telemetry_export.rs"]
+mod telemetry_export;
+
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
+    /// Send a bounded JSONL fixture to an explicit OTLP Collector endpoint.
+    TelemetryExport(telemetry_export::TelemetryExportArgs),
+    /// Report transport capabilities of this installed binary without reading configuration.
+    TelemetryCapabilities {
+        /// Fail when this artifact cannot export OTLP.
+        #[arg(long)]
+        require_otlp: bool,
+    },
+
     /// Query Claude API usage via the Anthropic OAuth API (native port of
     /// `loom_tools.common.usage`, #4275). Backs `check-usage.sh`.
     ///
@@ -66,8 +78,21 @@ impl TelemetryCommand {
     ///
     /// Propagates the subcommand's own failure. The `usage` arm never returns:
     /// it exits with the process code `check-usage.sh` branches on.
-    pub(crate) fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         match self {
+            TelemetryCommand::TelemetryExport(args) => args.run().await,
+            TelemetryCommand::TelemetryCapabilities { require_otlp } => {
+                println!(
+                    "{}",
+                    serde_json::json!({"otlp": cfg!(feature = "otlp"), "otlp_protocol": "http/json"})
+                );
+                anyhow::ensure!(
+                    !require_otlp || cfg!(feature = "otlp"),
+                    "this binary was built without the otlp feature"
+                );
+                Ok(())
+            }
+
             TelemetryCommand::Usage(args) => args.run(),
             TelemetryCommand::IngestTranscripts(args) => args.run(),
             TelemetryCommand::UsageReport(args) => args.run(),

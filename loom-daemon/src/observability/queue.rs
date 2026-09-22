@@ -60,6 +60,14 @@ pub fn default_queue_path(workspace_root: &Path) -> PathBuf {
 struct QueueState {
     items: VecDeque<TelemetryEnvelope>,
     dropped_total: u64,
+    head_sequence: u128,
+}
+
+/// An in-process queue cursor plus immutable payload snapshot. Sequence identity
+/// distinguishes even byte-identical envelopes pushed while an export is in flight.
+pub struct QueueSnapshot {
+    start_sequence: u128,
+    pub envelopes: Vec<TelemetryEnvelope>,
 }
 
 /// A bounded, disk-backed FIFO queue of [`TelemetryEnvelope`]s.
@@ -92,6 +100,7 @@ impl DurableQueue {
             state: Mutex::new(QueueState {
                 items,
                 dropped_total: 0,
+                head_sequence: 0,
             }),
         }
     }
@@ -106,6 +115,7 @@ impl DurableQueue {
         let mut state = self.lock();
         if state.items.len() >= self.capacity {
             state.items.pop_front();
+            state.head_sequence += 1;
             state.dropped_total += 1;
             log::warn!(
                 "observability: queue at capacity ({}); dropped oldest record \
@@ -145,12 +155,37 @@ impl DurableQueue {
         self.lock().items.iter().take(n).cloned().collect()
     }
 
+    /// Snapshot the payload and its sequence cursor under the same lock.
+    #[must_use]
+    pub fn peek_snapshot(&self, n: usize) -> QueueSnapshot {
+        let state = self.lock();
+        QueueSnapshot {
+            start_sequence: state.head_sequence,
+            envelopes: state.items.iter().take(n).cloned().collect(),
+        }
+    }
+
+    /// Acknowledge only the exported snapshot prefix still present in the FIFO.
+    /// Concurrent capacity drops may advance the head; newly pushed records must
+    /// never be mistaken for records sent before that advance.
+    pub fn ack_snapshot(&self, snapshot: &QueueSnapshot, acknowledged: usize) {
+        let end = snapshot.start_sequence + acknowledged.min(snapshot.envelopes.len()) as u128;
+        let mut state = self.lock();
+        let count = end
+            .saturating_sub(state.head_sequence)
+            .min(state.items.len() as u128) as usize;
+        state.items.drain(..count);
+        state.head_sequence += count as u128;
+        self.persist(&state.items);
+    }
+
     /// Remove the front `n` envelopes (clamped to the current length) after a
     /// successful export, persisting the drained state to disk.
     pub fn ack(&self, n: usize) {
         let mut state = self.lock();
         let n = n.min(state.items.len());
         state.items.drain(0..n);
+        state.head_sequence += n as u128;
         self.persist(&state.items);
     }
 
@@ -220,6 +255,27 @@ mod tests {
                 effort: None,
             }),
         )
+    }
+
+    #[test]
+    fn snapshot_ack_survives_capacity_eviction_and_identical_new_payloads() {
+        let dir = tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 2);
+        let first = envelope(1);
+        let second = envelope(2);
+        queue.push(first.clone());
+        queue.push(second.clone());
+        let snapshot = queue.peek_snapshot(2);
+        queue.push(second.clone()); // evicts first; identical to an in-flight record
+        queue.ack_snapshot(&snapshot, 2);
+        assert_eq!(queue.peek_batch(2), vec![second.clone()]);
+        queue.ack_snapshot(&snapshot, 2); // replayed acknowledgment is idempotent
+        assert_eq!(queue.peek_batch(2), vec![second.clone()]);
+        let snapshot = queue.peek_snapshot(1);
+        queue.push(first.clone());
+        queue.push(second.clone()); // evicts every record in snapshot
+        queue.ack_snapshot(&snapshot, 1);
+        assert_eq!(queue.peek_batch(2), vec![first, second]);
     }
 
     #[test]

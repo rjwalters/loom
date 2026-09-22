@@ -65,7 +65,7 @@ ALLOWED_HOST_SUFFIXES=(
   test.com t.com
   github.com githubusercontent.com
   anthropic.com claude.com
-  openai.com
+  openai.com opentelemetry.io
   apple.com
   npmjs.org crates.io
   biomejs.dev workers.dev

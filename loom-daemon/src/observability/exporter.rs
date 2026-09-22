@@ -22,9 +22,12 @@ use crate::telemetry::TelemetryEnvelope;
 
 use super::HostIdStatus;
 
+pub use super::outcome::{BatchOutcome, SignalCounts};
+
 /// A sink [`super::sender`]'s drain loop can push batches of
 /// [`TelemetryEnvelope`]s to. Implementations must never panic on a
-/// transport failure — they return [`ExportError`] and the caller retries.
+/// transport failure. The outcome identifies acknowledged prefixes; retryable
+/// failures leave the remaining envelopes queued.
 pub trait Exporter: Send + Sync {
     /// Push `envelopes` to the sink. `envelopes` is never empty (the caller
     /// only invokes this with a non-empty batch).
@@ -32,6 +35,23 @@ pub trait Exporter: Send + Sync {
         &self,
         envelopes: &[TelemetryEnvelope],
     ) -> impl std::future::Future<Output = Result<(), ExportError>> + Send;
+
+    /// Detailed acknowledgment for transports with multiple signal requests.
+    /// The prefix is removed durably before retrying any remaining envelopes.
+    fn emit_batch_outcome(
+        &self,
+        envelopes: &[TelemetryEnvelope],
+    ) -> impl std::future::Future<Output = BatchOutcome> + Send {
+        async {
+            match self.emit_batch(envelopes).await {
+                Ok(()) => BatchOutcome::accepted(envelopes.len()),
+                Err(error) => BatchOutcome {
+                    error: Some(error),
+                    ..BatchOutcome::default()
+                },
+            }
+        }
+    }
 
     /// Best-effort flush of any transport-level buffering. The default no-op
     /// is correct for [`HttpsExporter`] (every [`Exporter::emit_batch`] call

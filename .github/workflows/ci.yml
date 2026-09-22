@@ -212,6 +212,8 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Run tests (otlp feature)
         run: cargo nextest run --package loom-daemon --features otlp --profile ci
+      - name: Verify OTLP with a real pinned Collector
+        run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
 
   mcp-build:
     name: MCP Server Build
