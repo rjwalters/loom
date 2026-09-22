@@ -1147,8 +1147,6 @@ jobs:
       # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
       - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
         run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
-      - name: loom-daemon-watchdog peer-coordination dedup (#7664)
-        run: bash defaults/scripts/tests/test-loom-daemon-watchdog-dedup.sh
       - name: generic runtime adapter through native worker dispatcher (#8362)
         run: bash defaults/scripts/tests/test-spawn-generic.sh
       # #8255: skip-labels.sh is a thin stub over `loom-daemon skip-labels`,

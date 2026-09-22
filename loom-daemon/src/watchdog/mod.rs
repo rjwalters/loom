@@ -30,9 +30,13 @@
 //! # The equivalence proof
 //!
 //! `defaults/scripts/tests/test-loom-daemon-watchdog.sh` (188 assertions, plus
-//! 4 retired records) and `test-loom-daemon-watchdog-dedup.sh` (27) are
-//! retained black-box suites: they invoke the stub **by path** with
-//! environment overrides and assert on stdout, the log file and exit codes.
+//! 4 retired records) is a retained black-box suite: it invokes the stub **by
+//! path** with environment overrides and asserts on stdout, the log file and
+//! exit codes. The peer-coordination dedup window's own equivalence suite,
+//! `test-loom-daemon-watchdog-dedup.sh`, was retired in #8587 once this
+//! module's `peer_coord` submodule (with its own `#[cfg(test)]` coverage)
+//! became the only implementation — its pre-port shell counterpart had
+//! already been orphaned by this port.
 //!
 //! They run against this code with two harness changes and no altered
 //! expectations: `LOOM_DAEMON_SELF_BIN` pins the binary that implements the
