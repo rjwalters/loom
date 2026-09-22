@@ -1,24 +1,9 @@
 //! Launch-time bindings are binary-owned; no edit to global harness configuration.
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
-use std::{fs, io::Write, path::Path, path::PathBuf, process::Command};
+use std::{fs, io::Write, path::Path, process::Command};
 
-/// Where the launch-time bindings (and OpenCode's config dir, which carries
-/// its `auth.json` and plugin install) are written.
-///
-/// Default: `<workspace>/.loom/native-tools`, machine-local ignored state.
-/// `LOOM_NATIVE_TOOLS_DIR` relocates it — set by the native-ephemeral
-/// containment profile (issue #8403) to a per-launch path inside the
-/// container's own ephemeral writable layer, so N concurrent native workers
-/// on one host cannot share one session store or one `auth.json`. The
-/// workspace default is deliberately NOT usable for that: it lives under the
-/// parity-mounted repo root, which every worker on the host shares.
-fn bindings_dir(root: &Path) -> PathBuf {
-    std::env::var_os("LOOM_NATIVE_TOOLS_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join(".loom/native-tools"))
-}
+mod state;
 
 /// Profile-declared, non-secret provider data merged into the per-launch config.
 /// Secrets never appear here: OpenCode resolves its own `{env:VAR}` indirection
@@ -93,8 +78,9 @@ pub fn configure(
 ) -> Result<()> {
     super::guard::ready(root)?;
     let binary = std::env::current_exe()?;
-    let directory = bindings_dir(root);
-    fs::create_dir_all(&directory).context("cannot provision native tool bindings")?;
+    let state = state::prepare(root)?;
+    state.configure(command, runtime)?;
+    let directory = &state.directory;
     command
         .env("LOOM_WORKSPACE", root)
         .env("LOOM_NATIVE_TOOL_BIN", &binary);
@@ -110,7 +96,7 @@ pub fn configure(
             .arg(extension);
     } else {
         let config_dir = directory.join("opencode");
-        fs::create_dir_all(config_dir.join("plugins"))?;
+        state::private_directory(&config_dir.join("plugins"))?;
         write_binding(&config_dir.join("plugins/loom.ts"), include_str!("opencode.mjs"))?;
         write_binding(
             &config_dir.join("package.json"),

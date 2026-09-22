@@ -31,6 +31,8 @@ fn worker(root: &std::path::Path, runtime: &str) -> Command {
             "LOOM_NATIVE_GUARD_DIR",
             concat!(env!("CARGO_MANIFEST_DIR"), "/../defaults/hooks"),
         )
+        .env("LOOM_NATIVE_TOOLS_DIR", fixture().parent().unwrap().join("state"))
+        .env_remove("LOOM_NATIVE_AUTH_FILE")
         .env("LOOM_PI_BIN", fixture())
         .env("LOOM_OPENCODE_BIN", fixture())
         // The OpenCode adapter probes `--version` before exec (#8438). Every test
