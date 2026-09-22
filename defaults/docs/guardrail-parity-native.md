@@ -39,13 +39,18 @@ launch. The workspace mutation lock remains operational repository state.
 
 Profile environment and API-key pool injection keep their existing precedence.
 Guarded launches no longer implicitly reuse a harness's global auth store.
-For OAuth or an existing login, explicitly set `LOOM_NATIVE_AUTH_FILE` to that
+For an uncontained OAuth or existing-login launch, set `LOOM_NATIVE_AUTH_FILE` to that
 harness's external JSON auth file (owned by you, mode 0600, in a 0700 directory,
 at most 1 MiB). Its credential type and required fields must match the selected
 harness; wrong formats fail with a fixed diagnostic that omits credential values.
 Loom copies it into the private launch directory; the original is never changed,
-moved or deleted. Refreshes affect only the launch copy, so renew the external
-source separately when needed. Use the matching harness's auth format. With no
+moved or deleted. Container launches retain environment/pool injection; this
+host snapshot option does not add a secret mount. Refreshes affect only the
+launch copy. This is a snapshot, not persistent login synchronization: later
+launches may need renewed authentication, and concurrent refresh behavior depends
+on the provider. Prefer profile environment/API-key pool injection for repeated
+workers. Renew the external source separately and use the matching harness's
+auth format. With no
 injected credentials or snapshot, Loom emits migration guidance; unauthenticated
 local providers still work and remote providers report their own missing-auth
 error. Provider/model selection and fallback policy are unchanged.
@@ -54,7 +59,9 @@ The private launch state is retained for inspection and may contain credentials,
 sessions and logs: treat it as secret, keep its directories private, and remove
 completed launch directories when no longer needed. There is no automatic
 migration or deletion of existing repository-local state. Direct unguarded
-launches and interactive harness sessions keep their previous behavior. The OpenCode binding depends on the matching
+launches and interactive harness sessions keep their previous behavior.
+
+The OpenCode binding depends on the matching
 `@opencode-ai/plugin` package; OpenCode installs it into that isolated config
 directory. That package is pinned to 1.18.31 and was verified against an
 OpenCode 1.18.31 host only; whether a 2.x host loads it is unverified. No

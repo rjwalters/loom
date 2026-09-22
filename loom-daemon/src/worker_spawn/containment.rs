@@ -15,9 +15,9 @@
 //!
 //! 1. **Data-directory isolation.** OpenCode's `auth.json` and session store
 //!    live under `$XDG_DATA_HOME/opencode` (`~/.local/share/opencode` when
-//!    unset). Uncontained, `XDG_DATA_HOME` is not relocated per launch, so N
-//!    concurrent native workers on one host share one session store and one
-//!    `auth.json`. Every XDG base directory — plus `OPENCODE_CONFIG_DIR` and
+//!    unset). Guarded uncontained launches also isolate this state (#8568);
+//!    containment additionally makes its lifetime ephemeral. Every XDG base
+//!    directory — plus `OPENCODE_CONFIG_DIR` and
 //!    the Loom binding directory (`LOOM_NATIVE_TOOLS_DIR`) — is pointed at a
 //!    per-launch path inside the container's own ephemeral writable layer, so
 //!    two concurrent contained workers are disjoint twice over: different
