@@ -3,9 +3,46 @@
 //! `loom_daemon::tokens_pool::account_lifecycle`.
 
 use anyhow::{anyhow, Result};
+use loom_daemon::tokens_pool::account_scope::{
+    resolve_accounts_registry, shadowed_shared_accounts, AccountsRegistry,
+};
 
 use super::tokens::resolve_tokens_workspace;
 use crate::{AccountsAction, SessionAction};
+
+/// The `--workspace` default. A value equal to this is "wherever I am", which
+/// [`resolve_accounts_registry`] may resolve to an enclosing Loom workspace or
+/// to the shared machine-level registry; any other value is an explicitly
+/// named workspace and is honoured literally (issue #8540).
+const WORKSPACE_DEFAULT: &str = ".";
+
+/// Resolve the registry this invocation acts on, from the raw `--workspace`
+/// string (issue #8540).
+fn resolve_registry(workspace: &str) -> Result<AccountsRegistry> {
+    let resolved = resolve_tokens_workspace(workspace)?;
+    resolve_accounts_registry(&resolved, workspace != WORKSPACE_DEFAULT)
+}
+
+/// Say which registry is in effect, and whether it shadows same-named accounts
+/// in the shared one (issue #8540 acceptance criteria 2 and 3).
+///
+/// On **stderr**, and *before* the verb runs rather than after: `--json`
+/// output stays machine-parseable on stdout, and a verb that fails (the
+/// `no such account <name>` a shadowed shared account produces) still says
+/// which registry it looked in — which is the whole diagnostic the operator
+/// was missing.
+fn announce_registry(registry: &AccountsRegistry) {
+    eprintln!("Registry: {}", registry.describe());
+    let shadowed = shadowed_shared_accounts(registry);
+    if !shadowed.is_empty() {
+        eprintln!(
+            "note: this workspace's own registry shadows the shared machine-level registry for \
+             account(s) {}; changes here do not affect the shared entries. Manage those with \
+             `--workspace <the shared root>`.",
+            shadowed.join(", ")
+        );
+    }
+}
 
 pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -> Result<()> {
     use loom_daemon::tokens_pool::account_lifecycle::{
@@ -79,7 +116,9 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
         Ok(())
     }
 
-    let workspace = resolve_tokens_workspace(workspace)?;
+    let registry = resolve_registry(workspace)?;
+    announce_registry(&registry);
+    let workspace = registry.workspace.clone();
     let service = AccountLifecycle::new(workspace.clone(), ProcessCodexRunner)?;
     match action {
         AccountsAction::Add {
