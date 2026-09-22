@@ -11,8 +11,39 @@
 //! a host with no usable script is no longer limited by whether one exists.
 
 use super::{ArtifactInfo, ArtifactResolution};
-use crate::release_resolve::{resolve, Inputs, Resolution};
-use std::path::Path;
+use crate::release_resolve::{build_time_repo, resolve, resolve_repo, Inputs, Resolution};
+use std::path::{Path, PathBuf};
+
+/// The environment-derived [`Inputs`] for this host, built once so the
+/// resolution and the fetch that acts on it can never disagree about which
+/// repo they mean (#8513).
+fn env_inputs(root: &Path) -> Inputs<'_> {
+    Inputs {
+        repo_root: root,
+        target_override: std::env::var("LOOM_DAEMON_UPDATE_TARGET").ok(),
+        repo_override: std::env::var("LOOM_DAEMON_UPDATE_GH_REPO").ok(),
+        machine_checkout: std::env::var("LOOM_MACHINE_CHECKOUT")
+            .ok()
+            .map(PathBuf::from),
+        build_time_repo: build_time_repo(),
+        installed_bin: running_binary(),
+        fetch_disabled: artifact_fetch_disabled(),
+    }
+}
+
+/// The repo the tick would query for `root`, by [`resolve_repo`]'s priority
+/// order (#8513).
+///
+/// [`super::ScriptAutoUpdateProbe::fetch_artifact`] exports this to the
+/// `loom-daemon-update.sh --fetch` child as `LOOM_DAEMON_UPDATE_GH_REPO`,
+/// because the script resolves the repo *independently* — from its own cwd's
+/// `origin` remote — and would otherwise try to download the artifact this
+/// resolver found in Loom's releases from the workspace's own project. The
+/// resolution deciding to roll and the roll itself must name one repo.
+#[must_use]
+pub(super) fn fetch_repo(root: &Path) -> Option<String> {
+    resolve_repo(&env_inputs(root))
+}
 
 /// Resolve the latest artifact for this host.
 ///
@@ -21,16 +52,11 @@ use std::path::Path;
 /// the verdict logic compares against.
 #[must_use]
 pub(super) fn native_resolution(root: &Path) -> ArtifactResolution {
-    let inputs = Inputs {
-        repo_root: root,
-        target_override: std::env::var("LOOM_DAEMON_UPDATE_TARGET").ok(),
-        repo_override: std::env::var("LOOM_DAEMON_UPDATE_GH_REPO").ok(),
-        installed_bin: running_binary(),
-        fetch_disabled: artifact_fetch_disabled(),
-    };
+    let inputs = env_inputs(root);
     match resolve(&inputs) {
         Resolution::Unresolved(reason) => ArtifactResolution::Unresolved(reason),
         Resolution::Resolved(r) => ArtifactResolution::Resolved(ArtifactInfo {
+            repo: r.repo,
             tag: r.tag,
             version: r.version,
             published_at: r.published_at,
@@ -131,5 +157,14 @@ mod tests {
             assert_eq!(artifact_fetch_disabled(), want, "{v:?}");
         }
         unsafe { std::env::remove_var("LOOM_DAEMON_UPDATE_FETCH") };
+    }
+
+    #[test]
+    fn build_time_repo_resolves_to_this_workspaces_own_repository_field() {
+        // `repository.workspace = true` in `loom-daemon/Cargo.toml` inherits
+        // `[workspace.package] repository` (#8513) — for THIS crate that is
+        // always `https://github.com/rjwalters/loom`, so the compiled-in
+        // fallback is deterministic across every build of this repo.
+        assert_eq!(build_time_repo().as_deref(), Some("rjwalters/loom"));
     }
 }

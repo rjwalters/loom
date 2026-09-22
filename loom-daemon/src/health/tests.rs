@@ -3168,5 +3168,10 @@ fn worktree_reaper_is_unknown_without_a_status_round_trip() {
 
 mod section_inventory;
 
+// Wrong-repo-resolution escalation coverage (Issue #8513) — its own child
+// module so this file, already over `.loom/docs/file-size-policy.md`'s
+// threshold, does not grow to hold it.
+mod auto_update_stale_repo;
+
 #[cfg(test)]
 mod model_class_tests;

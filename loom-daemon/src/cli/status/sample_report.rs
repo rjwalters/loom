@@ -71,6 +71,8 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         auto_update_note: None,
         auto_update_artifact_version: None,
         auto_update_artifact_published_at: None,
+        auto_update_stale_repo_ticks: 0,
+        auto_update_stale_repo: None,
         host_breaker: None,
         admission_brake: None,
         rate_limit_breaker: None,

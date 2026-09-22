@@ -8805,7 +8805,7 @@ seams):
 | Variable | Purpose |
 |----------|---------|
 | `LOOM_DAEMON_UPDATE_FETCH` | `1`/`true`/`yes` ⇒ force (`--fetch`); `0`/`false`/`no` ⇒ off (`--no-fetch`); unset ⇒ auto |
-| `LOOM_DAEMON_UPDATE_GH_REPO` | Override the `owner/repo` slug used for release resolution (default: parsed from the `origin` remote) |
+| `LOOM_DAEMON_UPDATE_GH_REPO` | Override the `owner/repo` slug used for release resolution. Highest priority in the daemon's resolution order (see [Which repo's releases are queried](#artifact-first-auto-update-ticks-7609)); this script itself otherwise parses its own `origin` remote |
 | `LOOM_DAEMON_UPDATE_TARGET` | Override the detected release target triple |
 | `LOOM_DAEMON_UPDATE_COSIGN_PUBKEY` | Path to the cosign public key used to verify a **key-signed** Linux `.sig` (one published without a `.pem`) |
 | `LOOM_DAEMON_UPDATE_COSIGN_IDENTITY` | Pin one exact expected keyless signer identity instead of the derived regexp |
@@ -9047,8 +9047,40 @@ consulted on this path at all**:
 | artifact version **>** installed version | fetch the artifact (never `cargo build`) | `artifact 0.19.24 > installed 0.19.21 → fetching` |
 | artifact version **==** installed, published sha256 **≠** installed binary's | fetch the artifact (converge onto the released bytes) | `artifact 0.19.24 == installed 0.19.24 but sha differs (published … vs installed …) → fetching` |
 | artifact version **==** installed, sha matches | nothing to do | `artifact 0.19.24: artifact == installed, sha matches → up to date` |
-| latest release is **older** than installed | nothing to do | `artifact 0.19.20: latest release … is OLDER than the installed … → up to date` |
+| latest release is **older** than installed | nothing to fetch, but **WARN** — a probable wrong-repo resolution (#8513) | `resolved release 0.1.0 from <owner/repo> is OLDER than the installed 0.19.24 — probable wrong-repo resolution (queried <owner/repo>); nothing to fetch` |
 | **no** artifact resolves at all | fall through to the source path below, unchanged | `no artifact (<reason>) → source path: <source reason>` |
+
+**Which repo's releases are queried (#8513).** The daemon binary is released
+from exactly one project, so the *workspace's* `origin` remote — whatever repo
+this daemon happens to be managing — is the **last** resort, not the default:
+
+1. `LOOM_DAEMON_UPDATE_GH_REPO`
+2. the `origin` of `LOOM_MACHINE_CHECKOUT`, when set
+3. the repo **compiled into the binary** at build time (Cargo's `repository`
+   field — the checkout the release was actually built from)
+4. the workspace's own `origin`
+
+The incident behind the order: a host deliberately running with its workspace
+pointed at a *consumer* repo asked **that** project for `loom-daemon-<target>`
+assets, found none (its own latest release was `v0.11.0`), and logged the soft
+"no artifact for this platform" every tick for hours — one release short of a
+feature it needed, with nothing escalating. Two consequences fall out of it:
+
+- Every "no artifact" reason **names the repo it queried**
+  (`release v0.11.0 of owner/repo has no artifact for target …`), so a wrong
+  repository can no longer read like an unbuilt platform.
+- A release **older** than the installed version is logged at **WARN**, not
+  folded into the soft "up to date" line, and after
+  3 consecutive such ticks `loom-daemon health` reports the
+  `auto_update` section `degraded` with
+  `auto_update has made no progress for N ticks — the release resolved from
+  <owner/repo> is OLDER than the installed version`. The streak and the repo
+  are also in `loom-daemon status --json` /
+  `health --json` as `auto_update_stale_repo_ticks` /
+  `auto_update_stale_repo`.
+- The roll itself is pinned to the same answer: the artifact fetch exports the
+  resolved repo to `loom-daemon-update.sh` as `LOOM_DAEMON_UPDATE_GH_REPO`, so
+  the download can never target a different project than the resolution did.
 
 Why: on a four-host fleet on 2026-09-13 the source gate was shut on *every*
 host — two for "no source checkout / staleness undecidable" (a

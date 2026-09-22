@@ -100,6 +100,8 @@ fn test_daemon_status_request_response_round_trip() {
         auto_update_note: Some("within settle window".to_string()),
         auto_update_artifact_version: Some("0.19.24".to_string()),
         auto_update_artifact_published_at: Some("2026-09-13T12:00:00Z".to_string()),
+        auto_update_stale_repo_ticks: 0,
+        auto_update_stale_repo: None,
         host_breaker: None,
         admission_brake: None,
         rate_limit_breaker: None,
