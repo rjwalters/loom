@@ -138,14 +138,20 @@ pub fn parse_launch_runtime(record_json: &str) -> Option<RuntimeAttribution> {
 /// taking the LAST record in that region — the anchored counterpart of
 /// [`parse_launch_credential_after`], for a caller (a sweep) that has a
 /// `sweep_id=`-shaped anchor to scope by.
+///
+/// Composes [`crate::api_keys_pool::ingest::region_after`] and
+/// [`crate::api_keys_pool::ingest::last_launch_record_body`] rather than
+/// re-deriving the anchor/marker scan (issue #8612), so the line-anchoring
+/// [`parse_launch_credential_after`] documents applies identically here: a log
+/// line that merely *mentions* `# LOOM_LAUNCH ` mid-line can never suppress
+/// attribution of the real, earlier, line-start record.
 #[must_use]
 pub fn parse_launch_runtime_after(
     contents: &str,
     header_anchor: &str,
 ) -> Option<RuntimeAttribution> {
-    let region = &contents[contents.rfind(header_anchor)?..];
-    let body_start = region.rfind(LAUNCH_RECORD_MARKER)? + LAUNCH_RECORD_MARKER.len();
-    parse_launch_runtime(region[body_start..].lines().next()?)
+    let region = crate::api_keys_pool::ingest::region_after(contents, header_anchor)?;
+    parse_launch_runtime(crate::api_keys_pool::ingest::last_launch_record_body(region)?)
 }
 
 /// [`parse_launch_runtime`] over the WHOLE of `contents`, taking the last
@@ -160,10 +166,15 @@ pub fn parse_launch_runtime_after(
 /// in the file, read right after this tick's child exited" cannot belong to
 /// any tick but this one. A caller without that guarantee must use
 /// [`parse_launch_runtime_after`] instead.
+///
+/// "The last record in the file" is
+/// [`crate::api_keys_pool::ingest::last_launch_record_body`]'s line-anchored
+/// reading of it (issue #8612), not an unanchored substring search: a role
+/// tick's log carries the child's own transcript, which is exactly where a
+/// mid-line mention of the marker comes from.
 #[must_use]
 pub fn last_launch_runtime(contents: &str) -> Option<RuntimeAttribution> {
-    let body_start = contents.rfind(LAUNCH_RECORD_MARKER)? + LAUNCH_RECORD_MARKER.len();
-    parse_launch_runtime(contents[body_start..].lines().next()?)
+    parse_launch_runtime(crate::api_keys_pool::ingest::last_launch_record_body(contents)?)
 }
 
 /// A sweep's per-issue log path, derived from the workspace root alone
@@ -388,12 +399,14 @@ pub fn parse_launch_tap(record_json: &str) -> Option<TapAttribution> {
 
 /// [`parse_launch_tap`] over a whole per-sweep log, anchored exactly as
 /// [`parse_launch_credential_after`] anchors: only at/after this dispatch's
-/// header, and within that region the **last** record wins.
+/// header, and within that region the **last** record wins — the same two
+/// `ingest` helpers, so all four readers of this record share one scan (issue
+/// #8612) and a mid-line mention of the marker cannot drop a tap the way an
+/// unanchored substring search could.
 #[must_use]
 pub fn parse_launch_tap_after(contents: &str, header_anchor: &str) -> Option<TapAttribution> {
-    let region = &contents[contents.rfind(header_anchor)?..];
-    let body_start = region.rfind(LAUNCH_RECORD_MARKER)? + LAUNCH_RECORD_MARKER.len();
-    parse_launch_tap(region[body_start..].lines().next()?)
+    let region = crate::api_keys_pool::ingest::region_after(contents, header_anchor)?;
+    parse_launch_tap(crate::api_keys_pool::ingest::last_launch_record_body(region)?)
 }
 
 #[cfg(test)]
@@ -600,6 +613,41 @@ mod tests {
         assert_eq!(attribution.profile.as_deref(), Some("fresh"));
     }
 
+    /// Issue #8612, the runtime counterpart of #8541's credential case: the
+    /// mid-line mention must not suppress the real, earlier, line-start
+    /// record. The pre-#8612 unanchored `rfind` matched inside the transcript
+    /// line, took everything after it as the "record", and returned `None` —
+    /// silently dropping `sweep.outcome`'s `runtime`/`provider`/`profile`.
+    #[test]
+    fn a_mid_line_marker_mention_does_not_suppress_runtime_attribution() {
+        let log = format!(
+            "==== loom-daemon dispatch: sweep_id=s1 issue=42 ====\n{}\nagent transcript: I \
+             noticed a line starting with \"{}\" earlier in the log while summarizing it\n",
+            launch_line("pool", "zai", "alpha"),
+            LAUNCH_RECORD_MARKER,
+        );
+        let attribution = parse_launch_runtime_after(&log, "sweep_id=s1").unwrap();
+        assert_eq!(attribution.runtime, "pi");
+        assert_eq!(attribution.provider.as_deref(), Some("zai-coding-plan"));
+        assert_eq!(attribution.profile.as_deref(), Some("zai-flash"));
+    }
+
+    /// Issue #8612 for the unanchored entry point: a role tick's log is the
+    /// child's own transcript, so a mid-line mention of the marker is exactly
+    /// the text this reader is most likely to meet.
+    #[test]
+    fn a_mid_line_marker_mention_does_not_suppress_last_launch_runtime() {
+        let log = format!(
+            "role tick starting\n# LOOM_LAUNCH {}\nagent transcript: grepping for \"{}\" in \
+             launch_record.rs turned up three parsers\n",
+            serde_json::json!({"schema": 1, "runtime": "opencode", "profile": "glm-coding"}),
+            LAUNCH_RECORD_MARKER,
+        );
+        let attribution = last_launch_runtime(&log).unwrap();
+        assert_eq!(attribution.runtime, "opencode");
+        assert_eq!(attribution.profile.as_deref(), Some("glm-coding"));
+    }
+
     #[test]
     fn parse_launch_runtime_yields_nothing_for_a_missing_or_empty_runtime() {
         assert_eq!(parse_launch_runtime(r#"{"provider":"zai"}"#), None);
@@ -751,6 +799,27 @@ mod tests {
             r#"# LOOM_LAUNCH {"credentialSource":"pool","credentialProvider":"zai"}"#,
         );
         assert_eq!(parse_launch_tap_after(&log, "sweep_id=s1"), None);
+    }
+
+    /// Issue #8612 for the tap reader: dropping the tap here would report a
+    /// launch that really spent as "unmeasured", so the same line-anchoring
+    /// the credential and runtime readers got applies.
+    #[test]
+    fn a_mid_line_marker_mention_does_not_suppress_tap_attribution() {
+        let log = format!(
+            "==== loom-daemon dispatch: sweep_id=s1 issue=42 ====\n{}\nagent transcript: the \
+             record is the line beginning \"{}\" — see launch_record.rs\n",
+            tap_launch_line(
+                Some("opencode:zai-metered"),
+                "opencode",
+                Some("zai-metered"),
+                "pool",
+                Some("zai"),
+            ),
+            LAUNCH_RECORD_MARKER,
+        );
+        let tap = parse_launch_tap_after(&log, "sweep_id=s1").unwrap();
+        assert_eq!(tap.key(), "opencode:zai-metered@api_keys:zai");
     }
 
     #[test]

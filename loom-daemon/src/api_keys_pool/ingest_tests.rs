@@ -387,6 +387,44 @@ fn parse_launch_record_reads_the_pool_namespace_not_the_harness_provider() {
     assert!(parse_launch_record("nothing here").is_none());
 }
 
+/// The three scan properties every reader of the record depends on (issue
+/// #8612): line-anchored, last-wins, and stopping at the last line that parses
+/// as JSON even when that record says nothing about the caller's own keys.
+#[test]
+fn last_launch_record_body_is_line_anchored_last_wins_and_stops_at_valid_json() {
+    let real = launch_line("pool", Some("alpha"), "glm-5.3");
+
+    // Line-anchored: a mid-line mention of the marker is not the record.
+    let mentioned = format!(
+        "{real}\nagent transcript: a line starting with \"{LAUNCH_RECORD_PREFIX}\" holds it\n"
+    );
+    let body = last_launch_record_body(&mentioned).unwrap();
+    assert!(body.starts_with('{'), "{body}");
+    assert_eq!(parse_launch_record(&mentioned).unwrap().account.as_deref(), Some("alpha"));
+
+    // Last-wins, and a malformed line-start candidate falls back to an earlier
+    // one rather than ending the scan.
+    let re_exec = format!("{real}\n{}\n", launch_line("pool", Some("beta"), "glm-5.3"));
+    assert_eq!(parse_launch_record(&re_exec).unwrap().account.as_deref(), Some("beta"));
+    assert_eq!(
+        parse_launch_record(&format!("{real}\n# LOOM_LAUNCH {{not json\n"))
+            .unwrap()
+            .account
+            .as_deref(),
+        Some("alpha"),
+    );
+
+    // A VALID last record ends the scan even when it carries none of the keys
+    // a given caller reads — reaching further back would attribute an older
+    // launch's keys to this one. The caller says `None` instead.
+    let then_keyless = format!("{real}\n# LOOM_LAUNCH {{\"schema\":1,\"runtime\":\"pi\"}}\n");
+    assert!(parse_launch_record(&then_keyless)
+        .unwrap()
+        .credential_source
+        .is_empty());
+    assert!(last_launch_record_body("nothing here").is_none());
+}
+
 /// The detail line is safe to log: it names the account, never key material.
 #[test]
 fn the_detail_line_never_carries_key_material() {
