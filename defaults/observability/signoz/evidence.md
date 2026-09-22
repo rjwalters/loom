@@ -272,9 +272,38 @@ committed: an added `0.0.0.0:4318:4318` mapping on the ingester, a renamed netwo
 alias, a hand-edited image digest, `tar -xzf` moved ahead of the `sha256sum
 --check`, a literal `SIGNOZ_TOKENIZER_JWT_SECRET`, a volume renamed outside the
 project prefix, a raised ClickHouse `mem_limit`, and a dropped log-rotation cap.
-Every mutation failed exactly the intended test with an accurate message, and none
-of the eight is vacuous. All mutations were reverted; the committed render is
-unchanged by this section.
+Every mutation failed exactly the intended test with an accurate message. All
+mutations were reverted; the committed render is unchanged by this section.
+
+One of those eight mutations was not enough. Review found the credential
+assertion vacuous in almost every case it existed for. It scanned for the
+secret's own variable name followed by `=` — a string that occurs exactly once
+across all three files (`SIGNOZ_TOKENIZER_JWT_SECRET=` in the render), while the
+files between them hold **15** sites that actually consume a credential. The
+casting and the lock are YAML *mappings* and never spell `VAR=` at all, so a
+password pasted into `casting.yaml` — the one file here that is *meant* to be
+hand-edited — passed.
+
+The scan is now keyed on the consumption site: a key named
+`*password*`/`*secret*` in either the `KEY: value` or `KEY=value` form, plus the
+`user:password@host` userinfo of any URL, which is how
+`SIGNOZ_SQLSTORE_POSTGRES_DSN` carries the database password under a key that
+names neither. Values are normalised first — Foundry's percent-escaped patch
+form decoded, the YAML dumper's line wrapping folded back, and each *required*
+interpolation collapsed to an opaque marker so a non-required spelling (`$VAR`,
+`${VAR}`, `${VAR:-default}`) survives as itself and fails. That finds all 15
+sites: 3 in the render, 4 in the casting, 8 in the lock.
+
+Re-mutation-tested across 15 cases: a committed literal at 11 sites covering
+every (file × secret × form) combination — mapping, env assignment, plain DSN
+userinfo and percent-encoded DSN userinfo, in all three files — both
+non-required interpolation spellings, a literal at one of the two exempted
+ClickHouse settings, and a credential line deleted outright. The old assertion
+caught 3 of the 15; the current one catches all 15. Because a regex scan's
+realistic failure is finding *nothing* rather than finding the wrong thing, the
+test also asserts a minimum site count per file and that each file consumes each
+secret, so a re-render that changes the files' shape fails loudly instead of
+silently enforcing nothing.
 
 This closes the "verified once, by hand, unguarded afterwards" gap for the
 deployment's trust boundary and supply chain. It is a static contract and

@@ -56,6 +56,31 @@ const PRIVATE_CONTAINER_PORTS: &[&str] = &["4317", "4318", "8123", "9000", "9181
 /// checkout. A rendered file may only ever *reference* these.
 const REQUIRED_SECRET_VARS: &[&str] = &["SIGNOZ_TOKENIZER_JWT_SECRET", "SIGNOZ_POSTGRES_PASSWORD"];
 
+/// What a key has to be called to be treated as a credential slot.
+///
+/// The scan is keyed on the *consumption site* rather than on the secret's own
+/// variable name, because the two are not the same string anywhere it matters:
+/// the Postgres password arrives as `SIGNOZ_POSTGRES_PASSWORD` but is consumed
+/// under `POSTGRES_PASSWORD` and inside `SIGNOZ_SQLSTORE_POSTGRES_DSN`, and the
+/// casting and the lock are YAML *mappings* (`KEY: value`) that never spell
+/// `SIGNOZ_POSTGRES_PASSWORD=` at all. A scan for the variable's own name
+/// therefore inspects almost none of the places a literal can be pasted — most
+/// of all `casting.yaml`, the one file here that is meant to be hand-edited.
+const CREDENTIAL_KEY: &str = r"[A-Za-z0-9_]*(?i:password|secret)[A-Za-z0-9_]*";
+
+/// `(key, value)` pairs whose key matches [`CREDENTIAL_KEY`] but which are not
+/// credential slots. Both are ClickHouse server settings the lock embeds
+/// verbatim: a feature flag, and the `default` user's deliberately empty
+/// password (that datastore is reachable only on the project's private network,
+/// and the setting is upstream's, not this trial's).
+///
+/// The permitted value is pinned, so this exempts `password: ""` without
+/// exempting `password: hunter2`; and every pair is asserted below to still
+/// match something, so a rename upstream cannot leave a dead exemption quietly
+/// widening the scan.
+const NON_CREDENTIAL_SITES: &[(&str, &str)] =
+    &[("password", ""), ("show_named_collection_secrets", "1")];
+
 // ---------------------------------------------------------------------------
 // Minimal reader for Foundry's rendered block-style YAML
 // ---------------------------------------------------------------------------
@@ -311,35 +336,190 @@ fn every_rendered_object_is_namespaced_to_this_trial_project() {
     }
 }
 
+/// A place where one of these files hands a credential to a process: a
+/// `KEY: value` / `KEY=value` whose key names a password or a secret, or the
+/// password field of a URL's `user:password@host` userinfo — which is how the
+/// Postgres DSN carries it, under a key (`SIGNOZ_SQLSTORE_POSTGRES_DSN`) that
+/// names neither.
+#[derive(Debug)]
+struct CredentialSite {
+    /// What names the site, for the failure message.
+    what: String,
+    /// The value as written, normalised (see [`credential_sites`]).
+    value: String,
+}
+
+/// The opaque marker a *required* interpolation collapses to. Deliberately free
+/// of `:`, `=`, `@`, `/`, quotes and whitespace, so it cannot be mistaken for
+/// structure by the site scan that runs after the collapse.
+fn required_marker(var: &str) -> String {
+    format!("<<{var}>>")
+}
+
+/// Percent-decodes `%XX`. Foundry URL-escapes userinfo, so the casting's `test`
+/// patch operation — and the lock's copy of it — carry the interpolation as
+/// `$%7BVAR%3A%3F…%7D`. Decoding first means one scan covers both spellings
+/// instead of the escaped form being silently exempt.
+fn percent_decode(text: &str) -> String {
+    Regex::new(r"%([0-9A-Fa-f]{2})")
+        .unwrap()
+        .replace_all(text, |captured: &regex::Captures| {
+            u8::from_str_radix(&captured[1], 16)
+                .map(|byte| (byte as char).to_string())
+                .unwrap_or_else(|_| captured[0].to_owned())
+        })
+        .into_owned()
+}
+
+/// Folds the YAML dumper's line wrapping back into one logical line.
+///
+/// Both the render and the lock wrap long plain scalars, and both secrets land
+/// on the wrap: `${SIGNOZ_TOKENIZER_JWT_SECRET:?set a private` / `random
+/// session-signing secret}`. A line-oriented scan would see only the first half
+/// and could not tell a required interpolation from a truncated one. YAML
+/// restores such a break as a single space, and so does this: a non-blank line
+/// that is more indented than the line it follows and is not itself a comment,
+/// a sequence item or a `key:` belongs to the previous line's scalar.
+fn fold_wrapped_scalars(text: &str) -> String {
+    let structural = Regex::new(r"^\s*(#|-(\s|$)|[A-Za-z0-9_./-]+:(\s|$))").unwrap();
+    let mut folded: Vec<String> = Vec::new();
+    let mut previous_indent = 0usize;
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let continues = !line.trim().is_empty()
+            && indent > previous_indent
+            && !structural.is_match(line)
+            && !folded.is_empty();
+        if continues {
+            let last = folded.last_mut().unwrap();
+            last.push(' ');
+            last.push_str(line.trim_start());
+        } else {
+            folded.push(line.to_owned());
+            previous_indent = indent;
+        }
+    }
+    folded.join("\n")
+}
+
+/// Strips one matched pair of surrounding quotes, as YAML would.
+fn unquote(value: &str) -> String {
+    let value = value.trim();
+    for quote in ['"', '\''] {
+        if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
+            return value[1..value.len() - 1].to_owned();
+        }
+    }
+    value.to_owned()
+}
+
+/// Every credential-consumption site in one file, with its value normalised:
+/// percent-decoded, unwrapped, and with each *required* `${VAR:?…}`
+/// interpolation collapsed to [`required_marker`]. Collapsing before the scan is
+/// what keeps the interpolation's own `:` and `?` from reading as further
+/// structure inside the value they belong to — and it is why a non-required
+/// spelling (`$VAR`, `${VAR}`, `${VAR:-default}`) survives as itself and fails.
+fn credential_sites(text: &str) -> Vec<CredentialSite> {
+    let text = Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*):\?[^}]*\}")
+        .unwrap()
+        .replace_all(&fold_wrapped_scalars(&percent_decode(text)), "<<$1>>")
+        .into_owned();
+
+    let mut sites = Vec::new();
+    let keyed = Regex::new(&format!(r"(?m)({CREDENTIAL_KEY})[ \t]*[:=][ \t]*(.*)$")).unwrap();
+    for captured in keyed.captures_iter(&text) {
+        sites.push(CredentialSite {
+            what: captured[1].to_owned(),
+            value: unquote(&captured[2]),
+        });
+    }
+    let userinfo = Regex::new(r"://([^\s:/@]+):([^\s/@]*)@").unwrap();
+    for captured in userinfo.captures_iter(&text) {
+        sites.push(CredentialSite {
+            what: format!("the URL password of `{}`", &captured[1]),
+            value: unquote(&captured[2]),
+        });
+    }
+    sites
+}
+
 /// The README promises that neither the casting, the lock nor the rendered files
 /// contain an actual credential, and that a missing one fails configuration
 /// rather than starting with an empty session-signing secret. Both halves are
-/// the same assertion: every occurrence must be a *required* interpolation.
+/// the same assertion: every *site that consumes* a credential must hold a
+/// required interpolation of one of [`REQUIRED_SECRET_VARS`], in all three
+/// files.
+///
+/// The per-file minimums below are the point of the test as much as the checks
+/// they guard. Scanning is regex over three differently-shaped files, so the
+/// realistic failure is not a wrong verdict but *no verdict*: a re-render, or a
+/// reader that drifts out of step with Foundry's output, silently leaves the
+/// scan with nothing to inspect and the test passes while enforcing nothing.
+/// Requiring each file to yield at least the sites known to exist — and each
+/// file to consume each secret at least once — makes that failure loud.
 #[test]
 fn credentials_are_required_interpolations_and_never_committed_values() {
-    let assignment = |var: &str| Regex::new(&format!(r"{var}=([^\s]?)")).unwrap();
-    for (label, text) in [
-        ("compose.yaml", COMPOSE),
-        ("casting.yaml", CASTING),
-        ("casting.yaml.lock", LOCK),
+    let markers: BTreeMap<String, &str> = REQUIRED_SECRET_VARS
+        .iter()
+        .map(|var| (required_marker(var), *var))
+        .collect();
+    let mut exemptions_matched: BTreeSet<&str> = BTreeSet::new();
+
+    // Minimums, not exact counts: `compose.yaml` consumes each secret once plus
+    // the DSN; `casting.yaml` declares both and carries the DSN twice (the
+    // escaped `test` operation and its `replace`); the lock repeats the render
+    // for both the compose file and its own copy of the casting.
+    for (label, text, minimum) in [
+        ("compose.yaml", COMPOSE, 3usize),
+        ("casting.yaml", CASTING, 4),
+        ("casting.yaml.lock", LOCK, 8),
     ] {
-        for var in REQUIRED_SECRET_VARS {
-            for captured in assignment(var).captures_iter(text) {
-                assert_eq!(
-                    &captured[1], "$",
-                    "{label} assigns {var} a literal value instead of a Compose interpolation"
-                );
+        let mut consumed: BTreeSet<&str> = BTreeSet::new();
+        let mut policed = 0usize;
+
+        for site in credential_sites(text) {
+            if let Some((key, _)) = NON_CREDENTIAL_SITES
+                .iter()
+                .find(|(key, value)| *key == site.what && *value == site.value)
+            {
+                exemptions_matched.insert(key);
+                continue;
             }
+            let var = markers.get(&site.value).copied().unwrap_or_else(|| {
+                panic!(
+                    "{label} gives {} the value `{}`. Every credential site must hold a \
+                     `${{VAR:?…}}` required interpolation of one of {REQUIRED_SECRET_VARS:?}, so \
+                     that no credential is committed and a missing one fails \
+                     `docker compose config` instead of starting the stack without it",
+                    site.what, site.value
+                )
+            });
+            consumed.insert(var);
+            policed += 1;
+        }
+
+        assert!(
+            policed >= minimum,
+            "only found {policed} credential site(s) in {label}, expected at least {minimum} — \
+             the scan has gone blind to sites it is supposed to police (a re-render changed the \
+             file's shape, or a site was dropped), so this test would pass while enforcing \
+             nothing"
+        );
+        for var in REQUIRED_SECRET_VARS {
+            assert!(
+                consumed.contains(var),
+                "no site in {label} consumes {var}; found {consumed:?}"
+            );
         }
     }
-    for var in REQUIRED_SECRET_VARS {
-        let required = Regex::new(&format!(r"\$\{{{var}:\?")).unwrap();
-        assert!(
-            required.is_match(COMPOSE),
-            "{var} must use the `${{{var}:?…}}` required form so a missing value fails \
-             `docker compose config` instead of starting the stack without it"
-        );
-    }
+
+    assert_eq!(
+        exemptions_matched.len(),
+        NON_CREDENTIAL_SITES.len(),
+        "a NON_CREDENTIAL_SITES exemption no longer matches anything ({exemptions_matched:?} of \
+         {NON_CREDENTIAL_SITES:?}) — a dead exemption widens the scan for nothing and must be \
+         deleted"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -457,14 +637,28 @@ fn the_documented_memory_budget_is_the_sum_of_the_rendered_limits() {
     // `{}` on an f64 renders 3.75 as "3.75" and 4.0 as "4", which is exactly how
     // a GiB figure is written in prose.
     let steady_gib = format!("{} GiB", steady as f64 / 1024.0);
-    assert!(
-        README.contains(&steady_gib),
-        "the README must state the rendered steady-state cap ({steady} MiB = {steady_gib})"
+
+    // The README states the budget twice — once as prose under "Resource
+    // expectations", once in the rendered-deployment contract table — and a
+    // `contains` check would go on passing while one of the two went stale, so
+    // each statement is asserted separately. The two transient phrasings differ;
+    // the steady figure is the same string in both places and is counted.
+    assert_eq!(
+        README.matches(&steady_gib).count(),
+        2,
+        "both README statements of the steady-state cap ({steady} MiB = {steady_gib}) must agree \
+         with the rendered mem_limits — the prose under \"Resource expectations\" and the \
+         rendered-deployment contract table"
     );
-    assert!(
-        README.contains(&format!("{transient} MiB for transient")),
-        "the README must state the rendered transient initialization cap ({transient} MiB)"
-    );
+    for phrasing in [
+        format!("{transient} MiB for transient"),
+        format!("{transient} MiB transient"),
+    ] {
+        assert!(
+            README.contains(&phrasing),
+            "the README must state the rendered transient initialization cap as \"{phrasing}\""
+        );
+    }
 }
 
 /// The README's storage note ("three 10 MiB files per service") is only true
