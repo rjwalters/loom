@@ -44,12 +44,44 @@ pub const PRIVATE_DEFAULTS_ENV: &str = "LOOM_CONFIG_DEFAULTS_FILE";
 /// is just this file — see `docs/design/config-resolution-tiers.md` and
 /// `defaults/docs/daemon-reference.md` ("One file, fleet-wide: the
 /// machine-level defaults tier") for the write-it-once recipe.
+///
+/// Unused under `cfg(test)` on purpose — that is exactly what
+/// [`private_defaults_path`]'s test refusal below does, not an oversight.
+#[cfg_attr(test, allow(dead_code))]
 const DEFAULT_PRIVATE_DEFAULTS_REL: &str = ".local/share/loom/config/defaults.json";
 
 /// Resolve the path to the private/shared defaults file, honoring
 /// [`PRIVATE_DEFAULTS_ENV`]. Returns `None` when the env var is explicitly
 /// set to an empty string (tier disabled) or when no home directory can be
 /// determined.
+///
+/// # The home fallback is refused under `cfg(test)` (#8584)
+///
+/// For the same reason [`crate::api_keys_pool::paths::shared_api_keys_dir`]
+/// and [`crate::tokens_pool::paths::shared_tokens_dir`] refuse theirs
+/// (#4657): the env var is process-global and every `#[test]` in this crate
+/// links into **one** multi-threaded binary, so a home-directory fallback lets
+/// the operator's live `~/.local/share/loom/config/defaults.json` decide what
+/// a unit test's *fixture* config says.
+///
+/// Refusing it here rather than in each test is what makes the isolation
+/// **closed by construction**. The opt-in shape — every test file remembering
+/// to wrap itself in `set_var(PRIVATE_DEFAULTS_ENV, "")` — is only ever as
+/// good as the files that remembered, and it has now failed twice the same
+/// way: #4538 (`role_runner`'s config-default tests) and #8584
+/// (`runtime_preference::tests`, where a fleet host's
+/// `runtimes.defaultModelProfile` silently replaced the bundled profile the
+/// fixture assumed, so a native tap read as credential-`Unobservable` instead
+/// of gated on its API-key pool). Both reproduced *only* on a host whose
+/// operator had written that file, which is why CI never caught either.
+///
+/// The existing `set_var(PRIVATE_DEFAULTS_ENV, "")` guards across the crate
+/// stay correct and are left alone: an explicitly-empty override is still the
+/// disabled tier, and an explicit non-empty override still points the tier at
+/// a fixture path, under test exactly as in production. Integration tests
+/// under `loom-daemon/tests/` spawn the **binary**, which is not built with
+/// `cfg(test)`, so they must keep passing `LOOM_CONFIG_DEFAULTS_FILE=""` in
+/// the child environment — this guard does not reach them.
 #[must_use]
 pub fn private_defaults_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var(PRIVATE_DEFAULTS_ENV) {
@@ -59,7 +91,14 @@ pub fn private_defaults_path() -> Option<PathBuf> {
             Some(PathBuf::from(p))
         };
     }
-    dirs::home_dir().map(|h| h.join(DEFAULT_PRIVATE_DEFAULTS_REL))
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        dirs::home_dir().map(|h| h.join(DEFAULT_PRIVATE_DEFAULTS_REL))
+    }
 }
 
 /// Soft-fail JSON-object read: a missing file, an unreadable file, malformed
@@ -463,6 +502,60 @@ mod tests {
         let resolved = private_defaults_path();
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
         assert_eq!(resolved, None);
+    }
+
+    /// #8584: with the override **unset** — the state any test file that never
+    /// heard of `LOOM_CONFIG_DEFAULTS_FILE` runs in — the tier must resolve to
+    /// `None`, never to the operator's real
+    /// `~/.local/share/loom/config/defaults.json`.
+    ///
+    /// This is the assertion that makes the isolation closed by construction
+    /// rather than opt-in. Reverting the `cfg(test)` arm of
+    /// [`private_defaults_path`] fails this test on **every** host with a home
+    /// directory, whether or not that file happens to exist there — which is
+    /// the point: the host-dependent version of this check is what let #4538
+    /// and #8584 both reach `main`.
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_private_defaults_path_never_falls_back_to_operator_home_under_test() {
+        let prior = std::env::var(PRIVATE_DEFAULTS_ENV).ok();
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        let resolved = private_defaults_path();
+        let home = dirs::home_dir();
+        if let Some(prior) = prior {
+            std::env::set_var(PRIVATE_DEFAULTS_ENV, prior);
+        }
+        assert!(home.is_some(), "no home directory — this test proves nothing here");
+        assert_eq!(
+            resolved, None,
+            "the unset private-defaults tier must not resolve under cfg(test); it resolved to \
+             {resolved:?} (home {home:?}), which lets the operator's live machine-level config \
+             decide what a unit test's fixture config says — #4657/#4538/#8584"
+        );
+    }
+
+    /// The same guard at the seam callers actually use: a fixture repo whose
+    /// own `.loom/config.json` is the only tier present resolves to exactly
+    /// that file's content, with nothing merged underneath it from the host.
+    ///
+    /// `test_resolve_only_legacy_tier_present_matches_legacy_content_exactly`
+    /// below pins the same property, but pre-disables the tier by hand and so
+    /// cannot catch a regression in the fallback itself. This one deliberately
+    /// leaves the override unset. `runtimes.defaultModelProfile` is the key
+    /// #8584's two `runtime_preference` failures actually turned on.
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_resolve_effective_config_ignores_the_host_tier_with_the_override_unset() {
+        let prior = std::env::var(PRIVATE_DEFAULTS_ENV).ok();
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        let dir = tempdir().unwrap();
+        let legacy = json!({"runtimes": {"defaultModelProfile": "fixture-only"}});
+        write(&dir.path().join(LEGACY_CONFIG_REL), &legacy.to_string());
+        let resolved = resolve_effective_config(dir.path());
+        if let Some(prior) = prior {
+            std::env::set_var(PRIVATE_DEFAULTS_ENV, prior);
+        }
+        assert_eq!(resolved, legacy, "a host defaults file leaked into the fixture's config");
     }
 
     // ===== resolve_effective_config: behavior preservation =====
