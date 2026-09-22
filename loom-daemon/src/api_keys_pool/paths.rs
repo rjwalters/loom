@@ -228,7 +228,13 @@ pub fn list_providers(root: &Path) -> Result<Vec<String>, PoolReadError> {
     let mut names: Vec<String> = read_dir_tristate(root)?
         .unwrap_or_default()
         .into_iter()
-        .filter(|p| p.is_dir())
+        // Decided on the NAME alone, never on `is_dir()`: a pool *root* that is
+        // listable but not searchable (`r--`) makes every `stat` fail, and an
+        // `is_dir()` filter would then report a registered pool as empty (the
+        // same shape `list_account_files` fixed for PR #8428's finding 1). A
+        // name that turns out not to be a directory is caught downstream —
+        // `list_account_files`/`list_provider` on it returns a [`PoolReadError`]
+        // rather than silently reporting no accounts.
         .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
         .filter(|n| validate_provider(n).is_ok())
         .collect();
@@ -455,6 +461,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("zai"), "not a directory").unwrap();
         assert!(list_account_files(&tmp.path().join("zai")).is_err());
+    }
+
+    /// Issue #8450 item 5: `list_providers` must decide on the directory NAME
+    /// alone, matching `list_account_files`'s #8428 fix. Before the fix an
+    /// unsearchable (`r--`) root made every `stat` fail and `list_providers`
+    /// wrongly reported an empty pool.
+    #[cfg(unix)]
+    #[test]
+    fn a_listable_but_unsearchable_root_still_reports_its_providers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_account(tmp.path(), "zai", "alpha");
+        let _guard = ModeGuard::set(tmp.path(), 0o400);
+        if fs::metadata(tmp.path().join("zai")).is_ok() {
+            return; // running as root
+        }
+        assert_eq!(list_providers(tmp.path()).unwrap(), vec!["zai".to_string()]);
     }
 
     #[test]

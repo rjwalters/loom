@@ -401,11 +401,23 @@ pub(super) fn write_secret(path: &Path, body: &str) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let staged = (|| {
+    let staged: std::io::Result<()> = (|| {
         let mut file = options.open(&temp)?;
         file.write_all(body.as_bytes())?;
         file.sync_all()?;
-        fs::rename(&temp, path)
+        fs::rename(&temp, path)?;
+        // Durability of the just-written mark across power loss: on most Unix
+        // filesystems a `rename` is not itself durable until the directory
+        // entry is fsynced. Atomicity is already correct without this (a
+        // reader always sees the old file or the new one, never a torn one);
+        // this only narrows "the rename landed but a crash immediately after
+        // loses it" (issue #8450 item 7). Best-effort — `tokens_pool` does not
+        // do this either, and a failure here must not fail the write itself.
+        #[cfg(unix)]
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     })();
     staged.map_err(|e| {
         let _ = fs::remove_file(&temp);

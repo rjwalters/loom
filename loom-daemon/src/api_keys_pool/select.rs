@@ -53,7 +53,7 @@ use crate::tokens_pool::locking::MkdirLock;
 use crate::tokens_pool::{rng::Rng, rotation::next_rotation_index};
 
 use super::inflight::{self, Lease};
-use super::paths::{list_workspace_providers, provider_dir, resolve_provider_root, PoolReadError};
+use super::paths::{provider_dir, resolve_provider_root, resolve_provider_root_in, PoolReadError};
 use super::registry::{
     list_provider, list_provider_for_class, provider_is_pooled, read_credential, ApiKeyAccount,
     Credential, Ineligible, ALLOWLIST_FILE,
@@ -227,6 +227,19 @@ pub fn select_api_key_for(
 
     let credential = read_credential(&root, provider, &chosen.name)
         .map_err(|e| EmptyApiKeyPoolError(format!("selected account became unreadable: {e}")))?;
+    // Re-check against `expected_env` on the value just read, not only on the
+    // earlier `describe` pass (issue #8450 item 7): narrows the window against
+    // a concurrent `add --force --env-var OTHER` that changes the account's
+    // assigned variable between eligibility filtering and this read.
+    if let Some(expected) = expected_env {
+        if credential.env_name != expected {
+            return Err(EmptyApiKeyPoolError(format!(
+                "selected account {provider}/{} now assigns {}, but the profile's credentialEnv \
+                 is {expected} — it was changed concurrently; retry selection",
+                chosen.name, credential.env_name
+            )));
+        }
+    }
     // Count this spawn against the chosen account, still under `_cap_lock`.
     let lease = inflight::register(&root, provider, &chosen.name);
     Ok(SelectedApiKey {
@@ -346,7 +359,15 @@ pub struct ProviderHealth {
     pub unreadable: Option<String>,
     /// Accounts whose file permissions are looser than `0600`.
     pub insecure_permissions: Vec<String>,
+    /// The operator pin (`.allowlist`), when it could be read. Empty means "no
+    /// pin" — but only when [`Self::pin_unreadable`] is also `None`; see there.
     pub pinned: Vec<String>,
+    /// Set when `.allowlist` exists but could not be read. [`Self::pinned`] is
+    /// then `[]`, which must **not** be read as "no pin": selection itself
+    /// fails closed on an unreadable allowlist (issue #8450 item 6) — this
+    /// field is what lets `health` say so instead of misreporting "no pin".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_unreadable: Option<String>,
     /// Last successful `api-keys sync --from …` into the root that serves this
     /// provider (#8511), or `None` on a host that has never synced (or whose
     /// state file is damaged). Informational only — unlike `.disabled` or
@@ -369,13 +390,30 @@ pub fn list_accounts(
     workspace: &Path,
     provider: Option<&str>,
 ) -> Result<Vec<ApiKeyAccount>, PoolReadError> {
+    list_accounts_in(&super::paths::pool_roots(workspace), provider)
+}
+
+/// [`list_accounts`] over an explicit, precedence-ordered root list.
+///
+/// Passing a single root is how a management verb reaches accounts the
+/// ordinary precedence rule shadows: once a repo registers its own accounts
+/// for a provider, that provider's shared machine-level accounts resolve away
+/// and were unreachable from the repo (issue #8450 item 1). `--shared` on
+/// `list`/`health` passes `&[shared_api_keys_dir()]` here.
+///
+/// # Errors
+/// [`PoolReadError`] when any pool directory involved exists but cannot be read.
+pub fn list_accounts_in(
+    roots: &[std::path::PathBuf],
+    provider: Option<&str>,
+) -> Result<Vec<ApiKeyAccount>, PoolReadError> {
     let providers = match provider {
         Some(p) => vec![p.to_string()],
-        None => list_workspace_providers(workspace)?,
+        None => super::paths::list_providers_in(roots)?,
     };
     let mut accounts = Vec::new();
     for p in &providers {
-        accounts.extend(list_provider(&resolve_provider_root(workspace, p)?, p)?);
+        accounts.extend(list_provider(&resolve_provider_root_in(roots, p)?, p)?);
     }
     Ok(accounts)
 }
@@ -390,14 +428,26 @@ pub fn health(
     workspace: &Path,
     provider: Option<&str>,
 ) -> Result<Vec<ProviderHealth>, PoolReadError> {
+    health_in(&super::paths::pool_roots(workspace), provider)
+}
+
+/// [`health`] over an explicit, precedence-ordered root list — see
+/// [`list_accounts_in`] for why a management verb needs one (issue #8450 item 1).
+///
+/// # Errors
+/// [`PoolReadError`] when a pool *root* cannot be enumerated at all.
+pub fn health_in(
+    roots: &[std::path::PathBuf],
+    provider: Option<&str>,
+) -> Result<Vec<ProviderHealth>, PoolReadError> {
     let providers = match provider {
         Some(p) => vec![p.to_string()],
-        None => list_workspace_providers(workspace)?,
+        None => super::paths::list_providers_in(roots)?,
     };
     Ok(providers
         .into_iter()
         .map(|provider| {
-            let resolved = resolve_provider_root(workspace, &provider)
+            let resolved = resolve_provider_root_in(roots, &provider)
                 .and_then(|root| list_provider(&root, &provider).map(|accounts| (root, accounts)));
             let (root, accounts, unreadable) = match resolved {
                 Ok((root, accounts)) => (root, accounts, None),
@@ -415,6 +465,14 @@ pub fn health(
                     .filter(|a| a.ineligible.as_ref() == Some(&kind))
                     .count()
             };
+            // `.allowlist` unreadable withholds every account from selection
+            // (see `select_api_key_for`'s own `read_list` call), so `health`
+            // must surface that read error rather than reporting "no pin".
+            let (pinned, pin_unreadable) =
+                match super::registry::read_list(&root, &provider, ALLOWLIST_FILE) {
+                    Ok(list) => (list, None),
+                    Err(e) => (Vec::new(), Some(e)),
+                };
             ProviderHealth {
                 dir: provider_dir(&root, &provider),
                 total: accounts.len(),
@@ -437,8 +495,8 @@ pub fn health(
                     .filter(|a| !a.permissions_ok)
                     .map(|a| a.name.clone())
                     .collect(),
-                pinned: super::registry::read_list(&root, &provider, ALLOWLIST_FILE)
-                    .unwrap_or_default(),
+                pinned,
+                pin_unreadable,
                 last_sync: super::sync::read_state(&root).ok().flatten(),
                 accounts,
                 provider,

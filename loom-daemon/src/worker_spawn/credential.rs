@@ -101,16 +101,21 @@ impl Resolved {
     }
 }
 
-/// The pool provider namespace a profile's credential belongs to: the
-/// profile's explicit `credentialPool` when set, else derived from its
-/// `credentialEnv` (`ZAI_API_KEY` -> `zai`).
+/// The pool provider namespace a profile's credential belongs to: an explicit
+/// `credentialPool` override when set, else derived from its `credentialEnv`
+/// (`ZAI_API_KEY` -> `zai`).
 ///
 /// Deriving from the *source* variable rather than from the harness-facing
 /// `providers` entry is what keeps one subscription registered once: the same
 /// Z.ai coding plan is `zai` to Pi and `zai-coding-plan` to OpenCode.
+///
+/// Takes the override as a bare `Option<&str>`, not a whole [`Selection`], so
+/// a caller that only has a [`super::profiles::ModelProfile`] in hand — e.g.
+/// `spawn-worker profile-check` (issue #8450 item 2), which never builds a
+/// full `Selection` — can call it directly.
 #[must_use]
-pub fn pool_provider(selection: &Selection, source_var: &str) -> Option<String> {
-    if let Some(explicit) = selection.credential_pool.as_deref() {
+pub fn pool_provider(credential_pool: Option<&str>, source_var: &str) -> Option<String> {
+    if let Some(explicit) = credential_pool {
         return api_keys_pool::paths::validate_provider(explicit)
             .ok()
             .map(|()| explicit.to_string());
@@ -155,7 +160,7 @@ pub fn resolve(root: &std::path::Path, selection: &Selection) -> Result<Resolved
         _ => return Ok(environment_only(injected)),
     };
 
-    let Some(provider) = pool_provider(selection, source_var) else {
+    let Some(provider) = pool_provider(selection.credential_pool.as_deref(), source_var) else {
         return Ok(environment_only(injected));
     };
     let pooled = api_keys_pool::is_pooled(root, &provider).map_err(|error| {
@@ -246,16 +251,13 @@ mod tests {
     #[test]
     fn pool_provider_prefers_the_explicit_override() {
         let var = "ZAI_API_KEY";
-        assert_eq!(
-            pool_provider(&selection(Some(var), Some("shared-glm")), var).as_deref(),
-            Some("shared-glm")
-        );
-        assert_eq!(pool_provider(&selection(Some(var), None), var).as_deref(), Some("zai"));
+        assert_eq!(pool_provider(Some("shared-glm"), var).as_deref(), Some("shared-glm"));
+        assert_eq!(pool_provider(None, var).as_deref(), Some("zai"));
         // A malformed override does not silently fall back to the derivation:
         // it disables pooling for the profile rather than pointing somewhere
         // the operator did not name.
-        assert_eq!(pool_provider(&selection(Some(var), Some("../etc")), var), None);
-        assert_eq!(pool_provider(&selection(None, None), "_API_KEY"), None);
+        assert_eq!(pool_provider(Some("../etc"), var), None);
+        assert_eq!(pool_provider(None, "_API_KEY"), None);
     }
 
     #[test]
