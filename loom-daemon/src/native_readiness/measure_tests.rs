@@ -329,8 +329,11 @@ fn a_two_phase_report_discloses_comparability_and_claims_no_improvement() {
     assert_eq!(value["paid_retry"], false);
     assert_eq!(value["forge_contact"], false);
     assert_eq!(value["speedup_claimed"], false);
-    assert_eq!(value["plugin_load_proven"], serde_json::Value::Null);
-    assert_eq!(value["readiness_command"], serde_json::json!(["--version"]));
+    // The fake CLI answers every argv successfully but never writes the
+    // plugin-load receipt (it is not the real guarded binding), so the
+    // verdict is a measured `false` — not an unearned `null`.
+    assert_eq!(value["plugin_load_proven"], serde_json::json!(false));
+    assert_eq!(value["readiness_command"], serde_json::json!(["debug", "config"]));
     assert_eq!(value["phases"].as_array().unwrap().len(), 2);
     assert_eq!(value["unknown_boundaries"].as_array().unwrap().len(), 3);
     // Comparability is reported as a measured fact (or as unknown), never as

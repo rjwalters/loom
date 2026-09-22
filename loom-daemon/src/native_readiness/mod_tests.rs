@@ -20,6 +20,7 @@ fn attempt(index: usize, mode: Mode, cache: CacheOutcome, millis: &[u64]) -> Att
         mode,
         cache,
         total_millis: millis.iter().sum(),
+        plugin_load_observed: None,
         stages,
     }
 }
@@ -211,6 +212,72 @@ fn comparability_is_measured_not_assumed() {
     // Unreadable load average -> unknown, never an optimistic default.
     assert_eq!(comparable_load(&[phase(None, None), phase(None, None)]), None);
     assert_eq!(comparable_load(&[phase(Some(1.0), None)]), None);
+}
+
+#[test]
+fn plugin_load_verdict_is_none_when_no_attempt_observed_it() {
+    let attempts = vec![attempt(0, Mode::Cold, CacheOutcome::Bypassed, &[10])];
+    let phase = PhaseReport::new(Mode::Cold, host(Some(1.0), Some(1.0)), attempts);
+    assert_eq!(
+        plugin_load_verdict(&[phase]),
+        None,
+        "a run whose readiness boundary never completed has no opinion on plugin load"
+    );
+}
+
+#[test]
+fn plugin_load_verdict_is_true_when_every_observed_attempt_loaded() {
+    let mut a0 = attempt(0, Mode::Cold, CacheOutcome::Bypassed, &[10]);
+    a0.plugin_load_observed = Some(true);
+    let mut a1 = attempt(1, Mode::Cold, CacheOutcome::Bypassed, &[10]);
+    a1.plugin_load_observed = Some(true);
+    let phase = PhaseReport::new(Mode::Cold, host(Some(1.0), Some(1.0)), vec![a0, a1]);
+    assert_eq!(plugin_load_verdict(&[phase]), Some(true));
+}
+
+#[test]
+fn plugin_load_verdict_is_false_on_one_counterexample() {
+    let mut a0 = attempt(0, Mode::Cold, CacheOutcome::Bypassed, &[10]);
+    a0.plugin_load_observed = Some(true);
+    let mut a1 = attempt(1, Mode::Cold, CacheOutcome::Bypassed, &[10]);
+    a1.plugin_load_observed = Some(false);
+    let phase = PhaseReport::new(Mode::Cold, host(Some(1.0), Some(1.0)), vec![a0, a1]);
+    assert_eq!(
+        plugin_load_verdict(&[phase]),
+        Some(false),
+        "this probe shape loads the guarded plugin is a claim about every invocation \
+         of it, and one counterexample refutes it"
+    );
+}
+
+#[test]
+fn plugin_load_verdict_ignores_attempts_that_never_reached_the_boundary() {
+    let mut a0 = attempt(0, Mode::Cold, CacheOutcome::Bypassed, &[10]);
+    a0.plugin_load_observed = Some(true);
+    // Default plugin_load_observed is None: this attempt never got far enough
+    // to have an opinion, and must not be treated as a counterexample.
+    let a1 = attempt(1, Mode::Cold, CacheOutcome::Bypassed, &[]);
+    let phase = PhaseReport::new(Mode::Cold, host(Some(1.0), Some(1.0)), vec![a0, a1]);
+    assert_eq!(plugin_load_verdict(&[phase]), Some(true));
+}
+
+#[test]
+fn readiness_report_propagates_the_plugin_load_verdict() {
+    let mut a0 = attempt(0, Mode::Cold, CacheOutcome::Bypassed, &[10]);
+    a0.plugin_load_observed = Some(true);
+    let phase = PhaseReport::new(Mode::Cold, host(Some(1.0), Some(1.0)), vec![a0]);
+    let report = ReadinessReport::new(
+        NetworkMode::Allowed,
+        vec!["debug".into(), "config".into()],
+        Some("1.18.31".into()),
+        None,
+        vec![phase],
+    );
+    assert_eq!(
+        report.plugin_load_proven,
+        Some(true),
+        "must be derived from the attempts' own receipts, never asserted by construction"
+    );
 }
 
 #[test]

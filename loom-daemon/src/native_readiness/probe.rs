@@ -22,10 +22,23 @@
 //!
 //! It proves the binary executes, the guarded bindings can be written, the
 //! pinned package set can be materialized, and the CLI answers a provider-free
-//! invocation inside the deadline. It does **not** prove inference readiness,
-//! and it does not prove the CLI loaded the guarded plugin — a help/config
-//! command returning 0 is not evidence of plugin load. That is why
-//! [`super::ReadinessReport::plugin_load_proven`] stays `None`.
+//! invocation inside the deadline. It does **not** prove inference readiness.
+//!
+//! A **zero exit status still proves nothing about plugin load**, and the live
+//! run in `defaults/docs/native-readiness-verification-2026-09-22.md` (#8600)
+//! measured exactly that failure mode on the pinned OpenCode 1.18.31: with a
+//! guarded `plugins/loom.ts` whose initialization throws, the CLI logged
+//! `failed to load plugin` and **still exited 0**. `--version`, `-v`, `--help`,
+//! `-h` and `help` were separately shown never to reach the plugin loader at
+//! all, while `debug config` and `models` do.
+//!
+//! So this module does not infer plugin load from an exit code. It asks the
+//! guarded plugin itself: [`PLUGIN_LOAD_RECEIPT_ENV`] names a path the binding
+//! writes the instant its factory runs, and [`Probe::readiness`] reports
+//! whether that file appeared. A CLI that never loaded the binding — a fake
+//! one in a fixture included — cannot produce it, so the resulting
+//! [`super::ReadinessReport::plugin_load_proven`] is an observation of this
+//! run rather than a claim carried over from a receipt.
 
 use super::{Classification, NetworkMode, Observation};
 use crate::proc_exec::{run_bounded, Completion, ExecError};
@@ -57,11 +70,37 @@ pub const READINESS_ALLOWLIST: &[&str] = &[
 ];
 
 /// Argv used when the caller names none: the cheapest provider-free answer the
-/// CLI can give.
-pub const DEFAULT_READINESS: &[&str] = &["--version"];
+/// CLI can give **that actually reaches the plugin loader**.
+///
+/// It was `--version` until #8600. The live run recorded in
+/// `defaults/docs/native-readiness-verification-2026-09-22.md` showed that
+/// `--version` / `--help` / `help` are answered by the argument parser before
+/// the CLI bootstraps, so they never evaluate `plugins/loom.ts`, never resolve
+/// `@opencode-ai/plugin`, and make [`super::Stage::ServerSessionReady`] a
+/// second, costlier copy of [`super::Stage::BinaryProbe`]. `debug config` is
+/// the cheapest allowlisted argv observed to load the guarded binding, so it
+/// is the shape whose boundary is worth measuring.
+pub const DEFAULT_READINESS: &[&str] = &["debug", "config"];
 
 /// Package manager used to materialize the pinned plugin set by default.
+///
+/// Live-verified in #8600 as the resolver OpenCode 1.18.31 itself shells out
+/// to: with no `node_modules` present, the CLI's own plugin bootstrap wrote an
+/// npm `package-lock.json` (`lockfileVersion: 3`), populated `$HOME/.npm`, and
+/// produced a `node_modules` tree whose file listing is **identical** to
+/// `npm install --omit=dev` for the same manifest (3926 paths, byte-for-byte
+/// equal `find` output). The measured package boundary is therefore the same
+/// work the CLI does, not merely equivalent work.
 pub const DEFAULT_PACKAGE_MANAGER: &str = "npm";
+
+/// Environment variable naming the file the guarded plugin writes when its
+/// factory runs.
+///
+/// Set only by this probe, so the write is inert in production: the binding
+/// checks for the variable and does nothing when it is absent. The value is a
+/// path inside this attempt's private state tree, and the only thing derived
+/// from it is a boolean — no child output reaches the report through it.
+pub const PLUGIN_LOAD_RECEIPT_ENV: &str = "LOOM_NATIVE_READINESS_RECEIPT";
 
 /// Environment variables inherited from the parent. `PATH` only: the harness is
 /// a Node/Bun program that must be able to find its own interpreter, and
@@ -174,6 +213,15 @@ impl IsolatedState {
     pub fn package_root(&self) -> &Path {
         &self.config_dir
     }
+
+    /// The path the guarded plugin writes when its factory runs.
+    ///
+    /// Inside the attempt's own 0700 root, so two concurrent attempts cannot
+    /// read each other's evidence.
+    #[must_use]
+    pub fn plugin_load_receipt(&self) -> PathBuf {
+        self.root.join("plugin-load-receipt")
+    }
 }
 
 /// A bounded, provider-free probe of one installed harness binary.
@@ -252,8 +300,19 @@ impl Probe {
             .env("OPENCODE_CONFIG_DIR", &state.config_dir)
             .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
             .env("LOOM_NATIVE_READINESS_PROBE", "1")
+            .env(PLUGIN_LOAD_RECEIPT_ENV, state.plugin_load_receipt())
+            // The guarded binding refuses to initialize without these two, and
+            // a binding that refuses is a *failed* plugin load the CLI reports
+            // with exit 0 (#8600). Neither is credential-shaped: the workspace
+            // is this attempt's own private scratch root, and the tool binary
+            // is only ever executed by a tool call, which requires an assistant
+            // turn this probe never takes.
+            .env("LOOM_WORKSPACE", &state.root)
             .env("CI", "1")
             .env("NO_COLOR", "1");
+        if let Ok(self_bin) = std::env::current_exe() {
+            command.env("LOOM_NATIVE_TOOL_BIN", self_bin);
+        }
         for (key, path) in &state.xdg {
             command.env(key, path);
         }
@@ -301,21 +360,48 @@ impl Probe {
 
     /// Measure [`super::Stage::ServerSessionReady`]: the provider-free argv
     /// returns inside the deadline.
+    ///
+    /// The second element answers "did this invocation load the guarded
+    /// plugin?" from the receipt file the binding writes, never from the exit
+    /// status:
+    ///
+    /// * `Some(true)` — the receipt exists, so the binding's factory ran.
+    /// * `Some(false)` — the invocation completed and wrote no receipt, so it
+    ///   did not reach the binding (what `--version` and `--help` do, and what
+    ///   any CLI that is not the real guarded harness does).
+    /// * `None` — the invocation did not complete, so there was nothing to
+    ///   observe either way. Absence of evidence is reported as absence of
+    ///   evidence.
     #[must_use]
-    pub fn readiness(&self, state: &IsolatedState) -> Observation {
+    pub fn readiness(&self, state: &IsolatedState) -> (Observation, Option<bool>) {
+        let receipt = state.plugin_load_receipt();
+        // A stale receipt from an earlier boundary of this same attempt would
+        // be indistinguishable from this invocation's own evidence.
+        let _ = std::fs::remove_file(&receipt);
         let Ok(command) = self.command(state, &self.readiness.clone()) else {
-            return local_failure(0);
+            return (local_failure(0), None);
         };
-        run_stage(command, self.deadline).observation
+        let observation = run_stage(command, self.deadline).observation;
+        let loaded = if receipt.is_file() {
+            Some(true)
+        } else if matches!(observation, Observation::Measured { .. }) {
+            Some(false)
+        } else {
+            None
+        };
+        (observation, loaded)
     }
 
     /// Measure [`super::Stage::PackageResolution`] by materializing the pinned
     /// plugin package set with `npm` into `state.package_root()`.
     ///
-    /// This is **equivalent** package work, not necessarily the identical
-    /// resolver OpenCode itself uses — the report says so. What matters for the
-    /// question at hand is that it is the same pinned dependency, the same
-    /// platform, and observably separable from every other boundary.
+    /// Until #8600 this was documented as *equivalent* package work, because
+    /// nobody had checked what the CLI's own resolver produces. The live
+    /// comparison in `defaults/docs/native-readiness-verification-2026-09-22.md`
+    /// closed that: OpenCode 1.18.31 resolves the same manifest with npm into a
+    /// byte-identically-named `node_modules` tree, so this is the **same** work
+    /// under the same resolver — same pinned dependency, same platform, and
+    /// still observably separable from every other boundary.
     #[must_use]
     pub fn resolve_packages(&self, state: &IsolatedState) -> Observation {
         let mut command = Command::new(&self.package_manager);

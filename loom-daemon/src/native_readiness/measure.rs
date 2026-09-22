@@ -45,6 +45,18 @@ use std::{
 
 /// The relative paths a warm attempt shares through the cache. Package
 /// artifacts only — see [`super::package_cache`] for the enforcement.
+///
+/// Left at `node_modules` after the #8600 live run, which confirmed this is
+/// exactly the tree OpenCode's own resolver produces (see
+/// [`super::probe::DEFAULT_PACKAGE_MANAGER`]) and therefore the right thing to
+/// share. That run also found that publishing the **real** dependency tree is
+/// refused by [`super::package_cache`]'s own safety rules — `node_modules/.bin`
+/// holds symlinks, and `kubernetes-types/storage` trips
+/// [`super::package_cache::FORBIDDEN_COMPONENTS`] — so a warm phase currently
+/// degrades to [`CacheOutcome::Bypassed`] against the pinned CLI. That is
+/// reported honestly per attempt rather than hidden, and is tracked separately;
+/// narrowing this list would not fix it, because both blockers are inside the
+/// one artifact a warm launch needs.
 const SHARED_ARTIFACTS: &[&str] = &["node_modules"];
 
 /// Which phases to run.
@@ -60,7 +72,11 @@ pub enum Phases {
 
 #[derive(clap::Args)]
 pub struct ReadinessArgs {
-    /// Harness binary to probe. Defaults to `LOOM_OPENCODE_BIN`, then `opencode`.
+    /// Harness binary to probe. Defaults to `LOOM_OPENCODE_BIN`, then
+    /// `opencode`. Point it at the CLI itself, not at a wrapper script that
+    /// derives its install prefix from `$HOME`: every attempt runs with an
+    /// isolated `HOME`, so such a wrapper resolves to a path that does not
+    /// exist and exits 127 before the CLI ever runs (#8600).
     #[arg(long, value_name = "PATH")]
     bin: Option<PathBuf>,
     /// Attempts per phase.
@@ -196,6 +212,7 @@ impl ReadinessArgs {
             "reported_separately_from_model_execution": true,
             "wall_millis": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "cli_version": version,
+            "plugin_load_observed": attempt.plugin_load_observed,
             "cache": attempt.cache,
             "cache_base": cache.map(|c| c.base().display().to_string()),
             "stages": attempt.stages,
@@ -270,13 +287,14 @@ impl ReadinessArgs {
             observation,
         });
 
+        let (observation, plugin_load_observed) = if ok {
+            probe.readiness(&state)
+        } else {
+            (Observation::NotReached, None)
+        };
         stages.push(StageObservation {
             stage: Stage::ServerSessionReady,
-            observation: if ok {
-                probe.readiness(&state)
-            } else {
-                Observation::NotReached
-            },
+            observation,
         });
 
         stages.extend(unknown_boundaries());
@@ -286,6 +304,7 @@ impl ReadinessArgs {
                 mode,
                 cache: outcome,
                 total_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                plugin_load_observed,
                 stages,
             },
             version,
@@ -426,6 +445,9 @@ fn finish(
         mode,
         cache,
         total_millis: millis(started),
+        // The scratch tree failed before any child ran, so no readiness
+        // invocation existed to observe a plugin load from.
+        plugin_load_observed: None,
         stages,
     }
 }
