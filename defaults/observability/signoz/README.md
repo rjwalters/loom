@@ -169,11 +169,12 @@ not fabricated HTTP requests. Trace Explorer is the acceptance surface; an empty
 HTTP service-map/APM page does not establish a missing trace. Record actual
 Community-edition limitations and missing usage separately from measured zeros.
 
-`fixture-queries.sql` has not been executed against a live backend: the change
-that added it ran on a sweep host without Docker access, with the trial
-deployment stopped. Its column names follow the pinned v0.142.1 schema and its
-query 0 confirms them. Run it on the trial host and record the observations in
-`evidence.md` before ticking the shared-fixture acceptance criteria.
+`fixture-queries.sql` was executed live on 2026-09-22 against a real trial
+deployment; every assertion held on the first pass, including totals, the
+repair-chain graph, root-less-trace detection, absence-vs-zero gauges and the
+privacy-sentinel drop. See `evidence.md`'s "Shared fixture manifest, executed
+live" section for the full results. Query 0 remains a schema preflight in case
+a future SigNoz pin renames these columns.
 
 ## Retention and operation
 

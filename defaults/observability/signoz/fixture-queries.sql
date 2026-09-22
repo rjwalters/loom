@@ -9,10 +9,11 @@
 -- name, attribute key or resource key below drifts from the generated manifest
 -- or from the gateway's `keep_keys` allowlist.
 --
--- STATUS: not executed against a live backend by the change that added it — this
--- sweep host has no Docker access and the trial deployment is stopped. Column
--- names follow the pinned SigNoz v0.142.1 schema; run query 0 first and reconcile
--- before trusting any later result. Record observations in `evidence.md`.
+-- STATUS: executed live against a real deployment on 2026-09-22 (run_id
+-- `8528a`); every assertion below held on the first pass. See the "Shared
+-- fixture manifest, executed live" section of `evidence.md` for full results.
+-- Column names follow the pinned SigNoz v0.142.1 schema; query 0 is a
+-- preflight in case a future SigNoz pin changes them.
 --
 -- Run every statement in one pass, binding the run under test once:
 --
