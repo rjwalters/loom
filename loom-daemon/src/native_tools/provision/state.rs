@@ -85,6 +85,21 @@ fn outside_repositories(root: &Path, path: &Path) -> Result<()> {
         !path.starts_with(root),
         "native state and auth files must stay outside the workspace"
     );
+    outside_every_repository(path)
+}
+
+/// Whether no ancestor of `path` is a repository checkout (ordinary clone,
+/// linked worktree, or bare repository).
+///
+/// `pub` since #8581 so the readiness measurement's shared package cache is
+/// held to the same "never inside a checkout" rule as per-launch native state,
+/// by the same code rather than a second copy of the ancestry scan.
+///
+/// # Errors
+///
+/// Propagates an ancestry inspection failure — fails closed on an unreadable
+/// ancestor rather than assuming it is not a repository.
+pub fn outside_every_repository(path: &Path) -> Result<()> {
     for ancestor in path.ancestors().filter(|ancestor| !ancestor.is_file()) {
         // Git linked worktrees have a .git file; ordinary clones have a directory.
         let checkout = ancestor
@@ -102,7 +117,18 @@ fn outside_repositories(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn private_directory(path: &Path) -> Result<()> {
+/// Create `path` (and any missing parent) as a 0700 directory owned by the
+/// current user, then validate that it really is one.
+///
+/// `pub` since #8581 so the readiness measurement can create its isolated
+/// per-attempt state with the same check the production launch path applies,
+/// rather than a second, weaker copy of it.
+///
+/// # Errors
+///
+/// Propagates a creation failure, or a validation failure when the path is a
+/// symlink, is not owned by the current user, or is not mode 0700.
+pub fn private_directory(path: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
