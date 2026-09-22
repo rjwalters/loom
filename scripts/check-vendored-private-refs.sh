@@ -26,9 +26,18 @@
 # code rather than vendored prose: `fleet add-worker`'s egress defaults used to
 # bake in this fleet's ingest endpoint and scrub list, so a fork provisioned a
 # worker publishing to an unrelated operator's endpoint. The rest of
-# loom-daemon/src/ is NOT scanned yet — it still carries operator-named test
-# fixtures (token-pool account names and the like), which are test-only data
-# rather than shipped defaults and are a separate scrub.
+# loom-daemon/src/ is still not scanned here — but the operator-named test
+# fixtures it used to carry (token-pool account names and the like) are gone:
+# that was #8589's scrub, which also added a REPO-WIDE host-identifier gate
+# covering every tracked file — a private-network host identifier (the dashed
+# RFC 1918 form) or an identity at an operator-owned domain, anywhere.
+#
+# That gate lives in the `vendored-private-refs` job in
+# .github/workflows/ci.yml, NOT in this script: this script is
+# `contract`-category portable shell, and `loom-daemon shell-budget --check`
+# refuses any net growth of that pool with no override (epic #7810). Same
+# concern, same CI job, different file — see that job's comment. Like the
+# checks here, it reports file:line and never the matched value.
 #
 # Usage:
 #   check-vendored-private-refs.sh [--root <dir>]...   # repeatable
