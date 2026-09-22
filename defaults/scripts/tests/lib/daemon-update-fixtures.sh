@@ -14,6 +14,33 @@
 #   START_SCRIPT        the real loom-daemon-start.sh a fixture may copy
 #   NEW_FAKE_BIN_SRC    the fake-daemon source a fixture provisions from
 # `CARGO_TARGET_DIR` is read when set and is optional.
+#
+# WHICH BINARY IMPLEMENTS THE STUB (#8134, epic #7810 / #8087)
+#
+# Every fixture below copies the REAL loom-daemon-start.sh, which since #8087 is
+# a thin stub over `loom-daemon daemon-start`. The restart / --relaunch /
+# full-update flows exec it, so the suites only test what they think they do if
+# that stub execs the binary built from this working tree.
+#
+# `--self-only` is mandatory and is exactly the case that flag exists for: every
+# fixture pins $LOOM_DAEMON_BIN to a FAKE daemon binary, because that is the
+# daemon the update flow BUILDS, PROVISIONS and RESTARTS, and whose inherited
+# autonomy env the assertions read back. Exporting it as the implementation too
+# would make the stub exec the fake as itself and no start would ever happen.
+#
+# Pinned HERE rather than in each suite because all three consumers
+# (test-loom-daemon-update.sh, its -fetch and -resolve-json siblings) build
+# fixtures from this one definition, and a pin present in only some of them is
+# the drift this file was extracted to prevent. Guarded so re-sourcing is a
+# no-op. This is a HARNESS change, not an assertion change (#8011 /
+# verification-recipes.md §6): no expectation in any consumer suite moved.
+if [[ -z "${_LOOM_UPDATE_FIXTURES_DAEMON_BIN_PINNED:-}" ]]; then
+    # shellcheck source=require-daemon-bin.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/require-daemon-bin.sh"
+    loom_test_require_daemon_bin --self-only \
+        "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" daemon-start
+    _LOOM_UPDATE_FIXTURES_DAEMON_BIN_PINNED=1
+fi
 
 # sha256_of <path> — portable checksum in `.sha256`-file format
 # (`<hex>  <basename>`), matching the release workflow's own
@@ -64,6 +91,14 @@ new_fixture() {
     # "locate-daemon-bin.sh not found at <fixture>/.loom/scripts/lib" before
     # reaching the behaviour under test.
     cp "$CLI_DIR/../lib/locate-daemon-bin.sh" "$root/.loom/scripts/lib/locate-daemon-bin.sh"
+    # Same for lib/script-helper.sh (#8087): loom-daemon-start.sh is a thin stub
+    # over `loom-daemon daemon-start` and sources this helper relative to ITS
+    # OWN location to resolve + exec the implementing binary. Without it every
+    # fixture flow that execs the copied start script dies at
+    # "script-helper.sh: No such file or directory" before reaching the
+    # behaviour under test — the same failure shape locate-daemon-bin.sh above
+    # was added for.
+    cp "$CLI_DIR/../lib/script-helper.sh" "$root/.loom/scripts/lib/script-helper.sh"
     cp "$LOOM_REPO_ROOT/scripts/install/provision-daemon.sh" "$root/scripts/install/provision-daemon.sh"
     cat > "$root/loom-daemon/Cargo.toml" <<'EOF'
 [package]
