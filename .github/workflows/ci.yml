@@ -1305,13 +1305,20 @@ jobs:
       # binary this job builds. Both pin it via loom_test_require_daemon_bin
       # and FAIL rather than skip without one.
       #
-      # Only these two of the 19 test-worktree-*.sh suites move. The other 17
-      # drive paths this slice did not touch and stay hermetic in
-      # shell-suite-tests, which is the point of porting one family at a time.
+      # Only these three of the 20 test-worktree-*.sh suites move. The other
+      # 17 drive paths this slice (or #8553 below) did not touch and stay
+      # hermetic in shell-suite-tests, which is the point of porting one
+      # family at a time.
       - name: worktree snapshot verb (#4778, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-snapshot.sh
       - name: worktree stash-push/stash-pop pair (#5217, #6076, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-stash-baseline.sh
+      # #8553: worktree.sh's new issue claim-lock cross-check delegates to
+      # `loom-daemon worktree-lock check-issue` (this file is frozen by the
+      # file-size ratchet, so the new guard's decision logic lives in Rust,
+      # not shell) — needs the binary this job builds.
+      - name: worktree issue claim-lock cross-check (#8553)
+        run: bash defaults/scripts/tests/test-worktree-issue-lock.sh
       # #8396: premise-check.sh is a thin stub over `loom-daemon
       # premise-check`, the gate Curator and the sweep orchestrator run before
       # enrichment — needs the binary this job builds.

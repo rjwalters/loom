@@ -146,7 +146,11 @@ fn recorded(lock: &Path) -> Option<Owner> {
 /// Whether `pid` is alive. A failure to signal for any reason other than
 /// "no such process" is treated as ALIVE — refusing to break a lock we cannot
 /// prove is dead is the safe direction.
-fn pid_alive(pid: u32) -> bool {
+///
+/// `pub(crate)` (not private) so [`super::issue_lock`] can reuse the same
+/// liveness primitive for the DIFFERENT, per-issue claim lock it reads
+/// (#8553) — one liveness check, not two that could drift.
+pub(crate) fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }

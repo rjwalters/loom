@@ -13,13 +13,19 @@
 //!   was unreadable). Exit 2 when the locks directory cannot be created.
 //! - `release` → exit 0, always. Releasing a lock you no longer own is a
 //!   no-op by design, not an error.
+//! - `check-issue` → the DIFFERENT, per-issue sweep-claim lock cross-check
+//!   (#8553): exit 0 when free (or `--force` downgraded a live conflict to a
+//!   warning printed on stderr), exit 1 when a live conflict refused and
+//!   `--force` was not passed. On refusal, `--json` writes the refusal as a
+//!   JSON object to stdout (matching `worktree.sh`'s own `--json` contract);
+//!   without it, a human-readable message goes to stderr.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::lock;
+use loom_daemon::worktree_cli::{issue_lock, lock};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum WorktreeLockCommand {
@@ -52,6 +58,23 @@ pub(crate) enum WorktreeLockCommand {
         token: String,
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
+    },
+    /// Cross-check the daemon's PER-ISSUE sweep-claim lock (#8553) — a
+    /// different, longer-lived lock than the one `acquire`/`release` above
+    /// manage. Read-only: never acquires, never releases.
+    CheckIssue {
+        #[arg(long, value_name = "N")]
+        issue: u32,
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+        /// Proceed even though a live claim lock was found — print a warning
+        /// instead of refusing.
+        #[arg(long)]
+        force: bool,
+        /// On refusal, write the JSON error object `worktree.sh --json`
+        /// expects instead of a human-readable stderr message.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -98,6 +121,51 @@ impl WorktreeLockCommand {
                 let repo = repo.unwrap_or_else(|| PathBuf::from("."));
                 lock::release(&repo, &token);
                 std::process::exit(0);
+            }
+            WorktreeLockCommand::CheckIssue {
+                issue,
+                repo,
+                force,
+                json,
+            } => {
+                let repo = repo.unwrap_or_else(|| PathBuf::from("."));
+                let Some(live) = issue_lock::check(&repo, issue) else {
+                    std::process::exit(0);
+                };
+                let age = live.age_desc();
+                if force {
+                    eprintln!(
+                        "worktree-lock: issue #{issue} has a live claim lock (sweep '{}', pid \
+                         {}, acquired {}, {age} old) — proceeding anyway (--force). This \
+                         worktree may be shared with another active session (#8553).",
+                        live.sweep_id, live.owner_pid, live.acquired_at
+                    );
+                    std::process::exit(0);
+                }
+                if json {
+                    println!(
+                        "{{\"success\": false, \"error\": \"issue-claim-lock-live\", \
+                         \"issueNumber\": {issue}, \"sweepId\": {}, \"ownerPid\": {}, \
+                         \"acquiredAt\": {}}}",
+                        serde_json::to_string(&live.sweep_id).unwrap_or_else(|_| "\"\"".into()),
+                        live.owner_pid,
+                        serde_json::to_string(&live.acquired_at).unwrap_or_else(|_| "\"\"".into()),
+                    );
+                } else {
+                    eprintln!(
+                        "worktree-lock: issue #{issue} already has a LIVE claim lock: sweep \
+                         '{}', pid {}, acquired {} ({age} old).",
+                        live.sweep_id, live.owner_pid, live.acquired_at
+                    );
+                    eprintln!(
+                        "A second concurrent session checking out .loom/worktrees/issue-{issue} \
+                         would interleave writes with that live sweep (#8553)."
+                    );
+                    eprintln!(
+                        "Re-run with --force if you are certain it is safe to proceed anyway."
+                    );
+                }
+                std::process::exit(1);
             }
         }
     }
