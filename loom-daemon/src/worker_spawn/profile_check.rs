@@ -22,6 +22,17 @@ enum WorkerCommand {
         #[arg(long, value_name = "HARNESS")]
         runtime: Option<String>,
     },
+
+    /// Measure guarded native startup boundaries with a provider-free probe
+    /// (#8581). Makes no model call, reads no credential, contacts no forge,
+    /// and never retries anything for money.
+    ///
+    /// Prints one JSON timing report distinguishing the boundaries it measured
+    /// (binary probe, binding provisioning, package resolution, provider-free
+    /// readiness) from the ones no provider-free probe can observe (first
+    /// provider event, first tool, completion) — which are reported as
+    /// unknown-with-a-reason rather than estimated.
+    Readiness(crate::native_readiness::measure::ReadinessArgs),
 }
 
 fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), LaunchError> {
@@ -77,7 +88,10 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
 }
 
 pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
-    let WorkerCommand::ProfileCheck { name, runtime } = args.command;
+    let (name, runtime) = match args.command {
+        WorkerCommand::ProfileCheck { name, runtime } => (name, runtime),
+        WorkerCommand::Readiness(args) => return args.run(),
+    };
     match report(name.as_deref(), runtime.as_deref()) {
         Ok((text, resolvable)) => {
             print!("{text}");

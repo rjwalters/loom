@@ -5,6 +5,33 @@ use std::{fs, io::Write, path::Path, process::Command};
 
 mod state;
 
+pub use state::{outside_every_repository, private_directory};
+
+/// The exact pinned plugin manifest a guarded OpenCode launch provisions.
+///
+/// Exposed as a constant so the readiness measurement in
+/// [`crate::native_readiness`] keys its package cache on the same bytes
+/// production writes (#8581). A pin that drifts between the two would produce a
+/// cache entry that is valid for a package set no launch ever uses.
+pub const OPENCODE_PLUGIN_MANIFEST: &str =
+    r#"{"private":true,"dependencies":{"@opencode-ai/plugin":"1.18.31"}}"#;
+
+/// Write the guarded OpenCode bindings — the plugin source and the pinned
+/// package manifest — into `config_dir`.
+///
+/// Extracted from [`configure`] so a measurement can provision exactly what a
+/// launch provisions, rather than a hand-copied approximation of it.
+///
+/// # Errors
+///
+/// Propagates any filesystem failure, including a plugins directory that
+/// cannot be made 0700-private.
+pub fn write_opencode_bindings(config_dir: &Path) -> Result<()> {
+    state::private_directory(&config_dir.join("plugins"))?;
+    write_binding(&config_dir.join("plugins/loom.ts"), include_str!("opencode.mjs"))?;
+    write_binding(&config_dir.join("package.json"), OPENCODE_PLUGIN_MANIFEST)
+}
+
 /// Profile-declared, non-secret provider data merged into the per-launch config.
 /// Secrets never appear here: OpenCode resolves its own `{env:VAR}` indirection
 /// against the child environment the profile's credential mapping populates.
@@ -96,12 +123,7 @@ pub fn configure(
             .arg(extension);
     } else {
         let config_dir = directory.join("opencode");
-        state::private_directory(&config_dir.join("plugins"))?;
-        write_binding(&config_dir.join("plugins/loom.ts"), include_str!("opencode.mjs"))?;
-        write_binding(
-            &config_dir.join("package.json"),
-            r#"{"private":true,"dependencies":{"@opencode-ai/plugin":"1.18.31"}}"#,
-        )?;
+        write_opencode_bindings(&config_dir)?;
         command.env("OPENCODE_CONFIG_DIR", &config_dir);
         let mut config = inherited_config()?;
         let object = config
