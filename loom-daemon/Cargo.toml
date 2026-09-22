@@ -34,7 +34,7 @@ libc = "0.2"
 # deliberately NOT enabled — `OtlpExporter` posts the JSON encoding over the
 # existing `reqwest` client (reusing `super::sender`'s drain/retry loop), so
 # no gRPC transport stack is pulled in.
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["logs", "metrics", "gen-tonic-messages", "with-serde"], optional = true }
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["logs", "metrics", "trace", "gen-tonic-messages", "with-serde"], optional = true }
 
 tempfile = "3.27"
 

@@ -2077,7 +2077,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::info!(
             "Socket cleaned up, exiting {code} ({signal_name} received — no supervised relaunch)"
         );
-        std::process::exit(code);
+        observability::shutdown::exit(code).await;
     });
 
     log::info!("Loom daemon starting...");

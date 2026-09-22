@@ -112,6 +112,19 @@ impl DurableQueue {
     /// a journal-write failure" contract) so a full/unwritable disk degrades
     /// this queue to in-memory-only rather than crashing the collector.
     pub fn push(&self, envelope: TelemetryEnvelope) {
+        if let Err(error) = self.push_inner(envelope, false) {
+            log::warn!("observability: failed to persist queue: {error}");
+        }
+    }
+
+    /// Offer a terminal span and confirm its queue file and directory reached
+    /// stable storage before the caller removes active execution context.
+    /// On failure the in-memory offer remains; retain context for recovery.
+    pub fn push_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        self.push_inner(envelope, true)
+    }
+
+    fn push_inner(&self, envelope: TelemetryEnvelope, durable: bool) -> std::io::Result<()> {
         let mut state = self.lock();
         if state.items.len() >= self.capacity {
             state.items.pop_front();
@@ -125,7 +138,17 @@ impl DurableQueue {
             );
         }
         state.items.push_back(envelope);
-        self.persist(&state.items);
+        persist_to(&self.path, &state.items)?;
+        if durable {
+            std::fs::File::open(&self.path)?.sync_all()?;
+            let parent = self
+                .path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Current queue length.

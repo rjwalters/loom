@@ -51,7 +51,7 @@ fn receiver_ready(address: &str) -> bool {
 
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
-fn real_collector_decodes_installed_binary_logs_and_metrics() {
+fn real_collector_decodes_installed_binary_logs_metrics_and_correlated_traces() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/otlp_transport");
     let evidence = tempfile::tempdir().unwrap();
     let collector = Collector(format!("loom-8523-{}", std::process::id()));
@@ -101,15 +101,18 @@ fn real_collector_decodes_installed_binary_logs_and_metrics() {
             .arg(key),
     );
     let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
-    assert_eq!(ack["exported_envelopes"], 4);
+    assert_eq!(ack["exported_envelopes"], 6);
     let deadline = Instant::now() + Duration::from_secs(10);
     let text = loop {
         let text =
             std::fs::read_to_string(evidence.path().join("received.json")).unwrap_or_default();
-        if text.contains("resourceLogs") && text.contains("resourceMetrics") {
+        if text.contains("resourceLogs")
+            && text.contains("resourceMetrics")
+            && text.contains("resourceSpans")
+        {
             break text;
         }
-        assert!(Instant::now() < deadline, "collector never decoded both signals: {text}");
+        assert!(Instant::now() < deadline, "collector never decoded all three signals: {text}");
         std::thread::sleep(Duration::from_millis(100));
     };
     let decoded: Vec<serde_json::Value> = text
@@ -152,6 +155,28 @@ fn real_collector_decodes_installed_binary_logs_and_metrics() {
     assert!(!metrics
         .iter()
         .any(|m| m["name"] == "loom.host.cpu_idle_fraction"));
+    let spans: Vec<_> = decoded
+        .iter()
+        .filter_map(|v| v["resourceSpans"].as_array())
+        .flatten()
+        .flat_map(|r| r["scopeSpans"].as_array().unwrap())
+        .flat_map(|s| s["spans"].as_array().unwrap())
+        .collect();
+    assert_eq!(spans.len(), 2);
+    let child = spans
+        .iter()
+        .find(|s| s["name"] == "loom.role_attempt")
+        .unwrap();
+    let root = spans.iter().find(|s| s["name"] == "loom.sweep").unwrap();
+    assert_eq!(child["parentSpanId"], root["spanId"]);
+    assert_eq!(child["traceId"], root["traceId"]);
+    let linked_log = records
+        .iter()
+        .find(|r| r["eventName"] == "sweep.started")
+        .unwrap();
+    assert_eq!(linked_log["traceId"], child["traceId"]);
+    assert_eq!(linked_log["spanId"], child["spanId"]);
+    assert!(!text.contains("PRIVACY_SENTINEL"));
     println!(
         "Collector {IMAGE}; independently decoded {} logs and {} metrics; binary={}",
         records.len(),

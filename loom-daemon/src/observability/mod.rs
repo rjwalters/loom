@@ -88,6 +88,8 @@ pub mod otlp;
 pub mod outcome;
 pub mod queue;
 pub mod sender;
+pub mod shutdown;
+pub mod tracing;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

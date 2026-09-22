@@ -1252,7 +1252,7 @@ async fn run_drain_supervisor(
                 );
                 if then_exit {
                     log::warn!("{}", drain_complete_log_line(true, "", verify_poll_secs));
-                    std::process::exit(drain_exit_code(true));
+                    crate::observability::shutdown::exit(drain_exit_code(true)).await;
                 }
                 // This path only runs after `handle_drain_request` proved
                 // supervision, so `detect_supervisor()` should still be `Some`
@@ -1265,7 +1265,7 @@ async fn run_drain_supervisor(
                 // daemon that is about to exit.
                 let sup = crate::restart_verify::detect_and_spawn_verifier(std::process::id());
                 log::warn!("{}", drain_complete_log_line(false, &sup, verify_poll_secs));
-                std::process::exit(drain_exit_code(false));
+                crate::observability::shutdown::exit(drain_exit_code(false)).await;
             }
             DrainTick::TimedOutRefuse => {
                 // Issue #6007. A **teardown** (`then_exit`) drain keeps the
@@ -1356,7 +1356,7 @@ async fn run_drain_supervisor(
                          cancelled {cancelled} sweep(s); exiting {EXIT_SHUTDOWN} and staying down \
                          (then_exit — Issue #4343 teardown)"
                     );
-                    std::process::exit(drain_exit_code(true));
+                    crate::observability::shutdown::exit(drain_exit_code(true)).await;
                 }
                 // Same detection/fallback as the `DrainTick::Complete` relaunch
                 // branch above; this path only reaches here after
@@ -1368,7 +1368,7 @@ async fn run_drain_supervisor(
                      {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch. {}",
                     crate::restart_verify::relaunch_verify_note(&sup, verify_poll_secs)
                 );
-                std::process::exit(drain_exit_code(false));
+                crate::observability::shutdown::exit(drain_exit_code(false)).await;
             }
         }
     }
@@ -1888,11 +1888,12 @@ async fn handle_client(
                     "RestartDaemon: supervised — exiting {EXIT_RESTART}. {ack_message} \
                      The stale socket is reclaimed by the relaunched daemon's singleton guard."
                 );
-                std::process::exit(EXIT_RESTART);
+                crate::observability::shutdown::exit(EXIT_RESTART).await;
             }
             continue;
         }
 
+        crate::observability::shutdown::intercept(&request).await;
         let response = handle_request(
             request,
             &terminal_manager,
@@ -4656,14 +4657,8 @@ fn handle_request(
 
         Request::RemoveWatch { id } => handle_remove_watch(&id),
 
-        Request::Shutdown => {
-            // Exit NON-ZERO (Issue #4054): an explicit shutdown means "stay
-            // down", so under launchd `KeepAlive:SuccessfulExit` this must not
-            // trip a relaunch. Only `RestartDaemon` (handled in `handle_client`)
-            // exits 0. See the EXIT_* constants at the top of this module.
-            log::info!("Shutdown requested (exiting {EXIT_SHUTDOWN}; not a supervised relaunch)");
-            std::process::exit(EXIT_SHUTDOWN);
-        }
+        // Real IPC shutdown is intercepted asynchronously before this dispatcher.
+        Request::Shutdown => std::process::exit(EXIT_SHUTDOWN),
         Request::RestartDaemon => {
             // Structurally unreachable: `handle_client` intercepts
             // `RestartDaemon` before dispatching to `handle_request` (it must
