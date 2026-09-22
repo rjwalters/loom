@@ -153,30 +153,63 @@ pub fn region_after<'a>(contents: &'a str, anchor: &str) -> Option<&'a str> {
     contents.rfind(anchor).map(|at| &contents[at..])
 }
 
-/// The last `# LOOM_LAUNCH` record in `region`, if any.
+/// The JSON body of the last `# LOOM_LAUNCH` record in `region` — the shared
+/// line-scan every reader of the record sits on (issues #8541, #8612).
 ///
-/// The *last*, because a region may hold more than one launch (a re-dispatch
-/// inside one sweep) and the failure at the end of the region belongs to the
-/// launch that most recently started.
+/// Three properties, all deliberate and all relied on by callers that read
+/// *different* keys off the same record ([`parse_launch_record`] for the
+/// credential half, `launch_record::parse_launch_runtime` for #8507's runtime
+/// fields, `launch_record::parse_launch_tap` for #8556's tap):
+///
+/// * **Line-anchored.** A candidate must *start with* [`LAUNCH_RECORD_PREFIX`]
+///   after trim, so a line that merely *mentions* the marker mid-line (an
+///   agent transcript echoing it, a `git grep` of these files landing in the
+///   transcript) is not mistaken for the record. An unanchored substring
+///   search would take everything after the mention as the "body", fail to
+///   parse it, and silently drop attribution of a launch that really happened.
+/// * **Last wins.** A region may hold more than one launch (a re-dispatch
+///   inside one sweep, a containment re-exec writing its own record inside the
+///   container) and the outcome at the end of the region belongs to the launch
+///   that most recently started.
+/// * **Stops at the last line that parses as JSON.** A line-start candidate
+///   whose JSON is malformed is skipped in favour of an earlier one, but a
+///   candidate whose JSON is *valid* ends the scan even if it lacks the key
+///   the caller wanted — reaching further back would attribute an older
+///   launch's keys to this one. Callers express "this record says nothing
+///   about my keys" as `None` of their own (see [`LaunchRecord`]'s empty
+///   `credential_source`), never as a fallback to an earlier record.
 #[must_use]
-pub fn parse_launch_record(region: &str) -> Option<LaunchRecord> {
+pub fn last_launch_record_body(region: &str) -> Option<&str> {
     region.lines().rev().find_map(|line| {
         let json = line.trim().strip_prefix(LAUNCH_RECORD_PREFIX)?;
-        let value: Value = serde_json::from_str(json).ok()?;
-        let string = |key: &str| {
-            value
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
-        Some(LaunchRecord {
-            credential_source: string("credentialSource").unwrap_or_default(),
-            provider: string("credentialProvider"),
-            account: string("credentialAccount"),
-            model: string("model"),
-        })
+        // Parsed only to decide "is this a usable record?" — the body is
+        // handed back as text so each caller can read its own keys off it.
+        serde_json::from_str::<Value>(json).ok()?;
+        Some(json)
+    })
+}
+
+/// The last `# LOOM_LAUNCH` record in `region`, if any, as the credential
+/// fields this module acts on.
+///
+/// Scan semantics (line-anchored, last-wins, stops at the last valid JSON) are
+/// [`last_launch_record_body`]'s.
+#[must_use]
+pub fn parse_launch_record(region: &str) -> Option<LaunchRecord> {
+    let value: Value = serde_json::from_str(last_launch_record_body(region)?).ok()?;
+    let string = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(LaunchRecord {
+        credential_source: string("credentialSource").unwrap_or_default(),
+        provider: string("credentialProvider"),
+        account: string("credentialAccount"),
+        model: string("model"),
     })
 }
 
