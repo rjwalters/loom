@@ -693,6 +693,11 @@ async fn handle_health(
         // filesystem-only input this daemon-authoritative route does not
         // gather, so no `codex` section renders here.
         codex_accounts: None,
+        // #8572: same rule as `transcript_ingest` above — a CLI-collected,
+        // filesystem-only input (`/proc/meminfo`, `/proc/vmstat`, a `df` per
+        // tmpfs mount) this daemon-authoritative route does not gather, so no
+        // `tmpfs_visibility` section renders here.
+        tmpfs_visibility: None,
     });
 
     let mut body = serde_json::to_value(&health)?;

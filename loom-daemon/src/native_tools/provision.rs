@@ -103,6 +103,22 @@ pub fn configure(
     model: &str,
     provider: &ProviderConfig,
 ) -> Result<()> {
+    // Issue #8561/#8562: Kimi has no guarded `loom_*` tool binding yet — no
+    // extension, no plugin, nothing to write. Fail closed here, before ANY
+    // provisioning (`super::guard::ready` included) runs, rather than let a
+    // role-tagged launch fall through to Kimi's own unguarded builtin tools.
+    // `harness::Harness::Kimi::command` is the only caller that reaches this
+    // with `runtime == "kimi"`, and only when the launch is role-tagged
+    // (`guarded`) — an ordinary free-form trial never calls `configure` at
+    // all.
+    if runtime == "kimi" {
+        anyhow::bail!(
+            "Kimi has no guarded loom_* tool binding yet; a role-tagged launch would otherwise \
+             run with Kimi's own unguarded builtin tools instead of Loom's worktree/workflow/ \
+             destructive policies. Tracked in issue #8562. Unguarded free-form trials (no \
+             --role tag and no /loom:<role> prompt) remain supported."
+        );
+    }
     super::guard::ready(root)?;
     let binary = std::env::current_exe()?;
     let state = state::prepare(root)?;

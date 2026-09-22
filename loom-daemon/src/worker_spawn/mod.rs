@@ -374,7 +374,7 @@ fn run_preflight(
                 })
                 .filter(|s| s != "worker")
                 .collect::<Vec<_>>();
-            return Err(LaunchError::config(format!("Unknown runtime '{runtime}' (resolved from {source}): no runner found at {}. Available runtimes on disk: {}; native: pi opencode", runner.display(), available.join(" "))));
+            return Err(LaunchError::config(format!("Unknown runtime '{runtime}' (resolved from {source}): no runner found at {}. Available runtimes on disk: {}; native: pi opencode kimi", runner.display(), available.join(" "))));
         }
         let mut command = Command::new(runner);
         command.args(&args.args);

@@ -392,6 +392,7 @@ const BUNDLED_RUNTIME_MANIFESTS: &[(&str, &str)] = &[
     ("aider", include_str!("../../defaults/runtimes/aider.json")),
     ("pi", include_str!("../../defaults/runtimes/pi.json")),
     ("opencode", include_str!("../../defaults/runtimes/opencode.json")),
+    ("kimi", include_str!("../../defaults/runtimes/kimi.json")),
 ];
 
 /// Look up the bundled fallback manifest contents for `runtime`, if the
@@ -804,6 +805,29 @@ mod tests {
                 .runtime,
             "codex"
         );
+    }
+
+    /// Issue #8561: `defaults/runtimes/kimi.json` declares every capability
+    /// `"no"` (no on-disk copy is written by [`fixture`], so this exercises
+    /// the compiled-in [`BUNDLED_RUNTIME_MANIFESTS`] fallback). Curator
+    /// declares no `runtimeRequirements` at all, so it is trivially
+    /// compatible; Builder and Judge each require at least one capability
+    /// Kimi declares `"no"`, so both fail closed at 78 — the same mechanism
+    /// that already keeps Codex's `worktreeIsolation: "partial"` and the
+    /// aider tier-3 example out of those roles.
+    #[test]
+    fn kimi_is_admitted_only_for_roles_with_no_runtime_requirements() {
+        let d = fixture();
+        assert_eq!(
+            resolve_and_admit(d.path(), "curator", Some("kimi"))
+                .unwrap()
+                .runtime,
+            "kimi"
+        );
+        let e = resolve_and_admit(d.path(), "builder", Some("kimi")).unwrap_err();
+        assert_eq!(e.reason, "unmet capabilities: worktreeIsolation, mcp");
+        let e = resolve_and_admit(d.path(), "judge", Some("kimi")).unwrap_err();
+        assert_eq!(e.unmet_capabilities, vec!["mcp"]);
     }
 
     #[test]

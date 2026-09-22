@@ -404,6 +404,13 @@ async fn collect(window: Duration) -> HealthReport {
             )
         });
 
+    // 10. The tmpfs/`shared`-RAM + kernel OOM-kill snapshot (#8572, split from
+    //     #8512) — filesystem-only, no IPC, threaded in exactly like
+    //     `transcript_ingest_status` above. `tmpfs_visibility_section` omits
+    //     the section entirely when nothing was measurable (e.g. macOS), so
+    //     this always collects rather than pre-filtering.
+    let tmpfs_visibility_status = Some(loom_daemon::tmpfs_visibility::collect());
+
     health::assess(&HealthInputs {
         at: chrono::Utc::now(),
         window,
@@ -429,6 +436,7 @@ async fn collect(window: Duration) -> HealthReport {
         limit_calibration,
         codex_accounts: probe_codex_accounts(),
         transcript_ingest: transcript_ingest_status,
+        tmpfs_visibility: tmpfs_visibility_status,
     })
 }
 

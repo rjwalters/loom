@@ -1,0 +1,143 @@
+{
+  "date": "2026-09-22",
+  "issue": 8561,
+  "scope": "Credential-free harness probe of the real Kimi Code CLI binary. NOT a canary.",
+  "not_a_canary": {
+    "statement": "No model ever ran. Every provider call in this file failed at the transport or config layer on purpose. This file proves the #8561 adapter targets the pinned CLI's real surface; it proves NOTHING about a model completing a task.",
+    "missing_acceptance_criterion": "#8561's live canary: a read/edit/test task in a disposable checkout with a real Kimi/Moonshot credential, plus its own receipt in the shape of native-harness-canary-2026-09-19.json.",
+    "reason_not_performed": "No Kimi subscription credential and no Moonshot platform API key exist in the environment this adapter was built in. A receipt was deliberately not fabricated.",
+    "tracked_in": 8606
+  },
+  "versions": {
+    "kimi": "2.0.2",
+    "package": "@moonshot-ai/kimi-code",
+    "install": "npm install -g @moonshot-ai/kimi-code",
+    "node": "v24.19.0",
+    "version_command": "kimi -V",
+    "version_output": "2.0.2"
+  },
+  "platform": "linux x86_64",
+  "observations": [
+    {
+      "name": "flag-surface",
+      "command": "kimi --help",
+      "findings": {
+        "prompt_flag": "-p, --prompt <prompt>  Run one prompt non-interactively and print the response.",
+        "model_flag": "-m, --model <model>  LLM model alias to use for this invocation. Defaults to default_model in config.toml.",
+        "output_format_flag": "--output-format <format>  Output format for prompt mode. Defaults to text. (choices: \"text\", \"stream-json\")",
+        "input_format_flag": null,
+        "yolo_flag": "-y, --yolo",
+        "auto_flag": "--auto",
+        "plan_flag": "--plan"
+      },
+      "adapter_consequence": "There is no --input-format flag on 2.0.2, so Pi/OpenCode's stdin prompt-delivery route (#8506) has no Kimi equivalent. The prompt rides on -p's argv value and the adapter pins the child's stdin to null."
+    },
+    {
+      "name": "print-mode-flag-exclusivity",
+      "commands": [
+        "kimi -p hi --yolo",
+        "kimi -p hi --auto",
+        "kimi -p hi --plan"
+      ],
+      "observed_stderr": [
+        "error: Cannot combine --prompt with --yolo.",
+        "error: Cannot combine --prompt with --auto.",
+        "error: Cannot combine --prompt with --plan."
+      ],
+      "adapter_consequence": "The adapter never emits --yolo/--auto/--plan; -p already implies auto-approval. Loom's --dangerously-skip-permissions is a silent no-op for Kimi."
+    },
+    {
+      "name": "unknown-flag-is-not-tolerated",
+      "command": "kimi -p hi --dangerously-skip-permissions",
+      "exit": 1,
+      "observed_stderr": "error: unknown option '--dangerously-skip-permissions'",
+      "adapter_consequence": "Forwarding Loom's flag would hard-fail the launch, so it must be dropped, not passed through."
+    },
+    {
+      "name": "no-credential-permanent-failure",
+      "command": "kimi -p 'say hi' --output-format stream-json",
+      "env": {
+        "KIMI_CODE_HOME": "/tmp/kimi-probe-home"
+      },
+      "exit": 1,
+      "observed_stdout_first_event": "{\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.0.2\"}",
+      "observed_stderr": "error: failed to run prompt: No model configured. Run `kimi` and use /login to sign in, then retry; or set default_model in config.toml.",
+      "adapter_consequence": "stream-json is genuine NDJSON and emits a system.version meta event first, even on a failing run."
+    },
+    {
+      "name": "env-family-model-route",
+      "env_keys_present_in_bundle": [
+        "KIMI_MODEL_NAME",
+        "KIMI_MODEL_API_KEY",
+        "KIMI_MODEL_PROVIDER_TYPE",
+        "KIMI_MODEL_BASE_URL",
+        "KIMI_MODEL_THINKING_EFFORT"
+      ],
+      "provider_type_allowed_values": [
+        "kimi",
+        "anthropic",
+        "openai"
+      ],
+      "provider_type_validation_message": "KIMI_MODEL_PROVIDER_TYPE must be one of kimi, anthropic, openai, got \"...\".",
+      "observed": "A launch with KIMI_MODEL_NAME/KIMI_MODEL_API_KEY/KIMI_MODEL_PROVIDER_TYPE=openai/KIMI_MODEL_BASE_URL pointed at a local stub reached the HTTP layer, confirming the config-free env family resolves a model with no config.toml present.",
+      "adapter_consequence": "The API-key profile route (credentialEnv + credentialTargets.kimi + providerOptions.kimi) maps onto a real, working mechanism. The secret is injected as env only."
+    },
+    {
+      "name": "config-alias-model-route",
+      "setup": "$KIMI_CODE_HOME/config.toml with [providers.fake] (type/base_url/api_key_env) and [models.trial-alias]",
+      "commands": [
+        "kimi doctor",
+        "kimi -m trial-alias -p hi --output-format stream-json",
+        "kimi -m no-such-alias -p hi"
+      ],
+      "observed": [
+        "kimi doctor -> exit 0, 'OK config.toml', 'All checked config files are valid.'",
+        "-m trial-alias -> alias resolved to [models.trial-alias]; failed only on a missing required field: 'Model \"trial-alias\" must define a positive max_context_size in config.toml.'",
+        "-m no-such-alias -> 'Model \"no-such-alias\" is not configured in config.toml.'"
+      ],
+      "adapter_consequence": "-m <alias> resolves against [models.<alias>] in the operator's own config.toml, confirming the subscription/config-alias profile route (providers.kimi = alias, no credentialEnv)."
+    },
+    {
+      "name": "thinking-effort-is-NOT-validated-by-the-cli",
+      "command": "KIMI_MODEL_THINKING_EFFORT=bogus kimi -p hi (env-family model)",
+      "observed": "Accepted. The launch proceeded to contact the provider instead of rejecting the value; the variable binds through an unconstrained optional string schema field (thinking.forcedEffort).",
+      "bundle_effort_list": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "adapter_consequence": "The adapter validates the five levels itself and fails closed at 78, because the CLI will not."
+    },
+    {
+      "name": "exit-codes-the-vendor-75-does-not-exist",
+      "claimed_by_issue_8561": "0 success, 1 permanent (config/auth/quota), 75 transient (rate limit, 5xx, timeout)",
+      "bundle_process_exit_sites": [
+        0,
+        1,
+        2,
+        129,
+        143
+      ],
+      "rate_limit_probe": {
+        "setup": "local HTTP stub returning 429 {\"error\":{\"message\":\"rate limit exceeded\",\"type\":\"rate_limit_error\"}} as the KIMI_MODEL_BASE_URL provider",
+        "observed_in_stream": "{\"role\":\"meta\",\"type\":\"turn.step.retrying\",\"failed_attempt\":9,\"next_attempt\":10,\"max_attempts\":10,\"delay_ms\":38762.06,\"error_name\":\"APIProviderRateLimitError\",\"error_message\":\"429 rate limit exceeded\",\"status_code\":429}",
+        "retry_ladder": "10 in-process attempts with exponential backoff, ~150s total",
+        "exit_after_exhaustion": 1,
+        "observed_stderr": "error: failed to run prompt: provider.rate_limit: 429 rate limit exceeded"
+      },
+      "conclusion": "Kimi 2.0.2 never exits 75. It absorbs transients in-process and surfaces only the exhaustion of its own retry ladder, as exit 1. No 75 mapping and no _classify_error_kimi table were added. classify_error's generic transient table already returns RECOVERABLE for the exhaustion text (it matches both '429' and 'rate.limit'), pinned by defaults/scripts/tests/test-classify-error.sh."
+    },
+    {
+      "name": "kimi-code-home-relocation",
+      "observed": "With KIMI_CODE_HOME set, config.toml, logs (logs/kimi-code.log) and credentials all resolve under that root; kimi doctor reports the relocated paths.",
+      "adapter_consequence": "Per-account KIMI_CODE_HOME rotation is mechanically viable for the account-pool follow-up (#8563). This adapter does not set it."
+    }
+  ],
+  "automated_tests": {
+    "loom-daemon/tests/worker_spawn_kimi.rs": 7,
+    "runtime_admission::tests::kimi_is_admitted_only_for_roles_with_no_runtime_requirements": 1,
+    "note": "These drive the real spawn-worker path against a fixture harness binary, not against the kimi binary probed above."
+  }
+}
