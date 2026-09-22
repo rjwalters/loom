@@ -784,6 +784,69 @@ jobs:
             exit 1
           fi
 
+          # Out-of-order promotion guard (concurrent release runs).
+          #
+          # `gh release edit --latest` sends `make_latest=true`, which pins THIS
+          # release as Latest regardless of its creation date — unlike the
+          # `legacy`, date-ordered default it replaces. That is safe only if
+          # promotions can never complete out of order, and here they can: this
+          # workflow's `concurrency` group is keyed per tag/SHA with
+          # `cancel-in-progress: false`, so runs for DIFFERENT releases are
+          # explicitly allowed to overlap. They demonstrably do — v0.19.295 ran
+          # 18:37:25Z→18:52:30Z while v0.19.296 started at 18:42:40Z; start gaps
+          # run 5-20 min against 15-18 min durations. A run whose matrix is
+          # slower than its successor's would otherwise land its promotion LAST
+          # and drag Latest backward onto an older release until the next bump,
+          # rolling every host below it down a version.
+          #
+          # So: a newer release already holding the pointer makes this job a
+          # deliberate no-op, not a failure. The fleet is already on a newer
+          # COMPLETE Release, which is exactly where it should be.
+          read_latest() {
+            gh release view --repo "$REPO" --json tagName,createdAt \
+              --jq '[.tagName, .createdAt] | @tsv' 2>/dev/null || true
+          }
+
+          tag_created="$(gh release view "$TAG" --repo "$REPO" --json createdAt --jq '.createdAt' 2>/dev/null || true)"
+
+          # True when the release named by $1 (tag) / $2 (createdAt) is strictly
+          # newer than $TAG. Conservative on purpose — EITHER signal claiming
+          # "newer" holds the pointer where it is: creation date (what `legacy`
+          # ordered by, and what the concurrent-run race actually inverts) or
+          # semantic version. A promotion skipped when it could have run costs
+          # one release cycle of staleness and self-heals on the next bump; a
+          # promotion made when it should not have been is the regression this
+          # guard exists to prevent.
+          is_newer_than_tag() {
+            other_tag="$1"
+            other_created="$2"
+            [ -n "$other_tag" ] || return 1
+            [ "$other_tag" != "$TAG" ] || return 1
+
+            other_epoch=""
+            tag_epoch=""
+            if [ -n "$other_created" ] && [ -n "$tag_created" ]; then
+              other_epoch="$(date -u -d "$other_created" +%s 2>/dev/null || true)"
+              tag_epoch="$(date -u -d "$tag_created" +%s 2>/dev/null || true)"
+            fi
+            if [ -n "$other_epoch" ] && [ -n "$tag_epoch" ] && [ "$other_epoch" -gt "$tag_epoch" ]; then
+              return 0
+            fi
+
+            # `sort -V` puts the higher semantic version last.
+            highest="$(printf '%s\n%s\n' "${other_tag#v}" "${TAG#v}" | sort -V | tail -n1)"
+            [ "${other_tag#v}" != "${TAG#v}" ] && [ "$highest" = "${other_tag#v}" ]
+          }
+
+          latest_tsv="$(read_latest)"
+          latest_tag="$(printf '%s' "$latest_tsv" | cut -f1)"
+          latest_created="$(printf '%s' "$latest_tsv" | cut -f2)"
+          if is_newer_than_tag "$latest_tag" "$latest_created"; then
+            echo "releases/latest already names ${latest_tag}, which is newer than ${TAG} — leaving the pointer where it is."
+            echo "- SKIPPED: \`$TAG\` was not promoted to Latest — \`$latest_tag\` is newer and already Latest (out-of-order promotion guard, #8515)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           # Bounded retry on a transient forge failure, mirroring the
           # `gh release create` loop in `resolve` (#8290): the whole point of
           # this job is that the pointer advances, so a one-off 403/5xx here
@@ -816,12 +879,25 @@ jobs:
           # Read back what the forge actually believes, rather than trusting
           # our own write: `releases/latest` is the exact endpoint every
           # updater resolves against (`gh release view` with no tag).
-          latest_tag="$(gh release view --repo "$REPO" --json tagName --jq '.tagName' 2>/dev/null || true)"
-          if [ "$latest_tag" != "$TAG" ]; then
-            echo "::error::after promotion, releases/latest names '${latest_tag:-<none>}', not ${TAG}." >&2
+          #
+          # The assertion is "$TAG **or newer**", not strict equality: the same
+          # concurrency the guard above exists for lets a newer release's
+          # promotion land in the gap between our `edit` and this read. That
+          # repo state is entirely correct, and failing a healthy release run
+          # over it is exactly the false red `.loom/docs/ci-principles.md`
+          # forbids. Anything OLDER than $TAG is still a hard failure.
+          latest_tsv="$(read_latest)"
+          latest_tag="$(printf '%s' "$latest_tsv" | cut -f1)"
+          latest_created="$(printf '%s' "$latest_tsv" | cut -f2)"
+          if [ "$latest_tag" = "$TAG" ]; then
+            echo "- Promoted \`$TAG\` to Latest with ${pairs} complete binary/checksum pair(s) uploaded (#8515)." >> "$GITHUB_STEP_SUMMARY"
+          elif is_newer_than_tag "$latest_tag" "$latest_created"; then
+            echo "releases/latest now names ${latest_tag}, which is newer than ${TAG} — a concurrent release run took the pointer after our write. Correct state, not a failure."
+            echo "- Promoted \`$TAG\` to Latest (${pairs} complete binary/checksum pair(s)); \`$latest_tag\`, newer, has since taken the pointer (#8515)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::after promotion, releases/latest names '${latest_tag:-<none>}', which is neither ${TAG} nor newer." >&2
             exit 1
           fi
-          echo "- Promoted \`$TAG\` to Latest with ${pairs} complete binary/checksum pair(s) uploaded (#8515)." >> "$GITHUB_STEP_SUMMARY"
 
   build-worker-image:
     name: Build and publish loom-worker image

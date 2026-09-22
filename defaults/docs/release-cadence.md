@@ -136,6 +136,37 @@ Release instead of advancing it onto a broken one. A draft would instead risk a
 Release that is never published at all, invisible to everyone, on any single-leg
 failure.
 
+### …but the pointer never moves backward
+
+Deferring the pointer means setting it *imperatively*: `gh release edit --latest`
+sends `make_latest=true`, which pins **that** release as Latest regardless of its
+creation date — unlike the `legacy`, date-ordered default it replaces. That
+matters because release runs overlap. The workflow's `concurrency` group is keyed
+per tag/SHA with `cancel-in-progress: false`, so runs for *different* releases are
+explicitly allowed to run at once, and do: v0.19.295 ran 18:37:25Z → 18:52:30Z
+while v0.19.296 started at 18:42:40Z. Start gaps of 5-20 min against 15-18 min
+durations (macOS runner queueing can add much more) make "a run whose matrix is
+slower than its successor's" an ordinary outcome, not an exotic one — and its
+promotion would land *last*, dragging Latest back onto an older release and
+rolling every host below it down a version until the next bump.
+
+So `promote-release` reads the pointer before it writes: if `releases/latest`
+already names a **newer** release, the promotion is skipped, logged to the step
+summary as an intentional no-op, and the job exits **0**. Nothing is wrong in that
+state — a newer *complete* Release is already Latest, which is exactly where the
+fleet should be. The same comparison relaxes the post-write read-back to "`$TAG`
+**or newer**", so a concurrent run promoting past us in the gap between our write
+and our read is not a red run either (a false red on a healthy state is the
+failure mode [`ci-principles.md`](ci-principles.md) exists to prevent). Anything
+*older* than `$TAG` on the read-back is still a hard failure.
+
+"Newer" is conservative by construction: either creation date (what `legacy`
+ordered by, and what the race actually inverts) **or** semantic version claiming
+the incumbent is newer holds the pointer where it is. A promotion skipped when it
+could have run costs one release cycle of staleness and self-heals on the next
+bump; a promotion made when it should not have been is the regression the check
+exists to prevent.
+
 ### The resolver still says which case it is in
 
 Promotion closes the window for *this* repo's own automated releases. It does

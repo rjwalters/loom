@@ -400,6 +400,73 @@ fn the_release_workflow_does_not_point_latest_at_an_unuploaded_release() {
     );
 }
 
+/// The `promote-release` job's YAML block, or `None` outside a full checkout.
+fn promote_release_job() -> Option<String> {
+    let yml = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/release.yml"),
+    )
+    .ok()?;
+    let promote = yml.split_once("promote-release:")?.1;
+    Some(
+        promote
+            .split_once("\n  build-worker-image:")
+            .map_or(promote, |(job, _)| job)
+            .to_string(),
+    )
+}
+
+/// The other half of the promotion contract (#8515): moving the pointer
+/// imperatively (`gh release edit --latest`, i.e. `make_latest=true`) pins *that*
+/// release regardless of date, replacing GitHub's date-ordered `legacy`
+/// semantics. `concurrency:` is keyed per tag/SHA with `cancel-in-progress:
+/// false`, so runs for *different* releases overlap by design — and do in
+/// practice (v0.19.295 ran 18:37:25Z→18:52:30Z while v0.19.296 started
+/// 18:42:40Z). Without a guard, the slower run promotes last and drags Latest
+/// **backward** onto an older release until the next bump.
+///
+/// Like the test above, this is the part that cannot be exercised without
+/// cutting two overlapping real releases, so what is pinned is the invariant.
+#[test]
+fn the_promotion_job_refuses_to_move_latest_backward_onto_an_older_release() {
+    let Some(promote) = promote_release_job() else {
+        return; // not a full checkout; nothing to compare against
+    };
+
+    // (1) The current `releases/latest` — tag *and* creation date, since the
+    // race inverts date order — is read BEFORE the pointer is moved.
+    let read_at = promote
+        .find("--json tagName,createdAt")
+        .expect("promotion must read the current releases/latest (tagName + createdAt)");
+    let edit_at = promote
+        .find("gh release edit \"$TAG\" --repo \"$REPO\" --latest")
+        .expect("promotion must actually mark the release Latest");
+    assert!(
+        read_at < edit_at,
+        "the ordering check must run BEFORE the promotion, not after it: {promote}"
+    );
+
+    // (2) A newer release already holding the pointer is a deliberate no-op,
+    // never a red release run — the fleet is already on a newer complete
+    // Release, which is where it should be.
+    let guard = &promote[read_at..edit_at];
+    assert!(
+        guard.contains("exit 0"),
+        "a newer release already being Latest must skip-and-exit-0, not fail the run: {guard}"
+    );
+
+    // (3) The read-back accepts `$TAG` *or newer*. Strict equality there turns
+    // a concurrent run's legitimate promotion, landing between our write and
+    // our read, into a false red on a perfectly healthy repo state.
+    assert!(
+        !promote.contains(r#"if [ "$latest_tag" != "$TAG" ]"#),
+        "the read-back must accept `$TAG or newer`, not assert strict equality: {promote}"
+    );
+    assert!(
+        promote[edit_at..].contains("is_newer_than_tag"),
+        "the read-back must reuse the guard's newer-than comparison: {promote}"
+    );
+}
+
 #[test]
 fn an_empty_override_falls_through_to_detection_rather_than_being_used() {
     // `${LOOM_DAEMON_UPDATE_TARGET:-$(detect)}` — an empty env var means unset,
