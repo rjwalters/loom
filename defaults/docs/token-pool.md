@@ -2141,8 +2141,11 @@ Kimi Code CLI has **two** distinct credential shapes, and only one of them is
 this pool's concern. A Moonshot platform API key (`KIMI_MODEL_API_KEY`, the
 `example-kimi-moonshot-api` entry in `defaults/model-profiles.json`) is an
 opaque static secret exactly like a Z.ai coding-plan key, so it needs no new
-code here: `loom-daemon api-keys add --provider kimi <account>` registers it,
-and `credentialEnv: "KIMI_API_KEY"` in the profile already derives
+code here: `loom-daemon api-keys add kimi <account> --key-file <path>`
+registers it (the provider is positional, not a `--provider` flag; the
+default env-var name, `<PROVIDER>_API_KEY` = `KIMI_API_KEY`, is already the
+profile's `credentialEnv`, so no `--env-var` is needed), and
+`credentialEnv: "KIMI_API_KEY"` in the profile already derives
 `credentialPool: "kimi"` automatically (`provider_from_credential_env` strips
 the `_API_KEY` suffix the same way it derives `zai` from `ZAI_API_KEY`) — the
 profile sets it explicitly anyway, for the same self-documentation reason
