@@ -1,20 +1,8 @@
 //! Regression tests for the native worker seam. No provider calls or shell fixtures.
-use std::{path::PathBuf, process::Command, sync::OnceLock};
-fn fixture() -> &'static PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let bin = dir.join("harness");
-        assert!(Command::new("rustc")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/worker_cli.rs"))
-            .arg("-o")
-            .arg(&bin)
-            .status()
-            .unwrap()
-            .success());
-        bin
-    })
-}
+use std::process::Command;
+#[path = "support/worker_cli.rs"]
+mod worker_cli;
+use worker_cli::fixture;
 fn worker(root: &std::path::Path, runtime: &str) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
     c.args(["spawn-worker", "--"])
