@@ -213,6 +213,12 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/exit-codes/",
     ".loom/sweep-checkpoint/",
     ".loom/sweep-run/",
+    // Concierge budget ledger (#7947): the per-day turn / per-tick relay
+    // counters the operator-agent persona consults at the top of every turn.
+    // Machine-local and disposable — deleting it costs at most one day's spent
+    // budget — but it must never be committed, or one host's spend would
+    // arrive as another host's starting balance.
+    ".loom/concierge/",
     ".loom/stats/",
     ".loom/diagnostics/",
     ".loom/guide-docs-state.json",
@@ -931,6 +937,10 @@ mod tests {
             ".loom/status/",
             ".loom/retry-state/",
             ".loom/sweep-checkpoint/",
+            // #7947: the concierge budget ledger. Committing it would hand one
+            // host's spent turn budget to every other host as a starting
+            // balance.
+            ".loom/concierge/",
             ".loom/diagnostics/",
             ".loom/guide-docs-state.json",
             ".loom/metrics_state.json",

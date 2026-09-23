@@ -1994,6 +1994,10 @@ fn test_builtin_intervals_are_per_role_not_uniform() {
             ("hermit", 600),
             ("guide", 900),
             ("architect", 3600),
+            // #7947: a *listening* cadence, not a work cadence — each tick is
+            // a short `concierge listen` window, so it sits below the 5–15 min
+            // band's intent without violating it.
+            ("concierge", 300),
         ],
         "built-in per-role intervals drifted — update defaults/docs/daemon-reference.md's \
              role-runner table in the same change (#6204)"
@@ -2533,15 +2537,18 @@ fn test_default_roles_includes_architect_as_idle_only() {
         "#5656: architect must be idle-addressable ONLY — an interval-default architect \
              floods every unpinned repo's backlog with speculative proposals"
     );
-    // Every other shipped role is an interval default; architect is the
-    // sole carve-out today.
+    // Two shipped roles are excluded from the "unset `roles` ⇒ all defaults"
+    // fallback: architect (#5656, floods the backlog) and concierge (#7947, an
+    // inbound control channel wired to a chat room). Every other role is an
+    // interval default. `concierge_gate.rs` pins WHICH two, by name.
     assert_eq!(
         DEFAULT_ROLES
             .iter()
             .filter(|s| !s.is_interval_default())
             .count(),
-        1,
-        "a new idle-only role needs its own docs/table update (see daemon-reference.md)"
+        2,
+        "a new non-interval-default role needs its own docs/table update \
+         (see daemon-reference.md)"
     );
 }
 
@@ -5132,6 +5139,7 @@ fn shrinking_the_ring_reassigns_the_departed_hosts_slice_to_the_survivor() {
     }
 }
 
+mod concierge_gate;
 mod model_resolution;
 mod prompt_cache_prefix;
 mod roster_fence;

@@ -273,6 +273,22 @@ enum Commands {
         action: FleetAction,
     },
 
+    /// The operator-agent persona's I/O surface (Issue #7947, Phase 3b of
+    /// #4196): read room intent, vet a typed command, relay it to the daemon.
+    ///
+    /// `concierge relay` is the ONLY sanctioned path from a natural-language
+    /// read of a room message to a daemon command, and it refuses `--verb
+    /// confirm` unconditionally — a confirmation nonce is answered by the human
+    /// it was shown to, never by the persona. Off unless
+    /// `safehouse.concierge` names at least one allowed sender; `concierge
+    /// check` reports which.
+    ///
+    /// A one-line tuple variant wrapping `ConciergeArgs` (which carries the
+    /// `#[command(subcommand)]`), for the same reason `Telemetry` above is:
+    /// this file is frozen by the file-size ratchet, so the subcommand's shape
+    /// and docs live in `cli::concierge` and only the dispatch arm is here.
+    Concierge(cli::concierge::ConciergeArgs),
+
     /// Manage insta-crash quarantines (Issue #3939): the in-memory pauses the
     /// daemon applies to issues whose sweeps insta-crash repeatedly. Connects to
     /// the running daemon over its Unix socket, since the quarantine state lives
@@ -2807,6 +2823,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
         | Commands::JevTier { .. }
+        | Commands::Concierge(..)
         | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }
         | Commands::NoopCooldown { .. }

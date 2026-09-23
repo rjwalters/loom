@@ -109,11 +109,11 @@ const MAX_TURNS_ENV: &str = "LOOM_SAFEHOUSE_CONCIERGE_MAX_TURNS";
 /// The persona name the concierge speaks as in the room, when
 /// `safehouse.concierge.persona` does not name one.
 ///
-/// Deliberately distinct from `safehouse.persona` (`loom_daemon`, the narration
-/// + ChatOps identity): the room must be able to tell "the daemon answered"
-/// from "the agent answered", and 3a's `inbound_command` drops any message whose
-/// `from` matches the daemon's own persona — so a concierge sharing that persona
-/// could not steer the daemon at all.
+/// Deliberately distinct from `safehouse.persona` (`loom_daemon`, which is both
+/// the narration and the ChatOps identity): the room must be able to tell "the
+/// daemon answered" from "the agent answered", and 3a's `inbound_command` drops
+/// any message whose `from` matches the daemon's own persona — so a concierge
+/// sharing that persona could not steer the daemon at all.
 pub const DEFAULT_PERSONA: &str = "loom_concierge";
 
 /// Default per-tick cap on room messages the persona may act on.
