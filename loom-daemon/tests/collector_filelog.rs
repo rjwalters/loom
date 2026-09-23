@@ -20,6 +20,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use std::os::unix::fs::MetadataExt;
+
 const IMAGE: &str = "otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1";
 const CONFIG: &str = include_str!("../../defaults/observability/collector/config.yaml");
 
@@ -133,11 +135,21 @@ impl Trial {
         for source in ["codex", "pi", "claude"] {
             fs::create_dir_all(sessions.join(source)).unwrap();
         }
+        // Run the collector as the invoking user, mirroring the deployment's
+        // `user: "${LOOM_COLLECTOR_UID}:${LOOM_COLLECTOR_GID}"` (compose.yaml).
+        // Without this the image's built-in non-root UID cannot traverse the
+        // 0700 tempdir tempfile created, and every extension that touches
+        // /var/lib/otelcol dies with `mkdir ... permission denied` before any
+        // receiver runs.
+        let owner = fs::metadata(self.dir.path()).unwrap();
+        let (uid, gid) = (owner.uid(), owner.gid());
         docker(&[
             "run",
             "-d",
             "--name",
             &self.name,
+            "--user",
+            &format!("{uid}:{gid}"),
             "-v",
             &format!("{}:/etc/otelcol/config.yaml:ro", config_file.display()),
             "-v",
@@ -343,4 +355,63 @@ fn filelog_retain_lists_and_privacy_allowlist_stay_within_the_reviewed_key_set()
         CONFIG.contains("\"loom.session_id\", \"loom.agent_id\", \"loom.parent_agent_id\""),
         "transform/privacy's log keep_keys must list the three new #8669 keys"
     );
+}
+
+/// Static contract for #8686's host-side wiring (no Docker — this pins the
+/// committed files, the same posture as `signoz_deployment_contract.rs`):
+/// `compose.yaml` must bind-mount each runtime's session store **read-only**
+/// to exactly the fixed in-container path its `file_log/*` receiver tails,
+/// behind a **required** (`:?`) env var, and README's "Start and validate"
+/// dotenv block must document that var. Drop any of those four properties
+/// and a trial host either silently loses a tail (optional var), lets the
+/// collector write a runtime's session store (no `:ro`), mounts to a path
+/// nothing reads (target/receiver drift), or ships an env contract its own
+/// docs don't name (README drift).
+#[test]
+fn session_store_mounts_pair_required_env_vars_with_fixed_receiver_paths() {
+    const COMPOSE: &str = include_str!("../../defaults/observability/collector/compose.yaml");
+    const README: &str = include_str!("../../defaults/observability/collector/README.md");
+
+    // (required env var, fixed in-container mount target its receiver tails)
+    const MOUNTS: &[(&str, &str)] = &[
+        ("LOOM_CODEX_SESSIONS_DIR", "/var/lib/loom-sessions/codex"),
+        ("LOOM_PI_SESSIONS_DIR", "/var/lib/loom-sessions/pi"),
+        ("LOOM_CLAUDE_PROJECTS_DIR", "/var/lib/loom-sessions/claude"),
+    ];
+
+    for (var, target) in MOUNTS {
+        let gated = format!("${{{var}:?");
+        let mount_lines: Vec<&str> = COMPOSE.lines().filter(|l| l.contains(&gated)).collect();
+        assert_eq!(
+            mount_lines.len(),
+            1,
+            "{var} must gate exactly one compose mount, found {n}",
+            n = mount_lines.len()
+        );
+        let line = mount_lines[0].trim_start_matches([' ', '-']);
+        assert!(
+            line.ends_with(&format!("{target}:ro")),
+            "{var}'s mount must bind read-only to the fixed path {target} (got: {line})"
+        );
+
+        // The mount target must be the path its receiver actually tails:
+        // mount/receiver drift makes the receiver idle while the host thinks
+        // it is ingesting.
+        let tailed_glob = format!("\"{target}/**/*.jsonl\"");
+        assert!(
+            CONFIG.contains(&tailed_glob),
+            "no file_log receiver tails {tailed_glob}; the {var} mount feeds nothing"
+        );
+
+        // The env contract must be documented where operators provision it.
+        assert!(
+            README.contains(&format!("{var}=")),
+            "README's 'Start and validate' dotenv block must document {var}"
+        );
+    }
+
+    // The pre-existing volume/secret contract is unchanged by #8686.
+    assert!(COMPOSE.contains("./config.yaml:/etc/otelcol/config.yaml:ro"));
+    assert!(COMPOSE.contains("${LOOM_COLLECTOR_STATE_DIR:?"));
+    assert!(COMPOSE.contains(":/var/lib/otelcol"));
 }

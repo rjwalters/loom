@@ -20,6 +20,14 @@ services:
     volumes:
       - ./config.yaml:/etc/otelcol/config.yaml:ro
       - ${LOOM_COLLECTOR_STATE_DIR:?set an absolute local writable directory}:/var/lib/otelcol
+      # Least-privilege session-store mounts (#8686): each binds exactly one
+      # runtime's session directory read-only to the fixed in-container path
+      # its file_log/* receiver tails in config.yaml — never the whole $HOME.
+      # All three are required (:?), so an env file that predates this change
+      # fails `docker compose up` loudly instead of silently dropping a tail.
+      - ${LOOM_CODEX_SESSIONS_DIR:?set an absolute path to the host's ~/.codex/sessions}:/var/lib/loom-sessions/codex:ro
+      - ${LOOM_PI_SESSIONS_DIR:?set an absolute path to the host's ~/.pi/agent/sessions}:/var/lib/loom-sessions/pi:ro
+      - ${LOOM_CLAUDE_PROJECTS_DIR:?set an absolute path to the host's ~/.claude/projects}:/var/lib/loom-sessions/claude:ro
     secrets:
       - loom_ingest_key
       - clickstack_ingest_key
