@@ -1143,6 +1143,13 @@ jobs:
       # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
       - name: loom-daemon-update artifact fetch + verify (#8028)
         run: bash defaults/scripts/tests/test-loom-daemon-update-fetch.sh
+      # #8712: the fixture library is the subject, not any one flow. A fake
+      # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
+      # loom-daemon/target/release/ stalled a fleet host's auto_update for
+      # hours; this suite pins the containment guard that prevents it. It
+      # sources that library, so it needs the binary this job builds.
+      - name: daemon-update fixture containment (#8712)
+        run: bash defaults/scripts/tests/test-daemon-update-fixture-containment.sh
       # #8069: 284 assertions that had never run in ANY CI job. They were
       # excluded on the reason "wiring it needs a cargo build step or a binary
       # stub — follow-up"; this job is that cargo build step. The subject is
