@@ -34,6 +34,11 @@ impl TelemetryEnvelope {
             schema_version: match record {
                 TelemetryRecord::SweepIdentity(_) => 4,
                 TelemetryRecord::Span(_) => 3,
+                // Issue #8757: a new record kind, gated like `trace.span`
+                // (3) and `sweep.identity` (4) — only session-summary
+                // envelopes carry 5, so every existing kind's version is
+                // byte-identical to what a pre-#8757 reader expects.
+                TelemetryRecord::SessionSummary(_) => 5,
                 _ => CURRENT_SCHEMA_VERSION,
             },
             emitted_at: Utc::now(),

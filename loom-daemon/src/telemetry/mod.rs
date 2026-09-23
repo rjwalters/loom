@@ -262,6 +262,12 @@ pub enum TelemetryRecord {
     /// variant, and the reason [`CURRENT_SCHEMA_VERSION`] is `2`.
     #[serde(rename = "role_tick.outcome")]
     RoleTickOutcome(RoleTickOutcomeRecord),
+    /// One transcript's session shape (Issue #8757, G3 of #8714) — ids,
+    /// attribution, models, token totals, and turn/tool counts, emitted by
+    /// the transcript-ingest pass. Carries **no** prompt, tool-output, key
+    /// or email content by construction (see [`SessionSummaryRecord`]).
+    #[serde(rename = "session.summary")]
+    SessionSummary(SessionSummaryRecord),
     #[serde(rename = "trace.span")]
     Span(trace::SpanRecord),
 }
@@ -1106,6 +1112,111 @@ pub struct ManagedRepoEntry {
     /// `Private`, never `Public`.
     #[serde(default)]
     pub visibility: RepoVisibility,
+}
+
+/// One entry of a [`SessionSummaryRecord`]'s tool-call histogram: how many
+/// times the session invoked one named tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallCount {
+    /// Tool name exactly as the runtime recorded it (e.g. `"Bash"`) — an
+    /// allowlisted shape, never tool arguments or output.
+    pub tool: String,
+    /// Invocations of `tool` across the whole transcript.
+    pub count: u64,
+}
+
+/// `session.summary` — one transcript's session shape (Issue #8757, G3 of
+/// epic #8714). Emitted by the transcript-ingest pass
+/// ([`crate::activity::transcript_ingest`]), one record per ingested
+/// transcript (parent session or subagent), and exported through whatever
+/// exporter(s) `observability` configures — the same
+/// [`crate::observability::queue::DurableQueue`] the collector feeds.
+///
+/// # Wire safety — a summary, never a transcript excerpt
+///
+/// Every field is a count, an id, an allowlisted name, or a timestamp. The
+/// parse that produces it ([`crate::activity::transcript_parse`]) never
+/// copies message text, tool arguments, tool output, or any free-form string
+/// beyond role/model/tool **names** into the record, so no prompt, generated
+/// code, key, or email can appear on the wire for this kind. The redaction
+/// test suite pins this by fixture.
+///
+/// # Field presence contract
+///
+/// Optional fields (`role`, `issue`, `pr_number`, `outcome`,
+/// `parent_session_id`) are **omitted** when unknown, never fabricated —
+/// the same "unknown != zero" contract `host.health` established. `outcome`
+/// in particular is reserved: this pass has no positive terminal-outcome
+/// signal to read from a transcript, so it stays absent until a later slice
+/// (`session.analysis`, or registry correlation) can populate it honestly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummaryRecord {
+    /// Repository the session worked — the final path component of the
+    /// session's cwd (a Loom agent's cwd is the workspace root or a worktree
+    /// inside it; both map to the same repo name), matching
+    /// `activity::transcript_parse::repo_from_cwd`. Not an `owner/repo`
+    /// slug: the ingest pass has no forge round-trip to resolve one.
+    pub repo: String,
+    /// Visibility tag for `repo`. The schema contract (every record that
+    /// references a repository carries one) applies; the ingest pass has no
+    /// `owner/repo` slug to key [`visibility::derive_visibility`]'s cache
+    /// on, so it stamps the fail-closed default — `Private` — exactly what
+    /// every absent/unknown visibility decodes to anyway.
+    #[serde(default)]
+    pub visibility: RepoVisibility,
+    /// The session's own stable id: the transcript's `sessionId`, or the
+    /// subagent file's stem for a `subagents/` transcript whose records
+    /// carry no id of their own.
+    pub session_id: String,
+    /// The enclosing parent session's id, for a `subagents/` transcript;
+    /// absent for a parent-session transcript.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Runtime that wrote the transcript (#8664's `loom.runtime` vocabulary).
+    /// This pass reads Claude Code transcripts only, so today it is always
+    /// `"claude"`; the field exists so sibling per-runtime tails (#8669)
+    /// and this record share one shape.
+    pub runtime: String,
+    /// Attributed Loom role (`builder`, `judge`, …), when the first user
+    /// message names one (`activity::transcript_parse::attribute_role`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Issue number, when the session is a `/loom:<role> <N>` invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    /// PR number, when known. Not derivable from a transcript; reserved for
+    /// registry correlation (a later slice).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u32>,
+    /// Distinct models used across the transcript, sorted — the `(model, day)`
+    /// bucket keys collapsed to their model axis.
+    pub models: Vec<String>,
+    /// Token totals over the whole transcript — the same four counters
+    /// `activity.db`'s `resource_usage` rows already track, summed across
+    /// buckets (deduped by `message.id`, so a streamed message counts once).
+    pub tokens_input: i64,
+    /// See [`Self::tokens_input`].
+    pub tokens_output: i64,
+    /// See [`Self::tokens_input`].
+    pub tokens_cache_read: i64,
+    /// See [`Self::tokens_input`].
+    pub tokens_cache_write: i64,
+    /// Wall-clock span of the session, milliseconds — last record timestamp
+    /// minus first, across every record carrying a timestamp.
+    pub wall_ms: i64,
+    /// Real user turns: user records whose content is **not** a tool result
+    /// (the first slash-command prompt and every subsequent human turn).
+    pub turns: u64,
+    /// Tool invocations, histogram by tool name — assistant `tool_use`
+    /// content blocks, deduped by `message.id` exactly like the token
+    /// counters so a streamed message's blocks count once.
+    pub tool_calls: Vec<ToolCallCount>,
+    /// Tool results flagged `is_error` by the runtime.
+    pub tool_errors: u64,
+    /// Terminal outcome, when this pass can know one. See the struct doc:
+    /// nothing populates it yet, and it serializes away while unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 #[cfg(test)]

@@ -133,6 +133,43 @@ fn freeform_details_and_config_credentials_never_enter_otlp() {
     assert!(!serde_json::to_string(&log).unwrap().contains("SECRET"));
     assert!(attribute(&log, "loom.detail").is_none());
 }
+
+/// Issue #8757: a `session.summary` built from a transcript that contained a
+/// prompt, raw tool output, a key and an email carries none of the four onto
+/// the OTLP wire — the record's fields are counts, ids and allowlisted
+/// names by construction, and this pins that neither the JSON record nor
+/// its OTLP mapping opens a free-text channel.
+#[test]
+fn session_summary_never_carries_prompt_tool_output_key_or_email() {
+    let record: crate::telemetry::SessionSummaryRecord =
+        serde_json::from_value(serde_json::json!({
+            "repo": "fixture-repo", "session_id": "uuid-a",
+            "parent_session_id": "uuid-parent", "runtime": "claude",
+            "role": "builder", "issue": 8757,
+            "models": ["claude-sonnet-5"],
+            "tokens_input": 12, "tokens_output": 24,
+            "tokens_cache_read": 100, "tokens_cache_write": 10,
+            "wall_ms": 181000, "turns": 1,
+            "tool_calls": [{"tool": "Bash", "count": 2}],
+            "tool_errors": 1,
+        }))
+        .unwrap();
+    let log = map(TelemetryRecord::SessionSummary(record));
+    let json = serde_json::to_string(&log).unwrap();
+    for leaked in ["SECRET", "sk-ant", "@example.com", "prompt", "tool_output"] {
+        assert!(!json.contains(leaked), "{leaked} leaked: {json}");
+    }
+    assert_eq!(
+        attribute(&log, "loom.session_id"),
+        Some(any_value::Value::StringValue("uuid-a".into()))
+    );
+    assert_eq!(
+        attribute(&log, "loom.parent_session_id"),
+        Some(any_value::Value::StringValue("uuid-parent".into()))
+    );
+    assert_eq!(attribute(&log, "loom.turns"), Some(any_value::Value::IntValue(1)));
+    assert!(attribute(&log, "loom.outcome").is_none(), "unknown outcome stays absent");
+}
 #[test]
 fn oversized_or_invalid_usage_is_omitted_without_truncating_identity_or_fabricating_zero() {
     let mut record = outcome_record();
