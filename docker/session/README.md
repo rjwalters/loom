@@ -57,13 +57,15 @@ it just adds a persistence boundary the base image has no reason to need.
 
 ## Two ways to interact with a running container
 
-Both are ordinary `docker exec` — there is no separate control plane.
+Both use `docker exec`. Headless invocations have a bounded lifetime separate
+from the persistent account container.
 
 **Headless dispatch** (ADR-0017 Decision 2 — the normal path, what
 Phase 2's session lifecycle CLI actually runs):
 
 ```bash
-docker exec --workdir "$PWD" --env "LOOM_WORKSPACE=$WORKSPACE" <container> codex exec "do the thing"
+loom-daemon session-exec host --container <container> \
+  --workdir "$PWD" --env "LOOM_WORKSPACE=$WORKSPACE" -- codex exec "do the thing"
 ```
 
 `--workdir` is load-bearing (issue #8518): `docker exec` does not inherit
@@ -81,6 +83,52 @@ Exit codes, stdout/stderr, and the Codex `exec` transcript are exactly what
 they would be running `codex exec` directly on a bare-metal host — nothing
 about running inside this container changes `classify-error.sh`'s exit-code
 handling or the runtime-adapter contract's usage accounting.
+
+The adapter uses this transport automatically (#8773). It feature-checks
+`loom-daemon session-exec protocol` **inside the container** before starting
+Codex. Both host and image must support `loom-session-exec-v1`; older images
+fail with exit 78 and an update prerequisite, never an unsupervised fallback.
+
+Each invocation has a UUID and its own attached stdin lease. The host renews
+every 250ms; the container refuses to start without an unexpired lease and
+cancels after at most 2s without renewal. Expiry timestamps prevent delayed,
+buffered startup from reviving an abandoned invocation; a monotonic 2s timer
+also bounds recovery across wall-clock changes. Host/VM clocks must agree
+within the 2s lease (a larger skew fails closed).
+
+The host pins the launcher's lifetime with a Linux pidfd or macOS kqueue exit
+watch, after verifying the adapter still belongs to that launcher. Thus a
+daemon dying while intermediate shells survive also revokes the lease; PID
+reuse cannot keep it alive. The captured shell uses a unique temporary cancel
+marker to request cleanup and then waits, instead of signalling a reused PID.
+
+On cancellation the Linux supervisor sends TERM to its own children, then
+KILL after 1s, repeatedly adopting/reaping descendants as a subreaper. This
+includes tools using `setsid` or double-forking. Only unreaped direct children
+are signalled: no PID files, reusable PID lookup, account-wide `pkill`, or
+container stop. Completion also reaps any descendants left by a normally
+exiting worker. A private acknowledgement is stripped from stderr only after
+the complete tree has been reaped; the captured adapter waits for that
+acknowledgement before returning to the role runner's 5s TERM deadline.
+
+Cooperative cancellation normally completes in about 1s. An uncatchable host
+SIGKILL, lost transport, or daemon restart stops lease renewal: recovery takes
+at most 2s to begin, then the 1s escalation grace plus scheduling/reaping time
+(the fake-worker regression enforces a 4s budget). There can therefore be a
+short overlap after abrupt death; restart recovery must wait at least 4s
+before redispatching an abandoned invocation. These bounds assume a responsive
+kernel and Docker VM; an uninterruptible process or frozen VM cannot be
+acknowledged as clean. Missing acknowledgement is an explicit failure, not
+proof of cleanup, and requires checking session health before redispatch.
+
+Updating only the host does not upgrade an existing container. At an **idle
+account boundary**, use `loom-daemon accounts session stop NAME` without
+`--force` (it refuses active execs), then `loom-daemon accounts session start
+NAME --image IMAGE --mount-workspace /Users/you/GitHub`. Stop removes the old
+container while preserving the canonical external profile; the subsequent
+start recreates it. Plain start on an existing container reuses its old image.
+Verify its protocol before resuming dispatch. No auth copying or fresh login
+is part of this update; the interactive re-login surface below is unchanged.
 
 **Interactive re-login / inspection** (operator-only, rare — e.g. after a
 dead Codex refresh chain requires an interactive `codex login`):
