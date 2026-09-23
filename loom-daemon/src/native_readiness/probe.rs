@@ -310,7 +310,16 @@ impl Probe {
             .env("LOOM_WORKSPACE", &state.root)
             .env("CI", "1")
             .env("NO_COLOR", "1");
-        if let Ok(self_bin) = std::env::current_exe() {
+        // #8707: resolve through `daemon_bin_resolve`, not a raw
+        // `current_exe()`. This probe runs IN the daemon process, so from the
+        // moment `auto_update` stages a replacement until the drain-restart
+        // lands, `current_exe()` names the unlinked inode's ` (deleted)` path.
+        // Handing that to the guarded binding makes it refuse to initialize —
+        // a failed plugin load, i.e. "native not ready" — for the whole roll
+        // window, which is precisely when the #8436 native lane is the
+        // backstop. The resolver returns the identical path in the ordinary
+        // case and the on-disk replacement mid-roll.
+        if let Ok(self_bin) = crate::daemon_bin_resolve::resolve_daemon_bin() {
             command.env("LOOM_NATIVE_TOOL_BIN", self_bin);
         }
         for (key, path) in &state.xdg {
