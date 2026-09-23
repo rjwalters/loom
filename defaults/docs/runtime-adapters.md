@@ -1621,7 +1621,15 @@ the bridge gateway and a loopback bind is *not* reachable there, so the
 listener binds the bridge gateway address instead — reachable by other
 containers on that bridge, which is why the placeholder is a per-launch bearer
 token rather than an ambient allowance: a neighbour without it gets a logged
-401. `LOOM_EGRESS_PROXY_BIND` overrides the choice.
+401. That bound is narrower than it sounds, though: the container↔proxy hop
+on this path is plaintext HTTP on a shared L2 bridge, and Docker grants
+`CAP_NET_RAW` by default, so a co-resident container can sniff (or ARP-spoof
+its way into) that hop and obtain the live placeholder rather than merely
+fail to guess it — the same hop also carries prompt and response bodies in
+the clear. The blast radius stays bounded (the real credential never crosses
+this hop, the pin confines use to one origin, and `close_all()` kills the
+placeholder at container exit), but on Linux the peer set is wider than
+loopback. `LOOM_EGRESS_PROXY_BIND` overrides the choice.
 
 **Filesystem, not just environment.** A per-repo API-key pool
 (`<workspace>/.loom/api-keys/`) sits under the read-write workspace mount and

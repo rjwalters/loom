@@ -595,6 +595,36 @@ fn a_multi_variable_profile_cannot_be_proxied() {
     assert!(error.message.contains("exactly one credential variable"), "{}", error.message);
 }
 
+/// Regression for the Judge's blocking finding on #8701: an array-form
+/// `credentialEnv` with a `credentialTargets` map that only covers ONE of
+/// its declared names still produces exactly one `credentials` pair, so the
+/// check above alone would let it through — then `credential_sources` (the
+/// full declared set) would forward the unmapped variable into the
+/// container by name, unproxied and unwithheld, leaking the real host
+/// value straight past the substitution this module exists to enforce.
+#[test]
+fn a_declared_but_unmapped_variable_cannot_be_proxied() {
+    let _g = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_NATIVE_CREDENTIAL_PROXY");
+    let mut selection = selection_with(Some(anthropic_proxy()));
+    // Only one pair is mapped ...
+    assert_eq!(selection.credentials.len(), 1);
+    // ... but a second variable was declared in `credentialEnv` and never
+    // mapped, exactly like `"credentialEnv": ["A", "B"]` with
+    // `"credentialTargets": {"opencode": {"A": "A"}}`.
+    selection
+        .credential_sources
+        .push("LOOM_TEST_UNMAPPED_8701".into());
+    let on = json!({"runtimes":{"containment":{"credentialProxy":true}}});
+    let error = prepare(tmp.path(), &selection, &on).unwrap_err();
+    assert!(
+        error.message.contains("additional credentialEnv variables"),
+        "{}",
+        error.message
+    );
+}
+
 #[test]
 fn a_malformed_credential_proxy_block_is_refused_at_validation() {
     let bad = ProfileProxy {

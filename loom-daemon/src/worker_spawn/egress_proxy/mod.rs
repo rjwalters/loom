@@ -220,6 +220,18 @@ pub fn prepare(
              this profile declares a different number",
         ));
     };
+    // `credentials` is only the MAPPED pairs; `credential_sources` is every
+    // declared name (#8437). A declared-but-unmapped variable (array-form
+    // `credentialEnv` with a partial `credentialTargets` map) still passes
+    // the check above with exactly one pair, but would be forwarded into the
+    // container by name unproxied and unwithheld — this refuses that shape
+    // too, as defense in depth alongside the `profiles::resolve` guard.
+    if selection.credential_sources.len() != 1 {
+        return Err(LaunchError::config(
+            "credentialProxy applies to a profile with exactly one credential variable; \
+             this profile declares additional credentialEnv variables beyond the mapped pair",
+        ));
+    }
     // Resolve the REAL credential here, on the host, through the unchanged
     // #8401 ladder — pool selection, fail-closed states and account
     // attribution all behave exactly as they do for an uncontained launch.
