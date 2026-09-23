@@ -23,6 +23,7 @@
 //! #8058 Phase 2's class-scoped `class_cooldowns` marks.
 
 use super::*;
+use crate::tokens_pool::codex_reset::exhaustion_reset_horizon;
 
 impl SweepRegistry {
     /// Persist provider health before any reaper retry/failover decision.
@@ -61,11 +62,17 @@ impl SweepRegistry {
             provider: result.provider,
             name: result.account,
         };
-        if let Err(error) = tokens_pool::record_terminal_for_model(
+        // #8539: the provider's own reset horizon, when its refusal named one.
+        // Read from the same region, gated on the adapter's classification —
+        // see `tokens_pool::codex_reset` for why the text may only ever say
+        // *when* a hold ends, never *whether* there is one.
+        let reset_at = exhaustion_reset_horizon(&contents, &anchor, result.category);
+        if let Err(error) = tokens_pool::record_terminal_for_model_with_reset(
             &self.config.workspace_root,
             &id,
             result.category,
             result.model.as_deref(),
+            reset_at,
             "spawn-codex:v1",
         ) {
             log::warn!(

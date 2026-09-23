@@ -974,3 +974,185 @@ fn an_expired_class_hold_is_not_reported() {
     assert_eq!(capacity.healthy, 1);
     assert!(capacity.healthy_by_class.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// #8539: the provider-reported reset horizon
+// ---------------------------------------------------------------------------
+
+/// The headline case: a refusal that named its own reset replaces the blind
+/// `now + LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS` guess on both exhaustion arms.
+#[test]
+fn a_supplied_horizon_becomes_the_exhaustion_deadline() {
+    for classification in [
+        TerminalClassification::TokenExhausted,
+        TerminalClassification::ModelCreditsExhausted,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = descriptor(AccountProvider::Codex, "a").id;
+        let horizon = 100 + 30 * 60 * 60;
+        record_terminal_for_class_with_reset_at(
+            tmp.path(),
+            &id,
+            classification,
+            None,
+            Some(horizon),
+            "spawn-codex:v1",
+            100,
+        )
+        .unwrap();
+        let entry = account_health(tmp.path(), &id).unwrap().unwrap();
+        assert_eq!(
+            entry.cooldown_until,
+            Some(horizon),
+            "{classification:?} must honour the provider's own horizon"
+        );
+        // …and that horizon really does outlive the default cooldown, so this
+        // assertion cannot pass by coincidence.
+        assert!(horizon > 100 + DEFAULT_EXHAUSTED_COOLDOWN_SECS);
+    }
+}
+
+/// `None` reproduces the pre-#8539 behaviour byte for byte: the horizon is an
+/// enrichment, never a prerequisite.
+#[test]
+fn no_horizon_falls_back_to_the_configured_cooldown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let id = descriptor(AccountProvider::Codex, "a").id;
+    record_terminal_for_class_with_reset_at(
+        tmp.path(),
+        &id,
+        TerminalClassification::TokenExhausted,
+        None,
+        None,
+        "spawn-codex:v1",
+        100,
+    )
+    .unwrap();
+    let entry = account_health(tmp.path(), &id).unwrap().unwrap();
+    assert_eq!(entry.cooldown_until, Some(100 + DEFAULT_EXHAUSTED_COOLDOWN_SECS));
+}
+
+/// The horizon is untrusted input — it comes out of a log an agent also wrote
+/// into. An implausible one falls back rather than arming a hold nothing will
+/// notice, and one already in the past never shortens the hold to zero.
+#[test]
+fn an_implausible_or_past_horizon_falls_back_instead_of_being_trusted() {
+    for (label, reset_at) in [
+        ("already past", Some(99_u64)),
+        ("exactly now", Some(100)),
+        (
+            "beyond the plausible ceiling",
+            Some(100 + MAX_EXHAUSTION_RESET_HORIZON_SECS + 1),
+        ),
+        ("a misparsed far-future year", Some(u64::MAX)),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = descriptor(AccountProvider::Codex, "a").id;
+        record_terminal_for_class_with_reset_at(
+            tmp.path(),
+            &id,
+            TerminalClassification::TokenExhausted,
+            None,
+            reset_at,
+            "spawn-codex:v1",
+            100,
+        )
+        .unwrap();
+        let entry = account_health(tmp.path(), &id).unwrap().unwrap();
+        assert_eq!(
+            entry.cooldown_until,
+            Some(100 + DEFAULT_EXHAUSTED_COOLDOWN_SECS),
+            "{label}: must fall back to the configured cooldown"
+        );
+    }
+    // The boundary itself is accepted — the ceiling is inclusive.
+    let tmp = tempfile::tempdir().unwrap();
+    let id = descriptor(AccountProvider::Codex, "a").id;
+    let ceiling = 100 + MAX_EXHAUSTION_RESET_HORIZON_SECS;
+    record_terminal_for_class_with_reset_at(
+        tmp.path(),
+        &id,
+        TerminalClassification::TokenExhausted,
+        None,
+        Some(ceiling),
+        "spawn-codex:v1",
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        account_health(tmp.path(), &id)
+            .unwrap()
+            .unwrap()
+            .cooldown_until,
+        Some(ceiling)
+    );
+}
+
+/// Only the exhaustion arms consult it. Every other deadline here is Loom's
+/// own retry policy, not a prediction of a provider-side event, so a horizon
+/// read out of a refusal has no authority over it.
+#[test]
+fn a_horizon_never_reshapes_a_non_exhaustion_hold() {
+    for classification in [
+        TerminalClassification::Recoverable,
+        TerminalClassification::SessionLimit,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = descriptor(AccountProvider::Codex, "a").id;
+        let with_horizon = 100 + 30 * 60 * 60;
+        record_terminal_for_class_with_reset_at(
+            tmp.path(),
+            &id,
+            classification,
+            None,
+            Some(with_horizon),
+            "spawn-codex:v1",
+            100,
+        )
+        .unwrap();
+        let held = account_health(tmp.path(), &id)
+            .unwrap()
+            .unwrap()
+            .cooldown_until;
+
+        let baseline_dir = tempfile::tempdir().unwrap();
+        record_terminal_for_class_at(
+            baseline_dir.path(),
+            &id,
+            classification,
+            None,
+            "spawn-codex:v1",
+            100,
+        )
+        .unwrap();
+        let baseline = account_health(baseline_dir.path(), &id)
+            .unwrap()
+            .unwrap()
+            .cooldown_until;
+        assert_eq!(held, baseline, "{classification:?} must ignore the horizon");
+        assert_ne!(held, Some(with_horizon));
+    }
+}
+
+/// #8058 Phase 2's class scoping still holds when a horizon is supplied: the
+/// hold the horizon shapes is the **class** hold, and the account stays
+/// selectable for every other class.
+#[test]
+fn a_horizon_shapes_the_class_hold_a_named_model_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let id = descriptor(AccountProvider::Codex, "a").id;
+    let horizon = 100 + 30 * 60 * 60;
+    record_terminal_for_class_with_reset_at(
+        tmp.path(),
+        &id,
+        TerminalClassification::ModelCreditsExhausted,
+        Some("gpt-5-codex"),
+        Some(horizon),
+        "spawn-codex:v1",
+        100,
+    )
+    .unwrap();
+    let entry = account_health(tmp.path(), &id).unwrap().unwrap();
+    assert_eq!(entry.cooldown_until, None, "the account itself is not held");
+    assert_eq!(entry.class_cooldowns.get("gpt-5-codex"), Some(&horizon));
+}
