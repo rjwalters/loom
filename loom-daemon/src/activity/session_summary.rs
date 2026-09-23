@@ -183,7 +183,7 @@ mod tests {
     /// An assistant record whose content carries one `tool_use` block — the
     /// shape a real transcript writes between a user turn and the tool's
     /// result.
-    fn assistant_tool_line(id: &str, tool: &str, ts: &str, is_error: bool) -> String {
+    fn assistant_tool_line(id: &str, tool: &str, ts: &str) -> String {
         serde_json::json!({
             "type": "assistant",
             "timestamp": ts,
@@ -229,9 +229,9 @@ mod tests {
                     "<command-name>/loom:sweep</command-name>\n<command-args>8757</command-args>",
                     "2026-09-23T04:00:00Z",
                 ),
-                assistant_tool_line("msg_1", "Bash", "2026-09-23T04:01:00Z", false),
+                assistant_tool_line("msg_1", "Bash", "2026-09-23T04:01:00Z"),
                 tool_result_line("2026-09-23T04:01:30Z", false),
-                assistant_tool_line("msg_2", "Bash", "2026-09-23T04:02:00Z", false),
+                assistant_tool_line("msg_2", "Bash", "2026-09-23T04:02:00Z"),
                 tool_result_line("2026-09-23T04:02:30Z", true),
                 assistant_line("msg_3", "claude-opus-5", "2026-09-23T04:03:00Z", 10, 20),
                 // A streamed repeat of msg_3: same id, restated blocks —
@@ -337,7 +337,7 @@ mod tests {
                     ),
                     "2026-09-23T04:00:00Z",
                 ),
-                assistant_tool_line("msg_1", "Read", "2026-09-23T04:01:00Z", false),
+                assistant_tool_line("msg_1", "Read", "2026-09-23T04:01:00Z"),
                 tool_result_line("2026-09-23T04:01:30Z", false),
                 assistant_line("msg_2", "claude-sonnet-5", "2026-09-23T04:02:00Z", 5, 5),
             ],

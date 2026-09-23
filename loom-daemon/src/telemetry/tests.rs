@@ -10,7 +10,6 @@ mod role_tick;
 mod session_summary;
 mod token_snapshot;
 use role_tick::role_tick_outcome;
-use session_summary::session_summary;
 use token_snapshot::tokens_snapshot;
 
 // ------------------------------------------------------------------
