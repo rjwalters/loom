@@ -49,8 +49,22 @@ fn key_includes_version_pin_platform_arch_and_manifest_integrity() {
         ("plugin_pin", |i| {
             i.plugin_pin = "@opencode-ai/plugin@1.19.0".into();
         }),
-        ("platform", |i| i.platform = "macos".into()),
-        ("arch", |i| i.arch = "aarch64".into()),
+        ("platform", |i| {
+            i.platform = if i.platform == "macos" {
+                "linux"
+            } else {
+                "macos"
+            }
+            .into();
+        }),
+        ("arch", |i| {
+            i.arch = if i.arch == "aarch64" {
+                "x86_64"
+            } else {
+                "aarch64"
+            }
+            .into();
+        }),
         ("manifest_digest", |i| i.manifest_digest = "deadbeef".into()),
     ];
     for (field, apply) in mutations {

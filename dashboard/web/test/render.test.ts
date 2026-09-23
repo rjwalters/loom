@@ -208,7 +208,12 @@ describe("renderTokenAnalytics (authenticated surface)", () => {
     ];
     renderTokenAnalytics(container, computeTokenAnalytics(records, { now: NOW }), { now: NOW });
 
-    expect(container.querySelector("img")).toBeNull();
+    // The only <img> allowed is the dashboard's own Claude provider mark —
+    // never one smuggled in through an account name.
+    for (const img of container.querySelectorAll("img")) {
+      expect(img.getAttribute("src")).toBe("/icons/claude.svg");
+      expect(img.hasAttribute("onerror")).toBe(false);
+    }
     expect(container.querySelector("script")).toBeNull();
     expect(container.textContent).toContain("<script>evil()</script>");
   });

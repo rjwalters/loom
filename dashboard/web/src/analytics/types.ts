@@ -94,6 +94,11 @@ export interface TokenSample {
 
 export interface AccountReading {
   account: string;
+  /** Which provider's pool the account belongs to (`"claude"`, `"codex"`,
+   * …). A row from a daemon that predates per-provider pools carries none
+   * and is read as `"claude"` — the only pool such a daemon sampled. Part of
+   * the series identity: a Claude `robb` and a Codex `robb` are two accounts. */
+  provider: string;
   rank?: number;
   /** `usage_fraction` in `[0, 1]`. Absent when the daemon could not measure
    * it — treated as unknown (the sample is skipped for burn/forecast), never

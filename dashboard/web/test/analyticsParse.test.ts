@@ -48,8 +48,23 @@ describe("parseTokenSample", () => {
     expect(sample?.at).toBe(T0);
     expect(sample?.hostId).toBe("host-a");
     expect(sample?.accounts).toEqual([
-      { account: "agent-1", rank: 0, usageFraction: 0.42, limitWindowResetAt: T0 + 6 * HOUR, exhausted: false },
-      { account: "agent-2", rank: undefined, usageFraction: undefined, limitWindowResetAt: undefined, exhausted: true },
+      // No `provider` on the wire (a pre-per-provider daemon) reads as Claude.
+      {
+        account: "agent-1",
+        provider: "claude",
+        rank: 0,
+        usageFraction: 0.42,
+        limitWindowResetAt: T0 + 6 * HOUR,
+        exhausted: false,
+      },
+      {
+        account: "agent-2",
+        provider: "claude",
+        rank: undefined,
+        usageFraction: undefined,
+        limitWindowResetAt: undefined,
+        exhausted: true,
+      },
     ]);
   });
 
