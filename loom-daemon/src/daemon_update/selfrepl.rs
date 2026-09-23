@@ -156,6 +156,17 @@ mod tests {
     /// the inode would be UNCHANGED here — and on a real host the process
     /// executing that inode would start faulting in the new file's bytes at
     /// the old file's offsets.
+    ///
+    /// The destination is held OPEN across the replacement, the same way
+    /// [`the_version_read_follows_the_path_not_the_replaced_inode`] does.
+    /// Without that, `install(1)`'s unlink-then-create can hand the brand new
+    /// file back the exact inode NUMBER it just freed — nothing else was
+    /// competing for inodes in an otherwise-idle temp dir — which made this
+    /// assertion fail on ext4 CI runners even though the destination was
+    /// correctly replaced by unlink-and-create, not by truncate. Holding an
+    /// open handle keeps the old inode allocated (as a real running process
+    /// would), which is both what the assertion is actually about and what
+    /// stops the number from being recycled out from under the comparison.
     #[cfg(unix)]
     #[test]
     fn replacement_allocates_a_new_inode() {
@@ -165,6 +176,7 @@ mod tests {
         std::fs::write(&dest, "#!/bin/sh\necho old\n").unwrap();
         std::fs::write(&fresh, "#!/bin/sh\necho new\n").unwrap();
         let before = ino(&dest);
+        let held = std::fs::File::open(&dest).unwrap();
 
         assert!(super::super::provision::install_to(&fresh, &dest));
 
@@ -174,6 +186,7 @@ mod tests {
             "the destination was rewritten in place; a process running from it would be corrupted"
         );
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "#!/bin/sh\necho new\n");
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
