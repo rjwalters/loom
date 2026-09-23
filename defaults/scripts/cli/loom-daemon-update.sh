@@ -1190,6 +1190,15 @@ verify_destination_binary() {
 # provisioning. It is empty only if the artifact refused to report a version,
 # in which case there is nothing to compare against and we skip loudly rather
 # than invent a comparison.
+#
+# Deadline (#8770) for the `codesign -dvvv "$dest"` post-provision signature
+# check below -- a local crypto/keychain operation, not a forge call, so the
+# default mirrors loom-daemon/src/release_fetch/signature.rs's own
+# VERIFY_TIMEOUT (30s = cmd_out::DEFAULT_TIMEOUT). Overridable so a test that
+# needs the timeout to actually fire does not have to wait out the production
+# ceiling.
+DEST_SIG_VERIFY_TIMEOUT="${LOOM_DAEMON_UPDATE_DEST_SIG_TIMEOUT_SECS:-30}"
+
 verify_destination_artifact() {
     local dest="$1"
     if [[ -z "${ARTIFACT_VERSION_OUTPUT:-}" ]]; then
@@ -1227,18 +1236,47 @@ verify_destination_artifact() {
         if ! command -v codesign >/dev/null 2>&1; then
             warn "'codesign' not available -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature)."
         else
-            local dest_sig_desc
+            local dest_sig_desc dest_sig_rc
+            # Bounded (#8770, the shell-side twin of #8754's
+            # loom-daemon/src/release_fetch/signature.rs::verify_darwin fix):
+            # a contended host can make `codesign -dvvv` hang indefinitely, and
+            # this call previously had no deadline at all, unlike every other
+            # codesign invocation in the update path. DEST_SIG_VERIFY_TIMEOUT
+            # is overridable so the "it actually times out" test path does not
+            # have to wait out the production ceiling.
+            #
             # Read-then-match (#6662/#7932): NEVER `codesign ... | grep -q`,
             # which is exactly the pipefail bug this whole check exists to
             # guard against (grep -q closes the pipe before codesign finishes
             # writing, reporting 141 under `set -o pipefail`).
-            dest_sig_desc="$(codesign -dvvv "$dest" 2>&1 || true)"
-            if ! grep -q '^Authority=' <<<"$dest_sig_desc"; then
+            if command -v timeout >/dev/null 2>&1; then
+                dest_sig_desc="$(timeout "$DEST_SIG_VERIFY_TIMEOUT" codesign -dvvv "$dest" 2>&1)"
+                dest_sig_rc=$?
+            else
+                dest_sig_desc="$(codesign -dvvv "$dest" 2>&1)"
+                dest_sig_rc=$?
+            fi
+            # #8770: an empty report -- whether from a `timeout`-killed
+            # invocation (rc 124), or any other codesign failure that produced
+            # no diagnostic text at all -- is "we could not check", NOT "we
+            # checked and it's bad". Collapsing that into the exit-5 downgrade
+            # path below is the exact #8754 conflation one layer further into
+            # the update: only a codesign that ran to completion and actually
+            # wrote a report (even a negative one, e.g. "not signed at all")
+            # counts as a definitive answer about whether Authority= survived.
+            if [[ -z "$dest_sig_desc" ]]; then
+                if [[ "$dest_sig_rc" -eq 124 ]]; then
+                    warn "'codesign -dvvv' timed out after ${DEST_SIG_VERIFY_TIMEOUT}s on $dest -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature). Treating as inconclusive, not a downgrade."
+                else
+                    warn "'codesign -dvvv' produced no output for $dest (exit ${dest_sig_rc}) -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature). Treating as inconclusive, not a downgrade."
+                fi
+            elif ! grep -q '^Authority=' <<<"$dest_sig_desc"; then
                 err "Post-provision verification FAILED: the fetched release artifact carried a Developer ID (Authority=) signature, but the provisioned destination at $dest does not."
                 err "Provisioning has DOWNGRADED the signature -- this replaces the certificate-anchored designated requirement with a per-build ad-hoc identity and orphans every TCC grant on this host (the #7932 regression class). Refusing to report success."
                 exit 5
+            else
+                ok "Post-provision verification: destination binary at $dest retains its Developer ID Authority signature."
             fi
-            ok "Post-provision verification: destination binary at $dest retains its Developer ID Authority signature."
         fi
     fi
 }

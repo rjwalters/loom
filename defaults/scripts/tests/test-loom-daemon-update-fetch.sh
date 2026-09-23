@@ -1197,6 +1197,54 @@ else
     echo "  output: $outV"
 fi
 
+# ------------------------------------------------------------
+# V2. (#8770) A post-provision `codesign -dvvv` that never answers (a
+#     contended host, the same class #8754 fixed one layer up in
+#     verify_darwin) must be BOUNDED and treated as INCONCLUSIVE -- a warn
+#     and a skip of the downgrade check -- never the exit-5 "DOWNGRADED"
+#     accusation the empty report used to produce. LOOM_DAEMON_UPDATE_DEST_SIG_TIMEOUT_SECS
+#     shortens the deadline so this test does not wait out the 30s production
+#     ceiling; the fake codesign sleeps well past it on the destination path
+#     only, so every OTHER codesign call (the pre-provision verify) still
+#     answers immediately and the run reaches post-provision verification at
+#     all.
+# ------------------------------------------------------------
+WV2="$BASE_WORKDIR/w-fetch-v2"
+new_fixture "$WV2"
+write_fake_daemon "$WV2/installed-loom-daemon" "oldc0mm" "$WV2/marker"
+
+WV2_ASSETS="$WV2/gh-assets"
+mkdir -p "$WV2_ASSETS"
+WV2_BIN_NAME="loom-daemon-aarch64-apple-darwin"
+write_fake_artifact_daemon "$WV2_ASSETS/$WV2_BIN_NAME" "0.16.0" "sigdown0"
+sha256_of "$WV2_ASSETS/$WV2_BIN_NAME" > "$WV2_ASSETS/$WV2_BIN_NAME.sha256"
+
+WV2_FAKEBIN="$WV2/fakebin"
+mkdir -p "$WV2_FAKEBIN"
+write_fake_gh "$WV2_FAKEBIN/gh" "v0.16.0" "$WV2_ASSETS"
+# Authority= for every codesign target EXCEPT the provisioning destination,
+# which hangs for 10s -- long enough to outlive the 1s deadline below.
+write_fake_codesign_signature_hang "$WV2_FAKEBIN/codesign" "$WV2/installed-loom-daemon" 10
+
+outV2=$( cd "$WV2" && PATH="$WV2_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WV2/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="aarch64-apple-darwin" \
+    LOOM_DAEMON_UPDATE_DEST_SIG_TIMEOUT_SECS=1 \
+    timeout 20 bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcV2=$(echo "$outV2" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcV2" "macOS signature-preservation: a codesign that never answers is bounded and does NOT hard-fail (exit 0, not exit 5)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qi 'timed out' <<< "$outV2" && ! grep -q 'DOWNGRADED the signature' <<< "$outV2"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} macOS signature-preservation: a timed-out codesign is reported as inconclusive, never as a downgrade"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} macOS signature-preservation: a timed-out codesign is reported as inconclusive, never as a downgrade"
+    echo "  output: $outV2"
+fi
+
 
 # ------------------------------------------------------------
 # W. (#7609) A forced --fetch is NOT blocked by local-checkout state. The
