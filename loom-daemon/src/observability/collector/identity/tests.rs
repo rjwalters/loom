@@ -1,4 +1,5 @@
 use super::*;
+use crate::observability::queue::DurableQueue;
 use std::io::Write;
 
 const HEADER: &str = "==== loom-daemon dispatch: now sweep_id=sweep-42 issue=42 ====\n";

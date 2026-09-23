@@ -26,24 +26,24 @@
 
 use std::sync::Arc;
 
-use crate::observability::queue::DurableQueue;
 use crate::telemetry::{SessionSummaryRecord, TelemetryEnvelope, TelemetryRecord};
 
 /// The exporter-facing half of `session.summary` emission: wraps one record
 /// in a [`TelemetryEnvelope`] stamped with the same host id every other
 /// exported record carries (resolved once in `super::spawn_task`, threaded
-/// here so the two can never disagree) and pushes it onto the shared
-/// durable queue for the configured exporter(s) to drain.
+/// here so the two can never disagree) and offers it onto the shared
+/// fan-out sink for the configured exporter(s) to drain (#8756 — with N
+/// exporters the record lands in every per-exporter queue).
 #[derive(Clone)]
 pub struct SessionSummarySink {
-    queue: Arc<DurableQueue>,
+    queue: Arc<dyn super::queue::QueueSink>,
     host_id: String,
 }
 
 impl SessionSummarySink {
     /// Wrap `queue`/`host_id` (both owned by `super::spawn_task`) in a sink.
     #[must_use]
-    pub fn new(queue: Arc<DurableQueue>, host_id: impl Into<String>) -> Self {
+    pub fn new(queue: Arc<dyn super::queue::QueueSink>, host_id: impl Into<String>) -> Self {
         SessionSummarySink {
             queue,
             host_id: host_id.into(),
@@ -60,7 +60,7 @@ impl SessionSummarySink {
     /// producer: a persistence failure is logged by the queue and never
     /// propagates into the ingestion pass.
     pub fn push(&self, record: SessionSummaryRecord) {
-        self.queue.push(TelemetryEnvelope::new(
+        self.queue.offer(TelemetryEnvelope::new(
             self.host_id.clone(),
             TelemetryRecord::SessionSummary(record),
         ));

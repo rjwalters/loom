@@ -90,22 +90,24 @@ impl Sampler {
 
     fn enqueue(
         &mut self,
-        queue: &DurableQueue,
+        queue: &dyn crate::observability::queue::QueueSink,
         host: &str,
         root: PathBuf,
         record: SweepIdentityRecord,
     ) {
         let key = (root, record.sweep_id.clone());
         if self.sent.get(&key) != Some(&record) {
-            queue
-                .push(TelemetryEnvelope::new(host, TelemetryRecord::SweepIdentity(record.clone())));
+            queue.offer(TelemetryEnvelope::new(
+                host,
+                TelemetryRecord::SweepIdentity(record.clone()),
+            ));
             self.sent.insert(key, record);
         }
     }
 
     pub(super) async fn sample(
         &mut self,
-        queue: &DurableQueue,
+        queue: &dyn crate::observability::queue::QueueSink,
         host: &str,
         pool: &Arc<WorkspacePool>,
         slugs: &mut HashMap<String, String>,
