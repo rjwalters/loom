@@ -1,11 +1,15 @@
-//! Parity tests for the credential-bearing path class (#8005).
+//! Parity tests for the credential-bearing path class (#8005, extended by the
+//! #8734 audit).
 //!
 //! [`CREDENTIAL_PATTERNS`] is the single declared list. Shell cannot `source`
 //! Rust, and a consumer repo has neither `post_init.rs` to parse nor a
-//! trustworthy (non-stale) binary to ask, so the two shell stagers carry a
-//! literal copy — and these tests are what makes that copy safe: a credential
-//! path added on one side of the language boundary but not the other fails
-//! here instead of silently leaving one stager unguarded.
+//! trustworthy (non-stale) binary to ask, so every shell stager that needs
+//! the class carries a literal copy — and these tests are what makes each
+//! copy safe: a credential path added on one side of the language boundary
+//! but not the other fails here instead of silently leaving a stager
+//! unguarded. Covers `defaults/scripts/land-resync-commit.sh`,
+//! `defaults/scripts/resync-installed.sh`, `scripts/install-loom.sh`, and
+//! `install.sh`.
 
 use super::post_init::EPHEMERAL_PATTERNS;
 use super::{is_credential_path, CREDENTIAL_PATTERNS};
@@ -13,6 +17,11 @@ use std::collections::BTreeSet;
 
 const LAND_RESYNC_COMMIT: &str = include_str!("../../../defaults/scripts/land-resync-commit.sh");
 const RESYNC_INSTALLED: &str = include_str!("../../../defaults/scripts/resync-installed.sh");
+// #8734: the two "initial commit" `git add -A` sites audited alongside
+// land-resync-commit.sh / resync-installed.sh above. Unlike those two, these
+// are top-level installer entry points, not `defaults/` payload.
+const SCRIPTS_INSTALL_LOOM: &str = include_str!("../../../scripts/install-loom.sh");
+const INSTALL_SH: &str = include_str!("../../../install.sh");
 
 /// The Rust class, normalised the same way both shell copies spell it.
 fn rust_class(strip_dir_slash: bool) -> BTreeSet<String> {
@@ -41,13 +50,15 @@ fn land_resync_commit_array() -> BTreeSet<String> {
     body[..end].split_whitespace().map(str::to_string).collect()
 }
 
-/// Extract every `':!<path>'` exclusion from resync-installed.sh's printed
-/// `git add -A -- . ...` next-steps line.
-fn resync_installed_pathspec_excludes() -> BTreeSet<String> {
-    let line = RESYNC_INSTALLED
+/// Extract every `':!<path>'` exclusion from a `git add -A -- . ...` line
+/// (a printed next-steps recipe, or one this file actually executes).
+/// Shared by resync-installed.sh's printed suggestion and the executed
+/// `git add -A -- .` calls in scripts/install-loom.sh / install.sh.
+fn pathspec_excludes(content: &str, source_name: &str) -> BTreeSet<String> {
+    let line = content
         .lines()
         .find(|l| l.contains("git add -A -- ."))
-        .expect("resync-installed.sh must print a `git add -A -- . ':!...'` recipe");
+        .unwrap_or_else(|| panic!("{source_name} must contain a `git add -A -- . ':!...'` line"));
     line.split("':!")
         .skip(1)
         .map(|rest| rest.split('\'').next().unwrap_or_default().to_string())
@@ -112,10 +123,35 @@ fn land_resync_commit_array_matches_rust_class() {
 #[test]
 fn resync_installed_pathspec_matches_rust_class() {
     assert_eq!(
-        resync_installed_pathspec_excludes(),
+        pathspec_excludes(RESYNC_INSTALLED, "defaults/scripts/resync-installed.sh"),
         rust_class(true),
         "defaults/scripts/resync-installed.sh's printed `git add -A` exclusions have drifted \
          from loom-daemon/src/init/post_init.rs CREDENTIAL_PATTERNS — keep them identical (#8005)"
+    );
+}
+
+#[test]
+fn install_loom_sh_pathspec_matches_rust_class() {
+    // #8734: scripts/install-loom.sh's "Create initial commit" `git add -A`
+    // (the non-git-repo bootstrap path) carries its own literal copy of the
+    // exclusion pathspec, same reasoning as resync-installed.sh's above.
+    assert_eq!(
+        pathspec_excludes(SCRIPTS_INSTALL_LOOM, "scripts/install-loom.sh"),
+        rust_class(true),
+        "scripts/install-loom.sh's initial-commit `git add -A` exclusions have drifted from \
+         loom-daemon/src/init/post_init.rs CREDENTIAL_PATTERNS — keep them identical (#8005/#8734)"
+    );
+}
+
+#[test]
+fn install_sh_pathspec_matches_rust_class() {
+    // #8734: install.sh's "Create initial commit" block is a separate literal
+    // copy of the same pattern (same reachability as install-loom.sh's).
+    assert_eq!(
+        pathspec_excludes(INSTALL_SH, "install.sh"),
+        rust_class(true),
+        "install.sh's initial-commit `git add -A` exclusions have drifted from \
+         loom-daemon/src/init/post_init.rs CREDENTIAL_PATTERNS — keep them identical (#8005/#8734)"
     );
 }
 
