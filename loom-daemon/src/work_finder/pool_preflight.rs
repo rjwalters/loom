@@ -69,10 +69,23 @@
 //!   is a different condition with a different fix (`loom-daemon tokens
 //!   bootstrap`) and its own detection (#4642). This module holds only for
 //!   "a pool exists and every account in it is unspawnable".
-//! - **Not broadcast to peers.** Each host resolves its *own* pool (repo-local
-//!   shadow pool if it holds `.token` files, else shared — #3938/#7527), so
-//!   one host's exhaustion says nothing about a peer's. Broadcasting it would
-//!   suppress a peer whose pool is healthy.
+//! - **Not broadcast to peers — a recorded decision (#8001), not an
+//!   omission.** Each host resolves its *own* pool (repo-local shadow pool if
+//!   it holds `.token` files, else shared — #3938/#7527), and "shared" means
+//!   shared across the repos of **one host**: `~/.loom/tokens` is a directory
+//!   on that host's own disk, and its `.bad_tokens`/`.ranking` are never
+//!   synced to any peer. The hold's key is therefore a host-local absolute
+//!   path with no cross-host identity (unlike #7477's `(repo, issue)` key), and
+//!   peer pools are known to diverge in membership (lapsed accounts, per-repo
+//!   shadows on every fleet host), so no key exists under which "host A's pool
+//!   is dead" soundly implies "host B's is". Every host instead converges on
+//!   its own: the upstream account limit is the same for every host holding
+//!   that account, and each host's `.ranking` refresh observes it
+//!   independently. Broadcasting would only ever change behaviour where a
+//!   peer's own read says "spawnable" — which is either true (suppression is
+//!   the bug) or stale (bounded by [`note_pool_dead`] to one doomed dispatch
+//!   per host per 900 s). Full rationale: `.loom/docs/token-pool.md` §
+//!   "Why the hold is not broadcast to peers (#8001)".
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;

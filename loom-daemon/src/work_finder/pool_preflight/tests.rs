@@ -299,7 +299,11 @@ fn four_hosts_one_ready_issue_and_a_dead_pool_dispatch_nothing() {
         "precondition: without the pre-flight, 4 hosts x 20 ticks = 80 doomed dispatches"
     );
 
-    // Four independent daemons = four hosts, all sharing one pool directory.
+    // Four independent daemons = four hosts. Real hosts each read their OWN
+    // copy of the pool (see `hosts_with_separate_pool_dirs_hold_independently`);
+    // one fixture directory stands in for four copies that have all reached
+    // the same dead state — which each host observes on its own tick, with no
+    // peer broadcast (#8001).
     let hosts = [
         PoolHoldState::new(),
         PoolHoldState::new(),
@@ -320,6 +324,37 @@ fn four_hosts_one_ready_issue_and_a_dead_pool_dispatch_nothing() {
     for host in &hosts {
         assert_eq!(host.held_pool_count(), 1, "every host holds the dead pool");
     }
+}
+
+/// The deployment shape that decided #8001 (no peer broadcast): every host
+/// resolves its pool to a directory on its **own** disk, so two hosts can hold
+/// the same account names with different health. Host A's copy is fully
+/// bad-marked; host B's copy of the *same* accounts still has one spawnable.
+/// A must hold and B must keep dispatching — the hold's key is a host-local
+/// path, and nothing A observed says anything about B's pool. A broadcast of
+/// A's hold would suppress B here, which is the bug it would introduce.
+#[test]
+fn hosts_with_separate_pool_dirs_hold_independently() {
+    let accounts = ["agent2", "agent3", "robb"];
+    let host_a_ws = workspace_with_pool(&accounts);
+    let host_b_ws = workspace_with_pool(&accounts);
+    bad_mark_all(host_a_ws.path(), &accounts);
+    bad_mark_all(host_b_ws.path(), &["agent2", "agent3"]);
+
+    let host_a = PoolHoldState::new();
+    let host_b = PoolHoldState::new();
+
+    assert_eq!(ticks_for_host(Some(&host_a), host_a_ws.path(), 8001, 5), 0);
+    assert_eq!(
+        ticks_for_host(Some(&host_b), host_b_ws.path(), 8001, 5),
+        5,
+        "a host whose own pool still has a spawnable account must keep dispatching"
+    );
+
+    let a_holds = host_a.active_holds();
+    assert_eq!(a_holds.len(), 1);
+    assert_eq!(a_holds[0].dir, host_a_ws.path().join(".loom").join("tokens"));
+    assert_eq!(host_b.held_pool_count(), 0, "host A's hold never reaches host B");
 }
 
 /// The other half of the same test: the instant the pool recovers, all four

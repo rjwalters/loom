@@ -1249,7 +1249,8 @@ dispatch for that pool when `total > 0 && usable == 0`
 - **Not broadcast to peers.** Each host resolves its *own* pool (repo-local
   shadow if it holds `.token` files, else shared — #3938/#7527), so one host's
   exhaustion says nothing about a peer's; broadcasting it would suppress a peer
-  whose pool is healthy.
+  whose pool is healthy. This is a recorded decision — see
+  [Why the hold is not broadcast to peers (#8001)](#why-the-hold-is-not-broadcast-to-peers-8001).
 - `total == 0` (no pool provisioned at all) is a *different* condition with a
   different remedy (`loom-daemon tokens bootstrap`) and its own detection
   (#4642). It never arms this hold.
@@ -1286,6 +1287,57 @@ daemon's own read of the same directory: the wrapper proved a spawn cannot selec
 an account there. That backstop is bounded by `pool_clear_estimate`'s 900 s cap,
 so the worst case when the wrapper and the daemon disagree is one doomed dispatch
 per host per TTL, not one per tick.
+
+### Why the hold is not broadcast to peers (#8001)
+
+#7708 also asked for the hold to be broadcast "the way #7477 broadcasts backoff
+windows". That was evaluated and **deliberately not built**. The decision turns
+on which deployment shape is load-bearing, so here is the shape as it actually
+runs:
+
+- **"Shared" pool means shared across one host's repos, never across hosts.**
+  The default shared pool is `~/.loom/tokens` (`shared_tokens_dir`), a directory
+  on each host's own disk. Nothing syncs `.bad_tokens` or `.ranking` between
+  hosts — each host's `.ranking` is written by its own `token_ranking_refresh`
+  (every 600 s, from that host's own claude-monitor store or probes), and each
+  host's `.bad_tokens` records only its own spawns' outcomes.
+  [Overdue resets (#7420)](#overdue-resets-a-revoked-account-is-not-an-exhausted-one-7420)
+  below documents one account recorded `auth-dead` on some hosts and
+  `exhausted` on another at the same moment.
+- **Repo-local shadow pools are the norm, not the exception.** Fleet hosts carry
+  per-repo `.loom/tokens/` shadows (e.g. this repo on its primary host resolves
+  a repo-local pool, not `~/.loom/tokens`), and account membership differs
+  between hosts (lapsed or not-yet-imported accounts).
+
+Consequences for a broadcast:
+
+1. **There is no sound broadcast key.** The hold is keyed by the resolved pool's
+   *host-local absolute path*. #7477's key, `(repo, issue)`, names the same thing
+   on every host; a path like `/Users/…/.loom/tokens` names a different
+   directory — with different contents — on every host. A per-repo key would
+   suppress a peer whose shadow pool for that repo holds a healthy account; an
+   account-set key would miss whenever memberships drift, which they do.
+2. **Every host already converges on its own.** The fault behind #7708 is an
+   *upstream* account limit, identical for every host holding that account. Each
+   host's pre-flight reads its own `.ranking`, whose refresh observes the same
+   upstream limit independently, so each host arms its own hold on its own tick
+   (`four_hosts_one_ready_issue_and_a_dead_pool_dispatch_nothing`), and a host
+   whose pool is genuinely healthy keeps dispatching
+   (`hosts_with_separate_pool_dirs_hold_independently`).
+3. **A broadcast could only change behaviour where it is wrong or already
+   bounded.** It matters only when a peer's own read says "spawnable". Either the
+   read is right — the peer can do the work, and suppressing it is exactly the
+   bug a broadcast would introduce — or it is stale, in which case that peer's
+   first token-selection death arms its own post-mortem hold: at most one doomed
+   dispatch per host per 900 s, the same bound as above.
+
+So in the load-bearing shape (per-host pools, repo-local shadows on every host)
+a broadcast is not a correctness fix, and in the hypothetical shape where it
+would help (one pool directory genuinely shared cross-host in real time, e.g. a
+network mount) the local pre-flight already reads that same directory on every
+host and needs no broadcast either. Revisit only if pool state itself becomes
+fleet-shared — at which point the key should be the account identities, not a
+path.
 
 ## Worktree handling
 
