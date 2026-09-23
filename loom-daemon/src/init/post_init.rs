@@ -297,6 +297,53 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-local/",
 ];
 
+/// The credential-bearing subset of [`EPHEMERAL_PATTERNS`] (#8005) — paths that
+/// hold a live secret (OAuth token, API key, installation token, harness auth
+/// store), where a single commit is a one-way leak.
+///
+/// `.gitignore` is the first defence for these (every entry here is ALSO in
+/// [`EPHEMERAL_PATTERNS`], asserted by a test), but not a sufficient one: a
+/// host whose managed block is missing or stale — the stale-binary host class
+/// #7818 documents — ignores none of them. So every script that stages on
+/// Loom's behalf must refuse these paths UNCONDITIONALLY, independent of the
+/// ignore rules. The shell copies of this class
+/// (`defaults/scripts/land-resync-commit.sh`'s `LOOM_CREDENTIAL_PATTERNS`
+/// array and `defaults/scripts/resync-installed.sh`'s printed `:!` pathspec)
+/// are machine-checked against this list by `credential_class_tests`, so a
+/// credential path added here without them (or there without here) fails CI.
+/// They cannot be derived at runtime instead: consumer repos have no
+/// `post_init.rs` to parse, and asking the installed binary would re-create
+/// exactly the stale-binary dependency this defence exists to remove.
+///
+/// Deliberately NOT here: `.loom/account-health.{json,lock}` (account names +
+/// reason categories only, never a secret — #5014) and `.loom-local/` (a
+/// config overlay; credential policy forbids secrets in it). Both stay
+/// gitignored, and neither is on any stager's allowlist, but a tracked copy of
+/// either is not a "rotate the credential" emergency.
+///
+/// Matching contract (shared with the shell): a pattern ending in `/` is a
+/// directory and matches the directory itself and everything under it; any
+/// other pattern is an exact file path. No globs.
+pub const CREDENTIAL_PATTERNS: &[&str] = &[
+    ".loom/claude-config/",
+    ".loom/tokens/",
+    ".loom/accounts.env",
+    ".loom/api-keys/",
+    ".loom/gh-config/",
+    ".loom/gh-config-by-owner/",
+];
+
+/// Whether a repo-relative path falls in the [`CREDENTIAL_PATTERNS`] class.
+#[must_use]
+pub fn is_credential_path(path: &str) -> bool {
+    CREDENTIAL_PATTERNS
+        .iter()
+        .any(|p| match p.strip_suffix('/') {
+            Some(dir) => path == dir || path.starts_with(p),
+            None => path == *p,
+        })
+}
+
 /// Build the Loom-managed `.gitignore` block (marker lines + header + patterns),
 /// with no leading or trailing newline. Callers add surrounding newlines.
 fn managed_gitignore_block() -> String {
