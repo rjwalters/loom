@@ -115,6 +115,7 @@ mod locks;
 mod model;
 mod noop_cooldown;
 mod outcome_journal;
+mod pool_hold_broadcast;
 mod prless_retry;
 mod quarantine;
 mod reaper;
@@ -150,6 +151,8 @@ pub use model::*;
 pub use noop_cooldown::*;
 #[allow(unused_imports)]
 pub use outcome_journal::*;
+#[allow(unused_imports)]
+pub use pool_hold_broadcast::*;
 #[allow(unused_imports)]
 pub use prless_retry::*;
 #[allow(unused_imports)]

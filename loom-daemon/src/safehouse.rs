@@ -3754,34 +3754,17 @@ impl InboundEventSink for PeerClaimSink {
                     for expired in view.prune_expired_filing_locks(now) {
                         clear_filing_lock_mirror(&expired);
                     }
-                } else if ad.kind.is_cooldown_lane() {
-                    // Issue #7477: fleet-wide no-op-cooldown / dispatch-backoff
-                    // visibility. Each kind folds into its own single-purpose
+                } else if ad.kind.is_cooldown_lane() || ad.kind.is_pool_hold_lane() {
+                    // The BRAKE lanes: the #7477 per-issue no-op-cooldown /
+                    // dispatch-backoff windows and the #8001 per-pool
+                    // exhaustion hold. Each folds into its own single-purpose
                     // map (mirroring the filing-lock lane above) rather than
-                    // `observe_at`'s dispatch-claims map — a cooldown/backoff
-                    // window answers a different question ("should a peer
-                    // re-dispatch this issue right now") than "is a sweep in
-                    // flight".
-                    match ad.kind {
-                        crate::peer_claims::ClaimKind::NoopCooldownArmed => {
-                            view.observe_noop_cooldown_at(&ad, now);
-                            view.prune_expired_noop_cooldowns(now);
-                        }
-                        crate::peer_claims::ClaimKind::DispatchBackoffArmed => {
-                            view.observe_dispatch_backoff_at(&ad, now);
-                            view.prune_expired_dispatch_backoffs(now);
-                        }
-                        _ => {}
-                    }
-                } else if ad.kind.is_pool_hold_lane() {
-                    // Issue #8001: fleet-wide token-pool exhaustion holds.
-                    // Its own single-purpose map again — a pool hold answers
-                    // "may ANY sweep spawn from this pool right now", which
-                    // is neither "is issue #N in flight" nor a per-issue
-                    // brake, and it is keyed by the pool's account
-                    // fingerprint rather than by `(repo, issue)`.
-                    view.observe_pool_hold_at(&ad, now);
-                    view.prune_expired_pool_holds(now);
+                    // `observe_at`'s dispatch-claims map — a brake answers
+                    // "may a dispatch happen at all right now", not "is a
+                    // sweep in flight". The per-lane routing lives beside the
+                    // lanes themselves in `peer_claims::brakes`, so adding a
+                    // lane never touches this socket layer.
+                    crate::peer_claims::observe_brake_ad(&mut view, &ad, now);
                 } else if ad.kind == crate::peer_claims::ClaimKind::Completed {
                     view.observe_completion_at(&ad, now);
                     view.prune_expired_completions(now);
