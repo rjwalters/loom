@@ -20,6 +20,10 @@ export interface Attrs {
   class?: string;
   title?: string;
   href?: string;
+  /** `target`/`rel` for an off-site `<a>` (the forge links): opened in a new
+   * tab so the dashboard's live state is not navigated away from. */
+  target?: string;
+  rel?: string;
   id?: string;
   type?: string;
   role?: string;
@@ -46,6 +50,8 @@ export function el<K extends keyof HTMLElementTagNameMap>(
   if (attrs.style) node.setAttribute("style", attrs.style);
   if (attrs.type) node.setAttribute("type", attrs.type);
   if (attrs.href) node.setAttribute("href", attrs.href);
+  if (attrs.target) node.setAttribute("target", attrs.target);
+  if (attrs.rel) node.setAttribute("rel", attrs.rel);
   for (const [key, value] of Object.entries(attrs.data ?? {})) {
     if (value !== undefined) node.setAttribute(`data-${key}`, String(value));
   }

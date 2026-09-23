@@ -310,6 +310,12 @@ pub struct SweepStartedRecord {
     /// Selected reasoning-effort level, when one was chosen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Runtime adapter the sweep was dispatched on (`claude`, `codex`, …),
+    /// when the dispatch event carried one — the same value
+    /// `SweepInfo::runtime` records. Absent for a legacy dispatch that did
+    /// not name its runtime; never fabricated as `"claude"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
 }
 
 /// `sweep.phase` — a sweep advanced to a new lifecycle phase.
@@ -728,8 +734,16 @@ pub struct RoleTickOutcomeRecord {
 /// limit-window state matching what `loom-daemon tokens check --ranking` knows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenAccountState {
-    /// Token account name (the `<account>.token` basename in `.loom/tokens/`).
+    /// Token account name (the `<account>.token` basename in `.loom/tokens/`,
+    /// or the profile name from the multi-provider account registry).
     pub account: String,
+    /// Which provider's pool this account belongs to (`"claude"`, `"codex"`,
+    /// …) — the lowercase [`AccountProvider`] name. Defaults to `"claude"` on
+    /// deserialization so a record from a daemon that predates per-provider
+    /// pools (which only ever sampled the Claude `.ranking` file) still reads
+    /// as what it was.
+    #[serde(default = "default_token_provider")]
+    pub provider: String,
     /// The account's rank in the rotation pool, when ranking data exists
     /// (lower = preferred).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -752,6 +766,12 @@ pub struct TokenAccountState {
 }
 
 /// `tokens.snapshot` — a point-in-time view of the multi-account token pool.
+/// The provider a pre-per-provider `tokens.snapshot` row implicitly belonged
+/// to — see [`TokenAccountState::provider`].
+fn default_token_provider() -> String {
+    "claude".to_string()
+}
+
 /// Host-level: it references no repository, so it carries no visibility tag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenSnapshotRecord {

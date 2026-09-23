@@ -168,6 +168,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(effort) = &r.effort {
                 attributes.push(kv_string("loom.effort", effort.clone()));
             }
+            if let Some(runtime) = &r.runtime {
+                attributes.push(kv_string("loom.runtime", runtime.clone()));
+            }
             (
                 "sweep.started",
                 SeverityNumber::Info,
@@ -501,7 +504,10 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         TelemetryRecord::TokensSnapshot(r) => {
             let mut samples = Vec::new();
             for account in &r.accounts {
-                let mut attributes = vec![kv_string("account", account.account.clone())];
+                let mut attributes = vec![
+                    kv_string("account", account.account.clone()),
+                    kv_string("provider", account.provider.clone()),
+                ];
                 if let Some(rank) = account.rank {
                     attributes.push(kv_int("rank", i64::from(rank)));
                 }

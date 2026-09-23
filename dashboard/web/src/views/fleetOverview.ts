@@ -27,7 +27,9 @@ import {
   roleTickAggregateText,
   roleTickCompactText,
 } from "../format";
-import type { FleetView, HostStatus, HostView } from "../fleet";
+import { forgeLink, repoUrl, sweepWorkTitle, sweepWorkUrl } from "../forgeLinks";
+import { providerDisplayName, providerMark, runtimeProvider } from "../providers";
+import type { FleetView, HostStatus, HostView, ProviderSummary } from "../fleet";
 import type { HostHealthRecord, HostProtection, ManagedRepoEntry } from "../types";
 import { emptyFleetView } from "./states";
 import { runningComputeSection, type RunningComputeOptions } from "./runningCompute";
@@ -101,11 +103,50 @@ export function protectionBadge(protection: HostProtection | undefined): HTMLEle
   );
 }
 
-function tokenSummaryText(host: HostView): string {
-  const { total, exhausted, peakUsage } = host.tokens;
-  if (total === 0) return UNKNOWN;
-  const peak = peakUsage === undefined ? UNKNOWN : formatPercent(peakUsage);
-  return `${exhausted}/${total} exhausted · peak ${peak}`;
+/** One provider pool's summary line: `"17/21 exhausted · peak 100%"`, or
+ * just `"1/3 exhausted"` for a pool whose accounts report no usage fraction
+ * (Codex) — omitted rather than shown as a fake `peak 0%`. */
+export function providerPoolText(slice: ProviderSummary): string {
+  const base = `${slice.exhausted}/${slice.total} exhausted`;
+  return slice.peakUsage === undefined ? base : `${base} · peak ${formatPercent(slice.peakUsage)}`;
+}
+
+/**
+ * The token-pool section, one `<dt>/<dd>` pair per provider (`Claude`,
+ * `Codex`, …) so each provider's availability reads independently — a
+ * blended "17/21 exhausted" cannot tell "Claude is spent, Codex is fine"
+ * from the reverse, and only one of those stalls the sweeps. The label
+ * carries the provider's mark (`providers.ts`). A host that has reported no
+ * pool at all keeps the single unknown "Token pool" row it always had.
+ */
+function tokenPoolFields(host: HostView): DocumentFragment {
+  const fragment = document.createDocumentFragment();
+  if (host.tokens.providers.length === 0) {
+    fragment.appendChild(field("Token pool", UNKNOWN, "tokens.snapshot"));
+    return fragment;
+  }
+  for (const slice of host.tokens.providers) {
+    fragment.appendChild(
+      el(
+        "dt",
+        { class: "field__label field__label--provider", data: { testid: "token-pool-label", provider: slice.provider } },
+        providerMark(slice.provider, true),
+        el("span", { class: "field__label-text" }, "pool"),
+      ),
+    );
+    fragment.appendChild(
+      el(
+        "dd",
+        {
+          class: "field__value",
+          title: `tokens.snapshot — ${providerDisplayName(slice.provider)} accounts on this host`,
+          data: { testid: "token-pool-value", provider: slice.provider },
+        },
+        providerPoolText(slice),
+      ),
+    );
+  }
+  return fragment;
 }
 
 /**
@@ -271,7 +312,9 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
       el(
         "ul",
         { class: "card__repos" },
-        idleRepos.map((repo) => el("li", { class: "card__repo" }, el("span", { class: "card__repo-label" }, repo.slug))),
+        idleRepos.map((repo) =>
+          el("li", { class: "card__repo" }, forgeLink(repo.slug, repoUrl(repo.slug), "card__repo-label")),
+        ),
         hiddenPrivateCount > 0
           ? el("li", { class: "card__repo card__repo--private" }, `+ ${hiddenPrivateCount} private`)
           : null,
@@ -314,7 +357,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
     el(
       "dl",
       { class: "card__fields card__fields--wide" },
-      field("Token pool", tokenSummaryText(host), "tokens.snapshot"),
+      tokenPoolFields(host),
       field(
         "Active sweeps",
         // "none" alone reads as "this host is idle" — but role ticks
@@ -342,13 +385,21 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
             el(
               "li",
               { class: "card__sweep" },
+              // Which agent is doing the work — the runtime adapter's
+              // provider mark (Claude's icon, "Codex" text, …). Absent for a
+              // pre-runtime daemon: no mark, never a guessed one.
+              sweep.runtime ? providerMark(runtimeProvider(sweep.runtime)) : null,
               el("span", { class: "chip" }, sweep.phase ?? "starting"),
-              el(
-                "span",
-                { class: "card__sweep-label" },
+              // `#N` links to the sweep's work on the forge: the
+              // `feature/issue-N` branch once Builder has pushed one, the
+              // issue itself before that (Curator has no branch yet).
+              forgeLink(
                 sweep.issue === undefined ? sweep.sweepId : `#${sweep.issue}`,
+                sweepWorkUrl(sweep.repo, sweep.issue, sweep.phase),
+                "card__sweep-label",
+                sweepWorkTitle(sweep.issue, sweep.phase),
               ),
-              sweep.repo ? el("span", { class: "card__sweep-repo" }, sweep.repo) : null,
+              sweep.repo ? forgeLink(sweep.repo, repoUrl(sweep.repo), "card__sweep-repo") : null,
             ),
           ),
         )
@@ -362,7 +413,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
             return el(
               "li",
               { class: "card__repo" },
-              el("span", { class: "card__repo-label" }, repo.slug),
+              forgeLink(repo.slug, repoUrl(repo.slug), "card__repo-label"),
               el("span", { class: "chip" }, `×${count}`),
             );
           }),
