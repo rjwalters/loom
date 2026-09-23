@@ -19,6 +19,15 @@
 //! included) finds nothing — the silent under-count and leaked `sweep:` entry
 //! #5084 documents.
 //!
+//! Issue #8720 narrowed — but did not close — that window on the live path:
+//! the collector now re-seeds its map from the owning registry's adoption
+//! evidence, so an adopted sweep still tracked by this host's registry
+//! correlates to its real id. This module remains the backstop for every case
+//! that evidence cannot cover (the registry entry already retired, the
+//! collector task not yet running, a dropped queue, a transport failure),
+//! which is why it is deliberately more general than "fix restart adoption" —
+//! see below.
+//!
 //! ## Fix: the local outcome-telemetry journal is the queue of record
 //!
 //! [`crate::sweep_outcomes::append_outcome_telemetry`] already durably

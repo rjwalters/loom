@@ -50,7 +50,7 @@
 1788 loom-daemon/src/main_health_gate.rs
 2318 loom-daemon/src/main_health_gate/tests.rs
 1715 loom-daemon/src/orphan_process_reaper.rs
-1596 loom-daemon/src/peer_claims.rs
+1525 loom-daemon/src/peer_claims.rs
 2201 loom-daemon/src/role_runner.rs
 3850 loom-daemon/src/role_runner/tests.rs
 2443 loom-daemon/src/safehouse.rs

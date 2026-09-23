@@ -1,5 +1,12 @@
 use super::*;
 
+/// The overwhelmingly common case: this host's registry holds no adoption
+/// evidence for the issue, so correlation is exactly what it was before
+/// Issue #8720 — the in-memory dispatch map or the synthesized fallback.
+fn no_evidence() -> Option<TrackedSweepIdentity> {
+    None
+}
+
 fn dispatch(issue: u32, sweep: &str) -> Event {
     Event::SweepGlobalDispatch {
         sweep_id: sweep.into(),
@@ -121,6 +128,7 @@ fn live_logs_keep_correct_context_after_durable_execution_state_is_retired() {
             root.path(),
             "host",
             &mut state,
+            &no_evidence,
         );
         assert_eq!(envelopes[0].trace_context.as_ref(), Some(&context));
         store.complete(root.path(), "same-execution-label").unwrap();
@@ -138,6 +146,7 @@ fn live_logs_keep_correct_context_after_durable_execution_state_is_retired() {
                 root.path(),
                 "host",
                 &mut state,
+                &no_evidence,
             );
             assert!(!envelopes.is_empty());
             assert!(envelopes
@@ -165,6 +174,250 @@ fn restart_without_dispatch_does_not_guess_trace_identity_from_issue_number() {
         root.path(),
         "host",
         &mut HashMap::new(),
+        &no_evidence,
     );
     assert!(envelopes[0].trace_context.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #8720 — lifecycle correlation for a sweep ADOPTED across a daemon
+// restart. These drive the real `sweep_registry` adoption paths (lock-based
+// and journal-only) rather than a hand-built identity, so the id asserted here
+// is the one production adoption actually produces.
+// ---------------------------------------------------------------------------
+
+/// Every lifecycle sweep id carried by `envelopes`, in emission order.
+fn sweep_ids(envelopes: &[TelemetryEnvelope]) -> Vec<String> {
+    envelopes
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            TelemetryRecord::SweepStarted(r) => Some(r.sweep_id.clone()),
+            TelemetryRecord::SweepPhase(r) => Some(r.sweep_id.clone()),
+            TelemetryRecord::SweepCompleted(r) => Some(r.sweep_id.clone()),
+            TelemetryRecord::SweepOutcome(r) => Some(r.sweep_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn outcome_duration_sec(envelopes: &[TelemetryEnvelope]) -> i64 {
+    envelopes
+        .iter()
+        .find_map(|envelope| match &envelope.record {
+            TelemetryRecord::SweepOutcome(r) => Some(r.total_duration_sec),
+            _ => None,
+        })
+        .expect("a terminal event yields a sweep.outcome record")
+}
+
+/// Reproduction step 1: a registry entry created by **lock-based adoption**,
+/// preserving the pre-restart sweep id, with the surviving per-sweep log
+/// carrying that exact dispatch header.
+fn lock_adopted_registry(
+    workspace: &Path,
+    issue: u32,
+    sweep_id: &str,
+    acquired_at: DateTime<Utc>,
+) -> crate::sweep_registry::SweepRegistry {
+    let (mut registry, _record_log) =
+        crate::sweep_registry::test_support::fixture_registry(workspace);
+    let lock = registry.config().locks_dir().join(format!("issue-{issue}"));
+    std::fs::create_dir_all(&lock).unwrap();
+    let owner = crate::sweep_registry::LockOwner {
+        issue,
+        // Alive by construction, so the lock pass adopts rather than reaps it.
+        owner_pid: std::process::id(),
+        acquired_at: acquired_at.to_rfc3339(),
+        sweep_id: sweep_id.to_string(),
+        pgid: None,
+        model: None,
+        effort: None,
+    };
+    std::fs::write(lock.join("owner.json"), serde_json::to_string(&owner).unwrap()).unwrap();
+    let log_path = registry.compute_log_path(issue);
+    std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &log_path,
+        format!("==== loom-daemon dispatch: now sweep_id={sweep_id} issue={issue} ====\n"),
+    )
+    .unwrap();
+    assert!(registry.reconstruct().unwrap() >= 1, "the live lock must be adopted");
+    assert_eq!(
+        registry
+            .get(sweep_id)
+            .map(|info| info.started_at.timestamp()),
+        Some(acquired_at.timestamp()),
+        "adoption must keep the lock's own acquired_at, not stamp a new start"
+    );
+    registry
+}
+
+#[test]
+fn a_lock_adopted_sweep_correlates_its_later_events_to_the_original_sweep_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let sweep_id = "sweep-issue-8720-1790000000";
+    // The sweep has been running for 15 minutes; the daemon that dispatched it
+    // is gone.
+    let acquired_at = Utc::now() - chrono::Duration::seconds(900);
+    let registry = lock_adopted_registry(dir.path(), 8720, sweep_id, acquired_at);
+    let evidence = || registry.tracked_sweep_identity(8720);
+
+    // Reproduction step 2: collector correlation starts EMPTY — no
+    // `sweep.global.dispatch` was ever observed by this process.
+    let mut state = HashMap::new();
+    let envelopes = map_envelopes(
+        &phase(8720),
+        8720,
+        "rjwalters/loom",
+        RepoVisibility::Private,
+        dir.path(),
+        "host-a",
+        &mut state,
+        &evidence,
+    );
+    // Reproduction step 3: the phase resolves to the adopted registry entry's
+    // own id, not `unknown-issue-8720`.
+    assert_eq!(sweep_ids(&envelopes), vec![sweep_id.to_string()]);
+
+    // ...and so does the eventual terminal event, whose elapsed time is
+    // measured from the registry's real `acquired_at` rather than reset.
+    let envelopes = map_envelopes(
+        &terminal(8720),
+        8720,
+        "rjwalters/loom",
+        RepoVisibility::Private,
+        dir.path(),
+        "host-a",
+        &mut state,
+        &evidence,
+    );
+    assert_eq!(sweep_ids(&envelopes), vec![sweep_id.to_string(); 2]);
+    assert!(
+        outcome_duration_sec(&envelopes) >= 900,
+        "an adopted sweep's terminal record must measure from the adopted start, not zero"
+    );
+    assert!(state.is_empty(), "a terminal event still clears correlation state");
+}
+
+/// No `sweep.started` record is ever synthesized for an adopted sweep: the row
+/// it would create/resurrect already exists upstream with the true start
+/// instant, and re-announcing it here would stamp a fabricated one.
+#[test]
+fn adopting_a_sweep_never_replays_a_start_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = lock_adopted_registry(dir.path(), 8721, "sweep-issue-8721-adopted", Utc::now());
+    let evidence = || registry.tracked_sweep_identity(8721);
+    let envelopes = map_envelopes(
+        &phase(8721),
+        8721,
+        "rjwalters/loom",
+        RepoVisibility::Private,
+        dir.path(),
+        "host-a",
+        &mut HashMap::new(),
+        &evidence,
+    );
+    assert!(
+        envelopes
+            .iter()
+            .all(|e| !matches!(e.record, TelemetryRecord::SweepStarted(_))),
+        "correlating an adopted sweep must not emit a sweep.started replay"
+    );
+}
+
+/// Journal-only recovery (Issue #6262) is covered **separately** from the lock
+/// path because the original dispatch id is genuinely unrecoverable there: the
+/// lock did not survive, so the journal can only supply its own
+/// `journal-adopted-…` id. That is still strictly better than
+/// `unknown-issue-N` — it is the same id this daemon reports for that sweep in
+/// `host.health`'s `active_sweep_ids` and its `sweep.identity` record, so the
+/// dashboard converges on one row instead of two.
+#[test]
+fn a_journal_adopted_sweep_correlates_to_the_id_the_registry_reports_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut registry, _record_log) =
+        crate::sweep_registry::test_support::fixture_registry(dir.path());
+    let pid = std::process::id();
+    let entry = crate::sweep_journal::JournalEntry {
+        issue: 8722,
+        pid,
+        repo: registry.config().workspace_root.display().to_string(),
+        started_at: Utc::now() - chrono::Duration::seconds(60),
+    };
+    assert_eq!(registry.adopt_live_journal_sweeps(&[entry]), 1);
+    let expected = format!("journal-adopted-issue-8722-{pid}");
+    assert_eq!(
+        registry.tracked_sweep_identity(8722).map(|i| i.sweep_id),
+        Some(expected.clone())
+    );
+
+    let envelopes = map_envelopes(
+        &phase(8722),
+        8722,
+        "rjwalters/loom",
+        RepoVisibility::Private,
+        dir.path(),
+        "host-a",
+        &mut HashMap::new(),
+        &|| registry.tracked_sweep_identity(8722),
+    );
+    assert_eq!(sweep_ids(&envelopes), vec![expected]);
+}
+
+/// The pre-#8720 fallback is retained wherever there is no authoritative
+/// evidence — including the issue's own `unknown-issue-8715` example: a phase
+/// event injected by hand for an issue this host is not running.
+#[test]
+fn an_event_with_no_registry_evidence_keeps_the_synthesized_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, _record_log) = crate::sweep_registry::test_support::fixture_registry(dir.path());
+    assert!(registry.tracked_sweep_identity(8715).is_none());
+    let mut state = HashMap::new();
+    for event in [phase(8715), terminal(8715)] {
+        let envelopes = map_envelopes(
+            &event,
+            8715,
+            "rjwalters/loom",
+            RepoVisibility::Private,
+            dir.path(),
+            "host-a",
+            &mut state,
+            &|| registry.tracked_sweep_identity(8715),
+        );
+        assert!(envelopes
+            .iter()
+            .all(|e| sweep_ids(std::slice::from_ref(e)) == vec!["unknown-issue-8715".to_string()]));
+    }
+}
+
+/// A live dispatch observed by THIS process always wins: registry evidence is
+/// consulted only when the in-memory correlation map has nothing, so a running
+/// sweep's own id can never be overwritten by a registry read.
+#[test]
+fn an_observed_dispatch_is_never_overridden_by_registry_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = HashMap::new();
+    map_envelopes(
+        &dispatch(8724, "live-dispatch"),
+        8724,
+        "rjwalters/loom",
+        RepoVisibility::Private,
+        dir.path(),
+        "host-a",
+        &mut state,
+        &no_evidence,
+    );
+    let envelopes = map_envelopes(
+        &phase(8724),
+        8724,
+        "rjwalters/loom",
+        RepoVisibility::Private,
+        dir.path(),
+        "host-a",
+        &mut state,
+        &|| {
+            panic!("evidence must not be consulted while a dispatch is tracked");
+        },
+    );
+    assert_eq!(sweep_ids(&envelopes), vec!["live-dispatch".to_string()]);
 }

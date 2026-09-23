@@ -24,9 +24,17 @@ impl DispatchModel<'_> {
         let root = &config.workspace_root;
         // Only hermetic skip-label fixtures lack admission. Reading their
         // configured binding does not select credentials or reserve a slot.
-        let native = admitted.map_or_else(
-            || crate::worker_spawn::uses_native_sweep(root),
-            |admitted| crate::worker_spawn::is_native(&admitted.runtime),
+        //
+        // Issue #8721: when admission already ran, classify the ACTUAL
+        // admitted runtime directly (`DefaultModelPolicy::for_runtime`)
+        // instead of re-deriving it from config a second time — this is the
+        // one call site that has the real admitted runtime name in hand, so
+        // it is also the one place a `runtimes.default`/env override applied
+        // between admission and this resolve() can't disagree with what
+        // actually launched.
+        let policy = admitted.map_or_else(
+            || DefaultModelPolicy::resolve(root),
+            |admitted| DefaultModelPolicy::for_runtime(&admitted.runtime),
         );
         let resolved = match (self, kind) {
             (Self::Request(None) | Self::Autonomous { .. }, SweepKind::Issue(issue)) => {
@@ -41,7 +49,7 @@ impl DispatchModel<'_> {
                             *issue,
                         ),
                     },
-                    native,
+                    policy,
                 )
             }
             _ => {
@@ -49,13 +57,17 @@ impl DispatchModel<'_> {
                     Self::Request(model) => model,
                     _ => None,
                 };
-                let (model, source) = resolve_dispatch_model_for_runtime(root, explicit, native);
+                let (model, source) = resolve_dispatch_model_for_runtime(root, explicit, policy);
                 ExperimentDispatchModel {
                     model,
                     mode: "off".into(),
                     arm: None,
-                    source_label: if native && source == ModelSource::Default {
-                        "native-profile"
+                    source_label: if source == ModelSource::Default {
+                        match policy {
+                            DefaultModelPolicy::NativeProfile => "native-profile",
+                            DefaultModelPolicy::Codex => "codex-no-default",
+                            DefaultModelPolicy::ClaudeOrOther => source.as_str(),
+                        }
                     } else {
                         source.as_str()
                     },
