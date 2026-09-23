@@ -152,9 +152,18 @@ async fn reaper_does_not_resume_when_the_linked_pr_is_blocked() {
 
     // Checkpoint written AFTER the entry's `started_at`, so this run's own
     // `doctor-done` write counts as `checkpoint_progress` — exactly what a
-    // cap-exhausted Doctor cycle leaves behind.
+    // cap-exhausted Doctor cycle leaves behind. The mtime is set explicitly
+    // ahead of `started_at` rather than left to the write: Linux stamps file
+    // mtimes from a coarse (tick-granular) kernel clock that can trail the
+    // `Utc::now()` recorded as `started_at`, which made the #5614 clean-exit
+    // guard short-circuit before the PR-park check on CI.
     let sweep_id = insert_clean_exit_running(&mut reg, 8668, 1);
-    write_checkpoint(&reg, 8668, "doctor-done");
+    write_checkpoint_with_mtime(
+        &reg,
+        8668,
+        "doctor-done",
+        std::time::SystemTime::now() + Duration::from_secs(5),
+    );
 
     let changed = reg.reap_once();
     assert!(changed >= 1);
