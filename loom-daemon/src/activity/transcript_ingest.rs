@@ -70,8 +70,10 @@ use serde::Serialize;
 
 use super::db::ActivityDb;
 use super::resource_usage::{detect_provider, ModelPricing};
+use super::session_analysis::build_session_analysis;
 use super::session_summary::build_session_summary;
 use super::transcript_parse::{parse_transcript, ParsedTranscript};
+use crate::observability::session_analysis::SessionAnalysisSink;
 use crate::observability::session_summary::SessionSummarySink;
 use crate::transcript_tokens::{claude_projects_dir, project_slug, session_transcripts};
 
@@ -99,6 +101,12 @@ pub struct IngestOptions {
     /// emission entirely — the pass still writes `activity.db` exactly as
     /// before.
     pub summary_sink: Option<SessionSummarySink>,
+    /// Where this pass's derived `session.analysis` telemetry records go
+    /// (Issue #8760). `None` (a CLI pass, a test, or observability
+    /// disabled) skips emission entirely, independent of `summary_sink` —
+    /// a config that supplies one but not the other still gets exactly the
+    /// record kind(s) it asked for.
+    pub analysis_sink: Option<SessionAnalysisSink>,
 }
 
 impl Default for IngestOptions {
@@ -111,6 +119,7 @@ impl Default for IngestOptions {
             dry_run: false,
             max_transcript_bytes: MAX_TRANSCRIPT_BYTES,
             summary_sink: None,
+            analysis_sink: None,
         }
     }
 }
@@ -136,6 +145,9 @@ pub struct IngestStats {
     /// `session.summary` records pushed onto the observability queue
     /// (Issue #8757). Zero whenever no sink is configured.
     pub session_summaries: usize,
+    /// `session.analysis` records pushed onto the observability queue
+    /// (Issue #8760). Zero whenever no sink is configured.
+    pub session_analyses: usize,
 }
 
 /// Every transcript under `projects_dir` (parent sessions plus their
@@ -325,9 +337,22 @@ pub fn ingest(db: &ActivityDb, opts: &IngestOptions) -> Result<IngestStats> {
             // transcript is re-summarized on each pass that re-reads it —
             // the last record is the complete one, mirroring the
             // replace-never-append semantics of the rows it summarizes.
-            if let Some(sink) = &opts.summary_sink {
-                sink.push(build_session_summary(&path, &parsed));
-                stats.session_summaries += 1;
+            //
+            // `session.analysis` (Issue #8760) rides the same emission
+            // point, derived from the summary just built plus the same
+            // `parsed` transcript — independent of `summary_sink`, so a
+            // config that only wants one of the two record kinds gets
+            // exactly that.
+            if opts.summary_sink.is_some() || opts.analysis_sink.is_some() {
+                let summary = build_session_summary(&path, &parsed);
+                if let Some(sink) = &opts.analysis_sink {
+                    sink.push(build_session_analysis(&summary, &parsed));
+                    stats.session_analyses += 1;
+                }
+                if let Some(sink) = &opts.summary_sink {
+                    sink.push(summary);
+                    stats.session_summaries += 1;
+                }
             }
         }
     }
@@ -619,6 +644,9 @@ pub fn run_once(db_path: &Path, window_hours: i64) -> Result<IngestStats> {
         // (well before this pass's first tick); `None` there means
         // observability is off and no `session.summary` is emitted.
         summary_sink: crate::observability::session_summary::global_session_summary_sink().cloned(),
+        // Same registration pattern, one slice later (Issue #8760).
+        analysis_sink: crate::observability::session_analysis::global_session_analysis_sink()
+            .cloned(),
         ..IngestOptions::default()
     };
     ingest(&db, &opts)

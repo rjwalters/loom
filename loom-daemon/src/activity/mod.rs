@@ -49,6 +49,7 @@ mod prompts;
 mod quality;
 pub mod resource_usage;
 mod schema;
+pub mod session_analysis;
 pub mod session_summary;
 pub mod stats;
 pub mod test_parser;
