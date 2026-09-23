@@ -3473,9 +3473,10 @@ pub(crate) fn poll_and_classify_spawned_child(
 
     let immediate_preflight_death =
         if token_name == UNKNOWN_TOKEN_NAME && matches!(child.try_wait(), Ok(Some(_))) {
-            tail_lines(log_path, EXHAUSTION_LOG_TAIL_LINES)
+            // #8749: scope to the CURRENT dispatch's log region before
+            // bounding, like the reaper/quarantine sites (#8716).
+            dispatch_scoped_tail(log_path, EXHAUSTION_LOG_TAIL_LINES)
                 .ok()
-                .map(|lines| lines.join("\n"))
                 .and_then(|tail| classify_preflight_death(&tail))
         } else {
             None

@@ -152,3 +152,57 @@ fn the_line_bound_never_reaches_into_an_older_dispatch() {
     );
     assert_eq!(tail, new_lines[new_lines.len() - 3..].join("\n"));
 }
+
+/// Issue #8749: `poll_and_classify_spawned_child`'s immediate-preflight-death
+/// check reads the log through `dispatch_scoped_tail`, so a PRIOR dispatch's
+/// signature in the same reused per-issue log can neither classify nor clear
+/// the CURRENT dispatch's death.
+fn poll_classify_dead_child(body: &str) -> Option<&'static str> {
+    let dir = tempdir().unwrap();
+    let path = write_log(dir.path(), body);
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    child.wait().unwrap();
+
+    let (token_name, _runtime, death) =
+        poll_and_classify_spawned_child(&mut child, &path, "sweep_id=current");
+    assert_eq!(token_name, UNKNOWN_TOKEN_NAME);
+    death
+}
+
+#[test]
+fn spawned_child_preflight_death_ignores_an_older_dispatch_signature() {
+    let body = "==== loom-daemon dispatch: sweep_id=old ====\n\
+                spawn-claude: dispatching\n\
+                # MCP_PREFLIGHT_FAILED\n\
+                ==== loom-daemon dispatch: sweep_id=current ====\n\
+                spawn-opencode: bare model differs from the selected profile\n";
+
+    assert_eq!(
+        poll_classify_dead_child(body),
+        Some("preflight-no-cli-start"),
+        "the OLDER dispatch's MCP preflight marker must not label the current death"
+    );
+}
+
+#[test]
+fn spawned_child_preflight_death_is_not_cleared_by_an_older_cli_start() {
+    let body = "==== loom-daemon dispatch: sweep_id=old ====\n\
+                # CLAUDE_CLI_START\n\
+                Claude: working on it\n\
+                ==== loom-daemon dispatch: sweep_id=current ====\n\
+                spawn-claude: dispatching\n\
+                # MCP_PREFLIGHT_FAILED\n";
+
+    assert_eq!(poll_classify_dead_child(body), Some("preflight-mcp-failed"));
+}
+
+#[test]
+fn spawned_child_that_reached_cli_start_in_the_current_dispatch_is_not_preflight() {
+    let body = "==== loom-daemon dispatch: sweep_id=old ====\n\
+                # MCP_PREFLIGHT_FAILED\n\
+                ==== loom-daemon dispatch: sweep_id=current ====\n\
+                spawn-claude: dispatching\n\
+                # CLAUDE_CLI_START\n";
+
+    assert_eq!(poll_classify_dead_child(body), None);
+}
