@@ -315,6 +315,7 @@ export function multiHostSnapshot(): unknown {
         enteredPhaseAt: isoMinutesBefore(4),
         model: "opus",
         effort: "high",
+        runtime: "claude",
         updatedAt: isoMinutesBefore(4),
       },
       {
@@ -326,6 +327,7 @@ export function multiHostSnapshot(): unknown {
         // No phase yet: sweep.started has arrived, sweep.phase has not.
         startedAt: isoMinutesBefore(1),
         model: "opus",
+        runtime: "codex",
         updatedAt: isoMinutesBefore(1),
       },
       {

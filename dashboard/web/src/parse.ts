@@ -25,6 +25,7 @@ import type {
   HostHealthRecord,
   HostProtection,
   ManagedRepoEntry,
+  ProviderPoolAggregate,
   RoleTickFailure,
   RoleTickHealth,
   TokenAccount,
@@ -133,6 +134,7 @@ export function parseTokenAccount(value: unknown): TokenAccount {
   if (!isObject(value)) return {};
   return stripUndefined<TokenAccount>({
     account: str(value.account),
+    provider: str(value.provider),
     rank: num(value.rank),
     usage_fraction: num(value.usage_fraction),
     limit_window_reset_at: str(value.limit_window_reset_at),
@@ -152,6 +154,18 @@ export function parseTokensSnapshot(value: unknown): TokensSnapshotRecord {
     account_count: num(value.account_count),
     exhausted_count: num(value.exhausted_count),
     mean_usage_fraction: num(value.mean_usage_fraction),
+    max_usage_fraction: num(value.max_usage_fraction),
+    next_limit_window_reset_at: str(value.next_limit_window_reset_at),
+    providers: Array.isArray(value.providers) ? value.providers.map(parseProviderPoolAggregate) : undefined,
+  });
+}
+
+export function parseProviderPoolAggregate(value: unknown): ProviderPoolAggregate {
+  if (!isObject(value)) return {};
+  return stripUndefined<ProviderPoolAggregate>({
+    provider: str(value.provider),
+    account_count: num(value.account_count),
+    exhausted_count: num(value.exhausted_count),
     max_usage_fraction: num(value.max_usage_fraction),
     next_limit_window_reset_at: str(value.next_limit_window_reset_at),
   });
@@ -184,6 +198,7 @@ export function parseActiveSweep(value: unknown): ActiveSweep | undefined {
     enteredPhaseAt: str(value.enteredPhaseAt),
     model: str(value.model),
     effort: str(value.effort),
+    runtime: str(value.runtime),
     updatedAt: str(value.updatedAt),
   });
 }
