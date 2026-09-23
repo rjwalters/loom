@@ -107,11 +107,22 @@ pub const DEFAULT_CAPACITY: usize = 1024;
 ///
 /// Cloning the bus is **not** the way to add subscribers — call
 /// [`EventBus::subscribe`] instead. Wrap the bus in an `Arc` if you need
-/// to share it across tasks (the daemon's main wiring does so).
+/// to share it across tasks (the daemon's main wiring does so). Cloning an
+/// `EventBus` clones the underlying `broadcast::Sender` — the documented way
+/// to hold it in a long-lived task (ADR-0021's forge_events loop does).
 #[derive(Debug)]
 pub struct EventBus {
     tx: broadcast::Sender<Event>,
     capacity: usize,
+}
+
+impl Clone for EventBus {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            capacity: self.capacity,
+        }
+    }
 }
 
 impl EventBus {

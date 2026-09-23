@@ -1678,6 +1678,14 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data / older clients compatible.
     #[serde(default)]
     pub observability_export: Option<ObservabilityExportStatus>,
+    /// Forge event plane (ADR-0021, Phase 1): the daemon's read-only
+    /// consumption of the operator-deployed event feed — state, durable
+    /// cursor, counters, and the last error. Same "always has an answer"
+    /// contract as [`observability_export`]: a daemon of this vintage always
+    /// reports `Some(..)` — `disabled`, not `None`, when the phase-1
+    /// consumer is off. `#[serde(default)]` for older-wire compatibility.
+    #[serde(default)]
+    pub forge_events: Option<crate::forge_events::ForgeEventsStatus>,
     /// The daemon-wide peer-claim view + transport counters (Issue #5921):
     /// which issues THIS host currently sees claimed, by which host and with
     /// what remaining TTL, plus how many claims have been advertised /

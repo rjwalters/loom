@@ -285,6 +285,13 @@ pub(crate) fn build_status_json_value(
         // States: disabled | starting | never_exported | healthy |
         // host_id_mismatch | failing. `null` only from a pre-#5083 daemon.
         "observability_export": report.observability_export,
+        // Forge event plane (ADR-0021, Phase 1): the daemon's read-only
+        // consumption of the operator-deployed event feed (GitHub webhooks,
+        // Durable-Object queue + per-host cursor, bearer-key-gated).
+        // Always `Some` from a daemon of this vintage — `disabled` is a real
+        // answer, not silence:
+        //   loom-daemon status --json | jq -e '.forge_events.state == "healthy"'
+        "forge_events": report.forge_events,
         // Per-repo pressure-triggered deep-clean state (#5919): when the pass
         // last fired, what it reclaimed, and — for the common non-firing tick
         // — why it declined. Scripted consumers can assert reclamation is
@@ -1159,6 +1166,62 @@ fn render_observability_line(
         State::Unrecognized => format!(
             "Observability: unrecognized state from a newer daemon binary (host_id={host}) — \
              upgrade this client to read it"
+        ),
+    }
+}
+
+/// Forge event plane status line (ADR-0021, Phase 1) — the same "always has
+/// an answer" shape as [`render_observability_line`]: a daemon of this
+/// vintage reports `disabled` rather than printing nothing, so "opted in but
+/// not receiving" is never misread as "not wired up".
+fn render_forge_events_line(fe: Option<&loom_daemon::forge_events::ForgeEventsStatus>) -> String {
+    use loom_daemon::forge_events::ForgeEventsState as State;
+    let Some(fe) = fe else {
+        return "Forge events:  unknown (daemon predates ADR-0021)".to_string();
+    };
+    let host = fe.host_id.as_deref().unwrap_or("unknown-host");
+    match fe.state {
+        State::Disabled => "Forge events:  disabled (opt in with forgeEvents.enabled=true, \n                 forgeEvents.endpoint + hostId, and a key at ~/.loom/forge-events/key)"
+            .to_string(),
+        State::Misconfigured => format!(
+            "Forge events:  MISCONFIGURED (host_id={host}){}",
+            fe.last_error
+                .as_deref()
+                .map_or_else(String::new, |e| format!(" — {e}"))
+        ),
+        State::Connecting => format!(
+            "Forge events:  connecting — host_id={host}, no successful fetch yet (cursor={})",
+            fe.cursor
+        ),
+        State::Failing => format!(
+            "Forge events:  FAILING — {} consecutive error(s): {}",
+            fe.consecutive_errors,
+            fe.last_error.as_deref().unwrap_or("(no detail yet)")
+        ),
+        State::Healthy => format!(
+            "Forge events:  OK — cursor={} as host_id={host}, {} event(s) journaled, last \n                 success {}",
+            fe.cursor,
+            fe.events_journaled,
+            fe.last_success_at
+                .as_deref()
+                .map_or_else(|| "never".to_string(), |t| t.to_string()),
+        ),
+        State::AuthFailed => format!(
+            "Forge events:  AUTH FAILED (host_id={host}){}",
+            fe.last_error
+                .as_deref()
+                .map_or_else(String::new, |e| format!(" — {e}"))
+        ),
+        State::HostMismatch => format!(
+            "Forge events:  HOST MISMATCH (host_id={host}){}",
+            fe.last_error
+                .as_deref()
+                .map_or_else(String::new, |e| format!(" — {e}"))
+        ),
+        State::Backoff => format!(
+            "Forge events:  BACKING OFF (streak ≥ threshold) — {} consecutive error(s) as \n                 host_id={host}: {}",
+            fe.consecutive_errors,
+            fe.last_error.as_deref().unwrap_or("")
         ),
     }
 }
@@ -2254,6 +2317,10 @@ pub(crate) fn print_status_human(
         "{}",
         render_observability_line(report.observability_export.as_ref(), Utc::now())
     );
+
+    // Forge event plane (ADR-0021, Phase 1): the same "always has an answer"
+    // treatment as the observability line immediately above.
+    println!("{}", render_forge_events_line(report.forge_events.as_ref()));
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before

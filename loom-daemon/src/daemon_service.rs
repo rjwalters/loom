@@ -2025,6 +2025,19 @@ pub(crate) async fn run_daemon() -> Result<()> {
         workspace_pool.clone(),
     );
 
+    // Forge event plane (ADR-0021, Phase 1) — the daemon's feed consumer:
+    // polls the operator-deployed Worker's per-host event feed, journals the
+    // events under `~/.loom/forge-events/`, and publishes one `forge.event`
+    // in-process prompt per non-empty page (a re-query prompt, never a
+    // control-plane input — ADR-0014 invariant 1). FLAGS-OFF by default:
+    // `forgeEvents.enabled=true` plus a minted key at
+    // `~/.loom/forge-events/key` to opt in; registers a status snapshot even
+    // when disabled so `loom daemon status` never reads `None` from this
+    // daemon's vintage.
+    let forge_events_config = loom_daemon::forge_events::read_config(&sweep_workspace);
+    let _forge_events_handles =
+        loom_daemon::forge_events::spawn_task(&forge_events_config, &event_bus);
+
     // Start IPC server. `workspace_health_states` is threaded in so the
     // `DaemonStatus` request can report each registered repo's own halt state
     // (#3930), and `sweep_workspace` is the `effective_roots` fallback for the

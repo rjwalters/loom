@@ -2824,6 +2824,11 @@ pub fn build_daemon_status(
         // vintage: an exporter that never started reports `disabled`, which is
         // a real answer, not the silence #4830 alone could offer.
         observability_export: Some(crate::observability::global_export_status()),
+        // Forge event plane (ADR-0021, Phase 1) — the same process-global
+        // snapshot pattern. Always `Some` from a daemon of this vintage: a
+        // disabled or misconfigured consumer still reports its state, which
+        // is the real answer rather than the silence a missing field would be.
+        forge_events: Some(crate::forge_events::global_status()),
         // Per-repo deep-clean state (#5919) — the same process-global snapshot
         // pattern once more, projected by the module that owns the state (the
         // mapping lived here until #7990 moved it beside `snapshot()`).

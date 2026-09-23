@@ -16,6 +16,7 @@ use loom_daemon::types::{CapacityReport, CredentialPreflightReport, DaemonStatus
 /// struct.
 pub(crate) fn sample_report() -> DaemonStatusReport {
     DaemonStatusReport {
+        forge_events: None,
         journal_adopted_at_startup: 0,
         in_flight: vec![],
         unregistered_locked: vec![],

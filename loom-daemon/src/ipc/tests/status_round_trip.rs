@@ -21,6 +21,7 @@ fn test_daemon_status_request_response_round_trip() {
 
     // Response: carries the full report.
     let report = DaemonStatusReport {
+        forge_events: None,
         journal_adopted_at_startup: 0,
         in_flight: vec![],
         unregistered_locked: vec![],
