@@ -54,8 +54,11 @@ pub fn resolve_daemon_bin() -> Result<PathBuf, String> {
 
 /// Testable core: takes the raw `current_exe()` result and a PATH-lookup
 /// function (injected so tests never depend on the real `$PATH` / a real
-/// `loom-daemon` binary being installed).
-fn resolve_from_current_exe(
+/// `loom-daemon` binary being installed). `pub(crate)` so in-crate consumers
+/// facing the same deleted-inode failure class (runtime admission, #8707)
+/// can drive the real resolution strategy on a synthetic path instead of
+/// re-implementing it per call site.
+pub(crate) fn resolve_from_current_exe(
     exe: &Path,
     path_lookup: impl FnOnce(&str) -> Option<PathBuf>,
 ) -> Result<PathBuf, String> {
