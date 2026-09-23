@@ -1395,6 +1395,12 @@ jobs:
           grep -q '## Residual gaps' defaults/docs/guardrail-parity-codex.md
       - name: Run the mocked Codex adapter test suite
         run: bash defaults/scripts/tests/test-spawn-codex.sh
+      - name: Verify persistent-session cancellation with fake workers
+        env:
+          LOOM_TEST_SESSION_IMAGE: ubuntu:24.04
+        run: |
+          docker pull ubuntu:24.04
+          cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
 
   shell-suite-tests:
     name: Shell Test Suites (hermetic)
