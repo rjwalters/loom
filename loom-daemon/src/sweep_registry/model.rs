@@ -1,21 +1,17 @@
 //! Dispatch model resolution and the tiered model-alias ladder.
 
+#[cfg(test)]
+#[path = "model_dispatch_tests.rs"]
+mod dispatch_tests;
+
+#[path = "model_dispatch.rs"]
+mod model_dispatch;
+pub(crate) use model_dispatch::*;
+
 use super::*;
 
-/// Issue #3944: the shipped default model for **autonomous / daemon-dispatched**
-/// sweep children when neither an explicit dispatch `model` param nor an
-/// `autonomous.model` config value is present.
-///
-/// This is deliberately a **non-premium tier**. Without it, a daemon-dispatched
-/// child (`claude -p "/loom:sweep N"`) emits **no** `--model` flag and inherits
-/// whatever model the operator last configured interactively — on the v0.15.0
-/// canary that was a premium tier (Fable 5) which meters premium usage credits
-/// and hard-failed every spawn with "out of usage credits". An autonomous fleet
-/// must never silently inherit a premium interactive default, so daemon dispatch
-/// always pins an explicit, cost-appropriate model. `sonnet` is chosen as the
-/// sane default (fast + cheap for the bulk of build work); override per-repo via
-/// `autonomous.model` in `.loom/config.json`, or per-dispatch via the
-/// `dispatch_sweep` `model` param.
+/// Cost-safe default for autonomous Claude sweeps. Native sweeps use their
+/// selected profile unless a dispatch/config model explicitly overrides it.
 pub const DEFAULT_DISPATCH_MODEL: &str = "sonnet";
 
 /// Issue #3944: which tier of the dispatch-model precedence chain supplied the
@@ -58,29 +54,29 @@ pub fn read_autonomous_model(repo_root: &Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Issue #3944: resolve the model a daemon-dispatched child should run with,
-/// per the precedence **explicit dispatch `model` param > `autonomous.model` in
-/// `.loom/config.json` > shipped [`DEFAULT_DISPATCH_MODEL`]**. Empty/whitespace
-/// strings are treated as unset at every tier. Returns the resolved model plus
-/// the [`ModelSource`] that supplied it (for the dispatch log line).
-///
-/// All autonomous dispatch paths (work-finder, epic supervisor) resolve with
-/// `explicit = None` so they never fall through to the CLI-inherited default;
-/// `dispatch_sweep` passes its optional `model` param as `explicit` so an
-/// explicit request still wins, and an absent one still lands on the shipped
-/// default rather than the operator's interactive CLI default.
+/// Resolve a model against the configured binding for callers without dispatch
+/// admission (for example standalone roles). Sweep dispatch uses the admitted
+/// runtime through `DispatchModel`, preserving explicit > config > default.
 #[must_use]
 pub fn resolve_dispatch_model(repo_root: &Path, explicit: Option<&str>) -> (String, ModelSource) {
+    resolve_dispatch_model_for_runtime(
+        repo_root,
+        explicit,
+        crate::worker_spawn::uses_native_sweep(repo_root),
+    )
+}
+
+fn resolve_dispatch_model_for_runtime(
+    repo_root: &Path,
+    explicit: Option<&str>,
+    native: bool,
+) -> (String, ModelSource) {
     let (model, source) = if let Some(m) = explicit.map(str::trim).filter(|m| !m.is_empty()) {
         (m.to_string(), ModelSource::Param)
     } else if let Some(m) = read_autonomous_model(repo_root) {
         (m, ModelSource::Config)
     } else {
-        let default = if crate::worker_spawn::uses_native_sweep(repo_root) {
-            ""
-        } else {
-            DEFAULT_DISPATCH_MODEL
-        };
+        let default = if native { "" } else { DEFAULT_DISPATCH_MODEL };
         (default.to_string(), ModelSource::Default)
     };
     // Issue #3982: resolve the logical tier/alias to the concrete model ID before
@@ -350,33 +346,11 @@ pub struct ExperimentDispatchModel {
     pub source_label: &'static str,
 }
 
-/// Issue #4809: resolve the model for an autonomous, per-`issue` sweep
-/// dispatch, inserting the model-cost A/B experiment's forced arm model
-/// ahead of the #3944/#4501 default-pin precedence chain when — and ONLY
-/// when — the workspace resolves to `experiment` mode. Mode resolution reads
-/// the SAME env vars (`LOOM_MODEL_EXPERIMENT` / `LOOM_MODEL_EXPERIMENT_CANARY`)
-/// and CANARY guardrail (an uncommitted env confirmation or a gitignored
-/// `.loom/CANARY` sentinel under `repo_root` — never the committed
-/// `sweep.modelExperimentCanary` flag, rejected in #3731) that
-/// `sweep-experiment.sh resolve-mode` uses — see
-/// [`crate::script_helpers::sweep_experiment::resolve_effective_mode_default`].
-///
-/// `off` and `observe` modes are BYTE-IDENTICAL to calling
-/// [`resolve_dispatch_model`] directly (the required no-behavior-change
-/// contract for both) — only `experiment` mode substitutes the arm-forced
-/// model, and an explicit dispatch `model` param is never seen at this
-/// call's `resolve_dispatch_model(repo_root, None)` fallback (callers pass
-/// `explicit = None`, matching every existing autonomous dispatch site).
-///
-/// The arm itself is [`crate::script_helpers::sweep_experiment::assign_arm`]
-/// — a pure function of `issue` and the `complexity` stratum — so the SAME
-/// issue resolves to the SAME arm across a dispatch resume (no re-roll).
-///
-/// `complexity` is the Curator's `<!-- loom:complexity=<tier> -->` tier for
-/// this issue (#4827), which gives the `complex` and `routine` strata an
-/// independent ~50/50 A/B balance instead of stratifying the whole population
-/// as `routine`. `None` (no marker, or an unavailable body) keeps the
-/// pre-#4827 `routine` default — never an error.
+/// Resolve the autonomous single-issue model against the configured runtime.
+/// Dispatch callers defer this policy until runtime admission via `DispatchModel`.
+/// The canary-gated experiment overrides config/default for Claude; explicit
+/// request pins bypass it. Native runtimes keep their profile/config choices.
+/// Complexity is the issue's cached Curator stratum; missing means routine.
 #[must_use]
 pub fn resolve_autonomous_dispatch_model(
     repo_root: &Path,
@@ -402,14 +376,32 @@ pub fn resolve_autonomous_dispatch_model_lazy(
     issue: u32,
     complexity: impl FnOnce() -> Option<String>,
 ) -> ExperimentDispatchModel {
+    resolve_autonomous_model_for_runtime(
+        repo_root,
+        issue,
+        complexity,
+        crate::worker_spawn::uses_native_sweep(repo_root),
+    )
+}
+
+fn resolve_autonomous_model_for_runtime(
+    repo_root: &Path,
+    issue: u32,
+    complexity: impl FnOnce() -> Option<String>,
+    native: bool,
+) -> ExperimentDispatchModel {
     use crate::script_helpers::sweep_experiment as se;
-    if crate::worker_spawn::uses_native_sweep(repo_root) {
-        let (model, _) = resolve_dispatch_model(repo_root, None);
+    if native {
+        let (model, source) = resolve_dispatch_model_for_runtime(repo_root, None, native);
         return ExperimentDispatchModel {
             model,
             mode: "off".into(),
             arm: None,
-            source_label: "native-profile",
+            source_label: if source == ModelSource::Default {
+                "native-profile"
+            } else {
+                source.as_str()
+            },
         };
     }
 
@@ -439,7 +431,7 @@ pub fn resolve_autonomous_dispatch_model_lazy(
         };
     }
 
-    let (model, source) = resolve_dispatch_model(repo_root, None);
+    let (model, source) = resolve_dispatch_model_for_runtime(repo_root, None, native);
     ExperimentDispatchModel {
         model,
         mode,

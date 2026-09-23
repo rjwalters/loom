@@ -1510,40 +1510,6 @@ impl SweepRegistry {
     // Dispatch
     // ------------------------------------------------------------------------
 
-    /// Dispatch a sweep. See module docs.
-    ///
-    /// On idempotency hit returns the existing entry with `was_new = false`.
-    ///
-    /// `model` (issue #3477): when `Some` and non-empty, the spawned child
-    /// receives `--model <value>` appended to the `spawn-claude.sh` argv.
-    /// When `None`, no `--model` flag is emitted at all — the session/CLI
-    /// default is preserved end-to-end.
-    ///
-    /// `effort` (issue #3716): mirrors `model` exactly. When `Some` and
-    /// non-empty, the spawned child receives `--effort <level>` appended to
-    /// the argv (immediately after any `--model`). When `None` or empty, no
-    /// `--effort` flag is emitted at all — the session default reasoning
-    /// effort is preserved end-to-end.
-    ///
-    /// `depends_on` (issue #3729, stacked-PR v1): when `Some(N)`, the spawned
-    /// child receives `--depends-on <N>` embedded in the `-p` prompt string
-    /// (immediately after `--claim-owned`; issue #4121 — NOT a sibling argv
-    /// token, since `--depends-on` is not a real `claude` CLI flag),
-    /// instructing `/loom:sweep` to branch its worktree/PR off
-    /// `feature/issue-<N>`. When `None`, no `--depends-on` text is emitted —
-    /// byte-for-byte unchanged behavior. A single optional parent (not a
-    /// list) makes diamonds unrepresentable.
-    pub fn dispatch(
-        &mut self,
-        kind: &SweepKind,
-        idempotency_key: Option<String>,
-        model: Option<&str>,
-        effort: Option<&str>,
-        depends_on: Option<u32>,
-    ) -> Result<DispatchOutcome> {
-        self.dispatch_inner(kind, idempotency_key, model, effort, depends_on, None)
-    }
-
     /// Issue #4256: reaper-driven resume. When [`Self::reap_once`] observes a
     /// crashed sweep whose checkpoint shows real Builder-or-later progress
     /// (`RESUMABLE_CHECKPOINT_PHASES`) AND whose issue still has an open
@@ -1580,7 +1546,14 @@ impl SweepRegistry {
         issue: u32,
         resume_pr: u32,
     ) -> Result<DispatchOutcome> {
-        self.dispatch_inner(&SweepKind::Issue(issue), None, None, None, None, Some(resume_pr))
+        self.dispatch_inner(
+            &SweepKind::Issue(issue),
+            None,
+            DispatchModel::Resolved(None),
+            None,
+            None,
+            Some(resume_pr),
+        )
     }
 
     /// The **synchronous, self-contained** composition of the
@@ -1600,12 +1573,12 @@ impl SweepRegistry {
         &mut self,
         kind: &SweepKind,
         idempotency_key: Option<String>,
-        model: Option<&str>,
+        model: DispatchModel<'_>,
         effort: Option<&str>,
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
     ) -> Result<DispatchOutcome> {
-        match self.begin_issue_dispatch(
+        match self.begin_issue_dispatch_with_model(
             kind,
             idempotency_key,
             model,
@@ -1698,11 +1671,11 @@ impl SweepRegistry {
     /// and is pinned by
     /// `same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned`
     /// in this module's tests.
-    pub(crate) fn begin_issue_dispatch(
+    pub(crate) fn begin_issue_dispatch_with_model(
         &mut self,
         kind: &SweepKind,
         idempotency_key: Option<String>,
-        model: Option<&str>,
+        model: DispatchModel<'_>,
         effort: Option<&str>,
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
@@ -1715,18 +1688,8 @@ impl SweepRegistry {
             // hermetic unit fixtures do not install runtime manifests
             crate::runtime_preference::DispatchAdmission::none()
         } else {
-            // #8554: `runtime_preference::resolve_for_dispatch` substitutes
-            // for `runtime_admission::resolve_and_admit` — same arity, same
-            // `Err` shape, and byte-identical (reading no credential pool at
-            // all) when no `runtimes.preference` /
-            // `rolePreference.sweep-lifecycle` is configured. When one IS
-            // configured and the top tap's pool is dry, it resolves onto a
-            // lower tap instead of failing, which is exactly why the #7708
-            // work-finder hold (`work_finder::pool_preflight`) no longer held
-            // dispatch here. #8555: it also returns the metered backstop slot
-            // the choice consumed, which rides on `PreparedIssueDispatch` to
-            // `finish_issue_dispatch` and is attached to the child there —
-            // dropped, and so released, by every early return in between.
+            // The admitted runtime and optional backstop reservation travel
+            // together through begin/poll/finish; early returns release the slot.
             match crate::runtime_preference::resolve_for_dispatch(
                 &self.config.workspace_root,
                 "sweep-lifecycle",
@@ -1754,6 +1717,11 @@ impl SweepRegistry {
                 }
             }
         };
+
+        // Resolve implicit defaults/experiments only after the ONE runtime
+        // admission above; explicit pins remain explicit even after fallback.
+        let resolved_model = model.resolve(&self.config, kind, admission.admitted.as_ref());
+        let model = resolved_model.as_deref();
 
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
@@ -3246,7 +3214,7 @@ impl SweepRegistry {
     /// # Why the `start` handshake runs on its own thread
     ///
     /// Every caller of [`Self::finish_issue_dispatch`] — `ipc.rs`'s
-    /// `dispatch_sweep_nonblocking` Phase 3, `dispatch_issue_releasing_poll_lock`'s
+    /// `dispatch_sweep_nonblocking` Phase 3, `dispatch_model_releasing_poll_lock`'s
     /// Phase 3, `dispatch_inner`, and the reaper's resume path — invokes it
     /// **holding the registry's `Arc<Mutex<SweepRegistry>>`**, and the first two
     /// do so directly on a tokio worker thread. So this method must be O(1) on
@@ -3551,11 +3519,11 @@ pub(crate) fn poll_and_classify_spawned_child(
 /// behaviorally identical to `dispatch_inner`'s pre-existing shape for those
 /// tests, since no concurrent lock consumer ever competes with a synchronous
 /// `#[test]` anyway.
-pub(crate) fn dispatch_issue_releasing_poll_lock(
+pub(crate) fn dispatch_model_releasing_poll_lock(
     registry: &Arc<Mutex<SweepRegistry>>,
     kind: &SweepKind,
     idempotency_key: Option<String>,
-    model: Option<&str>,
+    model: DispatchModel<'_>,
     effort: Option<&str>,
     depends_on: Option<u32>,
 ) -> Result<DispatchOutcome> {
@@ -3565,7 +3533,7 @@ pub(crate) fn dispatch_issue_releasing_poll_lock(
         let mut sr = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sr.begin_issue_dispatch(kind, idempotency_key, model, effort, depends_on, None)
+        sr.begin_issue_dispatch_with_model(kind, idempotency_key, model, effort, depends_on, None)
     };
 
     let mut prepared = match begin_outcome? {
