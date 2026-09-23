@@ -281,19 +281,25 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_transcript_ingest_session ON transcript_ingest(session_id);
             CREATE INDEX IF NOT EXISTS idx_transcript_ingest_input_id ON transcript_ingest(input_id);
 
-            -- Transcript archive ledger (Issue #8494)
-            -- One row per Claude Code transcript already rolled into a
-            -- verified `.tar.zst` archive. `file_size`/`file_mtime` make an
-            -- unarchived-since-last-time file a cheap skip, mirroring
-            -- `transcript_ingest` above; `archive_file` names which archive
-            -- currently holds it, for selective restore.
+            -- Transcript archive ledger (Issue #8494; keyed per (transcript,
+            -- sink) since #8758). One row per Claude Code transcript already
+            -- rolled into a verified `.tar.zst` archive under a given sink.
+            -- `local` is the on-disk `.tar.zst` sink (#8494); a future remote
+            -- sink (s3/R2, sibling sub-issue #8759) ledgers its own rows for
+            -- the same transcripts without disturbing the local ones.
+            -- `file_size`/`file_mtime` make an unarchived-since-last-time
+            -- file a cheap skip, mirroring `transcript_ingest` above;
+            -- `archive_file` names which archive currently holds it, for
+            -- selective restore.
             CREATE TABLE IF NOT EXISTS transcript_archive (
-                transcript_path TEXT PRIMARY KEY,
+                transcript_path TEXT NOT NULL,
+                sink TEXT NOT NULL DEFAULT 'local',
                 file_size INTEGER NOT NULL,
                 file_mtime INTEGER NOT NULL,
                 sha256 TEXT NOT NULL,
                 archive_file TEXT NOT NULL,
-                archived_at DATETIME NOT NULL
+                archived_at DATETIME NOT NULL,
+                PRIMARY KEY (transcript_path, sink)
             );
 
             CREATE INDEX IF NOT EXISTS idx_transcript_archive_file ON transcript_archive(archive_file);
@@ -360,6 +366,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // Run migrations for existing databases
     migrate_token_usage_table(conn);
     migrate_quality_metrics_table(conn);
+    migrate_transcript_archive_table(conn);
 
     // Create cost analytics views
     create_cost_analytics_views(conn);
@@ -594,6 +601,82 @@ fn migrate_token_usage_table(conn: &Connection) {
     }
 }
 
+/// Migrate `transcript_archive` to the per-`(transcript, sink)` ledger of
+/// #8758. A database created by #8494 keyed the table on `transcript_path`
+/// alone; SQLite cannot alter a primary key in place, so the migration
+/// rebuilds the table (rename → create → copy with `sink='local'` → drop).
+///
+/// Every row written before #8758 came from the on-disk `.tar.zst` CLI pass,
+/// so `'local'` is the correct backfill identity — a re-run of that same pass
+/// skips exactly the files it already archived. Idempotent: a database that
+/// already carries the `sink` column (including one created fresh by
+/// [`init_schema`]'s `CREATE TABLE` above) is left untouched.
+fn migrate_transcript_archive_table(conn: &Connection) {
+    // `PRAGMA table_info` on a missing table returns zero rows (not an
+    // error), and an existing table's columns are listed by name — a robust
+    // sink-column probe that does not depend on error-message strings. The
+    // table itself always exists by the time this runs: `init_schema`'s
+    // `CREATE TABLE IF NOT EXISTS` above either created the new shape on a
+    // fresh database or left a pre-#8758 table in place for this migration.
+    let has_sink_column = conn
+        .prepare("PRAGMA table_info(transcript_archive)")
+        .and_then(|mut stmt| {
+            let mut found = false;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                if name == "sink" {
+                    found = true;
+                }
+            }
+            Ok(found)
+        })
+        .unwrap_or(false);
+    if has_sink_column {
+        log::debug!("transcript_archive already keyed per (transcript, sink)");
+        return;
+    }
+
+    let migration = "\
+        BEGIN;\
+        ALTER TABLE transcript_archive RENAME TO transcript_archive_pre_sink;\
+        CREATE TABLE transcript_archive (\
+            transcript_path TEXT NOT NULL,\
+            sink TEXT NOT NULL DEFAULT 'local',\
+            file_size INTEGER NOT NULL,\
+            file_mtime INTEGER NOT NULL,\
+            sha256 TEXT NOT NULL,\
+            archive_file TEXT NOT NULL,\
+            archived_at DATETIME NOT NULL,\
+            PRIMARY KEY (transcript_path, sink)\
+        );\
+        INSERT INTO transcript_archive (\
+            transcript_path, sink, file_size, file_mtime, sha256, archive_file, archived_at\
+        ) SELECT transcript_path, 'local', file_size, file_mtime, sha256, archive_file, archived_at \
+          FROM transcript_archive_pre_sink;\
+        DROP TABLE transcript_archive_pre_sink;\
+        COMMIT;";
+    match conn.execute_batch(migration) {
+        Ok(()) => {
+            log::info!("Migrated transcript_archive to the per-(transcript, sink) ledger (#8758)")
+        }
+        Err(e) => {
+            // Best-effort rollback so a half-applied migration does not hold
+            // the write lock; the pre-migration table still carries every row.
+            let _ = conn.execute_batch("ROLLBACK;");
+            log::warn!("Could not migrate transcript_archive to per-(transcript, sink): {e}");
+        }
+    }
+
+    // The rebuild above drops the old index with the old table.
+    if let Err(e) = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcript_archive_file ON transcript_archive(archive_file)",
+        [],
+    ) {
+        log::debug!("Could not create idx_transcript_archive_file: {e} (may be expected)");
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
@@ -675,6 +758,91 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         // Calling a second time should not error
+        init_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn fresh_transcript_archive_ledger_is_keyed_per_transcript_and_sink() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // The composite key accepts the same transcript under two sinks…
+        conn.execute(
+            "INSERT INTO transcript_archive \
+             (transcript_path, sink, file_size, file_mtime, sha256, archive_file, archived_at) \
+             VALUES ('p.jsonl', 'local', 1, 2, 'x', 'a.tar.zst', '2026-09-23T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transcript_archive \
+             (transcript_path, sink, file_size, file_mtime, sha256, archive_file, archived_at) \
+             VALUES ('p.jsonl', 's3', 1, 2, 'x', 'a.tar.zst', '2026-09-23T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // …but not the same (transcript, sink) twice.
+        assert!(conn
+            .execute(
+                "INSERT INTO transcript_archive \
+                 (transcript_path, sink, file_size, file_mtime, sha256, archive_file, archived_at) \
+                 VALUES ('p.jsonl', 'local', 1, 2, 'x', 'a.tar.zst', '2026-09-23T00:00:00Z')",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn pre_sink_transcript_archive_ledger_migrates_preserving_rows_as_local() {
+        // A #8494-era database: the ledger keyed on transcript_path alone,
+        // already carrying a row for an archived transcript.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transcript_archive (
+                transcript_path TEXT PRIMARY KEY,
+                file_size INTEGER NOT NULL,
+                file_mtime INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                archive_file TEXT NOT NULL,
+                archived_at DATETIME NOT NULL
+            );
+            INSERT INTO transcript_archive
+                (transcript_path, file_size, file_mtime, sha256, archive_file, archived_at)
+            VALUES ('p.jsonl', 10, 20, 'deadbeef', 'old.tar.zst', '2026-09-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let (sink, size, archive_file): (String, i64, String) = conn
+            .query_row(
+                "SELECT sink, file_size, archive_file FROM transcript_archive \
+                 WHERE transcript_path = 'p.jsonl'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sink, "local", "pre-#8758 rows were all archived on disk");
+        assert_eq!(size, 10);
+        assert_eq!(archive_file, "old.tar.zst");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM transcript_archive", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the row moved, it did not duplicate"
+        );
+        // The old table is gone and the index was recreated on the new table.
+        assert!(conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transcript_archive_pre_sink'")
+            .unwrap()
+            .exists([])
+            .is_ok_and(|x| !x));
+        assert!(conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_transcript_archive_file'")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        // Re-running init_schema on the migrated shape is a no-op.
         init_schema(&conn).unwrap();
     }
 }
