@@ -12,10 +12,13 @@
 //! unit-tested at the bottom of this file along with both transports' argv.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+
+use crate::proc_exec::{run_bounded, Completion};
 
 /// The `gh` binary to invoke. Honors `LOOM_GH_BIN` (tests / overrides), the
 /// same seam `forge_cmd::gh_bin`, `forge_cached_list`, and `role_collision`
@@ -38,23 +41,69 @@ fn gh_command(repo_root: &Path) -> Command {
     cmd
 }
 
+/// Wall-clock deadline for every read-only `gh` probe this module and
+/// `clean.rs` issue (issue #8708).
+///
+/// A `clean --workspace <ws> --deep --safe` on loom-worker-1 sat for 25
+/// hours with its `gh api repos/{owner}/{repo}/pulls?...` child wedged in
+/// `futex_do_wait`, pinning `loom-fleet-clean.service` in `activating` for
+/// a day and starving the scheduled 4-hourly fleet clean. Every `gh` call
+/// bounded here is a **read probe** — a hang must resolve as "no answer"
+/// rather than outlive the pass: past this deadline the child's whole
+/// process group is terminated (see [`crate::proc_exec`]) and the caller
+/// maps the result to its existing fail-closed answer — `"UNKNOWN"`,
+/// `None`, or `clean::PrStatus::Unknown` — never to "safe to delete".
+/// Mutating `gh` calls (`edit_labels`, `comment`) stay unbounded on
+/// purpose: a write whose transport died mid-flight may already have
+/// landed, and "assume it failed" is not a safe default there.
+pub(crate) const GH_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run one read-only `gh` probe to completion under `timeout` (#8708).
+///
+/// The seam every bounded probe in this module and `clean.rs` executes
+/// through. Returns `None` on deadline expiry (logged — the operational
+/// signal this bound exists for), on spawn failure, and on
+/// output-collection failure: exactly the "no answer" each caller's
+/// previous `cmd.output().ok()` / `let Ok(..) else` handling already
+/// mapped, now also covering the slow-hang side those handlers could not
+/// see. A probe that **exits** — zero or nonzero — is a completed answer
+/// and keeps its [`Output`], so each caller's existing
+/// `!out.status.success()` fail-closed path keeps deciding those.
+#[must_use]
+pub(crate) fn bounded_output(mut cmd: Command, timeout: Duration) -> Option<Output> {
+    // `Command::output()` nulls stdin when the caller left it unset; the
+    // bounded runner leaves stdin to the caller by design, so preserve that
+    // contract here rather than letting the child inherit the daemon's.
+    cmd.stdin(std::process::Stdio::null());
+    match run_bounded(cmd, timeout) {
+        Ok(Completion::Exited(out)) => Some(out),
+        Ok(Completion::TimedOut { .. }) => {
+            eprintln!(
+                "gh: probe exceeded {timeout:?} deadline — treating result as UNKNOWN (issue #8708)"
+            );
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 /// `gh issue view <N> --json state --jq .state`. Returns `"UNKNOWN"` on any
 /// failure (matches `clean.py`'s `except Exception: issue_state = "UNKNOWN"`).
 #[must_use]
 pub fn issue_state(repo_root: &Path, issue: u32) -> String {
-    let out = gh_command(repo_root)
-        .args([
-            "issue",
-            "view",
-            &issue.to_string(),
-            "--json",
-            "state",
-            "--jq",
-            ".state",
-        ])
-        .output();
+    let mut cmd = gh_command(repo_root);
+    cmd.args([
+        "issue",
+        "view",
+        &issue.to_string(),
+        "--json",
+        "state",
+        "--jq",
+        ".state",
+    ]);
+    let out = bounded_output(cmd, GH_PROBE_TIMEOUT);
     match out {
-        Ok(o) if o.status.success() => {
+        Some(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if s.is_empty() {
                 "UNKNOWN".to_string()
@@ -77,16 +126,16 @@ pub fn issue_state(repo_root: &Path, issue: u32) -> String {
 /// match [`issue_state`]'s contract.
 #[must_use]
 pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
-    let out = gh_command(repo_root)
-        .args([
-            "api",
-            &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
-            "--jq",
-            ".state",
-        ])
-        .output();
+    let mut cmd = gh_command(repo_root);
+    cmd.args([
+        "api",
+        &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
+        "--jq",
+        ".state",
+    ]);
+    let out = bounded_output(cmd, GH_PROBE_TIMEOUT);
     match out {
-        Ok(o) if o.status.success() => {
+        Some(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_uppercase();
             match s.as_str() {
                 "OPEN" | "CLOSED" => s,
@@ -109,15 +158,14 @@ pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
 /// never be read as "grace period already elapsed".
 #[must_use]
 pub fn issue_closed_at_rest(repo_root: &Path, issue: u32) -> Option<String> {
-    let out = gh_command(repo_root)
-        .args([
-            "api",
-            &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
-            "--jq",
-            ".closed_at",
-        ])
-        .output()
-        .ok()?;
+    let mut cmd = gh_command(repo_root);
+    cmd.args([
+        "api",
+        &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
+        "--jq",
+        ".closed_at",
+    ]);
+    let out = bounded_output(cmd, GH_PROBE_TIMEOUT)?;
     if !out.status.success() {
         return None;
     }
@@ -727,5 +775,83 @@ mod tests {
             parse_open_linked_pr_timeline("gh: rate limit exceeded"),
             OpenPrProbe::ProbeFailed
         );
+    }
+
+    // --- probe bounding (#8708) ------------------------------------------
+    //
+    // The 25-hour `clean --deep --safe` hang this issue reports was an
+    // unbounded `gh api` child wedged in `futex_do_wait`. Every bounded
+    // probe funnels through `bounded_output`; these tests pin the seam's
+    // contract with fixture executables addressed by ABSOLUTE path — no
+    // PATH mutation (the #5961 rule) and no `LOOM_GH_BIN` env racing other
+    // tests — and a sub-second deadline so CI never pays the 60s budget.
+
+    /// Write an executable `sh` fixture under `dir` and return its path.
+    fn write_probe_fixture(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn a_hung_gh_probe_is_killed_at_its_deadline_and_reports_no_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hung = write_probe_fixture(tmp.path(), "hung-probe", "#!/bin/sh\nsleep 30\n");
+        let started = std::time::Instant::now();
+        let out = bounded_output(Command::new(&hung), Duration::from_millis(750));
+        assert!(
+            out.is_none(),
+            "a probe past its deadline must report no answer, never hang: {out:?}"
+        );
+        // Bounded wall-clock: killed ~750ms in; 10s is an order-of-magnitude
+        // margin for CI scheduling, still nothing like the 30s the fixture
+        // would need to exit on its own.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the hung probe must be killed promptly, not waited out: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_fast_gh_probe_completes_with_its_output_captured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ok = write_probe_fixture(tmp.path(), "ok-probe", "#!/bin/sh\nprintf 'OPEN'\n");
+        // Retry the spawn on a no-answer: a freshly-written script can hit
+        // ETXTBSY (or a transient fork failure) under the parallel test
+        // harness — a harness race, not a property of the code under test
+        // (same mitigation `clean::tests::spawn_service_in` applies).
+        let out = (0..10)
+            .find_map(|_| bounded_output(Command::new(&ok), GH_PROBE_TIMEOUT))
+            .expect("a probe that exits inside the deadline must return its Output");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "OPEN");
+    }
+
+    #[test]
+    fn a_failing_gh_probe_is_a_completed_answer_not_a_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fail = write_probe_fixture(tmp.path(), "fail-probe", "#!/bin/sh\nexit 1\n");
+        // Same spawn-retry rationale as the fast-probe test above.
+        let out = (0..10)
+            .find_map(|_| bounded_output(Command::new(&fail), GH_PROBE_TIMEOUT))
+            .expect("a probe that ran and exited nonzero completed, it did not time out");
+        assert!(
+            !out.status.success(),
+            "the nonzero exit must survive the bounding so each caller's existing \
+             `!out.status.success()` -> fail-closed path keeps deciding it"
+        );
+    }
+
+    #[test]
+    fn a_missing_gh_binary_is_no_answer_exactly_as_before_the_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = bounded_output(Command::new(tmp.path().join("no-such-gh")), GH_PROBE_TIMEOUT);
+        assert!(out.is_none(), "a spawn failure must stay a no-answer: {out:?}");
     }
 }
