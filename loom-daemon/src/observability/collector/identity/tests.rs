@@ -150,3 +150,35 @@ fn missing_or_malformed_identity_is_unknown_and_has_no_fabricated_provider() {
     assert_eq!(parsed.model, None);
     assert!(parse_launch_runtime(r#"{"runtime":" "}"#).is_none());
 }
+
+/// Issue #8720 guardrail: restoring lifecycle correlation for an ADOPTED sweep
+/// must not turn identity enrichment into a row creator. A phase event only
+/// invalidates the replay cache so an already-resolved identity can be re-sent
+/// once a lifecycle row exists — on its own it enqueues nothing, opens no
+/// launch reader, and therefore cannot create or resurrect a row for an event
+/// with no authoritative registry evidence behind it (the issue's own
+/// hand-injected `unknown-issue-8715` example).
+#[test]
+fn a_phase_event_alone_never_produces_an_identity_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let queue = DurableQueue::open(root.join("queue.jsonl"), 100);
+    let mut sampler = Sampler::default();
+
+    sampler.observe(
+        &Event::SweepPhase {
+            issue: 8715,
+            phase: "builder".into(),
+            pr_number: None,
+            repo: Some(root.display().to_string()),
+        },
+        &root,
+    );
+
+    assert_eq!(queue.len(), 0, "a phase event must not enqueue an identity record");
+    assert!(sampler.sent.is_empty());
+    assert!(
+        sampler.readers.is_empty(),
+        "identity is sampled from live registry entries only, never from an event"
+    );
+}

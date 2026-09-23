@@ -19,12 +19,21 @@
 //! (sweep_id, started_at, trace_context)` map ([`DispatchState`]), populated on
 //! `sweep.global.dispatch` and consulted (then cleared) on the terminal
 //! event. Like every other in-process daemon tracker (e.g.
-//! `work_finder`'s per-root state maps), this resets across a daemon
-//! restart: a sweep already in flight when the collector starts emits
-//! `sweep.phase`/`sweep.completed`/`sweep.outcome` records with a
+//! `work_finder`'s per-root state maps), this resets across a daemon restart.
+//!
+//! A sweep already in flight when the collector starts therefore has no
+//! dispatch to correlate against. Since Issue #8720 the map is re-seeded from
+//! the owning registry's own **adoption evidence**
+//! ([`crate::sweep_registry::SweepRegistry::tracked_sweep_identity`]) when
+//! there is any, so an adopted sweep's `sweep.phase`/`sweep.completed`/
+//! `sweep.outcome` records carry the same id this daemon already reports for
+//! it in `host.health`'s `active_sweep_ids` and its `sweep.identity` record,
+//! and the same start instant adoption admitted it with. Only an event with
+//! **no** such evidence — a genuinely untracked issue — still degrades to a
 //! synthesized `unknown-issue-{N}` sweep id and a zero `total_duration_sec`
-//! rather than failing to emit at all — a degraded record beats a silently
-//! dropped one for a telemetry pipeline.
+//! rather than failing to emit at all: a degraded record beats a silently
+//! dropped one for a telemetry pipeline. Nothing on either path replays a
+//! `sweep.started` record for a sweep that started before this process did.
 //!
 //! # Terminal outcome: `SweepExited`/`SweepCrashed` only
 //!
@@ -142,6 +151,7 @@ async fn run_collector(
                             &host_id,
                             &mut dispatches,
                             &mut slug_cache,
+                            &workspace_pool,
                         )
                         .await;
                     }
@@ -213,6 +223,7 @@ async fn handle_event(
     host_id: &str,
     dispatches: &mut HashMap<DispatchKey, DispatchState>,
     slug_cache: &mut HashMap<String, String>,
+    workspace_pool: &WorkspacePool,
 ) {
     let Some(issue) = event_issue(&event) else {
         return;
@@ -227,17 +238,48 @@ async fn handle_event(
         return;
     };
     let visibility = resolve_visibility(&slug).await;
+    let root = Path::new(&workspace_path);
     for envelope in correlation::map_envelopes(
         &event,
         issue,
         &slug,
         visibility,
-        Path::new(&workspace_path),
+        root,
         host_id,
         dispatches,
+        // Lazily evaluated: `map_envelopes` only asks when its own correlation
+        // map has nothing, so an ordinary dispatched sweep's every phase event
+        // costs no registry lock at all.
+        &|| registry_evidence(workspace_pool, root, issue),
     ) {
         queue.push(envelope);
     }
+}
+
+/// This host's authoritative identity for the live sweep of `issue` in the
+/// workspace that emitted the event (Issue #8720), or `None` when the owning
+/// registry has no unambiguous non-terminal entry for it.
+///
+/// Looked up by **exact** root path rather than by scanning every provisioned
+/// registry: `workspace_root` here is the event's own `repo` stamp, which
+/// `SweepRegistry::emit_event` fills from `config().workspace_root.display()`
+/// — the same `PathBuf` [`WorkspacePool`] keys that registry under. Scanning
+/// (and locking) every other repo's registry to answer a question about this
+/// one would only add ways for another repo's same-numbered issue to become a
+/// candidate. A workspace with no provisioned registry (an event from a
+/// standalone registry, e.g. in tests) simply has no evidence, and the caller
+/// keeps today's synthesized-id fallback.
+fn registry_evidence(
+    workspace_pool: &WorkspacePool,
+    workspace_root: &Path,
+    issue: u32,
+) -> Option<crate::sweep_registry::TrackedSweepIdentity> {
+    let registry = workspace_pool.provisioned_registry_for(workspace_root)?;
+    let identity = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .tracked_sweep_identity(issue);
+    identity
 }
 
 /// The issue this event concerns, or `None` for an event kind this collector
