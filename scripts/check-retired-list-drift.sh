@@ -425,6 +425,16 @@ self_test() {
     fi
 
     # (7) the surface map still matches resync-installed.sh's retired_target_path()
+    #
+    # ONE-DIRECTIONAL, on purpose: `arms_expected` below is a hardcoded literal,
+    # not a value derived from this gate's own entry_for_defaults_path() /
+    # defaults_path_for_entry(). So this catches retired_target_path() drifting
+    # (the direction that matters — the consumer is what decides where an
+    # installed copy lives, and it can change without this file being touched).
+    # It does NOT catch someone editing this gate's map functions and updating
+    # `arms_expected` to match: that edit is visible in the same diff, so it is
+    # review-caught rather than test-caught. Do not describe this as "the two
+    # maps agree" — only one of the two is read from source here.
     local resync arms_expected arms_actual
     resync="$REPO_ROOT/defaults/scripts/resync-installed.sh"
     if [[ -f "$resync" ]]; then
@@ -435,7 +445,7 @@ self_test() {
             'hooks/*' 'scripts/*' 'roles/*' 'docs/*' 'runtimes/*' 'bin/*' \
             'commands/loom/*' '.claude/README.md' '.github/CONFIGURATION.md' | LC_ALL=C sort)"
         if [[ "$arms_actual" == "$arms_expected" ]]; then
-            st_pass "surface map agrees with resync-installed.sh's retired_target_path()"
+            st_pass "resync-installed.sh's retired_target_path() case arms match this gate's expected set (one-directional)"
         else
             st_fail_msg "retired_target_path() case arms drifted from this gate's surface map:
 --- resync-installed.sh

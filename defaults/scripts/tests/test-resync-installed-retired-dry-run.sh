@@ -13,15 +13,15 @@
 # would pass every existing assertion.
 #
 # Why that half matters, and why it is a contract rather than cosmetics:
-# 2AMLogic/2am's fleet-resync self-heal (`dirty_is_safe_resync_output`,
-# 2AMLogic/2am#1009) reconciles every dirty path in a consumer repo against
-# `resync-installed.sh --dry-run`'s plan and SKIPs the repo when a dirty path
-# is unaccounted for. So the dry-run plan is a consumed API: a retired file
-# missing from it stalls 23 repos, and a pinned file wrongly IN it makes a
-# consumer expect a removal that will never come. #8675 suspected the preview
-# was missing entirely; it is not (remove_retired_files() has its own
-# `$DRY_RUN` guard), so this suite is the regression lock that keeps it that
-# way.
+# A downstream fleet-management repo's resync self-heal
+# (`dirty_is_safe_resync_output`, example-org/fleet-repo#1009) reconciles every
+# dirty path in a consumer repo against `resync-installed.sh --dry-run`'s plan
+# and SKIPs the repo when a dirty path is unaccounted for. So the dry-run plan
+# is a consumed API: a retired file missing from it stalls 23 repos, and a
+# pinned file wrongly IN it makes a consumer expect a removal that will never
+# come. #8675 suspected the preview was missing entirely; it is not
+# (remove_retired_files() has its own `$DRY_RUN` guard), so this suite is the
+# regression lock that keeps it that way.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-resync-installed-retired-dry-run.sh
@@ -105,8 +105,8 @@ if grep -q "retired" <<<"$OUT"; then
 else
     fail "(#8675) the preview line gives no retirement reason (out=$OUT)"
 fi
-# The count matters as much as the line: 2am reads the summary to decide
-# whether the plan is empty.
+# The count matters as much as the line: the downstream self-heal reads the
+# summary to decide whether the plan is empty.
 if grep -qE "1 would be removed" <<<"$OUT"; then
     pass "(#8675) the dry-run summary counts the pending removal"
 else
