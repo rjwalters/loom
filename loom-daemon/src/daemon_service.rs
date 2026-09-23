@@ -1101,6 +1101,18 @@ pub(crate) async fn run_daemon() -> Result<()> {
         loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS
     );
 
+    // PR-less retry bound (#7972): resolve env > config > default for the
+    // default workspace so an issue whose dispatches keep ending without a
+    // pull request is spaced out and — at the threshold — held with
+    // `loom:blocked`, instead of being re-claimed forever. The only brake of
+    // the four keyed on "did the dispatch produce a PR" rather than on how the
+    // child died, which is why it catches the shape the others structurally
+    // cannot (a sweep that advances its checkpoint and still produces nothing).
+    // Resolve + set + log live in the module (`configure_prless_retry`), not
+    // inline here: `daemon_service.rs` is over the file-size ratchet's
+    // threshold and frozen at its current size (.loom/docs/file-size-policy.md).
+    sweep_registry::configure_prless_retry(&mut sweep, &sweep_workspace);
+
     // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
     // env > config > default for the default workspace so a fleet-wide,
     // cross-issue spawn failure (e.g. a stale `.mcp.json`) trips a visible

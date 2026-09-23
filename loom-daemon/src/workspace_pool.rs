@@ -439,6 +439,13 @@ impl WorkspacePool {
         // held out of dispatch instead of being re-offered on the very next
         // tick. Independent of the three brakes above.
         registry.set_decline_cooldown_config(sweep_registry::resolve_decline_cooldown_config(root));
+        // PR-less retry bound (#7972): resolve env > config > default for this
+        // workspace, so an issue whose dispatches keep ending without a pull
+        // request is spaced out and — at the threshold — held with
+        // `loom:blocked`, instead of being re-claimed forever. Independent of
+        // the four brakes above; it is the only one keyed on "did the dispatch
+        // produce a PR" rather than on how the child died.
+        registry.set_prless_retry_config(sweep_registry::resolve_prless_retry_config(root));
         // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
         // env > config > default for this workspace, mirroring the
         // insta-crash quarantine config above.
