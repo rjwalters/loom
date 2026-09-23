@@ -75,6 +75,14 @@ must re-apply them before its first run is trusted:
 If a daemon test fails on the box but passes on CI (or the reverse), check
 these two first before reading the code.
 
+## Known flakes
+
+- `forge_listing::tests::errors_carry_stderr_for_the_rate_limit_classifier`
+  — failed 1 of 2 full-suite runs on the box (passes solo, passes the other
+  full run; CI green). Parallel-interaction candidate in a PRE-EXISTING test,
+  untouched by ADR-0021. If it recurs >25% of full runs, triage for real;
+  until then: re-run the module solo before believing it.
+
 ## The box as a Superset host (multi-host subagents)
 
 Registered in the `noc0` org under the standalone CLI (`curl -fsSL
