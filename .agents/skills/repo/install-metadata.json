@@ -1,0 +1,8 @@
+{
+  "version": "0.12.1",
+  "commit": "a99ec1c",
+  "layout_version": 2,
+  "dev": false,
+  "filtered": true,
+  "commands": ["help","remote"]
+}
