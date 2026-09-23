@@ -1191,8 +1191,9 @@ impl SweepRegistry {
                             let log_path = self.entries.get(&sweep_id).map(|i| i.log_path.clone());
                             let classification = log_path
                                 .as_deref()
-                                .and_then(|p| tail_lines(p, EXHAUSTION_LOG_TAIL_LINES).ok())
-                                .map(|lines| lines.join("\n"))
+                                .and_then(|p| {
+                                    dispatch_scoped_tail(p, EXHAUSTION_LOG_TAIL_LINES).ok()
+                                })
                                 .and_then(|tail| classify_crash(&tail, exit_code));
                             // Issue #4386: whether THIS run's checkpoint write
                             // proves genuine progress (see the comment above
@@ -1922,8 +1923,9 @@ impl SweepRegistry {
                                 .entries
                                 .get(&sweep_id)
                                 .map(|i| i.log_path.clone())
-                                .and_then(|p| tail_lines(&p, EXHAUSTION_LOG_TAIL_LINES).ok())
-                                .map(|lines| lines.join("\n"))
+                                .and_then(|p| {
+                                    dispatch_scoped_tail(&p, EXHAUSTION_LOG_TAIL_LINES).ok()
+                                })
                                 .and_then(|tail| classify_crash(&tail, exit_code));
                             // #7708: captured before `classification` moves
                             // into the outcome journal below — see this

@@ -480,6 +480,49 @@ pub(crate) fn recover_adopted_runtime(log_path: &Path, sweep_id: &str) -> String
 /// tail is where it lands; a bounded tail keeps the read cheap.
 pub(crate) const EXHAUSTION_LOG_TAIL_LINES: usize = 200;
 
+/// Read `path` and return the last `n` lines of the CURRENT dispatch's log
+/// region — text at/after the newest [`DISPATCH_HEADER_MARKER`] — joined with
+/// `\n`, ready to feed [`classify_crash`] / [`classify_account_exhaustion`].
+///
+/// Issue #8716: the plain [`tail_lines`] helper takes the last `n` lines of
+/// the WHOLE per-issue log file. Per-issue logs are append-only and reused
+/// across dispatch attempts, so a short new attempt's tail can be padded out
+/// with lines from an OLDER attempt still sitting earlier in the same file —
+/// observed live as two OpenCode dispatch attempts (#8675/#8676) that died on
+/// a distinct native-model/config failure but were reported as rate-limited
+/// because an earlier Claude attempt's exhaustion banner was still within the
+/// last `n` lines. This helper applies the SAME dispatch-header scoping
+/// contract [`classify_preflight_death`] already applies internally
+/// (`contents.rfind(DISPATCH_HEADER_MARKER)`), but does it BEFORE bounding to
+/// `n` lines, so the bound itself can never straddle two dispatches.
+///
+/// A log with no dispatch header at all (written before the marker existed,
+/// or an adapter that never emits it) falls back to the tail of the WHOLE
+/// file — byte-for-byte the pre-#8716 behavior for that case, not a narrower
+/// one. This is deliberate: it is the one shape where scoping has no
+/// evidence to act on, so the fallback preserves rather than changes existing
+/// behavior for legacy logs.
+///
+/// Returns `Err` when the file is missing/unreadable, exactly like
+/// [`tail_lines`] (which this intentionally does not delegate to, so the
+/// region is sliced BEFORE the `n`-line bound is applied rather than after).
+pub(crate) fn dispatch_scoped_tail(path: &Path, n: usize) -> Result<String> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let region = contents
+        .rfind(DISPATCH_HEADER_MARKER)
+        .map_or(contents.as_str(), |start| &contents[start..]);
+    let lines: Vec<&str> = region.lines().collect();
+    let tail: &[&str] = if n == 0 {
+        &[]
+    } else if lines.len() > n {
+        &lines[lines.len() - n..]
+    } else {
+        &lines[..]
+    };
+    Ok(tail.join("\n"))
+}
+
 /// The account-exhaustion signature table (#4122).
 ///
 /// Each row is a `(label, regex)` pair matched against the tail of a dead
@@ -1683,6 +1726,10 @@ spawn-claude: using OAuth account 'stale-account' (mode=random)
 #[cfg(test)]
 #[path = "crash_signals_empty_pool_tests.rs"]
 mod empty_pool_tests;
+
+#[cfg(test)]
+#[path = "crash_signals_dispatch_scope_tests.rs"]
+mod dispatch_scope_tests;
 
 #[cfg(test)]
 #[path = "crash_signals_model_class_tests.rs"]
