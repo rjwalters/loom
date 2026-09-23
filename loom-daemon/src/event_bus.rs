@@ -106,8 +106,10 @@ pub const DEFAULT_CAPACITY: usize = 1024;
 /// In-memory pub/sub event bus.
 ///
 /// Cloning the bus is **not** the way to add subscribers — call
-/// [`EventBus::subscribe`] instead. Wrap the bus in an `Arc` if you need
-/// to share it across tasks (the daemon's main wiring does so).
+/// [`EventBus::subscribe`] instead. A clone is another *publisher handle* to
+/// the same channel (see the [`Clone`] impl below, added for #8765); wrap the
+/// bus in an `Arc` when several holders must share one handle rather than own
+/// their own (the daemon's main wiring does so).
 #[derive(Debug)]
 pub struct EventBus {
     tx: broadcast::Sender<Event>,
@@ -198,6 +200,30 @@ impl EventBus {
 impl Default for EventBus {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Cloning a bus yields another **handle to the same channel** — a clone of
+/// the underlying [`broadcast::Sender`], not a second, independent bus. An
+/// event published through any clone reaches every subscriber of every clone.
+///
+/// This exists for long-lived owned tasks (issue #8765's
+/// [`crate::forge_events`] poll loop is the first) that need to publish for
+/// the life of the process and would otherwise have to be handed an
+/// `Arc<EventBus>` — which the daemon's wiring already moves into the IPC
+/// server. It is **not** the way to add a subscriber: call
+/// [`EventBus::subscribe`] for that, on this handle or any other.
+///
+/// Note the one behavioural subtlety inherited from `broadcast`: a live
+/// sender clone keeps the channel open, so a subscriber's `recv` will not
+/// observe `Closed` while any clone is alive. Every clone this daemon makes
+/// lives as long as the process, so that is the intended shape.
+impl Clone for EventBus {
+    fn clone(&self) -> Self {
+        EventBus {
+            tx: self.tx.clone(),
+            capacity: self.capacity,
+        }
     }
 }
 

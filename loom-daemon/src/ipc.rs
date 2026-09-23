@@ -2831,6 +2831,12 @@ pub fn build_daemon_status(
         // a daemon with observability off — the singular field above already
         // distinguishes that state.
         observability_exports: crate::observability::global_export_statuses(),
+        // Forge event-feed consumer (ADR-0021, #8765) — same process-global
+        // snapshot pattern. Always `Some` from a daemon of this vintage: a
+        // consumer that never started reports `disabled`, so "is my cursor
+        // advancing, and if not, why" is always answered rather than inferred
+        // from an absent warning.
+        forge_events: Some(crate::forge_events::global_status()),
         // Per-repo deep-clean state (#5919) — the same process-global snapshot
         // pattern once more, projected by the module that owns the state (the
         // mapping lived here until #7990 moved it beside `snapshot()`).
