@@ -54,8 +54,11 @@ pub fn resolve_daemon_bin() -> Result<PathBuf, String> {
 
 /// Testable core: takes the raw `current_exe()` result and a PATH-lookup
 /// function (injected so tests never depend on the real `$PATH` / a real
-/// `loom-daemon` binary being installed).
-fn resolve_from_current_exe(
+/// `loom-daemon` binary being installed). `pub(crate)` so in-crate consumers
+/// facing the same deleted-inode failure class (runtime admission, #8707)
+/// can drive the real resolution strategy on a synthetic path instead of
+/// re-implementing it per call site.
+pub(crate) fn resolve_from_current_exe(
     exe: &Path,
     path_lookup: impl FnOnce(&str) -> Option<PathBuf>,
 ) -> Result<PathBuf, String> {
@@ -216,6 +219,55 @@ mod tests {
             candidate.is_file().then_some(candidate)
         });
         assert_eq!(found, Some(bin));
+    }
+
+    /// #8707 regression guard. Three sites decide the native (OpenCode/Pi/
+    /// Kimi) lane's availability from "where is my own binary?", and all three
+    /// run **in the daemon process** — where, from the moment `auto_update`
+    /// stages a replacement until the drain-restart lands (hours, per #8514),
+    /// a raw `std::env::current_exe()` names the unlinked inode's
+    /// ` (deleted)` path:
+    ///
+    /// - `runtime_admission.rs` — the adapter existence check that rejected
+    ///   every native dispatch (`adapter ... (deleted) is missing`).
+    /// - `native_readiness/probe.rs` — `LOOM_NATIVE_TOOL_BIN` for the
+    ///   readiness probe; a nonexistent path makes the guarded binding refuse
+    ///   to initialize, i.e. "native not ready".
+    /// - `native_tools/provision.rs` — `LOOM_NATIVE_TOOL_BIN` /
+    ///   `LOOM_DAEMON_SELF_BIN` for the launched session; a nonexistent path
+    ///   means every guarded `loom_*` tool call fails.
+    ///
+    /// Fixing only one leaves the #8436 backstop dark for the same window by
+    /// a different route, so pin all three to this resolver. Comment prose is
+    /// exempt (these modules discuss `current_exe()` at length); only real
+    /// call sites count.
+    #[test]
+    fn test_native_lane_self_binary_sites_route_through_this_resolver() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for relative in [
+            "runtime_admission.rs",
+            "native_readiness/probe.rs",
+            "native_tools/provision.rs",
+        ] {
+            let path = src.join(relative);
+            let body = fs::read_to_string(&path).unwrap();
+            let raw: Vec<_> = body
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .filter(|line| line.contains("std::env::current_exe("))
+                .collect();
+            assert!(
+                raw.is_empty(),
+                "{relative} calls std::env::current_exe() directly at {raw:?} — mid-roll that is \
+                 the ' (deleted)' path and the native lane goes dark (#8707). Use \
+                 daemon_bin_resolve::resolve_daemon_bin() instead."
+            );
+            assert!(
+                body.contains("daemon_bin_resolve::resolve_daemon_bin"),
+                "{relative} no longer resolves its own binary through \
+                 daemon_bin_resolve::resolve_daemon_bin (#8707)"
+            );
+        }
     }
 
     #[test]

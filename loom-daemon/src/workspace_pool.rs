@@ -281,6 +281,11 @@ impl WorkspacePool {
         // why the two must differ).
         let completion_ttl = peer_claims::resolve_peer_completion_ttl(repo_root);
         inner_view.set_completion_ttl(completion_ttl);
+        // Issue #8026: how recently this host must have advertised for its own
+        // receive-quiet verdict to carry weight. Env-only (no config key) —
+        // resolved here so a host with a deliberately slow reaper can widen it
+        // without recompiling.
+        inner_view.set_advertise_activity_window(peer_claims::resolve_advertise_activity_window());
         let view = Arc::new(Mutex::new(inner_view));
         let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(safehouse::PEER_CLAIM_CHANNEL_CAP);
         let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view.clone()));
