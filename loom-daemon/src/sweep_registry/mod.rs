@@ -115,6 +115,7 @@ mod locks;
 mod model;
 mod noop_cooldown;
 mod outcome_journal;
+mod prless_retry;
 mod quarantine;
 mod reaper;
 mod stacking;
@@ -145,6 +146,8 @@ pub use model::*;
 pub use noop_cooldown::*;
 #[allow(unused_imports)]
 pub use outcome_journal::*;
+#[allow(unused_imports)]
+pub use prless_retry::*;
 #[allow(unused_imports)]
 pub use quarantine::*;
 #[allow(unused_imports)]
@@ -622,6 +625,22 @@ pub struct SweepRegistry {
     /// the quarantine tally (a crash-loop brake) — this one says "no agent has
     /// standing to act on this issue until a maintainer clears a label".
     decline_cooldown: HashMap<u32, DeclineCooldownState>,
+    /// PR-less retry-bound parameters (Issue #7972). Set at provision time from
+    /// the resolved env > config > default value, mirroring
+    /// [`noop_cooldown_config`](Self::noop_cooldown_config).
+    prless_retry_config: PrlessRetryConfig,
+    /// PR-less claim/release state (Issue #7972): per-issue tallies and windows
+    /// armed by [`record_prless_release`](Self::record_prless_release) when a
+    /// terminal sweep outcome leaves no pull request behind.
+    ///
+    /// Keyed on the one signal the #7893 loop could not fake — *did this
+    /// dispatch produce a PR* — rather than on exit code, duration, or
+    /// checkpoint movement, each of which that loop satisfied while producing
+    /// nothing. Independent of [`noop_cooldown`](Self::noop_cooldown) (a
+    /// self-reported conclusion), [`dispatch_backoff`](Self::dispatch_backoff)
+    /// (a crash/no-progress cadence), [`decline_cooldown`](Self::decline_cooldown)
+    /// (a standing question) and the quarantine tally (a fast-crash brake).
+    prless_retry: HashMap<u32, PrlessRetryState>,
     /// Per-issue memo of the last **verified** open linked PR (Issue #6788),
     /// written only by [`probe_open_linked_pr`](Self::probe_open_linked_pr) and
     /// consumed only by it. See [`OpenPrMemoEntry`] and
@@ -1062,6 +1081,8 @@ impl SweepRegistry {
             noop_cooldown: HashMap::new(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
             decline_cooldown: HashMap::new(),
+            prless_retry_config: PrlessRetryConfig::default(),
+            prless_retry: HashMap::new(),
             open_pr_memo: Mutex::new(HashMap::new()),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),

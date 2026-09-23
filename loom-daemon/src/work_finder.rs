@@ -755,6 +755,26 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// The set of issue numbers currently inside a **PR-less retry window**
+    /// (Issue #7972): a previous dispatch claimed the issue, released it, and
+    /// left no pull request behind, and the window the reaper armed has not yet
+    /// elapsed. Skipped exactly like [`quarantined`](Self::quarantined) /
+    /// [`backed_off`](Self::backed_off) / [`noop_cooldown`](Self::noop_cooldown)
+    /// — filtered out *before* the concurrency budget is filled.
+    ///
+    /// A fourth, distinct bound, keyed on the one signal the observed #7893
+    /// loop could not fake: **did the dispatch produce a PR?** That loop
+    /// advanced its checkpoint on every attempt, which reset the quarantine
+    /// tally and cleared the dispatch backoff, so it re-claimed the same issue
+    /// fourteen times in four hours — several times inside the same minute —
+    /// without ever tripping `quarantined`, `backed_off` or `noop_cooldown`.
+    ///
+    /// Defaults to empty so a dispatcher that does not model the bound (e.g. a
+    /// test fake) opts out with zero boilerplate.
+    fn prless_retry(&self) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Whether this dispatcher's workspace is missing
     /// `.claude/commands/loom/sweep.md` — the **structural, workspace-level**
     /// refusal the registry's step-2.4 guard (#4027) enforces via the typed
@@ -932,6 +952,12 @@ pub fn publish_tick_summary_at(
         skipped_pr_open_backoff: report.skipped_pr_open_backoff,
         skipped_noop_cooldown: report.skipped_noop_cooldown,
         skipped_declined: report.skipped_declined,
+        // #7972: `skipped_prless_retry` is deliberately NOT carried on the
+        // cross-process `WorkFinderTickSummary` yet — `types.rs` is over the
+        // file-size ratchet's threshold and frozen at its current size
+        // (.loom/docs/file-size-policy.md), and a wire field is not worth
+        // displacing unrelated code for. The counter IS on `TickReport` and
+        // appears as `prless-retry-skip` on the per-tick summary log line.
         skipped_recheck_interval: report.skipped_recheck_interval,
         skipped_host_constraint: report.skipped_host_constraint,
         deferred_capacity: report.deferred_capacity,
@@ -1085,6 +1111,17 @@ pub struct TickReport {
     /// the park tally — and an operator watching `labeled-skip` climb has no
     /// way to tell which of the two they are looking at.
     pub skipped_declined: usize,
+    /// Issues skipped because they are inside a **PR-less retry window** (Issue
+    /// #7972): a previous dispatch claimed the issue, released it, and left no
+    /// pull request behind. Filtered out before the capacity gate via
+    /// [`WorkDispatcher::prless_retry`], exactly like
+    /// [`skipped_noop_cooldown`](Self::skipped_noop_cooldown) — and a distinct
+    /// counter because it measures a distinct pathology: not a crash
+    /// (`skipped_quarantined`), not a failed dispatch (`skipped_backoff`), not
+    /// a deliberate empty pass (`skipped_noop_cooldown`), but a **full,
+    /// apparently-healthy sweep that produced nothing** and would otherwise be
+    /// re-offered on the very next tick.
+    pub skipped_prless_retry: usize,
     /// Issues skipped because they self-declared a `<!-- loom:recheck-interval=
     /// <value> -->` marker (Issue #6685) and their own `updatedAt` is still
     /// within that interval — see [`WorkItem::is_within_recheck_interval`].
@@ -1352,6 +1389,10 @@ pub fn tick_with_saturation_brake(
     // mirroring `noop_cooldown` above. Empty on every host until a sweep
     // actually declines on a label rule.
     let declined = dispatcher.declined();
+    // PR-less retry windows (#7972) — resolved once per tick, mirroring
+    // `noop_cooldown` / `declined` above. Empty until a dispatch actually
+    // releases an issue without leaving a PR behind.
+    let prless_retry = dispatcher.prless_retry();
     let peer_claimed = dispatcher.peer_claimed();
     // Per-workspace additional skip-label list (#6685) — resolved once per
     // tick, mirroring every other dispatcher-supplied set above.
@@ -1493,6 +1534,18 @@ pub fn tick_with_saturation_brake(
         //      re-flips its label every tick.
         if declined.contains(&item.number) {
             report.skipped_declined += 1;
+            continue;
+        }
+        // 2b5. PR-less retry window (#7972): a previous dispatch claimed this
+        //      issue, released it, and left no pull request behind, and the
+        //      window the reaper armed has not elapsed. Skipped here — before
+        //      the capacity gate, like every sibling brake — so it neither
+        //      reserves a slot nor re-flips its label every tick. Distinct
+        //      from all four above: the loop this bounds advanced its
+        //      checkpoint on every attempt, so it reset the quarantine tally
+        //      and cleared the dispatch backoff while producing nothing.
+        if prless_retry.contains(&item.number) {
+            report.skipped_prless_retry += 1;
             continue;
         }
         // 2c. Peer soft claim (#4028): a peer host advertised a live claim over
@@ -1946,6 +1999,13 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
     // its no-op-cooldown set, dropped in pass 1 for the same reason.
     let declined_sets: Vec<HashSet<u32>> = workspaces.iter().map(|(_, d)| d.declined()).collect();
 
+    // Snapshot each workspace's PR-less retry set (#7972) alongside the
+    // decline set, dropped in pass 1 for the same reason: an issue whose last
+    // dispatch produced no pull request must not reserve a shared slot to
+    // produce none again.
+    let prless_retry_sets: Vec<HashSet<u32>> =
+        workspaces.iter().map(|(_, d)| d.prless_retry()).collect();
+
     // Snapshot each workspace's peer-claim set (#4028) alongside its quarantined
     // set. A peer's live soft claim drops the candidate in pass 1, before the
     // global sort and slot fill, so a peer-claimed issue never reserves a shared
@@ -2132,6 +2192,14 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             // above and independently of all of them.
             if declined_sets[idx].contains(&item.number) {
                 report.skipped_declined += 1;
+                continue;
+            }
+            // PR-less retry window (#7972): a previous dispatch claimed this
+            // issue, released it, and left no PR behind — drop before the
+            // global queue, like the four brakes above and independently of
+            // all of them.
+            if prless_retry_sets[idx].contains(&item.number) {
+                report.skipped_prless_retry += 1;
                 continue;
             }
             // Peer soft claim (#4028): a peer host is already building it — drop
@@ -3063,6 +3131,7 @@ where
                         || report.skipped_pr_open_backoff > 0
                         || report.skipped_noop_cooldown > 0
                         || report.skipped_declined > 0
+                        || report.skipped_prless_retry > 0
                         || report.skipped_recheck_interval > 0
                         || report.skipped_host_constraint > 0
                         || report.skipped_pr_open > 0
@@ -3077,7 +3146,7 @@ where
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} workspace-commands-missing-skip, \
                              {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
-                             {} declined-skip, \
+                             {} declined-skip, {} prless-retry-skip, \
                              {} recheck-interval-skip, \
                              {} host-constraint-skip, \
                              {} pr-open-skip, \
@@ -3095,6 +3164,7 @@ where
                             report.skipped_pr_open_backoff,
                             report.skipped_noop_cooldown,
                             report.skipped_declined,
+                            report.skipped_prless_retry,
                             report.skipped_recheck_interval,
                             report.skipped_host_constraint,
                             report.skipped_pr_open,
@@ -3637,6 +3707,7 @@ pub fn spawn_multi_work_finder_task(
                 || report.skipped_pr_open_backoff > 0
                 || report.skipped_noop_cooldown > 0
                 || report.skipped_declined > 0
+                || report.skipped_prless_retry > 0
                 || report.skipped_recheck_interval > 0
                 || report.skipped_host_constraint > 0
                 || report.skipped_pr_open > 0
@@ -3655,7 +3726,7 @@ pub fn spawn_multi_work_finder_task(
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} workspace-commands-missing-skip, \
                      {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
-                     {} declined-skip, \
+                     {} declined-skip, {} prless-retry-skip, \
                      {} recheck-interval-skip, \
                      {} host-constraint-skip, \
                      {} pr-open-skip, \
@@ -3675,6 +3746,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_pr_open_backoff,
                     report.skipped_noop_cooldown,
                     report.skipped_declined,
+                    report.skipped_prless_retry,
                     report.skipped_recheck_interval,
                     report.skipped_host_constraint,
                     report.skipped_pr_open,
@@ -3885,3 +3957,11 @@ mod tmpfs_warning;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+/// Work-finder coverage for the #7972 PR-less retry skip set. Its own file
+/// (with its own minimal fakes) rather than part of `tests` above, for the
+/// same file-size-ratchet reason `registry_refresh` / `tmpfs_warning` are
+/// split out — `tests.rs` is over threshold and frozen.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod prless_retry_tests;

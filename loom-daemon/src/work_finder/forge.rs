@@ -224,6 +224,20 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
+    /// Issues inside a live PR-less retry window (Issue #7972). Pure
+    /// in-memory read of the registry state `reap_once`'s terminal-outcome
+    /// classification maintains — no forge round trip, mirroring
+    /// `noop_cooldown()`.
+    fn prless_retry(&self) -> HashSet<u32> {
+        match self.registry.lock() {
+            Ok(reg) => reg.prless_retry_issues(chrono::Utc::now()),
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                HashSet::new()
+            }
+        }
+    }
+
     /// Whether this workspace is missing `.claude/commands/loom/sweep.md`
     /// (Issue #4027 guard 2.4, quarantined at the work-finder level by
     /// #6440). A cheap `stat` via `SweepRegistryConfig::has_sweep_command`

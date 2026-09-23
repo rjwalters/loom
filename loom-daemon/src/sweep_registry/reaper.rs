@@ -1375,6 +1375,38 @@ impl SweepRegistry {
                                 // inside — `record_insta_crash_outcome`).
                                 self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
                             }
+                            // PR-less retry bound (#7972). THIS is the branch
+                            // the #7893 loop lived in: a sweep that advanced
+                            // its checkpoint and then died produced
+                            // `checkpoint_progress == true` above, which
+                            // *clears* the dispatch backoff, the quarantine
+                            // tally and the resume runway — so fourteen
+                            // consecutive dispatches that each reached the
+                            // builder phase and each produced nothing reset
+                            // every existing brake and were re-offered on the
+                            // next tick, some within the same minute.
+                            //
+                            // Checkpoint movement is therefore the wrong
+                            // question; "did this dispatch leave a PR behind"
+                            // is the right one, and it is asked here,
+                            // deliberately OUTSIDE the `checkpoint_progress`
+                            // carve-out. Same two exclusions the arms above
+                            // use, for the same reasons: a pool death (#7708)
+                            // and a pre-flight death (#4386) are host- and
+                            // workspace-level faults that say nothing about
+                            // this issue, so neither may charge its tally —
+                            // plus `superseded` (#4463), where a NEWER sweep
+                            // owns the claim and this dead one's outcome is not
+                            // the issue's current state at all.
+                            if !pool_dead && !is_preflight_death && !superseded {
+                                self.note_prless_crash_outcome(
+                                    issue,
+                                    &sweep_id,
+                                    exit_code,
+                                    duration_sec,
+                                    resume_phase_check.as_deref(),
+                                );
+                            }
                             // Reaper-driven resume (Issue #4256): a crash whose
                             // checkpoint shows real Builder-or-later progress
                             // AND whose issue still has an open linked PR is
@@ -1792,6 +1824,13 @@ impl SweepRegistry {
                             // `clear_decline_cooldown` requires. Leave any
                             // existing decline-cooldown record exactly as it
                             // is and let a future tick's probe decide.
+                            // #7972: captured BEFORE the match below moves
+                            // `declined_rule` — the PR-less retry bound further
+                            // down must not charge a decline (a standing
+                            // question `record_decline` already owns) to the
+                            // issue's PR-less tally.
+                            let hard_excluded =
+                                matches!(declined_rule, Some(HardExclusionProbe::Excluded(_)));
                             match declined_rule {
                                 Some(HardExclusionProbe::Excluded(rule)) => {
                                     self.record_decline(issue, rule);
@@ -2008,6 +2047,33 @@ impl SweepRegistry {
                                 // reaches — and is handled inside —
                                 // `record_insta_crash_outcome`).
                                 self.record_insta_crash_outcome(&sweep_id, issue, counted_failure);
+                            }
+                            // PR-less retry bound (#7972) — the sibling call to
+                            // the one in the crashed branch above. Two things
+                            // differ here:
+                            //
+                            //   1. `open_pr_probe` may already hold a verdict
+                            //      (the #4366/#6350 arms probe on a clean exit),
+                            //      so pass it through rather than paying for a
+                            //      second forge round trip. On a NON-clean exit
+                            //      it is `None` and the bound runs its own
+                            //      probe — which the #6788 memo usually serves
+                            //      from cache.
+                            //   2. A hard-exclusion decline (#7528) is excluded
+                            //      on top of the pool-death / pre-flight-death
+                            //      carve-outs: that sweep declined on a label
+                            //      rule, not on the work, and `record_decline`
+                            //      already owns its cadence (`hard_excluded` is
+                            //      captured above, before the match that moves
+                            //      `declined_rule`).
+                            if !pool_dead && !is_preflight_death && !hard_excluded && !superseded {
+                                self.note_prless_exit_outcome(
+                                    issue,
+                                    &sweep_id,
+                                    open_pr_probe,
+                                    exit_code,
+                                    duration_sec,
+                                );
                             }
                         }
                         // Block-the-subtree (issue #3729, v1 item 4): if this
