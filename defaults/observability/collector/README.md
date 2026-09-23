@@ -138,6 +138,78 @@ An absent exporter endpoint fails Collector configuration validation, but an
 unreachable configured backend starts with queues/retries so outages are
 recoverable. Both exporter IDs are explicitly required by all three pipelines.
 
+## Interactive-session filelog receivers
+
+`file_log/codex`, `file_log/pi` and `file_log/claude` tail the on-disk session
+stores that interactive runtime sessions write directly, never through the
+daemon — see #8664 for why that gap exists. They feed the `logs` pipeline
+alongside `otlp` and pass through the same `transform/privacy` allowlist, so
+they land in ClickStack/SigNoz the same way daemon-emitted logs do. Unlike
+`otlp`, they only ever produce log records; there is no metrics or traces
+receiver for interactive sessions here (Claude Code's native OTLP export,
+#8668, is the live-metrics complement).
+
+Each receiver's `operators` pipeline: parses the JSONL line's raw text into
+`attributes` (`json_parser`, `on_error: send_quiet` — a malformed line still
+becomes a mostly-empty record with `loom.runtime` set, it never stalls or
+drops the rest of the file), moves a small, named set of fields into `loom.*`
+attributes, then **retains only that set and removes `body`**. `retain` is an
+explicit allowlist of attribute keys, not a denylist of the ones we happened
+to name — anything `json_parser` produced that no `move` operator claimed is
+dropped, including raw prompt/response/tool-output content. Clearing `body`
+matters independently: `transform/privacy`'s `keep_keys` only inspects
+`attributes`, so a filelog receiver that forgot to clear `body` would leak
+the entire raw JSON line straight through the allowlist. Both steps were
+verified against the real pinned Collector image (see
+[Executable contract and evidence](#executable-contract-and-evidence)).
+
+New attributes this issue adds to the shared allowlist (#8669): `loom.session_id`
+and `loom.agent_id` / `loom.parent_agent_id` (subagent lineage — an
+`agent_change` record's `parentAgentId` is the *immediate* parent at that
+record's level, not the root of the chain; walking `agent_id` -> matching
+`parent_agent_id` across records reconstructs the full chain regardless of
+depth). `loom.runtime`, `loom.provider`, `loom.model` and `loom.duration_sec`
+are reused from the existing schema.
+
+| Source | Path tailed (in-container) | `loom.*` fields populated |
+| --- | --- | --- |
+| Codex | `/var/lib/loom-sessions/codex/**/*.jsonl` | `runtime` (static `"codex"`), `session_id` (from a `session_meta` record), `model` (from a `turn_context` record) |
+| pi | `/var/lib/loom-sessions/pi/**/*.jsonl` | `runtime` (static `"pi"`), `session_id` (any record carrying `sessionId`), `provider`/`model` (from a `model_change` record), `agent_id`/`parent_agent_id` (from an `agent_change` record) |
+| Claude transcripts | `/var/lib/loom-sessions/claude/**/*.jsonl` | `runtime` (static `"claude"`), `session_id`, `duration_sec` (`durationMs / 1000`, when present) |
+
+**`compose.yaml` does not bind-mount anything to those three paths yet.** They
+were deliberately left as fixed in-container paths — not `${env:HOME}/...` —
+so wiring a real host directory in later is a least-privilege bind of exactly
+`~/.codex/sessions`, `~/.pi/agent/sessions` or `~/.claude/projects`, never the
+whole home directory (SSH keys, browser profiles and other unrelated secrets
+live there too). Until that mount lands, all three receivers are live but
+idle: an empty/non-existent glob is not an error (verified against the real
+image — the collector starts and stays healthy either way), so shipping this
+config alone does not change behavior for the already-running trial
+deployment. Wiring the mounts needs its own review, because unlike this
+change it touches `compose.yaml`'s volume/secret contract for a live
+deployment and should wait for the schema-verification step above — tracked
+separately rather than bundled here.
+
+**These field paths are assumptions, not verified against a real on-disk
+session file** — the issue that added them (#8669) had only the field *names*
+to go on, not a live sample of any of the three formats. Before relying on
+this in a real deployment, capture one real file per source and confirm the
+`type`/`payload`/`sessionId`/`agentId`/`parentAgentId`/`durationMs` paths
+above actually match; if a real schema differs, update the `move` operator's
+`from:` path and the `retain` list together — never widen `retain` beyond the
+table above without a matching addition to `transform/privacy`'s allowlist.
+Claude transcripts additionally carry a `toolUseResult` field and full
+message bodies; neither is referenced by any operator here on purpose, since
+both hold raw tool output / model text `retain` must never admit.
+
+Because `start_at: beginning` is set (retroactive pickup is the whole point,
+per #8664's acceptance criterion 4/5), the very first time a receiver sees a
+file it reads the entire thing, not just new lines — on a host with months of
+session history that is a real first-run cost. `file_storage/filelog`
+checkpoints each receiver's read position so this only happens once per file,
+not on every collector restart.
+
 ## Privacy and remote deployment
 
 This is a trusted private operational store, not the public dashboard projection.
@@ -146,7 +218,20 @@ metric attributes before both exporters. Free-text `loom.detail` is excluded.
 Only low-cardinality metric labels are permitted; trace IDs and issue numbers
 remain in logs/spans. Source-side Loom privacy rules must sanitize bodies, span
 names and nested values; this collector is **not** a general arbitrary-log
-redactor. Do not add filelog, shell output, prompts or model completions.
+redactor, and does not accept raw shell output, prompts or model completions.
+
+The one narrow exception is the `file_log/codex`, `file_log/pi` and
+`file_log/claude` receivers documented in
+["Interactive-session filelog receivers"](#interactive-session-filelog-receivers)
+below (#8669): they tail structured JSONL session stores, but never forward
+the raw parsed line. Each receiver's own `operators` pipeline moves ONLY a
+handful of named fields into `loom.*` attributes and then discards the parsed
+body (`remove: body`) before the record leaves the receiver — this is a
+second, receiver-level enforcement layer, independent of and prior to the
+`transform/privacy` allowlist below. Do not add a filelog receiver, or extend
+one of these three, without that same discipline: an operator pipeline that
+forwards a raw parsed field (or the body) unfiltered defeats the allowlist
+the same way a directly-instrumented free-text body would.
 
 All published ports bind host loopback; the Docker network is private to the
 trial, but other attached containers are trusted. For remote ingress, use TLS
@@ -246,6 +331,25 @@ errors, saturates a bounded queue, expires retries and rejects bad downstream
 credentials without logging their values. It cleans up only its own containers/network, including on assertion
 failure. Synthetic sink evidence does not replace the ClickStack/SigNoz product
 query and UI acceptance in issues #8527, #8528 and #8529.
+
+The interactive-session filelog receivers (#8669) have their own opt-in
+contract, run the same way:
+
+```console
+CARGO_BUILD_JOBS=2 cargo test -p loom-daemon --test collector_filelog -- --ignored --nocapture
+```
+
+It runs the production config verbatim (only the two OTLP-HTTP exporters are
+swapped for a local `file` sink), mounts synthetic Codex/pi/Claude session
+fixtures — including a malformed line and a three-level `agent_change`
+chain — at the three fixed `/var/lib/loom-sessions/<source>` paths, and
+asserts every source-specific sentinel string is absent from the exported
+output while the allowlisted `loom.*` fields (including multi-level
+`parent_agent_id` lineage and the Claude `durationMs -> duration_sec`
+conversion) are present. A second, non-Docker test in the same file
+statically checks that no filelog receiver's `retain` list, nor
+`transform/privacy`'s allowlist, admits a key outside the reviewed set —
+that one runs under plain `cargo test -p loom-daemon`.
 
 Upstream contracts: [Collector fan-out architecture](https://opentelemetry.io/docs/collector/architecture/),
 [persistent queues and retries](https://github.com/open-telemetry/opentelemetry-collector/blob/v0.161.0/exporter/exporterhelper/README.md),
