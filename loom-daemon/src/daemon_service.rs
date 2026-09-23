@@ -361,16 +361,19 @@ pub(crate) async fn run_daemon() -> Result<()> {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    // Start transcript token ingestion (Issue #8059; on by default since
-    // #8477 — see that module's doc for why). This is the only writer
+    // Start the background maintenance threads the activity module owns:
+    // (1) transcript token ingestion (Issue #8059; on by default since #8477
+    // — see that module's doc for why). This is the only writer
     // `resource_usage` has on a dispatch-driven host — the IPC
     // `GetTerminalOutput` path a `claude -p` sweep never traverses is the
-    // other one. `sweep_workspace` is read only to resolve
-    // `autonomous.transcriptIngest`; ingestion itself is independent of the
-    // workspace, reading every project's transcripts under
-    // `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`. Handle dropped, thread runs on.
-    let _ingest_handle =
-        activity::transcript_ingest::try_init_transcript_ingest(&db_path, &sweep_workspace);
+    // other one; (2) since #8758, the scheduled raw-transcript archive pass
+    // (opt-in via `autonomous.transcriptArchive`). For both, `sweep_workspace`
+    // is read only to resolve the `autonomous.*` config block — the passes
+    // themselves are workspace-independent, reading every project's
+    // transcripts under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`. Handles
+    // dropped, threads run on.
+    let (_ingest_handle, _transcript_archive_handle) =
+        activity::start_maintenance_threads(&db_path, &sweep_workspace);
 
     // #6499: a loud, top-of-boot-block diagnosis of the legacy
     // `.loom/config.json` tier — every existing repo's sole populated config

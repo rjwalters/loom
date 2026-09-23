@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 
 use loom_daemon::activity::transcript_archive::{
-    archive, default_archive_dir, ArchiveOptions, ArchiveStats, DEFAULT_ZSTD_LEVEL,
+    archive, default_archive_dir, ArchiveOptions, ArchiveStats, DEFAULT_ZSTD_LEVEL, LOCAL_SINK,
 };
 use loom_daemon::activity::ActivityDb;
 use loom_daemon::transcript_tokens::claude_projects_dir;
@@ -101,7 +101,7 @@ impl ArchiveTranscriptsArgs {
             std::fs::create_dir_all(parent).ok();
         }
         let activity = ActivityDb::new(db_path.clone())?;
-        let stats = archive(&activity, &opts)?;
+        let stats = archive(&activity, &opts, LOCAL_SINK)?;
 
         if self.format == "json" {
             println!("{}", serde_json::to_string_pretty(&stats)?);

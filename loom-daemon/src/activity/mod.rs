@@ -92,8 +92,39 @@ pub use transcript_parse::{attribute_role, parse_transcript, ParsedTranscript, U
 
 // Rolling compressed transcript archive (Issue #8494) — a verified `.tar.zst`
 // backstop for raw transcripts, which `transcript_ingest`'s derived-data
-// preservation does not cover.
-pub use transcript_archive::{archive, ArchiveOptions, ArchiveStats, Manifest, ManifestEntry};
+// preservation does not cover. Since #8758 the daemon can also schedule the
+// pass itself (`autonomous.transcriptArchive`, opt-in) instead of requiring
+// the operator's hand-run CLI or cron.
+pub use transcript_archive::{
+    archive, default_archive_dir, ArchiveOptions, ArchiveStats, Manifest, ManifestEntry,
+    ScheduledArchiveSettings, TranscriptArchiveConfig, LOCAL_SINK,
+};
+
+/// Start the two background transcript maintenance threads the activity
+/// module owns, returning their join handles in start order — the handles
+/// are informational (each thread keeps running when its handle is dropped;
+/// a disabled feature yields `None`).
+///
+/// 1. Token ingestion ([`transcript_ingest::try_init_transcript_ingest`],
+///    #8059; on by default since #8477) — the only writer `resource_usage`
+///    has on a dispatch-driven host.
+/// 2. The scheduled raw-transcript archive pass
+///    ([`transcript_archive::try_init_transcript_archive`], #8758; opt-in
+///    via `autonomous.transcriptArchive`) — the daemon-run form of #8494's
+///    CLI pass, ledgering under the `local` sink.
+///
+/// `repo_root` is read only to resolve each pass's `autonomous.*` config
+/// block; both passes are workspace-independent, reading every project's
+/// transcripts under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`.
+pub fn start_maintenance_threads(
+    db_path: &std::path::Path,
+    repo_root: &std::path::Path,
+) -> (Option<std::thread::JoinHandle<()>>, Option<std::thread::JoinHandle<()>>) {
+    (
+        transcript_ingest::try_init_transcript_ingest(db_path, repo_root),
+        transcript_archive::try_init_transcript_archive(db_path, repo_root),
+    )
+}
 
 // Re-export resource usage parsing and cost calculation
 // Used internally by db.rs for terminal output parsing
