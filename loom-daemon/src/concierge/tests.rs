@@ -15,12 +15,17 @@ use super::budget::{BudgetLedger, BudgetRefusal};
 use super::intent::{
     propose, scan_for_injection, ClarifyReason, Proposal, RoomMessage, Verb, VerbError,
 };
-use super::relay::{vet_relay, Authorization, RelayRefusal, RelayRequest};
+use super::relay::{vet_relay, vet_say, Authorization, RelayRefusal, RelayRequest, SayRefusal};
 use super::{config_from_value, ConciergeConfig, DEFAULT_MAX_MESSAGES_PER_TICK, DEFAULT_PERSONA};
-use crate::safehouse_chatops::Command;
+use crate::safehouse_chatops::{inbound_command, Command};
 
 const OPERATOR: &str = "@operator:example.org";
 const STRANGER: &str = "@stranger:example.org";
+
+/// The **daemon's** persona (3a's), not the concierge's. Spelled out rather
+/// than imported so a test that says "the daemon would hear this" is reading
+/// the same literal an operator's room does.
+const DAEMON: &str = "loom_daemon";
 
 fn config() -> ConciergeConfig {
     ConciergeConfig {
@@ -289,6 +294,50 @@ fn an_affirmation_must_actually_affirm_and_must_name_its_target() {
     assert_eq!(vet_relay(&cfg, &good), Ok(Command::Dispatch { issue: 42 }));
 }
 
+/// The target must be matched whole, exactly as the affirmation words are:
+/// with a plain substring test, a human affirming `#142` would also satisfy a
+/// pending `dispatch 42`.
+#[test]
+fn an_affirmation_naming_a_superstring_of_the_target_is_not_consent() {
+    let cfg = config();
+    let base = RelayRequest {
+        origin: msg(OPERATOR, "what about #42"),
+        verb: Verb::Dispatch,
+        arg: Some("42".to_owned()),
+        authorization: Authorization::None,
+    };
+    for body in ["yes, dispatch #142", "yes, dispatch 420", "yes, do 1420"] {
+        assert_eq!(
+            vet_relay(
+                &cfg,
+                &RelayRequest {
+                    authorization: Authorization::Human(msg(OPERATOR, body)),
+                    ..base.clone()
+                }
+            ),
+            Err(RelayRefusal::AuthorizationTargetMismatch {
+                expected: "42".to_owned()
+            }),
+            "accepted a superstring as consent: {body:?}"
+        );
+    }
+    // `#42` and bare `42` both still count — the `#` is a boundary, not part
+    // of the token.
+    for body in ["yes, dispatch #42", "yes, dispatch 42"] {
+        assert_eq!(
+            vet_relay(
+                &cfg,
+                &RelayRequest {
+                    authorization: Authorization::Human(msg(OPERATOR, body)),
+                    ..base.clone()
+                }
+            ),
+            Ok(Command::Dispatch { issue: 42 }),
+            "rejected a real affirmation: {body:?}"
+        );
+    }
+}
+
 #[test]
 fn an_injected_affirmation_is_not_an_affirmation() {
     let cfg = config();
@@ -545,6 +594,87 @@ fn the_concierge_allowlist_is_independent_of_3as() {
     let resolved = config_from_value(Some(&block)).expect("some");
     assert!(!resolved.allows(STRANGER));
     assert!(resolved.allows(OPERATOR));
+}
+
+// ============================================================================
+// `say` is the other out-path, and it is gated too
+// ============================================================================
+
+/// The second door. `relay` cannot express `confirm` because [`Verb`] has no
+/// such variant; `say` lets the persona write the entire body, so the only
+/// thing that keeps `confirm <nonce>` off this path is a refusal to emit a
+/// body the daemon would read as addressed to it.
+#[test]
+fn a_say_body_addressed_to_the_daemon_is_refused() {
+    // The exact bypass: the nonce the persona is told to echo, prefixed.
+    assert_eq!(
+        vet_say("*", "@loom_daemon confirm 3f9a", DAEMON),
+        Err(SayRefusal {
+            persona: DAEMON.to_owned()
+        })
+    );
+    // Every other addressing shape 3a honors, including case and `to`.
+    for body in [
+        "loom_daemon: cancel sweep-issue-42-1",
+        "@LOOM_DAEMON dispatch 42",
+        "  @loom_daemon: status",
+        "@loom_daemon", // a bare mention is still "addressed" to 3a
+        // 3a's mention rule needs no `@` and no `:` — a sentence that merely
+        // *opens* with the bare persona name is addressed to the daemon, which
+        // would answer it with a usage reply in the room. Refusing here is
+        // what the parser actually does; the persona reworders to "the daemon".
+        "loom_daemon is busy; I will report back when it answers",
+    ] {
+        assert!(
+            vet_say("*", body, DAEMON).is_err(),
+            "not refused, and 3a would read it as a command: {body:?}"
+        );
+    }
+    assert!(vet_say(DAEMON, "hello", DAEMON).is_err());
+}
+
+/// Prose stays prose: the refusal must not cost the persona its ability to
+/// quote a nonce, name the daemon, or talk about a command in a sentence.
+#[test]
+fn ordinary_prose_including_a_quoted_nonce_still_says() {
+    for body in [
+        "the daemon minted nonce 3f9a — reply `confirm 3f9a` yourself to run it",
+        "the daemon (loom_daemon) is busy; I will report back", // not leading
+        "@loom_daemonx is not the daemon",                      // a prefix is not a mention
+        "sweep-issue-42-1 finished",
+        "",
+    ] {
+        assert_eq!(vet_say("*", body, DAEMON), Ok(()), "wrongly refused: {body:?}");
+    }
+}
+
+/// The refusal and the daemon's parser must agree about the word "addressed",
+/// which is why `vet_say` calls 3a's own function instead of a regex of its
+/// own. Asserted as an equivalence over both shapes, so a future change to
+/// either side that separates them fails here.
+#[test]
+fn the_say_refusal_tracks_3as_parser_exactly() {
+    for body in [
+        "@loom_daemon confirm 3f9a",
+        "loom_daemon: status",
+        "@LOOM_DAEMON dispatch 42",
+        "@loom_daemonx is not the daemon",
+        "nonce 3f9a is yours to confirm",
+        "plain prose",
+    ] {
+        let event = json!({
+            "event": "room.message",
+            "envelope": { "from": DEFAULT_PERSONA, "to": "*", "body": body },
+        });
+        // `inbound_command` additionally drops the daemon's own traffic, so ask
+        // it as a third party would — the concierge is not the daemon.
+        let heard = inbound_command(&event, DAEMON).is_some();
+        assert_eq!(
+            vet_say("*", body, DAEMON).is_err(),
+            heard,
+            "refusal and parser disagree about {body:?}"
+        );
+    }
 }
 
 // ============================================================================

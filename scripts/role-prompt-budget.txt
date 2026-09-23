@@ -20,7 +20,7 @@ architect      14925        -
 auditor        20350        -
 builder        30735        -
 champion       14255        -
-concierge      14046        -
+concierge      14320        -
 curator        47040    30000
 doctor         33677    30000
 driver         10637        -

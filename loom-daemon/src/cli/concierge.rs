@@ -14,7 +14,7 @@
 //! | `listen` | in | drops everything not from an allowlisted sender, caps the batch |
 //! | `propose` | — | a deterministic second opinion; issues no command |
 //! | `relay` | out | **the boundary**: vets, charges budget, then sends |
-//! | `say` | out | prose only; structurally cannot carry a command |
+//! | `say` | out | prose only; a body the daemon would read as addressed to it is **refused** |
 //! | `budget` | — | admits or refuses a turn |
 //!
 //! # What this is and is not a boundary against
@@ -25,9 +25,20 @@
 //! advisory. It is **not** a sandbox. An agent with shell access can always
 //! open a socket itself, which is why the unconditional backstop stays where
 //! Phase 3a put it — the daemon's own sender allowlist, its closed six-verb
-//! grammar, and its confirm nonce — and why an operator who wants a smaller
-//! blast radius simply leaves the concierge persona off
-//! `safehouse.chatops.allowedSenders` and uses it as a read-only narrator.
+//! grammar, and its confirm nonce.
+//!
+//! # The daemon's allowlist is the outer gate, and today it is shut
+//!
+//! `safehoused` stamps a local socket client's `from` from its persona, so a
+//! relay reaches the daemon as `from = loom_concierge`. 3a's `accept_sender`
+//! discards any `safehouse.chatops.allowedSenders` entry not shaped
+//! `@localpart:server`, so that name cannot be put on the list: on a stock
+//! deployment **every relayed command is refused `sender-not-allowlisted`** and
+//! the persona is a read-only narrator (`listen` / `propose` / `say`) whether
+//! or not an operator wanted it that way. `check` reports this as
+//! `relay authorized: no` rather than leaving it to be discovered as silence;
+//! #8745 carries the fix. See `defaults/docs/safehouse.md` § "Can a relay from
+//! this persona be authorized at all?".
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -35,7 +46,7 @@ use serde_json::json;
 
 use loom_daemon::concierge::budget::{today_utc, BudgetLedger};
 use loom_daemon::concierge::intent::{propose, Proposal, RoomMessage, Verb};
-use loom_daemon::concierge::relay::{vet_relay, Authorization, RelayRequest};
+use loom_daemon::concierge::relay::{vet_relay, vet_say, Authorization, RelayRequest};
 use loom_daemon::concierge::{resolve_concierge_config, ConciergeConfig};
 use loom_daemon::safehouse::{Envelope, SafehouseClient, SafehouseConfig};
 
@@ -139,9 +150,13 @@ pub enum ConciergeAction {
 
     /// Send prose into the room as the concierge persona.
     ///
-    /// Structurally incapable of carrying a command: the body is addressed to
-    /// `*` (the room), never to the daemon persona, so the daemon's
-    /// `inbound_command` never sees it as addressed to it.
+    /// Cannot carry a command, and that is enforced rather than assumed.
+    /// Addressing the envelope to `*` (the room) is **not** sufficient on its
+    /// own: 3a reads a leading `@persona` / `persona:` mention as addressing
+    /// too, regardless of `to`. So the body is checked against 3a's own
+    /// `addresses_persona` and refused (`addresses-daemon`) when the daemon
+    /// would hear it as a command — which is what keeps `confirm <nonce>`
+    /// unrepresentable on this path as well as on `relay`.
     Say {
         /// What to say.
         #[arg(long, value_name = "TEXT")]
@@ -238,6 +253,7 @@ fn check(json: bool) -> Result<()> {
             std::process::exit(1);
         }
         Some(config) => {
+            let relay_authorized = relay_is_authorized(&config);
             if json {
                 println!(
                     "{}",
@@ -248,6 +264,7 @@ fn check(json: bool) -> Result<()> {
                         "room": config.room,
                         "maxMessagesPerTick": config.max_messages_per_tick,
                         "maxTurnsPerDay": config.max_turns_per_day,
+                        "relayAuthorized": relay_authorized,
                     })
                 );
             } else {
@@ -260,6 +277,18 @@ fn check(json: bool) -> Result<()> {
                 );
                 println!("  max messages/tick:  {}", config.max_messages_per_tick);
                 println!("  max turns/day:      {}", config.max_turns_per_day);
+                println!("  relay authorized:   {}", if relay_authorized { "yes" } else { "no" });
+                if !relay_authorized {
+                    println!(
+                        "    `{}` is not on safehouse.chatops.allowedSenders, so every relayed\n    \
+                         command is refused by the daemon as `sender-not-allowlisted`. 3a drops\n    \
+                         any allowlist entry not shaped `@localpart:server`, so a bare persona\n    \
+                         name cannot be added there — see defaults/docs/safehouse.md § \"Can a\n    \
+                         relay from this persona be authorized at all?\" and #8745. `listen`,\n    \
+                         `propose` and `say` are unaffected: the persona is a read-only narrator.",
+                        config.persona
+                    );
+                }
             }
             Ok(())
         }
@@ -349,9 +378,16 @@ async fn relay(
     Ok(())
 }
 
+/// The room-facing prose path. Vetted before the socket is even opened.
+const SAY_TO: &str = "*";
+
 async fn say(body: &str) -> Result<()> {
     let config = require_config()?;
-    send(&config, "*", body).await
+    // Refuse before connecting: a body the daemon would read as addressed to
+    // it is not prose, and `relay` is the only door a command goes through.
+    vet_say(SAY_TO, body, &daemon_persona())
+        .map_err(|refusal| anyhow::anyhow!("refused ({}): {refusal}", refusal.code()))?;
+    send(&config, SAY_TO, body).await
 }
 
 /// One connect-send-disconnect round trip as the concierge persona.
@@ -381,6 +417,26 @@ async fn send(config: &ConciergeConfig, to: &str, body: &str) -> Result<()> {
         .send_to(&envelope, room.as_deref())
         .await
         .map_err(|e| anyhow::anyhow!("safehoused rejected the send: {e}"))
+}
+
+/// Would the daemon accept a relay from this persona at all?
+///
+/// `safehoused` stamps a local socket client's `from` from its **persona**, so
+/// a relay arrives at the daemon as `from = <concierge persona>` — a bare name,
+/// not a Matrix ID. 3a's `accept_sender` drops any `chatops.allowedSenders`
+/// entry not shaped `@localpart:server`, so on a stock deployment that name
+/// cannot be allowlisted and every relay is refused `sender-not-allowlisted`.
+/// That is a real limitation, and `check` states it rather than letting an
+/// operator discover it as silence in the room (#8745 carries the fix).
+///
+/// Computed, not assumed: an operator whose `safehoused` stamps a Matrix-ID
+/// persona (or a future 3a that can allowlist a local persona) gets `yes` here
+/// with no code change — and that is also exactly the configuration in which
+/// `say`'s refusal above stops being belt-and-braces and starts being the thing
+/// keeping `confirm` out of the room.
+fn relay_is_authorized(config: &ConciergeConfig) -> bool {
+    loom_daemon::safehouse_chatops::resolve_chatops_config(&root())
+        .is_some_and(|chatops| chatops.allows(&config.persona))
 }
 
 /// The daemon's own persona — the addressee every relayed command carries.

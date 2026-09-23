@@ -43,7 +43,7 @@ use std::fmt;
 
 use super::intent::{scan_for_injection, Argument, RoomMessage, Verb};
 use super::ConciergeConfig;
-use crate::safehouse_chatops::Command;
+use crate::safehouse_chatops::{addresses_persona, Command};
 
 /// The human affirmation backing a [`RelayRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +238,76 @@ pub fn vet_relay(
     Ok(command)
 }
 
+/// Why a `say` was refused.
+///
+/// One variant, because there is one way for prose to stop being prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SayRefusal {
+    /// The daemon persona the body would have been read as addressing.
+    pub persona: String,
+}
+
+impl SayRefusal {
+    /// Stable machine-readable code, same convention as [`RelayRefusal::code`].
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        "addresses-daemon"
+    }
+}
+
+impl fmt::Display for SayRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { persona } = self;
+        write!(
+            f,
+            "this body would be read by the daemon as a command addressed to `{persona}` — \
+             `say` carries prose only. Every command goes through `relay`, which is where the \
+             verb vocabulary (no `confirm`) and the human-affirmation gates live. To quote a \
+             nonce or a command back to a human, write it without a leading `@{persona}` / \
+             `{persona}:` mention."
+        )
+    }
+}
+
+impl std::error::Error for SayRefusal {}
+
+/// Refuse a `say` whose body the daemon would read as an addressed command.
+///
+/// # Why this exists
+///
+/// `relay` is a narrow door: five verbs, no `confirm`, an affirmation gate on
+/// the destructive two. `say` is a wide one — the persona writes the entire
+/// body, unvetted, by design, because it is how it talks to humans. That is
+/// only safe if the daemon cannot *hear* what `say` emits, and 3a's addressing
+/// rule is `to == persona` **or** a leading `@persona` / `persona:` mention
+/// **regardless of `to`** (`accepts_the_at_mention_convention`). Addressing the
+/// envelope to `*` therefore does not, on its own, make a body inert: a
+/// `say --body "@loom_daemon confirm <nonce>"` would be parsed by
+/// [`crate::safehouse_chatops::inbound_command`] as a command, and `confirm`
+/// is precisely the verb the persona must never be able to emit.
+///
+/// The refusal is checked with 3a's own
+/// [`addresses_persona`](crate::safehouse_chatops::addresses_persona) — the
+/// function [`crate::safehouse_chatops::inbound_command`] itself calls — rather
+/// than a mention-shaped regex of our own, so the two cannot disagree about
+/// what "addressed" means. With this in place, `confirm` is unrepresentable on
+/// *both* out-paths rather than one, and the claim the docs make about `say` is
+/// true by construction instead of by convention.
+///
+/// # Errors
+///
+/// [`SayRefusal`] when the body would be read as addressed to `persona`.
+/// Terminal, like every relay refusal: the persona reports it and rewords, it
+/// does not retry through another door.
+pub fn vet_say(to: &str, body: &str, daemon_persona: &str) -> Result<(), SayRefusal> {
+    if addresses_persona(to, body, daemon_persona) {
+        return Err(SayRefusal {
+            persona: daemon_persona.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Build a [`Command`] from a typed verb + argument, via 3a's own parser.
 ///
 /// The argument is inserted into a single-token position in a string that is
@@ -309,9 +379,11 @@ fn check_authorization(
         return Err(RelayRefusal::AuthorizationNotAffirmative);
     }
     // (e) It has to name what it is affirming, so a stray "yes" in unrelated
-    // room chatter can never be harvested as consent.
+    // room chatter can never be harvested as consent. Whole-word, same as the
+    // affirmation test above: a plain substring match would let an affirmation
+    // naming `#142` satisfy a pending `dispatch 42`.
     let target = command_target(command);
-    if !body.contains(&target.to_ascii_lowercase()) {
+    if !contains_word(&body, &target.to_ascii_lowercase()) {
         return Err(RelayRefusal::AuthorizationTargetMismatch { expected: target });
     }
     Ok(())

@@ -1863,6 +1863,9 @@ not something the persona can express, mis-map onto, or be argued into.
 `loom-daemon concierge relay --verb confirm` refuses.
 
 The persona's job with a nonce is to repeat it into the room verbatim and stop.
+Repeating it goes through `say`, which refuses a body the daemon would read as
+addressed to it (see "`say` is gated too" below) — so `confirm` is
+unrepresentable on **both** out-paths, not just on `relay`.
 
 ### `dispatch` is gated here even though it is not gated at the daemon
 
@@ -1974,7 +1977,7 @@ off).
 | `listen --secs N` | in | drops everything not from an allowlisted sender, caps the batch |
 | `propose --sender --body` | — | a deterministic second opinion; issues no command |
 | `relay --verb …` | out | **the boundary**: `vet_relay`, then charge budget, then send |
-| `say --body` | out | prose only; addressed to `*`, so it cannot carry a command |
+| `say --body` | out | prose only; a body the daemon would read as addressed to it is **refused** |
 | `budget [--begin-turn]` | — | admits or refuses a turn |
 
 `listen` sees only the window it is awake for — safehoused's wire protocol has
@@ -1984,9 +1987,70 @@ listening. That is a deliberate Phase 3b limitation; a durable inbox is Phase 4.
 **This is a boundary at the layer where the persona's actions are made, not a
 sandbox.** An agent with shell access can always open a socket itself, which is
 why the unconditional backstop stays where 3a put it — the daemon's own sender
-allowlist, its closed grammar, and its confirm nonce. An operator who wants a
-smaller blast radius simply leaves `loom_concierge` off
-`safehouse.chatops.allowedSenders` and gets a read-only narrator.
+allowlist, its closed grammar, and its confirm nonce.
+
+### `say` is gated too, because addressing `*` is not enough
+
+3a treats a message as addressed to the daemon when `to` equals the persona
+**or** the body opens with an `@loom_daemon` / `loom_daemon:` / `loom_daemon `
+mention — *regardless of `to`* (`accepts_the_at_mention_convention`). So sending
+to `*` does not, on its own, make a body inert, and `say` lets the persona write
+the entire body with no verb, no `vet_relay` and no injection scan. Without a
+check, `concierge say --body "@loom_daemon confirm 3f9a"` would be a second
+out-path that reaches the daemon's parser — carrying the one verb `relay` exists
+to make unrepresentable, and carrying it through the exact instruction the
+persona is given ("echo the nonce back into the room").
+
+`say` therefore refuses any body that 3a would read as addressed to the daemon
+persona, using **3a's own `safehouse_chatops::addresses_persona`** — the
+function `inbound_command` itself calls — rather than a mention-shaped rule of
+its own, so the two cannot drift apart. The refusal code is
+`addresses-daemon`, and it fires before the socket is opened.
+
+Two consequences worth knowing as an operator:
+
+- Quoting a nonce is still fine (`reply \`confirm 3f9a\` yourself`): it is the
+  leading *mention* that addresses, not the word.
+- A sentence that merely *opens* with the bare persona name ("loom_daemon is
+  busy…") is addressed under 3a's rule and is refused. Reword to "the daemon";
+  the alternative is the daemon answering your prose with a usage reply.
+
+### Can a relay from this persona be authorized at all? (not yet — #8745)
+
+`safehoused` stamps a local socket client's envelope `from` from its **persona**
+(§Host identity), so a relay arrives at the daemon as `from = loom_concierge` —
+a bare name, not a Matrix ID. 3a's `accept_sender` discards any
+`safehouse.chatops.allowedSenders` entry that is not shaped `@localpart:server`
+(it logs `ignoring malformed allowedSenders entry`), so on a stock deployment
+**`loom_concierge` cannot be put on that list**, and every relayed command is
+refused by the daemon as `sender-not-allowlisted`.
+
+Stated plainly: **in Phase 3b the persona is a read-only narrator in every
+documented configuration.** `listen`, `propose` and `say` work end to end; the
+`relay` path is fully implemented and unit-tested up to the socket, and is
+expected to be refused at the daemon until 3a grows a way to allowlist a local
+persona (or `safehoused` stamps a Matrix-shaped identity for it). That is
+**#8745**'s job, together with the live-transport verification this phase did
+not do.
+
+`loom-daemon concierge check` computes and prints this rather than leaving it to
+be discovered as silence in the room:
+
+```
+  relay authorized:   no
+    `loom_concierge` is not on safehouse.chatops.allowedSenders, so every relayed
+    command is refused by the daemon as `sender-not-allowlisted`. …
+```
+
+It is computed from the resolved `chatops` allowlist, not hardcoded, so a
+deployment where the stamped identity *is* allowlistable reports `yes` with no
+code change. Note that such a deployment is also the one where `say`'s refusal
+above stops being belt-and-braces: with relays authorized, an unchecked `say`
+would be a live `confirm` channel.
+
+An operator who wants the smaller blast radius on purpose keeps
+`loom_concierge` (however it is stamped) off `safehouse.chatops.allowedSenders`
+and gets exactly today's read-only narrator.
 
 ### Implementation (phase 3b)
 
@@ -1997,7 +2061,11 @@ smaller blast radius simply leaves `loom_concierge` off
 - `loom-daemon/src/concierge/intent.rs` — `RoomMessage`, the injection scan, the
   five-variant `Verb`, and the conservative prose → `Proposal` map.
 - `loom-daemon/src/concierge/relay.rs` — `vet_relay`, the four gates, the
-  round-trip assertion against 3a's own parser.
+  round-trip assertion against 3a's own parser, and `vet_say` (the
+  `addresses-daemon` refusal on the prose path).
+- `loom-daemon/src/safehouse_chatops.rs` — `addresses_persona`, 3a's own
+  addressing rule, factored out of `inbound_command` so `vet_say` predicts the
+  parser instead of imitating it. 3a's grammar is otherwise untouched.
 - `loom-daemon/src/concierge/budget.rs` — the per-tick + per-day ledger.
 - `loom-daemon/src/cli/concierge.rs` — the six subcommands above.
 - `loom-daemon/src/role_runner.rs` — the `concierge` `RoleSpec` (300s listening
