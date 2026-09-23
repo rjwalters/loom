@@ -2157,32 +2157,11 @@ async fn dispatch_sweep_nonblocking(
             &kind,
         );
 
-        let gh_bin = sr
-            .config()
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("gh"));
-        let (resolved_model, model_source_label, arm) = match (&kind, model.as_deref()) {
-            (crate::types::SweepKind::Issue(issue), None) => {
-                let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model_lazy(
-                    &repo_root,
-                    *issue,
-                    || crate::sweep_registry::fetch_issue_complexity(&gh_bin, &repo_root, *issue),
-                );
-                (resolved.model, resolved.source_label, resolved.arm)
-            }
-            _ => {
-                let (m, s) =
-                    crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
-                (m, s.as_str(), None)
-            }
-        };
         log::info!(
-            "dispatch_sweep: {:?} with{} model={resolved_model} (source={model_source_label}); \
+            "dispatch_sweep: {:?}; \
              headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
              only, not capacity-limiting since #5270])",
             kind,
-            arm.map_or_else(String::new, |a| format!(" arm={a}")),
             headroom.occupancy,
             headroom.dynamic_cap,
             headroom.disk_headroom,
@@ -2190,10 +2169,10 @@ async fn dispatch_sweep_nonblocking(
             headroom.token_axis_limit
         );
 
-        sr.begin_issue_dispatch(
+        sr.begin_issue_dispatch_with_model(
             &kind,
             idempotency_key,
-            Some(&resolved_model),
+            crate::sweep_registry::DispatchModel::Request(model.as_deref()),
             effort.as_deref(),
             depends_on,
             None,
@@ -4226,59 +4205,22 @@ fn handle_request(
                 &kind,
             );
 
-            // Issue #4809: an explicit `model` param always wins (unchanged
-            // precedence), but an ABSENT one for a single-issue dispatch also
-            // considers the model-cost A/B experiment's forced arm — mirroring
-            // the autonomous work-finder / epic-supervisor dispatch paths —
-            // before falling back to `autonomous.model` / the shipped default.
-            //
-            // Issue #4827: the arm is stratified by the issue's real
-            // `<!-- loom:complexity=... -->` marker. Like the epic supervisor
-            // (and unlike the work finder, which carries the body on its
-            // `WorkItem`), this handler has no cached body — so the fetch is
-            // LAZY, running only inside the `experiment` branch. `off` /
-            // `observe` dispatches make zero extra `gh` calls, and a failed
-            // fetch degrades to the unchanged `routine` stratum.
-            let gh_bin = sr
-                .config()
-                .gh_bin
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from("gh"));
-            let (resolved_model, model_source_label, arm) = match (&kind, model.as_deref()) {
-                (crate::types::SweepKind::Issue(issue), None) => {
-                    let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model_lazy(
-                        &repo_root,
-                        *issue,
-                        || {
-                            crate::sweep_registry::fetch_issue_complexity(
-                                &gh_bin, &repo_root, *issue,
-                            )
-                        },
-                    );
-                    (resolved.model, resolved.source_label, resolved.arm)
-                }
-                _ => {
-                    let (m, s) =
-                        crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
-                    (m, s.as_str(), None)
-                }
-            };
+            // Model intent survives until the shared runtime-admission boundary.
             log::info!(
-                "dispatch_sweep: {:?} with{} model={resolved_model} (source={model_source_label}); \
+                "dispatch_sweep: {:?}; \
                  headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
                  only, not capacity-limiting since #5270])",
                 kind,
-                arm.map_or_else(String::new, |a| format!(" arm={a}")),
                 headroom.occupancy,
                 headroom.dynamic_cap,
                 headroom.disk_headroom,
                 headroom.ram_headroom,
                 headroom.token_axis_limit
             );
-            match sr.dispatch(
+            match sr.dispatch_with_model(
                 &kind,
                 idempotency_key,
-                Some(&resolved_model),
+                crate::sweep_registry::DispatchModel::Request(model.as_deref()),
                 effort.as_deref(),
                 depends_on,
             ) {
