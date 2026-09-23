@@ -528,6 +528,125 @@ describe("FleetState — host.health reconciliation (fix layer 2, integration)",
 });
 
 // ---------------------------------------------------------------------------
+// Adopted-sweep lifecycle correlation, from this side of the wire (issue
+// #8720). The daemon-side fix is what makes a post-restart phase carry the
+// ADOPTED sweep's own id; these pin what that id buys here, and what an
+// uncorrelated one still costs.
+// ---------------------------------------------------------------------------
+
+describe("FleetState — a sweep adopted across a daemon restart", () => {
+  const started = {
+    kind: "sweep.started",
+    sweep_id: "sweep-issue-8720-original",
+    repo: "rjwalters/loom",
+    visibility: "public",
+    issue: 8720,
+    started_at: "2026-09-22T00:00:00Z",
+    runtime: "claude",
+  };
+  const health = (ids: string[]) => ({
+    kind: "host.health",
+    captured_at: "2026-09-22T00:30:00Z",
+    daemon_version: "0.19.306",
+    uptime_sec: 60,
+    logical_cpus: 8,
+    active_sweep_ids: ids,
+  });
+
+  it("a phase carrying the adopted id updates the original row and survives reconciliation", async () => {
+    const stub = fleetStateStub("adopted-phase-reaches-original-row");
+    await update(stub, "host-a", started);
+    await update(stub, "host-a", {
+      ...launchIdentity,
+      sweep_id: started.sweep_id,
+      issue: 8720,
+    });
+
+    // Post-restart phase, correlated from registry adoption evidence.
+    await update(stub, "host-a", {
+      kind: "sweep.phase",
+      sweep_id: started.sweep_id,
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 8720,
+      phase: "judge",
+      entered_at: "2026-09-22T00:20:00Z",
+    });
+
+    let snap = await snapshot(stub);
+    expect(sweepIds(snap)).toEqual([started.sweep_id]);
+    expect(snap.activeSweeps[0]).toMatchObject({
+      phase: "judge",
+      startedAt: started.started_at,
+      runtime: launchIdentity.runtime,
+      model: launchIdentity.model,
+    });
+
+    // The daemon's own authoritative set names the adopted sweep, so
+    // reconciliation retains exactly the row the phase just updated.
+    await update(stub, "host-a", health([started.sweep_id]));
+    snap = await snapshot(stub);
+    expect(sweepIds(snap)).toEqual([started.sweep_id]);
+    expect(snap.activeSweeps[0]?.phase).toBe("judge");
+
+    await update(stub, "host-a", { kind: "sweep.completed", sweep_id: started.sweep_id });
+    expect((await snapshot(stub)).activeSweeps).toEqual([]);
+  });
+
+  it("an UNcorrelated phase splits the sweep into a second row that reconciliation then drops", async () => {
+    // The pre-#8720 shape, kept as the measured cost of the synthesized
+    // fallback: the original row keeps its stale phase while a separate
+    // `unknown-issue-N` row carries the live one, until the next host.health
+    // (which never names the synthesized id) reaps it — losing the update.
+    const stub = fleetStateStub("uncorrelated-phase-splits-the-row");
+    await update(stub, "host-a", started);
+    await update(stub, "host-a", {
+      kind: "sweep.phase",
+      sweep_id: "unknown-issue-8720",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 8720,
+      phase: "judge",
+      entered_at: "2026-09-22T00:20:00Z",
+    });
+
+    let snap = await snapshot(stub);
+    expect(sweepIds(snap)).toEqual(["sweep-issue-8720-original", "unknown-issue-8720"]);
+    expect(snap.activeSweeps.find((s) => s.sweepId === started.sweep_id)?.phase).toBeUndefined();
+
+    await update(stub, "host-a", health([started.sweep_id]));
+    snap = await snapshot(stub);
+    expect(sweepIds(snap)).toEqual([started.sweep_id]);
+    expect(snap.activeSweeps[0]?.phase).toBeUndefined();
+  });
+
+  it("a phase with no surviving original row is still not a resurrection vector for identity", async () => {
+    // Journal-only recovery after the original row aged out: the phase is the
+    // row's creator (unchanged behavior), but `sweep.identity` on its own
+    // still creates nothing.
+    const stub = fleetStateStub("adopted-phase-without-original-row");
+    const sweepId = "journal-adopted-issue-8720-4242";
+    await update(stub, "host-a", { ...launchIdentity, sweep_id: sweepId, issue: 8720 });
+    expect((await snapshot(stub)).activeSweeps).toEqual([]);
+
+    await update(stub, "host-a", {
+      kind: "sweep.phase",
+      sweep_id: sweepId,
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 8720,
+      phase: "builder",
+      entered_at: "2026-09-22T00:20:00Z",
+    });
+    await update(stub, "host-a", health([sweepId]));
+
+    const snap = await snapshot(stub);
+    expect(sweepIds(snap)).toEqual([sweepId]);
+    expect(snap.activeSweeps[0]).toMatchObject({ phase: "builder", issue: 8720 });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // `ephemeral_compute` live state (Issue #8305, Phase 2 of #8257): the pure
 // leak-detection/pruning decisions, then the launch → completion lifecycle
 // driven through the real Durable Object.
