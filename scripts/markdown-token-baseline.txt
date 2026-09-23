@@ -31,6 +31,7 @@
 12873 defaults/.claude/commands/loom/champion-reference.md
 3749 defaults/.claude/commands/loom/champion.md
 1100 defaults/.claude/commands/loom/comment-body-literal-path.md
+3818 defaults/.claude/commands/loom/concierge.md
 35434 defaults/.claude/commands/loom/curator.md
 22071 defaults/.claude/commands/loom/doctor.md
 131 defaults/.claude/commands/loom/driver.md

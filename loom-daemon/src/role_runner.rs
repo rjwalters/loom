@@ -530,6 +530,32 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
         default_interval_secs: 3600,
         interval_default: false,
     },
+    RoleSpec {
+        // The operator-agent persona (Issue #7947, Phase 3b of #4196).
+        //
+        // `interval_default: false` for a *stronger* reason than architect's.
+        // Architect is merely expensive to run everywhere; this role is an
+        // inbound control channel — it reads human prose out of a chat room and
+        // steers the daemon with it. A role like that must never arrive because
+        // a repo failed to pin `roles`, so it is excluded from the
+        // "unset `roles` ⇒ all defaults" fallback like architect, AND gated a
+        // second time on its own config resolving (see `role_is_config_gated`):
+        // naming it in `roles` is not enough, `safehouse.concierge` must also
+        // name at least one allowed sender. Two independent opt-ins, because
+        // one of them is a chat room.
+        //
+        // The 300s cadence is a *listening* cadence, not a work cadence: each
+        // tick is a short `concierge listen` window. Its cost bound is NOT
+        // carried in the prompt the way `architectMaxProposals` is — a daily
+        // turn budget spans sessions, so it lives in the ledger
+        // (`concierge::budget`) that `concierge budget --begin-turn` consults
+        // at the top of every session. See that module's doc for why a prompt
+        // cannot hold this particular number.
+        name: crate::concierge::CONCIERGE_ROLE,
+        prompt: "/loom:concierge",
+        default_interval_secs: 300,
+        interval_default: false,
+    },
 ];
 
 /// A stable, content-derived identifier for the running binary's
@@ -2396,6 +2422,34 @@ pub fn log_role_runner_disabled(repo_root: &Path, config: &RoleRunnerConfig) {
     log::info!("{}", disabled_role_runner_log_line(repo_root, config));
 }
 
+/// Whether `spec` is gated off for `root` by its **own** config block, beyond
+/// the role runner's own `enabled`/`roles` knobs — `Some(reason)` ⇒ do not
+/// tick (issue #7947).
+///
+/// Exactly one role has such a gate today: `concierge`, which requires
+/// `safehouse.concierge` to resolve (present, `enabled` not false, and at least
+/// one usable Matrix ID in `allowedSenders`). Naming it in
+/// `autonomous.roleRunner.roles` is deliberately **not** sufficient — an
+/// inbound control channel wired to a chat room should take two independent,
+/// explicit opt-ins, not one.
+///
+/// Written as a general predicate rather than an inline `if spec.name ==
+/// "concierge"` so that the next role with a config prerequisite has an obvious
+/// place to declare it, and so the "which roles are config-gated" question has
+/// one unit-testable answer.
+#[must_use]
+pub fn role_is_config_gated(spec: &RoleSpec, root: &Path) -> Option<&'static str> {
+    if spec.name == crate::concierge::CONCIERGE_ROLE
+        && crate::concierge::resolve_concierge_config(root).is_none()
+    {
+        return Some(
+            "safehouse.concierge does not resolve for this workspace (absent, disabled, or an \
+             empty allowedSenders); run `loom-daemon concierge check` there",
+        );
+    }
+    None
+}
+
 /// Resolve the **per-invocation architect proposal cap** (#5656) with
 /// precedence **env ([`ARCHITECT_MAX_PROPOSALS_ENV`]) > config
 /// (`autonomous.roleRunner.architectMaxProposals`, read from each root's own
@@ -3166,6 +3220,15 @@ fn decide_root_tick(
     // The root resolved enabled again — clear any stale disabled-warning so a
     // later disable re-warns (#4377).
     disabled_roots_warned.remove(root);
+    // Per-role config gate (#7947). A role whose own config block does not
+    // resolve never ticks, even when an explicit `roles` allowlist names it.
+    // Placed here — after the master switch, before sharding and the
+    // membership check — so a role that is structurally unable to do anything
+    // costs nothing further to decide about.
+    if let Some(reason) = role_is_config_gated(spec, root) {
+        log::debug!("role_runner: {} tick for {} skipped — {reason}", spec.name, root.display());
+        return None;
+    }
     // Host sharding (#6374): on a fleet, each workspace's role rotation must
     // run on exactly ONE host per interval — otherwise N dispatchers each
     // spawn the same role session over the same forge queue, which is both
