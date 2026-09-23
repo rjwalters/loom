@@ -365,6 +365,43 @@ jobs:
       - name: Check every tracked .sh is accounted for
         run: bash scripts/check-shell-allowlist.sh
 
+  retired-list-drift:
+    name: Retired List Drift
+    # Cheap structural check; always runs, and deliberately NOT path-filtered.
+    # A deletion under defaults/ is exactly what this gate exists to catch, and
+    # a `defaults/**` filter would be the same false economy the Shell Budget
+    # job already paid for once (.loom/docs/ci-principles.md: path-filtering is
+    # an optimisation, not a correctness tool).
+    #
+    # resync-installed.sh only ever WALKS files that still exist under
+    # defaults/, so a payload file deleted there is never noticed and survives
+    # forever in every installed repo. #5981 built the delete-side counterpart
+    # (defaults/.loom-retired.list) but nothing required its use, so the list
+    # drifted: three payload files were deleted with no entry, orphaning them
+    # in 23 repos on one host (#8675, 2AMLogic/2am#1009). This is the
+    # required-use half.
+    #
+    # Needs no toolchain: a `git diff`/grep/sed scan on a bare checkout, with
+    # no cargo step and no loom-daemon binary.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # fetch-depth: 0 because the gate diffs against the MERGE-BASE with
+      # origin/main, and a depth-1 checkout has no history to find one in. The
+      # gate FAILS rather than skipping when it cannot resolve a base — a gate
+      # that cannot tell "checked, fine" from "could not check" reports OK
+      # forever. Same reason the two jobs above take full history.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Self-test first, for the same reason its siblings do it: this gate's
+      # surface map duplicates resync-installed.sh's retired_target_path(), and
+      # a map that has silently drifted out of agreement passes everything.
+      - name: Self-test the gate
+        run: bash scripts/check-retired-list-drift.sh --self-test
+      - name: Check defaults/ deletions are recorded in .loom-retired.list
+        run: bash scripts/check-retired-list-drift.sh
+
   markdown-token-budget:
     name: Markdown Token Ratchet
     # Same ratchet as File Size Ratchet above, applied to agent-facing
