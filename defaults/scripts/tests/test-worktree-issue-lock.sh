@@ -70,8 +70,6 @@ if [[ -d "$SCRIPTS_DIR/lib" ]]; then
 fi
 chmod +x .loom/scripts/worktree.sh
 
-REPO="$TMP/repo"
-
 # write_issue_lock <issue> <owner_pid> <sweep_id> -- stage a live-shaped
 # claim lock at the DAEMON's schema (sweep_registry::locks::LockOwner), which
 # is what worktree.sh's cross-check reads.
