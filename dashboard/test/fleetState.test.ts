@@ -23,6 +23,8 @@
  * of them as an explicit parameter for exactly this reason.
  */
 import { env } from "cloudflare:test";
+import launchIdentity from "./fixtures/sweep-identity.json";
+import { parseActiveSweep } from "../web/src/parse";
 import { describe, expect, it } from "vitest";
 import {
   classifyAndPruneHosts,
@@ -765,5 +767,42 @@ describe("FleetState — ephemeral_compute live state (integration)", () => {
       active_sweep_ids: ["sweep-a-1"],
     });
     expect((await snapshot(stub)).activeCompute).toHaveLength(1);
+  });
+});
+
+
+describe("late sweep launch identity", () => {
+  it.each(["sweep.started", "sweep.phase"])("accepts unchanged identity replay after %s creates a row", async (kind) => {
+    const stub = fleetStateStub(`identity-before-${kind}`);
+    await update(stub, "host-a", launchIdentity);
+    expect((await snapshot(stub)).activeSweeps).toEqual([]);
+    await update(stub, "host-a", { kind, sweep_id: launchIdentity.sweep_id, phase: "builder", started_at: "2026-09-22T01:00:00Z", entered_at: "2026-09-22T01:01:00Z" });
+    const before = (await snapshot(stub)).activeSweeps[0]!;
+    await update(stub, "host-a", launchIdentity);
+    expect((await snapshot(stub)).activeSweeps[0]).toEqual({ ...before, runtime: launchIdentity.runtime, provider: launchIdentity.provider, model: launchIdentity.model });
+  });
+
+  it("enriches only an existing same-host sweep and preserves its phase and start", async () => {
+    const stub = fleetStateStub("launch-identity-lifecycle");
+    const identity = { ...launchIdentity, sweep_id: "active", profile: "private-profile", credentialAccount: "private-account" };
+    await update(stub, "host-a", identity);
+    expect((await snapshot(stub)).activeSweeps).toEqual([]);
+    await update(stub, "host-a", { kind: "sweep.started", sweep_id: "active", runtime: "opencode", started_at: "2026-09-22T01:00:00Z" });
+    await update(stub, "host-a", { kind: "sweep.phase", sweep_id: "active", phase: "builder", entered_at: "2026-09-22T01:01:00Z" });
+    await update(stub, "other-host", { ...identity, model: "wrong-host-model" });
+    expect((await snapshot(stub)).activeSweeps[0]!.model).toBeUndefined();
+    const beforeIdentity = (await snapshot(stub)).activeSweeps[0]!;
+    await update(stub, "host-a", identity);
+    expect((await snapshot(stub)).activeSweeps[0]).toMatchObject({ startedAt: beforeIdentity.startedAt, phase: beforeIdentity.phase, enteredPhaseAt: beforeIdentity.enteredPhaseAt, updatedAt: beforeIdentity.updatedAt });
+    await update(stub, "host-a", { ...identity, runtime: " ", provider: 7, model: "" });
+    await update(stub, "host-a", { kind: "sweep.phase", sweep_id: "active", phase: "judge" });
+    const sweep = (await snapshot(stub)).activeSweeps[0];
+    expect(sweep).toMatchObject({ runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3", phase: "judge", startedAt: "2026-09-22T01:00:00Z" });
+    expect(parseActiveSweep(sweep)).toMatchObject({ runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3" });
+    expect(sweep).not.toHaveProperty("profile");
+    expect(sweep).not.toHaveProperty("credentialAccount");
+    await update(stub, "host-a", { kind: "sweep.completed", sweep_id: "active" });
+    await update(stub, "host-a", identity);
+    expect((await snapshot(stub)).activeSweeps).toEqual([]);
   });
 });

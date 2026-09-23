@@ -364,3 +364,13 @@ describe("parseFleetSnapshot", () => {
     expect(parseHostProtection(null)).toBeUndefined();
   });
 });
+
+
+it("keeps unknown launch identity strings and rejects malformed or blank identity", () => {
+  const snapshot = parseFleetSnapshot({ hosts: {}, activeSweeps: [
+    { hostId: "host-a", sweepId: "future", runtime: "next-runtime", provider: "next-provider", model: "next-model" },
+    { hostId: "host-a", sweepId: "legacy", runtime: " ", provider: {}, model: 9 },
+  ] });
+  expect(snapshot.activeSweeps[0]).toMatchObject({ runtime: "next-runtime", provider: "next-provider", model: "next-model" });
+  for (const key of ["runtime", "provider", "model"]) expect(snapshot.activeSweeps[1]).not.toHaveProperty(key);
+});

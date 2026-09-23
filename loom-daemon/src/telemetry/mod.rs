@@ -56,6 +56,8 @@ use std::path::PathBuf;
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
 mod envelope;
+mod sweep_identity;
+pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod trace;
 pub mod visibility;
@@ -234,6 +236,9 @@ pub enum TelemetryRecord {
     /// A sweep began (mirrors the dispatch moment of the frozen SSE topics).
     #[serde(rename = "sweep.started")]
     SweepStarted(SweepStartedRecord),
+    /// Late-resolved launch identity; enriches an existing active sweep only.
+    #[serde(rename = "sweep.identity")]
+    SweepIdentity(SweepIdentityRecord),
     /// A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
     #[serde(rename = "sweep.phase")]
     SweepPhase(SweepPhaseRecord),

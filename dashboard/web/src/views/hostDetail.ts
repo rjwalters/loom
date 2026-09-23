@@ -25,7 +25,7 @@
 import { el, field } from "../dom";
 import { forgeLink, repoUrl, sweepWorkTitle, sweepWorkUrl } from "../forgeLinks";
 import { accountProvider } from "../fleet";
-import { providerMark, runtimeProvider } from "../providers";
+import { providerMark, sweepAgentMark } from "../providers";
 import {
   UNKNOWN,
   formatAbsolute,
@@ -291,9 +291,8 @@ export function sweepRow(sweep: ActiveSweep, now: Date = new Date()): HTMLElemen
     el(
       "td",
       { class: "detail__sweep-agent" },
-      // The runtime adapter's provider mark — which agent is doing the
-      // work. Unknown (a pre-runtime daemon) renders as unknown, not Claude.
-      sweep.runtime ? providerMark(runtimeProvider(sweep.runtime), true) : UNKNOWN,
+      // Resolved provider with the sweep runtime available in its tooltip.
+      sweepAgentMark(sweep, true) ?? UNKNOWN,
     ),
     el("td", {}, formatText(sweep.model)),
     el("td", {}, formatText(sweep.effort)),

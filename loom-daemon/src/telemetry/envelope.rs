@@ -31,10 +31,10 @@ impl TelemetryEnvelope {
     #[must_use]
     pub fn new(host_id: impl Into<String>, record: TelemetryRecord) -> Self {
         TelemetryEnvelope {
-            schema_version: if matches!(record, TelemetryRecord::Span(_)) {
-                3
-            } else {
-                CURRENT_SCHEMA_VERSION
+            schema_version: match record {
+                TelemetryRecord::SweepIdentity(_) => 4,
+                TelemetryRecord::Span(_) => 3,
+                _ => CURRENT_SCHEMA_VERSION,
             },
             emitted_at: Utc::now(),
             host_id: host_id.into(),

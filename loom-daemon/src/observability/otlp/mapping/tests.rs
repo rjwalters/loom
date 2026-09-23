@@ -695,3 +695,30 @@ fn mixed_batch_produces_both_a_logs_and_a_metrics_request() {
     assert!(build_logs_request(&batch).is_some());
     assert!(build_metrics_request(&batch).is_some());
 }
+
+#[test]
+fn active_identity_maps_distinct_runtime_provider_and_model_without_profile() {
+    let record: TelemetryRecord = serde_json::from_str(include_str!(
+        "../../../../../dashboard/test/fixtures/sweep-identity.json"
+    ))
+    .unwrap();
+    let request = build_logs_request(&[envelope("host-a", record)]).unwrap();
+    let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    for (key, expected) in [
+        ("loom.runtime", "opencode"),
+        ("loom.provider", "zai-coding-plan"),
+        ("loom.model", "glm-5.3"),
+    ] {
+        let value = log
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone());
+        assert_eq!(value, Some(any_value::Value::StringValue(expected.to_owned())));
+    }
+    assert!(!log
+        .attributes
+        .iter()
+        .any(|kv| kv.key.contains("profile") || kv.key.contains("credential")));
+}

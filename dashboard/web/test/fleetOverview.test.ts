@@ -596,3 +596,16 @@ describe("daemonIdentityText (#4956)", () => {
     expect(daemonIdentityText({}, NOW)).toBe(UNKNOWN);
   });
 });
+
+
+it("renders resolved Z.ai provider/model with OpenCode as launch runtime context", () => {
+  const host = findHost(view(), HEALTHY_HOST_ID)!;
+  host.sweeps[0] = { ...host.sweeps[0]!, runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3" };
+  const row = hostCard(host, NOW).querySelector(".card__sweep")!;
+  expect(row.textContent).toContain("Z.ai");
+  expect(row.textContent).toContain("glm-5.3");
+  const mark = row.querySelector<HTMLElement>('[data-testid="provider-mark"]')!;
+  expect(mark.dataset.provider).toBe("zai-coding-plan");
+  expect(mark.title).toContain("Runtime: OpenCode");
+  expect(mark.title).toContain("Sweep launch");
+});

@@ -28,7 +28,7 @@ import {
   roleTickCompactText,
 } from "../format";
 import { forgeLink, repoUrl, sweepWorkTitle, sweepWorkUrl } from "../forgeLinks";
-import { providerDisplayName, providerMark, runtimeProvider } from "../providers";
+import { providerDisplayName, providerMark, sweepAgentMark } from "../providers";
 import type { FleetView, HostStatus, HostView, ProviderSummary } from "../fleet";
 import type { HostHealthRecord, HostProtection, ManagedRepoEntry } from "../types";
 import { emptyFleetView } from "./states";
@@ -385,10 +385,10 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
             el(
               "li",
               { class: "card__sweep" },
-              // Which agent is doing the work — the runtime adapter's
-              // provider mark (Claude's icon, "Codex" text, …). Absent for a
-              // pre-runtime daemon: no mark, never a guessed one.
-              sweep.runtime ? providerMark(runtimeProvider(sweep.runtime)) : null,
+              // Resolved provider first; admitted runtime remains an honest
+              // fallback when older daemons have no launch attribution.
+              sweepAgentMark(sweep),
+              sweep.model ? el("span", { class: "chip", title: "Sweep launch model" }, sweep.model) : null,
               el("span", { class: "chip" }, sweep.phase ?? "starting"),
               // `#N` links to the sweep's work on the forge: the
               // `feature/issue-N` branch once Builder has pushed one, the

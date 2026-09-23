@@ -1,7 +1,6 @@
 /**
  * Provider identity — the names and marks the dashboard uses for the
- * pools (`tokens.snapshot`'s `provider`) and the agents (`sweep.started`'s
- * `runtime`) it renders.
+ * pools (`tokens.snapshot`'s `provider`) and the agents (`sweep.identity`'s provider or admitted runtime) it renders.
  *
  * The iconography deliberately matches the 2amlogic.com homepage fleet feed
  * (`marketing/website/src/components/ModelLabels.tsx`): Claude gets its
@@ -16,6 +15,7 @@
  */
 
 import { el } from "./dom";
+import type { ActiveSweep } from "./types";
 
 /** Display names for the provider/runtime identifiers the daemon emits. */
 const DISPLAY_NAME: Readonly<Record<string, string>> = {
@@ -27,18 +27,23 @@ const DISPLAY_NAME: Readonly<Record<string, string>> = {
   pi: "Pi",
   zai: "z.ai",
   "z.ai": "z.ai",
+  "zai-coding-plan": "Z.ai",
 };
 
 export function providerDisplayName(provider: string): string {
   return DISPLAY_NAME[provider.toLowerCase()] ?? provider;
 }
 
-/** The provider a sweep's `runtime` adapter draws its accounts from. Today
- * every adapter name is also its provider name (`claude` → Claude's pool,
- * `codex` → Codex's), so this is the identity map; it exists so the one
- * place a runtime→provider divergence would land is named. */
-export function runtimeProvider(runtime: string): string {
-  return runtime.toLowerCase();
+/** Launch identity, with an admitted runtime as an explicitly named fallback.
+ * Provider and adapter are separate: OpenCode can launch Z.ai or other models.
+ * Missing metadata stays unknown; the tooltip states the sweep-launch scope. */
+export function sweepAgentMark(sweep: ActiveSweep, withName = false): HTMLElement | null {
+  const identity = sweep.provider ?? sweep.runtime;
+  if (!identity) return null;
+  const mark = providerMark(identity, withName);
+  const context = sweep.runtime ? `Runtime: ${providerDisplayName(sweep.runtime)}` : "Runtime: unknown";
+  mark.title = `Sweep launch — ${context}; provider: ${sweep.provider ? providerDisplayName(sweep.provider) : "unknown"}${sweep.model ? `; model: ${sweep.model}` : ""}`;
+  return mark;
 }
 
 /**

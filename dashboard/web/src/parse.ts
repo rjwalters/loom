@@ -196,9 +196,10 @@ export function parseActiveSweep(value: unknown): ActiveSweep | undefined {
     phase: str(value.phase),
     startedAt: str(value.startedAt),
     enteredPhaseAt: str(value.enteredPhaseAt),
-    model: str(value.model),
+    model: str(typeof value.model === "string" ? value.model.trim() : value.model),
     effort: str(value.effort),
-    runtime: str(value.runtime),
+    runtime: str(typeof value.runtime === "string" ? value.runtime.trim() : value.runtime),
+    provider: str(typeof value.provider === "string" ? value.provider.trim() : value.provider),
     updatedAt: str(value.updatedAt),
   });
 }

@@ -337,3 +337,13 @@ describe("hostDetailView — history section (#5355)", () => {
     expect(history?.querySelector('[data-testid="history-loading"]')).toBeNull();
   });
 });
+
+
+it("renders resolved Z.ai and its model in the host sweep table", () => {
+  const host = findHost(buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW), HEALTHY_HOST_ID)!;
+  host.sweeps[0] = { ...host.sweeps[0]!, runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3" };
+  const row = hostDetailView(host, NOW).querySelector('[data-testid="sweep-row"]')!;
+  expect(row.textContent).toContain("Z.ai");
+  expect(row.textContent).toContain("glm-5.3");
+  expect(row.querySelector<HTMLElement>('[data-testid="provider-mark"]')!.title).toContain("Runtime: OpenCode");
+});

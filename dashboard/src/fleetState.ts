@@ -92,6 +92,8 @@ export interface ActiveSweepState {
   /** Runtime adapter the sweep was dispatched on (`claude`, `codex`, …),
    * from `sweep.started`'s `runtime`. Absent for a pre-runtime daemon. */
   runtime?: string;
+  /** Resolved launch provider, distinct from the runtime adapter. */
+  provider?: string;
   updatedAt: string;
 }
 
@@ -540,10 +542,26 @@ export class FleetState implements DurableObject {
           startedAt: typeof record.started_at === "string" ? record.started_at : undefined,
           model: typeof record.model === "string" ? record.model : undefined,
           effort: typeof record.effort === "string" ? record.effort : undefined,
-          runtime: typeof record.runtime === "string" ? record.runtime : undefined,
+          runtime: identityString(record.runtime),
+          provider: identityString(record.provider),
           updatedAt: now,
         };
         await this.state.storage.put(`sweep:${sweepId}`, entry);
+        break;
+      }
+      case "sweep.identity": {
+        const sweepId = record.sweep_id;
+        if (typeof sweepId !== "string") return;
+        const key = `sweep:${sweepId}`;
+        const existing = await this.state.storage.get<ActiveSweepState>(key);
+        // Late metadata cannot create/resurrect a sweep or cross host ownership.
+        if (!existing || existing.hostId !== hostId) return;
+        await this.state.storage.put(key, {
+          ...existing,
+          runtime: identityString(record.runtime) ?? existing.runtime,
+          provider: identityString(record.provider) ?? existing.provider,
+          model: identityString(record.model) ?? existing.model,
+        });
         break;
       }
       case "sweep.phase": {
@@ -563,6 +581,7 @@ export class FleetState implements DurableObject {
           model: existing?.model,
           effort: existing?.effort,
           runtime: existing?.runtime,
+          provider: existing?.provider,
           updatedAt: now,
         };
         await this.state.storage.put(`sweep:${sweepId}`, entry);
@@ -709,4 +728,9 @@ export class FleetState implements DurableObject {
 
     return { hosts, activeSweeps, activeCompute };
   }
+}
+
+/** Missing/malformed identity is unknown, never a request to erase known data. */
+function identityString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }

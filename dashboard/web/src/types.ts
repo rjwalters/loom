@@ -237,6 +237,8 @@ export interface ActiveSweep {
   /** Runtime adapter the sweep was dispatched on (`"claude"`, `"codex"`, …)
    * — which agent is doing the work. Absent for a pre-runtime daemon. */
   runtime?: string;
+  /** Provider resolved by this sweep launch (not by its child roles). */
+  provider?: string;
   updatedAt?: string;
 }
 
