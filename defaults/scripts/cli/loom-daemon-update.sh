@@ -503,6 +503,15 @@ else
 fi
 locate_daemon_bin() { loom_locate_daemon_bin "$1"; }
 
+# bounded_run (#4799) — wall-clock budget with a `timeout(1)`-compatible 124,
+# and a real portable implementation for hosts that ship no `timeout(1)`.
+# macOS is exactly such a host, and macOS is the ONLY platform on which
+# verify_destination_artifact()'s `codesign` probe runs, so a bare
+# `timeout … codesign …` there would silently degrade to unbounded — the very
+# hang #8770 exists to bound.
+# shellcheck source=../lib/bounded-run.sh
+source "$SCRIPT_DIR/../lib/bounded-run.sh" || { err "bounded-run.sh not found at $SCRIPT_DIR/../lib/bounded-run.sh — this checkout is missing an expected lib file."; exit 1; }
+
 # resolve_self_daemon_bin -- the loom-daemon that IMPLEMENTS this script's
 # ported logic, which is NOT the same binary as locate_daemon_bin's. The
 # definition moved into lib/locate-daemon-bin.sh with #8037, when
@@ -1232,53 +1241,42 @@ verify_destination_artifact() {
     # pre-provision download demonstrably carried an Authority (set by
     # verify_artifact_signature() before provisioning); skips silently when
     # that is unknown (Linux target, or codesign unavailable at download time).
-    if [[ "$ARTIFACT_SIGNATURE_HAD_AUTHORITY" == "true" ]]; then
-        if ! command -v codesign >/dev/null 2>&1; then
-            warn "'codesign' not available -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature)."
-        else
-            local dest_sig_desc dest_sig_rc
-            # Bounded (#8770, the shell-side twin of #8754's
-            # loom-daemon/src/release_fetch/signature.rs::verify_darwin fix):
-            # a contended host can make `codesign -dvvv` hang indefinitely, and
-            # this call previously had no deadline at all, unlike every other
-            # codesign invocation in the update path. DEST_SIG_VERIFY_TIMEOUT
-            # is overridable so the "it actually times out" test path does not
-            # have to wait out the production ceiling.
-            #
-            # Read-then-match (#6662/#7932): NEVER `codesign ... | grep -q`,
-            # which is exactly the pipefail bug this whole check exists to
-            # guard against (grep -q closes the pipe before codesign finishes
-            # writing, reporting 141 under `set -o pipefail`).
-            if command -v timeout >/dev/null 2>&1; then
-                dest_sig_desc="$(timeout "$DEST_SIG_VERIFY_TIMEOUT" codesign -dvvv "$dest" 2>&1)"
-                dest_sig_rc=$?
-            else
-                dest_sig_desc="$(codesign -dvvv "$dest" 2>&1)"
-                dest_sig_rc=$?
-            fi
-            # #8770: an empty report -- whether from a `timeout`-killed
-            # invocation (rc 124), or any other codesign failure that produced
-            # no diagnostic text at all -- is "we could not check", NOT "we
-            # checked and it's bad". Collapsing that into the exit-5 downgrade
-            # path below is the exact #8754 conflation one layer further into
-            # the update: only a codesign that ran to completion and actually
-            # wrote a report (even a negative one, e.g. "not signed at all")
-            # counts as a definitive answer about whether Authority= survived.
-            if [[ -z "$dest_sig_desc" ]]; then
-                if [[ "$dest_sig_rc" -eq 124 ]]; then
-                    warn "'codesign -dvvv' timed out after ${DEST_SIG_VERIFY_TIMEOUT}s on $dest -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature). Treating as inconclusive, not a downgrade."
-                else
-                    warn "'codesign -dvvv' produced no output for $dest (exit ${dest_sig_rc}) -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature). Treating as inconclusive, not a downgrade."
-                fi
-            elif ! grep -q '^Authority=' <<<"$dest_sig_desc"; then
-                err "Post-provision verification FAILED: the fetched release artifact carried a Developer ID (Authority=) signature, but the provisioned destination at $dest does not."
-                err "Provisioning has DOWNGRADED the signature -- this replaces the certificate-anchored designated requirement with a per-build ad-hoc identity and orphans every TCC grant on this host (the #7932 regression class). Refusing to report success."
-                exit 5
-            else
-                ok "Post-provision verification: destination binary at $dest retains its Developer ID Authority signature."
-            fi
-        fi
+    #
+    # Guard-clause form (#8770): the two skip conditions return early rather
+    # than nesting, which keeps the bounded-probe logic below at one indent.
+    [[ "$ARTIFACT_SIGNATURE_HAD_AUTHORITY" == "true" ]] || return 0
+    command -v codesign >/dev/null 2>&1 || { warn "'codesign' not available -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature)."; return 0; }
+
+    local dest_sig_desc dest_sig_rc=0
+    # Bounded (#8770, the shell-side twin of #8754's
+    # loom-daemon/src/release_fetch/signature.rs::verify_darwin fix): a
+    # contended host can make `codesign -dvvv` hang indefinitely, and this call
+    # previously had no deadline at all. bounded_run (NOT a bare `timeout …`)
+    # because this branch only ever runs on Darwin, which ships no
+    # `timeout(1)`: bounded_run's portable fallback is a real bound there, and
+    # it normalizes every implementation's kill to `timeout`'s own rc 124.
+    #
+    # Read-then-match (#6662/#7932): NEVER `codesign ... | grep -q`, which is
+    # exactly the pipefail bug this whole check exists to guard against (grep -q
+    # closes the pipe before codesign finishes writing, reporting 141 under
+    # `set -o pipefail`).
+    dest_sig_desc="$(bounded_run "$DEST_SIG_VERIFY_TIMEOUT" codesign -dvvv "$dest" 2>&1)" || dest_sig_rc=$?
+    # #8770: an empty report -- whether from a deadline-killed invocation
+    # (rc 124), or any other codesign failure that produced no diagnostic text
+    # at all -- is "we could not check", NOT "we checked and it's bad".
+    # Collapsing that into the exit-5 downgrade path below is the exact #8754
+    # conflation one layer further into the update: only a codesign that ran to
+    # completion and actually wrote a report (even a negative one, e.g. "not
+    # signed at all") counts as a definitive answer about whether Authority=
+    # survived.
+    [[ -n "$dest_sig_desc" ]] || { warn "'codesign -dvvv' $(if [[ "$dest_sig_rc" -eq 124 ]]; then echo "timed out after ${DEST_SIG_VERIFY_TIMEOUT}s"; else echo "exited ${dest_sig_rc} without writing a report"; fi) for $dest -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature). Treating as inconclusive, not a downgrade."; return 0; }
+
+    if ! grep -q '^Authority=' <<<"$dest_sig_desc"; then
+        err "Post-provision verification FAILED: the fetched release artifact carried a Developer ID (Authority=) signature, but the provisioned destination at $dest does not."
+        err "Provisioning has DOWNGRADED the signature -- this replaces the certificate-anchored designated requirement with a per-build ad-hoc identity and orphans every TCC grant on this host (the #7932 regression class). Refusing to report success."
+        exit 5
     fi
+    ok "Post-provision verification: destination binary at $dest retains its Developer ID Authority signature."
 }
 
 # verify_supervisor_matches_provisioned <provisioned_dest> — the #6009

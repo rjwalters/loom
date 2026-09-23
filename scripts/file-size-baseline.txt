@@ -13,7 +13,7 @@
 # <code-lines> <path>
 1657 defaults/scripts/claude-wrapper.sh
 1184 defaults/scripts/cli/loom-daemon-start.sh
-1590 defaults/scripts/cli/loom-daemon-update.sh
+1589 defaults/scripts/cli/loom-daemon-update.sh
 1063 defaults/scripts/lib/forge-helpers.sh
 1460 defaults/scripts/merge-pr.sh
 2033 defaults/scripts/tests/test-loom-daemon-start.sh
