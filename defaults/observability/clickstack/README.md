@@ -2,9 +2,17 @@
 
 This local trial is one destination of the shared collector in #8526. ClickStack
 bundles ClickHouse, HyperDX, an OpenTelemetry collector, and MongoDB. HyperDX is
-the UI for this destination, not a third backend. Real Loom traces and repair
-waterfalls depend on #8524/#8525; a synthetic fixture proves transport and schema,
-not Loom instrumentation.
+the UI for this destination, not a third backend. #8524 and #8525 have merged:
+`loom-daemon` now creates real `loom.sweep`/`loom.phase`/`loom.role_attempt`
+spans at real sweep dispatch and worker spawn, proven in-tree
+(`loom-daemon/tests/successful_sweep_waterfall.rs`,
+`loom-daemon/tests/lifecycle_traces.rs`). Routing one of those real traces
+through **this** deployment and querying it back out of ClickHouse is still
+open — see "Real trace and repair-waterfall verification" below — because it
+needs either a full sweep dispatch or an operator-held `ZAI_API_KEY` for the
+standalone canary tool, the same credential gate #8525 itself is waiting on.
+Until then the fixture below proves transport and schema, not Loom
+instrumentation.
 
 ## Pinned distribution and host budget
 
@@ -117,6 +125,52 @@ and dashboards through the installed UI where available, inspect them for secret
 and workload text, and preserve sanitized exports with the evaluation evidence.
 `queries.sql` provides reproducible read-only schema, parentage, gauge, duplicate
 and storage checks independently of UI exports.
+
+## Real trace and repair-waterfall verification
+
+This closes the two acceptance items `evidence.md`'s "Dependency status
+update" section leaves open. It needs a `loom-daemon` binary built with
+`--features otlp` and this deployment running with the shared collector from
+`../collector` in front of it (`LOOM_CLICKSTACK_INGEST_KEY_FILE` pointed at
+this project's ingestion key).
+
+**Real canary, without a paid model call.** `loom-daemon/src/observability/lifecycle.rs`
+is the production code a real sweep dispatch and worker spawn already use, and it
+is not gated on an LLM call. But its span-opening entry points
+(`lifecycle::begin`/`prepare_execution`) are only called from real sweep dispatch
+(`sweep_registry/dispatch.rs`), the paid canary tool below, and the in-tree tests —
+there is currently no standalone CLI subcommand that opens a root span on its
+own. `loom-daemon/tests/lifecycle_traces.rs::actual_checkpoint_cli_preserves_rapid_judge_doctor_repair_waterfall`
+and `loom-daemon/tests/successful_sweep_waterfall.rs` drive that real code
+(`lifecycle::begin`, the real `sweep-checkpoint` CLI for every phase/attempt,
+`lifecycle::finish_execution`) end to end and assert a correctly nested,
+correctly parented waterfall — including a Judge-rejected → Doctor →
+Judge-succeeded repair sequence with distinct Ok/Error span IDs — but only
+against an in-process durable-queue backfill, not a network export; both test
+files passed against unmodified `main` in this pass. The daemon's real export
+path (`observability::{sender,exporter,otlp}`, started by `observability::spawn_task`
+whenever a real `loom-daemon` process runs with tracing enabled) drains that
+same durable queue to the configured OTLP endpoint continuously, and
+`loom-daemon telemetry-export --input <queue.jsonl> --endpoint <collector URL>
+--key-file <collector key file>` (`loom-daemon/src/cli/telemetry_export.rs`) does
+the equivalent one-shot POST for an already-assembled envelope batch. Wiring
+those three pieces (a `begin`-based root span, the checkpoint CLI sequence,
+and a real POST to this deployment) into one reproducible, credential-free
+recipe is exactly what remains for the "real Loom canary"/"repair trace"
+acceptance boxes — this pass verified every piece individually but did not
+assemble and run it against a live receiver (see the host-contention note in
+`evidence.md`), so no fabricated end-to-end command sequence is given here.
+
+**Fully authorized canary.** `loom-daemon telemetry-live --execute --output
+<new private dir> --endpoint <collector URL> --key-file <collector key file>
+--guard-dir defaults/hooks --zshrc <file with a literal ZAI_API_KEY=... line>`
+(`loom-daemon/src/cli/telemetry_live.rs`) spawns real Pi and OpenCode
+processes against the bundled `zai-flash` model profile, producing a real
+`loom.sweep` root span from an actual (small, isolated, read-only) model
+invocation and exporting it through the same collector. It requires a real
+`ZAI_API_KEY` under operator control — the credential/authorization gate
+#8525 itself is waiting on for its own acceptance evidence — and is a paid,
+rate-limited call; do not run it without that authorization.
 
 ## Retention, persistence and key rotation
 
