@@ -184,6 +184,7 @@ test-resync-installed-agent-skills-guard.sh
 test-resync-installed-gh-config-guard.sh
 test-resync-installed-guard-check.sh
 test-resync-installed-local-fix-guard.sh
+test-resync-installed-retired-dry-run.sh
 test-resync-installed.sh
 test-review-feedback-reconciliation.sh
 test-run-ci-suites-daemon-guard.sh
