@@ -156,6 +156,71 @@ same network protection. Local bearer auth without TLS is only for loopback and
 the trusted trial network. Back up private stores and restrict access in both
 products; operational correlation IDs can identify repositories.
 
+## Known gap: OpenCode interactive sessions (issue #8670)
+
+**Interactive, human-launched `opencode` sessions do not reach this collector,
+by decision, not by oversight.** Everything below was verified against OpenCode
+1.18.31 on the telemetry-activation host on 2026-09-22; re-check it before
+acting on it.
+
+Only the *interactive* half is missing. Daemon-dispatched OpenCode work is
+already on the wire: issue #8507 folds OpenCode session tokens into
+`sweep.outcome` / `role_tick.outcome`'s `tokens_by_model`, and
+`loom.tokens_by_model`, `loom.models_used`, `loom.runtime`, `loom.provider` and
+`loom.model` are already allowlisted in `config.yaml`'s `keep_keys(...)`. A
+sweep or role tick that ran on OpenCode is queryable by runtime, model and
+duration today.
+
+OpenCode keeps sessions in SQLite (`$XDG_DATA_HOME/opencode/opencode.db`), not
+the JSONL session stores the other runtimes use, so the filelog approach #8669
+takes for Codex/pi/Claude cannot read it at all. Whatever reaches this collector
+for OpenCode must therefore be normalized to `loom.*` attributes *before* it is
+sent, which "Privacy and remote deployment" above requires of every source
+regardless. Three options were weighed:
+
+- **A native OpenCode exporter** is not this repo's to write. OpenCode is an
+  external upstream consumed as the pinned `opencode-ai` npm package under
+  `~/.loom/opt/opencode-<ver>/`, with `OPENCODE_DISABLE_AUTOUPDATE=1` baked into
+  the worker image; an upstream feature would not reach the fleet until a
+  deliberate pin bump. If it ever ships, wiring it is the #8668 shape — an env
+  block and a doc, not code here.
+- **A Loom-side periodic extract** is tractable and is the chosen design *when
+  it is warranted* — see below.
+- **Documenting the gap** is what shipped, because there is currently nothing to
+  extract: on a host with OpenCode installed since 2026-09-20,
+  `~/.local/share/opencode/` held only `log/` and `repos/` — no `opencode.db`.
+  Every session row that exists belongs to the Loom-managed store, i.e. work
+  already covered by #8507.
+
+### The extract design, if the triggers below fire
+
+`session` carries a stable `id`, `parent_id` (the subagent boundary), `agent`,
+a `model` JSON object (`id` + `providerID`), `directory`, and both
+`time_created` and `time_updated`. The non-obvious constraint is that **session
+rows are mutable running totals, not append-only events** — all four rows in the
+store read on 2026-09-22 had `time_updated > time_created`. So:
+
+- dedup **last-value-wins keyed on `session.id`**, watermarked on
+  `time_updated`; a `time_created` cursor would freeze each session at its
+  first-seen counters and silently undercount every turn that followed.
+- do **not** reach for the `event(aggregate_id, seq, …)` table, whose
+  `UNIQUE(aggregate_id, seq)` index is the textbook monotonic watermark: its
+  `data` column is raw prompt and completion text, which this pipeline forbids.
+- reuse `loom-daemon/src/opencode_usage.rs` and keep its invariant — one query
+  naming `session` alone, opened read-only — because the same database file also
+  holds `credential` and `account` tables, and `session` itself carries
+  free-text `title`, `metadata` and `summary_diffs` that must never be
+  projected.
+- extend that module's discovery to `$XDG_DATA_HOME/opencode/opencode.db`; it
+  scans only the Loom-managed `~/.loom/opt/opencode-<ver>/` stores today.
+
+**Re-open #8670 when both hold**: (1) an `opencode.db` appears at
+`$XDG_DATA_HOME/opencode/` on a fleet host carrying sessions not attributable to
+a Loom launch — real interactive usage exists; and (2) issue #8669's
+`loom.session_id` / `loom.agent_id` / `loom.parent_agent_id` allowlist entries
+have merged, so the extract has a settled attribute schema to match rather than
+a parallel one to invent.
+
 ## Executable contract and evidence
 
 From the repository root:
