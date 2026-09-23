@@ -357,6 +357,50 @@ function sweepIds(snap: FleetSnapshot): string[] {
   return snap.activeSweeps.map((s) => s.sweepId).sort();
 }
 
+describe("FleetState — sweep runtime", () => {
+  it("carries sweep.started's runtime into the live entry and keeps it across sweep.phase", async () => {
+    const stub = fleetStateStub("test-runtime-carry");
+    await update(stub, "host-a", {
+      kind: "sweep.started",
+      sweep_id: "sweep-rt-1",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 1,
+      started_at: "2026-08-02T00:00:00Z",
+      runtime: "codex",
+    });
+    let snap = await snapshot(stub);
+    expect(snap.activeSweeps[0]?.runtime).toBe("codex");
+
+    await update(stub, "host-a", {
+      kind: "sweep.phase",
+      sweep_id: "sweep-rt-1",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 1,
+      phase: "builder",
+      entered_at: "2026-08-02T00:05:00Z",
+    });
+    snap = await snapshot(stub);
+    expect(snap.activeSweeps[0]?.phase).toBe("builder");
+    expect(snap.activeSweeps[0]?.runtime).toBe("codex");
+  });
+
+  it("leaves runtime absent when the daemon did not name one", async () => {
+    const stub = fleetStateStub("test-runtime-absent");
+    await update(stub, "host-a", {
+      kind: "sweep.started",
+      sweep_id: "sweep-rt-2",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 2,
+      started_at: "2026-08-02T00:00:00Z",
+    });
+    const snap = await snapshot(stub);
+    expect(snap.activeSweeps[0]).not.toHaveProperty("runtime");
+  });
+});
+
 describe("FleetState — host.health reconciliation (fix layer 2, integration)", () => {
   it("a host.health update with active_sweep_ids removes this host's entries not in the set", async () => {
     const stub = fleetStateStub("test-reconcile-basic");

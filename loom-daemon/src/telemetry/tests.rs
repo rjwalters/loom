@@ -7,7 +7,9 @@ use super::*;
 
 mod admission_brake;
 mod role_tick;
+mod token_snapshot;
 use role_tick::role_tick_outcome;
+use token_snapshot::tokens_snapshot;
 
 // ------------------------------------------------------------------
 // Test fixtures — one freshly-constructed record per kind.
@@ -29,6 +31,7 @@ fn sweep_started() -> TelemetryRecord {
         started_at: ts(),
         model: Some("opus".to_string()),
         effort: Some("high".to_string()),
+        runtime: Some("claude".to_string()),
     })
 }
 
@@ -112,28 +115,6 @@ fn sweep_outcome() -> TelemetryRecord {
         runtime: Some("opencode".to_string()),
         provider: Some("friendli".to_string()),
         profile: Some("zai-flash".to_string()),
-    })
-}
-
-fn tokens_snapshot() -> TelemetryRecord {
-    TelemetryRecord::TokensSnapshot(TokenSnapshotRecord {
-        captured_at: ts(),
-        accounts: vec![
-            TokenAccountState {
-                account: "agent-1".to_string(),
-                rank: Some(0),
-                usage_fraction: Some(0.42),
-                limit_window_reset_at: Some(ts()),
-                exhausted: false,
-            },
-            TokenAccountState {
-                account: "agent-2".to_string(),
-                rank: None,
-                usage_fraction: None,
-                limit_window_reset_at: None,
-                exhausted: true,
-            },
-        ],
     })
 }
 
