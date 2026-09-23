@@ -19,6 +19,7 @@ pub(crate) mod dispatch;
 pub(crate) mod dispatch_backoff;
 mod duplicate_scan;
 pub(crate) mod fleet_experiment;
+mod git_blob_lines;
 pub(crate) mod health;
 pub(crate) mod inflight;
 pub(crate) mod lease_ensure;

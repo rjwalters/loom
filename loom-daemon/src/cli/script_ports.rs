@@ -140,6 +140,16 @@ pub(crate) enum ScriptPortCommand {
     /// per the shell-language policy, backing
     /// `generate-agent-skills.sh`'s Shape-A stub.
     GenerateAgentSkills(super::agent_skills::AgentSkillsArgs),
+
+    /// `verify-proposal-refs.sh`'s line-range check (#8656): resolve a cited
+    /// path against a rev, FOLLOWING a `120000` (symlink) tree entry to the
+    /// document it points at, and answer the range question against that
+    /// document. Since #7842 every `.loom/docs/*.md` with a `defaults/docs/`
+    /// counterpart is such a link, so the script's old `git show <rev>:<path>
+    /// | wc -l` measured the link-target STRING and reported every in-range
+    /// citation as a miss — on a script that BLOCKS FILING. Ported out of the
+    /// `contract`-category script per the shell language policy.
+    GitBlobLines(super::git_blob_lines::GitBlobLinesArgs),
 }
 
 impl ScriptPortCommand {
@@ -166,6 +176,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::PremiseCheck(args) => args.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
+            ScriptPortCommand::GitBlobLines(args) => args.run(),
         }
     }
 }

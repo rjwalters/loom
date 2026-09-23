@@ -1182,6 +1182,16 @@ jobs:
         run: bash defaults/scripts/tests/test-check-duplicate.sh
       - name: create-issue duplicate backstop graduation (#7971, #8289, #8360)
         run: bash defaults/scripts/tests/test-create-issue-duplicate-check.sh
+      # Moved out of shell-suite-tests by #8656: verify-proposal-refs.sh's
+      # line-range check is now `loom-daemon git-blob-lines --range`, which
+      # follows a 120000 (symlink) tree entry to the document it points at
+      # before counting. Every `.loom/docs/*.md` has been such a link since
+      # #7842, so the old `git show <rev>:<path> | wc -l` measured the link
+      # target STRING and reported every in-range citation as a miss — on a
+      # script that BLOCKS FILING. The suite needs the binary this job builds
+      # and fails rather than skips without one.
+      - name: verify-proposal-refs symlink-aware line ranges (#7658, #8656)
+        run: bash defaults/scripts/tests/test-verify-proposal-refs.sh
       # Moved out of shell-suite-tests by #8583: reconcile-stack.sh's rebase
       # planning/execution (fetch + PIN the remote default-branch tip, worktree
       # routing, parent-ref resolution and its ancestry check, the rebase
