@@ -66,6 +66,8 @@ only on a **breaking** wire change to the record shapes below. A backend should:
 |---|---|---|
 | `1` | The original six record kinds (`sweep.started`, `sweep.phase`, `sweep.completed`, `sweep.outcome`, `tokens.snapshot`, `host.health`). | — |
 | `2` | Adds the `role_tick.outcome` record kind (Issue #8056). | **Every `1`-era record shape is byte-identical in `2`.** The bump exists solely because a backend that pattern-matches exhaustively on `kind` has no arm for the new one. A `2` envelope carrying any of the original six kinds is still parseable by a `1`-era reader; a `1` envelope is still parseable by the current daemon (the version is read, never validated, on the read path). Issue #8056's *additive* fields on `sweep.outcome` — `failure_class`, `models_used`, `doctor_cycles` — shipped under `1` and did **not** bump it, exactly as this section prescribes: a new optional field is not a breaking change, a new record kind is. Issue #8222's `judge_verdicts` is additive under `2` for the same reason (and re-sourcing `doctor_cycles` changed the value's provenance, never its wire type). |
+| `3` | Adds `trace.span` (only trace envelopes use this version). | Existing lifecycle envelopes keep version `2`. |
+| `4` | Adds `sweep.identity` (#8713); only identity envelopes use `4`. | Existing lifecycle/trace versions and shapes remain unchanged. Older Workers store unknown kinds in history but cannot enrich live state from them. |
 
 ## `/ingest` response (the bound-`host_id` echo)
 
@@ -140,6 +142,7 @@ records (`tokens.snapshot`, `host.health`) do not.
 |---|---|---|
 | `sweep.started` / `sweep.phase` / `sweep.completed` | repo | sweep lifecycle moment |
 | `sweep.outcome` | repo | terminal sweep transition |
+| `sweep.identity` | repo | active launch identity becomes known |
 | `role_tick.outcome` | repo | role-runner tick (Issue #8056) |
 | `tokens.snapshot` / `host.health` | host | sampling interval |
 
@@ -167,6 +170,44 @@ A sweep began work on an issue.
 `SweepInfo::runtime` records — and is what lets a consumer say *which agent*
 is working the sweep. Omitted when the dispatch did not name one; never
 defaulted to `"claude"`.
+
+### `sweep.identity`
+
+Update-only launch attribution (#8713), emitted under envelope schema version
+`4` when an active sweep's resolved launch metadata becomes available:
+
+```json
+{"kind":"sweep.identity","repo":"example/project","visibility":"public","issue":42,"sweep_id":"sweep-42","runtime":"opencode","provider":"zai-coding-plan","model":"glm-5.3"}
+```
+
+`runtime`, `provider`, and `model` are optional, nonempty strings. `runtime`
+may initially name the admitted adapter; provider/model are populated only from
+the sweep's own `# LOOM_LAUNCH` record, never inferred from runtime or current
+config. They describe the **sweep launch**, not all child roles' models. Missing
+legacy metadata remains unknown; local profile, credential, account and path
+fields are never copied into this record.
+
+The collector samples active registries every five seconds (including adopted
+sweeps after restart), reads at most 256 KiB per sweep per pass, and caches the
+first resolved launch after the exact dispatch header. Large appended logs may
+require multiple passes. Partial lines, previous dispatches, child-role launches,
+and log truncation are handled without borrowing another launch's identity.
+Records are emitted when the known identity changes and replayed after an
+observed start/phase event. This repairs an identity update dropped because its
+lifecycle row did not exist yet, including restart adoption, while retaining
+the cached launch and read offset. The existing export flush cadence still applies.
+
+The Worker applies identity only to an existing same-host active entry. It keeps
+that entry's original start/phase and freshness timestamp; metadata alone is not
+proof of progress. A late update never recreates a completed or reconciled-away
+sweep. Public private-repository views retain runtime/provider/model but remove
+repository/issue/sweep identifiers and all unapproved fields.
+
+**Rollout:** deploy the consuming Worker/UI before updating daemon producers.
+New consumers tolerate old producers with absent metadata; old consumers store
+but ignore this new kind for live state. Existing SSE lifecycle topics and old
+envelope versions do not change. After a producer restart, its registry-backed
+scan can enrich a surviving Durable Object entry without replaying its start.
 
 ### `sweep.phase`
 

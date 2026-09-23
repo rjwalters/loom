@@ -178,6 +178,29 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes,
             )
         }
+        TelemetryRecord::SweepIdentity(r) => {
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_int("loom.issue", i64::from(r.issue)),
+                kv_string("loom.sweep_id", r.sweep_id.clone()),
+            ];
+            for (key, value) in [
+                ("loom.runtime", &r.runtime),
+                ("loom.provider", &r.provider),
+                ("loom.model", &r.model),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_string(key, value.clone()));
+                }
+            }
+            (
+                "sweep.identity",
+                SeverityNumber::Info,
+                "sweep launch identity".to_string(),
+                attributes,
+            )
+        }
         TelemetryRecord::SweepPhase(r) => (
             "sweep.phase",
             SeverityNumber::Info,
@@ -535,6 +558,7 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         // Every lifecycle-shaped kind — including `role_tick.outcome`
         // (#8056) — becomes a log record instead (see `log_record_for`).
         TelemetryRecord::SweepStarted(_)
+        | TelemetryRecord::SweepIdentity(_)
         | TelemetryRecord::SweepPhase(_)
         | TelemetryRecord::SweepCompleted(_)
         | TelemetryRecord::SweepOutcome(_)

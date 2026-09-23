@@ -98,6 +98,7 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // `runtime` (the adapter the sweep ran on — `claude`/`codex`/…) is fleet
   // capacity metadata like `model`: it names no repo, issue, or operator.
   "sweep.started": ["kind", "started_at", "model", "effort", "runtime"],
+  "sweep.identity": ["kind", "runtime", "provider", "model"],
   "sweep.phase": ["kind", "phase", "entered_at"],
   "sweep.completed": ["kind", "completed_at", "result"],
   "sweep.outcome": ["kind", "model", "effort", "config", "phase_durations", "total_duration_sec", "result"],
@@ -647,6 +648,7 @@ export interface PublicActiveSweep {
   model?: string;
   effort?: string;
   runtime?: string;
+  provider?: string;
   updatedAt: string;
 }
 
@@ -668,6 +670,7 @@ export function redactActiveSweep(sweep: ActiveSweepState, isAuthenticated: bool
     model: sweep.model,
     effort: sweep.effort,
     runtime: sweep.runtime,
+    provider: sweep.provider,
     updatedAt: sweep.updatedAt,
   };
 }

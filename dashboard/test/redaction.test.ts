@@ -1162,3 +1162,16 @@ describe("GET /public/events vs GET /api/events — live tail redaction", () => 
     await reader.cancel();
   }, 15_000);
 });
+
+
+describe("resolved sweep identity redaction", () => {
+  it("retains only runtime/provider/model for a private launch record", () => {
+    const record = { kind: "sweep.identity", repo: "secret/project", visibility: "private", issue: 42, sweep_id: "private-sweep", runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3", profile: "secret-profile", credentialAccount: "secret-account", credentialSource: "key", path: "/secret/log", branch: "secret-branch" };
+    expect(redactPayload("sweep.identity", record)).toEqual({ kind: "sweep.identity", runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3" });
+    const sweep = { hostId: "host-a", sweepId: "private-sweep", visibility: "private" as const, repo: "secret/project", issue: 42, runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3", updatedAt: "2026-09-22T00:00:00Z", profile: "secret-profile", credentialAccount: "secret-account", path: "/secret/log" };
+    const publicSweep = redactActiveSweep(sweep, false);
+    expect(publicSweep).toMatchObject({ runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3" });
+    for (const key of ["repo", "issue", "sweepId", "profile", "credentialAccount", "path"]) expect(publicSweep).not.toHaveProperty(key);
+    expect(redactActiveSweep(sweep, true).repo).toBe("secret/project");
+  });
+});

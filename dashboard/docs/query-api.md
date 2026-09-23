@@ -107,7 +107,13 @@ redacts each `activeSweeps` entry per the visibility policy above and empties
 ```
 
 `runtime` is the adapter the sweep was dispatched on (`claude`, `codex`, …),
-copied from `sweep.started`; absent when the emitting daemon did not name one.
+copied from `sweep.started` or late `sweep.identity` enrichment; absent when the emitting daemon did not name one.
+`provider` names the resolved launch provider separately from the runtime adapter
+(e.g. `zai-coding-plan` versus `opencode`); `model` is the resolved launch model.
+These describe the sweep launch, not all child roles. Missing values remain
+unknown. Identity enrichment preserves start/phase/freshness and applies only to
+an existing same-host active entry, never recreating a completed sweep. Deploy
+this Worker/UI before schema-4 identity producers; older daemons remain readable.
 
 **`freshness`** (issue #4957): derived from `updatedAt` alone (never the
 daemon-supplied `captured_at`, which a clock-skewed host could spoof) —

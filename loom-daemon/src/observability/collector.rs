@@ -54,6 +54,7 @@ use crate::workspace_pool::WorkspacePool;
 
 use super::queue::DurableQueue;
 mod correlation;
+mod identity;
 pub(crate) type DispatchKey = (String, u32);
 
 /// Timeout on the `gh repo view` slug lookup — generous but bounded so a
@@ -112,6 +113,9 @@ async fn run_collector(
 ) {
     let mut dispatches: HashMap<DispatchKey, DispatchState> = HashMap::new();
     let mut slug_cache: HashMap<String, String> = HashMap::new();
+    let mut identities = identity::Sampler::default();
+    let mut identity_timer = tokio::time::interval(Duration::from_secs(5));
+    identity_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
     snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -130,6 +134,7 @@ async fn run_collector(
             recv_result = subscription.recv() => {
                 match recv_result {
                     Ok(event) => {
+                        identities.observe(&event, &workspace_root);
                         handle_event(
                             event,
                             &queue,
@@ -146,6 +151,10 @@ async fn run_collector(
                     }
                     Err(_) => {}
                 }
+            }
+
+            _ = identity_timer.tick() => {
+                identities.sample(&queue, &host_id, &workspace_pool, &mut slug_cache).await;
             }
 
             _ = snapshot_timer.tick() => {
