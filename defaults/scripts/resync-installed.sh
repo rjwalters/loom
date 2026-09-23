@@ -1042,9 +1042,11 @@ removed_line_count() {
 # So the first time upstream EDITED such a file, the old upstream text being
 # replaced was read as "lines unique to the installed copy" and the update was
 # blocked as a phantom local fix. #8676's incident: commit 25fbc1bb3 renamed
-# `--arg end` -> `--arg range_end` in scripts/archive-transcripts.sh for jq 1.6
-# compatibility, and every repo on an older install reported that legitimate
-# fix blocked, each needing a hand-run --force.
+# the jq variable `end` to `range_end` in scripts/archive-transcripts.sh for jq
+# 1.6 compatibility, and every repo on an older install reported that legitimate
+# fix blocked, each needing a hand-run --force. (Named without the `--arg` flag
+# prefix on purpose: test-jq-reserved-word-args.sh is a repo-wide `git grep` for
+# that literal shape in `*.sh` and cannot tell a comment from a live binding.)
 #
 # Decide by CONTENT first. If the installed file is byte-identical to its
 # source counterpart as that stood at the version this repo currently has
