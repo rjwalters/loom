@@ -79,15 +79,91 @@
   box-shadow: inset 3px 0 0 0 var(--analytics-danger);
 }
 
-.burn-card__head {
+/* One section per provider pool (Claude, Codex, …): the provider's mark and
+ * an available/total count, then that pool's cards. */
+.burn-group {
+  margin: 0 0 1.1rem;
+}
+
+.burn-group__heading {
   align-items: center;
   display: flex;
-  gap: 0.5rem;
-  justify-content: flex-start;
+  font-size: 0.85rem;
+  font-weight: 600;
+  gap: 0.6rem;
+  margin: 0 0 0.5rem;
+}
+
+.burn-group__count {
+  color: var(--analytics-muted);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+
+/* Two stacked rows: identity (mark · name · host) and badges. Nothing in
+ * either may push past the card edge — the name truncates, badges wrap. */
+.burn-card__head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.burn-card__identity {
+  align-items: baseline;
+  display: flex;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.burn-card__identity .provider-mark {
+  align-self: center;
+  flex: none;
 }
 
 .burn-card__account {
+  flex: 1 1 auto;
   font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.burn-card__identity .burn-card__host {
+  flex: none;
+  white-space: nowrap;
+}
+
+.burn-card__badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  min-height: 1rem;
+}
+
+.burn-card__badges .badge {
+  margin-left: 0;
+}
+
+/* The no-telemetry stand-in for a sparkline (a Codex account). Same height
+ * as the sparkline so cards in one grid row stay aligned. */
+.burn-card__state {
+  align-items: center;
+  border-top: 1px dashed var(--analytics-line);
+  color: var(--analytics-muted);
+  display: flex;
+  font-size: 0.75rem;
+  height: 48px;
+  margin: 0.4rem 0;
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+.cell--account .provider-mark {
+  margin-right: 0.35rem;
 }
 
 .burn-card__host,

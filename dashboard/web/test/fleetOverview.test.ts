@@ -136,13 +136,74 @@ describe("hostCard", () => {
     expect(fieldValue(card, "Worktree free")).toBe("300 GB (80% used)");
   });
 
-  it("summarizes the token pool", () => {
-    expect(fieldValue(hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW), "Token pool")).toBe(
+  it("summarizes the token pool per provider, untagged rows reading as Claude", () => {
+    const healthy = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
+    const labels = [...healthy.querySelectorAll('[data-testid="token-pool-label"]')];
+    expect(labels.map((node) => node.getAttribute("data-provider"))).toEqual(["claude"]);
+    expect(labels[0]!.textContent).toBe("Claudepool");
+    expect(labels[0]!.querySelector('[data-testid="provider-mark"] img')?.getAttribute("src")).toBe("/icons/claude.svg");
+    expect(healthy.querySelector('[data-testid="token-pool-value"][data-provider="claude"]')?.textContent).toBe(
       "0/2 exhausted · peak 42%",
     );
-    expect(fieldValue(hostCard(findHost(view(), DEGRADED_HOST_ID)!, NOW), "Token pool")).toBe(
-      "1/2 exhausted · peak 100%",
+    expect(
+      hostCard(findHost(view(), DEGRADED_HOST_ID)!, NOW).querySelector('[data-testid="token-pool-value"]')?.textContent,
+    ).toBe("1/2 exhausted · peak 100%");
+  });
+
+  it("renders one token-pool row per provider so each pool's availability reads on its own", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: { record: { kind: "host.health", uptime_sec: 10 }, updatedAt: isoMinutesBefore(1) },
+            tokens: {
+              record: {
+                kind: "tokens.snapshot",
+                accounts: [
+                  { account: "agent-1", provider: "claude", usage_fraction: 1, exhausted: true },
+                  { account: "agent-2", provider: "claude", usage_fraction: 1, exhausted: true },
+                  { account: "cx-1", provider: "codex", exhausted: false },
+                  { account: "cx-2", provider: "codex", exhausted: false },
+                  { account: "cx-3", provider: "codex", exhausted: true },
+                ],
+              },
+              updatedAt: isoMinutesBefore(1),
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
     );
+    const card = hostCard(findHost(built, "h")!, NOW);
+    const values = [...card.querySelectorAll('[data-testid="token-pool-value"]')];
+    expect(values.map((node) => [node.getAttribute("data-provider"), node.textContent])).toEqual([
+      ["claude", "2/2 exhausted · peak 100%"],
+      // Codex accounts report no usage fraction: no "peak 0%" fabricated.
+      ["codex", "1/3 exhausted"],
+    ]);
+    // Codex has no icon on the homepage feed either — a text mark.
+    const codexLabel = card.querySelector('[data-testid="token-pool-label"][data-provider="codex"]')!;
+    expect(codexLabel.querySelector("img")).toBeNull();
+    expect(codexLabel.textContent).toBe("Codexpool");
+    // The degraded badge names the spent provider, not a blended pool.
+    expect(card.querySelector('[data-testid="status-badge"]')?.getAttribute("title")).toBe(
+      "claude token pool at or near exhaustion",
+    );
+  });
+
+  it("marks each sweep with the agent working it, and nothing when the runtime is unknown", () => {
+    const busy = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
+    const rows = [...busy.querySelectorAll(".card__sweep")];
+    const claude = rows[0]!.querySelector('[data-testid="provider-mark"]')!;
+    expect(claude.getAttribute("data-provider")).toBe("claude");
+    expect(claude.querySelector("img")?.getAttribute("alt")).toBe("Claude");
+    const codex = rows[1]!.querySelector('[data-testid="provider-mark"]')!;
+    expect(codex.getAttribute("data-provider")).toBe("codex");
+    expect(codex.textContent).toBe("Codex");
+    // SWEEP_ONLY_HOST_ID's sweep carries no runtime — no mark, never a guess.
+    const unknown = hostCard(findHost(view(), SWEEP_ONLY_HOST_ID)!, NOW);
+    expect(unknown.querySelector('.card__sweep [data-testid="provider-mark"]')).toBeNull();
   });
 
   it("renders the token pool as unknown when the host has never reported one", () => {
@@ -211,6 +272,43 @@ describe("hostCard", () => {
     const idle = hostCard(findHost(view(), IDLE_HOST_ID)!, NOW);
     expect(fieldValue(idle, "Active sweeps")).toBe("none (excludes role ticks)");
     expect(idle.querySelector('[data-testid="card-sweeps"]')).toBeNull();
+  });
+
+  it("links each sweep to its forge work and each repo slug to its forge page", () => {
+    const busy = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
+    const rows = [...busy.querySelectorAll(".card__sweep")];
+    // sweep-issue-4703-0 is in `builder` → the pushed feature branch.
+    const builderLabel = rows[0]!.querySelector(".card__sweep-label")!;
+    expect(builderLabel.tagName).toBe("A");
+    expect(builderLabel.getAttribute("href")).toBe("https://github.com/rjwalters/loom/tree/feature/issue-4703");
+    expect(builderLabel.getAttribute("target")).toBe("_blank");
+    expect(builderLabel.getAttribute("rel")).toBe("noopener noreferrer");
+    // sweep-issue-4749-0 has reported no phase yet → no branch exists, so
+    // the issue is the only honest destination.
+    const startingLabel = rows[1]!.querySelector(".card__sweep-label")!;
+    expect(startingLabel.getAttribute("href")).toBe("https://github.com/rjwalters/loom/issues/4749");
+    // The trailing repo slug on a sweep row goes to the repo itself.
+    const sweepRepo = rows[0]!.querySelector(".card__sweep-repo")!;
+    expect(sweepRepo.tagName).toBe("A");
+    expect(sweepRepo.getAttribute("href")).toBe("https://github.com/rjwalters/loom");
+
+    // Active and idle roster rows alike link to the repo page.
+    const activeRepo = busy.querySelector('[data-testid="card-repos"] .card__repo-label')!;
+    expect(activeRepo.tagName).toBe("A");
+    expect(activeRepo.getAttribute("href")).toBe("https://github.com/rjwalters/loom");
+    const idleRepos = [...busy.querySelectorAll('[data-testid="card-repos-idle"] .card__repo-label')];
+    expect(idleRepos.map((node) => node.getAttribute("href"))).toEqual([
+      "https://github.com/2AMLogic/gf180-pll",
+      "https://github.com/2AMLogic/gf180-trng",
+    ]);
+  });
+
+  it("renders a sweep with no linkable target as plain text, not a dead link", () => {
+    // SWEEP_ONLY_HOST_ID's sweep has no issue number: nothing to link.
+    const card = hostCard(findHost(view(), SWEEP_ONLY_HOST_ID)!, NOW);
+    const label = card.querySelector(".card__sweep-label")!;
+    expect(label.tagName).toBe("SPAN");
+    expect(label.hasAttribute("href")).toBe(false);
   });
 
   // #4976: the "Repositories" section, below "Active sweeps". #7662 split it

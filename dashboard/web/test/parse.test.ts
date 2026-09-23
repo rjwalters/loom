@@ -157,11 +157,13 @@ describe("parseFleetSnapshot", () => {
           },
         },
       },
-      activeSweeps: [{ hostId: "h", sweepId: "s", runtime: "codex" }],
+      activeSweeps: [{ hostId: "h", sweepId: "s", runtime: "codex", sandbox: "firecracker" }],
     });
     expect(snapshot.hosts.h?.health?.record.daemon_version).toBe("99.0.0");
     expect(snapshot.hosts.h?.health?.record).not.toHaveProperty("gpu_count");
-    expect(snapshot.activeSweeps[0]).not.toHaveProperty("runtime");
+    // `runtime` is a known field now; `sandbox` stands in as the unknown one.
+    expect(snapshot.activeSweeps[0]?.runtime).toBe("codex");
+    expect(snapshot.activeSweeps[0]).not.toHaveProperty("sandbox");
   });
 
   it("narrows host.health build identity, dropping wrong-typed values (#4956)", () => {

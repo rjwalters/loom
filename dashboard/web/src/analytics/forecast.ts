@@ -55,6 +55,8 @@ export interface AccountForecast {
   /** Hosts that reported the account this forecast covers (#4898). */
   hostIds: string[];
   account: string;
+  /** The provider pool the account belongs to (`AccountBurnCurve.provider`). */
+  provider: string;
   status: ForecastStatus;
   /** Points that fed the fit (live segment only). */
   sampleCount: number;
@@ -97,6 +99,7 @@ export function forecastAccount(curve: AccountBurnCurve, options: ForecastOption
   const base: AccountForecast = {
     hostIds: curve.hostIds,
     account: curve.account,
+    provider: curve.provider,
     status: "insufficient-data",
     sampleCount: points.length,
     latestUsageFraction: latest?.usageFraction,
