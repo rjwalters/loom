@@ -69,20 +69,53 @@
 //!   is a different condition with a different fix (`loom-daemon tokens
 //!   bootstrap`) and its own detection (#4642). This module holds only for
 //!   "a pool exists and every account in it is unspawnable".
-//! - **Not broadcast to peers.** Each host resolves its *own* pool (repo-local
-//!   shadow pool if it holds `.token` files, else shared — #3938/#7527), so
-//!   one host's exhaustion says nothing about a peer's. Broadcasting it would
-//!   suppress a peer whose pool is healthy.
+//! # Broadcast to peers, keyed by ACCOUNT SET — not by directory (#8001)
+//!
+//! This hold is broadcast over the peer-claim room
+//! ([`crate::peer_claims::ClaimKind::PoolHoldArmed`]/`PoolHoldCleared`), so a
+//! peer host does not have to re-discover a dead pool the expensive way —
+//! one doomed dispatch, one label flip and one permanent lease comment at a
+//! time. That is the remaining half of #7708's "do not let four hosts pick up
+//! the slack four times over".
+//!
+//! The reason it was **not** broadcast when this module first landed is real
+//! and is preserved, not discarded: each host resolves its *own* pool
+//! (repo-local shadow pool if it holds `.token` files, else shared —
+//! #3938/#7527), so one host's exhaustion says nothing about a peer holding a
+//! genuinely different pool, and suppressing that peer would be a silent
+//! fleet-wide stall. What changed is the **key**, not the risk appetite:
+//!
+//! - The hold set here stays keyed by the resolved pool **directory**, which
+//!   is correct for a within-host key (it is exactly what "same pool" means to
+//!   one filesystem) and wrong for a cross-host one — the identical path can
+//!   name different pools on two hosts, and the same pool has different paths
+//!   on two hosts.
+//! - The *broadcast* is keyed by
+//!   [`crate::tokens_pool::select::pool_account_fingerprint`] — a hash of the
+//!   pool's account names. Exhaustion is a property of the **accounts** (an
+//!   upstream rate-limit state every host holding that credential shares), not
+//!   of a directory, so two hosts with the same accounts match (suppression is
+//!   correct) and a repo-local shadow pool holding different accounts does not
+//!   (no suppression — the hazard above, structurally excluded rather than
+//!   merely documented).
+//!
+//! Fail-open throughout: a dropped ad, a peer without safehouse, or a host
+//! that simply has not received the ad yet degrades byte-for-byte to the
+//! pre-#8001 local-only pre-flight, which still stops that host on its own
+//! next tick.
 
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use crate::sweep_registry::PreflightDispatchGate;
-use crate::tokens_pool::select::{pool_clear_estimate, spawnable_pool_state};
+use crate::tokens_pool::select::{
+    pool_account_fingerprint, pool_clear_estimate, spawnable_pool_state,
+};
 use crate::workspace_pool::WorkspacePool;
 
 /// A live "this pool cannot spawn anything" hold, keyed by resolved pool
@@ -115,6 +148,42 @@ pub struct PoolExhaustionHold {
     pub wrapper_observed: bool,
 }
 
+/// A transition in this host's hold set worth telling peers about (Issue
+/// #8001) — the *edge*, never the steady state. Returned by
+/// [`PoolHoldState::observe_root_edge`]/[`PoolHoldState::note_pool_dead`] so
+/// the caller (which owns a `SweepRegistry`, and therefore the outbound
+/// peer-claim channel) can publish it; this module stays free of transport,
+/// matching the `decide`/`plan` split the rest of the daemon uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolHoldEdge {
+    /// This pool just became unspawnable on this host. `remaining` is the
+    /// hold's own `pool_clear_estimate` horizon (already capped at 900 s),
+    /// carried so a receiving peer can compute its local expiry.
+    Armed { remaining: Duration },
+    /// This pool just recovered on this host — release peers early rather
+    /// than leaving them suppressed for the remainder of a TTL this host has
+    /// already stopped honouring.
+    Cleared,
+}
+
+/// One root's full pre-flight verdict (Issue #8001).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolObservation {
+    /// `true` when this host's own live read says dispatch to the root must
+    /// be held this tick — the pre-#8001 [`PoolHoldState::observe_root`]
+    /// return value, unchanged.
+    pub held: bool,
+    /// The root's pool identity for cross-host matching
+    /// ([`pool_account_fingerprint`]), or `None` when the resolved pool holds
+    /// no accounts at all (the ABSENT-pool condition, #4642 — nothing to
+    /// broadcast and nothing a peer's hold could be about).
+    pub pool_key: Option<String>,
+    /// The arm/clear edge crossed by *this* call, if any. `None` on every
+    /// steady-state tick, which is what keeps a multi-hour outage to two ads
+    /// rather than one per tick.
+    pub edge: Option<PoolHoldEdge>,
+}
+
 /// The set of currently-held pools.
 ///
 /// Production uses the process-global [`PoolHoldState::global`]; the type is
@@ -125,6 +194,14 @@ pub struct PoolExhaustionHold {
 #[derive(Debug, Default)]
 pub struct PoolHoldState {
     holds: Mutex<HashMap<PathBuf, PoolExhaustionHold>>,
+    /// Pool keys currently held **by a peer** and already edge-logged by this
+    /// host (Issue #8001). Purely a log-deduplication set: the authoritative
+    /// peer state lives in [`crate::peer_claims::PeerClaimView`], which has
+    /// its own TTL. Without this, a peer-sourced hold would log once per tick
+    /// per root for the whole outage — precisely the noise
+    /// [`PoolHoldState::observe_root`]'s edge-logging discipline exists to
+    /// avoid.
+    peer_held_logged: Mutex<HashSet<String>>,
 }
 
 impl PoolHoldState {
@@ -183,6 +260,18 @@ impl PoolHoldState {
     ///   value gates dispatch, so this affects the edge-logging, never
     ///   whether a root with a spawnable tap is dispatched.
     pub fn observe_root(&self, root: &Path, now: DateTime<Utc>) -> bool {
+        self.observe_root_edge(root, now).held
+    }
+
+    /// [`Self::observe_root`] plus the cross-host broadcast payload (Issue
+    /// #8001): the root's [`pool_account_fingerprint`] and the arm/clear
+    /// **edge** this call crossed, if any.
+    ///
+    /// Identical hold semantics — `observe_root` is a thin projection of this
+    /// — so every pre-#8001 caller keeps its exact behaviour. The extra work
+    /// is one directory listing for the fingerprint, on a path that already
+    /// reads that directory twice (`total` and `usable`).
+    pub fn observe_root_edge(&self, root: &Path, now: DateTime<Utc>) -> PoolObservation {
         let now_epoch = u64::try_from(now.timestamp()).unwrap_or(0);
         let preference =
             crate::runtime_preference::resolve_runtime(root, "sweep-lifecycle", None, now_epoch);
@@ -197,9 +286,17 @@ impl PoolHoldState {
             _ => None,
         };
         if preference_resolution.is_none() && crate::worker_spawn::uses_native_sweep(root) {
-            return false;
+            // A native runtime never touches the Claude pool, so this root
+            // has no pool identity to broadcast about and no peer's hold can
+            // be about it.
+            return PoolObservation {
+                held: false,
+                pool_key: None,
+                edge: None,
+            };
         }
         let pool = spawnable_pool_state(root);
+        let pool_key = pool_account_fingerprint(&pool.dir);
         let (exhausted, preference_diagnostic) = match preference_resolution {
             Some(resolution) => match &resolution.chosen {
                 Some(_) => (false, None),
@@ -217,6 +314,7 @@ impl PoolHoldState {
 
         if exhausted {
             let next_clear_at = pool_clear_estimate(&pool.dir);
+            let mut edge = None;
             match holds.entry(pool.dir.clone()) {
                 Entry::Occupied(mut existing) => {
                     let hold = existing.get_mut();
@@ -224,6 +322,12 @@ impl PoolHoldState {
                     hold.next_clear_at = next_clear_at;
                 }
                 Entry::Vacant(slot) => {
+                    // #8001: the arming edge — the one tick per outage that
+                    // both logs and broadcasts. Every later tick refreshes
+                    // the Occupied arm above and stays silent on both.
+                    edge = Some(PoolHoldEdge::Armed {
+                        remaining: remaining_until(next_clear_at, now),
+                    });
                     if let Some(diagnostic) = &preference_diagnostic {
                         log::warn!(
                             "work_finder: every runtime in the sweep-lifecycle preference list \
@@ -256,7 +360,11 @@ impl PoolHoldState {
                     });
                 }
             }
-            return true;
+            return PoolObservation {
+                held: true,
+                pool_key,
+                edge,
+            };
         }
 
         // The live read says at least one account is spawnable. A hold armed
@@ -265,8 +373,8 @@ impl PoolHoldState {
         // whole reason #7708 happened is that the daemon's read and the
         // wrapper's can disagree. Everything else clears immediately — that
         // is the one-tick self-heal.
-        match holds.get(&pool.dir) {
-            Some(hold) if hold.wrapper_observed && now < hold.next_clear_at => true,
+        let (held, edge) = match holds.get(&pool.dir) {
+            Some(hold) if hold.wrapper_observed && now < hold.next_clear_at => (true, None),
             Some(hold) => {
                 log::info!(
                     "work_finder: token pool {} recovered — {}/{} accounts spawnable after {} \
@@ -277,9 +385,17 @@ impl PoolHoldState {
                     format_held_for(now - hold.since)
                 );
                 holds.remove(&pool.dir);
-                false
+                // #8001: the clearing edge. Broadcast so peers release this
+                // host's advertised hold NOW rather than sitting out the rest
+                // of a TTL this host has already stopped honouring.
+                (false, Some(PoolHoldEdge::Cleared))
             }
-            None => false,
+            None => (false, None),
+        };
+        PoolObservation {
+            held,
+            pool_key,
+            edge,
         }
     }
 
@@ -293,18 +409,42 @@ impl PoolHoldState {
     /// [`pool_clear_estimate`] never reports further than 900 s out, so the
     /// worst case is one doomed dispatch per host per 15 minutes — not one
     /// per tick.
-    pub fn note_pool_dead(&self, root: &Path, now: DateTime<Utc>) {
+    ///
+    /// Returns the [`PoolObservation`] describing the pool it armed (Issue
+    /// #8001) so the reaper can broadcast the arming edge. A post-mortem hold
+    /// is the *strongest* evidence this daemon ever gets that a pool cannot
+    /// spawn — a real wrapper proved it — which makes it the most valuable
+    /// thing to tell peers: every peer that honours it skips a dispatch that
+    /// was certain to die at token selection.
+    pub fn note_pool_dead(&self, root: &Path, now: DateTime<Utc>) -> PoolObservation {
         let pool = spawnable_pool_state(root);
+        let pool_key = pool_account_fingerprint(&pool.dir);
         let next_clear_at = pool_clear_estimate(&pool.dir);
+        let mut edge = None;
         let mut holds = self.lock();
         match holds.entry(pool.dir.clone()) {
             Entry::Occupied(mut existing) => {
                 let hold = existing.get_mut();
                 hold.total = pool.total;
                 hold.next_clear_at = next_clear_at;
+                // #8001: a wrapper-confirmed death STRENGTHENS an existing
+                // pre-flight hold (`wrapper_observed` flips false -> true),
+                // so it is an edge worth broadcasting even though this host
+                // was already holding — a peer that has not received (or has
+                // since expired) the original arm ad gets a fresh, longer
+                // window out of the strongest evidence available. Re-arming
+                // an already-post-mortem hold is a no-op edge.
+                if !hold.wrapper_observed {
+                    edge = Some(PoolHoldEdge::Armed {
+                        remaining: remaining_until(next_clear_at, now),
+                    });
+                }
                 hold.wrapper_observed = true;
             }
             Entry::Vacant(slot) => {
+                edge = Some(PoolHoldEdge::Armed {
+                    remaining: remaining_until(next_clear_at, now),
+                });
                 log::warn!(
                     "work_finder: a sweep died in spawn-claude.sh's TOKEN SELECTION step — pool \
                      {} held no usable account, so none was ever selected. This daemon's own \
@@ -325,6 +465,32 @@ impl PoolHoldState {
                 });
             }
         }
+        PoolObservation {
+            held: true,
+            pool_key,
+            edge,
+        }
+    }
+
+    /// Note that a **peer** reports `pool_key` dead, returning `true` only on
+    /// the arming edge — i.e. the first call since this host last saw the
+    /// pool free (Issue #8001). The caller logs on `true` only, giving the
+    /// peer-sourced hold the same once-per-outage log discipline
+    /// [`Self::observe_root`] gives the local one.
+    pub fn note_peer_hold(&self, pool_key: &str) -> bool {
+        self.peer_held_logged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pool_key.to_owned())
+    }
+
+    /// [`Self::note_peer_hold`]'s clearing edge: `true` only on the first
+    /// call after a peer-sourced hold on `pool_key` goes away.
+    pub fn note_peer_clear(&self, pool_key: &str) -> bool {
+        self.peer_held_logged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(pool_key)
     }
 
     /// Every pool currently held, for the status/health surface. Sorted by
@@ -348,10 +514,28 @@ impl PoolHoldState {
     #[cfg(test)]
     pub fn clear_all(&self) {
         self.lock().clear();
+        self.peer_held_logged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 }
 
-/// Human-readable "held for" duration used in the recovery log line.
+/// Seconds from `now` until `next_clear_at`, as a [`Duration`] (Issue #8001)
+/// — the `remaining` a [`PoolHoldEdge::Armed`] advertises.
+///
+/// Saturates at zero for an estimate already in the past: an ad advertising a
+/// zero window is the same as no ad at all to a receiver, which is the safe
+/// direction. The upper bound is `pool_clear_estimate`'s own 900 s cap, and
+/// the receiver re-applies that cap itself
+/// ([`crate::peer_claims::MAX_PEER_POOL_HOLD_TTL`]) rather than trusting it.
+fn remaining_until(next_clear_at: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    (next_clear_at - now)
+        .to_std()
+        .unwrap_or(Duration::from_secs(0))
+}
+
+/// Human-readable "held for" duration used in the recovery line.
 fn format_held_for(held: chrono::Duration) -> String {
     let secs = held.num_seconds().max(0);
     if secs < 60 {
@@ -382,6 +566,22 @@ fn format_held_for(held: chrono::Duration) -> String {
 /// whose pool is dead never holds a sibling repo whose pool is healthy — even
 /// though, in the common single-pool deployment, every root resolves to the
 /// same pool and so they hold together.
+///
+/// # The fleet half (Issue #8001)
+///
+/// This is also where a pool hold becomes fleet-visible, in both directions:
+///
+/// - **Publish.** Each root's arm/clear *edge* is broadcast over the
+///   peer-claim room, keyed by the pool's account fingerprint.
+/// - **Consult.** A root whose own live read says "healthy" is still held
+///   when a **peer** advertises a live hold on the very same pool. That is
+///   the point: the peer already paid for the discovery (a doomed dispatch,
+///   a label flip, a permanent lease comment), so this host should not pay
+///   for it again. It is a pure *addition* to the local verdict — a peer can
+///   only ever add a hold, never clear one this host's own read armed.
+///
+/// Fail-open: without safehouse coordination `peer_pool_hold` is always
+/// `(false, [])` and every line below collapses to the pre-#8001 behaviour.
 pub fn preflight_held_per_root(
     workspaces: &WorkspacePool,
     roots: &[PathBuf],
@@ -392,11 +592,12 @@ pub fn preflight_held_per_root(
     let held = roots
         .iter()
         .map(|root| {
-            let pool_held = state.observe_root(root, now);
+            let observation = state.observe_root_edge(root, now);
             let registry = workspaces.get_or_provision(root);
             let mut registry = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pool_held = fold_peer_pool_hold(state, &registry, &observation);
             match registry.preflight_dispatch_gate(now) {
                 PreflightDispatchGate::Open => pool_held,
                 PreflightDispatchGate::Held => true,
@@ -414,8 +615,75 @@ pub fn preflight_held_per_root(
     (held, probe_roots)
 }
 
+/// Publish `observation`'s arm/clear edge to peers and fold any peer-reported
+/// hold on the same pool into this root's verdict (Issue #8001). Returns the
+/// final "is this root's pool held" answer.
+///
+/// Split out of [`preflight_held_per_root`] so the peer half is unit-testable
+/// against a hand-built `SweepRegistry` + `PeerClaimView` pair, without
+/// needing a whole `WorkspacePool`.
+pub(crate) fn fold_peer_pool_hold(
+    state: &PoolHoldState,
+    registry: &crate::sweep_registry::SweepRegistry,
+    observation: &PoolObservation,
+) -> bool {
+    let Some(pool_key) = observation.pool_key.as_deref() else {
+        // No accounts in the resolved pool: nothing to advertise, and no
+        // peer's hold can be about a pool with no identity.
+        return observation.held;
+    };
+    match &observation.edge {
+        Some(PoolHoldEdge::Armed { remaining }) => registry.publish_peer_pool_hold_claim(
+            crate::peer_claims::ClaimKind::PoolHoldArmed,
+            pool_key,
+            *remaining,
+        ),
+        Some(PoolHoldEdge::Cleared) => registry.publish_peer_pool_hold_claim(
+            crate::peer_claims::ClaimKind::PoolHoldCleared,
+            pool_key,
+            Duration::from_secs(0),
+        ),
+        None => {}
+    }
+
+    // This host's own read already says hold — a peer's opinion can only
+    // agree, so skip the lookup entirely and leave the peer edge-log alone
+    // (the local hold has its own log line; two lines for one outage would
+    // defeat the point of edge-logging).
+    if observation.held {
+        return true;
+    }
+
+    let (peer_held, peers) = registry.peer_pool_hold(pool_key);
+    if peer_held {
+        if state.note_peer_hold(pool_key) {
+            log::warn!(
+                "work_finder: peer host(s) {} report the token pool this workspace resolves to \
+                 (account-set {pool_key}) is UNSPAWNABLE, while this host's own pre-flight read \
+                 still says it is fine. Trusting the peer and holding sweep dispatch — a peer's \
+                 hold is evidence THIS host has not paid for yet (a doomed dispatch, a claim \
+                 label flip and a permanent lease comment). Clears on the peer's recovery ad or \
+                 its hold TTL, whichever is first (#8001/#7708)",
+                peers.join(", ")
+            );
+        }
+    } else if state.note_peer_clear(pool_key) {
+        log::info!(
+            "work_finder: no peer host holds the token pool this workspace resolves to \
+             (account-set {pool_key}) any more; sweep dispatch resuming (#8001)"
+        );
+    }
+    peer_held
+}
+
 /// Single-workspace convenience over [`PoolHoldState::observe_root`] against
 /// this host's global hold set.
+///
+/// Deliberately **local-only**: this is the single-workspace probe
+/// (`fleet_experiment`, the work finder's per-root re-derivation) and it has
+/// no `SweepRegistry` to reach the peer-claim room through. The fleet half
+/// lives in [`preflight_held_per_root`]/[`fold_peer_pool_hold`], which every
+/// production dispatch path already goes through.
 #[must_use]
 pub fn observe_root(root: &Path, now: DateTime<Utc>) -> bool {
     PoolHoldState::global().observe_root(root, now)
@@ -424,8 +692,11 @@ pub fn observe_root(root: &Path, now: DateTime<Utc>) -> bool {
 /// Arm this host's post-mortem hold for `root`'s pool — see
 /// [`PoolHoldState::note_pool_dead`]. Called by the sweep reaper when a death
 /// classifies as `NO_USABLE_ACCOUNT_CLASS`.
-pub fn note_pool_dead(root: &Path) {
-    PoolHoldState::global().note_pool_dead(root, Utc::now());
+///
+/// Returns the [`PoolObservation`] so the reaper (which owns the outbound
+/// peer-claim channel) can broadcast the arming edge — see #8001.
+pub fn note_pool_dead(root: &Path) -> PoolObservation {
+    PoolHoldState::global().note_pool_dead(root, Utc::now())
 }
 
 /// Every pool this host currently holds — the read side for

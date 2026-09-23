@@ -3773,6 +3773,15 @@ impl InboundEventSink for PeerClaimSink {
                         }
                         _ => {}
                     }
+                } else if ad.kind.is_pool_hold_lane() {
+                    // Issue #8001: fleet-wide token-pool exhaustion holds.
+                    // Its own single-purpose map again — a pool hold answers
+                    // "may ANY sweep spawn from this pool right now", which
+                    // is neither "is issue #N in flight" nor a per-issue
+                    // brake, and it is keyed by the pool's account
+                    // fingerprint rather than by `(repo, issue)`.
+                    view.observe_pool_hold_at(&ad, now);
+                    view.prune_expired_pool_holds(now);
                 } else if ad.kind == crate::peer_claims::ClaimKind::Completed {
                     view.observe_completion_at(&ad, now);
                     view.prune_expired_completions(now);

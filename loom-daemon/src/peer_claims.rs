@@ -281,6 +281,37 @@ pub enum ClaimKind {
     /// [`crate::sweep_registry::SweepRegistry::record_dispatch_failure`]'s
     /// backoff state.
     DispatchBackoffArmed,
+    /// "The token pool identified by `pool_key` is UNSPAWNABLE on my host,
+    /// `remaining_secs` seconds left on my hold as of my send time" (Issue
+    /// #8001, the peer-broadcast half of #7708).
+    ///
+    /// Broadcast on the arming edge of
+    /// [`crate::work_finder::pool_preflight::PoolHoldState`] — both the
+    /// per-tick pre-flight path (`observe_root`) and the reaper's post-mortem
+    /// path (`note_pool_dead`). A peer holding the *same* pool (see
+    /// `pool_key` for what "same" means, and why it is not a directory path)
+    /// suppresses its own sweep dispatch without having to independently
+    /// re-derive `spawnable_pool_state` and discover the exhaustion the
+    /// expensive way — one doomed dispatch per host per hold window.
+    ///
+    /// This is the pool-scoped sibling of
+    /// [`ClaimKind::NoopCooldownArmed`]/[`ClaimKind::DispatchBackoffArmed`]:
+    /// those brake one *issue*, this brakes every issue resolving to one
+    /// *pool*, because a pool fault is not any issue's fault (#7708).
+    PoolHoldArmed,
+    /// "The token pool identified by `pool_key` RECOVERED on my host" (Issue
+    /// #8001) — releases this host's [`ClaimKind::PoolHoldArmed`] before its
+    /// TTL would lapse, mirroring [`ClaimKind::FilingUnlock`]'s early
+    /// release.
+    ///
+    /// This kind is why the pool lane is arm/clear rather than the
+    /// cooldown lane's arm-only shape: a pool hold's TTL comes from
+    /// `pool_clear_estimate`, capped at 900 s, and the local pre-flight
+    /// self-heals in **one tick**. Without an explicit clear, an operator
+    /// readmitting one account would resume the arming host immediately
+    /// while every peer stayed suppressed for up to 15 more minutes —
+    /// converting a latency win into a fleet-wide stall.
+    PoolHoldCleared,
 }
 
 /// The `issue` value carried by [`ClaimKind::FilingLock`]/
@@ -290,6 +321,29 @@ pub enum ClaimKind {
 /// every other ad and keeps a filing ad from ever being mistaken for a claim
 /// on a real issue #0.
 pub const FILING_LOCK_SENTINEL_ISSUE: u32 = 0;
+
+/// The `issue` value carried by [`ClaimKind::PoolHoldArmed`]/
+/// [`ClaimKind::PoolHoldCleared`] ads (Issue #8001). A pool hold is
+/// deliberately **not** about any one issue — attributing a pool-wide fault to
+/// whichever issue happened to be dispatched into it is precisely what #7708
+/// rejected — so the field is pinned to a sentinel exactly as
+/// [`FILING_LOCK_SENTINEL_ISSUE`] is, keeping the wire shape uniform and
+/// keeping a pool ad from ever reading as a claim on a real issue #0.
+pub const POOL_HOLD_SENTINEL_ISSUE: u32 = 0;
+
+/// Hard ceiling on the TTL a single [`ClaimKind::PoolHoldArmed`] ad may
+/// install in a receiver's view (Issue #8001), regardless of the
+/// `remaining_secs` it advertises.
+///
+/// Matches `tokens_pool::select::POOL_CLEAR_ESTIMATE_CAP_SECS` (900 s), the
+/// cap the *arming* side's own `pool_clear_estimate` already applies, so a
+/// well-behaved ad is never clamped. The ceiling exists for the ill-behaved
+/// one: the room is shared, this ad suppresses **all** dispatch for a pool
+/// rather than one issue, and a single ad advertising a year of remaining
+/// hold must not be able to wedge a peer's whole fleet lane. Bounded here so
+/// the worst case degrades to "one extra hold window", never to a stall that
+/// outlives the outage.
+pub const MAX_PEER_POOL_HOLD_TTL: Duration = Duration::from_secs(900);
 
 impl ClaimKind {
     #[must_use]
@@ -302,6 +356,8 @@ impl ClaimKind {
             ClaimKind::FilingUnlock => "filing_unlock",
             ClaimKind::NoopCooldownArmed => "noop_cooldown_armed",
             ClaimKind::DispatchBackoffArmed => "dispatch_backoff_armed",
+            ClaimKind::PoolHoldArmed => "pool_hold_armed",
+            ClaimKind::PoolHoldCleared => "pool_hold_cleared",
         }
     }
 
@@ -315,6 +371,8 @@ impl ClaimKind {
             "filing_unlock" => Some(ClaimKind::FilingUnlock),
             "noop_cooldown_armed" => Some(ClaimKind::NoopCooldownArmed),
             "dispatch_backoff_armed" => Some(ClaimKind::DispatchBackoffArmed),
+            "pool_hold_armed" => Some(ClaimKind::PoolHoldArmed),
+            "pool_hold_cleared" => Some(ClaimKind::PoolHoldCleared),
             _ => None,
         }
     }
@@ -334,6 +392,15 @@ impl ClaimKind {
     #[must_use]
     pub fn is_cooldown_lane(self) -> bool {
         matches!(self, ClaimKind::NoopCooldownArmed | ClaimKind::DispatchBackoffArmed)
+    }
+
+    /// Whether this kind belongs to the fleet-wide pool-exhaustion-hold lane
+    /// (Issue #8001) rather than any of the four lanes above — the router
+    /// predicate, mirroring [`Self::is_filing_lock_lane`]/
+    /// [`Self::is_cooldown_lane`].
+    #[must_use]
+    pub fn is_pool_hold_lane(self) -> bool {
+        matches!(self, ClaimKind::PoolHoldArmed | ClaimKind::PoolHoldCleared)
     }
 }
 
@@ -375,6 +442,21 @@ pub struct ClaimAd {
     /// time, the same "TTL measured against LOCAL receipt" discipline this
     /// module's other maps use (see the module doc comment).
     pub remaining_secs: Option<u64>,
+    /// The **cross-host-stable** identity of the token pool a
+    /// [`ClaimKind::PoolHoldArmed`]/[`ClaimKind::PoolHoldCleared`] ad is
+    /// about (Issue #8001) — [`crate::tokens_pool::select::pool_account_fingerprint`]'s
+    /// hash of the pool's sorted account names. `Some` only for that lane;
+    /// every other kind leaves it `None`.
+    ///
+    /// **Not a directory path**, for the same reason [`Self::repo`] is a slug
+    /// and not a workspace root: a local absolute path neither matches across
+    /// hosts that genuinely share a pool, nor distinguishes hosts that merely
+    /// happen to resolve the same path to *different* pools. That second case
+    /// is the one that matters — it is the "broadcasting would suppress a
+    /// peer whose pool is healthy" hazard `work_finder::pool_preflight`'s
+    /// module doc names. See the fingerprint function's own doc comment for
+    /// the full argument.
+    pub pool_key: Option<String>,
 }
 
 impl ClaimAd {
@@ -389,6 +471,7 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -403,6 +486,7 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -428,6 +512,7 @@ impl ClaimAd {
             ts,
             pr: Some(pr),
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -448,6 +533,7 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -464,6 +550,7 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -490,6 +577,7 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: Some(remaining_secs),
+            pool_key: None,
         }
     }
 
@@ -513,6 +601,62 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: Some(remaining_secs),
+            pool_key: None,
+        }
+    }
+
+    /// "The token pool `pool_key` is UNSPAWNABLE on my host, `remaining_secs`
+    /// seconds left on my hold as of my send time" (Issue #8001). Broadcast
+    /// by [`crate::sweep_registry::SweepRegistry::publish_peer_pool_hold_claim`]
+    /// on the *arming edge* of
+    /// [`crate::work_finder::pool_preflight::PoolHoldState`].
+    ///
+    /// `issue` is pinned to [`POOL_HOLD_SENTINEL_ISSUE`] — a pool hold covers
+    /// every issue at once, so naming one would be a category error.
+    #[must_use]
+    pub fn pool_hold_armed(
+        repo: String,
+        host: String,
+        pid: u32,
+        ts: String,
+        pool_key: String,
+        remaining_secs: u64,
+    ) -> Self {
+        Self {
+            kind: ClaimKind::PoolHoldArmed,
+            issue: POOL_HOLD_SENTINEL_ISSUE,
+            repo,
+            host,
+            pid,
+            ts,
+            pr: None,
+            remaining_secs: Some(remaining_secs),
+            pool_key: Some(pool_key),
+        }
+    }
+
+    /// "The token pool `pool_key` RECOVERED on my host" (Issue #8001) — the
+    /// early release of a [`Self::pool_hold_armed`] hold, before its TTL
+    /// would lapse. See [`ClaimKind::PoolHoldCleared`] for why this lane has
+    /// an explicit clear where the #7477 cooldown lane does not.
+    #[must_use]
+    pub fn pool_hold_cleared(
+        repo: String,
+        host: String,
+        pid: u32,
+        ts: String,
+        pool_key: String,
+    ) -> Self {
+        Self {
+            kind: ClaimKind::PoolHoldCleared,
+            issue: POOL_HOLD_SENTINEL_ISSUE,
+            repo,
+            host,
+            pid,
+            ts,
+            pr: None,
+            remaining_secs: None,
+            pool_key: Some(pool_key),
         }
     }
 
@@ -529,6 +673,7 @@ impl ClaimAd {
             "ts": self.ts,
             "pr": self.pr,
             "remaining_secs": self.remaining_secs,
+            "pool_key": self.pool_key,
         })
         .to_string()
     }
@@ -577,6 +722,17 @@ impl ClaimAd {
         // which is the safe direction: worst case a peer's cooldown is
         // invisible for one cycle, never a permanently wedged skip.
         let remaining_secs = obj.get("remaining_secs").and_then(Value::as_u64);
+        // `pool_key` is new as of Issue #8001: absent (any pre-#8001 peer, or
+        // any kind outside the pool-hold lane) degrades to `None` rather than
+        // rejecting the ad. A `PoolHoldArmed`/`PoolHoldCleared` ad with `None`
+        // here names no pool, so `PeerClaimView::observe_pool_hold_at` drops
+        // it — the safe direction: a pool hold that cannot say WHICH pool it
+        // covers must never be allowed to suppress an arbitrary one.
+        let pool_key = obj
+            .get("pool_key")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         if repo.is_empty() || host.is_empty() {
             return None;
         }
@@ -589,6 +745,7 @@ impl ClaimAd {
             ts,
             pr,
             remaining_secs,
+            pool_key,
         })
     }
 
@@ -953,6 +1110,27 @@ pub struct PeerClaimView {
     /// (Issue #7477) — the [`Self::noop_cooldowns`] sibling for
     /// [`ClaimKind::DispatchBackoffArmed`].
     dispatch_backoffs: HashMap<(String, u32), Instant>,
+    /// Fleet-visible token-pool exhaustion holds armed by peer hosts (Issue
+    /// #8001), keyed by `(pool_key, advertising_host)`, valued by the
+    /// **local** [`Instant`] at which this daemon's copy of the hold expires
+    /// — computed once at receipt time as
+    /// `received_at + min(remaining_secs, MAX_PEER_POOL_HOLD_TTL)`, never
+    /// re-derived from the advertiser's clock.
+    ///
+    /// # Why the key carries the host, and why it does NOT carry the repo
+    ///
+    /// - **Host in the key**: so a [`ClaimKind::PoolHoldCleared`] releases
+    ///   only its own sender's hold. Two peers can hold the same dead pool
+    ///   independently; the first to recover must not speak for the second.
+    ///   (Same reason `filing_holds` is host-keyed.)
+    /// - **Repo NOT in the key**: a pool is a *machine-level* resource shared
+    ///   across every workspace whose `resolve_tokens_dir` lands on it
+    ///   (#3938/#7527) — holding it per repo would let a hold armed while
+    ///   working repo A sail straight past a dispatch into repo B resolving
+    ///   the identical, identically-dead pool. The ad still carries `repo`
+    ///   for diagnostics, exactly as the filing lane does for its own
+    ///   fleet-wide hold.
+    pool_holds: HashMap<(String, String), Instant>,
 }
 
 impl PeerClaimView {
@@ -980,6 +1158,7 @@ impl PeerClaimView {
             filing_lock_ttl: DEFAULT_PEER_FILING_LOCK_TTL,
             noop_cooldowns: HashMap::new(),
             dispatch_backoffs: HashMap::new(),
+            pool_holds: HashMap::new(),
         }
     }
 
@@ -1070,10 +1249,17 @@ impl PeerClaimView {
     /// and reaching here is a no-op — a cooldown/backoff window answers "should
     /// a peer re-dispatch this issue right now", not "is a sweep in flight",
     /// so it must not perturb the `claims` map either.
+    /// # `ClaimKind::PoolHoldArmed`/`PoolHoldCleared` are out of scope here (Issue #8001)
+    ///
+    /// Same contract once more: a pool-hold ad routes to
+    /// [`Self::observe_pool_hold_at`], and reaching here is a no-op. Like the
+    /// filing lane it carries a sentinel issue ([`POOL_HOLD_SENTINEL_ISSUE`]),
+    /// so folding it in would manufacture a bogus peer claim on issue #0.
     pub fn observe_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
         if ad.kind == ClaimKind::Completed
             || ad.kind.is_filing_lock_lane()
             || ad.kind.is_cooldown_lane()
+            || ad.kind.is_pool_hold_lane()
         {
             return false;
         }
@@ -1102,7 +1288,9 @@ impl PeerClaimView {
             | ClaimKind::FilingLock
             | ClaimKind::FilingUnlock
             | ClaimKind::NoopCooldownArmed
-            | ClaimKind::DispatchBackoffArmed => {
+            | ClaimKind::DispatchBackoffArmed
+            | ClaimKind::PoolHoldArmed
+            | ClaimKind::PoolHoldCleared => {
                 unreachable!("returned above")
             }
         }
@@ -1423,6 +1611,94 @@ impl PeerClaimView {
     /// (Issue #7477).
     pub fn prune_expired_dispatch_backoffs(&mut self, now: Instant) {
         self.dispatch_backoffs.retain(|_, expiry| *expiry > now);
+    }
+
+    // ------------------------------------------------------------------
+    // Fleet-wide token-pool exhaustion holds (Issue #8001)
+    // ------------------------------------------------------------------
+
+    /// Observe an inbound [`ClaimKind::PoolHoldArmed`]/
+    /// [`ClaimKind::PoolHoldCleared`] ad at local time `now`: "peer host H
+    /// armed (or released) a pool-exhaustion hold on the pool identified by
+    /// `ad.pool_key`". The local expiry is computed as
+    /// `now + min(remaining_secs, MAX_PEER_POOL_HOLD_TTL)` — the
+    /// received-at-based TTL discipline every other map in this module uses,
+    /// never the advertiser's wall clock.
+    ///
+    /// Returns `true` when applied, `false` when dropped. An ad is dropped
+    /// when it is this host's own (the identical self-claim recognition
+    /// [`Self::observe_at`] applies, `UNKNOWN_HOST` carve-out included) or
+    /// when it names **no pool** (`pool_key: None` — a pre-#8001 peer or a
+    /// malformed payload). Dropping a keyless ad is the safe direction: a
+    /// hold that cannot say which pool it covers must never suppress an
+    /// arbitrary one.
+    ///
+    /// A [`ClaimKind::PoolHoldCleared`] releases only the entry advertised by
+    /// **that same host** — a peer may release its own hold early, never a
+    /// third host's (the `filing_unlock` rule, for the same reason).
+    ///
+    /// Deliberately does **not** touch `counters`/`last_received_at`/
+    /// `coordination_degraded` — same contract as
+    /// [`Self::observe_noop_cooldown_at`]: the `#6157` verdict answers "is
+    /// *dispatch* coordination healthy", and a pool-lane ad is not dispatch
+    /// traffic.
+    pub fn observe_pool_hold_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
+        debug_assert!(ad.kind.is_pool_hold_lane());
+        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
+        if ad.host == self.self_host && !is_unresolved_identity {
+            return false; // never hold on our own pool advertisement
+        }
+        let Some(pool_key) = ad.pool_key.clone() else {
+            return false; // names no pool — see the doc comment
+        };
+        let key = (pool_key, ad.host.clone());
+        match ad.kind {
+            ClaimKind::PoolHoldArmed => {
+                let remaining =
+                    Duration::from_secs(ad.remaining_secs.unwrap_or(0)).min(MAX_PEER_POOL_HOLD_TTL);
+                self.pool_holds.insert(key, now + remaining);
+                true
+            }
+            ClaimKind::PoolHoldCleared => self.pool_holds.remove(&key).is_some(),
+            _ => false,
+        }
+    }
+
+    /// Whether any **peer** currently holds the pool identified by `pool_key`
+    /// at local time `now` (Issue #8001) — the read side
+    /// `work_finder::pool_preflight::preflight_held_per_root` consults
+    /// alongside its own local `observe_root` verdict.
+    #[must_use]
+    pub fn pool_hold_held_by_peer_at(&self, pool_key: &str, now: Instant) -> bool {
+        self.pool_holds
+            .iter()
+            .any(|((key, _), expiry)| key == pool_key && *expiry > now)
+    }
+
+    /// Which peer hosts currently hold `pool_key` at local time `now` (Issue
+    /// #8001), sorted for a stable log line. Diagnostic companion to
+    /// [`Self::pool_hold_held_by_peer_at`] — the hold-edge WARN names them so
+    /// an operator can tell "peer host X says this pool is dead" apart from
+    /// "my own pre-flight says so".
+    #[must_use]
+    pub fn pool_hold_peers_at(&self, pool_key: &str, now: Instant) -> Vec<String> {
+        let mut hosts: Vec<String> = self
+            .pool_holds
+            .iter()
+            .filter(|((key, _), expiry)| key == pool_key && **expiry > now)
+            .map(|((_, host), _)| host.clone())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    }
+
+    /// Drop every expired `pool_holds` entry at local time `now` (Issue
+    /// #8001). Called opportunistically so a crashed peer's holds do not
+    /// accumulate — and, critically, so a crashed peer's hold **expires**:
+    /// its `PoolHoldCleared` will never arrive.
+    pub fn prune_expired_pool_holds(&mut self, now: Instant) {
+        self.pool_holds.retain(|_, expiry| *expiry > now);
     }
 
     /// Number of tracked claims (test/observability aid; includes not-yet-pruned
@@ -1764,6 +2040,7 @@ mod tests {
             ts: "2026-07-28T00:00:00Z".to_owned(),
             pr: None,
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
