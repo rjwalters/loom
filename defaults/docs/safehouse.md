@@ -49,6 +49,7 @@ below.
 - [Implementation (phase 2)](#implementation-phase-2)
 - [Inbound steering: ChatOps (phase 3a, #7893)](#inbound-steering-chatops-phase-3a-7893)
 - [Operator-agent persona: the Concierge (phase 3b, #7947)](#operator-agent-persona-the-concierge-phase-3b-7947)
+- [The daemon speaking first: digests and watch narrations (phase 4, #8762)](#the-daemon-speaking-first-digests-and-watch-narrations-phase-4-8762)
 <!-- toc:end -->
 
 ## The degradation contract (read this first)
@@ -2100,7 +2101,7 @@ holds**, never by an LLM:
 Three producers now write to the room as the persona — `say`, the digest, and
 the watch narration — and the `addresses-daemon` check they all pass through
 lives in exactly one function, `loom-daemon/src/concierge/room.rs::emit`. It
-runs [`vet_say`](#the-four-relay-gates-concierge-relayvet_relay) (3a's own
+runs [`vet_say`](#the-four-relay-gates-conciergerelayvet_relay) (3a's own
 `addresses_persona`, so the prediction cannot drift from the parser it predicts)
 **before any socket is opened**, charges the budget **before** the send, and
 sends last. `say` was rewritten to call it; the two new producers physically
@@ -2130,6 +2131,29 @@ axis, so they still post on a day whose turn budget is spent. The cadence
 question ("who calls a periodic digest?") is answered by the existing role
 runner rather than a new daemon timer: one less long-lived task, and the
 digest's suppression makes a listening cadence safe for a summary cadence.
+
+### What the persona may and may not do with them
+
+The concierge prompt (`.loom/roles/concierge.md`) carries the one-line rule —
+"you run them, you never author, re-render, or continue them". The reasoning
+behind each clause lives here, so the always-loaded prompt does not pay for it:
+
+- **Never re-render their content via `say`.** If the room should hear it, the
+  subcommand says it — through the same `addresses-daemon` gate as `say`, on the
+  daemon's own narration budget. A hand-typed "digest" via `say` would spend the
+  turn's relay allowance, escape the suppression cursor, and put probabilistic
+  prose where the room expects an auditable line.
+- **Never widen them into conversation.** If an operator replies to a digest
+  line, that reply is ordinary room traffic — handled through `listen` /
+  `propose` like any other message. A digest is not a thread the persona owes a
+  follow-up on.
+- **Phrasing is not the persona's to choose.** Both bodies are rendered by pure
+  functions from daemon state; the `watch resolved — …` prefix is what tells the
+  room this is a report, not an echo of the `watch` verb. `--dry-run` prints what
+  would be said without sending — a diagnostic, not a preview-then-`say`.
+- **A refusal or transport failure is terminal for the tick**, exactly like a
+  failed `say`: report nothing, retry nothing. The next tick retries by running
+  the subcommands again, and a narration-cap refusal recovers the next UTC day.
 
 ### Interface parity: what the room still cannot reach (scoping, prerequisite for decomposition)
 
