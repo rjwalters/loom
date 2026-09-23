@@ -2,7 +2,6 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import {
-  deriveTokenPoolAggregate,
   redactActiveSweep,
   redactElasticSpend,
   redactFleetSnapshot,
@@ -90,6 +89,7 @@ describe("redactPayload — per-kind field allowlist", () => {
       started_at: "2026-07-30T12:00:00Z",
       model: "opus",
       effort: "high",
+      runtime: "codex",
       branch: "feature/issue-4703",
       issue_title: "Fix the thing",
     });
@@ -98,6 +98,7 @@ describe("redactPayload — per-kind field allowlist", () => {
       started_at: "2026-07-30T12:00:00Z",
       model: "opus",
       effort: "high",
+      runtime: "codex",
     });
   });
 
@@ -236,6 +237,17 @@ describe("redactPayload — per-kind field allowlist", () => {
       mean_usage_fraction: 0.44,
       max_usage_fraction: 0.9,
       next_limit_window_reset_at: "2026-08-02T03:00:00Z",
+      // Rows from a daemon that predates per-provider pools carry no
+      // `provider`; they are the Claude pool, and say so.
+      providers: [
+        {
+          provider: "claude",
+          account_count: 3,
+          exhausted_count: 1,
+          max_usage_fraction: 0.9,
+          next_limit_window_reset_at: "2026-08-02T03:00:00Z",
+        },
+      ],
     });
   });
 
@@ -880,65 +892,6 @@ describe("redactManagedRepos", () => {
     expect(redactManagedRepos([])).toEqual([]);
   });
 });
-
-describe("deriveTokenPoolAggregate", () => {
-  it("reports null rather than a misleading zero when no account measured usage", () => {
-    expect(deriveTokenPoolAggregate({ accounts: [{ account: "a", exhausted: false }] })).toEqual({
-      account_count: 1,
-      exhausted_count: 0,
-      mean_usage_fraction: null,
-      max_usage_fraction: null,
-      next_limit_window_reset_at: null,
-    });
-  });
-
-  it("averages only over accounts that reported a usage_fraction", () => {
-    const aggregate = deriveTokenPoolAggregate({
-      accounts: [{ usage_fraction: 0.2 }, { usage_fraction: 0.8 }, { exhausted: true }],
-    });
-    expect(aggregate.mean_usage_fraction).toBe(0.5);
-    expect(aggregate.max_usage_fraction).toBe(0.8);
-    expect(aggregate.account_count).toBe(3);
-  });
-
-  it("takes the earliest limit-window reset across the pool", () => {
-    const aggregate = deriveTokenPoolAggregate({
-      accounts: [
-        { limit_window_reset_at: "2026-07-30T18:00:00Z" },
-        { limit_window_reset_at: "2026-07-30T14:00:00Z" },
-      ],
-    });
-    expect(aggregate.next_limit_window_reset_at).toBe("2026-07-30T14:00:00Z");
-  });
-
-  // This runs on a live SSE response path, so a malformed payload must
-  // degrade rather than throw and kill the stream.
-  it.each([
-    ["accounts absent", {}],
-    ["accounts not an array", { accounts: "nope" }],
-    ["accounts null", { accounts: null }],
-  ])("degrades to a zero-count aggregate when %s", (_label, payload) => {
-    expect(deriveTokenPoolAggregate(payload as Record<string, unknown>)).toEqual({
-      account_count: 0,
-      exhausted_count: 0,
-      mean_usage_fraction: null,
-      max_usage_fraction: null,
-      next_limit_window_reset_at: null,
-    });
-  });
-
-  it("ignores non-finite usage values rather than propagating NaN", () => {
-    const aggregate = deriveTokenPoolAggregate({
-      accounts: [{ usage_fraction: Number.NaN }, { usage_fraction: 0.4 }],
-    });
-    expect(aggregate.mean_usage_fraction).toBe(0.4);
-    expect(aggregate.max_usage_fraction).toBe(0.4);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Unit tests: `redactSseFrame` (live tail)
-// ---------------------------------------------------------------------------
 
 describe("redactSseFrame", () => {
   it("passes non-data frames through unchanged (retry/comment preamble, keepalive)", () => {

@@ -165,6 +165,7 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
             started_at: chrono::Utc::now(),
             model: None,
             effort: None,
+            runtime: None,
         }),
     )
 }

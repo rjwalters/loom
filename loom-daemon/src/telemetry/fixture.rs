@@ -338,6 +338,7 @@ pub fn build(run_id: &str, start: DateTime<Utc>) -> Result<FixtureBundle> {
             accounts: vec![
                 TokenAccountState {
                     account: "synthetic-zero".into(),
+                    provider: "claude".into(),
                     rank: None,
                     usage_fraction: Some(0.0),
                     limit_window_reset_at: None,
@@ -345,6 +346,7 @@ pub fn build(run_id: &str, start: DateTime<Utc>) -> Result<FixtureBundle> {
                 },
                 TokenAccountState {
                     account: "synthetic-unknown".into(),
+                    provider: "claude".into(),
                     rank: None,
                     usage_fraction: None,
                     limit_window_reset_at: None,
