@@ -8,6 +8,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
+mod forge_events_line;
 mod holds;
 mod model_class;
 
@@ -293,6 +294,14 @@ pub(crate) fn build_status_json_value(
         // `{}` when observability is off or from a pre-#8756 daemon (the
         // singular field above already distinguishes those states).
         "observability_exports": report.observability_exports,
+        // Forge event-feed consumer state (ADR-0021, #8765). Non-null for any
+        // daemon of this vintage and always carrying a `state`, so a watch
+        // loop asserts rather than infers:
+        //   loom-daemon status --json | jq -e '.forge_events.state == "healthy"'
+        // States: disabled | misconfigured | connecting | failing |
+        // auth_failed | host_mismatch | backoff | healthy. `null` only from a
+        // pre-ADR-0021 daemon.
+        "forge_events": report.forge_events,
         // Per-repo pressure-triggered deep-clean state (#5919): when the pass
         // last fired, what it reclaimed, and — for the common non-firing tick
         // — why it declined. Scripted consumers can assert reclamation is
@@ -2262,6 +2271,11 @@ pub(crate) fn print_status_human(
         "{}",
         render_observability_line(report.observability_export.as_ref(), Utc::now())
     );
+
+    // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
+    // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
+    // are five different answers that would otherwise all render as nothing.
+    println!("{}", forge_events_line::render(report.forge_events.as_ref(), Utc::now()));
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before

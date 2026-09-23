@@ -1694,6 +1694,16 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data / older clients compatible.
     #[serde(default)]
     pub observability_exports: std::collections::BTreeMap<String, ObservabilityExportStatus>,
+    /// State of the forge event-feed consumer (ADR-0021, #8765): whether this
+    /// daemon is polling its operator-provisioned per-host event feed, under
+    /// which `host_id`, how far its cursor has advanced, and — when it is not
+    /// advancing — which class of failure is responsible.
+    ///
+    /// `None` **only** from a pre-ADR-0021 daemon binary that never computed
+    /// one. A daemon of this vintage with no `forgeEvents` block reports
+    /// `Some(ForgeEventsStatus::disabled())`, so silence is never the answer.
+    #[serde(default)]
+    pub forge_events: Option<ForgeEventsStatus>,
     /// The daemon-wide peer-claim view + transport counters (Issue #5921):
     /// which issues THIS host currently sees claimed, by which host and with
     /// what remaining TTL, plus how many claims have been advertised /
@@ -1794,103 +1804,14 @@ pub struct DeepCleanRepoStatus {
     pub last_reclaimed: Option<String>,
 }
 
-/// The one-word answer to "is this host's telemetry landing?" (Issue #5083),
-/// derived from [`ObservabilityExportStatus`] by
-/// [`ObservabilityExportStatus::classify`].
-///
-/// Serialized in `snake_case` so a watch loop can assert on it directly, e.g.
-/// `loom-daemon status --json | jq -e '.observability_export.state == "healthy"'`.
-/// An unknown variant from a *newer* daemon deserializes as
-/// [`Self::Unrecognized`] rather than failing the whole status parse.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ObservabilityExportState {
-    /// `observability.enabled` is `false` (or the block is absent). Nothing is
-    /// being collected and nothing is being sent — a legitimate, deliberate
-    /// steady state, not a fault. **Never** reported when `enabled: true`; a
-    /// misconfiguration under an explicit opt-in reports [`Self::Misconfigured`]
-    /// instead (#5337) — before that fix the two were byte-identical on the
-    /// wire, making a bad `ingestKeyFile` path indistinguishable from telemetry
-    /// being off by choice.
-    #[default]
-    Disabled,
-    /// `observability.enabled` is `true` but a required piece of config could
-    /// not be resolved: no `endpoint`, no `ingestKeyFile`, or the configured
-    /// `ingestKeyFile` could not be read (missing, unreadable, or empty after
-    /// trimming) — see #5337. Also covers `exporter = "otlp"` requested on a
-    /// build without the `otlp` Cargo feature. The exporter never started, so
-    /// there is no `started_at`, but this is a **config error an operator
-    /// should fix**, not the same benign absence as [`Self::Disabled`].
-    /// [`ObservabilityExportStatus::endpoint`] carries whatever *did* resolve
-    /// and [`ObservabilityExportStatus::last_failure_detail`] names the
-    /// offending path and the underlying error.
-    Misconfigured,
-    /// The exporter is running but has not had a fair chance to flush yet —
-    /// it has been up for less than
-    /// [`ObservabilityExportStatus::never_exported_grace_secs`]. Distinguished
-    /// from [`Self::NeverExported`] precisely so a freshly-restarted daemon
-    /// does not trip a watch loop for the first flush interval.
-    Starting,
-    /// **The silent failure mode this issue exists for.** The exporter has
-    /// been running well past its grace window and has still never had a batch
-    /// acked. Before #5083 this was indistinguishable from healthy: no health
-    /// section, no status line, and a 0-byte queue file that reads the same
-    /// whether it drained or was never written.
-    NeverExported,
-    /// At least one batch has been acked and the most recent attempt did not
-    /// fail. Telemetry is flowing, filed under
-    /// [`ObservabilityExportStatus::host_id`].
-    Healthy,
-    /// Batches are being acked, but the backend echoes a *different* `host_id`
-    /// than this daemon reports for itself (#4830) — the records are landing,
-    /// under the wrong host. Takes precedence over [`Self::Failing`]: it is a
-    /// config-shaped fault that cannot self-recover, whereas a failing flush
-    /// usually can.
-    HostIdMismatch,
-    /// The most recent flush attempt failed (the queue is retrying with
-    /// backoff). `last_failure_detail` carries the exporter's own error text;
-    /// `last_success_at` says whether this is a regression or has never worked.
-    Failing,
-    /// A state name this build does not know — a newer daemon reporting to an
-    /// older client. Never produced by [`ObservabilityExportStatus::classify`].
-    #[serde(other)]
-    Unrecognized,
-}
-
-impl ObservabilityExportState {
-    /// The short, upper-case token the human-readable renderers lead with.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            ObservabilityExportState::Disabled => "disabled",
-            ObservabilityExportState::Misconfigured => "MISCONFIGURED",
-            ObservabilityExportState::Starting => "starting",
-            ObservabilityExportState::NeverExported => "NEVER EXPORTED",
-            ObservabilityExportState::Healthy => "OK",
-            ObservabilityExportState::HostIdMismatch => "HOST-ID MISMATCH",
-            ObservabilityExportState::Failing => "FAILING",
-            ObservabilityExportState::Unrecognized => "unrecognized",
-        }
-    }
-
-    /// Whether this state is a *problem* an operator should act on.
-    /// `disabled`, `starting`, and `healthy` are not; the rest are.
-    #[must_use]
-    pub fn is_problem(self) -> bool {
-        matches!(
-            self,
-            ObservabilityExportState::Misconfigured
-                | ObservabilityExportState::NeverExported
-                | ObservabilityExportState::HostIdMismatch
-                | ObservabilityExportState::Failing
-        )
-    }
-}
-
 mod observability_export;
 pub use observability_export::{
-    ObservabilityExportStatus, ObservabilityHostIdMismatch, NEVER_EXPORTED_GRACE_FLOOR_SECS,
+    ObservabilityExportState, ObservabilityExportStatus, ObservabilityHostIdMismatch,
+    NEVER_EXPORTED_GRACE_FLOOR_SECS,
 };
+
+mod forge_events;
+pub use forge_events::{ForgeEventsState, ForgeEventsStatus};
 
 /// One work-finder tick's dispatch/skip tally, stamped with the wall-clock
 /// time it completed and the dynamic cap it ran under (Issue #4761).

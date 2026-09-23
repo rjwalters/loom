@@ -5,6 +5,8 @@
 //! resolution, every autonomous subsystem's startup wiring, and the IPC
 //! accept loop that only returns on a startup failure.
 
+mod observer_tasks;
+
 use loom_daemon::activity::{self, ActivityDb};
 use loom_daemon::admission_brake;
 use loom_daemon::auto_update;
@@ -23,7 +25,6 @@ use loom_daemon::install_self_check;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
-use loom_daemon::observability;
 use loom_daemon::orphan_process_reaper;
 use loom_daemon::primary_checkout_reaper;
 use loom_daemon::quarantine_stash_status;
@@ -2028,21 +2029,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
         None
     };
 
-    // Pluggable telemetry exporter (#4705, epic #4702 Phase 1). Off by
-    // default (FLAGS-OFF, `observability.enabled=true` to opt in) — a bus
-    // subscriber plus a queue-drain sender, mirroring the idle_exit wiring
-    // immediately above. `Instant::now()` here approximates daemon uptime for
-    // the periodic `host.health` sample; see `observability::spawn_task`'s
-    // doc comment for why an exact daemon-start timestamp is not threaded
-    // through for this.
-    let observability_config = observability::read_config(&sweep_workspace);
-    let _observability_handles = observability::spawn_task(
-        &observability_config,
-        sweep_workspace.clone(),
-        &event_bus,
-        std::time::Instant::now(),
-        workspace_pool.clone(),
-    );
+    // Read-only observer side channels — telemetry export (#4705) and the
+    // forge event feed (ADR-0021, #8765). Both opt-in, both off by default,
+    // neither able to change what any dispatch path does. See
+    // `observer_tasks` for why they share a call site.
+    let _observer_handles =
+        observer_tasks::spawn(&sweep_workspace, &event_bus, workspace_pool.clone());
 
     // Start IPC server. `workspace_health_states` is threaded in so the
     // `DaemonStatus` request can report each registered repo's own halt state
@@ -2119,7 +2111,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::info!(
             "Socket cleaned up, exiting {code} ({signal_name} received — no supervised relaunch)"
         );
-        observability::shutdown::exit(code).await;
+        loom_daemon::observability::shutdown::exit(code).await;
     });
 
     log::info!("Loom daemon starting...");

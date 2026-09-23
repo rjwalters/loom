@@ -92,6 +92,7 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         observability_host_id_mismatch: None,
         observability_export: None,
         observability_exports: std::collections::BTreeMap::new(),
+        forge_events: None,
         peer_claims: None,
         deep_clean: Vec::new(),
         idle_exit: None,
