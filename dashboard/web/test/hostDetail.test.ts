@@ -164,18 +164,20 @@ describe("hostDetailView — token panel", () => {
     expect(rows).toHaveLength(2);
     // The reset window is in the future — rendered as a countdown, not
     // clamped to "just now" the way a past-event timestamp would be.
-    expect(cells(rows[0]!)).toEqual(["agent-1", "0", "42%", "in 5h 50m", "available"]);
+    // An untagged row is the Claude pool, and the Provider column says so.
+    expect(cells(rows[0]!)).toEqual(["agent-1", "Claude", "0", "42%", "in 5h 50m", "available"]);
+    expect(rows[0]!.querySelector('[data-testid="provider-mark"]')?.getAttribute("data-provider")).toBe("claude");
     // agent-2 has no limit_window_reset_at — unknown, not a fabricated date.
-    expect(cells(rows[1]!)[3]).toBe(UNKNOWN);
+    expect(cells(rows[1]!)[4]).toBe(UNKNOWN);
   });
 
   it("marks an exhausted account", () => {
     const rows = [...detail(DEGRADED_HOST_ID).querySelectorAll('[data-testid="token-account"]')];
     expect(rows[0]!.classList.contains("row--exhausted")).toBe(true);
-    expect(cells(rows[0]!)[4]).toBe("exhausted");
+    expect(cells(rows[0]!)[5]).toBe("exhausted");
     // agent-4 reports `exhausted: false` but no usage_fraction.
-    expect(cells(rows[1]!)[2]).toBe(UNKNOWN);
-    expect(cells(rows[1]!)[4]).toBe("available");
+    expect(cells(rows[1]!)[3]).toBe(UNKNOWN);
+    expect(cells(rows[1]!)[5]).toBe("available");
   });
 
   it("counts down to an exhausted account's reset instead of showing a dash", () => {
@@ -184,11 +186,11 @@ describe("hostDetailView — token panel", () => {
     // for. With the field fed, an exhausted account answers "when does
     // capacity return?" — a multi-day countdown, not a clamped "just now".
     const rows = [...detail(DEGRADED_HOST_ID).querySelectorAll('[data-testid="token-account"]')];
-    expect(cells(rows[0]!)[4]).toBe("exhausted");
-    expect(cells(rows[0]!)[3]).toBe("in 2d 14h");
-    expect(cells(rows[0]!)[3]).not.toBe(UNKNOWN);
+    expect(cells(rows[0]!)[5]).toBe("exhausted");
+    expect(cells(rows[0]!)[4]).toBe("in 2d 14h");
+    expect(cells(rows[0]!)[4]).not.toBe(UNKNOWN);
     // The absolute instant is still available as the tooltip for a bug report.
-    const resetCell = rows[0]!.querySelectorAll("td")[3];
+    const resetCell = rows[0]!.querySelectorAll("td")[4];
     expect(resetCell?.getAttribute("title")).toBeTruthy();
   });
 
@@ -247,6 +249,7 @@ describe("hostDetailView — active sweeps", () => {
       "#4703",
       "rjwalters/loom",
       "builder",
+      "Claude",
       "opus",
       "high",
       "10m 0s",
@@ -254,17 +257,31 @@ describe("hostDetailView — active sweeps", () => {
     ]);
   });
 
+  it("links the issue cell to the sweep's forge work and the repo cell to the repo", () => {
+    const rows = [...detail(HEALTHY_HOST_ID).querySelectorAll('[data-testid="sweep-row"]')];
+    const builderTds = [...rows[0]!.querySelectorAll("td")];
+    const label = builderTds[0]!.querySelector("a")!;
+    expect(label.getAttribute("href")).toBe("https://github.com/rjwalters/loom/tree/feature/issue-4703");
+    expect(label.getAttribute("target")).toBe("_blank");
+    expect(builderTds[1]!.querySelector("a")!.getAttribute("href")).toBe("https://github.com/rjwalters/loom");
+    // No phase yet → the issue, not a branch that does not exist.
+    const startingTds = [...rows[1]!.querySelectorAll("td")];
+    expect(startingTds[0]!.querySelector("a")!.getAttribute("href")).toBe(
+      "https://github.com/rjwalters/loom/issues/4749",
+    );
+  });
+
   it("carries the absolute timestamps in tooltips", () => {
     const row = detail(HEALTHY_HOST_ID).querySelector('[data-testid="sweep-row"]')!;
     const tds = [...row.querySelectorAll("td")];
-    expect(tds[5]!.getAttribute("title")).toBe("2026-07-30 12:00:00 UTC");
-    expect(tds[6]!.getAttribute("title")).toBe("2026-07-30 12:06:00 UTC");
+    expect(tds[6]!.getAttribute("title")).toBe("2026-07-30 12:00:00 UTC");
+    expect(tds[7]!.getAttribute("title")).toBe("2026-07-30 12:06:00 UTC");
   });
 
   it("degrades a partially-reported sweep instead of blanking the row", () => {
     const rows = [...detail(HEALTHY_HOST_ID).querySelectorAll('[data-testid="sweep-row"]')];
     // sweep-issue-4749-0: no phase, no effort, no enteredPhaseAt yet.
-    expect(cells(rows[1]!)).toEqual(["#4749", "rjwalters/loom", "starting", "opus", UNKNOWN, "1m 0s", UNKNOWN]);
+    expect(cells(rows[1]!)).toEqual(["#4749", "rjwalters/loom", "starting", "Codex", "opus", UNKNOWN, "1m 0s", UNKNOWN]);
   });
 
   it("falls back to the sweep id when the issue number is unknown", () => {

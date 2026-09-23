@@ -156,12 +156,17 @@ A sweep began work on an issue.
   "sweep_id": "sweep-issue-4703-0",
   "started_at": "2026-07-30T12:00:00Z",
   "model": "opus",
-  "effort": "high"
+  "effort": "high",
+  "runtime": "claude"
 }
 ```
 
 `model` and `effort` are omitted when unset (empty-means-unset, mirroring
-`SweepInfo`).
+`SweepInfo`). `runtime` is the admitted runtime adapter (`claude`, `codex`,
+…) copied from the `sweep.global.dispatch` event — the same value
+`SweepInfo::runtime` records — and is what lets a consumer say *which agent*
+is working the sweep. Omitted when the dispatch did not name one; never
+defaulted to `"claude"`.
 
 ### `sweep.phase`
 
@@ -583,32 +588,54 @@ A point-in-time view of the multi-account token pool (host-level — no `repo` /
   "accounts": [
     {
       "account": "agent-1",
+      "provider": "claude",
       "rank": 0,
       "usage_fraction": 0.42,
       "limit_window_reset_at": "2026-07-30T18:00:00Z",
       "exhausted": false
     },
-    { "account": "agent-2", "exhausted": true }
+    { "account": "agent-2", "provider": "claude", "exhausted": true },
+    { "account": "cx-1", "provider": "codex", "exhausted": false },
+    {
+      "account": "cx-2",
+      "provider": "codex",
+      "limit_window_reset_at": "2026-07-30T14:30:00Z",
+      "exhausted": true
+    }
   ]
 }
 ```
 
 Per account, `rank` / `usage_fraction` / `limit_window_reset_at` are omitted when
-unknown; `exhausted` is always present.
+unknown; `provider` and `exhausted` are always present. `provider` is the
+lowercase `AccountProvider` name (`claude`, `codex`, …) and is what a consumer
+groups on to show each provider's availability on its own — a reader MUST treat
+a row with no `provider` (a daemon that predates this field) as `claude`, which
+is the only pool such a daemon ever sampled.
 
-Every field is read out of the pool's `.ranking` file, so each maps to one of its
-pipe-delimited columns (`name|status|5h_util|limit_reset` — see
+**Claude rows** are read out of the pool's `.ranking` file, so each maps to one
+of its pipe-delimited columns (`name|status|5h_util|limit_reset` — see
 [`token-pool.md`](token-pool.md)): `rank` is the row's position, `usage_fraction`
 is `5h_util`, `exhausted` is derived from `status`, and `limit_window_reset_at`
 is `limit_reset`.
+
+**Every other provider's rows** (`codex`, …) come from the multi-provider account
+registry (`.loom/accounts.json` + the machine-level profile root) joined with the
+provider-health state file: one row per *enabled* account, `exhausted` is the
+daemon's own account-wide eligibility verdict (`ReauthRequired`, or a live
+`cooldown_until` hold), and `limit_window_reset_at` is that hold's deadline when
+there is one. These pools measure no usage fraction and have no ranking, so
+`rank` / `usage_fraction` are always absent for them — absent, not `0`.
 
 `limit_window_reset_at` is the instant the window **currently gating that
 account** rolls over — the 7-day window for an `exhausted` account (when it
 regains capacity), the 5-hour window otherwise (the rollover `usage_fraction` is
 racing). The daemon resolves which one before writing, so a consumer never has to
-know: it is always "when this account's constraint lifts". It is also the only
-per-account field here that survives public redaction, aggregated across the pool
-into `next_limit_window_reset_at` (the earliest reset, naming no account). A row
+know: it is always "when this account's constraint lifts". It is also one of only
+two per-account fields here that survive public redaction — aggregated across the
+pool into `next_limit_window_reset_at` (the earliest reset, naming no account),
+and, with `provider`, into the per-provider `providers[]` slices the public view
+carries instead of `accounts` (see `dashboard/docs/query-api.md`). A row
 whose reset is absent or unparseable reports no reset at all rather than a
 fabricated instant, so consumers must treat `null`/absent as *unknown* — never as
 "resets now".

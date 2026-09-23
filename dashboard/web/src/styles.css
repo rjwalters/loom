@@ -354,6 +354,56 @@ a:hover {
   border-top: none;
 }
 
+/* Off-site forge links (repo, issue, branch) inside the card rows and the
+ * host-detail sweep table. They keep the row's own colour so a dim repo
+ * slug stays dim and a chip-adjacent `#N` stays text-coloured; the faint
+ * underline is the only resting affordance, and hover brings in the accent. */
+.forge-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+}
+.forge-link:hover {
+  color: var(--accent);
+  text-decoration-color: currentColor;
+}
+
+/* ---- provider marks ------------------------------------------------------ */
+/* Claude's mark (the same Simple Icons glyph the 2amlogic.com fleet feed
+ * uses) or a short text label for any other provider — see providers.ts. */
+.provider-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.provider-mark__icon {
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+.provider-mark__name {
+  font-size: 12px;
+}
+.card__sweep .provider-mark__name,
+.detail__sweep-agent .provider-mark__name {
+  color: var(--text-dim);
+}
+/* The token-pool label carries the mark before its text; keep the label's
+ * own small-caps styling for the text part only. */
+.field__label--provider {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.field__label--provider .provider-mark__name {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 /* ---- badges + chips ------------------------------------------------------ */
 
 .badge {

@@ -276,6 +276,7 @@ mod tests {
                 started_at: chrono::Utc::now(),
                 model: None,
                 effort: None,
+                runtime: None,
             }),
         )
     }

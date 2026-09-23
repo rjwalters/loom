@@ -24,6 +24,7 @@ import type {
   FleetSnapshot,
   HostEntry,
   HostHealthRecord,
+  ProviderPoolAggregate,
   TokenAccount,
 } from "./types";
 
@@ -75,6 +76,28 @@ export interface TokenSummary {
   /** False when this summary came from the public aggregate, so the
    * per-account table has nothing to render and should say why. */
   hasAccountDetail: boolean;
+  /** The same pool, one slice per provider (`claude`, `codex`, …) in
+   * first-seen order — what lets the card show Claude's and Codex's
+   * availability independently instead of one blended figure. Empty when
+   * `total` is 0. A row/aggregate from a daemon or backend that predates
+   * per-provider pools collapses into a single `"claude"` slice. */
+  providers: ProviderSummary[];
+}
+
+/** One provider's slice of a `TokenSummary`. */
+export interface ProviderSummary {
+  provider: string;
+  total: number;
+  exhausted: number;
+  /** Highest known `usage_fraction` in this slice, or `undefined` when no
+   * account in it reports one (Codex accounts never do — never `0`). */
+  peakUsage: number | undefined;
+}
+
+/** The provider a token-account row belongs to — `"claude"` when the
+ * emitting daemon predates per-provider pools and sent none. */
+export function accountProvider(account: TokenAccount): string {
+  return account.provider && account.provider.length > 0 ? account.provider : "claude";
 }
 
 export interface HostView {
@@ -192,23 +215,59 @@ export function summarizeTokens(entry: HostEntry): TokenSummary {
   if (accounts) {
     let peakUsage: number | undefined;
     let exhausted = 0;
+    const providers: ProviderSummary[] = [];
     for (const account of accounts) {
       if (account.exhausted) exhausted += 1;
       if (account.usage_fraction !== undefined) {
         peakUsage = peakUsage === undefined ? account.usage_fraction : Math.max(peakUsage, account.usage_fraction);
       }
+      const name = accountProvider(account);
+      let slice = providers.find((entry) => entry.provider === name);
+      if (!slice) {
+        slice = { provider: name, total: 0, exhausted: 0, peakUsage: undefined };
+        providers.push(slice);
+      }
+      slice.total += 1;
+      if (account.exhausted) slice.exhausted += 1;
+      if (account.usage_fraction !== undefined) {
+        slice.peakUsage =
+          slice.peakUsage === undefined ? account.usage_fraction : Math.max(slice.peakUsage, account.usage_fraction);
+      }
     }
-    return { accounts, total: accounts.length, exhausted, peakUsage, hasAccountDetail: true };
+    return { accounts, total: accounts.length, exhausted, peakUsage, hasAccountDetail: true, providers };
   }
 
+  const total = record?.account_count ?? 0;
+  const exhausted = record?.exhausted_count ?? 0;
+  const peakUsage = record?.max_usage_fraction ?? undefined;
   return {
     accounts: [],
-    total: record?.account_count ?? 0,
-    exhausted: record?.exhausted_count ?? 0,
-    peakUsage: record?.max_usage_fraction ?? undefined,
+    total,
+    exhausted,
+    peakUsage,
     // A host that has simply never sent a tokens.snapshot has no record at
     // all; a public viewer's record exists but withholds the rows.
     hasAccountDetail: record === undefined,
+    providers: record?.providers
+      ? record.providers.map(providerSummaryFromAggregate).filter((slice): slice is ProviderSummary => slice !== undefined)
+      : // A backend that predates the per-provider aggregate: the whole
+        // pool was the Claude pool.
+        total > 0
+        ? [{ provider: "claude", total, exhausted, peakUsage }]
+        : [],
+  };
+}
+
+/** One public `providers[]` slice → `ProviderSummary`; `undefined` for a
+ * slice too malformed to name (no `provider`), which is dropped rather than
+ * rendered under a fabricated name. */
+function providerSummaryFromAggregate(slice: ProviderPoolAggregate): ProviderSummary | undefined {
+  if (!slice.provider) return undefined;
+  return {
+    provider: slice.provider,
+    total: slice.account_count ?? 0,
+    exhausted: slice.exhausted_count ?? 0,
+    peakUsage: slice.max_usage_fraction ?? undefined,
   };
 }
 
@@ -226,9 +285,31 @@ const HIGH_EXHAUSTION_FRACTION = 0.75;
  * no reported accounts (`total === 0`) is not degraded by this check —
  * that host simply has not sent a `tokens.snapshot` yet. */
 export function isTokenPoolDegraded(tokens: TokenSummary): boolean {
-  if (tokens.total === 0) return false;
-  const available = tokens.total - tokens.exhausted;
-  return available <= LOW_AVAILABILITY_THRESHOLD || tokens.exhausted / tokens.total >= HIGH_EXHAUSTION_FRACTION;
+  return degradedProviders(tokens).length > 0;
+}
+
+/** The provider pools that are at or near exhaustion, by name. Each
+ * provider is judged on its own: a fleet whose Claude pool is spent cannot
+ * dispatch Claude sweeps no matter how many Codex accounts sit idle, so one
+ * blended availability figure would hide exactly the outage an operator
+ * needs to see. A summary with no provider slices (an empty pool) falls
+ * back to the pool-wide numbers, which is then also empty — not degraded. */
+export function degradedProviders(tokens: TokenSummary): string[] {
+  const slices = tokens.providers.length > 0
+    ? tokens.providers
+    : [{ provider: "claude", total: tokens.total, exhausted: tokens.exhausted, peakUsage: tokens.peakUsage }];
+  return slices.filter((slice) => isPoolSliceDegraded(slice.total, slice.exhausted)).map((slice) => slice.provider);
+}
+
+function isPoolSliceDegraded(total: number, exhausted: number): boolean {
+  if (total === 0) return false;
+  const available = total - exhausted;
+  if (available === 0) return true;
+  // "One account left to rotate onto" is only a warning sign for a pool
+  // that had more: a single-account provider (one Codex subscription) is
+  // its normal, healthy self at one available, not perpetually degraded.
+  if (total > 1 && available <= LOW_AVAILABILITY_THRESHOLD) return true;
+  return exhausted / total >= HIGH_EXHAUSTION_FRACTION;
 }
 
 /**
@@ -322,7 +403,8 @@ export function buildHostView(
     degradedReason = distress;
   } else if (isTokenPoolDegraded(tokens)) {
     status = "degraded";
-    degradedReason = "token pool at or near exhaustion";
+    const spent = degradedProviders(tokens);
+    degradedReason = `${spent.join(", ")} token pool${spent.length === 1 ? "" : "s"} at or near exhaustion`;
   } else {
     status = "ok";
   }

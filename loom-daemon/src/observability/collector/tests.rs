@@ -246,6 +246,60 @@ fn token_snapshot_reads_a_ranking_file() {
     assert!(!record.accounts[0].exhausted);
     assert_eq!(record.accounts[1].account, "agent-2");
     assert!(record.accounts[1].exhausted);
+    // Every `.ranking` row is the Claude pool — the tag the dashboard splits
+    // the token-pool section on.
+    assert!(record.accounts.iter().all(|a| a.provider == "claude"));
+}
+
+/// The registry-backed providers' sampler reports nothing when there is
+/// nothing registered — no rows fabricated from an empty profile root, and
+/// no error that would take the whole `tokens.snapshot` down with it.
+/// `LOOM_CODEX_PROFILE_ROOT` is process-global env, hence `#[serial]`.
+#[test]
+#[serial(codex_profile_root)]
+fn registry_provider_accounts_are_empty_when_nothing_is_registered() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profile_root = tempfile::tempdir().unwrap();
+    std::env::set_var(
+        crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV,
+        profile_root.path().to_str().unwrap(),
+    );
+    let accounts = sample_registry_provider_accounts(workspace.path());
+    std::env::remove_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV);
+    assert!(accounts.is_empty(), "got {accounts:?}");
+}
+
+/// The dispatch event already names the admitted runtime adapter;
+/// `sweep.started` must carry it through (and stay silent, not `"claude"`,
+/// when the event did not name one).
+#[test]
+fn sweep_started_carries_the_dispatch_runtime() {
+    let mut dispatches = HashMap::new();
+    let event = Event::SweepGlobalDispatch {
+        sweep_id: "sweep-issue-7-0".to_string(),
+        kind: SweepKind::Issue(7),
+        runtime: Some("codex".to_string()),
+        runtime_source: None,
+        repo: Some("/repos/loom".to_string()),
+    };
+    let records =
+        map_event_to_records(&event, 7, "rjwalters/loom", RepoVisibility::Public, &mut dispatches);
+    match &records[0] {
+        TelemetryRecord::SweepStarted(r) => assert_eq!(r.runtime.as_deref(), Some("codex")),
+        other => panic!("expected sweep.started, got {other:?}"),
+    }
+
+    let records = map_event_to_records(
+        &dispatch_event(8, "sweep-issue-8-0"),
+        8,
+        "rjwalters/loom",
+        RepoVisibility::Public,
+        &mut dispatches,
+    );
+    match &records[0] {
+        TelemetryRecord::SweepStarted(r) => assert_eq!(r.runtime, None),
+        other => panic!("expected sweep.started, got {other:?}"),
+    }
 }
 
 #[test]

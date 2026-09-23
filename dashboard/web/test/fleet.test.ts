@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   STALE_AFTER_SEC,
   buildFleetView,
+  degradedProviders,
   distressReason,
   findHost,
   isHostDistressed,
@@ -182,6 +183,7 @@ describe("isTokenPoolDegraded", () => {
     exhausted,
     peakUsage: undefined,
     hasAccountDetail: true,
+    providers: [],
   });
 
   it("is not degraded when no accounts have been reported yet", () => {
@@ -206,6 +208,34 @@ describe("isTokenPoolDegraded", () => {
 
   it("is degraded once exhaustion crosses the 75% threshold, even with 2+ available", () => {
     expect(isTokenPoolDegraded(pool(20, 15))).toBe(true); // 5 available, 75% exhausted
+  });
+
+  it("judges each provider pool on its own — a spent Claude pool is degraded however idle Codex is", () => {
+    const summary = {
+      ...pool(8, 4),
+      providers: [
+        { provider: "claude", total: 4, exhausted: 4, peakUsage: 1 },
+        { provider: "codex", total: 4, exhausted: 0, peakUsage: undefined },
+      ],
+    };
+    // Pool-wide this is 4/8 — comfortably fine — which is exactly the
+    // blended figure that would have hidden the Claude outage.
+    expect(isTokenPoolDegraded(summary)).toBe(true);
+    expect(degradedProviders(summary)).toEqual(["claude"]);
+  });
+
+  it("does not treat a single-account provider as perpetually degraded", () => {
+    const summary = {
+      ...pool(3, 0),
+      providers: [
+        { provider: "claude", total: 2, exhausted: 0, peakUsage: 0.2 },
+        { provider: "codex", total: 1, exhausted: 0, peakUsage: undefined },
+      ],
+    };
+    expect(isTokenPoolDegraded(summary)).toBe(false);
+    // …until that one account is actually spent.
+    summary.providers[1]!.exhausted = 1;
+    expect(degradedProviders(summary)).toEqual(["codex"]);
   });
 });
 
@@ -336,7 +366,8 @@ describe("buildFleetView host-distress classification (#4975)", () => {
     );
     const host = findHost(built, "h");
     expect(host?.status).toBe("degraded");
-    expect(host?.degradedReason).toBe("token pool at or near exhaustion");
+    // Rows with no `provider` are the Claude pool, and the reason says so.
+    expect(host?.degradedReason).toBe("claude token pool at or near exhaustion");
   });
 });
 
@@ -361,7 +392,14 @@ describe("summarizeTokens", () => {
     const summary = summarizeTokens({});
     // `hasAccountDetail: true` with an empty pool: nothing is being withheld,
     // this host simply has not reported a snapshot.
-    expect(summary).toEqual({ accounts: [], total: 0, exhausted: 0, peakUsage: undefined, hasAccountDetail: true });
+    expect(summary).toEqual({
+      accounts: [],
+      total: 0,
+      exhausted: 0,
+      peakUsage: undefined,
+      hasAccountDetail: true,
+      providers: [],
+    });
   });
 
   it("reads the public aggregate when per-account rows were withheld", () => {
@@ -383,7 +421,60 @@ describe("summarizeTokens", () => {
       exhausted: 5,
       peakUsage: 0.91,
       hasAccountDetail: false,
+      // A backend that predates the per-provider aggregate: the pool was
+      // the Claude pool, so it becomes one Claude slice rather than none.
+      providers: [{ provider: "claude", total: 13, exhausted: 5, peakUsage: 0.91 }],
     });
+  });
+
+  it("reads the public per-provider aggregate when the backend sends one", () => {
+    const summary = summarizeTokens({
+      tokens: {
+        record: {
+          kind: "tokens.snapshot",
+          account_count: 5,
+          exhausted_count: 3,
+          max_usage_fraction: 1,
+          providers: [
+            { provider: "claude", account_count: 2, exhausted_count: 1, max_usage_fraction: 1 },
+            { provider: "codex", account_count: 3, exhausted_count: 2, max_usage_fraction: null },
+            // A slice too malformed to name is dropped, not rendered under a
+            // fabricated provider.
+            { account_count: 9 },
+          ],
+        },
+        updatedAt: "2026-07-30T12:00:00Z",
+      },
+    });
+    expect(summary.hasAccountDetail).toBe(false);
+    expect(summary.providers).toEqual([
+      { provider: "claude", total: 2, exhausted: 1, peakUsage: 1 },
+      { provider: "codex", total: 3, exhausted: 2, peakUsage: undefined },
+    ]);
+  });
+
+  it("splits per-account rows by provider, folding untagged rows into claude", () => {
+    const summary = summarizeTokens({
+      tokens: {
+        record: {
+          kind: "tokens.snapshot",
+          accounts: [
+            { account: "agent-1", usage_fraction: 0.5, exhausted: false },
+            { account: "agent-2", provider: "claude", usage_fraction: 0.9, exhausted: true },
+            { account: "cx-1", provider: "codex", exhausted: false },
+            { account: "cx-2", provider: "codex", exhausted: true },
+            { account: "cx-3", provider: "codex", exhausted: true },
+          ],
+        },
+        updatedAt: "2026-07-30T12:00:00Z",
+      },
+    });
+    expect(summary.total).toBe(5);
+    expect(summary.exhausted).toBe(3);
+    expect(summary.providers).toEqual([
+      { provider: "claude", total: 2, exhausted: 1, peakUsage: 0.9 },
+      { provider: "codex", total: 3, exhausted: 2, peakUsage: undefined },
+    ]);
   });
 
   it("prefers per-account rows over the aggregate when both are present", () => {

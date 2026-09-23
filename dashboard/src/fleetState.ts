@@ -89,6 +89,9 @@ export interface ActiveSweepState {
   enteredPhaseAt?: string;
   model?: string;
   effort?: string;
+  /** Runtime adapter the sweep was dispatched on (`claude`, `codex`, …),
+   * from `sweep.started`'s `runtime`. Absent for a pre-runtime daemon. */
+  runtime?: string;
   updatedAt: string;
 }
 
@@ -537,6 +540,7 @@ export class FleetState implements DurableObject {
           startedAt: typeof record.started_at === "string" ? record.started_at : undefined,
           model: typeof record.model === "string" ? record.model : undefined,
           effort: typeof record.effort === "string" ? record.effort : undefined,
+          runtime: typeof record.runtime === "string" ? record.runtime : undefined,
           updatedAt: now,
         };
         await this.state.storage.put(`sweep:${sweepId}`, entry);
@@ -558,6 +562,7 @@ export class FleetState implements DurableObject {
           enteredPhaseAt: typeof record.entered_at === "string" ? record.entered_at : now,
           model: existing?.model,
           effort: existing?.effort,
+          runtime: existing?.runtime,
           updatedAt: now,
         };
         await this.state.storage.put(`sweep:${sweepId}`, entry);
