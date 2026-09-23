@@ -787,6 +787,12 @@ impl SweepRegistry {
     /// detached thread (fail-safe: no container / no docker / a docker
     /// failure is logged and skipped, never an error).
     ///
+    /// Issue #8776: that call does **no** docker I/O on this thread — label
+    /// discovery (`docker ps`) moved inside the detached thread too, so an
+    /// unresponsive dockerd can no longer hold this lock-scoped step (and the
+    /// SIGTERM below it) for the `reap_gh_timeout()` discovery budget. The
+    /// only cost here is spawning the thread.
+    ///
     /// - Unknown sweep IDs return `Err`.
     /// - Already-terminal sweeps return [`BeginCancel::AlreadyTerminal`] with
     ///   an idempotent `was_running = false` outcome (no signal, no state
@@ -855,8 +861,10 @@ impl SweepRegistry {
     /// SIGKILL also escalates the container one —
     /// [`container_stop::finish_container_stop`] re-lists the issue's
     /// container(s) by label and `docker kill`s whatever is still running
-    /// (fail-safe, logged, never an error). Returns the [`CancelOutcome`] for
-    /// the (running) sweep.
+    /// (fail-safe, logged, never an error) — since #8776 the re-list and the
+    /// kill both run on a detached thread, so this lock-scoped step's terminal
+    /// transition and event emission never wait on docker either. Returns the
+    /// [`CancelOutcome`] for the (running) sweep.
     pub fn finish_cancel(
         &mut self,
         sweep_id: &str,
