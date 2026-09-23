@@ -20,9 +20,26 @@
 //! | Layer | Lives in | Enforces |
 //! |---|---|---|
 //! | Sender gating | [`ConciergeConfig::allows`] | who may address the persona at all |
-//! | Budget | [`budget`] | per-tick message cap + per-day turn cap |
+//! | Budget | [`budget`] | per-tick message cap, per-day turn cap, per-day narration cap |
 //! | Intent aid | [`intent`] | a conservative, deterministic prose → proposal map |
 //! | **Relay vetting** | [`relay`] | **the security boundary**: what may become a command |
+//! | Room output | [`room`] | the one vetted way *any* body reaches the room |
+//!
+//! # Phase 4: the daemon narrating on its own initiative
+//!
+//! Everything above is reactive — the persona reads the room and answers. Two
+//! Phase 4 additions (#8762) let the daemon *start* a room message:
+//! [`digest`] (a periodic "what the daemon has been doing" summary) and
+//! [`watch_narration`] (a [`crate::watch_registry`] watch reaching terminal
+//! state, told into the room instead of only into
+//! `~/.loom/logs/watch-results.log`).
+//!
+//! Neither widens the security surface, because neither gets its own out-path:
+//! both render a plain string and hand it to [`room::emit`], which is the same
+//! `vet_say` gate the persona's own `say` goes through. An output that 3a's
+//! `inbound_command` would read as an addressed command is therefore not
+//! "unlikely" — it is unsendable, on the identical mechanism, for all three
+//! callers. See [`room`] for why that is one function and not three.
 //!
 //! # The three properties that are structural, not advisory
 //!
@@ -74,8 +91,11 @@
 //! an accept-nobody config that still reports as enabled.
 
 pub mod budget;
+pub mod digest;
 pub mod intent;
 pub mod relay;
+pub mod room;
+pub mod watch_narration;
 
 #[cfg(test)]
 mod tests;
@@ -91,6 +111,7 @@ use crate::safehouse_chatops::normalize_sender;
 pub use budget::{BudgetLedger, BudgetRefusal, BudgetSnapshot};
 pub use intent::{scan_for_injection, InjectionScan, Proposal, RoomMessage, Verb};
 pub use relay::{vet_relay, Authorization, RelayRefusal, RelayRequest};
+pub use room::{emit, Charge, EmitRefusal};
 
 /// The role name the daemon-native role runner dispatches for this persona,
 /// and the stem of its prompt file. Named once so `role_runner`, the config
@@ -105,6 +126,7 @@ const ROOM_ENV: &str = "LOOM_SAFEHOUSE_CONCIERGE_ROOM";
 const PERSONA_ENV: &str = "LOOM_SAFEHOUSE_CONCIERGE_PERSONA";
 const MAX_MESSAGES_ENV: &str = "LOOM_SAFEHOUSE_CONCIERGE_MAX_MESSAGES";
 const MAX_TURNS_ENV: &str = "LOOM_SAFEHOUSE_CONCIERGE_MAX_TURNS";
+const MAX_NARRATIONS_ENV: &str = "LOOM_SAFEHOUSE_CONCIERGE_MAX_NARRATIONS";
 
 /// The persona name the concierge speaks as in the room, when
 /// `safehouse.concierge.persona` does not name one.
@@ -129,12 +151,29 @@ pub const DEFAULT_MAX_MESSAGES_PER_TICK: u32 = 5;
 /// knob that decides what the persona can spend in a day.
 pub const DEFAULT_MAX_TURNS_PER_DAY: u32 = 24;
 
+/// Default cap on **daemon-originated room narrations** per UTC day: the
+/// periodic digest ([`digest`]) plus watch-result lines
+/// ([`watch_narration`]).
+///
+/// A separate counter from the two above, because it bounds a different thing.
+/// Those two bound *an LLM session* — how many messages it may act on and how
+/// many sessions may run. This one bounds *the daemon talking on its own
+/// initiative*, which has no session to be bounded by: a fleet with a hundred
+/// registered watches resolving at once, or a digest cadence an operator tuned
+/// down to 60s, is a room firehose that no per-turn cap would have noticed.
+///
+/// 48 is two an hour sustained — comfortably above a 5-minute digest cadence
+/// that mostly suppresses itself as unchanged, and far below "the room is
+/// unusable".
+pub const DEFAULT_MAX_NARRATIONS_PER_DAY: u32 = 48;
+
 /// Clamp bounds. A cap of zero is `enabled: false` spelled confusingly, and an
 /// unbounded cap is the thing these knobs exist to prevent — so both tiers drop
 /// a `0`/unparseable value to the next tier rather than honoring it, exactly as
 /// [`crate::role_runner::resolve_architect_max_proposals`] does.
 const MAX_MESSAGES_CEILING: u32 = 50;
 const MAX_TURNS_CEILING: u32 = 500;
+const MAX_NARRATIONS_CEILING: u32 = 500;
 
 /// Resolved `safehouse.concierge` block.
 ///
@@ -159,6 +198,9 @@ pub struct ConciergeConfig {
     pub max_messages_per_tick: u32,
     /// Per-UTC-day cap on turns. See [`DEFAULT_MAX_TURNS_PER_DAY`].
     pub max_turns_per_day: u32,
+    /// Per-UTC-day cap on daemon-originated room narrations (digest +
+    /// watch results). See [`DEFAULT_MAX_NARRATIONS_PER_DAY`].
+    pub max_narrations_per_day: u32,
 }
 
 impl ConciergeConfig {
@@ -253,6 +295,11 @@ fn config_from_value(block: Option<&Value>) -> Option<ConciergeConfig> {
             DEFAULT_MAX_TURNS_PER_DAY,
             MAX_TURNS_CEILING,
         ),
+        max_narrations_per_day: clamp_cap(
+            block.get("maxNarrationsPerDay").and_then(Value::as_u64),
+            DEFAULT_MAX_NARRATIONS_PER_DAY,
+            MAX_NARRATIONS_CEILING,
+        ),
     })
 }
 
@@ -273,6 +320,7 @@ fn apply_env_overrides(config: Option<ConciergeConfig>) -> Option<ConciergeConfi
             room: None,
             max_messages_per_tick: DEFAULT_MAX_MESSAGES_PER_TICK,
             max_turns_per_day: DEFAULT_MAX_TURNS_PER_DAY,
+            max_narrations_per_day: DEFAULT_MAX_NARRATIONS_PER_DAY,
         },
         None => return None,
     };
@@ -296,6 +344,9 @@ fn apply_env_overrides(config: Option<ConciergeConfig>) -> Option<ConciergeConfi
     }
     if let Some(n) = env_cap(MAX_TURNS_ENV, MAX_TURNS_CEILING) {
         config.max_turns_per_day = n;
+    }
+    if let Some(n) = env_cap(MAX_NARRATIONS_ENV, MAX_NARRATIONS_CEILING) {
+        config.max_narrations_per_day = n;
     }
     // **Load-bearing, not defensive** — the same early return 3a's #8021
     // hardening made load-bearing there, written in from the start here. With
