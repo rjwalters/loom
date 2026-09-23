@@ -28,7 +28,23 @@ LOOM_COLLECTOR_GID=1000
 LOOM_COLLECTOR_STATE_DIR=/absolute/private/trial/collector-state
 LOOM_COLLECTOR_INGEST_KEY_FILE=/absolute/private/trial/loom-ingest.key
 LOOM_CLICKSTACK_INGEST_KEY_FILE=/absolute/private/trial/clickstack-ingest.key
+LOOM_CODEX_SESSIONS_DIR=/absolute/home/of/the/interactive/user/.codex/sessions
+LOOM_PI_SESSIONS_DIR=/absolute/home/of/the/interactive/user/.pi/agent/sessions
+LOOM_CLAUDE_PROJECTS_DIR=/absolute/home/of/the/interactive/user/.claude/projects
 ```
+
+The three `*_SESSIONS_DIR`/`*_PROJECTS_DIR` variables gate the collector's
+read-only session-store bind mounts (#8686). Point each at exactly that one
+directory of the user whose interactive sessions you want ingested — never at
+`$HOME` itself (SSH keys, browser profiles and other unrelated secrets live
+there too). All three are required (`:?`), like the other variables above, so
+an environment file that predates them fails `docker compose up` outright
+with a named-variable error. **Rolling out on a host that already runs this
+trial**: add the three lines to its private env file before the next
+`docker compose ... up -d`, or that restart will refuse to start. A missing or
+mistakenly empty session directory is safe — the corresponding `file_log/*`
+receiver stays idle on an empty glob (verified against the pinned image) —
+but the *variable* must still resolve.
 
 Use the host user's actual numeric UID/GID; create the state directory owned by
 that identity (0700) and ensure it can read the mounted keys. The image has no
@@ -173,35 +189,53 @@ are reused from the existing schema.
 
 | Source | Path tailed (in-container) | `loom.*` fields populated |
 | --- | --- | --- |
-| Codex | `/var/lib/loom-sessions/codex/**/*.jsonl` | `runtime` (static `"codex"`), `session_id` (from a `session_meta` record), `model` (from a `turn_context` record) |
-| pi | `/var/lib/loom-sessions/pi/**/*.jsonl` | `runtime` (static `"pi"`), `session_id` (any record carrying `sessionId`), `provider`/`model` (from a `model_change` record), `agent_id`/`parent_agent_id` (from an `agent_change` record) |
-| Claude transcripts | `/var/lib/loom-sessions/claude/**/*.jsonl` | `runtime` (static `"claude"`), `session_id`, `duration_sec` (`durationMs / 1000`, when present) |
+| Codex | `/var/lib/loom-sessions/codex/**/*.jsonl` | `runtime` (static `"codex"`), `session_id` (from a `session_meta` record), `model` (from a `turn_context` record) — both paths still unverified, no sample existed on the verifying host |
+| pi | `/var/lib/loom-sessions/pi/**/*.jsonl` | `runtime` (static `"pi"`), `session_id` (any record carrying `sessionId` — absent from the verified sample), `provider`/`model` (from a `model_change` record — verified 2026-09-23), `agent_id`/`parent_agent_id` (from an `agent_change` record — unverified, no such record in the sample) |
+| Claude transcripts | `/var/lib/loom-sessions/claude/**/*.jsonl` | `runtime` (static `"claude"`), `session_id` (verified 2026-09-23), `duration_sec` (`durationMs / 1000` — field absent from all 22,668 real transcripts sampled; guarded no-op until a format carries it) |
 
-**`compose.yaml` does not bind-mount anything to those three paths yet.** They
+**`compose.yaml` bind-mounts each of those three fixed in-container paths
+read-only from a host directory named by a required env var (#8686).** They
 were deliberately left as fixed in-container paths — not `${env:HOME}/...` —
-so wiring a real host directory in later is a least-privilege bind of exactly
+so wiring a real host directory in is a least-privilege bind of exactly
 `~/.codex/sessions`, `~/.pi/agent/sessions` or `~/.claude/projects`, never the
 whole home directory (SSH keys, browser profiles and other unrelated secrets
-live there too). Until that mount lands, all three receivers are live but
-idle: an empty/non-existent glob is not an error (verified against the real
-image — the collector starts and stays healthy either way), so shipping this
-config alone does not change behavior for the already-running trial
-deployment. Wiring the mounts needs its own review, because unlike this
-change it touches `compose.yaml`'s volume/secret contract for a live
-deployment and should wait for the schema-verification step above — tracked
-separately rather than bundled here.
+live there too). Each mount is `:ro` and gated behind
+`LOOM_CODEX_SESSIONS_DIR` / `LOOM_PI_SESSIONS_DIR` /
+`LOOM_CLAUDE_PROJECTS_DIR` (see ["Start and validate"](#start-and-validate)),
+so a receiver can read its runtime's session store but never write it, and an
+env file that omits one fails `docker compose up` loudly instead of silently
+dropping a tail. With the mounts in place the three receivers ingest each
+mounted store retroactively from the first line (`start_at: beginning`).
 
-**These field paths are assumptions, not verified against a real on-disk
-session file** — the issue that added them (#8669) had only the field *names*
-to go on, not a live sample of any of the three formats. Before relying on
-this in a real deployment, capture one real file per source and confirm the
-`type`/`payload`/`sessionId`/`agentId`/`parentAgentId`/`durationMs` paths
-above actually match; if a real schema differs, update the `move` operator's
-`from:` path and the `retain` list together — never widen `retain` beyond the
-table above without a matching addition to `transform/privacy`'s allowlist.
-Claude transcripts additionally carry a `toolUseResult` field and full
-message bodies; neither is referenced by any operator here on purpose, since
-both hold raw tool output / model text `retain` must never admit.
+**Field-path verification against real session files (2026-09-23, #8686).**
+The paths above were originally assumptions from #8664's field-name hints
+(#8669). Verified against real on-disk files on a fleet host — structure
+only; no file content is reproduced anywhere:
+
+- **Claude transcripts**: `sessionId` confirmed present on records across
+  22,668 real transcript files. `durationMs` was **not present in any of
+  them** (0/22,668, key-name scan) — no per-record duration field exists in
+  the current format, so `loom.duration_sec` for Claude is derived only if a
+  future format adds one; the guarded operator is retained as a no-op on
+  current data, not evidence that durations exist.
+- **pi**: `model_change` records confirmed carrying top-level `provider` and
+  `modelId` exactly as the move operators expect. The available sample (4
+  minimal test sessions on that host) contained no `sessionId` field and no
+  `agent_change` records at all, so `loom.session_id` and
+  `loom.agent_id`/`loom.parent_agent_id` remain **unverified by sample** —
+  their guards make them no-ops when the fields are absent, and real
+  multi-agent interactive sessions may yet emit them.
+- **Codex**: no `~/.codex/sessions` store existed on the verifying host, so
+  the `payload.id`/`payload.model` paths remain **entirely unverified**. Capture
+  a real Codex session file before relying on its `loom.*` fields.
+
+If a real schema differs from what is verified above, update the affected
+move operator's `from:` path and the `retain` list together — never widen
+`retain` beyond the table above without a matching addition to
+`transform/privacy`'s allowlist. Claude transcripts additionally carry a
+`toolUseResult` field and full message bodies; neither is referenced by any
+operator here on purpose, since both hold raw tool output / model text
+`retain` must never admit.
 
 Because `start_at: beginning` is set (retroactive pickup is the whole point,
 per #8664's acceptance criterion 4/5), the very first time a receiver sees a

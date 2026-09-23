@@ -46,9 +46,14 @@ receivers:
   # completions) that json_parser produced, not just the ones we did not name.
   # transform/privacy's keep_keys is therefore a second, independent
   # enforcement layer on top of this receiver-level one, not the only one.
-  # Schema assumptions for each source are recorded in README.md and are NOT
-  # yet verified against a real on-disk session file — see the README section
-  # before enabling any of these in a live deployment.
+  # Field-path verification state (2026-09-23, #8686; details in README.md):
+  # Claude `sessionId` and pi `model_change` `provider`/`modelId` are verified
+  # against real on-disk files; pi `sessionId`/agent lineage had no carrying
+  # record in the available sample; Claude `durationMs` was absent from every
+  # real transcript sampled (its guarded operator is a no-op on current data);
+  # Codex paths remain entirely unverified — no sample existed on the
+  # verifying host. The host-side mounts these receivers depend on are wired
+  # in compose.yaml behind required *_SESSIONS_DIR/*_PROJECTS_DIR env vars.
   file_log/codex:
     include: ["/var/lib/loom-sessions/codex/**/*.jsonl"]
     start_at: beginning
