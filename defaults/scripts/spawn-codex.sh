@@ -1044,7 +1044,7 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
     _session_pid=$!
     wait "$_session_pid"; _exit_code=$?
     # wait is interrupted by a trap; the next wait still owns the live child.
-    while jobs -pr | grep -qx "$_session_pid"; do wait "$_session_pid"; _exit_code=$?; done
+    while jobs -pr | grep -x "$_session_pid" >/dev/null; do wait "$_session_pid"; _exit_code=$?; done
     [[ "$_session_cancelled" -eq 0 ]] || _exit_code="$_session_cancelled"
     trap - TERM INT HUP
 else
