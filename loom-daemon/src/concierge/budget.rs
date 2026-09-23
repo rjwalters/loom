@@ -57,6 +57,20 @@ pub struct BudgetState {
     /// from a crashed turn cannot silently donate its remaining per-tick
     /// allowance to the next one.
     pub turn_id: String,
+    /// Daemon-originated room narrations sent today (digests, watch results).
+    ///
+    /// **Deliberately not a per-turn counter.** A narration is produced by
+    /// deterministic code from state the daemon already has — it is not a relay
+    /// and it is not an LLM conclusion — so it neither needs a turn to exist
+    /// nor may it spend the relay allowance the persona needs for actual
+    /// commands. What it shares with the other two counters is the thing that
+    /// matters: one ledger, one UTC-day rollover key, one write-then-rename.
+    ///
+    /// Present by `#[serde(default)]`, so a ledger written before this field
+    /// existed reads back as `0` rather than as a corrupt file (which
+    /// [`BudgetLedger::read`] would have treated as a fresh day, refilling the
+    /// *turn* budget as a side effect).
+    pub narrations: u32,
 }
 
 /// A read-only view, for `--json` output and for tests.
@@ -68,6 +82,8 @@ pub struct BudgetSnapshot {
     pub relays_this_turn: u32,
     pub relays_max_per_turn: u32,
     pub turn_id: String,
+    pub narrations_today: u32,
+    pub narrations_max_per_day: u32,
 }
 
 /// Why the budget refused.
@@ -77,6 +93,8 @@ pub enum BudgetRefusal {
     DailyTurnsExhausted { used: u32, max: u32 },
     /// This turn has relayed as many messages as it may.
     TickMessagesExhausted { used: u32, max: u32 },
+    /// Today's daemon-originated narrations (digest / watch result) are spent.
+    DailyNarrationsExhausted { used: u32, max: u32 },
     /// A relay was attempted without a turn (no `--begin-turn` ran, or the
     /// ledger was cleared underneath it).
     NoTurnInProgress,
@@ -92,6 +110,7 @@ impl BudgetRefusal {
         match self {
             Self::DailyTurnsExhausted { .. } => "daily-turns-exhausted",
             Self::TickMessagesExhausted { .. } => "tick-messages-exhausted",
+            Self::DailyNarrationsExhausted { .. } => "daily-narrations-exhausted",
             Self::NoTurnInProgress => "no-turn-in-progress",
             Self::NotPersisted { .. } => "not-persisted",
         }
@@ -111,6 +130,12 @@ impl fmt::Display for BudgetRefusal {
                 f,
                 "this turn has already relayed {used}/{max} message(s) \
                  (safehouse.concierge.maxMessagesPerTick) — say so in the room and stop"
+            ),
+            Self::DailyNarrationsExhausted { used, max } => write!(
+                f,
+                "concierge daily room-narration budget spent ({used}/{max} today) — the digest \
+                 and watch-result narrations stay quiet until 00:00 UTC (raise \
+                 safehouse.concierge.maxNarrationsPerDay to change that)"
             ),
             Self::NoTurnInProgress => write!(
                 f,
@@ -233,6 +258,42 @@ impl BudgetLedger {
         Ok(snapshot(&state, config))
     }
 
+    /// Charge one daemon-originated room narration against today's cap, or
+    /// refuse.
+    ///
+    /// **No turn required, and none consumed.** See [`BudgetState::narrations`]
+    /// for why: a digest or a watch-result line is rendered by deterministic
+    /// code from state the daemon already holds, so tying it to an LLM turn
+    /// would make a mechanical narration depend on a session, and charging it
+    /// to [`BudgetState::relays_this_turn`] would let narration starve the
+    /// persona's actual commands.
+    ///
+    /// Charged **before** the send, for the same reason
+    /// [`Self::charge_relay`] is: a send that succeeds and then fails to be
+    /// counted is an uncounted action, and that is the direction in which a
+    /// wedged ledger becomes an unbounded room firehose.
+    ///
+    /// # Errors
+    ///
+    /// [`BudgetRefusal::DailyNarrationsExhausted`] at the cap, or
+    /// [`BudgetRefusal::NotPersisted`].
+    pub fn charge_narration(
+        &self,
+        config: &ConciergeConfig,
+        today: &str,
+    ) -> Result<BudgetSnapshot, BudgetRefusal> {
+        let mut state = self.read(today);
+        if state.narrations >= config.max_narrations_per_day {
+            return Err(BudgetRefusal::DailyNarrationsExhausted {
+                used: state.narrations,
+                max: config.max_narrations_per_day,
+            });
+        }
+        state.narrations += 1;
+        self.write(&state)?;
+        Ok(snapshot(&state, config))
+    }
+
     /// The current state as a snapshot, charging nothing.
     #[must_use]
     pub fn snapshot(&self, config: &ConciergeConfig, today: &str) -> BudgetSnapshot {
@@ -262,6 +323,8 @@ fn snapshot(state: &BudgetState, config: &ConciergeConfig) -> BudgetSnapshot {
         relays_this_turn: state.relays_this_turn,
         relays_max_per_turn: config.max_messages_per_tick,
         turn_id: state.turn_id.clone(),
+        narrations_today: state.narrations,
+        narrations_max_per_day: config.max_narrations_per_day,
     }
 }
 
