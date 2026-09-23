@@ -48,7 +48,7 @@ use crate::telemetry::{
     SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord, TokenAccountState,
     TokenSnapshotRecord,
 };
-use crate::tokens_pool::{account_health, account_inventory, AccountProvider};
+use crate::tokens_pool::{account_inventory, health_snapshot, AccountProvider};
 use crate::types::{Event, RoleTickRecord, SweepKind};
 use crate::workspace_pool::WorkspacePool;
 
@@ -600,6 +600,11 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
 /// health file degrades to no rows for that provider rather than an error,
 /// matching the `.ranking` soft-fail above.
 fn sample_registry_provider_accounts(workspace_root: &Path) -> Vec<TokenAccountState> {
+    // One consistent read for the whole sample. A failed read is unknown
+    // capacity; only a successfully read snapshot can imply no health hold.
+    let Ok(health) = health_snapshot(workspace_root) else {
+        return Vec::new();
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -613,14 +618,9 @@ fn sample_registry_provider_accounts(workspace_root: &Path) -> Vec<TokenAccountS
             continue;
         };
         for descriptor in inventory.into_iter().filter(|account| account.enabled) {
-            let health = account_health(workspace_root, &descriptor.id)
-                .ok()
-                .flatten();
-            let exhausted = health
-                .as_ref()
-                .is_some_and(|entry| !entry.is_eligible_at(now));
-            let limit_window_reset_at = health
-                .as_ref()
+            let account_health = health.get(&descriptor.id);
+            let exhausted = account_health.is_some_and(|entry| !entry.is_eligible_at(now));
+            let limit_window_reset_at = account_health
                 .filter(|_| exhausted)
                 .and_then(|entry| entry.cooldown_until)
                 .and_then(|deadline| {
@@ -1017,6 +1017,9 @@ fn collect_active_sweep_ids(workspace_pool: &WorkspacePool) -> Vec<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod admission_brake_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod provider_accounts_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
