@@ -285,6 +285,14 @@ pub(crate) fn build_status_json_value(
         // States: disabled | starting | never_exported | healthy |
         // host_id_mismatch | failing. `null` only from a pre-#5083 daemon.
         "observability_export": report.observability_export,
+        // Per-exporter cells (#8756): one entry per configured exporter,
+        // keyed by exporter name — each sink's queue, counters and liveness
+        // surfaced independently:
+        //   loom-daemon status --json \
+        //     | jq -e '.observability_exports.otlp.state == "healthy"'
+        // `{}` when observability is off or from a pre-#8756 daemon (the
+        // singular field above already distinguishes those states).
+        "observability_exports": report.observability_exports,
         // Per-repo pressure-triggered deep-clean state (#5919): when the pass
         // last fired, what it reclaimed, and — for the common non-firing tick
         // — why it declined. Scripted consumers can assert reclamation is

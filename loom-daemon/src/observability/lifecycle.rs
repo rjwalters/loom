@@ -613,7 +613,7 @@ fn recover_orphans(journal: &Journal) {
     );
 }
 
-pub fn backfill(root: &Path, queue: &super::queue::DurableQueue) -> usize {
+pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
     if !super::tracing::enabled(root) {
         return 0;
     }
@@ -635,7 +635,7 @@ pub fn backfill(root: &Path, queue: &super::queue::DurableQueue) -> usize {
                 TelemetryRecord::Span(span),
             );
             envelope.trace_context = Some(context);
-            queue.push_durable(envelope)?;
+            queue.offer_durable(envelope)?;
             Ok(())
         }) {
             Ok(n) => {

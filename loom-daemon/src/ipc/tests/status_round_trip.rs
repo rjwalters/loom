@@ -159,6 +159,18 @@ fn test_daemon_status_request_response_round_trip() {
             records_exported: 128,
             ..Default::default()
         }),
+        // Per-exporter cells (#8756) — the round trip must preserve each
+        // sink's independent entry.
+        observability_exports: [(
+            "https".to_string(),
+            crate::types::ObservabilityExportStatus {
+                state: crate::types::ObservabilityExportState::Healthy,
+                exporter: Some("https".to_string()),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
         peer_claims: None,
         deep_clean: Vec::new(),
         idle_exit: Some(crate::types::IdleExitStatus {

@@ -67,6 +67,7 @@ Precedence is **env > config > default**, the same rule every other
 | `flushIntervalSecs` | `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` | 30 |
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
 | `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | `"https"` (or `"otlp"`, §3) |
+| `exporters` | — (config only) | unset ⇒ `exporter` / `"https"` (§3) |
 
 **`endpoint` resolution order is env > `.loom-local/local.json` > the committed
 `.loom/config.json`** (`config_resolver.rs`/`config-resolver.sh`), so — like
@@ -151,6 +152,52 @@ still omit the optional feature. Export remains disabled until explicitly enable
 See [execution traces](tracing.md) for persisted trace identity, correlated logs,
 completed-span export, and bounded shutdown.
 
+### Multi-exporter fan-out (#8756)
+
+`observability.exporters` accepts a **list**, delivering the same envelopes to
+N sinks simultaneously — e.g. the native Cloudflare dashboard *and* an
+OTLP-fed collector:
+
+```json
+{
+  "observability": {
+    "enabled": true,
+    "endpoint": "https://dashboard.example.com/ingest",
+    "exporters": ["https", { "kind": "otlp", "endpoint": "http://collector.internal:4318" }]
+  }
+}
+```
+
+Each entry is either a bare kind string (`"https"`, `"otlp"`) — using the
+shared `observability.endpoint` — or an object `{"kind": …, "endpoint": …}`
+carrying its own endpoint override (required when the two sinks live at
+different URLs, as in the example above). Each configured exporter gets its
+**own** durable queue file (`observability-queue.<name>.jsonl` under
+`.loom/logs/`), its own sender task with an independent retry/backoff loop,
+and its own status entry — `loom-daemon status --json`'s
+`observability_exports` map keys `https` / `otlp` independently, so one
+sink's outage (and its queue backlog) never affects the other's delivery.
+
+Back-compat and upgrade rules:
+
+- The singular `observability.exporter` key still works, treated as a
+  one-element list; `$LOOM_OBSERVABILITY_EXPORTER` (env) overrides any
+  configured list with a one-element list of its own.
+- A **sole** configured exporter keeps the legacy queue filename
+  (`observability-queue.jsonl`) unchanged. When a config first fans out to
+  N ≥ 2 exporters, a pre-fan-out backlog in that legacy file is adopted
+  (renamed) into the **first** configured exporter's per-name file, exactly
+  once — no records are stranded by the upgrade.
+- Entries dedupe by kind (first wins; queues and status are keyed by kind
+  name, so `"https"` can appear once). An unrecognized kind is logged and
+  skipped, never a hard error.
+- A policy failure on one entry (bad endpoint, placeholder host, missing
+  `otlp` Cargo feature in this build) degrades **that entry** to its own
+  `misconfigured` status while the other exporters run; only when *no*
+  exporter survives — or the shared ingest key is unusable — is export off
+  entirely.
+
+
 See [OTLP transport and artifact verification](otlp-transport.md) for response
 classification, per-signal counters, retry/drop policy and the real Collector
 canary. Mapping details remain in `observability/otlp/mapping.rs`.
@@ -222,6 +269,20 @@ never "disabled"; restart the daemon onto a current binary. Under
 an `ingestKeyFile` `io::Error`'s `Display`, which includes the OS errno) — the
 same "never the key itself" discipline every other error surface in this
 module uses.
+
+With the multi-exporter fan-out (#8756) the singular `observability_export`
+field above is the **first configured exporter's** cell — byte-identical to
+the pre-fan-out status for single-exporter configs — while the sibling
+`observability_exports` map carries one entry per configured exporter keyed
+by name, each with every field above:
+
+```bash
+loom-daemon status --json | jq -e '.observability_exports.otlp.state == "healthy"'
+```
+
+An entry absent from the map means that exporter is not configured; an empty
+map (`{}`) means observability is off or the daemon predates #8756 (the
+singular field above already distinguishes those states).
 
 The health section keeps its anomaly-only contract. It now recognizes three
 additional *non-green* conditions — `misconfigured`, `never_exported`, and

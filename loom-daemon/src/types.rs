@@ -1672,12 +1672,28 @@ pub struct DaemonStatusReport {
     /// thing: nothing at all. This field is the counterpart that always has an
     /// answer — see [`ObservabilityExportStatus`].
     ///
+    /// With the multi-exporter fan-out (#8756) this is the **first configured
+    /// exporter's** cell — byte-identical to the pre-fan-out status for every
+    /// single-exporter config; the full per-sink picture lives in
+    /// [`Self::observability_exports`].
+    ///
     /// `None` **only** from a pre-#5083 daemon binary that never computed one
     /// (never misread as "disabled" — a running daemon that has observability
     /// off reports `Some(ObservabilityExportStatus::disabled())`).
     /// `#[serde(default)]` keeps older wire data / older clients compatible.
     #[serde(default)]
     pub observability_export: Option<ObservabilityExportStatus>,
+    /// Per-exporter export status, one entry per configured exporter, keyed by
+    /// exporter name ("https", "otlp"; Issue #8756) — each sink's own queue,
+    /// counters and liveness surfaced independently, so
+    /// `loom-daemon status --json | jq '.observability_exports.otlp.state'`
+    /// answers "is the OTLP feed healthy?" without disturbing the HTTPS one.
+    ///
+    /// Empty when observability is off by choice, when no exporter reached
+    /// registration, or from a pre-#8756 daemon binary.
+    /// `#[serde(default)]` keeps older wire data / older clients compatible.
+    #[serde(default)]
+    pub observability_exports: std::collections::BTreeMap<String, ObservabilityExportStatus>,
     /// The daemon-wide peer-claim view + transport counters (Issue #5921):
     /// which issues THIS host currently sees claimed, by which host and with
     /// what remaining TTL, plus how many claims have been advertised /
@@ -1778,34 +1794,6 @@ pub struct DeepCleanRepoStatus {
     pub last_reclaimed: Option<String>,
 }
 
-/// A confirmed disagreement between the host identity this daemon resolves for
-/// itself and the `host_id` the ingest backend echoes back for the key it
-/// authenticated (Issue #4830).
-///
-/// Filed as a *data* type on the status wire rather than a log-only condition
-/// because the 2026-07-31 incident it exists for was invisible for hours: a Mac
-/// Studio pushed its whole first night of telemetry under another host's id
-/// because the wrong key file had been installed on it, and neither side had any
-/// way to notice. The backend cannot notice (a key-bound id is authoritative by
-/// design), so the *daemon* is the only party that holds both halves.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObservabilityHostIdMismatch {
-    /// What this daemon calls itself —
-    /// [`crate::sweep_registry::host_identity`], resolved with the precedence
-    /// `$LOOM_HOST_ID`, then `$HOSTNAME`, then the `hostname` binary, then
-    /// `"unknown-host"`. The same value it stamps on every outgoing envelope.
-    pub daemon_host_id: String,
-    /// The `host_id` the `/ingest` response echoed — the identity the
-    /// authenticated key is bound to, i.e. the host every pushed record is
-    /// actually being filed under.
-    pub ingest_host_id: String,
-    /// When the mismatch was first observed this daemon process. Never
-    /// re-stamped on subsequent flushes: the WARN and this record are both
-    /// once-per-lifetime, so this is the age of the condition, not of the last
-    /// flush.
-    pub first_seen_at: DateTime<Utc>,
-}
-
 /// The one-word answer to "is this host's telemetry landing?" (Issue #5083),
 /// derived from [`ObservabilityExportStatus`] by
 /// [`ObservabilityExportStatus::classify`].
@@ -1900,7 +1888,9 @@ impl ObservabilityExportState {
 }
 
 mod observability_export;
-pub use observability_export::{ObservabilityExportStatus, NEVER_EXPORTED_GRACE_FLOOR_SECS};
+pub use observability_export::{
+    ObservabilityExportStatus, ObservabilityHostIdMismatch, NEVER_EXPORTED_GRACE_FLOOR_SECS,
+};
 
 /// One work-finder tick's dispatch/skip tally, stamped with the wall-clock
 /// time it completed and the dynamic cap it ran under (Issue #4761).

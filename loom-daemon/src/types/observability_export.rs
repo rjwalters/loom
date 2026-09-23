@@ -3,8 +3,41 @@ use super::ObservabilityExportState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// A confirmed disagreement between the host identity this daemon resolves for
+/// itself and the `host_id` the ingest backend echoes back for the key it
+/// authenticated (Issue #4830).
+///
+/// Filed as a *data* type on the status wire rather than a log-only condition
+/// because the 2026-07-31 incident it exists for was invisible for hours: a Mac
+/// Studio pushed its whole first night of telemetry under another host's id
+/// because the wrong key file had been installed on it, and neither side had any
+/// way to notice. The backend cannot notice (a key-bound id is authoritative by
+/// design), so the *daemon* is the only party that holds both halves.
+///
+/// Lives beside [`ObservabilityExportStatus`] in this sibling module (moved
+/// from `types.rs` inline for the file-size ratchet, #8756); re-exported as
+/// `crate::types::ObservabilityHostIdMismatch` so every existing path is
+/// unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservabilityHostIdMismatch {
+    /// What this daemon calls itself —
+    /// [`crate::sweep_registry::host_identity`], resolved with the precedence
+    /// `$LOOM_HOST_ID`, then `$HOSTNAME`, then the `hostname` binary, then
+    /// `"unknown-host"`. The same value it stamps on every outgoing envelope.
+    pub daemon_host_id: String,
+    /// The `host_id` the `/ingest` response echoed — the identity the
+    /// authenticated key is bound to, i.e. the host every pushed record is
+    /// actually being filed under.
+    pub ingest_host_id: String,
+    /// When the mismatch was first observed this daemon process. Never
+    /// re-stamped on subsequent flushes: the WARN and this record are both
+    /// once-per-lifetime, so this is the age of the condition, not of the last
+    /// flush.
+    pub first_seen_at: DateTime<Utc>,
+}
+
 /// Positive, always-present state of this daemon's telemetry export (Issue
-/// #5083) — the counterpart to [`super::ObservabilityHostIdMismatch`]'s anomaly-only
+/// #5083) — the counterpart to [`ObservabilityHostIdMismatch`]'s anomaly-only
 /// signal.
 ///
 /// The 2026-08-03 incident this exists for: two hosts with byte-identical
@@ -17,7 +50,7 @@ use serde::{Deserialize, Serialize};
 /// Published by [`crate::observability::ExportStatus`] (updated by
 /// [`crate::observability::sender::try_flush`] on every attempt) and read back
 /// via [`crate::observability::global_export_status`], mirroring the
-/// process-global pattern [`super::ObservabilityHostIdMismatch`] already uses.
+/// process-global pattern [`ObservabilityHostIdMismatch`] already uses.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObservabilityExportStatus {
     /// The state as classified by the *daemon* at status-build time. Consumers

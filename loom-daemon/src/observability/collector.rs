@@ -61,7 +61,7 @@ use crate::tokens_pool::{account_inventory, health_snapshot, AccountProvider};
 use crate::types::{Event, RoleTickRecord, SweepKind};
 use crate::workspace_pool::WorkspacePool;
 
-use super::queue::DurableQueue;
+use super::queue::QueueSink;
 mod correlation;
 mod identity;
 pub(crate) type DispatchKey = (String, u32);
@@ -86,13 +86,18 @@ pub(crate) struct DispatchState {
 /// is used only to compute `host.health`'s `uptime_sec` (approximated as this
 /// task's own uptime — see [`super::spawn_task`]'s doc comment).
 ///
+/// `queue` is the fan-out sink (Issue #8756): with N exporters configured
+/// this is a [`super::queue::FanoutQueue`] cloning every envelope into each
+/// per-exporter queue; with one exporter it is that exporter's
+/// [`DurableQueue`] directly. The collector never knows the difference.
+///
 /// `workspace_pool` (Issue #4955) is this daemon's shared per-workspace
 /// registry pool — consulted only at each periodic snapshot tick to populate
 /// `host.health`'s `active_sweep_ids` with this host's authoritative
 /// in-flight sweep-id set. See [`collect_active_sweep_ids`].
 pub fn spawn_task(
     bus: &EventBus,
-    queue: Arc<DurableQueue>,
+    queue: Arc<dyn QueueSink>,
     workspace_root: PathBuf,
     host_id: String,
     snapshot_interval: Duration,
@@ -113,7 +118,7 @@ pub fn spawn_task(
 
 async fn run_collector(
     mut subscription: crate::event_bus::Subscription,
-    queue: Arc<DurableQueue>,
+    queue: Arc<dyn QueueSink>,
     workspace_root: PathBuf,
     host_id: String,
     snapshot_interval: Duration,
@@ -146,7 +151,7 @@ async fn run_collector(
                         identities.observe(&event, &workspace_root);
                         handle_event(
                             event,
-                            &queue,
+                            queue.as_ref(),
                             &workspace_root,
                             &host_id,
                             &mut dispatches,
@@ -164,12 +169,13 @@ async fn run_collector(
             }
 
             _ = identity_timer.tick() => {
-                identities.sample(&queue, &host_id, &workspace_pool, &mut slug_cache).await;
+                identities.sample(queue.as_ref(), &host_id, &workspace_pool, &mut slug_cache)
+                    .await;
             }
 
             _ = snapshot_timer.tick() => {
                 sample_snapshots(
-                    &queue,
+                    queue.as_ref(),
                     &workspace_root,
                     &host_id,
                     daemon_started_at,
@@ -196,7 +202,7 @@ async fn run_collector(
 /// keeps it off the reactor, mirroring how [`sample_host_health`] already
 /// dispatches its own blocking CPU probe.
 async fn run_backfill(
-    queue: &Arc<DurableQueue>,
+    queue: &Arc<dyn QueueSink>,
     workspace_root: &Path,
     workspace_pool: &Arc<WorkspacePool>,
 ) {
@@ -204,7 +210,7 @@ async fn run_backfill(
     let workspace_root = workspace_root.to_path_buf();
     let workspace_pool = workspace_pool.clone();
     let processed = tokio::task::spawn_blocking(move || {
-        super::backfill::run_backfill_pass_all(&workspace_root, &workspace_pool, &queue)
+        super::backfill::run_backfill_pass_all(&workspace_root, &workspace_pool, queue.as_ref())
     })
     .await
     .unwrap_or_else(|error| {
@@ -218,7 +224,7 @@ async fn run_backfill(
 
 async fn handle_event(
     event: Event,
-    queue: &DurableQueue,
+    queue: &dyn QueueSink,
     default_workspace_root: &Path,
     host_id: &str,
     dispatches: &mut HashMap<DispatchKey, DispatchState>,
@@ -252,7 +258,7 @@ async fn handle_event(
         // costs no registry lock at all.
         &|| registry_evidence(workspace_pool, root, issue),
     ) {
-        queue.push(envelope);
+        queue.offer(envelope);
     }
 }
 
@@ -555,7 +561,7 @@ async fn resolve_visibility(slug: &str) -> RepoVisibility {
 /// `managed_repos` roster sample does not re-shell out to `gh repo view` for
 /// a workspace root already resolved this run.
 async fn sample_snapshots(
-    queue: &DurableQueue,
+    queue: &dyn QueueSink,
     workspace_root: &Path,
     host_id: &str,
     daemon_started_at: Instant,
@@ -571,10 +577,10 @@ async fn sample_snapshots(
     token_record
         .accounts
         .extend(sample_registry_provider_accounts(workspace_root));
-    queue.push(TelemetryEnvelope::new(host_id, TelemetryRecord::TokensSnapshot(token_record)));
+    queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::TokensSnapshot(token_record)));
     let health_record =
         sample_host_health(workspace_root, daemon_started_at, workspace_pool, slug_cache).await;
-    queue.push(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
+    queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

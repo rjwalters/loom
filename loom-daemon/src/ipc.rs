@@ -2822,8 +2822,15 @@ pub fn build_daemon_status(
         // Positive export-liveness signal (#5083) — the counterpart to the
         // anomaly-only field above. Always `Some` from a daemon of this
         // vintage: an exporter that never started reports `disabled`, which is
-        // a real answer, not the silence #4830 alone could offer.
+        // a real answer, not the silence #4830 alone could offer. Since #8756
+        // this is the FIRST configured exporter's cell; the per-sink picture
+        // is the map below.
         observability_export: Some(crate::observability::global_export_status()),
+        // Per-exporter cells (#8756): one entry per configured exporter
+        // ("https", "otlp", …), each sink surfaced independently. Empty from
+        // a daemon with observability off — the singular field above already
+        // distinguishes that state.
+        observability_exports: crate::observability::global_export_statuses(),
         // Per-repo deep-clean state (#5919) — the same process-global snapshot
         // pattern once more, projected by the module that owns the state (the
         // mapping lived here until #7990 moved it beside `snapshot()`).

@@ -82,7 +82,7 @@ use crate::sweep_outcomes;
 use crate::telemetry::{self, TelemetryEnvelope, TelemetryRecord};
 use crate::workspace_pool::WorkspacePool;
 
-use super::queue::DurableQueue;
+use super::queue::QueueSink;
 
 /// Env var overriding the backfill cursor state path (test seam), mirroring
 /// [`crate::sweep_outcomes::OUTCOME_TELEMETRY_JOURNAL_PATH_ENV`].
@@ -238,7 +238,7 @@ fn synthesize_completed(
 /// Returns the number of `sweep.outcome` records processed (the number of
 /// envelopes pushed onto `queue` is twice this, for the paired `completed` +
 /// `outcome` records).
-pub fn run_backfill_pass(workspace_root: &Path, queue: &DurableQueue) -> usize {
+pub fn run_backfill_pass(workspace_root: &Path, queue: &dyn QueueSink) -> usize {
     let telemetry_path = sweep_outcomes::default_outcome_telemetry_path(workspace_root);
     let state_path = default_backfill_state_path(workspace_root);
     let mut state = load_state(&state_path);
@@ -250,14 +250,14 @@ pub fn run_backfill_pass(workspace_root: &Path, queue: &DurableQueue) -> usize {
     for envelope in &pending {
         match &envelope.record {
             TelemetryRecord::SweepOutcome(outcome) => {
-                queue.push(synthesize_completed(envelope, outcome));
-                queue.push(envelope.clone());
+                queue.offer(synthesize_completed(envelope, outcome));
+                queue.offer(envelope.clone());
             }
             // Forward-compatible: the telemetry journal today only ever
             // carries `sweep.outcome` (see `read_all_sweep_outcomes`'s doc),
             // but a future kind sharing the file should still be exported by
             // this backfill path rather than silently dropped.
-            _ => queue.push(envelope.clone()),
+            _ => queue.offer(envelope.clone()),
         }
         newest =
             Some(newest.map_or(envelope.emitted_at, |current| current.max(envelope.emitted_at)));
@@ -286,7 +286,7 @@ pub fn run_backfill_pass(workspace_root: &Path, queue: &DurableQueue) -> usize {
 pub fn run_backfill_pass_all(
     primary_workspace_root: &Path,
     workspace_pool: &WorkspacePool,
-    queue: &DurableQueue,
+    queue: &dyn QueueSink,
 ) -> usize {
     let mut roots: Vec<PathBuf> = vec![primary_workspace_root.to_path_buf()];
     for registry in workspace_pool.provisioned_registries() {
@@ -309,6 +309,7 @@ pub fn run_backfill_pass_all(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::queue::DurableQueue;
     use super::*;
     use crate::event_bus::EventBus;
     use serial_test::serial;
