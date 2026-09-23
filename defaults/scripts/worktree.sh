@@ -1360,6 +1360,7 @@ _LEASE_DAEMON_BIN="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
 # ANY nonzero, e.g. an installed daemon too old for `check-issue`) refuses --
 # an undetermined verdict must fail OPEN, matching every other guard here.
 # shellcheck disable=SC2086  # $_ijson is intentionally unquoted: omits the flag when empty
+# requires-daemon: worktree-lock optional   #8553 fails open on a daemon predating check-issue (no lock cross-check performed)
 [[ -z "$_LEASE_DAEMON_BIN" ]] || { _ijson=""; _irc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ijson="--json"; "$_LEASE_DAEMON_BIN" worktree-lock check-issue --issue "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ijson ${FORCE_CLAIM_LOCK:+--force} >&3 || _irc=$?; [[ "$_irc" -eq 1 ]] && exit 1; }
 
 # Check if worktree already exists
