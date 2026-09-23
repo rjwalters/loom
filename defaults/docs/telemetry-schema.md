@@ -428,7 +428,32 @@ reconciliation. The sibling `sweep-outcomes.jsonl` record carries the same
 reading under one optional `tap_usage` object (`{tap, usage}`,
 `#[serde(default)]`), resolved from the **same single log read** as `credential`
 so the two journals cannot disagree. Additive per #4703 — no `schema_version`
-bump. Full rationale, and why this is a prerequisite of every fleet-wide spend
+bump.
+
+One anchored region can hold several `# LOOM_LAUNCH` records — a re-dispatch, a
+containment re-exec, or an orchestrated sweep whose phases pin their own runtime
+(`runtimes.rolePreference` / `LOOM_RUNTIME_<ROLE>`) — and #8633 stopped charging
+all of them to whichever tap announced itself last. Issue #8659 fixes what a
+one-row field does with the rest, and the answer is deliberately different on
+the two journals:
+
+- **`config.tap` and its counters stay exactly one tap** — the launch this
+  outcome belongs to (the region's last record), now carrying **that tap's whole
+  share of the region** rather than only its final block. This map is flat
+  strings and `--group-by tap` puts a record in exactly one bucket, so a second
+  tap could only be spelled here by changing what a grouped row means.
+- **`config.tap_region_keys`** appears *only* when that single tap does not
+  account for the whole region — more than one tap, or a last record that was
+  unattributable while an earlier one was. It lists every tap in the region
+  (outcome's first, comma-separated), so a telemetry-only reader can never
+  mistake one tap's counters for the region's total.
+- **`sweep-outcomes.jsonl` carries the breakdown**: `tap_usage_all`, one folded
+  row per tap under the same condition `tap_region_keys` is written, and absent
+  otherwise — so a single-tap line (every line written before #8659) keeps its
+  exact key set. Unlike taps are never merged into one row; that is the #8633
+  error restated.
+
+Full rationale, and why this is a prerequisite of every fleet-wide spend
 ceiling rather than one:
 [`ADR-0020`](https://github.com/rjwalters/loom/blob/main/docs/adr/0020-fleet-metered-spend-ceiling.md).
 

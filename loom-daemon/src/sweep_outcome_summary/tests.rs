@@ -330,6 +330,7 @@ fn spawn_death_detection_covers_class_and_duration() {
             jev_tier: None,
             jev_confidence: None,
             tap_usage: None,
+            tap_usage_all: Vec::new(),
             duration_sec: 1200,
         },
         sweep_outcomes::OutcomeRecord {
@@ -346,6 +347,7 @@ fn spawn_death_detection_covers_class_and_duration() {
             jev_tier: None,
             jev_confidence: None,
             tap_usage: None,
+            tap_usage_all: Vec::new(),
             duration_sec: 1200,
         },
     ]);
@@ -374,6 +376,7 @@ fn spawn_death_detection_covers_class_and_duration() {
         jev_tier: None,
         jev_confidence: None,
         tap_usage: None,
+        tap_usage_all: Vec::new(),
         duration_sec: 900,
     }]);
     let exhausted = record("exhausted", "o/r", None, SweepResult::Failure, 900);
@@ -890,6 +893,7 @@ fn two_workspace_fixture_aggregates_across_both_journals() {
             jev_tier: None,
             jev_confidence: None,
             tap_usage: None,
+            tap_usage_all: Vec::new(),
             duration_sec: 900,
         }],
     );

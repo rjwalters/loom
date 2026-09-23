@@ -414,3 +414,156 @@ fn folding_separates_the_metered_backstop_from_the_subscription_taps() {
     // cost estimate is not a charge at all (`runtime-model-trials.md`).
     assert_eq!(folded["pi@harness-own"].cost_estimate, None);
 }
+
+// ============================================================================
+// account_region_by_tap — the journal-shaped read (Issue #8659)
+// ============================================================================
+
+/// The multi-tap region #8659 names: after #8633 the earlier launch was no
+/// longer misattributed, but a one-row reader did not record it at all. Both
+/// taps now come back, each with its own share and neither merged into the
+/// other.
+#[test]
+fn a_multi_tap_region_reports_every_taps_share_with_the_outcomes_tap_first() {
+    let log = log_with(
+        "sweep_id=s1",
+        &format!(
+            "{}\n{}\n{}\n{}",
+            launch_line("opencode:zai-metered", "pool", Some("zai")),
+            "{\"type\":\"step_finish\",\"tokens\":{\"input\":9000,\"output\":800},\"cost\":0.25}",
+            launch_line("codex", "env", None),
+            "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}"
+        ),
+    );
+    let region = account_region_by_tap(&log, "sweep_id=s1");
+
+    // The outcome's own row is still the LAST record — unchanged from
+    // `account_launch_log`, and with only its own tap's usage.
+    let outcome = region.outcome().expect("the last record is attributable");
+    assert_eq!(outcome.key(), "codex@env");
+    assert_eq!(outcome.usage.input, Some(7));
+    assert_eq!(outcome.usage.cost_estimate, None);
+
+    // …and the earlier metered launch is now recorded rather than dropped.
+    assert_eq!(
+        region
+            .breakdown()
+            .iter()
+            .map(TapAccounting::key)
+            .collect::<Vec<_>>(),
+        vec![
+            "codex@env".to_string(),
+            "opencode:zai-metered@api_keys:zai".to_string()
+        ],
+        "outcome's tap first, then the remaining taps in order of first appearance"
+    );
+    let metered = &region.breakdown()[1];
+    assert_eq!(metered.usage.input, Some(9000));
+    assert_eq!(metered.usage.output, Some(800));
+    assert!((metered.usage.cost_estimate.unwrap() - 0.25).abs() < 1e-9);
+}
+
+/// A re-dispatch or containment re-exec re-announces the **same** tap, so its
+/// blocks belong in one row: the outcome row carries the whole region and a
+/// one-row reader loses nothing — the concrete gain over reading only the
+/// region's last block.
+#[test]
+fn a_same_tap_multi_record_region_folds_into_one_row_that_covers_it_all() {
+    let log = log_with(
+        "sweep_id=s1",
+        &format!(
+            "{}\n{}\n{}\n{}",
+            launch_line("opencode:zai-metered", "pool", Some("zai")),
+            "{\"type\":\"step_finish\",\"tokens\":{\"input\":9000},\"cost\":0.25}",
+            launch_line("opencode:zai-metered", "pool", Some("zai")),
+            "{\"type\":\"step_finish\",\"tokens\":{\"input\":7}}"
+        ),
+    );
+    let region = account_region_by_tap(&log, "sweep_id=s1");
+    let outcome = region.outcome().expect("attributable");
+    assert_eq!(outcome.key(), "opencode:zai-metered@api_keys:zai");
+    assert_eq!(
+        outcome.usage.input,
+        Some(9007),
+        "both blocks are the same tap's spend, so one row must carry both"
+    );
+    assert_eq!(outcome.usage.usage_events, 2);
+    assert!((outcome.usage.cost_estimate.unwrap() - 0.25).abs() < 1e-9);
+    assert!(
+        region.breakdown().is_empty(),
+        "one tap ⇒ the outcome row is the whole region, so there is nothing to break out"
+    );
+}
+
+/// The overwhelmingly common shape stays exactly what it was: one row, the
+/// whole region's usage, and nothing to break out.
+#[test]
+fn a_single_record_region_has_an_outcome_row_and_an_empty_breakdown() {
+    let log = log_with(
+        "sweep_id=s1",
+        &format!(
+            "{}\n{}",
+            launch_line("pi", "env", None),
+            "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}"
+        ),
+    );
+    let region = account_region_by_tap(&log, "sweep_id=s1");
+    assert_eq!(
+        region.outcome().map(TapAccounting::key),
+        account_launch_log(&log, "sweep_id=s1").map(|row| row.key()),
+        "the one-row contract is unchanged for a single-record region"
+    );
+    assert_eq!(region.outcome().unwrap().usage.input, Some(7));
+    assert!(region.breakdown().is_empty());
+}
+
+/// An unattributable **last** record has no tap to name, so the outcome row
+/// declines exactly as `account_launch_log` does — an earlier launch is never
+/// promoted into "which tap did this sweep run on". Its measured usage is not
+/// lost either: the breakdown carries it, which is the whole point of #8659.
+#[test]
+fn an_unattributable_last_record_declines_the_outcome_row_but_keeps_the_breakdown() {
+    let log = log_with(
+        "sweep_id=s1",
+        &format!(
+            "{}\n{}\n{}\n{}",
+            launch_line("pi", "env", None),
+            "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}",
+            r#"# LOOM_LAUNCH {"schema":1,"credentialSource":"env"}"#,
+            "{\"type\":\"step_finish\",\"tokens\":{\"input\":9000}}"
+        ),
+    );
+    let region = account_region_by_tap(&log, "sweep_id=s1");
+    assert!(account_launch_log(&log, "sweep_id=s1").is_none());
+    assert!(
+        region.outcome().is_none(),
+        "no attributable last record ⇒ no opinion about the outcome's tap"
+    );
+    assert_eq!(
+        region
+            .breakdown()
+            .iter()
+            .map(TapAccounting::key)
+            .collect::<Vec<_>>(),
+        vec!["pi@env".to_string()]
+    );
+    assert_eq!(
+        region.breakdown()[0].usage.input,
+        Some(7),
+        "the unattributable record's 9000 tokens stay charged to nobody"
+    );
+}
+
+/// A region with no launch record at all is "no opinion" in both halves — the
+/// Claude/legacy-adapter shape every record on the fleet has today.
+#[test]
+fn a_region_with_no_launch_record_is_empty_in_both_halves() {
+    let region = account_region_by_tap(&log_with("sweep_id=s1", "clean run"), "sweep_id=s1");
+    assert!(region.outcome().is_none());
+    assert!(region.breakdown().is_empty());
+    assert!(region.per_tap.is_empty());
+    // A missing anchor is likewise empty, never a previous dispatch's region.
+    assert!(account_region_by_tap(&log_with("sweep_id=s1", "x"), "sweep_id=absent")
+        .per_tap
+        .is_empty());
+}

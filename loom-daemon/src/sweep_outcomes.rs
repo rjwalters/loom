@@ -260,8 +260,44 @@ pub struct OutcomeRecord {
     /// line written before this field existed; `#[serde(default)]` keeps those
     /// parsing, which matters because [`read_all`] silently drops any line that
     /// fails to deserialize.
+    ///
+    /// Since Issue #8659 this is the region's last launch's tap carrying **that
+    /// tap's whole share of the region**, not just its final block — see
+    /// [`crate::tap_usage::account_region_by_tap`] and [`Self::tap_usage_all`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tap_usage: Option<crate::tap_usage::TapAccounting>,
+    /// Every tap in this sweep's log region, folded to one row per tap
+    /// (Issue #8659) — populated **only** when the region was genuinely
+    /// multi-tap, and empty otherwise.
+    ///
+    /// One anchored region can hold several `# LOOM_LAUNCH` records (a
+    /// re-dispatch, a containment re-exec, an orchestrated sweep whose phases
+    /// pin their own runtime via `runtimes.rolePreference` /
+    /// `LOOM_RUNTIME_<ROLE>`). #8633 stopped charging all of them to the
+    /// region's last tap; what it could not do from a one-row field was record
+    /// the earlier launches at all. So:
+    ///
+    /// - **one tap in the region** (every single-record region, plus the
+    ///   re-dispatch/re-exec shape that re-announces the same tap) —
+    ///   [`Self::tap_usage`] already holds the whole region's usage and this
+    ///   stays empty, keeping the line byte-identical to a pre-#8659 one;
+    /// - **two or more taps** — every tap's folded row lands here, ordered with
+    ///   `tap_usage`'s own row first, so a spend reader sees the region's full
+    ///   spend instead of just the launch its outcome belongs to.
+    ///
+    /// Deliberately never a merge of unlike taps into one row: a metered builder
+    /// followed by a subscription-pinned judge must not report as either one,
+    /// which is the #8633 error restated. The paired `sweep.outcome` telemetry
+    /// record keeps exactly one tap (its `config` is a flat string map and
+    /// `--group-by tap` is one-record-one-bucket); it stamps
+    /// `config["tap_region_keys"]` when this field is populated, so a
+    /// telemetry-only reader can tell that the per-tap breakdown lives here.
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if` so every pre-#8659 line still
+    /// parses and no single-tap line grows a key — [`read_all`] silently drops
+    /// any line that fails to deserialize.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tap_usage_all: Vec<crate::tap_usage::TapAccounting>,
     /// Elapsed wall-clock seconds from dispatch to this terminal outcome.
     pub duration_sec: i64,
 }
@@ -690,6 +726,7 @@ mod tests {
             jev_tier: None,
             jev_confidence: None,
             tap_usage: None,
+            tap_usage_all: Vec::new(),
             duration_sec: 1,
         }
     }
