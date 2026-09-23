@@ -342,6 +342,79 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes,
             )
         }
+        TelemetryRecord::SessionSummary(r) => {
+            // Issue #8757 (G3 of #8714): session shape, mapped as a log
+            // record like the lifecycle kinds — an event with counts, not a
+            // gauge. Every attribute is a count, id, or allowlisted name;
+            // the parse never copies message text or tool output, so
+            // nothing here needs a free-text bound beyond `bounded`'s.
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.session_id", r.session_id.clone()),
+                kv_string("loom.runtime", r.runtime.clone()),
+                kv_int("loom.tokens.input", r.tokens_input),
+                kv_int("loom.tokens.output", r.tokens_output),
+                kv_int("loom.tokens.cache_read", r.tokens_cache_read),
+                kv_int("loom.tokens.cache_write", r.tokens_cache_write),
+                kv_int("loom.wall_ms", r.wall_ms),
+                kv_int("loom.turns", i64::try_from(r.turns).unwrap_or(i64::MAX)),
+                kv_int("loom.tool_errors", i64::try_from(r.tool_errors).unwrap_or(i64::MAX)),
+            ];
+            // Optional fields stay absent when unknown — an unobserved
+            // attribution must be an ABSENT attribute, never a zero one.
+            if let Some(parent) = &r.parent_session_id {
+                attributes.push(kv_string("loom.parent_session_id", parent.clone()));
+            }
+            if let Some(role) = &r.role {
+                attributes.push(kv_string("loom.role", role.clone()));
+            }
+            if let Some(issue) = r.issue {
+                attributes.push(kv_int("loom.issue", i64::from(issue)));
+            }
+            if let Some(pr_number) = r.pr_number {
+                attributes.push(kv_int("loom.pr_number", i64::from(pr_number)));
+            }
+            if let Some(outcome) = &r.outcome {
+                attributes.push(kv_string("loom.outcome", outcome.clone()));
+            }
+            if let Some(models) = metadata::models(Some(&r.models)) {
+                attributes.push(models);
+            }
+            if !r.tool_calls.is_empty() {
+                let entries = r
+                    .tool_calls
+                    .iter()
+                    .map(|call| AnyValue {
+                        value: Some(any_value::Value::KvlistValue(KeyValueList {
+                            values: vec![
+                                kv_string("tool", call.tool.clone()),
+                                kv_int("count", i64::try_from(call.count).unwrap_or(i64::MAX)),
+                            ],
+                        })),
+                    })
+                    .collect();
+                attributes.push(kv(
+                    "loom.tool_calls",
+                    AnyValue {
+                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
+                    },
+                ));
+            }
+            (
+                "session.summary",
+                SeverityNumber::Info,
+                format!(
+                    "session summary: {} {} on {}, {} turn(s), {} tool call(s)",
+                    r.runtime,
+                    r.role.as_deref().unwrap_or("role-unknown"),
+                    r.repo,
+                    r.turns,
+                    r.tool_calls.iter().map(|c| c.count).sum::<u64>(),
+                ),
+                attributes,
+            )
+        }
         TelemetryRecord::TokensSnapshot(_)
         | TelemetryRecord::HostHealth(_)
         | TelemetryRecord::Span(_) => return None,
@@ -563,6 +636,9 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         | TelemetryRecord::SweepCompleted(_)
         | TelemetryRecord::SweepOutcome(_)
         | TelemetryRecord::RoleTickOutcome(_)
+        // `session.summary` is a log record (see log_record_for), not a
+        // gauge — its counters are per-session events, not host samples.
+        | TelemetryRecord::SessionSummary(_)
         | TelemetryRecord::Span(_) => Vec::new(),
     }
 }

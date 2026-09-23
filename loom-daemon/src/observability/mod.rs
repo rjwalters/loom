@@ -29,6 +29,10 @@
 //!   synthesized `sweep.completed`, so a sweep adopted across a daemon
 //!   restart (whose dispatch this process never saw) still exports under its
 //!   real `sweep_id` instead of being silently under-counted.
+//! - [`session_summary`] (Issue #8757, G3 of #8714) — the process-global
+//!   sink the transcript-ingest thread pushes `session.summary` records
+//!   onto, sharing this same [`queue::DurableQueue`] so the new record kind
+//!   rides whichever exporter is configured with no egress code of its own.
 //!
 //! # Off by default (FLAGS-OFF posture)
 //!
@@ -90,6 +94,7 @@ pub mod outcome;
 pub mod overhead;
 pub mod queue;
 pub mod sender;
+pub mod session_summary;
 pub mod shutdown;
 pub mod tracing;
 
@@ -603,6 +608,16 @@ pub fn spawn_task(
         flush_interval.as_secs()
     );
     let queue = Arc::new(DurableQueue::open(queue_path, capacity));
+
+    // `session.summary` emission (Issue #8757): hand the transcript-ingest
+    // thread this same queue (see `session_summary`'s module doc for why a
+    // process-global, rather than a constructor argument, is the wiring) —
+    // shared with the collector/backfill producers above and drained by the
+    // sender(s) below, so the new record kind rides whichever exporter this
+    // config selected with no egress code of its own.
+    session_summary::register_global_session_summary_sink(
+        session_summary::SessionSummarySink::new(queue.clone(), host_id.clone()),
+    );
 
     // Export-liveness status (Issue #5083). Created here — where the endpoint,
     // host id, exporter kind and cadence are all resolved — but registered as
