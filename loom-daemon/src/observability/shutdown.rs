@@ -214,6 +214,7 @@ mod tests {
                 started_at: chrono::Utc::now(),
                 model: None,
                 effort: None,
+                runtime: None,
             }),
         ));
         let active = Arc::new(AtomicUsize::new(0));
@@ -262,6 +263,7 @@ mod tests {
                 started_at: chrono::Utc::now(),
                 model: None,
                 effort: None,
+                runtime: None,
             }),
         ));
         let status = ExportStatus::started("host", "http://localhost", "otlp", 30);

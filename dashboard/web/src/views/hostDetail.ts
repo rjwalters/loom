@@ -23,6 +23,9 @@
  */
 
 import { el, field } from "../dom";
+import { forgeLink, repoUrl, sweepWorkTitle, sweepWorkUrl } from "../forgeLinks";
+import { accountProvider } from "../fleet";
+import { providerMark, runtimeProvider } from "../providers";
 import {
   UNKNOWN,
   formatAbsolute,
@@ -141,6 +144,7 @@ function accountRow(account: TokenAccount, now: Date): HTMLElement {
       data: { testid: "token-account", account: account.account ?? "" },
     },
     el("td", {}, formatText(account.account)),
+    el("td", { class: "detail__account-provider" }, providerMark(accountProvider(account), true)),
     el("td", {}, account.rank === undefined ? UNKNOWN : String(account.rank)),
     el(
       "td",
@@ -245,6 +249,7 @@ function tokensPanel(host: HostView, now: Date): HTMLElement {
           "tr",
           {},
           el("th", {}, "Account"),
+          el("th", {}, "Provider"),
           el("th", {}, "Rank"),
           el("th", {}, "Usage"),
           el("th", {}, "Window resets"),
@@ -268,10 +273,28 @@ export function sweepRow(sweep: ActiveSweep, now: Date = new Date()): HTMLElemen
     el(
       "td",
       { title: sweep.sweepId },
-      sweep.issue === undefined ? sweep.sweepId : `#${sweep.issue}`,
+      // Same forge-link rule as the overview card: the `feature/issue-N`
+      // branch once Builder has pushed one, the issue itself before that.
+      forgeLink(
+        sweep.issue === undefined ? sweep.sweepId : `#${sweep.issue}`,
+        sweepWorkUrl(sweep.repo, sweep.issue, sweep.phase),
+        "detail__sweep-label",
+        sweepWorkTitle(sweep.issue, sweep.phase),
+      ),
     ),
-    el("td", {}, formatText(sweep.repo)),
+    el(
+      "td",
+      {},
+      sweep.repo ? forgeLink(sweep.repo, repoUrl(sweep.repo), "detail__sweep-repo") : formatText(sweep.repo),
+    ),
     el("td", {}, el("span", { class: "chip" }, sweep.phase ?? "starting")),
+    el(
+      "td",
+      { class: "detail__sweep-agent" },
+      // The runtime adapter's provider mark — which agent is doing the
+      // work. Unknown (a pre-runtime daemon) renders as unknown, not Claude.
+      sweep.runtime ? providerMark(runtimeProvider(sweep.runtime), true) : UNKNOWN,
+    ),
     el("td", {}, formatText(sweep.model)),
     el("td", {}, formatText(sweep.effort)),
     el(
@@ -322,6 +345,7 @@ function sweepsPanel(host: HostView, now: Date): HTMLElement {
           el("th", {}, "Issue"),
           el("th", {}, "Repo"),
           el("th", {}, "Phase"),
+          el("th", {}, "Agent"),
           el("th", {}, "Model"),
           el("th", {}, "Effort"),
           el("th", {}, "Running"),

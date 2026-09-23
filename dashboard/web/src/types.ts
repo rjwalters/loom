@@ -160,6 +160,10 @@ export interface HostHealthRecord {
  * so this side reads it as one thing: when the account's constraint lifts. */
 export interface TokenAccount {
   account?: string;
+  /** Which provider's pool this account belongs to (`"claude"`, `"codex"`,
+   * …). Absent on a row from a daemon that predates per-provider pools —
+   * such a row is a Claude account, and `fleet.ts` folds it in as one. */
+  provider?: string;
   rank?: number;
   usage_fraction?: number;
   limit_window_reset_at?: string;
@@ -182,6 +186,20 @@ export interface TokensSnapshotRecord {
   account_count?: number;
   exhausted_count?: number;
   mean_usage_fraction?: number | null;
+  max_usage_fraction?: number | null;
+  next_limit_window_reset_at?: string | null;
+  /** The public aggregate sliced per provider — see `ProviderPoolAggregate`.
+   * Absent on the authenticated shape (derive it from `accounts`) and on a
+   * public response from a backend that predates per-provider pools. */
+  providers?: ProviderPoolAggregate[];
+}
+
+/** One provider's slice of the public `tokens.snapshot` aggregate
+ * (`dashboard/src/redaction.ts`'s `ProviderPoolAggregate`). */
+export interface ProviderPoolAggregate {
+  provider?: string;
+  account_count?: number;
+  exhausted_count?: number;
   max_usage_fraction?: number | null;
   next_limit_window_reset_at?: string | null;
 }
@@ -216,6 +234,9 @@ export interface ActiveSweep {
   enteredPhaseAt?: string;
   model?: string;
   effort?: string;
+  /** Runtime adapter the sweep was dispatched on (`"claude"`, `"codex"`, …)
+   * — which agent is doing the work. Absent for a pre-runtime daemon. */
+  runtime?: string;
   updatedAt?: string;
 }
 
