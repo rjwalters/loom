@@ -997,15 +997,18 @@ impl SweepRegistry {
             peer_claims::ClaimKind::Advertise => ClaimAd::advertise(issue, repo, host, pid, ts),
             peer_claims::ClaimKind::Retract => ClaimAd::retract(issue, repo, host, pid, ts),
             // Unreachable: the early return above already handles `Completed`
-            // and the filing-lock lane. The cooldown lane (Issue #7477) has
-            // its own dedicated publisher, `publish_peer_cooldown_claim`,
-            // since it carries a `remaining_secs` payload this method's
-            // signature has no parameter for.
+            // and the filing-lock lane. The cooldown lane (Issue #7477) and
+            // the pool-hold lane (Issue #8001) each have their own dedicated
+            // publisher (`publish_peer_cooldown_claim` /
+            // `publish_peer_pool_hold_claim`), since each carries a payload
+            // this method's signature has no parameter for.
             peer_claims::ClaimKind::Completed
             | peer_claims::ClaimKind::FilingLock
             | peer_claims::ClaimKind::FilingUnlock
             | peer_claims::ClaimKind::NoopCooldownArmed
-            | peer_claims::ClaimKind::DispatchBackoffArmed => return,
+            | peer_claims::ClaimKind::DispatchBackoffArmed
+            | peer_claims::ClaimKind::PoolHoldArmed
+            | peer_claims::ClaimKind::PoolHoldCleared => return,
         };
         if let Err(e) = tx.try_send(ad) {
             // Fail-open: the soft claim is an optimization, never a liveness

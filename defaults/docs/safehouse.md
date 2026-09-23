@@ -1465,6 +1465,65 @@ The fix reuses the peer-claim channel exactly as #6352 and #6714 did — two mor
   cooldown defaults to one hour) — well inside the 15-minute lease TTL's own
   reclaim cadence for the backoff lane.
 
+### Fleet-wide token-pool exhaustion hold: the third brake lane (#8001)
+
+#7477 above brakes **one issue**. `work_finder::pool_preflight`'s hold (#7708)
+brakes **every issue resolving to one token pool**, because a pool-wide fault is
+not any issue's fault — and it was process-local, so all four fleet hosts had to
+rediscover the same dead pool independently, each paying a doomed dispatch, a
+`loom:issue`↔`loom:building` flip and a permanent `loom:lease` comment to learn
+it. Two more `ClaimKind`s on the same envelope close that:
+
+- **Publish only the edge.** `PoolHoldState::observe_root_edge` (the per-tick
+  pre-flight) and `note_pool_dead` (the reaper's post-mortem path) each return a
+  `PoolObservation` naming the arm/clear `PoolHoldEdge` they crossed, if any;
+  `SweepRegistry::publish_peer_pool_hold_claim` broadcasts it as
+  `ClaimKind::PoolHoldArmed` / `PoolHoldCleared`. Edge-triggered, not per tick —
+  a multi-hour outage costs two ads, not one per tick per root, mirroring the
+  hold's existing "log the edge once" discipline.
+- **Keyed by account set, never by directory.** The ad carries
+  `pool_key: Option<String>` — `tokens_pool::select::pool_account_fingerprint`,
+  a hash of the pool's sorted account names. A path key is wrong in both
+  directions (two hosts sharing one pool resolve different absolute paths; two
+  hosts with genuinely different repo-local shadow pools resolve the *same*
+  relative path), and the second failure is precisely the "suppress a peer whose
+  pool is healthy" hazard that kept #7708's hold local. Exhaustion is a property
+  of the **accounts**, so the account-set key matches exactly when suppression is
+  correct. Hashed rather than plain so account names never reach the shared room.
+- **Arm *and* clear, unlike the cooldown lane.** A pool hold's TTL comes from
+  `pool_clear_estimate` (capped at 900 s) but the local pre-flight self-heals in
+  **one tick**. Without an explicit clear, an operator readmitting one account
+  would resume the arming host immediately while every peer stayed suppressed for
+  up to 15 more minutes — a latency win converted into a fleet-wide stall. A
+  `PoolHoldCleared` releases only its own sender's entry (the `FilingUnlock`
+  rule): two peers can hold the same dead pool independently, and the first to
+  recover must not speak for the second.
+- **Consume in its own map, routed beside the lanes.** `PeerClaimSink` hands
+  every cooldown-lane *and* pool-hold-lane ad to `peer_claims::brakes::
+  observe_brake_ad`, which folds a pool ad into `PeerClaimView::pool_holds`,
+  keyed `(pool_key, advertising host)` — host in the key so a clear releases only
+  its sender's hold; repo *not* in the key, because a pool is a machine-level
+  resource shared across every workspace resolving to it (#3938/#7527). Never
+  `observe_at`'s dispatch-claims map (the ad carries a sentinel issue, so folding
+  it in would manufacture a phantom claim on issue #0), and never the #6157
+  coordination-health counters.
+- **TTL against local receipt, and capped on receipt.** Expiry is
+  `received_at + min(remaining_secs, MAX_PEER_POOL_HOLD_TTL)` (900 s, matching
+  the arming side's own `pool_clear_estimate` cap), so a well-behaved ad is never
+  clamped but an ill-behaved one cannot wedge a peer's whole fleet lane — this ad
+  suppresses *all* dispatch for a pool, not one issue. An ad naming **no** pool
+  (`pool_key: None` — a pre-#8001 peer, or a malformed payload) is dropped rather
+  than applied to an arbitrary pool.
+- **Consulted as a pure addition to the local verdict.**
+  `pool_preflight::fold_peer_pool_hold` holds a root whose own live read says
+  "healthy" when a peer advertises a live hold on the same pool. A peer can only
+  ever *add* a hold, never clear one this host's own read armed. Fail-open
+  throughout: without a peer-claim view (`safehouse.enabled` false), on a dropped
+  ad, or before any ad arrives, every line collapses byte-for-byte to the
+  pre-#8001 local-only pre-flight — which still stops that host on its own next
+  tick. The broadcast removes doomed dispatches; it is never the only thing that
+  can stop them.
+
 # Phase 2 — worker-side `safehouse-mcp` injection (#3999)
 
 Phase 1 lets the daemon *narrate*. Phase 2 gives each **worker** session a

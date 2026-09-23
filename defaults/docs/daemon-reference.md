@@ -4549,6 +4549,10 @@ byte-for-byte to the pre-#7477 per-host behavior. The lease-reclaim path
 (`claim_reconciliation`) reads none of this, so a genuinely orphaned claim that
 never armed a window is still reclaimed promptly. Full mechanism:
 [`safehouse.md` → "Fleet-wide no-op cooldown / dispatch backoff"](safehouse.md).
+A third brake lane rides the same channel with a **pool**-wide rather than
+per-issue scope — `PoolHoldArmed`/`PoolHoldCleared`, keyed by account-set
+fingerprint (#8001/#7708): [`safehouse.md` → "Fleet-wide token-pool exhaustion
+hold"](safehouse.md).
 
 **First in-repo caller (#6740).** `defaults/scripts/record-noop-release.sh`
 is the shell helper that actually makes this call — resolving the daemon

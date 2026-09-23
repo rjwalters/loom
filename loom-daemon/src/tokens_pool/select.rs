@@ -322,6 +322,66 @@ pub fn spawnable_pool_state(workspace_root: &Path) -> SpawnablePoolState {
     SpawnablePoolState { dir, total, usable }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-host-stable pool identity (issue #8001)
+// ---------------------------------------------------------------------------
+
+/// A **cross-host-stable** identity for the pool at `dir`: the SHA-256 of its
+/// sorted account names, hex-encoded and truncated to 16 chars. `None` when
+/// `dir` holds no `*.token` files at all (the ABSENT-pool condition, #4642 —
+/// there is no pool to identify).
+///
+/// # Why an account-set fingerprint and not the pool directory path
+///
+/// [`SpawnablePoolState::dir`] is a **local absolute path**, so it is the
+/// wrong shape for any cross-host key — exactly the reason
+/// [`crate::peer_claims::ClaimAd::repo`] carries a
+/// [`crate::peer_claims::repo_slug`] rather than the workspace root. A path
+/// key is wrong in *both* directions here:
+///
+/// - **False negative.** Two hosts sharing the same accounts resolve
+///   `~/.loom/tokens` to two different absolute paths (`/Users/a/...` vs
+///   `/home/b/...`). A path-keyed broadcast would never match, making it
+///   useless precisely in the deployment shape it exists for.
+/// - **False positive.** Two hosts with genuinely *different* pools can
+///   resolve to the same path string (identical usernames, or two checkouts
+///   each holding their own `<repo>/.loom/tokens` repo-local shadow pool at
+///   the same relative path). A path-keyed broadcast would suppress a peer
+///   whose pool is healthy — the exact hazard
+///   `work_finder::pool_preflight`'s module doc warns against.
+///
+/// Account names are the right key because **exhaustion is a property of the
+/// accounts, not of the directory**: a `.bad_tokens` exhaustion mark and a
+/// `.ranking` hard exclusion both record an upstream rate-limit state that is
+/// shared by every host holding a credential for that same account. Two hosts
+/// bootstrapped from the same accounts therefore fingerprint identically
+/// (broadcast applies, correctly), and a repo-local shadow pool holding a
+/// different account set fingerprints differently (broadcast does not apply,
+/// also correctly).
+///
+/// # Why hashed rather than the names themselves
+///
+/// The advertisement rides a shared safehouse room. Account names come from
+/// the pool's `*.token` filenames, which `tokens import-from-monitor` derives
+/// from the account itself — potentially an email local-part. Hashing keeps
+/// the key matchable without publishing account identities to the room.
+#[must_use]
+pub fn pool_account_fingerprint(dir: &Path) -> Option<String> {
+    use sha2::Digest;
+
+    let mut names: Vec<String> = list_token_files(dir).iter().map(|p| stem(p)).collect();
+    if names.is_empty() {
+        return None;
+    }
+    // `list_token_files` already sorts by path, but sort by *name* explicitly:
+    // the key must not depend on the directory prefix in any way.
+    names.sort();
+    names.dedup();
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(names.join("\n").as_bytes());
+    Some(hex::encode(hasher.finalize())[..16].to_string())
+}
+
 /// Cap, in seconds, on how far into the future [`pool_clear_estimate`] will
 /// ever report (issue #7607) — mirrors the `900 s` ceiling named in the
 /// issue's backoff proposal. Purely a presentation bound: the role runner

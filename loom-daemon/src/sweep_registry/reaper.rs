@@ -1345,8 +1345,10 @@ impl SweepRegistry {
                                 // filed this issue. Neither arm nor clear it;
                                 // arm the HOST-level pool hold instead, which
                                 // holds every issue at once.
-                                crate::work_finder::pool_preflight::note_pool_dead(
-                                    &self.config.workspace_root,
+                                self.broadcast_pool_hold(
+                                    crate::work_finder::pool_preflight::note_pool_dead(
+                                        &self.config.workspace_root,
+                                    ),
                                 );
                             } else if insta_crash {
                                 self.record_dispatch_failure(issue);
@@ -2008,8 +2010,10 @@ impl SweepRegistry {
                             // host-level pool hold is armed instead; see the
                             // sibling carve-out in the crashed branch above.
                             if pool_dead {
-                                crate::work_finder::pool_preflight::note_pool_dead(
-                                    &self.config.workspace_root,
+                                self.broadcast_pool_hold(
+                                    crate::work_finder::pool_preflight::note_pool_dead(
+                                        &self.config.workspace_root,
+                                    ),
                                 );
                             } else if insta_crash || no_progress || yielded_open_pr {
                                 self.record_dispatch_failure(issue);
