@@ -1426,8 +1426,10 @@ jobs:
           sudo --non-interactive mount --bind "$PWD/target" "$fixture_source/target"
           trap 'sudo --non-interactive umount "$fixture_source/target"' EXIT
           cd "$fixture_source"
+          cargo test -p loom-daemon --test private_workspace_docker --no-run --message-format=json > fixture-artifacts.json
+          fixture_test="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "private_workspace_docker" and .executable != null) | .executable' fixture-artifacts.json)"
           namei -l "$PWD/defaults/scripts" "$PWD/defaults/runtimes" "$PWD/defaults/roles" "$PWD/defaults/.claude/commands/loom" "$PWD/target/debug/loom-daemon"
-          sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env -- sh -c 'id && test -r "$PWD/target/debug/loom-daemon" && test -x "$PWD/target/debug/loom-daemon" && tar -cf /dev/null "$PWD/defaults"'
+          sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env -- sh -c 'id && test -x "$1" && test -r "$PWD/target/debug/loom-daemon" && test -x "$PWD/target/debug/loom-daemon" && tar -cf /dev/null "$PWD/defaults"' sh "$fixture_test"
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env --' cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
 
   shell-suite-tests:
