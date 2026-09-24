@@ -184,6 +184,7 @@ Slow correct job over clever fast one. **Never cancel verification of a distinct
 commit** — superseding is for PR branches; every `main` commit is distinct work.
 Path-filtering is an optimisation, not a correctness tool; one mechanism per
 behaviour. Rules + the incidents behind them: [`ci-principles`](.loom/docs/ci-principles.md).
+All org CI runs/jobs/durations/outcomes/logs are captured in SigNoz (standing policy): [`ci-observability`](.loom/docs/ci-observability.md).
 
 ### Builder Workflow
 
