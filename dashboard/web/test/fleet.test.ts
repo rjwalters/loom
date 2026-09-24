@@ -6,6 +6,10 @@ import {
   buildHostView,
   degradedProviders,
   distressReason,
+  ROLE_FAILURE_DEGRADED_MIN,
+  ROLE_FAILURE_RECENT_SEC,
+  sustainedRoleFailures,
+  throttleReason,
   findHost,
   isHostDistressed,
   isRosterMissingStatus,
@@ -258,25 +262,32 @@ describe("distressReason / isHostDistressed (#4975)", () => {
     expect(reason).toBeUndefined();
   });
 
-  it("names the breaker's own reason when dispatch is halted", () => {
-    const reason = distressReason({
+  it("does NOT treat the host-distress breaker's own halt as distress — that is throttling (#8832)", () => {
+    const record = {
       dispatch_halted: true,
       halt_reason: "load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)",
       load_per_core: 4.24,
       cpu_idle_fraction: 0,
-    });
-    expect(reason).toBe("dispatch halted: load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)");
+    };
+    expect(distressReason(record)).toBeUndefined();
+    expect(throttleReason(record)).toBe("dispatch paused: load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)");
+    expect(throttleReason({ dispatch_halted: true })).toBe("dispatch paused");
+    expect(throttleReason({ dispatch_halted: false })).toBeUndefined();
   });
 
-  it("still reports halted, generically, when dispatch_halted is true with no reason string", () => {
-    expect(distressReason({ dispatch_halted: true })).toBe("dispatch halted");
+  it("names the admission brake's foreign-load halt as distress (#8478, #8832)", () => {
+    const halt = "admission brake STARVING for 900s with 0 sweeps in flight (≥ this host's starvationWarnSecs 300); dispatch is suppressed by load Loom does not own (#8478)";
+    expect(distressReason({ dispatch_halted: true, halt_reason: halt })).toBe(`dispatch halted: ${halt}`);
   });
 
-  it("flags load/core at or above the daemon's own distress threshold even without dispatch_halted", () => {
-    // Same-number fallback for a daemon build that predates/disables the
-    // dispatch_halted field.
+  it("flags load/core at or above the daemon's own distress threshold only for a daemon that sends no dispatch_halted", () => {
+    // Same-number fallback for a daemon build that predates the field.
     expect(isHostDistressed({ load_per_core: 2.5 })).toBe(true);
     expect(isHostDistressed({ load_per_core: 2.49 })).toBe(false);
+    // #8832: when the daemon reports its own sustained verdict, one hot
+    // sample is not a second opinion.
+    expect(isHostDistressed({ load_per_core: 3.9, dispatch_halted: false })).toBe(false);
+    expect(isHostDistressed({ cpu_idle_fraction: 0, dispatch_halted: false })).toBe(false);
   });
 
   it("flags CPU idle pinned near zero even without dispatch_halted", () => {
@@ -287,11 +298,24 @@ describe("distressReason / isHostDistressed (#4975)", () => {
   });
 
   // #5022: role-tick health.
-  it("names the failing role(s) when roles has a persistent failure", () => {
-    const reason = distressReason({
-      roles: { total: 3, ok: 1, persistent: [{ root: "/repos/loom", role: "judge", failures: 2 }] },
-    });
+  it("names the failing role(s) when a persistent failure is repeated and recent", () => {
+    const reason = distressReason(
+      { roles: { total: 5, ok: 1, persistent: [{ root: "/repos/loom", role: "judge", failures: 3, last_at: isoMinutesBefore(5) }] } },
+      NOW,
+    );
     expect(reason).toBe("role tick(s) persistently failing: judge @ loom");
+  });
+
+  it("ignores a persistent pair below the repeat threshold — one or two failed ticks are a blip (#8832)", () => {
+    const roles = { total: 3, ok: 1, persistent: [{ root: "/repos/loom", role: "judge", failures: ROLE_FAILURE_DEGRADED_MIN - 1, last_at: isoMinutesBefore(1) }] };
+    expect(distressReason({ roles }, NOW)).toBeUndefined();
+  });
+
+  it("ignores a persistent pair whose latest tick is older than the recency window (#8832)", () => {
+    const stale = new Date(NOW.getTime() - (ROLE_FAILURE_RECENT_SEC + 60) * 1000).toISOString();
+    const roles = { total: 9, ok: 0, persistent: [{ root: "/repos/anvil", role: "doctor", failures: 9, last_at: stale }] };
+    expect(distressReason({ roles }, NOW)).toBeUndefined();
+    expect(sustainedRoleFailures({ roles }, NOW)).toEqual([]);
   });
 
   it("is not distressed when roles reports every tick ok", () => {
@@ -303,11 +327,14 @@ describe("distressReason / isHostDistressed (#4975)", () => {
   });
 
   it("takes priority over the load/idle heuristic fallbacks, same as dispatch_halted", () => {
-    const reason = distressReason({
-      roles: { total: 2, ok: 0, persistent: [{ root: "/repos/loom", role: "guide", failures: 2 }] },
-      load_per_core: 0.1,
-      cpu_idle_fraction: 0.9,
-    });
+    const reason = distressReason(
+      {
+        roles: { total: 3, ok: 0, persistent: [{ root: "/repos/loom", role: "guide", failures: 3, last_at: isoMinutesBefore(2) }] },
+        load_per_core: 0.1,
+        cpu_idle_fraction: 0.9,
+      },
+      NOW,
+    );
     expect(reason).toBe("role tick(s) persistently failing: guide @ loom");
   });
 });
@@ -319,14 +346,27 @@ describe("buildFleetView host-distress classification (#4975)", () => {
       activeSweeps: [],
     });
 
-  it("goes degraded when dispatch is halted, independent of the token pool", () => {
+  it("goes throttled — not degraded, not needing attention — when the host breaker pauses dispatch (#8832)", () => {
     const built = buildFleetView(
-      snapshotFor({ dispatch_halted: true, halt_reason: "host-distress breaker" }),
+      snapshotFor({ dispatch_halted: true, halt_reason: "host-distress breaker", load_per_core: 3.9 }),
       NOW,
     );
     const host = findHost(built, "h");
-    expect(host?.status).toBe("degraded");
-    expect(host?.degradedReason).toBe("dispatch halted: host-distress breaker");
+    expect(host?.status).toBe("throttled");
+    expect(host?.degradedReason).toBe("dispatch paused: host-distress breaker");
+    expect(built.needsAttention).toBe(0);
+  });
+
+  it("stays ok for a single failed role tick — the 2026-09-24 always-degraded case (#8832)", () => {
+    const built = buildFleetView(
+      snapshotFor({
+        dispatch_halted: false,
+        roles: { total: 400, ok: 399, persistent: [{ root: "/repos/loom", role: "judge", failures: 1, last_at: isoMinutesBefore(3) }] },
+      }),
+      NOW,
+    );
+    expect(findHost(built, "h")?.status).toBe("ok");
+    expect(built.needsAttention).toBe(0);
   });
 
   it("goes degraded when load/core is at the daemon's distress threshold", () => {
@@ -341,7 +381,7 @@ describe("buildFleetView host-distress classification (#4975)", () => {
     expect(host?.degradedReason).toBeUndefined();
   });
 
-  it("goes degraded when roles reports a persistent tick failure, independent of load/tokens (#5022)", () => {
+  it("goes degraded when roles reports a repeated, recent tick failure, independent of load/tokens (#5022, #8832)", () => {
     const built = buildFleetView(snapshotFor({ roles: persistentRoleTickFailureFixture() }), NOW);
     const host = findHost(built, "h");
     expect(host?.status).toBe("degraded");
@@ -372,7 +412,40 @@ describe("buildFleetView host-distress classification (#4975)", () => {
     const host = findHost(built, "h");
     expect(host?.status).toBe("degraded");
     // Rows with no `provider` are the Claude pool, and the reason says so.
-    expect(host?.degradedReason).toBe("claude token pool at or near exhaustion");
+    expect(host?.degradedReason).toBe("claude token pool exhausted — nothing left to dispatch on");
+  });
+});
+
+describe("buildFleetView token pool — near-empty is throttled, empty is degraded (#8832)", () => {
+  const withAccounts = (accounts: unknown[]) =>
+    parseFleetSnapshot({
+      hosts: {
+        h: {
+          health: { record: { kind: "host.health", dispatch_halted: false }, updatedAt: isoMinutesBefore(1) },
+          tokens: { record: { kind: "tokens.snapshot", accounts }, updatedAt: isoMinutesBefore(1) },
+        },
+      },
+      activeSweeps: [],
+    });
+
+  it("goes throttled, not degraded, when one account is left to rotate onto", () => {
+    const built = buildFleetView(
+      withAccounts([{ account: "a", exhausted: true }, { account: "b", exhausted: false }]),
+      NOW,
+    );
+    const host = findHost(built, "h");
+    expect(host?.status).toBe("throttled");
+    expect(host?.degradedReason).toBe("claude token pool running low");
+    expect(built.needsAttention).toBe(0);
+  });
+
+  it("goes degraded once every account in a provider is spent", () => {
+    const built = buildFleetView(
+      withAccounts([{ account: "a", exhausted: true }, { account: "b", exhausted: true }]),
+      NOW,
+    );
+    expect(findHost(built, "h")?.status).toBe("degraded");
+    expect(built.needsAttention).toBe(1);
   });
 });
 

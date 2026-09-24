@@ -108,7 +108,7 @@ describe("hostDetailView — health panel", () => {
     );
     const rendered = hostDetailView(built.hosts[0]!, NOW);
     expect(fieldValue(rendered, "Role ticks")).toBe(
-      "1/3 ticks ok; 1 persistent failure(s): judge @ loom",
+      "1/5 ticks ok; 1 persistent failure(s): judge @ loom",
     );
     expect(rendered.querySelector('[data-testid="status-badge"]')?.getAttribute("data-status")).toBe(
       "degraded",

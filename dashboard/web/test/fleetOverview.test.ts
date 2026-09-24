@@ -26,6 +26,7 @@ import {
   persistentRoleTickFailureFixture,
   rosterMissingSnapshot,
   unprotectedHostProtectionFixture,
+  DEGRADED_HOST_HALT_REASON,
 } from "./fixtures";
 
 const view = () => buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
@@ -198,7 +199,7 @@ describe("hostCard", () => {
     expect(codexLabel.textContent).toBe("Codexpool");
     // The degraded badge names the spent provider, not a blended pool.
     expect(card.querySelector('[data-testid="status-badge"]')?.getAttribute("title")).toBe(
-      "claude token pool at or near exhaustion",
+      "claude token pool exhausted — nothing left to dispatch on",
     );
   });
 
@@ -245,7 +246,7 @@ describe("hostCard", () => {
         hosts: {
           h: {
             health: {
-              record: { kind: "host.health", dispatch_halted: true, halt_reason: "host-distress breaker" },
+              record: { kind: "host.health", dispatch_halted: true, halt_reason: DEGRADED_HOST_HALT_REASON },
               updatedAt: isoMinutesBefore(1),
             },
           },
@@ -257,7 +258,30 @@ describe("hostCard", () => {
     const card = hostCard(findHost(built, "h")!, NOW);
     const badge = card.querySelector('[data-testid="status-badge"]');
     expect(badge?.getAttribute("data-status")).toBe("degraded");
-    expect(badge?.getAttribute("title")).toBe("dispatch halted: host-distress breaker");
+    expect(badge?.getAttribute("title")).toBe(`dispatch halted: ${DEGRADED_HOST_HALT_REASON}`);
+  });
+
+  it("badges a breaker-paused host 'Throttled', naming the pause in its tooltip (#8832)", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: {
+              record: { kind: "host.health", dispatch_halted: true, halt_reason: "host-distress breaker" },
+              updatedAt: isoMinutesBefore(1),
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    const card = hostCard(findHost(built, "h")!, NOW);
+    const badge = card.querySelector('[data-testid="status-badge"]');
+    expect(badge?.getAttribute("data-status")).toBe("throttled");
+    expect(badge?.textContent).toBe("Throttled");
+    expect(badge?.getAttribute("title")).toBe("dispatch paused: host-distress breaker");
+    expect(card.classList.contains("card--throttled")).toBe(true);
   });
 
   it("falls back to a generic tooltip when a degraded host has no specific reason recorded", () => {

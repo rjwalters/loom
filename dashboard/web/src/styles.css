@@ -253,6 +253,10 @@ a:hover {
 .card--degraded {
   border-color: var(--warn);
 }
+/* #8832 — a host shedding load by design: visible, never alarming. */
+.card--throttled {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
 /* Roster-expected hosts that never reported (#8792/#8804). `missing` shares
  * `stale`'s alarm colour — both mean "something that should be reporting is
  * not" — while `unprovisioned` is a dashed, unemphasised outline: a planning
@@ -439,6 +443,10 @@ a:hover {
 .badge--degraded {
   color: var(--warn);
   border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+}
+.badge--throttled {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 .badge--stale {
   color: var(--bad);
