@@ -25,6 +25,11 @@ impl Fixture {
         let codex = dir.path().join("bin/codex");
         std::fs::write(&codex, "#!/bin/sh\nprintf invoked > \"$TEST_HOST_CODEX_TOUCH\"\n").unwrap();
         std::fs::set_permissions(codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // No usable ambient installation: the inherited-lease refusal must
+        // use SELF_BIN before provider discovery can consult the host PATH.
+        let ambient = dir.path().join("bin/loom-daemon");
+        std::fs::write(&ambient, "#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(ambient, std::fs::Permissions::from_mode(0o755)).unwrap();
         symlink(&profile, dir.path().join("profile-link")).unwrap();
         Self {
             dir,
@@ -181,6 +186,7 @@ fn dry_runs_and_legacy_explicit_profiles_keep_escape_flag_behavior() {
         // private CODEX_HOME; that inactive candidate must not block it.
         let overridden = f
             .command(adapter)
+            .args(["--json", "-m", "gpt-5"])
             .env("LOOM_CODEX_HOME", &legacy)
             .env("CODEX_HOME", &f.profile)
             .env("LOOM_CODEX_SESSION_EXEC", "0")

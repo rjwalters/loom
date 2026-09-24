@@ -135,6 +135,54 @@ fn nonempty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Mirror only spawn-codex's model precedence. In particular, a prompt or
+/// config value that looks like `--model` is data, and `--` ends adapter flags.
+fn codex_adapter_model(args: &[std::ffi::OsString]) -> Option<String> {
+    let mut model = nonempty_env("LOOM_MODEL").or_else(|| nonempty_env("LOOM_CODEX_MODEL"));
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else { continue };
+        match arg {
+            "--" => break,
+            "-m" | "--model" => model = args.next().and_then(|s| s.to_str()).map(str::to_owned),
+            "-p" | "--prompt" | "--effort" | "-s" | "--sandbox" | "-c" | "--config" => {
+                args.next();
+            }
+            _ => {
+                if let Some(value) = arg
+                    .strip_prefix("--model=")
+                    .or_else(|| arg.strip_prefix("-m="))
+                {
+                    model = Some(value.to_owned());
+                }
+            }
+        }
+    }
+    model
+}
+
+#[cfg(test)]
+mod codex_adapter_tests {
+    #[test]
+    fn selection_reads_model_without_rejecting_legacy_arguments() {
+        for args in [
+            vec!["-m", "gpt-5", "--json"],
+            vec!["--model=gpt-5", "--unknown=literal"],
+            vec![
+                "--model", "old", "-m=gpt-5", "--prompt", "--model", "ignored",
+            ],
+            vec!["--model=gpt-5", "--config", "--model", "ignored"],
+            vec!["--model=gpt-5", "--", "--model=ignored"],
+        ] {
+            let args = args
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            assert_eq!(super::codex_adapter_model(&args).as_deref(), Some("gpt-5"));
+        }
+    }
+}
+
 /// Native sweep workers authenticate through their harness, not Claude's pool.
 pub fn uses_native_sweep(root: &Path) -> bool {
     crate::runtime_admission::resolve_binding(root, "sweep-lifecycle", None)
@@ -418,7 +466,10 @@ fn run_preflight(
         && std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none()
         && nonempty_env("LOOM_CODEX_NO_EXEC").is_none()
     {
-        let options = Options::parse(&args.args)?;
+        // Legacy adapters own their argv contract, including interactive and
+        // Codex-specific options. Read selection metadata without imposing the
+        // native harness parser's mandatory prompt or restricted flag list.
+        let model = codex_adapter_model(&args.args);
         if let Some(role) = nonempty_env("LOOM_ROLE") {
             crate::runtime_admission::resolve_and_admit(root, &role, Some("codex"))
                 .map_err(|e| LaunchError::config(e.diagnostic()))?;
@@ -426,7 +477,7 @@ fn run_preflight(
         crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
             root,
             &runtime,
-            options.model.as_deref(),
+            model.as_deref(),
             crate::tokens_pool::private_workspace::JobKind::Role,
             None,
             &format!("worker-{}", uuid::Uuid::new_v4()),

@@ -632,6 +632,9 @@ _loom_account_provider_for_runtime() {
 
 # --- Auth: CODEX_HOME profile passthrough (see header) ---
 CODEX_PROFILE_NAME=""
+if [[ -z "${LOOM_CODEX_NO_EXEC:-}" && -n "${LOOM_PRIVATE_LEASE_FD:-}" ]]; then
+    "$(loom_resolve_self_daemon_bin)" private-workspace check-adapter || exit 78
+fi
 # A managed headless dispatch with no explicit pin uses the provider-aware
 # selector. This fails closed when every profile is disabled, cooling down,
 # or awaiting reauthentication; it never falls back to ambient ~/.codex.
@@ -686,9 +689,6 @@ fi
 
 # requires-daemon: private-workspace >= 0.19.337  Private adapter refusal before model probes.
 if [[ -z "${LOOM_CODEX_NO_EXEC:-}" ]]; then
-    if [[ -n "${LOOM_PRIVATE_LEASE_FD:-}" ]]; then
-        "$(loom_resolve_self_daemon_bin)" private-workspace check-adapter || exit 78
-    fi
     for _guard_home in "${_requested_home:-$HOME/.codex}" "${LOOM_SPAWN_NO_EXPORT:+${CODEX_HOME:-$HOME/.codex}}"; do
         [[ -d "$_guard_home" ]] || continue
         _guard_home="$(cd -P -- "$_guard_home" && pwd -P)" || exit 78

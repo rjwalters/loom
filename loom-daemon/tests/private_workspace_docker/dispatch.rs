@@ -251,11 +251,13 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     use loom_daemon::role_runner::RoleInvocationRunner;
     let mut runner = loom_daemon::role_runner::ScriptRoleInvocationRunner::new(root.clone())
         .with_timeout(Duration::from_secs(30));
-    assert!(matches!(
-        runner.invoke("guide", "fixture guide"),
-        loom_daemon::role_runner::RoleTickOutcome::Success
-    ));
-    let role_log = std::fs::read_to_string(root.join(".loom/logs/role-guide.log")).unwrap();
+    let outcome = runner.invoke("guide", "fixture guide");
+    let role_log = std::fs::read_to_string(root.join(".loom/logs/role-guide.log"))
+        .unwrap_or_else(|error| format!("role log unavailable: {error}"));
+    assert!(
+        matches!(outcome, loom_daemon::role_runner::RoleTickOutcome::Success),
+        "scheduled private guide failed: {outcome:?}\n{role_log}"
+    );
     assert!(role_log.contains("fixture-private-complete"));
     use loom_daemon::tokens_pool::private_workspace::{dispatch::Selection, JobKind};
     let rejected_spawn = Selection::prepare(
