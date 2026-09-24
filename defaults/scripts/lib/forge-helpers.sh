@@ -882,14 +882,28 @@ forge_get_pr_body() {
 #   sensitivity, word boundaries, fenced code blocks, and the full list of
 #   closing keywords (close/closes/closed, fix/fixes/fixed, resolve/resolves/
 #   resolved). It also follows GitHub's own rule that "Updates #N", "See #N",
-#   and "References #N" do NOT close the issue.
+#   and "References #N" do NOT close the issue. It is NOT negation-aware --
+#   "does not fix #N" reads exactly like "fixes #N" to GitHub's own parser
+#   (#1057) -- and this branch deliberately reports that same raw truth
+#   rather than second-guessing it: this is "what GitHub will actually do at
+#   merge time", which some callers (merge-pr.sh's partial-increment-conflict
+#   pre-merge warning, #4569) need literally, negated or not. A caller that
+#   needs to know whether a candidate's ONLY closing signal is negated should
+#   re-check with forge_text_has_unnegated_closing_ref() below (e.g.
+#   champion-pr-merge.md's "Verify Issue Auto-Close" step does this before
+#   calling `gh issue close`).
 #
 # Gitea: The Gitea API does not expose an equivalent of closingIssuesReferences,
 #   so this falls back to a word-boundary regex over the PR body. The regex
 #   only matches the canonical closing keywords (case-insensitive), so plain
 #   `Updates #N` is correctly ignored. The substring trap (e.g. `Discloses #N`)
 #   is also avoided thanks to the leading `\b`. Note that this is a syntactic
-#   approximation — it does not strip fenced code blocks or quoted text.
+#   approximation — it does not strip fenced code blocks or quoted text. Unlike
+#   the GitHub branch above, this regex has no external ground truth to defer
+#   to and no known consumer that needs the raw (negation-unaware) match set,
+#   so it IS filtered through forge_text_has_unnegated_closing_ref() directly
+#   (#1057) -- a candidate whose only closing-keyword occurrence is negated
+#   (e.g. "does not fix #N") is never returned by this branch.
 #
 # This helper replaces the brittle `grep -Eo "(Closes|Fixes|Resolves) #[0-9]+"`
 # that previously appeared in Champion's "Verify Issue Auto-Close" step. That
@@ -910,15 +924,99 @@ forge_pr_close_targets() {
     # Word-boundary, case-insensitive match on canonical closing keywords only.
     # `Updates`, `See`, `References` are deliberately excluded.
     # `|| true` neutralizes grep's exit-1 (no match) under `set -e`.
-    { echo "$body" \
+    local raw_targets
+    raw_targets=$({ echo "$body" \
         | grep -Eoi '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#[0-9]+' \
         | grep -Eo '[0-9]+' \
-        | sort -un; } || true
+        | sort -un; } || true)
+    # Negation cross-check (#1057): unlike the GitHub GraphQL branch below,
+    # this regex has no upstream authority to defer to and no other caller
+    # (github-gated consumers in merge-pr.sh never take this branch) that
+    # depends on the raw, un-negation-aware match set — so filter directly
+    # here rather than only at the champion-pr-merge.md call site, closing
+    # the Gitea-specific gap that a GitHub-only fix would leave open (this
+    # path never touches closingIssuesReferences at all).
+    local n
+    while IFS= read -r n; do
+      [[ -n "$n" ]] || continue
+      # `|| true`: a negated-only candidate makes this single check return
+      # non-zero by design (it is correctly excluded from the output below);
+      # that must not be mistaken by `set -e` for a failure of the loop or
+      # the function as a whole.
+      { forge_text_has_unnegated_closing_ref "$body" "$n" && printf '%s\n' "$n"; } || true
+    done <<<"$raw_targets"
   else
     { "$gh_cmd" pr view "$pr_number" --json closingIssuesReferences \
         --jq '.closingIssuesReferences[].number' 2>/dev/null \
         | sort -un; } || true
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Negation-aware closing-reference cross-check (#1057).
+#
+# forge_pr_close_targets() above deliberately mirrors whatever GitHub's own
+# closingIssuesReferences parser (or, on Gitea, the equivalent word-boundary
+# regex) will ACTUALLY do at merge time — including its one shared blind
+# spot: neither is negation-aware. "does not fix #909" reads identically to
+# "fixes #909" to both parsers, because the match is just
+# `\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#N` with no look-back
+# for a preceding "not". A PR body reading "**does not fix #909** — left open
+# for its owner to close or subsume" auto-closed #909 anyway (2AMLogic/2am
+# #1057, PR #1051) — the author's own stated intent, twice, was to leave it
+# open.
+#
+# forge_pr_close_targets() itself is intentionally left returning the same
+# raw, un-negation-aware candidate set it always has: callers that need
+# "what will GitHub actually do at merge time" (e.g. merge-pr.sh's
+# partial-increment-conflict pre-merge warning, #4569) depend on that literal
+# truth, negated or not — GitHub's own close-on-merge behavior does not
+# consult this function, so filtering its output would just make the
+# candidate list lie about what is about to happen. The negation check
+# instead lives here, as a separate predicate a caller applies AFTER getting
+# the raw candidate list, at the point where IT is about to decide whether a
+# reference represents real intent (Champion's "Verify Issue Auto-Close"
+# step, champion-pr-merge.md).
+#
+# forge_text_has_unnegated_closing_ref TEXT ISSUE_NUM
+# Returns 0 (true) when TEXT contains at least one closing-keyword reference
+# to #ISSUE_NUM (close/closes/closed, fix/fixes/fixed, resolve/resolves/
+# resolved) that is NOT negated. Returns 1 when TEXT has no closing-keyword
+# reference to ISSUE_NUM at all, or when EVERY occurrence found is negated.
+#
+# Negation words: `not`, `never`, or any `n't` contraction (won't, doesn't,
+# isn't, wasn't, ... — matched generically via the `n['\'']t` suffix rather
+# than enumerating every contraction).
+#
+# "Same clause" is approximated by splitting TEXT on sentence-ending
+# punctuation (`.`, `!`, `?`, `;`) AND newlines before scanning, so a
+# negation word in one clause never suppresses a genuine close in a
+# different, unrelated clause elsewhere in the text — but a negation word
+# that shares a clause with the closing keyword stays bound to it. Within a
+# clause, only the text UP TO AND INCLUDING the matched `#N` counts as "the
+# reference's context" (matching the AC's "between the negated verb and the
+# #N reference, or immediately preceding the closing keyword") — text that
+# follows #N in the same clause cannot retroactively negate an earlier,
+# genuine close.
+forge_text_has_unnegated_closing_ref() {
+  local text="$1" issue_num="$2"
+  [[ -n "$text" && -n "$issue_num" ]] || return 1
+
+  local kw_re="\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\b[[:space:]]+#${issue_num}\\b"
+  local neg_re="\\bnot\\b|\\bnever\\b|n['’]t\\b"
+
+  local segment prefix
+  while IFS= read -r segment; do
+    grep -qEi "$kw_re" <<<"$segment" || continue
+    # Text up to and including the FIRST closing-keyword match for this
+    # issue in this clause-sized segment.
+    prefix=$(grep -Eoi "^.*${kw_re}" <<<"$segment" | head -1)
+    if ! grep -Eqi "$neg_re" <<<"$prefix"; then
+      return 0
+    fi
+  done < <(printf '%s\n' "$text" | tr '.!?;' '\n')
+
+  return 1
 }
 
 # ---------------------------------------------------------------------------

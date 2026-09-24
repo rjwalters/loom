@@ -2123,6 +2123,13 @@ PR_NUMBER=$1
 # It correctly ignores `Updates #N`, `See #N`, code-fenced text, and substring
 # traps like `Discloses #N`. The previous regex-based approach silently
 # misclassified `Updates #N` as a closing reference — see issue #3267.
+#
+# NOT negation-aware, by design (see forge_pr_close_targets's doc comment):
+# "does not fix #N" reads exactly like "fixes #N" to GitHub's own parser, so
+# LINKED_ISSUES can carry a candidate the PR author explicitly did NOT intend
+# to close (#1057). That is why every candidate below is re-checked with
+# forge_text_has_unnegated_closing_ref() before this step ever calls
+# `gh issue close`.
 source "$(git rev-parse --show-toplevel)/.loom/scripts/lib/forge-helpers.sh"
 forge_detect
 LINKED_ISSUES=$(forge_pr_close_targets "$PR_NUMBER")
@@ -2135,6 +2142,21 @@ fi
 # The head SHA this merge landed. `headRefOid` survives the merge, so this is
 # still readable here — it is the tree any `loom:ac-verified` marker must name.
 HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
+
+# --- Negation cross-check source text (#1057) ---
+# The two signals the AC requires: the PR body itself, and (GitHub only) the
+# squash merge commit message -- a closing keyword can live in either one.
+# Best-effort: an empty PR_NWO/PR_BODY_TEXT/MERGE_COMMIT_MSG just means that
+# signal contributes nothing, never a hard failure of this step.
+PR_NWO=$(forge_get_repo_nwo 2>/dev/null || echo "")
+PR_BODY_TEXT=$(forge_get_pr_body "$PR_NWO" "$PR_NUMBER" 2>/dev/null || echo "")
+MERGE_COMMIT_MSG=""
+if [ "$FORGE_TYPE" = "github" ]; then
+  MERGE_SHA=$(gh pr view "$PR_NUMBER" --json mergeCommit --jq '.mergeCommit.oid // empty' 2>/dev/null || echo "")
+  if [ -n "$MERGE_SHA" ]; then
+    MERGE_COMMIT_MSG=$(gh api "repos/$PR_NWO/commits/$MERGE_SHA" --jq '.commit.message // ""' 2>/dev/null || echo "")
+  fi
+fi
 
 # Check each linked issue. Plain `gh` — NOT "$GH_READ": this runs immediately
 # after your own merge and gates a write (`gh issue close`), so it must observe
@@ -2155,6 +2177,23 @@ for issue in $LINKED_ISSUES; do
     echo "Issue #$issue has an unverified out-of-band acceptance criterion — HOLDING the close"
     hold_issue_on_unverified_ac "$issue" "$PR_NUMBER" "$HEAD_SHA" "$AC_RC" "$AC_REPORT"
     continue   # do NOT close, do NOT confirm — next linked issue
+  fi
+
+  # --- Negation cross-check (#1057) ---
+  # LINKED_ISSUES came from forge_pr_close_targets(), which mirrors GitHub's
+  # own (non-negation-aware) parser. Re-derive whether a REAL closing
+  # reference exists before treating this candidate as a genuine close.
+  if ! forge_text_has_unnegated_closing_ref "$PR_BODY_TEXT" "$issue" \
+     && ! forge_text_has_unnegated_closing_ref "$MERGE_COMMIT_MSG" "$issue"; then
+    echo "Issue #$issue: every closing-keyword reference in the PR body/commit message is negated (e.g. \"does not fix #$issue\") — not a real closing intent (#1057)"
+    ISSUE_STATE=$(gh issue view "$issue" --json state --jq '.state' 2>&1)
+    if [ "$ISSUE_STATE" = "CLOSED" ]; then
+      echo "  Issue #$issue was already auto-closed by GitHub's own (non-negation-aware) parser — reopening"
+      gh issue reopen "$issue" --comment "Reopened by Champion: PR #$PR_NUMBER's only reference to this issue is negated (e.g. \"does not fix #$issue\") — GitHub's closing-reference parser is not negation-aware and closed this issue against the PR's stated intent. See #1057."
+    else
+      echo "  Issue #$issue is $ISSUE_STATE — leaving open (not closing on a negated reference)"
+    fi
+    continue   # do NOT close — next linked issue
   fi
 
   ISSUE_STATE=$(gh issue view "$issue" --json state --jq '.state' 2>&1)
