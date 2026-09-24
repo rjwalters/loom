@@ -102,7 +102,7 @@ box; `superset start --daemon --org noc0`):
 
 ## Subagent fan-out (concurrent tasks on one box)
 
-Proven pattern (first use 2026-07-23: #8649 + #8793 in parallel):
+Proven pattern (first use 2026-09-23: #8649 + #8793 in parallel):
 
 - one task = its own checkout + its own box dir `build/<issue>/`, never
   sharing a `target/` outside the shared one
