@@ -112,6 +112,7 @@ fn a_marked_issue_carries_complexity_on_the_record() {
         telemetry::SweepResult::Success,
         None,
         None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let path = registry.config().resolve_outcome_telemetry_path();
@@ -137,6 +138,7 @@ fn an_unmarked_issue_omits_complexity() {
         telemetry::SweepResult::Failure,
         None,
         None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let raw = raw_record(&registry, issue);
@@ -166,6 +168,7 @@ fn an_invalid_tier_marker_omits_complexity() {
         telemetry::SweepResult::Failure,
         None,
         None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let raw = raw_record(&registry, issue);
@@ -189,6 +192,7 @@ fn a_failing_fetch_omits_complexity_and_still_writes_the_record() {
         telemetry::SweepResult::Failure,
         Some("preflight-no-cli-start".to_string()),
         None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let raw = raw_record(&registry, issue);
@@ -214,6 +218,7 @@ fn skip_label_flip_makes_the_complexity_fetch_a_no_op() {
         telemetry::SweepResult::Success,
         None,
         None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let raw = raw_record(&registry, issue);
