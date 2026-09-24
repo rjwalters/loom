@@ -8,11 +8,13 @@ spans at real sweep dispatch and worker spawn, proven in-tree
 (`loom-daemon/tests/successful_sweep_waterfall.rs`,
 `loom-daemon/tests/lifecycle_traces.rs`). Routing one of those real traces
 through **this** deployment and querying it back out of ClickHouse is still
-open — see "Real trace and repair-waterfall verification" below — because it
-needs either a full sweep dispatch or an operator-held `ZAI_API_KEY` for the
-standalone canary tool, the same credential gate #8525 itself is waiting on.
-Until then the fixture below proves transport and schema, not Loom
-instrumentation.
+open — see "Real trace and repair-waterfall verification" below for the
+credential-free recipe (`loom-daemon/tests/clickstack_trial_canary.rs`,
+compiled and clippy-checked but not yet run against a live receiver) and the
+fully-authorized `telemetry-live --execute` alternative, which needs an
+operator-held `ZAI_API_KEY` — the same credential gate #8525 itself is
+waiting on. Until either runs against a live receiver, the fixture below
+proves transport and schema, not Loom instrumentation.
 
 ## Pinned distribution and host budget
 
@@ -153,13 +155,39 @@ whenever a real `loom-daemon` process runs with tracing enabled) drains that
 same durable queue to the configured OTLP endpoint continuously, and
 `loom-daemon telemetry-export --input <queue.jsonl> --endpoint <collector URL>
 --key-file <collector key file>` (`loom-daemon/src/cli/telemetry_export.rs`) does
-the equivalent one-shot POST for an already-assembled envelope batch. Wiring
-those three pieces (a `begin`-based root span, the checkpoint CLI sequence,
-and a real POST to this deployment) into one reproducible, credential-free
-recipe is exactly what remains for the "real Loom canary"/"repair trace"
-acceptance boxes — this pass verified every piece individually but did not
-assemble and run it against a live receiver (see the host-contention note in
-`evidence.md`), so no fabricated end-to-end command sequence is given here.
+the equivalent one-shot POST for an already-assembled envelope batch.
+
+`loom-daemon/tests/clickstack_trial_canary.rs` wires those three pieces (a
+`begin`-based root span, the same rejected-Judge → Doctor → successful-Judge
+checkpoint CLI sequence as the two tests above, and a real
+`telemetry-export` POST) into one reproducible, credential-free recipe —
+`#[ignore]`d so CI never runs it against a receiver, and compiled/linted like
+any other in-tree test (`cargo clippy --package loom-daemon --features otlp
+--all-targets`) so it cannot silently rot. Run it once this deployment (or
+the neutral collector in front of it) is up:
+
+```console
+LOOM_TRIAL_COLLECTOR_ENDPOINT=http://localhost:<collector port> \
+LOOM_TRIAL_COLLECTOR_KEY_FILE=/absolute/private/clickstack-ingest.key \
+LOOM_TRIAL_EVIDENCE_DIR=/absolute/private/new-evidence-dir \
+cargo test -p loom-daemon --features otlp --test clickstack_trial_canary \
+  -- --ignored --nocapture
+```
+
+It asserts locally (13 real spans, one trace ID, one Error-status Judge
+attempt and one Ok-status Judge attempt, real `telemetry-export` success
+against the receiver) and writes `envelopes.jsonl` (the exact records POSTed)
+and `expected-spans.json` (trace/span IDs, parentage, status and timestamps
+to check against `queries.sql`'s `ServiceName = 'loom-daemon'` query) into a
+new, private evidence directory. This pass built and clippy-linted the test
+against unmodified `main` (both clean) but did not run it against a live
+receiver — the shared host was under sustained contention for the whole
+investigation (see the host-contention note in `evidence.md`), and standing
+up this deployment under that load risks an unreliable validation, matching
+the prior pass's decision not to start it either. Running the command above
+against an actually-live deployment, and recording its evidence-directory
+output alongside this file, is what remains for the "real Loom canary"/"repair
+trace" acceptance boxes.
 
 **Fully authorized canary.** `loom-daemon telemetry-live --execute --output
 <new private dir> --endpoint <collector URL> --key-file <collector key file>
