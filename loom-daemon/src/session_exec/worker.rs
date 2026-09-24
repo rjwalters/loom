@@ -61,9 +61,14 @@ fn read_lease(
     received: &mut Instant,
 ) -> Option<bool> {
     let mut bytes = [0; 256];
+    let mut accepted = false;
+    let mut eof = false;
     loop {
+        if eof {
+            break;
+        }
         match input.read(&mut bytes) {
-            Ok(0) => return Some(false),
+            Ok(0) => eof = true,
             Ok(n) => pending.extend_from_slice(&bytes[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -83,10 +88,22 @@ fn read_lease(
             }
             *expiry = value;
             *received = Instant::now();
+            accepted = true;
         }
         if pending.len() > 32 {
             return Some(false);
         }
+    }
+    // An EOF sharing a pass with an accepted lease cannot veto the grant
+    // (#8793): the host's authorization is already in hand, so the recorded
+    // outcome stays the invocation's own (launch failure 127), not a
+    // cancellation the caller never requested. Only a pass that accepted
+    // nothing (pure EOF, explicit cancel, broken expiry) cancels.
+    if accepted {
+        return Some(true);
+    }
+    if eof {
+        return Some(false);
     }
     (*expiry != 0)
         .then(|| *expiry > now_ms() && received.elapsed() < Duration::from_millis(LEASE_MS))
@@ -169,5 +186,110 @@ pub(super) fn run(args: WorkerArgs) -> Result<i32> {
             })?;
         }
         std::thread::sleep(POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// Worker-stdin shape: return exactly what was written, then EOF (0). A
+    /// single `read_lease` call over it is one read pass whose data and
+    /// channel-close arrive together — the mixed burst #8793 races on.
+    struct Pipe(Vec<u8>);
+    impl Read for Pipe {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.len().min(out.len());
+            out[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+
+    /// A channel that blocks once (no data yet), then closes.
+    struct WouldBlockOnce {
+        blocked: bool,
+    }
+    impl Read for WouldBlockOnce {
+        fn read(&mut self, _out: &mut [u8]) -> std::io::Result<usize> {
+            if self.blocked {
+                self.blocked = false;
+                Err(std::io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
+    fn lease_line() -> Vec<u8> {
+        format!("{}\n", now_ms() + LEASE_MS).into_bytes()
+    }
+
+    #[test]
+    fn eof_in_the_same_pass_cannot_veto_an_accepted_lease() {
+        let mut expiry = 0;
+        let mut received = Instant::now();
+        assert_eq!(
+            read_lease(&mut Pipe(lease_line()), &mut Vec::new(), &mut expiry, &mut received),
+            Some(true)
+        );
+        // A later pass over the now-closed channel is a pure EOF and cancels.
+        assert_eq!(
+            read_lease(&mut Pipe(Vec::new()), &mut Vec::new(), &mut expiry, &mut received),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn eof_without_a_lease_cancels() {
+        let mut expiry = 0;
+        let mut received = Instant::now();
+        assert_eq!(
+            read_lease(&mut Pipe(Vec::new()), &mut Vec::new(), &mut expiry, &mut received),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn explicit_cancel_still_wins_after_a_grant() {
+        // The host cancels with the explicit line, never by closing stdin:
+        // it must cancel even when it follows a valid lease in one burst
+        // (the fifth-suite's fourth case).
+        let mut bytes = lease_line();
+        bytes.extend_from_slice(b"cancel\n");
+        let mut expiry = 0;
+        let mut received = Instant::now();
+        assert_eq!(
+            read_lease(&mut Pipe(bytes), &mut Vec::new(), &mut expiry, &mut received),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn expired_or_garbage_lease_lines_cancel() {
+        for line in [b"1\n".to_vec(), b"cancel\n".to_vec()] {
+            let mut expiry = 0;
+            let mut received = Instant::now();
+            assert_eq!(
+                read_lease(&mut Pipe(line), &mut Vec::new(), &mut expiry, &mut received),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn pass_with_no_data_and_no_grant_yet_keeps_waiting() {
+        // WouldBlock before the host's first beat: no decision (None) so the
+        // launch gate keeps polling until the lease window is spent.
+        let mut expiry = 0;
+        let mut received = Instant::now();
+        let mut input = WouldBlockOnce { blocked: true };
+        assert_eq!(read_lease(&mut input, &mut Vec::new(), &mut expiry, &mut received), None);
+        // The same channel closing later is a pure EOF: cancel.
+        assert_eq!(
+            read_lease(&mut input, &mut Vec::new(), &mut expiry, &mut received),
+            Some(false)
+        );
     }
 }
