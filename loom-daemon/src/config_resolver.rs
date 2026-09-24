@@ -107,7 +107,7 @@ pub fn private_defaults_path() -> Option<PathBuf> {
 /// error, mirroring the soft-fail contract already used by
 /// `work_finder::read_work_finder_config` and
 /// `main_health_gate::read_build_gate_config`.
-fn soft_read_json_object(path: &Path) -> Value {
+pub(crate) fn soft_read_json_object(path: &Path) -> Value {
     let text = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {

@@ -1597,6 +1597,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
             None
         };
 
+    // GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
+    // (`autonomous.ciTelemetry.enabled`); `None` and zero side effects when off.
+    let _ci_telemetry_handle = loom_daemon::ci_telemetry::spawn_task(sweep_workspace.clone());
+
     // Periodic merged-PR worktree reaper (Issue #4876). Before this loop the
     // ONLY trigger for "auto-removed when their PR merges" (CLAUDE.md's stated
     // contract) was `merge-pr.sh`'s synchronous `_remove_loom_worktree()` — so a

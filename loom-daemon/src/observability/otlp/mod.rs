@@ -172,6 +172,9 @@ impl Exporter for OtlpExporter {
                             Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(
                                 g,
                             )) => g.data_points.len() as u64,
+                            Some(
+                                opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(h),
+                            ) => h.data_points.len() as u64,
                             _ => 0,
                         })
                         .sum();
@@ -243,7 +246,8 @@ impl Exporter for OtlpExporter {
 fn signal_for(envelope: &TelemetryEnvelope) -> Signal {
     match envelope.record {
         crate::telemetry::TelemetryRecord::HostHealth(_)
-        | crate::telemetry::TelemetryRecord::TokensSnapshot(_) => Signal::Metrics,
+        | crate::telemetry::TelemetryRecord::TokensSnapshot(_)
+        | crate::telemetry::TelemetryRecord::CiDuration(_) => Signal::Metrics,
         crate::telemetry::TelemetryRecord::Span(_) => Signal::Traces,
         _ => Signal::Logs,
     }

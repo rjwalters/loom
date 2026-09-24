@@ -213,6 +213,10 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/exit-codes/",
     ".loom/sweep-checkpoint/",
     ".loom/sweep-run/",
+    // Durable per-host subsystem state (#8824: the CI telemetry dedup
+    // ledger, status and export cursor under `.loom/state/ci-telemetry/`).
+    // Committing it would hand one host's "already emitted" set to another.
+    ".loom/state/",
     // Concierge budget ledger (#7947): the per-day turn / per-tick relay
     // counters the operator-agent persona consults at the top of every turn.
     // Machine-local and disposable — deleting it costs at most one day's spent
