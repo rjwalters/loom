@@ -56,7 +56,7 @@ it on first use.
 
 ## Environment deltas already bit us (known-good floor for the box)
 
-These are not theoretical. On the first verification pass (2026-07-23), the
+These are not theoretical. On the first verification pass (2026-09-23), the
 box's bare Ubuntu 22.04 AMI produced three false failures that never appear on
 macOS or GitHub CI. The box image carries these fixes; a re-provisioned box
 must re-apply them before its first run is trusted:
@@ -71,6 +71,14 @@ must re-apply them before its first run is trusted:
    (same worktree kept, different bucket — the code is correct and
    conservative; the test's expectation is the CI-git one).
    `sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get update && sudo apt-get install -y git`.
+3. **`~/.local/share/loom-daemon/defaults` must exist** — no loom-daemon is
+   installed on the box (nothing to `cp -R` from), but the
+   `workspace_fleet` auto-init test resolves defaults from the user-share
+   path when the repo-relative one is not on the test process's CWD. Symptom:
+   `auto_init_missing_sweep_command_installs_sweep_md_on_a_bare_git_repo`
+   fails bin-green with "Defaults directory not found" while lib is 100%
+   (caught 2026-09-24 on the #8704 verification run).
+   `mkdir -p ~/.local/share/loom-daemon && ln -sfn <box-checkout>/defaults ~/.local/share/loom-daemon/defaults`
 
 If a daemon test fails on the box but passes on CI (or the reverse), check
 these two first before reading the code.
