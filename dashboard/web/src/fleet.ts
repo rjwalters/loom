@@ -24,6 +24,8 @@ import type {
   FleetSnapshot,
   HostEntry,
   HostHealthRecord,
+  MissingHostState,
+  ProviderPoolAggregate,
   TokenAccount,
 } from "./types";
 
@@ -59,7 +61,24 @@ export type HostStatus =
   | "stale"
   /** Known only from `activeSweeps`, or from a `hosts` entry with neither
    * `health` nor `tokens` yet — nothing to assess. */
-  | "unknown";
+  | "unknown"
+  /** Named by the backend's expected-host roster, holds an active ingest key,
+   * and has never reported (Issue #8792/#8804). A refinement of `unknown`:
+   * same absence of data, but the roster tells us the absence is *wrong*.
+   * Counts toward `FleetView.needsAttention` — it is an incident. */
+  | "missing"
+  /** Named by the expected-host roster but with no active ingest key, so it
+   * cannot report yet (Issue #8792/#8804). Also a refinement of `unknown`,
+   * but a planning to-do rather than an outage — deliberately NOT counted in
+   * `needsAttention`, and rendered distinctly from `missing`. */
+  | "unprovisioned";
+
+/** `true` for the two statuses that come from the expected-host roster rather
+ * than from telemetry (Issue #8804) — the hosts with no `health`/`tokens`
+ * entry to assess at all. */
+export function isRosterMissingStatus(status: HostStatus): boolean {
+  return status === "missing" || status === "unprovisioned";
+}
 
 export interface TokenSummary {
   /** The per-account rows, or `[]` for a public viewer, who is sent an
@@ -75,6 +94,28 @@ export interface TokenSummary {
   /** False when this summary came from the public aggregate, so the
    * per-account table has nothing to render and should say why. */
   hasAccountDetail: boolean;
+  /** The same pool, one slice per provider (`claude`, `codex`, …) in
+   * first-seen order — what lets the card show Claude's and Codex's
+   * availability independently instead of one blended figure. Empty when
+   * `total` is 0. A row/aggregate from a daemon or backend that predates
+   * per-provider pools collapses into a single `"claude"` slice. */
+  providers: ProviderSummary[];
+}
+
+/** One provider's slice of a `TokenSummary`. */
+export interface ProviderSummary {
+  provider: string;
+  total: number;
+  exhausted: number;
+  /** Highest known `usage_fraction` in this slice, or `undefined` when no
+   * account in it reports one (Codex accounts never do — never `0`). */
+  peakUsage: number | undefined;
+}
+
+/** The provider a token-account row belongs to — `"claude"` when the
+ * emitting daemon predates per-provider pools and sent none. */
+export function accountProvider(account: TokenAccount): string {
+  return account.provider && account.provider.length > 0 ? account.provider : "claude";
 }
 
 export interface HostView {
@@ -115,11 +156,27 @@ export interface FleetView {
    * reconcile against the cards below it.
    */
   reportingHosts: number;
+  /** Roster-expected hosts rendered with `status === "missing"` — enrolled,
+   * but never reported (Issue #8804). `0` on any snapshot without a
+   * `missingHosts` field, which is what keeps a pre-#8792 backend's overview
+   * identical to its pre-#8804 rendering. Counted separately from
+   * `reportingHosts` on purpose: these hosts are, by definition, not
+   * reporting — folding them into that number would overstate how much of the
+   * fleet is actually pushing telemetry. */
+  missingHosts: number;
+  /** Roster-expected hosts rendered with `status === "unprovisioned"` — named
+   * by the roster but never enrolled, so they *cannot* report (Issue #8804).
+   * Split from `missingHosts` because the two need different operator action;
+   * see `HostStatus`. */
+  unprovisionedHosts: number;
   totalSweeps: number;
-  /** Hosts in `stale` or `degraded` — the count the overview headline shows.
-   * `"unknown"` hosts are excluded here too (STATUS_ORDER treats them as
-   * their own bucket, not `stale`/`degraded`) — see the "excludes sweep-only
-   * hosts" test in `fleet.test.ts`. */
+  /** Hosts in `stale`, `degraded`, or `missing` — the count the overview
+   * headline shows. `"unknown"` hosts are excluded here (STATUS_ORDER treats
+   * them as their own bucket) — see the "excludes sweep-only hosts" test in
+   * `fleet.test.ts` — and so is `"unprovisioned"`, which is a provisioning
+   * to-do rather than something going wrong (#8804). `"missing"` *is*
+   * counted: a host the roster says is enrolled and that has never reported
+   * is the exact incident the roster exists to surface. */
   needsAttention: number;
   /** Fleet-wide role-tick totals (#5642) — see `aggregateRoleTicks`.
    * `undefined` when no reporting host has sent `health.roles` yet. Exists
@@ -192,23 +249,59 @@ export function summarizeTokens(entry: HostEntry): TokenSummary {
   if (accounts) {
     let peakUsage: number | undefined;
     let exhausted = 0;
+    const providers: ProviderSummary[] = [];
     for (const account of accounts) {
       if (account.exhausted) exhausted += 1;
       if (account.usage_fraction !== undefined) {
         peakUsage = peakUsage === undefined ? account.usage_fraction : Math.max(peakUsage, account.usage_fraction);
       }
+      const name = accountProvider(account);
+      let slice = providers.find((entry) => entry.provider === name);
+      if (!slice) {
+        slice = { provider: name, total: 0, exhausted: 0, peakUsage: undefined };
+        providers.push(slice);
+      }
+      slice.total += 1;
+      if (account.exhausted) slice.exhausted += 1;
+      if (account.usage_fraction !== undefined) {
+        slice.peakUsage =
+          slice.peakUsage === undefined ? account.usage_fraction : Math.max(slice.peakUsage, account.usage_fraction);
+      }
     }
-    return { accounts, total: accounts.length, exhausted, peakUsage, hasAccountDetail: true };
+    return { accounts, total: accounts.length, exhausted, peakUsage, hasAccountDetail: true, providers };
   }
 
+  const total = record?.account_count ?? 0;
+  const exhausted = record?.exhausted_count ?? 0;
+  const peakUsage = record?.max_usage_fraction ?? undefined;
   return {
     accounts: [],
-    total: record?.account_count ?? 0,
-    exhausted: record?.exhausted_count ?? 0,
-    peakUsage: record?.max_usage_fraction ?? undefined,
+    total,
+    exhausted,
+    peakUsage,
     // A host that has simply never sent a tokens.snapshot has no record at
     // all; a public viewer's record exists but withholds the rows.
     hasAccountDetail: record === undefined,
+    providers: record?.providers
+      ? record.providers.map(providerSummaryFromAggregate).filter((slice): slice is ProviderSummary => slice !== undefined)
+      : // A backend that predates the per-provider aggregate: the whole
+        // pool was the Claude pool.
+        total > 0
+        ? [{ provider: "claude", total, exhausted, peakUsage }]
+        : [],
+  };
+}
+
+/** One public `providers[]` slice → `ProviderSummary`; `undefined` for a
+ * slice too malformed to name (no `provider`), which is dropped rather than
+ * rendered under a fabricated name. */
+function providerSummaryFromAggregate(slice: ProviderPoolAggregate): ProviderSummary | undefined {
+  if (!slice.provider) return undefined;
+  return {
+    provider: slice.provider,
+    total: slice.account_count ?? 0,
+    exhausted: slice.exhausted_count ?? 0,
+    peakUsage: slice.max_usage_fraction ?? undefined,
   };
 }
 
@@ -226,9 +319,31 @@ const HIGH_EXHAUSTION_FRACTION = 0.75;
  * no reported accounts (`total === 0`) is not degraded by this check —
  * that host simply has not sent a `tokens.snapshot` yet. */
 export function isTokenPoolDegraded(tokens: TokenSummary): boolean {
-  if (tokens.total === 0) return false;
-  const available = tokens.total - tokens.exhausted;
-  return available <= LOW_AVAILABILITY_THRESHOLD || tokens.exhausted / tokens.total >= HIGH_EXHAUSTION_FRACTION;
+  return degradedProviders(tokens).length > 0;
+}
+
+/** The provider pools that are at or near exhaustion, by name. Each
+ * provider is judged on its own: a fleet whose Claude pool is spent cannot
+ * dispatch Claude sweeps no matter how many Codex accounts sit idle, so one
+ * blended availability figure would hide exactly the outage an operator
+ * needs to see. A summary with no provider slices (an empty pool) falls
+ * back to the pool-wide numbers, which is then also empty — not degraded. */
+export function degradedProviders(tokens: TokenSummary): string[] {
+  const slices = tokens.providers.length > 0
+    ? tokens.providers
+    : [{ provider: "claude", total: tokens.total, exhausted: tokens.exhausted, peakUsage: tokens.peakUsage }];
+  return slices.filter((slice) => isPoolSliceDegraded(slice.total, slice.exhausted)).map((slice) => slice.provider);
+}
+
+function isPoolSliceDegraded(total: number, exhausted: number): boolean {
+  if (total === 0) return false;
+  const available = total - exhausted;
+  if (available === 0) return true;
+  // "One account left to rotate onto" is only a warning sign for a pool
+  // that had more: a single-account provider (one Codex subscription) is
+  // its normal, healthy self at one available, not perpetually degraded.
+  if (total > 1 && available <= LOW_AVAILABILITY_THRESHOLD) return true;
+  return exhausted / total >= HIGH_EXHAUSTION_FRACTION;
 }
 
 /**
@@ -298,11 +413,21 @@ function latestReport(entry: HostEntry): string | undefined {
   return candidates.sort()[candidates.length - 1];
 }
 
+/**
+ * @param rosterState When set, this host is named by the backend's
+ *   expected-host roster and has no telemetry at all (Issue #8804) — so its
+ *   status becomes the roster's own verdict (`missing`/`unprovisioned`)
+ *   instead of the generic `unknown`. Only honored when the host has in fact
+ *   never reported; a host with any `health`/`tokens` entry keeps its
+ *   telemetry-derived status, so a card can never say "never reported"
+ *   alongside a live "last report 2m ago".
+ */
 export function buildHostView(
   hostId: string,
   entry: HostEntry,
   sweeps: ActiveSweep[],
   now: Date = new Date(),
+  rosterState?: MissingHostState,
 ): HostView {
   const tokens = summarizeTokens(entry);
   const lastReportAt = latestReport(entry);
@@ -312,7 +437,7 @@ export function buildHostView(
   let status: HostStatus;
   let degradedReason: string | undefined;
   if (lastReportAgeSec === undefined) {
-    status = "unknown";
+    status = rosterState ?? "unknown";
   } else if (lastReportAgeSec > STALE_AFTER_SEC) {
     status = "stale";
   } else if (distress !== undefined) {
@@ -322,7 +447,8 @@ export function buildHostView(
     degradedReason = distress;
   } else if (isTokenPoolDegraded(tokens)) {
     status = "degraded";
-    degradedReason = "token pool at or near exhaustion";
+    const spent = degradedProviders(tokens);
+    degradedReason = `${spent.join(", ")} token pool${spent.length === 1 ? "" : "s"} at or near exhaustion`;
   } else {
     status = "ok";
   }
@@ -331,8 +457,19 @@ export function buildHostView(
 }
 
 /** Sort: hosts needing attention first, then busiest, then by id so the list
- * does not reshuffle between polls when nothing changed. */
-const STATUS_ORDER: Record<HostStatus, number> = { stale: 0, degraded: 1, unknown: 2, ok: 3 };
+ * does not reshuffle between polls when nothing changed. `missing` leads —
+ * a host the roster says should be reporting and that never has is the
+ * loudest signal on the page — while `unprovisioned` sits just above the
+ * data-less `unknown` bucket, since it is a planning to-do (#8804). The
+ * relative order of the four pre-existing statuses is unchanged. */
+const STATUS_ORDER: Record<HostStatus, number> = {
+  missing: 0,
+  stale: 1,
+  degraded: 2,
+  unprovisioned: 3,
+  unknown: 4,
+  ok: 5,
+};
 
 export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()): FleetView {
   const sweepsByHost = new Map<string, ActiveSweep[]>();
@@ -342,11 +479,41 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
     else sweepsByHost.set(sweep.hostId, [sweep]);
   }
 
-  const hostIds = new Set<string>([...Object.keys(snapshot.hosts), ...sweepsByHost.keys()]);
+  // Issue #8804: the roster-expected hosts the backend reported as having no
+  // `health` entry (#8792). They join the host set exactly the way sweep-only
+  // hosts do — the whole point is that a host which never reported must be
+  // *visible*, not silently absent from a page built only from what did
+  // report.
+  //
+  // An entry is ignored when that host turns out to carry a `health` or
+  // `tokens` record after all. `diffExpectedRoster` already excludes
+  // health-bearing hosts, so this only fires on a hand-built/malformed
+  // snapshot or on the tokens-only edge the backend's own diff does not look
+  // at — and in both cases the telemetry is the better answer: overriding it
+  // would paint a host that demonstrably reported minutes ago as "never
+  // reported".
+  const rosterStates = new Map<string, MissingHostState>();
+  for (const missing of snapshot.missingHosts ?? []) {
+    const entry = snapshot.hosts[missing.hostId];
+    if (entry?.health || entry?.tokens) continue;
+    rosterStates.set(missing.hostId, missing.state);
+  }
+
+  const hostIds = new Set<string>([
+    ...Object.keys(snapshot.hosts),
+    ...sweepsByHost.keys(),
+    ...rosterStates.keys(),
+  ]);
 
   const hosts = [...hostIds]
     .map((hostId) =>
-      buildHostView(hostId, snapshot.hosts[hostId] ?? {}, sortSweeps(sweepsByHost.get(hostId) ?? []), now),
+      buildHostView(
+        hostId,
+        snapshot.hosts[hostId] ?? {},
+        sortSweeps(sweepsByHost.get(hostId) ?? []),
+        now,
+        rosterStates.get(hostId),
+      ),
     )
     .sort(
       (a, b) =>
@@ -361,9 +528,13 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
 
   return {
     hosts,
-    reportingHosts: hosts.filter((host) => host.status !== "unknown").length,
+    reportingHosts: hosts.filter((host) => host.status !== "unknown" && !isRosterMissingStatus(host.status)).length,
+    missingHosts: hosts.filter((host) => host.status === "missing").length,
+    unprovisionedHosts: hosts.filter((host) => host.status === "unprovisioned").length,
     totalSweeps: snapshot.activeSweeps.length,
-    needsAttention: hosts.filter((host) => host.status === "stale" || host.status === "degraded").length,
+    needsAttention: hosts.filter(
+      (host) => host.status === "stale" || host.status === "degraded" || host.status === "missing",
+    ).length,
     roleTicks: aggregateRoleTicks(hosts),
     activeCompute,
     leakedCompute: activeCompute.filter((job) => job.leaked === true).length,

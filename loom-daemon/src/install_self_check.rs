@@ -1471,6 +1471,12 @@ mod tests {
     }
 
     #[test]
+    // `LOOM_SHARED_TOKENS_DIR`-mutating tests here MUST use
+    // `#[serial(loom_shared_tokens_dir_env)]`, the key `role_runner::tests`
+    // already uses for the same var — never bare `#[serial]` (or, as here,
+    // no lock at all), or a `role_runner` test's own mutation of this
+    // process-global can race in unserialized (#8480 audit).
+    #[serial(loom_shared_tokens_dir_env)]
     fn test_ranking_skipped_when_no_pool() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
@@ -1480,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_shared_tokens_dir_env)]
     fn test_ranking_violation_when_missing_with_pool() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
@@ -1495,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_shared_tokens_dir_env)]
     fn test_ranking_ok_when_fresh() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
@@ -1510,12 +1516,14 @@ mod tests {
     /// drifted from live rate-limit state. We backdate the file's mtime and use
     /// a tight threshold.
     #[test]
-    #[serial]
+    #[serial(loom_shared_tokens_dir_env)]
     fn test_ranking_violation_when_stale() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
-        let dir = bootstrap_pool(tmp.path());
-        let ranking = dir.join(".ranking");
+        // `bootstrap_pool`'s return is joined inline rather than bound: this
+        // file is at its `scripts/check-file-size-budget.sh` ratchet ceiling,
+        // so the `#[serial(...)]` line added above had to be paid for here.
+        let ranking = bootstrap_pool(tmp.path()).join(".ranking");
         fs::write(&ranking, "agent-1\n").unwrap();
         // Backdate mtime by two hours.
         let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
@@ -1769,7 +1777,7 @@ mod tests {
     // ===================================================================
 
     #[test]
-    #[serial]
+    #[serial(loom_shared_tokens_dir_env)]
     fn test_run_pass_report_only_does_not_repair_or_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
@@ -1801,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_shared_tokens_dir_env)]
     fn test_run_pass_repair_mode_converges_runtimes() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");

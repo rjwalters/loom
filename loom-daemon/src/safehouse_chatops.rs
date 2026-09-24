@@ -368,13 +368,37 @@ pub fn inbound_command(event: &Value, persona: &str) -> Option<(String, String)>
         return None;
     }
     let to = nested("to").unwrap_or_default().trim();
-    if to.eq_ignore_ascii_case(persona) {
-        // Explicitly addressed: the whole body is the command, though a
-        // redundant leading mention is still tolerated.
-        return Some((from.to_owned(), strip_mention(body, persona).to_owned()));
+    // Addressed either explicitly (`to`) or by mention. In both cases a leading
+    // mention is stripped — redundant when `to` already named us, load-bearing
+    // when it did not.
+    addresses_persona(to, body, persona)
+        .then(|| (from.to_owned(), strip_mention(body, persona).to_owned()))
+}
+
+/// Would a message with this `to` and `body` be read as addressed to `persona`?
+///
+/// This is [`inbound_command`]'s own addressing rule, factored out so an
+/// *outbound* path can ask the question before it sends. The concierge's
+/// `say` uses it to refuse prose that the daemon would pick up as a command
+/// (`loom-daemon concierge say --body "@loom_daemon confirm …"`), which is the
+/// only reason it is public: a second, parallel "does this look addressed?"
+/// heuristic would be free to drift away from the parser it is supposed to
+/// predict, and a drift in that direction is a bypass.
+///
+/// Deliberately ignores `from`: [`inbound_command`] additionally drops the
+/// daemon's own messages, but an outbound caller asking "could this be read as
+/// a command?" wants the conservative answer, not the one that depends on who
+/// happens to be sending.
+#[must_use]
+pub fn addresses_persona(to: &str, body: &str, persona: &str) -> bool {
+    let body = body.trim();
+    if body.is_empty() {
+        return false;
     }
-    let stripped = strip_mention(body, persona);
-    (stripped.len() != body.len()).then(|| (from.to_owned(), stripped.to_owned()))
+    if to.trim().eq_ignore_ascii_case(persona) {
+        return true;
+    }
+    strip_mention(body, persona).len() != body.len()
 }
 
 /// Strip a leading `@persona`, `persona:` or `@persona:` mention. Returns the

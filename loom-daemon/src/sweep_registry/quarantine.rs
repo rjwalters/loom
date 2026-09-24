@@ -498,8 +498,8 @@ impl SweepRegistry {
         let log_path = info.log_path.clone();
         let token_name = info.token_name.clone();
 
-        let tail = match tail_lines(&log_path, EXHAUSTION_LOG_TAIL_LINES) {
-            Ok(lines) => lines.join("\n"),
+        let tail = match dispatch_scoped_tail(&log_path, EXHAUSTION_LOG_TAIL_LINES) {
+            Ok(tail) => tail,
             Err(_) => return false,
         };
         let Some(signature) = classify_account_exhaustion(&tail) else {
@@ -569,8 +569,7 @@ impl SweepRegistry {
             .entries
             .get(sweep_id)
             .map(|info| info.log_path.clone())
-            .and_then(|p| tail_lines(&p, EXHAUSTION_LOG_TAIL_LINES).ok())
-            .map(|lines| lines.join("\n"));
+            .and_then(|p| dispatch_scoped_tail(&p, EXHAUSTION_LOG_TAIL_LINES).ok());
 
         match classify_preflight_outcome(tail.as_deref()) {
             PreflightOutcome::Preflight(label) => {
@@ -2581,3 +2580,7 @@ mod provider_health_feedback;
 #[cfg(test)]
 #[path = "quarantine_empty_pool_tests.rs"]
 mod empty_pool_tests;
+
+#[cfg(test)]
+#[path = "quarantine_dispatch_scope_tests.rs"]
+mod dispatch_scope_tests;

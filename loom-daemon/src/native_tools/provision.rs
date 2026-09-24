@@ -1,23 +1,35 @@
 //! Launch-time bindings are binary-owned; no edit to global harness configuration.
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
-use std::{fs, io::Write, path::Path, path::PathBuf, process::Command};
+use std::{fs, io::Write, path::Path, process::Command};
 
-/// Where the launch-time bindings (and OpenCode's config dir, which carries
-/// its `auth.json` and plugin install) are written.
+mod state;
+
+pub use state::{outside_every_repository, private_directory};
+
+/// The exact pinned plugin manifest a guarded OpenCode launch provisions.
 ///
-/// Default: `<workspace>/.loom/native-tools`, machine-local ignored state.
-/// `LOOM_NATIVE_TOOLS_DIR` relocates it — set by the native-ephemeral
-/// containment profile (issue #8403) to a per-launch path inside the
-/// container's own ephemeral writable layer, so N concurrent native workers
-/// on one host cannot share one session store or one `auth.json`. The
-/// workspace default is deliberately NOT usable for that: it lives under the
-/// parity-mounted repo root, which every worker on the host shares.
-fn bindings_dir(root: &Path) -> PathBuf {
-    std::env::var_os("LOOM_NATIVE_TOOLS_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join(".loom/native-tools"))
+/// Exposed as a constant so the readiness measurement in
+/// [`crate::native_readiness`] keys its package cache on the same bytes
+/// production writes (#8581). A pin that drifts between the two would produce a
+/// cache entry that is valid for a package set no launch ever uses.
+pub const OPENCODE_PLUGIN_MANIFEST: &str =
+    r#"{"private":true,"dependencies":{"@opencode-ai/plugin":"1.18.31"}}"#;
+
+/// Write the guarded OpenCode bindings — the plugin source and the pinned
+/// package manifest — into `config_dir`.
+///
+/// Extracted from [`configure`] so a measurement can provision exactly what a
+/// launch provisions, rather than a hand-copied approximation of it.
+///
+/// # Errors
+///
+/// Propagates any filesystem failure, including a plugins directory that
+/// cannot be made 0700-private.
+pub fn write_opencode_bindings(config_dir: &Path) -> Result<()> {
+    state::private_directory(&config_dir.join("plugins"))?;
+    write_binding(&config_dir.join("plugins/loom.ts"), include_str!("opencode.mjs"))?;
+    write_binding(&config_dir.join("package.json"), OPENCODE_PLUGIN_MANIFEST)
 }
 
 /// Profile-declared, non-secret provider data merged into the per-launch config.
@@ -84,6 +96,25 @@ pub fn provider_only(command: &mut Command, provider: &ProviderConfig) -> Result
     Ok(())
 }
 
+/// Whether a **live guarded canary receipt** exists for Kimi Code CLI.
+///
+/// This is evidence tracking, not a setting — the same contract
+/// `opencode_version::Major::guard_verified` establishes for OpenCode
+/// majors (`.loom/docs/guardrail-parity-native.md` § "OpenCode major
+/// versions"). There is deliberately no configuration key and no
+/// environment override: the binding below is complete and unit-tested
+/// against shapes read out of the pinned CLI's own bundle, but a fixture
+/// test can only prove Loom *writes* that configuration, never that a real
+/// CLI *honours* it. Only a live canary — including the
+/// deliberately-broken-binding case, whose pass condition is "no file
+/// written and no unguarded tool used", not the exit code — distinguishes
+/// "failed closed" from "fell open".
+///
+/// Flipped to `true` by the change that also lands the dated receipt in
+/// `.loom/docs/guardrail-parity-native.md` and flips
+/// `defaults/runtimes/kimi.json`'s `worktreeIsolation`/`loomControl`.
+pub const KIMI_GUARD_VERIFIED: bool = false;
+
 pub fn configure(
     command: &mut Command,
     root: &Path,
@@ -91,10 +122,34 @@ pub fn configure(
     model: &str,
     provider: &ProviderConfig,
 ) -> Result<()> {
+    // Issue #8562: the Kimi binding below has no live canary receipt yet.
+    // Fail closed here, before ANY provisioning (`super::guard::ready`
+    // included) runs, rather than let a role-tagged launch reach a binding
+    // no live run has confirmed the CLI honours.
+    // `harness::Harness::Kimi::command` is the only caller that reaches this
+    // with `runtime == "kimi"`, and only when the launch is role-tagged
+    // (`guarded`) — an ordinary free-form trial never calls `configure` at
+    // all.
+    if runtime == "kimi" && !KIMI_GUARD_VERIFIED {
+        anyhow::bail!(
+            "Kimi's guarded loom_* tool binding has no live canary receipt yet, so a role-tagged \
+             launch is refused rather than run against an unverified boundary. Tracked in issue \
+             #8562; see .loom/docs/guardrail-parity-native.md for the receipt this waits on. \
+             Unguarded free-form trials (no --role tag and no /loom:<role> prompt) remain \
+             supported."
+        );
+    }
     super::guard::ready(root)?;
-    let binary = std::env::current_exe()?;
-    let directory = bindings_dir(root);
-    fs::create_dir_all(&directory).context("cannot provision native tool bindings")?;
+    // #8707: the path every guarded `loom_*` tool call in the native session
+    // executes. A raw `current_exe()` yields the unlinked inode's ` (deleted)`
+    // path once `auto_update` stages a replacement, so a session admitted
+    // mid-roll would launch with a tool binary that does not exist — the
+    // backstop admitted but unusable. `daemon_bin_resolve` returns the same
+    // path in the ordinary case and the on-disk replacement mid-roll.
+    let binary = crate::daemon_bin_resolve::resolve_daemon_bin().map_err(anyhow::Error::msg)?;
+    let state = state::prepare(root)?;
+    state.configure(command, runtime)?;
+    let directory = &state.directory;
     command
         .env("LOOM_WORKSPACE", root)
         .env("LOOM_NATIVE_TOOL_BIN", &binary);
@@ -108,14 +163,11 @@ pub fn configure(
         command
             .args(["--no-builtin-tools", "--no-extensions", "--extension"])
             .arg(extension);
+    } else if runtime == "kimi" {
+        write_kimi_bindings(command, root, directory, &binary)?;
     } else {
         let config_dir = directory.join("opencode");
-        fs::create_dir_all(config_dir.join("plugins"))?;
-        write_binding(&config_dir.join("plugins/loom.ts"), include_str!("opencode.mjs"))?;
-        write_binding(
-            &config_dir.join("package.json"),
-            r#"{"private":true,"dependencies":{"@opencode-ai/plugin":"1.18.31"}}"#,
-        )?;
+        write_opencode_bindings(&config_dir)?;
         command.env("OPENCODE_CONFIG_DIR", &config_dir);
         let mut config = inherited_config()?;
         let object = config
@@ -133,6 +185,39 @@ pub fn configure(
         command.env("OPENCODE_CONFIG_CONTENT", config.to_string());
         command.args(["--agent", "loom-worker"]);
     }
+    Ok(())
+}
+
+/// Relocate `KIMI_CODE_HOME` into this launch's private state directory and
+/// write the three generated bindings into it (#8562).
+///
+/// Relocating the whole home — rather than dropping a `.kimi-code/` overlay
+/// into the worktree — is what makes this per-launch and unreachable from
+/// repository content: `[tools]` and `[[hooks]]` have no project-level file
+/// at all, so an overlay could not carry the allowlist, and anything written
+/// inside the worktree is content the model may edit or commit.
+fn write_kimi_bindings(
+    command: &mut Command,
+    root: &Path,
+    directory: &Path,
+    binary: &Path,
+) -> Result<()> {
+    let home = directory.join("kimi");
+    state::private_directory(&home)?;
+    let cwd = std::env::current_dir().context("cannot resolve the launch working directory")?;
+    let server = super::kimi::server_name(directory);
+    let hook = super::kimi::hook_command(binary, root, &cwd)?;
+    write_binding(&home.join("config.toml"), &super::kimi::config_toml(&server, &hook))?;
+    write_binding(
+        &home.join("mcp.json"),
+        &super::kimi::mcp_json(&server, binary, root, &cwd, &super::guard::directory(root))?,
+    )?;
+    let agent = home.join("loom-worker.md");
+    write_binding(&agent, &super::kimi::agent_file(&server))?;
+    command
+        .env("KIMI_CODE_HOME", &home)
+        .arg("--agent-file")
+        .arg(agent);
     Ok(())
 }
 

@@ -13,8 +13,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 
 use super::account_registry::{
-    account_inventory, register_codex_account, set_codex_account_enabled, unregister_codex_account,
-    validate_name, AccountDescriptor, AccountProvider, CredentialKind, InventoryProvenance,
+    account_inventory, register_codex_account, reject_repository_local_root,
+    set_codex_account_enabled, unregister_codex_account, validate_name, AccountDescriptor,
+    AccountProvider, CredentialKind, InventoryProvenance,
 };
 use super::paths::codex_profile_root;
 use super::session_lifecycle::{container_name, is_session_managed};
@@ -824,31 +825,6 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         }
         Ok(profile)
     }
-}
-
-fn reject_repository_local_root(workspace: &Path, root: &Path) -> Result<()> {
-    let workspace = workspace
-        .canonicalize()
-        .context("workspace cannot be resolved")?;
-    let absolute_root = if root.is_absolute() {
-        root.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(root)
-    };
-    let canonical_intent = absolute_root
-        .ancestors()
-        .find(|candidate| candidate.exists())
-        .and_then(|existing| existing.canonicalize().ok().map(|base| (existing, base)))
-        .map(|(existing, base)| {
-            absolute_root
-                .strip_prefix(existing)
-                .map_or(base.clone(), |suffix| base.join(suffix))
-        })
-        .unwrap_or(absolute_root);
-    if canonical_intent.starts_with(&workspace) {
-        bail!("Codex profile root must not be repository-local");
-    }
-    Ok(())
 }
 
 fn ensure_private_dir(path: &Path) -> Result<()> {

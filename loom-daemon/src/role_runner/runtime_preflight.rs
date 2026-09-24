@@ -72,7 +72,133 @@ const CODEX_EXPLICIT_CREDENTIAL_ENV: [&str; 5] = [
 /// re-reads live state.
 const CODEX_CLEAR_ESTIMATE_CAP_SECS: i64 = 900;
 
-pub(super) fn check(
+/// Decide what — if anything — this role tick launches on, before it spawns.
+///
+/// **Preference-resolving since #8554.** [`static_check`] alone only ever
+/// answers "is the runtime static resolution picked exhausted?" — exactly the
+/// pre-#8554 behaviour, and all this function does when no preference list
+/// applies. When one DOES apply (`runtimes.rolePreference.<role>`, else
+/// `runtimes.preference`), the list decides the tap **for every tick, not
+/// only for a tick that would otherwise skip**: `resolve_runtime` walks it
+/// against live admission and credential availability, and the first tap that
+/// can serve the work is the one this tick launches on. That is what makes
+/// `rolePreference.judge` do the job it exists for — keeping Judge off the tap
+/// that built the change (a native sweep reviews in the same session that
+/// wrote it) — which a gate consulted only on exhaustion could not, since a
+/// healthy top-of-chain pool would silently ignore the list.
+///
+/// The gate is then the **fail-closed reporter**, never bypassed: the chosen
+/// tap is still put through [`static_check`], so no launch skips its own
+/// pre-spawn gate, and when the whole list is unavailable the tick reports the
+/// statically-admitted runtime's own skip — the same self-healing
+/// [`RoleTickOutcome::PoolExhausted`] shape #7607 keeps out of the stuck-role
+/// streak, not a new failure class.
+///
+/// - `Ok(admitted: None)`: proceed with the `admission` already passed in,
+///   unchanged.
+/// - `Ok(admitted: Some(runtime))`: the preference list chose `runtime` — the
+///   caller MUST launch with it instead of whatever `admission` named (it may
+///   be the same runtime; it is always one whose own gate just passed).
+/// - `Err(outcome)`: do not spawn. No list applies and the static gate
+///   skipped (byte-identical to before #8554), the chosen tap's own gate
+///   skipped, or every listed tap is unavailable (fail closed).
+///
+/// The returned [`DispatchAdmission`](crate::runtime_preference::DispatchAdmission)
+/// also carries the metered backstop slot the choice consumed (#8555). The
+/// caller **must** hand it to the child it spawns
+/// (`runtime_preference::handoff::attach`); dropping it instead releases the
+/// slot, which is exactly right for a tick that ends up not launching.
+pub(crate) fn check(
+    root: &Path,
+    logs: &Path,
+    role: &str,
+    admission: Option<&Result<ResolvedRuntime, RuntimeRejection>>,
+) -> Result<crate::runtime_preference::DispatchAdmission, RoleTickOutcome> {
+    // `None` ⇒ the caller opted out of admission (a test `spawn_bin`), and
+    // with it out of the pool gate AND out of preference resolution: there is
+    // no admitted runtime to pin, so there is nothing to re-point either.
+    if admission.is_none() {
+        return Ok(crate::runtime_preference::DispatchAdmission::none());
+    }
+    let gate = |admitted: Option<&Result<ResolvedRuntime, RuntimeRejection>>| match static_check(
+        root, logs, role, admitted,
+    ) {
+        Some(outcome) => Err(outcome),
+        None => Ok(()),
+    };
+    let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+    // Dispatch intent: a tick that settles on a governed backstop tap takes a
+    // metered slot (#8555). It is handed back to the caller, which attaches it
+    // to the child it spawns; every early return below — including the chosen
+    // tap's own pre-spawn gate refusing — drops the reservation, and with it
+    // releases the slot, so a tick that does not launch never holds one.
+    let context = crate::runtime_preference::DispatchContext {
+        complexity: None,
+        intent: crate::runtime_preference::Intent::Dispatch,
+    };
+    let Ok(crate::runtime_preference::Decision::Preference {
+        source,
+        resolution,
+        backstop,
+    }) = crate::runtime_preference::resolve_runtime_for(root, role, None, now, context)
+    else {
+        // No preference list applies to this role, an operator pin is in
+        // force (a pin disables fall-through by design), or the preference
+        // config itself is malformed: byte-identical to before #8554.
+        gate(admission)?;
+        return Ok(crate::runtime_preference::DispatchAdmission::none());
+    };
+    let marker = resolution.marker_line();
+    let exhausted = resolution.exhausted_diagnostic(role);
+    let Some(chosen) = resolution.chosen else {
+        // Every listed tap was skipped. Fail closed, reporting the
+        // statically-admitted runtime's own gate outcome when it has one, so
+        // a fleet-wide dry list still reads as the self-healing pool skip it
+        // is. `RuntimeRejected` is the remainder: a list that excludes the
+        // statically-admitted runtime entirely cannot borrow that runtime's
+        // verdict, and launching the unlisted runtime anyway would route
+        // around the operator's configuration.
+        gate(admission)?;
+        note_pre_spawn_skip(logs, role, &exhausted);
+        return Err(RoleTickOutcome::RuntimeRejected(RuntimeRejection {
+            role: role.to_string(),
+            runtime: String::new(),
+            source: crate::runtime_admission::RuntimeSource::Preference,
+            unmet_capabilities: vec![],
+            reason: exhausted,
+        }));
+    };
+    log::info!(
+        "role_runner: {role} runtime chosen by the ordered preference list — {marker} source={} \
+         (#8554)",
+        source.as_str()
+    );
+    // `Ok` by construction, so the chosen tap can be put through its OWN
+    // pre-spawn gate in the shape `static_check` reads before being handed
+    // back to the caller to launch.
+    let chosen_admission = Ok(chosen.admitted);
+    gate(Some(&chosen_admission))?;
+    // Past every gate: this tick IS launching, so the metered slot (if the
+    // chosen tap took one) travels back to the caller, which attaches it to
+    // the child it spawns. `?` above returns before this, dropping `backstop`
+    // and releasing the slot, which is exactly what a skipped tick should do.
+    Ok(crate::runtime_preference::DispatchAdmission {
+        admitted: chosen_admission.ok(),
+        backstop,
+    })
+}
+
+/// The pre-#8554 pool gate: is the admitted runtime's OWN credential source
+/// exhausted right now? Never consults the preference list — [`check`] is the
+/// preference-aware wrapper around it.
+///
+/// `pub(crate)` for the same single reason [`check`] was before #8554:
+/// `runtime_preference`'s tests pin **this** verdict against the
+/// side-effect-free availability mapping that shares its reads, which is the
+/// anti-drift guarantee behind "one mapping, two renderings". That comparison
+/// has to run against the gate itself, not the wrapper that consults the
+/// mapping. The role runner remains the only production caller of either.
+pub(crate) fn static_check(
     root: &Path,
     logs: &Path,
     role: &str,
@@ -136,8 +262,12 @@ fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> 
 }
 
 /// Snapshot of the codex account pool as the gate reads it.
+///
+/// `pub(crate)` since #8436: `runtime_preference::availability` answers the
+/// same question for a tap the ordered resolver is considering, and shares
+/// this read rather than forking the mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CodexPoolState {
+pub(crate) struct CodexPoolState {
     /// Enabled codex accounts in the workspace's inventory.
     pub enabled: usize,
     /// Enabled accounts not under an account-wide hold the selector could not
@@ -161,7 +291,7 @@ pub(super) struct CodexPoolState {
 /// per-account read this replaced re-parsed the file for every enabled
 /// account and left a window in which an account observed early and one
 /// observed late could disagree about the same tick's state.
-pub(super) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
+pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
     let mut state = CodexPoolState {
         enabled: 0,
         spawnable: 0,
@@ -249,19 +379,32 @@ fn adapter_account_provider(root: &Path, admitted: &ResolvedRuntime) -> String {
         .unwrap_or_else(|| "claude".to_string())
 }
 
+/// Whether the codex account pool is what actually decides this launch — the
+/// two stand-down conditions from the module doc, in one predicate: the
+/// adapter would select from a different account provider, or an explicit
+/// credential pin means it never reaches the selector at all.
+///
+/// Extracted for #8436 so `runtime_preference::availability` asks the exact
+/// same question (with the exact same environment reads and manifest lookup)
+/// that [`codex_gate`] asks, rather than re-deriving a second answer that
+/// could drift from this one.
+pub(crate) fn codex_pool_is_the_wall(root: &Path, admitted: &ResolvedRuntime) -> bool {
+    if adapter_account_provider(root, admitted) != "codex" {
+        return false;
+    }
+    let pinned = CODEX_EXPLICIT_CREDENTIAL_ENV
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+    !pinned
+}
+
 fn codex_gate(
     root: &Path,
     logs: &Path,
     role: &str,
     admitted: &ResolvedRuntime,
 ) -> Option<RoleTickOutcome> {
-    if adapter_account_provider(root, admitted) != "codex" {
-        return None;
-    }
-    let pinned = CODEX_EXPLICIT_CREDENTIAL_ENV
-        .iter()
-        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
-    if pinned {
+    if !codex_pool_is_the_wall(root, admitted) {
         return None;
     }
     let now = chrono::Utc::now();

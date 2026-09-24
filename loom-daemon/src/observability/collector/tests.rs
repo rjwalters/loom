@@ -67,7 +67,7 @@ fn dispatch_emits_sweep_started_and_tracks_state() {
         }
         other => panic!("expected SweepStarted, got {other:?}"),
     }
-    assert!(dispatches.contains_key(&42));
+    assert!(dispatches.contains_key(&("rjwalters/loom".to_owned(), 42)));
 }
 
 #[test]
@@ -144,7 +144,10 @@ fn clean_exit_zero_maps_to_success_and_clears_dispatch_state() {
         }
         other => panic!("expected SweepOutcome, got {other:?}"),
     }
-    assert!(!dispatches.contains_key(&7), "terminal event must clear tracked state");
+    assert!(
+        !dispatches.contains_key(&("rjwalters/loom".to_owned(), 7)),
+        "terminal event must clear tracked state"
+    );
 }
 
 #[test]
@@ -167,10 +170,11 @@ fn nonzero_exit_maps_to_failure() {
 fn crash_maps_to_failure_with_duration_from_tracked_dispatch() {
     let mut dispatches = HashMap::new();
     dispatches.insert(
-        5,
+        ("rjwalters/loom".to_owned(), 5),
         DispatchState {
             sweep_id: "sweep-issue-5-0".to_string(),
             started_at: Utc::now() - chrono::Duration::seconds(60),
+            trace_context: None,
         },
     );
     let records = map_event_to_records(
@@ -187,7 +191,7 @@ fn crash_maps_to_failure_with_duration_from_tracked_dispatch() {
         }
         other => panic!("expected SweepOutcome, got {other:?}"),
     }
-    assert!(!dispatches.contains_key(&5));
+    assert!(!dispatches.contains_key(&("rjwalters/loom".to_owned(), 5)));
 }
 
 #[test]
@@ -242,6 +246,60 @@ fn token_snapshot_reads_a_ranking_file() {
     assert!(!record.accounts[0].exhausted);
     assert_eq!(record.accounts[1].account, "agent-2");
     assert!(record.accounts[1].exhausted);
+    // Every `.ranking` row is the Claude pool — the tag the dashboard splits
+    // the token-pool section on.
+    assert!(record.accounts.iter().all(|a| a.provider == "claude"));
+}
+
+/// The registry-backed providers' sampler reports nothing when there is
+/// nothing registered — no rows fabricated from an empty profile root, and
+/// no error that would take the whole `tokens.snapshot` down with it.
+/// `LOOM_CODEX_PROFILE_ROOT` is process-global env, hence `#[serial]`.
+#[test]
+#[serial(codex_profile_root)]
+fn registry_provider_accounts_are_empty_when_nothing_is_registered() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profile_root = tempfile::tempdir().unwrap();
+    std::env::set_var(
+        crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV,
+        profile_root.path().to_str().unwrap(),
+    );
+    let accounts = sample_registry_provider_accounts(workspace.path());
+    std::env::remove_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV);
+    assert!(accounts.is_empty(), "got {accounts:?}");
+}
+
+/// The dispatch event already names the admitted runtime adapter;
+/// `sweep.started` must carry it through (and stay silent, not `"claude"`,
+/// when the event did not name one).
+#[test]
+fn sweep_started_carries_the_dispatch_runtime() {
+    let mut dispatches = HashMap::new();
+    let event = Event::SweepGlobalDispatch {
+        sweep_id: "sweep-issue-7-0".to_string(),
+        kind: SweepKind::Issue(7),
+        runtime: Some("codex".to_string()),
+        runtime_source: None,
+        repo: Some("/repos/loom".to_string()),
+    };
+    let records =
+        map_event_to_records(&event, 7, "rjwalters/loom", RepoVisibility::Public, &mut dispatches);
+    match &records[0] {
+        TelemetryRecord::SweepStarted(r) => assert_eq!(r.runtime.as_deref(), Some("codex")),
+        other => panic!("expected sweep.started, got {other:?}"),
+    }
+
+    let records = map_event_to_records(
+        &dispatch_event(8, "sweep-issue-8-0"),
+        8,
+        "rjwalters/loom",
+        RepoVisibility::Public,
+        &mut dispatches,
+    );
+    match &records[0] {
+        TelemetryRecord::SweepStarted(r) => assert_eq!(r.runtime, None),
+        other => panic!("expected sweep.started, got {other:?}"),
+    }
 }
 
 #[test]
@@ -575,9 +633,9 @@ async fn host_health_sample_surfaces_a_persistent_role_tick_failure() {
 
 /// A hermetic, `dispatch()`-able registry: `skip_label_flip = true` skips
 /// runtime admission / the workspace-commands guard / every `gh` call
-/// (mirrors `sweep_registry::test_support::fixture_registry`, which is
-/// not reachable from here — `sweep_registry::test_support` is a
-/// private, `#[cfg(test)]`-only module of a sibling module tree). The
+/// (a narrower local equivalent of `sweep_registry::test_support::
+/// fixture_registry`, whose fake spawn binary exits immediately rather than
+/// staying `Running` for the body of the tests below). The
 /// fake spawn binary sleeps briefly so the dispatched entry stays
 /// `Running` for the synchronous, single-threaded-until-`.await` body of
 /// the test below.
@@ -640,6 +698,51 @@ async fn collect_active_sweep_ids_reports_running_sweeps_across_every_provisione
     assert_eq!(ids, expected, "in-flight sweeps from BOTH provisioned registries are reported");
 }
 
+/// Issue #8720: the adoption evidence a lifecycle event is correlated against
+/// comes from **the registry that owns the emitting workspace root** — the
+/// same root the event stamps in its own `repo` field. Another repo's
+/// same-numbered issue is structurally not a candidate, and an unprovisioned
+/// root simply has no evidence (the caller keeps the synthesized fallback).
+#[tokio::test]
+async fn registry_evidence_is_scoped_to_the_workspace_root_that_emitted_the_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let a_root = dir.path().join("a");
+    let b_root = dir.path().join("b");
+    std::fs::create_dir_all(&a_root).unwrap();
+    std::fs::create_dir_all(&b_root).unwrap();
+    let pool = empty_pool();
+    pool.seed(a_root.clone(), Arc::new(std::sync::Mutex::new(dispatchable_registry(&a_root))));
+    pool.seed(b_root.clone(), Arc::new(std::sync::Mutex::new(dispatchable_registry(&b_root))));
+
+    // Only workspace `a` is running issue #7; `b` is idle.
+    let a_sweep_id = {
+        let registry = pool.get_or_provision(&a_root);
+        let mut registry = registry.lock().unwrap();
+        registry
+            .dispatch(&SweepKind::Issue(7), None, None, None, None)
+            .expect("dispatch into workspace a")
+            .sweep_id
+    };
+
+    assert_eq!(
+        registry_evidence(&pool, &a_root, 7).map(|identity| identity.sweep_id),
+        Some(a_sweep_id),
+        "the owning workspace's live sweep is the authoritative correlation id"
+    );
+    assert!(
+        registry_evidence(&pool, &b_root, 7).is_none(),
+        "another repo's same-numbered issue must never be borrowed as evidence"
+    );
+    assert!(
+        registry_evidence(&pool, &dir.path().join("never-provisioned"), 7).is_none(),
+        "a workspace with no provisioned registry has no evidence"
+    );
+    assert!(
+        registry_evidence(&pool, &a_root, 8).is_none(),
+        "an issue this host is not running has no evidence"
+    );
+}
+
 // ------------------------------------------------------------------
 // dispatch_halt_from_breaker (Issue #4975)
 // ------------------------------------------------------------------
@@ -670,13 +773,13 @@ fn breaker_snapshot(
 
 #[test]
 fn dispatch_halt_from_breaker_reports_not_halted_when_no_breaker_registered() {
-    assert_eq!(dispatch_halt_from_breaker(None), (false, None));
+    assert_eq!(dispatch_halt_from_breaker(None, None), (false, None));
 }
 
 #[test]
 fn dispatch_halt_from_breaker_reports_not_halted_when_closed() {
     let snapshot = breaker_snapshot(crate::host_breaker::BreakerPhase::Closed, None);
-    assert_eq!(dispatch_halt_from_breaker(Some(snapshot)), (false, None));
+    assert_eq!(dispatch_halt_from_breaker(Some(snapshot), None), (false, None));
 }
 
 #[test]
@@ -686,7 +789,7 @@ fn dispatch_halt_from_breaker_reports_halted_with_reason_when_open() {
         Some("load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)"),
     );
     assert_eq!(
-        dispatch_halt_from_breaker(Some(snapshot)),
+        dispatch_halt_from_breaker(Some(snapshot), None),
         (
             true,
             Some("load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)".to_string())
@@ -700,7 +803,7 @@ fn dispatch_halt_from_breaker_reports_halted_during_cooldown() {
         crate::host_breaker::BreakerPhase::CoolDown,
         Some("load-per-core 1.10 < 2.50; cooling down for 300s"),
     );
-    let (halted, reason) = dispatch_halt_from_breaker(Some(snapshot));
+    let (halted, reason) = dispatch_halt_from_breaker(Some(snapshot), None);
     assert!(halted, "CoolDown still suppresses dispatch, so it must count as halted");
     assert!(reason.is_some());
 }
@@ -885,6 +988,14 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         limit_calibration: None,
         // Same for #8407's codex reading: this fixture is not about that axis.
         codex_accounts: None,
+        // `HealthInputs` gained this field in #8477 after this fixture was
+        // added — `None` (not collected) is fine here since this fixture is
+        // not about the `transcript_ingest` axis.
+        transcript_ingest: None,
+        // `HealthInputs` gained this field in #8572 after this fixture was
+        // added — `None` (not collected) is fine here since this fixture is
+        // not about the `tmpfs_visibility` axis.
+        tmpfs_visibility: None,
     }
 }
 
@@ -997,6 +1108,7 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         managed_repos: vec![],
         roles: roles_health,
         protection: None,
+        admission_brake: None,
     };
     assert_eq!(
         host_health.roles.persistent.len(),

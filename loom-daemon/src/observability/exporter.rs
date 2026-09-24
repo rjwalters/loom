@@ -22,9 +22,12 @@ use crate::telemetry::TelemetryEnvelope;
 
 use super::HostIdStatus;
 
+pub use super::outcome::{BatchOutcome, SignalCounts};
+
 /// A sink [`super::sender`]'s drain loop can push batches of
 /// [`TelemetryEnvelope`]s to. Implementations must never panic on a
-/// transport failure — they return [`ExportError`] and the caller retries.
+/// transport failure. The outcome identifies acknowledged prefixes; retryable
+/// failures leave the remaining envelopes queued.
 pub trait Exporter: Send + Sync {
     /// Push `envelopes` to the sink. `envelopes` is never empty (the caller
     /// only invokes this with a non-empty batch).
@@ -32,6 +35,23 @@ pub trait Exporter: Send + Sync {
         &self,
         envelopes: &[TelemetryEnvelope],
     ) -> impl std::future::Future<Output = Result<(), ExportError>> + Send;
+
+    /// Detailed acknowledgment for transports with multiple signal requests.
+    /// The prefix is removed durably before retrying any remaining envelopes.
+    fn emit_batch_outcome(
+        &self,
+        envelopes: &[TelemetryEnvelope],
+    ) -> impl std::future::Future<Output = BatchOutcome> + Send {
+        async {
+            match self.emit_batch(envelopes).await {
+                Ok(()) => BatchOutcome::accepted(envelopes.len()),
+                Err(error) => BatchOutcome {
+                    error: Some(error),
+                    ..BatchOutcome::default()
+                },
+            }
+        }
+    }
 
     /// Best-effort flush of any transport-level buffering. The default no-op
     /// is correct for [`HttpsExporter`] (every [`Exporter::emit_batch`] call
@@ -219,7 +239,41 @@ impl HttpsExporter {
 }
 
 impl Exporter for HttpsExporter {
+    async fn emit_batch_outcome(&self, envelopes: &[TelemetryEnvelope]) -> BatchOutcome {
+        match self.emit_batch(envelopes).await {
+            Ok(()) => {
+                let dropped = envelopes
+                    .iter()
+                    .filter(|envelope| {
+                        matches!(envelope.record, crate::telemetry::TelemetryRecord::Span(_))
+                    })
+                    .count();
+                let mut outcome = BatchOutcome::accepted(envelopes.len());
+                outcome.exported -= dropped;
+                if dropped != 0 {
+                    outcome.signals.insert(
+                        "spans".into(),
+                        SignalCounts {
+                            dropped: dropped as u64,
+                            ..SignalCounts::default()
+                        },
+                    );
+                }
+                outcome
+            }
+            Err(error) => BatchOutcome {
+                error: Some(error),
+                ..BatchOutcome::default()
+            },
+        }
+    }
+
     async fn emit_batch(&self, envelopes: &[TelemetryEnvelope]) -> Result<(), ExportError> {
+        let native = super::tracing::native_envelopes(envelopes);
+        if native.is_empty() {
+            return Ok(());
+        }
+        let envelopes = native.as_slice();
         let response = self
             .client
             .post(&self.endpoint)
@@ -526,6 +580,7 @@ mod tests {
                 managed_repos: Vec::new(),
                 roles: crate::telemetry::RoleTickHealth::default(),
                 protection: None,
+                admission_brake: None,
             }),
         )
     }

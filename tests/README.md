@@ -21,9 +21,15 @@ Each suite is standalone and takes no arguments:
 
 ```bash
 bash tests/install/test-forge-detect.sh
-bash tests/hooks/test-guard-destructive.sh
+bash tests/hooks/test-guard-destructive-core.sh
 bash tests/hermit/test-stateless-ceremony.sh
 ```
+
+The `guard-destructive` coverage is **split across many focused suites**
+(`tests/hooks/test-guard-destructive-*.sh` — core, dispatcher, rm-scope,
+force-scope, write-confinement, masking, and so on); there is no single
+`test-guard-destructive.sh`. Run `ls tests/hooks/` for the current set, or use
+the one-pass runner below.
 
 To run everything CI runs, in one pass:
 

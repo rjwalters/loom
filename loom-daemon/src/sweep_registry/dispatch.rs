@@ -1,6 +1,9 @@
 //! The dispatch call path: `SweepRegistry::dispatch`, dispatch-backoff
 //! bookkeeping, and peer-claim publishing.
 
+#[path = "log_paths.rs"]
+mod log_paths;
+
 use super::*;
 
 mod child_env_markers;
@@ -994,15 +997,19 @@ impl SweepRegistry {
             peer_claims::ClaimKind::Advertise => ClaimAd::advertise(issue, repo, host, pid, ts),
             peer_claims::ClaimKind::Retract => ClaimAd::retract(issue, repo, host, pid, ts),
             // Unreachable: the early return above already handles `Completed`
-            // and the filing-lock lane. The cooldown lane (Issue #7477) has
-            // its own dedicated publisher, `publish_peer_cooldown_claim`,
-            // since it carries a `remaining_secs` payload this method's
-            // signature has no parameter for.
+            // and the filing-lock lane. The cooldown lane (Issue #7477) and
+            // the pool-hold lane (Issue #8001) each have their own dedicated
+            // publisher (`publish_peer_cooldown_claim` /
+            // `publish_peer_pool_hold_claim`), since each carries a payload
+            // this method's signature has no parameter for.
             peer_claims::ClaimKind::Completed
             | peer_claims::ClaimKind::FilingLock
             | peer_claims::ClaimKind::FilingUnlock
             | peer_claims::ClaimKind::NoopCooldownArmed
-            | peer_claims::ClaimKind::DispatchBackoffArmed => return,
+            | peer_claims::ClaimKind::DispatchBackoffArmed
+            | peer_claims::ClaimKind::PoolHoldArmed
+            | peer_claims::ClaimKind::PoolHoldCleared
+            | peer_claims::ClaimKind::Heartbeat => return,
         };
         if let Err(e) = tx.try_send(ad) {
             // Fail-open: the soft claim is an optimization, never a liveness
@@ -1507,40 +1514,6 @@ impl SweepRegistry {
     // Dispatch
     // ------------------------------------------------------------------------
 
-    /// Dispatch a sweep. See module docs.
-    ///
-    /// On idempotency hit returns the existing entry with `was_new = false`.
-    ///
-    /// `model` (issue #3477): when `Some` and non-empty, the spawned child
-    /// receives `--model <value>` appended to the `spawn-claude.sh` argv.
-    /// When `None`, no `--model` flag is emitted at all — the session/CLI
-    /// default is preserved end-to-end.
-    ///
-    /// `effort` (issue #3716): mirrors `model` exactly. When `Some` and
-    /// non-empty, the spawned child receives `--effort <level>` appended to
-    /// the argv (immediately after any `--model`). When `None` or empty, no
-    /// `--effort` flag is emitted at all — the session default reasoning
-    /// effort is preserved end-to-end.
-    ///
-    /// `depends_on` (issue #3729, stacked-PR v1): when `Some(N)`, the spawned
-    /// child receives `--depends-on <N>` embedded in the `-p` prompt string
-    /// (immediately after `--claim-owned`; issue #4121 — NOT a sibling argv
-    /// token, since `--depends-on` is not a real `claude` CLI flag),
-    /// instructing `/loom:sweep` to branch its worktree/PR off
-    /// `feature/issue-<N>`. When `None`, no `--depends-on` text is emitted —
-    /// byte-for-byte unchanged behavior. A single optional parent (not a
-    /// list) makes diamonds unrepresentable.
-    pub fn dispatch(
-        &mut self,
-        kind: &SweepKind,
-        idempotency_key: Option<String>,
-        model: Option<&str>,
-        effort: Option<&str>,
-        depends_on: Option<u32>,
-    ) -> Result<DispatchOutcome> {
-        self.dispatch_inner(kind, idempotency_key, model, effort, depends_on, None)
-    }
-
     /// Issue #4256: reaper-driven resume. When [`Self::reap_once`] observes a
     /// crashed sweep whose checkpoint shows real Builder-or-later progress
     /// (`RESUMABLE_CHECKPOINT_PHASES`) AND whose issue still has an open
@@ -1577,7 +1550,14 @@ impl SweepRegistry {
         issue: u32,
         resume_pr: u32,
     ) -> Result<DispatchOutcome> {
-        self.dispatch_inner(&SweepKind::Issue(issue), None, None, None, None, Some(resume_pr))
+        self.dispatch_inner(
+            &SweepKind::Issue(issue),
+            None,
+            DispatchModel::Resolved(None),
+            None,
+            None,
+            Some(resume_pr),
+        )
     }
 
     /// The **synchronous, self-contained** composition of the
@@ -1597,12 +1577,12 @@ impl SweepRegistry {
         &mut self,
         kind: &SweepKind,
         idempotency_key: Option<String>,
-        model: Option<&str>,
+        model: DispatchModel<'_>,
         effort: Option<&str>,
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
     ) -> Result<DispatchOutcome> {
-        match self.begin_issue_dispatch(
+        match self.begin_issue_dispatch_with_model(
             kind,
             idempotency_key,
             model,
@@ -1695,11 +1675,11 @@ impl SweepRegistry {
     /// and is pinned by
     /// `same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned`
     /// in this module's tests.
-    pub(crate) fn begin_issue_dispatch(
+    pub(crate) fn begin_issue_dispatch_with_model(
         &mut self,
         kind: &SweepKind,
         idempotency_key: Option<String>,
-        model: Option<&str>,
+        model: DispatchModel<'_>,
         effort: Option<&str>,
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
@@ -1708,15 +1688,18 @@ impl SweepRegistry {
         // before idempotency/account selection, claim lock, forge mutation,
         // log header, or child spawn. A full sweep remains one runtime and is
         // checked against Builder's (strongest lifecycle) requirements.
-        let runtime_admission = if self.config.skip_label_flip {
-            None // hermetic unit fixtures do not install runtime manifests
+        let admission = if self.config.skip_label_flip {
+            // hermetic unit fixtures do not install runtime manifests
+            crate::runtime_preference::DispatchAdmission::none()
         } else {
-            match crate::runtime_admission::resolve_and_admit(
+            // The admitted runtime and optional backstop reservation travel
+            // together through begin/poll/finish; early returns release the slot.
+            match crate::runtime_preference::resolve_for_dispatch(
                 &self.config.workspace_root,
                 "sweep-lifecycle",
                 None,
             ) {
-                Ok(admitted) => Some(admitted),
+                Ok(admission) => admission,
                 Err(rejection) => {
                     // Refused work still gets an event representation (#4494):
                     // `sweep.global.dispatch` describes admitted work only, so
@@ -1738,6 +1721,11 @@ impl SweepRegistry {
                 }
             }
         };
+
+        // Resolve implicit defaults/experiments only after the ONE runtime
+        // admission above; explicit pins remain explicit even after fallback.
+        let resolved_model = model.resolve(&self.config, kind, admission.admitted.as_ref());
+        let model = resolved_model.as_deref();
 
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
@@ -1766,7 +1754,7 @@ impl SweepRegistry {
                     idempotency_key,
                     model,
                     effort,
-                    runtime_admission,
+                    admission,
                 )));
             }
         };
@@ -2328,7 +2316,7 @@ impl SweepRegistry {
             model,
             effort,
             depends_on,
-            runtime_admission.as_ref(),
+            admission.admitted.as_ref(),
         ) {
             Ok(spawned) => spawned,
             Err(e) => {
@@ -2374,7 +2362,7 @@ impl SweepRegistry {
             model: model.filter(|m| !m.is_empty()).map(String::from),
             effort: effort.filter(|e| !e.is_empty()).map(String::from),
             depends_on,
-            runtime_admission,
+            admission,
         })))
     }
 
@@ -2409,7 +2397,7 @@ impl SweepRegistry {
             model,
             effort,
             depends_on,
-            runtime_admission,
+            mut admission,
         } = prepared;
 
         // Issue #4689: the child already died — synchronously observed,
@@ -2479,6 +2467,17 @@ impl SweepRegistry {
         }
 
         let pid = child.id();
+        // Issue #8555: hand this dispatch's metered backstop slot (the one
+        // `resolve_for_dispatch` took back in `begin_issue_dispatch`, carried
+        // here on `PreparedIssueDispatch`) to the child that will spend it, so
+        // the per-host ceiling counts live sweeps rather than resolutions.
+        // Placed AFTER the #4689 preflight-death branch above, which returns
+        // `Err` for a child that is already dead: attaching there would pin a
+        // slot to a pid that no longer exists — and returning there drops the
+        // reservation, which releases it. A no-op when no ceiling is configured
+        // or the walk never fell through to a governed tap — which is every
+        // pre-#8555 fleet.
+        crate::runtime_preference::handoff::attach(admission.backstop.take(), pid);
         // Issue #4980: capture the child's process group NOW, while it is alive
         // — `getpgid` cannot answer for a dead pid, so a group handle acquired
         // any later is unavailable in exactly the crash case that needs it most.
@@ -2561,7 +2560,7 @@ impl SweepRegistry {
             pgid,
             token_name: token_name.clone(),
             runtime,
-            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
+            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             log_path: log_path.clone(),
             idempotency_key,
             started_at: Utc::now(),
@@ -2609,8 +2608,8 @@ impl SweepRegistry {
         self.emit_event(Event::SweepGlobalDispatch {
             sweep_id: sweep_id.clone(),
             kind: kind.clone(),
-            runtime: runtime_admission.as_ref().map(|a| a.runtime.clone()),
-            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
+            runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
+            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             // Stamped by `emit_event` -> `set_repo_if_absent` below (#4201),
             // matching the pattern already used for SweepPhase/Blocker/Exited/
             // Crashed — leave it `None` at construction.
@@ -2657,7 +2656,7 @@ impl SweepRegistry {
         idempotency_key: Option<String>,
         model: Option<&str>,
         effort: Option<&str>,
-        runtime_admission: Option<crate::runtime_admission::ResolvedRuntime>,
+        mut admission: crate::runtime_preference::DispatchAdmission,
     ) -> Result<DispatchOutcome> {
         if prs.is_empty() {
             return Err(anyhow!(
@@ -2702,7 +2701,7 @@ impl SweepRegistry {
             model,
             effort,
             None, // depends_on: stacked-PR chaining is Issue-only (#3729).
-            runtime_admission.as_ref(),
+            admission.admitted.as_ref(),
         ) {
             Ok(spawned) => spawned,
             Err(e) => {
@@ -2732,6 +2731,11 @@ impl SweepRegistry {
         }
 
         let pid = child.id();
+        // #8555: hand this dispatch's metered backstop slot (the one
+        // `resolve_for_dispatch` took, carried down from `begin_issue_dispatch`)
+        // to the child that will spend it. Every `return` above drops it, which
+        // releases it — a refused PR-set dispatch holds nothing.
+        crate::runtime_preference::handoff::attach(admission.backstop.take(), pid);
         let pgid = spawned_leader_pgid(pid);
         self.children.insert(sweep_id.clone(), child);
 
@@ -2751,7 +2755,7 @@ impl SweepRegistry {
             pgid,
             token_name: token_name.clone(),
             runtime,
-            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
+            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             log_path: log_path.clone(),
             idempotency_key,
             started_at: Utc::now(),
@@ -2774,8 +2778,8 @@ impl SweepRegistry {
         self.emit_event(Event::SweepGlobalDispatch {
             sweep_id: sweep_id.clone(),
             kind: kind.clone(),
-            runtime: runtime_admission.as_ref().map(|a| a.runtime.clone()),
-            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
+            runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
+            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             repo: None,
         });
 
@@ -2791,26 +2795,6 @@ impl SweepRegistry {
     // ------------------------------------------------------------------------
     // Spawn
     // ------------------------------------------------------------------------
-
-    pub(crate) fn compute_log_path(&self, issue: u32) -> PathBuf {
-        self.config
-            .logs_dir()
-            .join(format!("sweep-issue-{issue}.log"))
-    }
-
-    /// The `PrSet` counterpart of [`Self::compute_log_path`] (Issue #5342):
-    /// one log file per PR set, named after every member so an operator can
-    /// tell two overlapping-but-distinct sets apart at a glance.
-    pub(crate) fn compute_prset_log_path(&self, prs: &[u32]) -> PathBuf {
-        let joined = prs
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("-");
-        self.config
-            .logs_dir()
-            .join(format!("sweep-prs-{joined}.log"))
-    }
 
     /// Enforce the configured dispatch stagger (Issue #3887): if less than
     /// `dispatch_stagger` has elapsed since the previous spawn, sleep the
@@ -3028,6 +3012,11 @@ impl SweepRegistry {
         // `PrSet` one. Both the rationale and the clearing (#7915) live in
         // [`child_env_markers::apply_issue_scoped_markers`].
         child_env_markers::apply_issue_scoped_markers(&mut cmd, kind);
+        crate::observability::tracing::prepare_child(
+            &mut cmd,
+            &self.config.workspace_root,
+            sweep_id,
+        );
         cmd
             // Always pin LOOM_WORKSPACE to the registry's configured root so
             // spawn-claude.sh resolves `.loom/tokens/` from the same place
@@ -3159,9 +3148,12 @@ impl SweepRegistry {
             }
         }
 
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn {} -p '{}'", spawn_bin.display(), prompt))?;
+        let child = crate::observability::lifecycle::spawn_child(
+            &mut cmd,
+            &self.config.workspace_root,
+            sweep_id,
+        )
+        .with_context(|| format!("failed to spawn {} -p '{}'", spawn_bin.display(), prompt))?;
         // Issue #3801: we RETAIN the `Child` handle (returned to `dispatch`,
         // which stores it in `self.children`) instead of dropping it. The
         // reaper `try_wait()`s it each tick so an exited child is reaped
@@ -3226,7 +3218,7 @@ impl SweepRegistry {
     /// # Why the `start` handshake runs on its own thread
     ///
     /// Every caller of [`Self::finish_issue_dispatch`] — `ipc.rs`'s
-    /// `dispatch_sweep_nonblocking` Phase 3, `dispatch_issue_releasing_poll_lock`'s
+    /// `dispatch_sweep_nonblocking` Phase 3, `dispatch_model_releasing_poll_lock`'s
     /// Phase 3, `dispatch_inner`, and the reaper's resume path — invokes it
     /// **holding the registry's `Arc<Mutex<SweepRegistry>>`**, and the first two
     /// do so directly on a tokio worker thread. So this method must be O(1) on
@@ -3482,9 +3474,10 @@ pub(crate) fn poll_and_classify_spawned_child(
 
     let immediate_preflight_death =
         if token_name == UNKNOWN_TOKEN_NAME && matches!(child.try_wait(), Ok(Some(_))) {
-            tail_lines(log_path, EXHAUSTION_LOG_TAIL_LINES)
+            // #8749: scope to the CURRENT dispatch's log region before
+            // bounding, like the reaper/quarantine sites (#8716).
+            dispatch_scoped_tail(log_path, EXHAUSTION_LOG_TAIL_LINES)
                 .ok()
-                .map(|lines| lines.join("\n"))
                 .and_then(|tail| classify_preflight_death(&tail))
         } else {
             None
@@ -3531,11 +3524,11 @@ pub(crate) fn poll_and_classify_spawned_child(
 /// behaviorally identical to `dispatch_inner`'s pre-existing shape for those
 /// tests, since no concurrent lock consumer ever competes with a synchronous
 /// `#[test]` anyway.
-pub(crate) fn dispatch_issue_releasing_poll_lock(
+pub(crate) fn dispatch_model_releasing_poll_lock(
     registry: &Arc<Mutex<SweepRegistry>>,
     kind: &SweepKind,
     idempotency_key: Option<String>,
-    model: Option<&str>,
+    model: DispatchModel<'_>,
     effort: Option<&str>,
     depends_on: Option<u32>,
 ) -> Result<DispatchOutcome> {
@@ -3545,7 +3538,7 @@ pub(crate) fn dispatch_issue_releasing_poll_lock(
         let mut sr = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sr.begin_issue_dispatch(kind, idempotency_key, model, effort, depends_on, None)
+        sr.begin_issue_dispatch_with_model(kind, idempotency_key, model, effort, depends_on, None)
     };
 
     let mut prepared = match begin_outcome? {

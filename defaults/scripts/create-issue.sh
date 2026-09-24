@@ -76,7 +76,14 @@
 #           against unrelated richly-worded issues, which scored 4-13%. The
 #           19% refusal reported in #8289 was a TRUE positive, so this band
 #           stays exactly where it was; the block message now explains the
-#           calibration instead of just asserting a percentage.
+#           calibration instead of just asserting a percentage. Between 18%
+#           and 25% a block additionally requires >= 18% TITLE overlap
+#           (#8591): two long issues in the same subsystem clear 18% on body
+#           text alone, which is how #8561 was refused as a duplicate of the
+#           unrelated #8505 at exactly the floor. An uncorroborated match
+#           drops to the WARN band instead of blocking; nothing is hidden.
+#           The rule and its constants live in the scan, see
+#           loom-daemon/src/cli/duplicate_scan.rs.
 #   13-17%  WARN (stderr, then FILE ANYWAY -- what --force used to be needed
 #           for). This is the documented ambiguous band: 13 is both the top of
 #           the unrelated range AND the score of a second CONFIRMED duplicate
@@ -137,7 +144,7 @@ source "$SCRIPT_DIR/lib/filing-lock.sh"
 usage() {
   # Line range = the whole leading comment block (keep in sync when the header
   # grows; `--help` silently truncating its own docs is its own small #8289).
-  sed -n '2,128p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,135p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 TITLE=""
@@ -359,11 +366,11 @@ if [[ -z "$(dup_check_skipped_reason)" ]]; then
       {
         echo "create-issue.sh: NOT FILED -- this looks like a duplicate of open work:"
         printf '%s' "$_dup_hits"
-        echo "Those scored at or above the ${_dup_block}% BLOCK threshold. That is not an"
-        echo "arbitrary bar: it is where this repo's confirmed duplicate pairs have scored"
-        echo "(#3550/#3551 = 19%), while unrelated issues score 4-13% (check-duplicate.sh)."
+        echo "Those scored at or above the ${_dup_block}% BLOCK threshold -- and, below 25%,"
+        echo "their TITLES agree too (#8591). #3550/#3551, this repo's confirmed duplicate"
+        echo "pair, scores 19% on bodies and 26% on titles; unrelated pairs miss one or both."
         if [[ -n "$_dup_near" ]]; then
-          echo "Also seen, in the low-confidence ${_dup_warn}-$((_dup_block - 1))% band (NOT a reason for this block):"
+          echo "Also seen, as low-confidence context (NOT a reason for this block):"
           printf '%s' "$_dup_near"
         fi
         echo "Nothing was created. Either:"
@@ -377,11 +384,11 @@ if [[ -z "$(dup_check_skipped_reason)" ]]; then
     # WARN band: announce and file. Deliberately NOT a block -- see the header.
     if [[ -n "$_dup_near" ]]; then
       {
-        echo "create-issue.sh: WARNING -- similar open work, below the ${_dup_block}% block threshold (FILING ANYWAY):"
+        echo "create-issue.sh: WARNING -- similar open work that did not meet the block bar (FILING ANYWAY):"
         printf '%s' "$_dup_near"
-        echo "  Scores in the ${_dup_warn}-$((_dup_block - 1))% band cannot decide anything on their own (unrelated"
-        echo "  issues reach 13% here, and one confirmed duplicate pair scored only 13%), so"
-        echo "  this filing proceeds. Read the item(s) above; close this as a duplicate if it is one."
+        echo "  Either it scored in the undecidable ${_dup_warn}-$((_dup_block - 1))% band (unrelated issues reach 13%,"
+        echo "  as did one confirmed duplicate pair), or it cleared ${_dup_block}% on body text alone"
+        echo "  without title agreement (#8591) -- each row says which. Close it as a dup if it is one."
       } >&2
     fi
 

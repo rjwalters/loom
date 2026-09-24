@@ -72,14 +72,23 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # literal exists to catch — so it is asserted DIFFERENTLY, not less: named in
 # the runner's own literal, and absent from the plan (proving the exclusion is
 # real rather than a half-applied move).
+#
+# #8087 moved test-loom-daemon-start.sh and test-loom-daemon-update.sh across
+# the same line, for the same reason: cli/loom-daemon-start.sh is now a thin
+# stub over `loom-daemon daemon-start` (the update suite reaches it through
+# lib/daemon-update-fixtures.sh, which copies the script into every fixture).
+# Both remain exactly as host-mutating as they were — they still `kill`, `rm
+# -f` pid files and `launchctl bootout` / `systemctl --user disable` whatever
+# they resolve — so both stay named in the runner's guard and simply move to
+# the unwired half of this assertion.
 GUARDED_WIRED_SUITES=(
-    test-loom-daemon-start.sh
     test-loom-daemon-stop.sh
-    test-loom-daemon-update.sh
     test-loom-daemon-quiesce.sh
 )
 GUARDED_UNWIRED_SUITES=(
     test-loom-daemon-watchdog.sh
+    test-loom-daemon-start.sh
+    test-loom-daemon-update.sh
 )
 
 plan_line() { # <plan output> <suite>

@@ -1,20 +1,8 @@
 //! Regression tests for the native worker seam. No provider calls or shell fixtures.
-use std::{path::PathBuf, process::Command, sync::OnceLock};
-fn fixture() -> &'static PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let bin = dir.join("harness");
-        assert!(Command::new("rustc")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/worker_cli.rs"))
-            .arg("-o")
-            .arg(&bin)
-            .status()
-            .unwrap()
-            .success());
-        bin
-    })
-}
+use std::process::Command;
+#[path = "support/worker_cli.rs"]
+mod worker_cli;
+use worker_cli::fixture;
 fn worker(root: &std::path::Path, runtime: &str) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
     c.args(["spawn-worker", "--"])
@@ -25,10 +13,14 @@ fn worker(root: &std::path::Path, runtime: &str) -> Command {
         .env_remove("LOOM_MODEL")
         .env_remove("LOOM_MODEL_PROFILE")
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        // Never let a test reach the operator's real `~/.loom/api-keys` (#8401).
+        .env("LOOM_SHARED_API_KEYS_DIR", "")
         .env(
             "LOOM_NATIVE_GUARD_DIR",
             concat!(env!("CARGO_MANIFEST_DIR"), "/../defaults/hooks"),
         )
+        .env("LOOM_NATIVE_TOOLS_DIR", fixture().parent().unwrap().join("state"))
+        .env_remove("LOOM_NATIVE_AUTH_FILE")
         .env("LOOM_PI_BIN", fixture())
         .env("LOOM_OPENCODE_BIN", fixture())
         // The OpenCode adapter probes `--version` before exec (#8438). Every test
@@ -52,6 +44,15 @@ fn argv(stdout: &str) -> Vec<String> {
 }
 fn quoted(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| format!("{a:?}")).collect()
+}
+/// The exact bytes the fixture read off its own stdin (issue #8506): whatever
+/// follows the `STDIN_BEGIN\n` marker line, verbatim, not `Debug`-escaped —
+/// so a test can assert byte-for-byte prompt delivery.
+fn stdin_of(stdout: &str) -> &str {
+    stdout
+        .split_once("STDIN_BEGIN\n")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default()
 }
 #[test]
 fn pi_translates_headless_flags_and_keeps_prompt_literal() {
@@ -84,6 +85,15 @@ fn pi_translates_headless_flags_and_keeps_prompt_literal() {
     assert!(text.contains("$(touch SHOULD_NOT_EXIST)"));
     assert!(!d.path().join("SHOULD_NOT_EXIST").exists());
     assert!(!text.contains("arg=\"--use-wrapper\""));
+    // #8506: the prompt never rides on argv at all — it arrives byte-for-byte
+    // on stdin instead, so an embedded `$(...)`/backtick sequence can never
+    // reach a shell.
+    assert!(!text.contains("arg=\"--\""), "{text}");
+    assert_eq!(
+        stdin_of(&text),
+        "- $(touch SHOULD_NOT_EXIST) `echo literal`\nsecond line",
+        "{text}"
+    );
 }
 #[test]
 fn opencode_selects_coding_plan_and_preserves_nonzero_and_log_streams() {
@@ -348,7 +358,9 @@ fn opencode_argv_is_exact_per_major_version() {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8(out.stdout).unwrap()
     };
-    // 1.x: byte-for-byte the argv this adapter produced before the probe existed.
+    // 1.x: byte-for-byte the argv this adapter produced before the probe existed
+    // (minus the trailing positional message, issue #8506: the prompt now
+    // arrives on stdin, never as an argv element).
     for version in [OPENCODE_V1, "v1.18.31", "opencode 1.18.31"] {
         let text = launch(version, &[]);
         assert_eq!(
@@ -364,11 +376,11 @@ fn opencode_argv_is_exact_per_major_version() {
                 "--variant",
                 "max",
                 "--auto",
-                "--",
-                "hello",
             ]),
             "{text}"
         );
+        assert!(!text.contains("arg=\"--\""), "{text}");
+        assert_eq!(stdin_of(&text), "hello", "{text}");
     }
     // 2.x: no --dir, no --variant; a private server; effort rides on the model.
     let text = launch(OPENCODE_V2, &[]);
@@ -382,11 +394,10 @@ fn opencode_argv_is_exact_per_major_version() {
             "--model",
             "zai-coding-plan/glm-5.3-flash#max",
             "--auto",
-            "--",
-            "hello",
         ]),
         "{text}"
     );
+    assert_eq!(stdin_of(&text), "hello", "{text}");
     // Without --dir, the working directory has to arrive by inheritance.
     assert!(text.contains(&format!("cwd={cwd:?}")), "{text}");
     assert!(text.contains(&format!("child_env PWD={cwd}")), "{text}");
@@ -402,11 +413,10 @@ fn opencode_argv_is_exact_per_major_version() {
             "--model",
             "example/model-v2",
             "--auto",
-            "--",
-            "hello"
         ]),
         "{text}"
     );
+    assert_eq!(stdin_of(&text), "hello", "{text}");
     // A '#' that would make the 2.x model#effort form ambiguous is refused.
     let out = worker(d.path(), "opencode")
         .env("FIXTURE_VERSION", OPENCODE_V2)
@@ -567,11 +577,17 @@ fn unrecognized_opencode_version_is_refused_before_launch_and_missing_binary_is_
 }
 
 #[test]
-fn native_launches_null_stdin_even_when_the_parent_has_an_open_pipe() {
-    // On OpenCode 2.x an open non-TTY stdin stalls `run` forever, silently. The
-    // parent MUST hand the worker a live pipe here: `Command::output()` does not
-    // inherit stdin, so without it this would pass even if the adapter stopped
-    // nulling stdin. The legacy runtime below is the control that proves it.
+fn native_launches_never_see_the_parents_pipe_and_get_the_prompt_on_their_own_stdin() {
+    // On OpenCode 2.x an open non-TTY stdin stalls `run` forever, silently, so
+    // #8506's fix — the prompt now travels on stdin instead of argv — must
+    // NEVER hand the harness the parent's own (potentially never-closed) pipe;
+    // it must get Loom's own already-fully-written, EOF-terminated prompt
+    // file instead. The parent MUST hand the worker a live pipe here:
+    // `Command::output()` does not inherit stdin, so without it this would
+    // pass even if the adapter stopped isolating stdin. The legacy runtime
+    // below is the control that proves the parent's pipe was really live —
+    // and its untouched `spawn-claude.sh`-style path still inherits it
+    // (issue #8506 AC: "Claude-runtime spawn-claude.sh path is untouched").
     use std::process::Stdio;
     let d = tempfile::tempdir().unwrap();
     legacy(d.path(), "claude");
@@ -597,10 +613,76 @@ fn native_launches_null_stdin_even_when_the_parent_has_an_open_pipe() {
         ("opencode", OPENCODE_V2),
     ] {
         let text = run(runtime, version);
-        assert!(text.contains("stdin_is_dev_null=true"), "{runtime} {version}: {text}");
+        // Never the parent's pipe, never `/dev/null`: a real backing file
+        // carrying the exact prompt bytes (issue #8506).
+        assert!(text.contains("stdin_kind=regular"), "{runtime} {version}: {text}");
+        assert_eq!(stdin_of(&text), "hello", "{runtime} {version}: {text}");
     }
     let text = run("claude", OPENCODE_V1);
-    assert!(text.contains("stdin_is_dev_null=false"), "control must see the pipe: {text}");
+    assert!(text.contains("stdin_kind=pipe"), "control must see the pipe: {text}");
+}
+
+/// Issue #8506's headline acceptance criterion: a synthetic 300 KiB `CLAUDE.md`
+/// pushes the expanded role prompt well past Linux's `MAX_ARG_STRLEN` (128
+/// KiB) — the exact shape that used to die with `E2BIG` on every judge/curator
+/// tick — and the launch must still succeed, with the harness receiving the
+/// full expansion byte-for-byte on stdin, on both native harnesses.
+#[test]
+fn an_oversized_repo_claude_md_still_launches_and_delivers_the_prompt_byte_for_byte() {
+    let d = tempfile::tempdir().unwrap();
+    let roles = d.path().join(".loom/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::write(roles.join("curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+    std::fs::write(roles.join("curator.md"), "Role task: $ARGUMENTS").unwrap();
+    // Comfortably over the old 128 KiB argv ceiling; nowhere near the new
+    // stdin-based sanity ceiling.
+    let big_claude_md = "x".repeat(300 * 1024);
+    std::fs::write(d.path().join("CLAUDE.md"), &big_claude_md).unwrap();
+    for runtime in ["pi", "opencode"] {
+        let out = worker(d.path(), runtime)
+            .args(["-p", "/loom:curator 8506"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{runtime}: {}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8(out.stdout).unwrap();
+        let received = stdin_of(&text);
+        assert!(
+            received.len() > 300 * 1024,
+            "{runtime}: prompt was truncated ({} bytes)",
+            received.len()
+        );
+        assert!(received.contains("Role task: 8506"), "{runtime}: {received}");
+        assert!(
+            received.contains(&big_claude_md),
+            "{runtime}: CLAUDE.md content was not delivered intact"
+        );
+    }
+}
+
+/// #8506 fix step 2 (the pre-exec size check): an expansion so large it
+/// crosses the belt-and-suspenders sanity ceiling must fail BEFORE `exec`
+/// with a classified, actionable error — never a bare OS error — naming the
+/// total size, the limit, and the offending source file, while keeping the
+/// same exit code (`126`) a genuine `exec`-time launch failure would report.
+#[test]
+fn a_pathological_prompt_fails_closed_with_a_classified_size_error() {
+    let d = tempfile::tempdir().unwrap();
+    let roles = d.path().join(".loom/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::write(roles.join("curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+    std::fs::write(roles.join("curator.md"), "Role task: $ARGUMENTS").unwrap();
+    // Comfortably over `prompt::MAX_PROMPT_BYTES` (8 MiB).
+    std::fs::write(d.path().join("CLAUDE.md"), "x".repeat(9 * 1024 * 1024)).unwrap();
+    let out = worker(d.path(), "pi")
+        .args(["-p", "/loom:curator 8506"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(126), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty(), "the harness must never have started");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("bytes"), "{stderr}");
+    assert!(stderr.contains("limit"), "{stderr}");
+    assert!(stderr.contains("CLAUDE.md"), "{stderr}");
 }
 
 #[test]

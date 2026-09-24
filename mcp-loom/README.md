@@ -242,14 +242,20 @@ mcp-loom/
 │   ├── types.ts           # Shared TypeScript types
 │   ├── shared/
 │   │   ├── config.ts      # Workspace/state file utilities
+│   │   ├── config.test.ts
+│   │   ├── config-resolver.ts       # Tiered config merge (TS port of config_resolver.rs)
+│   │   ├── config-resolver.test.ts
 │   │   ├── ipc.ts         # File-based IPC with retry
 │   │   ├── daemon.ts      # Socket-based daemon communication
 │   │   └── formatting.ts  # Log/output formatting
 │   └── tools/
 │       ├── logs.ts        # Log tools (empty - use bash)
 │       ├── ui.ts          # UI/Engine tools
+│       ├── ui.test.ts
 │       ├── terminals.ts   # Terminal management tools
-│       └── sweeps.ts      # Sweep-dispatch tools (loom-daemon IPC)
+│       ├── terminals.test.ts
+│       ├── sweeps.ts      # Sweep-dispatch tools (loom-daemon IPC)
+│       └── sweeps.test.ts
 ├── package.json
 └── tsconfig.json
 ```

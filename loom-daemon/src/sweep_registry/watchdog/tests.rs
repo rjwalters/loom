@@ -61,7 +61,7 @@ fn midbuild_recovery_is_not_blocked_by_an_armed_backoff() {
     let ws = tmp.path();
     let mut reg = backoff_registry(ws, 60, 900);
 
-    make_dirty_git_worktree(ws, 6055);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 6055);
     insert_terminal_issue(&mut reg, "sweep-issue-6055-dead", 6055, None);
     // An earlier fast failure armed a live window for this very issue.
     reg.record_dispatch_failure(6055);
@@ -96,7 +96,7 @@ fn midbuild_watchdog_does_not_recover_an_issue_with_a_live_claim() {
     let ws = dir.path();
     let (mut reg, _record_log) = fixture_registry(ws);
 
-    make_dirty_git_worktree(ws, 4562);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 4562);
     insert_terminal_issue(&mut reg, "sweep-issue-4562-dead", 4562, None);
     // The live sweep's claim survives in the machine-level journal even
     // though this daemon believes sweep-…-dead is terminal — the exact
@@ -138,7 +138,7 @@ fn midbuild_watchdog_recovers_once_the_live_claim_is_gone() {
     let ws = dir.path();
     let (mut reg, _record_log) = fixture_registry(ws);
 
-    make_dirty_git_worktree(ws, 4566);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 4566);
     insert_terminal_issue(&mut reg, "sweep-issue-4566-dead", 4566, None);
     {
         let sweep = FakeSweep::spawn(4566);
@@ -189,7 +189,7 @@ fn midbuild_live_claim_probe_runs_before_the_lock_takeover() {
     let ws = dir.path();
     let (mut reg, _record_log) = fixture_registry(ws);
 
-    make_dirty_git_worktree(ws, 4602);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 4602);
     insert_terminal_issue(&mut reg, "sweep-issue-4602-dead", 4602, None);
     let lock = write_lock_owner(&reg, 4602, "sweep-issue-4602-dead", DEAD_OWNER_PID);
     let owner_path = lock.join("owner.json");
@@ -403,7 +403,9 @@ fn worktree_dirty_and_clean_roundtrip() {
     // No worktree ⇒ not dirty.
     assert!(!reg.worktree_dirty(70));
 
-    // A worktree with an untracked file ⇒ dirty.
+    // A worktree with an untracked file ⇒ dirty. The plain fixture, not the
+    // quiet-pinning pairing (#8487): this test exercises only `worktree_dirty`
+    // / `clean_worktree`, neither of which consults the #8413 activity gate.
     make_dirty_git_worktree(ws, 70);
     assert!(reg.worktree_dirty(70));
 
@@ -424,7 +426,7 @@ fn midbuild_recovers_dead_sweep_with_dirty_worktree_once() {
 
     // A sweep that got into the Builder phase (dirty worktree) then its
     // child died (terminal Exited) without producing a PR.
-    make_dirty_git_worktree(ws, 6001);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 6001);
     insert_terminal_issue(&mut reg, "sweep-issue-6001-dead", 6001, None);
 
     // Detected + recovered: worktree cleaned, issue re-dispatched once.
@@ -452,7 +454,7 @@ fn midbuild_recovery_is_bounded_to_one() {
 
     // The issue already used its single recovery; the re-dispatched sweep
     // ALSO died mid-build (dirty worktree, terminal, no PR).
-    make_dirty_git_worktree(ws, 6002);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 6002);
     insert_terminal_issue(&mut reg, "sweep-issue-6002-dead2", 6002, None);
     reg.midbuild_retried.insert(6002);
 
@@ -471,7 +473,7 @@ fn midbuild_skips_sweep_that_produced_a_pr() {
 
     // A dead sweep with a dirty worktree BUT a PR recorded is a completed
     // Builder, not a mid-build death — never recovered.
-    make_dirty_git_worktree(ws, 6004);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 6004);
     insert_terminal_issue(&mut reg, "sweep-issue-6004-pr", 6004, Some(4321));
 
     assert_eq!(reg.midbuild_watchdog_once(), 0, "a sweep that produced a PR is not recovered");
@@ -486,7 +488,7 @@ fn midbuild_leaves_clean_worktree_alone() {
 
     // A dead sweep whose worktree exists but is CLEAN (committed, no
     // uncommitted edits) is not a "dirty mid-build death" and is left alone.
-    let wt = make_dirty_git_worktree(ws, 6005);
+    let wt = make_quiet_dirty_git_worktree(&mut reg, ws, 6005);
     std::fs::remove_file(wt.join("dirty.txt")).unwrap();
     assert!(!reg.worktree_dirty(6005), "precondition: worktree is clean");
     insert_terminal_issue(&mut reg, "sweep-issue-6005-clean", 6005, None);
@@ -501,7 +503,7 @@ fn midbuild_token_gate_defers_when_pool_exhausted_then_proceeds() {
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
 
-    make_dirty_git_worktree(ws, 6003);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 6003);
     insert_terminal_issue(&mut reg, "sweep-issue-6003-dead", 6003, None);
 
     // Every account exhausted/blocked ⇒ the pre-flight gate defers WITHOUT
@@ -545,7 +547,7 @@ fn midbuild_refuses_to_wipe_worktree_held_by_in_use_marker() {
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
 
-    let wt = make_dirty_git_worktree(ws, 6101);
+    let wt = make_quiet_dirty_git_worktree(&mut reg, ws, 6101);
     insert_terminal_issue(&mut reg, "sweep-issue-6101-dead", 6101, None);
     std::fs::write(
         wt.join(".loom-in-use"),
@@ -573,7 +575,7 @@ fn midbuild_refuses_to_wipe_worktree_with_git_operation_in_flight() {
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
 
-    let wt = make_dirty_git_worktree(ws, 6102);
+    let wt = make_quiet_dirty_git_worktree(&mut reg, ws, 6102);
     insert_terminal_issue(&mut reg, "sweep-issue-6102-dead", 6102, None);
     let index_lock = git_index_lock_path(&wt).expect("index.lock path resolves for a real repo");
     std::fs::write(&index_lock, "").unwrap();
@@ -593,7 +595,7 @@ fn midbuild_refuses_to_wipe_worktree_with_live_claim_lock_owner() {
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
 
-    make_dirty_git_worktree(ws, 6103);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 6103);
     insert_terminal_issue(&mut reg, "sweep-issue-6103-dead", 6103, None);
     let lock = reg.config.locks_dir().join("issue-6103");
     std::fs::create_dir_all(&lock).unwrap();
@@ -627,7 +629,7 @@ fn midbuild_ignores_stale_claim_lock_with_dead_owner() {
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
 
-    make_dirty_git_worktree(ws, 6104);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 6104);
     insert_terminal_issue(&mut reg, "sweep-issue-6104-dead", 6104, None);
     let lock = reg.config.locks_dir().join("issue-6104");
     std::fs::create_dir_all(&lock).unwrap();
@@ -663,7 +665,7 @@ fn midbuild_refuses_to_clean_worktree_when_a_peer_owns_the_issue_lock() {
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
 
-    make_dirty_git_worktree(ws, 6106);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 6106);
     insert_terminal_issue(&mut reg, "sweep-issue-6106-dead", 6106, None);
     let lock = write_lock_owner(&reg, 6106, "sweep-issue-6106-peer", 2_147_483_640);
 
@@ -760,7 +762,7 @@ fn midbuild_releases_its_own_claim_before_re_dispatching() {
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
 
-    make_dirty_git_worktree(ws, 6109);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 6109);
     insert_terminal_issue(&mut reg, "sweep-issue-6109-dead", 6109, None);
     write_lock_owner(&reg, 6109, "sweep-issue-6109-dead", 2_147_483_640);
 
@@ -796,7 +798,7 @@ fn midbuild_refuses_to_wipe_worktree_with_live_process_cwd_inside() {
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
 
-    let wt = make_dirty_git_worktree(ws, 6105);
+    let wt = make_quiet_dirty_git_worktree(&mut reg, ws, 6105);
     insert_terminal_issue(&mut reg, "sweep-issue-6105-dead", 6105, None);
 
     let mut child = Command::new("sleep")
@@ -846,7 +848,7 @@ fn midbuild_refuses_to_wipe_worktree_with_absolute_path_writer_cwd_outside() {
     let ws = tmp.path();
     let (mut reg, _rec) = fixture_registry(ws);
 
-    let wt = make_dirty_git_worktree(ws, 6110);
+    let wt = make_quiet_dirty_git_worktree(&mut reg, ws, 6110);
     insert_terminal_issue(&mut reg, "sweep-issue-6110-dead", 6110, None);
     let elsewhere = tempdir().unwrap();
     let target_file = wt.join("output.txt");
@@ -903,7 +905,7 @@ fn midbuild_ignores_running_sweeps() {
 
     // A still-Running sweep (not terminal) is never a mid-build-death
     // candidate, even with a dirty worktree.
-    make_dirty_git_worktree(ws, 6006);
+    make_quiet_dirty_git_worktree(&mut reg, ws, 6006);
     reg.entries.insert(
         "sweep-issue-6006-live".to_string(),
         SweepInfo {
@@ -964,7 +966,7 @@ fn midbuild_refuses_when_a_fresh_lease_names_a_different_sweep_same_host() {
     );
     let mut reg = fixture_registry_with_lease_gh(ws, &comments, 0);
 
-    make_dirty_git_worktree(ws, issue);
+    make_quiet_dirty_git_worktree(&mut reg, ws, issue);
     insert_terminal_issue(&mut reg, dead_sweep_id, issue, None);
 
     assert_eq!(
@@ -1014,7 +1016,7 @@ fn midbuild_refuses_when_a_fresh_lease_names_a_different_sweep_different_host() 
     );
     let mut reg = fixture_registry_with_lease_gh(ws, &comments, 0);
 
-    make_dirty_git_worktree(ws, issue);
+    make_quiet_dirty_git_worktree(&mut reg, ws, issue);
     insert_terminal_issue(&mut reg, dead_sweep_id, issue, None);
 
     assert_eq!(
@@ -1046,7 +1048,7 @@ fn midbuild_refuses_when_the_lease_read_fails() {
     let dead_sweep_id = "sweep-issue-8803-dead";
     let mut reg = fixture_registry_with_lease_gh(ws, "boom", 1);
 
-    make_dirty_git_worktree(ws, issue);
+    make_quiet_dirty_git_worktree(&mut reg, ws, issue);
     insert_terminal_issue(&mut reg, dead_sweep_id, issue, None);
 
     assert_eq!(

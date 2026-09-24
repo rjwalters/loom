@@ -55,7 +55,13 @@ use std::path::PathBuf;
 
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
+mod envelope;
+mod sweep_identity;
+pub use sweep_identity::SweepIdentityRecord;
+pub mod fixture;
+pub mod trace;
 pub mod visibility;
+pub use envelope::TelemetryEnvelope;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
 /// record shapes below so a Phase-2 backend ingesting a mixed-version fleet can
@@ -215,41 +221,6 @@ impl<'de> Visitor<'de> for RepoVisibilityVisitor {
 // Versioned envelope
 // ============================================================================
 
-/// The versioned wrapper every telemetry record is emitted inside. Carries the
-/// [`schema_version`](Self::schema_version) a mixed-version fleet's backend gates
-/// on, plus host-identifying context shared by every record kind, and the tagged
-/// [`record`](Self::record) payload itself.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TelemetryEnvelope {
-    /// Wire-schema version — [`CURRENT_SCHEMA_VERSION`] for a freshly constructed
-    /// envelope. A `#[serde(default)]` is intentionally NOT applied: an envelope
-    /// with no `schema_version` on the wire is a bug the backend should see,
-    /// not silently coerce to version 0.
-    pub schema_version: u32,
-    /// When the emitting daemon produced this envelope.
-    pub emitted_at: DateTime<Utc>,
-    /// Stable identifier for the emitting host (e.g. hostname or a configured
-    /// fleet host id). Populated by the exporter (#4705); opaque to the schema.
-    pub host_id: String,
-    /// The record payload — internally tagged on a `kind` discriminant so it
-    /// serializes to a single flat object (see [`TelemetryRecord`]).
-    pub record: TelemetryRecord,
-}
-
-impl TelemetryEnvelope {
-    /// Wrap `record` in an envelope stamped with [`CURRENT_SCHEMA_VERSION`] and
-    /// the current time. `host_id` identifies the emitting host.
-    #[must_use]
-    pub fn new(host_id: impl Into<String>, record: TelemetryRecord) -> Self {
-        TelemetryEnvelope {
-            schema_version: CURRENT_SCHEMA_VERSION,
-            emitted_at: Utc::now(),
-            host_id: host_id.into(),
-            record,
-        }
-    }
-}
-
 // ============================================================================
 // Record kinds — internally tagged on `kind`
 // ============================================================================
@@ -265,6 +236,9 @@ pub enum TelemetryRecord {
     /// A sweep began (mirrors the dispatch moment of the frozen SSE topics).
     #[serde(rename = "sweep.started")]
     SweepStarted(SweepStartedRecord),
+    /// Late-resolved launch identity; enriches an existing active sweep only.
+    #[serde(rename = "sweep.identity")]
+    SweepIdentity(SweepIdentityRecord),
     /// A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
     #[serde(rename = "sweep.phase")]
     SweepPhase(SweepPhaseRecord),
@@ -288,6 +262,30 @@ pub enum TelemetryRecord {
     /// variant, and the reason [`CURRENT_SCHEMA_VERSION`] is `2`.
     #[serde(rename = "role_tick.outcome")]
     RoleTickOutcome(RoleTickOutcomeRecord),
+    /// One transcript's session shape (Issue #8757, G3 of #8714) — ids,
+    /// attribution, models, token totals, and turn/tool counts, emitted by
+    /// the transcript-ingest pass. Carries **no** prompt, tool-output, key
+    /// or email content by construction (see [`SessionSummaryRecord`]).
+    #[serde(rename = "session.summary")]
+    SessionSummary(SessionSummaryRecord),
+    /// A derived per-session anomaly/quality rollup (Issue #8760, G3 part 2
+    /// of #8714) — retry-loop detection, the longest paired tool call, a USD
+    /// cost estimate, and anomaly flags, computed from a
+    /// [`SessionSummaryRecord`] plus the
+    /// [`crate::activity::transcript_parse::ParsedTranscript`] that produced
+    /// it. See [`SessionAnalysisRecord`] for the wire-safety contract (same
+    /// as `session.summary`: no prompt, tool-output, key or email content,
+    /// ever).
+    #[serde(rename = "session.analysis")]
+    SessionAnalysis(SessionAnalysisRecord),
+    /// One of the four named event-bus topics that carried no telemetry
+    /// record kind of their own (Issue #8760, G4 of #8714): `daemon.drain.*`,
+    /// `daemon.capacity.advisory`, `daemon.preflight.advisory`, and
+    /// `epic.issue.*`. See [`DaemonEventRecord`].
+    #[serde(rename = "daemon.event")]
+    DaemonEvent(DaemonEventRecord),
+    #[serde(rename = "trace.span")]
+    Span(trace::SpanRecord),
 }
 
 /// A sweep's terminal result. `#[serde(default)]`-friendly variants are not
@@ -339,6 +337,12 @@ pub struct SweepStartedRecord {
     /// Selected reasoning-effort level, when one was chosen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Runtime adapter the sweep was dispatched on (`claude`, `codex`, …),
+    /// when the dispatch event carried one — the same value
+    /// `SweepInfo::runtime` records. Absent for a legacy dispatch that did
+    /// not name its runtime; never fabricated as `"claude"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
 }
 
 /// `sweep.phase` — a sweep advanced to a new lifecycle phase.
@@ -542,6 +546,24 @@ pub struct SweepOutcomeRecord {
     /// an unobserved sweep as a judged-zero-times one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_verdicts: Option<Vec<JudgeVerdict>>,
+    /// Runtime adapter this sweep actually launched on (Issue #8507) —
+    /// `"claude"`, `"pi"`, `"opencode"`, … — read off the launch's own
+    /// `# LOOM_LAUNCH` record (`crate::launch_record::RuntimeAttribution`),
+    /// never re-derived from dispatch-time config. Omitted (never a fabricated
+    /// `"claude"` default) when no launch record was found — a Claude/legacy
+    /// spawn writes none, so the historical, byte-identical case for every
+    /// Claude sweep is simply "these three keys absent".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// The runtime's resolved provider namespace (`"zai-coding-plan"`,
+    /// `"friendli"`, …), when the launch resolved one. Same source and same
+    /// omission contract as `runtime`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The resolved model profile name, when one was selected. Same source
+    /// and same omission contract as `runtime`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// One Judge verdict on a PR, as reconstructed from the forge label timeline
@@ -694,6 +716,20 @@ pub struct RoleTickOutcomeRecord {
     /// optional field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_pool: Option<String>,
+    /// Runtime adapter this tick actually launched on (Issue #8507), read off
+    /// the tick's own `# LOOM_LAUNCH` record — same source and the same
+    /// "absent, never a fabricated `claude` default" contract as
+    /// [`SweepOutcomeRecord::runtime`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// The runtime's resolved provider namespace, when the launch resolved
+    /// one — same source and contract as [`SweepOutcomeRecord::provider`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The resolved model profile name, when one was selected — same source
+    /// and contract as [`SweepOutcomeRecord::profile`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     /// Per-`(model, speed, service_tier)` token totals for this tick, summed
     /// from the `/loom:<role>` Claude Code transcripts whose mtime falls in
     /// this tick's own window — the same grouped shape, and the same raw
@@ -725,8 +761,16 @@ pub struct RoleTickOutcomeRecord {
 /// limit-window state matching what `loom-daemon tokens check --ranking` knows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenAccountState {
-    /// Token account name (the `<account>.token` basename in `.loom/tokens/`).
+    /// Token account name (the `<account>.token` basename in `.loom/tokens/`,
+    /// or the profile name from the multi-provider account registry).
     pub account: String,
+    /// Which provider's pool this account belongs to (`"claude"`, `"codex"`,
+    /// …) — the lowercase [`AccountProvider`] name. Defaults to `"claude"` on
+    /// deserialization so a record from a daemon that predates per-provider
+    /// pools (which only ever sampled the Claude `.ranking` file) still reads
+    /// as what it was.
+    #[serde(default = "default_token_provider")]
+    pub provider: String,
     /// The account's rank in the rotation pool, when ranking data exists
     /// (lower = preferred).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -749,6 +793,12 @@ pub struct TokenAccountState {
 }
 
 /// `tokens.snapshot` — a point-in-time view of the multi-account token pool.
+/// The provider a pre-per-provider `tokens.snapshot` row implicitly belonged
+/// to — see [`TokenAccountState::provider`].
+fn default_token_provider() -> String {
+    "claude".to_string()
+}
+
 /// Host-level: it references no repository, so it carries no visibility tag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenSnapshotRecord {
@@ -836,6 +886,69 @@ pub struct HostProtectionSummary {
     /// `launchctl`/`systemctl`, or an unreachable `systemctl --user` bus).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchdog_provisioned: Option<bool>,
+}
+
+/// `host.health`'s saturation admission-brake summary (Issue #8478) — a narrow
+/// wire projection of [`crate::admission_brake::BrakeSnapshot`], carrying the
+/// facts a *fleet-level* consumer needs to tell "this host is quiet" apart from
+/// "this host's dispatch has been suppressed for hours by load Loom does not
+/// own".
+///
+/// # Why the existing fields were not enough
+///
+/// `dispatch_halted`/`halt_reason` (#4975) already report the host-distress
+/// **breaker**, and #8478 extends them to cover a sustained-starving brake too
+/// — that is what makes such a host render as degraded in the existing fleet
+/// view with no consumer change. But a boolean plus a prose reason cannot answer
+/// the question the 12-hour incident actually raised: *how long*. That duration
+/// existed only in the host-local `status --json` payload
+/// ([`crate::types::AdmissionBrakeStatus::starving_since`], #5715); nothing
+/// pushed it off-host, so a fleet check could not distinguish a brake that
+/// engaged this minute from one wedged since yesterday.
+///
+/// # Every field is a fact, never a verdict
+///
+/// `starving_secs` is computed at capture time against the emitting host's own
+/// clock so a consumer never has to subtract a remote timestamp from its own
+/// (clock skew across a fleet would otherwise make short streaks negative).
+/// `starvation_warn_secs` is that host's own resolved threshold, so
+/// "longer than N minutes" is evaluated against what *this* host considers
+/// alarming rather than a hardcoded fleet constant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdmissionBrakeSummary {
+    /// Whether new sweep admissions are currently held. In-flight sweeps are
+    /// never affected — the brake has no path to running work.
+    pub held: bool,
+    /// When the current starvation streak began (held with **zero** sweeps in
+    /// flight, continuously). `None` whenever the host is not starving,
+    /// including a brake held while sweeps genuinely drain (healthy
+    /// backpressure never starves, however long it holds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starving_since: Option<DateTime<Utc>>,
+    /// Seconds the current starvation streak has run, as measured on the
+    /// emitting host at capture time. `None` when not starving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starving_secs: Option<i64>,
+    /// This host's resolved starvation **warn** threshold in seconds — the
+    /// duration past which it logs `STARVING` locally.
+    pub starvation_warn_secs: i64,
+    /// Cumulative starvation-escape-hatch grants this daemon process's
+    /// lifetime. `0` on a healthy host forever; nonzero means the brake has
+    /// had to force at least one admission through a still-saturated host.
+    pub escape_hatch_grants: u32,
+    /// `true` once this host has been starving for at least its own
+    /// `starvation_warn_secs` — i.e. dispatch is suppressed and **nothing Loom
+    /// admitted** is producing the load. This is the single field a fleet-level
+    /// check should alert on; the rest are for the diagnosis that follows.
+    pub dispatch_suppressed_by_foreign_load: bool,
+    /// Which processes the CPU actually belongs to, as
+    /// [`crate::foreign_load::attribution_clause`] renders it. Sampled **only**
+    /// while `dispatch_suppressed_by_foreign_load` is true, so an ordinary
+    /// healthy host never pays for a `ps` shellout, and `None` whenever the
+    /// probe could not answer (no `ps`, a timeout, unparseable output) — an
+    /// absent attribution must never be read as "no foreign load".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_cpu_consumers: Option<String>,
 }
 
 /// `host.health` — host CPU/disk headroom plus the emitting binary's identity
@@ -978,6 +1091,18 @@ pub struct HostHealthRecord {
     /// (as `None`) rather than failing the whole envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protection: Option<HostProtectionSummary>,
+    /// This host's saturation admission-brake state (Issue #8478) — see
+    /// [`AdmissionBrakeSummary`]. `None` when no brake has been registered on
+    /// this host at all (no work-finder loop running), which is distinct from
+    /// `Some(..)` with `held: false` (a brake exists and is admitting). Both
+    /// must degrade gracefully on the consuming side: absent means "not
+    /// reported", never "not suppressed".
+    ///
+    /// `#[serde(default)]` so a record from a pre-#8478 daemon still decodes
+    /// (as `None`) rather than failing the whole envelope — the same
+    /// backward-compatibility contract `protection` established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_brake: Option<AdmissionBrakeSummary>,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —
@@ -1003,6 +1128,264 @@ pub struct ManagedRepoEntry {
     /// `Private`, never `Public`.
     #[serde(default)]
     pub visibility: RepoVisibility,
+}
+
+/// One entry of a [`SessionSummaryRecord`]'s tool-call histogram: how many
+/// times the session invoked one named tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallCount {
+    /// Tool name exactly as the runtime recorded it (e.g. `"Bash"`) — an
+    /// allowlisted shape, never tool arguments or output.
+    pub tool: String,
+    /// Invocations of `tool` across the whole transcript.
+    pub count: u64,
+}
+
+/// `session.summary` — one transcript's session shape (Issue #8757, G3 of
+/// epic #8714). Emitted by the transcript-ingest pass
+/// ([`crate::activity::transcript_ingest`]), one record per ingested
+/// transcript (parent session or subagent), and exported through whatever
+/// exporter(s) `observability` configures — the same
+/// [`crate::observability::queue::DurableQueue`] the collector feeds.
+///
+/// # Wire safety — a summary, never a transcript excerpt
+///
+/// Every field is a count, an id, an allowlisted name, or a timestamp. The
+/// parse that produces it ([`crate::activity::transcript_parse`]) never
+/// copies message text, tool arguments, tool output, or any free-form string
+/// beyond role/model/tool **names** into the record, so no prompt, generated
+/// code, key, or email can appear on the wire for this kind. The redaction
+/// test suite pins this by fixture.
+///
+/// # Field presence contract
+///
+/// Optional fields (`role`, `issue`, `pr_number`, `outcome`,
+/// `parent_session_id`) are **omitted** when unknown, never fabricated —
+/// the same "unknown != zero" contract `host.health` established. `outcome`
+/// in particular is reserved: this pass has no positive terminal-outcome
+/// signal to read from a transcript, so it stays absent until a later slice
+/// (`session.analysis`, or registry correlation) can populate it honestly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummaryRecord {
+    /// Repository the session worked — the final path component of the
+    /// session's cwd (a Loom agent's cwd is the workspace root or a worktree
+    /// inside it; both map to the same repo name), matching
+    /// `activity::transcript_parse::repo_from_cwd`. Not an `owner/repo`
+    /// slug: the ingest pass has no forge round-trip to resolve one.
+    pub repo: String,
+    /// Visibility tag for `repo`. The schema contract (every record that
+    /// references a repository carries one) applies; the ingest pass has no
+    /// `owner/repo` slug to key [`visibility::derive_visibility`]'s cache
+    /// on, so it stamps the fail-closed default — `Private` — exactly what
+    /// every absent/unknown visibility decodes to anyway.
+    #[serde(default)]
+    pub visibility: RepoVisibility,
+    /// The session's own stable id: the transcript's `sessionId`, or the
+    /// subagent file's stem for a `subagents/` transcript whose records
+    /// carry no id of their own.
+    pub session_id: String,
+    /// The enclosing parent session's id, for a `subagents/` transcript;
+    /// absent for a parent-session transcript.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Runtime that wrote the transcript (#8664's `loom.runtime` vocabulary).
+    /// This pass reads Claude Code transcripts only, so today it is always
+    /// `"claude"`; the field exists so sibling per-runtime tails (#8669)
+    /// and this record share one shape.
+    pub runtime: String,
+    /// Attributed Loom role (`builder`, `judge`, …), when the first user
+    /// message names one (`activity::transcript_parse::attribute_role`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Issue number, when the session is a `/loom:<role> <N>` invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    /// PR number, when known. Not derivable from a transcript; reserved for
+    /// registry correlation (a later slice).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u32>,
+    /// Distinct models used across the transcript, sorted — the `(model, day)`
+    /// bucket keys collapsed to their model axis.
+    pub models: Vec<String>,
+    /// Token totals over the whole transcript — the same four counters
+    /// `activity.db`'s `resource_usage` rows already track, summed across
+    /// buckets (deduped by `message.id`, so a streamed message counts once).
+    pub tokens_input: i64,
+    /// See [`Self::tokens_input`].
+    pub tokens_output: i64,
+    /// See [`Self::tokens_input`].
+    pub tokens_cache_read: i64,
+    /// See [`Self::tokens_input`].
+    pub tokens_cache_write: i64,
+    /// Wall-clock span of the session, milliseconds — last record timestamp
+    /// minus first, across every record carrying a timestamp.
+    pub wall_ms: i64,
+    /// Real user turns: user records whose content is **not** a tool result
+    /// (the first slash-command prompt and every subsequent human turn).
+    pub turns: u64,
+    /// Tool invocations, histogram by tool name — assistant `tool_use`
+    /// content blocks, deduped by `message.id` exactly like the token
+    /// counters so a streamed message's blocks count once.
+    pub tool_calls: Vec<ToolCallCount>,
+    /// Tool results flagged `is_error` by the runtime.
+    pub tool_errors: u64,
+    /// Terminal outcome, when this pass can know one. See the struct doc:
+    /// nothing populates it yet, and it serializes away while unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+// ============================================================================
+// `session.analysis` (Issue #8760, G3 part 2 of #8714)
+// ============================================================================
+
+/// One retry-loop candidate detected in a session's tool-call order (Issue
+/// #8760): a run of [`length`](Self::length) consecutive invocations of the
+/// identical tool name (`length >= `[`RETRY_LOOP_MIN_RUN`]). Detected purely
+/// from call **order and name** — never tool arguments or output — so this
+/// is a mechanical signal to investigate, not a verdict: a session that
+/// legitimately calls the same tool several times in a row for unrelated
+/// reasons looks identical to an actual failure-retry loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryLoop {
+    /// The tool invoked repeatedly.
+    pub tool: String,
+    /// Consecutive invocations in the run.
+    pub length: u32,
+}
+
+/// Minimum consecutive same-tool run length that counts as a retry loop
+/// (Issue #8760). Two calls in a row is ordinary (e.g. `Read` then `Read` on
+/// two different files); three or more consecutive identical invocations is
+/// the threshold this analysis flags as loop-shaped.
+pub const RETRY_LOOP_MIN_RUN: u32 = 3;
+
+/// The single `tool_use` -> `tool_result` pairing with the largest elapsed
+/// wall time in the session (Issue #8760) — the wire counterpart of
+/// [`crate::activity::transcript_parse::ToolCallSpan`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LongestToolCall {
+    /// The tool that took the longest to return a result.
+    pub tool: String,
+    /// Elapsed wall time between the `tool_use` and its paired
+    /// `tool_result`, milliseconds.
+    pub duration_ms: i64,
+}
+
+/// An anomaly flag class a `session.analysis` record can carry (Issue
+/// #8760). One variant today; additive — a future flag class is a new
+/// variant, never a repurposed existing one, so an older consumer's
+/// exhaustive match degrades to a decode error on an unrecognized flag
+/// rather than silently misreading it as a known one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnomalyFlag {
+    /// Combined `tokens_input + tokens_output` for the session exceeded
+    /// [`HIGH_TOKEN_USAGE_THRESHOLD`].
+    HighTokenUsage,
+}
+
+/// Static initial calibration for [`AnomalyFlag::HighTokenUsage`] (Issue
+/// #8760): combined `tokens_input + tokens_output` above this value flags
+/// the session. A fixed round number, **not** a true per-role fleet
+/// percentile (#8714's own illustrative "tokens > p99 for role" example) —
+/// this derivation has no access to a fleet-wide token distribution, only
+/// the one session's own `session.summary` fields, so a live percentile
+/// needs a historical query this bounded, mechanical slice does not add.
+/// Chosen well above a typical multi-hour Builder/Judge session's observed
+/// token volume so the flag stays rare and worth investigating rather than
+/// routine.
+pub const HIGH_TOKEN_USAGE_THRESHOLD: i64 = 300_000;
+
+/// `session.analysis` — a derived per-session anomaly/quality rollup (Issue
+/// #8760, G3 part 2 of epic #8714), computed from a landed
+/// [`SessionSummaryRecord`] plus the
+/// [`crate::activity::transcript_parse::ParsedTranscript`] that produced it
+/// (see [`crate::activity::session_analysis::build_session_analysis`]).
+/// Rides the same transcript-ingest emission point as `session.summary`, so
+/// a still-growing session is re-analyzed on each pass that re-reads it,
+/// mirroring that record's own replace-never-append semantics.
+///
+/// **Bounded, mechanical derivation only** — retry-loop detection, the
+/// longest paired tool call, a USD cost estimate (from the existing single
+/// [`crate::activity::resource_usage::ModelPricing`] rate card, applied
+/// per-model to the transcript's own usage buckets so a multi-model session
+/// is costed correctly rather than approximated from a flat total), and a
+/// fixed-threshold anomaly flag. **No LLM-written prose summary** — that is
+/// explicitly a later slice, per #8714's own G3 proposal.
+///
+/// # Wire safety — same contract as `session.summary`
+///
+/// Every field here is a count, an id, an allowlisted tool name, a
+/// duration, or a derived dollar figure. Nothing here is, or is derived
+/// from, message text, tool arguments, tool output, or any free-form
+/// transcript content — the redaction test suite pins this by fixture,
+/// mirroring `session_summary`'s own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionAnalysisRecord {
+    /// Same value as the source `session.summary` record's `repo`.
+    pub repo: String,
+    /// Same value as the source `session.summary` record's `visibility`.
+    #[serde(default)]
+    pub visibility: RepoVisibility,
+    /// Same value as the source `session.summary` record's `session_id` —
+    /// the join key a consumer uses to correlate the two records.
+    pub session_id: String,
+    /// Same value as the source `session.summary` record's
+    /// `parent_session_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Retry-loop candidates detected in the session's tool-call order.
+    /// Empty when none were detected — never omitted, so "computed and
+    /// found none" is distinguishable on the wire from "not computed".
+    #[serde(default)]
+    pub retry_loops: Vec<RetryLoop>,
+    /// The longest paired `tool_use` -> `tool_result` call in the session.
+    /// Absent when no pair could be matched (see
+    /// [`crate::activity::transcript_parse::ParsedTranscript::longest_tool_call`]'s
+    /// doc for why that can happen) — never a fabricated zero duration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub longest_tool_call: Option<LongestToolCall>,
+    /// USD cost estimate, summed per-model across the session's own usage
+    /// buckets via the shared rate card
+    /// ([`crate::activity::resource_usage::ModelPricing`]). Absent when the
+    /// session contributed no usage buckets at all — never a fabricated
+    /// `0.0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Anomaly flags raised for this session. Empty when none were raised.
+    #[serde(default)]
+    pub anomalies: Vec<AnomalyFlag>,
+}
+
+// ============================================================================
+// `daemon.event` (Issue #8760, G4 of #8714)
+// ============================================================================
+
+/// `daemon.event` — one of the four named event-bus topics that carried no
+/// telemetry record kind of their own (Issue #8760, G4 of epic #8714):
+/// `daemon.drain.*`, `daemon.capacity.advisory`, `daemon.preflight.advisory`,
+/// and `epic.issue.*`. Host/daemon-level operational signals, not per-session
+/// user work — carries no [`RepoVisibility`] tag, the same "references no
+/// repository" contract [`TokenSnapshotRecord`]/[`HostHealthRecord`] already
+/// establish.
+///
+/// Deliberately generic — one record shape for four topic families — rather
+/// than four new per-topic record types: every one of these topics is
+/// already a small, frozen, operator-facing payload
+/// ([`crate::event_bus`]'s own documented taxonomy) with no
+/// prompt/tool-output/secret content by construction, the same shape the
+/// live SSE event-bus tail already exposes to an authenticated operator.
+/// Wrapping that payload, rather than re-typing it four times, keeps this
+/// record kind additive to an already-reviewed shape instead of forking a
+/// second schema for the same data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonEventRecord {
+    /// The exact bus topic this record mirrors, e.g.
+    /// `"daemon.drain.started"`, `"epic.issue.123.decompose"`.
+    pub topic: String,
+    /// The event's own payload, exactly as published on the bus.
+    pub payload: serde_json::Value,
 }
 
 #[cfg(test)]

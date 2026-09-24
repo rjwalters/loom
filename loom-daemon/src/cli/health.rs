@@ -82,6 +82,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use loom_daemon::activity::transcript_ingest;
 use loom_daemon::daemon_install_state;
 use loom_daemon::daemon_pidfile;
 use loom_daemon::health::{self, HealthInputs, HealthReport};
@@ -373,6 +374,43 @@ async fn collect(window: Duration) -> HealthReport {
         status => Some(status),
     };
 
+    // 9. The transcript-ingest health snapshot (#8477) — one more best-effort
+    //    *local* input: whether the background pass is enabled
+    //    (`autonomous.transcriptIngest`/`LOOM_TRANSCRIPT_INGEST`, resolved
+    //    against the same `LOOM_ROOT` / daemon-reported / cwd repo root
+    //    `resolve_configured_codesign_identity` uses) and whether the
+    //    ledger is keeping up with transcripts actually on disk. Assessed by
+    //    `health::assess_transcript_ingest`, which — unlike
+    //    `limit_calibration` above — always renders a section: ingestion
+    //    being off is the fact this issue exists to surface, not an
+    //    unconfigured optional companion tool.
+    let transcript_ingest_repo_root = std::env::var_os("LOOM_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| {
+            status
+                .as_ref()
+                .and_then(|s| s.per_repo.first().map(|r| r.root.clone()))
+        })
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let transcript_ingest_config =
+        transcript_ingest::read_transcript_ingest_config(&transcript_ingest_repo_root);
+    let transcript_ingest_status =
+        loom_daemon::transcript_tokens::claude_projects_dir().map(|projects_dir| {
+            transcript_ingest::collect_health_status(
+                &limit_calibration::default_activity_db_path(),
+                &projects_dir,
+                &transcript_ingest_config,
+            )
+        });
+
+    // 10. The tmpfs/`shared`-RAM + kernel OOM-kill snapshot (#8572, split from
+    //     #8512) — filesystem-only, no IPC, threaded in exactly like
+    //     `transcript_ingest_status` above. `tmpfs_visibility_section` omits
+    //     the section entirely when nothing was measurable (e.g. macOS), so
+    //     this always collects rather than pre-filtering.
+    let tmpfs_visibility_status = Some(loom_daemon::tmpfs_visibility::collect());
+
     health::assess(&HealthInputs {
         at: chrono::Utc::now(),
         window,
@@ -397,6 +435,8 @@ async fn collect(window: Duration) -> HealthReport {
         load_per_core,
         limit_calibration,
         codex_accounts: probe_codex_accounts(),
+        transcript_ingest: transcript_ingest_status,
+        tmpfs_visibility: tmpfs_visibility_status,
     })
 }
 

@@ -3,9 +3,9 @@
 //! [`crate::telemetry::TelemetryEnvelope`] batches into the OTLP wire format,
 //! for operators with an existing OpenTelemetry stack (a self-hosted
 //! collector, Grafana, Honeycomb, …) who want to skip the native Cloudflare
-//! backend entirely. Selected via `observability.exporter = "otlp"`
-//! (`observability::resolve_exporter`) — [`super::exporter::HttpsExporter`]
-//! stays the default (`"https"`).
+//! backend entirely. Selected via `observability.exporter = "otlp"` or an
+//! `observability.exporters` entry (`observability::resolve_exporters`) —
+//! [`super::exporter::HttpsExporter`] stays the default (`"https"`).
 //!
 //! Gated behind the `otlp` Cargo feature (see `loom-daemon/Cargo.toml`): a
 //! default build never compiles `opentelemetry_proto` in, so choosing this
@@ -19,7 +19,8 @@
 //! [`super::exporter::HttpsExporter`] already depends on, and
 //! [`super::sender`]'s drain/retry/backoff loop — generic over any
 //! `E: `[`super::exporter::Exporter`] — governs retries exactly as it does
-//! for the HTTPS sink. **No OTLP-specific retry/backoff logic exists here.**
+//! for the HTTPS sink. OTLP response classification lives in `transport`;
+//! acknowledged signal prefixes are removed before retrying the remaining suffix.
 //! `opentelemetry-proto`'s `gen-tonic-messages` feature buys only the
 //! generated message *types* (`prost`-derived structs); `tonic`/gRPC
 //! transport is deliberately never enabled, so this feature adds no gRPC
@@ -60,12 +61,14 @@
 //! and every attribute above).
 
 mod mapping;
+mod traces;
+mod transport;
+
+use transport::{post, Signal};
 
 use std::time::Duration;
 
-use serde::Serialize;
-
-use super::exporter::{ExportError, Exporter};
+use super::exporter::{BatchOutcome, ExportError, Exporter};
 use crate::telemetry::TelemetryEnvelope;
 
 /// Per-request timeout — same rationale and value as
@@ -81,17 +84,23 @@ pub struct OtlpExporter {
     client: reqwest::Client,
     logs_endpoint: String,
     metrics_endpoint: String,
+    traces_endpoint: String,
     ingest_key: String,
 }
 
 impl OtlpExporter {
     /// Build an exporter posting to `{base_endpoint}/v1/logs` and
     /// `{base_endpoint}/v1/metrics` (a trailing slash on `base_endpoint` is
-    /// tolerated and stripped), authenticating with `ingest_key`. Fails only
-    /// if the underlying `reqwest::Client` cannot be constructed — never
-    /// touches the network.
+    /// tolerated and stripped), authenticating with `ingest_key`. Validates the
+    /// URL and builds the HTTP client without touching the network.
     pub fn new(base_endpoint: String, ingest_key: String) -> Result<Self, ExportError> {
+        if !super::endpoint_policy::valid_otlp_endpoint(&base_endpoint) {
+            return Err(ExportError::Transport(
+                "OTLP base URL must be HTTP(S), without credentials, query or fragment".to_string(),
+            ));
+        }
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|error| ExportError::Transport(error.to_string()))?;
@@ -100,288 +109,146 @@ impl OtlpExporter {
             client,
             logs_endpoint: format!("{base}/v1/logs"),
             metrics_endpoint: format!("{base}/v1/metrics"),
+            traces_endpoint: format!("{base}/v1/traces"),
             ingest_key,
-        })
-    }
-
-    async fn post<T: Serialize + Sync>(&self, endpoint: &str, body: &T) -> Result<(), ExportError> {
-        let response = self
-            .client
-            .post(endpoint)
-            .bearer_auth(&self.ingest_key)
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| ExportError::Transport(error.to_string()))?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        let status = response.status().as_u16();
-        let body_snippet = response
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(200)
-            .collect();
-        Err(ExportError::Rejected {
-            status,
-            body_snippet,
         })
     }
 }
 
 impl Exporter for OtlpExporter {
-    /// Maps `envelopes` into an OTLP logs request and/or an OTLP metrics
-    /// request (see the module docs) and POSTs whichever are non-empty —
-    /// skipping either POST entirely when the batch contains no envelope of
-    /// the corresponding signal.
-    ///
-    /// **Not atomic across the two requests**: if the logs POST succeeds but
-    /// the metrics POST then fails, this returns `Err` and
-    /// [`super::sender`] leaves the *whole* batch queued for retry — the
-    /// already-accepted log records will be POSTed again next attempt. This
-    /// is the same at-least-once tradeoff every sink in this module makes at
-    /// the single-request granularity; telemetry ingestion is expected to
-    /// tolerate duplicates, never data loss.
     async fn emit_batch(&self, envelopes: &[TelemetryEnvelope]) -> Result<(), ExportError> {
-        if let Some(request) = mapping::build_logs_request(envelopes) {
-            self.post(&self.logs_endpoint, &request).await?;
+        match self.emit_batch_outcome(envelopes).await.error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        if let Some(request) = mapping::build_metrics_request(envelopes) {
-            self.post(&self.metrics_endpoint, &request).await?;
+    }
+
+    async fn emit_batch_outcome(&self, envelopes: &[TelemetryEnvelope]) -> BatchOutcome {
+        let mut outcome = BatchOutcome::default();
+        let mut offset = 0;
+        while offset < envelopes.len() {
+            let signal = signal_for(&envelopes[offset]);
+            let count = envelopes[offset..]
+                .iter()
+                .take_while(|e| signal_for(e) == signal)
+                .count();
+            let group = &envelopes[offset..offset + count];
+            let mut exported_envelopes = count;
+            let response = match signal {
+                Signal::Logs => {
+                    let Some(request) = mapping::build_logs_request(group) else {
+                        outcome.acknowledged += count;
+                        offset += count;
+                        continue;
+                    };
+                    let items = request
+                        .resource_logs
+                        .iter()
+                        .flat_map(|r| &r.scope_logs)
+                        .map(|s| s.log_records.len() as u64)
+                        .sum();
+                    post(
+                        &self.client,
+                        &self.logs_endpoint,
+                        &self.ingest_key,
+                        signal,
+                        items,
+                        &request,
+                    )
+                    .await
+                }
+                Signal::Metrics => {
+                    let Some(request) = mapping::build_metrics_request(group) else {
+                        outcome.acknowledged += count;
+                        offset += count;
+                        continue;
+                    };
+                    let items = request
+                        .resource_metrics
+                        .iter()
+                        .flat_map(|r| &r.scope_metrics)
+                        .flat_map(|s| &s.metrics)
+                        .map(|m| match &m.data {
+                            Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(
+                                g,
+                            )) => g.data_points.len() as u64,
+                            _ => 0,
+                        })
+                        .sum();
+                    post(
+                        &self.client,
+                        &self.metrics_endpoint,
+                        &self.ingest_key,
+                        signal,
+                        items,
+                        &request,
+                    )
+                    .await
+                }
+                Signal::Traces => {
+                    let request = traces::build_traces_request(group);
+                    let items = request.as_ref().map_or(0, |request| {
+                        request
+                            .resource_spans
+                            .iter()
+                            .flat_map(|r| &r.scope_spans)
+                            .map(|s| s.spans.len())
+                            .sum::<usize>()
+                    });
+                    exported_envelopes = items;
+                    outcome
+                        .signals
+                        .entry(signal.unit().to_string())
+                        .or_default()
+                        .dropped += (count - items) as u64;
+                    let Some(request) = request else {
+                        outcome.acknowledged += count;
+                        offset += count;
+                        continue;
+                    };
+                    post(
+                        &self.client,
+                        &self.traces_endpoint,
+                        &self.ingest_key,
+                        signal,
+                        items as u64,
+                        &request,
+                    )
+                    .await
+                }
+            };
+            let fully_accepted =
+                response.counts.rejected == 0 && response.counts.dropped == 0 && !response.retry;
+            outcome
+                .signals
+                .entry(signal.unit().to_string())
+                .or_default()
+                .accumulate(&response.counts);
+            if response.error.is_some() {
+                outcome.error = response.error;
+            }
+            if response.retry {
+                break;
+            }
+            outcome.acknowledged += count;
+            if fully_accepted {
+                outcome.exported += exported_envelopes;
+            }
+            offset += count;
         }
-        Ok(())
+        outcome
+    }
+}
+
+fn signal_for(envelope: &TelemetryEnvelope) -> Signal {
+    match envelope.record {
+        crate::telemetry::TelemetryRecord::HostHealth(_)
+        | crate::telemetry::TelemetryRecord::TokensSnapshot(_) => Signal::Metrics,
+        crate::telemetry::TelemetryRecord::Span(_) => Signal::Traces,
+        _ => Signal::Logs,
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use crate::telemetry::{HostHealthRecord, SweepStartedRecord, TelemetryRecord};
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener};
-    use std::sync::{Arc, Mutex};
-
-    /// Every request the mock sink saw, as `(path, body)` — shared between the
-    /// accept-loop thread and the asserting test. Aliased rather than written
-    /// inline so `clippy::type_complexity` stays satisfied under
-    /// `--all-targets --features otlp`.
-    type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
-
-    /// A minimal two-path mock sink: records every request's path + body so
-    /// tests can assert `OtlpExporter` posts to `/v1/logs` and `/v1/metrics`
-    /// separately. Deliberately smaller than `exporter::tests::MockSink`
-    /// (single status code, no kill/revive) — the retry/backoff behavior is
-    /// already covered end-to-end for any `Exporter` by `sender.rs`'s tests.
-    struct MockSink {
-        addr: SocketAddr,
-        requests: RecordedRequests,
-        shutdown: Arc<std::sync::atomic::AtomicBool>,
-        handle: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl MockSink {
-        fn start() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let addr = listener.local_addr().unwrap();
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let handle = {
-                let requests = requests.clone();
-                let shutdown = shutdown.clone();
-                std::thread::spawn(move || {
-                    while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-                        match listener.accept() {
-                            Ok((mut stream, _)) => {
-                                stream.set_nonblocking(false).ok();
-                                if let Some((path, body)) = read_request(&mut stream) {
-                                    // Record the request *before* writing the
-                                    // response — same ordering, same reason, as
-                                    // `exporter::tests::MockSink` (#7256).
-                                    // `emit_batch(...).await` on the client side
-                                    // unblocks as soon as the response bytes are
-                                    // visible, which can race ahead of this
-                                    // thread's next line; recording first
-                                    // guarantees any caller that has observed the
-                                    // response also observes the recorded request.
-                                    requests.lock().unwrap().push((path, body));
-                                    let _ = write_response(&mut stream);
-                                }
-                            }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                })
-            };
-            MockSink {
-                addr,
-                requests,
-                shutdown,
-                handle: Some(handle),
-            }
-        }
-
-        fn base_url(&self) -> String {
-            format!("http://{}", self.addr)
-        }
-
-        fn requests(&self) -> Vec<(String, Vec<u8>)> {
-            self.requests.lock().unwrap().clone()
-        }
-    }
-
-    impl Drop for MockSink {
-        fn drop(&mut self) {
-            self.shutdown
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .ok();
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let header_end;
-        loop {
-            let n = stream.read(&mut chunk).ok()?;
-            if n == 0 {
-                return None;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
-                header_end = pos + 4;
-                break;
-            }
-        }
-        let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        let path = header_text
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("")
-            .to_string();
-        let content_length: usize = header_text
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
-            .and_then(|line| line.split_once(':').map(|x| x.1))
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0);
-        while buf.len() < header_end + content_length {
-            let n = stream.read(&mut chunk).ok()?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        let body = buf[header_end..(header_end + content_length).min(buf.len())].to_vec();
-        Some((path, body))
-    }
-
-    fn write_response(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-    }
-
-    fn sweep_started_envelope() -> TelemetryEnvelope {
-        TelemetryEnvelope::new(
-            "host-otlp-test",
-            TelemetryRecord::SweepStarted(SweepStartedRecord {
-                repo: "rjwalters/loom".to_string(),
-                visibility: crate::telemetry::RepoVisibility::Public,
-                issue: 4858,
-                sweep_id: "sweep-issue-4858-0".to_string(),
-                started_at: chrono::Utc::now(),
-                model: None,
-                effort: None,
-            }),
-        )
-    }
-
-    fn host_health_envelope() -> TelemetryEnvelope {
-        TelemetryEnvelope::new(
-            "host-otlp-test",
-            TelemetryRecord::HostHealth(HostHealthRecord {
-                captured_at: chrono::Utc::now(),
-                daemon_version: "0.17.0".to_string(),
-                build_commit: "deadbeef".to_string(),
-                built_at: None,
-                uptime_sec: 10,
-                logical_cpus: 8,
-                cpu_idle_fraction: None,
-                load_per_core: None,
-                worktree_root_free_gb: None,
-                worktree_root_total_gb: None,
-                active_sweep_ids: Vec::new(),
-                dispatch_halted: false,
-                halt_reason: None,
-                managed_repos: Vec::new(),
-                roles: crate::telemetry::RoleTickHealth::default(),
-                protection: None,
-            }),
-        )
-    }
-
-    #[tokio::test]
-    async fn emit_batch_posts_logs_and_metrics_to_their_own_paths_with_bearer_auth() {
-        let sink = MockSink::start();
-        let exporter = OtlpExporter::new(sink.base_url(), "s3cr3t-ingest-key".to_string()).unwrap();
-        let batch = vec![sweep_started_envelope(), host_health_envelope()];
-        exporter.emit_batch(&batch).await.unwrap();
-
-        let requests = sink.requests();
-        assert_eq!(requests.len(), 2, "one lifecycle + one host-level envelope ⇒ two POSTs");
-        let paths: Vec<&str> = requests.iter().map(|(path, _)| path.as_str()).collect();
-        assert!(paths.contains(&"/v1/logs"));
-        assert!(paths.contains(&"/v1/metrics"));
-    }
-
-    #[tokio::test]
-    async fn emit_batch_skips_the_metrics_post_for_an_all_lifecycle_batch() {
-        let sink = MockSink::start();
-        let exporter = OtlpExporter::new(sink.base_url(), "key".to_string()).unwrap();
-        exporter
-            .emit_batch(&[sweep_started_envelope()])
-            .await
-            .unwrap();
-
-        let requests = sink.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].0, "/v1/logs");
-    }
-
-    #[test]
-    fn base_endpoint_trailing_slash_is_tolerated() {
-        let exporter =
-            OtlpExporter::new("https://collector.example.com/".to_string(), "key".to_string())
-                .unwrap();
-        assert_eq!(exporter.logs_endpoint, "https://collector.example.com/v1/logs");
-        assert_eq!(exporter.metrics_endpoint, "https://collector.example.com/v1/metrics");
-    }
-
-    #[tokio::test]
-    async fn non_2xx_status_from_either_endpoint_is_a_rejected_error() {
-        // Bind-then-drop to get a loopback port nothing is listening on —
-        // reuses `exporter.rs`'s unreachable-sink pattern for the transport
-        // error path (rejected-status is already covered by
-        // `HttpsExporter`'s own tests at the `post` granularity).
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let exporter = OtlpExporter::new(format!("http://{addr}"), "key".to_string()).unwrap();
-        let error = exporter
-            .emit_batch(&[sweep_started_envelope()])
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ExportError::Transport(_)));
-    }
-}
+mod tests;

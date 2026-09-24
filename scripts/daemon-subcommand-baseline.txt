@@ -16,13 +16,9 @@
 # Format: one <path><TAB><subcommand> per line.
 clean.sh	clean
 defaults/scripts/agent-metrics.sh	stats
-defaults/scripts/agent-metrics.sh	sweep-experiment
 defaults/scripts/agent-spawn.sh	agent-spawn
 defaults/scripts/agent-wait.sh	agent-wait
 defaults/scripts/build-gate.sh	dispatch-backoff
-defaults/scripts/check-usage.sh	usage
-defaults/scripts/checkpoint.sh	checkpoint
-defaults/scripts/classify-dependency-block.sh	classify-dependency-block
 defaults/scripts/claude-wrapper.sh	retry-classify
 defaults/scripts/claude-wrapper.sh	tokens
 defaults/scripts/clean.sh	clean
@@ -31,19 +27,12 @@ defaults/scripts/cli/loom-daemon-update.sh	release-fetch
 defaults/scripts/cli/loom-daemon-watchdog.sh	daemon-watchdog
 defaults/scripts/cli/loom-help.sh	status
 defaults/scripts/cli/loom-status.sh	status
-defaults/scripts/dep-recheck-fingerprint.sh	dep-recheck-fingerprint
-defaults/scripts/detect-dependency-cycle.sh	detect-dependency-cycle
-defaults/scripts/detect-startable-subset.sh	detect-startable-subset
 defaults/scripts/probe-tokens.sh	tokens
 defaults/scripts/recover-orphaned-shepherds.sh	recover-orphans
-defaults/scripts/resolve-model.sh	resolve-model
 defaults/scripts/resync-installed.sh	update-gitignore
 defaults/scripts/spawn-claude.sh	tokens
 defaults/scripts/spawn-codex.sh	tokens
 defaults/scripts/spawn-worker.sh	spawn-worker
-defaults/scripts/strip-ansi.sh	strip-ansi
-defaults/scripts/sweep-experiment.sh	sweep-experiment
-defaults/scripts/validate-phase.sh	validate-phase
 defaults/scripts/worktree.sh	lease
 scripts/check-gitignore-convergence.sh	update-gitignore
 scripts/install/migrate-consumer.sh	workspace

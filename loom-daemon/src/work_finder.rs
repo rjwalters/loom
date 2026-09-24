@@ -755,6 +755,26 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// The set of issue numbers currently inside a **PR-less retry window**
+    /// (Issue #7972): a previous dispatch claimed the issue, released it, and
+    /// left no pull request behind, and the window the reaper armed has not yet
+    /// elapsed. Skipped exactly like [`quarantined`](Self::quarantined) /
+    /// [`backed_off`](Self::backed_off) / [`noop_cooldown`](Self::noop_cooldown)
+    /// — filtered out *before* the concurrency budget is filled.
+    ///
+    /// A fourth, distinct bound, keyed on the one signal the observed #7893
+    /// loop could not fake: **did the dispatch produce a PR?** That loop
+    /// advanced its checkpoint on every attempt, which reset the quarantine
+    /// tally and cleared the dispatch backoff, so it re-claimed the same issue
+    /// fourteen times in four hours — several times inside the same minute —
+    /// without ever tripping `quarantined`, `backed_off` or `noop_cooldown`.
+    ///
+    /// Defaults to empty so a dispatcher that does not model the bound (e.g. a
+    /// test fake) opts out with zero boilerplate.
+    fn prless_retry(&self) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Whether this dispatcher's workspace is missing
     /// `.claude/commands/loom/sweep.md` — the **structural, workspace-level**
     /// refusal the registry's step-2.4 guard (#4027) enforces via the typed
@@ -932,6 +952,12 @@ pub fn publish_tick_summary_at(
         skipped_pr_open_backoff: report.skipped_pr_open_backoff,
         skipped_noop_cooldown: report.skipped_noop_cooldown,
         skipped_declined: report.skipped_declined,
+        // #7972: `skipped_prless_retry` is deliberately NOT carried on the
+        // cross-process `WorkFinderTickSummary` yet — `types.rs` is over the
+        // file-size ratchet's threshold and frozen at its current size
+        // (.loom/docs/file-size-policy.md), and a wire field is not worth
+        // displacing unrelated code for. The counter IS on `TickReport` and
+        // appears as `prless-retry-skip` on the per-tick summary log line.
         skipped_recheck_interval: report.skipped_recheck_interval,
         skipped_host_constraint: report.skipped_host_constraint,
         deferred_capacity: report.deferred_capacity,
@@ -1085,6 +1111,17 @@ pub struct TickReport {
     /// the park tally — and an operator watching `labeled-skip` climb has no
     /// way to tell which of the two they are looking at.
     pub skipped_declined: usize,
+    /// Issues skipped because they are inside a **PR-less retry window** (Issue
+    /// #7972): a previous dispatch claimed the issue, released it, and left no
+    /// pull request behind. Filtered out before the capacity gate via
+    /// [`WorkDispatcher::prless_retry`], exactly like
+    /// [`skipped_noop_cooldown`](Self::skipped_noop_cooldown) — and a distinct
+    /// counter because it measures a distinct pathology: not a crash
+    /// (`skipped_quarantined`), not a failed dispatch (`skipped_backoff`), not
+    /// a deliberate empty pass (`skipped_noop_cooldown`), but a **full,
+    /// apparently-healthy sweep that produced nothing** and would otherwise be
+    /// re-offered on the very next tick.
+    pub skipped_prless_retry: usize,
     /// Issues skipped because they self-declared a `<!-- loom:recheck-interval=
     /// <value> -->` marker (Issue #6685) and their own `updatedAt` is still
     /// within that interval — see [`WorkItem::is_within_recheck_interval`].
@@ -1352,6 +1389,10 @@ pub fn tick_with_saturation_brake(
     // mirroring `noop_cooldown` above. Empty on every host until a sweep
     // actually declines on a label rule.
     let declined = dispatcher.declined();
+    // PR-less retry windows (#7972) — resolved once per tick, mirroring
+    // `noop_cooldown` / `declined` above. Empty until a dispatch actually
+    // releases an issue without leaving a PR behind.
+    let prless_retry = dispatcher.prless_retry();
     let peer_claimed = dispatcher.peer_claimed();
     // Per-workspace additional skip-label list (#6685) — resolved once per
     // tick, mirroring every other dispatcher-supplied set above.
@@ -1493,6 +1534,18 @@ pub fn tick_with_saturation_brake(
         //      re-flips its label every tick.
         if declined.contains(&item.number) {
             report.skipped_declined += 1;
+            continue;
+        }
+        // 2b5. PR-less retry window (#7972): a previous dispatch claimed this
+        //      issue, released it, and left no pull request behind, and the
+        //      window the reaper armed has not elapsed. Skipped here — before
+        //      the capacity gate, like every sibling brake — so it neither
+        //      reserves a slot nor re-flips its label every tick. Distinct
+        //      from all four above: the loop this bounds advanced its
+        //      checkpoint on every attempt, so it reset the quarantine tally
+        //      and cleared the dispatch backoff while producing nothing.
+        if prless_retry.contains(&item.number) {
+            report.skipped_prless_retry += 1;
             continue;
         }
         // 2c. Peer soft claim (#4028): a peer host advertised a live claim over
@@ -1946,6 +1999,13 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
     // its no-op-cooldown set, dropped in pass 1 for the same reason.
     let declined_sets: Vec<HashSet<u32>> = workspaces.iter().map(|(_, d)| d.declined()).collect();
 
+    // Snapshot each workspace's PR-less retry set (#7972) alongside the
+    // decline set, dropped in pass 1 for the same reason: an issue whose last
+    // dispatch produced no pull request must not reserve a shared slot to
+    // produce none again.
+    let prless_retry_sets: Vec<HashSet<u32>> =
+        workspaces.iter().map(|(_, d)| d.prless_retry()).collect();
+
     // Snapshot each workspace's peer-claim set (#4028) alongside its quarantined
     // set. A peer's live soft claim drops the candidate in pass 1, before the
     // global sort and slot fill, so a peer-claimed issue never reserves a shared
@@ -2132,6 +2192,14 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             // above and independently of all of them.
             if declined_sets[idx].contains(&item.number) {
                 report.skipped_declined += 1;
+                continue;
+            }
+            // PR-less retry window (#7972): a previous dispatch claimed this
+            // issue, released it, and left no PR behind — drop before the
+            // global queue, like the four brakes above and independently of
+            // all of them.
+            if prless_retry_sets[idx].contains(&item.number) {
+                report.skipped_prless_retry += 1;
                 continue;
             }
             // Peer soft claim (#4028): a peer host is already building it — drop
@@ -3063,6 +3131,7 @@ where
                         || report.skipped_pr_open_backoff > 0
                         || report.skipped_noop_cooldown > 0
                         || report.skipped_declined > 0
+                        || report.skipped_prless_retry > 0
                         || report.skipped_recheck_interval > 0
                         || report.skipped_host_constraint > 0
                         || report.skipped_pr_open > 0
@@ -3077,7 +3146,7 @@ where
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} workspace-commands-missing-skip, \
                              {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
-                             {} declined-skip, \
+                             {} declined-skip, {} prless-retry-skip, \
                              {} recheck-interval-skip, \
                              {} host-constraint-skip, \
                              {} pr-open-skip, \
@@ -3095,6 +3164,7 @@ where
                             report.skipped_pr_open_backoff,
                             report.skipped_noop_cooldown,
                             report.skipped_declined,
+                            report.skipped_prless_retry,
                             report.skipped_recheck_interval,
                             report.skipped_host_constraint,
                             report.skipped_pr_open,
@@ -3328,6 +3398,9 @@ pub fn spawn_multi_work_finder_task(
             // axis alongside disk, folded into the same `min(...)`. Read
             // BEFORE disk since #7512 — see the single-workspace loop above.
             let ram = crate::ram_headroom::ram_headroom_limit();
+            // Bounded tmpfs-fraction warning (#8572, split from #8512) — logs
+            // only, never gates dispatch; see `tmpfs_warning`'s module doc.
+            tmpfs_warning::check_and_warn(&fallback_root);
             let mut disk = disk_headroom_limit(&fallback_root);
             // Eager, out-of-cycle reclaim (#7512): on the tick the disk axis
             // FIRST becomes the term that binds the cap down, run the existing
@@ -3634,6 +3707,7 @@ pub fn spawn_multi_work_finder_task(
                 || report.skipped_pr_open_backoff > 0
                 || report.skipped_noop_cooldown > 0
                 || report.skipped_declined > 0
+                || report.skipped_prless_retry > 0
                 || report.skipped_recheck_interval > 0
                 || report.skipped_host_constraint > 0
                 || report.skipped_pr_open > 0
@@ -3652,7 +3726,7 @@ pub fn spawn_multi_work_finder_task(
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} workspace-commands-missing-skip, \
                      {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
-                     {} declined-skip, \
+                     {} declined-skip, {} prless-retry-skip, \
                      {} recheck-interval-skip, \
                      {} host-constraint-skip, \
                      {} pr-open-skip, \
@@ -3672,6 +3746,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_pr_open_backoff,
                     report.skipped_noop_cooldown,
                     report.skipped_declined,
+                    report.skipped_prless_retry,
                     report.skipped_recheck_interval,
                     report.skipped_host_constraint,
                     report.skipped_pr_open,
@@ -3859,401 +3934,10 @@ fn publish_capacity_advisory(event_bus: &Arc<EventBus>, advisory: &CapacityAdvis
 // ============================================================================
 
 /// Concrete [`WorkSource`] / [`WorkDispatcher`] implementations that wire the
-/// finder to the live forge (`gh`) and the daemon's [`SweepRegistry`].
-///
-/// The pure [`tick`] logic above is exercised in tests via mocks; these
-/// adapters are the runtime glue and shell out to `gh` / spawn children, so
-/// they are not unit-tested directly (mirroring
-/// [`crate::epic_supervisor::forge`]).
-pub mod forge {
-    use super::{
-        read_work_finder_config, resolve_extra_skip_labels_with_config, WorkDispatcher, WorkItem,
-        WorkSource,
-    };
-    use crate::sweep_registry::SweepRegistry;
-    use crate::types::{SweepKind, SweepState};
-    use anyhow::{anyhow, Result};
-    use std::collections::HashSet;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
-
-    /// A forge-backed [`WorkSource`] that lists open `loom:issue` items via
-    /// `gh`. Mirrors [`crate::epic_supervisor::forge::GhEpicSource`].
-    pub struct GhWorkSource {
-        gh_bin: PathBuf,
-        repo: Option<String>,
-        /// Working directory the `gh` query runs in. When set (multi-workspace
-        /// fan-out, #3928) `gh` auto-detects the repo from that root's git
-        /// remote, so each registered workspace is polled against its own repo
-        /// without a single machine-global `LOOM_REPO`. `None` keeps today's
-        /// behavior (inherit the daemon's cwd).
-        cwd: Option<PathBuf>,
-    }
-
-    impl GhWorkSource {
-        /// Construct a source using `gh` from `PATH`, honoring `LOOM_REPO` for
-        /// the `--repo` flag when set.
-        #[must_use]
-        pub fn new() -> Self {
-            Self {
-                gh_bin: PathBuf::from("gh"),
-                repo: std::env::var("LOOM_REPO").ok(),
-                cwd: None,
-            }
-        }
-
-        /// Construct a source scoped to a specific workspace `root` (#3928): the
-        /// `gh` query runs with `current_dir(root)` so it targets that repo's own
-        /// remote. `LOOM_REPO`, when set, is still honored as a machine-global
-        /// `--repo` override (preserving the single-workspace behavior
-        /// byte-for-byte); in a genuine multi-repo deployment it is left unset so
-        /// each root's cwd selects its repo.
-        #[must_use]
-        pub fn for_root(root: &Path) -> Self {
-            Self {
-                gh_bin: PathBuf::from("gh"),
-                repo: std::env::var("LOOM_REPO").ok(),
-                cwd: Some(root.to_path_buf()),
-            }
-        }
-
-        /// Override the `gh` binary path (for tests / non-standard installs).
-        #[must_use]
-        pub fn with_gh_bin(mut self, bin: PathBuf) -> Self {
-            self.gh_bin = bin;
-            self
-        }
-    }
-
-    impl Default for GhWorkSource {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl WorkSource for GhWorkSource {
-        fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
-            // ETag-cached REST listing (#4428): a poll where nothing changed
-            // costs zero rate limit (304), replacing the per-tick GraphQL
-            // `gh issue list`. REST issue listings include PRs, so filter the
-            // `pull_request`-marked rows to keep the pre-#4428 issue-only set.
-            let rows = crate::forge_listing::list_issues_cached(
-                &self.gh_bin,
-                self.cwd.as_deref(),
-                self.repo.as_deref(),
-                "loom:issue",
-                "open",
-            )?;
-            Ok(rows
-                .into_iter()
-                .filter(|r| !r.is_pull_request)
-                // The REST listing already returns `body` (#4827) — carrying it
-                // onto the item costs no extra request and lets dispatch read
-                // the `<!-- loom:complexity=... -->` stratum without a
-                // per-issue `gh issue view`.
-                .map(|r| {
-                    WorkItem::with_created_at(r.number, r.labels, r.created_at)
-                        .with_body(r.body)
-                        .with_updated_at(r.updated_at)
-                })
-                .collect())
-        }
-    }
-
-    /// A concrete [`WorkDispatcher`] backed by the daemon [`SweepRegistry`].
-    ///
-    /// `dispatch()` calls the registry's own `dispatch()` — reusing its
-    /// idempotency key, `mkdir`-atomic claim lock, and `loom:issue →
-    /// loom:building` label flip — so the finder never reimplements the race
-    /// guard. `in_flight()` reads the registry's `Running` / `Pending` entries.
-    pub struct RegistryDispatcher {
-        registry: Arc<Mutex<SweepRegistry>>,
-    }
-
-    impl RegistryDispatcher {
-        /// Construct a dispatcher over the shared registry.
-        #[must_use]
-        pub fn new(registry: Arc<Mutex<SweepRegistry>>) -> Self {
-            Self { registry }
-        }
-
-        /// The shared registry behind this dispatcher. Test-only seam so a
-        /// restart-survivorship test (#6262) can seed the registry the way the
-        /// daemon's own startup pass does — through the real registry, not by
-        /// injecting an in-flight set the way the `RecordingDispatcher` fake
-        /// allows.
-        #[cfg(test)]
-        #[must_use]
-        pub fn registry_for_test(&self) -> Arc<Mutex<SweepRegistry>> {
-            self.registry.clone()
-        }
-    }
-
-    impl WorkDispatcher for RegistryDispatcher {
-        fn in_flight(&self) -> HashSet<u32> {
-            let mut reg = match self.registry.lock() {
-                Ok(r) => r,
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    return HashSet::new();
-                }
-            };
-            // Reap-on-read (Issue #3893): reconcile liveness before seeding
-            // occupancy so a sweep whose child has exited does not over-count
-            // against the concurrency budget and defer legitimate new dispatch.
-            reg.reap_liveness();
-            let mut set = HashSet::new();
-            for state in [SweepState::Running, SweepState::Pending] {
-                for info in reg.list(Some(&state)) {
-                    if let SweepKind::Issue(n) = info.kind {
-                        set.insert(n);
-                    }
-                }
-            }
-            set
-        }
-
-        fn quarantined(&self) -> HashSet<u32> {
-            match self.registry.lock() {
-                Ok(reg) => reg.quarantined_issues(),
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    HashSet::new()
-                }
-            }
-        }
-
-        /// Issues inside a live per-issue dispatch-backoff window (Issue #4485).
-        /// Pure in-memory read of the registry state the reaper maintains — no
-        /// forge round trip, mirroring `quarantined()`.
-        fn backed_off(&self) -> HashSet<u32> {
-            match self.registry.lock() {
-                Ok(reg) => reg.dispatch_backoff_issues(chrono::Utc::now()),
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    HashSet::new()
-                }
-            }
-        }
-
-        /// The subset of `backed_off()` whose window was armed by the
-        /// open-PR guard rather than a real dispatch failure (Issue #7606).
-        /// Pure in-memory read, mirroring `backed_off()`.
-        fn pr_open_backed_off(&self) -> HashSet<u32> {
-            match self.registry.lock() {
-                Ok(reg) => reg.open_pr_backoff_issues(chrono::Utc::now()),
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    HashSet::new()
-                }
-            }
-        }
-
-        /// Issues inside a live no-op re-dispatch cooldown window (Issue
-        /// #6670). Pure in-memory read of the registry state a
-        /// `RecordNoopRelease` call maintains — no forge round trip,
-        /// mirroring `backed_off()`.
-        fn noop_cooldown(&self) -> HashSet<u32> {
-            match self.registry.lock() {
-                Ok(reg) => reg.noop_cooldown_issues(chrono::Utc::now()),
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    HashSet::new()
-                }
-            }
-        }
-
-        /// Issues inside a live hard-exclusion decline cooldown window (Issue
-        /// #7528). Pure in-memory read of the registry state the reaper's
-        /// checkpoint-less clean-exit path maintains — no forge round trip,
-        /// mirroring `noop_cooldown()`.
-        fn declined(&self) -> HashSet<u32> {
-            match self.registry.lock() {
-                Ok(reg) => reg.decline_cooldown_issues(chrono::Utc::now()),
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    HashSet::new()
-                }
-            }
-        }
-
-        /// Whether this workspace is missing `.claude/commands/loom/sweep.md`
-        /// (Issue #4027 guard 2.4, quarantined at the work-finder level by
-        /// #6440). A cheap `stat` via `SweepRegistryConfig::has_sweep_command`
-        /// — no forge round trip, no lock contention beyond the same mutex
-        /// every other dispatcher method already takes.
-        ///
-        /// Mirrors `dispatch_inner`'s own `!self.config.skip_label_flip &&
-        /// !self.config.has_sweep_command()` gate exactly: `skip_label_flip`
-        /// marks a hermetic unit-test fixture that never installs
-        /// `.claude/commands/loom/` on disk, so without this term every such
-        /// fixture would read as workspace-commands-missing and this
-        /// pre-filter would silently zero out their candidate batches —
-        /// unlike the guard in `dispatch()` itself, which they never actually
-        /// reach (label flips, and thus this guard, are the thing they're
-        /// opting out of).
-        fn workspace_commands_missing(&self) -> bool {
-            match self.registry.lock() {
-                Ok(reg) => !reg.config().skip_label_flip && !reg.config().has_sweep_command(),
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    false
-                }
-            }
-        }
-
-        /// Discounted occupancy count (Issue #4003): a sweep dispatched longer
-        /// than the registry's configured startup-proof grace window with zero
-        /// observed startup signal does not count toward the budget — see
-        /// `SweepRegistry::occupied_issues`. Reap-on-read first, mirroring
-        /// `in_flight()`, so a child whose process already exited never
-        /// over-counts either.
-        fn occupancy(&self) -> usize {
-            let mut reg = match self.registry.lock() {
-                Ok(r) => r,
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    return 0;
-                }
-            };
-            reg.reap_liveness();
-            reg.occupied_issues().len()
-        }
-
-        fn collisions(&self) -> u64 {
-            match self.registry.lock() {
-                Ok(reg) => reg.collision_count(),
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    0
-                }
-            }
-        }
-
-        fn peer_claimed(&self) -> HashSet<u32> {
-            match self.registry.lock() {
-                Ok(reg) => reg.peer_claimed_issues(),
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    HashSet::new()
-                }
-            }
-        }
-
-        /// Additional skip-label list for this workspace (Issue #6685),
-        /// resolved fresh each call from `<workspace_root>/.loom/config.json`
-        /// via [`read_work_finder_config`] / [`resolve_extra_skip_labels_with_config`]
-        /// — a cheap JSON read (mirrors `workspace_commands_missing()`'s own
-        /// per-call `stat`), so an operator's `autonomous.workFinder.extraSkipLabels`
-        /// edit takes effect on the very next tick with no registry-side
-        /// config plumbing or daemon restart required.
-        fn extra_skip_labels(&self) -> Vec<String> {
-            match self.registry.lock() {
-                Ok(reg) => resolve_extra_skip_labels_with_config(&read_work_finder_config(
-                    &reg.config().workspace_root,
-                )),
-                Err(poisoned) => {
-                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                    Vec::new()
-                }
-            }
-        }
-
-        /// Capabilities this **host** declares it holds (#6893), read fresh each
-        /// call from `LOOM_WORKER_CAPABILITIES`.
-        ///
-        /// Deliberately NOT resolved from `.loom/config.json` the way
-        /// [`extra_skip_labels`](Self::extra_skip_labels) above is: a skip-label
-        /// list is a repo policy, but "this machine has root / an admin token /
-        /// a production cloud profile" is a property of the host and its
-        /// credentials, and a file committed to git must not be able to assert
-        /// it. See [`crate::capability`].
-        fn declared_capabilities(&self) -> std::collections::BTreeSet<String> {
-            crate::capability::held_capabilities()
-        }
-
-        fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-            // Issue #6688: only the `repo_root` read needs the lock — grab it
-            // and release immediately, rather than holding the registry mutex
-            // across the whole call the way the pre-#6688 single `reg.dispatch(..)`
-            // call below used to (via `SweepRegistry::dispatch` ->
-            // `dispatch_inner`, which holds the lock across the up-to-5s
-            // account-selection poll; see `dispatch_issue_releasing_poll_lock`'s
-            // doc comment for the full hazard this avoids).
-            let repo_root = {
-                let reg = self
-                    .registry
-                    .lock()
-                    .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
-                reg.config().workspace_root.clone()
-            };
-            // Autonomous dispatch model (issue #3944): resolve an EXPLICIT model
-            // (`autonomous.model` config > shipped non-premium default) so the
-            // spawned child never silently inherits the operator's interactive
-            // CLI default (which may be a premium tier that burns usage credits).
-            // No dispatch-param tier here — the work finder has no per-issue
-            // override — so `explicit = None`.
-            //
-            // Issue #4809: this resolution ALSO inserts the model-cost A/B
-            // experiment's forced arm model when the workspace resolves to
-            // `experiment` mode (CANARY-gated) — the daemon-native replacement
-            // for the sweep.md prose instrumentation, which never executed in a
-            // headless child and was in any case overridden by this very
-            // default-pin precedence. `off`/`observe` modes are unaffected.
-            //
-            // Issue #4827: `complexity` is the issue's real
-            // `<!-- loom:complexity=... -->` stratum, read from the body the
-            // ETag-cached REST listing already returned — so the experiment's
-            // `complex` and `routine` strata each get an independent ~50/50 A/B
-            // balance instead of the whole population being stratified as
-            // `routine`. No extra forge call: the body arrives with the listing.
-            let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model(
-                &repo_root, issue, complexity,
-            );
-            // Issue #7482: this line is logged BEFORE `dispatch_issue_releasing_poll_lock`
-            // below runs the actual pre-spawn guards (open-PR #4123, park-label
-            // #4444, lease-order #6287, etc. — see `dispatch_inner`), any of
-            // which can still refuse the dispatch. So this must not claim a
-            // dispatch happened yet — it only names the *attempt*. The
-            // corresponding past-tense "dispatched issue #N" line is logged by
-            // each call site only once `dispatch()` returns `Ok(true)` (a
-            // confirmed new spawn), never here.
-            match resolved.arm {
-                Some(arm) => log::info!(
-                    "work_finder: attempting issue #{issue} with arm={arm} \
-                     (complexity={}) model={} (source={})",
-                    complexity.unwrap_or("routine"),
-                    resolved.model,
-                    resolved.source_label
-                ),
-                None => log::info!(
-                    "work_finder: attempting issue #{issue} with model={} (source={})",
-                    resolved.model,
-                    resolved.source_label
-                ),
-            }
-            let model = resolved.model;
-            // Idempotency key + the registry's claim lock make a re-dispatch of
-            // an already-running issue a no-op (`was_new = false`) or a loud
-            // lock-collision error.
-            let key = format!("workfinder-{issue}");
-            // Issue #6688: extends the #6592 begin/poll/finish split (proven
-            // for the IPC `DispatchSweep` handler) to this call site, so the
-            // account-selection poll no longer holds the registry mutex a
-            // concurrent `DaemonStatus`/`health` IPC call's per-root
-            // `registry.lock()` (`ipc.rs::build_daemon_status`) needs.
-            let outcome = crate::sweep_registry::dispatch_issue_releasing_poll_lock(
-                &self.registry,
-                &SweepKind::Issue(issue),
-                Some(key),
-                Some(&model),
-                None,
-                None,
-            )?;
-            Ok(outcome.was_new)
-        }
-    }
-}
+/// finder to the live forge (`gh`) and the daemon's [`SweepRegistry`]. Lives in
+/// its own file (#8572) for the same file-size-ratchet reason as
+/// [`registry_refresh`]; the move was pure, with no behavior change.
+pub mod forge;
 
 // Re-export the concrete adapters at the module root for ergonomic wiring.
 pub use forge::{GhWorkSource, RegistryDispatcher};
@@ -4265,6 +3949,19 @@ pub mod pool_preflight;
 // ratchet threshold (.loom/docs/file-size-policy.md) and may not grow.
 mod registry_refresh;
 
+/// The bounded, non-spammy tmpfs-fraction warning (issue #8572, split from
+/// #8512) — logs, never gates dispatch. Lives in its own file for the same
+/// file-size-ratchet reason as [`registry_refresh`].
+mod tmpfs_warning;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+/// Work-finder coverage for the #7972 PR-less retry skip set. Its own file
+/// (with its own minimal fakes) rather than part of `tests` above, for the
+/// same file-size-ratchet reason `registry_refresh` / `tmpfs_warning` are
+/// split out — `tests.rs` is over threshold and frozen.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod prless_retry_tests;

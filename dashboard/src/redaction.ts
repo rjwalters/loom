@@ -95,7 +95,10 @@ import type { ActiveSweepState, FleetSnapshot } from "./fleetState";
  * field on an existing kind does NOT appear in a public response until it is
  * added here on purpose. */
 const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
-  "sweep.started": ["kind", "started_at", "model", "effort"],
+  // `runtime` (the adapter the sweep ran on — `claude`/`codex`/…) is fleet
+  // capacity metadata like `model`: it names no repo, issue, or operator.
+  "sweep.started": ["kind", "started_at", "model", "effort", "runtime"],
+  "sweep.identity": ["kind", "runtime", "provider", "model"],
   "sweep.phase": ["kind", "phase", "entered_at"],
   "sweep.completed": ["kind", "completed_at", "result"],
   "sweep.outcome": ["kind", "model", "effort", "config", "phase_durations", "total_duration_sec", "result"],
@@ -157,6 +160,14 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     // "describes the machine, not the work" reasoning as `dispatch_halted`/
     // `halt_reason` directly above.
     "protection",
+    // Saturation admission-brake state (#8478) is deliberately ABSENT here:
+    // its scalars are machine detail (same footing as `dispatch_halted`), but
+    // its `top_cpu_consumers` names the executables running on the host —
+    // workload detail — so the object only ever reaches a public response
+    // through `PUBLIC_RECORD_DERIVATIONS`'s `redactAdmissionBrakeRow`, never a
+    // raw copy. See that function's doc for why the command list has no safe
+    // truncation.
+    //
     // `managed_repos` (#4976) is deliberately ABSENT here: each entry names a
     // specific repository, so — like `tokens.snapshot`'s `accounts` above —
     // it only ever reaches a public response through `PUBLIC_RECORD_
@@ -199,6 +210,7 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
  * unmeasurable probe is absent, never a fake `0`. */
 interface TokenAccountRow {
   account?: unknown;
+  provider?: unknown;
   rank?: unknown;
   usage_fraction?: unknown;
   limit_window_reset_at?: unknown;
@@ -218,6 +230,27 @@ export interface TokenPoolAggregate {
   /** Earliest limit-window reset across the pool — a fleet-level "capacity
    * returns at" that names no account. `null` when none reported one. */
   next_limit_window_reset_at: string | null;
+  /** The same aggregate, one entry per provider (`claude`, `codex`, …), in
+   * first-seen order. A row without a `provider` is a pre-per-provider
+   * daemon's Claude row, so it is folded into `"claude"`. Provider names are
+   * the daemon's own `AccountProvider` vocabulary, not account identifiers,
+   * so they are as public as `account_count` itself. */
+  providers: ProviderPoolAggregate[];
+}
+
+/** One provider's slice of {@link TokenPoolAggregate}. */
+export interface ProviderPoolAggregate {
+  provider: string;
+  account_count: number;
+  exhausted_count: number;
+  max_usage_fraction: number | null;
+  next_limit_window_reset_at: string | null;
+}
+
+/** The provider a `tokens.snapshot` row belongs to — `"claude"` when the
+ * emitting daemon predates per-provider pools and sent none. */
+function rowProvider(row: TokenAccountRow): string {
+  return typeof row.provider === "string" && row.provider.length > 0 ? row.provider : "claude";
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -255,12 +288,44 @@ export function deriveTokenPoolAggregate(payload: Record<string, unknown>): Toke
     .filter((value): value is string => typeof value === "string" && value.length > 0)
     .sort();
 
+  const providers: ProviderPoolAggregate[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const provider = rowProvider(row);
+    let slice = providers.find((entry) => entry.provider === provider);
+    if (!slice) {
+      slice = {
+        provider,
+        account_count: 0,
+        exhausted_count: 0,
+        max_usage_fraction: null,
+        next_limit_window_reset_at: null,
+      };
+      providers.push(slice);
+    }
+    slice.account_count += 1;
+    if (row.exhausted === true) slice.exhausted_count += 1;
+    if (isFiniteNumber(row.usage_fraction)) {
+      const usage = round4(row.usage_fraction);
+      slice.max_usage_fraction =
+        slice.max_usage_fraction === null ? usage : Math.max(slice.max_usage_fraction, usage);
+    }
+    const reset = row.limit_window_reset_at;
+    if (typeof reset === "string" && reset.length > 0) {
+      slice.next_limit_window_reset_at =
+        slice.next_limit_window_reset_at === null || reset < slice.next_limit_window_reset_at
+          ? reset
+          : slice.next_limit_window_reset_at;
+    }
+  }
+
   return {
     account_count: rows.length,
     exhausted_count: rows.filter((row) => row?.exhausted === true).length,
     mean_usage_fraction: usages.length ? round4(usages.reduce((sum, u) => sum + u, 0) / usages.length) : null,
     max_usage_fraction: usages.length ? round4(Math.max(...usages)) : null,
     next_limit_window_reset_at: resets[0] ?? null,
+    providers,
   };
 }
 
@@ -373,6 +438,71 @@ export function redactRoleTickHealth(roles: RoleTickHealthRow): Record<string, u
   return redacted;
 }
 
+/** `host.health`'s `admission_brake` summary (#8478), as the daemon sends it
+ * — the daemon always carries full detail (including a `ps`-sampled list of
+ * the process names eating the host); the redaction boundary is here. */
+interface AdmissionBrakeRow {
+  held?: unknown;
+  starving_since?: unknown;
+  starving_secs?: unknown;
+  starvation_warn_secs?: unknown;
+  escape_hatch_grants?: unknown;
+  dispatch_suppressed_by_foreign_load?: unknown;
+  top_cpu_consumers?: unknown;
+}
+
+/**
+ * Redact one `host.health.admission_brake` summary (#8478) for a public,
+ * unauthenticated viewer. Every scalar survives — whether dispatch is held,
+ * how long it has been starving, this host's own warn threshold, how many
+ * escape-hatch grants have fired, and the
+ * `dispatch_suppressed_by_foreign_load` verdict — all of which describe the
+ * *machine*, the same reasoning `dispatch_halted`/`halt_reason` (#4975) and
+ * `worktree_root_total_gb` (#5356) are allowed through on.
+ *
+ * `top_cpu_consumers` is deliberately dropped, not truncated. It is a
+ * `ps`-derived list of executable basenames, which is **workload** detail
+ * rather than machine detail: `ngspice ×25` says the host runs analog EDA
+ * simulation, the same category of "what is this operator actually working on"
+ * inference `sweep.outcome`'s `tokens_in`/`lines_added` (#5357) and
+ * `failure_class`/`models_used` (#8056) are held back for. There is also no
+ * truncation that makes it safe — unlike `roles[].root`, whose basename is
+ * demonstrably path-free, a command name IS the payload. It stays behind the
+ * Access gate; the authenticated `/api/*` surface returns it unchanged, which
+ * is where an operator diagnosing their own fleet reads it.
+ *
+ * **Dropping it here is only half the boundary** (Judge finding on PR #8547).
+ * `halt_reason` sits in `RECORD_FIELD_ALLOWLIST` above and is copied verbatim
+ * for the same public viewer, and the daemon derives it from this same brake
+ * summary — so interpolating the attribution into that free-text field would
+ * re-emit, byte for byte, exactly what this function removed. The daemon's
+ * `dispatch_halt_from_breaker`
+ * (`loom-daemon/src/observability/collector.rs`) therefore keeps `halt_reason`
+ * to scalars and the non-attributing verdict, with this field as the sole
+ * carrier of process attribution. Both halves are pinned together by
+ * `dashboard/test/redactionAdmissionBrake.test.ts`'s "no process attribution
+ * survives anywhere in the public projection" case and by its Rust counterpart
+ * in `loom-daemon/src/observability/collector/admission_brake_tests.rs`
+ * (`the_halt_reason_never_carries_process_attribution_past_the_public_boundary`).
+ *
+ * Like `redactRoleTickHealth`, a per-field pick (not a spread), so a future
+ * field added to the brake summary is dropped from the public view by default
+ * until this table is deliberately updated.
+ */
+export function redactAdmissionBrakeRow(brake: AdmissionBrakeRow): Record<string, unknown> {
+  const redacted: Record<string, unknown> = {};
+  if ("held" in brake) redacted.held = brake.held;
+  if ("starving_since" in brake) redacted.starving_since = brake.starving_since;
+  if ("starving_secs" in brake) redacted.starving_secs = brake.starving_secs;
+  if ("starvation_warn_secs" in brake) redacted.starvation_warn_secs = brake.starvation_warn_secs;
+  if ("escape_hatch_grants" in brake) redacted.escape_hatch_grants = brake.escape_hatch_grants;
+  if ("dispatch_suppressed_by_foreign_load" in brake) {
+    redacted.dispatch_suppressed_by_foreign_load = brake.dispatch_suppressed_by_foreign_load;
+  }
+  // `top_cpu_consumers` is deliberately NOT copied here — see the doc comment.
+  return redacted;
+}
+
 /**
  * Per-kind *derivations* layered on top of the field allowlist: fields the
  * public view gets that are computed from redacted-away input rather than
@@ -404,6 +534,20 @@ const PUBLIC_RECORD_DERIVATIONS: Readonly<Record<string, (payload: Record<string
       }
       if (payload.roles && typeof payload.roles === "object" && !Array.isArray(payload.roles)) {
         derived.roles = redactRoleTickHealth(payload.roles as RoleTickHealthRow);
+      }
+      // `admission_brake` (#8478) joins them for the same reason: its scalars
+      // are machine detail, but its `top_cpu_consumers` names the executables
+      // running on the host, so the whole object only ever reaches a public
+      // response through this derivation. Absent entirely when the payload
+      // carries no brake at all (a pre-#8478 daemon, or a host with no
+      // work-finder loop), so the field-presence contract stays "the daemon
+      // sent this".
+      if (
+        payload.admission_brake &&
+        typeof payload.admission_brake === "object" &&
+        !Array.isArray(payload.admission_brake)
+      ) {
+        derived.admission_brake = redactAdmissionBrakeRow(payload.admission_brake as AdmissionBrakeRow);
       }
       return derived;
     },
@@ -503,13 +647,15 @@ export interface PublicActiveSweep {
   enteredPhaseAt?: string;
   model?: string;
   effort?: string;
+  runtime?: string;
+  provider?: string;
   updatedAt: string;
 }
 
 /** Redact one `ActiveSweepState` (the Durable Object's live per-sweep
  * entry). Mirrors `redactHistoryRecord`'s field selection: repo/issue/sweep
  * id are stripped for a private, unauthenticated view; every other field
- * (phase, timing, model/effort) is aggregate/lifecycle metadata, not
+ * (phase, timing, model/effort/runtime) is aggregate/lifecycle metadata, not
  * repo-identifying, and survives. */
 export function redactActiveSweep(sweep: ActiveSweepState, isAuthenticated: boolean): PublicActiveSweep {
   if (!isPrivateAndUnauthenticated(sweep.visibility, isAuthenticated)) {
@@ -523,6 +669,8 @@ export function redactActiveSweep(sweep: ActiveSweepState, isAuthenticated: bool
     enteredPhaseAt: sweep.enteredPhaseAt,
     model: sweep.model,
     effort: sweep.effort,
+    runtime: sweep.runtime,
+    provider: sweep.provider,
     updatedAt: sweep.updatedAt,
   };
 }
@@ -538,6 +686,12 @@ export interface RedactedFleetSnapshot {
    * predate this field construct a bare `{ hosts, activeSweeps }`) even
    * though [`redactFleetSnapshot`] always populates it. */
   activeCompute?: FleetSnapshot["activeCompute"];
+  /** Roster-expected hosts with no health entry (Issue #8792). Passed
+   * through unchanged for both viewers: each entry is only a host ID (already
+   * public — it is every `hosts` key above) plus a derived state, with no
+   * repo/issue/branch/PR field to redact. Absent when no roster is
+   * configured. */
+  missingHosts?: FleetSnapshot["missingHosts"];
 }
 
 /** Redact a full `FleetSnapshot`: every host's `health`/`tokens` entry is
@@ -587,6 +741,7 @@ export function redactFleetSnapshot(snapshot: FleetSnapshot, isAuthenticated: bo
     // running-instance count is itself infrastructure-spend detail about a
     // private operator's fleet — the very thing the allowlist withholds).
     activeCompute: isAuthenticated ? snapshot.activeCompute : [],
+    ...(snapshot.missingHosts && { missingHosts: snapshot.missingHosts }),
   };
 }
 

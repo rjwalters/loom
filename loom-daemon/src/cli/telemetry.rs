@@ -1,10 +1,13 @@
 //! Token-cost telemetry subcommands: what a fleet's agents actually spent.
 //!
-//! Three members: `usage` (what the Anthropic OAuth API reports for the
+//! Five members: `usage` (what the Anthropic OAuth API reports for the
 //! current credential, live), `ingest-transcripts` (Issue #8059: persist
-//! what the local transcripts record into `activity.db`), and `usage-report`
+//! what the local transcripts record into `activity.db`), `usage-report`
 //! (Issue #8062: the role/model/repo/day cost breakdown over the rows
-//! ingestion writes).
+//! ingestion writes), `opencode-usage` (Issue #8507: the same question asked
+//! of OpenCode's own session store), and `archive-transcripts` (Issue #8494:
+//! a verified `.tar.zst` backstop for the *raw* transcripts, which
+//! ingestion's derived data does not cover).
 //!
 //! They are gathered into one **flattened** enum, exactly as
 //! [`super::script_ports`] is and for the same second reason: `main.rs` is over
@@ -23,8 +26,32 @@ use anyhow::Result;
 
 use loom_daemon::script_helpers;
 
+#[path = "telemetry_export.rs"]
+mod telemetry_export;
+#[path = "telemetry_fixture.rs"]
+mod telemetry_fixture;
+#[path = "telemetry_live.rs"]
+mod telemetry_live;
+#[path = "telemetry_overhead.rs"]
+mod telemetry_overhead;
+
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
+    /// Plan or explicitly execute two bounded Pi/OpenCode GLM smoke runs.
+    TelemetryLiveCanary(telemetry_live::LiveArgs),
+    /// Write deterministic synthetic telemetry and an independent-query manifest.
+    TelemetryFixture(telemetry_fixture::FixtureArgs),
+    /// Measure what lifecycle instrumentation costs on a representative run.
+    TelemetryOverhead(telemetry_overhead::OverheadArgs),
+    /// Send a bounded JSONL fixture to an explicit OTLP Collector endpoint.
+    TelemetryExport(telemetry_export::TelemetryExportArgs),
+    /// Report transport capabilities of this installed binary without reading configuration.
+    TelemetryCapabilities {
+        /// Fail when this artifact cannot export OTLP.
+        #[arg(long)]
+        require_otlp: bool,
+    },
+
     /// Query Claude API usage via the Anthropic OAuth API (native port of
     /// `loom_tools.common.usage`, #4275). Backs `check-usage.sh`.
     ///
@@ -57,6 +84,28 @@ pub(crate) enum TelemetryCommand {
     /// `--status` flag, unchanged) so `check-usage.sh`'s contract is never at
     /// risk of a parse ambiguity — see `usage_report_cli`'s module doc.
     UsageReport(super::usage_report_cli::UsageReportArgs),
+
+    /// Per-model token usage from OpenCode's own session store (Issue #8507).
+    ///
+    /// The backfill and verification path for non-Claude runtimes: the same
+    /// reader a sweep's `tokens_by_model` now uses, pointed at any directory
+    /// and window. Read-only — one query, naming `session` alone, never the
+    /// `credential`/`account` tables in the same file.
+    OpencodeUsage(super::opencode_usage_cli::OpencodeUsageArgs),
+
+    /// Roll raw Claude Code transcripts into a verified, incremental
+    /// `.tar.zst` archive before Claude Code's `cleanupPeriodDays` fuse
+    /// deletes them (#8494, split from #8477's item 5).
+    ///
+    /// #8477 (`ingest-transcripts`, above) preserves the *derived* token/cost
+    /// data, not the raw transcripts themselves. This covers those: excludes
+    /// `~/.claude/projects/<project>/memory/` (persistent agent memory, never
+    /// a transcript), records a manifest (path/size/mtime/sha256) per
+    /// archived file, reads the archive back to confirm it matches before
+    /// recording anything, and skips a transcript already archived with a
+    /// matching size/mtime on a later run. Opt-in and operator-driven — never
+    /// started automatically.
+    ArchiveTranscripts(super::transcript_archive_cli::ArchiveTranscriptsArgs),
 }
 
 impl TelemetryCommand {
@@ -66,11 +115,29 @@ impl TelemetryCommand {
     ///
     /// Propagates the subcommand's own failure. The `usage` arm never returns:
     /// it exits with the process code `check-usage.sh` branches on.
-    pub(crate) fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         match self {
+            TelemetryCommand::TelemetryLiveCanary(args) => args.run(),
+            TelemetryCommand::TelemetryFixture(args) => args.run(),
+            TelemetryCommand::TelemetryOverhead(args) => args.run(),
+            TelemetryCommand::TelemetryExport(args) => args.run().await,
+            TelemetryCommand::TelemetryCapabilities { require_otlp } => {
+                println!(
+                    "{}",
+                    serde_json::json!({"otlp": cfg!(feature = "otlp"), "otlp_protocol": "http/json"})
+                );
+                anyhow::ensure!(
+                    !require_otlp || cfg!(feature = "otlp"),
+                    "this binary was built without the otlp feature"
+                );
+                Ok(())
+            }
+
             TelemetryCommand::Usage(args) => args.run(),
             TelemetryCommand::IngestTranscripts(args) => args.run(),
             TelemetryCommand::UsageReport(args) => args.run(),
+            TelemetryCommand::OpencodeUsage(args) => args.run(),
+            TelemetryCommand::ArchiveTranscripts(args) => args.run(),
         }
     }
 }

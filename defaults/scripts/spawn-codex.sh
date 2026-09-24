@@ -771,8 +771,7 @@ fi
 
 if [[ "$CODEX_SESSION_EXEC" == "true" && "$HAS_PROMPT" != "true" ]]; then
     log_error "Profile '$CODEX_PROFILE_NAME' is session-managed; an interactive host-direct Codex run is not permitted against an adopted profile (ADR-0017 Decision 1)."
-    log_error "For interactive access (e.g. re-authentication), use:"
-    log_error "  loom-daemon accounts session attach $CODEX_PROFILE_NAME"
+    log_error "For interactive re-authentication, use: loom-daemon accounts session attach $CODEX_PROFILE_NAME"
     exit 78  # EX_CONFIG
 fi
 
@@ -805,14 +804,20 @@ fi
 # account_lifecycle.rs's `codex login status` call uses — so a wedged CLI
 # cannot hang a spawn. Escape hatch: LOOM_CODEX_AUTH_MODE_CHECK=0.
 CODEX_DROP_PINNED_MODEL=false
+# For a session-managed profile the probe runs INSIDE the account's container
+# (issue #8518): a host-direct `codex login status` against an adopted
+# profile is exactly the host-side CODEX_HOME access the ownership rule
+# forbids, and it would read the host's default login state, not the
+# account's. Same read-only, bounded probe account_lifecycle.rs uses.
+_codex_bin=(codex); [[ "$CODEX_SESSION_EXEC" == "true" ]] && _codex_bin=(docker exec "$CODEX_SESSION_CONTAINER" codex)
 if [[ -n "$EFFECTIVE_MODEL" && -z "${LOOM_CODEX_NO_EXEC:-}" \
       && "${LOOM_CODEX_AUTH_MODE_CHECK:-1}" != "0" ]] \
-    && command -v codex >/dev/null 2>&1; then
+    && command -v "${_codex_bin[0]}" >/dev/null 2>&1; then
     _auth_mode_bounded_run_lib="${_SCRIPT_DIR}/lib/bounded-run.sh"
     if [[ -f "$_auth_mode_bounded_run_lib" ]]; then
         # shellcheck source=./lib/bounded-run.sh
         source "$_auth_mode_bounded_run_lib"
-        _login_status_out="$(bounded_run 10 codex login status </dev/null 2>&1)"
+        _login_status_out="$(bounded_run 10 "${_codex_bin[@]}" login status </dev/null 2>&1)"
         _login_status_rc=$?
         if [[ $_login_status_rc -eq 0 ]] \
             && printf '%s' "$_login_status_out" | grep -qi "logged in using chatgpt"; then
@@ -967,10 +972,22 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
     # state by the crate's absolute source path, so it is orphaned disk the
     # moment a worktree goes away. An inline `CARGO_INCREMENTAL=1 cargo …`
     # prefix still outranks it per-invocation.
-    CODEX_INVOKE=(docker exec -e CARGO_INCREMENTAL=0 "$CODEX_SESSION_CONTAINER" codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
-else
-    CODEX_INVOKE=(codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
+    #
+    # --workdir "$PWD" (issue #8518): `docker exec` also does NOT inherit
+    # this script's cwd — without it Codex starts in the image's WORKDIR
+    # (/home/loom), which is neither a repository nor a trusted project, and
+    # every dispatch dies with "Not inside a trusted directory". The mount
+    # contract (docker/worker/MOUNT-CONTRACT.md §1) guarantees the host path
+    # exists byte-identically inside the container, so $PWD is valid there.
+    # LOOM_WORKSPACE and the Loom context vars below are forwarded
+    # explicitly for the same reason; host HOME/PATH/CODEX_HOME and ambient
+    # provider credentials are deliberately NOT forwarded — the container
+    # owns its own CODEX_HOME (ADR-0017 Decision 1).
+    CODEX_INVOKE=("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" session-exec host --container "$CODEX_SESSION_CONTAINER" --workdir "$PWD" --env "LOOM_WORKSPACE=$WORKSPACE" --env CARGO_INCREMENTAL=0 --owner-pid "$PPID")
+    for _v in LOOM_ROLE LOOM_RUNTIME LOOM_TERMINAL_ID LOOM_SWEEP_ID LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT LOOM_PROJECT_ROOT LOOM_SWEEP_CLAIM_OWNED LOOM_ACCOUNT_NAME LOOM_ACCOUNT_PROVIDER; do [[ -n "${!_v:-}" ]] && CODEX_INVOKE+=(--env "$_v=${!_v}"); done
+    CODEX_INVOKE+=(--)
 fi
+CODEX_INVOKE+=(codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
 
 # --- Test/CI hook: surface the resolved argv without touching the real CLI ---
 # Checked BEFORE the binary check so the mocked test can assert argv assembly on
@@ -982,30 +999,14 @@ if [[ -n "${LOOM_CODEX_NO_EXEC:-}" ]]; then
 fi
 
 # --- Binary check ---
+# requires-daemon: session-exec >= 0.19.316 Feature-probed for session profiles (#8773).
 # Exit 127 (not 78): 78/EX_CONFIG is reserved for configuration errors,
 # including spawn-worker.sh's unknown-runtime dispatch failure. A missing
 # runtime binary is the contract's "Runtime-missing" facet, which
 # spawn-claude.sh answers with 127.
-if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
-    if ! command -v docker >/dev/null 2>&1; then
-        log_error "'docker' command not found in PATH."
-        log_error "Session-exec dispatch requires Docker to exec into the session container '$CODEX_SESSION_CONTAINER' (issue #6926)."
-        exit 127
-    fi
-    # Fail with a named, actionable error rather than a raw `docker exec`
-    # failure when the session container has not been started (or was
-    # stopped) — the contract's missing-credential-shaped facet, reused for
-    # "missing session container".
-    _session_running="$(docker inspect -f '{{.State.Running}}' "$CODEX_SESSION_CONTAINER" 2>/dev/null || true)"
-    if [[ "$_session_running" != "true" ]]; then
-        log_error "Session container '$CODEX_SESSION_CONTAINER' for profile '$CODEX_PROFILE_NAME' is not running."
-        log_error "Start it with: loom-daemon accounts session start $CODEX_PROFILE_NAME"
-        exit 78  # EX_CONFIG
-    fi
-elif ! command -v codex >/dev/null 2>&1; then
-    log_error "'codex' command not found in PATH."
-    log_error "Install the OpenAI Codex CLI (>= 0.146.0), e.g.:"
-    log_error "  npm install -g @openai/codex     # or: brew install codex"
+[[ "$CODEX_SESSION_EXEC" != "true" ]] || "${LOOM_DAEMON_SELF_BIN:-loom-daemon}" session-exec protocol >/dev/null 2>&1 || { log_error "Session dispatch requires an updated loom-daemon with session-exec supervision; update Loom before retrying."; exit 78; }
+if [[ "$CODEX_SESSION_EXEC" != "true" ]] && ! command -v codex >/dev/null 2>&1; then
+    log_error "'codex' command not found in PATH. Install the OpenAI Codex CLI (>= 0.146.0), e.g.: npm install -g @openai/codex  # or: brew install codex"
     exit 127
 fi
 
@@ -1030,13 +1031,27 @@ fi
 # exit-code passthrough is preserved despite not using `exec`.
 _stderr_file="$(mktemp -t loom-spawn-codex.XXXXXX 2>/dev/null || mktemp)"
 # shellcheck disable=SC2064  # expand $_stderr_file now, at trap-install time.
-trap "rm -f '$_stderr_file'" EXIT
+trap "rm -f '$_stderr_file' '$_stderr_file.cancel'" EXIT
 
 set +e
 echo "# LOOM_CLI_START runtime=codex" >&2
-{ "${CODEX_INVOKE[@]}" </dev/null 2>&1 1>&3 3>&- \
-    | tee "$_stderr_file" >&2; } 3>&1
-_exit_code=${PIPESTATUS[0]}
+if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
+    # The Rust transport tees stderr itself. Keep this shell alive until its
+    # cleanup acknowledgement, including signals arriving during child startup.
+    _session_pid=""; _session_cancelled=0
+    trap '_session_cancelled=143; : > "$_stderr_file.cancel"' TERM INT HUP
+    LOOM_SESSION_STDERR_FILE="$_stderr_file" "${CODEX_INVOKE[@]}" </dev/null &
+    _session_pid=$!
+    wait "$_session_pid"; _exit_code=$?
+    # wait is interrupted by a trap; the next wait still owns the live child.
+    while jobs -pr | grep -x "$_session_pid" >/dev/null; do wait "$_session_pid"; _exit_code=$?; done
+    [[ "$_session_cancelled" -eq 0 ]] || _exit_code="$_session_cancelled"
+    trap - TERM INT HUP
+else
+    { "${CODEX_INVOKE[@]}" </dev/null 2>&1 1>&3 3>&- \
+        | tee "$_stderr_file" >&2; } 3>&1
+    _exit_code=${PIPESTATUS[0]}
+fi
 set -e
 
 # --- Session / transcript / cost reporting (contract points 1, 2 and 4) ---

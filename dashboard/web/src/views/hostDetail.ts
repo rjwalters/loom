@@ -23,6 +23,9 @@
  */
 
 import { el, field } from "../dom";
+import { forgeLink, repoUrl, sweepWorkTitle, sweepWorkUrl } from "../forgeLinks";
+import { accountProvider } from "../fleet";
+import { providerMark, sweepAgentMark } from "../providers";
 import {
   UNKNOWN,
   formatAbsolute,
@@ -58,6 +61,27 @@ function historyPlaceholder(): HTMLElement {
   );
 }
 
+/** Why this host has no `host.health` record to show. The default wording —
+ * "known only from its sweep activity" — is the sweep-only case it was
+ * written for, and would be a plainly wrong statement about a roster host
+ * with no sweeps at all, so the two roster states (#8804) say what the
+ * backend actually knows about them instead. */
+function healthMissingNotice(host: HostView): string {
+  if (host.status === "missing") {
+    return (
+      "This host is named by the fleet's expected-host roster and holds an active " +
+      "ingest key, but has never pushed a host.health record."
+    );
+  }
+  if (host.status === "unprovisioned") {
+    return (
+      "This host is named by the fleet's expected-host roster but has no active ingest " +
+      "key, so it cannot push telemetry yet — it has not been enrolled."
+    );
+  }
+  return "This host has not pushed a host.health record yet. It is known only from its sweep activity.";
+}
+
 function healthPanel(host: HostView, now: Date): HTMLElement {
   const timestamped = host.entry.health;
   if (!timestamped) {
@@ -65,11 +89,7 @@ function healthPanel(host: HostView, now: Date): HTMLElement {
       "section",
       { class: "panel", data: { testid: "health-panel" } },
       el("h2", { class: "panel__title" }, "Host health"),
-      noticeRow(
-        "This host has not pushed a host.health record yet. It is known only from " +
-          "its sweep activity.",
-        "health-missing",
-      ),
+      noticeRow(healthMissingNotice(host), "health-missing"),
     );
   }
 
@@ -141,6 +161,7 @@ function accountRow(account: TokenAccount, now: Date): HTMLElement {
       data: { testid: "token-account", account: account.account ?? "" },
     },
     el("td", {}, formatText(account.account)),
+    el("td", { class: "detail__account-provider" }, providerMark(accountProvider(account), true)),
     el("td", {}, account.rank === undefined ? UNKNOWN : String(account.rank)),
     el(
       "td",
@@ -245,6 +266,7 @@ function tokensPanel(host: HostView, now: Date): HTMLElement {
           "tr",
           {},
           el("th", {}, "Account"),
+          el("th", {}, "Provider"),
           el("th", {}, "Rank"),
           el("th", {}, "Usage"),
           el("th", {}, "Window resets"),
@@ -268,10 +290,27 @@ export function sweepRow(sweep: ActiveSweep, now: Date = new Date()): HTMLElemen
     el(
       "td",
       { title: sweep.sweepId },
-      sweep.issue === undefined ? sweep.sweepId : `#${sweep.issue}`,
+      // Same forge-link rule as the overview card: the `feature/issue-N`
+      // branch once Builder has pushed one, the issue itself before that.
+      forgeLink(
+        sweep.issue === undefined ? sweep.sweepId : `#${sweep.issue}`,
+        sweepWorkUrl(sweep.repo, sweep.issue, sweep.phase),
+        "detail__sweep-label",
+        sweepWorkTitle(sweep.issue, sweep.phase),
+      ),
     ),
-    el("td", {}, formatText(sweep.repo)),
+    el(
+      "td",
+      {},
+      sweep.repo ? forgeLink(sweep.repo, repoUrl(sweep.repo), "detail__sweep-repo") : formatText(sweep.repo),
+    ),
     el("td", {}, el("span", { class: "chip" }, sweep.phase ?? "starting")),
+    el(
+      "td",
+      { class: "detail__sweep-agent" },
+      // Resolved provider with the sweep runtime available in its tooltip.
+      sweepAgentMark(sweep, true) ?? UNKNOWN,
+    ),
     el("td", {}, formatText(sweep.model)),
     el("td", {}, formatText(sweep.effort)),
     el(
@@ -322,6 +361,7 @@ function sweepsPanel(host: HostView, now: Date): HTMLElement {
           el("th", {}, "Issue"),
           el("th", {}, "Repo"),
           el("th", {}, "Phase"),
+          el("th", {}, "Agent"),
           el("th", {}, "Model"),
           el("th", {}, "Effort"),
           el("th", {}, "Running"),

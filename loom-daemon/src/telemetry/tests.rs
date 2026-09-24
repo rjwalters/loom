@@ -5,8 +5,14 @@
 
 use super::*;
 
+mod admission_brake;
+mod daemon_event;
 mod role_tick;
+mod session_analysis;
+mod session_summary;
+mod token_snapshot;
 use role_tick::role_tick_outcome;
+use token_snapshot::tokens_snapshot;
 
 // ------------------------------------------------------------------
 // Test fixtures — one freshly-constructed record per kind.
@@ -28,6 +34,7 @@ fn sweep_started() -> TelemetryRecord {
         started_at: ts(),
         model: Some("opus".to_string()),
         effort: Some("high".to_string()),
+        runtime: Some("claude".to_string()),
     })
 }
 
@@ -108,28 +115,9 @@ fn sweep_outcome() -> TelemetryRecord {
             attempt: 1,
             verdict: "pass".to_string(),
         }]),
-    })
-}
-
-fn tokens_snapshot() -> TelemetryRecord {
-    TelemetryRecord::TokensSnapshot(TokenSnapshotRecord {
-        captured_at: ts(),
-        accounts: vec![
-            TokenAccountState {
-                account: "agent-1".to_string(),
-                rank: Some(0),
-                usage_fraction: Some(0.42),
-                limit_window_reset_at: Some(ts()),
-                exhausted: false,
-            },
-            TokenAccountState {
-                account: "agent-2".to_string(),
-                rank: None,
-                usage_fraction: None,
-                limit_window_reset_at: None,
-                exhausted: true,
-            },
-        ],
+        runtime: Some("opencode".to_string()),
+        provider: Some("friendli".to_string()),
+        profile: Some("zai-flash".to_string()),
     })
 }
 
@@ -173,10 +161,19 @@ fn host_health() -> TelemetryRecord {
             state: "protected".to_string(),
             watchdog_provisioned: Some(true),
         }),
+        admission_brake: None,
     })
 }
 
 fn every_record() -> Vec<TelemetryRecord> {
+    // Per-kind-versioned records (trace.span → 3, sweep.identity → 4,
+    // session.summary → 5, session.analysis → 6, daemon.event → 7) are
+    // deliberately absent here — they get their own round-trip/version
+    // coverage in their modules' tests (`trace/tests.rs`,
+    // `tests/role_tick.rs`, `tests/session_summary.rs`,
+    // `tests/session_analysis.rs`, `tests/daemon_event.rs`) and would break
+    // `fresh_envelope_carries_current_schema_version`, which asserts the
+    // default stamp for every kind in this list.
     vec![
         sweep_started(),
         sweep_phase(),
@@ -246,6 +243,9 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         models_used: None,
         doctor_cycles: None,
         judge_verdicts: None,
+        runtime: None,
+        provider: None,
+        profile: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for field in [
@@ -255,6 +255,9 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         "lines_deleted",
         "pr_number",
         "tokens_by_model",
+        "runtime",
+        "provider",
+        "profile",
     ] {
         assert!(
             value.get(field).is_none(),
@@ -357,6 +360,9 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
                 verdict: "pass".to_string(),
             },
         ]),
+        runtime: None,
+        provider: None,
+        profile: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(value["failure_class"], "account-exhausted:model-credits-exhausted");
@@ -400,6 +406,9 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         models_used: None,
         doctor_cycles: None,
         judge_verdicts: None,
+        runtime: None,
+        provider: None,
+        profile: None,
     };
 
     let unobserved = serde_json::to_value(&base).unwrap();
@@ -722,6 +731,7 @@ fn host_health_omits_built_at_when_unknown() {
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -815,6 +825,7 @@ fn host_health_omits_managed_repos_when_empty() {
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -910,6 +921,7 @@ fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
             persistent: Vec::new(),
         },
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     let roles = value.get("roles").unwrap();
@@ -1001,6 +1013,7 @@ fn host_health_omits_worktree_root_total_gb_when_unmeasurable() {
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -1033,6 +1046,7 @@ fn host_health_omits_protection_when_absent() {
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -1066,6 +1080,7 @@ fn host_health_free_without_total_serializes_with_no_fabricated_denominator() {
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(
@@ -1106,6 +1121,7 @@ fn host_health_omits_watchdog_provisioned_when_the_probe_could_not_answer() {
             state: "unknown".to_string(),
             watchdog_provisioned: None,
         }),
+        admission_brake: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     let protection = value.get("protection").unwrap();

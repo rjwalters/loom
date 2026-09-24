@@ -8,6 +8,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
+mod forge_events_line;
 mod holds;
 mod model_class;
 
@@ -285,6 +286,22 @@ pub(crate) fn build_status_json_value(
         // States: disabled | starting | never_exported | healthy |
         // host_id_mismatch | failing. `null` only from a pre-#5083 daemon.
         "observability_export": report.observability_export,
+        // Per-exporter cells (#8756): one entry per configured exporter,
+        // keyed by exporter name — each sink's queue, counters and liveness
+        // surfaced independently:
+        //   loom-daemon status --json \
+        //     | jq -e '.observability_exports.otlp.state == "healthy"'
+        // `{}` when observability is off or from a pre-#8756 daemon (the
+        // singular field above already distinguishes those states).
+        "observability_exports": report.observability_exports,
+        // Forge event-feed consumer state (ADR-0021, #8765). Non-null for any
+        // daemon of this vintage and always carrying a `state`, so a watch
+        // loop asserts rather than infers:
+        //   loom-daemon status --json | jq -e '.forge_events.state == "healthy"'
+        // States: disabled | misconfigured | connecting | failing |
+        // auth_failed | host_mismatch | backoff | healthy. `null` only from a
+        // pre-ADR-0021 daemon.
+        "forge_events": report.forge_events,
         // Per-repo pressure-triggered deep-clean state (#5919): when the pass
         // last fired, what it reclaimed, and — for the common non-firing tick
         // — why it declined. Scripted consumers can assert reclamation is
@@ -631,6 +648,13 @@ pub(crate) fn build_status_json_value(
             // relieve it) for a scripted consumer, mirroring the human line.
             "starving_since": b.starving_since,
             "starving_ticks": b.starving_ticks,
+            // Issue #8478: the DURATION, pre-computed. `starving_since` alone
+            // required every consumer to subtract it from its own clock, and
+            // the tick count is not a duration at all (it scales with the
+            // work-finder interval). The 12-hour incident behind #8478 was a
+            // duration question — "how long has this been held" — that no
+            // machine-readable field answered.
+            "starving_secs": b.starving_since.map(|s| (Utc::now() - s).num_seconds().max(0)),
             "escape_hatch_grants": b.escape_hatch_grants,
         })),
         "rate_limit_breaker": report.rate_limit_breaker.as_ref().map(|r| serde_json::json!({
@@ -2248,6 +2272,11 @@ pub(crate) fn print_status_human(
         render_observability_line(report.observability_export.as_ref(), Utc::now())
     );
 
+    // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
+    // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
+    // are five different answers that would otherwise all render as nothing.
+    println!("{}", forge_events_line::render(report.forge_events.as_ref(), Utc::now()));
+
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before
     // this line an operator had to read `daemon-watchdog.log` or poke
@@ -3732,11 +3761,10 @@ mod status_protection_tests {
             exporter: Some("https".to_string()),
             started_at: Some(render_now() - chrono::Duration::hours(4)),
             last_success_at: None,
-            last_failure_at: None,
-            last_failure_detail: None,
             records_exported: 0,
             consecutive_failures: 0,
             flush_interval_secs: Some(30),
+            ..Default::default()
         };
         mutate(&mut status);
         status
@@ -4414,6 +4442,41 @@ mod admission_brake_render_tests {
         );
         assert_eq!(healthy["admission_brake"]["starving_ticks"], 0);
         assert!(healthy["admission_brake"]["starving_since"].is_null());
+    }
+
+    /// #8478: the incident behind this field was a *duration* question ("how
+    /// long has dispatch been held?"). `starving_since` forced a consumer to do
+    /// clock arithmetic, and `starving_ticks` is not a duration at all — it
+    /// scales with the work-finder interval, so the same count means minutes on
+    /// one host and an hour on another.
+    #[test]
+    fn json_carries_the_starvation_duration_in_seconds() {
+        // `starving_brake` stamps `starving_since` 400s in the past.
+        let value = build_status_json_value(
+            &report_with(Some(starving_brake(Some(1.81), 5, 1))),
+            None,
+            &no_update(),
+            None,
+            None,
+            None,
+        );
+        let secs = value["admission_brake"]["starving_secs"]
+            .as_i64()
+            .expect("a starving brake must report its duration");
+        assert!((395..=405).contains(&secs), "expected ~400s of starvation, got {secs}");
+
+        let healthy = build_status_json_value(
+            &report_with(Some(brake(true, true, Some(1.10)))),
+            None,
+            &no_update(),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            healthy["admission_brake"]["starving_secs"].is_null(),
+            "a brake that is not starving has no duration to report — null, never 0"
+        );
     }
 
     #[test]

@@ -67,6 +67,7 @@ export function parseTokenSample(envelope: HistoryEnvelope): TokenSample | undef
     const usageFraction = parseFiniteNumber(raw.usage_fraction);
     accounts.push({
       account,
+      provider: typeof raw.provider === "string" && raw.provider !== "" ? raw.provider.toLowerCase() : "claude",
       rank: parseFiniteNumber(raw.rank),
       usageFraction,
       limitWindowResetAt: parseTimestamp(raw.limit_window_reset_at),

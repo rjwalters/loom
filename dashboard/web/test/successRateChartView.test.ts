@@ -39,6 +39,38 @@ describe("renderSuccessRateChart", () => {
     expect(container.querySelectorAll("polyline").length).toBe(0);
   });
 
+  it("draws a 0–100% axis, dates, a crosshair tooltip and a table view; no legend for one series (#8546)", () => {
+    const container = document.createElement("div");
+    renderSuccessRateChart(
+      container,
+      [
+        { bucketKey: "2026-09-19", successRate: 0.5, total: 4 },
+        { bucketKey: "2026-09-20", successRate: null, total: 0 },
+        { bucketKey: "2026-09-21", successRate: 1, total: 2 },
+      ],
+      { width: 640 },
+    );
+
+    expect(container.querySelector(".chart-title")?.textContent).toBe("Success rate");
+    const axisLabels = Array.from(container.querySelectorAll("text.chart-axis__label")).map((l) => l.textContent);
+    expect(axisLabels).toEqual(expect.arrayContaining(["0%", "50%", "100%", "Sep 19", "Sep 21"]));
+    expect(container.querySelector(".chart-legend")).toBeNull();
+
+    const tableRows = container.querySelectorAll(".chart-table tbody tr");
+    expect(tableRows.length).toBe(3);
+    expect(tableRows[1]?.textContent).toBe("Sep 20" + "—" + "0");
+
+    const hover = container.querySelector<SVGElement>("path.chart-hit");
+    hover?.dispatchEvent(new Event("focus"));
+    const tooltip = container.querySelector<HTMLElement>(".chart-tooltip");
+    expect(tooltip?.hidden).toBe(false);
+    expect(tooltip?.textContent).toContain("Sep 21");
+    expect(tooltip?.textContent).toContain("100%");
+    expect(container.querySelector("line.chart-crosshair")?.getAttribute("visibility")).toBe("visible");
+    hover?.dispatchEvent(new Event("blur"));
+    expect(tooltip?.hidden).toBe(true);
+  });
+
   it("renders a contentless <svg> for an empty point list", () => {
     const container = document.createElement("div");
     renderSuccessRateChart(container, []);

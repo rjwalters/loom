@@ -404,13 +404,39 @@ else
     echo -e "  ${RED}FAIL${NC}: champion-pr-merge.md does not branch on exit code 3"
 fi
 
+# The trap note itself moved to the exit-code exceptions reference doc (#8508,
+# to keep champion-pr-merge.md inside its markdown-token ratchet), so assert
+# what actually matters: the note still exists, and the Champion prompt still
+# points at it from the same section. A link with no target, or a target with
+# no note, both fail. Probe the installed (.loom/docs) and source
+# (defaults/docs) layouts, same two-depth reason as CHAMPION_MD above.
+if [[ -f "$HELPERS_DIR/../docs/merge-pr-exit-code-exceptions.md" ]]; then
+    EXIT_CODE_DOC="$HELPERS_DIR/../docs/merge-pr-exit-code-exceptions.md"
+else
+    EXIT_CODE_DOC="$HELPERS_DIR/../../defaults/docs/merge-pr-exit-code-exceptions.md"
+fi
+
 TESTS_RUN=$((TESTS_RUN + 1))
-if [[ -f "$CHAMPION_MD" ]] && grep -qi 'squash-merge detection trap' "$CHAMPION_MD"; then
+if [[ -f "$EXIT_CODE_DOC" ]] && grep -qi 'squash-merge detection trap' "$EXIT_CODE_DOC" \
+   && [[ -f "$CHAMPION_MD" ]] && grep -q 'merge-pr-exit-code-exceptions.md' "$CHAMPION_MD"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: champion-pr-merge.md documents the squash-merge detection trap"
+    echo -e "  ${GREEN}PASS${NC}: the squash-merge detection trap is documented and linked from champion-pr-merge.md"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: champion-pr-merge.md is missing the squash-merge detection trap note"
+    echo -e "  ${RED}FAIL${NC}: the squash-merge detection trap note or its link from champion-pr-merge.md is missing"
+fi
+
+# #8508's exit 4 shares exit 3's caller contract, so the same wiring must be
+# present: Champion has to branch on it instead of falling into the generic
+# failure path, and must pass the flag that can produce it in the first place.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$CHAMPION_MD" ]] && grep -q '"\$MERGE_RC" -eq 4' "$CHAMPION_MD" \
+   && grep -q -- '--redate-stale-checks' "$CHAMPION_MD"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: champion-pr-merge.md passes --redate-stale-checks and branches on exit 4 (#8508)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: champion-pr-merge.md does not wire merge-pr.sh's exit 4 (#8508)"
 fi
 
 # ============================================================================

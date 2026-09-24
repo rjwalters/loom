@@ -59,6 +59,31 @@ const FIXTURE_GIT_LOCAL_CONFIG: &str = "\
 /// the *exact* probe `SweepRegistry::worktree_dirty` runs, rather than
 /// leaving a host-config surprise to surface as an unrelated-looking
 /// assertion failure several layers up.
+///
+/// # This function mutates nothing outside `ws` (Issue #8487)
+///
+/// It used to end by writing `ACTIVITY_WINDOW_ENV=0` into the **process**
+/// environment, so that a worktree whose files were all created microseconds
+/// ago would not read as "a live worker is inside it" under #8413's
+/// filesystem-activity leg. That write was justified by an invariant that was
+/// simply false — "the mid-build tests are `#[serial]` besides", while
+/// [`super::super::watchdog::reset_quarantine`]'s two tests call this fixture
+/// with no `#[serial]` attribute at all — and, worse, it was never restored,
+/// so a single call disabled the activity gate for **every later test in the
+/// same binary** (deterministically failing
+/// `worktree_reaper::tests::liveness::a_live_worker_writing_into_the_worktree_is_not_reaped`,
+/// which needs the gate on and never touches this fixture).
+///
+/// The "…and QUIET" half of what a fixture worktree means is now pinned by the
+/// caller's own registry instead, via
+/// [`make_quiet_dirty_git_worktree`](super::make_quiet_dirty_git_worktree) →
+/// `SweepRegistry::set_activity_window` — scoped to one `SweepRegistry`, so a
+/// test that wants the filesystem leg *on* just says so on the same registry
+/// (see `watchdog/liveness_tests.rs`) and no test can leak that choice into
+/// another. The only invariant this fixture now claims is the one it can
+/// enforce: it writes nothing outside the worktree it builds. Callers that
+/// never consult the activity gate at all (`reset_quarantine`'s pure-`git`
+/// tests) therefore need no pin, and no `#[serial]` attribute, for it.
 pub(crate) fn make_dirty_git_worktree(ws: &Path, issue: u32) -> PathBuf {
     let wt = ws
         .join(".loom")
@@ -140,19 +165,6 @@ pub(crate) fn make_dirty_git_worktree(ws: &Path, issue: u32) -> PathBuf {
         String::from_utf8_lossy(&probe.stdout),
         String::from_utf8_lossy(&probe.stderr),
     );
-
-    // #8413: the mid-build watchdog now counts a filesystem write inside the
-    // activity window as live-use evidence — and every file above was written
-    // microseconds ago, so without this pin EVERY fixture worktree would read
-    // as "an untracked worker is inside it" and no test could reach the
-    // destructive path at all. Pinning the window to 0 here makes a fixture
-    // worktree mean "dirty and QUIET", which is what these tests have always
-    // meant; a test that wants the filesystem leg re-enables it explicitly
-    // afterwards (see `watchdog/liveness_tests.rs`). Setting a process-global
-    // env var is safe for exactly the reason the post-condition above already
-    // requires: these run one-process-per-test under `cargo nextest run`
-    // (#4385), and the mid-build tests are `#[serial]` besides.
-    std::env::set_var(crate::worktree_activity::ACTIVITY_WINDOW_ENV, "0");
 
     wt
 }

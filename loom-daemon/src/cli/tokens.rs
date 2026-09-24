@@ -550,6 +550,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
+        ForgeAction::CheckOpenPr { issue } => ForgeCmd::CheckOpenPr { issue },
         ForgeAction::AutoMerge {
             pr_number,
             method,

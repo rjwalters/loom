@@ -13,6 +13,7 @@
 //! | situation | [`Outcome`] | [`SignatureState`] (reporting only) |
 //! |---|---|---|
 //! | `codesign`/`cosign` not installed | [`Outcome::Skipped`] | [`SignatureState::Unavailable`] |
+//! | macOS: `codesign` started but never answered (timed out / uncollectable) | [`Outcome::Skipped`] | [`SignatureState::Unavailable`] |
 //! | no `.sig` asset published | [`Outcome::Skipped`] (silently — the shell made no call here either) | [`SignatureState::Skipped`] |
 //! | macOS: unsigned (`code object is not signed at all`) | [`Outcome::Skipped`] | [`SignatureState::Skipped`] |
 //! | keyless: signer identity underivable | [`Outcome::Skipped`] | [`SignatureState::Unavailable`] |
@@ -33,6 +34,17 @@
 //! every host with no distributed public key — #5054 chose keyless as the
 //! default trust root and deliberately shipped no key at all.
 //!
+//! The same split applies to a verification tool that STARTS but never
+//! answers (#8754). A [`CmdOutcome::Unavailable`] — `codesign` outliving its
+//! deadline on a contended host, or output that could not be collected — is
+//! "we do not know", and belongs in the `Skipped`/`Unavailable` row above,
+//! NOT the `Failed` row: only a tool that ran to completion and reported a
+//! bad signature is tamper evidence. Deciding that by `succeeded()` alone is
+//! what [`crate::cmd_out`]'s own module docs warn against, because a wedged
+//! tool is then indistinguishable from a negative answer — and on this
+//! pipeline that misreads a busy host as a compromised release and blocks
+//! auto-update fleet-wide for as long as the load lasts.
+//!
 //! On Linux the ARTIFACT'S OWN SHAPE selects the verification mode — never
 //! local configuration (#5054): a `.sig` accompanied by its `.pem` signing
 //! certificate was signed keylessly and is verified against the expected
@@ -51,6 +63,34 @@ use std::time::Duration;
 /// crypto/keychain operations, not forge calls, so the default is generous
 /// relative to how long they actually take.
 const VERIFY_TIMEOUT: Duration = cmd_out::DEFAULT_TIMEOUT;
+
+/// Test-only override for [`VERIFY_TIMEOUT`] in [`verify_darwin`], in
+/// milliseconds; `0` means "use [`VERIFY_TIMEOUT`]".
+///
+/// The `Unavailable::TimedOut` classification the #8754 tests assert is
+/// reachable only by letting a deadline actually fire, and waiting out the
+/// production 30s ceiling twice would dominate the suite. Lowering
+/// [`VERIFY_TIMEOUT`] itself under `cfg(test)` would instead shorten the
+/// deadline for every *other* test's fake `codesign`/`cosign`, making them
+/// flaky on a loaded runner — so the override is opt-in per test and the
+/// default stays exactly what production uses. Not compiled into a release
+/// build at all.
+#[cfg(test)]
+static VERIFY_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The deadline [`verify_darwin`] runs `codesign` under — [`VERIFY_TIMEOUT`],
+/// except where a `#[serial]` test has asked for a shorter one.
+fn verify_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = VERIFY_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    VERIFY_TIMEOUT
+}
 
 /// Ceiling for the `cosign version` presence probe — deliberately short, the
 /// same reasoning as `script_helpers::gh_cmd`'s probe: anything slow here is
@@ -177,14 +217,27 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
 
     let mut dv_cmd = Command::new("codesign");
     dv_cmd.arg("-dv").arg(bin_path).stdin(Stdio::null());
-    let dv_outcome = cmd_out::run_command(dv_cmd, VERIFY_TIMEOUT);
-    if matches!(&dv_outcome, CmdOutcome::Unavailable(Unavailable::Spawn(_))) {
+    let dv_outcome = cmd_out::run_command(dv_cmd, verify_timeout());
+    if let CmdOutcome::Unavailable(u) = &dv_outcome {
         return VerifyResult {
             outcome: Outcome::Skipped,
             state: Some(SignatureState::Unavailable),
-            message: "'codesign' not available -- skipping macOS signature verification \
-                      (best-effort; checksum already verified)."
-                .to_string(),
+            message: match u {
+                Unavailable::Spawn(_) => {
+                    "'codesign' not available -- skipping macOS signature verification \
+                     (best-effort; checksum already verified)."
+                        .to_string()
+                }
+                // #8754: a `codesign` that started but never answered is
+                // UNKNOWN, not "bad". Returning here also stops a wedged
+                // `codesign` from being asked a second time only to time out
+                // again and reach the tamper-evidence branch below.
+                _ => format!(
+                    "'codesign -dv' could not be completed for {name} ({u}) -- skipping macOS \
+                     signature verification (inconclusive, NOT tamper evidence; checksum already \
+                     verified)."
+                ),
+            },
             had_authority: None,
         };
     }
@@ -198,6 +251,10 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
             s.push_str(&String::from_utf8_lossy(&o.stderr));
             s
         }
+        // Unreachable — every `Unavailable` returned above (#8754). Kept for
+        // exhaustiveness, and deliberately NOT a source of `desc` text: an
+        // `Unavailable`'s `Display` is a diagnostic, not codesign's report,
+        // and must never be pattern-matched for signature facts.
         CmdOutcome::Unavailable(u) => u.to_string(),
     };
     let had_authority = desc.lines().any(|l| l.starts_with("Authority="));
@@ -220,16 +277,23 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
         .arg("--strict")
         .arg(bin_path)
         .stdin(Stdio::null());
-    let verify_outcome = cmd_out::run_command(verify_cmd, VERIFY_TIMEOUT);
-    if verify_outcome.succeeded() {
-        VerifyResult {
+    // Three ways, never two (#8754). `succeeded()` alone cannot separate a
+    // `codesign` that ran and said "invalid" from one that never answered:
+    // both are `false`, and routing the second into the tamper-evidence branch
+    // is exactly the collapse `cmd_out`'s own docs forbid ("Merging it into
+    // 'it failed' is how a wedged forge becomes an apparently-negative
+    // answer"). A host busy enough to make `codesign` outlive its deadline is
+    // common; a release whose signature genuinely does not validate is not.
+    match cmd_out::run_command(verify_cmd, verify_timeout()) {
+        CmdOutcome::Ran(o) if o.status.success() => VerifyResult {
             outcome: Outcome::Verified,
             state: Some(SignatureState::Verified),
             message: format!("macOS codesign verification passed for {name}."),
             had_authority: Some(had_authority),
-        }
-    } else {
-        VerifyResult {
+        },
+        // Ran to completion and reported a bad signature: tamper evidence,
+        // still a hard block.
+        CmdOutcome::Ran(_) => VerifyResult {
             outcome: Outcome::Failed,
             state: None,
             message: format!(
@@ -238,7 +302,20 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
                  evidence."
             ),
             had_authority: Some(had_authority),
-        }
+        },
+        // Never answered (timed out, or its output could not be collected):
+        // UNKNOWN. A loud skip like absent tooling — never a block, and never
+        // worded as tamper evidence.
+        CmdOutcome::Unavailable(u) => VerifyResult {
+            outcome: Outcome::Skipped,
+            state: Some(SignatureState::Unavailable),
+            message: format!(
+                "macOS codesign verification could not be completed for {name} ({u}) -- \
+                 SKIPPING verification (inconclusive, NOT tamper evidence; checksum already \
+                 verified)."
+            ),
+            had_authority: Some(had_authority),
+        },
     }
 }
 

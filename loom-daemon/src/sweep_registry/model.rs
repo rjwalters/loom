@@ -1,21 +1,17 @@
 //! Dispatch model resolution and the tiered model-alias ladder.
 
+#[cfg(test)]
+#[path = "model_dispatch_tests.rs"]
+mod dispatch_tests;
+
+#[path = "model_dispatch.rs"]
+mod model_dispatch;
+pub(crate) use model_dispatch::*;
+
 use super::*;
 
-/// Issue #3944: the shipped default model for **autonomous / daemon-dispatched**
-/// sweep children when neither an explicit dispatch `model` param nor an
-/// `autonomous.model` config value is present.
-///
-/// This is deliberately a **non-premium tier**. Without it, a daemon-dispatched
-/// child (`claude -p "/loom:sweep N"`) emits **no** `--model` flag and inherits
-/// whatever model the operator last configured interactively — on the v0.15.0
-/// canary that was a premium tier (Fable 5) which meters premium usage credits
-/// and hard-failed every spawn with "out of usage credits". An autonomous fleet
-/// must never silently inherit a premium interactive default, so daemon dispatch
-/// always pins an explicit, cost-appropriate model. `sonnet` is chosen as the
-/// sane default (fast + cheap for the bulk of build work); override per-repo via
-/// `autonomous.model` in `.loom/config.json`, or per-dispatch via the
-/// `dispatch_sweep` `model` param.
+/// Cost-safe default for autonomous Claude sweeps. Native sweeps use their
+/// selected profile unless a dispatch/config model explicitly overrides it.
 pub const DEFAULT_DISPATCH_MODEL: &str = "sonnet";
 
 /// Issue #3944: which tier of the dispatch-model precedence chain supplied the
@@ -58,28 +54,89 @@ pub fn read_autonomous_model(repo_root: &Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Issue #3944: resolve the model a daemon-dispatched child should run with,
-/// per the precedence **explicit dispatch `model` param > `autonomous.model` in
-/// `.loom/config.json` > shipped [`DEFAULT_DISPATCH_MODEL`]**. Empty/whitespace
-/// strings are treated as unset at every tier. Returns the resolved model plus
-/// the [`ModelSource`] that supplied it (for the dispatch log line).
-///
-/// All autonomous dispatch paths (work-finder, epic supervisor) resolve with
-/// `explicit = None` so they never fall through to the CLI-inherited default;
-/// `dispatch_sweep` passes its optional `model` param as `explicit` so an
-/// explicit request still wins, and an absent one still lands on the shipped
-/// default rather than the operator's interactive CLI default.
+/// Resolve a model against the configured binding for callers without dispatch
+/// admission (for example standalone roles). Sweep dispatch uses the admitted
+/// runtime through `DispatchModel`, preserving explicit > config > default.
 #[must_use]
 pub fn resolve_dispatch_model(repo_root: &Path, explicit: Option<&str>) -> (String, ModelSource) {
+    resolve_dispatch_model_for_runtime(repo_root, explicit, DefaultModelPolicy::resolve(repo_root))
+}
+
+/// Issue #8721: which default-fallback branch applies to the admitted runtime.
+/// [`DispatchModel::resolve`](super::model_dispatch::DispatchModel::resolve)
+/// (the real full-sweep dispatch path) already carries the ACTUAL admitted
+/// runtime name once admission has happened, so it classifies that directly
+/// via [`DefaultModelPolicy::for_runtime`] rather than re-querying
+/// `runtime_admission::resolve_binding` a second time; callers with no
+/// admission in hand (standalone roles, hermetic skip-label fixtures) fall
+/// back to [`DefaultModelPolicy::resolve`], which re-derives the binding the
+/// same way the pre-#8721 `uses_native_sweep` bool did. Either path folds
+/// native-vs-not and Codex-vs-not into the one classification instead of two
+/// independent checks.
+///
+/// This intentionally stays a narrow policy switch — not a general runtime
+/// taxonomy (see [`ModelFamily`]'s own module note) — because
+/// `resolve_dispatch_model`'s only remaining job at this branch is "what goes
+/// in the model field when nobody supplied one".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultModelPolicy {
+    /// pi/opencode/kimi (`worker_spawn::is_native`): unchanged pre-#8721
+    /// behavior — no dispatch-model default, the runtime's own profile
+    /// selection applies instead (#4501/#4809).
+    NativeProfile,
+    /// The Codex runtime (#8721): a distinct model family from
+    /// `DEFAULT_DISPATCH_MODEL`'s Claude-shaped default (see
+    /// `model_family`/`runtime_model_family`), so it must never inherit that
+    /// default silently. No shipped Codex-native default exists yet, so this
+    /// resolves to "no default" (an empty model) — the same convention
+    /// native-profile runtimes already use — rather than inventing a new
+    /// Codex model pin.
+    Codex,
+    /// Claude, or any other/unrecognized runtime (including a
+    /// `resolve_binding` error, which pre-#8721 already fell through to this
+    /// branch via `uses_native_sweep`'s `is_ok_and(false)`): unchanged
+    /// Claude-shaped `DEFAULT_DISPATCH_MODEL` fallback.
+    ClaudeOrOther,
+}
+
+impl DefaultModelPolicy {
+    /// Classify an already-known runtime name (e.g. `ResolvedRuntime::runtime`
+    /// after admission) — no config/forge I/O.
+    pub(crate) fn for_runtime(runtime: &str) -> Self {
+        if crate::worker_spawn::is_native(runtime) {
+            return Self::NativeProfile;
+        }
+        if runtime_model_family(runtime) == Some(ModelFamily::OpenAi) {
+            return Self::Codex;
+        }
+        Self::ClaudeOrOther
+    }
+
+    /// Re-derive the classification from the configured `sweep-lifecycle`
+    /// binding, for callers with no already-admitted runtime in hand.
+    fn resolve(repo_root: &Path) -> Self {
+        let Ok((runtime, _)) =
+            crate::runtime_admission::resolve_binding(repo_root, "sweep-lifecycle", None)
+        else {
+            return Self::ClaudeOrOther;
+        };
+        Self::for_runtime(&runtime)
+    }
+}
+
+fn resolve_dispatch_model_for_runtime(
+    repo_root: &Path,
+    explicit: Option<&str>,
+    policy: DefaultModelPolicy,
+) -> (String, ModelSource) {
     let (model, source) = if let Some(m) = explicit.map(str::trim).filter(|m| !m.is_empty()) {
         (m.to_string(), ModelSource::Param)
     } else if let Some(m) = read_autonomous_model(repo_root) {
         (m, ModelSource::Config)
     } else {
-        let default = if crate::worker_spawn::uses_native_sweep(repo_root) {
-            ""
-        } else {
-            DEFAULT_DISPATCH_MODEL
+        let default = match policy {
+            DefaultModelPolicy::NativeProfile | DefaultModelPolicy::Codex => "",
+            DefaultModelPolicy::ClaudeOrOther => DEFAULT_DISPATCH_MODEL,
         };
         (default.to_string(), ModelSource::Default)
     };
@@ -350,33 +407,11 @@ pub struct ExperimentDispatchModel {
     pub source_label: &'static str,
 }
 
-/// Issue #4809: resolve the model for an autonomous, per-`issue` sweep
-/// dispatch, inserting the model-cost A/B experiment's forced arm model
-/// ahead of the #3944/#4501 default-pin precedence chain when — and ONLY
-/// when — the workspace resolves to `experiment` mode. Mode resolution reads
-/// the SAME env vars (`LOOM_MODEL_EXPERIMENT` / `LOOM_MODEL_EXPERIMENT_CANARY`)
-/// and CANARY guardrail (an uncommitted env confirmation or a gitignored
-/// `.loom/CANARY` sentinel under `repo_root` — never the committed
-/// `sweep.modelExperimentCanary` flag, rejected in #3731) that
-/// `sweep-experiment.sh resolve-mode` uses — see
-/// [`crate::script_helpers::sweep_experiment::resolve_effective_mode_default`].
-///
-/// `off` and `observe` modes are BYTE-IDENTICAL to calling
-/// [`resolve_dispatch_model`] directly (the required no-behavior-change
-/// contract for both) — only `experiment` mode substitutes the arm-forced
-/// model, and an explicit dispatch `model` param is never seen at this
-/// call's `resolve_dispatch_model(repo_root, None)` fallback (callers pass
-/// `explicit = None`, matching every existing autonomous dispatch site).
-///
-/// The arm itself is [`crate::script_helpers::sweep_experiment::assign_arm`]
-/// — a pure function of `issue` and the `complexity` stratum — so the SAME
-/// issue resolves to the SAME arm across a dispatch resume (no re-roll).
-///
-/// `complexity` is the Curator's `<!-- loom:complexity=<tier> -->` tier for
-/// this issue (#4827), which gives the `complex` and `routine` strata an
-/// independent ~50/50 A/B balance instead of stratifying the whole population
-/// as `routine`. `None` (no marker, or an unavailable body) keeps the
-/// pre-#4827 `routine` default — never an error.
+/// Resolve the autonomous single-issue model against the configured runtime.
+/// Dispatch callers defer this policy until runtime admission via `DispatchModel`.
+/// The canary-gated experiment overrides config/default for Claude; explicit
+/// request pins bypass it. Native runtimes keep their profile/config choices.
+/// Complexity is the issue's cached Curator stratum; missing means routine.
 #[must_use]
 pub fn resolve_autonomous_dispatch_model(
     repo_root: &Path,
@@ -402,14 +437,41 @@ pub fn resolve_autonomous_dispatch_model_lazy(
     issue: u32,
     complexity: impl FnOnce() -> Option<String>,
 ) -> ExperimentDispatchModel {
+    resolve_autonomous_model_for_runtime(
+        repo_root,
+        issue,
+        complexity,
+        DefaultModelPolicy::resolve(repo_root),
+    )
+}
+
+fn resolve_autonomous_model_for_runtime(
+    repo_root: &Path,
+    issue: u32,
+    complexity: impl FnOnce() -> Option<String>,
+    policy: DefaultModelPolicy,
+) -> ExperimentDispatchModel {
     use crate::script_helpers::sweep_experiment as se;
-    if crate::worker_spawn::uses_native_sweep(repo_root) {
-        let (model, _) = resolve_dispatch_model(repo_root, None);
+    // The model-cost A/B experiment only ever forces a Claude-shaped model
+    // (`se::resolved_arm_model`), so it applies exclusively to the
+    // `ClaudeOrOther` branch — native-profile runtimes already skipped it
+    // pre-#8721, and Codex must too (#8721 AC3/AC4: Claude's experiment path
+    // is unchanged, and it must never become an implicit Codex model pin).
+    if policy != DefaultModelPolicy::ClaudeOrOther {
+        let (model, source) = resolve_dispatch_model_for_runtime(repo_root, None, policy);
         return ExperimentDispatchModel {
             model,
             mode: "off".into(),
             arm: None,
-            source_label: "native-profile",
+            source_label: if source == ModelSource::Default {
+                match policy {
+                    DefaultModelPolicy::NativeProfile => "native-profile",
+                    DefaultModelPolicy::Codex => "codex-no-default",
+                    DefaultModelPolicy::ClaudeOrOther => unreachable!("guarded above"),
+                }
+            } else {
+                source.as_str()
+            },
         };
     }
 
@@ -439,7 +501,7 @@ pub fn resolve_autonomous_dispatch_model_lazy(
         };
     }
 
-    let (model, source) = resolve_dispatch_model(repo_root, None);
+    let (model, source) = resolve_dispatch_model_for_runtime(repo_root, None, policy);
     ExperimentDispatchModel {
         model,
         mode,
@@ -608,6 +670,160 @@ mod tests {
         assert_eq!(read_autonomous_model(dir.path()), None);
         let (model, _) = resolve_dispatch_model(dir.path(), None);
         assert_eq!(model, DEFAULT_DISPATCH_MODEL);
+    }
+
+    // --- Issue #8721: Codex admission must not inherit the Claude default -- //
+
+    /// `LOOM_RUNTIME` is the top precedence tier in
+    /// `runtime_admission::resolve_binding` (above every `runtimes.*` config
+    /// fixture below) — a host/CI environment that happens to export it would
+    /// otherwise silently mask this whole suite's `runtimes.default`
+    /// fixtures. Cleared for the guard's lifetime and restored on drop; every
+    /// test using it is `#[serial]` since it mutates process-wide env shared
+    /// with the `LOOM_MODEL_EXPERIMENT*`-mutating tests in this same module.
+    struct ClearedLoomRuntimeEnv(Option<std::ffi::OsString>);
+    impl ClearedLoomRuntimeEnv {
+        fn new() -> Self {
+            let prior = std::env::var_os("LOOM_RUNTIME");
+            std::env::remove_var("LOOM_RUNTIME");
+            Self(prior)
+        }
+    }
+    impl Drop for ClearedLoomRuntimeEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("LOOM_RUNTIME", v),
+                None => std::env::remove_var("LOOM_RUNTIME"),
+            }
+        }
+    }
+
+    /// The core #8721 regression, mirroring the scratch test cited in the
+    /// issue's Observed section verbatim: `runtimes.default = "codex"` with no
+    /// explicit/config model must NEVER resolve to a Claude-shaped alias
+    /// (`sonnet` in particular — the exact value that used to leak through).
+    /// This asserts the actual value handed to the adapter — mocked purely
+    /// through `runtimes.default` config, no live Codex dispatch/credentials.
+    #[test]
+    #[serial]
+    fn resolve_dispatch_model_codex_admission_never_falls_back_to_claude_default() {
+        let _env_guard = ClearedLoomRuntimeEnv::new();
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"runtimes": {"default": "codex"}}"#);
+        let (model, source) = resolve_dispatch_model(dir.path(), None);
+
+        assert_ne!(model, DEFAULT_DISPATCH_MODEL);
+        assert_ne!(model, "sonnet");
+        for claude_alias in ["sonnet", "opus", "opusplan", "haiku", "fable"] {
+            assert_ne!(model, claude_alias, "must never resolve to a Claude-shaped alias");
+        }
+        assert!(
+            !model.to_ascii_lowercase().starts_with("claude"),
+            "must never resolve to a pinned Claude model ID either: {model:?}"
+        );
+        assert_eq!(source, ModelSource::Default);
+        // Matches the native-runtime (pi/opencode/kimi) "no default" convention
+        // rather than inventing a new Codex model pin.
+        assert_eq!(model, "");
+        assert_eq!(
+            model_runtime_mismatch("codex", &model),
+            None,
+            "an unset model is never a provable mismatch"
+        );
+    }
+
+    /// Explicit `model` param precedence over a Codex admission is unchanged —
+    /// AC3: an explicit request still wins, and a genuinely mismatched explicit
+    /// model (a Claude alias forwarded to Codex) is still catchable downstream
+    /// via `model_runtime_mismatch` exactly as before this fix.
+    #[test]
+    #[serial]
+    fn resolve_dispatch_model_codex_admission_explicit_param_still_wins() {
+        let _env_guard = ClearedLoomRuntimeEnv::new();
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"runtimes": {"default": "codex"}}"#);
+        let (model, source) = resolve_dispatch_model(dir.path(), Some("gpt-5-codex"));
+        assert_eq!(model, "gpt-5-codex");
+        assert_eq!(source, ModelSource::Param);
+        assert_eq!(model_runtime_mismatch("codex", &model), None);
+
+        // A genuinely mismatched explicit model still resolves (precedence is
+        // unchanged) — `model_runtime_mismatch` is the layer that refuses it,
+        // and that refusal still fires exactly as before this fix.
+        let (mismatched, mismatched_source) = resolve_dispatch_model(dir.path(), Some("sonnet"));
+        assert_eq!(mismatched, "sonnet");
+        assert_eq!(mismatched_source, ModelSource::Param);
+        assert!(model_runtime_mismatch("codex", &mismatched).is_some());
+    }
+
+    /// `autonomous.model` config precedence over a Codex admission is unchanged
+    /// (AC3) — config still wins over the (now Codex-aware) default branch.
+    #[test]
+    #[serial]
+    fn resolve_dispatch_model_codex_admission_config_still_wins_over_default() {
+        let _env_guard = ClearedLoomRuntimeEnv::new();
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"runtimes": {"default": "codex"}, "autonomous": {"model": "gpt-5-codex"}}"#,
+        );
+        let (model, source) = resolve_dispatch_model(dir.path(), None);
+        assert_eq!(model, "gpt-5-codex");
+        assert_eq!(source, ModelSource::Config);
+    }
+
+    /// Regression coverage (AC4): a Claude-admitted (the shipped default when
+    /// `runtimes.default` is unset) dispatch is byte-identical to pre-#8721
+    /// behavior — still the shipped `DEFAULT_DISPATCH_MODEL`.
+    #[test]
+    #[serial]
+    fn resolve_dispatch_model_claude_admission_unchanged() {
+        let _env_guard = ClearedLoomRuntimeEnv::new();
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"runtimes": {"default": "claude"}}"#);
+        let (model, source) = resolve_dispatch_model(dir.path(), None);
+        assert_eq!(model, DEFAULT_DISPATCH_MODEL);
+        assert_eq!(source, ModelSource::Default);
+    }
+
+    /// Regression coverage (AC2/AC4): a native-runtime (pi/opencode/kimi)
+    /// admission still resolves to the pre-#8721 "no default" convention
+    /// (profile selection instead of a model), unaffected by the new Codex
+    /// branch.
+    #[test]
+    #[serial]
+    fn resolve_dispatch_model_native_runtime_admission_unchanged() {
+        let _env_guard = ClearedLoomRuntimeEnv::new();
+        for runtime in ["pi", "opencode", "kimi"] {
+            let dir = tempdir().unwrap();
+            write_config(dir.path(), &format!(r#"{{"runtimes": {{"default": "{runtime}"}}}}"#));
+            let (model, source) = resolve_dispatch_model(dir.path(), None);
+            assert_eq!(model, "", "native runtime {runtime} must resolve to no default");
+            assert_eq!(source, ModelSource::Default);
+        }
+    }
+
+    /// `resolve_autonomous_dispatch_model` (the experiment-aware wrapper) must
+    /// route a Codex admission through the same "no default" branch and skip
+    /// the Claude-only A/B experiment entirely (AC4) — mirroring the existing
+    /// native-runtime short-circuit rather than adding a second one.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_codex_admission_skips_experiment_and_claude_default() {
+        let _env_guard = ClearedLoomRuntimeEnv::new();
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"runtimes": {"default": "codex"}}"#);
+
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+        clear_experiment_env();
+
+        assert_eq!(resolved.model, "");
+        assert_eq!(resolved.mode, "off");
+        assert_eq!(resolved.arm, None);
+        assert_eq!(resolved.source_label, "codex-no-default");
     }
 
     #[test]

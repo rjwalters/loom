@@ -48,12 +48,35 @@
 # set the exit code, are not counted toward NON_DISCRIMINATIVE, and appear
 # under their own marker so no caller can mistake them for a DUPLICATE_FOUND
 # row:
-#   NEAR_DUPLICATE (<warn>% <= similarity < <threshold>% -- context only)
+#   NEAR_DUPLICATE (context only, not a duplicate verdict)
 #   NEAR #<number>: <title> (similarity: <percent>%)
 # Why the band exists: below --threshold the scorer used to say NOTHING AT
 # ALL, so create-issue.sh's backstop was a cliff -- a hard, unexplained
 # refusal at threshold and total silence one point below it (#8289). The
 # band turns that cliff into a gradient without moving the block line.
+#
+# Title corroboration at low block scores (#8591). The shipped defaults:
+#
+#   --threshold          18   block line (the #4409 calibration, unmoved)
+#   --title-threshold    18   the title-only Jaccard a low block must reach
+#   --corroborate-below  25   ceiling of the region where that is required
+#
+# Only --threshold is a flag of THIS script; the other two are constants of
+# `loom-daemon duplicate-scan` (flags of that subcommand, defined once in
+# loom-daemon/src/cli/duplicate_scan.rs) and are not re-exposed here.
+#
+# An OPEN-issues candidate whose full-text score lands in [18, 25) blocks
+# only if its TITLE-only Jaccard also reaches 18%. Two long issues in the
+# same subsystem share enough jargon to clear 18% on full text alone: #8561
+# (a Kimi CLI harness adapter) was refused as a duplicate of #8505 (an
+# OpenCode metered-runtime budget bug) at exactly that floor on 2026-09-21,
+# on one shared title keyword ("runtime"). Titles are short and specific, so
+# they are the cheap second opinion: the confirmed pair #3550/#3551 scores
+# 19% on bodies but 26% on titles and still blocks; #8561/#8505 scores 3% and
+# no longer does. This is a calibration, not a disable -- and an
+# uncorroborated candidate is DEMOTED to a NEAR row (annotated with the title
+# overlap that fell short), never silently dropped. At/above 25% the body
+# overlap stands on its own. Pass --corroborate-below 0 for the old behaviour.
 #
 # Since #8360 the similarity scan itself (keyword extraction, true-Jaccard
 # scoring, threshold banding, degenerate detection) is
@@ -174,6 +197,9 @@ OPTIONS:
                              bodies (a second real duplicate pair scored only
                              13%, indistinguishable from unrelated) -- treat
                              a miss as inconclusive, not proof of no overlap.
+                             Which is also why a match between this line and
+                             25% needs >= 18% TITLE overlap to block (#8591);
+                             an uncorroborated one is demoted to a NEAR row.
     --warn-threshold NUM    Also report OPEN issues scoring in the
                              [NUM, --threshold) band as NEAR_DUPLICATE
                              context rows (#8289). Off by default, so every
@@ -367,8 +393,13 @@ search_similar_issues() {
     [[ -n "$self_issue" ]] && scan_args+=(--self-issue "$self_issue")
     if [[ -n "$warn_threshold" ]] && (( warn_threshold > 0 )) && (( warn_threshold < threshold )); then
         scan_args+=(--warn-threshold "$warn_threshold")
-        [[ -n "${NEAR_MATCH_FILE:-}" ]] && scan_args+=(--near-file "${NEAR_MATCH_FILE}")
     fi
+    # --near-file is passed UNCONDITIONALLY, not only with --warn-threshold
+    # (#8591): the scan also uses that channel to report a candidate DEMOTED
+    # out of the block band for want of title corroboration. Gating the file
+    # on the opt-in warn band would make those demotions vanish instead of
+    # merely stop blocking -- strictly worse than the false positive.
+    [[ -n "${NEAR_MATCH_FILE:-}" ]] && scan_args+=(--near-file "${NEAR_MATCH_FILE}")
     if $rest_fallback; then
         scan_args+=(--rest-fallback)
     fi
@@ -679,17 +710,15 @@ main() {
     local fallback_pools=""
     local header_labeled_rest=false
 
-    # Near-match side channel (#8289). Only allocated when the band is on, so
-    # a default invocation creates no temp file at all. Inherited by the
+    # Near-match side channel (#8289). Allocated on EVERY invocation since
+    # #8591: the band is still opt-in, but a title-corroboration demotion
+    # rides the same channel and is not. Inherited by the
     # command-substitution subshell below without export (same process tree);
-    # the daemon writes it only when at least one candidate landed in the
-    # band, so -s is the "there is context to show" signal.
-    NEAR_MATCH_FILE=""
-    if [[ -n "$warn_threshold" ]]; then
-        NEAR_MATCH_FILE=$(mktemp) || NEAR_MATCH_FILE=""
-        # shellcheck disable=SC2064 # expand NEAR_MATCH_FILE now, not at exit
-        [[ -n "$NEAR_MATCH_FILE" ]] && trap 'rm -f "'"$NEAR_MATCH_FILE"'"' EXIT
-    fi
+    # the daemon writes it only when there is at least one row to report, so
+    # -s is the "there is context to show" signal.
+    NEAR_MATCH_FILE=$(mktemp) || NEAR_MATCH_FILE=""
+    # shellcheck disable=SC2064 # expand NEAR_MATCH_FILE now, not at exit
+    [[ -n "$NEAR_MATCH_FILE" ]] && trap 'rm -f "'"$NEAR_MATCH_FILE"'"' EXIT
 
     # Search for similar issues
     local result
@@ -848,8 +877,16 @@ main() {
     local near_json="[]"
     if [[ -n "$NEAR_MATCH_FILE" && -s "$NEAR_MATCH_FILE" ]]; then
         near_json=$(jq -c 'map(. + {type: "near_match"})' "$NEAR_MATCH_FILE" 2>/dev/null || echo '[]')
-        near_output=$(jq -r --arg w "$warn_threshold" --arg b "$threshold" \
-            '"NEAR_DUPLICATE (\($w)% <= similarity < \($b)% -- context only, not a duplicate verdict)", (.[] | "NEAR #\(.number): \(.title) (similarity: \(.similarity)%)")' \
+        # The header no longer quotes the band arithmetic: since #8591 a row
+        # here can ALSO be a candidate demoted out of the block band for want
+        # of title corroboration, whose score is at/above --threshold. Each
+        # row carries its own score, and a demoted one names the title
+        # overlap that fell short, so the numbers are still all present.
+        # The bar a demoted row failed is a daemon-side constant, so it is NOT
+        # restated here -- one definition, in duplicate_scan.rs, not two that
+        # can drift.
+        near_output=$(jq -r \
+            '"NEAR_DUPLICATE (context only, not a duplicate verdict)", (.[] | "NEAR #\(.number): \(.title) (similarity: \(.similarity)%" + (if .title_similarity then ", title overlap only \(.title_similarity)% -- not corroborated, so not a block" else "" end) + ")")' \
             "$NEAR_MATCH_FILE" 2>/dev/null || true)
     fi
 

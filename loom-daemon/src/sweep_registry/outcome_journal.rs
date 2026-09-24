@@ -25,6 +25,13 @@ pub(crate) struct PhaseObservation {
     /// name its PR without a forge round trip — the checkpoint itself is
     /// deleted on success, before the record is written.
     pr_number: Option<u32>,
+    /// The checkpoint's `(jev_tier, jev_confidence)` pair, when the sweep
+    /// skill's Tier-2.5 dispatch step wrote one (Issue #8543) — a shadow-mode
+    /// Jev complexity classification, present only when `TYPESAFE_API_KEY`
+    /// was set for the run. Captured the same opportunistic, per-tick way as
+    /// `pr_number` (see [`SweepRegistry::sample_phase_transition`]), since it
+    /// too must survive the checkpoint's deletion on success.
+    jev: Option<(String, f64)>,
 }
 
 /// Cap on retained [`PhaseObservation`]s per sweep (Issue #4704). A normal
@@ -76,6 +83,22 @@ pub(crate) fn models_used_from(
     models.sort_unstable();
     models.dedup();
     (!models.is_empty()).then_some(models)
+}
+
+/// Best-effort extraction of the `jev_tier`/`jev_confidence` pair from a
+/// sweep checkpoint JSON file (Issue #8543), mirroring
+/// [`read_checkpoint_pr_number`]'s opaque-file, one-shot-read discipline.
+/// `None` unless BOTH fields are present and well-typed — a checkpoint
+/// carrying a tier with no confidence (or vice versa) is not one this reads,
+/// since the pair is always written together by the sweep skill's Tier-2.5
+/// step.
+#[must_use]
+fn read_checkpoint_jev(path: &Path) -> Option<(String, f64)> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let tier = v.get("jev_tier")?.as_str()?.to_string();
+    let confidence = v.get("jev_confidence")?.as_f64()?;
+    Some((tier, confidence))
 }
 
 impl SweepRegistry {
@@ -130,6 +153,19 @@ impl SweepRegistry {
     ) {
         let path = self.config.resolve_outcomes_journal_path();
         let token_name = self.resolve_token_account(sweep_id, issue);
+        // Issue #8447: the API-key pool's equivalent attribution, read off the
+        // child's own `# LOOM_LAUNCH` record. Resolved once here and handed to
+        // the paired telemetry record below so the two journals can never
+        // disagree about which account a sweep ran on.
+        // Issue #8556 adds tap-attributed usage accounting for the same launch,
+        // resolved in the SAME single pass over the log so the two attributions
+        // cannot disagree and a terminal transition still costs exactly one
+        // `read_to_string`.
+        // Issue #8659: that accounting is now the region folded per tap —
+        // `outcome()` is the launch this outcome belongs to (what both journals'
+        // one-row fields keep naming), and `breakdown()` is non-empty only when
+        // one row cannot represent the region.
+        let (credential, tap_region) = self.resolve_launch_attribution(sweep_id, issue);
         // Issue #8056: the single most-specific failure label for this
         // terminal transition, copied into the PAIRED `sweep.outcome`
         // telemetry record below so "real failure vs. <60s spawn death" is
@@ -150,6 +186,13 @@ impl SweepRegistry {
             .clone()
             .or_else(|| crash_classification.clone())
             .filter(|class| !class.is_empty());
+        // Issue #8543: whatever Tier-2.5 sampled for this sweep, or `(None,
+        // None)` when `TYPESAFE_API_KEY` was never set / the call never
+        // completed — the keyless case this keeps byte-identical to before
+        // #8543 (no fields serialized; see `OutcomeRecord::jev_tier`).
+        let (jev_tier, jev_confidence) = self
+            .sampled_jev(sweep_id)
+            .map_or((None, None), |(tier, confidence)| (Some(tier), Some(confidence)));
         let record = sweep_outcomes::OutcomeRecord {
             timestamp: Utc::now(),
             repo: self.config.workspace_root.display().to_string(),
@@ -160,6 +203,15 @@ impl SweepRegistry {
             death_class,
             crash_classification,
             token_name,
+            credential: credential.clone(),
+            jev_tier,
+            jev_confidence,
+            tap_usage: tap_region.outcome().cloned(),
+            // Empty — and so absent from the line entirely — whenever
+            // `tap_usage` above already accounts for the whole region, which is
+            // every single-record region and every re-dispatch/re-exec that
+            // re-announced the same tap (Issue #8659).
+            tap_usage_all: tap_region.breakdown().to_vec(),
             duration_sec,
         };
         if let Err(e) = sweep_outcomes::append_outcome(&path, &record) {
@@ -174,7 +226,94 @@ impl SweepRegistry {
         // `sweep_outcomes` module doc for why), carrying model/config/result
         // detail the #4644 journal was never meant to hold. Independent
         // best-effort side effect: never allowed to block reaping.
-        self.append_outcome_telemetry_journal(issue, sweep_id, duration_sec, result, failure_class);
+        self.append_outcome_telemetry_journal(
+            issue,
+            sweep_id,
+            duration_sec,
+            result,
+            failure_class,
+            credential,
+            tap_region,
+        );
+    }
+
+    /// Both launch attributions off **one** read of the sweep's own log: the
+    /// API-key pool account this sweep's native harness ran on (Issue #8447,
+    /// the provider-neutral counterpart of
+    /// [`resolve_token_account`](Self::resolve_token_account)) and the #8556
+    /// tap-attributed usage accounting.
+    ///
+    /// Unlike the OAuth path there is no dispatch-time capture to prefer: the
+    /// `# LOOM_LAUNCH` record is written by the child itself (see
+    /// [`crate::launch_record`]), so the sweep's own log is the single source.
+    /// One bounded `read_to_string` at the terminal transition, never a forge
+    /// call. Both halves are `None` — never a fabricated `"unknown"` account —
+    /// for a Claude/legacy-adapter spawn that writes no launch record, an
+    /// unreadable/rotated log, or a pre-#8401 binary.
+    ///
+    /// They are resolved together rather than by two calls because they are two
+    /// readings of the same `# LOOM_LAUNCH` record in the same anchored region.
+    /// One read keeps the terminal transition's cost exactly where #8447 left it
+    /// (one `read_to_string`, never a forge call) and makes it impossible for
+    /// the two journals to disagree about which credential a sweep ran on.
+    ///
+    /// The credential half is returned even when the tap half declines — a
+    /// record carrying credential fields but no runtime to key a tap on is
+    /// "no tap opinion", never a reason to lose the attribution #8447 already
+    /// reported.
+    ///
+    /// The tap half is the region folded **per tap** (Issue #8659), not one row:
+    /// [`RegionAccounting::outcome`](crate::tap_usage::RegionAccounting::outcome)
+    /// is the launch this outcome belongs to — carrying that tap's whole share
+    /// of the region rather than only its final block, and `None` under exactly
+    /// the conditions the single row was `None` under before — while
+    /// [`RegionAccounting::breakdown`](crate::tap_usage::RegionAccounting::breakdown)
+    /// carries every tap when one row cannot represent the region. Because the
+    /// outcome row keeps the last record's own attribution (account included),
+    /// the #8447 credential half below is unchanged by the fold.
+    pub(crate) fn resolve_launch_attribution(
+        &self,
+        sweep_id: &str,
+        issue: u32,
+    ) -> (
+        Option<crate::launch_record::CredentialAttribution>,
+        crate::tap_usage::RegionAccounting,
+    ) {
+        let log_path = self
+            .entries
+            .get(sweep_id)
+            .map_or_else(|| self.compute_log_path(issue), |i| i.log_path.clone());
+        let Ok(contents) = std::fs::read_to_string(log_path) else {
+            return (None, crate::tap_usage::RegionAccounting::default());
+        };
+        let anchor = format!("sweep_id={sweep_id}");
+        let tap_region = crate::tap_usage::account_region_by_tap(&contents, &anchor);
+        let credential = tap_region
+            .outcome()
+            .map(|accounting| accounting.tap.credential.clone())
+            .or_else(|| crate::launch_record::parse_launch_credential_after(&contents, &anchor));
+        (credential, tap_region)
+    }
+
+    /// The runtime/provider/profile this sweep's native harness actually
+    /// launched on (Issue #8507), for `sweep.outcome`'s top-level
+    /// `runtime`/`provider`/`profile` fields — the runtime-neutral counterpart
+    /// of [`resolve_launch_attribution`](Self::resolve_launch_attribution),
+    /// reading the SAME `# LOOM_LAUNCH` record for a second, independent set
+    /// of keys. `None` under the identical conditions
+    /// `resolve_launch_attribution` documents: a Claude/legacy-adapter
+    /// spawn writes no launch record at all.
+    pub(crate) fn resolve_runtime_attribution(
+        &self,
+        sweep_id: &str,
+        issue: u32,
+    ) -> Option<crate::launch_record::RuntimeAttribution> {
+        let log_path = self
+            .entries
+            .get(sweep_id)
+            .map_or_else(|| self.compute_log_path(issue), |i| i.log_path.clone());
+        let contents = std::fs::read_to_string(log_path).ok()?;
+        crate::launch_record::parse_launch_runtime_after(&contents, &format!("sweep_id={sweep_id}"))
     }
 
     /// The OAuth/token account this sweep actually ran on (Issue #8056), for
@@ -235,6 +374,19 @@ impl SweepRegistry {
     /// same terminal transition (Issue #8056) — passed in rather than re-derived
     /// so the telemetry record and the sibling `sweep-outcomes.jsonl` record can
     /// never disagree about why a sweep died.
+    ///
+    /// `credential` is likewise the caller's already-resolved API-key-pool
+    /// attribution (Issue #8447), passed in for the same reason: one log read
+    /// per terminal transition, and two journals that cannot disagree.
+    ///
+    /// `tap_region` is the tap-attributed accounting off that same read (Issue
+    /// #8556), which is what makes "how much went to the metered backstop vs.
+    /// the subscriptions" answerable from this journal — see
+    /// [`crate::tap_usage`]. Its outcome row is the launch this outcome belongs
+    /// to and is the only one this record's flat `config` map spells out (Issue
+    /// #8659); a region one row cannot represent is *flagged* here and broken
+    /// out in full on the sibling `sweep-outcomes.jsonl` line.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_outcome_telemetry_journal(
         &self,
         issue: u32,
@@ -242,6 +394,8 @@ impl SweepRegistry {
         duration_sec: i64,
         result: telemetry::SweepResult,
         failure_class: Option<String>,
+        credential: Option<crate::launch_record::CredentialAttribution>,
+        tap_region: crate::tap_usage::RegionAccounting,
     ) {
         let info = self.entries.get(sweep_id);
         let model = info.and_then(|i| i.model.clone());
@@ -252,12 +406,94 @@ impl SweepRegistry {
         let token_name = self.resolve_token_account(sweep_id, issue);
         let latest_phase = info.and_then(|i| i.latest_phase.clone());
         let started_at = info.map(|i| i.started_at);
+        // Issue #8507: the launch's own runtime/provider/profile, read off the
+        // SAME `# LOOM_LAUNCH` record `credential` above already reads — the
+        // ground truth of what actually ran, independent of the dispatch-time
+        // `config["runtime"]` string above (which can only ever hold what was
+        // *requested*, e.g. absent for an entry reconstructed after a daemon
+        // restart). `None` for a Claude/legacy-adapter spawn, same as `credential`.
+        let runtime_attribution = self.resolve_runtime_attribution(sweep_id, issue);
 
         let mut config = BTreeMap::new();
         if let Some(runtime) = runtime {
             config.insert("runtime".to_string(), runtime);
         }
         config.insert("token_account".to_string(), token_name);
+        // Issue #8447: the API-key pool's attribution beside the OAuth pool's,
+        // in the same free-form map (additive per #4703 — no schema bump).
+        // Names only, never key material. Keys are omitted rather than set to
+        // a placeholder when the spawn had no launch record or no pooled
+        // account, so "not a native pool spawn" stays distinguishable from
+        // "a pool spawn whose account is unknown".
+        if let Some(credential) = &credential {
+            config.insert("credential_source".to_string(), credential.source.clone());
+            if let Some(provider) = &credential.provider {
+                config.insert("credential_provider".to_string(), provider.clone());
+            }
+            if let Some(account) = &credential.account {
+                config.insert("credential_account".to_string(), account.clone());
+            }
+        }
+        // Issue #8556: the tap this sweep's spend belongs to, plus whatever its
+        // native stream reported consuming. Additive in the same free-form map
+        // (per #4703 — no schema bump), and `config["tap"]` is what
+        // `sweep_outcome_summary`'s `--group-by tap` folds on.
+        //
+        // Counters are written ONLY when the harness actually reported them: a
+        // missing counter means unmeasured, not zero, and a key absent from the
+        // map is how that stays distinguishable from a reported `0`. The cost
+        // key is spelled `tap_cost_estimate` so no reader can mistake a harness
+        // estimate for a measured charge.
+        //
+        // Issue #8659 fixes the multi-record decision here explicitly rather
+        // than by default: `config["tap"]` stays ONE tap — the launch this
+        // outcome belongs to, now carrying that tap's whole share of the region
+        // — because this map is flat strings and `--group-by tap` puts a record
+        // in exactly one bucket, so a second tap could only be spelled here by
+        // changing what a grouped row means. A region one row cannot represent
+        // is instead FLAGGED (`tap_region_keys`) and broken out per tap on the
+        // sibling `sweep-outcomes.jsonl` line (`tap_usage_all`), so a
+        // telemetry-only reader can never mistake one tap's counters for the
+        // region's total.
+        if let Some(accounting) = tap_region.outcome() {
+            config.insert("tap".to_string(), accounting.key());
+            let usage = &accounting.usage;
+            for (key, value) in [
+                ("tap_input_tokens", usage.input),
+                ("tap_output_tokens", usage.output),
+                ("tap_reasoning_tokens", usage.reasoning),
+                ("tap_cache_read_tokens", usage.cache_read),
+                ("tap_cache_write_tokens", usage.cache_write),
+            ] {
+                if let Some(value) = value {
+                    config.insert(key.to_string(), value.to_string());
+                }
+            }
+            if let Some(cost) = usage.cost_estimate {
+                config.insert("tap_cost_estimate".to_string(), cost.to_string());
+            }
+            if usage.is_measured() {
+                config.insert("tap_usage_events".to_string(), usage.usage_events.to_string());
+            }
+        }
+        // Every tap the region named, outcome's first — written only when the
+        // single `tap` key above does not account for the whole region, so a
+        // record whose region held one tap (every record written before #8659)
+        // keeps its exact key set. Present without a `tap` key at all when the
+        // region's last record was unattributable but an earlier one was: that
+        // is the one shape where the flag is the only telemetry-side signal
+        // that the region carried measurable spend.
+        if !tap_region.breakdown().is_empty() {
+            config.insert(
+                "tap_region_keys".to_string(),
+                tap_region
+                    .breakdown()
+                    .iter()
+                    .map(crate::tap_usage::TapAccounting::key)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
         // Issue #4809: attribute this sweep to the model-cost A/B experiment's
         // arm from its OWN dispatched model — the same inference the #3725
         // harvest already applies to `observe`-mode records
@@ -370,15 +606,22 @@ impl SweepRegistry {
             })
             .map_or((None, None), |(tin, tout)| (Some(tin), Some(tout)));
 
-        // Per-model token breakdown (Issue #6384): same source transcripts
-        // and same wall-clock window as `tokens_in`/`tokens_out` above, but
-        // grouped by `(model, speed, service_tier)` instead of flattened —
-        // see `ModelUsageTotals`'s own doc for why a flat sum cannot be
-        // priced. Same best-effort/never-fabricated-zero contract.
+        // Per-model token breakdown (Issue #6384): same wall-clock window as
+        // `tokens_in`/`tokens_out` above, but grouped by
+        // `(model, speed, service_tier)` instead of flattened — see
+        // `ModelUsageTotals`'s own doc for why a flat sum cannot be priced.
+        // Same best-effort/never-fabricated-zero contract.
+        //
+        // Issue #8507: the SOURCE is runtime-dispatched through
+        // `crate::usage_source`. The Claude on-disk JSONL transcripts stay the
+        // default for every runtime that seam cannot identify (including the
+        // `None` a Claude/legacy spawn yields), so this is byte-identical to
+        // the pre-#8507 behavior for every Claude sweep; an `opencode` launch
+        // instead reads OpenCode's own session store, scoped to this sweep's
+        // directories and the same wall-clock window.
         let tokens_by_model = started_at.and_then(|started_at| {
-            let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
-            crate::transcript_tokens::sum_sweep_tokens_by_model(
-                &projects_dir,
+            crate::usage_source::sweep_tokens_by_model(
+                runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
                 &self.config.workspace_root,
                 issue,
                 Some((started_at, Utc::now())),
@@ -430,11 +673,56 @@ impl SweepRegistry {
             models_used,
             doctor_cycles,
             judge_verdicts,
+            runtime: runtime_attribution.as_ref().map(|r| r.runtime.clone()),
+            provider: runtime_attribution
+                .as_ref()
+                .and_then(|r| r.provider.clone()),
+            profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
         };
-        let envelope = telemetry::TelemetryEnvelope::new(
+        let result_name = serde_json::to_value(result)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        let mut metadata = crate::observability::lifecycle::attributes(&[
+            ("loom.repo", &outcome_record.repo),
+            ("loom.issue", &issue.to_string()),
+            (
+                "loom.repo.visibility",
+                if visibility == telemetry::RepoVisibility::Public {
+                    "public"
+                } else {
+                    "private"
+                },
+            ),
+        ]);
+        if let Some(pr) = pr_number {
+            metadata.insert("loom.pr_number".into(), pr.to_string());
+        }
+        for (key, value) in [
+            ("loom.failure_class", outcome_record.failure_class.as_ref()),
+            ("loom.configured_model", outcome_record.model.as_ref()),
+            ("loom.effort", outcome_record.effort.as_ref()),
+            ("loom.runtime", outcome_record.config.get("runtime")),
+            ("loom.provider", outcome_record.config.get("provider")),
+        ] {
+            if let Some(value) = value {
+                metadata.insert(key.into(), value.clone());
+            }
+        }
+        if let Some(cycles) = outcome_record.doctor_cycles {
+            metadata.insert("loom.doctor_cycles".into(), cycles.to_string());
+        }
+        let trace_context = crate::observability::lifecycle::finish_execution(
+            &self.config.workspace_root,
+            sweep_id,
+            &result_name,
+            metadata,
+        );
+        let mut envelope = telemetry::TelemetryEnvelope::new(
             host_identity(),
             telemetry::TelemetryRecord::SweepOutcome(outcome_record),
         );
+        envelope.trace_context = trace_context;
         let path = self.config.resolve_outcome_telemetry_path();
         if let Err(e) = sweep_outcomes::append_outcome_telemetry(&path, &envelope) {
             log::warn!(
@@ -523,14 +811,22 @@ impl SweepRegistry {
         }
 
         let pr_number = read_checkpoint_pr_number(&checkpoint);
+        // Issue #8543: sampled on the same per-tick read as `pr_number`, for
+        // the identical reason — the checkpoint is gone by the time a
+        // successful sweep's terminal record is written.
+        let jev = read_checkpoint_jev(&checkpoint);
         let history = self.phase_history.entry(sweep_id.to_string()).or_default();
         if history.last().map(|o| o.phase.as_str()) == Some(phase.as_str()) {
             // Unchanged phase since the previous tick — the common case. Still
-            // absorb a `pr_number` that appeared after the transition was first
-            // observed, so a PR opened mid-phase is not lost.
+            // absorb a `pr_number`/`jev` pair that appeared after the
+            // transition was first observed, so a PR opened (or a Tier-2.5
+            // Jev call completed) mid-phase is not lost.
             if let Some(last) = history.last_mut() {
                 if last.pr_number.is_none() {
                     last.pr_number = pr_number;
+                }
+                if last.jev.is_none() {
+                    last.jev = jev;
                 }
             }
             return;
@@ -538,10 +834,18 @@ impl SweepRegistry {
         if history.len() >= MAX_PHASE_OBSERVATIONS {
             return;
         }
+        crate::observability::lifecycle::phase_transition(
+            &self.config.workspace_root,
+            sweep_id,
+            &phase,
+            *issue,
+            pr_number,
+        );
         history.push(PhaseObservation {
             phase: phase.clone(),
             at: Utc::now(),
             pr_number,
+            jev,
         });
         // Genuine transition — publish it (see the "Bus emission" doc section
         // above). Ordered after the history push so the dedupe state is already
@@ -563,6 +867,19 @@ impl SweepRegistry {
             .iter()
             .rev()
             .find_map(|o| o.pr_number)
+    }
+
+    /// The most recent `(jev_tier, jev_confidence)` pair observed on this
+    /// sweep's checkpoint (Issue #8543), or `None` when no Tier-2.5 Jev call
+    /// was ever sampled (no `TYPESAFE_API_KEY`, or the call failed/never
+    /// completed). Free (no forge/network call), mirrors
+    /// [`Self::sampled_pr_number`] exactly.
+    pub(crate) fn sampled_jev(&self, sweep_id: &str) -> Option<(String, f64)> {
+        self.phase_history
+            .get(sweep_id)?
+            .iter()
+            .rev()
+            .find_map(|o| o.jev.clone())
     }
 
     /// The most recently opportunistically-sampled `(lines_added,
@@ -666,3 +983,37 @@ mod tests;
     unused_imports
 )]
 mod timeline_tests;
+
+// API-key-pool credential attribution (#8447), in its own sibling module for
+// the same file-size reason as `timeline_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod credential_tests;
+
+// Runtime/provider/profile attribution + the OpenCode `tokens_by_model`
+// dispatch seam (Issue #8507), in its own sibling module for the same
+// file-size reason as `credential_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod runtime_tests;
+
+// Tap-attributed usage accounting (#8556) end-to-end across both terminal
+// journals, in its own sibling module for the same file-size reason.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod tap_usage_tests;

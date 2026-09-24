@@ -970,6 +970,13 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // multi-repo host from re-shelling to `docker` once per repo per tick.
     crate::docker_image_clean::run_for(repo_root);
 
+    // #8512: orphaned tmpfs/ramfs scratch (`/dev/shm/cargo-target-*`, etc.) —
+    // host-level like the docker pass above, own host-wide cooldown. See
+    // `crate::tmpfs_reclaim`'s module docs for why this uses a deliberately
+    // narrower, non-attribution-based safety model than the worktree-scoped
+    // cargo-target reclaim.
+    let _ = crate::tmpfs_reclaim::run_for(repo_root);
+
     report
 }
 

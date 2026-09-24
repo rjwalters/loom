@@ -14,9 +14,33 @@ fn inputs(root: &Path) -> Inputs<'_> {
         repo_root: root,
         target_override: None,
         repo_override: None,
+        machine_checkout: None,
+        build_time_repo: None,
         installed_bin: None,
         fetch_disabled: false,
     }
+}
+
+/// A throwaway git checkout with an `origin` remote set to `slug`, for
+/// exercising [`host::repo_slug`]-backed tiers without touching a real one.
+fn git_checkout_with_origin(slug: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    run(&["init", "-q"]);
+    run(&[
+        "remote",
+        "add",
+        "origin",
+        &format!("https://github.com/{slug}.git"),
+    ]);
+    dir
 }
 
 fn reason(r: &Resolution) -> String {
@@ -75,6 +99,136 @@ fn an_unresolvable_repo_slug_refuses_and_names_the_override() {
     let why = reason(&resolve(&i));
     assert!(why.contains("could not resolve owner/repo"), "{why}");
     assert!(why.contains("LOOM_DAEMON_UPDATE_GH_REPO"), "{why}");
+}
+
+// ---- repo-resolution priority order (#8513) -------------------------
+//
+// Asserted against `resolve_repo` directly rather than through `resolve`:
+// every tier below the first is decided before any forge call, so these stay
+// pure (no `gh`, no network, no 30s timeout per case). Each case populates at
+// least one LOWER tier with a different slug than the one expected to win, so
+// a wrong-tier bug picks a name the assertion rejects instead of passing by
+// coincidence.
+
+#[test]
+fn repo_override_wins_over_every_lower_tier() {
+    let workspace = git_checkout_with_origin("workspace-owner/workspace-repo");
+    let machine = git_checkout_with_origin("machine-owner/machine-repo");
+    let mut i = inputs(workspace.path());
+    i.repo_override = Some("override-owner/override-repo".to_string());
+    i.machine_checkout = Some(machine.path().to_path_buf());
+    i.build_time_repo = Some("build-owner/build-repo".to_string());
+    assert_eq!(resolve_repo(&i).as_deref(), Some("override-owner/override-repo"));
+}
+
+#[test]
+fn machine_checkout_origin_wins_over_build_time_and_workspace() {
+    // The #8513 fix itself: a workspace whose own `origin` is a consumer
+    // repo, but `LOOM_MACHINE_CHECKOUT` names a real Loom checkout on the
+    // same host.
+    let workspace = git_checkout_with_origin("workspace-owner/workspace-repo");
+    let machine = git_checkout_with_origin("machine-owner/machine-repo");
+    let mut i = inputs(workspace.path());
+    i.machine_checkout = Some(machine.path().to_path_buf());
+    i.build_time_repo = Some("build-owner/build-repo".to_string());
+    assert_eq!(resolve_repo(&i).as_deref(), Some("machine-owner/machine-repo"));
+}
+
+#[test]
+fn build_time_repo_wins_over_the_workspaces_own_origin() {
+    // No override, no LOOM_MACHINE_CHECKOUT — the shape of the original
+    // incident: a daemon whose only checkout is the consumer workspace still
+    // resolves the repo it was BUILT from rather than that workspace's own
+    // `origin`. This is the acceptance criterion "a daemon started with its
+    // workspace in a repo whose latest release is v0.1.0 still resolves the
+    // Loom release repo".
+    let workspace = git_checkout_with_origin("workspace-owner/workspace-repo");
+    let mut i = inputs(workspace.path());
+    i.build_time_repo = Some("build-owner/build-repo".to_string());
+    assert_eq!(resolve_repo(&i).as_deref(), Some("build-owner/build-repo"));
+}
+
+#[test]
+fn the_workspaces_own_origin_is_the_last_resort() {
+    // Every higher tier absent — the pre-#8513 sole behavior, still reachable.
+    let workspace = git_checkout_with_origin("workspace-owner/workspace-repo");
+    let i = inputs(workspace.path());
+    assert_eq!(resolve_repo(&i).as_deref(), Some("workspace-owner/workspace-repo"));
+}
+
+#[test]
+fn a_machine_checkout_with_no_resolvable_origin_falls_through_rather_than_refusing() {
+    // `LOOM_MACHINE_CHECKOUT` pointing at something that is not a git
+    // checkout with a GitHub `origin` (a moved directory, a bare path) must
+    // not swallow the tiers below it — the daemon still has a perfectly good
+    // build-time answer.
+    let workspace = git_checkout_with_origin("workspace-owner/workspace-repo");
+    let mut i = inputs(workspace.path());
+    i.machine_checkout = Some(PathBuf::from("/nonexistent/loom-checkout"));
+    i.build_time_repo = Some("build-owner/build-repo".to_string());
+    assert_eq!(resolve_repo(&i).as_deref(), Some("build-owner/build-repo"));
+}
+
+#[test]
+fn an_empty_machine_checkout_path_is_treated_as_unset() {
+    // An exported-but-empty env var is how a shell says "not set"; a `""`
+    // path must not be probed as if it were a checkout.
+    let workspace = git_checkout_with_origin("workspace-owner/workspace-repo");
+    let mut i = inputs(workspace.path());
+    i.machine_checkout = Some(PathBuf::new());
+    i.build_time_repo = Some("build-owner/build-repo".to_string());
+    assert_eq!(resolve_repo(&i).as_deref(), Some("build-owner/build-repo"));
+}
+
+#[test]
+fn an_empty_build_time_repo_falls_through_like_an_empty_override() {
+    // Cargo reports `CARGO_PKG_REPOSITORY` as an empty string, never absent,
+    // when a crate has no `repository` field configured (e.g. an
+    // unconfigured fork) — must not become a literal empty repo slug.
+    let workspace = git_checkout_with_origin("workspace-owner/workspace-repo");
+    let mut i = inputs(workspace.path());
+    i.build_time_repo = Some(String::new());
+    assert_eq!(resolve_repo(&i).as_deref(), Some("workspace-owner/workspace-repo"));
+}
+
+#[test]
+fn no_tier_resolving_is_none_rather_than_an_empty_slug() {
+    // The refusal below (`could not resolve owner/repo …`) depends on this
+    // being `None`: an empty slug would be passed to `gh -R ""`.
+    let root = std::env::temp_dir(); // no git remote here
+    assert_eq!(resolve_repo(&inputs(&root)), None);
+}
+
+#[test]
+fn the_refusal_names_every_tier_that_was_consulted() {
+    // An operator reading this has to be able to tell WHICH lookups came up
+    // empty, not just that one did (#8513).
+    let root = std::env::temp_dir();
+    let mut i = inputs(&root);
+    i.target_override = Some("aarch64-apple-darwin".to_string());
+    let why = reason(&resolve(&i));
+    assert!(why.contains("LOOM_DAEMON_UPDATE_GH_REPO"), "{why}");
+    assert!(why.contains("LOOM_MACHINE_CHECKOUT"), "{why}");
+    assert!(why.contains("built from"), "{why}");
+    assert!(why.contains("workspace"), "{why}");
+}
+
+#[test]
+fn the_no_artifact_reason_names_the_repo_it_asked() {
+    // AC2, and the exact line the incident emitted for 20+ ticks with no repo
+    // in it: "release v0.11.0 has no artifact for target
+    // x86_64-unknown-linux-gnu (checked for …)" reads like an unbuilt
+    // platform, not like a wrong repository.
+    let why = no_artifact_reason(
+        "v0.11.0",
+        "consumer-owner/consumer-repo",
+        "x86_64-unknown-linux-gnu",
+        "loom-daemon-x86_64-unknown-linux-gnu",
+        "loom-daemon-x86_64-unknown-linux-gnu.sha256",
+    );
+    assert!(why.contains("consumer-owner/consumer-repo"), "{why}");
+    assert!(why.contains("v0.11.0"), "{why}");
+    assert!(why.contains("x86_64-unknown-linux-gnu"), "{why}");
 }
 
 #[test]

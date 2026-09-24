@@ -4,6 +4,8 @@
 mod cancellation;
 mod files;
 mod guard;
+pub mod kimi;
+pub mod mcp;
 pub mod provision;
 
 use anyhow::{bail, Context, Result};
@@ -49,6 +51,54 @@ pub fn cli(args: ToolArgs) -> Result<()> {
 }
 
 pub fn execute(args: &ToolArgs, request: &Request) -> Result<String> {
+    use crate::{
+        observability::lifecycle,
+        telemetry::trace::{SpanName, SpanStatus},
+    };
+    let tool = match request.tool.as_str() {
+        "read" => "read",
+        "write" => "write",
+        "edit" => "edit",
+        "bash" => "bash",
+        _ => "unsupported",
+    };
+    let span = lifecycle::inherited(
+        &args.workspace,
+        SpanName::Tool,
+        lifecycle::attributes(&[("loom.tool.name", tool)]),
+    );
+    let result = execute_inner(args, request, span.as_ref());
+    if let Some(span) = span {
+        span.finish_linked();
+        span.finish(
+            if result.is_ok() {
+                "success"
+            } else if cancellation::requested() {
+                "cancelled"
+            } else if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<ToolTimeout>())
+            {
+                "timeout"
+            } else {
+                "failure"
+            },
+            if result.is_ok() {
+                SpanStatus::Ok
+            } else {
+                SpanStatus::Error
+            },
+        );
+    }
+    result
+}
+
+fn execute_inner(
+    args: &ToolArgs,
+    request: &Request,
+    span: Option<&crate::observability::lifecycle::Span>,
+) -> Result<String> {
     let cwd = args
         .cwd
         .canonicalize()
@@ -76,6 +126,9 @@ pub fn execute(args: &ToolArgs, request: &Request) -> Result<String> {
                 .clamp(1, 600);
             let mut child = Command::new("bash");
             child.args(["-c", command]).current_dir(cwd);
+            if let Some(span) = span {
+                span.command(&mut child);
+            }
             let output = crate::proc_exec::run_bounded_cancellable(
                 child,
                 Duration::from_secs(seconds),
@@ -95,14 +148,21 @@ pub fn execute(args: &ToolArgs, request: &Request) -> Result<String> {
                     }
                     Ok(text)
                 }
-                crate::proc_exec::Completion::TimedOut { .. } => {
-                    bail!("command timed out; its process group was terminated")
-                }
+                crate::proc_exec::Completion::TimedOut { .. } => Err(ToolTimeout.into()),
             }
         }
         _ => bail!("unsupported native tool"),
     }
 }
+#[derive(Debug)]
+struct ToolTimeout;
+impl std::fmt::Display for ToolTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("command timed out; its process group was terminated")
+    }
+}
+impl std::error::Error for ToolTimeout {}
+
 fn field<'a>(input: &'a Value, name: &str) -> Result<&'a str> {
     input
         .get(name)

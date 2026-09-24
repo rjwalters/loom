@@ -1,5 +1,13 @@
 use super::*;
 use serial_test::serial;
+// `compare_versions` moved to the `artifact_verdict` sibling in #8513; it is
+// crate-private there, so name it explicitly rather than re-exporting it.
+use super::artifact_verdict::compare_versions;
+
+// Wrong-repo-resolution coverage (Issue #8513) lives in its own child module
+// so this file, already over `.loom/docs/file-size-policy.md`'s threshold,
+// does not grow to hold it. It reuses the fixtures below via `use super::*`.
+mod stale_repo;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1132,6 +1140,7 @@ fn artifact(
     installed_sha: Option<&str>,
 ) -> ArtifactInfo {
     ArtifactInfo {
+        repo: "test-owner/test-repo".to_string(),
         tag: format!("v{version}"),
         version: version.to_string(),
         published_at: Some("2026-09-13T12:00:00Z".to_string()),
@@ -1227,12 +1236,6 @@ fn test_classify_equal_version_same_sha_is_up_to_date() {
     let upper = SHA_A.to_uppercase();
     let verdict =
         classify_artifact(&artifact("0.19.24", Some("0.19.24"), Some(&upper), Some(SHA_A)));
-    assert!(matches!(verdict, ArtifactVerdict::UpToDate { .. }));
-}
-
-#[test]
-fn test_classify_older_release_is_up_to_date() {
-    let verdict = classify_artifact(&artifact("0.19.0", Some("0.19.21"), Some(SHA_A), Some(SHA_B)));
     assert!(matches!(verdict, ArtifactVerdict::UpToDate { .. }));
 }
 

@@ -582,18 +582,17 @@ fn exporting_inputs(
 ) -> HealthInputs {
     let mut inputs = healthy_inputs();
     let mut export = crate::types::ObservabilityExportStatus {
-        state: ObservabilityExportState::Starting,
+        state: crate::types::ObservabilityExportState::Starting,
         host_id: Some("robb-studio".to_string()),
         ingest_host_id: None,
         endpoint: Some("https://dashboard.example/ingest".to_string()),
         exporter: Some("https".to_string()),
         started_at: Some(now() - chrono::Duration::hours(4)),
         last_success_at: None,
-        last_failure_at: None,
-        last_failure_detail: None,
         records_exported: 0,
         consecutive_failures: 0,
         flush_interval_secs: Some(30),
+        ..Default::default()
     };
     mutate(&mut export);
     inputs.status.as_mut().unwrap().observability_export = Some(export);
@@ -727,7 +726,7 @@ fn a_mismatch_still_wins_and_now_carries_the_export_facts() {
     let mut inputs = mismatched_inputs(3600);
     inputs.status.as_mut().unwrap().observability_export =
         Some(crate::types::ObservabilityExportStatus {
-            state: ObservabilityExportState::HostIdMismatch,
+            state: crate::types::ObservabilityExportState::HostIdMismatch,
             host_id: Some("robb-studio".to_string()),
             ingest_host_id: Some("robb-pro".to_string()),
             last_success_at: Some(now() - chrono::Duration::seconds(12)),
@@ -3168,6 +3167,11 @@ fn worktree_reaper_is_unknown_without_a_status_round_trip() {
 }
 
 mod section_inventory;
+
+// Wrong-repo-resolution escalation coverage (Issue #8513) — its own child
+// module so this file, already over `.loom/docs/file-size-policy.md`'s
+// threshold, does not grow to hold it.
+mod auto_update_stale_repo;
 
 #[cfg(test)]
 mod model_class_tests;

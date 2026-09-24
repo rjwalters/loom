@@ -90,6 +90,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+mod brakes;
+pub use brakes::{observe_brake_ad, MAX_PEER_POOL_HOLD_TTL, POOL_HOLD_SENTINEL_ISSUE};
+
+mod coordination_idle;
+pub use coordination_idle::{
+    resolve_advertise_activity_window, ADVERTISE_ACTIVITY_WINDOW_ENV,
+    DEFAULT_ADVERTISE_ACTIVITY_WINDOW,
+};
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -275,6 +284,53 @@ pub enum ClaimKind {
     /// [`crate::sweep_registry::SweepRegistry::record_dispatch_failure`]'s
     /// backoff state.
     DispatchBackoffArmed,
+    /// "The token pool identified by `pool_key` is UNSPAWNABLE on my host,
+    /// `remaining_secs` seconds left on my hold as of my send time" (Issue
+    /// #8001, the peer-broadcast half of #7708).
+    ///
+    /// Broadcast on the arming edge of
+    /// [`crate::work_finder::pool_preflight::PoolHoldState`] — both the
+    /// per-tick pre-flight path (`observe_root`) and the reaper's post-mortem
+    /// path (`note_pool_dead`). A peer holding the *same* pool (see
+    /// `pool_key` for what "same" means, and why it is not a directory path)
+    /// suppresses its own sweep dispatch without having to independently
+    /// re-derive `spawnable_pool_state` and discover the exhaustion the
+    /// expensive way — one doomed dispatch per host per hold window.
+    ///
+    /// This is the pool-scoped sibling of
+    /// [`ClaimKind::NoopCooldownArmed`]/[`ClaimKind::DispatchBackoffArmed`]:
+    /// those brake one *issue*, this brakes every issue resolving to one
+    /// *pool*, because a pool fault is not any issue's fault (#7708).
+    PoolHoldArmed,
+    /// "The token pool identified by `pool_key` RECOVERED on my host" (Issue
+    /// #8001) — releases this host's [`ClaimKind::PoolHoldArmed`] before its
+    /// TTL would lapse, mirroring [`ClaimKind::FilingUnlock`]'s early
+    /// release.
+    ///
+    /// This kind is why the pool lane is arm/clear rather than the
+    /// cooldown lane's arm-only shape: a pool hold's TTL comes from
+    /// `pool_clear_estimate`, capped at 900 s, and the local pre-flight
+    /// self-heals in **one tick**. Without an explicit clear, an operator
+    /// readmitting one account would resume the arming host immediately
+    /// while every peer stayed suppressed for up to 15 more minutes —
+    /// converting a latency win into a fleet-wide stall.
+    PoolHoldCleared,
+    /// "I am alive" (Issue #8736) — a periodic liveness signal published
+    /// every reaper tick **regardless of live-sweep count**, unlike
+    /// [`ClaimKind::Advertise`] (entirely dispatch-gated). Closes the
+    /// converse of the #8026 idle gate: this host busy while its *peers*
+    /// are idle looks byte-for-byte identical, from `received`/`quiet_for`
+    /// alone, to a genuinely dead receive path — advertising is the only
+    /// thing an idle host would otherwise ever transmit, and idle hosts by
+    /// definition transmit nothing. A heartbeat is the one signal an idle
+    /// host still emits, so [`PeerClaimView::evaluate_coordination`] can
+    /// anchor its receive-quiet clock on "last heartbeat or claim received"
+    /// instead of claims alone. Folded into its own bookkeeping
+    /// ([`PeerClaimView::observe_heartbeat_at`]) rather than
+    /// `counters.received`/`last_received_at` — see that method's doc
+    /// comment for why the `#6157` transport counters must stay scoped to
+    /// genuine dispatch-claim traffic only.
+    Heartbeat,
 }
 
 /// The `issue` value carried by [`ClaimKind::FilingLock`]/
@@ -284,6 +340,11 @@ pub enum ClaimKind {
 /// every other ad and keeps a filing ad from ever being mistaken for a claim
 /// on a real issue #0.
 pub const FILING_LOCK_SENTINEL_ISSUE: u32 = 0;
+
+/// The `issue` value carried by a [`ClaimKind::Heartbeat`] ad (Issue #8736) —
+/// mirrors [`FILING_LOCK_SENTINEL_ISSUE`]'s rationale: a heartbeat is not
+/// about any particular issue.
+pub const HEARTBEAT_SENTINEL_ISSUE: u32 = 0;
 
 impl ClaimKind {
     #[must_use]
@@ -296,6 +357,9 @@ impl ClaimKind {
             ClaimKind::FilingUnlock => "filing_unlock",
             ClaimKind::NoopCooldownArmed => "noop_cooldown_armed",
             ClaimKind::DispatchBackoffArmed => "dispatch_backoff_armed",
+            ClaimKind::PoolHoldArmed => "pool_hold_armed",
+            ClaimKind::PoolHoldCleared => "pool_hold_cleared",
+            ClaimKind::Heartbeat => "heartbeat",
         }
     }
 
@@ -309,6 +373,9 @@ impl ClaimKind {
             "filing_unlock" => Some(ClaimKind::FilingUnlock),
             "noop_cooldown_armed" => Some(ClaimKind::NoopCooldownArmed),
             "dispatch_backoff_armed" => Some(ClaimKind::DispatchBackoffArmed),
+            "pool_hold_armed" => Some(ClaimKind::PoolHoldArmed),
+            "pool_hold_cleared" => Some(ClaimKind::PoolHoldCleared),
+            "heartbeat" => Some(ClaimKind::Heartbeat),
             _ => None,
         }
     }
@@ -328,6 +395,15 @@ impl ClaimKind {
     #[must_use]
     pub fn is_cooldown_lane(self) -> bool {
         matches!(self, ClaimKind::NoopCooldownArmed | ClaimKind::DispatchBackoffArmed)
+    }
+
+    /// Whether this kind belongs to the fleet-wide pool-exhaustion-hold lane
+    /// (Issue #8001) rather than any of the four lanes above — the router
+    /// predicate, mirroring [`Self::is_filing_lock_lane`]/
+    /// [`Self::is_cooldown_lane`].
+    #[must_use]
+    pub fn is_pool_hold_lane(self) -> bool {
+        matches!(self, ClaimKind::PoolHoldArmed | ClaimKind::PoolHoldCleared)
     }
 }
 
@@ -369,6 +445,21 @@ pub struct ClaimAd {
     /// time, the same "TTL measured against LOCAL receipt" discipline this
     /// module's other maps use (see the module doc comment).
     pub remaining_secs: Option<u64>,
+    /// The **cross-host-stable** identity of the token pool a
+    /// [`ClaimKind::PoolHoldArmed`]/[`ClaimKind::PoolHoldCleared`] ad is
+    /// about (Issue #8001) — [`crate::tokens_pool::select::pool_account_fingerprint`]'s
+    /// hash of the pool's sorted account names. `Some` only for that lane;
+    /// every other kind leaves it `None`.
+    ///
+    /// **Not a directory path**, for the same reason [`Self::repo`] is a slug
+    /// and not a workspace root: a local absolute path neither matches across
+    /// hosts that genuinely share a pool, nor distinguishes hosts that merely
+    /// happen to resolve the same path to *different* pools. That second case
+    /// is the one that matters — it is the "broadcasting would suppress a
+    /// peer whose pool is healthy" hazard `work_finder::pool_preflight`'s
+    /// module doc names. See the fingerprint function's own doc comment for
+    /// the full argument.
+    pub pool_key: Option<String>,
 }
 
 impl ClaimAd {
@@ -383,6 +474,7 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -397,6 +489,7 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -422,6 +515,7 @@ impl ClaimAd {
             ts,
             pr: Some(pr),
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -442,6 +536,7 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -458,6 +553,7 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -484,6 +580,7 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: Some(remaining_secs),
+            pool_key: None,
         }
     }
 
@@ -507,6 +604,28 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: Some(remaining_secs),
+            pool_key: None,
+        }
+    }
+
+    /// "I am alive" (Issue #8736) — published every reaper tick regardless of
+    /// live-sweep count by
+    /// [`crate::sweep_registry::SweepRegistry::publish_peer_heartbeat`].
+    /// `issue` is pinned to [`HEARTBEAT_SENTINEL_ISSUE`] — a heartbeat is not
+    /// about any particular issue, mirroring [`Self::filing_lock`]'s use of
+    /// [`FILING_LOCK_SENTINEL_ISSUE`].
+    #[must_use]
+    pub fn heartbeat(repo: String, host: String, pid: u32, ts: String) -> Self {
+        Self {
+            kind: ClaimKind::Heartbeat,
+            issue: HEARTBEAT_SENTINEL_ISSUE,
+            repo,
+            host,
+            pid,
+            ts,
+            pr: None,
+            remaining_secs: None,
+            pool_key: None,
         }
     }
 
@@ -523,6 +642,7 @@ impl ClaimAd {
             "ts": self.ts,
             "pr": self.pr,
             "remaining_secs": self.remaining_secs,
+            "pool_key": self.pool_key,
         })
         .to_string()
     }
@@ -571,6 +691,17 @@ impl ClaimAd {
         // which is the safe direction: worst case a peer's cooldown is
         // invisible for one cycle, never a permanently wedged skip.
         let remaining_secs = obj.get("remaining_secs").and_then(Value::as_u64);
+        // `pool_key` is new as of Issue #8001: absent (any pre-#8001 peer, or
+        // any kind outside the pool-hold lane) degrades to `None` rather than
+        // rejecting the ad. A `PoolHoldArmed`/`PoolHoldCleared` ad with `None`
+        // here names no pool, so `PeerClaimView::observe_pool_hold_at` drops
+        // it — the safe direction: a pool hold that cannot say WHICH pool it
+        // covers must never be allowed to suppress an arbitrary one.
+        let pool_key = obj
+            .get("pool_key")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         if repo.is_empty() || host.is_empty() {
             return None;
         }
@@ -583,6 +714,7 @@ impl ClaimAd {
             ts,
             pr,
             remaining_secs,
+            pool_key,
         })
     }
 
@@ -858,10 +990,37 @@ pub struct PeerClaimView {
     /// from when neither this nor [`Self::last_received_at`] has a value
     /// yet. `None` on a daemon that has never dispatched (nothing to judge).
     first_advertised_at: Option<Instant>,
+    /// Local [`Instant`] of this host's MOST RECENT [`Self::record_advertised`]
+    /// call (Issue #8026) — the idle gate's input. Unlike
+    /// `first_advertised_at` above this one IS overwritten by every
+    /// heartbeat: the question it answers is "is this host currently saying
+    /// anything?", not "how long has it been trying?". `None` until the first
+    /// advertisement. See [`coordination_idle`] for the full decision rule.
+    last_advertised_at: Option<Instant>,
+    /// How recently this host must have advertised for its receive-quiet
+    /// verdict to carry any weight (Issue #8026) — default
+    /// [`DEFAULT_ADVERTISE_ACTIVITY_WINDOW`], overridden post-`new()` via
+    /// [`Self::set_advertise_activity_window`] (the same setter shape
+    /// [`Self::set_completion_ttl`] uses, so existing call sites are
+    /// untouched).
+    advertise_activity_window: Duration,
+    /// The floor the receive-quiet clock is measured from, rebased to `now` on
+    /// every evaluation tick where this host is idle (Issue #8026). Keeps a
+    /// host that resumes dispatching after a long lull from inheriting a
+    /// stale, already-blown quiet window: it gets a full fresh grace window to
+    /// hear back from its peers. `None` until the first idle tick.
+    coordination_clock_base: Option<Instant>,
     /// Local [`Instant`] of the most recent GENUINE peer receive (Issue
     /// #6157) — set by [`Self::observe_at`], mirroring what
     /// [`PeerClaimCounters::received`] counts.
     last_received_at: Option<Instant>,
+    /// Local [`Instant`] of the most recent peer [`ClaimKind::Heartbeat`]
+    /// (Issue #8736) — set by [`Self::observe_heartbeat_at`]. Merged with
+    /// [`Self::last_received_at`] (whichever is more recent wins) by
+    /// [`Self::evaluate_coordination`]'s receive-quiet anchor, but never fed
+    /// into `counters.received` — a heartbeat proves a peer is alive, not
+    /// that a dispatch claim arrived.
+    last_heartbeat_received_at: Option<Instant>,
     /// Whether [`Self::evaluate_coordination`] currently judges coordination
     /// DEGRADED (Issue #6157).
     coordination_degraded: bool,
@@ -927,6 +1086,27 @@ pub struct PeerClaimView {
     /// (Issue #7477) — the [`Self::noop_cooldowns`] sibling for
     /// [`ClaimKind::DispatchBackoffArmed`].
     dispatch_backoffs: HashMap<(String, u32), Instant>,
+    /// Fleet-visible token-pool exhaustion holds armed by peer hosts (Issue
+    /// #8001), keyed by `(pool_key, advertising_host)`, valued by the
+    /// **local** [`Instant`] at which this daemon's copy of the hold expires
+    /// — computed once at receipt time as
+    /// `received_at + min(remaining_secs, MAX_PEER_POOL_HOLD_TTL)`, never
+    /// re-derived from the advertiser's clock.
+    ///
+    /// # Why the key carries the host, and why it does NOT carry the repo
+    ///
+    /// - **Host in the key**: so a [`ClaimKind::PoolHoldCleared`] releases
+    ///   only its own sender's hold. Two peers can hold the same dead pool
+    ///   independently; the first to recover must not speak for the second.
+    ///   (Same reason `filing_holds` is host-keyed.)
+    /// - **Repo NOT in the key**: a pool is a *machine-level* resource shared
+    ///   across every workspace whose `resolve_tokens_dir` lands on it
+    ///   (#3938/#7527) — holding it per repo would let a hold armed while
+    ///   working repo A sail straight past a dispatch into repo B resolving
+    ///   the identical, identically-dead pool. The ad still carries `repo`
+    ///   for diagnostics, exactly as the filing lane does for its own
+    ///   fleet-wide hold.
+    pool_holds: HashMap<(String, String), Instant>,
 }
 
 impl PeerClaimView {
@@ -940,7 +1120,11 @@ impl PeerClaimView {
             completion_ttl: DEFAULT_PEER_COMPLETION_TTL,
             counters: PeerClaimCounters::default(),
             first_advertised_at: None,
+            last_advertised_at: None,
+            advertise_activity_window: DEFAULT_ADVERTISE_ACTIVITY_WINDOW,
+            coordination_clock_base: None,
             last_received_at: None,
+            last_heartbeat_received_at: None,
             coordination_degraded: false,
             coordination_degraded_since: None,
             consecutive_receives_while_degraded: 0,
@@ -951,6 +1135,7 @@ impl PeerClaimView {
             filing_lock_ttl: DEFAULT_PEER_FILING_LOCK_TTL,
             noop_cooldowns: HashMap::new(),
             dispatch_backoffs: HashMap::new(),
+            pool_holds: HashMap::new(),
         }
     }
 
@@ -972,6 +1157,14 @@ impl PeerClaimView {
     /// stay untouched.
     pub fn set_completion_ttl(&mut self, ttl: Duration) {
         self.completion_ttl = ttl;
+    }
+
+    /// Override the advertise-activity window (Issue #8026), resolved by
+    /// `WorkspacePool::start_peer_coordination` via
+    /// [`resolve_advertise_activity_window`] — mirrors
+    /// [`Self::set_completion_ttl`]'s post-`new()` setter shape.
+    pub fn set_advertise_activity_window(&mut self, window: Duration) {
+        self.advertise_activity_window = window;
     }
 
     /// This daemon's own host identity (self-claim recognition key).
@@ -1033,10 +1226,26 @@ impl PeerClaimView {
     /// and reaching here is a no-op — a cooldown/backoff window answers "should
     /// a peer re-dispatch this issue right now", not "is a sweep in flight",
     /// so it must not perturb the `claims` map either.
+    /// # `ClaimKind::PoolHoldArmed`/`PoolHoldCleared` are out of scope here (Issue #8001)
+    ///
+    /// Same contract once more: a pool-hold ad routes to
+    /// [`Self::observe_pool_hold_at`], and reaching here is a no-op. Like the
+    /// filing lane it carries a sentinel issue ([`POOL_HOLD_SENTINEL_ISSUE`]),
+    /// so folding it in would manufacture a bogus peer claim on issue #0.
+    /// # `ClaimKind::Heartbeat` is out of scope here (Issue #8736)
+    ///
+    /// Same contract once more: a heartbeat ad routes to
+    /// [`Self::observe_heartbeat_at`], and reaching here is a no-op. It feeds
+    /// only [`Self::evaluate_coordination`]'s receive-quiet anchor, never
+    /// `counters.received`/`last_received_at` — see that method's doc
+    /// comment for why a liveness ping must not be mistaken for a genuine
+    /// dispatch-claim receive.
     pub fn observe_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
         if ad.kind == ClaimKind::Completed
+            || ad.kind == ClaimKind::Heartbeat
             || ad.kind.is_filing_lock_lane()
             || ad.kind.is_cooldown_lane()
+            || ad.kind.is_pool_hold_lane()
         {
             return false;
         }
@@ -1065,7 +1274,10 @@ impl PeerClaimView {
             | ClaimKind::FilingLock
             | ClaimKind::FilingUnlock
             | ClaimKind::NoopCooldownArmed
-            | ClaimKind::DispatchBackoffArmed => {
+            | ClaimKind::DispatchBackoffArmed
+            | ClaimKind::PoolHoldArmed
+            | ClaimKind::PoolHoldCleared
+            | ClaimKind::Heartbeat => {
                 unreachable!("returned above")
             }
         }
@@ -1084,6 +1296,34 @@ impl PeerClaimView {
         if self.coordination_degraded {
             self.consecutive_receives_while_degraded += 1;
         }
+        true
+    }
+
+    /// Observe an inbound [`ClaimKind::Heartbeat`] ad at local time `now`
+    /// (Issue #8736): "peer host H is alive", published every reaper tick
+    /// regardless of whether that peer currently holds any live claim.
+    ///
+    /// Returns `true` when applied (a peer's), `false` when ignored as this
+    /// host's own ad — the identical self-claim recognition [`Self::observe_at`]
+    /// applies, including the `UNKNOWN_HOST` carve-out (see that method's doc
+    /// comment).
+    ///
+    /// Deliberately does **not** touch `counters.received`/`last_received_at`/
+    /// `consecutive_receives_while_degraded`: those answer "did a genuine
+    /// dispatch-claim ad arrive", which is what the `#6157` true-positive
+    /// signature (`received=0` while `advertised>0`) and the AC4
+    /// sustained-receive recovery bar both depend on. A heartbeat proves only
+    /// that the peer process is up and the transport can reach it — real
+    /// signal for [`Self::evaluate_coordination`]'s NOT-yet-degraded
+    /// receive-quiet anchor (via `last_heartbeat_received_at`), but never a
+    /// substitute for the stronger "a real claim arrived" recovery bar.
+    pub fn observe_heartbeat_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
+        debug_assert_eq!(ad.kind, ClaimKind::Heartbeat);
+        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
+        if ad.host == self.self_host && !is_unresolved_identity {
+            return false; // never treat our own heartbeat as a peer's
+        }
+        self.last_heartbeat_received_at = Some(now);
         true
     }
 
@@ -1292,102 +1532,6 @@ impl PeerClaimView {
         expired
     }
 
-    // ------------------------------------------------------------------
-    // Fleet-wide no-op-cooldown / dispatch-backoff visibility (Issue #7477)
-    // ------------------------------------------------------------------
-
-    /// Observe an inbound [`ClaimKind::NoopCooldownArmed`] ad at local time
-    /// `now`: "peer host H armed a no-op cooldown on issue #N in `repo`,
-    /// `remaining_secs` seconds left as of H's send time". The local expiry
-    /// is computed as `now + remaining_secs` — the received-at-based TTL
-    /// discipline every other map in this module uses, never the
-    /// advertiser's wall clock.
-    ///
-    /// Returns `true` when applied (a peer's), `false` when ignored as this
-    /// host's own ad — the identical self-claim recognition
-    /// [`Self::observe_at`] applies, including the `UNKNOWN_HOST` carve-out
-    /// (see that method's doc comment): a host must back off on its own
-    /// no-op-cooldown ad exactly as readily as on a peer's, so an
-    /// unresolved-identity self-ad is still treated as a peer's here.
-    ///
-    /// A missing/zero `remaining_secs` (a malformed or already-expired ad)
-    /// degrades to "already expired" — harmless, since a subsequent read
-    /// simply finds nothing there rather than a bogus indefinite hold.
-    ///
-    /// Deliberately does **not** touch `counters`/`last_received_at`/
-    /// `coordination_degraded` — same contract as
-    /// [`Self::observe_completion_at`] and [`Self::observe_filing_lock_at`]:
-    /// the `#6157` verdict answers "is *dispatch* coordination healthy", and
-    /// a cooldown-lane ad is not dispatch traffic, so it must never
-    /// manufacture a false recovery out of the cooldown lane alone.
-    pub fn observe_noop_cooldown_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
-        debug_assert_eq!(ad.kind, ClaimKind::NoopCooldownArmed);
-        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
-        if ad.host == self.self_host && !is_unresolved_identity {
-            return false; // never back off on our own cooldown
-        }
-        let remaining = ad.remaining_secs.unwrap_or(0);
-        let expiry = now + Duration::from_secs(remaining);
-        self.noop_cooldowns
-            .insert((ad.repo.clone(), ad.issue), expiry);
-        true
-    }
-
-    /// [`Self::observe_noop_cooldown_at`]'s sibling for
-    /// [`ClaimKind::DispatchBackoffArmed`] (Issue #7477) — identical
-    /// contract, including leaving the `#6157` coordination-health
-    /// bookkeeping untouched.
-    pub fn observe_dispatch_backoff_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
-        debug_assert_eq!(ad.kind, ClaimKind::DispatchBackoffArmed);
-        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
-        if ad.host == self.self_host && !is_unresolved_identity {
-            return false; // never back off on our own backoff
-        }
-        let remaining = ad.remaining_secs.unwrap_or(0);
-        let expiry = now + Duration::from_secs(remaining);
-        self.dispatch_backoffs
-            .insert((ad.repo.clone(), ad.issue), expiry);
-        true
-    }
-
-    /// Every issue in `repo` with a live (non-expired) fleet-wide no-op
-    /// cooldown at local time `now` (Issue #7477) — unioned into
-    /// [`crate::sweep_registry::SweepRegistry::noop_cooldown_issues`] so a
-    /// peer's self-reported "no actionable delta" suppresses re-dispatch
-    /// fleet-wide, not just on the host that recorded it.
-    #[must_use]
-    pub fn noop_cooldown_issues_at(&self, repo: &str, now: Instant) -> HashSet<u32> {
-        self.noop_cooldowns
-            .iter()
-            .filter(|((r, _), expiry)| r == repo && **expiry > now)
-            .map(|((_, issue), _)| *issue)
-            .collect()
-    }
-
-    /// [`Self::noop_cooldown_issues_at`]'s sibling for dispatch backoff
-    /// (Issue #7477).
-    #[must_use]
-    pub fn dispatch_backoff_issues_at(&self, repo: &str, now: Instant) -> HashSet<u32> {
-        self.dispatch_backoffs
-            .iter()
-            .filter(|((r, _), expiry)| r == repo && **expiry > now)
-            .map(|((_, issue), _)| *issue)
-            .collect()
-    }
-
-    /// Drop every expired `noop_cooldowns` entry at local time `now` (Issue
-    /// #7477). Called opportunistically so the map does not grow without
-    /// bound from stale peer ads.
-    pub fn prune_expired_noop_cooldowns(&mut self, now: Instant) {
-        self.noop_cooldowns.retain(|_, expiry| *expiry > now);
-    }
-
-    /// [`Self::prune_expired_noop_cooldowns`]'s sibling for dispatch backoff
-    /// (Issue #7477).
-    pub fn prune_expired_dispatch_backoffs(&mut self, now: Instant) {
-        self.dispatch_backoffs.retain(|_, expiry| *expiry > now);
-    }
-
     /// Number of tracked claims (test/observability aid; includes not-yet-pruned
     /// expired entries).
     #[must_use]
@@ -1424,6 +1568,11 @@ impl PeerClaimView {
         if self.first_advertised_at.is_none() {
             self.first_advertised_at = Some(now);
         }
+        // Issue #8026: the idle gate's input — always the LATEST ad, so
+        // `evaluate_coordination` can ask "is this host currently saying
+        // anything?" before concluding that the silence coming back is a
+        // fault. See [`coordination_idle`] for why.
+        self.last_advertised_at = Some(now);
     }
 
     /// Record that a dispatch was backed off because this view showed a live
@@ -1493,15 +1642,31 @@ impl PeerClaimView {
     ///
     /// - Never advertised ([`Self::first_advertised_at`] is `None`) —
     ///   healthy: nothing to judge yet.
+    /// - **Not currently advertising** (Issue #8026) — healthy, and the quiet
+    ///   clock is rebased to `now`. Advertising is dispatch-gated, so an idle
+    ///   host transmits nothing and has no standing to call the silence coming
+    ///   back a fault; during a fleet-wide lull every host is idle at once and
+    ///   would otherwise flip DEGRADED simultaneously with nothing broken. See
+    ///   [`coordination_idle`] for the full rationale and the one detection
+    ///   loss it accepts.
     /// - Not currently degraded: once the time since the more recent of
-    ///   `first_advertised_at`/`last_received_at` reaches `grace`, flip
-    ///   DEGRADED — the exact signature of the 2026-08-13 incident (sustained
-    ///   advertising, zero receives: `received=0` while `advertised>0`, and
-    ///   the log-scale equivalent of "no receive within N× the advertisement
-    ///   interval").
+    ///   `first_advertised_at`/`last_received_at`/`last_heartbeat_received_at`
+    ///   reaches `grace`, flip DEGRADED — the exact signature of the
+    ///   2026-08-13 incident (sustained advertising, zero receives:
+    ///   `received=0` while `advertised>0`, and the log-scale equivalent of
+    ///   "no receive within N× the advertisement interval"). Folding in
+    ///   `last_heartbeat_received_at` (Issue #8736) closes the #8026 idle
+    ///   gate's converse: peers that are genuinely idle (no claims to send)
+    ///   still emit a heartbeat every reaper tick, so their silence on the
+    ///   `claims` channel alone is no longer mistaken for a dead receive
+    ///   path. A host whose receive path is truly one-way still gets neither
+    ///   signal, so the true-positive case above is unaffected.
     /// - Currently degraded: recovers only once `recovery_threshold`
     ///   CONSECUTIVE genuine peer receives have landed since going degraded
-    ///   — a single stray ad does not clear it (issue's AC4).
+    ///   — a single stray ad does not clear it (issue's AC4), and a
+    ///   heartbeat never counts toward this (see
+    ///   [`Self::observe_heartbeat_at`]'s doc comment): recovery requires
+    ///   proof a real claim arrived, not just that a peer is alive.
     pub fn evaluate_coordination(
         &mut self,
         now: Instant,
@@ -1539,7 +1704,33 @@ impl PeerClaimView {
                 transitioned: false,
             };
         };
-        let anchor = self.last_received_at.unwrap_or(first);
+        // Issue #8026: withhold the verdict while this host is itself silent.
+        if !coordination_idle::is_advertising_actively(
+            self.last_advertised_at,
+            now,
+            self.advertise_activity_window,
+        ) {
+            self.coordination_clock_base = Some(now);
+            return CoordinationEvaluation {
+                degraded: false,
+                reason: "this host is not currently advertising — no basis to judge the \
+                         receive path (#8026)"
+                    .to_string(),
+                transitioned: false,
+            };
+        }
+        // Issue #8736: a heartbeat is as good as a genuine receive for THIS
+        // anchor (though never for `counters.received` or recovery — see
+        // `observe_heartbeat_at`) — whichever signal is more recent wins.
+        let received_anchor = [self.last_received_at, self.last_heartbeat_received_at]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(first);
+        let anchor = match self.coordination_clock_base {
+            Some(base) if base > received_anchor => base,
+            _ => received_anchor,
+        };
         let quiet_for = now.saturating_duration_since(anchor);
         if quiet_for >= grace {
             self.coordination_degraded = true;
@@ -1686,7 +1877,7 @@ impl PeerClaimView {
 mod tests {
     use super::*;
 
-    fn ad(kind: ClaimKind, issue: u32, repo: &str, host: &str) -> ClaimAd {
+    pub(super) fn ad(kind: ClaimKind, issue: u32, repo: &str, host: &str) -> ClaimAd {
         ClaimAd {
             kind,
             issue,
@@ -1696,38 +1887,7 @@ mod tests {
             ts: "2026-07-28T00:00:00Z".to_owned(),
             pr: None,
             remaining_secs: None,
-        }
-    }
-
-    /// A [`ClaimKind::NoopCooldownArmed`]/[`ClaimKind::DispatchBackoffArmed`]
-    /// ad carrying a real `remaining_secs` (Issue #7477) — use this rather
-    /// than `ad()` whenever a test cares about the cooldown-lane expiry,
-    /// since `ad()` leaves `remaining_secs: None`.
-    fn cooldown_ad(
-        kind: ClaimKind,
-        issue: u32,
-        repo: &str,
-        host: &str,
-        remaining_secs: u64,
-    ) -> ClaimAd {
-        match kind {
-            ClaimKind::NoopCooldownArmed => ClaimAd::noop_cooldown_armed(
-                issue,
-                repo.to_owned(),
-                host.to_owned(),
-                42,
-                "2026-07-28T00:00:00Z".to_owned(),
-                remaining_secs,
-            ),
-            ClaimKind::DispatchBackoffArmed => ClaimAd::dispatch_backoff_armed(
-                issue,
-                repo.to_owned(),
-                host.to_owned(),
-                42,
-                "2026-07-28T00:00:00Z".to_owned(),
-                remaining_secs,
-            ),
-            _ => panic!("cooldown_ad called with a non-cooldown-lane kind"),
+            pool_key: None,
         }
     }
 
@@ -2236,170 +2396,19 @@ mod tests {
         assert_eq!(status.claims_room, None);
     }
 
-    // ---- peer-coordination health (Issue #6157) ----
-
-    // Issue #8276 raised DEFAULT_COORDINATION_DEGRADE_GRACE from 600s to
-    // 1200s. That value is a pragmatic compromise, not one derived from a
-    // clean measurement (see the constant's doc comment for the corrected
-    // derivation) — the grace-boundary and healthy/degrades-at-arbitrary-
-    // grace behavior below already exercises the transition generically at
-    // any grace value, including this one, so no #8276-specific literal
-    // test is added here.
-
-    #[test]
-    fn coordination_stays_healthy_when_never_advertised() {
-        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(100));
-        let now = Instant::now();
-        let eval = view.evaluate_coordination(now, Duration::from_secs(600), 3);
-        assert!(!eval.degraded);
-        assert!(!eval.transitioned);
-        assert!(!view.coordination_degraded());
-    }
-
-    #[test]
-    fn coordination_stays_healthy_within_grace_with_no_receive_yet() {
-        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(1000));
-        let base = Instant::now();
-        view.record_advertised_at(base);
-
-        let grace = Duration::from_secs(600);
-        // Just under the grace window: still healthy.
-        let eval = view.evaluate_coordination(base + Duration::from_secs(599), grace, 3);
-        assert!(!eval.degraded);
-        assert!(!eval.transitioned);
-    }
-
-    /// The 2026-08-13 incident's exact signature: sustained advertising
-    /// (2510 advertised, one per dispatch/reaper heartbeat), zero receives,
-    /// for hours. Once the grace window elapses with no receive at all,
-    /// coordination must flip DEGRADED.
-    #[test]
-    fn coordination_degrades_after_grace_with_zero_receives() {
-        let mut view = PeerClaimView::new("robb-studio".into(), Duration::from_secs(1000));
-        let base = Instant::now();
-        view.record_advertised_at(base);
-
-        let grace = Duration::from_secs(600);
-        let eval = view.evaluate_coordination(base + Duration::from_secs(600), grace, 3);
-        assert!(eval.degraded);
-        assert!(eval.transitioned, "the tick that crosses the grace window must transition");
-        assert!(view.coordination_degraded());
-        assert_eq!(view.coordination_degraded_for_secs(base + Duration::from_secs(600)), Some(0));
-
-        // A later tick, still no receive: still degraded, but no LONGER a
-        // transition (already-degraded ticks should not re-fire an alert).
-        let eval2 = view.evaluate_coordination(base + Duration::from_secs(700), grace, 3);
-        assert!(eval2.degraded);
-        assert!(!eval2.transitioned);
-        assert_eq!(view.coordination_degraded_for_secs(base + Duration::from_secs(700)), Some(100));
-    }
-
-    /// A receive that arrives just before the grace window elapses resets
-    /// the "quiet for" anchor — the receive path is not actually dead, it
-    /// was just slow once.
-    #[test]
-    fn coordination_receive_before_grace_elapses_prevents_degrade() {
-        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(1000));
-        let base = Instant::now();
-        view.record_advertised_at(base);
-
-        let grace = Duration::from_secs(600);
-        // A genuine peer receive lands at t+590, just inside the window.
-        view.observe_at(
-            &ad(ClaimKind::Advertise, 1, "loom", "peer"),
-            base + Duration::from_secs(590),
-        );
-
-        // At t+600 (which would have tripped the grace measured from
-        // first-advertised) coordination is still healthy: the anchor moved
-        // to the receive at t+590.
-        let eval = view.evaluate_coordination(base + Duration::from_secs(600), grace, 3);
-        assert!(!eval.degraded);
-        assert!(!eval.transitioned);
-    }
-
-    /// Issue #6157 AC4: recovery requires SUSTAINED receives, not a single
-    /// one — a lone stray ad must not immediately clear a DEGRADED verdict.
-    #[test]
-    fn coordination_recovery_requires_sustained_not_single_receive() {
-        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(1000));
-        let base = Instant::now();
-        view.record_advertised_at(base);
-        let grace = Duration::from_secs(600);
-        let recovery_threshold = 3;
-
-        // Trip DEGRADED.
-        let eval =
-            view.evaluate_coordination(base + Duration::from_secs(600), grace, recovery_threshold);
-        assert!(eval.degraded && eval.transitioned);
-
-        // A single receive lands while degraded: not enough to recover.
-        view.observe_at(
-            &ad(ClaimKind::Advertise, 1, "loom", "peer"),
-            base + Duration::from_secs(610),
-        );
-        let eval2 =
-            view.evaluate_coordination(base + Duration::from_secs(620), grace, recovery_threshold);
-        assert!(eval2.degraded, "a single receive must not clear a DEGRADED verdict");
-        assert!(!eval2.transitioned);
-        assert_eq!(view.coordination_receives_toward_recovery(), 1);
-
-        // Two more receives land — three consecutive total, meeting the
-        // threshold.
-        view.observe_at(
-            &ad(ClaimKind::Retract, 1, "loom", "peer"),
-            base + Duration::from_secs(630),
-        );
-        view.observe_at(
-            &ad(ClaimKind::Advertise, 2, "loom", "peer"),
-            base + Duration::from_secs(640),
-        );
-        let eval3 =
-            view.evaluate_coordination(base + Duration::from_secs(650), grace, recovery_threshold);
-        assert!(!eval3.degraded, "3 consecutive receives must clear the DEGRADED verdict");
-        assert!(eval3.transitioned);
-        assert!(!view.coordination_degraded());
-        assert_eq!(view.coordination_receives_toward_recovery(), 0);
-    }
-
-    /// A self-advertisement is never counted as a receive (mirrors
-    /// `own_advertisement_is_never_backed_off_on`), so it can never
-    /// manufacture a false recovery signal for THIS host's own DEGRADED
-    /// coordination.
-    #[test]
-    fn coordination_recovery_ignores_self_advertisements() {
-        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(1000));
-        let base = Instant::now();
-        view.record_advertised_at(base);
-        let grace = Duration::from_secs(600);
-        let eval = view.evaluate_coordination(base + Duration::from_secs(600), grace, 3);
-        assert!(eval.degraded && eval.transitioned);
-
-        // Re-advertising (a reaper heartbeat) and our own ad arriving back
-        // somehow must not count toward recovery.
-        view.record_advertised_at(base + Duration::from_secs(610));
-        assert!(!view.observe_at(
-            &ad(ClaimKind::Advertise, 1, "loom", "me"),
-            base + Duration::from_secs(611)
-        ));
-        assert_eq!(view.coordination_receives_toward_recovery(), 0);
-
-        let eval2 = view.evaluate_coordination(base + Duration::from_secs(620), grace, 3);
-        assert!(eval2.degraded, "self-ads must never clear a DEGRADED verdict");
-    }
+    // ---- peer-coordination health (Issue #6157/#8026) ----
+    //
+    // `evaluate_coordination`'s degrade/recover/idle-gate coverage lives in the
+    // sibling `peer_claims/coordination_tests.rs`, moved there by #8026: this
+    // file is frozen at its current size by scripts/file-size-baseline.txt and
+    // the policy's own preferred remedy for that is a sibling module.
 
     // ---- repo_slug ----
-
-    #[test]
-    fn repo_slug_prefers_env_then_basename() {
-        // Env override wins.
-        std::env::set_var("LOOM_REPO", "rjwalters/loom");
-        assert_eq!(repo_slug(Path::new("/anything/here")), "rjwalters/loom");
-        std::env::remove_var("LOOM_REPO");
-        // Basename fallback is cross-host-stable for the same repo.
-        assert_eq!(repo_slug(Path::new("/Users/a/loom")), "loom");
-        assert_eq!(repo_slug(Path::new("/home/b/loom")), "loom");
-    }
+    //
+    // `repo_slug`'s coverage lives in the sibling `peer_claims/repo_slug_tests.rs`
+    // because it mutates the process-global `LOOM_REPO` and so must carry the
+    // crate-wide `#[serial]` key for that variable (#8496), and this file is
+    // frozen at its current size by scripts/file-size-baseline.txt.
 
     // ---- integration-shaped: two hosts, one issue, exactly one proceeds ----
 
@@ -2634,237 +2643,16 @@ mod tests {
         host_b.observe_filing_lock_at(&a_release, t);
         assert!(!host_b.filing_lock_held_by_peer_at(t));
     }
-
-    // ==================================================================
-    // Fleet-wide no-op-cooldown / dispatch-backoff visibility (Issue #7477)
-    // ==================================================================
-
-    #[test]
-    fn cooldown_lane_ads_round_trip_over_the_wire() {
-        for kind in [
-            ClaimKind::NoopCooldownArmed,
-            ClaimKind::DispatchBackoffArmed,
-        ] {
-            let a = cooldown_ad(kind, 7466, "rjwalters/loom", "host-a", 3600);
-            let parsed = ClaimAd::from_body_str(&a.to_body_json()).unwrap();
-            assert_eq!(parsed, a);
-            assert_eq!(parsed.remaining_secs, Some(3600));
-            assert!(parsed.kind.is_cooldown_lane());
-        }
-    }
-
-    /// A cooldown-lane ad must never be folded into the dispatch-claims map —
-    /// it answers a different question ("should a peer re-dispatch this
-    /// issue right now") than "is a sweep in flight".
-    #[test]
-    fn observe_at_ignores_cooldown_lane_ads() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t = Instant::now();
-        let ad = cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 3600);
-        assert!(!view.observe_at(&ad, t));
-        assert!(view.is_empty());
-        assert_eq!(view.counters().received, 0, "cooldown ads are not dispatch traffic");
-    }
-
-    /// The exact #7477 shape: a peer's self-reported "no actionable delta"
-    /// on issue #7466 must suppress THIS host's fleet-wide skip set for that
-    /// issue, in the repo the ad named, until the broadcast `remaining_secs`
-    /// elapses (measured against local receipt, never the advertiser's
-    /// clock).
-    #[test]
-    fn a_peer_noop_cooldown_is_visible_and_expires_on_schedule() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t0 = Instant::now();
-        let ad = cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "rjwalters/loom", "host-b", 3600);
-        assert!(view.observe_noop_cooldown_at(&ad, t0));
-
-        assert!(view
-            .noop_cooldown_issues_at("rjwalters/loom", t0 + Duration::from_secs(3599))
-            .contains(&7466));
-        assert!(
-            !view
-                .noop_cooldown_issues_at("rjwalters/loom", t0 + Duration::from_secs(3601))
-                .contains(&7466),
-            "an elapsed cooldown must no longer suppress dispatch"
-        );
-    }
-
-    /// [`a_peer_noop_cooldown_is_visible_and_expires_on_schedule`]'s sibling
-    /// for the dispatch-backoff lane.
-    #[test]
-    fn a_peer_dispatch_backoff_is_visible_and_expires_on_schedule() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t0 = Instant::now();
-        let ad = cooldown_ad(ClaimKind::DispatchBackoffArmed, 7468, "rjwalters/loom", "host-c", 60);
-        assert!(view.observe_dispatch_backoff_at(&ad, t0));
-
-        assert!(view
-            .dispatch_backoff_issues_at("rjwalters/loom", t0 + Duration::from_secs(59))
-            .contains(&7468));
-        assert!(!view
-            .dispatch_backoff_issues_at("rjwalters/loom", t0 + Duration::from_secs(61))
-            .contains(&7468));
-    }
-
-    /// Cooldown/backoff visibility is scoped per-`(repo, issue)`, unlike the
-    /// fleet-wide filing lock — two managed repos' issue #N must never
-    /// cross-suppress each other.
-    #[test]
-    fn cooldown_visibility_is_scoped_to_its_own_repo() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t = Instant::now();
-        let ad = cooldown_ad(ClaimKind::NoopCooldownArmed, 42, "repo-one", "host-b", 3600);
-        view.observe_noop_cooldown_at(&ad, t);
-        assert!(view.noop_cooldown_issues_at("repo-one", t).contains(&42));
-        assert!(
-            !view.noop_cooldown_issues_at("repo-two", t).contains(&42),
-            "a different repo's identical issue number must not be suppressed"
-        );
-    }
-
-    /// Never back off on this host's own cooldown/backoff ad, but two
-    /// identity-unresolved hosts must still back off from each other — the
-    /// #5063 carve-out, applied to this lane too.
-    #[test]
-    fn own_cooldown_ad_is_ignored_but_unknown_host_is_not() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t = Instant::now();
-        let own = cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "A", 3600);
-        assert!(!view.observe_noop_cooldown_at(&own, t));
-        assert!(!view.noop_cooldown_issues_at("loom", t).contains(&7466));
-
-        let mut unresolved = PeerClaimView::new(
-            crate::sweep_registry::UNKNOWN_HOST.to_string(),
-            Duration::from_secs(120),
-        );
-        let ad = cooldown_ad(
-            ClaimKind::NoopCooldownArmed,
-            7466,
-            "loom",
-            crate::sweep_registry::UNKNOWN_HOST,
-            3600,
-        );
-        assert!(unresolved.observe_noop_cooldown_at(&ad, t));
-        assert!(unresolved
-            .noop_cooldown_issues_at("loom", t)
-            .contains(&7466));
-    }
-
-    /// A repeat ad (a peer re-arming/re-affirming the same window) refreshes
-    /// the local expiry clock, exactly like a repeat `Advertise` does for a
-    /// dispatch claim.
-    #[test]
-    fn re_observing_a_noop_cooldown_refreshes_its_expiry() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t0 = Instant::now();
-        view.observe_noop_cooldown_at(
-            &cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 100),
-            t0,
-        );
-        let t1 = t0 + Duration::from_secs(90);
-        view.observe_noop_cooldown_at(
-            &cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 100),
-            t1,
-        );
-        assert!(
-            view.noop_cooldown_issues_at("loom", t0 + Duration::from_secs(150))
-                .contains(&7466),
-            "a refreshed window must survive past the original receipt's expiry"
-        );
-    }
-
-    /// A missing/zero `remaining_secs` (a malformed or already-expired ad)
-    /// degrades to "already expired" — harmless, since a subsequent read
-    /// simply finds nothing there rather than a bogus indefinite hold.
-    #[test]
-    fn malformed_zero_remaining_secs_reads_as_already_expired() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t = Instant::now();
-        view.observe_noop_cooldown_at(
-            &cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 0),
-            t,
-        );
-        assert!(!view.noop_cooldown_issues_at("loom", t).contains(&7466));
-    }
-
-    /// Pruning removes only the lapsed entries, mirroring
-    /// `prune_expired_filing_locks`'s contract.
-    #[test]
-    fn prune_expired_noop_cooldowns_drops_only_lapsed_entries() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t0 = Instant::now();
-        view.observe_noop_cooldown_at(
-            &cooldown_ad(ClaimKind::NoopCooldownArmed, 1, "loom", "B", 10),
-            t0,
-        );
-        view.observe_noop_cooldown_at(
-            &cooldown_ad(ClaimKind::NoopCooldownArmed, 2, "loom", "B", 1000),
-            t0,
-        );
-        let after = t0 + Duration::from_secs(20);
-        view.prune_expired_noop_cooldowns(after);
-        assert!(!view.noop_cooldown_issues_at("loom", after).contains(&1));
-        assert!(view.noop_cooldown_issues_at("loom", after).contains(&2));
-    }
-
-    /// A cooldown-lane ad must likewise not perturb the #6157
-    /// dispatch-coordination-health bookkeeping — mirrors
-    /// `observing_a_filing_lock_does_not_touch_coordination_health` and
-    /// `observing_a_completion_never_touches_coordination_health_counters`.
-    /// Critically, a stream of peer cooldown ads must NOT be able to clear a
-    /// DEGRADED verdict: the verdict answers "is *dispatch* coordination
-    /// healthy", and the cooldown lane is not dispatch traffic.
-    #[test]
-    fn observing_a_cooldown_does_not_touch_coordination_health() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t = Instant::now();
-        view.observe_noop_cooldown_at(
-            &cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 3600),
-            t,
-        );
-        view.observe_dispatch_backoff_at(
-            &cooldown_ad(ClaimKind::DispatchBackoffArmed, 7468, "loom", "B", 60),
-            t,
-        );
-        assert_eq!(view.counters(), PeerClaimCounters::default());
-        assert!(!view.coordination_degraded());
-        assert_eq!(view.coordination_receives_toward_recovery(), 0);
-    }
-
-    /// The #7477 fix must not make a genuinely orphaned claim (a crashed
-    /// sweep whose host never got to arm — or broadcast — a cooldown/backoff
-    /// window) un-reclaimable: with no cooldown ad ever observed, the
-    /// fleet-wide skip sets are empty and the candidate stays immediately
-    /// offerable. This is the "must not regress the lease-reclaim path"
-    /// acceptance criterion expressed at the layer that actually holds the
-    /// new state — `claim_reconciliation` itself never reads these maps.
-    #[test]
-    fn no_cooldown_ad_means_no_fleet_suppression() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t = Instant::now();
-        // A live *dispatch* claim from a crashed peer says nothing about
-        // cooldown — the two lanes are independent maps.
-        view.observe_at(&ad(ClaimKind::Advertise, 7466, "loom", "B"), t);
-        assert!(view.noop_cooldown_issues_at("loom", t).is_empty());
-        assert!(view.dispatch_backoff_issues_at("loom", t).is_empty());
-    }
-
-    /// The two cooldown lanes are independent of each other: a no-op
-    /// cooldown on an issue must not read back as a dispatch backoff (or
-    /// vice versa), since they carry different durations and are consumed by
-    /// different work-finder skip sets.
-    #[test]
-    fn the_two_cooldown_lanes_do_not_cross_contaminate() {
-        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
-        let t = Instant::now();
-        view.observe_noop_cooldown_at(
-            &cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 3600),
-            t,
-        );
-        assert!(view.noop_cooldown_issues_at("loom", t).contains(&7466));
-        assert!(
-            !view.dispatch_backoff_issues_at("loom", t).contains(&7466),
-            "a no-op cooldown must not read back as a dispatch backoff"
-        );
-    }
 }
+
+// [`repo_slug`]'s coverage, in its own sibling file (#8496): it mutates the
+// process-global `LOOM_REPO` and therefore needs that variable's crate-wide
+// `#[serial]` key, which this over-threshold module has no line budget for
+// (scripts/file-size-baseline.txt).
+#[cfg(test)]
+mod repo_slug_tests;
+
+// [`PeerClaimView::evaluate_coordination`]'s coverage, in its own sibling file
+// (#8026) — same line-budget reason as `repo_slug_tests` above.
+#[cfg(test)]
+mod coordination_tests;

@@ -22,7 +22,11 @@
 #     that must be unwritable;
 #   - 13 for a premise-false record;
 #   - 1 (never 0) on a usage error — the gate fails CLOSED;
-#   - the `SCOPE=` / `TRIGGER=` / `VERDICT=` stdout keys exist and are stable.
+#   - the `SCOPE=` / `TRIGGER=` / `VERDICT=` stdout keys exist and are stable;
+#   - #8499: citations resolve against the INVOKING working tree, driven
+#     through a real linked worktree whose primary clone lacks the cited path.
+#     A Rust unit test cannot see this — it needs the `.git` pointer file and
+#     a process cwd, which is precisely what this entry point supplies.
 #
 # Needs a BUILT `loom-daemon` (the subject is a stub over a Rust subcommand) —
 # same shape as test-skip-labels.sh, wired in the "Native Port Suites" CI job,
@@ -79,6 +83,22 @@ run() {
     local label="$1" want="$2"
     shift 3
     bash "$SUBJECT" "$@" >"$OUT" 2>&1
+    local rc=$?
+    if [[ "$rc" -eq "$want" ]]; then
+        pass "$label (exit $rc)"
+    else
+        fail "$label: expected exit $want, got $rc"
+        sed 's/^/    /' "$OUT"
+    fi
+}
+
+# run_in <cwd> <label> <expected-rc> -- <args...>
+# Same as `run`, from a chosen working directory and WITHOUT --repo-root, so
+# the default root resolution is what is under test (#8499).
+run_in() {
+    local cwd="$1" label="$2" want="$3"
+    shift 4
+    (cd "$cwd" && bash "$SUBJECT" "$@") >"$OUT" 2>&1
     local rc=$?
     if [[ "$rc" -eq "$want" ]]; then
         pass "$label (exit $rc)"
@@ -240,6 +260,86 @@ printf 'Post a loom:premise-check record before curating.\n' >"$WORK/record-pros
 run "a prose mention is not a record" 10 -- --body-file "$WORK/incident.md" \
     --record-file "$WORK/record-prose.md" --repo-root "$FIXTURE" --no-scan
 has_line "  still reports RECORD=absent" '^RECORD=absent$'
+
+# ---------------------------------------------------------------------------
+# 12. #8499: a citation resolves against the INVOKING WORKING TREE, not the
+#     shared primary clone it was created from.
+#
+#     Loom's whole model is that the primary clone sits on `main` while N
+#     worktrees run ahead of it, so a citation written inside a worktree
+#     routinely names a file the primary clone does not have yet. Resolving it
+#     against the primary clone returned RECORD-MALFORMED (12) — "does not
+#     resolve in this checkout" — for a record that was entirely correct, and
+#     exit 12 is what curator.md and the sweep orchestrator read as "do not
+#     enrich". It failed the dangerous way too: a citation that resolves ONLY
+#     in the stale primary clone was reported as resolving.
+#
+#     The fixture is a real linked worktree, because the defect lives in the
+#     `.git` pointer-file dereference that only a real one has.
+# ---------------------------------------------------------------------------
+if ! command -v git >/dev/null 2>&1; then
+    fail "git is required to exercise the linked-worktree citation root (#8499)"
+else
+    mkdir -p "$WORK/primary"
+    # `pwd -P` so the fixture path matches the canonicalized root the gate
+    # prints (on macOS $TMPDIR is a /var -> /private/var symlink).
+    PRIMARY="$(cd "$WORK/primary" && pwd -P)"
+    mkdir -p "$PRIMARY/.loom" "$PRIMARY/src" "$PRIMARY/docs"
+    git init -q -b main "$PRIMARY"
+    git -C "$PRIMARY" config user.email "premise-check-test@example.com"
+    git -C "$PRIMARY" config user.name "premise-check test"
+    printf '{}\n' >"$PRIMARY/.loom/config.json"
+    printf '// No automatic kill/restart is attempted (deliberate).\n' \
+        >"$PRIMARY/src/watchdog.rs"
+    git -C "$PRIMARY" add -A >/dev/null
+    git -C "$PRIMARY" commit -qm "base"
+
+    # A branch that ADDS the cited file, then put the primary clone back on
+    # `main` — exactly the "primary is behind" state the bug needs.
+    git -C "$PRIMARY" checkout -q -b feature/issue-8499
+    printf '# Landed on the branch, not yet on main.\n' >"$PRIMARY/docs/ahead.md"
+    git -C "$PRIMARY" add -A >/dev/null
+    git -C "$PRIMARY" commit -qm "add docs/ahead.md"
+    git -C "$PRIMARY" checkout -q main
+
+    LINKED="$PRIMARY/.loom/worktrees/issue-8499"
+    git -C "$PRIMARY" worktree add -q "$LINKED" feature/issue-8499 2>/dev/null
+    [[ -d "$LINKED" ]] && LINKED="$(cd "$LINKED" && pwd -P)"
+
+    if [[ ! -f "$LINKED/docs/ahead.md" || -f "$PRIMARY/docs/ahead.md" ]]; then
+        fail "fixture: expected docs/ahead.md only in the linked worktree"
+    else
+        {
+            marker "exists=yes deliberate=no reversal=no verdict=clear"
+            printf 'premise-searched: docs/ahead.md\n'
+        } >"$WORK/record-ahead.md"
+
+        run_in "$LINKED" "a worktree-only citation resolves from that worktree" 0 -- \
+            --body-file "$WORK/incident.md" --record-file "$WORK/record-ahead.md" --no-scan
+        has_line "  reports VERDICT=proceed" '^VERDICT=proceed$'
+
+        # The control: the same record, run from the behind primary clone, is
+        # still malformed. Without this the test above could pass vacuously.
+        run_in "$PRIMARY" "the same citation is unresolvable in the behind clone" 12 -- \
+            --body-file "$WORK/incident.md" --record-file "$WORK/record-ahead.md" --no-scan
+        has_line "  the reason names the root it resolved against" "REASON=.*$PRIMARY"
+
+        # ...and the inverse direction: a citation that exists ONLY in the
+        # stale primary clone must NOT be reported as resolving from the
+        # worktree.
+        printf 'stale\n' >"$PRIMARY/untracked-in-primary-only.md"
+        {
+            marker "exists=yes deliberate=no reversal=no verdict=clear"
+            printf 'premise-searched: untracked-in-primary-only.md\n'
+        } >"$WORK/record-primary-only.md"
+        run_in "$LINKED" "a primary-clone-only citation does not resolve from the worktree" 12 -- \
+            --body-file "$WORK/incident.md" \
+            --record-file "$WORK/record-primary-only.md" --no-scan
+        has_line "  the reason names the worktree it resolved against" "REASON=.*$LINKED"
+    fi
+
+    git -C "$PRIMARY" worktree remove --force "$LINKED" >/dev/null 2>&1
+fi
 
 echo
 echo "passed: $passed, failed: $failed"

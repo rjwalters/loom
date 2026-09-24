@@ -16,12 +16,46 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct Dep {
     pub number: i64,
+    /// `Some("owner/name")` for a cross-repo reference written `owner/repo#N`
+    /// (#8502); `None` for a bare `#N`, which means the invoking repo.
+    ///
+    /// Load-bearing in two places: the live lookup must resolve the state in
+    /// **that** repo rather than the invoking one, and the rendered
+    /// [`deps_lines`] entry must name it, so `owner/a#5` and `owner/b#5` are
+    /// two dependencies rather than one.
+    #[serde(default)]
+    pub repo: Option<String>,
     #[serde(default)]
     pub checked: bool,
     /// The referenced issue's or PR's own state. `None` for a checked item —
-    /// never looked up, never consulted.
+    /// never looked up, never consulted. Also `None` on a freshly parsed
+    /// entry, before [`super::forge`] resolves it.
     #[serde(default)]
     pub state: Option<String>,
+}
+
+impl Dep {
+    /// How this entry reads in prose and in error messages: `#123` for a
+    /// same-repo reference, `owner/repo#123` for a cross-repo one.
+    #[must_use]
+    pub fn reference(&self) -> String {
+        match self.repo.as_deref() {
+            Some(r) => format!("{r}#{}", self.number),
+            None => format!("#{}", self.number),
+        }
+    }
+
+    /// The `deps_lines` key. A same-repo entry keeps the bare number the
+    /// fingerprint has always used — changing it would move `CONCLUSION_HASH`
+    /// for every existing same-repo dependency, manufacturing exactly the hash
+    /// churn this subcommand exists to stop. A cross-repo entry is qualified,
+    /// because the number alone does not identify it.
+    fn line_key(&self) -> String {
+        match self.repo.as_deref() {
+            Some(r) => format!("{r}#{}", self.number),
+            None => self.number.to_string(),
+        }
+    }
 }
 
 /// The `--stdin` document.
@@ -39,10 +73,11 @@ pub struct Outcome {
 }
 
 /// A checklist item: `- [ ] #123: ...` or `* [ ] #123: ...`, with an optional
-/// dependency phrase (`Blocked by`, `Depends on`, `Requires`, `**Epic**`)
-/// and/or a `PR `/`Issue ` token before the `#N`, in that order. All of the
-/// optional parts are case-insensitive, and either may appear without the
-/// other (`- [ ] Blocked by PR #3` matches both).
+/// dependency phrase (`Blocked by`, `Depends on`, `Requires`, `**Epic**`),
+/// an optional `PR `/`Issue ` token, and an optional `owner/repo` prefix
+/// before the `#N`, in that order. All of the optional parts are
+/// case-insensitive, and each may appear without the others
+/// (`- [ ] Blocked by PR owner/repo#3` matches all three).
 ///
 /// The optional token is #7501: curator prose naturally varies ("PR #N",
 /// "Issue #N"), and silently dropping such an item produces a false
@@ -58,6 +93,22 @@ pub struct Outcome {
 /// [`super::extract::DEPENDENCY_PHRASES`], shared rather than re-spelled, per
 /// that module's own "reused verbatim … rather than inventing a second
 /// vocabulary" precedent.
+///
+/// The optional `owner/repo` prefix is #8502, and is the same argument a third
+/// time: a Curator in a *consumer* repo naturally writes an upstream
+/// prerequisite as `- [ ] rjwalters/loom#8257: …`, because a bare `#8257`
+/// would not resolve there. Before the prefix was accepted, such a line
+/// matched **nothing** — the character after the checkbox is `r`, which is
+/// neither a phrase, a `pr `/`issue ` token, nor a `#` — so the item was not
+/// merely mis-parsed but invisible, and the subcommand reported
+/// `DEPS=''`/`VERDICT=clear` for an issue whose upstream dependency was still
+/// open. Live repro: `2AMLogic/2am#532`.
+///
+/// The prefix is deliberately charset-restricted (`owner` must start
+/// alphanumeric; no spaces, quotes, or leading `-`) because it is fed to
+/// `gh --repo`, and every issue body is untrusted input — see
+/// `defaults/docs/untrusted-external-content.md`. A restricted charset that
+/// cannot begin with `-` cannot be smuggled through as a flag.
 ///
 /// Two deliberate narrowings relative to [`super::extract`]'s `phrase_re`:
 /// the separator between phrase and `#N` is `[*_: \t]*` rather than
@@ -79,15 +130,24 @@ fn item_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         // The bullet and its box, then an optional dependency phrase (#8119),
-        // then an optional `PR `/`Issue ` token (#7501), then the reference.
+        // then an optional `PR `/`Issue ` token (#7501), then an optional
+        // `owner/repo` prefix (#8502), then the reference.
         // Kept on one line: the phrases themselves contain literal spaces, so
         // `(?x)` free-spacing mode would silently mangle the shared vocabulary.
         let pattern = format!(
-            r"(?im)^[ \t]*[-*][ \t]*\[([ xX])\][ \t]*(?:(?:{DEPENDENCY_PHRASES})[*_: \t]*)?(?:(?:pr|issue)[ \t]+)?#([0-9]+)"
+            r"(?im)^[ \t]*[-*][ \t]*\[(?P<box>[ xX])\][ \t]*(?:(?:{DEPENDENCY_PHRASES})[*_: \t]*)?(?:(?:pr|issue)[ \t]+)?(?P<repo>{OWNER_REPO})?#(?P<num>[0-9]+)"
         );
         Regex::new(&pattern).expect("static checklist pattern")
     })
 }
+
+/// `owner/name`, as GitHub (and Gitea) spell it: an owner of alphanumerics and
+/// hyphens that cannot start with a hyphen, then a repository name that may
+/// also contain `.` and `_`.
+///
+/// Narrow on purpose — this value is passed to `gh --repo` verbatim, so it
+/// must not be able to carry whitespace, a quote, or a leading `-`.
+const OWNER_REPO: &str = r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+";
 
 /// The `## Dependencies` (or `### Dependencies`) section of a body.
 ///
@@ -134,23 +194,34 @@ fn is_heading_up_to_h3(line: &str) -> bool {
     (1..=3).contains(&hashes) && line[hashes..].starts_with([' ', '\t'])
 }
 
-/// The checklist entries declared in `body`'s `## Dependencies` section.
+/// The checklist entries declared in `body`'s `## Dependencies` section, in
+/// document order.
 ///
-/// Returns `(number, checked)` pairs in document order.
+/// Each entry's `state` is `None` — parsing reads what the checklist *says*,
+/// never the forge. [`super::forge::fetch_named_deps`] resolves the state of
+/// every unchecked one afterwards, in the repo named by its own `repo` field.
 #[must_use]
-pub fn parse_entries(body: &str) -> Vec<(i64, bool)> {
+pub fn parse_entries(body: &str) -> Vec<Dep> {
     let section = dependencies_section(body);
     item_re()
         .captures_iter(&section)
         .filter_map(|c| {
-            let checked = c.get(1)?.as_str() != " ";
-            Some((c.get(2)?.as_str().parse().ok()?, checked))
+            Some(Dep {
+                number: c.name("num")?.as_str().parse().ok()?,
+                repo: c.name("repo").map(|m| m.as_str().to_string()),
+                checked: c.name("box")?.as_str() != " ",
+                state: None,
+            })
         })
         .collect()
 }
 
-/// One `<ref#>:<state-or-checked>` line per dependency, sorted
+/// One `<ref>:<state-or-checked>` line per dependency, sorted
 /// lexicographically (the shell's trailing `| sort`).
+///
+/// `<ref>` is the bare number for a same-repo dependency (unchanged, so no
+/// existing `CONCLUSION_HASH` moves) and `owner/repo#N` for a cross-repo one
+/// (#8502) — see [`Dep::line_key`].
 ///
 /// A checked item always renders `checked`, whatever `state` it carries — that
 /// field is never consulted for one.
@@ -160,9 +231,9 @@ pub fn deps_lines(deps: &[Dep]) -> String {
         .iter()
         .map(|d| {
             if d.checked {
-                format!("{}:checked", d.number)
+                format!("{}:checked", d.line_key())
             } else {
-                format!("{}:{}", d.number, d.state.as_deref().unwrap_or("null"))
+                format!("{}:{}", d.line_key(), d.state.as_deref().unwrap_or("null"))
             }
         })
         .collect();

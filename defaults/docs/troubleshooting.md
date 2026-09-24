@@ -653,6 +653,74 @@ removal path can attribute them. `loom-daemon target-dir-gc` (the #8459
 section above) is the backstop that prunes them by age; this section is what
 stops new ones from accumulating.
 
+### tmpfs/ramfs scratch reclaim — orphaned `/dev/shm` build dirs (#8512)
+
+**Symptom**: a host runs low on RAM, or hits a kernel OOM-kill storm on
+unrelated processes, even though `df`/`du` over the repo tree looks fine. The
+culprit is scratch parked on a `tmpfs`-backed mount (`/dev/shm`, or any other
+`tmpfs`/`ramfs` mount) — every byte written there counts against RAM/swap, not
+disk, and none of Loom's disk-headroom probes above (`deep_clean`,
+`docker_image_clean`, `target_dir_gc`) ever look outside the repo tree. One
+incident: a build redirected `CARGO_TARGET_DIR` to
+`/dev/shm/cargo-target-<issue>`, the owning worktree was removed, and the
+6.2 GB directory sat pinned in RAM for 2.5 days before an OOM-kill storm on
+the serial console forced attention.
+
+**Never park build/scratch output on `/dev/shm` or any other `tmpfs`/`ramfs`
+mount.** It is RAM, not swappable disk space, shared with everything else
+running on the host — and nothing can reclaim it by attribution once its
+worktree is gone (see the "Limitation" note above: a `CARGO_TARGET_DIR`
+exported only inside a build environment cannot be proven to belong to any
+one worktree once that variable is no longer set).
+
+**Sanctioned on-disk location for a private/disposable target dir**: a
+worktree-local `target/` (the Cargo default — reclaimed for free when the
+worktree is removed, see above), or, when a shared/external location is
+genuinely needed, a `.cargo/config.toml` **inside the worktree** pointing
+`build.target-dir` at an ordinary disk path (e.g.
+`/Volumes/build/cargo-target/issue-<N>`, or a real disk-backed `/tmp` —
+never `/dev/shm`). Both shapes are attributable to the worktree and reclaimed
+by the mechanisms documented above; a `tmpfs`/`ramfs` mount is neither
+disk-backed nor attributable.
+
+`loom-daemon tmpfs-scratch-gc` is the backstop for what already leaked: it
+enumerates every `tmpfs`/`ramfs` mount from `/proc/mounts` (never a hardcoded
+`/dev/shm` prefix), lists Loom-named scratch directories (`cargo-target-*`,
+`tmp-issue*`) directly under each one, and reclaims any that (a) no live
+process holds open and (b) have not been written to for at least a staleness
+window (default 6 hours, configurable via `autonomous.tmpfsScratchGc.*` /
+`LOOM_TMPFS_SCRATCH_GC_STALENESS_SECS`). It also runs automatically as a
+`worktree_reaper` sibling pass (default-on) alongside `deep_clean`/
+`docker_image_clean` on every reaper tick — no separate cron line needed,
+unlike `target-dir-gc` above.
+
+```bash
+loom-daemon tmpfs-scratch-gc --dry-run    # or --dry-run --json
+loom-daemon tmpfs-scratch-gc              # the real run
+```
+
+**Safety model — deliberately weaker than the attribution-based reclaim
+above, and that is intentional.** The per-worktree cargo-target reclaim never
+deletes by name/pattern match alone, because a machine-global redirect cannot
+be proven to belong to one worktree — but that same caution is exactly why
+this incident's directory was never reclaimed by anything that already
+existed: nothing tracks an orphaned tmpfs directory back to a worktree that no
+longer exists. `tmpfs-scratch-gc` therefore trades provable attribution for
+four narrower, independently-checked signals instead: a recognized Loom name
+pattern, a confirmed `tmpfs`/`ramfs` mount type, no open file handle, and an
+age floor on the directory's newest mtime — never a bare name match on an
+arbitrary directory, and never anything outside a mount already classified
+`tmpfs`/`ramfs`. A **symlink** wearing a matching name never qualifies either
+(only a real directory does), so the removal cannot be aimed through one at
+something outside the mount.
+
+The pass is inert on a host it cannot measure: an unreadable `/proc/mounts`
+(non-Linux host, unusual sandbox) yields an empty mount list, which is a clean
+no-op rather than an error. The full config surface —
+`autonomous.tmpfsScratchGc.{enabled,stalenessSecs,minIntervalSecs,namePatterns}`
+and their `LOOM_TMPFS_SCRATCH_GC*` env overrides — is tabulated in
+[`daemon-reference.md`](daemon-reference.md) → "tmpfs scratch reclaim (#8512)".
+
 ### A worktree vanished mid-session — who removed it? (#5950)
 
 **Symptom**: a Builder's worktree and/or its `feature/issue-N` branch disappears
@@ -1359,6 +1427,54 @@ git -C <target> status --short
 git -C <target> restore --staged --worktree -- .loom .claude CLAUDE.md .gitignore
 git -C <target> stash list | grep loom-install   # changes the installer stashed, if any
 ```
+
+### `cost_by_role` / `cost_by_month` are empty, or token history stops ~30 days back (#8477)
+
+Token/cost history has a **30-day fuse**, and it is one-way: Claude Code
+deletes session transcripts `cleanupPeriodDays` (default 30) after they were
+last touched, and the cleanup runs at session start — so on a fleet host, where
+agents start constantly, transcripts are pruned continuously as they cross the
+line. **The transcripts are the only copy.** Anything not ingested before its
+transcript is deleted is gone permanently; there is no forge-side or API-side
+backfill.
+
+Diagnose in one call — the `transcript_ingest` health section always renders:
+
+```bash
+loom-daemon health --json | jq '.sections[] | select(.key == "transcript_ingest")'
+```
+
+| Verdict | Meaning | Fix |
+|---|---|---|
+| `Degraded`, summary says `OFF` | This host opted out — `LOOM_TRANSCRIPT_INGEST=0` in the daemon's environment, or `autonomous.transcriptIngest.enabled: false` in `.loom/config.json`. It is losing history right now | Remove the opt-out, then **restart the daemon** (the knob is resolved once at bring-up — "landed != effective", see [`fleet-config-lifecycle.md`](fleet-config-lifecycle.md)) |
+| `Degraded`, summary says `stuck` | Enabled, but the newest ledger entry is >6h old while a newer transcript sits on disk — a crashed thread, a wedged database lock, or a daemon that has been down | Restart the daemon; run `loom-daemon ingest-transcripts --since 48h` immediately to catch up before anything else ages out |
+| `Green`, `nothing ingested yet` | Enabled, no pass has completed — normal on a host that just started | Wait one interval (default 15 min), or force a pass with `loom-daemon ingest-transcripts` |
+
+Corroborate from the log and a dry run:
+
+```bash
+grep 'Transcript ingestion' ~/.loom/daemon.log | tail -1
+loom-daemon ingest-transcripts --dry-run --format json | jq '{transcripts_seen, skipped_unchanged}'
+```
+
+A healthy host reports `skipped_unchanged` ≈ `transcripts_seen`. **A
+`skipped_unchanged` of `0` means nothing has ever been ingested** — that is the
+exact reading that opened #8477 on a host carrying 100,942 transcripts.
+
+Before #8477 the periodic pass was opt-in and off by default, so every host
+that never hand-set `LOOM_TRANSCRIPT_INGEST=1` was silently in this state. It
+is on by default now; a host that still reads `OFF` has an explicit opt-out
+somewhere (check the daemon's unit/plist environment as well as config — an env
+var wins over config).
+
+**Widening the window** is a separate lever: raise `cleanupPeriodDays` in
+`~/.claude/settings.json` to keep the raw transcripts longer (~33 GB per 30
+days on the measured host; a `.tar.zst` of that set compressed 10.9:1). That is
+only needed for forensics or `claude --resume` — the cost views do not depend
+on the raw transcripts once the rows are ingested. **Any transcript archiving
+or pruning must exclude `~/.claude/projects/<project>/memory/`**, which holds
+persistent agent memory rather than session transcripts. Full reference:
+[`transcript-token-ingest.md`](transcript-token-ingest.md).
 
 ### Daemon won't start
 
@@ -2715,12 +2831,13 @@ including mid-sweep, with zero risk to the live checkout:
 ./.loom/scripts/resync-installed.sh --output /tmp/loom-resync-staging
 cd /tmp/loom-resync-staging
 git checkout -b chore/resync-installed-$(date +%Y%m%d)
-# Never a bare `git add -A` here (#7818): `.loom/gh-config/` and
-# `.loom/gh-config-by-owner/` are the daemon-owned GH_CONFIG_DIR trees holding
-# live GitHub App installation tokens, and a bare add is exactly what swept one
-# into a public repo on 2026-08-23. The exclusions below are belt-and-braces —
-# loom-daemon's managed .gitignore block already covers both.
-git add -A -- . ':!.loom/gh-config' ':!.loom/gh-config-by-owner'
+# Never a bare `git add -A` here (#7818/#8005): the credential-bearing class
+# (post_init.rs CREDENTIAL_PATTERNS — token pool, account keys, harness auth,
+# GH_CONFIG_DIR trees) must never be staged, and a bare add is exactly what
+# swept a live installation token into a public repo on 2026-08-23. The
+# exclusions are belt-and-braces — the managed .gitignore block covers them too.
+git add -A -- . ':!.loom/claude-config' ':!.loom/tokens' ':!.loom/accounts.env' \
+  ':!.loom/api-keys' ':!.loom/gh-config' ':!.loom/gh-config-by-owner'
 git commit -m 'chore: resync installed Loom surfaces'
 git push -u origin HEAD   # open a PR from here
 cd - && git worktree remove /tmp/loom-resync-staging   # from the primary checkout when done
@@ -2729,8 +2846,8 @@ cd - && git worktree remove /tmp/loom-resync-staging   # from the primary checko
 Or skip the hand-rolled add entirely and let
 `./.loom/scripts/land-resync-commit.sh` stage and commit for you — it stages an
 explicit allowlist of resync-surface pathspecs (never `-A`), refuses to land if
-any unrelated dirt is present, and unconditionally excludes the two credential
-trees above even on a host whose `.gitignore` is stale.
+any unrelated dirt is present, and unconditionally excludes the credential class
+above even on a host whose `.gitignore` is stale.
 
 **If a credential path is already git-TRACKED, that same script stops instead
 (#8004).** Excluding it from one commit fixes nothing in that state: git applies

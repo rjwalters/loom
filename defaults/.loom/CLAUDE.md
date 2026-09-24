@@ -1,16 +1,19 @@
 # Loom Orchestration - Repository Guide
 
-This repository uses **Loom** for AI-powered development orchestration.
+This repository uses **Loom** for development orchestration.
 
 **Installation Date**: {{INSTALL_DATE}}
 
-> **This file is the operating core** — only what an agent must know to act
-> correctly *right now*. Reference-tier detail (daemon internals, build-gate
-> schema, forge auth, troubleshooting) lives in `.loom/docs/*`, installed
-> alongside this file. Sections below link to the specific doc rather than
-> inlining it, so this file stays a manageable per-dispatch context cost.
+> **Operating core:** dispatch instructions here; reference details in `.loom/docs/*`.
 
 <!-- agents-md:include:start -->
+## Credential storage
+
+Secrets must stay outside every repository and worktree, including ignored
+`.env`, `.loom-local`, logs and artifacts. Use owner-only user credential files
+or an OS credential store; reference them without copying values. Never print
+secrets. `.gitignore` is insufficient. See [credential policy](.loom/docs/credential-storage.md).
+
 ## What is Loom?
 
 Loom is a CLI + daemon for AI-powered development orchestration. It coordinates
@@ -152,13 +155,9 @@ credentials, infra, hardware; skipped by autonomous dispatch), `loom:abort`
 
 ### REST vs GraphQL for forge queries
 
-Prefer forge REST calls over GraphQL-backed convenience commands when GraphQL is
-rate-limited or exhausted (they share separate hourly budgets). In practice:
-read and mutate issues/labels via `gh api repos/:owner/:repo/issues/:number`
-(and the `--method PATCH`/`POST` forms) rather than GraphQL-backed
-`gh issue list --label` / `gh issue view` queries when GraphQL quota is tight.
-The REST path stays available after GraphQL is exhausted, so it is the reliable
-fallback for issue reads, edits, and label changes during heavy dispatch.
+When GitHub GraphQL is rate-limited, use the separate REST quota: read issues
+with `gh api repos/:owner/:repo/issues/:number`; mutate via `--method PATCH`
+or `POST`. Prefer this fallback over `gh issue list` / `gh issue view`.
 
 ### Issues Are Suggestions (Role Autonomy)
 
@@ -173,15 +172,9 @@ decision — route it to `loom:blocked` or `loom:operator-only` instead.
 ## Git Worktree Workflow
 
 Loom uses git worktrees to isolate agent work. **Issue Worktrees**
-(`.loom/worktrees/issue-N`) hold issue-specific work for Builder agents.
-
-```bash
-gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"
-./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42
-# ... work, commit ...
-git push -u origin feature/issue-42
-gh pr create --label "loom:review-requested"
-```
+(`.loom/worktrees/issue-N`) hold issue-specific work for Builder agents. The
+guard-to-PR recipe lives in exactly one place — "Builder Workflow" below — so no
+second copy can go missing its pre-claim guard.
 
 - Always use `./.loom/scripts/worktree.sh <issue-number>` (writes a
   `.loom-managed` sentinel that authorizes cleanup). **Never run `git worktree`
@@ -245,11 +238,17 @@ verifiable by a command, not by judgment, **and** (2) the diff is confined to
 non-executing files (`.md`, `.txt`, and similar). Anything touching `.sh`, `.rs`,
 `.ts`, a role prompt, `.github/labels.yml`, or `.loom/config.json` is out of the
 lane, **unconditionally**. This is a predicate on the *change* (evaluated by
-whoever files), not a config toggle, opt-out, or human-approval gate. **Judge and
-Champion are unaffected** — both run unmodified; only Curator may be skipped.
+whoever files), not a config toggle, opt-out, or human-approval gate. **Judge,
+Champion, and step 0's open-PR guard are unaffected** — all three still apply to
+a hand-claim, which duplicates in-flight work as readily as a dispatched one;
+only Curator may be skipped.
 
 ### Builder Workflow
 
+0. Guard: `loom-daemon forge check-open-pr 42` — **exit 0 prints an already-open
+   linked PR, so do NOT claim**; 1 = none; anything else = unanswered, not an
+   all-clear (`--help` has the contract). Same probe the daemon's dispatch
+   refuses on, and a hand-claim is not exempt.
 1. Find issue: `gh issue list --label="loom:issue"`
 2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`
 3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
@@ -322,8 +321,8 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
 ### Multi-Account Token Pool
 
 For Pro/Max plans, Loom rotates among multiple Claude OAuth accounts so one
-weekly limit does not stall the pipeline. Provision `.loom/tokens/` with
-`loom-daemon tokens bootstrap` (or `import-from-monitor --force` on a host running
+weekly limit does not stall the pipeline. Provision external `~/.loom/tokens/` with
+`loom-daemon tokens bootstrap --shared` (or `import-from-monitor --shared --force` on a host running
 [claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor))
 plus `loom-daemon tokens check --ranking` to rank accounts by remaining capacity.
 Agents spawn through `.loom/scripts/spawn-claude.sh` (never `claude` directly),
