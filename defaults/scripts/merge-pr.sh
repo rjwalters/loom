@@ -1103,14 +1103,11 @@ _check_verdict_label_contradiction
 # construction. Full rationale, bound and release conditions:
 # defaults/docs/merge-pr-exit-code-exceptions.md. Known residual: this guard
 # is evaluated once, here, and `--auto` may then wait out CI before merging
-# (bounded by LOOM_AUTO_MERGE_TIMEOUT), so the base branch can move inside
-# that window. #8410 deliberately does NOT re-run this guard after that wait
-# — see `_revalidate_merge_guards` for why — leaving the same minutes-scale
-# window the pre-#8410 UNSTABLE wait path always had, not the 22-hour
-# exposure this guard exists to close. #8410 also removed the server-side
-# queued path this note used to mention: `--auto` never arms a forge queue
-# anymore, so there is no separate post-arm completion window to reason
-# about beyond the one described above.
+# (bounded by LOOM_AUTO_MERGE_TIMEOUT) — #8410 deliberately does NOT re-run it
+# after that wait (see `_revalidate_merge_guards`), leaving the same
+# minutes-scale window the pre-#8410 UNSTABLE wait path always had, not the
+# 22-hour exposure this guard exists to close; #8410 also removed the
+# server-side queued path this note used to describe.
 #
 # PLAN-GATED REPOSITORIES (#8844): on a PRIVATE repo owned by a GitHub Free
 # account or org, `GET /repos/{nwo}/rules/branches/{branch}` answers "HTTP 403:
