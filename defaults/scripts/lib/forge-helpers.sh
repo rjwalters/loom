@@ -962,9 +962,9 @@ forge_pr_close_targets() {
 # "fixes #909" to both parsers, because the match is just
 # `\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#N` with no look-back
 # for a preceding "not". A PR body reading "**does not fix #909** — left open
-# for its owner to close or subsume" auto-closed #909 anyway (2AMLogic/2am
-# #1057, PR #1051) — the author's own stated intent, twice, was to leave it
-# open.
+# for its owner to close or subsume" auto-closed #909 anyway
+# (example-org/tool-repo#1057, PR #1051) — the author's own stated intent,
+# twice, was to leave it open.
 #
 # forge_pr_close_targets() itself is intentionally left returning the same
 # raw, un-negation-aware candidate set it always has: callers that need
@@ -1010,7 +1010,8 @@ forge_text_has_unnegated_closing_ref() {
     grep -qEi "$kw_re" <<<"$segment" || continue
     # Text up to and including the FIRST closing-keyword match for this
     # issue in this clause-sized segment.
-    prefix=$(grep -Eoi "^.*${kw_re}" <<<"$segment" | head -1)
+    prefix=$(grep -Eoi "^.*${kw_re}" <<<"$segment")
+    prefix=${prefix%%$'\n'*}
     if ! grep -Eqi "$neg_re" <<<"$prefix"; then
       return 0
     fi

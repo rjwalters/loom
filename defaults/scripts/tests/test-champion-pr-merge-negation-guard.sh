@@ -3,7 +3,7 @@
 #
 # THE FAILURE MODE THIS GUARDS AGAINST
 #
-# 2AMLogic/2am#1057: PR #1051's body contained "**does not fix #909** -- ...
+# example-org/tool-repo#1057: PR #1051's body contained "**does not fix #909** -- ...
 # #909 is left open for its owner to close or subsume; nothing here depends
 # on it." -- an explicit, twice-stated intent to leave #909 open. GitHub's
 # own closingIssuesReferences parser (and the Gitea word-boundary regex
@@ -166,7 +166,7 @@ GITEA_BRANCH=$(awk '
   infn && ingitea { print }
 ' "$FORGE_HELPERS")
 
-if printf '%s' "$GITEA_BRANCH" | grep -q "forge_text_has_unnegated_closing_ref"; then
+if grep -q "forge_text_has_unnegated_closing_ref" <<<"$GITEA_BRANCH"; then
     pass "forge_pr_close_targets()'s Gitea branch filters through forge_text_has_unnegated_closing_ref"
 else
     fail "forge_pr_close_targets()'s Gitea branch does not call forge_text_has_unnegated_closing_ref"

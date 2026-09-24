@@ -201,7 +201,7 @@ rm -rf "$STUB_DIR"
 
 # --- Test forge_text_has_unnegated_closing_ref (#1057) ---
 # A stray "does not fix #N" (or "not ... resolve #N") false-positived as a real
-# closing reference (2AMLogic/2am #1057, PR #1051 auto-closed #909 against the
+# closing reference (example-org/tool-repo#1057, PR #1051 auto-closed #909 against the
 # author's own explicit stated intent to leave it open). This is the
 # negation-aware cross-check that stops it.
 echo ""
