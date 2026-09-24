@@ -291,7 +291,7 @@ pub(super) fn prepare(config: &Config, id: &str, branch: Option<&str>) -> Result
     let mut args = vec!["exec", "--workdir", ROOT];
     // `--env NAME` copies the host process's value directly; secrets never
     // appear in argv, config files, remote URLs or our captured output.
-    for name in ["GH_TOKEN", "GITHUB_TOKEN", "GITEA_TOKEN", "FORGE_TOKEN"] {
+    for name in FORGE_ENV {
         if std::env::var_os(name).is_some() {
             args.extend(["--env", name]);
         }

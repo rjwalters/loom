@@ -246,7 +246,10 @@ fn credential(operation: &str) -> Result<()> {
         bail!("credential request is outside the configured forge");
     }
     let gh_host = std::env::var("GH_HOST").unwrap_or_else(|_| "github.com".into());
-    let names = if expected.host_str() == Some(gh_host.as_str()) {
+    let github = expected.host_str() == Some(gh_host.as_str());
+    let gitea_username = std::env::var("GITEA_USERNAME").ok();
+    let username = credential_username(github, gitea_username.as_deref())?;
+    let names = if github {
         ["GH_TOKEN", "GITHUB_TOKEN"]
     } else {
         ["GITEA_TOKEN", "FORGE_TOKEN"]
@@ -254,7 +257,7 @@ fn credential(operation: &str) -> Result<()> {
     for name in names {
         if let Ok(token) = std::env::var(name) {
             if !token.is_empty() && !token.chars().any(char::is_control) {
-                println!("username=x-access-token\npassword={token}\n");
+                println!("username={username}\npassword={token}\n");
                 return Ok(());
             }
         }
@@ -267,6 +270,20 @@ fn credential(operation: &str) -> Result<()> {
         bail!("forge authentication helper failed");
     }
     Ok(())
+}
+
+pub(super) fn credential_username(github: bool, gitea_username: Option<&str>) -> Result<&str> {
+    let username = if github {
+        "x-access-token"
+    } else {
+        gitea_username
+            .filter(|name| !name.is_empty())
+            .unwrap_or("x-access-token")
+    };
+    if username.contains(':') || username.chars().any(char::is_control) {
+        bail!("Gitea username must not contain ':' or control characters");
+    }
+    Ok(username)
 }
 
 fn private_metadata(path: &Path) -> Result<()> {

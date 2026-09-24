@@ -1,4 +1,21 @@
 use super::*;
+
+#[test]
+fn forge_credential_username_preserves_basic_auth_and_rejects_protocol_injection() {
+    use repository::credential_username;
+    assert_eq!(credential_username(false, Some("fixture-user")).unwrap(), "fixture-user");
+    assert_eq!(credential_username(false, None).unwrap(), "x-access-token");
+    assert_eq!(credential_username(false, Some("")).unwrap(), "x-access-token");
+    assert_eq!(credential_username(true, Some("unused-user")).unwrap(), "x-access-token");
+    for invalid in [
+        "bad:user",
+        "bad\npassword=injected",
+        "bad\ruser",
+        "bad\0user",
+    ] {
+        assert!(credential_username(false, Some(invalid)).is_err());
+    }
+}
 use std::process::Command;
 
 fn git(path: &Path, args: &[&str]) -> String {

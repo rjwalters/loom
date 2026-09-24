@@ -21,6 +21,15 @@ pub const MODE: &str = "private-clone";
 pub const PROTOCOL: &str = "loom-private-workspace-v1";
 const PROFILE: &str = "/home/loom/.codex-profile";
 const GH_CONFIG: &str = "/run/loom-gh";
+// Keep preparation and supervised jobs on the same external auth context.
+const FORGE_ENV: [&str; 6] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_HOST",
+    "GITEA_TOKEN",
+    "FORGE_TOKEN",
+    "GITEA_USERNAME",
+];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {

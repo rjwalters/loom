@@ -5,14 +5,20 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
+#[path = "private_workspace_docker/auth.rs"]
+mod auth;
+
+#[track_caller]
 fn checked(output: Output) -> String {
     assert!(
         output.status.success(),
-        "command failed: {}",
+        "fixture command failed ({}): {}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
 }
+#[track_caller]
 fn docker(args: &[&str]) -> String {
     checked(Command::new("docker").args(args).output().unwrap())
 }
@@ -68,16 +74,22 @@ impl Fixture {
             "GITHUB_TOKEN",
             "GITEA_TOKEN",
             "FORGE_TOKEN",
+            "GITEA_USERNAME",
+            "GH_HOST",
             "LOOM_ACCOUNT_SCOPE",
             "LOOM_RUNTIME",
         ] {
             cmd.env_remove(key);
         }
+        cmd.env("GITEA_USERNAME", auth::USERNAME)
+            .env("GITEA_TOKEN", auth::PASSWORD);
         cmd
     }
+    #[track_caller]
     fn cli(&self, args: &[&str]) -> String {
         checked(self.command(args).output().unwrap())
     }
+    #[track_caller]
     fn start(&self, name: &str) -> Value {
         serde_json::from_str(&self.cli(&[
             "session",
@@ -91,6 +103,7 @@ impl Fixture {
         ]))
         .unwrap()
     }
+    #[track_caller]
     fn exec(&self, name: &str, command: &str) -> String {
         docker(&[
             "exec",
@@ -186,7 +199,7 @@ impl Fixture {
                 .unwrap(),
         );
         std::fs::copy(worker, context.join("loom-daemon")).unwrap();
-        std::fs::write(context.join("serve.py"), "import http.server, ssl\ns=http.server.HTTPServer(('0.0.0.0',8443),http.server.SimpleHTTPRequestHandler)\nc=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\nc.load_cert_chain('/srv/cert.pem','/srv/key.pem')\ns.socket=c.wrap_socket(s.socket,server_side=True)\ns.serve_forever()\n").unwrap();
+        std::fs::write(context.join("serve.py"), auth::SERVER).unwrap();
         std::fs::write(context.join("Dockerfile"), r#"FROM ubuntu:24.04
 RUN apt-get update -qq && apt-get install -y --no-install-recommends git tini python3 openssl ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY loom-daemon /usr/local/bin/loom-daemon
@@ -197,22 +210,33 @@ ENV GIT_SSL_NO_VERIFY=true
 WORKDIR /srv
 "#).unwrap();
         docker(&["build", "-q", "-t", &f.image, context.to_str().unwrap()]);
-        docker(&[
-            "run",
-            "-d",
-            "--name",
-            &f.server,
-            &f.image,
-            "python3",
-            "/srv/serve.py",
-        ]);
+        checked(
+            Command::new("docker")
+                .args([
+                    "run",
+                    "-d",
+                    "--name",
+                    &f.server,
+                    "--env",
+                    "FIXTURE_GITEA_AUTH",
+                    "--env",
+                    "FIXTURE_GITHUB_AUTH",
+                    &f.image,
+                    "python3",
+                    "/srv/serve.py",
+                ])
+                .env("FIXTURE_GITEA_AUTH", format!("{}:{}", auth::USERNAME, auth::PASSWORD))
+                .env("FIXTURE_GITHUB_AUTH", format!("x-access-token:{}", auth::GH_TOKEN))
+                .output()
+                .unwrap(),
+        );
         let ip = docker(&[
             "inspect",
             "--format",
             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
             &f.server,
         ]);
-        f.repository = format!("https://{}:8443/repo.git", ip.trim());
+        f.repository = format!("https://{}:8443/gitea/repo.git", ip.trim());
         let auth = f.root.path().join("synthetic-auth.json");
         std::fs::write(&auth, "synthetic-credential-free-fixture").unwrap();
         for name in &f.names {
@@ -298,15 +322,20 @@ fn private_clones_contain_writes_reuse_and_serialize_all_job_kinds() {
         ".git"
     );
     assert_eq!(f.exec(a, "test -d /workspace/repo/.git && test ! -e /workspace/repo/.git/objects/info/alternates && echo private").trim(), "private");
-    // Paths in either host fixture are inaccessible, even to an attempted
-    // writer. A similarly named volume on another account is not attached.
+    // An identical absolute path may be writable in private /tmp (Linux
+    // fixtures also live under /tmp). Check host integrity, not mkdir failure.
     for path in [
         f.root.path().join("source"),
         f.root.path().join("host-sibling"),
     ] {
-        let command = format!("test ! -e '{}' && ! mkdir -p '{}'", path.display(), path.display());
+        let command = format!("test ! -e '{0}' && if mkdir -p '{0}' 2>/dev/null; then printf attack > '{0}/file'; printf attack > '{0}/keep'; fi", path.display());
         f.exec(a, &command);
     }
+    let private_tmp = format!("/tmp/{}/source", f.server);
+    f.exec(a, &format!("mkdir -p '{private_tmp}' && printf private > '{private_tmp}/file'"));
+    assert_eq!(std::fs::read_to_string(f.root.path().join("source/file")).unwrap(), "base");
+    assert!(!f.root.path().join("source/keep").exists());
+    assert!(!f.root.path().join("host-sibling/file").exists());
     f.exec(a, "test ! -e /var/run/docker.sock && test ! -e /run/containerd/containerd.sock");
     f.exec(a, "echo only-a > /workspace/cache/account-a");
     f.exec(b, "test ! -e /workspace/cache/account-a");

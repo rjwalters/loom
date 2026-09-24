@@ -188,7 +188,7 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
     lease.begin(&job)?;
     job.base_revision = docker::prepare(&config, id, args.branch.as_deref())?;
     lease.begin(&job)?;
-    let env = ["GH_TOKEN", "GITHUB_TOKEN", "GITEA_TOKEN", "FORGE_TOKEN"]
+    let env = FORGE_ENV
         .iter()
         .filter(|name| std::env::var_os(name).is_some())
         .map(|name| (*name).to_owned())
