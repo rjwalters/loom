@@ -102,7 +102,7 @@ box; `superset start --daemon --org noc0`):
 
 ## Subagent fan-out (concurrent tasks on one box)
 
-Proven pattern (first use 2026-07-23: #8649 + #8793 in parallel):
+Proven pattern (first use 2026-09-23: #8649 + #8793 in parallel):
 
 - one task = its own checkout + its own box dir `build/<issue>/`, never
   sharing a `target/` outside the shared one
@@ -118,6 +118,17 @@ Proven pattern (first use 2026-07-23: #8649 + #8793 in parallel):
 - agents never re-provision: the pinned alias is the only entry. If ssh
   fails (idle-stop), they STOP and report — a stopped box needs
   `repo-remote up --yes` + a re-seed check + `superset start` before use
+
+## GitHub CI branch gate
+
+`ci.yml` has no visible branch pattern, but observed behavior (2026-09-23):
+workflows only run on `main` and `feature/issue-<n>` branches — a PR opened
+from `feature/i-would-like-to-have-github-we` produced zero runs, while the
+docs PR on `feature/issue-8766` got `ci.yml` within a minute. Assume the
+repo restricts allowed workflow runs to the issue-branch pattern: **always
+work from a `feature/issue-<n>` branch, even for chores**, or CI (and the
+supersede-concurrency and champion machinery keyed to it) silently does not
+see the PR.
 
 ## What stays local
 
