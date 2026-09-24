@@ -20,7 +20,7 @@ use std::io::Read;
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::refs;
+use loom_daemon::merge_pr::{backticked_trailers, refs};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum MergePrRefsCommand {
@@ -45,6 +45,24 @@ pub(crate) enum MergePrRefsCommand {
     PartialIncrementRefSnippets {
         #[arg(long, value_name = "N")]
         issue: u64,
+    },
+
+    /// Ready-to-print advisory warnings for whole-line `Part of #N` trailers
+    /// that were written inside a code span and therefore parse as no
+    /// declaration at all (#8796). One complete message per line, empty when
+    /// there is nothing to say. Backs the advisory call folded into
+    /// `_check_partial_increment_close_conflict` in `merge-pr.sh`.
+    ///
+    /// The caller re-emits each line through its own `warning`, so the whole
+    /// message is composed here — `merge-pr.sh` is frozen by the file-size
+    /// and shell-budget ratchets and cannot afford to carry the text.
+    BacktickedTrailerWarnings {
+        /// The PR the body belongs to, named in the warning.
+        #[arg(long, value_name = "N")]
+        pr: u64,
+        /// Report the would-be outcome without claiming a merge is happening.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -80,6 +98,11 @@ impl MergePrRefsCommand {
                 let s = refs::partial_increment_ref_snippets(&body, issue);
                 if !s.is_empty() {
                     println!("{s}");
+                }
+            }
+            MergePrRefsCommand::BacktickedTrailerWarnings { pr, dry_run } => {
+                for line in backticked_trailers::backticked_trailer_warnings(&body, pr, dry_run) {
+                    println!("{line}");
                 }
             }
         }

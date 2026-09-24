@@ -1300,7 +1300,38 @@ _check_partial_increment_close_conflict() {
 
   local partial_refs
   partial_refs="$(_partial_increment_refs "$pr_body")"
-  [[ -n "$partial_refs" ]] || return 0
+
+  # Non-blocking advisory (#8796): the body carries a whole-line `Part of #N`
+  # trailer that was written inside a CODE SPAN, so it parses as no declaration
+  # at all. The #5234 exclusion above is correct and unchanged — a backticked
+  # `Part of #N` is a hypothetical mention, not a declared intent. The gap it
+  # leaves is that a Builder can write the convention's exact trailer text in
+  # backticks ("a literal piece of syntax, so quote it"), and the PR then looks
+  # completely right to a human reviewer and to Judge while silently defeating
+  # the automation: $partial_refs comes back empty, the #3667 `loom:building`
+  # -> `loom:issue` reset no-ops with NO log line anywhere, and the family/epic
+  # issue is stranded at `loom:building` indefinitely (the rjwalters/kicad-tools
+  # PR #5686 -> issue #5240 incident). Runs BEFORE the early return below,
+  # because that is precisely the case this exists for.
+  #
+  # Everything except the re-emission lives in `loom-daemon merge-pr-refs
+  # backticked-trailer-warnings` (merge_pr::backticked_trailers): the matched
+  # shape, the suppression of a shape that ALSO has a real plain-text trailer,
+  # the `--dry-run` prefix, and the message text itself. merge-pr.sh is frozen
+  # by the file-size AND shell-budget ratchets (#8831), so this call is folded
+  # onto the same physical line as the pre-existing early return rather than a
+  # separate statement (let alone a separate function) — the whole advisory
+  # adds zero net lines to the frozen "contract" shell budget.
+  #
+  # Unlike every other _mp_refs caller this one is deliberately FAIL-OPEN
+  # (`2>/dev/null`, and a process substitution whose exit status is never
+  # examined): the others answer a merge-or-refuse question, where an empty
+  # result is indistinguishable from "no answer" and would close an unfinished
+  # issue. This one only decides whether to print advice — on a loom-daemon
+  # predating this subcommand it prints nothing, exactly the pre-#8796
+  # behaviour, and blocks nothing. `|| [[ -n "$bt_line" ]]` because _mp_refs
+  # emits no trailing newline, so the last line would otherwise be discarded.
+  { local bt_line bt_args=(backticked-trailer-warnings --pr "$PR_NUMBER"); [[ "${DRY_RUN:-false}" == "true" ]] && bt_args+=(--dry-run); while IFS= read -r bt_line || [[ -n "$bt_line" ]]; do warning "$bt_line"; done < <(printf '%s\n' "$pr_body" | _mp_refs "${bt_args[@]}" 2>/dev/null); [[ -n "$partial_refs" ]] || return 0; }
 
   # Closing references GitHub will honor on merge, from three unioned signals:
   #   1. the body's own closing keywords (quota-free regex);

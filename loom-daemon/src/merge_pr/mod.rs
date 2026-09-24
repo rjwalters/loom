@@ -32,6 +32,13 @@
 //! branch's current tip, which is how a ratchet baseline tightened under an
 //! in-flight PR red-lined main on 2026-09-18.
 //!
+//! [`backticked_trailers`] is not a port either — it is new functionality
+//! (#8796) covering [`refs`]'s deliberate blind spot: a `Part of #N` trailer
+//! written inside a code span is correctly NOT a declaration (#5234), which
+//! means a Builder who backticks the real trailer silently loses the #3667
+//! label reset with nothing logged anywhere. It emits a non-blocking pre-merge
+//! warning; the parser is untouched.
+//!
 //! [`redate`] is not a port — it is new functionality (#8508) closing the gap
 //! #8248 left open: once that guard blocks a merge, nothing automatically
 //! produces the fresh evidence it is waiting for when the merge token lacks
@@ -41,6 +48,7 @@
 //! the PR is escalated to a durable `loom:operator` hold rather than pushed
 //! at forever.
 
+pub mod backticked_trailers;
 pub mod head_sync;
 pub mod labels;
 pub mod redate;

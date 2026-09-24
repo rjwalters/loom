@@ -67,6 +67,19 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'  # retired() below
 NC='\033[0m'
 
+# #8796's advisory is deliberately FAIL-OPEN in merge-pr.sh (an absent warning
+# is the pre-#8796 behaviour and must never block a merge), so a binary
+# predating `backticked-trailer-warnings` would make every BT case below fail as
+# "no warning emitted" — which reads like a logic bug in the detector rather
+# than a stale binary. loom_test_require_daemon_bin only probes top-level
+# subcommands, so the sub-subcommand gets its own preflight.
+if ! "${LOOM_DAEMON_SELF_BIN:?}" merge-pr-refs backticked-trailer-warnings --help >/dev/null 2>&1; then
+    echo -e "${RED}FATAL${NC}: the resolved loom-daemon does not know 'merge-pr-refs backticked-trailer-warnings'," >&2
+    echo "so it predates #8796 and the backticked-trailer cases below would fail as false negatives." >&2
+    echo "Rebuild it: cargo build --package loom-daemon" >&2
+    exit 1
+fi
+
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
@@ -549,6 +562,136 @@ assert_eq "456" "$(_partial_increment_refs "$quoted_body")" \
   "Blockquote marker: '> Part of #456' still counts as a declaration"
 
 echo ""
+echo "Testing the backticked-trailer advisory (#8796)..."
+
+# The gap #5234's (correct) code-span exclusion leaves: a Builder who writes the
+# convention's exact trailer text inside a code span produces a PR that looks
+# right to a human reviewer and to Judge while the #3667 reset silently no-ops.
+# Every case below asserts BOTH halves of the fix — the parser's answer is
+# unchanged, and the silence is now visible.
+#
+# Detection itself is asserted in Rust (merge_pr::backticked_trailers::tests,
+# which pins the matched shape against nine markers and four prose shapes). What
+# this suite owns is the wiring: that merge-pr.sh calls it at all, before the
+# empty-refs early return, that it prints through `warning`, mutates nothing,
+# and carries the --dry-run prefix.
+
+# BT1: the incident shape — rjwalters/kicad-tools PR #5686's body carried
+# `Part of #5240` (whole line, inside an inline code span) instead of the plain
+# text form. The reset never fired and the label swap had to be applied by hand.
+backticked_body='## Summary
+
+Implements the first slice.
+
+`Part of #5240`'
+assert_eq "" "$(_partial_increment_refs "$backticked_body")" \
+  "#8796 incident: backticked '\`Part of #5240\`' is still NOT a declaration (#5234 unchanged)"
+
+reset_log
+PR_JSON="$(jq -n --arg body "$backticked_body" '{body: $body}')"
+run_capturing_stderr _check_partial_increment_close_conflict
+bt_err="$(read_stderr)"
+assert_contains "$bt_err" "Backticked partial-increment trailer (#8796)" \
+  "#8796 incident: the pre-merge guard emits the backticked-trailer warning"
+assert_contains "$bt_err" '"`Part of #5240`"' \
+  "#8796 incident: warning quotes the offending line verbatim"
+assert_contains "$bt_err" "#5240" \
+  "#8796 incident: warning names the affected issue"
+assert_contains "$bt_err" "loom:building" \
+  "#8796 incident: warning states the consequence (the #3667 reset will not run)"
+assert_eq "" "$PARTIAL_CONFLICT_ISSUES" \
+  "#8796 incident: advisory only — no conflict recorded"
+assert_eq "" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "#8796 incident: advisory only — the issue is not added to the tracking sets"
+assert_eq "" "$(read_log)" \
+  "#8796 incident: advisory only — non-blocking, mutates nothing"
+
+# BT2: the correct, plain-text trailer must NOT warn. This is the shape the
+# convention asks for and the one the reset already handles.
+reset_log
+PR_JSON='{"body":"## Summary\n\nImplements the first slice.\n\nPart of #123"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+assert_not_contains "$(read_stderr)" "Backticked partial-increment trailer" \
+  "Plain-text 'Part of #123' trailer: no warning (the declaration parses)"
+assert_eq "123" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "Plain-text 'Part of #123' trailer: the normal partial-increment path is untouched"
+
+# BT3: the #5234 incident body — a MID-SENTENCE backticked mention — must stay
+# silent. It is prose describing a hypothetical, and warning on it would train
+# operators to ignore this warning entirely, taking the real case with it.
+reset_log
+PR_JSON="$(jq -n --arg body "$incident_body" '{body: $body}')"
+run_capturing_stderr _check_partial_increment_close_conflict
+assert_not_contains "$(read_stderr)" "Backticked partial-increment trailer" \
+  "#5234 prose: a mid-sentence backticked mention does NOT warn (not a whole-line trailer)"
+
+# BT4: a line that merely LISTS backticked trailers as examples (documentation
+# prose) is not an attempted declaration either.
+reset_log
+PR_JSON='{"body":"Use `Part of #123` / `Contributes to #456` for a partial increment."}'
+run_capturing_stderr _check_partial_increment_close_conflict
+assert_not_contains "$(read_stderr)" "Backticked partial-increment trailer" \
+  "Docs prose: a line listing backticked trailers as examples does NOT warn"
+
+# BT5: a backticked trailer inside a FENCED code block is documentation, and is
+# stripped before matching — the same treatment _partial_increment_refs gives it.
+fenced_backticked_body='Write the trailer plainly:
+
+```markdown
+`Part of #123`
+```
+
+Part of #456'
+reset_log
+PR_JSON="$(jq -n --arg body "$fenced_backticked_body" '{body: $body}')"
+run_capturing_stderr _check_partial_increment_close_conflict
+assert_not_contains "$(read_stderr)" "Backticked partial-increment trailer" \
+  "Fenced block: a backticked trailer inside a fence does NOT warn"
+assert_eq "456" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "Fenced block: the real plain-text trailer outside the fence still declares #456"
+
+# BT6: an issue named by BOTH a backticked line and a real plain-text trailer is
+# not warned about — the reset fires for it regardless, so the warning would be
+# pure noise.
+reset_log
+PR_JSON='{"body":"Part of #123\n\n`Part of #123`"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+assert_not_contains "$(read_stderr)" "Backticked partial-increment trailer" \
+  "Both shapes: no warning — #123 is already a parsed declaration"
+assert_eq "123" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "Both shapes: the plain-text trailer still drives the normal path"
+
+# BT7: list and numbered markers. The numbered case also proves the marker
+# ordinal cannot leak in as an issue number (the PA6 trap, which the detector
+# has to avoid independently of _partial_increment_refs).
+reset_log
+PR_JSON='{"body":"- `Contributes to #42`"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+assert_contains "$(read_stderr)" "reference to #42 wrapped in a code span" \
+  "List marker: '- \`Contributes to #42\`' warns on #42"
+reset_log
+PR_JSON='{"body":"3. `Part of #789`"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+numbered_bt_err="$(read_stderr)"
+assert_contains "$numbered_bt_err" "reference to #789 wrapped in a code span" \
+  "Numbered marker: '3. \`Part of #789\`' warns on #789"
+assert_not_contains "$numbered_bt_err" "reference to #3 wrapped in a code span" \
+  "Numbered marker: the marker ordinal 3 does not leak in as an issue number"
+
+# BT8: --dry-run prefixes the warning, matching the conflict warnings' contract.
+reset_log
+PR_JSON="$(jq -n --arg body "$backticked_body" '{body: $body}')"
+# Set/unset explicitly rather than `DRY_RUN=true run_capturing_stderr …`: in
+# bash a variable assignment preceding a SHELL FUNCTION call leaks into the
+# calling shell afterwards, which would silently flip every later case to
+# dry-run mode.
+DRY_RUN=true
+run_capturing_stderr _check_partial_increment_close_conflict
+DRY_RUN=false
+assert_contains "$(read_stderr)" "[dry-run] Backticked partial-increment trailer (#8796)" \
+  "Dry run: the advisory carries the [dry-run] prefix"
+
+echo ""
 echo "Testing _check_partial_increment_close_conflict (pre-merge guard)..."
 
 # T11: reproduces the censusapi#5 -> censusapi#2 incident shape — a deliberate
@@ -851,6 +994,26 @@ retired "merge-pr.sh's source contains the inline-code-span strip" \
     "merge_pr::refs::tests::the_inline_code_strip_changes_the_answer_and_this_pins_which_way, which asserts the one single-line shape where the strip is load-bearing (\"\`x\` Part of #5\" -> [5]) and would fail if the strip were removed -- the property the original successor did NOT pin."
 assert_contains "$src" '_partial_increment_ref_snippets' \
   "merge-pr.sh quotes the matched partial-increment declaration text in the pre-merge warning (#5234 AC #4)"
+assert_contains "$src" '_mp_refs "${bt_args[@]}" 2>/dev/null' \
+  "merge-pr.sh runs the backticked-trailer advisory over the PR body (#8796)"
+# ORDER is the whole point: the case this advisory exists for is the one where
+# $partial_refs is EMPTY, so a refactor that moves the call after the early
+# return silently disables it for every body it was written to catch — the same
+# class of silent no-op the advisory itself reports. The call and the return are
+# folded onto the SAME physical line (so this advisory adds zero net lines to
+# the frozen "contract" shell budget, #8831) — "before" is therefore a substring
+# position on that one line, not a line-number comparison.
+bt_full_line="$(grep -nF '_mp_refs "${bt_args[@]}" 2>/dev/null' "$MERGE_PR_SRC" | head -1)"
+bt_line_text="${bt_full_line#*:}"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -n "$bt_full_line" && "${bt_line_text%%return 0*}" == *'_mp_refs "${bt_args[@]}"'* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: the advisory runs BEFORE the empty-refs early return (#8796)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: the advisory must run BEFORE the empty-refs early return (#8796)"
+    echo "    line: '${bt_line_text:-not found}'"
+fi
 
 # --- Summary ---
 echo ""
