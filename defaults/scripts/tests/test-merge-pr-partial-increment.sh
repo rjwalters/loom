@@ -181,9 +181,6 @@ awk '
 
 for _fn in _strip_fenced_code_blocks _partial_increment_refs _closing_refs_stdin \
            _body_closing_refs _closing_ref_snippets _partial_increment_ref_snippets \
-           _backticked_partial_increment_trailer_refs \
-           _backticked_partial_increment_trailer_snippets \
-           _warn_backticked_partial_increment_trailers \
            _pr_commit_messages _check_partial_increment_close_conflict \
            _reset_one_partial_issue _reset_partial_increment_labels; do
     if ! grep -q "^${_fn}() {" "$FUNCS_FILE"; then
@@ -552,14 +549,52 @@ assert_eq "456" "$(_partial_increment_refs "$quoted_body")" \
   "Blockquote marker: '> Part of #456' still counts as a declaration"
 
 echo ""
-echo "Testing backticked-trailer warning (#5690)..."
+echo "Testing backticked-trailer warning (#5690, ported to Rust #8831)..."
 
-# BT1: the exact incident shape — PR #5686's body wrote the trailer as
-# `Part of #5240` (whole line, wrapped in an inline code span) instead of the
-# plain `Part of #5240`. #5234's code-span exclusion correctly reads that as a
-# non-declaration, so the #3667 reset silently no-opped and #5240 was stranded
-# at loom:building with no log line anywhere. The parser's answer must NOT
-# change; the new warning is what makes the silence visible.
+# #8831: the detection logic (_backticked_partial_increment_trailer_refs /
+# _backticked_partial_increment_trailer_snippets) and the warning-message
+# assembly moved to loom-daemon (cli/merge_pr_refs.rs's
+# `backticks-partial-increment-warnings`, loom_daemon::merge_pr::refs) to keep
+# the portable shell pool net zero (Shell Budget Ratchet). BT2-BT7 exercised
+# the detector's regex shape directly and are retired in favor of the byte-
+# identical port's own unit tests
+# (loom-daemon/src/merge_pr/refs/tests.rs::bt2_.. through bt7_..). BT1 and BT8
+# stay HERE as call-site wiring pins: they prove merge-pr.sh's own guard still
+# invokes the daemon correctly and still surfaces the warning end to end —
+# they do not re-litigate the regex shape.
+retired "BT2: plain-text trailer does not warn" \
+  "a real 'Part of #N' trailer must not trigger the backticked-trailer warning" \
+  "detection logic moved to loom-daemon (#8831); shell no longer defines the detector to call directly" \
+  "loom-daemon/src/merge_pr/refs/tests.rs::bt2_a_plain_text_trailer_does_not_warn"
+retired "BT3: mid-sentence backticked mention does not warn" \
+  "prose describing a hypothetical must stay silent" \
+  "detection logic moved to loom-daemon (#8831)" \
+  "loom-daemon/src/merge_pr/refs/tests.rs::bt3_a_mid_sentence_backticked_mention_does_not_warn"
+retired "BT4: a line listing backticked trailers as examples does not warn" \
+  "documentation prose is not an attempted declaration" \
+  "detection logic moved to loom-daemon (#8831)" \
+  "loom-daemon/src/merge_pr/refs/tests.rs::bt4_a_line_listing_backticked_trailers_as_examples_does_not_warn"
+retired "BT5: a backticked trailer inside a fenced block does not warn" \
+  "fenced code blocks are stripped before matching" \
+  "detection logic moved to loom-daemon (#8831)" \
+  "loom-daemon/src/merge_pr/refs/tests.rs::bt5_a_backticked_trailer_inside_a_fenced_block_does_not_warn"
+retired "BT6: an issue named by both shapes is not warned about" \
+  "the plain-text trailer's declaration wins; the reset fires regardless" \
+  "detection logic moved to loom-daemon (#8831)" \
+  "loom-daemon/src/merge_pr/refs/tests.rs::bt6_an_issue_named_by_both_shapes_is_not_warned_about"
+retired "BT7: marker-prefixed and numbered-list forms; the PA6 ordinal trap" \
+  "a numbered-list marker's own ordinal must not leak in as an issue number" \
+  "detection logic moved to loom-daemon (#8831)" \
+  "loom-daemon/src/merge_pr/refs/tests.rs::bt7_marker_prefixed_and_numbered_list_forms"
+
+# BT1 (wiring pin): the exact incident shape — PR #5686's body wrote the
+# trailer as `Part of #5240` (whole line, wrapped in an inline code span)
+# instead of the plain `Part of #5240`. #5234's code-span exclusion correctly
+# reads that as a non-declaration, so the #3667 reset silently no-opped and
+# #5240 was stranded at loom:building with no log line anywhere. The parser's
+# answer must NOT change; the guard's warning is what makes the silence
+# visible — and this proves merge-pr.sh's call site still wires it up after
+# the port.
 backticked_body='## Summary
 
 Implements the first slice.
@@ -567,8 +602,6 @@ Implements the first slice.
 `Part of #5240`'
 assert_eq "" "$(_partial_increment_refs "$backticked_body")" \
   "#5690 incident: backticked '\`Part of #5240\`' is still NOT a declaration (#5234 unchanged)"
-assert_eq "5240" "$(_backticked_partial_increment_trailer_refs "$backticked_body")" \
-  "#5690 incident: the backticked-trailer detector DOES see #5240"
 
 reset_log
 PR_JSON="$(jq -n --arg body "$backticked_body" '{body: $body}')"
@@ -587,68 +620,9 @@ assert_eq "" "$PARTIAL_OPEN_BEFORE_MERGE" \
 assert_eq "" "$(read_log)" \
   "#5690 incident: warning is non-blocking and mutates nothing"
 
-# BT2: the correct, plain-text trailer must NOT warn (the whole point — this is
-# the shape the convention asks for and the one the reset already handles).
-plain_body='## Summary
-
-Implements the first slice.
-
-Part of #123'
-assert_eq "" "$(_backticked_partial_increment_trailer_refs "$plain_body")" \
-  "Plain-text 'Part of #123' trailer: detector finds nothing to warn about"
-
-reset_log
-PR_JSON="$(jq -n --arg body "$plain_body" '{body: $body}')"
-run_capturing_stderr _check_partial_increment_close_conflict
-assert_not_contains "$(read_stderr)" "Backticked partial-increment trailer (#5690)" \
-  "Plain-text 'Part of #123' trailer: no warning (declaration parses, reset will fire)"
-
-# BT3: the #5234 incident body — a MID-SENTENCE backticked mention — must stay
-# silent. It is prose describing a hypothetical, and warning on it would train
-# operators to ignore this warning entirely.
-assert_eq "" "$(_backticked_partial_increment_trailer_refs "$incident_body")" \
-  "#5234 prose: mid-sentence backticked 'Part of #4574' does NOT warn (not a whole-line trailer)"
-
-# BT4: a line that merely LISTS backticked trailers as examples (documentation
-# prose) is not an attempted declaration either.
-example_line_body='Use `Part of #123` / `Contributes to #456` for a partial increment.'
-assert_eq "" "$(_backticked_partial_increment_trailer_refs "$example_line_body")" \
-  "Docs prose: a line listing backticked trailers as examples does NOT warn"
-
-# BT5: a backticked trailer inside a FENCED code block is documentation, and is
-# stripped before matching — same treatment _partial_increment_refs gives it.
-fenced_backticked_body='Write the trailer plainly:
-
-```markdown
-`Part of #123`
-```
-
-Part of #456'
-assert_eq "" "$(_backticked_partial_increment_trailer_refs "$fenced_backticked_body")" \
-  "Fenced block: a backticked trailer inside a fence does NOT warn"
-
-# BT6: an issue named by BOTH a backticked line and a real plain-text trailer
-# is not warned about — the reset fires for it regardless.
-both_body='Part of #123
-
-`Part of #123`'
-assert_eq "123" "$(_partial_increment_refs "$both_body")" \
-  "Both shapes: the plain-text trailer still declares #123"
-reset_log
-PR_JSON="$(jq -n --arg body "$both_body" '{body: $body}')"
-run_capturing_stderr _check_partial_increment_close_conflict
-assert_not_contains "$(read_stderr)" "Backticked partial-increment trailer (#5690)" \
-  "Both shapes: no warning — #123 is already a parsed declaration"
-
-# BT7: marker-prefixed and numbered-list forms. The numbered case also proves
-# the marker ordinal cannot leak in as an issue number (the PA6 trap, which the
-# detector must avoid independently of _partial_increment_refs).
-assert_eq "42" "$(_backticked_partial_increment_trailer_refs '- `Contributes to #42`')" \
-  "List marker: '- \`Contributes to #42\`' warns on #42"
-assert_eq "789" "$(_backticked_partial_increment_trailer_refs '3. `Part of #789`')" \
-  "Numbered marker: '3. \`Part of #789\`' yields ONLY 789 (ordinal does not leak)"
-
-# BT8: --dry-run prefixes the warning, matching the conflict warnings' contract.
+# BT2 (wiring pin, renumbered from BT8): --dry-run prefixes the warning,
+# matching the conflict warnings' contract — proves the guard forwards
+# DRY_RUN to the daemon subcommand correctly.
 reset_log
 PR_JSON="$(jq -n --arg body "$backticked_body" '{body: $body}')"
 # Set/unset explicitly rather than `DRY_RUN=true run_capturing_stderr …`:
@@ -660,6 +634,15 @@ run_capturing_stderr _check_partial_increment_close_conflict
 unset DRY_RUN
 assert_contains "$(read_stderr)" "[dry-run] Backticked partial-increment trailer (#5690)" \
   "Dry run: warning carries the [dry-run] prefix"
+
+# BT3 (wiring pin): a plain-text-only body must not warn — proves the guard
+# does not fire the daemon subcommand's finding when there is nothing to
+# report (the common, non-#5690 path).
+reset_log
+PR_JSON='{"body":"## Summary\n\nImplements the first slice.\n\nPart of #123"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+assert_not_contains "$(read_stderr)" "Backticked partial-increment trailer (#5690)" \
+  "Plain-text 'Part of #123' trailer: no warning (declaration parses, reset will fire)"
 
 echo ""
 echo "Testing _check_partial_increment_close_conflict (pre-merge guard)..."
