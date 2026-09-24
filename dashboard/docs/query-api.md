@@ -128,6 +128,28 @@ than ever appearing here — see `src/fleetState.ts`'s `classifyFreshness`/
 any consumer of this route should treat a `stale`/`offline` sample's
 numbers as historical, never as current.
 
+**`missingHosts`** (issue #8792) is present only when the deployment sets the
+`EXPECTED_HOSTS` var (see `deploy-runbook.md` → "Declaring the expected host
+roster"). It lists every roster host with **no** `health` entry — the case the
+`freshness` classification above cannot see, because a host that never
+reported has no entry to classify:
+
+```json
+"missingHosts": [
+  { "hostId": "loom-worker-3", "state": "missing" },
+  { "hostId": "loom-worker-4", "state": "unprovisioned" }
+]
+```
+
+`state` is `"missing"` when the host holds an active ingest key but has never
+reported (or went silent long enough to be pruned), and `"unprovisioned"` when
+it has no active key at all (not yet enrolled via `POST /admin/hosts`, or
+revoked). A host that reported and then went quiet is never listed here — it
+keeps its `health` entry and reads as `stale`/`offline`. Removing a host from
+the roster removes it from this list: the roster only ever adds rows. The
+field carries only host IDs (already public as `hosts` keys) and a derived
+state, so `/public/fleet-state` returns it unredacted.
+
 A completed sweep is not present in `activeSweeps` (removed on
 `sweep.completed` — see `src/fleetState.ts`'s module doc); its full record
 lives in D1 and is queryable via `GET /api/history`.

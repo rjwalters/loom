@@ -686,6 +686,12 @@ export interface RedactedFleetSnapshot {
    * predate this field construct a bare `{ hosts, activeSweeps }`) even
    * though [`redactFleetSnapshot`] always populates it. */
   activeCompute?: FleetSnapshot["activeCompute"];
+  /** Roster-expected hosts with no health entry (Issue #8792). Passed
+   * through unchanged for both viewers: each entry is only a host ID (already
+   * public — it is every `hosts` key above) plus a derived state, with no
+   * repo/issue/branch/PR field to redact. Absent when no roster is
+   * configured. */
+  missingHosts?: FleetSnapshot["missingHosts"];
 }
 
 /** Redact a full `FleetSnapshot`: every host's `health`/`tokens` entry is
@@ -735,6 +741,7 @@ export function redactFleetSnapshot(snapshot: FleetSnapshot, isAuthenticated: bo
     // running-instance count is itself infrastructure-spend detail about a
     // private operator's fleet — the very thing the allowlist withholds).
     activeCompute: isAuthenticated ? snapshot.activeCompute : [],
+    ...(snapshot.missingHosts && { missingHosts: snapshot.missingHosts }),
   };
 }
 
