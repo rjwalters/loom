@@ -170,6 +170,68 @@ fn session_summary_never_carries_prompt_tool_output_key_or_email() {
     assert_eq!(attribute(&log, "loom.turns"), Some(any_value::Value::IntValue(1)));
     assert!(attribute(&log, "loom.outcome").is_none(), "unknown outcome stays absent");
 }
+/// Issue #8760: a `session.analysis` record — every field a count, id,
+/// allowlisted tool name, duration, or derived dollar figure — carries none
+/// of a prompt/tool-output/key/email marker onto the OTLP wire either,
+/// mirroring `session_summary_never_carries_prompt_tool_output_key_or_email`
+/// above (the redaction test suite extended for the new kind, per #8760's
+/// Test Plan).
+#[test]
+fn session_analysis_never_carries_prompt_tool_output_key_or_email() {
+    let record: crate::telemetry::SessionAnalysisRecord =
+        serde_json::from_value(serde_json::json!({
+            "repo": "fixture-repo", "session_id": "uuid-a",
+            "parent_session_id": "uuid-parent",
+            "retry_loops": [{"tool": "Bash", "length": 3}],
+            "longest_tool_call": {"tool": "Bash", "duration_ms": 5000},
+            "cost_usd": 0.042,
+            "anomalies": ["high_token_usage"],
+        }))
+        .unwrap();
+    let log = map(TelemetryRecord::SessionAnalysis(record));
+    let json = serde_json::to_string(&log).unwrap();
+    for leaked in ["SECRET", "sk-ant", "@example.com", "prompt", "tool_output"] {
+        assert!(!json.contains(leaked), "{leaked} leaked: {json}");
+    }
+    assert_eq!(
+        attribute(&log, "loom.session_id"),
+        Some(any_value::Value::StringValue("uuid-a".into()))
+    );
+    assert_eq!(
+        attribute(&log, "loom.longest_tool_call.tool"),
+        Some(any_value::Value::StringValue("Bash".into()))
+    );
+    assert_eq!(
+        attribute(&log, "loom.longest_tool_call.duration_ms"),
+        Some(any_value::Value::IntValue(5000))
+    );
+    assert!(matches!(
+        attribute(&log, "loom.cost_usd"),
+        Some(any_value::Value::DoubleValue(_))
+    ));
+}
+
+/// Issue #8760 (G4): a `daemon.event` record's `payload` is carried whole,
+/// but it is sourced only from the already-reviewed, small, operator-facing
+/// event-bus payloads (`crate::event_bus`'s frozen taxonomy) — never from
+/// transcript content — so the same marker set never appears.
+#[test]
+fn daemon_event_payload_carries_no_secret_markers() {
+    let record = crate::telemetry::DaemonEventRecord {
+        topic: "daemon.drain.started".to_string(),
+        payload: serde_json::json!({"in_flight": 2, "timeout_secs": 300}),
+    };
+    let log = map(TelemetryRecord::DaemonEvent(record));
+    let json = serde_json::to_string(&log).unwrap();
+    for leaked in ["SECRET", "sk-ant", "@example.com"] {
+        assert!(!json.contains(leaked), "{leaked} leaked: {json}");
+    }
+    assert_eq!(
+        attribute(&log, "loom.topic"),
+        Some(any_value::Value::StringValue("daemon.drain.started".into()))
+    );
+}
+
 #[test]
 fn oversized_or_invalid_usage_is_omitted_without_truncating_identity_or_fabricating_zero() {
     let mut record = outcome_record();

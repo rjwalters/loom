@@ -73,6 +73,13 @@
 //! stays open for future extension, but the documented taxonomy is the
 //! contract subscribers should rely on.
 //!
+//! `daemon.drain.*`, `daemon.capacity.advisory`, `daemon.preflight.advisory`,
+//! and `epic.issue.*` gained a `daemon.event`
+//! [`crate::telemetry::TelemetryRecord`] kind (Issue #8760, G4 of #8714),
+//! carried onto the observability export queue by a dedicated bus subscriber
+//! ([`crate::observability::daemon_event`]) — purely additive export
+//! coverage, not a change to this taxonomy or any topic string.
+//!
 //! # Durability (Issue #4644)
 //!
 //! This bus is **in-memory only** — a bounded [`tokio::sync::broadcast`]
