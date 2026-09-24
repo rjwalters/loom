@@ -314,28 +314,30 @@ function providerSummaryFromAggregate(slice: ProviderPoolAggregate): ProviderSum
 }
 
 /**
- * A pool is treated as "close to the edge" — worth a `degraded` badge — once
- * one account or fewer is left to rotate onto, or three quarters of the pool
- * is spent. Below that line, some accounts being exhausted is the pool
- * working exactly as designed (the selector rotates away from them), not a
- * fault: see #4864.
+ * A pool is treated as "close to the edge" — worth a `throttled` badge (#8832;
+ * `degraded` before it) — once one account or fewer is left to rotate onto,
+ * or three quarters of the pool is spent. Below that line, some accounts
+ * being exhausted is the pool working exactly as designed (the selector
+ * rotates away from them), not a fault: see #4864.
  */
 const LOW_AVAILABILITY_THRESHOLD = 1;
 const HIGH_EXHAUSTION_FRACTION = 0.75;
 
 /** `true` when the token pool is empty of capacity or nearly so. A pool with
- * no reported accounts (`total === 0`) is not degraded by this check —
- * that host simply has not sent a `tokens.snapshot` yet. */
+ * no reported accounts (`total === 0`) is not flagged by this check — that
+ * host simply has not sent a `tokens.snapshot` yet. */
 export function isTokenPoolDegraded(tokens: TokenSummary): boolean {
   return degradedProviders(tokens).length > 0;
 }
 
-/** The provider pools that are at or near exhaustion, by name. Each
- * provider is judged on its own: a fleet whose Claude pool is spent cannot
- * dispatch Claude sweeps no matter how many Codex accounts sit idle, so one
- * blended availability figure would hide exactly the outage an operator
- * needs to see. A summary with no provider slices (an empty pool) falls
- * back to the pool-wide numbers, which is then also empty — not degraded. */
+/** The provider pools that are at or near exhaustion, by name — the
+ * `throttled` case (#8832); `emptyProviders` above is the `degraded` one.
+ * Each provider is judged on its own: a fleet whose Claude pool is spent
+ * cannot dispatch Claude sweeps no matter how many Codex accounts sit idle,
+ * so one blended availability figure would hide exactly the outage an
+ * operator needs to see. A summary with no provider slices (an empty pool)
+ * falls back to the pool-wide numbers, which is then also empty — not
+ * flagged. */
 export function degradedProviders(tokens: TokenSummary): string[] {
   const slices = tokens.providers.length > 0
     ? tokens.providers
