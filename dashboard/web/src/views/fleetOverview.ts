@@ -37,6 +37,7 @@ import { runningComputeSection, type RunningComputeOptions } from "./runningComp
 const STATUS_LABEL: Record<HostStatus, string> = {
   ok: "OK",
   degraded: "Degraded",
+  throttled: "Throttled",
   stale: "Stale",
   unknown: "No data",
   missing: "Missing",
@@ -51,7 +52,8 @@ const STATUS_LABEL: Record<HostStatus, string> = {
  */
 const STATUS_TITLE: Record<HostStatus, string> = {
   ok: "Reporting recently; token pool has healthy capacity",
-  degraded: "Reporting recently, but showing signs of distress",
+  degraded: "Reporting recently, but something needs attention",
+  throttled: "Healthy, but holding back new work by design (load shedding or a low token pool) — clears on its own",
   stale: "No telemetry received recently — the daemon may be stopped or offline",
   unknown: "This host has not pushed host.health or tokens.snapshot yet",
   missing:

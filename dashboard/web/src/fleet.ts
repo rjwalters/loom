@@ -26,6 +26,7 @@ import type {
   HostHealthRecord,
   MissingHostState,
   ProviderPoolAggregate,
+  RoleTickFailure,
   TokenAccount,
 } from "./types";
 
@@ -53,10 +54,17 @@ export type HostStatus =
    * host from `ok` — see `isHostDistressed` below: the trigger is
    * refusing-work or pinned-at-zero-idle, not raw utilization. */
   | "ok"
-  /** Reporting recently, but either the token pool is at or near exhaustion,
-   * or the host itself is distressed (dispatch halted, or CPU idle pinned
-   * near zero — see `isHostDistressed`). */
+  /** Reporting recently, but something needs a person: a role tick failing
+   * repeatedly and recently, a provider's token pool with nothing left, or
+   * dispatch suppressed by load Loom does not own — see `distressReason`.
+   * Transient, self-healing conditions are `throttled` instead (#8832). */
   | "degraded"
+  /** Reporting recently and healthy, but running constrained by design: the
+   * daemon's own host-distress breaker is holding new dispatch while load
+   * drains, or the token pool is running low but not empty (#8832). This is
+   * the fleet protecting itself, not a fault — it is shown, never counted in
+   * `FleetView.needsAttention`. */
+  | "throttled"
   /** Last report is older than `STALE_AFTER_SEC`. */
   | "stale"
   /** Known only from `activeSweeps`, or from a `hosts` entry with neither
@@ -124,9 +132,9 @@ export interface HostView {
   sweeps: ActiveSweep[];
   tokens: TokenSummary;
   status: HostStatus;
-  /** Why `status` is `"degraded"`, naming the specific cause (token
-   * exhaustion, a named halt reason, or a distress heuristic) rather than a
-   * generic "Degraded" — see `views/fleetOverview.ts`'s badge tooltip.
+  /** Why `status` is `"degraded"` or `"throttled"`, naming the specific
+   * cause (token exhaustion, a named halt reason, a failing role) rather than
+   * a generic badge — see `views/fleetOverview.ts`'s badge tooltip.
    * `undefined` for every other status. */
   degradedReason: string | undefined;
   /** Most recent of the health/tokens `updatedAt`s — the host's liveness
@@ -306,33 +314,47 @@ function providerSummaryFromAggregate(slice: ProviderPoolAggregate): ProviderSum
 }
 
 /**
- * A pool is treated as "close to the edge" — worth a `degraded` badge — once
- * one account or fewer is left to rotate onto, or three quarters of the pool
- * is spent. Below that line, some accounts being exhausted is the pool
- * working exactly as designed (the selector rotates away from them), not a
- * fault: see #4864.
+ * A pool is treated as "close to the edge" — worth a `throttled` badge (#8832;
+ * `degraded` before it) — once one account or fewer is left to rotate onto,
+ * or three quarters of the pool is spent. Below that line, some accounts
+ * being exhausted is the pool working exactly as designed (the selector
+ * rotates away from them), not a fault: see #4864.
  */
 const LOW_AVAILABILITY_THRESHOLD = 1;
 const HIGH_EXHAUSTION_FRACTION = 0.75;
 
 /** `true` when the token pool is empty of capacity or nearly so. A pool with
- * no reported accounts (`total === 0`) is not degraded by this check —
- * that host simply has not sent a `tokens.snapshot` yet. */
+ * no reported accounts (`total === 0`) is not flagged by this check — that
+ * host simply has not sent a `tokens.snapshot` yet. */
 export function isTokenPoolDegraded(tokens: TokenSummary): boolean {
   return degradedProviders(tokens).length > 0;
 }
 
-/** The provider pools that are at or near exhaustion, by name. Each
- * provider is judged on its own: a fleet whose Claude pool is spent cannot
- * dispatch Claude sweeps no matter how many Codex accounts sit idle, so one
- * blended availability figure would hide exactly the outage an operator
- * needs to see. A summary with no provider slices (an empty pool) falls
- * back to the pool-wide numbers, which is then also empty — not degraded. */
+/** The provider pools that are at or near exhaustion, by name — the
+ * `throttled` case (#8832); `emptyProviders` above is the `degraded` one.
+ * Each provider is judged on its own: a fleet whose Claude pool is spent
+ * cannot dispatch Claude sweeps no matter how many Codex accounts sit idle,
+ * so one blended availability figure would hide exactly the outage an
+ * operator needs to see. A summary with no provider slices (an empty pool)
+ * falls back to the pool-wide numbers, which is then also empty — not
+ * flagged. */
 export function degradedProviders(tokens: TokenSummary): string[] {
   const slices = tokens.providers.length > 0
     ? tokens.providers
     : [{ provider: "claude", total: tokens.total, exhausted: tokens.exhausted, peakUsage: tokens.peakUsage }];
   return slices.filter((slice) => isPoolSliceDegraded(slice.total, slice.exhausted)).map((slice) => slice.provider);
+}
+
+/** The provider pools with no account left to rotate onto at all — the
+ * token condition that actually stops dispatch, and so the only one that
+ * makes a host `degraded` (#8832). A pool merely *near* exhaustion
+ * (`degradedProviders`) is the selector working as designed during a weekly
+ * wall and renders `throttled`. */
+export function emptyProviders(tokens: TokenSummary): string[] {
+  const slices = tokens.providers.length > 0
+    ? tokens.providers
+    : [{ provider: "claude", total: tokens.total, exhausted: tokens.exhausted, peakUsage: tokens.peakUsage }];
+  return slices.filter((slice) => slice.total > 0 && slice.exhausted >= slice.total).map((slice) => slice.provider);
 }
 
 function isPoolSliceDegraded(total: number, exhausted: number): boolean {
@@ -368,38 +390,97 @@ const HOST_DISTRESS_LOAD_PER_CORE = 2.5;
 const ZERO_IDLE_FRACTION_THRESHOLD = 0.02;
 
 /**
- * Why a host looks distressed, in priority order, or `undefined` when it
- * does not. `dispatch_halted` and `roles.persistent` (both sustained,
- * stateful signals the daemon itself computed — see `host_breaker.rs`'s
- * module doc and `crate::health::summarize_role_ticks`, #5022) are checked
- * first and named with their own reason; the load/idle checks below them are
- * same-number, single-sample fallbacks for a host whose daemon
- * predates/disables those fields. A host that is merely busy — high load,
- * but still admitting new dispatch and idle well above zero — returns
- * `undefined` here and stays `"ok"` (busy ≠ degraded, #4975).
+ * How many failed ticks a `(root, role)` pair must show in the daemon's
+ * role-tick ring before the dashboard calls the host degraded (#8832). The
+ * daemon lists a pair as `persistent` the moment its *latest* tick failed —
+ * a single failure — and with ~50 repos × 8 roles per host, some pair has
+ * nearly always just failed once. Three is above a one-off blip (a slow
+ * forge, a token rotation) while still well under the daemon's own
+ * five-in-a-row escalation (`ROLE_TICK_ESCALATION_THRESHOLD`).
  */
-export function distressReason(health: HostHealthRecord | undefined): string | undefined {
+export const ROLE_FAILURE_DEGRADED_MIN = 3;
+
+/**
+ * How recent a failing pair's latest tick must be to count (#8832). The
+ * daemon samples its whole tick ring with no window, so a pair that failed
+ * and then stopped ticking (repo unregistered, role disabled) stays
+ * "persistent" until eviction or restart. Two hours is twice the longest
+ * built-in role interval (architect, 3600 s): a pair that should have ticked
+ * again by now and has not is history, not a live fault.
+ */
+export const ROLE_FAILURE_RECENT_SEC = 2 * 60 * 60;
+
+/**
+ * The admission brake's starving-on-foreign-load halt (#8478) — the one
+ * `dispatch_halted` cause that is an incident rather than backpressure: the
+ * host refuses all work because of load Loom does not own, and nothing in
+ * Loom will clear it. Matched on the daemon's own reason prefix
+ * (`dispatch_halt_from_breaker`, `loom-daemon/src/observability/collector.rs`).
+ */
+const FOREIGN_LOAD_HALT = /^admission brake STARVING\b/;
+
+/** The persistent role failures that are both repeated and recent — the only
+ * ones that make a host `degraded` (#8832). */
+export function sustainedRoleFailures(
+  health: HostHealthRecord | undefined,
+  now: Date = new Date(),
+): RoleTickFailure[] {
+  return (health?.roles?.persistent ?? []).filter((failure) => {
+    if ((failure.failures ?? 0) < ROLE_FAILURE_DEGRADED_MIN) return false;
+    const age = secondsSince(failure.last_at, now);
+    // No timestamp: cannot show it is stale, so do not hide it.
+    return age === undefined || age <= ROLE_FAILURE_RECENT_SEC;
+  });
+}
+
+/**
+ * Why a host needs a person, in priority order, or `undefined` when it does
+ * not. Narrowed by #8832 so `degraded` means "act on this", not "something
+ * somewhere ticked badly once":
+ *
+ * - dispatch halted by the admission brake on foreign load (#8478);
+ * - a role pair failing repeatedly and recently (`sustainedRoleFailures`);
+ * - the single-sample load/idle heuristics — ONLY for a record with no
+ *   `dispatch_halted` field at all (a daemon that predates #4975). When the
+ *   daemon reports `dispatch_halted`, its breaker's *sustained* verdict is
+ *   authoritative and one hot 5-minute sample is not a second opinion.
+ *
+ * The host-distress breaker's own halt is deliberately NOT here: it is the
+ * host shedding load as designed, and renders `throttled` via
+ * `throttleReason`. A merely busy host stays `ok` (busy ≠ degraded, #4975).
+ */
+export function distressReason(health: HostHealthRecord | undefined, now: Date = new Date()): string | undefined {
   if (!health) return undefined;
-  if (health.dispatch_halted) {
-    return health.halt_reason ? `dispatch halted: ${health.halt_reason}` : "dispatch halted";
+  if (health.dispatch_halted && health.halt_reason && FOREIGN_LOAD_HALT.test(health.halt_reason)) {
+    return `dispatch halted: ${health.halt_reason}`;
   }
-  const persistentRoleFailures = health.roles?.persistent ?? [];
-  if (persistentRoleFailures.length > 0) {
-    const names = persistentRoleFailures.map(roleFailureLabel).join(", ");
+  const sustained = sustainedRoleFailures(health, now);
+  if (sustained.length > 0) {
+    const names = sustained.map(roleFailureLabel).join(", ");
     return `role tick(s) persistently failing: ${names}`;
   }
-  if (health.load_per_core !== undefined && health.load_per_core >= HOST_DISTRESS_LOAD_PER_CORE) {
-    return `load/core ${health.load_per_core.toFixed(2)} at or above the host-distress threshold (${HOST_DISTRESS_LOAD_PER_CORE})`;
-  }
-  if (health.cpu_idle_fraction !== undefined && health.cpu_idle_fraction <= ZERO_IDLE_FRACTION_THRESHOLD) {
-    return "CPU idle pinned near zero";
+  if (health.dispatch_halted === undefined) {
+    if (health.load_per_core !== undefined && health.load_per_core >= HOST_DISTRESS_LOAD_PER_CORE) {
+      return `load/core ${health.load_per_core.toFixed(2)} at or above the host-distress threshold (${HOST_DISTRESS_LOAD_PER_CORE})`;
+    }
+    if (health.cpu_idle_fraction !== undefined && health.cpu_idle_fraction <= ZERO_IDLE_FRACTION_THRESHOLD) {
+      return "CPU idle pinned near zero";
+    }
   }
   return undefined;
 }
 
+/** Why a healthy host is holding back new work by its own design (#8832) —
+ * the host-distress breaker (or any non-foreign-load halt) — or `undefined`.
+ * Checked only after `distressReason` found nothing. */
+export function throttleReason(health: HostHealthRecord | undefined): string | undefined {
+  if (!health?.dispatch_halted) return undefined;
+  return health.halt_reason ? `dispatch paused: ${health.halt_reason}` : "dispatch paused";
+}
+
 /** `true` when `distressReason` finds a reason — see its doc for the rules. */
-export function isHostDistressed(health: HostHealthRecord | undefined): boolean {
-  return distressReason(health) !== undefined;
+export function isHostDistressed(health: HostHealthRecord | undefined, now: Date = new Date()): boolean {
+  return distressReason(health, now) !== undefined;
 }
 
 /** Newest of the two `updatedAt`s. String compare is safe here *only* because
@@ -432,7 +513,7 @@ export function buildHostView(
   const tokens = summarizeTokens(entry);
   const lastReportAt = latestReport(entry);
   const lastReportAgeSec = secondsSince(lastReportAt, now);
-  const distress = distressReason(entry.health?.record);
+  const distress = distressReason(entry.health?.record, now);
 
   let status: HostStatus;
   let degradedReason: string | undefined;
@@ -445,12 +526,23 @@ export function buildHostView(
     // both fire — it is the more actionable/urgent of the two reasons.
     status = "degraded";
     degradedReason = distress;
-  } else if (isTokenPoolDegraded(tokens)) {
+  } else if (emptyProviders(tokens).length > 0) {
     status = "degraded";
-    const spent = degradedProviders(tokens);
-    degradedReason = `${spent.join(", ")} token pool${spent.length === 1 ? "" : "s"} at or near exhaustion`;
+    const empty = emptyProviders(tokens);
+    degradedReason = `${empty.join(", ")} token pool${empty.length === 1 ? "" : "s"} exhausted — nothing left to dispatch on`;
   } else {
-    status = "ok";
+    // #8832: self-protective, self-clearing conditions — shown, not alarmed.
+    const throttle = throttleReason(entry.health?.record);
+    if (throttle !== undefined) {
+      status = "throttled";
+      degradedReason = throttle;
+    } else if (isTokenPoolDegraded(tokens)) {
+      status = "throttled";
+      const low = degradedProviders(tokens);
+      degradedReason = `${low.join(", ")} token pool${low.length === 1 ? "" : "s"} running low`;
+    } else {
+      status = "ok";
+    }
   }
 
   return { hostId, entry, sweeps, tokens, status, degradedReason, lastReportAt, lastReportAgeSec };
@@ -466,9 +558,10 @@ const STATUS_ORDER: Record<HostStatus, number> = {
   missing: 0,
   stale: 1,
   degraded: 2,
-  unprovisioned: 3,
-  unknown: 4,
-  ok: 5,
+  throttled: 3,
+  unprovisioned: 4,
+  unknown: 5,
+  ok: 6,
 };
 
 export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()): FleetView {

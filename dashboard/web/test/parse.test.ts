@@ -280,13 +280,13 @@ describe("parseFleetSnapshot", () => {
       activeSweeps: [],
     });
     const roles = snapshot.hosts.h?.health?.record.roles;
-    expect(roles?.total).toBe(3);
+    expect(roles?.total).toBe(5);
     expect(roles?.ok).toBe(1);
     expect(roles?.persistent).toEqual([
       {
         root: "/repos/loom",
         role: "judge",
-        failures: 2,
+        failures: 4,
         last_at: "2026-07-30T12:09:00.000Z",
         detail: "no-token-pool",
       },
