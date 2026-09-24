@@ -99,6 +99,12 @@ box; `superset start --daemon --org noc0`):
   cycle — after any `repo-remote up`, re-run `superset start --daemon --org
   noc0` (one line, seconds) before expecting the host back in
   `superset hosts list`
+- **connect caveat (proven 2026-09-24):** the *public* IP changes on every
+  stop/start (52.202.131.241 → 52.200.81.136); the private IP and the EBS
+  disk do not (warm `target/` and `/home/ubuntu/shared` survive a plain stop
+  — no re-seed needed). Recovery recipe: `repo-remote.sh status` for the new
+  IP → update the alias's HostName in `~/.ssh/config` → `ssh-keygen -R
+  <old-ip>` → connect once with `-o StrictHostKeyChecking=accept-new`.
 
 ## Subagent fan-out (concurrent tasks on one box)
 
