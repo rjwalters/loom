@@ -1416,11 +1416,18 @@ jobs:
       - name: Verify account-private clones and exclusive jobs with Docker fixtures
         # Owner-only synthetic profiles must belong to the session image's UID.
         # Build as runner; execute only this fixture as UID 1000 with Docker access.
-        # Share public fixture inputs only; account profiles keep owner-only modes.
+        # Stage public inputs outside the runner's owner-only home. Account
+        # profiles and the checkout's .git directory are never shared.
         run: |
+          fixture_source="$(mktemp -d /tmp/loom-private-ci.XXXXXX)"
+          chmod 0755 "$fixture_source"
+          git archive HEAD | tar -x -C "$fixture_source"
+          mkdir "$fixture_source/target"
+          sudo --non-interactive mount --bind "$PWD/target" "$fixture_source/target"
+          trap 'sudo --non-interactive umount "$fixture_source/target"' EXIT
+          cd "$fixture_source"
           namei -l "$PWD/defaults/scripts" "$PWD/defaults/runtimes" "$PWD/defaults/roles" "$PWD/defaults/.claude/commands/loom" "$PWD/target/debug/loom-daemon"
-          chmod -R a+rX defaults target/debug/loom-daemon
-          sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env -- sh -c 'id && test -r target/debug/loom-daemon && test -x target/debug/loom-daemon && tar -cf /dev/null defaults'
+          sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env -- sh -c 'id && test -r "$PWD/target/debug/loom-daemon" && test -x "$PWD/target/debug/loom-daemon" && tar -cf /dev/null "$PWD/defaults"'
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env --' cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
 
   shell-suite-tests:
