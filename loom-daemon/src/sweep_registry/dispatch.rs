@@ -1008,7 +1008,8 @@ impl SweepRegistry {
             | peer_claims::ClaimKind::NoopCooldownArmed
             | peer_claims::ClaimKind::DispatchBackoffArmed
             | peer_claims::ClaimKind::PoolHoldArmed
-            | peer_claims::ClaimKind::PoolHoldCleared => return,
+            | peer_claims::ClaimKind::PoolHoldCleared
+            | peer_claims::ClaimKind::Heartbeat => return,
         };
         if let Err(e) = tx.try_send(ad) {
             // Fail-open: the soft claim is an optimization, never a liveness

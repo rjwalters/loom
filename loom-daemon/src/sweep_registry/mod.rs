@@ -111,6 +111,7 @@ mod crash_signals;
 mod decline_cooldown;
 mod dispatch;
 mod guards;
+mod heartbeat_broadcast;
 mod locks;
 mod model;
 mod noop_cooldown;

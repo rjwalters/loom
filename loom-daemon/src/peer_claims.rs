@@ -315,6 +315,22 @@ pub enum ClaimKind {
     /// while every peer stayed suppressed for up to 15 more minutes —
     /// converting a latency win into a fleet-wide stall.
     PoolHoldCleared,
+    /// "I am alive" (Issue #8736) — a periodic liveness signal published
+    /// every reaper tick **regardless of live-sweep count**, unlike
+    /// [`ClaimKind::Advertise`] (entirely dispatch-gated). Closes the
+    /// converse of the #8026 idle gate: this host busy while its *peers*
+    /// are idle looks byte-for-byte identical, from `received`/`quiet_for`
+    /// alone, to a genuinely dead receive path — advertising is the only
+    /// thing an idle host would otherwise ever transmit, and idle hosts by
+    /// definition transmit nothing. A heartbeat is the one signal an idle
+    /// host still emits, so [`PeerClaimView::evaluate_coordination`] can
+    /// anchor its receive-quiet clock on "last heartbeat or claim received"
+    /// instead of claims alone. Folded into its own bookkeeping
+    /// ([`PeerClaimView::observe_heartbeat_at`]) rather than
+    /// `counters.received`/`last_received_at` — see that method's doc
+    /// comment for why the `#6157` transport counters must stay scoped to
+    /// genuine dispatch-claim traffic only.
+    Heartbeat,
 }
 
 /// The `issue` value carried by [`ClaimKind::FilingLock`]/
@@ -324,6 +340,11 @@ pub enum ClaimKind {
 /// every other ad and keeps a filing ad from ever being mistaken for a claim
 /// on a real issue #0.
 pub const FILING_LOCK_SENTINEL_ISSUE: u32 = 0;
+
+/// The `issue` value carried by a [`ClaimKind::Heartbeat`] ad (Issue #8736) —
+/// mirrors [`FILING_LOCK_SENTINEL_ISSUE`]'s rationale: a heartbeat is not
+/// about any particular issue.
+pub const HEARTBEAT_SENTINEL_ISSUE: u32 = 0;
 
 impl ClaimKind {
     #[must_use]
@@ -338,6 +359,7 @@ impl ClaimKind {
             ClaimKind::DispatchBackoffArmed => "dispatch_backoff_armed",
             ClaimKind::PoolHoldArmed => "pool_hold_armed",
             ClaimKind::PoolHoldCleared => "pool_hold_cleared",
+            ClaimKind::Heartbeat => "heartbeat",
         }
     }
 
@@ -353,6 +375,7 @@ impl ClaimKind {
             "dispatch_backoff_armed" => Some(ClaimKind::DispatchBackoffArmed),
             "pool_hold_armed" => Some(ClaimKind::PoolHoldArmed),
             "pool_hold_cleared" => Some(ClaimKind::PoolHoldCleared),
+            "heartbeat" => Some(ClaimKind::Heartbeat),
             _ => None,
         }
     }
@@ -581,6 +604,27 @@ impl ClaimAd {
             ts,
             pr: None,
             remaining_secs: Some(remaining_secs),
+            pool_key: None,
+        }
+    }
+
+    /// "I am alive" (Issue #8736) — published every reaper tick regardless of
+    /// live-sweep count by
+    /// [`crate::sweep_registry::SweepRegistry::publish_peer_heartbeat`].
+    /// `issue` is pinned to [`HEARTBEAT_SENTINEL_ISSUE`] — a heartbeat is not
+    /// about any particular issue, mirroring [`Self::filing_lock`]'s use of
+    /// [`FILING_LOCK_SENTINEL_ISSUE`].
+    #[must_use]
+    pub fn heartbeat(repo: String, host: String, pid: u32, ts: String) -> Self {
+        Self {
+            kind: ClaimKind::Heartbeat,
+            issue: HEARTBEAT_SENTINEL_ISSUE,
+            repo,
+            host,
+            pid,
+            ts,
+            pr: None,
+            remaining_secs: None,
             pool_key: None,
         }
     }
@@ -970,6 +1014,13 @@ pub struct PeerClaimView {
     /// #6157) — set by [`Self::observe_at`], mirroring what
     /// [`PeerClaimCounters::received`] counts.
     last_received_at: Option<Instant>,
+    /// Local [`Instant`] of the most recent peer [`ClaimKind::Heartbeat`]
+    /// (Issue #8736) — set by [`Self::observe_heartbeat_at`]. Merged with
+    /// [`Self::last_received_at`] (whichever is more recent wins) by
+    /// [`Self::evaluate_coordination`]'s receive-quiet anchor, but never fed
+    /// into `counters.received` — a heartbeat proves a peer is alive, not
+    /// that a dispatch claim arrived.
+    last_heartbeat_received_at: Option<Instant>,
     /// Whether [`Self::evaluate_coordination`] currently judges coordination
     /// DEGRADED (Issue #6157).
     coordination_degraded: bool,
@@ -1073,6 +1124,7 @@ impl PeerClaimView {
             advertise_activity_window: DEFAULT_ADVERTISE_ACTIVITY_WINDOW,
             coordination_clock_base: None,
             last_received_at: None,
+            last_heartbeat_received_at: None,
             coordination_degraded: false,
             coordination_degraded_since: None,
             consecutive_receives_while_degraded: 0,
@@ -1180,8 +1232,17 @@ impl PeerClaimView {
     /// [`Self::observe_pool_hold_at`], and reaching here is a no-op. Like the
     /// filing lane it carries a sentinel issue ([`POOL_HOLD_SENTINEL_ISSUE`]),
     /// so folding it in would manufacture a bogus peer claim on issue #0.
+    /// # `ClaimKind::Heartbeat` is out of scope here (Issue #8736)
+    ///
+    /// Same contract once more: a heartbeat ad routes to
+    /// [`Self::observe_heartbeat_at`], and reaching here is a no-op. It feeds
+    /// only [`Self::evaluate_coordination`]'s receive-quiet anchor, never
+    /// `counters.received`/`last_received_at` — see that method's doc
+    /// comment for why a liveness ping must not be mistaken for a genuine
+    /// dispatch-claim receive.
     pub fn observe_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
         if ad.kind == ClaimKind::Completed
+            || ad.kind == ClaimKind::Heartbeat
             || ad.kind.is_filing_lock_lane()
             || ad.kind.is_cooldown_lane()
             || ad.kind.is_pool_hold_lane()
@@ -1215,7 +1276,8 @@ impl PeerClaimView {
             | ClaimKind::NoopCooldownArmed
             | ClaimKind::DispatchBackoffArmed
             | ClaimKind::PoolHoldArmed
-            | ClaimKind::PoolHoldCleared => {
+            | ClaimKind::PoolHoldCleared
+            | ClaimKind::Heartbeat => {
                 unreachable!("returned above")
             }
         }
@@ -1234,6 +1296,34 @@ impl PeerClaimView {
         if self.coordination_degraded {
             self.consecutive_receives_while_degraded += 1;
         }
+        true
+    }
+
+    /// Observe an inbound [`ClaimKind::Heartbeat`] ad at local time `now`
+    /// (Issue #8736): "peer host H is alive", published every reaper tick
+    /// regardless of whether that peer currently holds any live claim.
+    ///
+    /// Returns `true` when applied (a peer's), `false` when ignored as this
+    /// host's own ad — the identical self-claim recognition [`Self::observe_at`]
+    /// applies, including the `UNKNOWN_HOST` carve-out (see that method's doc
+    /// comment).
+    ///
+    /// Deliberately does **not** touch `counters.received`/`last_received_at`/
+    /// `consecutive_receives_while_degraded`: those answer "did a genuine
+    /// dispatch-claim ad arrive", which is what the `#6157` true-positive
+    /// signature (`received=0` while `advertised>0`) and the AC4
+    /// sustained-receive recovery bar both depend on. A heartbeat proves only
+    /// that the peer process is up and the transport can reach it — real
+    /// signal for [`Self::evaluate_coordination`]'s NOT-yet-degraded
+    /// receive-quiet anchor (via `last_heartbeat_received_at`), but never a
+    /// substitute for the stronger "a real claim arrived" recovery bar.
+    pub fn observe_heartbeat_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
+        debug_assert_eq!(ad.kind, ClaimKind::Heartbeat);
+        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
+        if ad.host == self.self_host && !is_unresolved_identity {
+            return false; // never treat our own heartbeat as a peer's
+        }
+        self.last_heartbeat_received_at = Some(now);
         true
     }
 
@@ -1560,14 +1650,23 @@ impl PeerClaimView {
     ///   [`coordination_idle`] for the full rationale and the one detection
     ///   loss it accepts.
     /// - Not currently degraded: once the time since the more recent of
-    ///   `first_advertised_at`/`last_received_at` reaches `grace`, flip
-    ///   DEGRADED — the exact signature of the 2026-08-13 incident (sustained
-    ///   advertising, zero receives: `received=0` while `advertised>0`, and
-    ///   the log-scale equivalent of "no receive within N× the advertisement
-    ///   interval").
+    ///   `first_advertised_at`/`last_received_at`/`last_heartbeat_received_at`
+    ///   reaches `grace`, flip DEGRADED — the exact signature of the
+    ///   2026-08-13 incident (sustained advertising, zero receives:
+    ///   `received=0` while `advertised>0`, and the log-scale equivalent of
+    ///   "no receive within N× the advertisement interval"). Folding in
+    ///   `last_heartbeat_received_at` (Issue #8736) closes the #8026 idle
+    ///   gate's converse: peers that are genuinely idle (no claims to send)
+    ///   still emit a heartbeat every reaper tick, so their silence on the
+    ///   `claims` channel alone is no longer mistaken for a dead receive
+    ///   path. A host whose receive path is truly one-way still gets neither
+    ///   signal, so the true-positive case above is unaffected.
     /// - Currently degraded: recovers only once `recovery_threshold`
     ///   CONSECUTIVE genuine peer receives have landed since going degraded
-    ///   — a single stray ad does not clear it (issue's AC4).
+    ///   — a single stray ad does not clear it (issue's AC4), and a
+    ///   heartbeat never counts toward this (see
+    ///   [`Self::observe_heartbeat_at`]'s doc comment): recovery requires
+    ///   proof a real claim arrived, not just that a peer is alive.
     pub fn evaluate_coordination(
         &mut self,
         now: Instant,
@@ -1620,7 +1719,14 @@ impl PeerClaimView {
                 transitioned: false,
             };
         }
-        let received_anchor = self.last_received_at.unwrap_or(first);
+        // Issue #8736: a heartbeat is as good as a genuine receive for THIS
+        // anchor (though never for `counters.received` or recovery — see
+        // `observe_heartbeat_at`) — whichever signal is more recent wins.
+        let received_anchor = [self.last_received_at, self.last_heartbeat_received_at]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(first);
         let anchor = match self.coordination_clock_base {
             Some(base) if base > received_anchor => base,
             _ => received_anchor,
