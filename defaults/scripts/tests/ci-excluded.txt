@@ -61,6 +61,7 @@ scripts/test-daemon-liveness.sh  Runs in the post-Builder buildGate (.loom/confi
 # different reason — it is not equivalence evidence for a port.
 test-spawn-claude.sh  Needs a built loom-daemon (spawn-claude.sh token selection, #4228); wired in the "Native Port Suites" job (#8069), which builds one first. Until #8069 it ran in NO job at all — the old reason here said wiring it needed "a cargo build step or a binary stub — follow-up", and that job has since been built.
 test-token-model-class.sh  Same constraint as test-spawn-claude.sh above, which it was split out of (#8058): it drives spawn-claude.sh / claude-wrapper.sh against a real `loom-daemon tokens select|mark-bad`, so it needs a built binary. Wired in the "Native Port Suites" job (#8069) alongside its parent — that job already builds one, so there is no reason left to leave this one excluded pending a follow-up.
+test-spawn-claude-credential-proxy.sh  Same constraint as test-spawn-claude.sh above (#8697): it drives spawn-claude.sh's contained dispatch through a real `loom-daemon worker proxy-exec` listener and host-side `tokens select`, so it needs a built binary. Wired in the "Native Port Suites" job; FAILS rather than SKIPs without a binary.
 
 test-loom-dispatcher.sh  Wired through scripts/test-installer.sh in Installer Integration Tests; requires the Rust spawn-worker dispatcher (#8362).
 test-spawn-generic.sh  Wired in native-port equivalence job; requires the Rust spawn-worker dispatcher (#8362).

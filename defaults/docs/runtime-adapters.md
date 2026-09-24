@@ -1648,12 +1648,50 @@ error. A proxy that quietly degraded to env-passthrough would be
 indistinguishable from one that worked; the opt-out is the absent
 `credentialProxy` block, not a runtime fallback.
 
-**Scope.** This ships for the native-harness contained dispatch. Claude's own
-container is built by `spawn-claude.sh` and is not routed through the proxy
-yet; per-launch usage attribution and `429`-driven bad-marking at the proxy are
-follow-ups on #8674. The end-to-end live verification of both a Claude-shaped
-and an API-key-native profile is tracked there too — the automated suite covers
-the swap, the refusals and the dispatch argv, not a real provider call.
+**Claude's container (issue #8697).** `spawn-claude.sh`'s per-sweep container
+goes through the same proxy, behind its own default-off switch (env
+`LOOM_SWEEP_CREDENTIAL_PROXY` > `runtimes.containment.claudeCredentialProxy` >
+off; no effect unless `runtimes.containment.enabled` is on):
+
+```json
+{ "runtimes": { "containment": { "enabled": true, "claudeCredentialProxy": true } } }
+```
+
+A shell adapter cannot host the listener, so it shells out to `loom-daemon
+worker proxy-exec --docker-workspace <ws>`, which reuses the registry,
+placeholder and listener above and owns the proxy's docker flags. With the
+switch on, the account is selected on the **host**, the `docker run` receives
+`CLAUDE_CODE_OAUTH_TOKEN=<placeholder>` and `ANTHROPIC_BASE_URL=<proxy>` (both
+by name), `<workspace>/.loom/tokens/` and `.loom/api-keys/` are masked with an
+empty tmpfs, and the shared token pool is not mounted. A missing subcommand or
+an unset host credential is an exit-78 refusal, never a plain `docker run`
+with the real token. `proxy-exec` sits between the sweep and the docker client,
+so a signal sent to that one pid does not reach docker; cancellation uses the
+daemon's process-group kill, which does, exactly as on the native path.
+
+Claude Code sends an OAuth token as `Authorization: Bearer` plus an
+`anthropic-beta` list that includes `oauth-2025-04-20`. It sends both to
+`ANTHROPIC_BASE_URL`, so the `authorization-bearer` swap is all an OAuth token
+needs. The beta header passes through unchanged. An env-supplied token has no
+refresh chain.
+
+Three consequences of the proxied Claude path:
+
+- **No mid-sweep rotation.** The pool is not visible inside the container, so
+  `claude-wrapper.sh` cannot rotate to another account. An exhausted account
+  ends the launch instead, and the host pool does not get its bad-mark
+  (#8818).
+- **No survival across a hard daemon stop.** The proxy's lifetime is the
+  launch's. `restart --drain` is unaffected.
+- **Some requests bypass the proxy.** They go straight to `api.anthropic.com`
+  carrying the placeholder, where they fail harmlessly. Examples: telemetry and
+  profile lookups.
+
+**Scope.** Per-launch usage attribution and `429`-driven bad-marking at the
+proxy are follow-ups on #8674. The end-to-end live verification of both a
+Claude-shaped and an API-key-native profile is tracked there too. The automated
+suite covers the swap, the refusals and the dispatch argv, not a real provider
+call.
 
 **Known limitation: file-path credentials are not mounted (#8454).** The
 by-name forwarding above assumes a credential's VALUE is the secret itself —

@@ -1178,6 +1178,11 @@ jobs:
       # builds. Wired alongside its parent rather than left excluded.
       - name: token model-class selection (#8058)
         run: bash defaults/scripts/tests/test-token-model-class.sh
+      # #8697: spawn-claude.sh's contained dispatch through the credential
+      # egress proxy — drives a real `loom-daemon worker proxy-exec` listener
+      # and host-side `tokens select`, so it needs the binary this job builds.
+      - name: spawn-claude credential egress proxy (#8697)
+        run: bash defaults/scripts/tests/test-spawn-claude-credential-proxy.sh
       # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
       # closing-reference analysis now delegates to `loom-daemon`, so this
       # suite's require-daemon-bin harness needs the binary this job builds.

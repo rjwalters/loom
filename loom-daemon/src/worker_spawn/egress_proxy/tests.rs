@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Serialize env mutation — `enabled` reads process-global env.
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -195,13 +195,13 @@ fn refusal_statuses_match_the_acceptance_criteria() {
 
 /// Headers one fake-upstream request was handed, plus its body.
 #[derive(Clone, Debug, Default)]
-struct Seen {
-    head: String,
-    body: String,
+pub(super) struct Seen {
+    pub(super) head: String,
+    pub(super) body: String,
 }
 
 /// A one-shot fake provider on loopback. Returns `(host:port, seen)`.
-async fn fake_upstream(reply: &'static str) -> (String, Arc<Mutex<Vec<Seen>>>) {
+pub(super) async fn fake_upstream(reply: &'static str) -> (String, Arc<Mutex<Vec<Seen>>>) {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -256,7 +256,7 @@ async fn fake_upstream(reply: &'static str) -> (String, Arc<Mutex<Vec<Seen>>>) {
 }
 
 /// Minimal client: send `request` verbatim, read the whole reply.
-async fn raw_request(addr: std::net::SocketAddr, request: &str) -> String {
+pub(super) async fn raw_request(addr: std::net::SocketAddr, request: &str) -> String {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(request.as_bytes()).await.unwrap();
     stream.flush().await.unwrap();

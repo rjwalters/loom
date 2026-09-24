@@ -32,13 +32,22 @@
 //! stays env-passthrough exactly as before, and the whole mechanism is off
 //! until `runtimes.containment.credentialProxy` says otherwise.
 //!
-//! # Scope (first slice)
+//! # Two entry points, one mechanism
 //!
-//! This ships the mechanism and wires it into the **native-harness** contained
-//! dispatch ([`super::containment`]). Claude's own container is built by
-//! `spawn-claude.sh` and is not routed through here yet; see the follow-ups
-//! filed against #8674.
+//! - The **native-harness** contained dispatch ([`super::containment`], #8674)
+//!   calls [`prepare`], which resolves the real credential through the #8401
+//!   ladder and hands the placeholder to `docker run` as an assignment.
+//! - **Claude's** per-sweep container is built by the `spawn-claude.sh` shell
+//!   adapter, which has nowhere to host a listener. It shells out to
+//!   `loom-daemon worker proxy-exec` ([`exec`], #8697), which takes the
+//!   credential the adapter already selected, swaps it for a placeholder in the
+//!   environment of the `docker run` it launches, and serves the proxy for
+//!   exactly that launch's lifetime.
+//!
+//! Both go through [`arm`] and [`run_with_proxy`], so they share one registry
+//! shape, one placeholder format and one set of refusals.
 
+pub mod exec;
 pub mod registry;
 pub mod server;
 #[cfg(test)]
@@ -247,7 +256,41 @@ pub fn prepare(
         .to_str()
         .ok_or_else(|| LaunchError::config("credentialProxy requires a UTF-8 credential value"))?
         .to_string();
+    let provider = resolved
+        .provider
+        .clone()
+        .or_else(|| selection.profile.clone())
+        .unwrap_or_else(|| selection.provider.clone());
+    arm(
+        secret,
+        provider,
+        &declared,
+        upstream,
+        &[source.as_str(), target.as_str()],
+        vec![crate::api_keys_pool::paths::per_repo_api_keys_dir(root)],
+    )
+    .map(Some)
+}
 
+/// Bind the listener, mint the placeholder and register the launch record —
+/// the half of substitution that does not care where the real credential came
+/// from. Shared by the native-harness dispatch ([`prepare`], which resolves
+/// the credential through the #8401 ladder) and the shell-adapter entry point
+/// ([`exec`], issue #8697, which is handed a credential its adapter already
+/// selected), so both paths get one registry, one placeholder shape and one
+/// set of refusal semantics.
+///
+/// `credential_names` are every environment variable the container might read
+/// the credential from: each is assigned the placeholder AND withheld from
+/// by-name forwarding.
+fn arm(
+    secret: String,
+    provider: String,
+    declared: &ProfileProxy,
+    upstream: Upstream,
+    credential_names: &[&str],
+    mask_dirs: Vec<std::path::PathBuf>,
+) -> Result<Prepared, LaunchError> {
     let (bind_ip, container_host) = resolve_bind();
     let bound = server::Bound::bind(bind_ip).map_err(|e| {
         LaunchError::config(format!("credentialProxy cannot bind a listener on {bind_ip}: {e}"))
@@ -259,27 +302,20 @@ pub fn prepare(
     let registry = Registry::new();
     registry.insert(
         &placeholder,
-        Record::new(
-            launch_id.clone(),
-            resolved
-                .provider
-                .clone()
-                .or_else(|| selection.profile.clone())
-                .unwrap_or_else(|| selection.provider.clone()),
-            upstream.clone(),
-            declared.header,
-            secret,
-        ),
+        Record::new(launch_id.clone(), provider, upstream.clone(), declared.header, secret),
     );
 
-    // The placeholder is assigned under BOTH the profile's source variable and
-    // its harness-facing target, so the profile resolution that re-runs inside
-    // the container finds it whichever name it reads — and, being an explicit
-    // assignment, it wins over any by-name forwarding of the same variable.
+    // The placeholder is assigned under EVERY credential name (for a native
+    // profile: its source variable and its harness-facing target), so the
+    // profile resolution that re-runs inside the container finds it whichever
+    // name it reads — and, being an explicit assignment, it wins over any
+    // by-name forwarding of the same variable.
     let mut assignments: Vec<(String, String)> = Vec::new();
-    for name in [source, target] {
+    let mut withheld: Vec<String> = Vec::new();
+    for name in credential_names {
         if !assignments.iter().any(|(k, _)| k == name) {
-            assignments.push((name.clone(), placeholder.as_str().to_string()));
+            assignments.push(((*name).to_string(), placeholder.as_str().to_string()));
+            withheld.push((*name).to_string());
         }
     }
     for name in &declared.base_url_env {
@@ -295,18 +331,18 @@ pub fn prepare(
             HeaderStyle::XApiKey => "x-api-key",
         },
     );
-    Ok(Some(Prepared {
+    Ok(Prepared {
         injection: containment::Injection {
             assignments,
-            withheld: vec![source.clone(), target.clone()],
-            mask_dirs: vec![crate::api_keys_pool::paths::per_repo_api_keys_dir(root)],
+            withheld,
+            mask_dirs,
             add_host_gateway: true,
         },
         launch_id,
         registry,
         bound,
         marker,
-    }))
+    })
 }
 
 /// Serve the proxy for exactly as long as the contained launch runs, then
