@@ -19,7 +19,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
 use crate::telemetry::{
-    RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryRecord,
+    AnomalyFlag, RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryRecord,
 };
 
 // ============================================================================
@@ -116,6 +116,15 @@ fn severity_for_role_tick(result: RoleTickResult) -> SeverityNumber {
             SeverityNumber::Warn
         }
         _ => SeverityNumber::Info,
+    }
+}
+
+/// The wire string for a `session.analysis` anomaly flag (Issue #8760) —
+/// the serde `rename_all = "snake_case"` spelling, restated here so the
+/// OTLP attribute value matches the JSON one exactly.
+fn anomaly_flag_str(flag: AnomalyFlag) -> &'static str {
+    match flag {
+        AnomalyFlag::HighTokenUsage => "high_token_usage",
     }
 }
 
@@ -415,6 +424,97 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes,
             )
         }
+        TelemetryRecord::SessionAnalysis(r) => {
+            // Issue #8760 (G3 part 2 of #8714): the derived per-session
+            // rollup, mapped as a log record like `session.summary` — an
+            // event with counts and a dollar figure, not a gauge.
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.session_id", r.session_id.clone()),
+            ];
+            if let Some(parent) = &r.parent_session_id {
+                attributes.push(kv_string("loom.parent_session_id", parent.clone()));
+            }
+            if let Some(cost_usd) = r.cost_usd {
+                attributes.push(kv(
+                    "loom.cost_usd",
+                    AnyValue {
+                        value: Some(any_value::Value::DoubleValue(cost_usd)),
+                    },
+                ));
+            }
+            if let Some(longest) = &r.longest_tool_call {
+                attributes.push(kv_string("loom.longest_tool_call.tool", longest.tool.clone()));
+                attributes.push(kv_int("loom.longest_tool_call.duration_ms", longest.duration_ms));
+            }
+            if !r.retry_loops.is_empty() {
+                let entries = r
+                    .retry_loops
+                    .iter()
+                    .map(|retry_loop| AnyValue {
+                        value: Some(any_value::Value::KvlistValue(KeyValueList {
+                            values: vec![
+                                kv_string("tool", retry_loop.tool.clone()),
+                                kv_int("length", i64::from(retry_loop.length)),
+                            ],
+                        })),
+                    })
+                    .collect();
+                attributes.push(kv(
+                    "loom.retry_loops",
+                    AnyValue {
+                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
+                    },
+                ));
+            }
+            if !r.anomalies.is_empty() {
+                let entries = r
+                    .anomalies
+                    .iter()
+                    .map(|flag| any_string(anomaly_flag_str(*flag)))
+                    .collect();
+                attributes.push(kv(
+                    "loom.anomalies",
+                    AnyValue {
+                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
+                    },
+                ));
+            }
+            (
+                "session.analysis",
+                if r.anomalies.is_empty() {
+                    SeverityNumber::Info
+                } else {
+                    SeverityNumber::Warn
+                },
+                format!(
+                    "session analysis: {} on {}, {} retry loop(s), {} anomaly flag(s)",
+                    r.session_id,
+                    r.repo,
+                    r.retry_loops.len(),
+                    r.anomalies.len(),
+                ),
+                attributes,
+            )
+        }
+        TelemetryRecord::DaemonEvent(r) => {
+            // Issue #8760 (G4 of #8714): a generic wrapper for four
+            // previously-uncovered event-bus topics. The payload is
+            // already-reviewed, small, operator-facing JSON (never
+            // free-form transcript content), so it is carried whole as one
+            // compact-JSON string attribute rather than re-typed per topic.
+            let attributes = vec![
+                kv_string("loom.topic", r.topic.clone()),
+                kv_string("loom.payload", serde_json::to_string(&r.payload).unwrap_or_default()),
+            ];
+            (
+                "daemon.event",
+                SeverityNumber::Info,
+                format!("daemon event: {}", r.topic),
+                attributes,
+            )
+        }
         TelemetryRecord::TokensSnapshot(_)
         | TelemetryRecord::HostHealth(_)
         | TelemetryRecord::Span(_) => return None,
@@ -636,9 +736,12 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         | TelemetryRecord::SweepCompleted(_)
         | TelemetryRecord::SweepOutcome(_)
         | TelemetryRecord::RoleTickOutcome(_)
-        // `session.summary` is a log record (see log_record_for), not a
-        // gauge — its counters are per-session events, not host samples.
+        // `session.summary` / `session.analysis` / `daemon.event` are log
+        // records (see log_record_for), not gauges — each is a per-session
+        // or per-bus-event event, not a host sample.
         | TelemetryRecord::SessionSummary(_)
+        | TelemetryRecord::SessionAnalysis(_)
+        | TelemetryRecord::DaemonEvent(_)
         | TelemetryRecord::Span(_) => Vec::new(),
     }
 }

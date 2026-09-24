@@ -187,6 +187,17 @@ record's level, not the root of the chain; walking `agent_id` -> matching
 depth). `loom.runtime`, `loom.provider`, `loom.model` and `loom.duration_sec`
 are reused from the existing schema.
 
+Issue #8760 (G3 part 2 / G4 of #8714) adds two more record kinds and six more
+allowlisted attributes: `session.analysis`'s `loom.cost_usd`,
+`loom.retry_loops`, `loom.longest_tool_call.tool`,
+`loom.longest_tool_call.duration_ms`, `loom.anomalies` (all derived from
+counts/ids/allowlisted tool names — never transcript content, same as
+`session.summary`); and `daemon.event`'s `loom.topic` /
+`loom.payload` (the latter is the already-reviewed, small, operator-facing
+`daemon.drain.*` / `daemon.capacity.advisory` / `daemon.preflight.advisory` /
+`epic.issue.*` event-bus payload, carried whole as one JSON string rather than
+re-typed per topic — see `crate::event_bus`'s frozen taxonomy).
+
 | Source | Path tailed (in-container) | `loom.*` fields populated |
 | --- | --- | --- |
 | Codex | `/var/lib/loom-sessions/codex/**/*.jsonl` | `runtime` (static `"codex"`), `session_id` (from a `session_meta` record), `model` (from a `turn_context` record) — both paths still unverified, no sample existed on the verifying host |

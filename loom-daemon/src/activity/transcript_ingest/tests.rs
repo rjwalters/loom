@@ -668,3 +668,137 @@ fn without_a_sink_no_session_summary_is_emitted() {
     assert_eq!(stats.session_summaries, 0);
     assert!(!home.path().join("queue.jsonl").exists());
 }
+
+// ------------------------------------------------------------------
+// `session.analysis` emission (Issue #8760, G3 part 2 of #8714)
+// ------------------------------------------------------------------
+
+fn analysis_sink_for(dir: &Path) -> crate::observability::session_analysis::SessionAnalysisSink {
+    use crate::observability::queue::DurableQueue;
+    crate::observability::session_analysis::SessionAnalysisSink::new(
+        std::sync::Arc::new(DurableQueue::open(dir.join("analysis-queue.jsonl"), 100)),
+        "host-test",
+    )
+}
+
+/// A `session.analysis` record is pushed alongside `session.summary` when
+/// both sinks are configured — one per ingested transcript, sharing the
+/// same identity (`session_id`/`parent_session_id`) its sibling summary
+/// carries.
+#[test]
+fn a_pass_emits_one_session_analysis_per_ingested_transcript() {
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join("projects");
+    seed(
+        &projects,
+        "uuid-a",
+        &[
+            user_line(
+                "<command-name>/loom:sweep</command-name>\n<command-args>8760</command-args>",
+            ),
+            assistant_line("msg_1", "claude-sonnet-5", "2026-09-18T04:00:00Z", 10, 20),
+        ],
+        &[],
+    );
+
+    let summary_sink = sink_for(home.path());
+    let analysis_sink = analysis_sink_for(home.path());
+    let db = open_db(home.path());
+    let stats = ingest(
+        &db,
+        &IngestOptions {
+            summary_sink: Some(summary_sink),
+            analysis_sink: Some(analysis_sink),
+            ..opts(&projects)
+        },
+    )
+    .unwrap();
+
+    assert_eq!(stats.session_summaries, 1);
+    assert_eq!(stats.session_analyses, 1);
+
+    let envelopes = {
+        use crate::observability::queue::DurableQueue;
+        let queue = DurableQueue::open(home.path().join("analysis-queue.jsonl"), 100);
+        queue.peek_batch(50)
+    };
+    let analyses: Vec<_> = envelopes
+        .iter()
+        .filter_map(|e| match &e.record {
+            crate::telemetry::TelemetryRecord::SessionAnalysis(r) => Some(r.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(analyses.len(), 1);
+    assert_eq!(analyses[0].session_id, "uuid-a");
+    assert_eq!(analyses[0].parent_session_id, None);
+    // A single-call session has no cost of zero (an assistant usage record
+    // exists) and no retry loop.
+    assert!(analyses[0].cost_usd.unwrap() > 0.0);
+    assert_eq!(analyses[0].retry_loops, Vec::new());
+
+    for envelope in &envelopes {
+        assert_eq!(envelope.host_id, "host-test");
+        assert_eq!(envelope.schema_version, 6);
+    }
+}
+
+/// `analysis_sink` and `summary_sink` are independently optional: a config
+/// that only supplies one gets exactly that record kind.
+#[test]
+fn analysis_sink_alone_emits_no_session_summary() {
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join("projects");
+    seed(
+        &projects,
+        "uuid-a",
+        &[assistant_line(
+            "msg_1",
+            "claude-sonnet-5",
+            "2026-09-18T04:00:00Z",
+            10,
+            20,
+        )],
+        &[],
+    );
+
+    let analysis_sink = analysis_sink_for(home.path());
+    let db = open_db(home.path());
+    let stats = ingest(
+        &db,
+        &IngestOptions {
+            analysis_sink: Some(analysis_sink),
+            ..opts(&projects)
+        },
+    )
+    .unwrap();
+
+    assert_eq!(stats.session_analyses, 1);
+    assert_eq!(stats.session_summaries, 0, "no summary_sink was configured");
+    assert!(!home.path().join("queue.jsonl").exists());
+}
+
+/// No analysis sink configured: nothing is queued for `session.analysis`,
+/// independent of `summary_sink`'s own configuration.
+#[test]
+fn without_an_analysis_sink_no_session_analysis_is_emitted() {
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join("projects");
+    seed(
+        &projects,
+        "uuid-a",
+        &[assistant_line(
+            "msg_1",
+            "claude-sonnet-5",
+            "2026-09-18T04:00:00Z",
+            10,
+            20,
+        )],
+        &[],
+    );
+
+    let db = open_db(home.path());
+    let stats = ingest(&db, &opts(&projects)).unwrap();
+    assert_eq!(stats.session_analyses, 0);
+    assert!(!home.path().join("analysis-queue.jsonl").exists());
+}

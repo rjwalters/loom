@@ -16,7 +16,7 @@
 4419 defaults/.claude/commands/loom/architect.md
 9844 defaults/.claude/commands/loom/auditor.md
 5701 defaults/.claude/commands/loom/builder-complexity.md
-12592 defaults/.claude/commands/loom/builder-pr.md
+12820 defaults/.claude/commands/loom/builder-pr.md
 4043 defaults/.claude/commands/loom/builder-worktree.md
 19129 defaults/.claude/commands/loom/builder.md
 4803 defaults/.claude/commands/loom/bump.md

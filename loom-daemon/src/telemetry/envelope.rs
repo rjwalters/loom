@@ -39,6 +39,13 @@ impl TelemetryEnvelope {
                 // envelopes carry 5, so every existing kind's version is
                 // byte-identical to what a pre-#8757 reader expects.
                 TelemetryRecord::SessionSummary(_) => 5,
+                // Issue #8760: two more new record kinds, gated the same
+                // way — only `session.analysis` envelopes carry 6 and only
+                // `daemon.event` envelopes carry 7, so every pre-existing
+                // kind's version is unchanged for a mixed-version fleet's
+                // backend.
+                TelemetryRecord::SessionAnalysis(_) => 6,
+                TelemetryRecord::DaemonEvent(_) => 7,
                 _ => CURRENT_SCHEMA_VERSION,
             },
             emitted_at: Utc::now(),

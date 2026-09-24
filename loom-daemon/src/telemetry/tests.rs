@@ -6,7 +6,9 @@
 use super::*;
 
 mod admission_brake;
+mod daemon_event;
 mod role_tick;
+mod session_analysis;
 mod session_summary;
 mod token_snapshot;
 use role_tick::role_tick_outcome;
@@ -165,11 +167,13 @@ fn host_health() -> TelemetryRecord {
 
 fn every_record() -> Vec<TelemetryRecord> {
     // Per-kind-versioned records (trace.span → 3, sweep.identity → 4,
-    // session.summary → 5) are deliberately absent here — they get their
-    // own round-trip/version coverage in their modules' tests
-    // (`trace/tests.rs`, `tests/role_tick.rs`, `tests/session_summary.rs`)
-    // and would break `fresh_envelope_carries_current_schema_version`,
-    // which asserts the default stamp for every kind in this list.
+    // session.summary → 5, session.analysis → 6, daemon.event → 7) are
+    // deliberately absent here — they get their own round-trip/version
+    // coverage in their modules' tests (`trace/tests.rs`,
+    // `tests/role_tick.rs`, `tests/session_summary.rs`,
+    // `tests/session_analysis.rs`, `tests/daemon_event.rs`) and would break
+    // `fresh_envelope_carries_current_schema_version`, which asserts the
+    // default stamp for every kind in this list.
     vec![
         sweep_started(),
         sweep_phase(),
