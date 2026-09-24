@@ -355,3 +355,126 @@ fn a_dropped_outbound_ad_still_counts_as_advertising() {
     let evals = run_ticks(&mut view, base, 0, 600, true, grace);
     assert!(evals.last().expect("ticks ran").degraded);
 }
+
+// ---- the converse false positive (Issue #8736) ----
+//
+// #8026's idle gate covers THIS host going idle. It deliberately leaves the
+// converse open: this host stays busy (actively advertising, so the #8026
+// gate is wide open and evaluation proceeds), but its *peers* have nothing
+// to advertise — no `Advertise`/`Retract` ever arrives, so `last_received_at`
+// never advances. Byte-for-byte identical, from `received`/`quiet_for`
+// alone, to a genuinely one-way receive path. A peer [`ClaimKind::Heartbeat`]
+// is the one signal an idle peer still emits; these tests cover
+// `evaluate_coordination`'s use of it.
+
+/// **The bug this issue is about.** This host dispatches continuously
+/// (`record_advertised_at` every tick, so #8026's gate stays open the whole
+/// time) for far longer than one grace window, while its peers advertise NO
+/// claims at all — only heartbeats. Coordination must stay healthy
+/// throughout, because the heartbeats prove the peers are alive and simply
+/// have nothing to claim, not that the receive path is dead.
+#[test]
+fn peers_idle_this_host_busy_stays_healthy_via_heartbeats() {
+    let mut view = PeerClaimView::new("robb-studio".into(), Duration::from_secs(1000));
+    let base = Instant::now();
+    let grace = Duration::from_secs(1200);
+
+    let mut t = 0_u64;
+    while t <= 4 * grace.as_secs() {
+        let at = base + Duration::from_secs(t);
+        view.record_advertised_at(at); // this host stays busy the whole time
+        view.observe_heartbeat_at(
+            &ad(ClaimKind::Heartbeat, HEARTBEAT_SENTINEL_ISSUE, "loom", "peer"),
+            at,
+        );
+        let eval = view.evaluate_coordination(at, grace, RECOVERY);
+        assert!(
+            !eval.degraded,
+            "a heartbeating-but-claimless peer must never read as a dead receive path (t={t}s)"
+        );
+        t += REAPER_TICK;
+    }
+    assert!(!view.coordination_degraded());
+}
+
+/// A direct before/after control for the same shape, phrased around the
+/// exact grace-crossing tick: with NO heartbeat, this host degrades exactly
+/// as `coordination_degrades_after_grace_with_zero_receives` proves; with an
+/// in-window heartbeat and nothing else, the identical tick stays healthy.
+#[test]
+fn peers_heartbeating_with_no_claims_still_healthy() {
+    let grace = Duration::from_secs(600);
+    let base = Instant::now();
+
+    // Control: sustained advertising, zero receives, zero heartbeats — the
+    // genuine-break signature, must degrade at the grace boundary.
+    let mut no_heartbeat = PeerClaimView::new("me".into(), Duration::from_secs(1000));
+    let broke = run_ticks(&mut no_heartbeat, base, 0, 600, true, grace);
+    assert!(broke.last().expect("ticks ran").degraded, "the control case must still degrade");
+
+    // Same shape, but a peer heartbeat lands just inside the window and
+    // nothing else ever does — no `Advertise`/`Retract` at all.
+    let mut heartbeating = PeerClaimView::new("me".into(), Duration::from_secs(1000));
+    heartbeating.record_advertised_at(base);
+    heartbeating.observe_heartbeat_at(
+        &ad(ClaimKind::Heartbeat, HEARTBEAT_SENTINEL_ISSUE, "loom", "peer"),
+        base + Duration::from_secs(590),
+    );
+    heartbeating.record_advertised_at(base + Duration::from_secs(600));
+    let eval = heartbeating.evaluate_coordination(base + Duration::from_secs(600), grace, RECOVERY);
+    assert!(
+        !eval.degraded,
+        "a recent heartbeat must move the receive-quiet anchor, same as a genuine receive"
+    );
+    assert!(!eval.transitioned);
+}
+
+/// Bookkeeping isolation: a heartbeat must never inflate `counters.received`
+/// or progress an already-DEGRADED verdict toward recovery — both of those
+/// answer "did a genuine dispatch-claim ad arrive", a stronger bar than
+/// "a peer is alive" (see `observe_heartbeat_at`'s doc comment).
+#[test]
+fn heartbeats_never_count_toward_receive_counter_or_recovery() {
+    let mut view = PeerClaimView::new("me".into(), Duration::from_secs(1000));
+    let base = Instant::now();
+    let grace = Duration::from_secs(600);
+
+    // Trip DEGRADED the ordinary way.
+    view.record_advertised_at(base);
+    view.record_advertised_at(base + Duration::from_secs(600));
+    let eval = view.evaluate_coordination(base + Duration::from_secs(600), grace, RECOVERY);
+    assert!(eval.degraded && eval.transitioned);
+    assert_eq!(view.counters().received, 0);
+
+    // Three heartbeats land while degraded — nowhere near enough to clear
+    // it under the genuine-receive recovery bar, and must not touch the
+    // transport counter either.
+    for t in [610_u64, 620, 630] {
+        view.observe_heartbeat_at(
+            &ad(ClaimKind::Heartbeat, HEARTBEAT_SENTINEL_ISSUE, "loom", "peer"),
+            base + Duration::from_secs(t),
+        );
+    }
+    assert_eq!(
+        view.counters().received,
+        0,
+        "a heartbeat must never inflate the receive counter"
+    );
+    assert_eq!(view.coordination_receives_toward_recovery(), 0);
+    let still_degraded =
+        view.evaluate_coordination(base + Duration::from_secs(640), grace, RECOVERY);
+    assert!(still_degraded.degraded, "heartbeats alone must never clear a DEGRADED verdict");
+    assert!(!still_degraded.transitioned);
+}
+
+/// A self-heartbeat is ignored, mirroring self-claim recognition —
+/// otherwise a daemon could manufacture its own liveness signal.
+#[test]
+fn self_heartbeat_is_ignored() {
+    let mut view = PeerClaimView::new("me".into(), Duration::from_secs(1000));
+    let now = Instant::now();
+    assert!(!view.observe_heartbeat_at(
+        &ad(ClaimKind::Heartbeat, HEARTBEAT_SENTINEL_ISSUE, "loom", "me"),
+        now
+    ));
+}

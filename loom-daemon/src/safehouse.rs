@@ -3768,6 +3768,13 @@ impl InboundEventSink for PeerClaimSink {
                 } else if ad.kind == crate::peer_claims::ClaimKind::Completed {
                     view.observe_completion_at(&ad, now);
                     view.prune_expired_completions(now);
+                } else if ad.kind == crate::peer_claims::ClaimKind::Heartbeat {
+                    // Issue #8736: a liveness ping, folded into its own
+                    // single-purpose field rather than `observe_at`'s
+                    // dispatch-claims map — see `observe_heartbeat_at`'s doc
+                    // comment for why it must never inflate the `#6157`
+                    // transport counters.
+                    view.observe_heartbeat_at(&ad, now);
                 } else {
                     view.observe_at(&ad, now);
                     // Opportunistically prune so a crashed peer's entries do
@@ -4122,3 +4129,10 @@ async fn run_coordination(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+// [`PeerClaimSink`]'s `ClaimKind::Heartbeat` routing (Issue #8736), in its own
+// sibling file rather than `tests` above — that module is at the line-budget
+// ratchet (`scripts/file-size-baseline.txt`).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod heartbeat_tests;
