@@ -1218,11 +1218,9 @@ verify_destination_artifact() {
         err "Post-provision verification FAILED: provisioning reported success but no executable binary was found at the destination ('${dest:-<unknown>}')."
         exit 5
     fi
-    local dest_version
-    dest_version=$("$dest" --version 2>/dev/null || true)
+    local dest_version; dest_version=$("$dest" --version 2>/dev/null || true)
     if [[ "$dest_version" != "$ARTIFACT_VERSION_OUTPUT" ]]; then
-        err "Post-provision verification FAILED: destination binary at $dest reports '${dest_version:-<none>}' but the fetched release artifact reports '$ARTIFACT_VERSION_OUTPUT'."
-        err "Provisioning reported success yet the destination is NOT the freshly-fetched binary — a silent no-op roll. Refusing to report success."
+        err "Post-provision verification FAILED: destination binary at $dest reports '${dest_version:-<none>}' but the fetched release artifact reports '$ARTIFACT_VERSION_OUTPUT' — provisioning reported success yet the destination is NOT the freshly-fetched binary (a silent no-op roll); refusing to report success."
         exit 5
     fi
     ok "Post-provision verification: destination binary at $dest is the fetched release artifact ($dest_version)."
@@ -1247,7 +1245,7 @@ verify_destination_artifact() {
     [[ "$ARTIFACT_SIGNATURE_HAD_AUTHORITY" == "true" ]] || return 0
     command -v codesign >/dev/null 2>&1 || { warn "'codesign' not available -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature)."; return 0; }
 
-    local dest_sig_desc dest_sig_rc=0
+    local dest_sig_desc dest_sig_rc=0 dest_sig_desc_file
     # Bounded (#8770, the shell-side twin of #8754's
     # loom-daemon/src/release_fetch/signature.rs::verify_darwin fix): a
     # contended host can make `codesign -dvvv` hang indefinitely, and this call
@@ -1256,11 +1254,20 @@ verify_destination_artifact() {
     # `timeout(1)`: bounded_run's portable fallback is a real bound there, and
     # it normalizes every implementation's kill to `timeout`'s own rc 124.
     #
-    # Read-then-match (#6662/#7932): NEVER `codesign ... | grep -q`, which is
-    # exactly the pipefail bug this whole check exists to guard against (grep -q
-    # closes the pipe before codesign finishes writing, reporting 141 under
-    # `set -o pipefail`).
-    dest_sig_desc="$(bounded_run "$DEST_SIG_VERIFY_TIMEOUT" codesign -dvvv "$dest" 2>&1)" || dest_sig_rc=$?
+    # Foreground, NOT `$(bounded_run …)` (#8770): bounded_run's portable
+    # fallback kills the child with a background subshell, and inside a
+    # command substitution that killer never reaches the child -- the bound
+    # silently stops being enforced and the call runs for the child's full
+    # lifetime (measured on macOS bash 3.2.57 and bash 5.3: a 2s budget hung
+    # the full 30s in-substitution, bound in 2s foreground). So bounded_run
+    # runs in the function's shell and its report lands in a temp file that
+    # is read back. That also strengthens the read-then-match property below:
+    # codesign now writes to a regular file, so there is no pipe at all left
+    # to SIGPIPE (the class of bug #6662/#7932's `codesign ... | grep -q` hit
+    # under `set -o pipefail`).
+    dest_sig_desc_file="$(mktemp "${TMPDIR:-/tmp}/loom-daemon-destsig.XXXXXX" 2>/dev/null || mktemp)"
+    bounded_run "$DEST_SIG_VERIFY_TIMEOUT" codesign -dvvv "$dest" >"$dest_sig_desc_file" 2>&1; dest_sig_rc=$?
+    dest_sig_desc="$(cat "$dest_sig_desc_file" 2>/dev/null)"; rm -f "$dest_sig_desc_file"
     # #8770: an empty report -- whether from a deadline-killed invocation
     # (rc 124), or any other codesign failure that produced no diagnostic text
     # at all -- is "we could not check", NOT "we checked and it's bad".
