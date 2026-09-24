@@ -100,6 +100,25 @@ box; `superset start --daemon --org noc0`):
   noc0` (one line, seconds) before expecting the host back in
   `superset hosts list`
 
+## Subagent fan-out (concurrent tasks on one box)
+
+Proven pattern (first use 2026-07-23: #8649 + #8793 in parallel):
+
+- one task = its own checkout + its own box dir `build/<issue>/`, never
+  sharing a `target/` outside the shared one
+- `CARGO_TARGET_DIR=/home/ubuntu/shared/target` for every task build: the
+  dir is seeded from a warm loom `target/` (11 GB); dependency crates
+  (~95% of a cold build) are path-independent and come back warm, only the
+  loom crates rebuild per path → first build of a new task ≈ minutes, not
+  the 10–15 of a cold tree. Re-seed after the source tree is evergreen:
+  `cp -a <warm-checkout>/target /home/ubuntu/shared/target`
+- concurrent agents serialize on cargo's build lock in the shared dir —
+  expected, not a failure; heavy repro loops (e.g. #8793-style load tests)
+  should be coordinated so they don't starve each other
+- agents never re-provision: the pinned alias is the only entry. If ssh
+  fails (idle-stop), they STOP and report — a stopped box needs
+  `repo-remote up --yes` + a re-seed check + `superset start` before use
+
 ## What stays local
 
 Edits, `rg`, design/ADR work, `git` metadata (commit, log, diff review),
