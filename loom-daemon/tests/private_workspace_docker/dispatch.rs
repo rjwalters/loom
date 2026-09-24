@@ -1,5 +1,6 @@
 //! Synthetic Codex CLI drives the real adapters; Git and Docker are real.
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 
 struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -248,6 +249,24 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     .unwrap_err();
     assert!(rejected.to_string().contains("capabilit"), "{rejected}");
     assert!(!root.join(".loom/locks/issue-8786").exists());
+    // A read-only synthetic profile must fail before any role/model launch.
+    // Restore its original owner-only mode before asserting or continuing.
+    let profile = f.root.path().join("profiles").join(name);
+    std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let inaccessible = loom_daemon::tokens_pool::private_workspace::dispatch::Selection::prepare(
+        &root,
+        "codex",
+        None,
+        loom_daemon::tokens_pool::private_workspace::JobKind::Role,
+        None,
+        "fixture-inaccessible",
+    )
+    .err();
+    std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(inaccessible
+        .unwrap()
+        .to_string()
+        .contains("profile is not readable and writable"));
     use loom_daemon::role_runner::RoleInvocationRunner;
     let mut runner = loom_daemon::role_runner::ScriptRoleInvocationRunner::new(root.clone())
         .with_timeout(Duration::from_secs(30));

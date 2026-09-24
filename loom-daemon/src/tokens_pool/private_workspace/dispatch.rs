@@ -162,13 +162,7 @@ impl Selection {
         lease.begin(&job)?;
         // The issue helper owns creation of its worktree/branch in the clone.
         job.base_revision = docker::prepare(&config, id, None)?;
-        docker::command(&[
-            "exec",
-            &config.container,
-            "loom-daemon",
-            "private-workspace",
-            "setup",
-        ])?;
+        docker::setup(&config)?;
         lease.begin(&job)?;
         let record = export::record_prepared(root, &config, &job)?;
         selection.prepared = Some(Prepared {

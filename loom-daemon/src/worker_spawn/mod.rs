@@ -161,28 +161,6 @@ fn codex_adapter_model(args: &[std::ffi::OsString]) -> Option<String> {
     model
 }
 
-#[cfg(test)]
-mod codex_adapter_tests {
-    #[test]
-    fn selection_reads_model_without_rejecting_legacy_arguments() {
-        for args in [
-            vec!["-m", "gpt-5", "--json"],
-            vec!["--model=gpt-5", "--unknown=literal"],
-            vec![
-                "--model", "old", "-m=gpt-5", "--prompt", "--model", "ignored",
-            ],
-            vec!["--model=gpt-5", "--config", "--model", "ignored"],
-            vec!["--model=gpt-5", "--", "--model=ignored"],
-        ] {
-            let args = args
-                .into_iter()
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>();
-            assert_eq!(super::codex_adapter_model(&args).as_deref(), Some("gpt-5"));
-        }
-    }
-}
-
 /// Native sweep workers authenticate through their harness, not Claude's pool.
 pub fn uses_native_sweep(root: &Path) -> bool {
     crate::runtime_admission::resolve_binding(root, "sweep-lifecycle", None)
@@ -597,4 +575,26 @@ pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
         std::process::exit(error.code);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod codex_adapter_tests {
+    #[test]
+    fn selection_reads_model_without_rejecting_legacy_arguments() {
+        for args in [
+            vec!["-m", "gpt-5", "--json"],
+            vec!["--model=gpt-5", "--unknown=literal"],
+            vec![
+                "--model", "old", "-m=gpt-5", "--prompt", "--model", "ignored",
+            ],
+            vec!["--model=gpt-5", "--config", "--model", "ignored"],
+            vec!["--model=gpt-5", "--", "--model=ignored"],
+        ] {
+            let args = args
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            assert_eq!(super::codex_adapter_model(&args).as_deref(), Some("gpt-5"));
+        }
+    }
 }

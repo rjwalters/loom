@@ -1,7 +1,46 @@
 use super::*;
 use std::process::Command;
 
-pub(super) fn setup() -> Result<()> {
+/// Only fixed status codes cross the Docker boundary. TOML/hook diagnostics
+/// can contain operator configuration and must never be copied to host logs.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum SetupStatus {
+    Ready,
+    ProfileInaccessible,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SetupReport {
+    pub protocol: String,
+    pub status: SetupStatus,
+}
+
+pub(super) fn report() -> SetupReport {
+    let accessible = || -> std::io::Result<()> {
+        std::fs::read_dir(PROFILE)?;
+        std::fs::File::open(Path::new(PROFILE).join("auth.json"))?;
+        // This process owns the account lease. Prove effective access without
+        // changing ownership, modes, or any operator configuration.
+        let _probe = tempfile::NamedTempFile::new_in(PROFILE)?;
+        Ok(())
+    };
+    let status = if accessible().is_err() {
+        SetupStatus::ProfileInaccessible
+    } else if setup().is_ok() {
+        SetupStatus::Ready
+    } else {
+        SetupStatus::Failed
+    };
+    SetupReport {
+        protocol: PROTOCOL.into(),
+        status,
+    }
+}
+
+fn setup() -> Result<()> {
     let repo = Path::new(REPO);
     if repo.canonicalize()? != repo || !repo.join(".git").is_dir() {
         bail!("private setup requires the owned clone");

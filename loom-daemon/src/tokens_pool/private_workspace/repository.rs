@@ -58,7 +58,7 @@ impl WorkerCommand {
     pub fn run(self) -> Result<()> {
         match self {
             Self::Protocol => println!("{PROTOCOL}"),
-            Self::Setup => worker_setup::setup()?,
+            Self::Setup => println!("{}", serde_json::to_string(&worker_setup::report())?),
             Self::Snapshot { issue } => {
                 println!("{}", serde_json::to_string(&export::snapshot(issue)?)?)
             }
