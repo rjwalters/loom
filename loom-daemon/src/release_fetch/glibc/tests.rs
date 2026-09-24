@@ -48,14 +48,25 @@ fn with_fake_bin<F: FnOnce()>(bindir: &Path, f: F) {
     std::env::set_var("PATH", old);
 }
 
-/// An empty-`PATH` sandbox: routes lookups only through `bindir` plus the
-/// bare minimum `bash` needs to run at all, so a probe for a tool NOT in
-/// `bindir` genuinely fails rather than finding the real one on the host.
+/// Puts `bindir` first on a minimal `PATH` (`bindir:/usr/bin:/bin`).
+///
+/// NOTE: this is NOT a sandbox. `/usr/bin:/bin` must stay on `PATH` because
+/// every fake script is `#!/usr/bin/env bash`, which resolves `bash` via
+/// `PATH` -- so the host's REAL `ldd`/`getconf` remain reachable. A test that
+/// needs a tool to be "unavailable" must shadow it in `bindir` with a fake
+/// that fails (see [`fake_unavailable`]), never rely on omission; omission
+/// makes the outcome depend on the host's own glibc (#8843 CI failure).
 fn with_only(bindir: &Path, f: impl FnOnce()) {
     let old = std::env::var("PATH").unwrap_or_default();
     std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bindir.display()));
     f();
     std::env::set_var("PATH", old);
+}
+
+/// Shadows `name` with a fake that exits non-zero without output, so the
+/// probe for it genuinely fails regardless of what the host has installed.
+fn fake_unavailable(dir: &Path, name: &str) {
+    write_script(dir, name, "exit 1\n");
 }
 
 fn fake_target_bin(dir: &Path) -> std::path::PathBuf {
@@ -87,7 +98,9 @@ fn non_gnu_target_is_a_silent_noop() {
 fn missing_objdump_is_a_loud_skip_not_a_block() {
     let dir = tempdir();
     let bin = fake_target_bin(&dir);
-    let empty_bin_dir = tempdir(); // deliberately no objdump, ldd, or getconf here
+    let empty_bin_dir = tempdir();
+    // Shadow the host's real objdump (`with_only` keeps /usr/bin on PATH).
+    fake_unavailable(&empty_bin_dir, "objdump");
     let mut result = None;
     with_only(&empty_bin_dir, || {
         result = Some(check(&bin, "x86_64-unknown-linux-gnu"));
@@ -138,8 +151,8 @@ fn missing_ldd_and_getconf_is_a_loud_skip_not_a_block() {
     // forced explicitly here, by shadowing both with fakes that fail, rather
     // than by omission (there is no PATH on a real Linux host that lacks
     // them both).
-    write_script(&fakebin, "ldd", "exit 1\n");
-    write_script(&fakebin, "getconf", "exit 1\n");
+    fake_unavailable(&fakebin, "ldd");
+    fake_unavailable(&fakebin, "getconf");
     let mut result = None;
     with_only(&fakebin, || {
         result = Some(check(&bin, "x86_64-unknown-linux-gnu"));
@@ -239,6 +252,11 @@ fn falls_back_to_getconf_when_ldd_is_unavailable() {
     let bin = fake_target_bin(&dir);
     let fakebin = tempdir();
     fake_objdump(&fakebin, &["GLIBC_2.39"]);
+    // `ldd` must be made unavailable EXPLICITLY: `with_only` keeps
+    // `/usr/bin:/bin` on PATH, so omitting it would resolve the host's real
+    // `ldd` and the getconf fallback would never run -- the verdict would
+    // then depend on the CI runner's glibc (2.39 on ubuntu-24.04 => `Ok`).
+    fake_unavailable(&fakebin, "ldd");
     write_script(&fakebin, "getconf", "echo 'glibc 2.35'\nexit 0\n");
 
     let mut result = None;

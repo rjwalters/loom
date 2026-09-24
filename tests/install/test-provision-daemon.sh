@@ -1212,7 +1212,7 @@ make_fake_bin "$SRC42_GOOD" "0.19.330"
 make_unloadable_bin "$SRC42_BAD"
 DEST42="$WORKDIR/dest42"
 
-out42_first=$(LOOM_DAEMON_BIN_DIR="$DEST42" provision_machine_daemon "$SRC42_GOOD" 2>&1)
+_out42_first=$(LOOM_DAEMON_BIN_DIR="$DEST42" provision_machine_daemon "$SRC42_GOOD" 2>&1)
 rc42_first=$?
 assert_eq "unloadable upgrade: the good first install returns 0" "0" "$rc42_first"
 
@@ -1235,6 +1235,8 @@ make_unloadable_bin "$SRC43_BAD2"
 out43=$(LOOM_DAEMON_BIN_DIR="$DEST42" provision_machine_daemon "$SRC43_BAD2" 2>&1)
 rc43=$?
 assert_eq "second same-day quarantine: provision still returns 1" "1" "$rc43"
+assert_contains "second same-day quarantine: reports the quarantine move" "$out43" "quarantined unloadable binary"
+assert_contains "second same-day quarantine: reports the restore" "$out43" "restored the previous working binary"
 assert_eq "second same-day quarantine: TWO quarantined copies now exist (neither clobbered)" "2" \
   "$(find "$DEST42" -maxdepth 1 -name 'loom-daemon.badglibc-*' 2>/dev/null | wc -l | tr -d ' ')"
 assert_eq "second same-day quarantine: restored binary still reports the working version" \
