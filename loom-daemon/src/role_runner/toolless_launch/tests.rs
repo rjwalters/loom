@@ -47,6 +47,7 @@ fn resolved(runtime: &str) -> ResolvedRuntime {
         role_manifest: PathBuf::from("/nonexistent/judge.json"),
         runtime_manifest: PathBuf::from("/nonexistent/runtime.json"),
         suggested_worker_type: None,
+        execution: None,
     }
 }
 

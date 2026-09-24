@@ -16,8 +16,19 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
                 .map(|n| n.to_string_lossy().into_owned())
         })
     });
+    // An inherited private lease means the daemon admitted this launch for a
+    // private clone (possibly on containment evidence, #8787, with the host
+    // hook preflight deferred to the worker). It must never degrade into an
+    // ordinary shared-session exec.
+    let leased = std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_some();
+    let host = |args| {
+        if leased {
+            bail!("private lease was inherited but this session is not a configured private clone; refusing a non-private launch");
+        }
+        crate::session_exec::run_host(args)
+    };
     let (Some(root), Some(name)) = (root, name) else {
-        return crate::session_exec::run_host(args);
+        return host(args);
     };
     let private_profile = std::env::var_os("CODEX_HOME")
         .or_else(|| std::env::var_os("LOOM_CODEX_HOME"))
@@ -25,10 +36,10 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
     if private_profile.as_ref().is_some_and(|profile| {
         state_dir(profile).is_ok_and(|dir| !dir.join("workspace.json").exists())
     }) {
-        return crate::session_exec::run_host(args);
+        return host(args);
     }
     if !configured(&root, &name)? {
-        return crate::session_exec::run_host(args);
+        return host(args);
     }
     let (config, dir) = lifecycle::resolve(&root, &name)?;
     let selection = if std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none() {
@@ -62,6 +73,7 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
     }
     args.container = job.container_id.clone();
     args.workdir = REPO.into();
+    let args_env = args.env.clone();
     args.env = child_env(&args.env, &config, &job)?;
     // Resolve hooks on the worker, using its private installed bridge. Never
     // bless hook trust or enable a capability that the manifest rejects.
@@ -102,17 +114,34 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
         Ok(_) => "failed",
         Err(_) => "recovery-required",
     };
-    export::update(&root, &config, &job, outcome)?;
     let after = docker::inspect(&config.container)?;
+    let same = after.as_ref().is_some_and(|s| s["Id"] == job.container_id);
+    // A mutable session could have edited the (writable) clone's guard bundle,
+    // hook wiring or trust. Re-verify after it exits so such a change is never
+    // silent: the job is marked and its lease retained for operator recovery,
+    // and the next admission refuses until the bundle is restored (#8787).
+    if same && containment::mutable(&role_of(&args_env)) {
+        if let Err(error) = docker::verify_policy(&job.container_id, &job.base_revision) {
+            export::update(&root, &config, &job, "policy-violated")?;
+            bail!("private session changed its enforcement after launch; lease retained: {error}");
+        }
+    }
+    export::update(&root, &config, &job, outcome)?;
     // Missing transport acknowledgements retain the durable lease even when
     // the host process exits. A later admission must prove the old worker idle.
-    if result.is_ok()
-        && after.as_ref().is_some_and(|s| s["Id"] == job.container_id)
-        && docker::idle(after.as_ref(), &config.container)?
-    {
+    if result.is_ok() && same && docker::idle(after.as_ref(), &config.container)? {
         lease.finish()?;
     }
     result
+}
+
+/// The role the worker will see: only the forwarded value reaches `execute`,
+/// so the post-session check keys on exactly the same one.
+fn role_of(env: &[String]) -> String {
+    env.iter()
+        .find_map(|item| item.strip_prefix("LOOM_ROLE="))
+        .map(str::to_owned)
+        .unwrap_or_default()
 }
 
 fn child_env(input: &[String], config: &Config, job: &lease::Job) -> Result<Vec<String>> {
@@ -148,6 +177,9 @@ fn child_env(input: &[String], config: &Config, job: &lease::Job) -> Result<Vec<
     if let Some(issue) = job.issue {
         env.push(format!("LOOM_PRIVATE_ISSUE={issue}"));
     }
+    // Host-owned identity of the bound job, re-checked by the worker (#8787).
+    env.push(format!("LOOM_PRIVATE_CONTAINER_ID={}", job.container_id));
+    env.push(format!("LOOM_PRIVATE_BASE_REVISION={}", job.base_revision));
     for name in FORGE_ENV {
         if std::env::var_os(name).is_some() {
             env.push(name.into());
@@ -196,6 +228,12 @@ mod tests {
         .unwrap();
         assert!(env.contains(&"LOOM_WORKSPACE=/workspace/repo".into()));
         assert!(env.contains(&"LOOM_ROLE=guide".into()));
+        // The bound job identity the worker re-checks comes from the host
+        // lease, never from caller-supplied environment (#8787).
+        assert!(env.contains(&format!("LOOM_PRIVATE_CONTAINER_ID={}", "a".repeat(64))));
+        assert!(env.contains(&"LOOM_PRIVATE_BASE_REVISION=".to_string()));
+        assert_eq!(role_of(&["LOOM_ROLE=builder".into()]), "builder");
+        assert_eq!(role_of(&["LOOM_ROLE_X=builder".into()]), "");
         assert!(!env
             .iter()
             .any(|v| v.contains("/host/") || v.starts_with("LOOM_RUN_JOB")));

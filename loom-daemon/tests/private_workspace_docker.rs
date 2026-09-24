@@ -7,6 +7,8 @@ use std::time::Duration;
 
 #[path = "private_workspace_docker/auth.rs"]
 mod auth;
+#[path = "private_workspace_docker/containment.rs"]
+mod containment;
 #[path = "private_workspace_docker/dispatch.rs"]
 mod dispatch;
 

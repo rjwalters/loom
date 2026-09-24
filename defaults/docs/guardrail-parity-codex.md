@@ -34,6 +34,7 @@ Read this before dispatching a Codex worker at anything you care about.
 - [Residual gaps](#residual-gaps)
 - [Admission checklist (contract point 5/6)](#admission-checklist-contract-point-56)
 - [Promotion gate (`hooks` / `worktreeIsolation`)](#promotion-gate-hooks--worktreeisolation)
+- [Private-clone containment admission (issue #8787)](#private-clone-containment-admission-issue-8787)
 - [CODEX_HOME profile layout, refresh, and security posture](#codex_home-profile-layout-refresh-and-security-posture)
 - [References](#references)
 <!-- toc:end -->
@@ -377,8 +378,16 @@ is reinstalled and re-trusted.
 `spawn-codex.sh` emits one audit line per spawn:
 
 ```text
-spawn-codex: hooks=<ready|not-ready|unavailable> role=<name> mutable=<bool> trust-bypass=never reason="…"
+spawn-codex: hooks=<ready|not-ready|unavailable|deferred-to-private-clone> role=<name> mutable=<bool> trust-bypass=never reason="…"
 ```
+
+`deferred-to-private-clone` (issue #8787) appears only for a launch that
+inherited a private account lease and runs through session-exec: the managed
+hook lives inside the private clone, so readiness is proven there — the
+transport refuses any non-private fallback and the worker refuses a mutable
+role before Codex starts unless the in-clone hook is installed, trusted and
+byte-identical to the base revision. See
+[Private-clone containment admission](#private-clone-containment-admission-issue-8787).
 
 - **Mutable roles (`builder`, `doctor`, and their aliases)** exit **78 before the
   CLI starts** unless `hooks=ready`. Missing, stale, wrong-version, untrusted,
@@ -628,7 +637,9 @@ Known, documented, and accepted for tier-2. None is silent.
 `defaults/runtimes/codex.json` keeps `hooks: partial` and
 `worktreeIsolation: partial`, so `check-runtime-capabilities.sh` (and the
 daemon's `runtime_admission`) continue to reject **Builder + Codex** and
-**Doctor + Codex** with exit 78. `defaults/roles/doctor.json` now declares the
+**Doctor + Codex** with exit 78. Verified private-clone containment (issue
+#8787) is an execution-specific admission, not this promotion: it leaves both
+values `partial` and records its own provenance. `defaults/roles/doctor.json` now declares the
 same `runtimeRequirements` as Builder (`worktreeIsolation`, `mcp`), so Doctor
 fails closed for the same reason instead of slipping through unconstrained.
 
@@ -673,6 +684,95 @@ When items 1–3 are satisfied, promote **only** the capabilities the evidence
 proves, append the evidence links to this document, and leave `mcp`,
 `subagents`, and `skills` untouched. `subagents` stays `no` regardless — native
 Codex agents remain prohibited (gap 9).
+
+## Private-clone containment admission (issue #8787)
+
+An account-private clone (`loom-daemon accounts session start NAME
+--private-clone URL`, see `defaults/docs/private-session-dispatch.md`)
+is a **different, execution-specific** form of repository isolation from the
+native per-worktree confinement this document tracks. For one launch whose
+account, container, mounts, private Git root and exclusive job lease are
+verified, `runtime_admission` may treat that clone as satisfying the single
+requirement `worktreeIsolation`, and **only** that one. Builder, Doctor and full
+sweeps (`sweep-lifecycle`) can therefore run on Codex inside a verified private
+clone; every other role requirement is still checked against the manifest, and
+read-oriented roles are unaffected.
+
+This is **not** a capability promotion. `defaults/runtimes/codex.json` keeps
+`hooks: partial` and `worktreeIsolation: partial`; host, host-repository-mounted,
+shared-Git, shared-account and unverifiable sessions are refused exactly as
+before (`check-runtime-capabilities.sh` still exits 78 for Builder + Codex). An
+admission that used containment carries `execution` provenance
+(`mode=private-clone satisfied=worktreeIsolation native=hooks=partial,worktreeIsolation=partial
+policy=managed-hooks-trusted+guard-bundle-at-base …`) in the daemon log, the
+worker's `# LOOM_RUNTIME_CONTAINMENT` stderr marker and
+`loom-daemon accounts session status NAME --json` (`admission`), so it is never
+mistaken for native hook parity.
+
+### Obligation → mechanism
+
+Containment replaces only the filesystem-isolation obligation. Everything the
+managed hook bridge enforces is still enforced by the bridge, now verified
+inside the clone:
+
+| Obligation | Mechanism (all fail closed) |
+|---|---|
+| Host, sibling and peer repository isolation | `docker::validate` of the bound container **by ID**: read-only root, all capabilities dropped, `no-new-privileges`, UID 1000, exactly the private named volume + external profile (+ optional read-only gh config) mounted, no host workspace or runtime socket; volume/profile attached to no other container; independent clone with no alternates. Re-checked when the proof is built, again by the transport immediately before exec, and by the worker. |
+| Exclusive writer, stale-context refusal | The owned account lease (flock descriptor inherited by the transport, durable `job.json` with container ID and base revision). The worker re-checks the host-supplied container ID and base revision against the clone's `identity.json`, the container hostname and the read-only root. A busy lease, replaced/renamed container, peer attachment, changed mount or stale identity refuses before Codex starts. |
+| Protected remote operations (force-push, protected-branch deletion) | The managed `pre_tool_use` bridge's destructive-command policy (`guard-destructive.sh`), required **installed for `/workspace/repo` and trusted by the profile** (`provision-codex-hooks.sh verify`, run inside the clone) before a mutable role is admitted. Docker/network isolation is not a substitute: the worker holds a live forge credential. Forge-side branch protection remains the backstop. |
+| Loom lifecycle controls (merge helper, label/registry mutation, host control) | The bridge's `guard-loom-workflow.sh` (same readiness requirement), plus the existing private-v1 refusals: `run-job` host/SSH/Docker executors, MCP servers/plugins/alternate profiles, host path/remote-executor CLI selectors, and no forwarded daemon socket or executor environment. |
+| Credential boundary | The external per-account profile and narrow forge environment are forwarded by name only; worker output crossing the boundary is fixed status codes; exported records and provenance carry account names, never credentials. Containment does **not** make the selected account's credentials or forge access harmless. |
+| Control/guard integrity | The clone is worker-writable, so before admission, at launch and after the session the worker proves the guard bundle — the canonical hook directory, the guard libraries it sources, the hook provisioner, and every repository config layer (`.loom/config.json`, `.loom-project/project.json`, `.loom-local/local.json`) — is byte-identical to the base revision with no untracked additions, comparing file contents against hash-verified tree objects (so `assume-unchanged`, replace refs, fsmonitor and symlinks cannot hide an edit). A change refuses admission; a change detected after a session marks the job `policy-violated` and retains its lease for operator recovery. |
+| Secondary mutation channels | Shell, patch and helper calls all pass through the same bridge; `write_stdin` stays denied outright (gap 12); no additional executor is introduced. |
+
+### Supported combination
+
+| Component | Version / identity |
+|---|---|
+| Private transport protocol | `loom-private-workspace-v1` |
+| Session image Codex CLI | `0.149.1` (`docker/session/Dockerfile`, floor `0.146.0`) |
+| Bridge wire schema | pinned to `0.146.0` (`deny`-only responses) — the CLI floor is a version check, **not** evidence the `0.149.1` hook wire is unchanged; the live canary must confirm it |
+| Worker endpoints | the session image's own `loom-daemon private-workspace setup`, `verify-policy` and `execute`; an image without `verify-policy` fails closed ("update the session image") |
+
+### Evidence and its limits
+
+CI evidence: shared Rust admission tests (Builder/Doctor/sweep-lifecycle,
+unchanged read roles, an additional unmet capability, missing proof, explicit
+Codex refusal without fall-through, Claude → verified Codex → backstop
+selection), worker-side guard-integrity tests on disposable Git fixtures, the
+adapter boundary test (host hook preflight relocated only for a leased private
+session), and the `private_workspace_docker` fixture: untrusted hook, peer
+attachment, busy lease, guard mutation and stale identity between preparation
+and launch are refused; the allowed path edits, commits and pushes an issue
+branch through the real adapters while the installed bridge denies force-push,
+merge, `write_stdin` and base-checkout patches, with the forge's `main`
+unchanged. That fixture simulates the operator's one-time trust step and uses a
+synthetic Codex CLI, so it is **not** the production go/no-go: live
+daemon-dispatched lifecycle evidence remains #4496.
+
+Remaining limitations:
+
+- Guard integrity is proven before admission, at launch and after the session,
+  not continuously. The bridge itself confines patch and Bash writes to the
+  issue worktree, but an edit that evades those policies mid-session would
+  affect later tool calls of that session and be detected (not prevented) when
+  it ends.
+- Trust remains the profile-level baseline-diff signal (gap 11); a hook killed
+  by `SIGKILL` is silence, which Codex reads as allow (gap 14); matcher
+  semantics are unverified on a live CLI (gap 13).
+- Whether Codex reloads `hooks.json`/`config.toml` mid-session is unverified; a
+  removed or untrusted hook is detected after the session and refused at the
+  next admission.
+- Network egress is not restricted by containment.
+
+### Rollback
+
+Nothing global changes, so rollback is configuration only: pin the role or
+sweep back to the prior runtime (`runtimes.roles.builder` / `runtimes.roles.sweep-lifecycle = "claude"`, an
+explicit dispatch runtime, or remove `codex` from `runtimes.preference`), or
+stop using the private session for the account. Without a verified private
+clone, Codex Builder/Doctor/sweep admission is refused exactly as it was before
+#8787.
 
 ## CODEX_HOME profile layout, refresh, and security posture
 

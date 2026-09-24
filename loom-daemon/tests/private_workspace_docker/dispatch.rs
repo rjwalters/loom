@@ -3,9 +3,9 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 
-struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+pub(super) struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
 impl Environment {
-    fn set(values: &[(&'static str, Option<std::ffi::OsString>)]) -> Self {
+    pub(super) fn set(values: &[(&'static str, Option<std::ffi::OsString>)]) -> Self {
         let old = values
             .iter()
             .map(|(key, value)| {
@@ -66,6 +66,32 @@ if [[ "$*" == *retain* ]]; then
   sleep 30
   exit 0
 fi
+if [[ "$*" == *guarded* ]]; then
+  # Emulate Codex consulting its installed pre_tool_use hook (#8787): the
+  # command comes from the profile's managed hooks.json, unmodified.
+  test "${LOOM_ROLE:-}" = builder
+  test -n "${LOOM_PRIVATE_CONTAINER_ID:-}"
+  hook="$(jq -r '[.hooks.PreToolUse[].hooks[].command | select(contains("guard-codex-bridge.sh"))][0]' "$CODEX_HOME/hooks.json")"
+  test -n "$hook" && test "$hook" != null
+  wt=/workspace/repo/.loom/worktrees/issue-8787
+  git worktree add -b feature/issue-8787 "$wt" HEAD
+  printf '# Loom-managed worktree marker\n' > "$wt/.loom-managed"
+  decide() {
+    jq -nc --arg t "$1" --argjson i "$2" --arg c "$wt" '{hook_event_name:"PreToolUse",session_id:"11111111-2222-3333-4444-555555555555",transcript_path:null,turn_id:"turn-1",tool_use_id:"call-1",model:"fixture",permission_mode:"default",agent_id:"agent-1",agent_type:"primary",cwd:$c,tool_name:$t,tool_input:$i}' \
+      | sh -c "$hook" | jq -rs 'if length == 0 then "allow" else .[0].hookSpecificOutput.permissionDecision end'
+  }
+  test "$(decide shell '{"command":["bash","-lc","git push --force origin main"]}')" = deny
+  test "$(decide shell '{"command":["bash","-lc","gh pr merge 1 --squash"]}')" = deny
+  test "$(decide write_stdin '{"session_id":1,"chars":"true\\n"}')" = deny
+  test "$(decide apply_patch "$(jq -nc '{input:"*** Begin Patch\n*** Update File: /workspace/repo/file\n@@\n-base\n+tampered\n*** End Patch"}')")" = deny
+  test "$(decide apply_patch "$(jq -nc --arg p "$wt/change.txt" '{input:("*** Begin Patch\n*** Add File: " + $p + "\n+issue change\n*** End Patch")}')")" = allow
+  echo 'issue change' > "$wt/change.txt"
+  git -C "$wt" add change.txt
+  git -C "$wt" commit -m 'fixture guarded change'
+  git -C "$wt" push -u origin feature/issue-8787
+  echo fixture-guarded-complete
+  exit 0
+fi
 if [[ "$*" == *mutate* ]]; then
   git switch -c feature/issue-8786
   echo 'private issue mutation' > mutation.txt
@@ -99,7 +125,7 @@ sys.exit(1)
 "#;
 
 impl Fixture {
-    fn adapter(&self, name: &str, prompt: &str) -> Command {
+    pub(super) fn adapter(&self, name: &str, prompt: &str) -> Command {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -231,8 +257,10 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         .unwrap()
         .is_none());
     }
-    // Production admission remains deliberately closed until #8787. No fixture
-    // manifest is promoted and no synthetic hook-trust receipt is installed.
+    // #8787: containment is attempted for the sweep (Builder requirements) but
+    // refused before any claim: the managed hook installed in the clone has
+    // not been trusted, so the remote-operation/lifecycle obligations remain
+    // unproven. No manifest is promoted and no trust is fabricated here.
     let mut config = loom_daemon::sweep_registry::SweepRegistryConfig::new(root.clone());
     config.journal_path = Some(root.join("sweeps.json"));
     let registry = std::sync::Arc::new(std::sync::Mutex::new(
@@ -248,6 +276,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     )
     .unwrap_err();
     assert!(rejected.to_string().contains("capabilit"), "{rejected}");
+    assert!(rejected.to_string().contains("pre_tool_use hook"), "{rejected}");
     assert!(!root.join(".loom/locks/issue-8786").exists());
     // A read-only synthetic profile must fail before any role/model launch.
     // Restore its original owner-only mode before asserting or continuing.

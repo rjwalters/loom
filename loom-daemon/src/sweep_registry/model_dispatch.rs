@@ -18,6 +18,19 @@ impl DispatchModel<'_> {
         kind: &SweepKind,
         admitted: Option<&crate::runtime_admission::ResolvedRuntime>,
     ) -> Option<String> {
+        self.resolve_for_runtime(config, kind, admitted.map(|a| a.runtime.as_str()))
+    }
+
+    /// [`Self::resolve`] keyed on the admitted runtime's NAME — the only part
+    /// of the admission it reads. Private-clone containment (#8787) needs the
+    /// model before its own admission completes (account selection is
+    /// model-aware), and must resolve it exactly as the launch will.
+    pub(crate) fn resolve_for_runtime(
+        self,
+        config: &SweepRegistryConfig,
+        kind: &SweepKind,
+        admitted: Option<&str>,
+    ) -> Option<String> {
         if let Self::Resolved(model) = self {
             return model.map(str::to_owned);
         }
@@ -32,10 +45,8 @@ impl DispatchModel<'_> {
         // it is also the one place a `runtimes.default`/env override applied
         // between admission and this resolve() can't disagree with what
         // actually launched.
-        let policy = admitted.map_or_else(
-            || DefaultModelPolicy::resolve(root),
-            |admitted| DefaultModelPolicy::for_runtime(&admitted.runtime),
-        );
+        let policy = admitted
+            .map_or_else(|| DefaultModelPolicy::resolve(root), DefaultModelPolicy::for_runtime);
         let resolved = match (self, kind) {
             (Self::Request(None) | Self::Autonomous { .. }, SweepKind::Issue(issue)) => {
                 resolve_autonomous_model_for_runtime(
@@ -76,7 +87,7 @@ impl DispatchModel<'_> {
         };
         log::info!(
             "sweep dispatch: attempting {kind:?} runtime={} model={} (source={}) arm={:?}",
-            admitted.map_or("fixture", |a| a.runtime.as_str()),
+            admitted.unwrap_or("fixture"),
             resolved.model,
             resolved.source_label,
             resolved.arm,

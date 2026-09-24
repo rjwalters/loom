@@ -96,8 +96,30 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
     }
     control::audit()?;
     control::audit_args(&command)?;
+    // The transport binds these from the host-owned lease after re-validating
+    // the container by ID; a missing or stale value fails closed (#8787).
+    let container_id = std::env::var("LOOM_PRIVATE_CONTAINER_ID").unwrap_or_default();
+    let revision = std::env::var("LOOM_PRIVATE_BASE_REVISION").unwrap_or_default();
+    containment::evidence(&container_id, &revision).map_err(|_| {
+        anyhow::anyhow!("{}", containment::PolicyStatus::ContextInvalid.obligation())
+    })?;
     let role = std::env::var("LOOM_ROLE").unwrap_or_default();
-    if !role.is_empty() {
+    if containment::mutable(&role) {
+        // Mutable roles need the verified clone AND the managed policy bridge
+        // (trusted, byte-identical to the base revision). Containment satisfies
+        // only repository isolation; every other requirement is still checked.
+        let account = std::env::var("LOOM_ACCOUNT_NAME").unwrap_or_default();
+        let proof = containment::in_container_proof(&account, &container_id, &revision)?;
+        let admitted = containment::admit_with(Path::new(REPO), &role, Some("codex"), &proof)
+            .map_err(|e| anyhow::anyhow!(e.diagnostic()))?;
+        if let Some(execution) = &admitted.execution {
+            eprintln!(
+                "{}{}",
+                crate::runtime_admission::CONTAINMENT_LOG_MARKER,
+                execution.summary()
+            );
+        }
+    } else if !role.is_empty() {
         crate::runtime_admission::resolve_and_admit(Path::new(REPO), &role, Some("codex"))
             .map_err(|e| anyhow::anyhow!(e.diagnostic()))?;
     }

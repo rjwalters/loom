@@ -870,7 +870,16 @@ _hook_provisioner="${_SCRIPT_DIR}/provision-codex-hooks.sh"
 _hook_status="unknown"
 _hook_reason=""
 
-if [[ ! -x "$_hook_provisioner" && ! -r "$_hook_provisioner" ]]; then
+if [[ -n "${LOOM_PRIVATE_LEASE_FD:-}" && "$CODEX_SESSION_EXEC" == "true" ]]; then
+    # Private clone (issue #8787): the managed hook is installed for
+    # /workspace/repo INSIDE the account's session, so verifying it here
+    # against the host $WORKSPACE would check the wrong bridge. This is a
+    # relocation, not a skip: `session-exec host` refuses a non-private launch
+    # once a lease is inherited, and `private-workspace execute` refuses a
+    # mutable role before Codex starts unless the in-clone hook is installed,
+    # trusted and byte-identical to the base revision.
+    _hook_status="deferred-to-private-clone"
+elif [[ ! -x "$_hook_provisioner" && ! -r "$_hook_provisioner" ]]; then
     _hook_status="unavailable"
     _hook_reason="provision-codex-hooks.sh is not installed next to this adapter"
 elif [[ -z "${CODEX_HOME:-}" ]]; then
@@ -893,7 +902,8 @@ fi
 
 log_info "spawn-codex: hooks=$_hook_status role=${_hook_role:-unset} mutable=$_hook_role_is_mutable trust-bypass=never${_hook_reason:+ reason=\"$_hook_reason\"}"
 
-if [[ "$_hook_role_is_mutable" == "true" && "$_hook_status" != "ready" ]]; then
+if [[ "$_hook_role_is_mutable" == "true" && "$_hook_status" != "ready" \
+      && "$_hook_status" != "deferred-to-private-clone" ]]; then
     log_error "Role '$_hook_role' mutates the repository, but Loom's managed Codex pre_tool_use hook is not ready (status=$_hook_status)."
     [[ -n "$_hook_reason" ]] && log_error "  reason: $_hook_reason"
     log_error "Without it a Codex worker runs with NO managed-worktree confinement,"

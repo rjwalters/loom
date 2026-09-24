@@ -21,15 +21,27 @@ pub(super) fn run_role_with_timeout(
     admission: Option<&crate::runtime_admission::ResolvedRuntime>,
     load_per_core_override: Option<f64>,
     backstop: Option<crate::runtime_preference::Reservation>,
+    contained: Option<crate::tokens_pool::private_workspace::dispatch::Selection>,
 ) -> RoleTickOutcome {
-    let selection = match crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
-        workspace_root,
-        admission.map_or("claude", |a| a.runtime.as_str()),
-        Some(model),
-        crate::tokens_pool::private_workspace::JobKind::Role,
-        None,
-        &format!("role-{role}-{}", uuid::Uuid::new_v4()),
-    ) {
+    // #8787: an admission that relied on private-clone containment must launch
+    // through the exact selection that proved it — never a fresh pick, and
+    // never without one.
+    let contained_admission = admission.is_some_and(|a| a.execution.is_some());
+    let prepared = match contained {
+        Some(selection) if contained_admission => Ok(Some(selection)),
+        _ if contained_admission => Err(anyhow::anyhow!(
+            "containment admission has no prepared private selection; refusing launch"
+        )),
+        _ => crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
+            workspace_root,
+            admission.map_or("claude", |a| a.runtime.as_str()),
+            Some(model),
+            crate::tokens_pool::private_workspace::JobKind::Role,
+            None,
+            &format!("role-{role}-{}", uuid::Uuid::new_v4()),
+        ),
+    };
+    let selection = match prepared {
         Ok(selection) => selection,
         Err(error) => {
             note_pre_spawn_skip(&logs_dir, role, &error.to_string());
@@ -280,5 +292,59 @@ pub(super) fn run_role_with_timeout(
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #8787: an admission satisfied by private-clone containment can only
+    /// launch through the selection that proved it. Without one the tick fails
+    /// before any spawn, account pick or log write.
+    #[test]
+    fn contained_admission_without_its_selection_refuses_before_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let proof = crate::runtime_admission::ContainmentProof::fixture("seat");
+        let admitted =
+            crate::runtime_admission::ResolvedRuntime {
+                role: "doctor".into(),
+                runtime: "codex".into(),
+                source: crate::runtime_admission::RuntimeSource::RoleConfig,
+                adapter: PathBuf::from("/nonexistent/spawn-codex.sh"),
+                role_manifest: PathBuf::from("/nonexistent/doctor.json"),
+                runtime_manifest: PathBuf::from("/nonexistent/codex.json"),
+                suggested_worker_type: None,
+                execution: Some(proof.provenance(
+                    vec!["worktreeIsolation".into()],
+                    std::collections::BTreeMap::new(),
+                )),
+            };
+        let marker = root.path().join("spawned");
+        let script = root.path().join("spawn.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        let outcome = run_role_with_timeout(
+            &script,
+            root.path(),
+            "doctor",
+            "/loom:doctor",
+            root.path().join("logs"),
+            Duration::from_secs(5),
+            "",
+            "default",
+            "",
+            "default",
+            Some(&admitted),
+            None,
+            None,
+            None,
+        );
+        match outcome {
+            RoleTickOutcome::Failure(reason) => {
+                assert!(reason.contains("no prepared private selection"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!marker.exists());
     }
 }

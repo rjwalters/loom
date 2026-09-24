@@ -221,3 +221,48 @@ fn dry_runs_and_legacy_explicit_profiles_keep_escape_flag_behavior() {
         .unwrap();
     assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));
 }
+
+/// #8787: the host-side managed-hook preflight is relocated into the private
+/// clone only for a leased private session — never skipped. Without a lease a
+/// mutable role still needs host hook readiness; with one, the launch must go
+/// through the private transport (which re-validates the lease and container)
+/// and never falls back to a host or shared-session Codex.
+#[test]
+fn mutable_roles_defer_hook_proof_only_to_a_leased_private_session() {
+    let f = Fixture::new();
+    for role in ["builder", "sweep-lifecycle"] {
+        let unleased = f
+            .command("spawn-codex.sh")
+            .env("CODEX_HOME", &f.profile)
+            .env("LOOM_ROLE", role)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&unleased.stderr);
+        assert!(!unleased.status.success(), "{stderr}");
+        assert!(!stderr.contains("deferred-to-private-clone"), "{stderr}");
+        assert!(!f.dir.path().join("host-invoked").exists());
+
+        let mut leased = f.command("spawn-codex.sh");
+        leased
+            .env("CODEX_HOME", &f.profile)
+            .env("LOOM_ROLE", role)
+            .env("LOOM_PRIVATE_LEASE_FD", "198");
+        let lock = std::fs::File::create(f.dir.path().join(format!("{role}.lock"))).unwrap();
+        let fd = lock.as_raw_fd();
+        unsafe {
+            leased.pre_exec(move || {
+                if libc::dup2(fd, 198) < 0 || libc::fcntl(198, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = leased.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("hooks=deferred-to-private-clone"), "{stderr}");
+        // The fixture's private identity is not a valid session: the private
+        // transport refuses, and no host Codex ever runs.
+        assert!(!output.status.success(), "{stderr}");
+        assert!(!f.dir.path().join("host-invoked").exists());
+    }
+}

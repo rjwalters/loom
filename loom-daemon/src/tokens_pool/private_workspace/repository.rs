@@ -24,6 +24,13 @@ pub enum WorkerCommand {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// Verify containment policy for a mutable-role admission (#8787).
+    VerifyPolicy {
+        #[arg(long)]
+        container_id: String,
+        #[arg(long)]
+        revision: String,
+    },
     Prepare(PrepareArgs),
     /// Git credential-helper protocol; output goes only to Git's private pipe.
     Credential {
@@ -68,6 +75,13 @@ impl WorkerCommand {
                 adapter::check(profile.as_deref())?;
             }
             Self::Execute { command } => worker_setup::execute(command)?,
+            Self::VerifyPolicy {
+                container_id,
+                revision,
+            } => println!(
+                "{}",
+                serde_json::to_string(&containment::report(&container_id, &revision))?
+            ),
             Self::Prepare(args) => {
                 repository_url(&args.repository)?;
                 match prepare(Path::new(ROOT), &args) {

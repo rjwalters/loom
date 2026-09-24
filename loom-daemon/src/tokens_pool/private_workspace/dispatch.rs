@@ -185,6 +185,54 @@ impl Selection {
         }
         Ok(())
     }
+    /// Re-verify this prepared selection as containment evidence (#8787):
+    /// the owned lease's durable job, the bound container re-inspected BY ID
+    /// with its settings, mounts and exclusive volume/profile ownership
+    /// re-validated, and the in-container policy verification. Any drift
+    /// since preparation — a replaced/renamed container, a peer attachment,
+    /// a changed mount — fails closed here, before admission.
+    pub fn contain(&self, root: &Path) -> Result<containment::ContainmentProof> {
+        let prepared = self
+            .prepared
+            .as_ref()
+            .context("account has no prepared private workspace lease")?;
+        let job = lease::read(&prepared.lease.dir)?
+            .context("prepared private lease lost its durable job identity")?;
+        let (config, dir) = lifecycle::resolve(root, &self.name)?;
+        if dir != prepared.lease.dir || job.base_revision.is_empty() {
+            bail!("prepared private lease does not belong to the selected account");
+        }
+        let state = docker::inspect_id(&job.container_id)?
+            .context("bound private session container disappeared after preparation")?;
+        docker::validate(&config, &state)?;
+        if state["Id"] != job.container_id.as_str() || state["State"]["Running"] != true {
+            bail!("bound private session container changed after preparation");
+        }
+        docker::verify_policy(&job.container_id, &job.base_revision)?;
+        containment::proof_for(&config.account, &job.container_id, &job.base_revision)
+    }
+
+    /// Persist the secret-free admission provenance beside the durable job,
+    /// for status and post-session enforcement.
+    pub fn record_admission(
+        &self,
+        admitted: &crate::runtime_admission::ResolvedRuntime,
+    ) -> Result<()> {
+        let prepared = self
+            .prepared
+            .as_ref()
+            .context("account has no prepared private workspace lease")?;
+        save(
+            &prepared.lease.dir.join(lease::ADMISSION),
+            &serde_json::json!({
+                "role": admitted.role,
+                "runtime": admitted.runtime,
+                "source": admitted.source,
+                "execution": admitted.execution,
+            }),
+        )
+    }
+
     pub(super) fn lease(&self) -> Option<&lease::Lease> {
         self.prepared.as_ref().map(|p| &p.lease)
     }

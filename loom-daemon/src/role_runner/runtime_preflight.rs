@@ -108,11 +108,16 @@ const CODEX_CLEAR_ESTIMATE_CAP_SECS: i64 = 900;
 /// caller **must** hand it to the child it spawns
 /// (`runtime_preference::handoff::attach`); dropping it instead releases the
 /// slot, which is exactly right for a tick that ends up not launching.
+///
+/// `containment` (#8787) lets a Codex tap whose only unmet requirement is
+/// repository isolation be admitted on verified private-clone containment
+/// during the walk; the caller carries the selection it holds to the launch.
 pub(crate) fn check(
     root: &Path,
     logs: &Path,
     role: &str,
     admission: Option<&Result<ResolvedRuntime, RuntimeRejection>>,
+    containment: &mut dyn crate::runtime_preference::ContainmentPreparer,
 ) -> Result<crate::runtime_preference::DispatchAdmission, RoleTickOutcome> {
     // `None` ⇒ the caller opted out of admission (a test `spawn_bin`), and
     // with it out of the pool gate AND out of preference resolution: there is
@@ -140,7 +145,14 @@ pub(crate) fn check(
         source,
         resolution,
         backstop,
-    }) = crate::runtime_preference::resolve_runtime_for(root, role, None, now, context)
+    }) = crate::runtime_preference::resolve_runtime_contained(
+        root,
+        role,
+        None,
+        now,
+        context,
+        containment,
+    )
     else {
         // No preference list applies to this role, an operator pin is in
         // force (a pin disables fall-through by design), or the preference

@@ -122,6 +122,7 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
             .as_ref()
             .is_some_and(|s| s["State"]["Running"] == true),
         lease: lease::read(dir)?,
+        admission: lease::admission(dir)?,
         config,
     })
 }

@@ -1,7 +1,12 @@
 //! Opt-in account-private clone lifecycle and supervised dispatch. Account
 //! coordination stays outside repositories; bounded recovery metadata stays
-//! with the logical host repository. Runtime capability admission is unchanged.
+//! with the logical host repository. Static capability manifests are
+//! unchanged; a verified clone can satisfy repository isolation for one launch
+//! through [`containment`] (#8787).
 mod adapter;
+pub mod containment;
+#[cfg(test)]
+mod containment_tests;
 mod control;
 pub mod dispatch;
 mod docker;
@@ -60,6 +65,9 @@ pub struct Status {
     pub container_id: Option<String>,
     pub running: bool,
     pub lease: Option<lease::Job>,
+    /// Containment admission provenance for the current job (#8787).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, clap::Args)]

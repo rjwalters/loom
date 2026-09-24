@@ -327,12 +327,29 @@ pub fn resolve_for_dispatch(
     role: &str,
     explicit: Option<&str>,
 ) -> Result<DispatchAdmission, RuntimeRejection> {
+    resolve_for_dispatch_with(root, role, explicit, &mut NoContainment)
+}
+
+/// [`resolve_for_dispatch`] for a launch path that can prepare verified
+/// private-clone containment (#8787). The preparer is consulted only for a
+/// candidate whose sole unmet requirement containment can satisfy; the
+/// contained selection it holds must travel to the spawn with the admission.
+///
+/// # Errors
+/// As [`resolve_for_dispatch`]; a containment refusal names the precise
+/// unmet obligation.
+pub fn resolve_for_dispatch_with(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    preparer: &mut dyn ContainmentPreparer,
+) -> Result<DispatchAdmission, RuntimeRejection> {
     let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
     let context = DispatchContext {
         complexity: None,
         intent: Intent::Dispatch,
     };
-    let mut decision = resolve_runtime_for(root, role, explicit, now, context)?;
+    let mut decision = resolve_runtime_contained(root, role, explicit, now, context, preparer)?;
     if let Some(marker) = decision.marker_line() {
         log::info!("runtime_preference: {role} resolved by preference list — {marker} (#8554)");
     }
@@ -573,6 +590,79 @@ pub fn resolve_runtime_for(
     now: u64,
     context: DispatchContext<'_>,
 ) -> Result<Decision, RuntimeRejection> {
+    resolve_runtime_contained(root, role, explicit, now, context, &mut NoContainment)
+}
+
+/// A launch path's ability to satisfy a containment-eligible rejection with
+/// verified private-clone isolation (#8787).
+///
+/// Implemented by `tokens_pool::private_workspace::containment::Preparer`,
+/// which prepares a leased, Docker-validated private selection and admits
+/// against the proof built from it. Resolution itself never constructs proof;
+/// with [`NoContainment`] (every probe, and every caller that cannot carry a
+/// prepared selection to its spawn) behaviour is exactly the pre-#8787 static
+/// admission.
+pub trait ContainmentPreparer {
+    /// Try to admit `role` under `explicit` using verified containment.
+    /// Must return `rejection` (possibly with the unmet obligation appended)
+    /// when containment cannot be proven.
+    ///
+    /// # Errors
+    /// The rejection, when containment does not apply or cannot be proven.
+    fn contain(
+        &mut self,
+        role: &str,
+        explicit: Option<&str>,
+        rejection: RuntimeRejection,
+    ) -> Result<ResolvedRuntime, RuntimeRejection>;
+    /// Release the containment prepared for a candidate the walk passed over.
+    fn release(&mut self);
+}
+
+/// The default: no containment is available on this path.
+pub struct NoContainment;
+
+impl ContainmentPreparer for NoContainment {
+    fn contain(
+        &mut self,
+        _role: &str,
+        _explicit: Option<&str>,
+        rejection: RuntimeRejection,
+    ) -> Result<ResolvedRuntime, RuntimeRejection> {
+        Err(rejection)
+    }
+    fn release(&mut self) {}
+}
+
+/// Static admission, retried through `preparer` only when containment could
+/// satisfy the rejection. The binding (and so an explicit pin) is unchanged:
+/// a contained retry is for the same runtime, never a different one.
+fn admit_static(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    preparer: &mut dyn ContainmentPreparer,
+) -> Result<ResolvedRuntime, RuntimeRejection> {
+    match crate::runtime_admission::resolve_and_admit(root, role, explicit) {
+        Err(rejection) if rejection.containment_eligible() => {
+            preparer.contain(role, explicit, rejection)
+        }
+        other => other,
+    }
+}
+
+/// [`resolve_runtime_for`] with a [`ContainmentPreparer`] (#8787).
+///
+/// # Errors
+/// As [`resolve_runtime`].
+pub fn resolve_runtime_contained(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    now: u64,
+    context: DispatchContext<'_>,
+    preparer: &mut dyn ContainmentPreparer,
+) -> Result<Decision, RuntimeRejection> {
     let Some(canonical) = canonical_role(role) else {
         // Unknown roles are not this module's error to shape: hand straight
         // back the rejection `resolve_and_admit` already produces for them.
@@ -582,9 +672,11 @@ pub fn resolve_runtime_for(
         });
     };
     if let Some(pin) = operator_pin(canonical, explicit) {
+        // A pin disables fall-through: containment may satisfy the pinned
+        // runtime itself, but a refusal never moves to another runtime.
         return Ok(Decision::Static {
             reason: StaticReason::OperatorPin(pin),
-            result: crate::runtime_admission::resolve_and_admit(root, role, explicit),
+            result: admit_static(root, role, explicit, preparer),
         });
     }
     let config = crate::config_resolver::resolve_effective_config(root);
@@ -598,7 +690,7 @@ pub fn resolve_runtime_for(
     let Some((source, taps)) = listed else {
         return Ok(Decision::Static {
             reason: StaticReason::NoPreferenceConfigured,
-            result: crate::runtime_admission::resolve_and_admit(root, role, None),
+            result: admit_static(root, role, None, preparer),
         });
     };
     let backstop_ceiling = ceiling::configured(&config).map_err(|reason| RuntimeRejection {
@@ -613,10 +705,13 @@ pub fn resolve_runtime_for(
     // first `Ok`, so at most one slot is ever taken per walk, and it always
     // belongs to the tap actually chosen.
     let mut reservation: Option<ceiling::Reservation> = None;
+    // Both walk questions may touch the preparer: admission to prepare a
+    // contained candidate, availability to release one it then passes over.
+    let preparer = std::cell::RefCell::new(preparer);
     let resolution = resolve::resolve(
         &taps,
         |tap| {
-            crate::runtime_admission::resolve_and_admit(root, canonical, Some(&tap.runtime))
+            admit_static(root, canonical, Some(&tap.runtime), *preparer.borrow_mut())
                 .map(|mut admitted| {
                     // The walk chose among candidates; it is not the operator
                     // pin `Explicit` denotes, even though each candidate was
@@ -630,12 +725,18 @@ pub fn resolve_runtime_for(
                 })
         },
         |tier, tap, admitted| {
+            let release = || {
+                if admitted.execution.is_some() {
+                    preparer.borrow_mut().release();
+                }
+            };
             match availability::availability(root, tap, admitted, now) {
                 state if state.is_spawnable() => {}
                 state => {
+                    release();
                     return Err(state
                         .skip_reason()
-                        .expect("a non-spawnable availability always yields a skip reason"))
+                        .expect("a non-spawnable availability always yields a skip reason"));
                 }
             }
             // The ceiling is asked LAST, and only for the tiers it governs:
@@ -650,10 +751,21 @@ pub fn resolve_runtime_for(
                     reservation = slot;
                     Ok(())
                 }
-                ceiling::Verdict::Refused(reason) => Err(reason),
+                ceiling::Verdict::Refused(reason) => {
+                    release();
+                    Err(reason)
+                }
             }
         },
     );
+    // A contained candidate is kept only when it is the tap actually chosen.
+    if !resolution
+        .chosen
+        .as_ref()
+        .is_some_and(|chosen| chosen.admitted.execution.is_some())
+    {
+        preparer.borrow_mut().release();
+    }
     Ok(Decision::Preference {
         source,
         resolution,
@@ -661,6 +773,9 @@ pub fn resolve_runtime_for(
     })
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod containment_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;

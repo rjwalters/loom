@@ -1,6 +1,6 @@
 //! Slow private workspace admission runs without holding the registry mutex.
 use super::*;
-use crate::tokens_pool::private_workspace::{dispatch::Selection, JobKind};
+use crate::tokens_pool::private_workspace::{containment::Preparer, dispatch::Selection, JobKind};
 
 pub(crate) struct PreparedLaunch {
     pub admission: crate::runtime_preference::DispatchAdmission,
@@ -26,10 +26,27 @@ pub(crate) fn prepare(
     if config.skip_label_flip {
         return Ok(None);
     }
-    let admission = match crate::runtime_preference::resolve_for_dispatch(
+    let issue = match kind {
+        SweepKind::Issue(n) => Some(u64::from(*n)),
+        SweepKind::PrSet(_) => None,
+    };
+    // Verified private-clone containment (#8787) is prepared here, outside
+    // the registry lock, only for a candidate whose sole unmet requirement it
+    // can satisfy. The selection it holds is the same one the launch uses:
+    // there is no second account-selection pass.
+    let owner = format!("dispatch-{}", uuid::Uuid::new_v4());
+    let mut containment = Preparer::new(
+        &config.workspace_root,
+        JobKind::Sweep,
+        issue,
+        owner.clone(),
+        Box::new(|runtime: &str| model.resolve_for_runtime(&config, kind, Some(runtime))),
+    );
+    let admission = match crate::runtime_preference::resolve_for_dispatch_with(
         &config.workspace_root,
         "sweep-lifecycle",
         None,
+        &mut containment,
     ) {
         Ok(admission) => admission,
         Err(rejection) => {
@@ -48,22 +65,31 @@ pub(crate) fn prepare(
             return Err(rejection.into());
         }
     };
-    let resolved = model.resolve(&config, kind, admission.admitted.as_ref());
-    let issue = match kind {
-        SweepKind::Issue(n) => Some(u64::from(*n)),
-        SweepKind::PrSet(_) => None,
+    let contained = admission
+        .admitted
+        .as_ref()
+        .is_some_and(|admitted| admitted.execution.is_some());
+    let (selection, resolved) = if contained {
+        let (selection, model) = containment
+            .take()
+            .context("contained admission lost its prepared private selection")?;
+        (Some(selection), model)
+    } else {
+        drop(containment);
+        let resolved = model.resolve(&config, kind, admission.admitted.as_ref());
+        let selection = Selection::prepare(
+            &config.workspace_root,
+            admission
+                .admitted
+                .as_ref()
+                .map_or("claude", |a| a.runtime.as_str()),
+            resolved.as_deref(),
+            JobKind::Sweep,
+            issue,
+            &owner,
+        )?;
+        (selection, resolved)
     };
-    let selection = Selection::prepare(
-        &config.workspace_root,
-        admission
-            .admitted
-            .as_ref()
-            .map_or("claude", |a| a.runtime.as_str()),
-        resolved.as_deref(),
-        JobKind::Sweep,
-        issue,
-        &format!("dispatch-{}", uuid::Uuid::new_v4()),
-    )?;
     Ok(Some(PreparedLaunch {
         admission,
         model: resolved,

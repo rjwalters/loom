@@ -307,6 +307,35 @@ pub(super) fn setup(config: &Config) -> Result<()> {
     }
 }
 
+/// In-container policy verification for a containment admission (#8787).
+/// Only a fixed status crosses the boundary; an image without the endpoint
+/// fails closed rather than being treated as ready.
+pub(super) fn verify_policy(id: &str, revision: &str) -> Result<()> {
+    let output = command(&[
+        "exec",
+        "--workdir",
+        REPO,
+        id,
+        "loom-daemon",
+        "private-workspace",
+        "verify-policy",
+        "--container-id",
+        id,
+        "--revision",
+        revision,
+    ])
+    .context("private policy endpoint unavailable; update the session image before admitting a mutable Codex role")?;
+    let report: containment::PolicyReport = serde_json::from_str(&output)
+        .context("private policy endpoint unavailable; update the session image")?;
+    if report.protocol != PROTOCOL {
+        bail!("private policy protocol mismatch; update the session image");
+    }
+    match report.status {
+        containment::PolicyStatus::Ready => Ok(()),
+        status => bail!("{}", status.obligation()),
+    }
+}
+
 pub(super) fn prepare(config: &Config, id: &str, branch: Option<&str>) -> Result<String> {
     let mut args = vec!["exec", "--workdir", ROOT];
     // `--env NAME` copies the host process's value directly; secrets never
