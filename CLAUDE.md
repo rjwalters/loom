@@ -262,7 +262,7 @@ missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
 **Secrets stay outside every repository/worktree**, including ignored `.env`,
 `.loom-local`, logs and artifacts. Use owner-only user credential files or an OS
 credential store; reference them without copying values. Never print secrets.
-See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insufficient.
+See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insufficient. Task credentials (cloud tokens, SSH keys) use a reference-by-name convention — look up `.loom/credentials.md` before asking: [`.loom/docs/credentials.md`](.loom/docs/credentials.md).
 
 - **GitHub** — Loom uses the `gh` CLI (the `gh auth login` credential; scope to
   one repo with `export GH_TOKEN=…`). Fleet rate-limit protections (breaker, ETag
