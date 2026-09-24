@@ -22,8 +22,17 @@ fn args(command: &[&str]) -> ExecArgs {
         header: HeaderStyle::AuthorizationBearer,
         base_url_env: vec!["ANTHROPIC_BASE_URL".into()],
         provider: "claude".into(),
+        docker_workspace: None,
+        forward_env: vec!["LOOM_TOKEN_NAME".into()],
         command: command.iter().map(OsString::from).collect(),
     }
+}
+
+fn argv(command: &Command) -> Vec<String> {
+    command
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
 }
 
 fn env_with(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
@@ -191,33 +200,152 @@ fn the_cli_shape_spawn_claude_uses_parses() {
         #[command(flatten)]
         exec: ExecArgs,
     }
+    // Exactly what spawn-claude.sh passes: everything else is Claude's default.
     let parsed = Harness::try_parse_from([
         "proxy-exec",
-        "--credential-env",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "--upstream",
-        "https://api.anthropic.com",
-        "--header",
-        "authorization-bearer",
-        "--base-url-env",
-        "ANTHROPIC_BASE_URL",
+        "--docker-workspace",
+        "/ws",
         "--",
         "docker",
         "run",
         "--rm",
         "-e",
-        "CLAUDE_CODE_OAUTH_TOKEN",
+        "LOOM_ROLE",
         "img",
     ])
     .unwrap()
     .exec;
     assert_eq!(parsed.credential_env, "CLAUDE_CODE_OAUTH_TOKEN");
+    assert_eq!(parsed.upstream, "https://api.anthropic.com");
     assert_eq!(parsed.header, HeaderStyle::AuthorizationBearer);
     assert_eq!(parsed.base_url_env, vec!["ANTHROPIC_BASE_URL".to_string()]);
+    assert_eq!(parsed.forward_env, vec!["LOOM_TOKEN_NAME".to_string()]);
+    assert_eq!(parsed.docker_workspace.as_deref(), Some(std::path::Path::new("/ws")));
     assert_eq!(parsed.command[0], "docker");
     assert_eq!(parsed.command[3], "-e");
+
+    // Explicit flags still override the defaults, for any other adapter.
+    let parsed = Harness::try_parse_from([
+        "proxy-exec",
+        "--credential-env",
+        "OPENAI_API_KEY",
+        "--upstream",
+        "https://api.openai.com",
+        "--header",
+        "authorization-bearer",
+        "--base-url-env",
+        "OPENAI_BASE_URL",
+        "--",
+        "true",
+    ])
+    .unwrap()
+    .exec;
+    assert_eq!(parsed.credential_env, "OPENAI_API_KEY");
+    assert_eq!(parsed.base_url_env, vec!["OPENAI_BASE_URL".to_string()]);
+    assert!(parsed.docker_workspace.is_none());
     assert!(parse_header("x-api-key").is_ok());
     assert!(parse_header("basic").is_err());
+}
+
+// ------------------------------------------------------ --docker-workspace
+
+#[test]
+fn without_docker_workspace_the_argv_is_passed_through_untouched() {
+    let env = env_with(&[("CLAUDE_CODE_OAUTH_TOKEN", REAL)]);
+    let (_prepared, command) = build(&args(&["docker", "run", "--rm", "img"]), &env).unwrap();
+    assert_eq!(argv(&command), vec!["run", "--rm", "img"]);
+}
+
+#[test]
+fn docker_workspace_splices_forwards_add_host_and_pool_masks_after_run() {
+    let ws = tempfile::tempdir().unwrap();
+    let root = ws.path();
+    std::fs::create_dir_all(root.join(".loom/tokens")).unwrap();
+    std::fs::create_dir_all(root.join(".loom/api-keys")).unwrap();
+    std::fs::create_dir_all(root.join("shared-pool")).unwrap();
+    let env = env_with(&[
+        ("CLAUDE_CODE_OAUTH_TOKEN", REAL),
+        ("LOOM_SHARED_TOKENS_DIR", root.join("shared-pool").to_str().unwrap()),
+    ]);
+    let mut exec_args = args(&[
+        "docker",
+        "run",
+        "--rm",
+        "-e",
+        "LOOM_TOKEN_NAME",
+        "img",
+        "cmd",
+    ]);
+    exec_args.docker_workspace = Some(root.to_path_buf());
+    let (_prepared, command) = build(&exec_args, &env).unwrap();
+    let mask =
+        |p: &str| format!("type=tmpfs,destination={},tmpfs-mode=0555", root.join(p).display());
+    assert_eq!(
+        argv(&command),
+        vec![
+            "run".to_string(),
+            "--mount".into(),
+            mask(".loom/tokens"),
+            "--mount".into(),
+            mask(".loom/api-keys"),
+            "--mount".into(),
+            mask("shared-pool"),
+            "-e".into(),
+            "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            "-e".into(),
+            "ANTHROPIC_BASE_URL".into(),
+            // LOOM_TOKEN_NAME is already forwarded by the caller: not doubled.
+            "--add-host".into(),
+            "host.docker.internal:host-gateway".into(),
+            "--rm".into(),
+            "-e".into(),
+            "LOOM_TOKEN_NAME".into(),
+            "img".into(),
+            "cmd".into(),
+        ]
+    );
+}
+
+#[test]
+fn docker_workspace_masks_only_existing_pools_inside_the_workspace() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(ws.path().join(".loom/api-keys")).unwrap();
+    let env = env_with(&[
+        ("CLAUDE_CODE_OAUTH_TOKEN", REAL),
+        ("LOOM_SHARED_TOKENS_DIR", outside.path().to_str().unwrap()),
+    ]);
+    let mut exec_args = args(&["docker", "run", "img"]);
+    exec_args.docker_workspace = Some(ws.path().to_path_buf());
+    let (_prepared, command) = build(&exec_args, &env).unwrap();
+    let mounts: Vec<String> = argv(&command)
+        .windows(2)
+        .filter(|w| w[0] == "--mount")
+        .map(|w| w[1].clone())
+        .collect();
+    // .loom/tokens does not exist (docker would create it on the host); the
+    // shared pool is outside the workspace (never mounted at all).
+    assert_eq!(
+        mounts,
+        vec![format!(
+            "type=tmpfs,destination={},tmpfs-mode=0555",
+            ws.path().join(".loom/api-keys").display()
+        )]
+    );
+    assert!(argv(&command).contains(&"LOOM_TOKEN_NAME".to_string()));
+}
+
+#[test]
+fn docker_workspace_refuses_a_command_that_is_not_docker_run() {
+    let env = env_with(&[("CLAUDE_CODE_OAUTH_TOKEN", REAL)]);
+    let mut exec_args = args(&["docker", "exec", "c"]);
+    exec_args.docker_workspace = Some("/ws".into());
+    assert_eq!(build(&exec_args, &env).unwrap_err().code, 78);
+
+    let mut exec_args = args(&["docker", "run", "img"]);
+    exec_args.docker_workspace = Some("/ws".into());
+    exec_args.forward_env = vec!["NOT A NAME".into()];
+    assert_eq!(build(&exec_args, &env).unwrap_err().code, 78);
 }
 
 // ------------------------------------------------- round trip + lifetime (AC3)

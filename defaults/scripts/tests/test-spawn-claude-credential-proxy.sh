@@ -79,7 +79,7 @@ echo "==========================================="
 REAL_TOKEN="sk-ant-oat01-fake-real-token-8697"
 
 WS="$(mktemp -d)"
-mkdir -p "$WS/.loom/tokens"
+mkdir -p "$WS/.loom/tokens" "$WS/.loom/api-keys"
 chmod 700 "$WS/.loom/tokens"
 echo -n "$REAL_TOKEN" > "$WS/.loom/tokens/acct.token"
 chmod 600 "$WS/.loom/tokens/acct.token"
@@ -109,9 +109,9 @@ cat > "$STUBS/docker" <<STUB
 printf '%s\n' "\$*" >> "$DOCKER_LOG"
 args=("\$@")
 i=1
-[[ "\${args[i]:-}" == "--rm" ]] && i=\$((i + 1))
 while true; do
     case "\${args[i]:-}" in
+        --rm) i=\$((i + 1)) ;;
         -v | --mount | --add-host | --label | --cpus | --memory | -w) i=\$((i + 2)) ;;
         -e)
             case "\${args[i+1]:-}" in *=*) export "\${args[i+1]}" ;; esac
@@ -150,7 +150,6 @@ seen_token="$(sed -n 1p "$STUBS/claude-seen.txt" 2>/dev/null || true)"
 seen_base="$(sed -n 2p "$STUBS/claude-seen.txt" 2>/dev/null || true)"
 
 assert_contains "stub-claude ran" "$out" "the proxied launch still reaches claude"
-assert_contains "credential egress proxy ENABLED" "$out" "spawn-claude logs the proxy decision"
 assert_contains "# LOOM_ACCOUNT name=acct" "$out" "the account is selected on the HOST"
 assert_contains "# LOOM_EGRESS_PROXY launch=" "$out" "proxy-exec writes its secret-free marker to the sweep log"
 assert_contains "upstream=https://api.anthropic.com" "$out" "the upstream is pinned to api.anthropic.com"
@@ -164,6 +163,9 @@ assert_contains "-e ANTHROPIC_BASE_URL " "$docker_log" "the base URL is forwarde
 assert_contains "--add-host host.docker.internal:host-gateway" "$docker_log" "the container can reach the host listener"
 assert_contains "--mount type=tmpfs,destination=$WS/.loom/tokens,tmpfs-mode=0555" "$docker_log" \
     "the per-repo token pool is masked out of the container filesystem"
+assert_contains "--mount type=tmpfs,destination=$WS/.loom/api-keys,tmpfs-mode=0555" "$docker_log" \
+    "the per-repo API-key pool is masked out of the container filesystem"
+assert_contains "-e LOOM_TOKEN_NAME " "$docker_log" "the host-selected account name is forwarded by name"
 assert_not_contains "no-shared-pool" "$docker_log" "the shared token pool is never mounted"
 assert_contains "containment=claude-ephemeral" "$out" "the containment marker is unchanged"
 if command -v curl >/dev/null 2>&1; then
@@ -223,7 +225,7 @@ set +e
 out="$(run_spawn LOOM_DAEMON_BIN="$OLD/loom-daemon")"
 rc=$?
 set -e
-assert_eq "78" "$rc" "a daemon without 'worker proxy-exec': refused, never a plain docker run"
+assert_eq "78" "$rc" "a daemon without 'worker proxy-exec': refused, never an unproxied container launch"
 assert_contains "Refusing to forward the real credential" "$out" "the refusal names why"
 assert_eq "" "$(cat "$DOCKER_LOG")" "a daemon without 'worker proxy-exec': docker is never invoked"
 

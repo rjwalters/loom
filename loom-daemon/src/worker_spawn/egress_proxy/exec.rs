@@ -9,17 +9,30 @@
 //! `exec docker run …`, runs
 //!
 //! ```text
-//! loom-daemon worker proxy-exec --credential-env CLAUDE_CODE_OAUTH_TOKEN \
-//!     --upstream https://api.anthropic.com --base-url-env ANTHROPIC_BASE_URL \
-//!     -- docker run … -e CLAUDE_CODE_OAUTH_TOKEN -e ANTHROPIC_BASE_URL … <image> …
+//! loom-daemon worker proxy-exec --docker-workspace <WORKSPACE> -- docker run … <image> …
 //! ```
+//!
+//! (The credential variable, upstream and base-URL variable default to
+//! Claude's — `CLAUDE_CODE_OAUTH_TOKEN`, `https://api.anthropic.com`,
+//! `ANTHROPIC_BASE_URL` — because Claude is the one shell adapter using this
+//! today; each is an explicit flag for any other.)
 //!
 //! This process reads the REAL credential out of its own environment, binds
 //! the listener, registers a per-launch placeholder, and spawns the command
 //! with the credential variable **overwritten** by the placeholder and each
-//! `--base-url-env` variable set to the proxy's URL. The adapter forwards
-//! those names by NAME (`-e VAR`), so docker reads the placeholder — never the
-//! real value — out of the environment this process handed it.
+//! `--base-url-env` variable set to the proxy's URL. Those names are forwarded
+//! by NAME (`-e VAR`), so docker reads the placeholder — never the real value
+//! — out of the environment this process handed it.
+//!
+//! `--docker-workspace` keeps that contract out of the shell adapter (#8697
+//! review): it splices the proxy's own `docker run` flags in right after
+//! `run` — the `-e VAR` forwards above (plus `--forward-env`, `LOOM_TOKEN_NAME`
+//! by default), `--add-host host.docker.internal:host-gateway` so the
+//! container can reach the host listener, and an empty read-only tmpfs over
+//! every token-pool directory the workspace bind mount would otherwise expose
+//! (`.loom/tokens`, `.loom/api-keys`, and the shared pool when it lives inside
+//! the workspace), so the container holds no real credential on its
+//! filesystem either.
 //!
 //! Everything downstream of [`super::arm`] is the native path's code: the same
 //! registry, the same listener, the same [`super::run_with_proxy`] lifetime
@@ -38,6 +51,7 @@
 use super::{arm, run_with_proxy, HeaderStyle, Prepared, ProfileProxy, PLACEHOLDER_PREFIX};
 use crate::worker_spawn::LaunchError;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Arguments for `loom-daemon worker proxy-exec`.
@@ -46,11 +60,10 @@ pub struct ExecArgs {
     /// Environment variable that holds the REAL credential in this process's
     /// environment. The command sees a per-launch placeholder under the same
     /// name instead.
-    #[arg(long, value_name = "VAR")]
+    #[arg(long, value_name = "VAR", default_value = "CLAUDE_CODE_OAUTH_TOKEN")]
     pub credential_env: String,
-    /// The one origin the credential may be sent to
-    /// (e.g. `https://api.anthropic.com`).
-    #[arg(long, value_name = "URL")]
+    /// The one origin the credential may be sent to.
+    #[arg(long, value_name = "URL", default_value = "https://api.anthropic.com")]
     pub upstream: String,
     /// How the real credential is presented upstream:
     /// `authorization-bearer` (default) or `x-api-key`.
@@ -58,8 +71,26 @@ pub struct ExecArgs {
     pub header: HeaderStyle,
     /// Environment variable set, in the command's environment, to the proxy's
     /// base URL. Repeatable.
-    #[arg(long = "base-url-env", value_name = "VAR")]
+    #[arg(
+        long = "base-url-env",
+        value_name = "VAR",
+        default_value = "ANTHROPIC_BASE_URL"
+    )]
     pub base_url_env: Vec<String>,
+    /// The command is a `docker run` whose container bind-mounts this
+    /// workspace: splice in the proxy's own docker flags (by-name `-e`
+    /// forwards, `--add-host`, token-pool tmpfs masks) right after `run`.
+    #[arg(long, value_name = "DIR")]
+    pub docker_workspace: Option<PathBuf>,
+    /// With `--docker-workspace`: an extra variable to forward into the
+    /// container by name (e.g. the non-secret account name host-side
+    /// selection exported). Repeatable.
+    #[arg(
+        long = "forward-env",
+        value_name = "VAR",
+        default_value = "LOOM_TOKEN_NAME"
+    )]
+    pub forward_env: Vec<String>,
     /// Attribution label for the launch record (never a secret).
     #[arg(long, value_name = "NAME", default_value = "claude")]
     pub provider: String,
@@ -159,7 +190,7 @@ pub(crate) fn build(
     )?;
 
     let mut command = Command::new(program);
-    command.args(rest);
+    command.args(docker_args(args, rest, env)?);
     // Defense in depth: any OTHER variable carrying the same value (an
     // operator who also exported it as ANTHROPIC_AUTH_TOKEN, say) is removed
     // from the child's environment, so a by-name `-e` of that variable cannot
@@ -178,6 +209,78 @@ pub(crate) fn build(
         command.env(key, value);
     }
     Ok((prepared, command))
+}
+
+/// The command's argv after the program: unchanged, or — with
+/// `--docker-workspace` — `run`, then the proxy's own docker flags, then the
+/// caller's.
+fn docker_args(
+    args: &ExecArgs,
+    rest: &[OsString],
+    env: &[(OsString, OsString)],
+) -> Result<Vec<OsString>, LaunchError> {
+    let Some(workspace) = &args.docker_workspace else {
+        return Ok(rest.to_vec());
+    };
+    let (run, tail) = rest
+        .split_first()
+        .filter(|(run, _)| run.as_os_str() == "run")
+        .ok_or_else(|| {
+            LaunchError::config("proxy-exec: --docker-workspace needs a `docker run …` command")
+        })?;
+    if !args.forward_env.iter().all(|n| is_env_name(n)) {
+        return Err(LaunchError::config(
+            "proxy-exec: --forward-env must be an environment variable name",
+        ));
+    }
+    let mut out = vec![run.clone()];
+    for dir in masked_pool_dirs(workspace, env) {
+        out.push("--mount".into());
+        out.push(format!("type=tmpfs,destination={},tmpfs-mode=0555", dir.display()).into());
+    }
+    let forwarded = |argv: &[OsString], name: &str| {
+        argv.windows(2)
+            .any(|w| w[0] == "-e" && w[1].as_os_str() == name)
+    };
+    let names = std::iter::once(&args.credential_env)
+        .chain(&args.base_url_env)
+        .chain(&args.forward_env);
+    for name in names {
+        if !forwarded(tail, name) && !forwarded(&out, name) {
+            out.push("-e".into());
+            out.push(name.into());
+        }
+    }
+    out.push("--add-host".into());
+    out.push("host.docker.internal:host-gateway".into());
+    out.extend(tail.iter().cloned());
+    Ok(out)
+}
+
+/// Token-pool directories the workspace bind mount would expose inside the
+/// container: the per-repo pools, plus the shared pool
+/// (`LOOM_SHARED_TOKENS_DIR`, else `$HOME/.loom/tokens`) when it lives inside
+/// the workspace. Existing directories only — masking a missing one would make
+/// docker create the mountpoint on the host through the bind mount.
+fn masked_pool_dirs(workspace: &Path, env: &[(OsString, OsString)]) -> Vec<PathBuf> {
+    let var = |name: &str| {
+        env.iter()
+            .find(|(k, v)| k.to_str() == Some(name) && !v.is_empty())
+            .map(|(_, v)| PathBuf::from(v))
+    };
+    let shared = var("LOOM_SHARED_TOKENS_DIR")
+        .unwrap_or_else(|| var("HOME").unwrap_or_default().join(".loom/tokens"));
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in [
+        workspace.join(".loom/tokens"),
+        workspace.join(".loom/api-keys"),
+        shared,
+    ] {
+        if dir.starts_with(workspace) && dir != workspace && dir.is_dir() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Entry point for `loom-daemon worker proxy-exec`. Never returns on success:

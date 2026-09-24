@@ -1658,13 +1658,16 @@ off; no effect unless `runtimes.containment.enabled` is on):
 ```
 
 A shell adapter cannot host the listener, so it shells out to `loom-daemon
-worker proxy-exec`, which reuses the registry, placeholder and listener above.
-With the switch on, the account is selected on the **host**, the `docker run`
-receives `CLAUDE_CODE_OAUTH_TOKEN=<placeholder>` and
-`ANTHROPIC_BASE_URL=<proxy>` (both by name), `<workspace>/.loom/tokens/` and
-`.loom/api-keys/` are masked with an empty tmpfs, and the shared token pool is
-not mounted. A missing subcommand or an unset host credential is an exit-78
-refusal, never a plain `docker run` with the real token.
+worker proxy-exec --docker-workspace <ws>`, which reuses the registry,
+placeholder and listener above and owns the proxy's docker flags. With the
+switch on, the account is selected on the **host**, the `docker run` receives
+`CLAUDE_CODE_OAUTH_TOKEN=<placeholder>` and `ANTHROPIC_BASE_URL=<proxy>` (both
+by name), `<workspace>/.loom/tokens/` and `.loom/api-keys/` are masked with an
+empty tmpfs, and the shared token pool is not mounted. A missing subcommand or
+an unset host credential is an exit-78 refusal, never a plain `docker run`
+with the real token. `proxy-exec` sits between the sweep and the docker client,
+so a signal sent to that one pid does not reach docker; cancellation uses the
+daemon's process-group kill, which does, exactly as on the native path.
 
 Claude Code sends an OAuth token as `Authorization: Bearer` plus an
 `anthropic-beta` list that includes `oauth-2025-04-20`. It sends both to
