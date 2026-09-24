@@ -82,8 +82,8 @@ any running code** — no host captures CI telemetry today.
 
 ## Capture scope & exclusions
 
-- **Scope is the org, not a repo list.** `autonomous.ciTelemetry.org`
-  (planned default `2amlogic`, defined by #8824) names the captured org; repo
+- **Scope is the org, not a repo list.** The `org` key of the
+  `autonomous.ciTelemetry` config block (planned default `2amlogic`, defined by #8824) names the captured org; repo
   discovery walks it on every poll. There is no allowlist of repos to keep in
   sync.
 - **Metrics and run/job records are unconditional.** Durations, outcomes
