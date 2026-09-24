@@ -13,6 +13,20 @@ use std::{
 pub const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 32 * 1024;
 
+// Test-only counters for the durability barriers this module issues *besides*
+// the per-boundary journal write (Issue #8643). Thread-local, so tests running
+// in parallel never observe one another's counts.
+#[cfg(test)]
+thread_local! {
+    static PARENT_DIR_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CURSOR_COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_barrier(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
+    counter.with(|slot| slot.set(slot.get() + 1));
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSpan {
     pub record: SpanRecord,
@@ -83,8 +97,24 @@ impl Journal {
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
             }
         }
-        File::open(parent)?.sync_all()?;
-        anyhow::ensure!(file.metadata()?.len() <= MAX_JOURNAL_BYTES, "trace journal full");
+        let len = file.metadata()?.len();
+        // A parent-directory fsync durably links a *newly created* journal;
+        // once the file holds a record that link is already stable, so
+        // repeating it on every lock spends a barrier and buys nothing
+        // (Issue #8643). The condition is "the journal is still empty", not
+        // "this call created the file", and that difference is what keeps the
+        // skip durability-neutral: creation happens before the lock is held,
+        // so another process can legitimately open a file this one created and
+        // has not yet fsynced. Whoever appends the FIRST record necessarily
+        // holds the lock on a zero-length journal and therefore fsyncs the
+        // directory before that record exists — no record is ever made durable
+        // ahead of the directory entry a reader has to reach it through.
+        if len == 0 {
+            File::open(parent)?.sync_all()?;
+            #[cfg(test)]
+            count_barrier(&PARENT_DIR_SYNCS);
+        }
+        anyhow::ensure!(len <= MAX_JOURNAL_BYTES, "trace journal full");
         Ok(file)
     }
     fn entries(file: &mut File) -> Result<Vec<Entry>> {
@@ -362,8 +392,35 @@ impl Journal {
         Ok(true)
     }
 
+    /// Atomically replace the byte cursor and durably link the replacement:
+    /// two barriers (the temp file's `sync_all`, the parent directory's
+    /// `fsync`) every time it is called, which is why [`Self::drain`] commits
+    /// per *delivered* record rather than per journal entry.
+    fn commit_cursor(cursor_path: &Path, cursor: u64) -> Result<()> {
+        let parent = cursor_path.parent().context("cursor has no parent")?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        write!(temporary, "{cursor}")?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(cursor_path).map_err(|e| e.error)?;
+        File::open(parent)?.sync_all()?;
+        #[cfg(test)]
+        count_barrier(&CURSOR_COMMITS);
+        Ok(())
+    }
+
     /// Byte cursor advances only after the caller durably accepts a complete span.
     /// A crash after acceptance but before cursor persistence replays stable IDs.
+    ///
+    /// The cursor is committed once per **delivered** record plus once for the
+    /// batch's undelivered tail — not once per journal entry (Issue #8643).
+    /// Entries that deliver nothing (`Started`, `Owner`, `Supervisor`) are
+    /// re-read and re-skipped on replay, never re-delivered, so batching the
+    /// cursor across them costs nothing on a crash. Batching it across
+    /// *delivered* records would instead re-offer up to a whole batch, and the
+    /// backend only deduplicates `sweep.completed`/`sweep.outcome` by
+    /// `(kind, sweep_id)` — `trace.span` has no such index, so a replayed span
+    /// duplicates its row. The at-most-one-replayed-record contract therefore
+    /// stays exactly as it was.
     pub fn drain(&self, mut accept: impl FnMut(SpanRecord) -> Result<()>) -> Result<usize> {
         let _drain_lock = self.drain_lock()?;
         let mut file = self.lock()?;
@@ -396,18 +453,22 @@ impl Journal {
         drop(reader);
         drop(file);
         let mut count = 0;
-        for (cursor, entry) in batch {
+        let mut committed = cursor;
+        let mut scanned = cursor;
+        for (end, entry) in batch {
+            scanned = end;
             if let Entry::Completed(record) = entry {
                 record.validate().map_err(anyhow::Error::msg)?;
                 accept(record.bounded())?;
                 count += 1;
+                Self::commit_cursor(&cursor_path, end)?;
+                committed = end;
             }
-            let parent = cursor_path.parent().context("cursor has no parent")?;
-            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-            write!(temporary, "{cursor}")?;
-            temporary.as_file().sync_all()?;
-            temporary.persist(&cursor_path).map_err(|e| e.error)?;
-            File::open(parent)?.sync_all()?;
+        }
+        // One commit for the undelivered tail, so the cursor still reaches EOF
+        // and `retire_if_drained` can retire a fully drained journal.
+        if scanned > committed {
+            Self::commit_cursor(&cursor_path, scanned)?;
         }
         Ok(count)
     }
