@@ -19,9 +19,6 @@ coverage/
 # config -- stays committable. .aider.chat.history.md is a verbatim transcript
 # of the session, and this repo's agents run `git add -A` as a documented
 # Builder step against a public remote.
-.aider.chat.history.md
-.aider.input.history
-.aider.tags.cache.v*/
 
 # Env files
 .env
