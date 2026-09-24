@@ -30,11 +30,13 @@ import {
   classifyAndPruneHosts,
   classifyComputeEntries,
   classifyFreshness,
+  diffExpectedRoster,
   filterRevokedHosts,
   isComputeEntryLeaked,
   isSweepEntryStale,
   LIVE_AFTER_SEC,
   OFFLINE_AFTER_SEC,
+  parseExpectedHostRoster,
   PRUNE_AFTER_MS,
   PRUNE_COMPUTE_AFTER_MS,
   selectReconciledAwaySweepKeys,
@@ -160,6 +162,84 @@ describe("classifyAndPruneHosts", () => {
     expect(pruneKeys).toEqual(["health:host-a"]);
     expect(hosts["host-a"]?.health).toBeUndefined();
     expect(hosts["host-a"]?.tokens?.freshness?.status).toBe("live");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Expected-host roster diff (Issue #8792): a roster host that has never
+// reported must surface as `missing`/`unprovisioned`, not silently vanish.
+// ---------------------------------------------------------------------------
+
+describe("parseExpectedHostRoster", () => {
+  it("returns [] for an unset or blank roster (no roster configured)", () => {
+    expect(parseExpectedHostRoster(undefined)).toEqual([]);
+    expect(parseExpectedHostRoster("")).toEqual([]);
+    expect(parseExpectedHostRoster("  ,\n ,")).toEqual([]);
+  });
+
+  it("splits on commas and/or whitespace, dedupes, and sorts", () => {
+    expect(parseExpectedHostRoster("robb-studio, robb-pro\nloom-worker-1  loom-worker-2,robb-pro")).toEqual([
+      "loom-worker-1",
+      "loom-worker-2",
+      "robb-pro",
+      "robb-studio",
+    ]);
+  });
+});
+
+describe("diffExpectedRoster", () => {
+  // A partial Durable Object snapshot: host-live and host-offline have
+  // reported (health entries); host-tokens-only has a tokens entry but no
+  // health; host-never and host-planned have no entry at all.
+  const hosts: FleetSnapshot["hosts"] = {
+    "host-live": { health: { record: { kind: "host.health" }, updatedAt: secondsAgo(60) } },
+    "host-offline": { health: { record: { kind: "host.health" }, updatedAt: secondsAgo(OFFLINE_AFTER_SEC + 60) } },
+    "host-tokens-only": { tokens: { record: { kind: "tokens.snapshot" }, updatedAt: secondsAgo(60) } },
+  };
+  const roster = ["host-live", "host-never", "host-offline", "host-planned", "host-tokens-only"];
+  const activeKeys = new Set(["host-live", "host-never", "host-offline", "host-tokens-only"]);
+
+  it("flags an enrolled roster host with zero health records as missing", () => {
+    const diff = diffExpectedRoster(hosts, roster, activeKeys);
+    expect(diff).toContainEqual({ hostId: "host-never", state: "missing" });
+  });
+
+  it("flags a roster host with no active ingest key as unprovisioned, distinct from missing", () => {
+    const diff = diffExpectedRoster(hosts, roster, activeKeys);
+    expect(diff).toContainEqual({ hostId: "host-planned", state: "unprovisioned" });
+    expect(diff).not.toContainEqual({ hostId: "host-planned", state: "missing" });
+  });
+
+  it("never lists a host that has reported — an offline host stays offline, not missing", () => {
+    const ids = diffExpectedRoster(hosts, roster, activeKeys).map((host) => host.hostId);
+    expect(ids).not.toContain("host-live");
+    expect(ids).not.toContain("host-offline");
+  });
+
+  it("treats a tokens-only host (no health) as missing — health is what the host list counts", () => {
+    expect(diffExpectedRoster(hosts, roster, activeKeys)).toContainEqual({
+      hostId: "host-tokens-only",
+      state: "missing",
+    });
+  });
+
+  it("a host removed from the roster is not rendered as missing", () => {
+    const shrunk = roster.filter((id) => id !== "host-never");
+    const ids = diffExpectedRoster(hosts, shrunk, activeKeys).map((host) => host.hostId);
+    expect(ids).not.toContain("host-never");
+  });
+
+  it("an empty roster yields no missing hosts — pre-#8792 behavior", () => {
+    expect(diffExpectedRoster(hosts, [], activeKeys)).toEqual([]);
+  });
+
+  it("filterRevokedHosts preserves an attached missingHosts list", () => {
+    const missingHosts = diffExpectedRoster(hosts, roster, activeKeys);
+    const filtered = filterRevokedHosts(
+      { hosts, activeSweeps: [], activeCompute: [], missingHosts },
+      new Set(["host-live"]),
+    );
+    expect(filtered.missingHosts).toEqual(missingHosts);
   });
 });
 
