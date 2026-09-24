@@ -112,7 +112,13 @@
 
 import { extractBearerToken, authenticateHost, hashIngestKey } from "./auth";
 import { validateAccessJwt } from "./accessAuth";
-import { FleetState, filterRevokedHosts, type FleetSnapshot } from "./fleetState";
+import {
+  diffExpectedRoster,
+  FleetState,
+  filterRevokedHosts,
+  parseExpectedHostRoster,
+  type FleetSnapshot,
+} from "./fleetState";
 import { renderPublicPage } from "./publicPage";
 import {
   createLiveTailStream,
@@ -164,6 +170,14 @@ export interface Env {
    * env, where `/api/version` and the footer fall back to `"unknown"` rather
    * than throwing. */
   BUILD_COMMIT?: string;
+  /** The operator's expected host roster (issue #8792): host IDs separated
+   * by commas and/or whitespace — a plain, non-secret `[vars]` entry (or
+   * `wrangler deploy --var EXPECTED_HOSTS:...` from the operator's own
+   * repo, where the roster of record lives). A listed host with no health
+   * record renders as `missing`/`unprovisioned` instead of silently dropping
+   * out of the fleet count; see `fleetState.ts`'s `diffExpectedRoster`.
+   * Unset means "no roster" — the pre-#8792 behavior, unchanged. */
+  EXPECTED_HOSTS?: string;
 }
 
 /** A single global Durable Object instance holds fleet-wide live state —
@@ -208,7 +222,30 @@ async function fetchLiveFleetSnapshot(env: Env): Promise<FleetSnapshot> {
   const response = await fleetStateStub(env).fetch("https://fleet-state/snapshot");
   const snapshot = (await response.json()) as FleetSnapshot;
   const revokedHostIds = await fetchRevokedHostIds(env, Object.keys(snapshot.hosts));
-  return filterRevokedHosts(snapshot, revokedHostIds);
+  const filtered = filterRevokedHosts(snapshot, revokedHostIds);
+
+  // Issue #8792: diff the operator's expected roster against what actually
+  // reported. Applied *after* the revoked filter, so a revoked roster host
+  // whose stale DO entries survived is still diffed (as `unprovisioned` — it
+  // holds no active key) rather than rendering its last-known numbers.
+  const roster = parseExpectedHostRoster(env.EXPECTED_HOSTS);
+  if (roster.length === 0) return filtered;
+  const activeKeyHostIds = await fetchActiveKeyHostIds(env, roster);
+  return { ...filtered, missingHosts: diffExpectedRoster(filtered.hosts, roster, activeKeyHostIds) };
+}
+
+/** D1 host_ids, among `hostIds`, holding a non-revoked ingest key — what
+ * separates a roster host that is enrolled-but-silent (`missing`) from one
+ * that was never enrolled (`unprovisioned`); see `diffExpectedRoster`. */
+async function fetchActiveKeyHostIds(env: Env, hostIds: readonly string[]): Promise<Set<string>> {
+  if (hostIds.length === 0) return new Set();
+  const placeholders = hostIds.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(
+    `SELECT host_id FROM hosts WHERE revoked_at IS NULL AND host_id IN (${placeholders})`,
+  )
+    .bind(...hostIds)
+    .all<{ host_id: string }>();
+  return new Set(results.map((row) => row.host_id));
 }
 
 // ---------------------------------------------------------------------------

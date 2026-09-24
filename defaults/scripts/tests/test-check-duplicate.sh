@@ -1153,6 +1153,70 @@ assert_eq "3" "$(echo "$OUT" | jq -r '.matches | length')" "(z3) --json parses a
 assert_eq "801 901 1001" "$(echo "$OUT" | jq -r '[.matches[].number] | join(" ")')" "(z3) --json recovers every match number, none swallowed by a splice"
 assert_eq "issue pr closed_issue" "$(echo "$OUT" | jq -r '[.matches[].type] | join(" ")')" "(z3) --json assigns each match its correct pool type"
 
+echo ""
+echo "Testing title corroboration at low block scores (issue #8591)..."
+
+# At the DEFAULT threshold (18) a full-text match between 18% and 25% must
+# also reach 18% similarity on TITLES ALONE before it blocks. The fixtures
+# below keep every percentage hand-checkable: the query is the 4-keyword
+# title {alpha,bravo,charlie,delta} with no body, so a 9-keyword candidate
+# sharing 2 keywords scores 2/(4+9-2) = 18% -- exactly the floor #8561 hit.
+
+# (tc1) Uncorroborated: the 18% comes entirely from the candidate's BODY, its
+# title shares nothing. This is the #8561-vs-#8505 shape -- same-subsystem
+# jargon in two long bodies, unrelated titles. It must NOT block, and must
+# not vanish either: it is demoted to an annotated NEAR row.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 8505, "title": "Zulu Yankee Xray Whiskey", "body": "alpha bravo kilo lima mike"}]
+EOF
+run_cds --title "Alpha Bravo Charlie Delta"
+assert_eq "0" "$RC" "(tc1) An uncorroborated floor-score match is not a duplicate verdict"
+assert_not_contains "$OUT" "DUPLICATE_FOUND" "(tc1) …and gets no DUPLICATE_FOUND header"
+assert_contains "$OUT" "NEAR #8505" "(tc1) …but is still reported, as context"
+assert_contains "$OUT" "not corroborated" "(tc1) …annotated with WHY it did not block"
+assert_contains "$OUT" "title overlap only 0%" "(tc1) …naming the title overlap that fell short"
+
+# (tc2) Corroborated: the same 18% full-text score, but carried by the
+# candidate's TITLE, so the titles agree at 18% too. A calibration, not a
+# disable -- this still blocks.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 3550, "title": "Alpha Bravo Kilo Lima Mike November Oscar Papa Quebec", "body": ""}]
+EOF
+run_cds --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(tc2) A corroborated floor-score match still blocks"
+assert_contains "$OUT" "DUPLICATE_FOUND" "(tc2) …under the ordinary duplicate header"
+assert_contains "$OUT" "#3550: Alpha Bravo Kilo Lima Mike November Oscar Papa Quebec (similarity: 18%)" \
+  "(tc2) …listed with its score"
+assert_not_contains "$OUT" "NEAR #3550" "(tc2) …and not also as a near row"
+
+# (tc3) --json: a demoted row lands in near_matches, never in matches, and
+# carries the title_similarity that explains it.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 8505, "title": "Zulu Yankee Xray Whiskey", "body": "alpha bravo kilo lima mike"}]
+EOF
+run_cds --title "Alpha Bravo Charlie Delta" --json
+assert_eq "false" "$(echo "$OUT" | jq -r '.duplicate_found')" "(tc3) --json duplicate_found stays false for a demoted match"
+assert_eq "0" "$(echo "$OUT" | jq -r '.matches | length')" "(tc3) --json matches never absorbs a demoted match"
+assert_eq "8505" "$(echo "$OUT" | jq -r '.near_matches[0].number')" "(tc3) --json reports the demotion in near_matches"
+assert_eq "18" "$(echo "$OUT" | jq -r '.near_matches[0].similarity')" "(tc3) --json demoted row keeps its full-text score"
+assert_eq "0" "$(echo "$OUT" | jq -r '.near_matches[0].title_similarity')" "(tc3) --json demoted row carries title_similarity"
+
+# (tc4) The rule is scoped to the low-confidence region: raise the candidate's
+# body overlap above the 25% ceiling and it blocks on body text alone, titles
+# still disagreeing: the candidate's 9 keywords share 3 of the query's 4, so
+# 3/(4+9-3) = 30%, clear of the 25% ceiling.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 8506, "title": "Zulu Yankee Xray Whiskey", "body": "alpha bravo charlie kilo lima"}]
+EOF
+run_cds --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(tc4) Above the corroboration ceiling, body overlap stands on its own"
+assert_contains "$OUT" "DUPLICATE_FOUND" "(tc4) …and blocks as before"
+assert_not_contains "$OUT" "NEAR #8506" "(tc4) …with no demotion"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

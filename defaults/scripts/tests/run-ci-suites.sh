@@ -230,6 +230,24 @@ LIVE_DAEMON_GUARDED_SUITES="test-loom-daemon-start.sh test-loom-daemon-stop.sh t
 #     loudly as "subprocess did not complete" instead of silently as a
 #     content mismatch) rather than left as a permanent pin.
 #
+# BOTH occupants are currently UNWIRED (#8087): cli/loom-daemon-start.sh is now
+# a thin stub over `loom-daemon daemon-start`, so test-loom-daemon-start.sh and
+# test-loom-daemon-update.sh (which reaches the same script through
+# lib/daemon-update-fixtures.sh) need a built binary and moved to
+# ci-excluded.txt, wired in ci.yml's "Native Port Suites" job instead. That
+# job's steps are sequential, so they get the isolation this lane was giving
+# them by construction rather than by quarantine list.
+#
+# They stay NAMED here on purpose. The lane filter simply never matches a suite
+# that is not in ci-wired.txt, so the two names cost nothing today — and if
+# either suite is ever re-wired into this runner's concurrent pool, it lands
+# already pinned rather than silently rejoining the pool the #6639/#7391 flakes
+# were observed in. test-run-ci-suites-serial-lane.sh asserts that retention
+# directly (named here, absent from --plan) and exercises the lane MECHANISM
+# through the LOOM_CI_SERIAL_SUITES seam below, the same
+# "asserted-differently-not-less" split #8086 introduced for the live-daemon
+# guard's own literal.
+#
 # LOOM_CI_SERIAL_SUITES overrides the list (space-separated basenames); an
 # empty value disables the lane entirely. It exists as a test seam for
 # test-run-ci-suites-serial-lane.sh and as an operator escape hatch.

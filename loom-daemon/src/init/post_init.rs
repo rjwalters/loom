@@ -213,6 +213,12 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/exit-codes/",
     ".loom/sweep-checkpoint/",
     ".loom/sweep-run/",
+    // Concierge budget ledger (#7947): the per-day turn / per-tick relay
+    // counters the operator-agent persona consults at the top of every turn.
+    // Machine-local and disposable — deleting it costs at most one day's spent
+    // budget — but it must never be committed, or one host's spend would
+    // arrive as another host's starting balance.
+    ".loom/concierge/",
     ".loom/stats/",
     ".loom/diagnostics/",
     ".loom/guide-docs-state.json",
@@ -227,6 +233,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // hold OAuth keys and must never be committed.
     ".loom/tokens/",
     ".loom/accounts.env",
+    // Per-host API-key account pool (#8401): `<provider>/<account>.env` files
+    // holding provider subscription keys (e.g. Z.ai GLM coding plans). Same
+    // never-commit contract as `.loom/tokens/` above, and per-host for the
+    // same reason — a lapsed key on one machine must not poison another.
+    ".loom/api-keys/",
     // Codex/token-pool per-repo health cache + its sibling `mkdir` lock, written
     // atomically by the daemon token pool (#5014). Machine-local runtime state
     // that surfaced as untracked dirt in 0.17.0. Not secret-bearing (account
@@ -291,6 +302,53 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // repo after a resync while that one holds immediately.
     ".loom-local/",
 ];
+
+/// The credential-bearing subset of [`EPHEMERAL_PATTERNS`] (#8005) — paths that
+/// hold a live secret (OAuth token, API key, installation token, harness auth
+/// store), where a single commit is a one-way leak.
+///
+/// `.gitignore` is the first defence for these (every entry here is ALSO in
+/// [`EPHEMERAL_PATTERNS`], asserted by a test), but not a sufficient one: a
+/// host whose managed block is missing or stale — the stale-binary host class
+/// #7818 documents — ignores none of them. So every script that stages on
+/// Loom's behalf must refuse these paths UNCONDITIONALLY, independent of the
+/// ignore rules. The shell copies of this class
+/// (`defaults/scripts/land-resync-commit.sh`'s `LOOM_CREDENTIAL_PATTERNS`
+/// array and `defaults/scripts/resync-installed.sh`'s printed `:!` pathspec)
+/// are machine-checked against this list by `credential_class_tests`, so a
+/// credential path added here without them (or there without here) fails CI.
+/// They cannot be derived at runtime instead: consumer repos have no
+/// `post_init.rs` to parse, and asking the installed binary would re-create
+/// exactly the stale-binary dependency this defence exists to remove.
+///
+/// Deliberately NOT here: `.loom/account-health.{json,lock}` (account names +
+/// reason categories only, never a secret — #5014) and `.loom-local/` (a
+/// config overlay; credential policy forbids secrets in it). Both stay
+/// gitignored, and neither is on any stager's allowlist, but a tracked copy of
+/// either is not a "rotate the credential" emergency.
+///
+/// Matching contract (shared with the shell): a pattern ending in `/` is a
+/// directory and matches the directory itself and everything under it; any
+/// other pattern is an exact file path. No globs.
+pub const CREDENTIAL_PATTERNS: &[&str] = &[
+    ".loom/claude-config/",
+    ".loom/tokens/",
+    ".loom/accounts.env",
+    ".loom/api-keys/",
+    ".loom/gh-config/",
+    ".loom/gh-config-by-owner/",
+];
+
+/// Whether a repo-relative path falls in the [`CREDENTIAL_PATTERNS`] class.
+#[must_use]
+pub fn is_credential_path(path: &str) -> bool {
+    CREDENTIAL_PATTERNS
+        .iter()
+        .any(|p| match p.strip_suffix('/') {
+            Some(dir) => path == dir || path.starts_with(p),
+            None => path == *p,
+        })
+}
 
 /// Build the Loom-managed `.gitignore` block (marker lines + header + patterns),
 /// with no leading or trailing newline. Callers add surrounding newlines.
@@ -879,6 +937,10 @@ mod tests {
             ".loom/status/",
             ".loom/retry-state/",
             ".loom/sweep-checkpoint/",
+            // #7947: the concierge budget ledger. Committing it would hand one
+            // host's spent turn budget to every other host as a starting
+            // balance.
+            ".loom/concierge/",
             ".loom/diagnostics/",
             ".loom/guide-docs-state.json",
             ".loom/metrics_state.json",

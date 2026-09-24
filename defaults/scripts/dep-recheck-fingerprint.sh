@@ -67,6 +67,19 @@
 #                      pre-port shell matched `-` only; `*` is valid GitHub
 #                      task-list syntax and missing it would produce a false
 #                      VERDICT=clear, the worse failure direction.
+#                      An item may carry, in this order, a dependency phrase
+#                      (`Blocked by`/`Depends on`/`Requires`/`**Epic**`,
+#                      #8119), a `PR `/`Issue ` token (#7501), and an
+#                      `owner/repo` prefix (#8502) - so
+#                      `- [ ] Blocked by PR owner/repo#7: ...` is one item.
+#                      A CROSS-REPO `owner/repo#N` reference has its state
+#                      read in THAT repo, not the invoking one, and renders in
+#                      DEPS as `owner/repo#N:<state>` (a bare `#N` still
+#                      renders as `N:<state>`, so no existing hash moves).
+#                      Same worse-failure-direction reasoning throughout:
+#                      before #8502 such a line matched nothing at all and
+#                      reported DEPS='' / VERDICT=clear for a still-open
+#                      upstream prerequisite.
 #   extract-refs       Reference extraction (#4963): the issue body always,
 #                      plus any comment NOT authored by the automation
 #                      identity and NOT carrying its own marker. That
@@ -109,5 +122,6 @@ source "$SCRIPT_DIR/lib/script-helper.sh"
 # Guarded so `source`ing this file is a no-op: a stub that exec'd on source
 # would replace the sourcing shell and run the subcommand with ITS arguments.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # requires-daemon: dep-recheck-fingerprint >= 0.19.104   #7961/#7969 — the Rust port added loom-daemon/src/cli/dep_recheck.rs in 71d1fbae3, merged when VERSION read 0.19.103 (so 0.19.103 is the last version WITHOUT it); the post-merge bump that first shipped it was 0.19.104 (d3ea1a822). Hard, not `optional`: curator.md `eval`s this output, so there is nothing to degrade to. The refusal exits LOOM_SCRIPT_HELPER_MISSING_RC=2 set above, never 1 — 1 MEANS "unreadable issue/PR, fail safe" here (#8484).
     loom_exec_script_helper dep-recheck-fingerprint "$@"
 fi

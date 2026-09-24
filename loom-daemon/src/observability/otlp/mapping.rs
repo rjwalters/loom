@@ -2,6 +2,8 @@
 //! parent module's doc comment for the mapping table this file implements;
 //! this module is the field-by-field implementation plus its unit tests.
 
+mod metadata;
+
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -17,7 +19,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
 use crate::telemetry::{
-    RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryRecord,
+    AnomalyFlag, RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryRecord,
 };
 
 // ============================================================================
@@ -38,7 +40,7 @@ fn kv(key: &str, value: AnyValue) -> KeyValue {
     }
 }
 
-fn kv_string(key: &str, value: impl Into<String>) -> KeyValue {
+pub(super) fn kv_string(key: &str, value: impl Into<String>) -> KeyValue {
     kv(key, any_string(value))
 }
 
@@ -55,7 +57,7 @@ fn kv_int(key: &str, value: i64) -> KeyValue {
 /// `timestamp_nanos_opt` only returns `None` far outside any timestamp this
 /// daemon ever produces (year ~1677 or ~2262), so the floor is unreachable in
 /// practice and exists only to avoid a panic/wraparound on the conversion.
-fn nanos(ts: DateTime<Utc>) -> u64 {
+pub(super) fn nanos(ts: DateTime<Utc>) -> u64 {
     ts.timestamp_nanos_opt()
         .and_then(|n| u64::try_from(n).ok())
         .unwrap_or(0)
@@ -117,6 +119,15 @@ fn severity_for_role_tick(result: RoleTickResult) -> SeverityNumber {
     }
 }
 
+/// The wire string for a `session.analysis` anomaly flag (Issue #8760) —
+/// the serde `rename_all = "snake_case"` spelling, restated here so the
+/// OTLP attribute value matches the JSON one exactly.
+fn anomaly_flag_str(flag: AnomalyFlag) -> &'static str {
+    match flag {
+        AnomalyFlag::HighTokenUsage => "high_token_usage",
+    }
+}
+
 fn severity_text(severity: SeverityNumber) -> &'static str {
     match severity {
         SeverityNumber::Error => "ERROR",
@@ -128,7 +139,7 @@ fn severity_text(severity: SeverityNumber) -> &'static str {
 /// A `Resource` describing the emitting daemon host. `daemon_version` is only
 /// known from a `host.health` record, so it is threaded in separately rather
 /// than read off `envelope.record` — see [`build_metrics_request`].
-fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
+pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
     let mut attributes = vec![
         kv_string("service.name", "loom-daemon"),
         kv_string("service.instance.id", host_id),
@@ -152,7 +163,7 @@ fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
 /// become metrics instead (see [`metric_samples_for`]).
 fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     let time_unix_nano = nanos(envelope.emitted_at);
-    let (event_name, severity, body, attributes) = match &envelope.record {
+    let (event_name, severity, _body, attributes) = match &envelope.record {
         TelemetryRecord::SweepStarted(r) => {
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
@@ -166,10 +177,36 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(effort) = &r.effort {
                 attributes.push(kv_string("loom.effort", effort.clone()));
             }
+            if let Some(runtime) = &r.runtime {
+                attributes.push(kv_string("loom.runtime", runtime.clone()));
+            }
             (
                 "sweep.started",
                 SeverityNumber::Info,
                 format!("sweep started: {} issue #{}", r.repo, r.issue),
+                attributes,
+            )
+        }
+        TelemetryRecord::SweepIdentity(r) => {
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_int("loom.issue", i64::from(r.issue)),
+                kv_string("loom.sweep_id", r.sweep_id.clone()),
+            ];
+            for (key, value) in [
+                ("loom.runtime", &r.runtime),
+                ("loom.provider", &r.provider),
+                ("loom.model", &r.model),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_string(key, value.clone()));
+                }
+            }
+            (
+                "sweep.identity",
+                SeverityNumber::Info,
+                "sweep launch identity".to_string(),
                 attributes,
             )
         }
@@ -193,35 +230,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
             ];
-            // Per-model token usage (Issue #6384) — mirrors `sweep.outcome`'s
-            // `loom.phase_durations` array-of-kvlist pattern below so a
-            // consumer walks both attributes the same way. Omitted entirely
-            // when absent, matching the schema's own "unknown != zero"
-            // contract — never an empty array attribute.
-            if let Some(rows) = r.tokens_by_model.as_ref().filter(|v| !v.is_empty()) {
-                let entries = rows
-                    .iter()
-                    .map(|row| AnyValue {
-                        value: Some(any_value::Value::KvlistValue(KeyValueList {
-                            values: vec![
-                                kv_string("model", row.model.clone()),
-                                kv_string("speed", row.speed.clone()),
-                                kv_string("service_tier", row.service_tier.clone()),
-                                kv_int("input", row.input),
-                                kv_int("cache_read", row.cache_read),
-                                kv_int("cache_write_5m", row.cache_write_5m),
-                                kv_int("cache_write_1h", row.cache_write_1h),
-                                kv_int("output", row.output),
-                            ],
-                        })),
-                    })
-                    .collect();
-                attributes.push(kv(
-                    "loom.tokens_by_model",
-                    AnyValue {
-                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
-                    },
-                ));
+            if let Some(usage) = metadata::usage(r.tokens_by_model.as_deref()) {
+                attributes.push(usage);
             }
             (
                 "sweep.completed",
@@ -253,9 +263,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(pr_number) = r.pr_number {
                 attributes.push(kv_int("loom.pr_number", i64::from(pr_number)));
             }
-            for (key, value) in &r.config {
-                attributes.push(kv_string(&format!("loom.config.{key}"), value.clone()));
-            }
+            attributes.extend(metadata::outcome(r));
             if !r.phase_durations.is_empty() {
                 let entries = r
                     .phase_durations
@@ -308,15 +316,17 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(effort) = &r.effort {
                 attributes.push(kv_string("loom.effort", effort.clone()));
             }
-            if let Some(detail) = &r.detail {
-                attributes.push(kv_string("loom.detail", detail.clone()));
-            }
+            // Arbitrary failure detail can contain credentials or workload text.
+            // The typed result and bounded observed metadata are sufficient here.
             // #8408: which credential pool gated a pre-spawn pool skip.
             if let Some(gated_pool) = &r.gated_pool {
                 attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
             }
-            if let Some(models_used) = &r.models_used {
-                attributes.push(kv_string("loom.models_used", models_used.join(",")));
+            if let Some(models) = metadata::models(r.models_used.as_deref()) {
+                attributes.push(models);
+            }
+            if let Some(usage) = metadata::usage(r.tokens_by_model.as_deref()) {
+                attributes.push(usage);
             }
             if let Some(actions) = &r.actions {
                 attributes
@@ -341,16 +351,197 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes,
             )
         }
-        TelemetryRecord::TokensSnapshot(_) | TelemetryRecord::HostHealth(_) => return None,
+        TelemetryRecord::SessionSummary(r) => {
+            // Issue #8757 (G3 of #8714): session shape, mapped as a log
+            // record like the lifecycle kinds — an event with counts, not a
+            // gauge. Every attribute is a count, id, or allowlisted name;
+            // the parse never copies message text or tool output, so
+            // nothing here needs a free-text bound beyond `bounded`'s.
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.session_id", r.session_id.clone()),
+                kv_string("loom.runtime", r.runtime.clone()),
+                kv_int("loom.tokens.input", r.tokens_input),
+                kv_int("loom.tokens.output", r.tokens_output),
+                kv_int("loom.tokens.cache_read", r.tokens_cache_read),
+                kv_int("loom.tokens.cache_write", r.tokens_cache_write),
+                kv_int("loom.wall_ms", r.wall_ms),
+                kv_int("loom.turns", i64::try_from(r.turns).unwrap_or(i64::MAX)),
+                kv_int("loom.tool_errors", i64::try_from(r.tool_errors).unwrap_or(i64::MAX)),
+            ];
+            // Optional fields stay absent when unknown — an unobserved
+            // attribution must be an ABSENT attribute, never a zero one.
+            if let Some(parent) = &r.parent_session_id {
+                attributes.push(kv_string("loom.parent_session_id", parent.clone()));
+            }
+            if let Some(role) = &r.role {
+                attributes.push(kv_string("loom.role", role.clone()));
+            }
+            if let Some(issue) = r.issue {
+                attributes.push(kv_int("loom.issue", i64::from(issue)));
+            }
+            if let Some(pr_number) = r.pr_number {
+                attributes.push(kv_int("loom.pr_number", i64::from(pr_number)));
+            }
+            if let Some(outcome) = &r.outcome {
+                attributes.push(kv_string("loom.outcome", outcome.clone()));
+            }
+            if let Some(models) = metadata::models(Some(&r.models)) {
+                attributes.push(models);
+            }
+            if !r.tool_calls.is_empty() {
+                let entries = r
+                    .tool_calls
+                    .iter()
+                    .map(|call| AnyValue {
+                        value: Some(any_value::Value::KvlistValue(KeyValueList {
+                            values: vec![
+                                kv_string("tool", call.tool.clone()),
+                                kv_int("count", i64::try_from(call.count).unwrap_or(i64::MAX)),
+                            ],
+                        })),
+                    })
+                    .collect();
+                attributes.push(kv(
+                    "loom.tool_calls",
+                    AnyValue {
+                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
+                    },
+                ));
+            }
+            (
+                "session.summary",
+                SeverityNumber::Info,
+                format!(
+                    "session summary: {} {} on {}, {} turn(s), {} tool call(s)",
+                    r.runtime,
+                    r.role.as_deref().unwrap_or("role-unknown"),
+                    r.repo,
+                    r.turns,
+                    r.tool_calls.iter().map(|c| c.count).sum::<u64>(),
+                ),
+                attributes,
+            )
+        }
+        TelemetryRecord::SessionAnalysis(r) => {
+            // Issue #8760 (G3 part 2 of #8714): the derived per-session
+            // rollup, mapped as a log record like `session.summary` — an
+            // event with counts and a dollar figure, not a gauge.
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.session_id", r.session_id.clone()),
+            ];
+            if let Some(parent) = &r.parent_session_id {
+                attributes.push(kv_string("loom.parent_session_id", parent.clone()));
+            }
+            if let Some(cost_usd) = r.cost_usd {
+                attributes.push(kv(
+                    "loom.cost_usd",
+                    AnyValue {
+                        value: Some(any_value::Value::DoubleValue(cost_usd)),
+                    },
+                ));
+            }
+            if let Some(longest) = &r.longest_tool_call {
+                attributes.push(kv_string("loom.longest_tool_call.tool", longest.tool.clone()));
+                attributes.push(kv_int("loom.longest_tool_call.duration_ms", longest.duration_ms));
+            }
+            if !r.retry_loops.is_empty() {
+                let entries = r
+                    .retry_loops
+                    .iter()
+                    .map(|retry_loop| AnyValue {
+                        value: Some(any_value::Value::KvlistValue(KeyValueList {
+                            values: vec![
+                                kv_string("tool", retry_loop.tool.clone()),
+                                kv_int("length", i64::from(retry_loop.length)),
+                            ],
+                        })),
+                    })
+                    .collect();
+                attributes.push(kv(
+                    "loom.retry_loops",
+                    AnyValue {
+                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
+                    },
+                ));
+            }
+            if !r.anomalies.is_empty() {
+                let entries = r
+                    .anomalies
+                    .iter()
+                    .map(|flag| any_string(anomaly_flag_str(*flag)))
+                    .collect();
+                attributes.push(kv(
+                    "loom.anomalies",
+                    AnyValue {
+                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
+                    },
+                ));
+            }
+            (
+                "session.analysis",
+                if r.anomalies.is_empty() {
+                    SeverityNumber::Info
+                } else {
+                    SeverityNumber::Warn
+                },
+                format!(
+                    "session analysis: {} on {}, {} retry loop(s), {} anomaly flag(s)",
+                    r.session_id,
+                    r.repo,
+                    r.retry_loops.len(),
+                    r.anomalies.len(),
+                ),
+                attributes,
+            )
+        }
+        TelemetryRecord::DaemonEvent(r) => {
+            // Issue #8760 (G4 of #8714): a generic wrapper for four
+            // previously-uncovered event-bus topics. The payload is
+            // already-reviewed, small, operator-facing JSON (never
+            // free-form transcript content), so it is carried whole as one
+            // compact-JSON string attribute rather than re-typed per topic.
+            let attributes = vec![
+                kv_string("loom.topic", r.topic.clone()),
+                kv_string("loom.payload", serde_json::to_string(&r.payload).unwrap_or_default()),
+            ];
+            (
+                "daemon.event",
+                SeverityNumber::Info,
+                format!("daemon event: {}", r.topic),
+                attributes,
+            )
+        }
+        TelemetryRecord::TokensSnapshot(_)
+        | TelemetryRecord::HostHealth(_)
+        | TelemetryRecord::Span(_) => return None,
     };
     Some(LogRecord {
         time_unix_nano,
         observed_time_unix_nano: time_unix_nano,
         severity_number: severity as i32,
         severity_text: severity_text(severity).to_string(),
-        body: Some(any_string(body)),
-        attributes,
+        body: Some(any_string(event_name)),
+        attributes: metadata::bounded(attributes),
         event_name: event_name.to_string(),
+        trace_id: envelope
+            .trace_context
+            .as_ref()
+            .map(|c| c.trace_id.bytes())
+            .unwrap_or_default(),
+        span_id: envelope
+            .trace_context
+            .as_ref()
+            .map(|c| c.span_id.bytes())
+            .unwrap_or_default(),
+        flags: envelope
+            .trace_context
+            .as_ref()
+            .map(|c| u32::from(c.flags))
+            .unwrap_or_default(),
         ..Default::default()
     })
 }
@@ -509,7 +700,10 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         TelemetryRecord::TokensSnapshot(r) => {
             let mut samples = Vec::new();
             for account in &r.accounts {
-                let mut attributes = vec![kv_string("account", account.account.clone())];
+                let mut attributes = vec![
+                    kv_string("account", account.account.clone()),
+                    kv_string("provider", account.provider.clone()),
+                ];
                 if let Some(rank) = account.rank {
                     attributes.push(kv_int("rank", i64::from(rank)));
                 }
@@ -537,10 +731,18 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         // Every lifecycle-shaped kind — including `role_tick.outcome`
         // (#8056) — becomes a log record instead (see `log_record_for`).
         TelemetryRecord::SweepStarted(_)
+        | TelemetryRecord::SweepIdentity(_)
         | TelemetryRecord::SweepPhase(_)
         | TelemetryRecord::SweepCompleted(_)
         | TelemetryRecord::SweepOutcome(_)
-        | TelemetryRecord::RoleTickOutcome(_) => Vec::new(),
+        | TelemetryRecord::RoleTickOutcome(_)
+        // `session.summary` / `session.analysis` / `daemon.event` are log
+        // records (see log_record_for), not gauges — each is a per-session
+        // or per-bus-event event, not a host sample.
+        | TelemetryRecord::SessionSummary(_)
+        | TelemetryRecord::SessionAnalysis(_)
+        | TelemetryRecord::DaemonEvent(_)
+        | TelemetryRecord::Span(_) => Vec::new(),
     }
 }
 

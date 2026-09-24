@@ -14,9 +14,11 @@ use super::*;
 
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::Result;
+use serial_test::serial;
 use tempfile::TempDir;
 
 use crate::work_finder::{tick, TickReport, WorkDispatcher, WorkItem, WorkSource};
@@ -348,4 +350,512 @@ fn all_four_hosts_resume_on_the_tick_after_the_pool_recovers() {
         );
         assert_eq!(host.held_pool_count(), 0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// #8554: preference-aware hold — arms on the WHOLE list, not just Claude
+// ---------------------------------------------------------------------------
+
+/// Every env var that can pin a runtime or repoint the codex account reader.
+/// Cleared for the scope of a test and restored on drop, mirroring
+/// `role_runner::runtime_preflight::tests::EnvGuard`.
+const PREFERENCE_ENV: [&str; 8] = [
+    "LOOM_RUNTIME",
+    "LOOM_RUNTIME_SWEEP_LIFECYCLE",
+    "LOOM_CODEX_HOME",
+    "CODEX_HOME",
+    "LOOM_CODEX_PROFILE",
+    "LOOM_SPAWN_NO_EXPORT",
+    "LOOM_CODEX_NO_EXEC",
+    "LOOM_CODEX_PROFILE_ROOT",
+];
+
+struct PreferenceEnvGuard(Vec<(&'static str, Option<String>)>);
+
+impl PreferenceEnvGuard {
+    fn new(profile_root: &Path) -> Self {
+        let prior = PREFERENCE_ENV
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        for key in PREFERENCE_ENV {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root);
+        Self(prior)
+    }
+}
+
+impl Drop for PreferenceEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.0.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// A workspace with BOTH a Claude token pool (`workspace_with_pool`) and the
+/// on-disk role/runtime manifests plus an executable `codex` adapter stub
+/// that `runtime_preference::resolve_runtime("sweep-lifecycle", ...)` needs
+/// to admit a fallback tap for real, instead of failing closed on missing
+/// files. `sweep-lifecycle`'s role-manifest lookup substitutes `builder.json`
+/// (`runtime_admission`'s own fallback), so that is the file written here.
+fn workspace_with_pool_and_preference(names: &[&str], config: &serde_json::Value) -> TempDir {
+    let dir = workspace_with_pool(names);
+    for sub in ["roles", "runtimes", "scripts"] {
+        fs::create_dir_all(dir.path().join(".loom").join(sub)).unwrap();
+    }
+    fs::write(dir.path().join(".loom/config.json"), config.to_string()).unwrap();
+    fs::write(
+        dir.path().join(".loom/roles/builder.json"),
+        r#"{"runtimeRequirements":["mcp"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(".loom/runtimes/codex.json"),
+        r#"{"runtime":"codex","accountProvider":"codex","capabilities":{"mcp":"yes"}}"#,
+    )
+    .unwrap();
+    // Both adapters, so the `claude` tap is genuinely ADMITTED and its skip
+    // (when it is skipped) is `unavailable(claude_tokens: …)` — the #7708
+    // pool-exhaustion shape this hold exists for — and never the materially
+    // different `not-admitted(...)` a missing adapter would produce.
+    for runtime in ["codex", "claude"] {
+        let adapter = dir.path().join(format!(".loom/scripts/spawn-{runtime}.sh"));
+        fs::write(&adapter, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+/// The core #8554 acceptance criterion: the Claude pool is fully bad-marked
+/// (the exact #7708 shape), but `runtimes.preference` names a codex fallback
+/// with a healthy account — the hold must NOT arm; dispatch belongs on codex
+/// instead of holding every workspace resolving to this pool.
+#[test]
+#[serial]
+fn a_spawnable_lower_tap_keeps_the_hold_from_arming() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(
+        !host.observe_root(ws.path(), chrono::Utc::now()),
+        "a spawnable fallback tap must keep the hold from arming"
+    );
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// The other half: every tap in the list is unavailable too (here, zero
+/// codex accounts) — the hold still arms, exactly as the Claude-only check
+/// did before #8554.
+#[test]
+#[serial]
+fn a_wholly_unavailable_preference_list_still_arms_the_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    // No codex profile directories created: the codex pool is provisioned
+    // (manifest + adapter exist) but has zero enabled accounts.
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.held_pool_count(), 1);
+}
+
+/// A healthy Claude pool with a preference list configured never holds —
+/// tier 0 serves the work, exactly as the no-preference case does.
+#[test]
+#[serial]
+fn a_healthy_claude_pool_never_arms_even_with_a_preference_list() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(
+        &["a", "b"],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+
+    let host = PoolHoldState::new();
+    assert!(!host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// An operator pin (`LOOM_RUNTIME=claude`) disables fall-through at the hold
+/// too: a dry Claude pool still arms the hold even with a spawnable codex
+/// fallback configured, because the pin is a deliberate act that a silent
+/// route-around would defeat.
+#[test]
+#[serial]
+fn an_operator_pin_disables_fall_through_at_the_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+    bad_mark_all(ws.path(), &["a"]);
+    std::env::set_var("LOOM_RUNTIME", "claude");
+
+    let host = PoolHoldState::new();
+    assert!(
+        host.observe_root(ws.path(), chrono::Utc::now()),
+        "a pin must keep the hold on Claude even with a spawnable fallback"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fleet broadcast of the hold (Issue #8001)
+// ---------------------------------------------------------------------------
+//
+// The shape these mirror is #7477's: one process models N hosts, each host
+// being one `PoolHoldState` + one `SweepRegistry` + one `PeerClaimView`. The
+// room itself is modelled by hand-delivering the ad the publishing host put
+// on its outbound channel into the receiving host's view — the same thing
+// `safehouse::PeerClaimSink::on_event` does in production, minus the socket.
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant};
+
+use crate::peer_claims::{ClaimAd, ClaimKind, PeerClaimView};
+use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+use crate::tokens_pool::paths::resolve_tokens_dir;
+use crate::tokens_pool::select::pool_account_fingerprint;
+
+/// One simulated fleet host: its own hold set, its own registry (with an
+/// outbound peer-claim channel), and its own inbound peer-claim view.
+struct FleetHost {
+    holds: PoolHoldState,
+    registry: SweepRegistry,
+    view: Arc<Mutex<PeerClaimView>>,
+    outbound: tokio::sync::mpsc::Receiver<ClaimAd>,
+}
+
+impl FleetHost {
+    fn new(name: &str, root: &Path) -> Self {
+        let mut registry = SweepRegistry::new(SweepRegistryConfig::new(root.to_path_buf()));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        registry.set_peer_claim_publisher(tx);
+        let view =
+            Arc::new(Mutex::new(PeerClaimView::new(name.to_owned(), StdDuration::from_secs(120))));
+        registry.set_peer_claims(Arc::clone(&view));
+        Self {
+            holds: PoolHoldState::new(),
+            registry,
+            view,
+            outbound: rx,
+        }
+    }
+
+    /// This host's full per-root verdict: its own pre-flight read, its own
+    /// arm/clear broadcast, and any peer-reported hold folded in — exactly
+    /// what `preflight_held_per_root` computes per root in production.
+    fn preflight(&self, root: &Path, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let observation = self.holds.observe_root_edge(root, now);
+        fold_peer_pool_hold(&self.holds, &self.registry, &observation)
+    }
+
+    /// Drain everything this host published and deliver it to `peer`'s view —
+    /// the room, modelled.
+    fn deliver_to(&mut self, peer: &FleetHost) {
+        while let Ok(ad) = self.outbound.try_recv() {
+            if ad.kind.is_pool_hold_lane() {
+                let mut v = peer.view.lock().unwrap();
+                v.observe_pool_hold_at(&ad, Instant::now());
+            }
+        }
+    }
+
+    /// Drop everything this host published without delivering it — a
+    /// safehoused outage / dropped ad.
+    fn drop_outbound(&mut self) {
+        while self.outbound.try_recv().is_ok() {}
+    }
+}
+
+fn fingerprint_of(root: &Path) -> String {
+    pool_account_fingerprint(&resolve_tokens_dir(root)).expect("fixture pool has accounts")
+}
+
+/// **The #8001 acceptance criterion.** Host A discovers the pool is dead and
+/// broadcasts. Host B — whose own `spawnable_pool_state` read still reports a
+/// perfectly healthy pool, so its own pre-flight would NOT hold — holds
+/// dispatch anyway, purely on the strength of the received ad.
+#[test]
+fn a_peer_holds_on_the_broadcast_without_rederiving_exhaustion_itself() {
+    let now = chrono::Utc::now();
+    // Host A's workspace: dead pool. Host B's: the SAME accounts, but its own
+    // view of them is healthy (no `.bad_tokens`) — B's own read cannot catch
+    // this, which is the whole point.
+    let ws_a = workspace_with_pool(&["a", "b", "c"]);
+    bad_mark_all(ws_a.path(), &["a", "b", "c"]);
+    let ws_b = workspace_with_pool(&["a", "b", "c"]);
+
+    assert_eq!(
+        fingerprint_of(ws_a.path()),
+        fingerprint_of(ws_b.path()),
+        "the same account set must fingerprint identically across hosts"
+    );
+
+    let mut host_a = FleetHost::new("host-a", ws_a.path());
+    let host_b = FleetHost::new("host-b", ws_b.path());
+
+    assert!(host_a.preflight(ws_a.path(), now), "A's own read must hold");
+    // Before the ad arrives B is free — this is the baseline the broadcast
+    // has to change, and it proves B's OWN read says "healthy".
+    assert!(
+        !host_b.preflight(ws_b.path(), now),
+        "B's own pre-flight read must report the pool healthy"
+    );
+    assert_eq!(
+        host_b.holds.held_pool_count(),
+        0,
+        "B must hold nothing of its own — any hold it takes is the peer's"
+    );
+
+    host_a.deliver_to(&host_b);
+
+    assert!(
+        host_b.preflight(ws_b.path(), now),
+        "B must hold on A's broadcast despite its own read saying healthy"
+    );
+    assert_eq!(
+        host_b.holds.held_pool_count(),
+        0,
+        "the peer-sourced hold must not be forged into B's own local hold set"
+    );
+}
+
+/// **The correctness risk the module doc names.** A peer resolving a
+/// genuinely DIFFERENT (healthy) repo-local shadow pool must not be
+/// suppressed by another host's hold — even though both hosts hold their
+/// pools at the identical relative path `<root>/.loom/tokens`, which is
+/// exactly why the broadcast is keyed by account set and not by directory.
+#[test]
+fn a_peer_with_a_different_healthy_shadow_pool_is_not_suppressed() {
+    let now = chrono::Utc::now();
+    let ws_a = workspace_with_pool(&["a", "b", "c"]);
+    bad_mark_all(ws_a.path(), &["a", "b", "c"]);
+    // B's repo-local shadow pool holds a DIFFERENT account set (#7527/#3938).
+    let ws_b = workspace_with_pool(&["x", "y"]);
+
+    assert_ne!(
+        fingerprint_of(ws_a.path()),
+        fingerprint_of(ws_b.path()),
+        "different account sets must fingerprint differently"
+    );
+    assert_eq!(
+        ws_a.path().join(".loom").join("tokens").file_name(),
+        ws_b.path().join(".loom").join("tokens").file_name(),
+        "both pools sit at the same relative path — a path key would collide"
+    );
+
+    let mut host_a = FleetHost::new("host-a", ws_a.path());
+    let host_b = FleetHost::new("host-b", ws_b.path());
+
+    assert!(host_a.preflight(ws_a.path(), now));
+    host_a.deliver_to(&host_b);
+
+    assert!(
+        !host_b.preflight(ws_b.path(), now),
+        "a host whose own pool is healthy and DIFFERENT must never be \
+         suppressed by a peer's hold"
+    );
+}
+
+/// Recovery propagates early: when A's pool recovers it broadcasts a clear,
+/// and B resumes immediately rather than sitting out the remainder of the
+/// advertised TTL.
+#[test]
+fn a_recovery_broadcast_releases_the_peer_early() {
+    let now = chrono::Utc::now();
+    let ws_a = workspace_with_pool(&["a", "b"]);
+    bad_mark_all(ws_a.path(), &["a", "b"]);
+    let ws_b = workspace_with_pool(&["a", "b"]);
+
+    let mut host_a = FleetHost::new("host-a", ws_a.path());
+    let host_b = FleetHost::new("host-b", ws_b.path());
+
+    assert!(host_a.preflight(ws_a.path(), now));
+    host_a.deliver_to(&host_b);
+    assert!(host_b.preflight(ws_b.path(), now), "B holds on the arm ad");
+
+    readmit_all(ws_a.path());
+    assert!(!host_a.preflight(ws_a.path(), now), "A clears on its very next tick");
+    host_a.deliver_to(&host_b);
+
+    assert!(
+        !host_b.preflight(ws_b.path(), now),
+        "B must resume on A's clear ad, not wait out the advertised TTL"
+    );
+}
+
+/// A second host holding the same pool keeps the hold alive after the first
+/// one clears: a `PoolHoldCleared` speaks only for its own sender.
+#[test]
+fn one_peers_recovery_does_not_release_another_peers_hold() {
+    let now = chrono::Utc::now();
+    let pool_key = {
+        let ws = workspace_with_pool(&["a", "b"]);
+        fingerprint_of(ws.path())
+    };
+    let ws_c = workspace_with_pool(&["a", "b"]);
+    let host_c = FleetHost::new("host-c", ws_c.path());
+
+    {
+        let mut v = host_c.view.lock().unwrap();
+        for peer in ["host-a", "host-b"] {
+            v.observe_pool_hold_at(
+                &ClaimAd::pool_hold_armed(
+                    "repo".into(),
+                    peer.into(),
+                    1,
+                    "ts".into(),
+                    pool_key.clone(),
+                    900,
+                ),
+                Instant::now(),
+            );
+        }
+        // Only host-a recovers.
+        v.observe_pool_hold_at(
+            &ClaimAd::pool_hold_cleared(
+                "repo".into(),
+                "host-a".into(),
+                1,
+                "ts".into(),
+                pool_key.clone(),
+            ),
+            Instant::now(),
+        );
+    }
+
+    assert!(
+        host_c.preflight(ws_c.path(), now),
+        "host-b still holds the pool — one peer's recovery must not speak for another's"
+    );
+}
+
+/// Fail-open: a dropped ad (safehoused outage, saturated channel) leaves the
+/// peer exactly where it was before #8001 — free to dispatch, and still
+/// protected by its own pre-flight on its own next tick once its own view of
+/// the pool catches up.
+#[test]
+fn a_dropped_ad_degrades_to_the_local_only_preflight() {
+    let now = chrono::Utc::now();
+    let ws_a = workspace_with_pool(&["a", "b"]);
+    bad_mark_all(ws_a.path(), &["a", "b"]);
+    let ws_b = workspace_with_pool(&["a", "b"]);
+
+    let mut host_a = FleetHost::new("host-a", ws_a.path());
+    let host_b = FleetHost::new("host-b", ws_b.path());
+
+    assert!(host_a.preflight(ws_a.path(), now));
+    host_a.drop_outbound(); // the ad never reaches the room
+
+    assert!(!host_b.preflight(ws_b.path(), now), "a dropped ad must not hold B — fail-open");
+
+    // B's own read catching up still holds it, unchanged from pre-#8001.
+    bad_mark_all(ws_b.path(), &["a", "b"]);
+    assert!(host_b.preflight(ws_b.path(), now));
+}
+
+/// The arm edge is published exactly once per outage, not once per tick —
+/// what keeps a multi-hour outage from flooding the shared room.
+#[test]
+fn the_arm_edge_is_broadcast_once_per_outage() {
+    let now = chrono::Utc::now();
+    let ws = workspace_with_pool(&["a"]);
+    bad_mark_all(ws.path(), &["a"]);
+    let mut host = FleetHost::new("host-a", ws.path());
+
+    for _ in 0..5 {
+        assert!(host.preflight(ws.path(), now));
+    }
+
+    let mut ads = Vec::new();
+    while let Ok(ad) = host.outbound.try_recv() {
+        ads.push(ad);
+    }
+    assert_eq!(ads.len(), 1, "five held ticks must publish one arm ad");
+    assert_eq!(ads[0].kind, ClaimKind::PoolHoldArmed);
+    assert_eq!(ads[0].pool_key.as_deref(), Some(fingerprint_of(ws.path()).as_str()));
+    assert!(ads[0].remaining_secs.is_some_and(|s| s > 0 && s <= 900));
+
+    readmit_all(ws.path());
+    for _ in 0..3 {
+        assert!(!host.preflight(ws.path(), now));
+    }
+    let mut ads = Vec::new();
+    while let Ok(ad) = host.outbound.try_recv() {
+        ads.push(ad);
+    }
+    assert_eq!(ads.len(), 1, "three recovered ticks must publish one clear ad");
+    assert_eq!(ads[0].kind, ClaimKind::PoolHoldCleared);
+}
+
+/// A wrapper-confirmed death (the post-mortem path the reaper drives) is the
+/// strongest evidence available, so it broadcasts too — including when it
+/// merely *upgrades* an existing pre-flight hold.
+#[test]
+fn a_post_mortem_hold_broadcasts_its_arming_edge() {
+    let now = chrono::Utc::now();
+    let ws = workspace_with_pool(&["a"]);
+    let host = PoolHoldState::new();
+
+    // Healthy live read, wrapper says otherwise: arms, and must advertise.
+    let observation = host.note_pool_dead(ws.path(), now);
+    assert!(observation.held);
+    assert_eq!(observation.pool_key.as_deref(), Some(fingerprint_of(ws.path()).as_str()));
+    assert!(matches!(observation.edge, Some(PoolHoldEdge::Armed { .. })));
+
+    // Re-confirming an already-post-mortem hold is not a fresh edge.
+    let again = host.note_pool_dead(ws.path(), now);
+    assert!(again.edge.is_none(), "a repeat post-mortem must not re-broadcast");
+}
+
+/// An upgrade from a pre-flight hold to a wrapper-confirmed one IS a fresh
+/// edge: a peer that missed (or has since expired) the original arm ad gets a
+/// new window backed by the strongest evidence this daemon ever gets.
+#[test]
+fn a_preflight_hold_upgraded_by_the_wrapper_rebroadcasts() {
+    let now = chrono::Utc::now();
+    let ws = workspace_with_pool(&["a"]);
+    bad_mark_all(ws.path(), &["a"]);
+    let host = PoolHoldState::new();
+
+    assert!(host.observe_root(ws.path(), now));
+    let upgraded = host.note_pool_dead(ws.path(), now);
+    assert!(
+        matches!(upgraded.edge, Some(PoolHoldEdge::Armed { .. })),
+        "false -> true on wrapper_observed is a fresh, stronger edge"
+    );
+}
+
+/// An empty pool (#4642's ABSENT-pool condition) has no identity, so it is
+/// never advertised and no peer hold can be about it.
+#[test]
+fn an_empty_pool_has_no_broadcast_identity() {
+    let now = chrono::Utc::now();
+    let ws = tempfile::tempdir().unwrap();
+    fs::create_dir_all(ws.path().join(".loom").join("tokens")).unwrap();
+
+    let host = PoolHoldState::new();
+    let observation = host.observe_root_edge(ws.path(), now);
+    assert!(!observation.held);
+    assert!(observation.pool_key.is_none());
+    assert!(observation.edge.is_none());
 }

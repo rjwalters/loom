@@ -39,6 +39,9 @@ fn record(
         models_used: None,
         doctor_cycles: None,
         judge_verdicts: None,
+        runtime: None,
+        provider: None,
+        profile: None,
     }
 }
 
@@ -94,17 +97,189 @@ impl MergeLookup for ForgeDown {
 }
 
 #[test]
-fn group_by_parses_the_five_documented_dimensions() {
+fn group_by_parses_the_six_documented_dimensions() {
     for (spec, expected) in [
         ("arm", GroupBy::Arm),
         ("MODEL", GroupBy::Model),
         ("repo", GroupBy::Repo),
         ("host", GroupBy::Host),
         ("Day", GroupBy::Day),
+        ("tap", GroupBy::Tap),
     ] {
         assert_eq!(GroupBy::parse(spec).unwrap(), expected);
     }
     assert!(GroupBy::parse("phase").is_err());
+}
+
+/// Issue #8556: the tap stamp a post-#8556 native spawn writes is authoritative
+/// — it is the only source that can name the model-profile half, and therefore
+/// the only one that can tell a flat-rate coding plan from a metered endpoint
+/// reached through the same runtime.
+#[test]
+fn an_explicit_tap_stamp_is_used_verbatim() {
+    let mut stamped = record("s1", "o/r", None, SweepResult::Success, 100);
+    stamped
+        .config
+        .insert("tap".into(), "opencode:zai-metered@api_keys:zai".into());
+    // Present but ignored: the stamp already encodes both halves.
+    stamped.config.insert("runtime".into(), "opencode".into());
+    stamped
+        .config
+        .insert("credential_source".into(), "pool".into());
+    assert_eq!(resolve_tap(&stamped), "opencode:zai-metered@api_keys:zai");
+}
+
+/// Pre-#8556 history still lands in a tap bucket rather than being dropped from
+/// the report: the credential keys #8447 already writes reconstruct the key.
+/// Reconstruction never invents a profile — a reconstructed key is always the
+/// bare runtime.
+#[test]
+fn a_record_without_a_tap_stamp_is_reconstructed_from_its_credential_keys() {
+    let reconstructed = |pairs: &[(&str, &str)]| {
+        let mut r = record("s", "o/r", None, SweepResult::Success, 100);
+        for (k, v) in pairs {
+            r.config.insert((*k).into(), (*v).into());
+        }
+        resolve_tap(&r)
+    };
+    assert_eq!(
+        reconstructed(&[
+            ("runtime", "opencode"),
+            ("credential_source", "pool"),
+            ("credential_provider", "zai"),
+        ]),
+        "opencode@api_keys:zai",
+    );
+    assert_eq!(reconstructed(&[("runtime", "pi"), ("credential_source", "env")]), "pi@env",);
+    assert_eq!(
+        reconstructed(&[("runtime", "pi"), ("credential_source", "none")]),
+        "pi@harness-own",
+    );
+    // The Claude/legacy-adapter path writes no launch record at all, so it has
+    // no credential keys — but its pool is a property of the runtime itself,
+    // which makes naming it a reading rather than a guess.
+    assert_eq!(reconstructed(&[("runtime", "claude")]), "claude@claude_tokens");
+    assert_eq!(reconstructed(&[("runtime", "codex")]), "codex@codex_accounts");
+    // Neither half readable: bucketed as unknown, never guessed at.
+    assert_eq!(reconstructed(&[]), format!("{UNKNOWN_GROUP}@{UNKNOWN_GROUP}"));
+}
+
+/// The #8556 query end-to-end: grouping by tap separates the metered backstop
+/// from the subscription taps, and no record is dropped for want of a stamp.
+#[test]
+fn grouping_by_tap_separates_the_metered_backstop_from_the_subscriptions() {
+    let tapped = |sweep: &str, tap: &str| {
+        let mut r = record(sweep, "o/r", Some("glm-5.3"), SweepResult::Success, 100);
+        r.config.insert("tap".into(), tap.into());
+        entry(r, day(10), "h1")
+    };
+    let records = vec![
+        tapped("s1", "opencode:zai-metered@api_keys:zai"),
+        tapped("s2", "opencode:zai-metered@api_keys:zai"),
+        tapped("s3", "claude@claude_tokens"),
+        // No stamp at all: reconstructed, not dropped.
+        entry(record("s4", "o/r", None, SweepResult::Success, 100), day(10), "h1"),
+    ];
+    let report = summarize(
+        &records,
+        &SpawnDeathIndex::default(),
+        opts(GroupBy::Tap),
+        &mut NoneMerged,
+        vec!["/ws".into()],
+    );
+    assert_eq!(report.records_grouped, 4);
+    let row = |g: &str| {
+        report
+            .rows
+            .iter()
+            .find(|r| r.group == g)
+            .unwrap_or_else(|| panic!("missing tap row {g}: {:?}", report.rows))
+    };
+    assert_eq!(row("opencode:zai-metered@api_keys:zai").sweeps, 2);
+    assert_eq!(row("claude@claude_tokens").sweeps, 1);
+    assert_eq!(row(&format!("{UNKNOWN_GROUP}@{UNKNOWN_GROUP}")).sweeps, 1);
+}
+
+/// Issue #8634: one logical tap can straddle the profile-stamping boundary
+/// (#8556, landed in #8625) — its pre-stamp records reconstruct a
+/// BARE-RUNTIME key while its post-stamp records carry the profile half — so
+/// `--group-by tap` shows two rows for what is really one tap. Merging them
+/// would mean inventing a profile for the older records, so the report ships
+/// a caveat instead of changing the placement rule.
+#[test]
+fn tap_grouping_flags_a_tap_split_across_the_stamping_boundary() {
+    // Post-#8625: stamped, so the profile half is known.
+    let mut stamped = record("s1", "o/r", None, SweepResult::Success, 100);
+    stamped
+        .config
+        .insert("tap".into(), "opencode:zai-metered@api_keys:zai".into());
+    // Pre-#8625: no stamp, so the key is reconstructed to the bare runtime.
+    let mut pre = record("s2", "o/r", None, SweepResult::Success, 100);
+    for (k, v) in [
+        ("runtime", "opencode"),
+        ("credential_source", "pool"),
+        ("credential_provider", "zai"),
+    ] {
+        pre.config.insert(k.into(), v.into());
+    }
+    let report = summarize(
+        &[entry(stamped, day(10), "h1"), entry(pre, day(10), "h1")],
+        &SpawnDeathIndex::default(),
+        opts(GroupBy::Tap),
+        &mut NoneMerged,
+        vec!["/ws".into()],
+    );
+    // Both rows survive — nothing is merged and no profile is invented.
+    assert_eq!(report.rows.len(), 2);
+    let note = report
+        .notes
+        .iter()
+        .find(|n| n.contains("profile-stamping boundary"))
+        .unwrap_or_else(|| panic!("missing tap-split caveat: {:?}", report.notes));
+    assert!(
+        note.contains("opencode@api_keys:zai vs opencode:zai-metered@api_keys:zai"),
+        "caveat should name the split pair: {note}"
+    );
+    // The caveat reaches the human renderer too, not just --json.
+    assert!(render_text(&report).contains("profile-stamping boundary"));
+}
+
+/// The same caveat must stay quiet when nothing straddles the boundary: two
+/// stamped rows sharing a runtime and credential are two real taps (a
+/// stamped key with no profile half is not a reconstruction), and a
+/// reconstructed row with no stamped counterpart is just one tap.
+#[test]
+fn tap_grouping_ships_no_split_caveat_without_a_reconstructed_bare_row() {
+    let tapped = |sweep: &str, tap: &str| {
+        let mut r = record(sweep, "o/r", None, SweepResult::Success, 100);
+        r.config.insert("tap".into(), tap.into());
+        entry(r, day(10), "h1")
+    };
+    let mut reconstructed = record("s3", "o/r", None, SweepResult::Success, 100);
+    reconstructed.config.insert("runtime".into(), "pi".into());
+    let report = summarize(
+        &[
+            // Stamped, bare runtime (this runtime has no profile half)…
+            tapped("s1", "opencode@api_keys:zai"),
+            // …alongside a stamped profile on the same credential.
+            tapped("s2", "opencode:zai-metered@api_keys:zai"),
+            // Reconstructed, but no stamped row shares its runtime.
+            entry(reconstructed, day(10), "h1"),
+        ],
+        &SpawnDeathIndex::default(),
+        opts(GroupBy::Tap),
+        &mut NoneMerged,
+        vec!["/ws".into()],
+    );
+    assert_eq!(report.rows.len(), 3);
+    assert!(
+        !report
+            .notes
+            .iter()
+            .any(|n| n.contains("profile-stamping boundary")),
+        "unexpected tap-split caveat: {:?}",
+        report.notes
+    );
 }
 
 #[test]
@@ -233,6 +408,11 @@ fn spawn_death_detection_covers_class_and_duration() {
             death_class: Some("preflight-token-selection-failed".into()),
             crash_classification: None,
             token_name: "acct".into(),
+            credential: None,
+            jev_tier: None,
+            jev_confidence: None,
+            tap_usage: None,
+            tap_usage_all: Vec::new(),
             duration_sec: 1200,
         },
         sweep_outcomes::OutcomeRecord {
@@ -245,6 +425,11 @@ fn spawn_death_detection_covers_class_and_duration() {
             death_class: None,
             crash_classification: Some("execution-error".into()),
             token_name: "acct".into(),
+            credential: None,
+            jev_tier: None,
+            jev_confidence: None,
+            tap_usage: None,
+            tap_usage_all: Vec::new(),
             duration_sec: 1200,
         },
     ]);
@@ -269,6 +454,11 @@ fn spawn_death_detection_covers_class_and_duration() {
         death_class: None,
         crash_classification: Some("account-exhausted:rate-limited".into()),
         token_name: "acct".into(),
+        credential: None,
+        jev_tier: None,
+        jev_confidence: None,
+        tap_usage: None,
+        tap_usage_all: Vec::new(),
         duration_sec: 900,
     }]);
     let exhausted = record("exhausted", "o/r", None, SweepResult::Failure, 900);
@@ -781,6 +971,11 @@ fn two_workspace_fixture_aggregates_across_both_journals() {
             death_class: Some("preflight-token-selection-failed".into()),
             crash_classification: None,
             token_name: "acct".into(),
+            credential: None,
+            jev_tier: None,
+            jev_confidence: None,
+            tap_usage: None,
+            tap_usage_all: Vec::new(),
             duration_sec: 900,
         }],
     );

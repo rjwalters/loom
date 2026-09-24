@@ -253,6 +253,24 @@ a:hover {
 .card--degraded {
   border-color: var(--warn);
 }
+/* Roster-expected hosts that never reported (#8792/#8804). `missing` shares
+ * `stale`'s alarm colour — both mean "something that should be reporting is
+ * not" — while `unprovisioned` is a dashed, unemphasised outline: a planning
+ * to-do, not an outage, and it must never read as one at a glance. */
+.card--missing {
+  border-color: var(--bad);
+}
+.card--unprovisioned {
+  border-style: dashed;
+}
+/* The one-sentence explanation on a roster-missing card, which stands in for
+ * the health/token field lists an ordinary card carries. */
+.card__notice {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
 .card__header {
   display: flex;
   align-items: center;
@@ -354,6 +372,56 @@ a:hover {
   border-top: none;
 }
 
+/* Off-site forge links (repo, issue, branch) inside the card rows and the
+ * host-detail sweep table. They keep the row's own colour so a dim repo
+ * slug stays dim and a chip-adjacent `#N` stays text-coloured; the faint
+ * underline is the only resting affordance, and hover brings in the accent. */
+.forge-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+}
+.forge-link:hover {
+  color: var(--accent);
+  text-decoration-color: currentColor;
+}
+
+/* ---- provider marks ------------------------------------------------------ */
+/* Claude's mark (the same Simple Icons glyph the 2amlogic.com fleet feed
+ * uses) or a short text label for any other provider — see providers.ts. */
+.provider-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.provider-mark__icon {
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+.provider-mark__name {
+  font-size: 12px;
+}
+.card__sweep .provider-mark__name,
+.detail__sweep-agent .provider-mark__name {
+  color: var(--text-dim);
+}
+/* The token-pool label carries the mark before its text; keep the label's
+ * own small-caps styling for the text part only. */
+.field__label--provider {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.field__label--provider .provider-mark__name {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 /* ---- badges + chips ------------------------------------------------------ */
 
 .badge {
@@ -378,6 +446,16 @@ a:hover {
 }
 .badge--unknown {
   color: var(--text-dim);
+}
+/* #8804 — see `.card--missing`/`.card--unprovisioned` for why these two are
+ * deliberately not the same colour as each other. */
+.badge--missing {
+  color: var(--bad);
+  border-color: color-mix(in srgb, var(--bad) 45%, transparent);
+}
+.badge--unprovisioned {
+  color: var(--text-dim);
+  border-style: dashed;
 }
 .chip {
   background: var(--bg-sunken);
@@ -513,7 +591,145 @@ a:hover {
   font-size: 12px;
 }
 .chart-slot {
-  margin-bottom: 22px;
+  position: relative;
+  margin-bottom: 26px;
+}
+
+/* --- Chart chrome (#8546): title, axes, legend, tooltip, table view ------- */
+.chart-svg {
+  display: block;
+  max-width: 100%;
+  font-family: inherit;
+}
+.chart-head {
+  margin: 0 0 8px;
+}
+.chart-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.chart-subtitle {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.chart-axis__label,
+.durations-chart__tip-label {
+  font-variant-numeric: tabular-nums;
+}
+.chart-hit {
+  cursor: crosshair;
+  outline: none;
+}
+.chart-hit:focus-visible {
+  stroke: var(--accent);
+  stroke-width: 1;
+}
+.outcomes-chart__bar.is-hovered rect,
+.durations-chart rect.is-hovered {
+  filter: brightness(1.18);
+}
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.chart-legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.chart-legend__swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+.chart-legend__swatch--line {
+  height: 2px;
+  width: 16px;
+  border-radius: 1px;
+}
+.chart-tooltip {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  min-width: 120px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-raised);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.chart-tooltip[hidden] {
+  display: none;
+}
+.chart-tooltip__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.chart-tooltip__row--emphasis .chart-tooltip__value {
+  color: var(--text);
+}
+.chart-tooltip__key {
+  display: inline-block;
+  width: 12px;
+  height: 2px;
+  border-radius: 1px;
+  flex: none;
+}
+.chart-tooltip__value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text);
+}
+.chart-tooltip__label {
+  margin-left: auto;
+}
+.chart-table {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.chart-table summary {
+  cursor: pointer;
+  user-select: none;
+}
+.chart-table table {
+  margin-top: 6px;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.chart-table caption {
+  text-align: left;
+  color: var(--text-dim);
+  padding: 0 0 4px;
+}
+.chart-table th,
+.chart-table td {
+  padding: 2px 10px 2px 0;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-weight: 400;
+}
+.chart-table th[scope="col"] {
+  color: var(--text-dim);
+}
+.chart-table th[scope="row"],
+.chart-table th:first-child,
+.chart-table td:first-child {
+  text-align: left;
 }
 
 /* --- Host history panel (#5355) ---------------------------------------- */

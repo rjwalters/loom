@@ -36,21 +36,8 @@ name: Build and Release
 # takes precedence (see the detect step below); it then owes its consumers the
 # matching public key out of band.
 #
-# Output format (for Phase 3's verifier): the checksum is always present and is
-# computed over the FINAL artifact (after any in-place codesign), so it matches
-# whatever bytes are uploaded. macOS signatures are embedded in the Mach-O
-# (verify with `codesign --verify`); Linux signatures are detached `.sig` files
-# — keyless ones ship the signing certificate alongside as `.pem` (verify with
-# `cosign verify-blob --certificate <pem> --signature <sig>
-# --certificate-identity-regexp ... --certificate-oidc-issuer ...`), key-signed
-# ones ship the bare `.sig` (verify with `cosign verify-blob --key <pubkey>
-# --signature <sig>`). The presence of the `.pem` is the wire signal that tells
-# the consumer which mode was used.
-#
-# Consuming these artifacts from `loom-daemon-update.sh` / the daemon
-# auto-updater is out of scope here (#4990 Phase 3) — the LOCAL `cargo build`
-# path in `loom-daemon-update.sh` remains the default/fallback for dev
-# machines, canaries, and forks with no Release access.
+# Artifacts include checksums and platform signatures; Linux keyless signatures
+# carry a .pem certificate. Update verification is owned by loom-daemon-update.sh.
 #
 # Release on every VERSION bump (#7609): a `push` to `main` that
 # changes `VERSION` runs the `resolve` job first, which creates the tag
@@ -109,12 +96,20 @@ on:
         description: 'Release tag to build for (e.g., v0.1.0)'
         required: false
         type: string
+      gate_sha:
+        description: 'Optional immutable 40-character commit SHA: run only the full hosted build gate'
+        required: false
+        type: string
+      gate_issue:
+        description: 'Issue number for the hosted gate managed worktree (required with gate_sha)'
+        required: false
+        type: string
 
 # One run per tag: a second push of the same VERSION (or a manual re-run) waits
 # rather than racing the first run's asset uploads. Never cancels — a half-
 # uploaded Release is worse than a late one.
 concurrency:
-  group: release-${{ github.event.release.tag_name || github.event.inputs.tag || github.sha }}
+  group: release-${{ github.event.inputs.gate_sha || github.event.release.tag_name || github.event.inputs.tag || github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -130,6 +125,16 @@ permissions:
   packages: write
 
 jobs:
+  hosted-build-gate:
+    if: github.event_name == 'workflow_dispatch' && inputs.gate_sha != ''
+    uses: ./.github/workflows/hosted-build-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      candidate_sha: ${{ inputs.gate_sha }}
+      issue: ${{ inputs.gate_issue }}
+
   # Resolves the ONE tag every later job builds, uploads to, and downloads
   # from, and whether this run publishes at all:
   #   release           → the created Release's tag; publish=true
@@ -139,6 +144,7 @@ jobs:
   #                       publish=true; publish=skip if it already exists
   resolve:
     name: Resolve release tag
+    if: github.event_name != 'workflow_dispatch' || inputs.gate_sha == ''
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
@@ -321,7 +327,17 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --package loom-daemon --release --target ${{ matrix.target }}
+        run: cargo build --package loom-daemon --release --features otlp --target ${{ matrix.target }}
+
+      - name: Verify released OTLP capability
+        if: ${{ !matrix.cross }}
+        run: target/${{ matrix.target }}/release/loom-daemon telemetry-capabilities --require-otlp
+
+      - name: Decode released binary telemetry with the pinned Collector
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          LOOM_OTLP_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/loom-daemon
+        run: cargo test --package loom-daemon --release --features otlp --target ${{ matrix.target }} --test otlp_collector -- --ignored --nocapture
 
       - name: Package artifact
         run: |
@@ -724,15 +740,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
-          # No `path:` — the artifact already carries its own `dist/…` prefix
-          # (uploaded from repo-root-relative paths above), so downloading to
-          # the default (repo root) lands it at `dist/loom-daemon-…` directly.
+          path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
+          path: dist
 
       # Stage both triple-named binaries under the `linux-<arch>` naming the
       # Dockerfile's `LOOM_DAEMON_BIN` default expects (`TARGETARCH`-keyed —
@@ -876,12 +891,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
+          path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
+          path: dist
 
       - name: Verify binaries are present, executable, and staged per-arch
         run: |
@@ -1023,12 +1040,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
+          path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
+          path: dist
 
       - name: Verify binaries are present, executable, and staged per-arch
         run: |

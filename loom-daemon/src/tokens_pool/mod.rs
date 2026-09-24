@@ -63,12 +63,14 @@
 
 pub mod account_lifecycle;
 pub mod account_registry;
+pub mod account_scope;
 pub mod affinity;
 pub mod allowlist;
 pub mod bad_tokens;
 pub mod bootstrap;
 pub mod check;
 pub mod codex_check;
+pub mod codex_reset;
 pub mod failure_counts;
 pub mod health;
 pub mod locking;
@@ -77,10 +79,12 @@ pub mod monitor_classes;
 pub mod monitor_db;
 pub mod monitor_ranking_json;
 pub mod paths;
+pub mod private_workspace;
 pub mod rng;
 pub mod rotation;
 pub mod select;
 pub mod session_lifecycle;
+pub mod status_order;
 
 pub use account_registry::{
     account_inventory, account_inventory_quiet, select_account, AccountBinding, AccountDescriptor,
@@ -88,11 +92,12 @@ pub use account_registry::{
 };
 pub use health::{
     account_health, clear_reauth, health_snapshot, provider_capacity_at, record_availability_at,
-    record_probe_at, record_terminal, record_terminal_for_class_at, record_terminal_for_model,
-    record_terminal_for_model_at, select_healthy_at, select_healthy_for_class_at,
-    select_healthy_for_model_at, AccountHealth, AvailabilityEffect, AvailabilityOutcome,
-    HealthReason, NoHealthyAccountError, ProbeEffect, ProbeOutcome, ProviderCapacity,
-    TerminalClassification,
+    record_probe_at, record_terminal, record_terminal_for_class_at,
+    record_terminal_for_class_with_reset_at, record_terminal_for_model,
+    record_terminal_for_model_at, record_terminal_for_model_with_reset, select_healthy_at,
+    select_healthy_for_class_at, select_healthy_for_model_at, AccountHealth, AvailabilityEffect,
+    AvailabilityOutcome, HealthReason, NoHealthyAccountError, ProbeEffect, ProbeOutcome,
+    ProviderCapacity, TerminalClassification,
 };
 pub use select::{EmptyTokenPoolError, SelectedToken, EX_CONFIG};
 

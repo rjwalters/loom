@@ -576,12 +576,41 @@ mod tests {
     // ScriptRankingRefreshRunner — binary resolution + execution
     // ===================================================================
 
+    /// Issue #8532: this test spawns no subprocess, so unlike its three
+    /// co-failing siblings in that report it cannot be explained by host load
+    /// delaying an exec. It has exactly **one** possible failure mode, and it
+    /// is deterministic rather than timing-dependent: `resolve_bin()` (no
+    /// override) delegates to [`crate::daemon_bin_resolve::resolve_daemon_bin`],
+    /// which reads `std::env::current_exe()` and then — by design, issue
+    /// #6471 — **strips the kernel's literal `" (deleted)"` marker** when this
+    /// process's own executable has been unlinked, returning the live file at
+    /// the stripped path. A raw `assert_eq!(resolved, current_exe())` therefore
+    /// fails for precisely the scenario the code under test exists to survive:
+    /// a concurrent `cargo build`/`cargo test` relinking this very test binary
+    /// mid-run (routine when several worktrees share one `CARGO_TARGET_DIR` —
+    /// the `/repo:host-optimize` fleet-host convention, cf. #8176).
+    ///
+    /// So normalise the expectation exactly the way the resolver does, rather
+    /// than asserting on a raw read the kernel can suffix out from under us.
+    /// This does not weaken what the test is actually for — that an
+    /// override-free runner resolves to *this binary's own path* and not to a
+    /// `$PATH` lookup or some script — and it hides nothing: the marker-
+    /// stripping and `$PATH`-fallback branches have their own direct coverage
+    /// in `daemon_bin_resolve::tests` (`test_deleted_suffix_stripped_when_
+    /// replacement_exists`, `test_falls_back_to_path_lookup_when_stripped_
+    /// path_is_also_gone`), which inject the path instead of depending on
+    /// `/proc/self/exe`.
     #[test]
     fn test_resolve_bin_defaults_to_current_exe() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf());
         let resolved = runner.resolve_bin().unwrap();
-        assert_eq!(resolved, std::env::current_exe().unwrap());
+
+        let raw = std::env::current_exe().unwrap();
+        let expected = crate::daemon_bin_resolve::strip_deleted_suffix(&raw)
+            .filter(|stripped| stripped.is_file())
+            .unwrap_or(raw);
+        assert_eq!(resolved, expected);
     }
 
     #[test]

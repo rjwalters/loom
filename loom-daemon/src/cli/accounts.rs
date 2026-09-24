@@ -3,9 +3,47 @@
 //! `loom_daemon::tokens_pool::account_lifecycle`.
 
 use anyhow::{anyhow, Result};
+use loom_daemon::tokens_pool::account_scope::{
+    resolve_accounts_registry, shadowed_shared_accounts, AccountsRegistry,
+};
 
+use super::accounts_session::handle_session_command;
 use super::tokens::resolve_tokens_workspace;
-use crate::{AccountsAction, SessionAction};
+use crate::AccountsAction;
+
+/// The `--workspace` default. A value equal to this is "wherever I am", which
+/// [`resolve_accounts_registry`] may resolve to an enclosing Loom workspace or
+/// to the shared machine-level registry; any other value is an explicitly
+/// named workspace and is honoured literally (issue #8540).
+const WORKSPACE_DEFAULT: &str = ".";
+
+/// Resolve the registry this invocation acts on, from the raw `--workspace`
+/// string (issue #8540).
+fn resolve_registry(workspace: &str) -> Result<AccountsRegistry> {
+    let resolved = resolve_tokens_workspace(workspace)?;
+    resolve_accounts_registry(&resolved, workspace != WORKSPACE_DEFAULT)
+}
+
+/// Say which registry is in effect, and whether it shadows same-named accounts
+/// in the shared one (issue #8540 acceptance criteria 2 and 3).
+///
+/// On **stderr**, and *before* the verb runs rather than after: `--json`
+/// output stays machine-parseable on stdout, and a verb that fails (the
+/// `no such account <name>` a shadowed shared account produces) still says
+/// which registry it looked in — which is the whole diagnostic the operator
+/// was missing.
+fn announce_registry(registry: &AccountsRegistry) {
+    eprintln!("Registry: {}", registry.describe());
+    let shadowed = shadowed_shared_accounts(registry);
+    if !shadowed.is_empty() {
+        eprintln!(
+            "note: this workspace's own registry shadows the shared machine-level registry for \
+             account(s) {}; changes here do not affect the shared entries. Manage those with \
+             `--workspace <the shared root>`.",
+            shadowed.join(", ")
+        );
+    }
+}
 
 pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -> Result<()> {
     use loom_daemon::tokens_pool::account_lifecycle::{
@@ -79,7 +117,9 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
         Ok(())
     }
 
-    let workspace = resolve_tokens_workspace(workspace)?;
+    let registry = resolve_registry(workspace)?;
+    announce_registry(&registry);
+    let workspace = registry.workspace.clone();
     let service = AccountLifecycle::new(workspace.clone(), ProcessCodexRunner)?;
     match action {
         AccountsAction::Add {
@@ -283,78 +323,4 @@ fn run_availability_check(workspace: &std::path::Path, ranking: bool, json: bool
         std::process::exit(1);
     }
     Ok(())
-}
-
-fn handle_session_command(action: SessionAction, workspace: std::path::PathBuf) -> Result<()> {
-    use loom_daemon::tokens_pool::session_lifecycle::{
-        ProcessContainerRunner, SessionLifecycle, SessionStatus,
-    };
-
-    fn print_session_status(status: &SessionStatus, json: bool) -> Result<()> {
-        if json {
-            println!("{}", serde_json::to_string_pretty(status)?);
-        } else {
-            println!(
-                "{}: {} (container={}, id={}, image={}, started_at={}, codex_home={}, \
-                 mount={}, session_managed={}, workspace={})",
-                status.name,
-                if status.running { "running" } else { "stopped" },
-                status.container_name,
-                status.container_id.as_deref().unwrap_or("-"),
-                status.image.as_deref().unwrap_or("-"),
-                status.started_at.as_deref().unwrap_or("-"),
-                status.codex_home.display(),
-                status.mount_path,
-                status.session_managed,
-                status
-                    .workspace
-                    .as_ref()
-                    .map_or_else(|| "-".to_string(), |w| w.display().to_string()),
-            );
-        }
-        Ok(())
-    }
-
-    match action {
-        SessionAction::Start {
-            name,
-            image,
-            workspace: workspace_arg,
-            json,
-        } => {
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image);
-            print_session_status(
-                &lifecycle.start_with_workspace(&name, workspace_arg.as_deref())?,
-                json,
-            )
-        }
-        SessionAction::Stop { name, force, json } => {
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
-            print_session_status(&lifecycle.stop(&name, force)?, json)
-        }
-        SessionAction::Status { name, json } => {
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
-            print_session_status(&lifecycle.status(&name)?, json)
-        }
-        SessionAction::Attach { name } => {
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
-            let code = lifecycle.attach(&name)?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(())
-        }
-        SessionAction::Shell {
-            name,
-            workspace: workspace_arg,
-            args,
-        } => {
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
-            let code = lifecycle.shell(&name, workspace_arg.as_deref(), &args)?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(())
-        }
-    }
 }

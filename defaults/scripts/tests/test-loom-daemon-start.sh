@@ -22,6 +22,25 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 START_SCRIPT="$(cd "$SCRIPT_DIR/../cli" && pwd)/loom-daemon-start.sh"
 
+# WHICH BINARY IMPLEMENTS THE STUB (#8134, epic #7810 / #8087)
+#
+# loom-daemon-start.sh is a thin stub over `loom-daemon daemon-start`, so this
+# suite is only testing what it thinks it is if the stub execs the binary built
+# from the working tree. `--self-only` is mandatory here and is exactly the
+# case that flag exists for: this suite pins $LOOM_DAEMON_BIN to FAKE daemon
+# binaries (one that prints the autonomy env it inherited, one that just
+# sleeps) to exercise the LAUNCH path, and $LOOM_DAEMON_BIN means "the daemon
+# this caller manages or probes" — not "the binary that implements me". Without
+# --self-only the harness would export $LOOM_DAEMON_BIN over the top of those
+# per-invocation pins AND hand the stub a fake to exec as itself.
+#
+# This is a HARNESS change, not an assertion change: every expectation below is
+# byte-for-byte what it was against the shell. Editing the oracle to fit the
+# answer is never the cheap option (verification-recipes.md §6).
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin --self-only "$(cd "$SCRIPT_DIR/.." && pwd)" daemon-start
+
 # Background-PID bookkeeping (#4773): the `sleep 30 &` decoys below stand in
 # for a real daemon MainPID and are tracked here so the EXIT/INT/TERM trap can
 # reap them even if this suite is interrupted before its own inline `kill`.

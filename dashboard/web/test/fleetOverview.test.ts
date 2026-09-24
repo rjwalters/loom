@@ -3,18 +3,28 @@ import { describe, expect, it } from "vitest";
 import { buildFleetView, findHost } from "../src/fleet";
 import { parseFleetSnapshot } from "../src/parse";
 import { UNKNOWN } from "../src/format";
-import { daemonIdentityText, fleetOverviewView, hostCard, protectionBadge, statusBadge } from "../src/views/fleetOverview";
+import {
+  daemonIdentityText,
+  fleetOverviewView,
+  hostCard,
+  hostCountText,
+  protectionBadge,
+  statusBadge,
+} from "../src/views/fleetOverview";
 import {
   DEGRADED_HOST_ID,
   HEALTHY_HOST_ID,
   IDLE_HOST_ID,
+  MISSING_HOST_ID,
   NOW,
   PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID,
   STALE_HOST_ID,
   SWEEP_ONLY_HOST_ID,
+  UNPROVISIONED_HOST_ID,
   isoMinutesBefore,
   multiHostSnapshot,
   persistentRoleTickFailureFixture,
+  rosterMissingSnapshot,
   unprotectedHostProtectionFixture,
 } from "./fixtures";
 
@@ -136,13 +146,74 @@ describe("hostCard", () => {
     expect(fieldValue(card, "Worktree free")).toBe("300 GB (80% used)");
   });
 
-  it("summarizes the token pool", () => {
-    expect(fieldValue(hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW), "Token pool")).toBe(
+  it("summarizes the token pool per provider, untagged rows reading as Claude", () => {
+    const healthy = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
+    const labels = [...healthy.querySelectorAll('[data-testid="token-pool-label"]')];
+    expect(labels.map((node) => node.getAttribute("data-provider"))).toEqual(["claude"]);
+    expect(labels[0]!.textContent).toBe("Claudepool");
+    expect(labels[0]!.querySelector('[data-testid="provider-mark"] img')?.getAttribute("src")).toBe("/icons/claude.svg");
+    expect(healthy.querySelector('[data-testid="token-pool-value"][data-provider="claude"]')?.textContent).toBe(
       "0/2 exhausted · peak 42%",
     );
-    expect(fieldValue(hostCard(findHost(view(), DEGRADED_HOST_ID)!, NOW), "Token pool")).toBe(
-      "1/2 exhausted · peak 100%",
+    expect(
+      hostCard(findHost(view(), DEGRADED_HOST_ID)!, NOW).querySelector('[data-testid="token-pool-value"]')?.textContent,
+    ).toBe("1/2 exhausted · peak 100%");
+  });
+
+  it("renders one token-pool row per provider so each pool's availability reads on its own", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: { record: { kind: "host.health", uptime_sec: 10 }, updatedAt: isoMinutesBefore(1) },
+            tokens: {
+              record: {
+                kind: "tokens.snapshot",
+                accounts: [
+                  { account: "agent-1", provider: "claude", usage_fraction: 1, exhausted: true },
+                  { account: "agent-2", provider: "claude", usage_fraction: 1, exhausted: true },
+                  { account: "cx-1", provider: "codex", exhausted: false },
+                  { account: "cx-2", provider: "codex", exhausted: false },
+                  { account: "cx-3", provider: "codex", exhausted: true },
+                ],
+              },
+              updatedAt: isoMinutesBefore(1),
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
     );
+    const card = hostCard(findHost(built, "h")!, NOW);
+    const values = [...card.querySelectorAll('[data-testid="token-pool-value"]')];
+    expect(values.map((node) => [node.getAttribute("data-provider"), node.textContent])).toEqual([
+      ["claude", "2/2 exhausted · peak 100%"],
+      // Codex accounts report no usage fraction: no "peak 0%" fabricated.
+      ["codex", "1/3 exhausted"],
+    ]);
+    // Codex has no icon on the homepage feed either — a text mark.
+    const codexLabel = card.querySelector('[data-testid="token-pool-label"][data-provider="codex"]')!;
+    expect(codexLabel.querySelector("img")).toBeNull();
+    expect(codexLabel.textContent).toBe("Codexpool");
+    // The degraded badge names the spent provider, not a blended pool.
+    expect(card.querySelector('[data-testid="status-badge"]')?.getAttribute("title")).toBe(
+      "claude token pool at or near exhaustion",
+    );
+  });
+
+  it("marks each sweep with the agent working it, and nothing when the runtime is unknown", () => {
+    const busy = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
+    const rows = [...busy.querySelectorAll(".card__sweep")];
+    const claude = rows[0]!.querySelector('[data-testid="provider-mark"]')!;
+    expect(claude.getAttribute("data-provider")).toBe("claude");
+    expect(claude.querySelector("img")?.getAttribute("alt")).toBe("Claude");
+    const codex = rows[1]!.querySelector('[data-testid="provider-mark"]')!;
+    expect(codex.getAttribute("data-provider")).toBe("codex");
+    expect(codex.textContent).toBe("Codex");
+    // SWEEP_ONLY_HOST_ID's sweep carries no runtime — no mark, never a guess.
+    const unknown = hostCard(findHost(view(), SWEEP_ONLY_HOST_ID)!, NOW);
+    expect(unknown.querySelector('.card__sweep [data-testid="provider-mark"]')).toBeNull();
   });
 
   it("renders the token pool as unknown when the host has never reported one", () => {
@@ -211,6 +282,43 @@ describe("hostCard", () => {
     const idle = hostCard(findHost(view(), IDLE_HOST_ID)!, NOW);
     expect(fieldValue(idle, "Active sweeps")).toBe("none (excludes role ticks)");
     expect(idle.querySelector('[data-testid="card-sweeps"]')).toBeNull();
+  });
+
+  it("links each sweep to its forge work and each repo slug to its forge page", () => {
+    const busy = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
+    const rows = [...busy.querySelectorAll(".card__sweep")];
+    // sweep-issue-4703-0 is in `builder` → the pushed feature branch.
+    const builderLabel = rows[0]!.querySelector(".card__sweep-label")!;
+    expect(builderLabel.tagName).toBe("A");
+    expect(builderLabel.getAttribute("href")).toBe("https://github.com/rjwalters/loom/tree/feature/issue-4703");
+    expect(builderLabel.getAttribute("target")).toBe("_blank");
+    expect(builderLabel.getAttribute("rel")).toBe("noopener noreferrer");
+    // sweep-issue-4749-0 has reported no phase yet → no branch exists, so
+    // the issue is the only honest destination.
+    const startingLabel = rows[1]!.querySelector(".card__sweep-label")!;
+    expect(startingLabel.getAttribute("href")).toBe("https://github.com/rjwalters/loom/issues/4749");
+    // The trailing repo slug on a sweep row goes to the repo itself.
+    const sweepRepo = rows[0]!.querySelector(".card__sweep-repo")!;
+    expect(sweepRepo.tagName).toBe("A");
+    expect(sweepRepo.getAttribute("href")).toBe("https://github.com/rjwalters/loom");
+
+    // Active and idle roster rows alike link to the repo page.
+    const activeRepo = busy.querySelector('[data-testid="card-repos"] .card__repo-label')!;
+    expect(activeRepo.tagName).toBe("A");
+    expect(activeRepo.getAttribute("href")).toBe("https://github.com/rjwalters/loom");
+    const idleRepos = [...busy.querySelectorAll('[data-testid="card-repos-idle"] .card__repo-label')];
+    expect(idleRepos.map((node) => node.getAttribute("href"))).toEqual([
+      "https://github.com/2AMLogic/gf180-pll",
+      "https://github.com/2AMLogic/gf180-trng",
+    ]);
+  });
+
+  it("renders a sweep with no linkable target as plain text, not a dead link", () => {
+    // SWEEP_ONLY_HOST_ID's sweep has no issue number: nothing to link.
+    const card = hostCard(findHost(view(), SWEEP_ONLY_HOST_ID)!, NOW);
+    const label = card.querySelector(".card__sweep-label")!;
+    expect(label.tagName).toBe("SPAN");
+    expect(label.hasAttribute("href")).toBe(false);
   });
 
   // #4976: the "Repositories" section, below "Active sweeps". #7662 split it
@@ -496,5 +604,159 @@ describe("daemonIdentityText (#4956)", () => {
 
   it("renders an entirely empty record as unknown, never a fabricated identity", () => {
     expect(daemonIdentityText({}, NOW)).toBe(UNKNOWN);
+  });
+});
+
+
+it("renders resolved Z.ai provider/model with OpenCode as launch runtime context", () => {
+  const host = findHost(view(), HEALTHY_HOST_ID)!;
+  host.sweeps[0] = { ...host.sweeps[0]!, runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3" };
+  const row = hostCard(host, NOW).querySelector(".card__sweep")!;
+  expect(row.textContent).toContain("Z.ai");
+  expect(row.textContent).toContain("glm-5.3");
+  const mark = row.querySelector<HTMLElement>('[data-testid="provider-mark"]')!;
+  expect(mark.dataset.provider).toBe("zai-coding-plan");
+  expect(mark.title).toContain("Runtime: OpenCode");
+  expect(mark.title).toContain("Sweep launch");
+});
+
+// ---------------------------------------------------------------------------
+// Expected-host roster (#8792 backend → #8804 SPA)
+// ---------------------------------------------------------------------------
+
+describe("fleetOverviewView — roster-missing hosts (#8804)", () => {
+  const roster = () => buildFleetView(parseFleetSnapshot(rosterMissingSnapshot()), NOW);
+
+  const cardFor = (hostId: string): HTMLElement => {
+    const card = fleetOverviewView(roster(), NOW).querySelector(`[data-host="${hostId}"]`);
+    expect(card).toBeTruthy();
+    return card as HTMLElement;
+  };
+
+  it("renders a card for a roster host that never reported", () => {
+    const rendered = fleetOverviewView(roster(), NOW);
+    const hosts = [...rendered.querySelectorAll('[data-testid="host-card"]')].map((card) =>
+      card.getAttribute("data-host"),
+    );
+    expect(hosts).toContain(MISSING_HOST_ID);
+    expect(hosts).toContain(UNPROVISIONED_HOST_ID);
+    // Missing leads the grid: an enrolled host that is silent is the loudest
+    // signal on the page.
+    expect(hosts[0]).toBe(MISSING_HOST_ID);
+  });
+
+  it("renders missing and unprovisioned distinctly from each other", () => {
+    const missing = cardFor(MISSING_HOST_ID);
+    const unprovisioned = cardFor(UNPROVISIONED_HOST_ID);
+
+    expect(missing.className).toContain("card--missing");
+    expect(unprovisioned.className).toContain("card--unprovisioned");
+    expect(missing.getAttribute("data-roster-state")).toBe("missing");
+    expect(unprovisioned.getAttribute("data-roster-state")).toBe("unprovisioned");
+
+    expect(missing.querySelector('[data-testid="status-badge"]')?.getAttribute("data-status")).toBe("missing");
+    expect(unprovisioned.querySelector('[data-testid="status-badge"]')?.getAttribute("data-status")).toBe(
+      "unprovisioned",
+    );
+    expect(missing.querySelector('[data-testid="status-badge"]')?.textContent).toBe("Missing");
+    expect(unprovisioned.querySelector('[data-testid="status-badge"]')?.textContent).toBe("Unprovisioned");
+
+    // The explanation is the whole point of the card, and the two must never
+    // share wording: one says investigate, the other says enroll.
+    const missingDetail = missing.querySelector('[data-testid="roster-state-detail"]')?.textContent ?? "";
+    const unprovisionedDetail =
+      unprovisioned.querySelector('[data-testid="roster-state-detail"]')?.textContent ?? "";
+    expect(missingDetail).not.toBe("");
+    expect(unprovisionedDetail).not.toBe("");
+    expect(missingDetail).not.toBe(unprovisionedDetail);
+    expect(unprovisionedDetail).toContain("ingest key");
+  });
+
+  it("renders both distinctly from a host that reported and then went quiet", () => {
+    // The SSR fallback's equivalent of "offline" on this SPA is `stale`: a
+    // host with telemetry that has aged out. A never-reported roster host
+    // must not be confusable with it.
+    const stale = cardFor(STALE_HOST_ID);
+    expect(stale.className).toContain("card--stale");
+    expect(stale.hasAttribute("data-roster-state")).toBe(false);
+    expect(stale.querySelector('[data-testid="roster-state-detail"]')).toBeNull();
+    for (const hostId of [MISSING_HOST_ID, UNPROVISIONED_HOST_ID]) {
+      expect(cardFor(hostId).className).not.toContain("card--stale");
+    }
+  });
+
+  it("counts roster hosts in the headline host count, with a reporting breakdown", () => {
+    const summary = fleetOverviewView(roster(), NOW).querySelector('[data-testid="fleet-summary"]');
+    // 5 reporting + 1 missing + 1 unprovisioned = 7 (the sweep-only host is
+    // still excluded from the reporting count, per #5101).
+    expect(summary?.textContent).toContain("7 hosts (5 reporting, 1 missing, 1 unprovisioned)");
+    // A silent enrolled host is an incident, so it joins the 2 stale/degraded.
+    expect(summary?.textContent).toContain("3 need");
+  });
+
+  it("leaves the headline untouched when the payload carries no missingHosts", () => {
+    const summary = fleetOverviewView(view(), NOW).querySelector('[data-testid="fleet-summary"]');
+    expect(summary?.textContent).toContain("5 hosts");
+    expect(summary?.textContent).not.toContain("reporting");
+    expect(summary?.textContent).not.toContain("unprovisioned");
+  });
+
+  it("omits the health and token field lists a never-reported host cannot fill", () => {
+    // Every host.health field would be "—" by definition; the explanation
+    // stands in for them.
+    const card = cardFor(MISSING_HOST_ID);
+    expect(card.querySelector(".card__fields")).toBeNull();
+    expect(fieldValue(card, "Daemon")).toBeUndefined();
+    expect(fieldValue(card, "Token pool")).toBeUndefined();
+  });
+
+  it("still lists in-flight sweeps pushed by a host that never sent health", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {},
+        activeSweeps: [{ hostId: "m", sweepId: "s1", issue: 8804, phase: "builder" }],
+        missingHosts: [{ hostId: "m", state: "missing" }],
+      }),
+      NOW,
+    );
+    const card = fleetOverviewView(built, NOW).querySelector('[data-host="m"]') as HTMLElement;
+    const sweeps = card.querySelector('[data-testid="card-sweeps"]');
+    expect(sweeps?.textContent).toContain("#8804");
+    expect(sweeps?.textContent).toContain("builder");
+  });
+
+  it("links a roster host's card to its drill-down like any other host", () => {
+    expect(cardFor(MISSING_HOST_ID).querySelector(".card__title")?.getAttribute("href")).toBe(
+      `#/hosts/${MISSING_HOST_ID}`,
+    );
+  });
+});
+
+describe("hostCountText (#8804)", () => {
+  const base = {
+    hosts: [],
+    totalSweeps: 0,
+    needsAttention: 0,
+    roleTicks: undefined,
+    activeCompute: [],
+    leakedCompute: 0,
+  };
+
+  it("renders the pre-#8804 wording when no roster host is missing", () => {
+    expect(hostCountText({ ...base, reportingHosts: 3, missingHosts: 0, unprovisionedHosts: 0 })).toBe("3 hosts");
+    expect(hostCountText({ ...base, reportingHosts: 1, missingHosts: 0, unprovisionedHosts: 0 })).toBe("1 host");
+    expect(hostCountText({ ...base, reportingHosts: 0, missingHosts: 0, unprovisionedHosts: 0 })).toBe("0 hosts");
+  });
+
+  it("includes roster hosts in the total and names only the non-zero buckets", () => {
+    expect(hostCountText({ ...base, reportingHosts: 4, missingHosts: 1, unprovisionedHosts: 0 })).toBe(
+      "5 hosts (4 reporting, 1 missing)",
+    );
+    expect(hostCountText({ ...base, reportingHosts: 4, missingHosts: 0, unprovisionedHosts: 2 })).toBe(
+      "6 hosts (4 reporting, 2 unprovisioned)",
+    );
+    expect(hostCountText({ ...base, reportingHosts: 0, missingHosts: 3, unprovisionedHosts: 1 })).toBe(
+      "4 hosts (0 reporting, 3 missing, 1 unprovisioned)",
+    );
   });
 });

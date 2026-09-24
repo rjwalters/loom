@@ -1,6 +1,7 @@
 [package]
 name = "loom-daemon"
 version.workspace = true
+repository.workspace = true
 edition = "2021"
 
 [dependencies]
@@ -34,9 +35,16 @@ libc = "0.2"
 # deliberately NOT enabled — `OtlpExporter` posts the JSON encoding over the
 # existing `reqwest` client (reusing `super::sender`'s drain/retry loop), so
 # no gRPC transport stack is pulled in.
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["logs", "metrics", "gen-tonic-messages", "with-serde"], optional = true }
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["logs", "metrics", "trace", "gen-tonic-messages", "with-serde"], optional = true }
 
 tempfile = "3.27"
+# `.tar.zst` transcript archiving (#8494): `tar` builds/reads the archive
+# container, `zstd` (bundled C library, same "vendor the native dep" pattern
+# `rusqlite`'s `bundled` feature above already uses) compresses it. Default
+# features only — no `zstdmt`/`pkg-config`/`cmake`, so a plain build needs
+# nothing beyond the C toolchain `rusqlite`'s bundled build already requires.
+tar = "0.4.46"
+zstd = "0.14.0"
 
 [dev-dependencies]
 tokio-test = "0.4"

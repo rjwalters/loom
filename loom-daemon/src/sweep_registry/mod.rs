@@ -111,16 +111,23 @@ mod crash_signals;
 mod decline_cooldown;
 mod dispatch;
 mod guards;
+mod heartbeat_broadcast;
 mod locks;
 mod model;
 mod noop_cooldown;
 mod outcome_journal;
+mod pool_hold_broadcast;
+mod prless_retry;
 mod quarantine;
 mod reaper;
 mod stacking;
+// `pub(crate)` (still `#[cfg(test)]`-only) so a test outside this module tree
+// can build a real registry rather than a hand-shaped stand-in for it — the
+// observability collector's adoption-correlation tests (#8720) drive the
+// genuine lock/journal adoption paths through this fixture.
 #[cfg(test)]
 #[allow(unused_imports)]
-mod test_support;
+pub(crate) mod test_support;
 mod watchdog;
 
 // Re-exported at the same effective visibility each item already declares
@@ -145,6 +152,10 @@ pub use model::*;
 pub use noop_cooldown::*;
 #[allow(unused_imports)]
 pub use outcome_journal::*;
+#[allow(unused_imports)]
+pub use pool_hold_broadcast::*;
+#[allow(unused_imports)]
+pub use prless_retry::*;
 #[allow(unused_imports)]
 pub use quarantine::*;
 #[allow(unused_imports)]
@@ -622,6 +633,22 @@ pub struct SweepRegistry {
     /// the quarantine tally (a crash-loop brake) — this one says "no agent has
     /// standing to act on this issue until a maintainer clears a label".
     decline_cooldown: HashMap<u32, DeclineCooldownState>,
+    /// PR-less retry-bound parameters (Issue #7972). Set at provision time from
+    /// the resolved env > config > default value, mirroring
+    /// [`noop_cooldown_config`](Self::noop_cooldown_config).
+    prless_retry_config: PrlessRetryConfig,
+    /// PR-less claim/release state (Issue #7972): per-issue tallies and windows
+    /// armed by [`record_prless_release`](Self::record_prless_release) when a
+    /// terminal sweep outcome leaves no pull request behind.
+    ///
+    /// Keyed on the one signal the #7893 loop could not fake — *did this
+    /// dispatch produce a PR* — rather than on exit code, duration, or
+    /// checkpoint movement, each of which that loop satisfied while producing
+    /// nothing. Independent of [`noop_cooldown`](Self::noop_cooldown) (a
+    /// self-reported conclusion), [`dispatch_backoff`](Self::dispatch_backoff)
+    /// (a crash/no-progress cadence), [`decline_cooldown`](Self::decline_cooldown)
+    /// (a standing question) and the quarantine tally (a fast-crash brake).
+    prless_retry: HashMap<u32, PrlessRetryState>,
     /// Per-issue memo of the last **verified** open linked PR (Issue #6788),
     /// written only by [`probe_open_linked_pr`](Self::probe_open_linked_pr) and
     /// consumed only by it. See [`OpenPrMemoEntry`] and
@@ -726,6 +753,22 @@ pub struct SweepRegistry {
     /// mutex, and blocking there is the 2026-07-26 wedge shape. Entries are
     /// removed as soon as the group drains, so this never accumulates.
     pending_group_reaps: HashMap<SweepId, PendingGroupReap>,
+    /// Explicit override for the filesystem-activity window
+    /// [`worktree_in_use`](Self::worktree_in_use) judges a worktree's mtimes
+    /// against (Issue #8487). `None` — the only value production ever holds —
+    /// means "resolve it per call from
+    /// [`ACTIVITY_WINDOW_ENV`](crate::worktree_activity::ACTIVITY_WINDOW_ENV),
+    /// else the default", i.e. byte-for-byte the pre-#8487 behavior.
+    ///
+    /// It exists because the *tests* need to say "this worktree is dirty and
+    /// QUIET" — every fixture worktree is written microseconds before the
+    /// assertion, so its mtimes always read as a live worker (#8413) unless the
+    /// filesystem leg is disabled. They used to say that by writing
+    /// `ACTIVITY_WINDOW_ENV=0` into the *process* environment and never
+    /// restoring it, which leaked "the gate is off" into every later test in
+    /// the same binary. Scoping the pin to one registry removes the shared
+    /// mutable global instead of adding another lock around it.
+    activity_window: Option<Duration>,
 }
 
 /// Resolve this host's identity string for collision records (Issue #4085) and
@@ -934,7 +977,16 @@ pub struct PreparedIssueDispatch {
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
     pub(crate) depends_on: Option<u32>,
-    pub(crate) runtime_admission: Option<crate::runtime_admission::ResolvedRuntime>,
+    /// What this dispatch resolved onto, and the metered backstop slot that
+    /// choosing it took (#8555). Carried here — rather than parked in shared
+    /// state keyed on the resolving thread — because this box is precisely the
+    /// value that crosses the resolve→spawn seam on EVERY dispatch path,
+    /// including the two that do not stay on one thread: `ipc.rs`'s
+    /// `spawn_blocking(...).await` between begin and finish, and the reaper's
+    /// batch of pending resumes prepared in one pass and finished in another.
+    /// Dropping this box releases the slot, so an abandoned dispatch cannot
+    /// leak one. See `runtime_preference::handoff`.
+    pub(crate) admission: crate::runtime_preference::DispatchAdmission,
 }
 
 /// Result of the lock-scoped [`begin_cancel`](SweepRegistry::begin_cancel)
@@ -971,6 +1023,21 @@ pub struct CancelOutcome {
     /// `true` when the sweep was in `Running`/`Pending` state at the
     /// moment of the call; `false` when it was already terminal.
     pub was_running: bool,
+}
+
+/// Registry-sourced correlation evidence about one issue's live sweep
+/// (Issue #8720) — see [`SweepRegistry::tracked_sweep_identity`].
+///
+/// Deliberately carries only what the registry genuinely knows: the
+/// authoritative `sweep_id` and the `started_at` it was admitted with
+/// (`owner.acquired_at` for a lock-adopted entry, the journal's recorded
+/// process start for a journal-adopted one). Nothing here is synthesized at
+/// read time, so a consumer can re-anchor a post-restart record to the
+/// original sweep without inventing a start instant for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedSweepIdentity {
+    pub sweep_id: SweepId,
+    pub started_at: DateTime<Utc>,
 }
 
 /// Generate a stable sweep ID for the given kind. Format follows the
@@ -1037,6 +1104,8 @@ impl SweepRegistry {
             noop_cooldown: HashMap::new(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
             decline_cooldown: HashMap::new(),
+            prless_retry_config: PrlessRetryConfig::default(),
+            prless_retry: HashMap::new(),
             open_pr_memo: Mutex::new(HashMap::new()),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
@@ -1044,59 +1113,21 @@ impl SweepRegistry {
             phase_history: HashMap::new(),
             sampled_loc: HashMap::new(),
             pending_group_reaps: HashMap::new(),
+            activity_window: None,
         }
     }
 
     /// Construct an empty registry with the given event bus pre-attached.
+    ///
+    /// Delegates to [`new`](Self::new) and attaches the bus, rather than
+    /// repeating its ~50-field initializer: the two differed only in `bus`,
+    /// and keeping a second copy meant every field added to the struct had to
+    /// be added in two places or the build broke (Issue #8487).
     #[must_use]
     pub fn with_event_bus(config: SweepRegistryConfig, bus: Arc<EventBus>) -> Self {
-        Self {
-            config,
-            entries: BTreeMap::new(),
-            children: BTreeMap::new(),
-            bus: Some(bus),
-            dispatch_stagger: Duration::ZERO,
-            last_spawn_at: None,
-            startup_proof_grace: Duration::from_secs(DEFAULT_STARTUP_PROOF_GRACE_SECS),
-            watchdog_retried: HashSet::new(),
-            watchdog_gaveup: HashSet::new(),
-            watchdog_progressed: HashSet::new(),
-            midbuild_retried: HashSet::new(),
-            midbuild_gaveup: HashSet::new(),
-            midbuild_inuse: HashSet::new(),
-            midbuild_liveclaim: HashSet::new(),
-            midbuild_lease_superseded: HashSet::new(),
-            review_stall_retried: HashSet::new(),
-            review_stall_gaveup: HashSet::new(),
-            quarantine_config: QuarantineConfig::default(),
-            insta_crash_counts: HashMap::new(),
-            resume_attempt_counts: HashMap::new(),
-            quarantined: HashMap::new(),
-            pending_quarantine_release: HashSet::new(),
-            detect_collisions: false,
-            collision_count: 0,
-            peer_claim_publisher: None,
-            peer_claims: None,
-            preflight_tripwire_config: PreflightTripwireConfig::default(),
-            preflight_death_streak: 0,
-            preflight_death_last_marker: None,
-            preflight_advisory_tripped: false,
-            preflight_probe_last_at: None,
-            preflight_advisory_changed_at: None,
-            dispatch_backoff_config: DispatchBackoffConfig::default(),
-            dispatch_backoff: HashMap::new(),
-            noop_cooldown_config: NoopCooldownConfig::default(),
-            noop_cooldown: HashMap::new(),
-            decline_cooldown_config: DeclineCooldownConfig::default(),
-            decline_cooldown: HashMap::new(),
-            open_pr_memo: Mutex::new(HashMap::new()),
-            token_selection_failures: HashMap::new(),
-            label_flip_log: HashMap::new(),
-            flap_warned_at: HashMap::new(),
-            phase_history: HashMap::new(),
-            sampled_loc: HashMap::new(),
-            pending_group_reaps: HashMap::new(),
-        }
+        let mut registry = Self::new(config);
+        registry.bus = Some(bus);
+        registry
     }
 
     /// Attach (or replace) the event bus used for lifecycle emission.
@@ -1272,6 +1303,68 @@ impl SweepRegistry {
     #[must_use]
     pub fn get(&self, sweep_id: &str) -> Option<&SweepInfo> {
         self.entries.get(sweep_id)
+    }
+
+    /// The authoritative lifecycle identity of the **one** non-terminal sweep
+    /// this registry tracks for `issue`, or `None` when there is no
+    /// unambiguous one (Issue #8720).
+    ///
+    /// This is the registry's side of post-restart lifecycle correlation. A
+    /// sweep adopted across a daemon restart — by the lock pass
+    /// ([`Self::reconstruct`], which keeps the pre-restart `owner.sweep_id`
+    /// and `acquired_at`) or by the journal pass
+    /// ([`Self::adopt_live_journal_sweeps`], which can only synthesize a
+    /// `journal-adopted-…` id because the dispatch id is genuinely not
+    /// recoverable) — never re-emits `sweep.global.dispatch`, so the
+    /// observability collector's in-memory dispatch map has nothing for it.
+    /// Rather than let the collector fall back to a synthesized
+    /// `unknown-issue-N` for the sweep's next phase/terminal event, it asks
+    /// here and gets whatever id THIS registry is already reporting for the
+    /// same sweep in `host.health`'s `active_sweep_ids` and in its
+    /// `sweep.identity` record.
+    ///
+    /// # Why the answer must be unambiguous or absent
+    ///
+    /// This is evidence, not a guess: the caller's alternative is the
+    /// synthesized-id fallback that exists today, so returning `None` is never
+    /// a regression, whereas returning the wrong one of two candidates
+    /// silently mis-attributes a live sweep's phase. Hence:
+    ///
+    /// - **Terminal entries are ignored.** A finished sweep's id is not
+    ///   evidence about a new event for the same issue number.
+    /// - **Two or more non-terminal candidates yield `None`.** The registry's
+    ///   own invariants make that essentially unreachable
+    ///   (`adopt_live_journal_sweeps` skips an issue `has_tracked_sweep_for`
+    ///   already covers, and dispatch admission is per-issue), but "essentially
+    ///   unreachable" is not "impossible", and a coin flip between two live
+    ///   sweeps is worse than the honest unknown fallback.
+    /// - **Scoping to one repo is the caller's job and is structural**: this
+    ///   method is only reachable through the registry that owns the emitting
+    ///   workspace root, so another repo's same-numbered issue is never even
+    ///   a candidate.
+    ///
+    /// Reads `self.entries` directly rather than going through
+    /// [`Self::list`]: the caller wants identity, not presentation, so the
+    /// live-phase checkpoint overlay ([`Self::overlay_live_phase`], disk I/O
+    /// under this registry's mutex) would be pure cost on the collector's
+    /// event path.
+    #[must_use]
+    pub fn tracked_sweep_identity(&self, issue: u32) -> Option<TrackedSweepIdentity> {
+        let mut candidates = self.entries.values().filter(|info| {
+            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(n) if n == issue)
+        });
+        let found = candidates.next()?;
+        if candidates.next().is_some() {
+            log::debug!(
+                "sweep_registry: issue #{issue} has more than one non-terminal entry — \
+                 declining to name an authoritative sweep id for lifecycle correlation (#8720)"
+            );
+            return None;
+        }
+        Some(TrackedSweepIdentity {
+            sweep_id: found.sweep_id.clone(),
+            started_at: found.started_at,
+        })
     }
 
     /// For a `Running`/`Pending` entry with no `latest_phase` yet (i.e. every

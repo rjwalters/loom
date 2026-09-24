@@ -193,7 +193,11 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
 
 ### Requirements
 
-- macOS (Linux support planned)
+- macOS or Linux. Every release publishes `loom-daemon` binaries for
+  `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and
+  `aarch64-unknown-linux-gnu`, plus a multi-arch
+  `ghcr.io/rjwalters/loom-worker` image — macOS is the primary development
+  platform, Linux is the primary fleet-worker platform.
 - Git repository
 - tmux (`brew install tmux`)
 - [Claude Code](https://claude.ai/code) for AI agents
@@ -205,9 +209,11 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
 ./install.sh /path/to/your/repo
 ```
 
-**Direct initialization:**
+**Direct initialization** (`loom-daemon` as an installed/built binary on your
+`PATH` — note `loom-daemon/` in this repo is the crate directory, not an
+executable, so there is no `./loom-daemon` to run):
 ```bash
-./loom-daemon init /path/to/your/repo
+loom-daemon init /path/to/your/repo
 ```
 
 ### What Gets Installed
@@ -216,7 +222,9 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
 your-repo/
 ├── .loom/
 │   ├── config.json      # Terminal configuration
+│   ├── config/          # Additional config data (e.g. skill-routes.json)
 │   ├── roles/           # Agent role definitions
+│   ├── runtimes/        # Runtime adapter manifests
 │   ├── scripts/         # Helper scripts
 │   ├── hooks/           # Guard hooks (PreToolUse)
 │   ├── docs/            # Reference documentation
@@ -349,7 +357,9 @@ gh pr create --label "loom:review-requested"
 | `/loom:hermit` | Identify simplification opportunities | Manual (cadence #3381) |
 | `/loom:doctor` | Fix PR feedback and conflicts | Manual |
 | `/loom:champion` | Evaluate proposals, auto-merge PRs | Cron via GH Actions |
+| `/loom:guide` | Triage and prioritize the issue queue (`loom:urgent`) | Cron via GH Actions |
 | `/loom:auditor` | Validate main branch builds | Cron via GH Actions |
+| `/loom:driver` | Plain shell environment — no autonomous role behavior | Manual |
 
 ## Development
 

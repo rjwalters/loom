@@ -30,6 +30,15 @@ pub(super) const LOOM_OWNED_PREFIXES: &[&str] = &[
     ".loom/sweep-checkpoint/",
     ".loom/sweep-run/",
     ".loom/tokens/",
+    // Per-host API-key account pool for native harnesses (#8401), mirroring
+    // the bash list. Same never-committed contract as `.loom/tokens/` above:
+    // host-local credential material, gitignored by design, so in a repo whose
+    // managed .gitignore block predates #8401 it surfaces as untracked dirt
+    // and would wedge this gate "dirty" every tick — the `.loom-local/`
+    // failure mode below (#8075/#4039), repeated verbatim. Safe to ignore
+    // here for the same reason: the gate's remediation is `git reset --hard
+    // <remote>` and never `git clean`, so the pool survives.
+    ".loom/api-keys/",
     ".loom/accounts.env",
     ".loom/exit-codes/",
     ".loom/stats/",
@@ -127,6 +136,17 @@ mod tests {
         // This module can grow, so the entry gets its coverage here.
         assert!(loom_owned(".loom-local/config.json"));
         assert!(loom_owned(".loom-local/anything/nested.txt"));
+    }
+
+    #[test]
+    fn both_per_host_credential_pools_are_loom_owned() {
+        // The bash mirror (`defaults/scripts/check-main-clean.sh`'s
+        // `LOOM_OWNED_PREFIXES`) and this table are kept in sync by hand, and
+        // nothing in CI enforces the parity — #8401 added `.loom/api-keys/`
+        // to the bash side first and this side was the half that got missed.
+        // Pin both pools here so the next credential pool notices.
+        assert!(loom_owned(".loom/tokens/alpha.json"));
+        assert!(loom_owned(".loom/api-keys/zai/alpha.env"));
     }
 
     #[test]

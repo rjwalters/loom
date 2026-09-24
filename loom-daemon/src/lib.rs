@@ -130,6 +130,8 @@
 pub mod activity;
 pub mod admission_brake;
 pub mod agent_session;
+pub mod agent_skills;
+pub mod api_keys_pool;
 pub mod auto_update;
 pub mod autonomy_marker;
 pub mod build_slot;
@@ -138,6 +140,7 @@ pub mod capability;
 pub mod capacity;
 pub mod claim_reconciliation;
 pub mod cmd_out;
+pub mod concierge;
 pub mod config_resolver;
 pub mod cpu_headroom;
 pub mod credential_preflight;
@@ -145,6 +148,7 @@ pub mod daemon_bin_resolve;
 pub mod daemon_heartbeat;
 pub mod daemon_install_state;
 pub mod daemon_pidfile;
+pub mod daemon_start;
 /// Non-blocking wrapper around the startup claim-reconciliation +
 /// stranded-quarantine reconciliation passes (Issue #7974) — a new sibling
 /// module rather than growing `daemon_service.rs`, which the file-size
@@ -163,8 +167,11 @@ pub mod errors;
 pub mod event_bus;
 pub mod filing_lock;
 pub mod fleet;
+pub mod foreign_load;
 pub mod forge_cached_list;
+pub mod forge_check_open_pr;
 pub mod forge_cmd;
+pub mod forge_events;
 pub mod forge_listing;
 pub mod forge_parser;
 pub mod gh_repo_env;
@@ -181,6 +188,9 @@ pub mod init;
 pub mod install_self_check;
 pub mod ipc;
 pub mod issue_creation_mutex;
+pub mod jev_merge_risk;
+pub mod jev_tier;
+pub mod launch_record;
 pub mod launchd_env_drift;
 pub mod launchd_reload;
 pub mod limit_calibration;
@@ -189,6 +199,7 @@ pub mod main_health_gate;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;
+pub mod opencode_usage;
 pub mod orphan_process_reaper;
 pub mod peer_claims;
 pub mod phase_join;
@@ -201,6 +212,7 @@ pub mod quarantine_stash_status;
 pub mod ram_headroom;
 pub mod rate_limit_breaker;
 pub mod reclaim_pr_warning;
+pub mod reconcile_stack;
 pub mod release_fetch;
 pub mod release_resolve;
 pub mod repo_root;
@@ -212,6 +224,7 @@ pub mod role_shard;
 pub mod role_tick_telemetry;
 pub mod role_validation;
 pub mod runtime_admission;
+pub mod runtime_preference;
 pub mod safehouse;
 /// Inbound safehouse ChatOps steering (#7893, Phase 3a of #4196). A sibling
 /// module rather than a `safehouse::` submodule: `safehouse.rs` is an
@@ -237,6 +250,7 @@ pub mod sweep_journal;
 pub mod sweep_outcome_summary;
 pub mod sweep_outcomes;
 pub mod sweep_registry;
+pub mod tap_usage;
 pub mod target_dir_gc;
 pub mod telemetry;
 pub mod terminal;
@@ -246,11 +260,21 @@ pub mod terminal_restore;
 /// module that asserts on log severity.
 #[cfg(test)]
 pub mod test_log_capture;
+/// Host-wide reclaim of orphaned Loom-named scratch directories parked on a
+/// `tmpfs`/`ramfs` mount (issue #8512) — see the module docs for the
+/// deliberately different, narrower safety model this needs relative to the
+/// worktree-attribution-based cargo-target reclaim (#7239).
+pub mod tmpfs_reclaim;
+/// tmpfs/`shared`-RAM and kernel OOM-kill visibility (issue #8572, split from
+/// #8512) — the read-only counterpart to [`tmpfs_reclaim`]'s write path,
+/// consumed by `loom-daemon health` and the work finder's bounded warning.
+pub mod tmpfs_visibility;
 pub mod token_ranking_refresh;
 pub mod tokens;
 pub mod tokens_pool;
 pub mod transcript_tokens;
 pub mod types;
+pub mod usage_source;
 pub mod watch_registry;
 pub mod watchdog;
 pub mod watchdog_provisioning_guard;
@@ -550,4 +574,6 @@ mod tests {
     }
 }
 
+pub mod native_readiness;
 pub mod native_tools;
+pub mod session_exec;

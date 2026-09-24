@@ -1,0 +1,2 @@
+# The derived image only edits its pinned base; send no local files to BuildKit.
+*

@@ -65,13 +65,23 @@ ALLOWED_HOST_SUFFIXES=(
   test.com t.com
   github.com githubusercontent.com
   anthropic.com claude.com
-  openai.com
+  # `kimi.com` / `moonshot.ai` are Moonshot AI's public endpoints, added with
+  # the Kimi Code CLI native harness (#8561): the former hosts the CLI docs
+  # `defaults/docs/runtime-model-trials.md` cites, the latter the platform API
+  # endpoint its example model profile names. Same category as anthropic.com /
+  # openai.com on these two lines — a vendor Loom drives, not an
+  # operator-owned deployment. Folded onto the existing lines rather than
+  # given their own so this stays a zero-line change to the shell budget.
+  # `chatgpt.com` is OpenAI's public product host, cited verbatim in the
+  # Codex usage-limit refusal captured for #8539 (token-pool.md and the
+  # matching assert_classify row) — same category, folded onto this line.
+  openai.com opentelemetry.io kimi.com moonshot.ai chatgpt.com
   apple.com
   npmjs.org crates.io
   biomejs.dev workers.dev
   developercertificate.org
   percy.io
-  ghcr.io
+  ghcr.io clickhouse.com signoz.io opentelemetry.io
   # Package/source origins the fleet bootstrap plan fetches from (#7814).
   tailscale.com
   sf.net

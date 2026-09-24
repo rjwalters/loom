@@ -32,6 +32,7 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
             started_at: ts(),
             model: Some("opus".to_string()),
             effort: Some("high".to_string()),
+            runtime: Some("claude".to_string()),
         }),
     )
 }
@@ -122,6 +123,11 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             lines_added: None,
             lines_deleted: None,
             tokens_by_model: None,
+            // Issue #8507: this fixture is a Claude sweep, which writes no
+            // launch record — so all three stay absent.
+            runtime: None,
+            provider: None,
+            profile: None,
             failure_class: None,
             models_used: None,
             doctor_cycles: None,
@@ -138,6 +144,7 @@ fn tokens_snapshot_envelope() -> TelemetryEnvelope {
             accounts: vec![
                 TokenAccountState {
                     account: "agent-1".to_string(),
+                    provider: "claude".to_string(),
                     rank: Some(0),
                     usage_fraction: Some(0.42),
                     limit_window_reset_at: Some(ts()),
@@ -145,6 +152,7 @@ fn tokens_snapshot_envelope() -> TelemetryEnvelope {
                 },
                 TokenAccountState {
                     account: "agent-2".to_string(),
+                    provider: "codex".to_string(),
                     rank: None,
                     usage_fraction: None,
                     limit_window_reset_at: None,
@@ -185,6 +193,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
                 }],
             },
             protection: None,
+            admission_brake: None,
         }),
     )
 }
@@ -500,6 +509,7 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         managed_repos: Vec::new(),
         roles: crate::telemetry::RoleTickHealth::default(),
         protection: None,
+        admission_brake: None,
     };
     let batch = vec![envelope(
         "host-c",
@@ -626,6 +636,10 @@ fn role_tick_outcome_envelope(
             effort: None,
             detail: Some("codex-account-pool-exhausted: no account provisioned".to_string()),
             gated_pool: gated_pool.map(str::to_string),
+            // Issue #8507: a Claude tick writes no launch record.
+            runtime: None,
+            provider: None,
+            profile: None,
             tokens_by_model: None,
             models_used: None,
             actions: None,
@@ -680,4 +694,31 @@ fn mixed_batch_produces_both_a_logs_and_a_metrics_request() {
     ];
     assert!(build_logs_request(&batch).is_some());
     assert!(build_metrics_request(&batch).is_some());
+}
+
+#[test]
+fn active_identity_maps_distinct_runtime_provider_and_model_without_profile() {
+    let record: TelemetryRecord = serde_json::from_str(include_str!(
+        "../../../../../dashboard/test/fixtures/sweep-identity.json"
+    ))
+    .unwrap();
+    let request = build_logs_request(&[envelope("host-a", record)]).unwrap();
+    let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    for (key, expected) in [
+        ("loom.runtime", "opencode"),
+        ("loom.provider", "zai-coding-plan"),
+        ("loom.model", "glm-5.3"),
+    ] {
+        let value = log
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone());
+        assert_eq!(value, Some(any_value::Value::StringValue(expected.to_owned())));
+    }
+    assert!(!log
+        .attributes
+        .iter()
+        .any(|kv| kv.key.contains("profile") || kv.key.contains("credential")));
 }

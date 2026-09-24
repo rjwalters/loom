@@ -18,6 +18,15 @@ use anyhow::Result;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ScriptPortCommand {
+    /// Supervised persistent-container transport backing spawn-codex.sh.
+    #[command(subcommand)]
+    SessionExec(loom_daemon::session_exec::SessionExecCommand),
+    /// Private workspace endpoint used inside a session container.
+    #[command(subcommand)]
+    PrivateWorkspace(loom_daemon::tokens_pool::private_workspace::WorkerCommand),
+    /// Durable phase completion markers and trace observations (#8525).
+    SweepCheckpoint(super::sweep_checkpoint::SweepCheckpointArgs),
+
     /// Champion's dependency-classification family (PR 3):
     /// `classify-dependency-block`, `detect-dependency-cycle`,
     /// `detect-startable-subset`.
@@ -82,6 +91,14 @@ pub(crate) enum ScriptPortCommand {
     /// `StartInterval` cadence, so it owns no long-lived process.
     DaemonWatchdog(super::watchdog::WatchdogArgs),
 
+    /// Safe start wrapper for the raw `loom-daemon` process (#8087), backing
+    /// `loom-daemon-start.sh`. Unlike every other port here it STARTS A
+    /// PROCESS, and it must bring that process up with byte-identical
+    /// autonomy flags to what the shell computed — see
+    /// `daemon_start`'s module doc for why "did it start?" is not a test of
+    /// that.
+    DaemonStart(super::daemon_start::DaemonStartArgs),
+
     /// The combined "not a work item" label list for a role prompt's
     /// unfiltered fallback query (#8255): the fleet-wide hard exclusions
     /// (`hard-exclusion-labels.sh`'s list) plus this workspace's configured
@@ -113,6 +130,32 @@ pub(crate) enum ScriptPortCommand {
     /// false, 1 could not run — and 1 must be treated as 10, never as 0. Not
     /// a port either: same frozen-`main.rs` reason as `shell-budget` above.
     PremiseCheck(super::premise_check::PremiseCheckArgs),
+
+    /// `reconcile-stack.sh`'s rebase planner and executor (#8583): fetch and
+    /// PIN the remote default-branch tip, route to the worktree holding the
+    /// child branch, resolve the parent ref (with the #7982 pin fallback and
+    /// its #8010 ancestry check), then replay only the child's own commits
+    /// onto the pinned commit. Exit 0 planned/rebased, 1 a prerequisite
+    /// refused with nothing mutated, 2 the rebase itself failed.
+    ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
+
+    /// Generate `.agents/skills/loom-<name>/SKILL.md` from every
+    /// `defaults/roles/<name>.md` role prompt (#8673) — the cross-vendor
+    /// skill-discovery surface Codex, Kimi Code, Mistral Vibe, and Grok read
+    /// natively. Not a port either: brand-new logic, native from the start
+    /// per the shell-language policy, backing
+    /// `generate-agent-skills.sh`'s Shape-A stub.
+    GenerateAgentSkills(super::agent_skills::AgentSkillsArgs),
+
+    /// `verify-proposal-refs.sh`'s line-range check (#8656): resolve a cited
+    /// path against a rev, FOLLOWING a `120000` (symlink) tree entry to the
+    /// document it points at, and answer the range question against that
+    /// document. Since #7842 every `.loom/docs/*.md` with a `defaults/docs/`
+    /// counterpart is such a link, so the script's old `git show <rev>:<path>
+    /// | wc -l` measured the link-target STRING and reported every in-range
+    /// citation as a miss — on a script that BLOCKS FILING. Ported out of the
+    /// `contract`-category script per the shell language policy.
+    GitBlobLines(super::git_blob_lines::GitBlobLinesArgs),
 }
 
 impl ScriptPortCommand {
@@ -120,6 +163,9 @@ impl ScriptPortCommand {
     /// the stubs' callers branch on.
     pub(crate) fn run(self) -> Result<()> {
         match self {
+            ScriptPortCommand::SessionExec(args) => args.run(),
+            ScriptPortCommand::PrivateWorkspace(args) => args.run(),
+            ScriptPortCommand::SweepCheckpoint(args) => args.run(),
             ScriptPortCommand::DepClassify(cmd) => cmd.run(),
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
             ScriptPortCommand::ReleaseFetch(args) => args.run(),
@@ -131,10 +177,14 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
+            ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
             ScriptPortCommand::PremiseCheck(args) => args.run(),
+            ScriptPortCommand::ReconcileStack(args) => args.run(),
+            ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
+            ScriptPortCommand::GitBlobLines(args) => args.run(),
         }
     }
 }
@@ -158,6 +208,15 @@ pub(crate) enum MergePrCommand {
     /// freshly-read head. Exit 0 + sentinel = retry authorized, 1 = foreign
     /// head move (re-queue), 2 = attribution undeterminable (also re-queue).
     HeadSyncRetry(super::merge_pr_head_sync::HeadSyncRetryArgs),
+
+    /// The automated remedy for a merge the #8248 freshness guard blocked
+    /// (#8508): push a tree-identical no-op commit so CI re-runs and re-dates
+    /// every check, since the merge token lacks `actions:write` to re-run the
+    /// stale one directly. Exit 0 = pushed, 3 = branch already moved (not a
+    /// failure, re-evaluate fresh), 4 = remedy already spent on this head, so
+    /// the PR was escalated to a durable `loom:operator` hold, 1 = could not
+    /// read/write forge state.
+    RedateChecks(super::merge_pr_redate::RedateChecksArgs),
 }
 
 impl MergePrCommand {
@@ -166,6 +225,7 @@ impl MergePrCommand {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
+            MergePrCommand::RedateChecks(args) => args.run(),
         }
     }
 }

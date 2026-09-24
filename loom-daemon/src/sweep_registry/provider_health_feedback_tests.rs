@@ -8,6 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use crate::sweep_registry::test_support::fixture_registry;
+use chrono::{Local, Timelike};
 use tempfile::tempdir;
 
 /// Insert a `codex`-runtime entry with `token` already captured (so
@@ -18,6 +19,21 @@ fn insert_codex_entry_with_log(
     registry: &mut SweepRegistry,
     issue: u32,
     token: &str,
+    log_body: &str,
+) -> String {
+    insert_codex_entry_with_prefixed_log(registry, issue, token, "", log_body)
+}
+
+/// [`insert_codex_entry_with_log`], with `log_prefix` written *before* this
+/// sweep's `sweep_id=` anchor — i.e. text belonging to an earlier run that
+/// happened to share the log file. Nothing there may be attributed to this
+/// sweep (#8539: a call site passing the wrong anchor is exactly what this
+/// distinguishes).
+fn insert_codex_entry_with_prefixed_log(
+    registry: &mut SweepRegistry,
+    issue: u32,
+    token: &str,
+    log_prefix: &str,
     log_body: &str,
 ) -> String {
     let sweep_id = format!("sweep-issue-{issue}-codex-health");
@@ -45,9 +61,113 @@ fn insert_codex_entry_with_log(
         },
     );
     std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
-    std::fs::write(&log_path, format!("sweep_id={sweep_id} issue={issue} ====\n{log_body}"))
-        .unwrap();
+    std::fs::write(
+        &log_path,
+        format!("{log_prefix}sweep_id={sweep_id} issue={issue} ====\n{log_body}"),
+    )
+    .unwrap();
     sweep_id
+}
+
+/// A horizon `days` out from now, as the (instant, refusal-line) pair a test
+/// needs: the wall-clock rendering the Codex CLI would print, and the instant
+/// the daemon should end up holding the account until.
+///
+/// Derived from *now* rather than hard-coded so these tests do not start
+/// failing once a fixed fixture date drifts into the past — the
+/// already-past-horizon rejection in `health::exhaustion_deadline` would
+/// otherwise silently turn them into assertions about the fallback cooldown.
+fn refusal_naming_a_horizon(days: i64) -> (u64, String) {
+    let instant = (Local::now() + chrono::Duration::days(days))
+        .with_minute(0)
+        .unwrap()
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
+    let rendered = instant.format("%B %d, %Y %I:%M %p").to_string();
+    let epoch = u64::try_from(instant.timestamp()).unwrap();
+    (
+        epoch,
+        format!(
+            "ERROR: You've hit your usage limit. Visit \
+             https://chatgpt.com/codex/settings/usage to purchase more credits or try again at \
+             {rendered}.\n"
+        ),
+    )
+}
+
+/// #8539 call-site wiring: an exhaustion whose refusal names a reset horizon
+/// holds the account until *that* instant, not until `now + cooldown`.
+///
+/// The end-to-end shape is the point — `codex_reset`'s own unit tests call the
+/// parser directly and so cannot catch this call site passing the wrong
+/// contents or the wrong anchor.
+#[test]
+fn provider_health_feedback_honours_the_refusals_own_reset_horizon() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let (expected_epoch, refusal) = refusal_naming_a_horizon(2);
+    let sweep_id = insert_codex_entry_with_log(
+        &mut registry,
+        74,
+        "profile-e",
+        &format!(
+            "{refusal}# LOOM_TERMINAL_RESULT v=2 provider=codex account=profile-e \
+             category=TOKEN_EXHAUSTED exit_code=1 model=none\n"
+        ),
+    );
+
+    registry.apply_provider_health_feedback(&sweep_id, Some(1));
+
+    let id = AccountId {
+        provider: AccountProvider::Codex,
+        name: "profile-e".into(),
+    };
+    let health = tokens_pool::account_health(dir.path(), &id)
+        .unwrap()
+        .expect("health record written");
+    assert_eq!(
+        health.cooldown_until,
+        Some(expected_epoch),
+        "the hold must end at the horizon the provider itself named"
+    );
+}
+
+/// The anchor argument at this call site is load-bearing: a refusal printed by
+/// an *earlier* run sharing the log file is outside this sweep's region and
+/// must not set its deadline. A call site that passed the whole file (or a
+/// wrong anchor) would read that stale horizon and fail here.
+#[test]
+fn provider_health_feedback_ignores_a_horizon_outside_its_own_region() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let (stale_epoch, stale_refusal) = refusal_naming_a_horizon(30);
+    let sweep_id = insert_codex_entry_with_prefixed_log(
+        &mut registry,
+        75,
+        "profile-f",
+        &format!("sweep_id=sweep-issue-1-earlier issue=1 ====\n{stale_refusal}"),
+        "# LOOM_TERMINAL_RESULT v=2 provider=codex account=profile-f \
+         category=TOKEN_EXHAUSTED exit_code=1 model=none\n",
+    );
+
+    registry.apply_provider_health_feedback(&sweep_id, Some(1));
+
+    let id = AccountId {
+        provider: AccountProvider::Codex,
+        name: "profile-f".into(),
+    };
+    let health = tokens_pool::account_health(dir.path(), &id)
+        .unwrap()
+        .expect("health record written");
+    let cooldown_until = health
+        .cooldown_until
+        .expect("an exhaustion sets a cooldown");
+    assert_ne!(
+        cooldown_until, stale_epoch,
+        "the previous run's horizon must not become this sweep's deadline"
+    );
 }
 
 /// AC #1: a v2 `MODEL_CREDITS_EXHAUSTED` record naming its model produces a

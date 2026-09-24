@@ -238,10 +238,7 @@ pub fn check(rec: &Record, repo_root: &Path) -> Outcome {
 
     if rec.deliberate {
         if let Some(bad) = first_unresolvable(&rec.evidence, repo_root) {
-            return Outcome::Malformed(format!(
-                "premise-evidence: `{bad}` does not resolve in this checkout \
-                 (want a repo-relative path, path:line, or ADR-NNNN)"
-            ));
+            return Outcome::Malformed(unresolvable_reason("premise-evidence", &bad, repo_root));
         }
         if rec.evidence.is_empty() {
             return Outcome::Malformed(
@@ -269,10 +266,7 @@ pub fn check(rec: &Record, repo_root: &Path) -> Outcome {
         }
     } else {
         if let Some(bad) = first_unresolvable(&rec.searched, repo_root) {
-            return Outcome::Malformed(format!(
-                "premise-searched: `{bad}` does not resolve in this checkout \
-                 (want a repo-relative path, path:line, or ADR-NNNN)"
-            ));
+            return Outcome::Malformed(unresolvable_reason("premise-searched", &bad, repo_root));
         }
         if rec.searched.is_empty() {
             return Outcome::Malformed(
@@ -289,6 +283,22 @@ pub fn check(rec: &Record, repo_root: &Path) -> Outcome {
         (Verdict::Clear, Exists::No) => Outcome::PremiseFalse,
         (Verdict::Clear, _) => Outcome::Proceed,
     }
+}
+
+/// Why an unresolvable citation is malformed, **naming the tree it was
+/// resolved against** (issue #8499).
+///
+/// The root is not decoration: before #8499 this check ran against the shared
+/// primary clone even when invoked from a worktree, so the failure accused a
+/// correct record of citing a path that did not exist — and reading
+/// `repo_root.rs` was the only way to find out which tree it meant. Printing
+/// the root makes a resolution mismatch diagnosable from the output alone.
+fn unresolvable_reason(field: &str, bad: &str, repo_root: &Path) -> String {
+    format!(
+        "{field}: `{bad}` does not resolve in the checkout at {} \
+         (want a repo-relative path, path:line, or ADR-NNNN)",
+        repo_root.display()
+    )
 }
 
 /// The first citation that does not resolve, if any.

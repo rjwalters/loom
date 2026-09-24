@@ -705,9 +705,25 @@ mod tests {
     // ===================================================================
 
     #[test]
-    fn every_default_role_has_a_probe_queue() {
-        // Detection must not silently no-op for a shipped standalone role.
+    fn every_forge_queue_role_has_a_probe_queue() {
+        // Detection must not silently no-op for a shipped standalone role that
+        // works a forge queue.
+        //
+        // `concierge` (#7947) is the one shipped role with no forge queue at
+        // all: its trigger source is a safehouse room, not a label, so there is
+        // no listing a pre-tick probe could compare against. The `None` arm in
+        // `probe_target_for_role` already degrades to a logged
+        // `Unknown("role has no label-defined queue")` no-op for exactly this
+        // case (#4623) — named here so the exemption is a decision rather than
+        // a gap someone later "fixes" by inventing a label for it.
         for spec in crate::role_runner::DEFAULT_ROLES {
+            if spec.name == crate::concierge::CONCIERGE_ROLE {
+                assert!(
+                    probe_target_for_role(spec.name).is_none(),
+                    "concierge has no forge queue — it must not acquire a probe label"
+                );
+                continue;
+            }
             assert!(
                 probe_target_for_role(spec.name).is_some(),
                 "no probe target for shipped role {}",

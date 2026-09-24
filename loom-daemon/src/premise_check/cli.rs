@@ -45,11 +45,29 @@ pub fn run(opts: &Options) -> ! {
 }
 
 fn evaluate(opts: &Options) -> Result<i32, i32> {
+    // TWO roots, deliberately (issue #8499). `repo_root` is the shared clone:
+    // the `gh` read cache and the origin remote live there, one per checkout,
+    // so a linked worktree's `.git` pointer is followed back to the main one.
     let repo_root = opts
         .repo_root
         .clone()
         .or_else(crate::repo_root::find_repo_root_from_cwd)
         .unwrap_or_else(|| PathBuf::from("."));
+    // `content_root` is the working tree the caller is reasoning IN. A
+    // citation is a claim about file content, and the primary clone sits on
+    // `main` while N worktrees run ahead of it — resolving citations there
+    // failed a correct record with RECORD-MALFORMED (exit 12) purely because
+    // the shared checkout had not pulled the cited file yet, and would
+    // equally pass a citation that resolves only in the stale tree. The
+    // evidence scan reads the same content and follows the same root.
+    //
+    // An explicit `--repo-root` still sets both: a caller naming a tree is
+    // naming the one tree it wants everything resolved against.
+    let content_root = opts
+        .repo_root
+        .clone()
+        .or_else(crate::repo_root::find_worktree_root_from_cwd)
+        .unwrap_or_else(|| repo_root.clone());
 
     let inputs = match (&opts.body_file, opts.issue) {
         (Some(path), _) => hermetic_inputs(opts, path)?,
@@ -60,7 +78,7 @@ fn evaluate(opts: &Options) -> Result<i32, i32> {
         }
     };
 
-    let decision = decide(&inputs, &repo_root);
+    let decision = decide(&inputs, &content_root);
 
     println!(
         "SCOPE={}",
@@ -110,7 +128,7 @@ fn evaluate(opts: &Options) -> Result<i32, i32> {
     // The scan is advisory and costs two `git grep` passes, so it runs only
     // where it can change what a human does next: when the gate is closed.
     if !opts.no_scan && decision.exit_code != exit::PROCEED {
-        emit_candidates(opts, &inputs, &repo_root, decision.record.as_ref());
+        emit_candidates(opts, &inputs, &content_root, decision.record.as_ref());
     }
 
     Ok(decision.exit_code)
@@ -124,14 +142,19 @@ fn yesno(b: bool) -> &'static str {
     }
 }
 
+/// `content_root`, not the clone root: the scan reads the same file content the
+/// citations resolve against, so the two must agree or a suggested
+/// `EVIDENCE-CANDIDATE=` would name a path the record could not then cite
+/// (issue #8499). `evaluate` holds both roots in scope, so this parameter is
+/// named for the one it must be given.
 fn emit_candidates(
     opts: &Options,
     inputs: &Inputs,
-    repo_root: &Path,
+    content_root: &Path,
     rec: Option<&record::Record>,
 ) {
-    let anchors = evidence::anchors(&inputs.title, &inputs.body, repo_root);
-    let candidates = evidence::scan(repo_root, &anchors, opts.scan_limit);
+    let anchors = evidence::anchors(&inputs.title, &inputs.body, content_root);
+    let candidates = evidence::scan(content_root, &anchors, opts.scan_limit);
     let cited = rec.map(record::cited_paths).unwrap_or_default();
     for c in &candidates {
         // Tab-separated, one line each: path:line, whether the record already

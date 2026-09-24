@@ -1,0 +1,43 @@
+# Explicit opt-in: docker compose --profile trial ...
+name: loom-observability-gateway
+services:
+  collector:
+    profiles: [trial]
+    image: otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1
+    command: ["--config=/etc/otelcol/config.yaml"]
+    user: "${LOOM_COLLECTOR_UID:?set a non-root UID}:${LOOM_COLLECTOR_GID:?set its GID}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1
+    stop_grace_period: 30s
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:14318:4318"
+      - "127.0.0.1:13133:13133"
+      - "127.0.0.1:18888:8888"
+    volumes:
+      - ./config.yaml:/etc/otelcol/config.yaml:ro
+      - ${LOOM_COLLECTOR_STATE_DIR:?set an absolute local writable directory}:/var/lib/otelcol
+      # Least-privilege session-store mounts (#8686): each binds exactly one
+      # runtime's session directory read-only to the fixed in-container path
+      # its file_log/* receiver tails in config.yaml — never the whole $HOME.
+      # All three are required (:?), so an env file that predates this change
+      # fails `docker compose up` loudly instead of silently dropping a tail.
+      - ${LOOM_CODEX_SESSIONS_DIR:?set an absolute path to the host's ~/.codex/sessions}:/var/lib/loom-sessions/codex:ro
+      - ${LOOM_PI_SESSIONS_DIR:?set an absolute path to the host's ~/.pi/agent/sessions}:/var/lib/loom-sessions/pi:ro
+      - ${LOOM_CLAUDE_PROJECTS_DIR:?set an absolute path to the host's ~/.claude/projects}:/var/lib/loom-sessions/claude:ro
+    secrets:
+      - loom_ingest_key
+      - clickstack_ingest_key
+    networks: [observability]
+secrets:
+  loom_ingest_key:
+    file: ${LOOM_COLLECTOR_INGEST_KEY_FILE:?set an absolute local secret file}
+  clickstack_ingest_key:
+    file: ${LOOM_CLICKSTACK_INGEST_KEY_FILE:?set ClickStack raw ingestion key file}
+networks:
+  observability:
+    external: true
+    name: loom-observability

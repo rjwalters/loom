@@ -109,7 +109,13 @@ jobs:
         run: |
           git config user.name "Loom Bot"
           git config user.email "loom-bot@your-org.com"
-          git add .loom CLAUDE.md .claude .gitignore
+          # #8005/#8734: exclude the credential-bearing class (token pool,
+          # account keys, harness auth, GH_CONFIG_DIR trees) even though
+          # `runs-on: macos-latest` is normally an ephemeral, fresh-checkout
+          # runner -- this is the same pathspec `resync-installed.sh` prints,
+          # cheap insurance if this template is adapted to a persistent /
+          # self-hosted runner instead.
+          git add .loom CLAUDE.md .claude .gitignore ':!.loom/claude-config' ':!.loom/tokens' ':!.loom/accounts.env' ':!.loom/api-keys' ':!.loom/gh-config' ':!.loom/gh-config-by-owner'
           git diff --staged --quiet || git commit -m "chore: update Loom configuration"
           git push
 ```
@@ -323,7 +329,12 @@ sync-loom-config:
     # Commit if changes detected
     - git config user.name "Loom Sync Bot"
     - git config user.email "loom-bot@your-org.com"
-    - git add .loom CLAUDE.md .claude .gitignore
+    # #8005/#8734: exclude the credential-bearing class -- unlike GitHub
+    # Actions' hosted runners, GitLab's shell/docker executors commonly
+    # reuse the same persistent workspace across scheduled pipeline runs, so
+    # a prior job's `.loom/tokens/` (or similar) can genuinely still be on
+    # disk, untracked, when this `git add` runs.
+    - git add .loom CLAUDE.md .claude .gitignore ':!.loom/claude-config' ':!.loom/tokens' ':!.loom/accounts.env' ':!.loom/api-keys' ':!.loom/gh-config' ':!.loom/gh-config-by-owner'
     - git diff --staged --quiet || (git commit -m "chore: sync Loom config" && git push)
 ```
 

@@ -39,6 +39,7 @@
 //! | `daemon.drain.timeout`   | Drain supervisor | `{in_flight, forced, cancelled?}` |
 //! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, disk_headroom, ram_headroom, token_axis_limit, message}` |
 //! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
+//! | `forge.event` | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
 //! pinned. The four `epic.issue.{N}.*` topics were authorized by **#3873**
@@ -73,6 +74,33 @@
 //! stays open for future extension, but the documented taxonomy is the
 //! contract subscribers should rely on.
 //!
+//! `daemon.drain.*`, `daemon.capacity.advisory`, `daemon.preflight.advisory`,
+//! and `epic.issue.*` gained a `daemon.event`
+//! [`crate::telemetry::TelemetryRecord`] kind (Issue #8760, G4 of #8714),
+//! carried onto the observability export queue by a dedicated bus subscriber
+//! ([`crate::observability::daemon_event`]) — purely additive export
+//! coverage, not a change to this taxonomy or any topic string.
+//!
+//! The `forge.event` topic was authorized by **#8767** (epic #8764) for the
+//! forge event-plane feed consumer. Publisher: `loom-daemon/src/forge_events.rs`
+//! (#8765) — one `Event::Generic` per non-empty verified feed page. Payload:
+//! `{source: "forge-event-feed", host_id: string, count: u64, first_seq: u64,
+//! last_seq: u64, types: string[]}`, `types` being the page's event-type names
+//! sorted and deduplicated. The payload is a **routing hint only, never
+//! decision input** — it carries counts, sequence bounds and event-type names
+//! but no forge state, so a consumer that wants state re-reads the forge
+//! through its normal rate-limited clients and must be idempotent under the
+//! per-page dedup contract (a prompt may arrive with the events themselves
+//! absent from the bus — the on-disk journal is the copy, the prompt is a
+//! "check now"). Invariant source: `docs/adr/0021-forge-event-plane.md`
+//! (ADR-0021); implementation: `loom-daemon/src/forge_events.rs`.
+//!
+//! **`Generic`-topic rule.** A `Generic` topic is allowed only while it (a) is
+//! listed in this inventory, (b) carries a `source` field naming its producing
+//! subsystem on every payload, and (c) never triggers a write to external
+//! state without a forge-verified re-read in the consumer. `forge.event`
+//! satisfies all three; every future prompt topic must too.
+//!
 //! # Durability (Issue #4644)
 //!
 //! This bus is **in-memory only** — a bounded [`tokio::sync::broadcast`]
@@ -106,8 +134,10 @@ pub const DEFAULT_CAPACITY: usize = 1024;
 /// In-memory pub/sub event bus.
 ///
 /// Cloning the bus is **not** the way to add subscribers — call
-/// [`EventBus::subscribe`] instead. Wrap the bus in an `Arc` if you need
-/// to share it across tasks (the daemon's main wiring does so).
+/// [`EventBus::subscribe`] instead. A clone is another *publisher handle* to
+/// the same channel (see the [`Clone`] impl below, added for #8765); wrap the
+/// bus in an `Arc` when several holders must share one handle rather than own
+/// their own (the daemon's main wiring does so).
 #[derive(Debug)]
 pub struct EventBus {
     tx: broadcast::Sender<Event>,
@@ -198,6 +228,30 @@ impl EventBus {
 impl Default for EventBus {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Cloning a bus yields another **handle to the same channel** — a clone of
+/// the underlying [`broadcast::Sender`], not a second, independent bus. An
+/// event published through any clone reaches every subscriber of every clone.
+///
+/// This exists for long-lived owned tasks (issue #8765's
+/// [`crate::forge_events`] poll loop is the first) that need to publish for
+/// the life of the process and would otherwise have to be handed an
+/// `Arc<EventBus>` — which the daemon's wiring already moves into the IPC
+/// server. It is **not** the way to add a subscriber: call
+/// [`EventBus::subscribe`] for that, on this handle or any other.
+///
+/// Note the one behavioural subtlety inherited from `broadcast`: a live
+/// sender clone keeps the channel open, so a subscriber's `recv` will not
+/// observe `Closed` while any clone is alive. Every clone this daemon makes
+/// lives as long as the process, so that is the intended shape.
+impl Clone for EventBus {
+    fn clone(&self) -> Self {
+        EventBus {
+            tx: self.tx.clone(),
+            capacity: self.capacity,
+        }
     }
 }
 

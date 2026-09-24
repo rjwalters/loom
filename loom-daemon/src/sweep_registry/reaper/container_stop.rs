@@ -44,6 +44,25 @@
 //!    covering a `docker stop` client that died before dockerd received or
 //!    completed the request.
 //!
+//! # Nothing here runs on the caller's thread (#8776)
+//!
+//! `docker ps` is docker I/O too, and an unresponsive dockerd wedges it for the
+//! whole [`reap_gh_timeout`] budget (5s by default). Both halves are called
+//! from inside the registry's critical section —
+//! [`begin_cancel`](super::SweepRegistry::begin_cancel) *before* it delivers
+//! the host process-group SIGTERM — so when #8435 moved only `docker stop`
+//! off-thread and left the **discovery** in front of the spawn, a wedged
+//! dockerd still held the registry mutex for the full discovery timeout and
+//! pushed SIGTERM delivery out behind it. Unrelated `get_status`/`list_sweeps`
+//! reads (and bare-metal sweeps that own no container at all) paid for it.
+//!
+//! So both halves now spawn **first** and discover **inside** the detached
+//! thread: nothing either half does — resolving the binary aside, which is one
+//! env read — can block the caller. The only work left on the caller's thread
+//! is `std::thread::Builder::spawn` itself. Each detached thread stays bounded
+//! exactly as before ([`output_with_timeout`] kills a child that overruns, and
+//! there are no retries), so moving the discovery cannot leak a helper process.
+//!
 //! # Fail-safe contract (#8435 AC3)
 //!
 //! A docker CLI failure during cancellation must not abort the rest of the
@@ -208,6 +227,26 @@ pub(crate) fn list_issue_containers(program: &Path, issue: u32) -> Vec<IssueCont
     }
 }
 
+/// Run `work` on a detached, named thread so the caller's registry critical
+/// section never waits on docker I/O (#8776).
+///
+/// A spawn failure is the same class of fail-safe no-op every other docker
+/// failure in this module is: logged and skipped, never an error, and never
+/// retried — and deliberately NOT retried inline, since running the teardown
+/// on the caller's thread is exactly the blocking this indirection exists to
+/// prevent.
+fn spawn_teardown(name: &str, issue: u32, work: impl FnOnce() + Send + 'static) {
+    if let Err(e) = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(work)
+    {
+        log::warn!(
+            "cancel_sweep: could not spawn the {name} thread for issue #{issue}: {e} — \
+             skipping container teardown (#8435/#8776)"
+        );
+    }
+}
+
 fn describe(containers: &[IssueContainer]) -> String {
     containers
         .iter()
@@ -222,12 +261,14 @@ fn describe(containers: &[IssueContainer]) -> String {
 /// Begin half of the container teardown, called from
 /// [`begin_cancel`](super::SweepRegistry::begin_cancel) BEFORE/ALONGSIDE the
 /// process-group SIGTERM (issue #8435): list the issue's container(s) by label
-/// and issue `docker stop --time <grace>` on a detached thread so the
-/// lock-scoped cancel step never blocks on dockerd's grace.
+/// and issue `docker stop --time <grace>` — both on a detached thread so the
+/// lock-scoped cancel step never blocks on docker I/O (#8776).
 ///
-/// No containers found — including no docker binary, a failed or timed-out
-/// `docker ps` — is a debug-level no-op; a stop that does run logs what it
-/// stopped and how it ended. Nothing here can fail the cancel itself.
+/// Returns as soon as the thread is spawned, so the caller's SIGTERM is
+/// delivered without waiting on discovery (see the module doc's "#8776"
+/// section). No containers found — including no docker binary, a failed or
+/// timed-out `docker ps` — is a debug-level no-op; a stop that does run logs
+/// what it stopped and how it ended. Nothing here can fail the cancel itself.
 pub(crate) fn begin_container_stop(sweep_id: &str, issue: u32, grace: Duration) {
     begin_container_stop_with(&docker_program(), sweep_id, issue, grace);
 }
@@ -244,67 +285,64 @@ pub(crate) fn begin_container_stop_with(
     grace: Duration,
 ) {
     let program = program.to_path_buf();
-    let containers = list_issue_containers(&program, issue);
-    if containers.is_empty() {
-        log::debug!(
-            "cancel_sweep: no running container labelled for issue #{issue} (sweep \
-             {sweep_id}) — nothing to stop (#8435)"
+    let sweep_id = sweep_id.to_string();
+    spawn_teardown("loom-container-stop", issue, move || {
+        // Discovery runs HERE, not on the caller's thread (#8776): `docker ps`
+        // against a wedged dockerd burns the whole `reap_gh_timeout()` budget,
+        // and on the caller's thread that budget is spent holding the registry
+        // mutex and delaying the host-side SIGTERM.
+        let containers = list_issue_containers(&program, issue);
+        if containers.is_empty() {
+            log::debug!(
+                "cancel_sweep: no running container labelled for issue #{issue} (sweep \
+                 {sweep_id}) — nothing to stop (#8435)"
+            );
+            return;
+        }
+        log::info!(
+            "cancel_sweep: stopping {} container(s) for issue #{issue} (sweep {sweep_id}): \
+             {} — docker stop --time {}s (#8435)",
+            containers.len(),
+            describe(&containers),
+            grace.as_secs()
         );
-        return;
-    }
-    log::info!(
-        "cancel_sweep: stopping {} container(s) for issue #{issue} (sweep {sweep_id}): \
-         {} — docker stop --time {}s (#8435)",
-        containers.len(),
-        describe(&containers),
-        grace.as_secs()
-    );
-    let spawn_result = std::thread::Builder::new()
-        .name("loom-container-stop".to_string())
-        .spawn(move || {
-            // `docker stop` blocks up to its own --time grace while dockerd
-            // escalates SIGTERM → SIGKILL container-side. Bound the CLIENT to
-            // grace + the reaper's subprocess budget so a wedged CLI cannot
-            // outlive the cancel either; dockerd keeps executing an in-flight
-            // stop after its client dies, and the finish half below (plus
-            // `--rm`'s daemon-side removal) covers the rest.
-            let bound = grace + REAP_GH_TIMEOUT;
-            let cmd = command_with(&program, stop_args(grace, &containers));
-            match output_with_timeout(cmd, bound) {
-                Ok(Some(out)) if out.status.success() => {
-                    log::info!(
-                        "cancel_sweep: docker stop for issue #{issue} completed ({}) (#8435)",
-                        String::from_utf8_lossy(&out.stdout).trim()
-                    );
-                }
-                Ok(Some(out)) => {
-                    log::warn!(
-                        "cancel_sweep: docker stop for issue #{issue} exited {:?} — the \
-                         container may outlive the cancel (#8435)",
-                        out.status.code()
-                    );
-                }
-                Ok(None) => {
-                    log::warn!(
-                        "cancel_sweep: docker stop client for issue #{issue} exceeded {}s \
-                         and was killed — dockerd may still complete the stop (#8435)",
-                        bound.as_secs()
-                    );
-                }
-                Err(e) => {
-                    log::warn!(
-                        "cancel_sweep: docker stop for issue #{issue} could not run ({e}) \
-                         (#8435)"
-                    );
-                }
+        // `docker stop` blocks up to its own --time grace while dockerd
+        // escalates SIGTERM → SIGKILL container-side. Bound the CLIENT to
+        // grace + the reaper's subprocess budget so a wedged CLI cannot
+        // outlive the cancel either; dockerd keeps executing an in-flight
+        // stop after its client dies, and the finish half below (plus
+        // `--rm`'s daemon-side removal) covers the rest.
+        let bound = grace + REAP_GH_TIMEOUT;
+        let cmd = command_with(&program, stop_args(grace, &containers));
+        match output_with_timeout(cmd, bound) {
+            Ok(Some(out)) if out.status.success() => {
+                log::info!(
+                    "cancel_sweep: docker stop for issue #{issue} completed ({}) (#8435)",
+                    String::from_utf8_lossy(&out.stdout).trim()
+                );
             }
-        });
-    if let Err(e) = spawn_result {
-        log::warn!(
-            "cancel_sweep: could not spawn the docker stop thread for issue #{issue}: {e} \
-             (#8435)"
-        );
-    }
+            Ok(Some(out)) => {
+                log::warn!(
+                    "cancel_sweep: docker stop for issue #{issue} exited {:?} — the \
+                     container may outlive the cancel (#8435)",
+                    out.status.code()
+                );
+            }
+            Ok(None) => {
+                log::warn!(
+                    "cancel_sweep: docker stop client for issue #{issue} exceeded {}s \
+                     and was killed — dockerd may still complete the stop (#8435)",
+                    bound.as_secs()
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "cancel_sweep: docker stop for issue #{issue} could not run ({e}) \
+                     (#8435)"
+                );
+            }
+        }
+    });
 }
 
 /// Finish half of the container teardown, called from
@@ -319,7 +357,10 @@ pub(crate) fn begin_container_stop_with(
 /// the begin half finishes on its own thread.
 ///
 /// No containers still running is a debug-level no-op; every failure is
-/// logged and skipped — nothing here can fail the cancel itself.
+/// logged and skipped — nothing here can fail the cancel itself. Like the
+/// begin half, the whole sequence runs on a detached thread (#8776) so
+/// `finish_cancel`'s terminal-state transition and event emission are never
+/// held up by docker I/O.
 pub(crate) fn finish_container_stop(sweep_id: &str, issue: u32, escalate: bool) {
     finish_container_stop_with(&docker_program(), sweep_id, issue, escalate);
 }
@@ -335,45 +376,64 @@ pub(crate) fn finish_container_stop_with(
     if !escalate {
         return;
     }
-    let containers = list_issue_containers(program, issue);
-    if containers.is_empty() {
-        log::debug!(
-            "cancel_sweep: no container left to kill for issue #{issue} (sweep {sweep_id}) \
-             (#8435)"
+    let program = program.to_path_buf();
+    let sweep_id = sweep_id.to_string();
+    spawn_teardown("loom-container-kill", issue, move || {
+        // Re-listing is docker I/O with the same wedge exposure as the begin
+        // half's, so it runs off the caller's thread for the same reason
+        // (#8776) — `finish_cancel` also holds the registry mutex.
+        let containers = list_issue_containers(&program, issue);
+        if containers.is_empty() {
+            log::debug!(
+                "cancel_sweep: no container left to kill for issue #{issue} (sweep \
+                 {sweep_id}) (#8435)"
+            );
+            return;
+        }
+        log::warn!(
+            "cancel_sweep: container(s) for issue #{issue} (sweep {sweep_id}) survived the \
+             grace window — docker kill: {} (#8435)",
+            describe(&containers)
         );
-        return;
-    }
-    log::warn!(
-        "cancel_sweep: container(s) for issue #{issue} (sweep {sweep_id}) survived the \
-         grace window — docker kill: {} (#8435)",
-        describe(&containers)
-    );
-    let cmd = command_with(program, kill_args(&containers));
-    match output_with_timeout(cmd, reap_gh_timeout()) {
-        Ok(Some(out)) if out.status.success() => {
-            log::info!(
-                "cancel_sweep: docker kill for issue #{issue} completed ({}) (#8435)",
-                String::from_utf8_lossy(&out.stdout).trim()
-            );
+        let cmd = command_with(&program, kill_args(&containers));
+        match output_with_timeout(cmd, reap_gh_timeout()) {
+            Ok(Some(out)) if out.status.success() => {
+                log::info!(
+                    "cancel_sweep: docker kill for issue #{issue} completed ({}) (#8435)",
+                    String::from_utf8_lossy(&out.stdout).trim()
+                );
+            }
+            Ok(Some(out)) => {
+                log::warn!(
+                    "cancel_sweep: docker kill for issue #{issue} exited {:?} — the container \
+                     may outlive the cancel (#8435)",
+                    out.status.code()
+                );
+            }
+            Ok(None) => {
+                log::warn!(
+                    "cancel_sweep: docker kill for issue #{issue} timed out — the container \
+                     may outlive the cancel (#8435)"
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "cancel_sweep: docker kill for issue #{issue} could not run ({e}) (#8435)"
+                );
+            }
         }
-        Ok(Some(out)) => {
-            log::warn!(
-                "cancel_sweep: docker kill for issue #{issue} exited {:?} — the container \
-                 may outlive the cancel (#8435)",
-                out.status.code()
-            );
-        }
-        Ok(None) => {
-            log::warn!(
-                "cancel_sweep: docker kill for issue #{issue} timed out — the container may \
-                 outlive the cancel (#8435)"
-            );
-        }
-        Err(e) => {
-            log::warn!("cancel_sweep: docker kill for issue #{issue} could not run ({e}) (#8435)");
-        }
-    }
+    });
 }
+
+// The registry-level cancellation-latency regression for #8776 (a stalled fake
+// `docker ps` must not delay SIGTERM or an unrelated `get_status`) lives in its
+// own sibling file rather than in `reaper::tests`: both `reaper.rs` and
+// `reaper/tests.rs` sit at the file-size ratchet's ceiling and are frozen
+// (`.loom/docs/file-size-policy.md`), and the contract it pins — that neither
+// teardown half touches docker on the caller's thread — is this module's.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+mod cancel_latency_tests;
 
 #[cfg(test)]
 mod tests {
@@ -526,7 +586,11 @@ mod tests {
         let dir = tempdir("noop");
         let fake = fake_docker(&dir, "");
         begin_container_stop_with(&fake, "sweep-issue-4242-0", 4242, Duration::from_secs(2));
-        // Give a wrongly-spawned stop thread every chance to misfire.
+        // Discovery itself is off-thread since #8776, so wait for the probe
+        // rather than assuming it already ran on the caller's thread.
+        let ps_seen = wait_for_condition(5_000, || invocations(&dir).contains("ps --filter"));
+        assert!(ps_seen, "the ps probe never ran: {}", invocations(&dir));
+        // Give a wrongly-issued stop every chance to misfire.
         std::thread::sleep(Duration::from_millis(400));
         let log = invocations(&dir);
         assert_eq!(
@@ -589,6 +653,9 @@ mod tests {
         // containers", and neither panicked nor surfaced an error.
         begin_container_stop_with(&script, "sweep-issue-4242-0", 4242, Duration::from_secs(2));
         finish_container_stop_with(&script, "sweep-issue-4242-0", 4242, true);
+        // Both halves are detached threads (#8776): let them finish before the
+        // fixture directory (and the script they exec) goes away.
+        std::thread::sleep(Duration::from_millis(400));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -446,3 +446,33 @@ describe("GET /public/fleet-state, /api/fleet-state — D1-revoked host with un-
     expect(body.hosts["host-live"]).toBeDefined();
   });
 });
+
+describe("GET /public/fleet-state — expected-host roster (issue #8792)", () => {
+  type Body = { hosts: Record<string, unknown>; missingHosts?: { hostId: string; state: string }[] };
+
+  it("omits missingHosts entirely when EXPECTED_HOSTS is unset", async () => {
+    const response = await callWorker(new Request("https://ingest.example/public/fleet-state"));
+    const body = (await response.json()) as Body;
+    expect(body.missingHosts).toBeUndefined();
+  });
+
+  it("classifies roster hosts as missing (enrolled, never reported) vs unprovisioned (no active key); reporting hosts are not listed", async () => {
+    await seedHost(env.DB, "roster-reporting", "roster-reporting-key");
+    await ingestHostHealth("roster-reporting", "roster-reporting-key");
+    await seedHost(env.DB, "roster-silent", "roster-silent-key");
+    await seedHost(env.DB, "roster-revoked", "roster-revoked-key");
+    await revokeHost(env.DB, "roster-revoked");
+
+    const response = await callWorker(new Request("https://ingest.example/public/fleet-state"), {
+      EXPECTED_HOSTS: "roster-reporting, roster-silent\nroster-planned roster-revoked",
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Body;
+    expect(body.hosts["roster-reporting"]).toBeDefined();
+    expect(body.missingHosts).toEqual([
+      { hostId: "roster-planned", state: "unprovisioned" },
+      { hostId: "roster-revoked", state: "unprovisioned" },
+      { hostId: "roster-silent", state: "missing" },
+    ]);
+  });
+});

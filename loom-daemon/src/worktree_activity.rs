@@ -467,6 +467,25 @@ pub fn live_holders(worktree_path: &Path) -> Vec<LiveHolder> {
     )
 }
 
+/// Render [`LiveHolder`]s as the mid-build watchdog's own evidence type —
+/// the shared body of [`live_use_evidence`] and [`live_use_evidence_in`].
+fn to_use_evidence(holders: Vec<LiveHolder>) -> Vec<crate::sweep_registry::WorktreeUseEvidence> {
+    use crate::sweep_registry::WorktreeUseEvidence as Evidence;
+    holders
+        .into_iter()
+        .map(|holder| match holder {
+            LiveHolder::Inflight(reg) => Evidence::InflightClaim(reg.summary()),
+            LiveHolder::RecentWrite {
+                age_secs,
+                window_secs,
+            } => Evidence::RecentWrite {
+                age_secs,
+                window_secs,
+            },
+        })
+        .collect()
+}
+
 /// [`live_holders`], rendered as the mid-build watchdog's own evidence type so
 /// it joins the four registry-visible signals as a peer rather than as a second
 /// gate bolted on beside them (#8413).
@@ -480,20 +499,30 @@ pub fn live_holders(worktree_path: &Path) -> Vec<LiveHolder> {
 /// window is never reset, however idle every other signal says it is.
 #[must_use]
 pub fn live_use_evidence(worktree_path: &Path) -> Vec<crate::sweep_registry::WorktreeUseEvidence> {
-    use crate::sweep_registry::WorktreeUseEvidence as Evidence;
-    live_holders(worktree_path)
-        .into_iter()
-        .map(|holder| match holder {
-            LiveHolder::Inflight(reg) => Evidence::InflightClaim(reg.summary()),
-            LiveHolder::RecentWrite {
-                age_secs,
-                window_secs,
-            } => Evidence::RecentWrite {
-                age_secs,
-                window_secs,
-            },
-        })
-        .collect()
+    to_use_evidence(live_holders(worktree_path))
+}
+
+/// [`live_use_evidence`] with the activity window supplied by the caller
+/// instead of read from [`ACTIVITY_WINDOW_ENV`] — the testing seam behind it,
+/// mirroring [`live_holders_in`] / [`removal_veto_in`] (Issue #8487).
+///
+/// A zero `window` disables the filesystem leg, leaving the inflight leg (which
+/// has no window of its own). That is the "dirty, but QUIET" shape every
+/// mid-build watchdog fixture worktree means, and passing it explicitly is what
+/// lets those tests stop pinning a *process-global* env var that leaked into
+/// every later test in the same process.
+#[must_use]
+pub fn live_use_evidence_in(
+    worktree_path: &Path,
+    window: Duration,
+) -> Vec<crate::sweep_registry::WorktreeUseEvidence> {
+    to_use_evidence(live_holders_in(
+        None,
+        worktree_path,
+        SystemTime::now(),
+        window,
+        inflight::resolve_stale(),
+    ))
 }
 
 /// Downgrade a **removal** decision to [`WorktreeDecision::SkipInUse`] when

@@ -32,7 +32,7 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 pub enum FlushOutcome {
     /// The queue was empty — nothing to send.
     Empty,
-    /// A batch of this many envelopes was exported and acked.
+    /// This many envelopes were resolved (exported or permanently dropped).
     Sent(usize),
     /// The export attempt failed; the batch remains queued for retry.
     Failed,
@@ -40,8 +40,8 @@ pub enum FlushOutcome {
 
 /// Attempt to send one batch (up to `batch_size` envelopes, peeked from the
 /// front of `queue`) via `exporter`. Only acks (removes) the batch from
-/// `queue` on a confirmed successful export — a failure leaves the queue
-/// untouched so the same envelopes are retried next time.
+/// `queue` for the prefix acknowledged by the exporter. A retryable failure
+/// preserves the suffix; permanent OTLP rejection/drop advances the prefix.
 ///
 /// Every decided attempt (sent or failed) is also recorded on `status` (Issue
 /// #5083) — this is the single point in the daemon that *knows* whether
@@ -56,27 +56,30 @@ pub async fn try_flush<E: Exporter>(
     batch_size: usize,
     status: &ExportStatus,
 ) -> FlushOutcome {
-    let batch = queue.peek_batch(batch_size);
+    let snapshot = queue.peek_snapshot(batch_size);
+    let batch = &snapshot.envelopes;
     if batch.is_empty() {
         return FlushOutcome::Empty;
     }
-    match exporter.emit_batch(&batch).await {
-        Ok(()) => {
-            let sent = batch.len();
-            queue.ack(sent);
-            status.record_success(sent);
-            FlushOutcome::Sent(sent)
-        }
-        Err(error) => {
-            log::warn!(
-                "observability: export failed, {} record(s) remain queued \
-                 (dropped_total={}): {error}",
-                queue.len(),
-                queue.dropped_total()
-            );
-            status.record_failure(&error.to_string());
-            FlushOutcome::Failed
-        }
+    let outcome = exporter.emit_batch_outcome(batch).await;
+    let acknowledged = outcome.acknowledged.min(batch.len());
+    queue.ack_snapshot(&snapshot, acknowledged);
+    status.record_signals(&outcome.signals);
+    if outcome.exported > 0 {
+        status.record_success(outcome.exported);
+    }
+    if let Some(error) = outcome.error {
+        log::warn!(
+            "observability: export diagnostic, {} envelope(s) remain queued: {error}",
+            queue.len()
+        );
+        status.record_failure(&error.to_string());
+    }
+    if acknowledged == batch.len() {
+        // Includes non-retryable drops: advance so a poison request cannot starve the queue.
+        FlushOutcome::Sent(acknowledged)
+    } else {
+        FlushOutcome::Failed
     }
 }
 
@@ -91,25 +94,42 @@ pub fn spawn_task<E>(
 where
     E: Exporter + Send + Sync + 'static,
 {
-    tokio::spawn(run_sender(queue, exporter, batch_size, flush_interval, status))
+    super::shutdown::spawn_sender(queue, exporter, batch_size, flush_interval, status)
 }
 
-async fn run_sender<E: Exporter>(
+pub(super) async fn run_sender<E: Exporter>(
     queue: Arc<DurableQueue>,
-    exporter: E,
+    exporter: &E,
     batch_size: usize,
     flush_interval: Duration,
     status: Arc<ExportStatus>,
+    mut shutdown: tokio::sync::mpsc::Receiver<super::shutdown::Request>,
 ) {
     let mut rng = Rng::from_entropy();
     let mut backoff = MIN_BACKOFF;
     loop {
-        tokio::time::sleep(jittered(flush_interval, &mut rng)).await;
+        if !super::shutdown::pause(
+            &queue,
+            exporter,
+            batch_size,
+            &status,
+            &mut shutdown,
+            jittered(flush_interval, &mut rng),
+        )
+        .await
+        {
+            return;
+        }
         // Drain every currently-queued batch before sleeping again, so a
         // burst that arrived between ticks does not wait a full extra
         // `flush_interval` per batch.
         loop {
-            match try_flush(&queue, &exporter, batch_size, &status).await {
+            let Some(outcome) =
+                super::shutdown::flush(&queue, exporter, batch_size, &status, &mut shutdown).await
+            else {
+                return;
+            };
+            match outcome {
                 FlushOutcome::Empty => {
                     backoff = MIN_BACKOFF;
                     break;
@@ -119,7 +139,18 @@ async fn run_sender<E: Exporter>(
                     // Loop again immediately — more may still be queued.
                 }
                 FlushOutcome::Failed => {
-                    tokio::time::sleep(jittered(backoff, &mut rng)).await;
+                    if !super::shutdown::pause(
+                        &queue,
+                        exporter,
+                        batch_size,
+                        &status,
+                        &mut shutdown,
+                        jittered(backoff, &mut rng),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
                     break;
                 }
@@ -172,6 +203,7 @@ mod tests {
                 managed_repos: Vec::new(),
                 roles: crate::telemetry::RoleTickHealth::default(),
                 protection: None,
+                admission_brake: None,
             }),
         )
     }

@@ -23,6 +23,13 @@
 //!
 //! Both `.git` and `.loom` are required: `.git` alone is any git checkout,
 //! `.loom` alone is machine-level daemon state such as `~/.loom/tokens`.
+//!
+//! That `gitdir:` dereference is correct for *shared state* and wrong for
+//! *file content*, so this module exposes a second resolver,
+//! [`find_worktree_root`], which stops at the invoking working tree instead
+//! (issue #8499). Pick by what the value is used for, not by convenience:
+//! config/cache/token lookups take [`find_repo_root`]; "does this path exist,
+//! and what does it say?" takes [`find_worktree_root`].
 
 use std::path::{Path, PathBuf};
 
@@ -34,15 +41,7 @@ use std::path::{Path, PathBuf};
 /// contract).
 #[must_use]
 pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let mut current: PathBuf = if start.is_absolute() {
-        start.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(start)
-    };
-    // Best-effort canonicalization; a non-existent start path still walks up.
-    if let Ok(c) = current.canonicalize() {
-        current = c;
-    }
+    let mut current = normalized_start(start)?;
     loop {
         let git_path = current.join(".git");
         if git_path.exists() {
@@ -62,6 +61,59 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
 pub fn find_repo_root_from_cwd() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     find_repo_root(&cwd)
+}
+
+/// Walk up from `start` looking for the enclosing *working tree* — the same
+/// walk [`find_repo_root`] performs, minus the `gitdir:` dereference.
+///
+/// The two answer different questions and a caller must pick deliberately
+/// (issue #8499):
+///
+/// - [`find_repo_root`] answers **"where is the shared state for this
+///   clone?"** — `.loom/config.json`, the `gh` read cache, the token pool.
+///   There is exactly one per clone, so following a linked worktree's `.git`
+///   pointer file back to the main checkout is the *right* answer there.
+/// - This function answers **"which tree am I reasoning about?"** — file
+///   content, which differs per worktree by construction. Loom's whole model
+///   is that the primary clone sits on `main` while N worktrees run ahead of
+///   it, so resolving content against the main checkout reports a file the
+///   caller can see as missing (and a file the caller *cannot* see as
+///   present). `premise-check`'s citation resolution hit exactly that: a
+///   `RECORD-MALFORMED` (exit 12) for a citation that was correct in the
+///   worktree it was written in.
+///
+/// Returns `None` outside any Loom checkout; the caller decides the fallback.
+#[must_use]
+pub fn find_worktree_root(start: &Path) -> Option<PathBuf> {
+    let mut current = normalized_start(start)?;
+    loop {
+        // No `resolve_git_root` here: a linked worktree's `.git` pointer file
+        // marks *this* directory as a working tree, which is the whole point.
+        if current.join(".git").exists() && current.join(".loom").is_dir() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// [`find_worktree_root`] rooted at the process working directory.
+#[must_use]
+pub fn find_worktree_root_from_cwd() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    find_worktree_root(&cwd)
+}
+
+/// Absolutize `start`, then canonicalize best-effort — a non-existent start
+/// path still walks up.
+fn normalized_start(start: &Path) -> Option<PathBuf> {
+    let current: PathBuf = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
+    };
+    Some(current.canonicalize().unwrap_or(current))
 }
 
 /// Resolve a `--workspace` CLI argument (default `.`) to the enclosing Loom
@@ -178,14 +230,15 @@ mod tests {
         assert_eq!(find_repo_root(dir.path()), None);
     }
 
-    #[test]
-    fn resolves_worktree_gitlink_to_main_checkout() {
-        let dir = tempdir().unwrap();
-        let main = dir.path().join("repo");
+    /// A linked worktree whose `.git` is a `gitdir:` pointer file, laid out
+    /// the way `worktree.sh` lays one out. Returns `(main, worktree)`.
+    fn make_linked_worktree(dir: &Path) -> (PathBuf, PathBuf) {
+        let main = dir.join("repo");
         make_repo(&main);
         std::fs::create_dir_all(main.join(".git").join("worktrees").join("issue-42")).unwrap();
-        let worktree = dir.path().join("wt");
-        std::fs::create_dir_all(&worktree).unwrap();
+        let worktree = dir.join("wt");
+        make_repo(&worktree);
+        std::fs::remove_dir_all(worktree.join(".git")).unwrap();
         std::fs::write(
             worktree.join(".git"),
             format!(
@@ -197,7 +250,56 @@ mod tests {
             ),
         )
         .unwrap();
+        (main, worktree)
+    }
+
+    #[test]
+    fn resolves_worktree_gitlink_to_main_checkout() {
+        let dir = tempdir().unwrap();
+        let (main, worktree) = make_linked_worktree(dir.path());
         assert_eq!(find_repo_root(&worktree), Some(main.canonicalize().unwrap()));
+    }
+
+    /// The #8499 regression: the *content* resolver must stay in the linked
+    /// worktree. Following the gitlink here reports the main checkout's files,
+    /// which is a different commit by construction.
+    #[test]
+    fn worktree_root_stays_in_the_linked_worktree() {
+        let dir = tempdir().unwrap();
+        let (main, worktree) = make_linked_worktree(dir.path());
+        assert_eq!(find_worktree_root(&worktree), Some(worktree.canonicalize().unwrap()));
+        // ...and the two resolvers genuinely disagree, which is the point.
+        assert_eq!(find_repo_root(&worktree), Some(main.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn worktree_root_finds_the_tree_from_a_nested_directory() {
+        let dir = tempdir().unwrap();
+        let (_main, worktree) = make_linked_worktree(dir.path());
+        let nested = worktree.join("loom-daemon").join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_worktree_root(&nested), Some(worktree.canonicalize().unwrap()));
+    }
+
+    /// In the primary clone the two resolvers agree — there is no gitlink to
+    /// dereference, so nothing about the ordinary case changes.
+    #[test]
+    fn worktree_root_matches_repo_root_in_the_primary_clone() {
+        let dir = tempdir().unwrap();
+        make_repo(dir.path());
+        let root = dir.path().canonicalize().unwrap();
+        assert_eq!(find_worktree_root(dir.path()), Some(root.clone()));
+        assert_eq!(find_repo_root(dir.path()), Some(root));
+    }
+
+    #[test]
+    fn worktree_root_requires_both_markers() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom").join("tokens")).unwrap();
+        assert_eq!(find_worktree_root(dir.path()), None);
+        let other = tempdir().unwrap();
+        std::fs::create_dir_all(other.path().join(".git")).unwrap();
+        assert_eq!(find_worktree_root(other.path()), None);
     }
 
     #[test]

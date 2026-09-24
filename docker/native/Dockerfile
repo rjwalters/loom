@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 #
 # loom-worker-native image (#8403, Epic #6896 Phase 3) — the native-harness
-# layer FROM loom-worker that per-sweep EPHEMERAL containers for Pi/OpenCode
-# sweeps run. Full architecture: docs/adr/0017-session-container-architecture.md.
+# layer FROM loom-worker that per-sweep EPHEMERAL containers for
+# Pi/OpenCode/Kimi (#8565) sweeps run. Full architecture:
+# docs/adr/0017-session-container-architecture.md.
 #
 # Which of the two container lifetimes is this? The EPHEMERAL one, the same
 # lifetime `spawn-claude.sh`'s containerized dispatch uses (#7429/#7430) — one
@@ -18,26 +19,33 @@
 #
 # What this layer adds ON TOP OF loom-worker, and nothing else:
 #   1. Node.js LTS (tarball, checksum-verified) — npm is the only distribution
-#      channel for both native CLIs, and OpenCode additionally installs its own
-#      `@opencode-ai/plugin` package into its config directory at launch time,
-#      so npm has to be present at RUN time as well as build time. The base
-#      image ships no Node by design (docker/worker/README.md "What this image
-#      deliberately does NOT include"); this is a genuine transitive dependency
-#      of "add the native CLIs", the same judgement docker/session/Dockerfile
-#      already made for Codex.
-#   2. The two native CLIs PINNED at the versions .loom/docs/
+#      channel for all three native CLIs, and OpenCode additionally installs
+#      its own `@opencode-ai/plugin` package into its config directory at
+#      launch time, so npm has to be present at RUN time as well as build time.
+#      The base image ships no Node by design (docker/worker/README.md "What
+#      this image deliberately does NOT include"); this is a genuine transitive
+#      dependency of "add the native CLIs", the same judgement
+#      docker/session/Dockerfile already made for Codex.
+#   2. The three native CLIs PINNED at the versions .loom/docs/
 #      guardrail-parity-native.md records as tested (see the verification
-#      receipt native-runtime-verification-2026-09-19.md): OpenCode 1.18.31 and
-#      Pi 0.85.1. Pinned, never `@latest`: a floating tag would let an
-#      unrelated rebuild silently ship a version nothing has been verified
-#      against, and "CLI exit zero is not acceptance evidence" (the parity
-#      doc's own words) means a drifted version would not announce itself.
-#   3. `OPENCODE_DISABLE_AUTOUPDATE=1` — the runtime half of the same
-#      guarantee. Pinning the install is not enough if the CLI can update
-#      ITSELF past the tested version on first launch inside the container.
+#      receipt native-runtime-verification-2026-09-19.md): OpenCode 1.18.31,
+#      Pi 0.85.1 and Kimi 2.0.2. Pinned, never `@latest`: a floating tag would
+#      let an unrelated rebuild silently ship a version nothing has been
+#      verified against, and "CLI exit zero is not acceptance evidence" (the
+#      parity doc's own words) means a drifted version would not announce
+#      itself.
+#   3. `OPENCODE_DISABLE_AUTOUPDATE=1` / `KIMI_CODE_NO_AUTO_UPDATE=1` — the
+#      runtime half of the same guarantee. Pinning the install is not enough if
+#      the CLI can update ITSELF past the tested version on first launch inside
+#      the container. `KIMI_DISABLE_TELEMETRY=1` rides along with Kimi's: a
+#      dispatched worker must not phone home either.
 #
 # What it deliberately does NOT add: no ENTRYPOINT, no tmux server, no daemon,
-# no CODEX_HOME, and no session persistence of any kind. The base image's
+# no CODEX_HOME, no KIMI_CODE_HOME, and no session persistence of any kind.
+# Kimi's home is deliberately NOT set here — `worker_spawn::containment` points
+# it at a per-launch path in the writable layer (below), and baking an
+# image-level value would give every worker in a container one shared home
+# again. The base image's
 # `CMD ["/bin/bash"]` shape is exactly right here — a real dispatch overrides
 # it with `<workspace>/.loom/scripts/spawn-worker.sh …`, which is what
 # `loom_daemon::worker_spawn::containment` execs. Zero secrets, zero identity,
@@ -63,6 +71,14 @@ ARG DEBIAN_FRONTEND=noninteractive
 # fresh canary run; never one without the other.
 ARG OPENCODE_VERSION=1.18.31
 ARG PI_VERSION=0.85.1
+ARG KIMI_CODE_VERSION=2.0.2
+
+# `@moonshot-ai/kimi-code`'s own `engines.node` floor, asserted at build time
+# rather than trusted: npm only WARNS on an engine mismatch by default, so a
+# future Node downgrade here would ship a Kimi that fails at first launch
+# inside a dispatched sweep instead of failing this build. Bump alongside the
+# pin above whenever the package's floor moves.
+ARG KIMI_NODE_FLOOR=22.19.0
 
 # Node.js LTS, pinned + checksum-verified. Deliberately NOT `apt-get install
 # nodejs npm`: Ubuntu 24.04's `npm` package drags in ~150 `node-*` build
@@ -105,33 +121,59 @@ ENV PATH="/home/loom/.npm-global/bin:${PATH}"
 # shipping an image whose behavior nothing has verified. Unlike the Codex
 # layer's floor check, this is an EQUALITY check: the parity doc records a
 # tested version, not a minimum, and "newer" is not "verified".
-RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+#
+# The Node floor is checked FIRST, before any package is fetched: an image
+# whose Node is below Kimi's `engines.node` must fail at the assertion that
+# names the reason, not later at a launch-time syntax error. `sort -V` with the
+# floor first means an EQUAL version passes.
+RUN NODE_ACTUAL="$(node --version | tr -d v)" \
+    && NODE_SORTED="$(printf '%s\n%s\n' "${KIMI_NODE_FLOOR}" "${NODE_ACTUAL}" | sort -V)" \
+    && if [ "${NODE_SORTED%%$'\n'*}" != "${KIMI_NODE_FLOOR}" ]; then \
+         echo "FATAL: node ${NODE_ACTUAL} is below @moonshot-ai/kimi-code's engines.node floor ${KIMI_NODE_FLOOR} — raise NODE_VERSION (and its SHA256 args) before pinning this Kimi version" >&2; exit 1; \
+       fi \
+    && npm install -g "opencode-ai@${OPENCODE_VERSION}" "@earendil-works/pi-coding-agent@${PI_VERSION}" "@moonshot-ai/kimi-code@${KIMI_CODE_VERSION}" \
     && npm cache clean --force \
     && rm -rf /home/loom/.npm \
     && OPENCODE_ACTUAL="$(opencode --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" \
     && PI_ACTUAL="$(pi --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" \
-    && echo "Installed: opencode ${OPENCODE_ACTUAL}, pi ${PI_ACTUAL}" \
+    && KIMI_ACTUAL="$(kimi -V 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" \
+    && echo "Installed: opencode ${OPENCODE_ACTUAL}, pi ${PI_ACTUAL}, kimi ${KIMI_ACTUAL} (node ${NODE_ACTUAL})" \
     && if [ "${OPENCODE_ACTUAL}" != "${OPENCODE_VERSION}" ]; then \
          echo "FATAL: opencode ${OPENCODE_ACTUAL} != pinned ${OPENCODE_VERSION} (.loom/docs/guardrail-parity-native.md)" >&2; exit 1; \
        fi \
     && if [ "${PI_ACTUAL}" != "${PI_VERSION}" ]; then \
          echo "FATAL: pi ${PI_ACTUAL} != pinned ${PI_VERSION} (.loom/docs/guardrail-parity-native.md)" >&2; exit 1; \
+       fi \
+    && if [ "${KIMI_ACTUAL}" != "${KIMI_CODE_VERSION}" ]; then \
+         echo "FATAL: kimi ${KIMI_ACTUAL} != pinned ${KIMI_CODE_VERSION} (.loom/docs/guardrail-parity-native.md)" >&2; exit 1; \
        fi
 
-# --- Never self-update past the tested version -----------------------------
+# --- Never self-update past the tested version, never phone home ------------
 # The runtime half of the pin above. Baked into the image (not only passed at
 # `docker run`) so an interactive `docker run -it …` inspection session has the
-# same guarantee a dispatched sweep does.
+# same guarantee a dispatched sweep does. `worker_spawn::containment` passes
+# the same three at `docker run` time; both halves are deliberate, exactly as
+# for OpenCode's.
 ENV OPENCODE_DISABLE_AUTOUPDATE=1
+ENV KIMI_CODE_NO_AUTO_UPDATE=1
+ENV KIMI_DISABLE_TELEMETRY=1
 
 # --- Ephemeral per-launch state root ---------------------------------------
 # `worker_spawn::containment` points XDG_DATA_HOME / XDG_CONFIG_HOME /
-# XDG_CACHE_HOME / XDG_STATE_HOME / OPENCODE_CONFIG_DIR / LOOM_NATIVE_TOOLS_DIR
-# at `<this dir>/<per-launch id>/…`. Created here so the tree has correct
-# non-root ownership before anything writes into it, and EMPTY — it is a
-# writable-layer location, never a mount point and never baked content. This is
-# what makes two concurrent native workers' session stores and `auth.json`
-# files disjoint: different containers AND different paths within them.
+# XDG_CACHE_HOME / XDG_STATE_HOME / OPENCODE_CONFIG_DIR / KIMI_CODE_HOME /
+# LOOM_NATIVE_TOOLS_DIR at `<this dir>/<per-launch id>/…`. Created here so the
+# tree has correct non-root ownership before anything writes into it, and
+# EMPTY — it is a writable-layer location, never a mount point and never baked
+# content. This is what makes two concurrent native workers' session stores and
+# `auth.json` files disjoint: different containers AND different paths within
+# them.
+#
+# Kimi's per-launch home lands here too, and must stay WRITABLE at run time:
+# Kimi downloads `rg` and `fd` into `$KIMI_CODE_HOME/bin/` on first use, so a
+# fresh home means a fresh fetch. That is a deliberate trade — a baked,
+# image-level home shared by every worker in the container is the exact
+# collision the relocation exists to prevent — and it is why this tree is
+# ordinary writable layer rather than anything mounted read-only.
 RUN mkdir -p /home/loom/.loom-native
 
 WORKDIR /workspace
