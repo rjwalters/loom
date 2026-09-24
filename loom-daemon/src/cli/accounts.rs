@@ -7,8 +7,9 @@ use loom_daemon::tokens_pool::account_scope::{
     resolve_accounts_registry, shadowed_shared_accounts, AccountsRegistry,
 };
 
+use super::accounts_session::handle_session_command;
 use super::tokens::resolve_tokens_workspace;
-use crate::{AccountsAction, SessionAction};
+use crate::AccountsAction;
 
 /// The `--workspace` default. A value equal to this is "wherever I am", which
 /// [`resolve_accounts_registry`] may resolve to an enclosing Loom workspace or
@@ -322,78 +323,4 @@ fn run_availability_check(workspace: &std::path::Path, ranking: bool, json: bool
         std::process::exit(1);
     }
     Ok(())
-}
-
-fn handle_session_command(action: SessionAction, workspace: std::path::PathBuf) -> Result<()> {
-    use loom_daemon::tokens_pool::session_lifecycle::{
-        ProcessContainerRunner, SessionLifecycle, SessionStatus,
-    };
-
-    fn print_session_status(status: &SessionStatus, json: bool) -> Result<()> {
-        if json {
-            println!("{}", serde_json::to_string_pretty(status)?);
-        } else {
-            println!(
-                "{}: {} (container={}, id={}, image={}, started_at={}, codex_home={}, \
-                 mount={}, session_managed={}, workspace={})",
-                status.name,
-                if status.running { "running" } else { "stopped" },
-                status.container_name,
-                status.container_id.as_deref().unwrap_or("-"),
-                status.image.as_deref().unwrap_or("-"),
-                status.started_at.as_deref().unwrap_or("-"),
-                status.codex_home.display(),
-                status.mount_path,
-                status.session_managed,
-                status
-                    .workspace
-                    .as_ref()
-                    .map_or_else(|| "-".to_string(), |w| w.display().to_string()),
-            );
-        }
-        Ok(())
-    }
-
-    match action {
-        SessionAction::Start {
-            name,
-            image,
-            mount_workspace: workspace_arg,
-            json,
-        } => {
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image);
-            print_session_status(
-                &lifecycle.start_with_workspace(&name, workspace_arg.as_deref())?,
-                json,
-            )
-        }
-        SessionAction::Stop { name, force, json } => {
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
-            print_session_status(&lifecycle.stop(&name, force)?, json)
-        }
-        SessionAction::Status { name, json } => {
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
-            print_session_status(&lifecycle.status(&name)?, json)
-        }
-        SessionAction::Attach { name } => {
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
-            let code = lifecycle.attach(&name)?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(())
-        }
-        SessionAction::Shell {
-            name,
-            mount_workspace: workspace_arg,
-            args,
-        } => {
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
-            let code = lifecycle.shell(&name, workspace_arg.as_deref(), &args)?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(())
-        }
-    }
 }

@@ -261,3 +261,72 @@ the base image, CI's own smoke test only runs natively against the
 `linux/amd64` leg (no native arm64 GitHub Actions runner here); verify an
 arm64 build/run manually on an Apple Silicon or other arm64 host if you need
 to validate that leg end to end.
+
+
+## Private-clone workspaces
+
+Issue #8785 adds an opt-in foundational lifecycle. Host-mounted sessions keep
+all existing behavior; daemon routing and mutable Codex admission are separate
+work in #8786/#8787. Use a session image containing both
+`private-workspace protocol` (`loom-private-workspace-v1`) and `session-exec
+protocol`; old images fail clearly, without an unsupervised fallback.
+
+```bash
+loom-daemon accounts session start agent-1 \
+  --private-clone https://github.com/OWNER/REPO.git --base main --image SESSION_IMAGE
+loom-daemon accounts session status agent-1 --json
+loom-daemon accounts session job agent-1 --kind role --owner manual-check \
+  --issue 123 --branch feature/issue-123 -- git status
+loom-daemon accounts session stop agent-1 --json
+```
+
+Start persists the configured HTTPS repository/base and creates an independent
+clone in `loom-codex-workspace-ACCOUNT` at `/workspace/repo`. Status and stop
+continue reporting the private identity even after container removal. Repeat
+the same start command to reuse the volume. Different repositories/bases,
+account profiles, engines, container mounts or volume owners refuse reuse.
+No credential is copied into the clone or URL. Existing external gh configuration
+is mounted read-only; `GH_TOKEN`/`GITHUB_TOKEN` (GitHub) or
+`GITEA_TOKEN`/`FORGE_TOKEN` (other HTTPS forges) may be supplied at job time.
+Git's native helper accepts requests only for the configured forge host.
+Local-path/SSH remotes and URL credentials are unsupported and fail before
+creation. The account's existing persistent authentication profile remains its
+single refresh owner.
+
+`session job` is the explicit lease-consuming primitive for future dispatch.
+`--kind role|sweep|interactive` shares one exclusion domain. It prepares the
+remote base, optionally selects an issue branch, and runs the supplied command
+through the supervised session-exec protocol. Existing branch tips are never
+reset. Existing issue helpers may create worktrees entirely inside the volume.
+The command is headless: interactive TTY/input is unsupported. Unleased
+`session attach`/`session shell` refuse private sessions, including while idle;
+private containers have no baseline tmux shell. Host Docker access remains an
+operator authority, not an agent capability, and raw `docker exec` bypasses
+must not be used for normal job dispatch.
+
+Account coordination metadata lives in `.private-sessions/ACCOUNT` beside the
+external profile directories. The process lock is account-wide; durable job
+records contain owner, kind, issue/branch, container identity and resolved base.
+A missing cleanup acknowledgement retains the job record. A dead PID or expired
+timer cannot reclaim it: the original container must be absent/stopped on the
+same Docker engine, or its process inventory must prove only the private idle
+baseline remains. Detached/surviving children block recovery. Dirty worktrees,
+untracked files and unpublished branch/detached commits block reuse without
+resetting or deleting anything. Recover/publish that work deliberately before
+retrying; unknown origin/metadata state also requires operator recovery.
+
+To migrate a host-mounted session, finish its active work, run the existing
+`session stop ACCOUNT` without `--force`, then run the private start command
+with the selected repository and current image. Never try to change a live
+container's mounts. Private stop retains the volume and account profile. To
+retire a private configuration, first stop it, recover/publish all retained
+work, and archive its external `.private-sessions/ACCOUNT` metadata and volume
+before configuring another workspace; there is no automatic destructive
+migration or volume cleanup. Shared caches and extra jobs per account are
+explicitly deferred to #8788.
+
+The ignored `private_workspace_docker` integration target is explicitly run in
+CI. It builds synthetic credential-free fixtures and proves clone/worktree
+operations, persistence, host/peer write denial, job exclusion, and retained
+dirty/unpublished work. On macOS, supply a Linux build of the worker endpoint
+with `LOOM_TEST_LINUX_BIN`; `LOOM_TEST_HOST_BIN` optionally selects the host build.
