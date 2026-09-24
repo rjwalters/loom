@@ -57,7 +57,7 @@ struct Cli {
 enum Commands {
     /// Launch a worker through a native harness adapter or a legacy runtime.
     SpawnWorker(loom_daemon::worker_spawn::WorkerArgs),
-    /// Inspect worker model profiles without launching anything.
+    /// Inspect worker model profiles; run a launch behind the credential proxy.
     #[command(subcommand_required = true)]
     Worker(loom_daemon::worker_spawn::WorkerCommand),
     /// Execute one guarded native harness tool request from stdin.
