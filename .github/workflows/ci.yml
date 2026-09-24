@@ -1138,11 +1138,18 @@ jobs:
         run: bash defaults/scripts/tests/test-loom-daemon-update-resolve-json.sh
       # Split out of test-loom-daemon-update.sh by #8028 (epic #7810 PR 6a):
       # fetch_and_verify_artifact() now drives `loom-daemon release-fetch`
-      # through the stub's delegation, so these 64 assertions (tests A-V) need
+      # through the stub's delegation, so these assertions (tests A-Y) need
       # the binary this job builds. The parent suite stays in
       # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
       - name: loom-daemon-update artifact fetch + verify (#8028)
         run: bash defaults/scripts/tests/test-loom-daemon-update-fetch.sh
+      # Split out of test-loom-daemon-update-fetch.sh by #8770: scenarios V
+      # (#8008) and V2 (#8770) assert what provisioning does to the
+      # DESTINATION binary's signature, not what --fetch downloads. They reach
+      # `loom-daemon release-fetch` the same way their former host does, so
+      # they need the binary this job builds.
+      - name: loom-daemon-update post-provision signature check (#8008, #8770)
+        run: bash defaults/scripts/tests/test-loom-daemon-update-dest-signature.sh
       # #8712: the fixture library is the subject, not any one flow. A fake
       # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
       # loom-daemon/target/release/ stalled a fleet host's auto_update for
