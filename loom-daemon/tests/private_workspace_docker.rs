@@ -7,6 +7,8 @@ use std::time::Duration;
 
 #[path = "private_workspace_docker/auth.rs"]
 mod auth;
+#[path = "private_workspace_docker/dispatch.rs"]
+mod dispatch;
 
 #[track_caller]
 fn checked(output: Output) -> String {
@@ -33,6 +35,17 @@ struct Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            let logs = Command::new("docker")
+                .args(["logs", &self.server])
+                .output()
+                .unwrap();
+            eprintln!(
+                "fixture forge diagnostics: {} {}",
+                String::from_utf8_lossy(&logs.stdout),
+                String::from_utf8_lossy(&logs.stderr)
+            );
+        }
         for name in &self.names {
             if std::thread::panicking() {
                 let diagnostic = Command::new("docker")
@@ -129,6 +142,9 @@ impl Fixture {
         ])
     }
     fn new() -> Self {
+        Self::with_adapters(false)
+    }
+    fn with_adapters(adapters: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let tag = uuid::Uuid::new_v4().simple().to_string();
         let host = std::env::var_os("LOOM_TEST_HOST_BIN")
@@ -181,6 +197,28 @@ impl Fixture {
         };
         git(&["init", "-b", "main"]);
         std::fs::write(source.join("file"), "base").unwrap();
+        if adapters {
+            let defaults = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("defaults");
+            for (src, dest) in [
+                ("runtimes", ".loom/runtimes"),
+                ("scripts", ".loom/scripts"),
+                ("hooks", ".loom/hooks"),
+                ("roles", ".loom/roles"),
+                (".claude/commands/loom", ".claude/commands/loom"),
+            ] {
+                dispatch::copy_tree(&defaults.join(src), &source.join(dest));
+            }
+            std::fs::write(
+                source.join(".gitignore"),
+                ".loom/sweep-checkpoint/\n.loom/logs/\n.loom/private-jobs/\n.loom/locks/\n",
+            )
+            .unwrap();
+            std::fs::write(source.join(".loom/config.json"), r#"{"forge":{"type":"github"}}"#)
+                .unwrap();
+        }
         git(&["add", "."]);
         git(&["commit", "-m", "fixture"]);
         let context = f.root.path().join("context");
@@ -198,14 +236,25 @@ impl Fixture {
                 .output()
                 .unwrap(),
         );
+        checked(
+            Command::new("git")
+                .arg("-C")
+                .arg(context.join("repo.git"))
+                .args(["config", "http.receivepack", "true"])
+                .output()
+                .unwrap(),
+        );
         std::fs::copy(worker, context.join("loom-daemon")).unwrap();
+        std::fs::write(context.join("codex"), dispatch::CODEX).unwrap();
+        std::fs::write(context.join("gh"), dispatch::GH).unwrap();
         std::fs::write(context.join("serve.py"), auth::SERVER).unwrap();
         std::fs::write(context.join("Dockerfile"), r#"FROM ubuntu:24.04
-RUN apt-get update -qq && apt-get install -y --no-install-recommends git tini python3 openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -qq && apt-get install -y --no-install-recommends git tini python3 openssl ca-certificates jq coreutils && rm -rf /var/lib/apt/lists/*
 COPY loom-daemon /usr/local/bin/loom-daemon
+COPY codex gh /usr/local/bin/
 COPY repo.git /srv/repo.git
 COPY serve.py /srv/serve.py
-RUN chmod 0755 /usr/local/bin/loom-daemon && openssl req -x509 -newkey rsa:2048 -nodes -keyout /srv/key.pem -out /srv/cert.pem -days 1 -subj /CN=fixture && git config --system user.name Fixture && git config --system user.email fixture@example.invalid
+RUN chmod 0755 /usr/local/bin/loom-daemon /usr/local/bin/codex /usr/local/bin/gh && openssl req -x509 -newkey rsa:2048 -nodes -keyout /srv/key.pem -out /srv/cert.pem -days 1 -subj /CN=fixture && git config --system user.name Fixture && git config --system user.email fixture@example.invalid
 ENV GIT_SSL_NO_VERIFY=true
 WORKDIR /srv
 "#).unwrap();

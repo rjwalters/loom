@@ -287,6 +287,26 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn setup(config: &Config) -> Result<()> {
+    let output = command(&[
+        "exec",
+        &config.container,
+        "loom-daemon",
+        "private-workspace",
+        "setup",
+    ])?;
+    let report: worker_setup::SetupReport = serde_json::from_str(&output)
+        .context("private setup endpoint unavailable; update the session image")?;
+    if report.protocol != PROTOCOL {
+        bail!("private setup protocol mismatch; update the session image");
+    }
+    match report.status {
+        worker_setup::SetupStatus::Ready => Ok(()),
+        worker_setup::SetupStatus::ProfileInaccessible => bail!("private account profile is not readable and writable by session UID 1000; check external profile ownership and permissions (profile was preserved)"),
+        worker_setup::SetupStatus::Failed => bail!("private helper/configuration setup failed; inspect the owned account locally (configuration was preserved)"),
+    }
+}
+
 pub(super) fn prepare(config: &Config, id: &str, branch: Option<&str>) -> Result<String> {
     let mut args = vec!["exec", "--workdir", ROOT];
     // `--env NAME` copies the host process's value directly; secrets never
