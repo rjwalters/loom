@@ -59,7 +59,7 @@ impl SessionExecCommand {
                 println!("{PROTOCOL}");
                 Ok(0)
             }
-            Self::Host(args) => host::run(args),
+            Self::Host(args) => crate::tokens_pool::private_workspace::transport::run(args),
             #[cfg(target_os = "linux")]
             Self::Worker(args) => worker::run(args),
             #[cfg(not(target_os = "linux"))]

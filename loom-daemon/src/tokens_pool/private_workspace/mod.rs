@@ -1,12 +1,18 @@
-//! Opt-in account-private clones. This is a lifecycle primitive, not daemon
-//! routing or a runtime capability claim. Host state is outside the repository;
-//! Docker owns the persistent clone volume. Unknown work is never discarded.
+//! Opt-in account-private clone lifecycle and supervised dispatch. Account
+//! coordination stays outside repositories; bounded recovery metadata stays
+//! with the logical host repository. Runtime capability admission is unchanged.
+mod adapter;
+mod control;
+pub mod dispatch;
 mod docker;
+pub mod export;
 mod lease;
 mod lifecycle;
 mod repository;
 #[cfg(test)]
 mod tests;
+pub mod transport;
+mod worker_setup;
 
 pub use lifecycle::{configured, run_job, start, status, stop};
 pub use repository::WorkerCommand;

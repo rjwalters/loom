@@ -54,7 +54,7 @@ pub(super) const CLAIM_OWNED_ENV: &str = "LOOM_SWEEP_CLAIM_OWNED";
 /// has nothing to do with — exactly the lie the `Issue`-only scoping exists to
 /// prevent. Removing makes the guarantee hold under inheritance, not merely
 /// under a clean parent environment.
-pub(super) fn apply_issue_scoped_markers(cmd: &mut Command, kind: &SweepKind) {
+pub(crate) fn apply_issue_scoped_markers(cmd: &mut Command, kind: &SweepKind) {
     match kind {
         SweepKind::Issue(issue) => {
             cmd.env(CLAIM_OWNED_ENV, issue.to_string());

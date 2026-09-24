@@ -117,14 +117,13 @@ mod model;
 mod noop_cooldown;
 mod outcome_journal;
 mod pool_hold_broadcast;
+pub(crate) mod private_dispatch;
 mod prless_retry;
 mod quarantine;
 mod reaper;
+mod spawn_process;
 mod stacking;
-// `pub(crate)` (still `#[cfg(test)]`-only) so a test outside this module tree
-// can build a real registry rather than a hand-shaped stand-in for it — the
-// observability collector's adoption-correlation tests (#8720) drive the
-// genuine lock/journal adoption paths through this fixture.
+// Shared test registry fixture for adoption-correlation coverage.
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) mod test_support;

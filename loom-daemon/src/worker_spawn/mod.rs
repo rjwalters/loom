@@ -414,6 +414,30 @@ fn run_preflight(
         command.args(&args.args);
         command
     };
+    let private_selection = if runtime == "codex"
+        && std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none()
+        && nonempty_env("LOOM_CODEX_NO_EXEC").is_none()
+    {
+        let options = Options::parse(&args.args)?;
+        if let Some(role) = nonempty_env("LOOM_ROLE") {
+            crate::runtime_admission::resolve_and_admit(root, &role, Some("codex"))
+                .map_err(|e| LaunchError::config(e.diagnostic()))?;
+        }
+        crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
+            root,
+            &runtime,
+            options.model.as_deref(),
+            crate::tokens_pool::private_workspace::JobKind::Role,
+            None,
+            &format!("worker-{}", uuid::Uuid::new_v4()),
+        )
+        .map_err(|e| LaunchError::config(e.to_string()))?
+    } else {
+        None
+    };
+    if let Some(selection) = &private_selection {
+        selection.apply(&mut command);
+    }
     command.env("LOOM_RUNTIME", &runtime);
     // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
     // item 1). Cargo keys a crate's incremental session state by the crate's

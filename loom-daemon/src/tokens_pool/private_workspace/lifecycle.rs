@@ -10,7 +10,7 @@ pub fn configured(workspace: &Path, name: &str) -> Result<bool> {
         .exists())
 }
 
-fn resolve(workspace: &Path, name: &str) -> Result<(Config, PathBuf)> {
+pub(super) fn resolve(workspace: &Path, name: &str) -> Result<(Config, PathBuf)> {
     let account = account(workspace, name)?;
     let dir = state_dir(&account.credential_reference)?;
     let config =

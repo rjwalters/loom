@@ -22,6 +22,13 @@ pub(super) struct Lease {
 }
 
 impl Lease {
+    pub(super) fn fd(&self) -> i32 {
+        self._file.as_raw_fd()
+    }
+    pub(super) fn from_file(file: File, dir: PathBuf) -> Self {
+        Self { _file: file, dir }
+    }
+
     pub fn acquire(dir: &Path) -> Result<Self> {
         std::fs::DirBuilder::new()
             .recursive(true)
