@@ -189,6 +189,9 @@ export class HostHistoryPanel {
     renderMetricTrendChart(this.diskContainer, buildHealthMetricTrend(healthRecords, "worktree_root_free_gb"), {
       formatValue: (value) => formatGigabytes(value),
     });
-    renderOutcomesChart(this.throughputContainer, buildOutcomesOverTime(records, granularityForWindow(this.window)));
+    const granularity = granularityForWindow(this.window);
+    renderOutcomesChart(this.throughputContainer, buildOutcomesOverTime(records, granularity), {
+      granularityLabel: granularity === "weekly" ? "week" : "day",
+    });
   }
 }
