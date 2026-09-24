@@ -139,3 +139,28 @@ Edits, `rg`, design/ADR work, `git` metadata (commit, log, diff review),
 `create-issue.sh`, and the 2am worker's `node --test` (fast). The division
 exists so the laptop stays responsive while a 10-minute test compile happens
 off-machine.
+## Pi-subagent fan-out (host agents, box builds) — proven 2026-09-24
+
+Works around the drained per-plan agent billing: pi subagents run on this
+session's working route (`cerebras/qwen-3.8-27b` via the harness's
+`PI_PROVIDER`/`PI_MODEL` env; `pi auth check` showed anthropic "ready" but
+the API key is the same drained account — verify on first use, not on paper).
+
+- Spawn: `pi -a -p --model cerebras/qwen-3.8-27b --thinking <level> -- "$(cat prompt.md)"`
+  from the worktree (nohup, log per task). `-a` trusts the project-local
+  AGENTS.md/CLAUDE.md so house style applies. `--thinking low` is unsafe for
+  literal-command instructions (observed misread); high is the floor, xhigh
+  for the multi-hour tasks.
+- Prompt shape: task spec (issue number + read-first list) + the box-rule
+  block (sync to `build/<issue>/`, CARGO_TARGET_DIR=/home/ubuntu/shared/target,
+  idle-stop recovery recipe) + the Loom loop close-out (fetch, rebase onto
+  origin/main, force-with-lease push of the branch only, `gh pr create` on
+  `feature/issue-<n>` so CI fires, `gh pr edit --add-label loom:review-requested`
+  for judge intake, <=10-line final answer) + "stop with HANDOFF.md if you
+  cannot converge".
+- Monitor: pid liveness + `gh pr list --head feature/issue-<n>` + log tail.
+  `pi -p` text mode is quiet until the final message — judge liveness by the
+  process group and worktree/box activity, not log flow.
+- Observed: a 27B open-weights model on a well-specified, well-fenced task
+  (tight scoping + read-first list + close-out checklist) does not replace a
+  frontier model on open-ended design; give it shape, not space.
