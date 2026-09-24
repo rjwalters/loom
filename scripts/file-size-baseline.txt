@@ -52,7 +52,7 @@
 1715 loom-daemon/src/orphan_process_reaper.rs
 1525 loom-daemon/src/peer_claims.rs
 2136 loom-daemon/src/role_runner.rs
-3850 loom-daemon/src/role_runner/tests.rs
+3760 loom-daemon/src/role_runner/tests.rs
 2443 loom-daemon/src/safehouse.rs
 3913 loom-daemon/src/safehouse/tests.rs
 1532 loom-daemon/src/script_helpers/sweep_experiment.rs
