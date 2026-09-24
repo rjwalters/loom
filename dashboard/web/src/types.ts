@@ -276,9 +276,40 @@ export interface ActiveComputeJob {
   leaked?: boolean;
 }
 
+/**
+ * Why a roster-expected host has no telemetry to render (Issue #8792) — the
+ * wire counterpart of `../../src/fleetState.ts`'s `MissingHostState`, which is
+ * the source of truth for what each value means:
+ *
+ *   - `missing` — an active (non-revoked) ingest key exists for it, yet the
+ *     backend holds no `health` entry: something that *should* be reporting is
+ *     not. An incident.
+ *   - `unprovisioned` — no active ingest key exists for it, so it *cannot*
+ *     report yet. A to-do, not an outage — which is why the two are rendered
+ *     distinctly and only `missing` counts toward "needs attention".
+ *
+ * A host that reported and then went quiet is neither: it still has a `health`
+ * entry and reads as `stale` through the ordinary freshness path.
+ */
+export type MissingHostState = "missing" | "unprovisioned";
+
+/** One entry of `FleetSnapshot.missingHosts`. */
+export interface MissingHost {
+  hostId: string;
+  state: MissingHostState;
+}
+
 export interface FleetSnapshot {
   hosts: Record<string, HostEntry>;
   activeSweeps: ActiveSweep[];
+  /** Roster-expected hosts with no `health` entry at all (Issue #8792): the
+   * Worker's `EXPECTED_HOSTS`-vs-reporting diff, attached in
+   * `../../src/index.ts`. Absent — not `[]` — from a backend that predates
+   * #8792 and from a deployment with no roster configured; `parse.ts` leaves
+   * the key off entirely in both cases, so "no roster" and "roster, nothing
+   * missing" stay distinguishable and a pre-#8792 payload renders exactly as
+   * it did before (#8804). */
+  missingHosts?: MissingHost[];
   /** Live `ephemeral_compute` jobs (Issue #8305). Always `[]` for an
    * unauthenticated viewer — the redaction policy withholds every field of
    * that kind, including the count (`../../src/redaction.ts`).

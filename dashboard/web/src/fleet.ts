@@ -24,6 +24,7 @@ import type {
   FleetSnapshot,
   HostEntry,
   HostHealthRecord,
+  MissingHostState,
   ProviderPoolAggregate,
   TokenAccount,
 } from "./types";
@@ -60,7 +61,24 @@ export type HostStatus =
   | "stale"
   /** Known only from `activeSweeps`, or from a `hosts` entry with neither
    * `health` nor `tokens` yet — nothing to assess. */
-  | "unknown";
+  | "unknown"
+  /** Named by the backend's expected-host roster, holds an active ingest key,
+   * and has never reported (Issue #8792/#8804). A refinement of `unknown`:
+   * same absence of data, but the roster tells us the absence is *wrong*.
+   * Counts toward `FleetView.needsAttention` — it is an incident. */
+  | "missing"
+  /** Named by the expected-host roster but with no active ingest key, so it
+   * cannot report yet (Issue #8792/#8804). Also a refinement of `unknown`,
+   * but a planning to-do rather than an outage — deliberately NOT counted in
+   * `needsAttention`, and rendered distinctly from `missing`. */
+  | "unprovisioned";
+
+/** `true` for the two statuses that come from the expected-host roster rather
+ * than from telemetry (Issue #8804) — the hosts with no `health`/`tokens`
+ * entry to assess at all. */
+export function isRosterMissingStatus(status: HostStatus): boolean {
+  return status === "missing" || status === "unprovisioned";
+}
 
 export interface TokenSummary {
   /** The per-account rows, or `[]` for a public viewer, who is sent an
@@ -138,11 +156,27 @@ export interface FleetView {
    * reconcile against the cards below it.
    */
   reportingHosts: number;
+  /** Roster-expected hosts rendered with `status === "missing"` — enrolled,
+   * but never reported (Issue #8804). `0` on any snapshot without a
+   * `missingHosts` field, which is what keeps a pre-#8792 backend's overview
+   * identical to its pre-#8804 rendering. Counted separately from
+   * `reportingHosts` on purpose: these hosts are, by definition, not
+   * reporting — folding them into that number would overstate how much of the
+   * fleet is actually pushing telemetry. */
+  missingHosts: number;
+  /** Roster-expected hosts rendered with `status === "unprovisioned"` — named
+   * by the roster but never enrolled, so they *cannot* report (Issue #8804).
+   * Split from `missingHosts` because the two need different operator action;
+   * see `HostStatus`. */
+  unprovisionedHosts: number;
   totalSweeps: number;
-  /** Hosts in `stale` or `degraded` — the count the overview headline shows.
-   * `"unknown"` hosts are excluded here too (STATUS_ORDER treats them as
-   * their own bucket, not `stale`/`degraded`) — see the "excludes sweep-only
-   * hosts" test in `fleet.test.ts`. */
+  /** Hosts in `stale`, `degraded`, or `missing` — the count the overview
+   * headline shows. `"unknown"` hosts are excluded here (STATUS_ORDER treats
+   * them as their own bucket) — see the "excludes sweep-only hosts" test in
+   * `fleet.test.ts` — and so is `"unprovisioned"`, which is a provisioning
+   * to-do rather than something going wrong (#8804). `"missing"` *is*
+   * counted: a host the roster says is enrolled and that has never reported
+   * is the exact incident the roster exists to surface. */
   needsAttention: number;
   /** Fleet-wide role-tick totals (#5642) — see `aggregateRoleTicks`.
    * `undefined` when no reporting host has sent `health.roles` yet. Exists
@@ -379,11 +413,21 @@ function latestReport(entry: HostEntry): string | undefined {
   return candidates.sort()[candidates.length - 1];
 }
 
+/**
+ * @param rosterState When set, this host is named by the backend's
+ *   expected-host roster and has no telemetry at all (Issue #8804) — so its
+ *   status becomes the roster's own verdict (`missing`/`unprovisioned`)
+ *   instead of the generic `unknown`. Only honored when the host has in fact
+ *   never reported; a host with any `health`/`tokens` entry keeps its
+ *   telemetry-derived status, so a card can never say "never reported"
+ *   alongside a live "last report 2m ago".
+ */
 export function buildHostView(
   hostId: string,
   entry: HostEntry,
   sweeps: ActiveSweep[],
   now: Date = new Date(),
+  rosterState?: MissingHostState,
 ): HostView {
   const tokens = summarizeTokens(entry);
   const lastReportAt = latestReport(entry);
@@ -393,7 +437,7 @@ export function buildHostView(
   let status: HostStatus;
   let degradedReason: string | undefined;
   if (lastReportAgeSec === undefined) {
-    status = "unknown";
+    status = rosterState ?? "unknown";
   } else if (lastReportAgeSec > STALE_AFTER_SEC) {
     status = "stale";
   } else if (distress !== undefined) {
@@ -413,8 +457,19 @@ export function buildHostView(
 }
 
 /** Sort: hosts needing attention first, then busiest, then by id so the list
- * does not reshuffle between polls when nothing changed. */
-const STATUS_ORDER: Record<HostStatus, number> = { stale: 0, degraded: 1, unknown: 2, ok: 3 };
+ * does not reshuffle between polls when nothing changed. `missing` leads —
+ * a host the roster says should be reporting and that never has is the
+ * loudest signal on the page — while `unprovisioned` sits just above the
+ * data-less `unknown` bucket, since it is a planning to-do (#8804). The
+ * relative order of the four pre-existing statuses is unchanged. */
+const STATUS_ORDER: Record<HostStatus, number> = {
+  missing: 0,
+  stale: 1,
+  degraded: 2,
+  unprovisioned: 3,
+  unknown: 4,
+  ok: 5,
+};
 
 export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()): FleetView {
   const sweepsByHost = new Map<string, ActiveSweep[]>();
@@ -424,11 +479,41 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
     else sweepsByHost.set(sweep.hostId, [sweep]);
   }
 
-  const hostIds = new Set<string>([...Object.keys(snapshot.hosts), ...sweepsByHost.keys()]);
+  // Issue #8804: the roster-expected hosts the backend reported as having no
+  // `health` entry (#8792). They join the host set exactly the way sweep-only
+  // hosts do — the whole point is that a host which never reported must be
+  // *visible*, not silently absent from a page built only from what did
+  // report.
+  //
+  // An entry is ignored when that host turns out to carry a `health` or
+  // `tokens` record after all. `diffExpectedRoster` already excludes
+  // health-bearing hosts, so this only fires on a hand-built/malformed
+  // snapshot or on the tokens-only edge the backend's own diff does not look
+  // at — and in both cases the telemetry is the better answer: overriding it
+  // would paint a host that demonstrably reported minutes ago as "never
+  // reported".
+  const rosterStates = new Map<string, MissingHostState>();
+  for (const missing of snapshot.missingHosts ?? []) {
+    const entry = snapshot.hosts[missing.hostId];
+    if (entry?.health || entry?.tokens) continue;
+    rosterStates.set(missing.hostId, missing.state);
+  }
+
+  const hostIds = new Set<string>([
+    ...Object.keys(snapshot.hosts),
+    ...sweepsByHost.keys(),
+    ...rosterStates.keys(),
+  ]);
 
   const hosts = [...hostIds]
     .map((hostId) =>
-      buildHostView(hostId, snapshot.hosts[hostId] ?? {}, sortSweeps(sweepsByHost.get(hostId) ?? []), now),
+      buildHostView(
+        hostId,
+        snapshot.hosts[hostId] ?? {},
+        sortSweeps(sweepsByHost.get(hostId) ?? []),
+        now,
+        rosterStates.get(hostId),
+      ),
     )
     .sort(
       (a, b) =>
@@ -443,9 +528,13 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
 
   return {
     hosts,
-    reportingHosts: hosts.filter((host) => host.status !== "unknown").length,
+    reportingHosts: hosts.filter((host) => host.status !== "unknown" && !isRosterMissingStatus(host.status)).length,
+    missingHosts: hosts.filter((host) => host.status === "missing").length,
+    unprovisionedHosts: hosts.filter((host) => host.status === "unprovisioned").length,
     totalSweeps: snapshot.activeSweeps.length,
-    needsAttention: hosts.filter((host) => host.status === "stale" || host.status === "degraded").length,
+    needsAttention: hosts.filter(
+      (host) => host.status === "stale" || host.status === "degraded" || host.status === "missing",
+    ).length,
     roleTicks: aggregateRoleTicks(hosts),
     activeCompute,
     leakedCompute: activeCompute.filter((job) => job.leaked === true).length,

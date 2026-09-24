@@ -8,11 +8,14 @@ import {
   DEGRADED_HOST_ID,
   HEALTHY_HOST_ID,
   IDLE_HOST_ID,
+  MISSING_HOST_ID,
   NOW,
   PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID,
   SWEEP_ONLY_HOST_ID,
+  UNPROVISIONED_HOST_ID,
   multiHostSnapshot,
   persistentRoleTickFailureFixture,
+  rosterMissingSnapshot,
   unprotectedHostProtectionFixture,
 } from "./fixtures";
 
@@ -346,4 +349,44 @@ it("renders resolved Z.ai and its model in the host sweep table", () => {
   expect(row.textContent).toContain("Z.ai");
   expect(row.textContent).toContain("glm-5.3");
   expect(row.querySelector<HTMLElement>('[data-testid="provider-mark"]')!.title).toContain("Runtime: OpenCode");
+});
+
+// ---------------------------------------------------------------------------
+// Expected-host roster (#8792 backend → #8804 SPA)
+// ---------------------------------------------------------------------------
+
+describe("hostDetailView — roster-missing hosts (#8804)", () => {
+  const rosterDetail = (hostId: string) =>
+    hostDetailView(findHost(buildFleetView(parseFleetSnapshot(rosterMissingSnapshot()), NOW), hostId)!, NOW);
+
+  it("badges a roster host's drill-down with its own state", () => {
+    expect(
+      rosterDetail(MISSING_HOST_ID).querySelector('[data-testid="status-badge"]')?.getAttribute("data-status"),
+    ).toBe("missing");
+    expect(
+      rosterDetail(UNPROVISIONED_HOST_ID)
+        .querySelector('[data-testid="status-badge"]')
+        ?.getAttribute("data-status"),
+    ).toBe("unprovisioned");
+  });
+
+  it("says why there is no health record, instead of blaming sweep-only discovery", () => {
+    // The default notice ("known only from its sweep activity") is a plainly
+    // wrong statement about a roster host with no sweeps at all.
+    const missing = rosterDetail(MISSING_HOST_ID).querySelector('[data-testid="health-missing"]')?.textContent ?? "";
+    const unprovisioned =
+      rosterDetail(UNPROVISIONED_HOST_ID).querySelector('[data-testid="health-missing"]')?.textContent ?? "";
+    expect(missing).toContain("expected-host roster");
+    expect(missing).toContain("active ingest key");
+    expect(missing).not.toContain("sweep activity");
+    expect(unprovisioned).toContain("no active ingest key");
+    expect(unprovisioned).not.toContain("sweep activity");
+    expect(missing).not.toBe(unprovisioned);
+  });
+
+  it("leaves the sweep-only host's notice exactly as it was", () => {
+    expect(detail(SWEEP_ONLY_HOST_ID).querySelector('[data-testid="health-missing"]')?.textContent).toContain(
+      "known only from its sweep activity",
+    );
+  });
 });

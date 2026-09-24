@@ -61,6 +61,27 @@ function historyPlaceholder(): HTMLElement {
   );
 }
 
+/** Why this host has no `host.health` record to show. The default wording —
+ * "known only from its sweep activity" — is the sweep-only case it was
+ * written for, and would be a plainly wrong statement about a roster host
+ * with no sweeps at all, so the two roster states (#8804) say what the
+ * backend actually knows about them instead. */
+function healthMissingNotice(host: HostView): string {
+  if (host.status === "missing") {
+    return (
+      "This host is named by the fleet's expected-host roster and holds an active " +
+      "ingest key, but has never pushed a host.health record."
+    );
+  }
+  if (host.status === "unprovisioned") {
+    return (
+      "This host is named by the fleet's expected-host roster but has no active ingest " +
+      "key, so it cannot push telemetry yet — it has not been enrolled."
+    );
+  }
+  return "This host has not pushed a host.health record yet. It is known only from its sweep activity.";
+}
+
 function healthPanel(host: HostView, now: Date): HTMLElement {
   const timestamped = host.entry.health;
   if (!timestamped) {
@@ -68,11 +89,7 @@ function healthPanel(host: HostView, now: Date): HTMLElement {
       "section",
       { class: "panel", data: { testid: "health-panel" } },
       el("h2", { class: "panel__title" }, "Host health"),
-      noticeRow(
-        "This host has not pushed a host.health record yet. It is known only from " +
-          "its sweep activity.",
-        "health-missing",
-      ),
+      noticeRow(healthMissingNotice(host), "health-missing"),
     );
   }
 
