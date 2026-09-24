@@ -118,7 +118,7 @@ use std::time::{Duration, SystemTime};
 use chrono::Utc;
 
 use crate::workspace_registry::WorkspaceRegistry;
-use crate::worktree_activity::{reclaim_skip_reason, resolve_activity_window};
+use crate::worktree_activity::{reclaim_skip_reason, removal_veto, resolve_activity_window};
 use crate::worktree_ops::clean::{
     self, CleanOptions, WorktreeDecision, WorktreeProbes, DEFAULT_GRACE_PERIOD_SECS,
 };
@@ -361,7 +361,13 @@ fn reap_worktrees_generic(
         report.scanned += 1;
 
         let worktree_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
-        let decision = classify(&worktree_path, num);
+        // #8413: `classify` only sees registry-visible liveness (claim-lock,
+        // `.loom-in-use`, a process whose cwd is inside). An in-session builder
+        // mid-`cargo` has none of those, so its worktree stayed removable while
+        // a compile was running. `removal_veto` adds the registry-INDEPENDENT
+        // signals — a live `loom-daemon inflight` claim on this tree, or a write
+        // inside the activity window — downgrading a removal to `SkipInUse`.
+        let decision = removal_veto(&worktree_path, classify(&worktree_path, num));
 
         if matches!(decision, WorktreeDecision::RemoveWithQuarantine) {
             match quarantine(&worktree_path, num) {
@@ -964,6 +970,13 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // multi-repo host from re-shelling to `docker` once per repo per tick.
     crate::docker_image_clean::run_for(repo_root);
 
+    // #8512: orphaned tmpfs/ramfs scratch (`/dev/shm/cargo-target-*`, etc.) —
+    // host-level like the docker pass above, own host-wide cooldown. See
+    // `crate::tmpfs_reclaim`'s module docs for why this uses a deliberately
+    // narrower, non-attribution-based safety model than the worktree-scoped
+    // cargo-target reclaim.
+    let _ = crate::tmpfs_reclaim::run_for(repo_root);
+
     report
 }
 
@@ -1209,6 +1222,12 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
     use std::sync::{Arc, Mutex};
+
+    // #8413's cases — the registry-independent live-worker veto, plus the
+    // three dirty-past-grace cases it changed the preconditions of — live in a
+    // sibling file (`worktree_reaper/tests/liveness.rs`) because this file is
+    // at its file-size ratchet baseline; see `.loom/docs/file-size-policy.md`.
+    mod liveness;
 
     // ===================================================================
     // Test fixtures
@@ -1722,24 +1741,9 @@ mod tests {
         assert!(report.skipped.is_empty());
     }
 
-    #[test]
-    #[serial]
-    fn test_no_pr_worktree_dirty_past_grace_is_quarantined_then_reaped() {
-        let repo = make_repo(&[(324, true)]);
-        let spec = ProbeSpec {
-            pr_status: PrStatus::NoPr,
-            issue_closed_at: Some("2020-01-01T00:00:00Z".to_string()),
-            branch_reachable: true,
-            uncommitted: true,
-            quarantine_ok: true,
-            ..ProbeSpec::default()
-        };
-        let (report, removed, quarantined) = run_pass_full(repo.path(), &spec, &default_opts());
-        assert_eq!(removed, vec![324]);
-        assert_eq!(report.removed, vec![324]);
-        assert!(report.skipped.is_empty());
-        assert_eq!(quarantined, vec![324], "the dirt must be stashed before removal");
-    }
+    // `test_no_pr_worktree_dirty_past_grace_is_quarantined_then_reaped` moved
+    // to `tests/liveness.rs` (#8413): a dirty worktree is now only reclaimed
+    // once it is also quiet, so the case needs the activity window pinned.
 
     #[test]
     #[serial]
@@ -1774,41 +1778,9 @@ mod tests {
         assert!(report.skipped[0].1.contains("grace period not passed"), "{:?}", report.skipped);
     }
 
-    #[test]
-    #[serial]
-    fn test_uncommitted_changes_past_grace_are_quarantined_then_reaped() {
-        // #6653: the grace period already elapsed (the default spec's merge
-        // timestamp is well in the past) — uncommitted changes no longer
-        // hold the worktree forever, they get quarantine-stashed first.
-        let repo = make_repo(&[(303, true)]);
-        let spec = ProbeSpec {
-            uncommitted: true,
-            quarantine_ok: true,
-            ..ProbeSpec::default()
-        };
-        let (report, removed, quarantined) = run_pass_full(repo.path(), &spec, &default_opts());
-        assert_eq!(removed, vec![303]);
-        assert_eq!(report.removed, vec![303]);
-        assert!(report.skipped.is_empty());
-        assert_eq!(quarantined, vec![303]);
-    }
-
-    #[test]
-    #[serial]
-    fn test_uncommitted_changes_past_grace_block_the_reap_when_quarantine_fails() {
-        // A failed (or no-op) `git stash push` must never be silently
-        // treated as "safe to remove" — the worktree stays put.
-        let repo = make_repo(&[(303, true)]);
-        let spec = ProbeSpec {
-            uncommitted: true,
-            quarantine_ok: false,
-            ..ProbeSpec::default()
-        };
-        let (report, removed, quarantined) = run_pass_full(repo.path(), &spec, &default_opts());
-        assert!(removed.is_empty());
-        assert_eq!(quarantined, vec![303], "the quarantine attempt itself must still happen");
-        assert!(report.skipped[0].1.contains("quarantine-stash failed"), "{:?}", report.skipped);
-    }
+    // `test_uncommitted_changes_past_grace_are_quarantined_then_reaped` and
+    // `..._block_the_reap_when_quarantine_fails` moved to `tests/liveness.rs`
+    // (#8413), for the same reason as the `NoPr` case above.
 
     #[test]
     #[serial]

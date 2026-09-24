@@ -246,8 +246,11 @@ gh issue list --state open --label loom:operator-only --json number --jq 'length
 **2. The merge-risk hold digest — [#6877](https://github.com/rjwalters/loom/issues/6877).**
 Champion's Held-PR Census (#6720 / #6851 / #7020) overwrites this issue's body
 every pass with one row per held PR — PR number, the hold's own reason, the
-`mergeable` status, and how long a conflict has been rotting — plus an
-aggregate line. It is **pinned** to the repository so it is reachable from the
+`mergeable` status, how long a conflict has been rotting, and (#8552) the PR's
+**base-staleness**: whether `main` has moved into the files this PR changes
+while it waited, and whether the rebase that implies looks mechanical or
+structural — plus an aggregate line. It is **pinned** to the repository so it
+is reachable from the
 issues page without knowing the number; `champion-pr-merge.md` → "Held-PR
 Census" → "Per-PR Digest" → Step 2 re-pins it on **every** pass, so an
 unpinned digest self-heals rather than silently staying invisible (the pin is
@@ -589,6 +592,20 @@ approval weight over a documented decision.
 This is narrow: it flags proposed *reversals* of existing, documented/tested
 behaviour, not autonomously-filed issues in general (see CLAUDE.md § "Issues
 Are Suggestions").
+
+**Since #8396 this rule has a mechanism, not only a prose statement.**
+`./.loom/scripts/premise-check.sh --issue N` (`loom-daemon premise-check`)
+runs **before** Curator enrichment — from the sweep orchestrator's Curator
+phase, and from `curator.md` § "Before Starting Curation" on every other
+path. For a scoped population (`loom:architect`/`loom:hermit`/`loom:auditor`,
+an incident-report heading, or an issue whose own text claims a reversal) it
+requires a recorded premise check, and it **refuses** the one combination this
+section names as the anti-pattern: a record saying `deliberate=yes
+reversal=yes` is admissible only with `verdict=operator-decision`, which is
+this exact routing. It invents no label and relaxes nothing above — exit `11`
+means "apply `loom:operator-only` + `loom:operator-decision`, with the
+disagreement-axis comment rule 4 already requires". Contract and design
+rationale: [`premise-gate.md`](premise-gate.md).
 
 ## `loom:needs-capability` — a narrower claim than `loom:operator-only` (#5817)
 

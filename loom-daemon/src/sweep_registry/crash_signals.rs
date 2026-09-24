@@ -145,6 +145,28 @@ pub enum WorktreeUseEvidence {
     /// A git operation is mid-flight (`index.lock` present) — precisely the
     /// `git commit` window in which #4449 lost an uncommitted fix.
     GitOperationInFlight(PathBuf),
+    /// A live `loom-daemon inflight` claim (#8268) is registered against this
+    /// worktree (Issue #8413). The string is the registration's own
+    /// `summary()` — command, tree, branch, age, claimant, pid.
+    ///
+    /// This is the signal an **in-session builder** can publish about itself:
+    /// it has no claim-lock, writes no `.loom-in-use` marker, and issues each
+    /// shell command as a one-shot subshell, so none of the four signals above
+    /// sees it between commands. Claiming before a long build/test run makes it
+    /// visible to every destructive path without a daemon sweep record.
+    InflightClaim(String),
+    /// Something wrote inside the worktree within the activity window
+    /// ([`crate::worktree_activity`], #8116) — an edit, a commit into the linked
+    /// gitdir, or a build writing into `target/` (Issue #8413).
+    ///
+    /// The **implicit** counterpart of [`Self::InflightClaim`], and the one
+    /// signal that needs no cooperation at all from the worker. It is also the
+    /// minimum-age floor the 2026-09-20 incident asked for: this watchdog only
+    /// ever looks at sweeps that have already *exited*, so a write landing after
+    /// that exit is by definition somebody the daemon does not track — most
+    /// likely an in-session builder mid-compile, whose output goes only into
+    /// `target/` and is invisible to every other signal here.
+    RecentWrite { age_secs: u64, window_secs: u64 },
 }
 
 impl std::fmt::Display for WorktreeUseEvidence {
@@ -162,6 +184,15 @@ impl std::fmt::Display for WorktreeUseEvidence {
             Self::GitOperationInFlight(path) => {
                 write!(f, "git operation in flight ({} exists)", path.display())
             }
+            Self::InflightClaim(summary) => write!(f, "live in-flight claim: {summary}"),
+            Self::RecentWrite {
+                age_secs,
+                window_secs,
+            } => write!(
+                f,
+                "filesystem write {age_secs}s ago (within the {}m activity window)",
+                window_secs / 60
+            ),
         }
     }
 }
@@ -448,6 +479,49 @@ pub(crate) fn recover_adopted_runtime(log_path: &Path, sweep_id: &str) -> String
 /// `RATE_LIMIT_ABORT` sentinel is emitted right before the child dies, so the
 /// tail is where it lands; a bounded tail keeps the read cheap.
 pub(crate) const EXHAUSTION_LOG_TAIL_LINES: usize = 200;
+
+/// Read `path` and return the last `n` lines of the CURRENT dispatch's log
+/// region — text at/after the newest [`DISPATCH_HEADER_MARKER`] — joined with
+/// `\n`, ready to feed [`classify_crash`] / [`classify_account_exhaustion`].
+///
+/// Issue #8716: the plain [`tail_lines`] helper takes the last `n` lines of
+/// the WHOLE per-issue log file. Per-issue logs are append-only and reused
+/// across dispatch attempts, so a short new attempt's tail can be padded out
+/// with lines from an OLDER attempt still sitting earlier in the same file —
+/// observed live as two OpenCode dispatch attempts (#8675/#8676) that died on
+/// a distinct native-model/config failure but were reported as rate-limited
+/// because an earlier Claude attempt's exhaustion banner was still within the
+/// last `n` lines. This helper applies the SAME dispatch-header scoping
+/// contract [`classify_preflight_death`] already applies internally
+/// (`contents.rfind(DISPATCH_HEADER_MARKER)`), but does it BEFORE bounding to
+/// `n` lines, so the bound itself can never straddle two dispatches.
+///
+/// A log with no dispatch header at all (written before the marker existed,
+/// or an adapter that never emits it) falls back to the tail of the WHOLE
+/// file — byte-for-byte the pre-#8716 behavior for that case, not a narrower
+/// one. This is deliberate: it is the one shape where scoping has no
+/// evidence to act on, so the fallback preserves rather than changes existing
+/// behavior for legacy logs.
+///
+/// Returns `Err` when the file is missing/unreadable, exactly like
+/// [`tail_lines`] (which this intentionally does not delegate to, so the
+/// region is sliced BEFORE the `n`-line bound is applied rather than after).
+pub(crate) fn dispatch_scoped_tail(path: &Path, n: usize) -> Result<String> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let region = contents
+        .rfind(DISPATCH_HEADER_MARKER)
+        .map_or(contents.as_str(), |start| &contents[start..]);
+    let lines: Vec<&str> = region.lines().collect();
+    let tail: &[&str] = if n == 0 {
+        &[]
+    } else if lines.len() > n {
+        &lines[lines.len() - n..]
+    } else {
+        &lines[..]
+    };
+    Ok(tail.join("\n"))
+}
 
 /// The account-exhaustion signature table (#4122).
 ///
@@ -1652,6 +1726,10 @@ spawn-claude: using OAuth account 'stale-account' (mode=random)
 #[cfg(test)]
 #[path = "crash_signals_empty_pool_tests.rs"]
 mod empty_pool_tests;
+
+#[cfg(test)]
+#[path = "crash_signals_dispatch_scope_tests.rs"]
+mod dispatch_scope_tests;
 
 #[cfg(test)]
 #[path = "crash_signals_model_class_tests.rs"]

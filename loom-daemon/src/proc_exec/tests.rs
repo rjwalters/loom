@@ -12,6 +12,25 @@ use std::time::{Duration, Instant};
 const GENEROUS: Duration = Duration::from_secs(10);
 
 #[test]
+fn observed_execution_exposes_actual_child_but_not_failed_spawn() {
+    let mut observed = None;
+    let completion = run_bounded_observed(Command::new("/bin/echo"), GENEROUS, |pid| {
+        assert_ne!(pid, std::process::id());
+        assert!(pid > 0);
+        observed = Some(pid);
+    })
+    .expect("echo should spawn");
+    assert!(observed.is_some());
+    assert!(matches!(completion, Completion::Exited(output) if output.status.success()));
+    let mut called = false;
+    assert!(run_bounded_observed(Command::new("/missing/loom-canary-test"), GENEROUS, |_| {
+        called = true
+    })
+    .is_err());
+    assert!(!called, "failed spawn must not invent child ownership");
+}
+
+#[test]
 fn a_successful_command_reports_its_bytes_and_zero_status() {
     let mut cmd = Command::new("/bin/echo");
     cmd.arg("hi");

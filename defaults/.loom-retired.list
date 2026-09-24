@@ -24,6 +24,21 @@
 # NEVER remove an entry from this list once added: an already-installed
 # repo that hasn't resynced in a while must still catch up on every
 # retirement since its last run, not just the most recent one.
+#
+# The one exception is UN-retirement: if a path listed here is ever re-added
+# under defaults/, the entry must go too, in the same change. Keeping both
+# would make every resync create the file on the update walk and then delete
+# it again in remove_retired_files() (which runs after the walks), so the
+# file could never actually land — check-retired-list-drift.sh's reverse
+# check fails this case rather than letting it ship. Un-retiring is a real
+# decision, not an accident: make it deliberately, and expect installed
+# repos that already dropped the file to get it back on their next resync.
+#
+# Adding one is no longer optional: scripts/check-retired-list-drift.sh (CI
+# job "Retired List Drift", #8675) fails any change that deletes a payload
+# path under defaults/ without an entry here, and equally fails an entry
+# naming a file that still exists under defaults/. Between #5981 and #8675
+# nothing required the entry, and three retirements landed without one.
 
 # #5710 / #5718 — orphaned agent-status-file protocol (report/get/list/clear);
 # agent state is daemon-owned now (sweep registry, heartbeat, event bus) and
@@ -37,3 +52,31 @@ scripts/status.sh
 # validate-toolchain.sh wrapper that exec'd this file is removed in the same
 # change (repo-only, not a defaults/ payload — not listed here).
 scripts/validate-toolchain.sh
+
+# #8588 — the label-preflight library (loom_label_exists,
+# loom_apply_issue_label, loom_apply_pr_label) and its unit test. Landed via
+# #6716 as a shared mechanism role prompts were meant to converge on
+# incrementally; the retrofit of the `--add-label` call sites never happened,
+# so both files sat with zero production callers for a month. Retired rather
+# than wired: a role prompt that needs create-then-apply semantics already has
+# epic.md's "Ensure Epic Labels Exist" pattern, and sync-labels.sh remains the
+# remediation for a missing label.
+scripts/lib/label-preflight.sh
+scripts/tests/test-label-preflight.sh
+
+# #8605 (80309c318, 2026-09-22) — the pre-port watchdog peer-coordination
+# dedup library and its suite, orphaned when the dedup decision moved into
+# loom-daemon. Deleted from defaults/ without an entry here, so every
+# already-installed repo kept both files; recorded retroactively by #8675,
+# which also added scripts/check-retired-list-drift.sh so a deletion can no
+# longer land without its entry.
+scripts/lib/watchdog-peer-coord-dedup.sh
+scripts/tests/test-loom-daemon-watchdog-dedup.sh
+
+# #8363 (a9e2361e0, 2026-09-19) — spawn-worker.sh's shell suite, retired with
+# the runtime-dispatch port. Same unrecorded-deletion shape as the two above;
+# this orphan is the one example-org/fleet-repo#1009 traced, where a resync
+# had written it into 23 repos' trees and the file then appeared in no later
+# resync plan, so the consumer's dirt reconciliation could not explain it and
+# skipped every repo for four days. Recorded retroactively by #8675.
+scripts/tests/test-spawn-worker.sh

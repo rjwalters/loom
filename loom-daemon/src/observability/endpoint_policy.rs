@@ -39,6 +39,20 @@ const RESERVED_ENDPOINT_SUFFIXES: &[&str] = &[
     "test",
 ];
 
+/// OTLP carries authentication only in its Bearer header. Reject embedded
+/// credentials and query/fragment data before a caller displays the endpoint.
+#[must_use]
+pub fn valid_otlp_endpoint(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
 /// Extract the normalized host using the outbound HTTP client's URL parser.
 /// Percent encoding, IDNA separators, and special-scheme syntax must have the
 /// same interpretation here and in reqwest before any ingest key is loaded.
@@ -80,6 +94,19 @@ pub fn reserved_placeholder_host(endpoint: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn otlp_urls_reject_embedded_secret_locations() {
+        for endpoint in [
+            "http://user:secret@localhost",
+            "http://localhost?key=secret",
+            "http://localhost#secret",
+            "not a URL",
+            "ftp://localhost",
+        ] {
+            assert!(!super::valid_otlp_endpoint(endpoint));
+        }
+        assert!(super::valid_otlp_endpoint("https://localhost:4318/prefix/"));
+    }
     use super::*;
 
     // Pure classification — no env, no runtime, no fixtures.

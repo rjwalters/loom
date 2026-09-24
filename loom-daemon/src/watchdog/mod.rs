@@ -30,9 +30,13 @@
 //! # The equivalence proof
 //!
 //! `defaults/scripts/tests/test-loom-daemon-watchdog.sh` (188 assertions, plus
-//! 4 retired records) and `test-loom-daemon-watchdog-dedup.sh` (27) are
-//! retained black-box suites: they invoke the stub **by path** with
-//! environment overrides and assert on stdout, the log file and exit codes.
+//! 4 retired records) is a retained black-box suite: it invokes the stub **by
+//! path** with environment overrides and asserts on stdout, the log file and
+//! exit codes. The peer-coordination dedup window's own equivalence suite,
+//! `test-loom-daemon-watchdog-dedup.sh`, was retired in #8587 once this
+//! module's `peer_coord` submodule (with its own `#[cfg(test)]` coverage)
+//! became the only implementation — its pre-port shell counterpart had
+//! already been orphaned by this port.
 //!
 //! They run against this code with two harness changes and no altered
 //! expectations: `LOOM_DAEMON_SELF_BIN` pins the binary that implements the
@@ -398,6 +402,7 @@ fn outage(
         let escalation = if *attempt >= limits.max_attempts {
             escalation_note(
                 paths,
+                reporter,
                 state,
                 snap,
                 &format!("the circuit breaker is OPEN after {attempt} attempts"),
@@ -492,6 +497,7 @@ fn outage(
     let escalation_note = match escalate_for {
         Some(EscalationTrigger::BreakerOpen) => escalation_note(
             paths,
+            reporter,
             state,
             snap,
             &format!(
@@ -503,6 +509,7 @@ fn outage(
         ),
         Some(EscalationTrigger::RecoveryImpossible) => escalation_note(
             paths,
+            reporter,
             state,
             snap,
             &format!(
@@ -617,6 +624,7 @@ fn supervisor_remediation(
 /// it tells the reader to go look somewhere nothing exists.
 fn escalation_note(
     paths: &config::Paths,
+    reporter: &report::Reporter,
     state: &consts::StateFiles,
     snap: &liveness::Snapshot,
     reason: &str,
@@ -654,7 +662,7 @@ fn escalation_note(
             };
 
             match script {
-                Some(s) if escalate::file_issue(&s, &ctx, &state.escalation_sentinel) => {
+                Some(s) if escalate::file_issue(&s, &ctx, &state.escalation_sentinel, reporter) => {
                     " ESCALATED out-of-band: filed a forge tracking issue so this outage is not \
                      confined to a logfile nobody tails (#5391)."
                         .to_string()
@@ -1054,6 +1062,7 @@ fn peer_coordination(
                             &escalate::hostname(),
                             &health.summary,
                             flap,
+                            reporter,
                         ),
                         peer_coord::Repeat::FileFresh => None,
                     }
@@ -1076,7 +1085,11 @@ fn peer_coordination(
                     peer_coord::file(s, &hostname, &health, &paths.log, &state.peer_coord_sentinel)
                 }) {
                     Some(issue_ref) => {
-                        peer_coord::write_sentinel(&state.peer_coord_sentinel, &issue_ref);
+                        peer_coord::write_sentinel(
+                            &state.peer_coord_sentinel,
+                            &issue_ref,
+                            reporter,
+                        );
                         "ESCALATED out-of-band: filed a forge tracking issue so this degradation \
                          is not confined to a logfile nobody tails (#6222)."
                             .to_string()

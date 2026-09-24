@@ -624,6 +624,46 @@ here). It is intentionally **not** implemented in this change; the scope split
 + test hardening + `nice` above already break the self-reddening loop this
 issue targets. Tracked as follow-up under #3974.
 
+### Worker builds run with `CARGO_INCREMENTAL=0` (#8456)
+
+Every Loom-spawned worker builds with `CARGO_INCREMENTAL=0` in its
+environment. The value is injected at the daemon dispatcher's single env seam
+(`worker_spawn::run`, the same place `LOOM_RUNTIME` and the #8077 test-isolation
+defaults are set), so it covers every dispatch surface — daemon sweep dispatch,
+role-runner children, and manual `spawn-worker.sh` runs — for every runtime
+adapter, native harnesses (Pi, OpenCode) and legacy shell adapters (Claude,
+Codex, Aider, generic) alike. Dispatch paths that cross a docker boundary carry
+it across explicitly, because neither `docker run -e` by-name passthrough nor
+`docker exec` forwards it on their own: `spawn-claude.sh`'s containment env
+exports it alongside `CARGO_TARGET_DIR`, and `spawn-codex.sh`'s session-exec
+wraps the CLI in `docker exec -e CARGO_INCREMENTAL=0`. A native containment
+container re-execs `spawn-worker.sh`, which re-enters the dispatcher seam
+inside the container, so it needs no separate handling.
+
+**Why** (#8453 item 1): a host that points every checkout at one shared cargo
+target directory (`build.target-dir` in `~/.cargo/config.toml`) and configures
+`rustc-wrapper = "sccache"` gets the worst of both worlds from incremental
+compilation:
+
+- **sccache cannot cache an incrementally-compiled crate.** A `rustc`
+  invocation carrying incremental state is non-cacheable, so workspace crates
+  never hit the cache — the host pays full compile cost *and* keeps the
+  incremental artifacts, losing on both axes at once.
+- **The incremental state itself is orphaned disk.** Cargo keys a crate's
+  incremental session state by the crate's **absolute source path**, and every
+  Loom worktree is a new path — so state written under a discarded worktree is
+  never reused and never cleaned up. One fleet host accumulated **213 GB across
+  6,402 session dirs** (measured 2026-09-20) before this was traced.
+
+Scope is deliberately narrow: this is a **spawn-time** env var in the
+environment Loom constructs for a worker, never a global cargo config change —
+an operator's own interactive shell (and any manually-run `cargo build` outside
+a spawn adapter) is unaffected. The default is unconditional rather than
+`${VAR:-0}`: an inherited `CARGO_INCREMENTAL=1` from the spawning environment
+would silently re-enable both failure modes. A worker that genuinely wants
+incremental for one command still can — an inline `CARGO_INCREMENTAL=1 cargo
+build` prefix outranks the ambient value for that invocation only.
+
 ## Failure semantics
 
 A gate failure is **not** the same as a builder failure: the issue is automatically re-queued (`loom:issue`) and a future builder can take a fresh attempt. The `PhaseResult.data` block carries:

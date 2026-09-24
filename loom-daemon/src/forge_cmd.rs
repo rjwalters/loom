@@ -709,6 +709,11 @@ pub enum ForgeCmd {
     Pr(Vec<String>),
     /// `forge auth <args…>` — passthrough to `gh auth` on GitHub.
     Auth(Vec<String>),
+    /// `forge check-open-pr <issue>` — the #4123 open-linked-PR guard as a
+    /// pre-claim check (#8551). Implemented in
+    /// [`crate::forge_check_open_pr`]; see that module for the exit-code
+    /// contract.
+    CheckOpenPr { issue: u32 },
     /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]`.
     AutoMerge {
         pr: u32,
@@ -739,6 +744,7 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::Issue(args) => gh_passthrough("issue", &args),
         ForgeCmd::Pr(args) => gh_passthrough("pr", &args),
         ForgeCmd::Auth(args) => gh_passthrough("auth", &args),
+        ForgeCmd::CheckOpenPr { issue } => crate::forge_check_open_pr::handle(issue),
         ForgeCmd::AutoMerge {
             pr,
             method,
@@ -747,6 +753,22 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
     }
 }
 
+/// # Test-isolation invariant (#8465)
+///
+/// Every `#[serial]`-annotated test in this module MUST use the
+/// `loom_config_env` lock key — never the bare, unnamed `#[serial]`.
+/// `serial_test` only mutually excludes tests that share the *same* key, so two
+/// different keys inside one module are two independent groups that run
+/// concurrently with each other. This module's tests mutate process-global env
+/// (`LOOM_FORGE_TYPE`, `GITEA_TOKEN`, `GITEA_USERNAME`,
+/// `LOOM_ALLOW_INSECURE_BASIC_AUTH`, `LOOM_GH_BIN`, …) through shared helpers
+/// such as [`tests::clear_forge_env`], so a split key is a data race and was
+/// the cause of the intermittent `gitea_basic_auth_colon_username_rejected`
+/// failure under the full `--lib` run.
+///
+/// `loom_config_env` (and not a forge-local key) is the authoritative group
+/// because these tests also set `LOOM_CONFIG_DEFAULTS_FILE` and `LOOM_GH_BIN`,
+/// which tests in other modules mutate under that same key.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -762,6 +784,9 @@ mod tests {
         std::env::set_var("LOOM_CONFIG_DEFAULTS_FILE", "");
     }
 
+    /// Clear the process-global forge env read by [`detect_forge`] and
+    /// [`gitea_config_from_forge`]. Callers MUST be
+    /// `#[serial(loom_config_env)]` — see the module-level invariant (#8465).
     fn clear_forge_env() {
         std::env::remove_var("LOOM_FORGE_TYPE");
         std::env::remove_var("GITEA_TOKEN");
@@ -934,7 +959,7 @@ mod tests {
     // ===== #4061: Gitea hard-fail pair =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn gitea_missing_url_hard_fails() {
         clear_forge_env();
         std::env::set_var("GITEA_TOKEN", "tok");
@@ -945,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn gitea_missing_token_hard_fails() {
         clear_forge_env();
         let forge = json!({ "gitea": { "url": "https://g.example.com" } });
@@ -957,7 +982,7 @@ mod tests {
     // ===== #4061: GITEA_TOKEN / GITEA_USERNAME beat config =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn gitea_env_token_beats_config() {
         clear_forge_env();
         std::env::set_var("GITEA_TOKEN", "env-token");
@@ -968,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn gitea_env_username_beats_config_and_switches_basic() {
         clear_forge_env();
         std::env::set_var("GITEA_TOKEN", "tok");
@@ -983,7 +1008,7 @@ mod tests {
     // ===== #4061: trailing-slash stripping =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn gitea_url_trailing_slash_stripped() {
         clear_forge_env();
         std::env::set_var("GITEA_TOKEN", "tok");
@@ -996,7 +1021,7 @@ mod tests {
     // ===== #4061: Basic-auth guards =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn gitea_basic_auth_colon_username_rejected() {
         clear_forge_env();
         std::env::set_var("GITEA_TOKEN", "tok");
@@ -1008,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn gitea_basic_auth_over_http_rejected_without_override() {
         clear_forge_env();
         std::env::set_var("GITEA_TOKEN", "tok");
@@ -1238,8 +1263,9 @@ exit 1
 
     /// Sets `LOOM_GH_BIN` / `CAPTURE_FILE` / `MOCK_RESULT`, runs
     /// `github_auto_merge`, and clears the env vars again. Serialized (env
-    /// vars are process-global) like the other `#[serial]` tests in this
-    /// module.
+    /// vars are process-global) under the module's single
+    /// `#[serial(loom_config_env)]` key like every other test here — `LOOM_GH_BIN`
+    /// is also driven by `loom_config_env`-keyed tests in other modules.
     fn run_github_auto_merge_with_mock(
         gh: &Path,
         capture_file: &Path,
@@ -1257,7 +1283,7 @@ exit 1
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn github_auto_merge_threads_expected_head_oid_into_mutation() {
         let dir = tempdir().unwrap();
         let gh = write_mock_gh_for_auto_merge(dir.path());
@@ -1282,7 +1308,7 @@ exit 1
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn github_auto_merge_omits_expected_head_oid_when_not_supplied() {
         let dir = tempdir().unwrap();
         let gh = write_mock_gh_for_auto_merge(dir.path());
@@ -1299,7 +1325,7 @@ exit 1
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn github_auto_merge_head_mismatch_exits_distinct_code() {
         let dir = tempdir().unwrap();
         let gh = write_mock_gh_for_auto_merge(dir.path());
@@ -1313,7 +1339,7 @@ exit 1
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn github_auto_merge_non_mismatch_failure_exits_generic_failure() {
         let dir = tempdir().unwrap();
         let gh = write_mock_gh_for_auto_merge(dir.path());
@@ -1324,7 +1350,7 @@ exit 1
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn github_auto_merge_without_precondition_never_reports_head_mismatch() {
         // Even if the (unlikely) response text happens to match the
         // head-mismatch pattern, no precondition means no

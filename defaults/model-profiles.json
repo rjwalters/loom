@@ -6,6 +6,7 @@
       "opencode": "zai-coding-plan"
     },
     "credentialEnv": "ZAI_API_KEY",
+    "credentialPool": "zai",
     "effort": "max",
     "allowedEfforts": [
       "low",
@@ -59,6 +60,69 @@
         "VERTEX_LOCATION": "VERTEX_LOCATION"
       }
     }
+  },
+  "example-kimi-subscription": {
+    "model": "REPLACE_WITH_KIMI_CONFIG_ALIAS",
+    "providers": {
+      "kimi": "REPLACE_WITH_KIMI_CONFIG_ALIAS"
+    },
+    "effort": "high",
+    "allowedEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ]
+  },
+  "example-kimi-moonshot-api": {
+    "model": "REPLACE_WITH_MOONSHOT_MODEL_ID",
+    "providers": {
+      "kimi": "moonshot"
+    },
+    "credentialEnv": "KIMI_API_KEY",
+    "credentialPool": "kimi",
+    "credentialTargets": {
+      "kimi": "KIMI_MODEL_API_KEY"
+    },
+    "providerOptions": {
+      "kimi": {
+        "providerType": "kimi",
+        "baseUrl": "https://api.moonshot.ai/v1"
+      }
+    },
+    "effort": "high",
+    "allowedEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ]
+  },
+  "example-proxied-anthropic": {
+    "model": "REPLACE_WITH_ANTHROPIC_MODEL_ID",
+    "providers": {
+      "opencode": "anthropic"
+    },
+    "credentialEnv": "ANTHROPIC_API_KEY",
+    "credentialPool": "anthropic",
+    "credentialTargets": {
+      "opencode": "ANTHROPIC_AUTH_TOKEN"
+    },
+    "credentialProxy": {
+      "upstream": "https://api.anthropic.com",
+      "header": "authorization-bearer",
+      "baseUrlEnv": [
+        "ANTHROPIC_BASE_URL"
+      ]
+    },
+    "effort": "high",
+    "allowedEfforts": [
+      "low",
+      "high",
+      "max"
+    ]
   },
   "example-openai-compatible": {
     "model": "REPLACE_WITH_MODEL_ID",

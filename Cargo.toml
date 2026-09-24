@@ -8,7 +8,16 @@ resolver = "2"
 # hardcoded its own version, so every bump edited two files that could drift
 # apart independently -- the "the bump missed a file" class of #6536/#6730.
 [workspace.package]
-version = "0.19.233"
+version = "0.19.336"
+# The repo this workspace is built from — compiled into `loom-daemon` via
+# `repository.workspace = true` + `env!("CARGO_PKG_REPOSITORY")` (#8513). This
+# is the build-time fallback `auto_update`'s release resolver falls back to
+# when neither `LOOM_DAEMON_UPDATE_GH_REPO` nor `LOOM_MACHINE_CHECKOUT` is set:
+# unlike the runtime workspace's own `origin` remote, it can never resolve to
+# a consumer repo's own (possibly lower-versioned) releases, because it is
+# baked in at compile time from the checkout the release was actually built
+# from.
+repository = "https://github.com/rjwalters/loom"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

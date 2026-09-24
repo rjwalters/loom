@@ -56,6 +56,17 @@ use super::locking::MkdirLock;
 
 const SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_EXHAUSTED_COOLDOWN_SECS: u64 = 5 * 60 * 60;
+/// How far ahead a caller-supplied exhaustion horizon may be before it is
+/// discarded in favour of [`DEFAULT_EXHAUSTED_COOLDOWN_SECS`] (issue #8539).
+///
+/// A provider that says "try again at" names a plan window's own rollover —
+/// hours, or at most a monthly cycle. Anything further out is far more likely a
+/// misparse (a wrong year, a date read out of unrelated prose) than a real
+/// reset, and the cost is asymmetric: too *short* a hold costs one bounced
+/// dispatch that immediately re-marks the account, while too *long* a hold
+/// idles a working subscription with nothing scheduled to notice. 35 days is a
+/// full monthly cycle plus slack.
+pub const MAX_EXHAUSTION_RESET_HORIZON_SECS: u64 = 35 * 24 * 60 * 60;
 pub const DEFAULT_RECOVERABLE_BACKOFF_SECS: u64 = 60;
 pub const DEFAULT_SESSION_BACKOFF_SECS: u64 = 30;
 
@@ -455,6 +466,25 @@ fn cooldown_from_env(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// When an exhaustion hold recorded at `now` should end: the provider's own
+/// reported horizon when it is usable, otherwise the configured cooldown
+/// (issue #8539).
+///
+/// "Usable" is deliberately narrow — see
+/// [`record_terminal_for_class_with_reset_at`] for why the rejection cases all
+/// fall back rather than fail.
+fn exhaustion_deadline(now: u64, reset_at: Option<u64>) -> u64 {
+    let ceiling = now.saturating_add(MAX_EXHAUSTION_RESET_HORIZON_SECS);
+    reset_at
+        .filter(|until| *until > now && *until <= ceiling)
+        .unwrap_or_else(|| {
+            now.saturating_add(cooldown_from_env(
+                "LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS",
+                DEFAULT_EXHAUSTED_COOLDOWN_SECS,
+            ))
+        })
+}
+
 pub fn record_terminal(
     workspace: &Path,
     id: &AccountId,
@@ -475,6 +505,35 @@ pub fn record_terminal_for_model(
     provenance: &str,
 ) -> Result<()> {
     record_terminal_for_model_at(workspace, id, classification, model, provenance, now_epoch())
+}
+
+/// [`record_terminal_for_model`], carrying the **provider-reported reset
+/// horizon** the failure named (issue #8539).
+///
+/// `reset_at` is a Unix timestamp read out of the provider's own refusal (for
+/// Codex, [`super::codex_reset`]). It replaces the blind
+/// `now + LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS` deadline on the exhaustion arms
+/// **only** — see [`record_terminal_for_class_with_reset_at`] for the
+/// validation and for why the other arms ignore it. `None` reproduces
+/// [`record_terminal_for_model`] exactly.
+pub fn record_terminal_for_model_with_reset(
+    workspace: &Path,
+    id: &AccountId,
+    classification: TerminalClassification,
+    model: Option<&str>,
+    reset_at: Option<u64>,
+    provenance: &str,
+) -> Result<()> {
+    let class = model.and_then(model_class_of);
+    record_terminal_for_class_with_reset_at(
+        workspace,
+        id,
+        classification,
+        class.as_deref(),
+        reset_at,
+        provenance,
+        now_epoch(),
+    )
 }
 
 /// Record terminal feedback with no model information: every hold it writes is
@@ -521,6 +580,48 @@ pub fn record_terminal_for_class_at(
     id: &AccountId,
     classification: TerminalClassification,
     model_class: Option<&str>,
+    provenance: &str,
+    now: u64,
+) -> Result<()> {
+    record_terminal_for_class_with_reset_at(
+        workspace,
+        id,
+        classification,
+        model_class,
+        None,
+        provenance,
+        now,
+    )
+}
+
+/// [`record_terminal_for_class_at`], carrying the provider-reported reset
+/// horizon (issue #8539).
+///
+/// # Which arms use it, and why only those
+///
+/// `reset_at` shapes the two **exhaustion** arms (`TOKEN_EXHAUSTED`,
+/// `MODEL_CREDITS_EXHAUSTED`) and nothing else. Those are the only holds whose
+/// deadline is a fact the provider knows and Loom was previously guessing: a
+/// plan window rolls over at an instant the provider names. Every other
+/// deadline here is a *Loom* policy — the transient backoff ladder, the
+/// session-capacity pause — chosen to shape retry behaviour, not to predict a
+/// provider-side event, so a horizon read out of a refusal has no authority
+/// over them.
+///
+/// # Validation (the horizon is untrusted input)
+///
+/// A supplied horizon is used only when it is strictly in the future and no
+/// further out than [`MAX_EXHAUSTION_RESET_HORIZON_SECS`]. Anything else — a
+/// horizon already past (a stale line, a misread year), or an implausible one —
+/// falls back to the configured cooldown, i.e. exactly the pre-#8539
+/// behaviour. This is the one place that judgement is made, so the parser
+/// upstream stays a pure reader of text and no caller can skip the check.
+pub fn record_terminal_for_class_with_reset_at(
+    workspace: &Path,
+    id: &AccountId,
+    classification: TerminalClassification,
+    model_class: Option<&str>,
+    reset_at: Option<u64>,
     provenance: &str,
     now: u64,
 ) -> Result<()> {
@@ -592,10 +693,7 @@ pub fn record_terminal_for_class_at(
             }
             TerminalClassification::TokenExhausted => {
                 entry.reason = HealthReason::PlanExhausted;
-                entry.cooldown_until = Some(now.saturating_add(cooldown_from_env(
-                    "LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS",
-                    DEFAULT_EXHAUSTED_COOLDOWN_SECS,
-                )));
+                entry.cooldown_until = Some(exhaustion_deadline(now, reset_at));
             }
             // #8058 Phase 2: credits are scoped to one model class, so this
             // records a hold for that class alone and leaves the account
@@ -608,10 +706,7 @@ pub fn record_terminal_for_class_at(
             // guessing it would block a class that still had credit. Unknown
             // model ⇒ the account-wide over-approximation, as before.
             TerminalClassification::ModelCreditsExhausted => {
-                let deadline = now.saturating_add(cooldown_from_env(
-                    "LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS",
-                    DEFAULT_EXHAUSTED_COOLDOWN_SECS,
-                ));
+                let deadline = exhaustion_deadline(now, reset_at);
                 match model_class.clone() {
                     Some(class) => {
                         entry.class_cooldowns.insert(class, deadline);
@@ -757,6 +852,129 @@ pub fn record_probe_at(
     })
 }
 
+/// Conclusive result of a proactive **availability** probe (issue #8407) —
+/// the quota-headroom sibling of [`ProbeOutcome`], which establishes only
+/// auth validity.
+///
+/// As with [`ProbeOutcome`], only states a measurement can actually establish
+/// are representable. "No reading", "a reading whose own window already rolled
+/// over", and "a schema this reader does not understand" are all absences of
+/// evidence and must never reach this API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityOutcome {
+    /// The subscription is at (or over) its plan ceiling until `until`
+    /// (epoch seconds) — the instant the binding window rolls over.
+    Exhausted { until: u64 },
+    /// The subscription measurably had headroom when the reading was taken at
+    /// `observed_at` (epoch seconds).
+    Available { observed_at: u64 },
+}
+
+/// What [`record_availability_at`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvailabilityEffect {
+    /// A plan-exhaustion cooldown was armed (or extended) from the reading.
+    MarkedExhausted,
+    /// A plan-exhaustion cooldown was released by a *newer* reading showing
+    /// headroom.
+    ClearedExhaustionHold,
+    /// Health already agreed with the reading; only the probe stamp moved.
+    Unchanged,
+}
+
+/// Apply a proactive availability measurement to an account's health record.
+///
+/// The selection-time counterpart of [`record_terminal_at`]'s reactive
+/// `TOKEN_EXHAUSTED` arm: it writes the *same* [`HealthReason::PlanExhausted`]
+/// cooldown [`select_healthy_at`] already honours, but from a reading taken
+/// before any work is dispatched rather than from a dispatch that already
+/// died.
+///
+/// Three guardrails keep a measurement from ever widening or narrowing more
+/// than the evidence supports:
+///
+/// * **A re-auth hold outranks it.** A broken credential is not a quota fact,
+///   and an availability reading is not the independent verification a
+///   re-auth release requires ([`record_probe_at`] is).
+/// * **A hold is never shortened.** An `Exhausted` reading takes the *later*
+///   of the existing deadline and its own, so a reactive hold recorded from a
+///   real dispatch failure can never be cut short by a measurement.
+/// * **A release requires strictly newer evidence.** `Available` clears a
+///   plan-exhaustion cooldown only when the reading post-dates the record it
+///   would release; a reading taken before that hold was written says nothing
+///   about it. Transient backoffs, session-limit holds and class-scoped credit
+///   holds are never touched — they are not plan-exhaustion facts.
+pub fn record_availability_at(
+    workspace: &Path,
+    id: &AccountId,
+    outcome: AvailabilityOutcome,
+    provenance: &str,
+    now: u64,
+) -> Result<AvailabilityEffect> {
+    if id.name.is_empty() || provenance.is_empty() {
+        bail!("account identity and signal provenance are required");
+    }
+    with_state(workspace, |state| {
+        let index = state.accounts.iter().position(|entry| entry.id() == *id);
+        let mut entry = index.map_or_else(
+            || AccountHealth {
+                provider: id.provider,
+                name: id.name.clone(),
+                reason: HealthReason::Healthy,
+                updated_at: now,
+                signal_provenance: provenance.to_string(),
+                cooldown_until: None,
+                consecutive_transient_failures: 0,
+                last_success: None,
+                last_probe: None,
+                class_cooldowns: HashMap::new(),
+            },
+            |index| state.accounts.remove(index),
+        );
+        entry.last_probe = Some(now);
+        let effect = if entry.reason == HealthReason::ReauthRequired {
+            AvailabilityEffect::Unchanged
+        } else {
+            match outcome {
+                AvailabilityOutcome::Exhausted { until } => {
+                    let deadline = entry.cooldown_until.map_or(until, |held| held.max(until));
+                    let changed = entry.reason != HealthReason::PlanExhausted
+                        || entry.cooldown_until != Some(deadline);
+                    entry.reason = HealthReason::PlanExhausted;
+                    entry.cooldown_until = Some(deadline);
+                    entry.updated_at = now;
+                    entry.signal_provenance = provenance.to_string();
+                    if changed {
+                        AvailabilityEffect::MarkedExhausted
+                    } else {
+                        AvailabilityEffect::Unchanged
+                    }
+                }
+                AvailabilityOutcome::Available { observed_at } => {
+                    if entry.reason == HealthReason::PlanExhausted
+                        && entry.cooldown_until.is_some()
+                        && observed_at > entry.updated_at
+                    {
+                        entry.reason = HealthReason::Healthy;
+                        entry.cooldown_until = None;
+                        entry.updated_at = now;
+                        entry.signal_provenance = provenance.to_string();
+                        AvailabilityEffect::ClearedExhaustionHold
+                    } else {
+                        AvailabilityEffect::Unchanged
+                    }
+                }
+            }
+        };
+        state.accounts.push(entry);
+        state
+            .accounts
+            .sort_by(|a, b| (a.provider as u8, &a.name).cmp(&(b.provider as u8, &b.name)));
+        Ok(effect)
+    })
+}
+
 /// Clear an auth hold only after the caller has independently verified reauth.
 pub fn clear_reauth(workspace: &Path, id: &AccountId, provenance: &str) -> Result<()> {
     with_state(workspace, |state| {
@@ -782,6 +1000,23 @@ pub fn account_health(workspace: &Path, id: &AccountId) -> Result<Option<Account
         .accounts
         .into_iter()
         .find(|entry| entry.id() == *id))
+}
+
+/// Every health record in the workspace's `account-health.json`, keyed by
+/// account (Issue #8444) — **one** read and parse of the file.
+///
+/// [`account_health`] answers the same question for a single account, but a
+/// caller asking it in a loop re-reads and re-parses the whole file per
+/// account and can observe two different versions of it within one logical
+/// pass (the role runner's pre-spawn codex gate did exactly that). Fails the
+/// same way `account_health` does — an unreadable or malformed state file is
+/// an error, never an empty snapshot, so callers keep failing closed on it.
+pub fn health_snapshot(workspace: &Path) -> Result<HashMap<AccountId, AccountHealth>> {
+    Ok(read_state(workspace)?
+        .accounts
+        .into_iter()
+        .map(|entry| (entry.id(), entry))
+        .collect())
 }
 
 /// Select a healthy account for `provider` — the account-wide question, whose

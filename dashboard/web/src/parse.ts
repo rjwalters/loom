@@ -25,6 +25,9 @@ import type {
   HostHealthRecord,
   HostProtection,
   ManagedRepoEntry,
+  MissingHost,
+  MissingHostState,
+  ProviderPoolAggregate,
   RoleTickFailure,
   RoleTickHealth,
   TokenAccount,
@@ -133,6 +136,7 @@ export function parseTokenAccount(value: unknown): TokenAccount {
   if (!isObject(value)) return {};
   return stripUndefined<TokenAccount>({
     account: str(value.account),
+    provider: str(value.provider),
     rank: num(value.rank),
     usage_fraction: num(value.usage_fraction),
     limit_window_reset_at: str(value.limit_window_reset_at),
@@ -152,6 +156,18 @@ export function parseTokensSnapshot(value: unknown): TokensSnapshotRecord {
     account_count: num(value.account_count),
     exhausted_count: num(value.exhausted_count),
     mean_usage_fraction: num(value.mean_usage_fraction),
+    max_usage_fraction: num(value.max_usage_fraction),
+    next_limit_window_reset_at: str(value.next_limit_window_reset_at),
+    providers: Array.isArray(value.providers) ? value.providers.map(parseProviderPoolAggregate) : undefined,
+  });
+}
+
+export function parseProviderPoolAggregate(value: unknown): ProviderPoolAggregate {
+  if (!isObject(value)) return {};
+  return stripUndefined<ProviderPoolAggregate>({
+    provider: str(value.provider),
+    account_count: num(value.account_count),
+    exhausted_count: num(value.exhausted_count),
     max_usage_fraction: num(value.max_usage_fraction),
     next_limit_window_reset_at: str(value.next_limit_window_reset_at),
   });
@@ -182,8 +198,10 @@ export function parseActiveSweep(value: unknown): ActiveSweep | undefined {
     phase: str(value.phase),
     startedAt: str(value.startedAt),
     enteredPhaseAt: str(value.enteredPhaseAt),
-    model: str(value.model),
+    model: str(typeof value.model === "string" ? value.model.trim() : value.model),
     effort: str(value.effort),
+    runtime: str(typeof value.runtime === "string" ? value.runtime.trim() : value.runtime),
+    provider: str(typeof value.provider === "string" ? value.provider.trim() : value.provider),
     updatedAt: str(value.updatedAt),
   });
 }
@@ -217,6 +235,35 @@ export function parseActiveComputeJob(value: unknown): ActiveComputeJob | undefi
     updatedAt: str(value.updatedAt),
     leaked: value.leaked === true ? true : undefined,
   });
+}
+
+const MISSING_HOST_STATES: readonly MissingHostState[] = ["missing", "unprovisioned"];
+
+/** Narrow one `missingHosts` entry (Issue #8792 backend → #8804 SPA).
+ *
+ * Strict on both fields, unlike the best-effort narrowing the `host.health`
+ * record gets. An entry with no `hostId` is unaddressable in the UI — it could
+ * not be listed under a stable key or linked to a drill-down — so it is
+ * dropped rather than rendered under a fabricated identity, exactly as
+ * {@link parseActiveSweep} drops a sweep with no `sweepId`.
+ *
+ * An unrecognized `state` is dropped for a different reason: the two known
+ * states prescribe *opposite* operator actions (`missing` — investigate a host
+ * that should be reporting; `unprovisioned` — enroll a host that never was),
+ * so guessing one for an unknown third value would tell an operator to do the
+ * wrong thing. The usual "a newer producer must still render" concern does not
+ * apply here the way it does to `host.health`: `missingHosts` is computed by
+ * the Worker (`../../src/index.ts`), which ships from the same commit and the
+ * same deploy as this bundle — not by N independently-updated host daemons. A
+ * backend that grows a third state therefore lands together with the dashboard
+ * build that knows how to render it. */
+export function parseMissingHost(value: unknown): MissingHost | undefined {
+  if (!isObject(value)) return undefined;
+  const hostId = str(value.hostId);
+  if (!hostId) return undefined;
+  const state = MISSING_HOST_STATES.find((known) => known === value.state);
+  if (!state) return undefined;
+  return { hostId, state };
 }
 
 export function parseFleetSnapshot(value: unknown): FleetSnapshot {
@@ -253,6 +300,18 @@ export function parseFleetSnapshot(value: unknown): FleetSnapshot {
     }
   }
   snapshot.activeCompute = activeCompute;
+
+  // Issue #8804. Deliberately NOT normalized to `[]` when absent, unlike
+  // `activeCompute` above: an omitted field means "this backend has no roster
+  // notion at all" (pre-#8792, or no `EXPECTED_HOSTS` configured), and leaving
+  // the key off keeps every consumer — and every pre-existing fixture's
+  // `toEqual` — byte-identical to its pre-#8804 behavior. A wrong-typed
+  // `missingHosts` degrades the same way, since it is then not an array.
+  if (Array.isArray(value.missingHosts)) {
+    snapshot.missingHosts = value.missingHosts
+      .map(parseMissingHost)
+      .filter((host): host is MissingHost => host !== undefined);
+  }
 
   return snapshot;
 }

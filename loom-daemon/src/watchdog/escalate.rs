@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::env;
+use super::{env, report};
 
 /// Whether escalation may be attempted this tick.
 #[derive(Debug, PartialEq, Eq)]
@@ -156,12 +156,44 @@ pub fn body(ctx: &Context) -> String {
 }
 
 /// Record that this outage has been escalated, so later ticks do not refile.
-pub fn write_sentinel(sentinel: &Path) {
+///
+/// #8649: shares the same failure-reporting fix as
+/// [`super::peer_coord::write_sentinel`] — a failed write here used to vanish
+/// via `let _ =`, so a still-open outage would refile every tick for as long
+/// as the write kept failing (e.g. a full disk). This now reports the failure
+/// loudly instead of discarding it.
+///
+/// FAILS OPEN, same as before and for the same reason as its peer-coordination
+/// sibling: the outage issue itself was already filed by the caller (a network
+/// call, independent of this write), so blocking or retrying here would only
+/// trade "occasionally duplicated" for "occasionally silent".
+pub fn write_sentinel(sentinel: &Path, reporter: &report::Reporter) {
     if let Some(dir) = sentinel.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            reporter.report(
+                report::Level::Warn,
+                &format!(
+                    "failed to create the parent directory for the outage-escalation sentinel \
+                     {} ({e}) — the sentinel write below will fail too, so a later tick may \
+                     re-escalate this same outage.",
+                    sentinel.display()
+                ),
+            );
+        }
     }
-    let _ =
-        std::fs::write(sentinel, format!("{}\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")));
+    if let Err(e) =
+        std::fs::write(sentinel, format!("{}\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")))
+    {
+        reporter.report(
+            report::Level::Warn,
+            &format!(
+                "failed to write the outage-escalation sentinel {} ({e}) — the forge issue was \
+                 filed, but a later tick cannot see this sentinel and may re-escalate the same \
+                 outage (#8649).",
+                sentinel.display()
+            ),
+        );
+    }
 }
 
 /// This host's name for the issue title and body.
@@ -200,7 +232,12 @@ pub fn hostname() -> String {
 /// same host is *supposed* to file again once the sentinel has been cleared by
 /// a recovery. The sentinel is this path's dedup, not the forge's.
 #[must_use]
-pub fn file_issue(script: &Path, ctx: &Context, sentinel: &Path) -> bool {
+pub fn file_issue(
+    script: &Path,
+    ctx: &Context,
+    sentinel: &Path,
+    reporter: &report::Reporter,
+) -> bool {
     let mut cmd = std::process::Command::new(script);
     cmd.arg("--title")
         .arg(title(ctx.hostname))
@@ -216,7 +253,7 @@ pub fn file_issue(script: &Path, ctx: &Context, sentinel: &Path) -> bool {
         .is_some_and(|o| o.status.success());
 
     if filed {
-        write_sentinel(sentinel);
+        write_sentinel(sentinel, reporter);
     }
     filed
 }
@@ -237,6 +274,34 @@ mod tests {
             recovery_state: Path::new("/home/u/.loom/.watchdog-recovery-state"),
             sentinel: Path::new("/home/u/.loom/.watchdog-outage-escalated"),
         }
+    }
+
+    #[test]
+    fn a_failed_sentinel_write_is_reported_not_silently_eaten() {
+        // #8649: the write used to vanish via `let _ =`. Point the sentinel
+        // at a path whose PARENT is a plain file — `create_dir_all` and the
+        // write both fail deterministically, no read-only filesystem needed
+        // — and assert the failure lands in the watchdog log rather than
+        // disappearing.
+        let d = tempfile::tempdir().expect("tempdir");
+        let blocker = d.path().join("not-a-directory");
+        std::fs::write(&blocker, "x").expect("write blocker file");
+        let sentinel = blocker.join("sentinel");
+
+        let log = d.path().join("watchdog.log");
+        let reporter = report::Reporter::new(log.clone(), false);
+        write_sentinel(&sentinel, &reporter);
+
+        assert!(
+            !sentinel.exists(),
+            "the write must actually have failed for this test to prove anything"
+        );
+        let logged = std::fs::read_to_string(&log).expect("reporter must still have logged");
+        assert!(logged.contains("[WARN]"), "failure must be reported, not swallowed: {logged}");
+        assert!(
+            logged.contains("outage-escalation sentinel"),
+            "the report should name what failed: {logged}"
+        );
     }
 
     #[test]

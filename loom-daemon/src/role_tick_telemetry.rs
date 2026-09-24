@@ -35,6 +35,17 @@
 //!   comes from a local `git remote get-url origin`; the visibility tag comes
 //!   from [`crate::telemetry::visibility::derive_visibility`]'s 300s-TTL
 //!   memo, which is the same one every `sweep.outcome` already pays.
+//! - **Runtime-dispatched token source (Issue #8507).** The Claude-transcript
+//!   scan above is the DEFAULT source, used whenever this tick's own
+//!   `# LOOM_LAUNCH` record (read back off its per-role log — see
+//!   [`resolve_runtime_attribution`]) is absent or names anything but
+//!   `"opencode"`. An `opencode` launch instead sources `tokens_by_model`
+//!   from [`crate::opencode_usage`], filtered by this workspace's directory
+//!   and the tick's own window; `actions` has no OpenCode-native source
+//!   today, so an opencode tick **omits** `actions` entirely — unmeasured, not
+//!   an observed zero (a zeroed tally would be indistinguishable from a
+//!   genuinely quiet Claude tick; deriving the real per-command counts from
+//!   OpenCode's event stream is tracked follow-up work).
 //!
 //! # Attribution is time-and-role scoped, and says so
 //!
@@ -128,17 +139,26 @@ pub fn classify(outcome: &RoleTickOutcome) -> (RoleTickResult, Option<String>) {
         // #8408: the tag names the pool that was read (`pool-exhausted` is the
         // Claude pool's pre-#8408 literal); the machine-readable form is the
         // record's `gated_pool` key, projected by `RoleTickOutcome::gated_pool`.
+        // #8444: a permanent hold (nothing provisioned, unreadable pool
+        // state) carries the same stable, timestamp-free tail the in-memory
+        // ring uses, so a consumer reading the durable records sees the same
+        // "identical every tick" shape the stuck-role streak is built on.
         RoleTickOutcome::PoolExhausted {
             total,
             next_clear_at,
             pool,
+            hold,
         } => (
             RoleTickResult::SkippedPoolExhausted,
-            Some(format!(
-                "{}: 0/{total} spawnable; next check ~{}",
-                pool.detail_tag(),
-                next_clear_at.to_rfc3339()
-            )),
+            Some(if hold.is_self_healing() {
+                format!(
+                    "{}: 0/{total} spawnable; next check ~{}",
+                    pool.detail_tag(),
+                    next_clear_at.to_rfc3339()
+                )
+            } else {
+                format!("{}: {}", pool.detail_tag(), hold.detail_suffix())
+            }),
         ),
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => {
             (RoleTickResult::SkippedModelRuntimeMismatch, Some(mismatch.detail()))
@@ -169,22 +189,36 @@ pub fn emit_for_tick(
     outcome: &RoleTickOutcome,
     resolved_model_effort: Option<(String, String)>,
 ) {
+    emit_for_tick_correlated(root, role, started_at, outcome, resolved_model_effort, None);
+}
+
+pub fn emit_for_tick_correlated(
+    root: &Path,
+    role: &str,
+    started_at: DateTime<Utc>,
+    outcome: &RoleTickOutcome,
+    resolved_model_effort: Option<(String, String)>,
+    trace_context: Option<crate::telemetry::trace::TraceContext>,
+) {
     let (result, detail) = classify(outcome);
     let (model, effort) = match resolved_model_effort {
         Some((model, effort)) => (Some(model), Some(effort)),
         None => (None, None),
     };
-    emit(&RoleTickTelemetry {
-        root: root.to_path_buf(),
-        role: role.to_string(),
-        started_at,
-        ended_at: Utc::now(),
-        result,
-        model,
-        effort,
-        detail,
-        gated_pool: outcome.gated_pool().map(str::to_string),
-    });
+    emit_correlated(
+        &RoleTickTelemetry {
+            root: root.to_path_buf(),
+            role: role.to_string(),
+            started_at,
+            ended_at: Utc::now(),
+            result,
+            model,
+            effort,
+            detail,
+            gated_pool: outcome.gated_pool().map(str::to_string),
+        },
+        trace_context,
+    );
 }
 
 /// Whether `head` — the leading bytes of a Claude Code session transcript —
@@ -267,8 +301,18 @@ pub struct TranscriptScan {
     /// Per-`(model, speed, service_tier)` token totals, in the deterministic
     /// tuple order [`ModelUsageTotals`] callers already expect.
     pub tokens_by_model: Vec<ModelUsageTotals>,
-    /// Forge-mutating commands observed.
-    pub actions: RoleTickActions,
+    /// Forge-mutating commands observed — `None` when this scan had no
+    /// transcript to read them from at all.
+    ///
+    /// Optional for the same reason [`RoleTickActions`] is optional on the
+    /// record itself: absent means "no scanner ran over an attributable
+    /// transcript", a present zero means "a transcript was read and no such
+    /// command appeared". A token source that answers `tokens_by_model`
+    /// *without* a transcript — [`crate::usage_source::UsageSource::OpenCodeSessionDb`]
+    /// — must leave this `None` rather than synthesize
+    /// `RoleTickActions::default()`, which would publish an unmeasured tick as
+    /// a genuine zero.
+    pub actions: Option<RoleTickActions>,
 }
 
 /// Classify one shell command into the [`RoleTickActions`] buckets it
@@ -375,9 +419,11 @@ pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
     // That is the difference between "this tick did nothing observable" and
     // "nothing about this tick was observable", which the record's optional
     // fields exist to preserve.
+    // `actions` is `Some` on this path by construction: reaching here means at
+    // least one transcript was read, so a zero count is an *observation*.
     read_any.then_some(TranscriptScan {
         tokens_by_model: totals.into_values().collect(),
-        actions,
+        actions: Some(actions),
     })
 }
 
@@ -433,7 +479,11 @@ pub fn build_record(
     let (tokens_by_model, actions) = match scan {
         Some(scan) => {
             let tokens = (!scan.tokens_by_model.is_empty()).then_some(scan.tokens_by_model);
-            (tokens, Some(scan.actions))
+            // A scan that measured tokens without reading a transcript carries
+            // `actions: None`, and that absence propagates verbatim — never
+            // rewritten into a zeroed `RoleTickActions` (see the field's doc
+            // comment and [`RoleTickActions`]'s own).
+            (tokens, scan.actions)
         }
         None => (None, None),
     };
@@ -449,10 +499,54 @@ pub fn build_record(
         effort: tick.effort.clone().filter(|e| !e.is_empty()),
         detail: tick.detail.clone().filter(|d| !d.is_empty()),
         gated_pool: tick.gated_pool.clone().filter(|p| !p.is_empty()),
+        // Populated by `emit` via `apply_runtime_attribution` (Issue #8507):
+        // that resolution needs a filesystem read this function deliberately
+        // stays free of (see the doc comment above).
+        runtime: None,
+        provider: None,
+        profile: None,
         tokens_by_model,
         models_used,
         actions,
     }
+}
+
+/// This tick's own runtime/provider/profile (Issue #8507), read off the
+/// per-role log's last `# LOOM_LAUNCH` record — the role-tick counterpart of
+/// `sweep_registry::outcome_journal::resolve_runtime_attribution`.
+///
+/// Uses [`crate::launch_record::last_launch_runtime`] (no anchor) rather than
+/// the anchored `..._after` a sweep uses: a role tick has no `sweep_id=`-shaped
+/// anchor to scope by, but `role_runner`'s per-`(root, role)` run guard makes
+/// two concurrent ticks of the same role impossible, so the log's last record
+/// at the moment this reads it — right after the tick's own child exited —
+/// cannot belong to any other tick. `None` for a Claude/legacy-adapter spawn
+/// (writes no launch record), an unreadable/rotated log, or a tick that never
+/// spawned at all (the caller gates this on [`RoleTickResult::spawned`]).
+fn resolve_runtime_attribution(
+    root: &Path,
+    role: &str,
+) -> Option<crate::launch_record::RuntimeAttribution> {
+    let logs_dir = root.join(".loom").join("logs");
+    let log_path = crate::role_runner::role_log_path(&logs_dir, role);
+    let contents = std::fs::read_to_string(log_path).ok()?;
+    crate::launch_record::last_launch_runtime(&contents)
+}
+
+/// Copy a resolved [`crate::launch_record::RuntimeAttribution`] onto an
+/// already-built record (Issue #8507). Split out of [`build_record`] so that
+/// function stays filesystem-free and independently testable — see its doc
+/// comment.
+fn apply_runtime_attribution(
+    mut record: RoleTickOutcomeRecord,
+    attribution: Option<crate::launch_record::RuntimeAttribution>,
+) -> RoleTickOutcomeRecord {
+    if let Some(attribution) = attribution {
+        record.runtime = Some(attribution.runtime);
+        record.provider = attribution.provider;
+        record.profile = attribution.profile;
+    }
+    record
 }
 
 /// Append one `role_tick.outcome` envelope for `tick` to the role-tick
@@ -464,24 +558,67 @@ pub fn build_record(
 /// `append_outcome_telemetry_journal`: any failure is logged and swallowed,
 /// because a telemetry write must never change whether a role keeps ticking.
 pub fn emit(tick: &RoleTickTelemetry) {
+    emit_correlated(tick, None);
+}
+
+fn emit_correlated(
+    tick: &RoleTickTelemetry,
+    trace_context: Option<crate::telemetry::trace::TraceContext>,
+) {
     let (repo, visibility) = resolve_repo(&tick.root);
+    // Issue #8507: the tick's own runtime/provider/profile, read once and
+    // reused both for the record's top-level fields (below, via
+    // `apply_runtime_attribution`) and to pick the token-usage SOURCE for a
+    // non-Claude runtime — never looked up on a tick that did not spawn (see
+    // `resolve_runtime_attribution`'s doc comment).
+    let runtime_attribution = tick
+        .result
+        .spawned()
+        .then(|| resolve_runtime_attribution(&tick.root, &tick.role))
+        .flatten();
+    let source = crate::usage_source::UsageSource::for_runtime(
+        runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+    );
     let scan = tick.result.spawned().then(|| {
-        let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
-        let transcripts = attributed_transcripts(
-            &projects_dir,
-            &tick.root,
-            &tick.role,
-            tick.started_at,
-            tick.ended_at,
-        );
-        scan_transcripts(&transcripts)
+        if source == crate::usage_source::UsageSource::OpenCodeSessionDb {
+            // OpenCode's session store answers `tokens_by_model` but has no
+            // transcript for this scanner to derive forge-mutating `actions`
+            // from. `actions` is therefore `None` — *unmeasured*, not an
+            // observed zero: publishing `{issues_labeled: 0, …}` here would be
+            // indistinguishable from a genuinely quiet Claude tick and would
+            // make a GLM/OpenCode trial's role ticks read as real zeroes
+            // (#8507). Deriving real per-command actions from the native JSON
+            // event stream is follow-up work (see `crate::opencode_usage`'s
+            // module doc).
+            crate::opencode_usage::tokens_by_model(
+                &crate::usage_source::role_tick_directories(&tick.root),
+                Some((tick.started_at, tick.ended_at)),
+                None,
+            )
+            .map(|tokens_by_model| TranscriptScan {
+                tokens_by_model,
+                actions: None,
+            })
+        } else {
+            let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
+            let transcripts = attributed_transcripts(
+                &projects_dir,
+                &tick.root,
+                &tick.role,
+                tick.started_at,
+                tick.ended_at,
+            );
+            scan_transcripts(&transcripts)
+        }
     });
     let record = build_record(tick, repo, visibility, scan.flatten());
+    let record = apply_runtime_attribution(record, runtime_attribution);
     let path = crate::sweep_outcomes::default_role_tick_telemetry_path(&tick.root);
-    let envelope = TelemetryEnvelope::new(
+    let mut envelope = TelemetryEnvelope::new(
         crate::sweep_registry::host_identity(),
         TelemetryRecord::RoleTickOutcome(record),
     );
+    envelope.trace_context = trace_context;
     if let Err(e) = crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope) {
         log::warn!(
             "role_tick_telemetry: failed to append {} tick record for {} at {}: {e} — \

@@ -12,7 +12,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::locking::MkdirLock;
-use super::paths::{codex_profile_root, per_repo_accounts_file, resolve_tokens_dir};
+use super::paths::{
+    codex_profile_root, is_shared_accounts_root, per_repo_accounts_file, resolve_tokens_dir,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -475,6 +477,24 @@ fn read_repo_registry(workspace: &Path) -> Result<Option<Vec<RegistryEntry>>> {
     Ok(Some(registry.accounts))
 }
 
+/// The Codex account names `workspace`'s own registry *file* holds, or an
+/// empty list when it has no registry file (issue #8540).
+///
+/// Deliberately not [`account_inventory`]: this answers "what is written in
+/// that one file", with no profile-root validation, no pre-registry directory
+/// adoption, and no filesystem probe of the profiles themselves — so it can be
+/// asked about a *different* registry than the one the command is acting on
+/// (the shared one, to detect shadowing) without that registry's unprovisioned
+/// entries turning into warnings or errors.
+pub fn codex_registry_names(workspace: &Path) -> Result<Vec<String>> {
+    Ok(read_repo_registry(workspace)?
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.provider == AccountProvider::Codex)
+        .map(|entry| entry.name)
+        .collect())
+}
+
 fn claude_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
     let pool = resolve_tokens_dir(workspace);
     let provenance = if pool == super::paths::per_repo_tokens_dir(workspace) {
@@ -536,14 +556,104 @@ fn discovered_codex_profiles(root: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(out)
 }
 
-fn codex_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
+/// Warn once per process that a registered Codex account has no profile
+/// directory on this host (Issue #8444).
+///
+/// The warning is real — a committed registry entry this host never
+/// provisioned is worth saying out loud once — but it sits on a read the
+/// daemon's pre-spawn codex gate performs on **every** role tick, which
+/// turned it into steady stderr noise (one line per unprovisioned entry, per
+/// tick, forever). Deduped on the `(name, reference)` pair, so a second
+/// registry entry still gets its own line and a re-provisioned account that
+/// later goes missing again is not re-announced within the same process.
+fn warn_unprovisioned_once(name: &str, credential_reference: &str, root: &Path) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    let key = (name.to_string(), credential_reference.to_string());
+    let first = WARNED
+        .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+        .lock()
+        .map_or(true, |mut seen| seen.insert(key));
+    if !first {
+        return;
+    }
+    eprintln!(
+        "WARNING Codex account {name:?} is registered but its profile directory \
+         {credential_reference:?} was not found under {}; this host has not provisioned it yet, \
+         skipping (further identical warnings are suppressed for the life of this process)",
+        root.display()
+    );
+}
+
+/// Refuse a Codex profile root that would live *inside* the repository
+/// checkout named by `workspace` — credentials must never sit somewhere a
+/// `git add` can reach.
+///
+/// # The `$HOME`-as-workspace false positive (issue #8540)
+///
+/// The predicate is "is `root` under `workspace`", so it fires on *any*
+/// ancestor relationship — including the one that exists by construction when
+/// `workspace` resolved to `$HOME` (a `--workspace .` defaulted from a non-repo
+/// cwd) and `root` is the perfectly ordinary `~/.loom/codex-profiles`. That
+/// made every `accounts` verb fail from `$HOME` with a message naming the
+/// profile root, which had not moved, rather than the cwd, which had.
+///
+/// The shared machine-level accounts root is therefore exempt: it is the
+/// *home* of the profile root, not a repository that could capture it. Callers
+/// resolving a non-repo cwd to the shared registry (see the `accounts` CLI)
+/// consequently never trip this at all.
+///
+/// A `workspace` that cannot be canonicalized (it does not exist yet) can
+/// contain nothing, so it is accepted rather than made a hard error — the
+/// caller's own later write is the place that failure belongs.
+pub fn reject_repository_local_root(workspace: &Path, root: &Path) -> Result<()> {
+    if is_shared_accounts_root(workspace) {
+        return Ok(());
+    }
+    let Ok(canonical_workspace) = workspace.canonicalize() else {
+        return Ok(());
+    };
+    let absolute_root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(root)
+    };
+    // Canonicalize as much of `root` as exists so a not-yet-created profile
+    // root is still judged on its real (symlink-resolved) location.
+    let canonical_intent = absolute_root
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .and_then(|existing| existing.canonicalize().ok().map(|base| (existing, base)))
+        .map(|(existing, base)| {
+            absolute_root
+                .strip_prefix(existing)
+                .map_or(base.clone(), |suffix| base.join(suffix))
+        })
+        .unwrap_or(absolute_root);
+    if canonical_intent.starts_with(&canonical_workspace) {
+        bail!(
+            "Codex profile root {} is inside the workspace {} — account credentials must not \
+             live in a repository checkout. Either point LOOM_CODEX_PROFILE_ROOT outside that \
+             directory, or pass `--workspace <path>` to name the workspace you meant.",
+            canonical_intent.display(),
+            canonical_workspace.display(),
+        );
+    }
+    Ok(())
+}
+
+fn codex_inventory(workspace: &Path, quiet: bool) -> Result<Vec<AccountDescriptor>> {
     let root = codex_profile_root()
         .ok_or_else(|| anyhow!("Codex profile root is disabled by LOOM_CODEX_PROFILE_ROOT"))?;
-    if let (Ok(root), Ok(workspace)) = (root.canonicalize(), workspace.canonicalize()) {
-        if root.starts_with(&workspace) {
-            bail!("Codex profile root {} must not be repository-local", root.display());
-        }
-    }
+    reject_repository_local_root(workspace, &root)?;
+    // A registry file read from the shared machine-level root *is* the shared
+    // registry — provenance names which registry an entry came from, so it must
+    // not read `Repo` just because the file has the per-repo shape (#8540).
+    let registry_provenance = if is_shared_accounts_root(workspace) {
+        InventoryProvenance::Shared
+    } else {
+        InventoryProvenance::Repo
+    };
     let entries = read_repo_registry(workspace)?;
     let mut out = Vec::new();
     if let Some(entries) = entries {
@@ -558,14 +668,13 @@ fn codex_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
                 Ok(directory) => directory,
                 Err(err) => {
                     if codex_directory_is_missing(&root, &entry.credential_reference) {
-                        eprintln!(
-                            "WARNING Codex account {:?} is registered but its profile \
-                             directory {:?} was not found under {}; this host has not \
-                             provisioned it yet, skipping",
-                            entry.name,
-                            entry.credential_reference,
-                            root.display()
-                        );
+                        if !quiet {
+                            warn_unprovisioned_once(
+                                &entry.name,
+                                &entry.credential_reference,
+                                &root,
+                            );
+                        }
                         continue;
                     }
                     // Anything else (invalid name, wrong type, escapes the
@@ -583,7 +692,7 @@ fn codex_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
                 credential_kind: CredentialKind::CodexHome,
                 credential_reference: directory,
                 enabled: entry.enabled,
-                provenance: InventoryProvenance::Repo,
+                provenance: registry_provenance,
                 email: entry.email,
             });
         }
@@ -612,7 +721,25 @@ pub fn account_inventory(
 ) -> Result<Vec<AccountDescriptor>> {
     match provider {
         AccountProvider::Claude => claude_inventory(workspace),
-        AccountProvider::Codex => codex_inventory(workspace),
+        AccountProvider::Codex => codex_inventory(workspace, false),
+    }
+}
+
+/// [`account_inventory`], with the "registered but not provisioned on this
+/// host" stderr warning suppressed (Issue #8444).
+///
+/// The same inventory, byte for byte — this changes nothing but whether a
+/// skipped registry entry is announced. For callers on a polling path (the
+/// role runner's per-tick pre-spawn codex gate), where the warning is noise
+/// rather than news: the operator-facing surfaces (`accounts list`, account
+/// selection) keep the loud read.
+pub fn account_inventory_quiet(
+    workspace: &Path,
+    provider: AccountProvider,
+) -> Result<Vec<AccountDescriptor>> {
+    match provider {
+        AccountProvider::Claude => claude_inventory(workspace),
+        AccountProvider::Codex => codex_inventory(workspace, true),
     }
 }
 
@@ -693,6 +820,7 @@ fn epoch_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokens_pool::paths::SHARED_ACCOUNTS_ROOT_ENV;
     use serial_test::serial;
     use std::collections::HashSet;
     use std::fs;
@@ -701,6 +829,43 @@ mod tests {
         let path = per_repo_accounts_file(workspace);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, body).unwrap();
+    }
+
+    /// The shared-root exemption added for issue #8540 must stay *exactly* as
+    /// wide as the false positive it removes: the workspace that **is** the
+    /// shared root. A repository checkout that merely lives underneath it —
+    /// which describes nearly every real checkout, since the shared root
+    /// defaults to `$HOME` — still has its profile root rejected. Losing that
+    /// distinction would let credentials land somewhere `git add` can reach.
+    #[test]
+    #[serial]
+    fn the_shared_root_exemption_does_not_extend_to_repos_beneath_it() {
+        let shared = tempfile::tempdir().unwrap();
+        std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, shared.path());
+
+        // The shared root itself: its own `.loom/codex-profiles` is the
+        // ordinary machine-level location, not a repository-local one.
+        let shared_profiles = shared.path().join(".loom").join("codex-profiles");
+        fs::create_dir_all(&shared_profiles).unwrap();
+        reject_repository_local_root(shared.path(), &shared_profiles)
+            .expect("the shared root's own profile root is not repository-local");
+
+        // A checkout *inside* the shared root is still a repository.
+        let repo = shared.path().join("GitHub").join("loom");
+        let repo_profiles = repo.join(".loom").join("codex-profiles");
+        fs::create_dir_all(&repo_profiles).unwrap();
+        let error = reject_repository_local_root(&repo, &repo_profiles)
+            .expect_err("a profile root inside a checkout must be refused")
+            .to_string();
+        assert!(error.contains("must not live in a repository checkout"), "{error}");
+        // The message names both paths, so it points at what actually moved.
+        assert!(error.contains("--workspace"), "{error}");
+
+        // ...and the shared root's profile root is not repo-local *to* that
+        // checkout either, so an ordinary setup is unaffected.
+        reject_repository_local_root(&repo, &shared_profiles).unwrap();
+
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
     }
 
     #[test]

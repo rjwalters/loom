@@ -31,7 +31,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::telemetry::TelemetryEnvelope;
 
@@ -41,6 +41,16 @@ pub const QUEUE_PATH_ENV: &str = "LOOM_OBSERVABILITY_QUEUE_PATH";
 
 /// Default filename under `<workspace_root>/.loom/logs/`.
 pub const QUEUE_FILENAME: &str = "observability-queue.jsonl";
+
+/// Per-exporter queue filename under `<workspace_root>/.loom/logs/` when more
+/// than one exporter is configured (Issue #8756) — `observability-queue.<name>
+/// .jsonl` for the exporter named `name` ("https", "otlp"). A **sole**
+/// exporter keeps [`QUEUE_FILENAME`] unchanged so a pre-fan-out backlog stays
+/// discoverable without migration.
+#[must_use]
+pub fn named_queue_filename(name: &str) -> String {
+    format!("observability-queue.{name}.jsonl")
+}
 
 /// Resolve the default queue path: [`QUEUE_PATH_ENV`] override (non-empty),
 /// else `<workspace_root>/.loom/logs/observability-queue.jsonl`.
@@ -60,6 +70,14 @@ pub fn default_queue_path(workspace_root: &Path) -> PathBuf {
 struct QueueState {
     items: VecDeque<TelemetryEnvelope>,
     dropped_total: u64,
+    head_sequence: u128,
+}
+
+/// An in-process queue cursor plus immutable payload snapshot. Sequence identity
+/// distinguishes even byte-identical envelopes pushed while an export is in flight.
+pub struct QueueSnapshot {
+    start_sequence: u128,
+    pub envelopes: Vec<TelemetryEnvelope>,
 }
 
 /// A bounded, disk-backed FIFO queue of [`TelemetryEnvelope`]s.
@@ -92,6 +110,7 @@ impl DurableQueue {
             state: Mutex::new(QueueState {
                 items,
                 dropped_total: 0,
+                head_sequence: 0,
             }),
         }
     }
@@ -103,9 +122,23 @@ impl DurableQueue {
     /// a journal-write failure" contract) so a full/unwritable disk degrades
     /// this queue to in-memory-only rather than crashing the collector.
     pub fn push(&self, envelope: TelemetryEnvelope) {
+        if let Err(error) = self.push_inner(envelope, false) {
+            log::warn!("observability: failed to persist queue: {error}");
+        }
+    }
+
+    /// Offer a terminal span and confirm its queue file and directory reached
+    /// stable storage before the caller removes active execution context.
+    /// On failure the in-memory offer remains; retain context for recovery.
+    pub fn push_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        self.push_inner(envelope, true)
+    }
+
+    fn push_inner(&self, envelope: TelemetryEnvelope, durable: bool) -> std::io::Result<()> {
         let mut state = self.lock();
         if state.items.len() >= self.capacity {
             state.items.pop_front();
+            state.head_sequence += 1;
             state.dropped_total += 1;
             log::warn!(
                 "observability: queue at capacity ({}); dropped oldest record \
@@ -115,7 +148,17 @@ impl DurableQueue {
             );
         }
         state.items.push_back(envelope);
-        self.persist(&state.items);
+        persist_to(&self.path, &state.items)?;
+        if durable {
+            std::fs::File::open(&self.path)?.sync_all()?;
+            let parent = self
+                .path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Current queue length.
@@ -145,12 +188,37 @@ impl DurableQueue {
         self.lock().items.iter().take(n).cloned().collect()
     }
 
+    /// Snapshot the payload and its sequence cursor under the same lock.
+    #[must_use]
+    pub fn peek_snapshot(&self, n: usize) -> QueueSnapshot {
+        let state = self.lock();
+        QueueSnapshot {
+            start_sequence: state.head_sequence,
+            envelopes: state.items.iter().take(n).cloned().collect(),
+        }
+    }
+
+    /// Acknowledge only the exported snapshot prefix still present in the FIFO.
+    /// Concurrent capacity drops may advance the head; newly pushed records must
+    /// never be mistaken for records sent before that advance.
+    pub fn ack_snapshot(&self, snapshot: &QueueSnapshot, acknowledged: usize) {
+        let end = snapshot.start_sequence + acknowledged.min(snapshot.envelopes.len()) as u128;
+        let mut state = self.lock();
+        let count = end
+            .saturating_sub(state.head_sequence)
+            .min(state.items.len() as u128) as usize;
+        state.items.drain(..count);
+        state.head_sequence += count as u128;
+        self.persist(&state.items);
+    }
+
     /// Remove the front `n` envelopes (clamped to the current length) after a
     /// successful export, persisting the drained state to disk.
     pub fn ack(&self, n: usize) {
         let mut state = self.lock();
         let n = n.min(state.items.len());
         state.items.drain(0..n);
+        state.head_sequence += n as u128;
         self.persist(&state.items);
     }
 
@@ -167,6 +235,74 @@ impl DurableQueue {
                 self.path.display()
             );
         }
+    }
+}
+
+/// The collector/backfill/tracing push surface every envelope producer writes
+/// through (Issue #8756). Before the multi-exporter fan-out each producer held
+/// a `&DurableQueue`; now the same call sites write through this trait so the
+/// single-sink and N-sink topologies share one producer path — `DurableQueue`
+/// implements it directly (one sink) and [`FanoutQueue`] fans each offer out
+/// to N per-exporter queues.
+pub trait QueueSink: Send + Sync {
+    /// Best-effort enqueue: a persistence failure is logged and swallowed by
+    /// the implementation, never blocking the caller.
+    fn offer(&self, envelope: TelemetryEnvelope);
+
+    /// Durable enqueue for terminal records the caller may destroy its
+    /// context for immediately after (trace spans): the queue file and its
+    /// directory must reach stable storage before returning `Ok(())`.
+    fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()>;
+}
+
+impl QueueSink for DurableQueue {
+    fn offer(&self, envelope: TelemetryEnvelope) {
+        self.push(envelope);
+    }
+
+    fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        self.push_durable(envelope)
+    }
+}
+
+/// The multi-exporter fan point (Issue #8756): every offered envelope is
+/// cloned into **each** per-exporter [`DurableQueue`], and each queue keeps a
+/// fully independent drain/retry state — a stopped sink's backlog never holds
+/// or re-sends a healthy sink's records, and vice versa.
+pub struct FanoutQueue {
+    queues: Vec<Arc<DurableQueue>>,
+}
+
+impl FanoutQueue {
+    /// Fan offers out to `queues` in the given (config) order.
+    #[must_use]
+    pub fn new(queues: Vec<Arc<DurableQueue>>) -> Self {
+        FanoutQueue { queues }
+    }
+
+    /// The per-exporter queues being fanned out to, in config order.
+    #[must_use]
+    pub fn queues(&self) -> &[Arc<DurableQueue>] {
+        &self.queues
+    }
+}
+
+impl QueueSink for FanoutQueue {
+    fn offer(&self, envelope: TelemetryEnvelope) {
+        for queue in &self.queues {
+            queue.push(envelope.clone());
+        }
+    }
+
+    /// Offers to every queue; the first persistence failure aborts the
+    /// remaining fan-out and surfaces (`Err`) so the caller retains its
+    /// recovery context — queues already offered keep their records, which is
+    /// the same partial-write shape a single failing [`DurableQueue`] leaves.
+    fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        for queue in &self.queues {
+            queue.push_durable(envelope.clone())?;
+        }
+        Ok(())
     }
 }
 
@@ -218,8 +354,30 @@ mod tests {
                 started_at: chrono::Utc::now(),
                 model: None,
                 effort: None,
+                runtime: None,
             }),
         )
+    }
+
+    #[test]
+    fn snapshot_ack_survives_capacity_eviction_and_identical_new_payloads() {
+        let dir = tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 2);
+        let first = envelope(1);
+        let second = envelope(2);
+        queue.push(first.clone());
+        queue.push(second.clone());
+        let snapshot = queue.peek_snapshot(2);
+        queue.push(second.clone()); // evicts first; identical to an in-flight record
+        queue.ack_snapshot(&snapshot, 2);
+        assert_eq!(queue.peek_batch(2), vec![second.clone()]);
+        queue.ack_snapshot(&snapshot, 2); // replayed acknowledgment is idempotent
+        assert_eq!(queue.peek_batch(2), vec![second.clone()]);
+        let snapshot = queue.peek_snapshot(1);
+        queue.push(first.clone());
+        queue.push(second.clone()); // evicts every record in snapshot
+        queue.ack_snapshot(&snapshot, 1);
+        assert_eq!(queue.peek_batch(2), vec![first, second]);
     }
 
     #[test]
@@ -347,5 +505,67 @@ mod tests {
         std::env::remove_var(QUEUE_PATH_ENV);
         let path = default_queue_path(Path::new("/repos/loom"));
         assert_eq!(path, PathBuf::from("/repos/loom/.loom/logs/observability-queue.jsonl"));
+    }
+
+    // ------------------------------------------------------------------
+    // FanoutQueue (#8756) — the collector-facing fan point. One offered
+    // envelope lands in EVERY per-exporter queue; each queue keeps an
+    // independent drain state, so one sink's backlog/retry never holds or
+    // re-sends another's.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fanout_offer_lands_in_every_queue_file() {
+        let dir = tempdir().unwrap();
+        let https = Arc::new(DurableQueue::open(dir.path().join("q.https.jsonl"), 10));
+        let otlp = Arc::new(DurableQueue::open(dir.path().join("q.otlp.jsonl"), 10));
+        let fanout = FanoutQueue::new(vec![https.clone(), otlp.clone()]);
+        QueueSink::offer(&fanout, envelope(7));
+        assert_eq!(https.len(), 1, "https sink received the envelope");
+        assert_eq!(otlp.len(), 1, "otlp sink received the same envelope");
+        assert!(dir.path().join("q.https.jsonl").exists());
+        assert!(dir.path().join("q.otlp.jsonl").exists());
+    }
+
+    #[test]
+    fn fanout_drain_states_are_independent() {
+        let dir = tempdir().unwrap();
+        let https = Arc::new(DurableQueue::open(dir.path().join("q.https.jsonl"), 10));
+        let otlp = Arc::new(DurableQueue::open(dir.path().join("q.otlp.jsonl"), 10));
+        let fanout = FanoutQueue::new(vec![https.clone(), otlp.clone()]);
+        QueueSink::offer(&fanout, envelope(1));
+        QueueSink::offer(&fanout, envelope(2));
+        // The https sender drains both; the otlp sink is down and drains none.
+        https.ack(2);
+        assert!(https.is_empty());
+        assert_eq!(otlp.len(), 2, "a stopped sink's backlog is retained");
+        // On recovery the otlp sender drains its own queue — and only its own.
+        otlp.ack(1);
+        assert_eq!(otlp.len(), 1, "no cross-sink re-send: https already acked");
+    }
+
+    #[test]
+    fn fanout_offer_durable_propagates_sync_failures() {
+        let dir = tempdir().unwrap();
+        let ok = Arc::new(DurableQueue::open(dir.path().join("q.https.jsonl"), 10));
+        // A queue whose backing file cannot be persisted: capacity-1 queue
+        // backed by a path whose parent does not exist yet still accepts
+        // in-memory — so instead use a directory as the file path to force
+        // the persist to fail.
+        let bad_path = dir.path().join("not-a-file");
+        std::fs::create_dir_all(&bad_path).unwrap();
+        let bad = Arc::new(DurableQueue::open(bad_path, 10));
+        let fanout = FanoutQueue::new(vec![ok.clone(), bad.clone()]);
+        assert!(
+            QueueSink::offer_durable(&fanout, envelope(1)).is_err(),
+            "a persist failure must surface to the caller, not be swallowed"
+        );
+    }
+
+    #[test]
+    fn fanout_empty_list_offers_nowhere() {
+        let fanout = FanoutQueue::new(Vec::new());
+        QueueSink::offer(&fanout, envelope(1)); // must not panic
+        assert!(fanout.queues().is_empty());
     }
 }

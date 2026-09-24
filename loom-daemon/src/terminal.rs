@@ -1693,9 +1693,10 @@ impl TerminalManager {
     pub fn list_terminals(&mut self) -> Vec<TerminalInfo> {
         // If registry is empty but tmux sessions exist, restore from tmux
         // Skip restore when LOOM_NO_RESTORE=1 is set (used in tests to prevent
-        // cross-test-binary contamination via shared tmux server)
-        let no_restore = std::env::var("LOOM_NO_RESTORE")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        // cross-test-binary contamination via shared tmux server). The
+        // predicate is single-sourced in `terminal_restore` so the daemon's
+        // startup restore path honors the same flag (issue #8463).
+        let no_restore = crate::terminal_restore::no_restore_env();
 
         if self.terminals.is_empty() && !no_restore {
             log::debug!("Registry empty, attempting to restore from tmux");

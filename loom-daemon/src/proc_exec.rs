@@ -195,15 +195,36 @@ fn terminate_group(_pid: u32) {}
 /// Run with cooperative cancellation, terminating the owned process group.
 /// Cancellation returns `Collect(Interrupted)` because side effects may have run.
 pub fn run_bounded_cancellable(
+    cmd: Command,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> Result<Completion, ExecError> {
+    run_bounded_inner(cmd, timeout, cancelled, |_| {})
+}
+
+/// Observe the actual child PID before waiting, while retaining the shared
+/// process-group deadline and pipe-draining behavior. The observer must return
+/// promptly and must not panic; it is intended for local lifecycle bookkeeping.
+pub fn run_bounded_observed(
+    cmd: Command,
+    timeout: Duration,
+    spawned: impl FnOnce(u32),
+) -> Result<Completion, ExecError> {
+    run_bounded_inner(cmd, timeout, || false, spawned)
+}
+
+fn run_bounded_inner(
     mut cmd: Command,
     timeout: Duration,
     cancelled: impl Fn() -> bool,
+    spawned: impl FnOnce(u32),
 ) -> Result<Completion, ExecError> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     place_in_own_process_group(&mut cmd);
 
     let mut child = cmd.spawn().map_err(ExecError::Spawn)?;
     let pid = child.id();
+    spawned(pid);
 
     // Drain both pipes on their own threads, concurrently with the wait below.
     // This is the fix for the original's deadlock: the child can fill the pipe

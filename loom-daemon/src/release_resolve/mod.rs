@@ -33,4 +33,6 @@ pub mod host;
 pub mod resolve;
 pub mod semver;
 
-pub use resolve::{resolve, Inputs, Resolution, Resolved};
+pub use resolve::{
+    asset_names, build_time_repo, resolve, resolve_repo, Inputs, Resolution, Resolved,
+};

@@ -165,6 +165,8 @@ fn records_judge_verdicts_and_doctor_cycles_from_the_label_timeline() {
         600,
         telemetry::SweepResult::Success,
         None,
+        None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let path = registry.config().resolve_outcome_telemetry_path();
@@ -205,6 +207,8 @@ fn a_first_pass_approval_is_readable_off_the_record_alone() {
         300,
         telemetry::SweepResult::Success,
         None,
+        None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let path = registry.config().resolve_outcome_telemetry_path();
@@ -233,6 +237,8 @@ fn a_failing_timeline_fetch_omits_both_fields_and_still_writes_the_record() {
         420,
         telemetry::SweepResult::Failure,
         Some("preflight-no-cli-start".to_string()),
+        None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let raw = raw_record(&registry, issue);
@@ -269,6 +275,8 @@ fn a_sweep_with_no_pr_omits_both_fields() {
         30,
         telemetry::SweepResult::Failure,
         None,
+        None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let raw = raw_record(&registry, issue);
@@ -295,6 +303,8 @@ fn an_observed_timeline_with_no_verdict_reports_empty_not_absent() {
         90,
         telemetry::SweepResult::Failure,
         None,
+        None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let raw = raw_record(&registry, issue);
@@ -333,6 +343,8 @@ fn a_loom_repo_override_is_passed_as_the_gh_repo_env_var() {
         120,
         telemetry::SweepResult::Success,
         None,
+        None,
+        crate::tap_usage::RegionAccounting::default(),
     );
     std::env::remove_var("LOOM_REPO");
 
@@ -367,6 +379,8 @@ fn skip_label_flip_makes_the_fetch_a_no_op() {
         60,
         telemetry::SweepResult::Success,
         None,
+        None,
+        crate::tap_usage::RegionAccounting::default(),
     );
 
     let raw = raw_record(&registry, issue);

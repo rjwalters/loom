@@ -1252,7 +1252,7 @@ async fn run_drain_supervisor(
                 );
                 if then_exit {
                     log::warn!("{}", drain_complete_log_line(true, "", verify_poll_secs));
-                    std::process::exit(drain_exit_code(true));
+                    crate::observability::shutdown::exit(drain_exit_code(true)).await;
                 }
                 // This path only runs after `handle_drain_request` proved
                 // supervision, so `detect_supervisor()` should still be `Some`
@@ -1265,7 +1265,7 @@ async fn run_drain_supervisor(
                 // daemon that is about to exit.
                 let sup = crate::restart_verify::detect_and_spawn_verifier(std::process::id());
                 log::warn!("{}", drain_complete_log_line(false, &sup, verify_poll_secs));
-                std::process::exit(drain_exit_code(false));
+                crate::observability::shutdown::exit(drain_exit_code(false)).await;
             }
             DrainTick::TimedOutRefuse => {
                 // Issue #6007. A **teardown** (`then_exit`) drain keeps the
@@ -1356,7 +1356,7 @@ async fn run_drain_supervisor(
                          cancelled {cancelled} sweep(s); exiting {EXIT_SHUTDOWN} and staying down \
                          (then_exit — Issue #4343 teardown)"
                     );
-                    std::process::exit(drain_exit_code(true));
+                    crate::observability::shutdown::exit(drain_exit_code(true)).await;
                 }
                 // Same detection/fallback as the `DrainTick::Complete` relaunch
                 // branch above; this path only reaches here after
@@ -1368,7 +1368,7 @@ async fn run_drain_supervisor(
                      {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch. {}",
                     crate::restart_verify::relaunch_verify_note(&sup, verify_poll_secs)
                 );
-                std::process::exit(drain_exit_code(false));
+                crate::observability::shutdown::exit(drain_exit_code(false)).await;
             }
         }
     }
@@ -1888,11 +1888,12 @@ async fn handle_client(
                     "RestartDaemon: supervised — exiting {EXIT_RESTART}. {ack_message} \
                      The stale socket is reclaimed by the relaunched daemon's singleton guard."
                 );
-                std::process::exit(EXIT_RESTART);
+                crate::observability::shutdown::exit(EXIT_RESTART).await;
             }
             continue;
         }
 
+        crate::observability::shutdown::intercept(&request).await;
         let response = handle_request(
             request,
             &terminal_manager,
@@ -2156,32 +2157,11 @@ async fn dispatch_sweep_nonblocking(
             &kind,
         );
 
-        let gh_bin = sr
-            .config()
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("gh"));
-        let (resolved_model, model_source_label, arm) = match (&kind, model.as_deref()) {
-            (crate::types::SweepKind::Issue(issue), None) => {
-                let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model_lazy(
-                    &repo_root,
-                    *issue,
-                    || crate::sweep_registry::fetch_issue_complexity(&gh_bin, &repo_root, *issue),
-                );
-                (resolved.model, resolved.source_label, resolved.arm)
-            }
-            _ => {
-                let (m, s) =
-                    crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
-                (m, s.as_str(), None)
-            }
-        };
         log::info!(
-            "dispatch_sweep: {:?} with{} model={resolved_model} (source={model_source_label}); \
+            "dispatch_sweep: {:?}; \
              headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
              only, not capacity-limiting since #5270])",
             kind,
-            arm.map_or_else(String::new, |a| format!(" arm={a}")),
             headroom.occupancy,
             headroom.dynamic_cap,
             headroom.disk_headroom,
@@ -2189,10 +2169,10 @@ async fn dispatch_sweep_nonblocking(
             headroom.token_axis_limit
         );
 
-        sr.begin_issue_dispatch(
+        sr.begin_issue_dispatch_with_model(
             &kind,
             idempotency_key,
-            Some(&resolved_model),
+            crate::sweep_registry::DispatchModel::Request(model.as_deref()),
             effort.as_deref(),
             depends_on,
             None,
@@ -2814,6 +2794,8 @@ pub fn build_daemon_status(
         auto_update_note: au.note,
         auto_update_artifact_version: au.artifact_version,
         auto_update_artifact_published_at: au.artifact_published_at,
+        auto_update_stale_repo_ticks: au.stale_repo_ticks,
+        auto_update_stale_repo: au.stale_repo,
         // Host-distress circuit breaker (#4235) — read from the process-global
         // handle the work-finder loop registers/updates each tick, mirroring the
         // auto-update global-snapshot pattern above. `None` (no breaker
@@ -2840,8 +2822,21 @@ pub fn build_daemon_status(
         // Positive export-liveness signal (#5083) — the counterpart to the
         // anomaly-only field above. Always `Some` from a daemon of this
         // vintage: an exporter that never started reports `disabled`, which is
-        // a real answer, not the silence #4830 alone could offer.
+        // a real answer, not the silence #4830 alone could offer. Since #8756
+        // this is the FIRST configured exporter's cell; the per-sink picture
+        // is the map below.
         observability_export: Some(crate::observability::global_export_status()),
+        // Per-exporter cells (#8756): one entry per configured exporter
+        // ("https", "otlp", …), each sink surfaced independently. Empty from
+        // a daemon with observability off — the singular field above already
+        // distinguishes that state.
+        observability_exports: crate::observability::global_export_statuses(),
+        // Forge event-feed consumer (ADR-0021, #8765) — same process-global
+        // snapshot pattern. Always `Some` from a daemon of this vintage: a
+        // consumer that never started reports `disabled`, so "is my cursor
+        // advancing, and if not, why" is always answered rather than inferred
+        // from an absent warning.
+        forge_events: Some(crate::forge_events::global_status()),
         // Per-repo deep-clean state (#5919) — the same process-global snapshot
         // pattern once more, projected by the module that owns the state (the
         // mapping lived here until #7990 moved it beside `snapshot()`).
@@ -4223,59 +4218,22 @@ fn handle_request(
                 &kind,
             );
 
-            // Issue #4809: an explicit `model` param always wins (unchanged
-            // precedence), but an ABSENT one for a single-issue dispatch also
-            // considers the model-cost A/B experiment's forced arm — mirroring
-            // the autonomous work-finder / epic-supervisor dispatch paths —
-            // before falling back to `autonomous.model` / the shipped default.
-            //
-            // Issue #4827: the arm is stratified by the issue's real
-            // `<!-- loom:complexity=... -->` marker. Like the epic supervisor
-            // (and unlike the work finder, which carries the body on its
-            // `WorkItem`), this handler has no cached body — so the fetch is
-            // LAZY, running only inside the `experiment` branch. `off` /
-            // `observe` dispatches make zero extra `gh` calls, and a failed
-            // fetch degrades to the unchanged `routine` stratum.
-            let gh_bin = sr
-                .config()
-                .gh_bin
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from("gh"));
-            let (resolved_model, model_source_label, arm) = match (&kind, model.as_deref()) {
-                (crate::types::SweepKind::Issue(issue), None) => {
-                    let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model_lazy(
-                        &repo_root,
-                        *issue,
-                        || {
-                            crate::sweep_registry::fetch_issue_complexity(
-                                &gh_bin, &repo_root, *issue,
-                            )
-                        },
-                    );
-                    (resolved.model, resolved.source_label, resolved.arm)
-                }
-                _ => {
-                    let (m, s) =
-                        crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
-                    (m, s.as_str(), None)
-                }
-            };
+            // Model intent survives until the shared runtime-admission boundary.
             log::info!(
-                "dispatch_sweep: {:?} with{} model={resolved_model} (source={model_source_label}); \
+                "dispatch_sweep: {:?}; \
                  headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
                  only, not capacity-limiting since #5270])",
                 kind,
-                arm.map_or_else(String::new, |a| format!(" arm={a}")),
                 headroom.occupancy,
                 headroom.dynamic_cap,
                 headroom.disk_headroom,
                 headroom.ram_headroom,
                 headroom.token_axis_limit
             );
-            match sr.dispatch(
+            match sr.dispatch_with_model(
                 &kind,
                 idempotency_key,
-                Some(&resolved_model),
+                crate::sweep_registry::DispatchModel::Request(model.as_deref()),
                 effort.as_deref(),
                 depends_on,
             ) {
@@ -4656,14 +4614,8 @@ fn handle_request(
 
         Request::RemoveWatch { id } => handle_remove_watch(&id),
 
-        Request::Shutdown => {
-            // Exit NON-ZERO (Issue #4054): an explicit shutdown means "stay
-            // down", so under launchd `KeepAlive:SuccessfulExit` this must not
-            // trip a relaunch. Only `RestartDaemon` (handled in `handle_client`)
-            // exits 0. See the EXIT_* constants at the top of this module.
-            log::info!("Shutdown requested (exiting {EXIT_SHUTDOWN}; not a supervised relaunch)");
-            std::process::exit(EXIT_SHUTDOWN);
-        }
+        // Real IPC shutdown is intercepted asynchronously before this dispatcher.
+        Request::Shutdown => std::process::exit(EXIT_SHUTDOWN),
         Request::RestartDaemon => {
             // Structurally unreachable: `handle_client` intercepts
             // `RestartDaemon` before dispatching to `handle_request` (it must

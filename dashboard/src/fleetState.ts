@@ -89,6 +89,11 @@ export interface ActiveSweepState {
   enteredPhaseAt?: string;
   model?: string;
   effort?: string;
+  /** Runtime adapter the sweep was dispatched on (`claude`, `codex`, …),
+   * from `sweep.started`'s `runtime`. Absent for a pre-runtime daemon. */
+  runtime?: string;
+  /** Resolved launch provider, distinct from the runtime adapter. */
+  provider?: string;
   updatedAt: string;
 }
 
@@ -254,6 +259,93 @@ export interface FleetSnapshot {
   /** Currently-running ephemeral compute jobs (Issue #8305). Each entry
    * carries a `leaked` flag set by [`classifyComputeEntries`]. */
   activeCompute: ActiveComputeState[];
+  /** Roster-expected hosts with no `health` entry at all (Issue #8792) —
+   * see [`diffExpectedRoster`]. Never produced by the Durable Object itself
+   * (it has no notion of an expected roster); the Worker attaches it in
+   * `src/index.ts`'s `fetchLiveFleetSnapshot`. Optional on the type for the
+   * same reason `freshness` is: fixtures/callers that predate it, and a
+   * deployment with no `EXPECTED_HOSTS` configured, omit it. */
+  missingHosts?: MissingHost[];
+}
+
+// ---------------------------------------------------------------------------
+// Expected-host roster (Issue #8792)
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a roster-expected host has no `health` entry to render.
+ *
+ *   - `missing`       — the backend holds an active (non-revoked) ingest key
+ *     for it, yet the Durable Object has no `health:` entry: the host was
+ *     provisioned and has never reported (e.g. a daemon that predates
+ *     telemetry export, #5083, or a misconfigured `[observability]` block),
+ *     or it went silent long enough ago that [`PRUNE_AFTER_MS`] aged its
+ *     last entry out. Either way it is an *incident*: something that should
+ *     be reporting is not.
+ *   - `unprovisioned` — no active ingest key exists for it (no `hosts` row in
+ *     D1, or only a revoked one): the host was added to the roster but has
+ *     not been enrolled yet (`POST /admin/hosts`), so it *cannot* report.
+ *     A to-do, not an outage — rendered distinctly from `missing` so a
+ *     freshly-planned host is never mistaken for one that was live and
+ *     stopped.
+ *
+ * A host that reported and then went quiet (within the prune horizon) is
+ * neither: it still has a `health` entry and reads as `stale`/`offline` via
+ * [`classifyFreshness`].
+ */
+export type MissingHostState = "missing" | "unprovisioned";
+
+export interface MissingHost {
+  hostId: string;
+  state: MissingHostState;
+}
+
+/**
+ * Parse the operator-supplied expected-host roster (the `EXPECTED_HOSTS`
+ * Worker var — see `src/index.ts`'s `Env`). Accepts host IDs separated by
+ * commas and/or any whitespace (so a YAML-folded or one-per-line list pastes
+ * in unchanged); blanks are dropped, duplicates collapsed, and the result is
+ * sorted for stable rendering. Unset/empty yields `[]` — "no roster
+ * configured", under which the dashboard behaves exactly as it did before
+ * this knob existed.
+ */
+export function parseExpectedHostRoster(raw: string | undefined): string[] {
+  if (!raw) return [];
+  const ids = new Set(
+    raw
+      .split(/[\s,]+/)
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0),
+  );
+  return Array.from(ids).sort();
+}
+
+/**
+ * The roster-vs-reporting diff (Issue #8792): every roster host with no
+ * `health` entry in `hosts`, classified as `missing` or `unprovisioned` (see
+ * [`MissingHostState`]).
+ *
+ * `activeKeyHostIds` is the subset of `roster` holding a **non-revoked**
+ * ingest key in D1 — passed in rather than queried here so this stays a pure,
+ * directly-testable function (same split as [`classifyAndPruneHosts`]).
+ *
+ * Deliberately one-directional: the roster only ever *adds* rows, never
+ * hides one. A reporting host absent from the roster still renders normally,
+ * and a host *removed* from the roster simply stops being diffed — so
+ * decommissioning a host by dropping it from the roster reads as intentional
+ * rather than as a new, permanent `missing` incident.
+ */
+export function diffExpectedRoster(
+  hosts: FleetSnapshot["hosts"],
+  roster: readonly string[],
+  activeKeyHostIds: ReadonlySet<string>,
+): MissingHost[] {
+  const missing: MissingHost[] = [];
+  for (const hostId of roster) {
+    if (hosts[hostId]?.health) continue;
+    missing.push({ hostId, state: activeKeyHostIds.has(hostId) ? "missing" : "unprovisioned" });
+  }
+  return missing;
 }
 
 /**
@@ -291,7 +383,12 @@ export function filterRevokedHosts(
       hosts[hostId] = entry;
     }
   }
-  return { hosts, activeSweeps: snapshot.activeSweeps, activeCompute: snapshot.activeCompute };
+  return {
+    hosts,
+    activeSweeps: snapshot.activeSweeps,
+    activeCompute: snapshot.activeCompute,
+    ...(snapshot.missingHosts && { missingHosts: snapshot.missingHosts }),
+  };
 }
 
 /** Body accepted by the internal `POST /update` route — one record's worth
@@ -537,9 +634,26 @@ export class FleetState implements DurableObject {
           startedAt: typeof record.started_at === "string" ? record.started_at : undefined,
           model: typeof record.model === "string" ? record.model : undefined,
           effort: typeof record.effort === "string" ? record.effort : undefined,
+          runtime: identityString(record.runtime),
+          provider: identityString(record.provider),
           updatedAt: now,
         };
         await this.state.storage.put(`sweep:${sweepId}`, entry);
+        break;
+      }
+      case "sweep.identity": {
+        const sweepId = record.sweep_id;
+        if (typeof sweepId !== "string") return;
+        const key = `sweep:${sweepId}`;
+        const existing = await this.state.storage.get<ActiveSweepState>(key);
+        // Late metadata cannot create/resurrect a sweep or cross host ownership.
+        if (!existing || existing.hostId !== hostId) return;
+        await this.state.storage.put(key, {
+          ...existing,
+          runtime: identityString(record.runtime) ?? existing.runtime,
+          provider: identityString(record.provider) ?? existing.provider,
+          model: identityString(record.model) ?? existing.model,
+        });
         break;
       }
       case "sweep.phase": {
@@ -558,6 +672,8 @@ export class FleetState implements DurableObject {
           enteredPhaseAt: typeof record.entered_at === "string" ? record.entered_at : now,
           model: existing?.model,
           effort: existing?.effort,
+          runtime: existing?.runtime,
+          provider: existing?.provider,
           updatedAt: now,
         };
         await this.state.storage.put(`sweep:${sweepId}`, entry);
@@ -704,4 +820,9 @@ export class FleetState implements DurableObject {
 
     return { hosts, activeSweeps, activeCompute };
   }
+}
+
+/** Missing/malformed identity is unknown, never a request to erase known data. */
+function identityString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }

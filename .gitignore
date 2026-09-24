@@ -74,6 +74,7 @@ Thumbs.db
 .loom/exit-codes/
 .loom/sweep-checkpoint/
 .loom/sweep-run/
+.loom/concierge/
 .loom/stats/
 .loom/diagnostics/
 .loom/guide-docs-state.json
@@ -86,6 +87,7 @@ Thumbs.db
 .loom/native-tools/
 .loom/tokens/
 .loom/accounts.env
+.loom/api-keys/
 .loom/account-health.json
 .loom/account-health.lock
 .loom/CANARY
@@ -181,9 +183,22 @@ Thumbs.db
 # Skill routing local overrides (untracked, user-specific)
 .loom/config/skill-routes.local.json
 
+# Co-install hygiene, sibling of `.claude/skills` above: `.squad/` is a FOREIGN
+# tool's runtime state directory (a SQLite database — `squad.db` plus its `-wal`
+# / `-shm` companions). Loom neither writes nor reads it; it simply materializes
+# in the checkout when that tool runs here. Left unignored it sits untracked and
+# visible to this repo's documented `git add -A` Builder step, so a binary DB
+# holding another tool's session state can be staged into a public remote.
+# IMPORTANT: like `.claude/skills`, this lives ONLY in loom's own committed
+# .gitignore — it must NOT be added to EPHEMERAL_PATTERNS in
+# loom-daemon/src/init/post_init.rs, since consumer repos have no reason to
+# inherit a rule for a tool they may not use.
+.squad/
+
 # NOTE (#8075): the host-local config override tier `.loom-local/` used to be
 # ignored HERE, outside the managed block, which is precisely why consumer
 # repos never got it — the installer-managed block is generated from
 # EPHEMERAL_PATTERNS in loom-daemon/src/init/post_init.rs, not from this file.
 # It now lives in that list (and therefore in the block above), with the
 # rationale for ignoring it recorded alongside the pattern there.
+.aider*

@@ -84,8 +84,16 @@ USER root
 # reparented to it (including anything a `docker exec`'d command leaves
 # behind), which is the "equivalent thin init that reaps zombies" ADR-0017
 # Decision 2 calls for as an alternative to a bespoke reaper loop.
+# safe.directory=*: the only repositories this container ever sees are the
+# ones `session_lifecycle::create()` bind-mounted on purpose, and on Docker
+# Desktop (macOS) a bind mount is presented as owned by root while Codex runs
+# as uid 1000 — without this, `git` reports "dubious ownership", Codex's own
+# repo check then sees "not a repository", and every headless dispatch is
+# refused with "Not inside a trusted directory" (issue #8518). System-level
+# so it holds for whatever HOME a `docker exec` ends up with.
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends tini \
+    && git config --system --add safe.directory '*' \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && case "${TARGETARCH}" in \

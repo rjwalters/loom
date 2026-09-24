@@ -24,6 +24,14 @@
       "allowedSenders": [],
       "room": null,
       "confirmTtlSecs": 120
+    },
+    "concierge": {
+      "enabled": false,
+      "allowedSenders": [],
+      "room": null,
+      "persona": "loom_concierge",
+      "maxMessagesPerTick": 5,
+      "maxTurnsPerDay": 24
     }
   },
   "health_monitoring": {

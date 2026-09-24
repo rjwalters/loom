@@ -1356,8 +1356,23 @@ GITIGNORE
   fi
 
   # Create initial commit
+  #
+  # #8734 audit (follow-up to #7818/#8005, same reachability as
+  # scripts/install-loom.sh's copy of this block): this branch only runs when
+  # $TARGET_PATH was NOT already a git repository, so the .gitignore written
+  # just above (which does not yet carry loom-daemon's managed
+  # CREDENTIAL_PATTERNS block -- that lands later, during the actual .loom/
+  # install) cannot be relied on. A directory can still hold a live
+  # credential-bearing path here: an operator who ran `loom-daemon tokens
+  # bootstrap` (or set up .loom/accounts.env / .loom/gh-config* manually) in
+  # this same directory *before* ever running `git init` leaves .loom/tokens/
+  # etc. sitting untracked on disk exactly where this `git add -A` would
+  # sweep it into the very first commit. Exclude the class unconditionally,
+  # the same way land-resync-commit.sh / resync-installed.sh do
+  # (machine-checked against loom-daemon/src/init/post_init.rs
+  # CREDENTIAL_PATTERNS by credential_class_tests.rs).
   info "Creating initial commit..."
-  git add -A
+  git add -A -- . ':!.loom/claude-config' ':!.loom/tokens' ':!.loom/accounts.env' ':!.loom/api-keys' ':!.loom/gh-config' ':!.loom/gh-config-by-owner'
   git commit -m "Initial commit" --quiet || error "Failed to create initial commit"
   success "Initial commit created"
   echo ""

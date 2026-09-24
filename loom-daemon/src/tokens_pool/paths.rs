@@ -19,9 +19,56 @@ use std::path::{Path, PathBuf};
 pub const SHARED_TOKENS_DIR_ENV: &str = "LOOM_SHARED_TOKENS_DIR";
 pub const CODEX_PROFILE_ROOT_ENV: &str = "LOOM_CODEX_PROFILE_ROOT";
 
+/// Env override naming the machine-level workspace root whose
+/// `.loom/accounts.json` is the **shared** account registry (issue #8540).
+/// An explicitly empty value disables the shared registry entirely.
+pub const SHARED_ACCOUNTS_ROOT_ENV: &str = "LOOM_SHARED_ACCOUNTS_ROOT";
+
 #[must_use]
 pub fn per_repo_accounts_file(workspace: &Path) -> PathBuf {
     workspace.join(".loom").join("accounts.json")
+}
+
+/// The machine-level root whose `<root>/.loom/accounts.json` is the *shared*
+/// account registry — `$HOME` by default, i.e. the same `~/.loom` that already
+/// holds `codex-profiles/` and the shared token pool.
+///
+/// This is not a new location: `--workspace` defaulting to `.` from `$HOME`
+/// already computed exactly this path (issue #8540). Naming it makes the
+/// "which registry am I acting on" question answerable instead of an implicit
+/// function of the operator's cwd.
+///
+/// Refused under `cfg(test)` for the same reason [`shared_tokens_dir`] refuses
+/// its own home default (issue #4657): a test that fell back to the real
+/// `$HOME` would read — and a mutating `accounts` verb would *write* — the
+/// operator's live registry. Tests opt in with an explicit
+/// `LOOM_SHARED_ACCOUNTS_ROOT`.
+#[must_use]
+pub fn shared_accounts_root() -> Option<PathBuf> {
+    match std::env::var(SHARED_ACCOUNTS_ROOT_ENV) {
+        Ok(value) if value.trim().is_empty() => None,
+        Ok(value) => Some(expand_tilde(value.trim())),
+        #[cfg(test)]
+        Err(_) => None,
+        #[cfg(not(test))]
+        Err(_) => dirs::home_dir(),
+    }
+}
+
+/// `true` iff `workspace` *is* the shared machine-level accounts root.
+///
+/// Compared canonically where possible so `/var/folders/...` and its
+/// `/private/var/folders/...` symlink resolution (macOS) are the same answer,
+/// falling back to a literal comparison for a root that does not exist.
+#[must_use]
+pub fn is_shared_accounts_root(workspace: &Path) -> bool {
+    let Some(shared) = shared_accounts_root() else {
+        return false;
+    };
+    match (shared.canonicalize(), workspace.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => shared == workspace,
+    }
 }
 
 /// Machine-level Codex profile root. An explicitly empty override disables it.
@@ -315,6 +362,51 @@ mod tests {
             before, after,
             "the fake ~/.loom/tokens/.bad_tokens must be byte-identical before/after"
         );
+    }
+
+    // =====================================================================
+    // shared account registry (issue #8540)
+    // =====================================================================
+
+    #[test]
+    #[serial]
+    fn shared_accounts_root_defaults_to_none_under_test() {
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
+        assert_eq!(shared_accounts_root(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn shared_accounts_root_is_disabled_by_an_empty_override() {
+        std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, "");
+        assert_eq!(shared_accounts_root(), None);
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn shared_accounts_root_honors_an_explicit_path() {
+        let shared = tempfile::tempdir().unwrap();
+        std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, shared.path());
+        assert_eq!(shared_accounts_root().as_deref(), Some(shared.path()));
+        assert!(is_shared_accounts_root(shared.path()));
+        let other = tempfile::tempdir().unwrap();
+        assert!(!is_shared_accounts_root(other.path()));
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
+    }
+
+    /// The shared registry file is the same `<root>/.loom/accounts.json` shape
+    /// a per-repo workspace uses — only the root differs.
+    #[test]
+    #[serial]
+    fn shared_registry_file_uses_the_per_repo_shape() {
+        std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, "/tmp/loom-shared-home");
+        let root = shared_accounts_root().unwrap();
+        assert_eq!(
+            per_repo_accounts_file(&root),
+            PathBuf::from("/tmp/loom-shared-home/.loom/accounts.json")
+        );
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
     }
 
     // =====================================================================

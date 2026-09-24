@@ -49,8 +49,9 @@
 //! not need. The API-key account pool (#8401) is the countable credential
 //! source a native gate can be built on once it lands.
 use super::*;
+use crate::role_runner::outcome::{PoolHold, PoolStateFile};
 use crate::runtime_admission::{ResolvedRuntime, RuntimeRejection};
-use crate::tokens_pool::{account_health, account_inventory, AccountProvider, HealthReason};
+use crate::tokens_pool::{account_inventory_quiet, health_snapshot, AccountProvider, HealthReason};
 
 /// Environment variables under which `spawn-codex.sh` never reaches the
 /// provider-aware account selector: the three explicit profile pins (auth
@@ -71,7 +72,133 @@ const CODEX_EXPLICIT_CREDENTIAL_ENV: [&str; 5] = [
 /// re-reads live state.
 const CODEX_CLEAR_ESTIMATE_CAP_SECS: i64 = 900;
 
-pub(super) fn check(
+/// Decide what — if anything — this role tick launches on, before it spawns.
+///
+/// **Preference-resolving since #8554.** [`static_check`] alone only ever
+/// answers "is the runtime static resolution picked exhausted?" — exactly the
+/// pre-#8554 behaviour, and all this function does when no preference list
+/// applies. When one DOES apply (`runtimes.rolePreference.<role>`, else
+/// `runtimes.preference`), the list decides the tap **for every tick, not
+/// only for a tick that would otherwise skip**: `resolve_runtime` walks it
+/// against live admission and credential availability, and the first tap that
+/// can serve the work is the one this tick launches on. That is what makes
+/// `rolePreference.judge` do the job it exists for — keeping Judge off the tap
+/// that built the change (a native sweep reviews in the same session that
+/// wrote it) — which a gate consulted only on exhaustion could not, since a
+/// healthy top-of-chain pool would silently ignore the list.
+///
+/// The gate is then the **fail-closed reporter**, never bypassed: the chosen
+/// tap is still put through [`static_check`], so no launch skips its own
+/// pre-spawn gate, and when the whole list is unavailable the tick reports the
+/// statically-admitted runtime's own skip — the same self-healing
+/// [`RoleTickOutcome::PoolExhausted`] shape #7607 keeps out of the stuck-role
+/// streak, not a new failure class.
+///
+/// - `Ok(admitted: None)`: proceed with the `admission` already passed in,
+///   unchanged.
+/// - `Ok(admitted: Some(runtime))`: the preference list chose `runtime` — the
+///   caller MUST launch with it instead of whatever `admission` named (it may
+///   be the same runtime; it is always one whose own gate just passed).
+/// - `Err(outcome)`: do not spawn. No list applies and the static gate
+///   skipped (byte-identical to before #8554), the chosen tap's own gate
+///   skipped, or every listed tap is unavailable (fail closed).
+///
+/// The returned [`DispatchAdmission`](crate::runtime_preference::DispatchAdmission)
+/// also carries the metered backstop slot the choice consumed (#8555). The
+/// caller **must** hand it to the child it spawns
+/// (`runtime_preference::handoff::attach`); dropping it instead releases the
+/// slot, which is exactly right for a tick that ends up not launching.
+pub(crate) fn check(
+    root: &Path,
+    logs: &Path,
+    role: &str,
+    admission: Option<&Result<ResolvedRuntime, RuntimeRejection>>,
+) -> Result<crate::runtime_preference::DispatchAdmission, RoleTickOutcome> {
+    // `None` ⇒ the caller opted out of admission (a test `spawn_bin`), and
+    // with it out of the pool gate AND out of preference resolution: there is
+    // no admitted runtime to pin, so there is nothing to re-point either.
+    if admission.is_none() {
+        return Ok(crate::runtime_preference::DispatchAdmission::none());
+    }
+    let gate = |admitted: Option<&Result<ResolvedRuntime, RuntimeRejection>>| match static_check(
+        root, logs, role, admitted,
+    ) {
+        Some(outcome) => Err(outcome),
+        None => Ok(()),
+    };
+    let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+    // Dispatch intent: a tick that settles on a governed backstop tap takes a
+    // metered slot (#8555). It is handed back to the caller, which attaches it
+    // to the child it spawns; every early return below — including the chosen
+    // tap's own pre-spawn gate refusing — drops the reservation, and with it
+    // releases the slot, so a tick that does not launch never holds one.
+    let context = crate::runtime_preference::DispatchContext {
+        complexity: None,
+        intent: crate::runtime_preference::Intent::Dispatch,
+    };
+    let Ok(crate::runtime_preference::Decision::Preference {
+        source,
+        resolution,
+        backstop,
+    }) = crate::runtime_preference::resolve_runtime_for(root, role, None, now, context)
+    else {
+        // No preference list applies to this role, an operator pin is in
+        // force (a pin disables fall-through by design), or the preference
+        // config itself is malformed: byte-identical to before #8554.
+        gate(admission)?;
+        return Ok(crate::runtime_preference::DispatchAdmission::none());
+    };
+    let marker = resolution.marker_line();
+    let exhausted = resolution.exhausted_diagnostic(role);
+    let Some(chosen) = resolution.chosen else {
+        // Every listed tap was skipped. Fail closed, reporting the
+        // statically-admitted runtime's own gate outcome when it has one, so
+        // a fleet-wide dry list still reads as the self-healing pool skip it
+        // is. `RuntimeRejected` is the remainder: a list that excludes the
+        // statically-admitted runtime entirely cannot borrow that runtime's
+        // verdict, and launching the unlisted runtime anyway would route
+        // around the operator's configuration.
+        gate(admission)?;
+        note_pre_spawn_skip(logs, role, &exhausted);
+        return Err(RoleTickOutcome::RuntimeRejected(RuntimeRejection {
+            role: role.to_string(),
+            runtime: String::new(),
+            source: crate::runtime_admission::RuntimeSource::Preference,
+            unmet_capabilities: vec![],
+            reason: exhausted,
+        }));
+    };
+    log::info!(
+        "role_runner: {role} runtime chosen by the ordered preference list — {marker} source={} \
+         (#8554)",
+        source.as_str()
+    );
+    // `Ok` by construction, so the chosen tap can be put through its OWN
+    // pre-spawn gate in the shape `static_check` reads before being handed
+    // back to the caller to launch.
+    let chosen_admission = Ok(chosen.admitted);
+    gate(Some(&chosen_admission))?;
+    // Past every gate: this tick IS launching, so the metered slot (if the
+    // chosen tap took one) travels back to the caller, which attaches it to
+    // the child it spawns. `?` above returns before this, dropping `backstop`
+    // and releasing the slot, which is exactly what a skipped tick should do.
+    Ok(crate::runtime_preference::DispatchAdmission {
+        admitted: chosen_admission.ok(),
+        backstop,
+    })
+}
+
+/// The pre-#8554 pool gate: is the admitted runtime's OWN credential source
+/// exhausted right now? Never consults the preference list — [`check`] is the
+/// preference-aware wrapper around it.
+///
+/// `pub(crate)` for the same single reason [`check`] was before #8554:
+/// `runtime_preference`'s tests pin **this** verdict against the
+/// side-effect-free availability mapping that shares its reads, which is the
+/// anti-drift guarantee behind "one mapping, two renderings". That comparison
+/// has to run against the gate itself, not the wrapper that consults the
+/// mapping. The role runner remains the only production caller of either.
+pub(crate) fn static_check(
     root: &Path,
     logs: &Path,
     role: &str,
@@ -124,14 +251,23 @@ fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> 
             total: pool.total,
             next_clear_at,
             pool: CredentialPool::ClaudeTokens,
+            // `pool.total > 0` is the guard above, and an unreadable Claude
+            // pool is not a state this gate can observe, so the Claude arm
+            // only ever reports the self-healing hold — the "no pool at all"
+            // case is `RoleTickOutcome::NoTokenPool`, checked before it.
+            hold: PoolHold::SelfHealing,
         });
     }
     None
 }
 
 /// Snapshot of the codex account pool as the gate reads it.
+///
+/// `pub(crate)` since #8436: `runtime_preference::availability` answers the
+/// same question for a tap the ordered resolver is considering, and shares
+/// this read rather than forking the mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CodexPoolState {
+pub(crate) struct CodexPoolState {
     /// Enabled codex accounts in the workspace's inventory.
     pub enabled: usize,
     /// Enabled accounts not under an account-wide hold the selector could not
@@ -142,37 +278,50 @@ pub(super) struct CodexPoolState {
     /// blocked accounts, when any has one.
     pub earliest_clear: Option<u64>,
     /// Set when the inventory or the health state could not be read; the
-    /// selector fails closed on the same read, so the gate does too.
-    pub read_error: Option<String>,
+    /// selector fails closed on the same read, so the gate does too. Names
+    /// WHICH file failed (#8444) — the gate used to blame the inventory even
+    /// when it was `account-health.json` that would not parse.
+    pub read_error: Option<(PoolStateFile, String)>,
 }
 
 /// Read the codex account pool for `root` at `now` (epoch seconds). Pure file
 /// reads — no selection cursor is advanced and no probe is run.
-pub(super) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
+///
+/// `account-health.json` is read and parsed **once** per call (#8444). The
+/// per-account read this replaced re-parsed the file for every enabled
+/// account and left a window in which an account observed early and one
+/// observed late could disagree about the same tick's state.
+pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
     let mut state = CodexPoolState {
         enabled: 0,
         spawnable: 0,
         earliest_clear: None,
         read_error: None,
     };
-    let inventory = match account_inventory(root, AccountProvider::Codex) {
+    // The quiet read (#8444): the loud variant's "registered but its profile
+    // directory was not found" warning fires per unprovisioned registry entry
+    // and this runs on every codex-role tick, so it is the one caller that
+    // must not own that stderr line.
+    let inventory = match account_inventory_quiet(root, AccountProvider::Codex) {
         Ok(inventory) => inventory,
         Err(e) => {
-            state.read_error = Some(format!("{e:#}"));
+            state.read_error = Some((PoolStateFile::Inventory, format!("{e:#}")));
+            return state;
+        }
+    };
+    let health_state = match health_snapshot(root) {
+        Ok(health) => health,
+        Err(e) => {
+            // Count the pool first: `enabled` is what the skip reports as
+            // `0/N`, and the inventory read that produced it did succeed.
+            state.enabled = inventory.iter().filter(|account| account.enabled).count();
+            state.read_error = Some((PoolStateFile::HealthState, format!("{e:#}")));
             return state;
         }
     };
     for account in inventory.iter().filter(|account| account.enabled) {
         state.enabled += 1;
-        let health = match account_health(root, &account.id) {
-            Ok(health) => health,
-            Err(e) => {
-                state.read_error = Some(format!("{e:#}"));
-                state.spawnable = 0;
-                return state;
-            }
-        };
-        let Some(health) = health else {
+        let Some(health) = health_state.get(&account.id) else {
             state.spawnable += 1;
             continue;
         };
@@ -196,9 +345,19 @@ pub(super) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
 }
 
 /// The account provider `spawn-codex.sh` will select from for `admitted`'s
-/// runtime — the same lookup, in the same order, as that script's
+/// runtime — the same manifest lookup, in the same order, as that script's
 /// `_loom_account_provider_for_runtime`: the workspace's installed manifest,
 /// else the one beside the adapter, else (missing file or key) `claude`.
+///
+/// **One deliberate divergence** (#8444): the script parses the manifest with
+/// `jq` and falls open to `claude` when `jq` is not on `PATH`; this reader
+/// parses the JSON natively and so still answers `codex` there. On such a
+/// host the script would select from the *Claude* pool, making a dry codex
+/// pool the wrong wall to gate on. It is left as a known gap rather than
+/// mirrored, because probing `PATH` for `jq` would make this gate — and every
+/// test of it — depend on a tool that is a de-facto prerequisite of the whole
+/// `.loom/scripts/` surface anyway: a host missing `jq` cannot run a Loom
+/// spawn adapter at all, so the divergence is unreachable in practice.
 fn adapter_account_provider(root: &Path, admitted: &ResolvedRuntime) -> String {
     let file = format!("{}.json", admitted.runtime);
     let beside_adapter = admitted
@@ -220,19 +379,32 @@ fn adapter_account_provider(root: &Path, admitted: &ResolvedRuntime) -> String {
         .unwrap_or_else(|| "claude".to_string())
 }
 
+/// Whether the codex account pool is what actually decides this launch — the
+/// two stand-down conditions from the module doc, in one predicate: the
+/// adapter would select from a different account provider, or an explicit
+/// credential pin means it never reaches the selector at all.
+///
+/// Extracted for #8436 so `runtime_preference::availability` asks the exact
+/// same question (with the exact same environment reads and manifest lookup)
+/// that [`codex_gate`] asks, rather than re-deriving a second answer that
+/// could drift from this one.
+pub(crate) fn codex_pool_is_the_wall(root: &Path, admitted: &ResolvedRuntime) -> bool {
+    if adapter_account_provider(root, admitted) != "codex" {
+        return false;
+    }
+    let pinned = CODEX_EXPLICIT_CREDENTIAL_ENV
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+    !pinned
+}
+
 fn codex_gate(
     root: &Path,
     logs: &Path,
     role: &str,
     admitted: &ResolvedRuntime,
 ) -> Option<RoleTickOutcome> {
-    if adapter_account_provider(root, admitted) != "codex" {
-        return None;
-    }
-    let pinned = CODEX_EXPLICIT_CREDENTIAL_ENV
-        .iter()
-        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
-    if pinned {
+    if !codex_pool_is_the_wall(root, admitted) {
         return None;
     }
     let now = chrono::Utc::now();
@@ -248,10 +420,22 @@ fn codex_gate(
         .and_then(|deadline| i64::try_from(deadline).ok())
         .and_then(|deadline| chrono::DateTime::from_timestamp(deadline, 0))
         .map_or(cap, |deadline| deadline.clamp(now, cap));
-    let why = match &state.read_error {
-        Some(error) => format!("the account inventory could not be read: {error}"),
-        None if state.enabled == 0 => "no enabled codex account is provisioned".to_string(),
-        None => "every enabled account is cooling down or needs re-auth".to_string(),
+    // #8444: which of the three states this is decides both the operator
+    // text and — through `hold` — whether the skip is reported as the
+    // self-healing hold `PoolExhausted` documents or as the permanent
+    // misconfiguration the stuck-role path escalates.
+    let (hold, why) = match &state.read_error {
+        Some((file, error)) => (
+            PoolHold::Unreadable(*file),
+            format!("{} could not be read: {error}", file.as_str()),
+        ),
+        None if state.enabled == 0 => {
+            (PoolHold::Unprovisioned, "no enabled codex account is provisioned".to_string())
+        }
+        None => (
+            PoolHold::SelfHealing,
+            "every enabled account is cooling down or needs re-auth".to_string(),
+        ),
     };
     note_pre_spawn_skip(
         logs,
@@ -269,6 +453,7 @@ fn codex_gate(
         total: state.enabled,
         next_clear_at,
         pool: CredentialPool::CodexAccounts,
+        hold,
     })
 }
 

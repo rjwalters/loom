@@ -82,6 +82,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use loom_daemon::activity::transcript_ingest;
 use loom_daemon::daemon_install_state;
 use loom_daemon::daemon_pidfile;
 use loom_daemon::health::{self, HealthInputs, HealthReport};
@@ -373,6 +374,43 @@ async fn collect(window: Duration) -> HealthReport {
         status => Some(status),
     };
 
+    // 9. The transcript-ingest health snapshot (#8477) — one more best-effort
+    //    *local* input: whether the background pass is enabled
+    //    (`autonomous.transcriptIngest`/`LOOM_TRANSCRIPT_INGEST`, resolved
+    //    against the same `LOOM_ROOT` / daemon-reported / cwd repo root
+    //    `resolve_configured_codesign_identity` uses) and whether the
+    //    ledger is keeping up with transcripts actually on disk. Assessed by
+    //    `health::assess_transcript_ingest`, which — unlike
+    //    `limit_calibration` above — always renders a section: ingestion
+    //    being off is the fact this issue exists to surface, not an
+    //    unconfigured optional companion tool.
+    let transcript_ingest_repo_root = std::env::var_os("LOOM_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| {
+            status
+                .as_ref()
+                .and_then(|s| s.per_repo.first().map(|r| r.root.clone()))
+        })
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let transcript_ingest_config =
+        transcript_ingest::read_transcript_ingest_config(&transcript_ingest_repo_root);
+    let transcript_ingest_status =
+        loom_daemon::transcript_tokens::claude_projects_dir().map(|projects_dir| {
+            transcript_ingest::collect_health_status(
+                &limit_calibration::default_activity_db_path(),
+                &projects_dir,
+                &transcript_ingest_config,
+            )
+        });
+
+    // 10. The tmpfs/`shared`-RAM + kernel OOM-kill snapshot (#8572, split from
+    //     #8512) — filesystem-only, no IPC, threaded in exactly like
+    //     `transcript_ingest_status` above. `tmpfs_visibility_section` omits
+    //     the section entirely when nothing was measurable (e.g. macOS), so
+    //     this always collects rather than pre-filtering.
+    let tmpfs_visibility_status = Some(loom_daemon::tmpfs_visibility::collect());
+
     health::assess(&HealthInputs {
         at: chrono::Utc::now(),
         window,
@@ -396,6 +434,55 @@ async fn collect(window: Duration) -> HealthReport {
         codesign_preflight,
         load_per_core,
         limit_calibration,
+        codex_accounts: probe_codex_accounts(),
+        transcript_ingest: transcript_ingest_status,
+        tmpfs_visibility: tmpfs_visibility_status,
+    })
+}
+
+/// This host's Codex account reading (#8407): inventory + health counts, one
+/// read-only availability pass, and the provider-namespaced ranking file's
+/// freshness.
+///
+/// Filesystem-only and read-only, like every other input this collector
+/// gathers — `CheckOptions::default()` writes no ranking file and records no
+/// health state, so rendering the health report can never change what the
+/// next dispatch selects. `None` on any host with no resolvable workspace or
+/// an unreadable registry: an optional signal's absence never becomes a
+/// non-green line (the same rule `codesign_preflight` follows).
+fn probe_codex_accounts() -> Option<health::codex_accounts::CodexAccountsSnapshot> {
+    use loom_daemon::tokens_pool::{codex_check, provider_capacity_at, AccountProvider};
+
+    let workspace = super::tokens::resolve_tokens_workspace(".").ok()?;
+    let inventory =
+        loom_daemon::tokens_pool::account_inventory(&workspace, AccountProvider::Codex).ok()?;
+    if inventory.is_empty() {
+        return None;
+    }
+    let now = chrono::Utc::now();
+    let capacity = provider_capacity_at(
+        &workspace,
+        AccountProvider::Codex,
+        &inventory,
+        u64::try_from(now.timestamp()).unwrap_or(0),
+    )
+    .ok()?;
+    let statuses = codex_check::run_check(&workspace, codex_check::CheckOptions::default(), now)
+        .map(|(report, _)| {
+            let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+            for account in &report.accounts {
+                *counts.entry(account.status.clone()).or_insert(0) += 1;
+            }
+            counts
+        })
+        .unwrap_or_default();
+    let (ranking_present, ranking_age_secs) = codex_check::ranking_file_state(&workspace);
+    Some(health::codex_accounts::CodexAccountsSnapshot {
+        workspace,
+        capacity,
+        statuses,
+        ranking_present,
+        ranking_age_secs,
     })
 }
 
@@ -911,6 +998,21 @@ mod tests {
     /// Neither env nor a resolvable config with the key set -> `None`, the
     /// same "nothing configured" outcome `sign_daemon_binary` treats as
     /// "use ad-hoc signing" -- never a false positive finding.
+    ///
+    /// `LOOM_ROOT` alone does not fully sandbox
+    /// `resolve_configured_codesign_identity`: `resolve_effective_config`
+    /// also merges in a machine-level "private/shared defaults" tier
+    /// (`config_resolver::private_defaults_path`, normally
+    /// `~/.local/share/loom/config/defaults.json`) that is deliberately
+    /// *independent* of `repo_root` — it is meant to apply fleet-wide
+    /// regardless of which repo is being resolved. On a host that has
+    /// provisioned that file with a `codesign.identity` (the documented
+    /// "one file, fleet-wide" setup), this test's empty `LOOM_ROOT` tempdir
+    /// still resolves to that real identity instead of `None` (issue #8463).
+    /// Disable the tier for the duration of this test the same way
+    /// production does — `LOOM_CONFIG_DEFAULTS_FILE` set to an empty string
+    /// (see `config_resolver::private_defaults_path`'s doc comment) — rather
+    /// than relying on the host happening not to have one provisioned.
     #[test]
     #[serial_test::serial(codesign_identity_env)]
     fn resolve_configured_codesign_identity_is_none_when_unconfigured() {
@@ -918,8 +1020,10 @@ mod tests {
 
         std::env::remove_var("LOOM_CODESIGN_IDENTITY");
         std::env::set_var("LOOM_ROOT", tmp.path());
+        std::env::set_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let resolved = resolve_configured_codesign_identity(None);
         std::env::remove_var("LOOM_ROOT");
+        std::env::remove_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV);
 
         assert_eq!(resolved, None);
     }

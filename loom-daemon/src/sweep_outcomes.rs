@@ -201,6 +201,103 @@ pub struct OutcomeRecord {
     /// Token account name selected by `spawn-claude.sh` for this run, or
     /// `"unknown"` when never surfaced (mirrors `SweepInfo::token_name`).
     pub token_name: String,
+    /// Secret-free credential attribution for a **native harness** spawn
+    /// (Issue #8447): where its credential came from (`pool`/`env`/`none`),
+    /// and — for a pool-sourced one — the API-key pool's provider namespace
+    /// plus the selected account's NAME. Never key material: it is read off
+    /// the child's own `# LOOM_LAUNCH` record, which carries names only (see
+    /// [`crate::launch_record`]).
+    ///
+    /// The API-key-pool counterpart of [`Self::token_name`], kept a separate
+    /// field rather than folded into it because the two describe different
+    /// pools with different identities — a Claude OAuth account name and a
+    /// `(provider, account)` pair — and a single column would make
+    /// per-account attribution ambiguous the moment both pools are in use on
+    /// one host.
+    ///
+    /// `None` for a Claude/legacy-adapter spawn (no launch record), for a
+    /// sweep whose log is gone, and for every journal line written before
+    /// this field existed — `#[serde(default)]` keeps those parsing, which
+    /// matters because [`read_all`] silently drops any line that fails to
+    /// deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<crate::launch_record::CredentialAttribution>,
+    /// Shadow-mode Jev (TypeSafe) complexity classification, sampled from the
+    /// sweep's checkpoint at Builder dispatch (issue #8543) — a calibrated
+    /// second opinion beside the Curator's own `<!-- loom:complexity=<tier>
+    /// -->` marker, never a routing input itself. One of `mechanical` /
+    /// `routine` / `complex`. `None` when `TYPESAFE_API_KEY` was unset for
+    /// this sweep (the common case today — a keyless dispatch is
+    /// byte-identical to one from before #8543) or when the Jev call failed;
+    /// either way a missing key here never blocks the sweep.
+    /// `#[serde(default)]` so a journal line written before this field
+    /// existed still parses — see [`Self::crash_classification`]'s doc for
+    /// why every reader here needs that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jev_tier: Option<String>,
+    /// Jev's confidence in [`Self::jev_tier`] (0.0-1.0), paired with it and
+    /// under the same `None` conditions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jev_confidence: Option<f64>,
+    /// Tap-attributed usage accounting for a **native harness** spawn (Issue
+    /// #8556): the `(runtime, credential source)` tap this sweep ran on, plus
+    /// whatever its native event stream reported consuming.
+    ///
+    /// The prerequisite #8556 names for *any* fleet-wide metered spend ceiling:
+    /// a metered API key is one credential shared across every host, so "how
+    /// much went to the metered backstop vs. the subscriptions" must be a query
+    /// over a key that names the credential — see [`crate::tap_usage`] and
+    /// `docs/adr/0020-fleet-metered-spend-ceiling.md`.
+    ///
+    /// Strictly a **superset** of [`Self::credential`], not a replacement: that
+    /// field's readers (#8447) keep their exact shape, and both are resolved
+    /// from the same single log read so the two can never disagree.
+    ///
+    /// Counters inside are individually optional — a missing counter means
+    /// unmeasured, never zero — and the cost figure is the harness's own
+    /// estimate, never a measured charge. `None` for a Claude/legacy-adapter
+    /// spawn (no launch record), a sweep whose log is gone, and every journal
+    /// line written before this field existed; `#[serde(default)]` keeps those
+    /// parsing, which matters because [`read_all`] silently drops any line that
+    /// fails to deserialize.
+    ///
+    /// Since Issue #8659 this is the region's last launch's tap carrying **that
+    /// tap's whole share of the region**, not just its final block — see
+    /// [`crate::tap_usage::account_region_by_tap`] and [`Self::tap_usage_all`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_usage: Option<crate::tap_usage::TapAccounting>,
+    /// Every tap in this sweep's log region, folded to one row per tap
+    /// (Issue #8659) — populated **only** when the region was genuinely
+    /// multi-tap, and empty otherwise.
+    ///
+    /// One anchored region can hold several `# LOOM_LAUNCH` records (a
+    /// re-dispatch, a containment re-exec, an orchestrated sweep whose phases
+    /// pin their own runtime via `runtimes.rolePreference` /
+    /// `LOOM_RUNTIME_<ROLE>`). #8633 stopped charging all of them to the
+    /// region's last tap; what it could not do from a one-row field was record
+    /// the earlier launches at all. So:
+    ///
+    /// - **one tap in the region** (every single-record region, plus the
+    ///   re-dispatch/re-exec shape that re-announces the same tap) —
+    ///   [`Self::tap_usage`] already holds the whole region's usage and this
+    ///   stays empty, keeping the line byte-identical to a pre-#8659 one;
+    /// - **two or more taps** — every tap's folded row lands here, ordered with
+    ///   `tap_usage`'s own row first, so a spend reader sees the region's full
+    ///   spend instead of just the launch its outcome belongs to.
+    ///
+    /// Deliberately never a merge of unlike taps into one row: a metered builder
+    /// followed by a subscription-pinned judge must not report as either one,
+    /// which is the #8633 error restated. The paired `sweep.outcome` telemetry
+    /// record keeps exactly one tap (its `config` is a flat string map and
+    /// `--group-by tap` is one-record-one-bucket); it stamps
+    /// `config["tap_region_keys"]` when this field is populated, so a
+    /// telemetry-only reader can tell that the per-tap breakdown lives here.
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if` so every pre-#8659 line still
+    /// parses and no single-tap line grows a key — [`read_all`] silently drops
+    /// any line that fails to deserialize.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tap_usage_all: Vec<crate::tap_usage::TapAccounting>,
     /// Elapsed wall-clock seconds from dispatch to this terminal outcome.
     pub duration_sec: i64,
 }
@@ -625,6 +722,11 @@ mod tests {
             death_class: Some("preflight-token-selection-failed".to_string()),
             crash_classification: None,
             token_name: "agent-1".to_string(),
+            credential: None,
+            jev_tier: None,
+            jev_confidence: None,
+            tap_usage: None,
+            tap_usage_all: Vec::new(),
             duration_sec: 1,
         }
     }
@@ -677,6 +779,39 @@ mod tests {
             Some("account-exhausted:model-credits-exhausted")
         );
         assert_ne!(records[0].crash_classification, records[1].crash_classification);
+    }
+
+    /// Issue #8543: `jev_tier`/`jev_confidence` round-trip through the
+    /// journal, and are omitted (not written as `null`) when absent — the
+    /// keyless-dispatch byte-identity requirement from the issue's AC.
+    #[test]
+    fn jev_tier_and_confidence_round_trip_and_are_omitted_when_absent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sweep-outcomes.jsonl");
+
+        let mut with_jev = record(1, "exited");
+        with_jev.jev_tier = Some("routine".to_string());
+        with_jev.jev_confidence = Some(0.62);
+        let without_jev = record(2, "exited");
+
+        append_outcome(&path, &with_jev).unwrap();
+        append_outcome(&path, &without_jev).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert!(lines[0].contains("\"jev_tier\":\"routine\""));
+        assert!(lines[0].contains("\"jev_confidence\":0.62"));
+        assert!(
+            !lines[1].contains("jev_tier"),
+            "a record with no Jev classification must omit the key, not emit null: {}",
+            lines[1]
+        );
+
+        let records = read_all(&path);
+        assert_eq!(records[0].jev_tier.as_deref(), Some("routine"));
+        assert!((records[0].jev_confidence.unwrap() - 0.62).abs() < 1e-12);
+        assert_eq!(records[1].jev_tier, None);
+        assert_eq!(records[1].jev_confidence, None);
     }
 
     /// Issue #5697: a journal line written before `crash_classification`
@@ -817,6 +952,9 @@ mod tests {
                 models_used: None,
                 doctor_cycles: None,
                 judge_verdicts: None,
+                runtime: None,
+                provider: None,
+                profile: None,
             }),
         )
     }
@@ -1019,6 +1157,9 @@ mod tests {
                 effort: None,
                 detail: None,
                 gated_pool: None,
+                runtime: None,
+                provider: None,
+                profile: None,
                 tokens_by_model: None,
                 models_used: None,
                 actions: None,

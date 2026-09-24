@@ -1451,54 +1451,19 @@ pub mod forge {
                 .registry
                 .lock()
                 .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
-            // Autonomous dispatch model (issue #3944): resolve an EXPLICIT
-            // non-premium model (`autonomous.model` config > shipped default) so
-            // the epic child never inherits the operator's interactive CLI
-            // default. No per-dispatch override tier here.
-            //
-            // Issue #4809: this ALSO inserts the model-cost A/B experiment's
-            // forced arm model when the workspace resolves to `experiment` mode
-            // (CANARY-gated) — see `work_finder::dispatch` for the full
-            // rationale; `off`/`observe` modes are unaffected.
-            //
-            // Issue #4827: unlike the work finder, the epic supervisor has no
-            // cached issue body to read the `<!-- loom:complexity=... -->`
-            // stratum from, so it fetches one — but LAZILY, inside
-            // `resolve_autonomous_dispatch_model_lazy`'s `experiment` branch,
-            // so `off`/`observe` dispatch still makes zero extra `gh` calls.
-            // A failed fetch resolves to `None` (the unchanged `routine`
-            // stratum) and never fails the dispatch.
-            let repo_root = reg.config().workspace_root.clone();
-            let gh_bin = reg
-                .config()
-                .gh_bin
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("gh"));
-            let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model_lazy(
-                &repo_root,
-                child,
-                || crate::sweep_registry::fetch_issue_complexity(&gh_bin, &repo_root, child),
-            );
-            match resolved.arm {
-                Some(arm) => log::info!(
-                    "epic_supervisor: dispatching child #{child} for epic #{_epic} with \
-                     arm={arm} model={} (source={})",
-                    resolved.model,
-                    resolved.source_label
-                ),
-                None => log::info!(
-                    "epic_supervisor: dispatching child #{child} for epic #{_epic} with \
-                     model={} (source={})",
-                    resolved.model,
-                    resolved.source_label
-                ),
-            }
-            let model = resolved.model;
+            // Request-time model resolution follows the admitted runtime;
+            // issue complexity is fetched only for an eligible experiment.
             // Idempotency key + the registry's claim lock make a re-dispatch of
             // an already-running child a no-op.
             let key = format!("epic-child-{child}");
-            reg.dispatch(&SweepKind::Issue(child), Some(key), Some(&model), None, None)
-                .map(|_| ())
+            reg.dispatch_with_model(
+                &SweepKind::Issue(child),
+                Some(key),
+                crate::sweep_registry::DispatchModel::Request(None),
+                None,
+                None,
+            )
+            .map(|_| ())
         }
     }
 

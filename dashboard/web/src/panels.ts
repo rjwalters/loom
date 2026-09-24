@@ -26,7 +26,7 @@
 
 import { el } from "./dom";
 import { isAuthenticatedViewer } from "./api";
-import { HistoricalChartsPanel } from "./historicalChartsPanel";
+import { DEFAULT_WINDOW_DAYS, HistoricalChartsPanel } from "./historicalChartsPanel";
 import { LiveFeedPanel } from "./liveFeedPanel";
 import { SpendPanel } from "./spendPanel";
 import { currentSurface } from "./analytics/bootstrap";
@@ -91,7 +91,11 @@ function mountCharts(root: HTMLElement): PanelTeardown {
   root.replaceChildren(
     section(
       "Historical charts",
-      el("p", { class: "panel-route__note" }, "Sweep outcomes, success rate and duration percentiles over time."),
+      el(
+        "p",
+        { class: "panel-route__note" },
+        `Sweep outcomes, success rate and duration percentiles over the last ${DEFAULT_WINDOW_DAYS} days.`,
+      ),
       outcomes,
       successRate,
       durations,
@@ -106,7 +110,7 @@ function mountCharts(root: HTMLElement): PanelTeardown {
   });
   panel.refresh().catch((error: unknown) => renderMountError(outcomes, error));
 
-  return () => {};
+  return () => panel.dispose();
 }
 
 function mountTokens(root: HTMLElement): PanelTeardown {

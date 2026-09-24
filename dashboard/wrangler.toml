@@ -146,6 +146,15 @@ MAX_RECORDS = "500000"
 #
 # DISPLAY_TIMEZONE = "America/Los_Angeles"
 
+# Expected host roster (issue #8792): host IDs, separated by commas and/or
+# whitespace. A listed host with no health record renders as MISSING (enrolled,
+# never reported) or UNPROVISIONED (no active ingest key) instead of silently
+# dropping out of the fleet count. Unset — the default here — disables the
+# check. Keep your real list in your own infra repo and pass it at deploy time
+# (`wrangler deploy --var EXPECTED_HOSTS:...`); see docs/deploy-runbook.md.
+#
+# EXPECTED_HOSTS = "host-a,host-b"
+
 # CHANGE ME (both, together) — required only if you want the single-URL
 # fallback layout (docs/cloudflare-access.md): anonymous visitors to `/` see
 # the public view, a `2amlogic.com`-style Access identity sees the full

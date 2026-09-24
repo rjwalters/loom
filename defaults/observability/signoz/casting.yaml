@@ -1,0 +1,180 @@
+# Render with Foundry v0.2.17; generated output and lock are committed alongside.
+apiVersion: v1alpha1
+kind: Installation
+metadata:
+  name: loom-signoz
+spec:
+  deployment:
+    flavor: compose
+    mode: docker
+  signoz:
+    spec:
+      version: v0.142.1
+      image: signoz/signoz:v0.142.1@sha256:49501b04d77a1e8328d31519c977dd4503b724c74425764a3ab83768db3ee8ff
+      env:
+        SIGNOZ_ANALYTICS_ENABLED: "false"
+        SIGNOZ_TOKENIZER_JWT_SECRET: "${SIGNOZ_TOKENIZER_JWT_SECRET:?set a private random session-signing secret}"
+        # SigNoz escapes literal underscores in configuration keys with "__".
+        SIGNOZ_PROMETHEUS_ACTIVE__QUERY__TRACKER_PATH: /tmp/signoz-active-queries
+  ingester:
+    spec:
+      version: v0.144.10
+      image: signoz/signoz-otel-collector:v0.144.10@sha256:34ecb436b687cc23bef5f706904cdf005998ca4ebe543653a634055a9fe204f6
+      config:
+        data:
+          opamp.yaml: |
+            server_endpoint: ws://loom-signoz-signoz-0:4320/v1/opamp
+  telemetrystore:
+    kind: clickhouse
+    spec:
+      version: 25.12.5
+      image: clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a
+  telemetrykeeper:
+    kind: clickhousekeeper
+    spec:
+      version: 25.12.5
+      image: clickhouse/clickhouse-keeper:25.12.5@sha256:525b8b0f93ccb371131c46f22a066ea43d33d74aba314203e8044609945d8524
+  metastore:
+    kind: postgres
+    spec:
+      version: "16"
+      image: postgres:16@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6
+      env:
+        POSTGRES_PASSWORD: "${SIGNOZ_POSTGRES_PASSWORD:?set a private database password}"
+  patches:
+    - target: deployment/compose.yaml
+      operations:
+        # Foundry URL-escapes userinfo, including Compose placeholders. Keep the
+        # password external and assert the pinned render before replacing it.
+        - op: test
+          path: /services/loom-signoz-signoz-0/environment/2
+          value: "SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:$%7BSIGNOZ_POSTGRES_PASSWORD%3A%3Fset%20a%20private%20database%20password%7D@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable"
+        - op: replace
+          path: /services/loom-signoz-signoz-0/environment/2
+          value: "SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:${SIGNOZ_POSTGRES_PASSWORD:?set a private database password}@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable"
+        - op: add
+          path: /networks/loom-observability
+          value:
+            external: true
+            name: loom-observability
+        - op: remove
+          path: /services/ingester/ports
+        - op: add
+          path: /services/ingester/networks/loom-observability
+          value:
+            aliases: [signoz-otel-collector]
+        - op: replace
+          path: /services/loom-signoz-signoz-0/ports
+          value: ["127.0.0.1:18081:8080"]
+        - op: add
+          path: /services/ingester/mem_limit
+          value: 512m
+        - op: add
+          path: /services/ingester/cpus
+          value: 1.0
+        - op: add
+          path: /services/loom-signoz-signoz-0/mem_limit
+          value: 768m
+        - op: add
+          path: /services/loom-signoz-signoz-0/cpus
+          value: 1.0
+        - op: add
+          path: /services/loom-signoz-metastore-postgres-0/mem_limit
+          value: 256m
+        - op: add
+          path: /services/loom-signoz-metastore-postgres-0/cpus
+          value: 0.5
+        - op: add
+          path: /services/loom-signoz-telemetrykeeper-clickhousekeeper-0/mem_limit
+          value: 256m
+        - op: add
+          path: /services/loom-signoz-telemetrykeeper-clickhousekeeper-0/cpus
+          value: 0.5
+        - op: add
+          path: /services/loom-signoz-telemetrystore-clickhouse-0-0/mem_limit
+          value: 2g
+        - op: add
+          path: /services/loom-signoz-telemetrystore-clickhouse-0-0/cpus
+          value: 2.0
+        - op: add
+          path: /services/loom-signoz-telemetrystore-clickhouse-user-scripts/mem_limit
+          value: 256m
+        - op: add
+          path: /services/loom-signoz-telemetrystore-migrator/mem_limit
+          value: 512m
+        - op: add
+          path: /services/loom-signoz-telemetrystore-migrator/depends_on
+          value:
+            loom-signoz-telemetrystore-clickhouse-0-0:
+              condition: service_healthy
+        - op: add
+          path: /services/ingester/depends_on
+          value:
+            loom-signoz-telemetrystore-migrator:
+              condition: service_completed_successfully
+            loom-signoz-signoz-0:
+              condition: service_healthy
+              restart: true
+        - op: add
+          path: /services/loom-signoz-signoz-0/depends_on
+          value:
+            loom-signoz-metastore-postgres-0:
+              condition: service_healthy
+            loom-signoz-telemetrystore-migrator:
+              condition: service_completed_successfully
+        - op: replace
+          path: /services/loom-signoz-signoz-0/healthcheck/start_period
+          value: 900s
+        - op: replace
+          path: /services/loom-signoz-signoz-0/healthcheck/timeout
+          value: 30s
+        - op: replace
+          path: /services/loom-signoz-telemetrykeeper-clickhousekeeper-0/healthcheck/start_period
+          value: 300s
+        - op: replace
+          path: /services/loom-signoz-telemetrykeeper-clickhousekeeper-0/healthcheck/timeout
+          value: 30s
+        - op: replace
+          path: /services/loom-signoz-telemetrystore-clickhouse-0-0/healthcheck/start_period
+          value: 600s
+        - op: replace
+          path: /services/loom-signoz-telemetrystore-clickhouse-0-0/healthcheck/timeout
+          value: 30s
+        - op: add
+          path: /services/ingester/logging
+          value: &bounded_logs
+            driver: json-file
+            options: {max-size: 10m, max-file: "3"}
+        - op: add
+          path: /services/loom-signoz-signoz-0/logging
+          value: *bounded_logs
+        - op: add
+          path: /services/loom-signoz-metastore-postgres-0/logging
+          value: *bounded_logs
+        - op: add
+          path: /services/loom-signoz-telemetrykeeper-clickhousekeeper-0/logging
+          value: *bounded_logs
+        - op: add
+          path: /services/loom-signoz-telemetrystore-clickhouse-0-0/logging
+          value: *bounded_logs
+        - op: add
+          path: /services/loom-signoz-telemetrystore-clickhouse-user-scripts/logging
+          value: *bounded_logs
+        - op: add
+          path: /services/loom-signoz-telemetrystore-migrator/logging
+          value: *bounded_logs
+        - op: replace
+          path: /services/loom-signoz-telemetrystore-clickhouse-user-scripts/command/2
+          value: |-
+            set -eu
+            node_arch=$$(uname -m)
+            case "$${node_arch}" in
+              aarch64|arm64) node_arch=arm64; expected=e5605ebffa82a450ebbcdf6cf19dad546e1e40d52dbf3e03cfd2d2d5b7394211 ;;
+              x86_64|amd64) node_arch=amd64; expected=33997073eb6d82b7be4f27f9fc8ec9e28a395e0f20674d5d54bb2fa28a75488d ;;
+              *) echo "Unsupported histogram helper architecture" >&2; exit 1 ;;
+            esac
+            cd /tmp
+            wget -O histogram-quantile.tar.gz "https://github.com/SigNoz/signoz/releases/download/histogram-quantile%2Fv0.0.1/histogram-quantile_linux_$${node_arch}.tar.gz"
+            printf '%s  histogram-quantile.tar.gz\n' "$${expected}" | sha256sum --check --strict
+            tar -xzf histogram-quantile.tar.gz
+            mv histogram-quantile /var/lib/clickhouse/user_scripts/histogramQuantile

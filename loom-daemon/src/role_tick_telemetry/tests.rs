@@ -172,9 +172,12 @@ fn scan_transcripts_folds_tokens_and_actions_in_one_pass() {
     fs::write(&path, text).unwrap();
 
     let scan = scan_transcripts(&[path]).expect("a readable transcript yields a scan");
-    assert_eq!(scan.actions.issues_labeled, 1);
-    assert_eq!(scan.actions.comments_posted, 1);
-    assert_eq!(scan.actions.prs_merged, 0);
+    let actions = scan
+        .actions
+        .expect("a read transcript always yields measured actions");
+    assert_eq!(actions.issues_labeled, 1);
+    assert_eq!(actions.comments_posted, 1);
+    assert_eq!(actions.prs_merged, 0);
     let models: Vec<&str> = scan
         .tokens_by_model
         .iter()
@@ -203,7 +206,11 @@ fn scan_transcripts_distinguishes_observed_zero_from_unobserved() {
     // A real session that did nothing forge-mutating and reported no usage.
     fs::write(&path, role_head("guide")).unwrap();
     let scan = scan_transcripts(&[path]).expect("a readable transcript is an observation");
-    assert_eq!(scan.actions, RoleTickActions::default());
+    assert_eq!(
+        scan.actions,
+        Some(RoleTickActions::default()),
+        "a transcript WAS read, so a zero count is an observation, not an absence"
+    );
     assert!(scan.tokens_by_model.is_empty());
 }
 
@@ -218,11 +225,11 @@ fn build_record_carries_every_observed_field() {
             totals("claude-opus-5", 1, 2),
             totals("claude-sonnet-5", 3, 4),
         ],
-        actions: RoleTickActions {
+        actions: Some(RoleTickActions {
             issues_labeled: 2,
             prs_merged: 1,
             comments_posted: 3,
-        },
+        }),
     };
     let record = build_record(
         &tick(RoleTickResult::Success),
@@ -273,7 +280,10 @@ fn build_record_keeps_an_observed_zero_action_count() {
         &tick(RoleTickResult::Success),
         "rjwalters/loom".to_string(),
         RepoVisibility::Private,
-        Some(TranscriptScan::default()),
+        Some(TranscriptScan {
+            actions: Some(RoleTickActions::default()),
+            ..TranscriptScan::default()
+        }),
     );
     // Observed-and-empty: the actions object is present with zeros, and the
     // token list — genuinely empty — is still omitted (it follows
@@ -284,6 +294,37 @@ fn build_record_keeps_an_observed_zero_action_count() {
     assert_eq!(json["actions"]["issues_labeled"], 0);
 }
 
+/// Issue #8507: a source that measures tokens **without** a transcript — the
+/// OpenCode session-store shape — carries `actions: None`, and that absence
+/// must reach the record as an ABSENT key. A zeroed `RoleTickActions` here
+/// would be indistinguishable from a genuinely quiet Claude tick, i.e. exactly
+/// the "synthesize the absent from the present-zero" that `RoleTickActions`'s
+/// own doc comment forbids.
+#[test]
+fn build_record_omits_actions_for_a_token_only_scan_with_no_transcript() {
+    let record = build_record(
+        &tick(RoleTickResult::Success),
+        "rjwalters/loom".to_string(),
+        RepoVisibility::Private,
+        Some(TranscriptScan {
+            tokens_by_model: vec![totals("glm-5.3", 11, 22)],
+            actions: None,
+        }),
+    );
+    // Tokens WERE measured, so they are present …
+    assert_eq!(record.tokens_by_model.as_ref().map(Vec::len), Some(1));
+    assert_eq!(record.models_used, Some(vec!["glm-5.3".to_string()]));
+    // … while `actions` was never measured, so it is absent, not zeroed.
+    assert_eq!(record.actions, None);
+    let json = serde_json::to_value(&record).unwrap();
+    assert!(
+        json.get("actions").is_none(),
+        "an unmeasured actions must be an ABSENT key — a present zero would read \
+         as a genuine 'this tick labeled/merged/commented nothing'"
+    );
+    assert!(json.get("tokens_by_model").is_some());
+}
+
 /// Issue #8056 test plan: a tick that skipped before spawning must report the
 /// right `result` and must NOT fabricate token counts — even if a stale
 /// transcript for the same role happens to sit inside the slack window.
@@ -291,11 +332,11 @@ fn build_record_keeps_an_observed_zero_action_count() {
 fn build_record_never_fabricates_tokens_for_a_pre_spawn_skip() {
     let poisoned = TranscriptScan {
         tokens_by_model: vec![totals("claude-sonnet-5", 999, 999)],
-        actions: RoleTickActions {
+        actions: Some(RoleTickActions {
             issues_labeled: 9,
             prs_merged: 9,
             comments_posted: 9,
-        },
+        }),
     };
     for result in [
         RoleTickResult::SkippedNoTokenPool,
@@ -329,7 +370,7 @@ fn build_record_attributes_a_load_skipped_tick_which_did_spawn() {
         RepoVisibility::Private,
         Some(TranscriptScan {
             tokens_by_model: vec![totals("claude-sonnet-5", 7, 8)],
-            actions: RoleTickActions::default(),
+            actions: Some(RoleTickActions::default()),
         }),
     );
     assert_eq!(record.models_used, Some(vec!["claude-sonnet-5".to_string()]));
@@ -458,6 +499,7 @@ fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
             total: 4,
             next_clear_at: at(9_000),
             pool: crate::role_runner::CredentialPool::ClaudeTokens,
+            hold: crate::role_runner::PoolHold::SelfHealing,
         },
         None,
     );
@@ -482,6 +524,169 @@ fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
     assert_eq!(r.actions, None);
 }
 
+// ------------------------------------------------------------------------
+// Runtime/provider/profile attribution + the OpenCode `tokens_by_model`
+// dispatch seam (Issue #8507)
+// ------------------------------------------------------------------------
+
+/// The `# LOOM_LAUNCH` record a native spawn's own log carries, verbatim in
+/// shape (see `worker_spawn::run`).
+fn launch_line(runtime: &str, provider: &str, profile: &str) -> String {
+    format!(
+        "# LOOM_LAUNCH {}\n",
+        serde_json::json!({
+            "schema": 1,
+            "runtime": runtime,
+            "provider": provider,
+            "model": "zai-org/GLM-5.3",
+            "profile": profile,
+        })
+    )
+}
+
+/// Write `<root>/.loom/logs/role-<role>.log` with `body` — the file
+/// `resolve_runtime_attribution` reads back.
+fn write_role_log(root: &Path, role: &str, body: &str) {
+    let logs_dir = root.join(".loom").join("logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    fs::write(crate::role_runner::role_log_path(&logs_dir, role), body).unwrap();
+}
+
+#[test]
+#[serial_test::serial]
+fn a_successful_tick_carries_runtime_provider_and_profile_from_its_own_log() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    write_role_log(&root, "judge", &launch_line("pi", "zai-coding-plan", "zai-flash"));
+
+    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    emit_for_tick(
+        &root,
+        "judge",
+        Utc::now(),
+        &RoleTickOutcome::Success,
+        Some(("claude-sonnet-5".to_string(), "high".to_string())),
+    );
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].runtime.as_deref(), Some("pi"));
+    assert_eq!(records[0].provider.as_deref(), Some("zai-coding-plan"));
+    assert_eq!(records[0].profile.as_deref(), Some("zai-flash"));
+}
+
+#[test]
+#[serial_test::serial]
+fn a_tick_with_no_launch_record_leaves_runtime_provider_profile_absent() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    // No role log at all — mirrors a Claude-runtime tick, which writes none.
+
+    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    emit_for_tick(&root, "judge", Utc::now(), &RoleTickOutcome::Success, None);
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].runtime, None);
+    assert_eq!(records[0].provider, None);
+    assert_eq!(records[0].profile, None);
+}
+
+/// A pre-spawn skip must never resolve a runtime attribution even if a
+/// PREVIOUS tick's launch record still sits in the role log — mirroring the
+/// module's own never-borrow-a-neighbour's-transcript contract for tokens.
+#[test]
+#[serial_test::serial]
+fn a_pre_spawn_skip_never_borrows_a_previous_ticks_runtime_attribution() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    write_role_log(&root, "champion", &launch_line("opencode", "friendli", "glm-flash"));
+
+    let journal = stage_tick_env(dir.path(), &root, "champion", &role_head("champion"));
+    emit_for_tick(&root, "champion", Utc::now(), &RoleTickOutcome::NoTokenPool, None);
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].runtime, None, "a skip never spawned, so it has nothing to attribute");
+}
+
+/// AC: an `opencode`-runtime tick's `tokens_by_model` comes from the
+/// OpenCode session-store database, filtered by this workspace's directory
+/// and the tick's own window — not from (in this test, absent) Claude
+/// transcripts.
+#[test]
+#[serial_test::serial]
+fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    write_role_log(&root, "judge", &launch_line("opencode", "friendli", "glm-flash"));
+
+    let db_dir = tempdir().unwrap();
+    let db_path = db_dir.path().join("opencode.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                 model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+                 tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+                 tokens_cache_write INTEGER, directory TEXT, time_created INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES (?1, 500, 40, 0, 10, 2, ?2, ?3)",
+            rusqlite::params![
+                serde_json::json!({"id": "zai-org/GLM-5.3", "providerID": "friendli"}).to_string(),
+                root.to_string_lossy().into_owned(),
+                Utc::now().timestamp_millis(),
+            ],
+        )
+        .unwrap();
+    }
+    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db_path);
+
+    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    emit_for_tick(
+        &root,
+        "judge",
+        Utc::now() - chrono::Duration::seconds(30),
+        &RoleTickOutcome::Success,
+        Some(("zai-org/GLM-5.3".to_string(), String::new())),
+    );
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].runtime.as_deref(), Some("opencode"));
+    let rows = records[0]
+        .tokens_by_model
+        .as_ref()
+        .expect("opencode session attributed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].model, "zai-org/GLM-5.3");
+    assert_eq!(rows[0].input, 500);
+    assert_eq!(rows[0].output, 40);
+    // #8507: the session DB answers tokens but holds no transcript, so
+    // `actions` is UNMEASURED and must be absent. A present
+    // `{issues_labeled: 0, prs_merged: 0, comments_posted: 0}` here would make
+    // this trial's role ticks read as a genuine "did nothing to the forge" —
+    // the exact conflation `RoleTickActions`'s doc comment forbids.
+    assert_eq!(records[0].actions, None);
+    let json = serde_json::to_value(&records[0]).unwrap();
+    assert!(
+        json.get("actions").is_none(),
+        "an opencode tick must omit the actions key, not serialize a zeroed tally"
+    );
+}
+
 #[test]
 fn classify_maps_every_outcome_variant_to_its_own_result() {
     use crate::role_runner::ModelRuntimeMismatch;
@@ -496,6 +701,7 @@ fn classify_maps_every_outcome_variant_to_its_own_result() {
                 total: 2,
                 next_clear_at: at(10),
                 pool: crate::role_runner::CredentialPool::ClaudeTokens,
+                hold: crate::role_runner::PoolHold::SelfHealing,
             },
             RoleTickResult::SkippedPoolExhausted,
         ),
@@ -547,6 +753,7 @@ fn a_pool_skip_record_names_the_pool_that_gated_it() {
         total: 4,
         next_clear_at: at(900),
         pool: crate::role_runner::CredentialPool::CodexAccounts,
+        hold: crate::role_runner::PoolHold::SelfHealing,
     };
     let (result, detail) = classify(&codex);
     assert_eq!(result, RoleTickResult::SkippedPoolExhausted);

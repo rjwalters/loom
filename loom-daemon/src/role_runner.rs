@@ -530,6 +530,32 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
         default_interval_secs: 3600,
         interval_default: false,
     },
+    RoleSpec {
+        // The operator-agent persona (Issue #7947, Phase 3b of #4196).
+        //
+        // `interval_default: false` for a *stronger* reason than architect's.
+        // Architect is merely expensive to run everywhere; this role is an
+        // inbound control channel — it reads human prose out of a chat room and
+        // steers the daemon with it. A role like that must never arrive because
+        // a repo failed to pin `roles`, so it is excluded from the
+        // "unset `roles` ⇒ all defaults" fallback like architect, AND gated a
+        // second time on its own config resolving (see `role_is_config_gated`):
+        // naming it in `roles` is not enough, `safehouse.concierge` must also
+        // name at least one allowed sender. Two independent opt-ins, because
+        // one of them is a chat room.
+        //
+        // The 300s cadence is a *listening* cadence, not a work cadence: each
+        // tick is a short `concierge listen` window. Its cost bound is NOT
+        // carried in the prompt the way `architectMaxProposals` is — a daily
+        // turn budget spans sessions, so it lives in the ledger
+        // (`concierge::budget`) that `concierge budget --begin-turn` consults
+        // at the top of every session. See that module's doc for why a prompt
+        // cannot hold this particular number.
+        name: crate::concierge::CONCIERGE_ROLE,
+        prompt: "/loom:concierge",
+        default_interval_secs: 300,
+        interval_default: false,
+    },
 ];
 
 /// A stable, content-derived identifier for the running binary's
@@ -746,28 +772,20 @@ pub fn record_role_tick_at(
         RoleTickOutcome::NoTokenPool => (false, Some("no-token-pool".to_string())),
         // #7607: recorded as NOT ok, same as `NoTokenPool` — a role that
         // cannot run at all is exactly what a health check must surface —
-        // but the `RoleTickRecord::pool_exhausted` flag set below routes it
-        // into `crate::health::RoleTickSummary::pool_exhausted` instead of
-        // `persistent`, so it is never counted as (or mistaken for) an
-        // ordinary role failure. The
-        // detail is deliberately volatile (spawnable/total counts and the
-        // next-clear estimate change every tick) — unlike `NoTokenPool`'s
-        // fixed sentinel, this means it never accidentally builds an
-        // escalation streak (`consecutive_identical_failures` below), which
-        // is correct: pool exhaustion is expected to self-heal, not a
-        // config-shaped defect that "can never succeed as configured".
-        RoleTickOutcome::PoolExhausted {
-            total,
-            next_clear_at,
-            pool,
-        } => (
-            false,
-            Some(format!(
-                "{}: 0/{total} spawnable, next check ~{}",
-                pool.detail_tag(),
-                next_clear_at.to_rfc3339()
-            )),
-        ),
+        // but the `RoleTickRecord::pool_exhausted` flag set below routes a
+        // SELF-HEALING hold into `crate::health::RoleTickSummary::
+        // pool_exhausted` instead of `persistent`, so it is never counted as
+        // (or mistaken for) an ordinary role failure. That hold's detail is
+        // deliberately volatile (spawnable/total counts and the next-clear
+        // estimate change every tick) — unlike `NoTokenPool`'s fixed
+        // sentinel, this means it never accidentally builds an escalation
+        // streak (`consecutive_identical_failures` below), which is correct:
+        // pool exhaustion is expected to self-heal, not a config-shaped
+        // defect that "can never succeed as configured". A PERMANENT hold
+        // (#8444: nothing provisioned, or unreadable pool state) is the
+        // config-shaped defect, and gets the opposite of both treatments —
+        // see `RoleTickOutcome::pool_exhausted_detail`.
+        RoleTickOutcome::PoolExhausted { .. } => (false, Some(outcome.pool_exhausted_detail())),
         // #5028: same reasoning as `NoTokenPool` — a permanent config
         // conflict is exactly what a health check must surface, and the
         // operator-facing `detail()` names the broken config key directly
@@ -784,9 +802,11 @@ pub fn record_role_tick_at(
             detail,
         } => (true, Some(format!("load-skipped (load/core {load_per_core:.2}): {detail}"))),
     };
-    // #7607: distinguishes a `PoolExhausted` skip from every other
-    // not-ok outcome — see `RoleTickRecord::pool_exhausted`'s doc comment.
-    let pool_exhausted = matches!(outcome, RoleTickOutcome::PoolExhausted { .. });
+    // #7607: distinguishes a `PoolExhausted` skip from every other not-ok
+    // outcome — see `RoleTickRecord::pool_exhausted`'s doc comment. #8444:
+    // only the SELF-HEALING hold; the two permanent ones stay on the
+    // persistent/escalatable path, where a `NoTokenPool` already sits.
+    let pool_exhausted = outcome.self_healing_pool_hold();
     let mut ring = role_tick_ring()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
@@ -975,6 +995,7 @@ pub struct ScriptRoleInvocationRunner {
     ///
     /// [`invoke`]: RoleInvocationRunner::invoke
     resolved_model_effort: Option<(String, String)>,
+    trace_context: Option<crate::telemetry::trace::TraceContext>,
 }
 
 impl ScriptRoleInvocationRunner {
@@ -988,6 +1009,7 @@ impl ScriptRoleInvocationRunner {
             model: None,
             load_per_core_override: None,
             resolved_model_effort: None,
+            trace_context: None,
         }
     }
 
@@ -1037,137 +1059,17 @@ impl ScriptRoleInvocationRunner {
     }
 }
 
-impl RoleInvocationRunner for ScriptRoleInvocationRunner {
-    fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
-        let script = match self.resolve_spawn_bin() {
-            Ok(p) => p,
-            Err(e) => {
-                note_pre_spawn_skip(&self.logs_dir(), role, &format!("spawn-bin unresolved: {e}"));
-                return RoleTickOutcome::Failure(e);
-            }
-        };
-        // Resolve the runtime BEFORE the credential-pool preflight (#8408): the
-        // gate reads the pool the admitted runtime draws from, never Claude's
-        // by default. Claude keeps its old ordering (pool gate ahead of an
-        // admission rejection), including on incomplete installations.
-        let admission_result = self
-            .spawn_bin
-            .is_none()
-            .then(|| crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None));
-        if let Some(outcome) = runtime_preflight::check(
-            &self.workspace_root,
-            &self.logs_dir(),
-            role,
-            admission_result.as_ref(),
-        ) {
-            return outcome;
-        }
-        // Issue #5028 (follow-up to #5001 AC2/AC3): runtime admission now
-        // resolves BEFORE the model, because the runtime is a per-role INPUT
-        // to the model/runtime mismatch check just below — a Claude-shaped
-        // model can only be judged wrong once the admitted runtime is known.
-        let admission = if let Some(result) = admission_result {
-            match result {
-                Ok(value) => Some(value),
-                Err(e) => {
-                    note_pre_spawn_skip(
-                        &self.logs_dir(),
-                        role,
-                        &format!("runtime admission rejected: {e}"),
-                    );
-                    return RoleTickOutcome::RuntimeRejected(e);
-                }
-            }
-        } else {
-            None
-        };
-        // Issue #4501: pin the child's model instead of inheriting the account's
-        // interactive CLI default (`fable` on the host that filed the issue,
-        // where every role child burned the most constrained quota tier and then
-        // died on "You've reached your Fable 5 limit").
-        let (model, model_source) = match &self.model {
-            Some(m) => (m.clone(), "override".to_string()),
-            None => resolve_role_runner_model(&self.workspace_root, role),
-        };
-        // Issue #7894: an UNPINNED model that conflicts with the admitted
-        // runtime degrades to the runtime CLI's own default rather than being
-        // refused below — see `reconcile_unpinned_model_with_runtime`. Only the
-        // shipped-default tier is touched, so an explicit pin still reaches
-        // #5028's refusal unchanged.
-        let (model, model_source) = match &admission {
-            Some(admitted) => {
-                reconcile_unpinned_model_with_runtime(&admitted.runtime, model, model_source)
-            }
-            None => (model, model_source),
-        };
-        // Issue #5028: refuse a launch whose resolved model is a provable
-        // conflict with the just-admitted runtime — e.g.
-        // `runtimes.roles.judge = "codex"` with
-        // `autonomous.roleRunner.roleModels.judge = "sonnet"`, a Claude-shaped
-        // pin the Codex adapter rejects with an HTTP 400. Detected here, before
-        // any spawn, so the role runner skips the doomed launch instead of
-        // burning a tick (and a token draw) on a guaranteed failure every time
-        // (#5001 AC2/AC3). Since #7894 this only ever fires on a model that
-        // came from a tier an operator actually configured: an unpinned
-        // conflict was already degraded to the CLI-default pass-through just
-        // above, so the refusal is now exclusively about a wrong *stated
-        // intent*, never about a default nobody chose.
-        // Gated on `admission` being `Some` — tests that opt out of admission
-        // via `spawn_bin` have no resolved runtime to check against, and are
-        // unaffected (mirrors the token-pool preflight's `spawn_bin.is_none()`
-        // gate above).
-        if let Some(admitted) = &admission {
-            if let Some(reason) =
-                crate::sweep_registry::model_runtime_mismatch(&admitted.runtime, &model)
-            {
-                MODEL_RUNTIME_MISMATCH_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
-                let mismatch = ModelRuntimeMismatch {
-                    role: role.to_string(),
-                    runtime: admitted.runtime.clone(),
-                    model,
-                    model_source,
-                    reason,
-                };
-                note_pre_spawn_skip(&self.logs_dir(), role, &mismatch.detail());
-                return RoleTickOutcome::ModelRuntimeMismatch(mismatch);
-            }
-        }
-        // Issue #8054: the reasoning-effort axis, resolved independently of the
-        // model (no shipped default — unconfigured resolves to the empty string,
-        // which the emission site renders as no `--effort` argument at all).
-        // Resolved AFTER the mismatch preflight above so a refused launch does
-        // not pay for a second config read.
-        let (effort, effort_source) = resolve_role_runner_effort(&self.workspace_root, role);
-        // Issue #8056: the launched values, captured for the durable
-        // `role_tick.outcome` record. Set here — after every pre-spawn bail-out
-        // above has already returned — so "resolved" never claims a model for a
-        // tick that skipped before resolving one.
-        self.resolved_model_effort = Some((model.clone(), effort.clone()));
-        run_role_with_timeout(
-            &script,
-            &self.workspace_root,
-            role,
-            prompt,
-            self.logs_dir(),
-            self.timeout,
-            &model,
-            &model_source,
-            &effort,
-            &effort_source,
-            admission.as_ref(),
-            self.load_per_core_override,
-        )
-    }
-
-    fn resolved_model_effort(&self) -> Option<(String, String)> {
-        self.resolved_model_effort.clone()
-    }
-}
+mod invocation;
 
 /// The per-role log file every invocation — real or skipped — writes to:
 /// `<logs_dir>/role-<role>.log`.
+///
+/// `pub(crate)` since Issue #8507: `role_tick_telemetry` derives the same
+/// path to read a just-finished tick's own `# LOOM_LAUNCH` record back off
+/// its log, and a second private copy of this join would be free to drift
+/// from this one.
 #[must_use]
-fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
+pub(crate) fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
     logs_dir.join(format!("role-{role}.log"))
 }
 
@@ -1241,6 +1143,7 @@ fn run_role_with_timeout(
     effort_source: &str,
     admission: Option<&crate::runtime_admission::ResolvedRuntime>,
     load_per_core_override: Option<f64>,
+    backstop: Option<crate::runtime_preference::Reservation>,
 ) -> RoleTickOutcome {
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
         return RoleTickOutcome::Failure(format!(
@@ -1386,6 +1289,7 @@ fn run_role_with_timeout(
         cmd.process_group(0);
     }
 
+    crate::observability::lifecycle::role_command(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1393,11 +1297,18 @@ fn run_role_with_timeout(
         }
     };
     let pid = child.id();
+    // #8555: hand this tick's metered backstop slot (the one `runtime_preflight`
+    // took, carried here by value) to the child that will spend it. No-op when
+    // no ceiling is configured or the tick did not fall through to a governed
+    // tap; every bail-out before this point dropped it, releasing it.
+    crate::runtime_preference::handoff::attach(backstop, pid);
+    crate::observability::lifecycle::role_child_spawned(pid);
 
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
+                crate::observability::lifecycle::role_child_exited("success");
                 // Issue #8443: feed this tick's own terminal record back into
                 // account health BEFORE reporting success — mirrors the
                 // sweep reaper calling `apply_provider_health_feedback`
@@ -1409,9 +1320,26 @@ fn run_role_with_timeout(
                     &tick_anchor,
                     status.code(),
                 );
+                // Issue #8448: exit 0 is not, by itself, evidence that a
+                // GUARDED NATIVE launch did anything. When this tick's own
+                // native event stream shows the `loom_*` binding was never
+                // offered, report the failed launch it actually was instead
+                // of a healthy `Success`. A no-opinion result (any non-native
+                // runtime, an unreadable log, an unparseable stream) leaves
+                // the pre-#8448 behaviour byte-identical — see
+                // `toolless_launch`'s module doc for the four conditions.
+                if let Some(detail) = toolless_launch::detect(&log_path, admission, &tick_anchor) {
+                    log::warn!("role_runner: {detail}");
+                    return RoleTickOutcome::Failure(detail);
+                }
                 return RoleTickOutcome::Success;
             }
             Ok(Some(status)) => {
+                crate::observability::lifecycle::role_child_exited(if status.code().is_some() {
+                    "failure"
+                } else {
+                    "signal"
+                });
                 // Issues #6757/#8123: prefer a purpose-built failure sentinel
                 // (naming the real cause and the role's own log path) over an
                 // arbitrary tail-window fragment of stderr, when one is
@@ -2494,6 +2422,34 @@ pub fn log_role_runner_disabled(repo_root: &Path, config: &RoleRunnerConfig) {
     log::info!("{}", disabled_role_runner_log_line(repo_root, config));
 }
 
+/// Whether `spec` is gated off for `root` by its **own** config block, beyond
+/// the role runner's own `enabled`/`roles` knobs — `Some(reason)` ⇒ do not
+/// tick (issue #7947).
+///
+/// Exactly one role has such a gate today: `concierge`, which requires
+/// `safehouse.concierge` to resolve (present, `enabled` not false, and at least
+/// one usable Matrix ID in `allowedSenders`). Naming it in
+/// `autonomous.roleRunner.roles` is deliberately **not** sufficient — an
+/// inbound control channel wired to a chat room should take two independent,
+/// explicit opt-ins, not one.
+///
+/// Written as a general predicate rather than an inline `if spec.name ==
+/// "concierge"` so that the next role with a config prerequisite has an obvious
+/// place to declare it, and so the "which roles are config-gated" question has
+/// one unit-testable answer.
+#[must_use]
+pub fn role_is_config_gated(spec: &RoleSpec, root: &Path) -> Option<&'static str> {
+    if spec.name == crate::concierge::CONCIERGE_ROLE
+        && crate::concierge::resolve_concierge_config(root).is_none()
+    {
+        return Some(
+            "safehouse.concierge does not resolve for this workspace (absent, disabled, or an \
+             empty allowedSenders); run `loom-daemon concierge check` there",
+        );
+    }
+    None
+}
+
 /// Resolve the **per-invocation architect proposal cap** (#5656) with
 /// precedence **env ([`ARCHITECT_MAX_PROPOSALS_ENV`]) > config
 /// (`autonomous.roleRunner.architectMaxProposals`, read from each root's own
@@ -3264,6 +3220,15 @@ fn decide_root_tick(
     // The root resolved enabled again — clear any stale disabled-warning so a
     // later disable re-warns (#4377).
     disabled_roots_warned.remove(root);
+    // Per-role config gate (#7947). A role whose own config block does not
+    // resolve never ticks, even when an explicit `roles` allowlist names it.
+    // Placed here — after the master switch, before sharding and the
+    // membership check — so a role that is structurally unable to do anything
+    // costs nothing further to decide about.
+    if let Some(reason) = role_is_config_gated(spec, root) {
+        log::debug!("role_runner: {} tick for {} skipped — {reason}", spec.name, root.display());
+        return None;
+    }
     // Host sharding (#6374): on a fleet, each workspace's role rotation must
     // run on exactly ONE host per interval — otherwise N dispatchers each
     // spawn the same role session over the same forge queue, which is both
@@ -3709,12 +3674,13 @@ pub fn spawn_multi_role_task(
                     // most one memoized) subprocess work — and best-effort by
                     // contract: it can never change whether the role keeps
                     // ticking.
-                    crate::role_tick_telemetry::emit_for_tick(
+                    crate::role_tick_telemetry::emit_for_tick_correlated(
                         &root_for_task,
                         name,
                         started_at,
                         &outcome,
                         runner.resolved_model_effort(),
+                        runner.trace_context.clone(),
                     );
                     outcome
                 })
@@ -3827,14 +3793,10 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
                  .loom/docs/token-pool.md, #4642)"
             );
         }
-        RoleTickOutcome::PoolExhausted {
-            total,
-            next_clear_at,
-            pool,
-        } => {
+        RoleTickOutcome::PoolExhausted { next_clear_at, .. } => {
             log::warn!(
                 "role_runner: {role} tick skipped after {elapsed:.1?} — {}; next check ~{} (#7607)",
-                pool.exhausted_phrase(*total),
+                outcome.pool_hold_phrase(),
                 next_clear_at.to_rfc3339()
             );
         }
@@ -3900,15 +3862,11 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
              .loom/docs/token-pool.md, #4642)",
             root.display()
         ),
-        RoleTickOutcome::PoolExhausted {
-            total,
-            next_clear_at,
-            pool,
-        } => log::warn!(
+        RoleTickOutcome::PoolExhausted { next_clear_at, .. } => log::warn!(
             "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {}; next check ~{} \
              (#7607)",
             root.display(),
-            pool.exhausted_phrase(*total),
+            outcome.pool_hold_phrase(),
             next_clear_at.to_rfc3339()
         ),
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => log::warn!(
@@ -4193,28 +4151,27 @@ fn log_outcome_for_root_deduped(
             );
         }
         RootTickLogAction::PoolExhaustedEdge => {
-            if let RoleTickOutcome::PoolExhausted {
-                total,
-                next_clear_at,
-                pool,
-            } = outcome
-            {
+            if let RoleTickOutcome::PoolExhausted { next_clear_at, .. } = outcome {
                 log::warn!(
                     "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {}; next \
                      check ~{} (further identical skips for this root are logged at DEBUG until \
                      the pool regains capacity, #7607)",
                     root.display(),
-                    pool.exhausted_phrase(*total),
+                    outcome.pool_hold_phrase(),
                     next_clear_at.to_rfc3339()
                 );
             }
         }
+        // #8444: the clause names the pool that was actually gated (a codex
+        // skip no longer reports "token pool") and the hold it is still
+        // under — see `CredentialPool::repeat_phrase`.
         RootTickLogAction::PoolExhaustedRepeat => {
             log::debug!(
-                "role_runner: {role} tick for {} skipped again after {elapsed:.1?} — token pool \
-                 still exhausted (repeat of an already-logged skip; not re-warned every tick — \
-                 see the skip-edge WARN above, #7607)",
-                root.display()
+                "role_runner: {role} tick for {} skipped again after {elapsed:.1?} — {} (repeat \
+                 of an already-logged skip; not re-warned every tick — see the skip-edge WARN \
+                 above, #7607)",
+                root.display(),
+                outcome.pool_repeat_phrase()
             );
         }
         RootTickLogAction::ModelMismatchEdge => {
@@ -4262,7 +4219,7 @@ fn log_outcome_for_root_deduped(
 
 // The per-invocation result type (#8056) — see `role_runner/outcome.rs`.
 mod outcome;
-pub use outcome::{CredentialPool, RoleTickOutcome};
+pub use outcome::{CredentialPool, PoolHold, PoolStateFile, RoleTickOutcome};
 
 // Failure-sentinel classification for a role's `role-<role>.log` (issues
 // #6757, #8123) — see `role_runner/failure_sentinel.rs`.
@@ -4287,9 +4244,16 @@ pub use model_resolution::{
 #[allow(clippy::unwrap_used)]
 mod tests;
 
-mod runtime_preflight;
+// `pub(crate)` since #8436: `runtime_preference::availability` asks the same
+// "which pool does this runtime consume" question without the skip side
+// effects, and reuses this module's codex reads rather than forking them.
+pub(crate) mod runtime_preflight;
 
 // Feeds a codex-runtime role tick's own `LOOM_TERMINAL_RESULT` record into
 // account health (issue #8443) — the role-tick analogue of
 // `sweep_registry::apply_provider_health_feedback`.
 mod provider_health_feedback;
+
+// Demotes an exit-0 guarded-native tick that never used a `loom_*` tool from
+// `Success` to `Failure` (issue #8448) — see `role_runner/toolless_launch.rs`.
+mod toolless_launch;

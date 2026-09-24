@@ -99,11 +99,21 @@ redacts each `activeSweeps` entry per the visibility policy above and empties
       "enteredPhaseAt": "2026-07-30T12:03:20Z",
       "model": "opus",
       "effort": "high",
+      "runtime": "claude",
       "updatedAt": "2026-07-30T12:03:20Z"
     }
   ]
 }
 ```
+
+`runtime` is the adapter the sweep was dispatched on (`claude`, `codex`, …),
+copied from `sweep.started` or late `sweep.identity` enrichment; absent when the emitting daemon did not name one.
+`provider` names the resolved launch provider separately from the runtime adapter
+(e.g. `zai-coding-plan` versus `opencode`); `model` is the resolved launch model.
+These describe the sweep launch, not all child roles. Missing values remain
+unknown. Identity enrichment preserves start/phase/freshness and applies only to
+an existing same-host active entry, never recreating a completed sweep. Deploy
+this Worker/UI before schema-4 identity producers; older daemons remain readable.
 
 **`freshness`** (issue #4957): derived from `updatedAt` alone (never the
 daemon-supplied `captured_at`, which a clock-skewed host could spoof) —
@@ -117,6 +127,28 @@ than ever appearing here — see `src/fleetState.ts`'s `classifyFreshness`/
 `PRUNE_AFTER_MS`. Both the SSR `/` fallback page (`src/publicPage.ts`) and
 any consumer of this route should treat a `stale`/`offline` sample's
 numbers as historical, never as current.
+
+**`missingHosts`** (issue #8792) is present only when the deployment sets the
+`EXPECTED_HOSTS` var (see `deploy-runbook.md` → "Declaring the expected host
+roster"). It lists every roster host with **no** `health` entry — the case the
+`freshness` classification above cannot see, because a host that never
+reported has no entry to classify:
+
+```json
+"missingHosts": [
+  { "hostId": "loom-worker-3", "state": "missing" },
+  { "hostId": "loom-worker-4", "state": "unprovisioned" }
+]
+```
+
+`state` is `"missing"` when the host holds an active ingest key but has never
+reported (or went silent long enough to be pruned), and `"unprovisioned"` when
+it has no active key at all (not yet enrolled via `POST /admin/hosts`, or
+revoked). A host that reported and then went quiet is never listed here — it
+keeps its `health` entry and reads as `stale`/`offline`. Removing a host from
+the roster removes it from this list: the roster only ever adds rows. The
+field carries only host IDs (already public as `hosts` keys) and a derived
+state, so `/public/fleet-state` returns it unredacted.
 
 A completed sweep is not present in `activeSweeps` (removed on
 `sweep.completed` — see `src/fleetState.ts`'s module doc); its full record
@@ -168,7 +200,7 @@ zero.
 On `GET /public/fleet-state`, a `visibility: "private"` entry in
 `activeSweeps` has `repo`/`issue`/`sweepId` omitted entirely (not
 null-valued — `JSON.stringify` drops the key) rather than the shape above;
-`phase`/timing/`model`/`effort`/`hostId` survive unchanged. A
+`phase`/timing/`model`/`effort`/`runtime`/`hostId` survive unchanged. A
 `visibility: "public"` entry is identical on both routes.
 
 ## `GET /api/history` / `GET /public/history`
@@ -243,9 +275,9 @@ non-integer), or `cursor` (non-positive or non-integer) returns `400` with a
 
   `tokens.snapshot` is the one kind whose *shape* differs by route. `/api/*`
   returns the per-account rows as ingested (`accounts[]`, each with
-  `account`/`rank`/`usage_fraction`/`limit_window_reset_at`/`exhausted`).
-  `/public/*` drops `accounts` entirely and returns a derived aggregate in
-  its place:
+  `account`/`provider`/`rank`/`usage_fraction`/`limit_window_reset_at`/
+  `exhausted`). `/public/*` drops `accounts` entirely and returns a derived
+  aggregate in its place:
 
   ```json
   {
@@ -255,9 +287,30 @@ non-integer), or `cursor` (non-positive or non-integer) returns `400` with a
     "exhausted_count": 5,
     "mean_usage_fraction": 0.3246,
     "max_usage_fraction": 0.91,
-    "next_limit_window_reset_at": "2026-07-30T18:00:00Z"
+    "next_limit_window_reset_at": "2026-07-30T18:00:00Z",
+    "providers": [
+      {
+        "provider": "claude",
+        "account_count": 10,
+        "exhausted_count": 5,
+        "max_usage_fraction": 0.91,
+        "next_limit_window_reset_at": "2026-07-30T18:00:00Z"
+      },
+      {
+        "provider": "codex",
+        "account_count": 3,
+        "exhausted_count": 0,
+        "max_usage_fraction": null,
+        "next_limit_window_reset_at": null
+      }
+    ]
   }
   ```
+
+  `providers` is the same summary sliced per provider pool (`claude`, `codex`,
+  …), in first-seen order — a provider name is the daemon's own
+  `AccountProvider` vocabulary, not an account identifier. A row with no
+  `provider` (a daemon that predates per-provider pools) counts as `claude`.
 
   How loaded the pool is, and when capacity returns, without naming an
   account or exposing any single account's burn. The two usage figures are

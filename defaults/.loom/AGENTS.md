@@ -21,6 +21,13 @@ This repository uses **Loom** for AI-powered development orchestration.
 > other runtimes — perform the equivalent `gh` / `git` / `./.loom/scripts/*`
 > steps directly instead.
 
+## Credential storage
+
+Secrets must stay outside every repository and worktree, including ignored
+`.env`, `.loom-local`, logs and artifacts. Use owner-only user credential files
+or an OS credential store; reference them without copying values. Never print
+secrets. `.gitignore` is insufficient. See [credential policy](.loom/docs/credential-storage.md).
+
 ## What is Loom?
 
 Loom is a CLI + daemon for AI-powered development orchestration. It coordinates
@@ -80,13 +87,9 @@ credentials, infra, hardware; skipped by autonomous dispatch), `loom:abort`
 
 ### REST vs GraphQL for forge queries
 
-Prefer forge REST calls over GraphQL-backed convenience commands when GraphQL is
-rate-limited or exhausted (they share separate hourly budgets). In practice:
-read and mutate issues/labels via `gh api repos/:owner/:repo/issues/:number`
-(and the `--method PATCH`/`POST` forms) rather than GraphQL-backed
-`gh issue list --label` / `gh issue view` queries when GraphQL quota is tight.
-The REST path stays available after GraphQL is exhausted, so it is the reliable
-fallback for issue reads, edits, and label changes during heavy dispatch.
+When GitHub GraphQL is rate-limited, use the separate REST quota: read issues
+with `gh api repos/:owner/:repo/issues/:number`; mutate via `--method PATCH`
+or `POST`. Prefer this fallback over `gh issue list` / `gh issue view`.
 
 ### Issues Are Suggestions (Role Autonomy)
 
@@ -101,15 +104,9 @@ decision — route it to `loom:blocked` or `loom:operator-only` instead.
 ## Git Worktree Workflow
 
 Loom uses git worktrees to isolate agent work. **Issue Worktrees**
-(`.loom/worktrees/issue-N`) hold issue-specific work for Builder agents.
-
-```bash
-gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"
-./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42
-# ... work, commit ...
-git push -u origin feature/issue-42
-gh pr create --label "loom:review-requested"
-```
+(`.loom/worktrees/issue-N`) hold issue-specific work for Builder agents. The
+guard-to-PR recipe lives in exactly one place — "Builder Workflow" below — so no
+second copy can go missing its pre-claim guard.
 
 - Always use `./.loom/scripts/worktree.sh <issue-number>` (writes a
   `.loom-managed` sentinel that authorizes cleanup). **Never run `git worktree`

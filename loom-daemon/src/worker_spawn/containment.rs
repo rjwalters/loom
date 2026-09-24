@@ -15,9 +15,12 @@
 //!
 //! 1. **Data-directory isolation.** OpenCode's `auth.json` and session store
 //!    live under `$XDG_DATA_HOME/opencode` (`~/.local/share/opencode` when
-//!    unset). Uncontained, `XDG_DATA_HOME` is not relocated per launch, so N
-//!    concurrent native workers on one host share one session store and one
-//!    `auth.json`. Every XDG base directory — plus `OPENCODE_CONFIG_DIR` and
+//!    unset); Kimi puts its *whole* state — config, sessions, logs,
+//!    credentials, plugins and its cached `rg`/`fd` binaries — under one
+//!    `KIMI_CODE_HOME` (`~/.kimi-code` when unset, #8565). Guarded uncontained
+//!    launches also isolate this state (#8568);
+//!    containment additionally makes its lifetime ephemeral. Every XDG base
+//!    directory — plus `OPENCODE_CONFIG_DIR`, `KIMI_CODE_HOME` and
 //!    the Loom binding directory (`LOOM_NATIVE_TOOLS_DIR`) — is pointed at a
 //!    per-launch path inside the container's own ephemeral writable layer, so
 //!    two concurrent contained workers are disjoint twice over: different
@@ -49,10 +52,10 @@ use std::{
 pub const KIND: &str = "native-ephemeral";
 
 /// Default image: the `loom-worker-native` overlay (`docker/native/`), which
-/// is `loom-worker` plus the pinned OpenCode/Pi CLIs at the versions
+/// is `loom-worker` plus the pinned OpenCode/Pi/Kimi CLIs at the versions
 /// `guardrail-parity-native.md` records as tested. Deliberately NOT the base
-/// `loom-worker` image — that one ships no Node and therefore neither CLI, so
-/// a dispatch into it would fail at `exec` with a bare "not found".
+/// `loom-worker` image — that one ships no Node and therefore no CLI at all,
+/// so a dispatch into it would fail at `exec` with a bare "not found".
 pub const DEFAULT_IMAGE: &str = "ghcr.io/rjwalters/loom-worker-native:latest";
 
 /// The container-side home directory. The image's non-root `loom` user
@@ -247,9 +250,44 @@ fn parse_meminfo_total_kb(contents: &str) -> Option<u64> {
 /// not exist in the image or points at the host's own binaries. Forwarding
 /// them would make the contained dispatch fail in a way that looks like a
 /// missing CLI rather than a leaked host path.
+/// Every harness state directory this dispatch relocates into the container's
+/// per-launch ephemeral layer, paired with its leaf under
+/// [`Profile::ephemeral_root`].
+///
+/// One list, two uses: it emits the `-e KEY=<root>/<leaf>` assignments, and it
+/// is the exclusion set the by-name passthrough below is filtered against — a
+/// name-only `-e KEY` appearing AFTER an assignment wins in docker, so a host
+/// value leaking in through the credential list (a model profile whose
+/// `credentialTargets` names one of these by mistake) would silently undo the
+/// isolation. Being derived from the same constant, the two can never drift.
+///
+/// `KIMI_CODE_HOME` (#8565) is Kimi's whole state root in one variable —
+/// config, sessions, logs, credentials, plugins and the `rg`/`fd` binaries it
+/// downloads into `$KIMI_CODE_HOME/bin/` on first use. Relocating it per
+/// launch is what keeps N concurrent Kimi workers off one shared
+/// `~/.kimi-code`, and it is the unguarded (free-form trial) path's only
+/// relocation: a guarded, role-tagged launch re-points the same variable at
+/// `native_tools::provision`'s own private launch directory, which resolves
+/// under the per-launch `LOOM_NATIVE_TOOLS_DIR` below — inside the container,
+/// exactly as `OPENCODE_CONFIG_DIR` does.
+const ISOLATED_DIRS: &[(&str, &str)] = &[
+    ("XDG_DATA_HOME", "data"),
+    ("XDG_CONFIG_HOME", "config"),
+    ("XDG_CACHE_HOME", "cache"),
+    ("XDG_STATE_HOME", "state"),
+    ("OPENCODE_CONFIG_DIR", "opencode"),
+    ("KIMI_CODE_HOME", "kimi"),
+    ("LOOM_NATIVE_TOOLS_DIR", "native-tools"),
+];
+
+fn is_isolated_dir(name: &str) -> bool {
+    ISOLATED_DIRS.iter().any(|(key, _)| *key == name)
+}
+
 const HOST_ONLY_ENV: &[&str] = &[
     "LOOM_PI_BIN",
     "LOOM_OPENCODE_BIN",
+    "LOOM_KIMI_BIN",
     "LOOM_DAEMON_BIN",
     "LOOM_DAEMON_SELF_BIN",
     "LOOM_NATIVE_TOOL_BIN",
@@ -259,6 +297,32 @@ const HOST_ONLY_ENV: &[&str] = &[
     "LOOM_SPAWN_CONTAINERIZED",
     "LOOM_WORKSPACE",
 ];
+
+/// Container-side environment changes a caller layers on top of the dispatch
+/// (issue #8674's credential substitution is the only producer today).
+///
+/// Deliberately data, not a dependency: this module applies the three
+/// primitives — assign by value, withhold a name, mask a host directory —
+/// without knowing what a placeholder or an egress proxy is, so the isolation
+/// rules below stay readable and the substitution logic stays testable on its
+/// own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Injection {
+    /// `-e KEY=VALUE`, emitted LAST so it outranks any by-name forwarding.
+    pub assignments: Vec<(String, String)>,
+    /// Variable names that must NOT be forwarded by name. A by-name `-e VAR`
+    /// makes docker read the value from the *dispatching* process, which is
+    /// exactly the real credential this exists to withhold.
+    pub withheld: Vec<String>,
+    /// Host directories to mask with an empty read-only tmpfs. The workspace
+    /// is bind-mounted read-write, so a per-repo API-key pool under it would
+    /// otherwise be readable inside the container even with the environment
+    /// clean.
+    pub mask_dirs: Vec<PathBuf>,
+    /// Map `host.docker.internal` to the host gateway, so the container can
+    /// reach a host-side listener on every docker flavour.
+    pub add_host_gateway: bool,
+}
 
 fn forwarded_by_name(name: &str) -> bool {
     if HOST_ONLY_ENV.contains(&name) {
@@ -278,6 +342,11 @@ fn forwarded_by_name(name: &str) -> bool {
 /// straight from this process's environment: the key never appears in this
 /// command's argv (and therefore never in `ps`, a shell history, or a log),
 /// and nothing writes it to a file anywhere in the container.
+///
+/// `injection` (issue #8674) is what turns that last property from "not in
+/// argv" into "not in the container at all": when present it withholds the
+/// credential's names from the by-name forwarding above and assigns a
+/// placeholder in their place. See [`Injection`].
 pub fn docker_command(
     profile: &Profile,
     workspace: &Path,
@@ -285,6 +354,7 @@ pub fn docker_command(
     log: Option<&Path>,
     args: &[OsString],
     credentials: &[&str],
+    injection: Option<&Injection>,
 ) -> Result<Command, LaunchError> {
     if which_docker().is_none() {
         return Err(LaunchError::config(
@@ -309,25 +379,35 @@ pub fn docker_command(
     for (host, container, read_only) in extra_mounts(&root, log, workspace) {
         command.arg("-v").arg(mount(&host, &container, read_only));
     }
+    // Mask host directories the workspace mount would otherwise expose (#8674:
+    // a per-repo `.loom/api-keys/` pool). An empty tmpfs, mode 0555 — readable
+    // (so the in-container credential ladder sees "no accounts registered"
+    // rather than an unreadable pool it must fail closed on) and unwritable.
+    // Emitted AFTER the workspace mount so it nests inside it.
+    for dir in injection.iter().flat_map(|i| i.mask_dirs.iter()) {
+        command
+            .arg("--mount")
+            .arg(format!("type=tmpfs,destination={},tmpfs-mode=0555", dir.display()));
+    }
     command.arg("-w").arg(cwd);
 
     // --- Per-launch isolated XDG / config / binding directories ----------
     // All under the container's own ephemeral writable layer, never a mounted
     // host path, so nothing here survives the container and two concurrent
     // workers cannot see each other's session store or `auth.json`.
-    for (key, sub) in [
-        ("XDG_DATA_HOME", "data"),
-        ("XDG_CONFIG_HOME", "config"),
-        ("XDG_CACHE_HOME", "cache"),
-        ("XDG_STATE_HOME", "state"),
-        ("OPENCODE_CONFIG_DIR", "opencode"),
-        ("LOOM_NATIVE_TOOLS_DIR", "native-tools"),
-    ] {
+    for (key, sub) in ISOLATED_DIRS {
         command.arg("-e").arg(format!("{key}={root}/{sub}"));
     }
     // Never self-update past the version this image pins and
-    // guardrail-parity-native.md records as tested.
+    // guardrail-parity-native.md records as tested, and never phone home from
+    // a dispatched worker. Kimi's pair (#8565) is the counterpart of
+    // OpenCode's; `harness::Harness::Kimi` sets the same two on the child
+    // inside the container, and they are repeated HERE so an unguarded
+    // free-form trial — and an interactive `docker exec` inspection of a live
+    // sweep's container — gets the identical guarantee.
     command.arg("-e").arg("OPENCODE_DISABLE_AUTOUPDATE=1");
+    command.arg("-e").arg("KIMI_CODE_NO_AUTO_UPDATE=1");
+    command.arg("-e").arg("KIMI_DISABLE_TELEMETRY=1");
     command.arg("-e").arg(format!("HOME={CONTAINER_HOME}"));
     command
         .arg("-e")
@@ -348,10 +428,35 @@ pub fn docker_command(
             .filter(|n| !n.is_empty() && std::env::var_os(n).is_some())
             .map(|n| (*n).to_string()),
     );
+    // A per-launch directory is set above by ASSIGNMENT; a bare `-e NAME` here
+    // would re-read the HOST's value for it and, being later on the command
+    // line, win. Drop those names rather than let a misdeclared credential
+    // target point a contained worker back at a shared (or nonexistent) host
+    // path — the isolation is the point of this module.
+    names.retain(|name| !is_isolated_dir(name));
+    // #8674: a withheld name must never be forwarded by name — that is what
+    // would put the REAL credential in the container's environment.
+    if let Some(injection) = injection {
+        names.retain(|name| !injection.withheld.iter().any(|w| w == name));
+    }
     names.sort();
     names.dedup();
     for name in names {
         command.arg("-e").arg(name);
+    }
+    // --- Injected assignments (#8674) ------------------------------------
+    // LAST, so a later `-e KEY=VALUE` wins over any earlier by-name `-e KEY`
+    // that slipped through — the same ordering rule `ISOLATED_DIRS` relies on,
+    // applied in the opposite direction.
+    if let Some(injection) = injection {
+        if injection.add_host_gateway {
+            command
+                .arg("--add-host")
+                .arg("host.docker.internal:host-gateway");
+        }
+        for (key, value) in &injection.assignments {
+            command.arg("-e").arg(format!("{key}={value}"));
+        }
     }
 
     // --- Limits + observability labels (issue #7430's shape) -------------
@@ -386,6 +491,43 @@ pub fn docker_command(
     command.arg(workspace.join(".loom/scripts/spawn-worker.sh"));
     command.args(args);
     Ok(command)
+}
+
+/// INSIDE the container: create the per-launch directories the outer half
+/// named with `-e KEY=<root>/<leaf>` above, each 0700.
+///
+/// A no-op anywhere else — it fires only when this process is the re-exec'd
+/// copy (`LOOM_NATIVE_CONTAINMENT` is set by `docker_command` and by nothing
+/// else), so host dispatch is byte-for-byte unchanged.
+///
+/// Why it exists (#8565): the outer half can only *name* those paths; none of
+/// them exists in the image, whose `.loom-native` tree is deliberately empty.
+/// A harness that `mkdir -p`s its own state root (OpenCode, Pi) never notices.
+/// Kimi's relocated home is not only a config root but a *download target* —
+/// it fetches `rg`/`fd` into `$KIMI_CODE_HOME/bin/` on first use — so a
+/// missing home surfaces as a tool failure mid-run rather than at startup.
+/// Creating the tree here, once, is cheaper than depending on each CLI's
+/// mkdir behaviour and re-verifying it at every version bump.
+///
+/// Best-effort by design: a creation failure is left to the harness to report
+/// against its own path, since this function has no launch to fail cleanly.
+pub fn materialize_launch_dirs() {
+    if env_nonempty("LOOM_NATIVE_CONTAINMENT").as_deref() != Some(KIND) {
+        return;
+    }
+    for (key, _) in ISOLATED_DIRS {
+        let Some(path) = env_nonempty(key) else {
+            continue;
+        };
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        let _ = builder.create(&path);
+    }
 }
 
 fn which_docker() -> Option<PathBuf> {

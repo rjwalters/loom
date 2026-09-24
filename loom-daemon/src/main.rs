@@ -57,11 +57,13 @@ struct Cli {
 enum Commands {
     /// Launch a worker through a native harness adapter or a legacy runtime.
     SpawnWorker(loom_daemon::worker_spawn::WorkerArgs),
-    /// Inspect worker model profiles without launching anything.
+    /// Inspect worker model profiles; run a launch behind the credential proxy.
     #[command(subcommand_required = true)]
     Worker(loom_daemon::worker_spawn::WorkerCommand),
     /// Execute one guarded native harness tool request from stdin.
     RuntimeTool(loom_daemon::native_tools::ToolArgs),
+    /// Serve the guarded native tool surface to an MCP client over stdio.
+    NativeMcp(loom_daemon::native_tools::mcp::McpArgs),
     /// Initialize a Loom workspace in a target repository
     Init {
         /// Target workspace directory (must be a git repository)
@@ -270,6 +272,22 @@ enum Commands {
         #[command(subcommand)]
         action: FleetAction,
     },
+
+    /// The operator-agent persona's I/O surface (Issue #7947, Phase 3b of
+    /// #4196): read room intent, vet a typed command, relay it to the daemon.
+    ///
+    /// `concierge relay` is the ONLY sanctioned path from a natural-language
+    /// read of a room message to a daemon command, and it refuses `--verb
+    /// confirm` unconditionally — a confirmation nonce is answered by the human
+    /// it was shown to, never by the persona. Off unless
+    /// `safehouse.concierge` names at least one allowed sender; `concierge
+    /// check` reports which.
+    ///
+    /// A one-line tuple variant wrapping `ConciergeArgs` (which carries the
+    /// `#[command(subcommand)]`), for the same reason `Telemetry` above is:
+    /// this file is frozen by the file-size ratchet, so the subcommand's shape
+    /// and docs live in `cli::concierge` and only the dispatch arm is here.
+    Concierge(cli::concierge::ConciergeArgs),
 
     /// Manage insta-crash quarantines (Issue #3939): the in-memory pauses the
     /// daemon applies to issues whose sweeps insta-crash repeatedly. Connects to
@@ -540,6 +558,23 @@ enum Commands {
         action: TokensAction,
     },
 
+    /// Manage the per-host API-key account pool at `.loom/api-keys/` (issue
+    /// #8401) — the API-key analogue of `tokens` (Claude OAuth) and
+    /// `accounts` (Codex `CODEX_HOME` profiles), used by native harness
+    /// profiles whose `credentialEnv` names a provider key (e.g. a fleet of
+    /// Z.ai GLM coding-plan subscriptions rotated through OpenCode/Pi). No
+    /// verb accepts key material on the command line; `list`/`health` are
+    /// secret-free by construction. Purely file-based; does not require a
+    /// running daemon.
+    ApiKeys {
+        #[command(subcommand)]
+        action: ApiKeysAction,
+
+        /// Loom workspace whose API-key pool is read or updated.
+        #[arg(long, value_name = "PATH", default_value = ".", global = true)]
+        workspace: String,
+    },
+
     /// Manage secret-safe machine-level AI account profiles.
     Accounts {
         #[command(subcommand)]
@@ -740,6 +775,63 @@ enum Commands {
         aggressive_min_age: u64,
     },
 
+    /// Prune stale `incremental/`/`deps/` cache entries out of a shared,
+    /// cross-worktree cargo target directory (issue #8459). A standalone
+    /// manual/cron backstop, NOT wired into the periodic worktree reaper —
+    /// see `loom_daemon::target_dir_gc`'s module docs for why. Safe against a
+    /// build in progress: the whole pass defers (removes nothing) whenever
+    /// the target dir's `.cargo-lock` advisory lock is held, or its state is
+    /// unmeasurable.
+    TargetDirGc {
+        /// The shared cargo target directory to scan (its `debug`/`release`/
+        /// target-triple subdirectories are found automatically) — e.g. the
+        /// value `scripts/cargo-target-dir.sh` prints, or a `CARGO_TARGET_DIR`
+        /// you already export.
+        #[arg(long, value_name = "PATH")]
+        target_dir: String,
+
+        /// Prune entries whose newest mtime (recursive — see the module
+        /// docs) is at least this many days old. `0` prunes unconditionally
+        /// (no age floor) — see `PruneCandidate::is_stale`'s documented
+        /// behavior before using it outside a deliberate full reclaim.
+        #[arg(long, default_value_t = loom_daemon::target_dir_gc::DEFAULT_THRESHOLD_DAYS)]
+        threshold_days: u64,
+
+        /// Report what would be removed and its size, without deleting
+        /// anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Emit the report as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Reclaim orphaned Loom-named scratch directories parked on a `tmpfs`/
+    /// `ramfs` mount (e.g. `/dev/shm/cargo-target-*`), issue #8512. A manual
+    /// front-end for `loom_daemon::tmpfs_reclaim`, also wired into the
+    /// periodic worktree reaper as a host-wide sibling pass — see that
+    /// module's docs for the deliberately narrower safety model this uses
+    /// relative to the worktree-attribution-based cargo-target reclaim.
+    TmpfsScratchGc {
+        /// Reclaim a directory whose newest mtime (recursive) is at least
+        /// this many seconds old and which no live process holds open.
+        /// Omitted: resolved from `autonomous.tmpfsScratchGc.stalenessSecs`
+        /// (env > config > 21600, i.e. 6h), the same value the daemon's own
+        /// reaper pass uses.
+        #[arg(long)]
+        staleness_secs: Option<u64>,
+
+        /// Report what would be removed and its size, without deleting
+        /// anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Emit the report as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Native port of `loom-cleanup` (Issue #4272): log archival, the only
     /// cleanup.py functionality that survived the daemon-brain retirement
     /// (#3396). Purely file-based; does not require a running daemon.
@@ -793,6 +885,28 @@ enum Commands {
     Forge {
         #[command(subcommand)]
         action: ForgeAction,
+    },
+
+    /// Shadow-mode Jev (TypeSafe) pre-score for Champion's PR auto-merge
+    /// criterion #2 (issue #8545) — read-only telemetry, never a merge
+    /// decision. Prints a JSON object with four calibrated
+    /// probability/confidence pairs (diff composition, blast radius, Judge
+    /// review depth, revertability) to stdout; exits non-zero with no stdout
+    /// output on any failure, including a missing `TYPESAFE_API_KEY`.
+    JevMergeRisk {
+        /// The PR number to score.
+        pr: u64,
+    },
+
+    /// Shadow-mode Jev (TypeSafe) complexity-tier classifier, run beside the
+    /// Curator's `<!-- loom:complexity=<tier> -->` marker (issue #8543) — a
+    /// calibrated second opinion, never a routing decision. Prints a JSON
+    /// object with a probability per tier (`mechanical`/`routine`/`complex`)
+    /// plus a confidence to stdout; exits non-zero with no stdout output on
+    /// any failure, including a missing `TYPESAFE_API_KEY`.
+    JevTier {
+        /// The issue number to classify.
+        issue: u64,
     },
 
     // ---------------------------------------------------------------------
@@ -1742,6 +1856,21 @@ enum ForgeAction {
         )]
         args: Vec<String>,
     },
+    /// `forge check-open-pr <issue>` — the #4123 open-linked-PR guard as a
+    /// **pre-claim** check for the manual/in-session Builder path (#8551).
+    ///
+    /// Exits `0` and prints the PR number when an open linked PR already
+    /// exists (**do not claim**), `1` on a verified absence (safe to claim),
+    /// and `5` when the probe could not answer (fail closed — NOT an
+    /// absence). Reuses the same closes-graph ∪ timeline probe the daemon's
+    /// own dispatch guard uses.
+    #[command(name = "check-open-pr")]
+    CheckOpenPr {
+        /// Issue number you are about to claim.
+        #[arg(value_name = "ISSUE")]
+        issue: u32,
+    },
+
     /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]` —
     /// enable auto-merge for a PR (formerly `loom-auto-merge`). GitHub:
     /// `enablePullRequestAutoMerge` GraphQL mutation. Gitea: declines (exit
@@ -2133,6 +2262,22 @@ enum AccountsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Report each account's **availability** — quota headroom and reset
+    /// horizon — the `tokens check` analogue for the Codex pool (issue
+    /// #8407). Reads each profile's own recorded rate-limit snapshot; makes
+    /// no API call and starts no `codex` process.
+    Check {
+        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
+        provider: String,
+        /// Persist what the probe learned: write the provider-namespaced
+        /// ranking file and feed each conclusive reading into account health,
+        /// where selection already consults it. Without this flag the command
+        /// is a pure read.
+        #[arg(long)]
+        ranking: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Probe one account's structural and login status.
     Status {
         #[arg(value_name = "PROVIDER")]
@@ -2216,79 +2361,6 @@ enum AccountsAction {
         name: String,
         #[arg(long)]
         json: bool,
-    },
-}
-
-/// Sub-actions for `loom-daemon accounts session` (issue #6925).
-#[derive(Subcommand)]
-enum SessionAction {
-    /// Launch (or reuse, if already running; resume, if stopped-but-present)
-    /// the account's session container, then adopt its profile under the
-    /// ownership rule (a session-managed profile refuses further
-    /// host-direct `CODEX_HOME` use — see `accounts reauth`/`status`).
-    Start {
-        /// The account's short profile name, or its registered email
-        /// (issue #7389 -- see `accounts add --email`).
-        #[arg(value_name = "NAME")]
-        name: String,
-        /// Override the session image (default:
-        /// `ghcr.io/rjwalters/loom-worker-session:latest`).
-        #[arg(long, value_name = "IMAGE")]
-        image: Option<String>,
-        /// Workspace root to bind-mount read-write at the identical
-        /// absolute host path (`docker/worker/MOUNT-CONTRACT.md` §1).
-        /// Defaults to the `--workspace` this `loom-daemon` invocation
-        /// itself resolved (issue #7389).
-        #[arg(long, value_name = "PATH")]
-        workspace: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Tear down the container cleanly. Refuses an in-flight `docker exec`
-    /// unless `--force` (the #5119 restart-safety contract: never a raw
-    /// SIGKILL of active work).
-    Stop {
-        #[arg(value_name = "NAME")]
-        name: String,
-        /// Stop even if an in-flight `docker exec` is detected.
-        #[arg(long)]
-        force: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Report running/stopped and basic health (container id, uptime, mount
-    /// paths).
-    Status {
-        #[arg(value_name = "NAME")]
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Attach to the container's tmux server for interactive `codex login` /
-    /// inspection. Operator-only — never the dispatch path (headless
-    /// dispatch is a plain `docker exec`, added by a later Phase 2 issue).
-    Attach {
-        #[arg(value_name = "NAME")]
-        name: String,
-    },
-    /// "Start-if-absent, run Codex, attach" composite (issue #7389) —
-    /// what the operator-facing `codex-agent <account>` shim execs into.
-    /// Starts the session if not already running, launches `codex` in a
-    /// tmux window cwd'd to the mounted workspace, and attaches. Re-running
-    /// `shell` re-attaches to the same window rather than stacking a
-    /// second Codex process.
-    Shell {
-        /// The account's short profile name, or its registered email.
-        #[arg(value_name = "NAME")]
-        name: String,
-        /// Workspace root, same default as `session start --workspace`.
-        #[arg(long, value_name = "PATH")]
-        workspace: Option<PathBuf>,
-        /// Extra arguments passed to `codex` inside the tmux window, after
-        /// a literal `--` (default when omitted: `--yolo`, the operator's
-        /// own bare-metal invocation).
-        #[arg(last = true)]
-        args: Vec<String>,
     },
 }
 
@@ -2437,6 +2509,8 @@ async fn main() {
 }
 
 use cli::accounts::handle_accounts_command;
+use cli::accounts_session::SessionAction;
+use cli::api_keys::{handle_api_keys_command, ApiKeysAction};
 use cli::cleanup_ops::{
     handle_clean_command, handle_cleanup_command, handle_recover_orphans_command,
 };
@@ -2451,7 +2525,7 @@ use cli::workspace_fleet::{
     handle_calibrate_command, handle_fleet_command, handle_workspace_command,
 };
 
-fn handle_cli_command(command: Commands) -> Result<()> {
+async fn handle_cli_command(command: Commands) -> Result<()> {
     match command {
         // Script helpers (epic #4081 Phase 3 family 5, issue #4275).
         Commands::StripAnsi { file } => handle_strip_ansi_command(file.as_deref()),
@@ -2472,7 +2546,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             tier.as_deref(),
             &runtime,
         ),
-        Commands::Telemetry(cmd) => cmd.run(),
+        Commands::Telemetry(cmd) => cmd.run().await,
         Commands::Checkpoint { action } => handle_checkpoint_command(action),
         Commands::Claim { command, args } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -2543,11 +2617,13 @@ fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Fleet { action } => handle_fleet_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
+        Commands::ApiKeys { action, workspace } => handle_api_keys_command(action, &workspace),
         Commands::Accounts { action, workspace } => handle_accounts_command(action, &workspace),
         Commands::ClaudeConfig { action } => handle_claude_config_command(action),
         Commands::SpawnWorker(args) => loom_daemon::worker_spawn::cli(args),
         Commands::Worker(args) => loom_daemon::worker_spawn::profile_cli(args),
         Commands::RuntimeTool(args) => loom_daemon::native_tools::cli(args),
+        Commands::NativeMcp(args) => loom_daemon::native_tools::mcp::serve(args),
         Commands::AgentSpawn {
             role,
             name,
@@ -2626,6 +2702,22 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             aggressive,
             aggressive_min_age,
         ),
+        Commands::TargetDirGc {
+            target_dir,
+            threshold_days,
+            dry_run,
+            json,
+        } => cli::target_dir_gc::handle_target_dir_gc_command(
+            &target_dir,
+            threshold_days,
+            dry_run,
+            json,
+        ),
+        Commands::TmpfsScratchGc {
+            staleness_secs,
+            dry_run,
+            json,
+        } => cli::tmpfs_scratch_gc::handle_tmpfs_scratch_gc_command(staleness_secs, dry_run, json),
         Commands::Cleanup { action } => handle_cleanup_command(action),
         Commands::RecoverOrphans {
             workspace,
@@ -2651,7 +2743,10 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             unreachable!("PeerClaims is handled in main() before handle_cli_command")
         }
         // Async commands are dispatched by main before reaching this sync handler.
-        Commands::Quarantine { .. }
+        Commands::JevMergeRisk { .. }
+        | Commands::JevTier { .. }
+        | Commands::Concierge(..)
+        | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }
         | Commands::NoopCooldown { .. }
         | Commands::Dispatch { .. }

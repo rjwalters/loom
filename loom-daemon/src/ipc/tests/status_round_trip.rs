@@ -100,6 +100,8 @@ fn test_daemon_status_request_response_round_trip() {
         auto_update_note: Some("within settle window".to_string()),
         auto_update_artifact_version: Some("0.19.24".to_string()),
         auto_update_artifact_published_at: Some("2026-09-13T12:00:00Z".to_string()),
+        auto_update_stale_repo_ticks: 0,
+        auto_update_stale_repo: None,
         host_breaker: None,
         admission_brake: None,
         rate_limit_breaker: None,
@@ -155,6 +157,30 @@ fn test_daemon_status_request_response_round_trip() {
             started_at: Some(chrono::Utc::now()),
             last_success_at: Some(chrono::Utc::now()),
             records_exported: 128,
+            ..Default::default()
+        }),
+        // Per-exporter cells (#8756) — the round trip must preserve each
+        // sink's independent entry.
+        observability_exports: [(
+            "https".to_string(),
+            crate::types::ObservabilityExportStatus {
+                state: crate::types::ObservabilityExportState::Healthy,
+                exporter: Some("https".to_string()),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        forge_events: Some(crate::types::ForgeEventsStatus {
+            state: crate::types::ForgeEventsState::Backoff,
+            endpoint: Some("https://events.internal".to_string()),
+            host_id: Some("robb-studio".to_string()),
+            cursor: 4096,
+            pages_observed: 12,
+            events_observed: 340,
+            consecutive_failures: 5,
+            poll_interval_secs: 300,
+            last_error: Some("auth_failed".to_string()),
             ..Default::default()
         }),
         peer_claims: None,
@@ -228,6 +254,19 @@ fn test_daemon_status_request_response_round_trip() {
             assert_eq!(export.host_id.as_deref(), Some("robb-studio"));
             assert_eq!(export.ingest_host_id.as_deref(), Some("robb-pro"));
             assert_eq!(export.records_exported, 128);
+            // ADR-0021 (#8765): the feed-consumer record survives the wire
+            // too, including the error CLASS underneath a backoff promotion
+            // — `backoff` answers "how often is it retrying", never "why".
+            let feed = r
+                .forge_events
+                .as_ref()
+                .expect("forge_events status round-trips");
+            assert_eq!(feed.state, crate::types::ForgeEventsState::Backoff);
+            assert_eq!(feed.host_id.as_deref(), Some("robb-studio"));
+            assert_eq!(feed.cursor, 4096);
+            assert_eq!(feed.events_observed, 340);
+            assert_eq!(feed.last_error.as_deref(), Some("auth_failed"));
+            assert_eq!(feed.poll_interval_secs, 300);
             assert_eq!(r.per_repo[0].health_gate_enabled, Some(true));
             assert!(r.per_repo[0].health_gate_verdict_at.is_some());
             assert_eq!(

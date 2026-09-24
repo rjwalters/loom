@@ -37,6 +37,13 @@
 //!     each peer's own `/api/status` directly and renders per-host panels
 //!     with a reachability indicator. No central store, no server-side
 //!     aggregation.
+//!   - `GET /api/api-keys` (Issue #8447) — the provider-neutral API-key pool's
+//!     account view: one secret-free row per account, carrying the **provider**
+//!     namespace, the pool directory it resolved from, and its eligibility
+//!     state (including the unreadable/withheld states the spawn path fails
+//!     closed on). Built from [`crate::api_keys_pool::health`], the same
+//!     library call `loom-daemon api-keys health --json` renders. See
+//!     [`api_keys`].
 //!
 //! Nothing starts until the `serve` subcommand is explicitly invoked (never
 //! from the default daemon-run path, never from a config value alone).
@@ -113,6 +120,10 @@ const PEERS_PATH: &str = "/api/peers";
 /// Path the consolidated health-verdict endpoint answers (Issue #4761).
 const HEALTH_PATH: &str = "/api/health";
 
+/// The API-key pool account view (Issue #8447) — its own module so this file,
+/// already over the file-size ratchet's threshold, keeps only the route.
+pub mod api_keys;
+
 /// Every route this listener answers (used for the 404 dispatch check).
 const KNOWN_PATHS: &[&str] = &[
     ROOT_PATH,
@@ -122,6 +133,7 @@ const KNOWN_PATHS: &[&str] = &[
     TOKENS_PATH,
     PEERS_PATH,
     HEALTH_PATH,
+    api_keys::API_KEYS_PATH,
 ];
 
 /// The embedded dashboard page (Issue #4393). Plain HTML/CSS/vanilla JS, no
@@ -667,11 +679,25 @@ async fn handle_health(
         // daemon-authoritative sections only, so it threads `None` ("not
         // collected here") and no `limit_calibration` section renders.
         limit_calibration: None,
+        // #8477: likewise a CLI-collector-only input (activity-DB read plus a
+        // `~/.claude/projects` walk) — threaded as `None` here for the same
+        // reason as `limit_calibration` just above, so no `transcript_ingest`
+        // section renders on this route.
+        transcript_ingest: None,
         // #8163: corroborates (or refutes) an `indeterminate-busy` roll-up.
         // A `/proc/loadavg`-class read — cheap enough for this route's poll
         // cadence, and taken here rather than daemon-side-over-IPC precisely
         // because the verdict it guards is the one reported when IPC failed.
         load_per_core: crate::cpu_headroom::load_per_core(),
+        // #8407: same rule as `limit_calibration` above — a CLI-collected,
+        // filesystem-only input this daemon-authoritative route does not
+        // gather, so no `codex` section renders here.
+        codex_accounts: None,
+        // #8572: same rule as `transcript_ingest` above — a CLI-collected,
+        // filesystem-only input (`/proc/meminfo`, `/proc/vmstat`, a `df` per
+        // tmpfs mount) this daemon-authoritative route does not gather, so no
+        // `tmpfs_visibility` section renders here.
+        tmpfs_visibility: None,
     });
 
     let mut body = serde_json::to_value(&health)?;
@@ -1118,6 +1144,10 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServeState>) -> Res
         return handle_peers(&mut stream, &state.peers).await;
     }
 
+    if parsed.path == api_keys::API_KEYS_PATH {
+        return api_keys::handle(&mut stream, &state.socket_path).await;
+    }
+
     if parsed.path == HEALTH_PATH {
         return handle_health(
             &mut stream,
@@ -1188,7 +1218,7 @@ mod tests {
     /// A minimal but structurally complete [`DaemonStatusReport`] for tests —
     /// the zero-workspaces / zero-in-flight case, matching what a freshly
     /// started daemon with no registered repos reports.
-    fn empty_report() -> DaemonStatusReport {
+    pub(super) fn empty_report() -> DaemonStatusReport {
         // `Default` IS the zero-workspaces / zero-in-flight shape this fixture
         // wants (see `DaemonStatusReport`'s own doc) — spread it rather than
         // restating ~50 fields, only naming the one value that differs.
@@ -1267,7 +1297,7 @@ mod tests {
     /// Spin up a fake daemon Unix socket that answers exactly one
     /// `DaemonStatus` request with a canned report, mirroring the fake-socket
     /// pattern already used by `main.rs`'s `dispatch_tests` module.
-    async fn spawn_fake_daemon_socket(report: DaemonStatusReport) -> PathBuf {
+    pub(super) async fn spawn_fake_daemon_socket(report: DaemonStatusReport) -> PathBuf {
         let dir = tempfile::tempdir().expect("tempdir");
         // Leak the tempdir so it outlives the spawned task (tests are
         // short-lived processes; this is the same tradeoff `dispatch_tests`
@@ -1351,7 +1381,7 @@ mod tests {
 
     // ===== Integration: full HTTP round-trip on an ephemeral port =====
 
-    async fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
+    pub(super) async fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
         let (status, _head, body) = http_get_full(addr, path).await;
         (status, body)
     }
@@ -2365,7 +2395,7 @@ mod tests {
         }
     }
 
-    fn report_with_repo_root(root: &Path) -> DaemonStatusReport {
+    pub(super) fn report_with_repo_root(root: &Path) -> DaemonStatusReport {
         let mut report = empty_report();
         report.per_repo = vec![crate::types::RepoStatus {
             root: root.to_path_buf(),

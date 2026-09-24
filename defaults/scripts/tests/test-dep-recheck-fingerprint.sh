@@ -269,52 +269,54 @@ assert_eq "$(field "$p1" CONCLUSION_HASH)" "$(field "$p_reordered" CONCLUSION_HA
 STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 
+# The stub is REPO-AWARE (#8502): it looks for a repo-qualified fixture
+# `<owner>__<name>-issue-N.json` first and only then the unqualified
+# `issue-N.json`. Every pre-#8502 test passes `--repo owner/repo` and ships
+# only unqualified fixtures, so all of them keep resolving exactly as before
+# via the fallback. The qualified form is what lets T15i assert *which* repo a
+# cross-repo `owner/repo#N` reference was looked up in — without it the stub
+# answers the same JSON for every repo and the assertion would pass even if
+# the invoking repo were used, which is the bug itself.
 cat >"$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
 D="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
 
+# fixture <kind> <number> <repo> - repo-qualified fixture, else unqualified.
+fixture() {
+  local kind="$1" num="$2" repo="${3:-}" f
+  if [[ -n "$repo" ]]; then
+    f="$D/${repo//\//__}-$kind-$num.json"
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  fi
+  f="$D/$kind-$num.json"
+  [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  return 1
+}
+
 case "${1:-}" in
-  issue)
-    shift
+  issue|pr)
+    kind="$1"; shift
     sub="$1"; shift
     num=""
     jqexpr=""
+    repo=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --json) shift 2 ;;
         --jq) jqexpr="${2:-}"; shift 2 ;;
-        --repo) shift 2 ;;
+        --repo) repo="${2:-}"; shift 2 ;;
         *) [[ -z "$num" ]] && num="$1"; shift ;;
       esac
     done
     if [[ "$sub" == "view" ]]; then
-      f="$D/issue-$num.json"
-      [[ -f "$f" ]] || { echo "stub gh: missing $f" >&2; exit 1; }
+      f="$(fixture "$kind" "$num" "$repo")" || {
+        echo "stub gh: missing fixture for $kind #$num (repo='${repo:-<none>}')" >&2
+        exit 1
+      }
       if [[ -n "$jqexpr" ]]; then jq -r "$jqexpr" "$f"; else cat "$f"; fi
     else
-      echo "stub gh: unhandled issue sub '$sub'" >&2; exit 3
-    fi
-    ;;
-  pr)
-    shift
-    sub="$1"; shift
-    num=""
-    jqexpr=""
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        --json) shift 2 ;;
-        --jq) jqexpr="${2:-}"; shift 2 ;;
-        --repo) shift 2 ;;
-        *) [[ -z "$num" ]] && num="$1"; shift ;;
-      esac
-    done
-    if [[ "$sub" == "view" ]]; then
-      f="$D/pr-$num.json"
-      [[ -f "$f" ]] || { echo "stub gh: missing $f" >&2; exit 1; }
-      if [[ -n "$jqexpr" ]]; then jq -r "$jqexpr" "$f"; else cat "$f"; fi
-    else
-      echo "stub gh: unhandled pr sub '$sub'" >&2; exit 3
+      echo "stub gh: unhandled $kind sub '$sub'" >&2; exit 3
     fi
     ;;
   *) echo "stub gh: unhandled args: $*" >&2; exit 3 ;;
@@ -531,6 +533,58 @@ out_phrase3="$("$TARGET_SCRIPT" named-dependency --number 8119 --repo owner/repo
 assert_eq "clear" "$(field "$out_phrase3" VERDICT)" \
     "T15h: once every phrase-named reference is resolved, the same body reports VERDICT=clear"
 rm -f "$STUB_DIR/issue-100.json" "$STUB_DIR/issue-6333.json" "$STUB_DIR/issue-8119.json"
+
+# T15i (#8502 THE REGRESSION): a checklist item naming a CROSS-REPO
+# prerequisite as `owner/repo#N` - the shape a Curator in a consumer repo
+# naturally writes, because a bare `#N` would not resolve upstream. Live
+# repro: example-org/example-app#532 named `rjwalters/loom#8257`, the pre-fix regex
+# matched the line not at all (the character after `[ ]` is `r`, which is
+# neither a phrase, a `pr `/`issue ` token, nor a `#`), and the subcommand
+# reported DEPS='' / VERDICT=clear while #8257 was genuinely still OPEN.
+#
+# The two #8257 fixtures are the discriminator, and are deliberately in
+# CONFLICT: the cross-repo one says OPEN, the invoking repo's says CLOSED. A
+# lookup against the invoking repo (`--repo owner/repo`) therefore produces
+# VERDICT=clear, so `blocked` below can ONLY come from resolving the
+# dependency in rjwalters/loom - which is acceptance criterion #2.
+jq -n '{body: "## Dependencies\n\n- [ ] rjwalters/loom#8257: \"dashboard: add an `ephemeral_compute` record type\" — still **OPEN** as of 2026-09-20\n"}' \
+    >"$STUB_DIR/issue-532.json"
+jq -n '{state: "OPEN"}' >"$STUB_DIR/rjwalters__loom-issue-8257.json"
+jq -n '{state: "CLOSED"}' >"$STUB_DIR/issue-8257.json"
+
+out_xrepo="$("$TARGET_SCRIPT" named-dependency --number 532 --repo owner/repo)"
+assert_eq "blocked" "$(field "$out_xrepo" VERDICT)" \
+    "T15i: a '- [ ] owner/repo#N: ...' cross-repo checklist item is parsed AND resolved in that repo, reporting VERDICT=blocked instead of a false clear (#8502)"
+assert_eq "'rjwalters/loom#8257:OPEN'" "$(field "$out_xrepo" DEPS)" \
+    "T15i: DEPS names the cross-repo reference in full (owner/repo#N), not a bare number that could mean either repo"
+assert_eq "rjwalters/loom#8257:OPEN" "$(eval_var "$out_xrepo" DEPS)" \
+    "T15i: the eval-consumed DEPS value survives the '#' in a cross-repo reference (it would otherwise start a bash comment)"
+
+# T15j (#8502): the other direction - once the UPSTREAM issue closes, the same
+# body reports clear and CONCLUSION_HASH moves, exactly as it already does for
+# a same-repo dependency. Note the invoking repo's #8257 fixture is unchanged
+# throughout, so neither the verdict flip nor the hash change can have come
+# from it.
+jq -n '{state: "CLOSED"}' >"$STUB_DIR/rjwalters__loom-issue-8257.json"
+out_xrepo_closed="$("$TARGET_SCRIPT" named-dependency --number 532 --repo owner/repo)"
+assert_eq "clear" "$(field "$out_xrepo_closed" VERDICT)" \
+    "T15j: once the cross-repo dependency closes, the same body reports VERDICT=clear (#8502)"
+assert_ne "$(field "$out_xrepo" CONCLUSION_HASH)" "$(field "$out_xrepo_closed" CONCLUSION_HASH)" \
+    "T15j: a cross-repo dependency's state change moves CONCLUSION_HASH, just as a same-repo one does (#8502)"
+
+# T15k (#8502): a bare `#N` alongside a cross-repo one still resolves against
+# the INVOKING repo - the prefix is optional, and adding it must not redirect
+# every existing same-repo lookup somewhere else. Same number in both repos,
+# deliberately different states, so the two answers cannot be confused.
+jq -n '{state: "OPEN"}' >"$STUB_DIR/rjwalters__loom-issue-8257.json"
+jq -n '{body: "## Dependencies\n\n- [ ] rjwalters/loom#8257: upstream\n- [ ] #8257: local, same number on purpose\n"}' \
+    >"$STUB_DIR/issue-532.json"
+out_mixed="$("$TARGET_SCRIPT" named-dependency --number 532 --repo owner/repo)"
+assert_eq "$(printf '%s\n%s' '8257:CLOSED' 'rjwalters/loom#8257:OPEN')" "$(eval_var "$out_mixed" DEPS)" \
+    "T15k: a bare #N and a cross-repo owner/repo#N with the SAME number are two distinct entries, each resolved in its own repo (#8502)"
+assert_eq "blocked" "$(field "$out_mixed" VERDICT)" \
+    "T15k: the still-OPEN cross-repo half blocks even though the same-numbered local issue is CLOSED (#8502)"
+rm -f "$STUB_DIR/issue-532.json" "$STUB_DIR/issue-8257.json" "$STUB_DIR/rjwalters__loom-issue-8257.json"
 
 # --- T16: dep-recheck - narrowed label fingerprint (#7362): a pure label flip
 # among loom:pr/loom:review-requested/loom:reviewing/loom:operator/loom:treating

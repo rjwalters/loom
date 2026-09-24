@@ -315,6 +315,7 @@ export function multiHostSnapshot(): unknown {
         enteredPhaseAt: isoMinutesBefore(4),
         model: "opus",
         effort: "high",
+        runtime: "claude",
         updatedAt: isoMinutesBefore(4),
       },
       {
@@ -326,6 +327,7 @@ export function multiHostSnapshot(): unknown {
         // No phase yet: sweep.started has arrived, sweep.phase has not.
         startedAt: isoMinutesBefore(1),
         model: "opus",
+        runtime: "codex",
         updatedAt: isoMinutesBefore(1),
       },
       {
@@ -342,6 +344,33 @@ export function multiHostSnapshot(): unknown {
 }
 
 export const EMPTY_SNAPSHOT: unknown = { hosts: {}, activeSweeps: [] };
+
+/** Named by the roster, holds an active ingest key, has never reported →
+ * `missing` (#8792/#8804). */
+export const MISSING_HOST_ID = "fleet-silent-7";
+
+/** Named by the roster with no active ingest key → `unprovisioned`: it cannot
+ * report yet (#8792/#8804). */
+export const UNPROVISIONED_HOST_ID = "fleet-planned-8";
+
+/**
+ * `multiHostSnapshot()` plus the backend's expected-host roster diff
+ * (`missingHosts`, #8792) — one host of each state, neither of which has any
+ * entry in `hosts`.
+ *
+ * Deliberately a separate fixture rather than a field added to
+ * `multiHostSnapshot()`: every other test in this suite asserts the
+ * no-roster rendering, which must stay exactly what it was before #8804.
+ */
+export function rosterMissingSnapshot(): unknown {
+  return {
+    ...(multiHostSnapshot() as Record<string, unknown>),
+    missingHosts: [
+      { hostId: MISSING_HOST_ID, state: "missing" },
+      { hostId: UNPROVISIONED_HOST_ID, state: "unprovisioned" },
+    ],
+  };
+}
 
 /**
  * A `host.health.roles` summary with one persistent tick failure (#5022) —

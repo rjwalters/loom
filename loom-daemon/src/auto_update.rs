@@ -145,8 +145,12 @@ use crate::event_bus::EventBus;
 use crate::ipc::DrainState;
 use crate::workspace_pool::WorkspacePool;
 
+mod failure_digest;
 mod native_probe;
 mod relaunch_verify_note;
+mod stale_repo;
+
+use failure_digest::failure_digest;
 
 // ============================================================================
 // Constants
@@ -222,9 +226,6 @@ const DEFAULT_REBUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Poll granularity while waiting for the rebuild subprocess.
 const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Max bytes of captured script output retained in a failure/roll log line.
-const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
 
 /// The clean-tree gate's base refusal reason (Issue #7608), shared between
 /// [`AutoUpdateState::decide`] (which has no path detail) and [`run_tick`]
@@ -376,6 +377,11 @@ pub struct AutoUpdateStatusSnapshot {
     /// That release's publish timestamp, verbatim from the forge (RFC-3339),
     /// when the forge reported one.
     pub artifact_published_at: Option<String>,
+    /// [`stale_repo::StaleRepoStreak::ticks`] (#8513): consecutive ticks whose
+    /// resolved release was OLDER than installed, i.e. a probable wrong repo.
+    pub stale_repo_ticks: u32,
+    /// The repo that streak's most recent tick queried.
+    pub stale_repo: Option<String>,
 }
 
 /// Shared, thread-safe handle the loop publishes to and
@@ -477,6 +483,9 @@ pub struct UpdateCheck {
 /// installed binary at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArtifactInfo {
+    /// The repo this release was resolved from (`owner/repo`, #8513), so the
+    /// tick's log line can name which repo it actually queried.
+    pub repo: String,
     /// The release tag (e.g. `v0.19.24`).
     pub tag: String,
     /// The semver parsed out of the tag (e.g. `0.19.24`).
@@ -511,142 +520,22 @@ impl ArtifactResolution {
     #[must_use]
     pub fn is_actionable(&self) -> bool {
         match self {
-            Self::Resolved(info) => {
-                !matches!(classify_artifact(info), ArtifactVerdict::UpToDate { .. })
-            }
+            Self::Resolved(info) => !matches!(
+                classify_artifact(info),
+                ArtifactVerdict::UpToDate { .. } | ArtifactVerdict::StaleRepo { .. }
+            ),
             Self::Unresolved(_) => false,
         }
     }
 }
 
-/// What the resolved artifact means for the installed binary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArtifactVerdict {
-    /// The release is a newer version than what is installed.
-    Newer {
-        /// The installed version, or `None` when no binary was resolvable.
-        installed: Option<String>,
-        /// The release's version.
-        artifact: String,
-    },
-    /// Same version, different bytes — the host built this version from source
-    /// before the release existed (or the binary was re-signed locally after
-    /// install). Fetching converges it onto the released, verified bytes.
-    ShaDiffers {
-        /// The (shared) version.
-        version: String,
-        /// The release's published sha256 — also the convergence key recorded
-        /// in [`ArtifactRollRecord`], so one unsuccessful convergence cannot
-        /// turn into a fetch/restart loop.
-        asset_sha256: String,
-        /// The installed binary's own sha256.
-        installed_sha256: String,
-    },
-    /// Nothing to do.
-    UpToDate {
-        /// The release's version.
-        version: String,
-        /// Why there is nothing to do (sha matched, release is older, or the
-        /// comparison could not be made).
-        why: String,
-    },
-}
+/// The verdict types and the pure classification that produces them —
+/// extracted to a sibling module (#8513) both because this file is over
+/// `.loom/docs/file-size-policy.md`'s threshold and because the new
+/// wrong-repo verdict belongs next to the comparison that derives it.
+mod artifact_verdict;
 
-/// Compare two dotted-numeric versions the same way the update script's
-/// `semver_compare` does: up to three components, non-numeric characters
-/// stripped defensively, missing components treated as `0`. Deliberately NOT a
-/// full semver implementation — the daemon's own versions are always
-/// `MAJOR.MINOR.PATCH`, and disagreeing with the shell comparison that drives
-/// the actual fetch would be worse than being simplistic.
-#[must_use]
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    fn component(s: Option<&str>) -> u64 {
-        s.map(|part| {
-            part.chars()
-                .filter(char::is_ascii_digit)
-                .collect::<String>()
-        })
-        .and_then(|digits| digits.parse::<u64>().ok())
-        .unwrap_or(0)
-    }
-    let mut left = a.split('.');
-    let mut right = b.split('.');
-    for _ in 0..3 {
-        let ord = component(left.next()).cmp(&component(right.next()));
-        if ord != std::cmp::Ordering::Equal {
-            return ord;
-        }
-    }
-    std::cmp::Ordering::Equal
-}
-
-/// Classify a resolved artifact against the installed binary. Pure — no I/O,
-/// no state — so the whole decision matrix is unit-testable with plain values.
-#[must_use]
-pub fn classify_artifact(info: &ArtifactInfo) -> ArtifactVerdict {
-    let installed = info
-        .installed_version
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let Some(installed) = installed else {
-        // No resolvable installed binary at all — any published artifact is
-        // strictly better than nothing (this is the update script's own
-        // "no loom-daemon binary currently resolvable ⇒ update needed" rule).
-        return ArtifactVerdict::Newer {
-            installed: None,
-            artifact: info.version.clone(),
-        };
-    };
-    match compare_versions(&info.version, installed) {
-        std::cmp::Ordering::Greater => ArtifactVerdict::Newer {
-            installed: Some(installed.to_string()),
-            artifact: info.version.clone(),
-        },
-        std::cmp::Ordering::Less => ArtifactVerdict::UpToDate {
-            version: info.version.clone(),
-            why: format!(
-                "latest release {} is OLDER than the installed {installed} — nothing to fetch",
-                info.version
-            ),
-        },
-        std::cmp::Ordering::Equal => {
-            let asset = info
-                .asset_sha256
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let local = info
-                .installed_sha256
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            match (asset, local) {
-                (Some(asset), Some(local)) if asset.eq_ignore_ascii_case(local) => {
-                    ArtifactVerdict::UpToDate {
-                        version: info.version.clone(),
-                        why: "artifact == installed, sha matches".to_string(),
-                    }
-                }
-                (Some(asset), Some(local)) => ArtifactVerdict::ShaDiffers {
-                    version: info.version.clone(),
-                    asset_sha256: asset.to_string(),
-                    installed_sha256: local.to_string(),
-                },
-                // One side's checksum is unknown, so "same bytes?" cannot be
-                // answered. Treat as converged rather than guessing: a wrong
-                // "differs" here would re-fetch (and restart) on every single
-                // tick forever, which is far worse than a missed convergence.
-                _ => ArtifactVerdict::UpToDate {
-                    version: info.version.clone(),
-                    why: "artifact == installed, but no published/installed checksum is available \
-                          to compare — assuming converged"
-                        .to_string(),
-                },
-            }
-        }
-    }
-}
+pub use artifact_verdict::{classify_artifact, ArtifactVerdict};
 
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.
@@ -942,7 +831,22 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
                 root.display()
             ));
         };
-        run_update_script_with(&script, &root, self.timeout, low_priority, &["--fetch"])
+        // #8513: pin the child to the repo THIS resolver chose. The script
+        // resolves the release repo independently (its cwd's `origin`), so on
+        // a host whose workspace is not the Loom checkout it would look for
+        // the artifact we found in Loom's releases in the workspace's own
+        // project and hard-fail `--fetch`. `LOOM_DAEMON_UPDATE_GH_REPO` is the
+        // script's own documented override, and when the operator already set
+        // it, `resolve_repo`'s tier 1 hands back that same value.
+        let repo = native_probe::fetch_repo(&root);
+        run_update_script_with(
+            &script,
+            &root,
+            self.timeout,
+            low_priority,
+            &["--fetch"],
+            repo.as_deref(),
+        )
     }
 
     fn check(&self) -> UpdateCheck {
@@ -1099,7 +1003,7 @@ fn run_update_script(
     timeout: Duration,
     low_priority: bool,
 ) -> RebuildOutcome {
-    run_update_script_with(script, cwd, timeout, low_priority, &[])
+    run_update_script_with(script, cwd, timeout, low_priority, &[], None)
 }
 
 /// [`run_update_script`] with `extra_args` inserted alongside `--no-restart`.
@@ -1111,12 +1015,19 @@ fn run_update_script(
 /// the default-`auto` reasoning documented above, and deliberately so: the
 /// source path is reached by the *tick's own* decision (no artifact resolved),
 /// never by a mid-run downgrade inside the script that the daemon cannot see.
+///
+/// `repo` (#8513), when `Some`, is exported to the child as
+/// `LOOM_DAEMON_UPDATE_GH_REPO` — the script's own documented override — so
+/// the fetch downloads from the repo THIS process resolved rather than
+/// re-deriving one from its cwd's `origin` remote. The source path passes
+/// `None`: a `cargo build` reads no releases at all.
 fn run_update_script_with(
     script: &Path,
     cwd: &Path,
     timeout: Duration,
     low_priority: bool,
     extra_args: &[&str],
+    repo: Option<&str>,
 ) -> RebuildOutcome {
     let log_path =
         std::env::temp_dir().join(format!("loom-auto-update-{}.log", uuid::Uuid::new_v4()));
@@ -1140,6 +1051,9 @@ fn run_update_script_with(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(stderr_file));
+    if let Some(repo) = repo {
+        command.env("LOOM_DAEMON_UPDATE_GH_REPO", repo);
+    }
     if low_priority {
         nice_child(&mut command);
     }
@@ -1209,9 +1123,9 @@ fn nice_child(command: &mut Command) {
 fn nice_child(_command: &mut Command) {}
 
 /// Map a `loom-daemon-update.sh` exit code to a [`RebuildOutcome`], attaching a
-/// tail of the captured output on any non-success.
+/// [`failure_digest`] of the captured output on any non-success.
 fn classify_exit(code: Option<i32>, log_path: &Path) -> RebuildOutcome {
-    let tail = || truncate_tail(&std::fs::read_to_string(log_path).unwrap_or_default());
+    let tail = || failure_digest(&std::fs::read_to_string(log_path).unwrap_or_default());
     match code {
         Some(0) => RebuildOutcome::Success,
         // #4053: exit 4 (build-verification) and 5 (post-provision
@@ -1228,19 +1142,6 @@ fn classify_exit(code: Option<i32>, log_path: &Path) -> RebuildOutcome {
     }
 }
 
-/// Keep only the last [`MAX_OUTPUT_TAIL_BYTES`] bytes of captured output,
-/// trimmed, on a char boundary.
-fn truncate_tail(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT_TAIL_BYTES {
-        return s.trim().to_string();
-    }
-    let start = s.len() - MAX_OUTPUT_TAIL_BYTES;
-    let start = (start..s.len())
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(s.len());
-    s[start..].trim().to_string()
-}
-
 // ============================================================================
 // Loop state + pure decision logic
 // ============================================================================
@@ -1252,6 +1153,10 @@ pub enum TickDecision {
     /// Do nothing this tick; the string is the human-readable reason surfaced in
     /// `loom-daemon status`.
     Skip(String),
+    /// Do nothing, but at WARN rather than [`Self::Skip`]'s INFO: a
+    /// [`ArtifactVerdict::StaleRepo`] tick (#8513), where "nothing to do" is
+    /// itself the symptom rather than a healthy host.
+    SkipWarn(String),
     /// All gates passed — run the rebuild.
     Rebuild {
         /// `true` when gate 4's deferral deadline forced this rebuild while
@@ -1352,6 +1257,11 @@ pub struct AutoUpdateState {
     /// roll itself performs, and the reason a same-version convergence fetch
     /// cannot become a fetch/restart loop.
     last_artifact_roll: Option<ArtifactRollRecord>,
+    /// The consecutive-wrong-repo-resolution streak (#8513) that feeds
+    /// [`crate::health::assess_auto_update`]'s "no progress for N ticks"
+    /// surface — a persistently stale-repo host is stuck exactly as a
+    /// terminal/backoff one is, just for a different reason.
+    stale_repo: stale_repo::StaleRepoStreak,
 }
 
 impl AutoUpdateState {
@@ -1404,6 +1314,9 @@ impl AutoUpdateState {
                 self.decide_artifact(now, info, in_flight, settle)
             }
             ArtifactResolution::Unresolved(reason) => {
+                // No artifact resolved this tick at all — any stale-repo
+                // streak from a previous tick no longer applies (#8513).
+                self.stale_repo.reset();
                 match self.decide_source(now, check, tree_clean, in_flight, settle, defer_deadline)
                 {
                     TickDecision::Skip(source_reason) => TickDecision::Skip(format!(
@@ -1436,10 +1349,32 @@ impl AutoUpdateState {
         in_flight: usize,
         settle: Duration,
     ) -> TickDecision {
-        let (target, why) = match classify_artifact(info) {
+        let verdict = classify_artifact(info);
+        // Issue #8513: the streak counts only genuinely CONSECUTIVE
+        // stale-repo ticks, so anything else this tick resolved drops it —
+        // but the reset must not run before the `StaleRepo` arm increments,
+        // or the counter would be re-zeroed every tick and never reach the
+        // health threshold.
+        if !matches!(verdict, ArtifactVerdict::StaleRepo { .. }) {
+            self.stale_repo.reset();
+        }
+        let (target, why) = match verdict {
             ArtifactVerdict::UpToDate { version, why } => {
                 self.clear_tracking();
                 return TickDecision::Skip(format!("artifact {version}: {why} → up to date"));
+            }
+            ArtifactVerdict::StaleRepo {
+                artifact,
+                installed,
+                repo,
+            } => {
+                // #8513: tracked for health's "no progress for N ticks"
+                // surface and logged at WARN, naming the repo queried.
+                self.clear_tracking();
+                self.stale_repo.record(repo.clone());
+                return TickDecision::SkipWarn(stale_repo::warn_reason(
+                    &artifact, &installed, &repo,
+                ));
             }
             ArtifactVerdict::Newer {
                 installed,
@@ -1824,6 +1759,8 @@ impl AutoUpdateState {
             note: Some(note),
             artifact_version,
             artifact_published_at,
+            stale_repo_ticks: self.stale_repo.ticks(),
+            stale_repo: self.stale_repo.repo(),
         }
     }
 }
@@ -2007,6 +1944,14 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
             // latest-tick `note` field (overwritten every tick, useless
             // unless read live at exactly the right moment).
             log::info!("auto_update: {reason}");
+            reason
+        }
+        TickDecision::SkipWarn(reason) => {
+            // Issue #8513: a stale-repo resolution is "do nothing" like a
+            // `Skip`, but it is NOT healthy — WARN rather than INFO, so it
+            // reaches the daemon's own log at a level an operator actually
+            // notices, exactly like the staleness warning above.
+            log::warn!("auto_update: {reason}");
             reason
         }
         TickDecision::Rebuild { low_priority } => {

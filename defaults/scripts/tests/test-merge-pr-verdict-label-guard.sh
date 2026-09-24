@@ -118,9 +118,20 @@ loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr"
 # merge-pr.sh's own comment above it), so the extraction captures exactly
 # that one line. Extracting from source keeps the test in lockstep with the
 # script instead of re-implementing it.
+#
+# Two more lines come with it (#8285): the one-line `_mp_daemon_roll_hint`,
+# which the refusal path calls to name the daemon version floor and the roll
+# command, and every `# requires-daemon:` marker comment — that function reads
+# the floor back out of ${BASH_SOURCE[0]}, i.e. out of THIS extracted file, so
+# the markers have to travel with it or the refusal degrades to
+# `<undeclared>` here while production says 0.19.172.
 FUNCS_FILE="$(mktemp)"
 trap 'rm -f "$FUNCS_FILE" 2>/dev/null || true' EXIT
-awk '/^_check_verdict_label_contradiction\(\) \{/ { print; exit }' "$MERGE_PR_SRC" > "$FUNCS_FILE"
+awk '
+  /^# requires-daemon:/          { print; next }
+  /^_mp_daemon_roll_hint\(\) \{/ { print; next }
+  /^_check_verdict_label_contradiction\(\) \{/ { print; exit }
+' "$MERGE_PR_SRC" > "$FUNCS_FILE"
 
 if ! grep -q '_check_verdict_label_contradiction()' "$FUNCS_FILE"; then
     echo -e "${RED}FATAL${NC}: could not extract _check_verdict_label_contradiction from $MERGE_PR_SRC" >&2
@@ -256,6 +267,16 @@ assert_eq "1" "$LAST_RC" "an absent loom-daemon BLOCKS the merge (never silently
 assert_contains "$LAST_OUT" "Merge blocked" "the refusal is stated as a block"
 assert_contains "$LAST_OUT" "could not run" "the message distinguishes 'never ran' from 'found a contradiction'"
 assert_contains "$LAST_OUT" "loom-daemon" "the message names what is missing, so it is actionable"
+# #8285: "actionable" now means the operator can act WITHOUT a second lookup —
+# the version floor this guard needs, and the command that rolls this host to
+# it. Before, the message said only "build or install loom-daemon", which on a
+# host whose binary was merely OLD (not absent) read as already-done advice.
+assert_contains "$LAST_OUT" "requires loom-daemon >= " \
+  "the refusal names the MINIMUM daemon version, read from merge-pr.sh's requires-daemon marker"
+assert_contains "$LAST_OUT" "cli/loom-daemon-update.sh --fetch" \
+  "the refusal names the artifact-first roll command for this host"
+assert_not_contains "$LAST_OUT" "<undeclared>" \
+  "the floor resolved from a real marker (a '<undeclared>' here means the markers did not travel with the extraction)"
 
 # T-FC2: a binary that EXISTS and exits ZERO but never emits the clean
 # sentinel — e.g. an older loom-daemon, or anything substituted onto the path.
