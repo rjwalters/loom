@@ -430,6 +430,30 @@ incidents (#5979, #4903) with no ceiling in sight as token pools and queue
 depth both grow. A session/containment boundary is the mechanism this ADR
 commits to instead of continuing to absorb both costs indefinitely.
 
+## Addendum: optional private-clone sessions (#8785)
+
+The operator's 2026-09-23 direction adds an independent-clone alternative to the
+path-parity workspace decision. It does not replace the default host-mounted
+mode or change persistent account authentication ownership. The private mode
+owns one ordinary Docker-managed volume per account, including its repository,
+Git metadata and initial build caches. It exposes no host repository mount.
+
+One exclusive account job lease serializes standalone roles, sweeps and manual
+headless jobs. Tmux attach/shell refuse this mode until they can safely join the
+same exclusion domain. Supervised session-exec retains cancellation semantics;
+missing cleanup evidence or surviving descendants retain the lease. Dirty or
+unpublished work is never automatically reset, and stop preserves both the
+workspace volume and external credential profile. Actual Docker settings and
+volume ownership are checked before reuse. The mode deliberately trades initial
+clone/cache duplication for a small, inspectable isolation boundary.
+
+This phase provides the lifecycle and explicit job primitive only. Normal
+dispatch/log/recovery integration (#8786), contextual capability admission
+(#8787) and live canary (#4496) remain separate gates. No global capability flag
+or routing default changes here. Efficiency/parallelism exploration is #8788.
+See the [mount contract](../../docker/worker/MOUNT-CONTRACT.md) and
+[session CLI/migration guide](../../docker/session/README.md#private-clone-workspaces).
+
 ## References
 
 - Epic **#6896** — Session containers: persistent Codex auth, mandatory

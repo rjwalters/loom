@@ -79,6 +79,7 @@ pub mod monitor_classes;
 pub mod monitor_db;
 pub mod monitor_ranking_json;
 pub mod paths;
+pub mod private_workspace;
 pub mod rng;
 pub mod rotation;
 pub mod select;

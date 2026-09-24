@@ -3,6 +3,7 @@
 //! setsid/double-fork descendants owned until they have all been reaped.
 
 mod host;
+pub use host::run as run_host;
 mod owner;
 #[cfg(target_os = "linux")]
 mod worker;

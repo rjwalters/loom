@@ -1401,6 +1401,8 @@ jobs:
         run: |
           docker pull ubuntu:24.04
           cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
+      - name: Verify account-private clones and exclusive jobs with Docker fixtures
+        run: cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
 
   shell-suite-tests:
     name: Shell Test Suites (hermetic)

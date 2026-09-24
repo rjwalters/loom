@@ -70,7 +70,7 @@ fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
     }
 }
 
-pub(super) fn run(args: HostArgs) -> Result<i32> {
+pub fn run(args: HostArgs) -> Result<i32> {
     signals();
     let parent = unsafe { libc::getppid() };
     // A unique temporary marker revokes the captured shell's invocation without

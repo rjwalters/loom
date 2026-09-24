@@ -13,10 +13,12 @@ filesystems under this contract. Getting it wrong is not a performance bug —
 it silently corrupts git worktrees (§1) or reintroduces a known rebuild-storm
 incident (§4).
 
-## 1. Path parity (the load-bearing rule)
+## 1. Path parity (host-mounted mode)
 
-**The host workspace root MUST be mounted at the identical absolute path
-inside the container.**
+**In the default host-mounted mode, the host workspace root MUST be mounted
+at the identical absolute path inside the container.** The explicitly selected
+private-clone session mode below instead owns a real independent clone; it
+does not import host worktree pointers.
 
 ```bash
 # CORRECT — host path and container path are byte-identical
@@ -65,12 +67,44 @@ remains valid for **standalone use** (a one-off `docker run` against an
 ad-hoc checkout with no worktree fan-out, e.g. a developer smoke-testing the
 image locally per README.md § "Building and testing locally").
 
-**Loom-managed dispatch — anything driven by `spawn-worker.sh`, the daemon's
+**Host-mounted Loom dispatch — anything driven by `spawn-worker.sh`, the daemon's
 containerized-dispatch mode (epic #6896 Phase 3), or the `run-job` seam
 (Phase 4) — MUST use a parity mount and override `-w`/`WORKDIR` to the parity
 path, not `/workspace`.** The two conventions do not conflict: `/workspace`
 is what you get if you don't opt into worktree-aware dispatch; parity mounts
 are what worktree-aware dispatch requires.
+
+### Private-clone session mode (#8785)
+
+`accounts session start NAME --private-clone HTTPS_URL` opts one account into
+an independent clone at `/workspace/repo`, with metadata and build caches in
+its Docker-managed `/workspace` volume. This is a separate lifecycle mode;
+normal daemon dispatch and Codex capability admission follow in #8786/#8787.
+
+- No host checkout, sibling repository, shared Git objects, or cross-account
+  writable cache is mounted. Git metadata must be real private directories,
+  without alternates or symlinks. Existing issue worktrees stay inside the
+  private volume and use their container paths throughout.
+- The volume MUST use Docker's ordinary `local` driver without driver options
+  (a named bind-backed volume is not isolation). Actual mounts, volume ownership,
+  peer attachments and containment settings are verified on every reuse/job.
+- The only bind mounts are the existing per-account external `CODEX_HOME` (rw)
+  and an optional external gh configuration directory (ro). No token pool,
+  runtime socket, device, host PID/IPC/network namespace or privilege is granted.
+  Rootfs is read-only, all capabilities are dropped, no-new-privileges is set,
+  and `/tmp` is a private tmpfs. The image is trusted, operator-selected code.
+- Caches are initially private and persistent under `/workspace/cache`:
+  Cargo home/target, npm cache and XDG cache. Section 4's shared host-cache
+  requirement applies to host-mounted mode, not this explicit alternative.
+- One host-owned account lease covers lifecycle operations and role, sweep and
+  interactive jobs across all repositories. A crashed host does not imply an
+  idle worker: reclaim only after original-container absence/stoppage or an
+  exact idle process inventory. Unknown evidence remains unavailable.
+- Dirty or unpublished work is retained and reported. Stop removes the idle
+  container, never its volume, credential profile or recovery metadata.
+
+The supported CLI and migration procedure are in
+[`docker/session/README.md`](../session/README.md#private-clone-workspaces).
 
 ## 2. Secrets mounts
 
