@@ -76,6 +76,12 @@ export class HistoricalChartsPanel {
   private readonly windowDays: number;
   private readonly now: () => Date;
   private filter: HistoryQueryFilter;
+  /** The last fetched records, kept so a container resize re-renders the
+   * charts at the new pixel width without another round trip (#8546: the
+   * charts render at fixed pixel size rather than scaling a viewBox). */
+  private records: HistoryRecord[] = [];
+  private resizeObserver: ResizeObserver | undefined;
+  private lastWidth = 0;
 
   constructor(options: HistoricalChartsPanelOptions) {
     this.basePath = options.basePath;
@@ -124,6 +130,7 @@ export class HistoricalChartsPanel {
     const records: HistoryRecord[] = pages.flat();
 
     if (records.length === 0) {
+      this.records = [];
       this.renderNote(
         this.outcomesContainer,
         `No completed sweeps ${this.filter.since ? "in the selected range" : `in the last ${this.windowDays} days`}.`,
@@ -132,10 +139,41 @@ export class HistoricalChartsPanel {
       return;
     }
 
-    const buckets = buildOutcomesOverTime(records, this.granularity);
-    renderOutcomesChart(this.outcomesContainer, buckets);
-    renderSuccessRateChart(this.successRateContainer, buildSuccessRateTrend(buckets));
-    renderDurationPercentilesChart(this.durationsContainer, buildDurationPercentiles(records));
+    this.records = records;
+    this.renderCharts();
+    this.observeResize();
+  }
+
+  /** Draw all three charts from the cached records at the containers'
+   * current width. Safe to call again on resize — each view clears and
+   * re-renders its container. */
+  private renderCharts(): void {
+    const granularityLabel = this.granularity === "weekly" ? "week" : "day";
+    const buckets = buildOutcomesOverTime(this.records, this.granularity);
+    renderOutcomesChart(this.outcomesContainer, buckets, { granularityLabel });
+    renderSuccessRateChart(this.successRateContainer, buildSuccessRateTrend(buckets), { granularityLabel });
+    renderDurationPercentilesChart(this.durationsContainer, buildDurationPercentiles(this.records));
+    this.lastWidth = this.outcomesContainer.clientWidth;
+  }
+
+  /** Re-render on a container width change (window resize, sidebar toggle).
+   * Height changes and the observer's own initial callback are ignored via
+   * the width comparison, so this never loops on its own render. */
+  private observeResize(): void {
+    if (this.resizeObserver || typeof ResizeObserver === "undefined") return;
+    this.resizeObserver = new ResizeObserver(() => {
+      if (this.records.length === 0) return;
+      const width = this.outcomesContainer.clientWidth;
+      if (width > 0 && width !== this.lastWidth) this.renderCharts();
+    });
+    this.resizeObserver.observe(this.outcomesContainer);
+  }
+
+  /** Release the resize observer. Panels are torn down on every route change
+   * (see `panels.ts`), so this is the mount's teardown. */
+  dispose(): void {
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = undefined;
   }
 
   private renderNote(container: HTMLElement, text: string, testid: string): void {

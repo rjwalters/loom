@@ -110,7 +110,7 @@ function mountCharts(root: HTMLElement): PanelTeardown {
   });
   panel.refresh().catch((error: unknown) => renderMountError(outcomes, error));
 
-  return () => {};
+  return () => panel.dispose();
 }
 
 function mountTokens(root: HTMLElement): PanelTeardown {
