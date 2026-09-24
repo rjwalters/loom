@@ -3,10 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   STALE_AFTER_SEC,
   buildFleetView,
+  buildHostView,
   degradedProviders,
   distressReason,
   findHost,
   isHostDistressed,
+  isRosterMissingStatus,
   isTokenPoolDegraded,
   sortSweeps,
   summarizeTokens,
@@ -16,13 +18,16 @@ import {
   DEGRADED_HOST_ID,
   HEALTHY_HOST_ID,
   IDLE_HOST_ID,
+  MISSING_HOST_ID,
   NOW,
   PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID,
   STALE_HOST_ID,
   SWEEP_ONLY_HOST_ID,
+  UNPROVISIONED_HOST_ID,
   isoMinutesBefore,
   multiHostSnapshot,
   persistentRoleTickFailureFixture,
+  rosterMissingSnapshot,
 } from "./fixtures";
 
 const view = () => buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
@@ -514,5 +519,119 @@ describe("sortSweeps", () => {
       { hostId: "h", sweepId: "a", startedAt: "2026-07-30T12:00:00Z" },
     ]);
     expect(sorted.map((sweep) => sweep.sweepId)).toEqual(["a", "z"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Expected-host roster (#8792 backend → #8804 SPA)
+// ---------------------------------------------------------------------------
+
+describe("buildFleetView — missingHosts (#8804)", () => {
+  const roster = () => buildFleetView(parseFleetSnapshot(rosterMissingSnapshot()), NOW);
+
+  it("adds roster hosts that never reported to the host set", () => {
+    const built = roster();
+    // 6 telemetry-derived hosts (5 reporting + 1 sweep-only), plus the two
+    // roster hosts that have no `hosts` entry at all.
+    expect(built.hosts).toHaveLength(8);
+    expect(findHost(built, MISSING_HOST_ID)?.status).toBe("missing");
+    expect(findHost(built, UNPROVISIONED_HOST_ID)?.status).toBe("unprovisioned");
+  });
+
+  it("counts roster hosts separately from reporting hosts", () => {
+    const built = roster();
+    expect(built.reportingHosts).toBe(5);
+    expect(built.missingHosts).toBe(1);
+    expect(built.unprovisionedHosts).toBe(1);
+  });
+
+  it("counts a missing host as needing attention, but not an unprovisioned one", () => {
+    // `missing` means an enrolled host is silent — an incident.
+    // `unprovisioned` means it was never enrolled — a to-do, not an outage,
+    // and flagging it would make "needs attention" permanently non-zero for
+    // any roster listing a host someone plans to add.
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {},
+        activeSweeps: [],
+        missingHosts: [
+          { hostId: "m", state: "missing" },
+          { hostId: "u", state: "unprovisioned" },
+        ],
+      }),
+      NOW,
+    );
+    expect(built.needsAttention).toBe(1);
+    expect(built.reportingHosts).toBe(0);
+  });
+
+  it("sorts missing first and unprovisioned above the data-less unknown bucket", () => {
+    const built = roster();
+    const order = built.hosts.map((host) => host.hostId);
+    expect(order[0]).toBe(MISSING_HOST_ID);
+    expect(order.indexOf(UNPROVISIONED_HOST_ID)).toBeLessThan(order.indexOf(SWEEP_ONLY_HOST_ID));
+    // The four pre-existing statuses keep their relative order.
+    expect(order.indexOf(STALE_HOST_ID)).toBeLessThan(order.indexOf(DEGRADED_HOST_ID));
+    expect(order.indexOf(DEGRADED_HOST_ID)).toBeLessThan(order.indexOf(SWEEP_ONLY_HOST_ID));
+    expect(order.indexOf(SWEEP_ONLY_HOST_ID)).toBeLessThan(order.indexOf(HEALTHY_HOST_ID));
+  });
+
+  it("keeps the sweeps of a roster host that pushed sweep records but never health", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {},
+        activeSweeps: [{ hostId: "m", sweepId: "s1", phase: "builder" }],
+        missingHosts: [{ hostId: "m", state: "missing" }],
+      }),
+      NOW,
+    );
+    const host = findHost(built, "m");
+    expect(host?.status).toBe("missing");
+    expect(host?.sweeps).toHaveLength(1);
+  });
+
+  it("never overrides live telemetry with a stale roster classification", () => {
+    // A host with a real health record is not "never reported", whatever a
+    // hand-built or racing snapshot's missingHosts claims — a card saying
+    // both "last report 2m ago" and "never reported" would be incoherent.
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: { health: { record: { kind: "host.health" }, updatedAt: isoMinutesBefore(2) } },
+          t: { tokens: { record: { kind: "tokens.snapshot", accounts: [] }, updatedAt: isoMinutesBefore(2) } },
+        },
+        activeSweeps: [],
+        missingHosts: [
+          { hostId: "h", state: "missing" },
+          { hostId: "t", state: "missing" },
+        ],
+      }),
+      NOW,
+    );
+    expect(findHost(built, "h")?.status).toBe("ok");
+    expect(findHost(built, "t")?.status).toBe("ok");
+    expect(built.missingHosts).toBe(0);
+    expect(built.reportingHosts).toBe(2);
+  });
+
+  it("leaves every count untouched when the payload carries no missingHosts", () => {
+    const withRoster = roster();
+    const without = view();
+    expect(without.missingHosts).toBe(0);
+    expect(without.unprovisionedHosts).toBe(0);
+    expect(without.hosts).toHaveLength(6);
+    expect(without.reportingHosts).toBe(withRoster.reportingHosts);
+    expect(without.needsAttention).toBe(2);
+  });
+
+  it("classifies roster state through buildHostView's own parameter", () => {
+    expect(buildHostView("h", {}, [], NOW, "missing").status).toBe("missing");
+    expect(buildHostView("h", {}, [], NOW, "unprovisioned").status).toBe("unprovisioned");
+    expect(buildHostView("h", {}, [], NOW).status).toBe("unknown");
+    expect(isRosterMissingStatus("missing")).toBe(true);
+    expect(isRosterMissingStatus("unprovisioned")).toBe(true);
+    for (const status of ["ok", "degraded", "stale", "unknown"] as const) {
+      expect(isRosterMissingStatus(status)).toBe(false);
+    }
   });
 });

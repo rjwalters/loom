@@ -253,6 +253,24 @@ a:hover {
 .card--degraded {
   border-color: var(--warn);
 }
+/* Roster-expected hosts that never reported (#8792/#8804). `missing` shares
+ * `stale`'s alarm colour — both mean "something that should be reporting is
+ * not" — while `unprovisioned` is a dashed, unemphasised outline: a planning
+ * to-do, not an outage, and it must never read as one at a glance. */
+.card--missing {
+  border-color: var(--bad);
+}
+.card--unprovisioned {
+  border-style: dashed;
+}
+/* The one-sentence explanation on a roster-missing card, which stands in for
+ * the health/token field lists an ordinary card carries. */
+.card__notice {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
 .card__header {
   display: flex;
   align-items: center;
@@ -428,6 +446,16 @@ a:hover {
 }
 .badge--unknown {
   color: var(--text-dim);
+}
+/* #8804 — see `.card--missing`/`.card--unprovisioned` for why these two are
+ * deliberately not the same colour as each other. */
+.badge--missing {
+  color: var(--bad);
+  border-color: color-mix(in srgb, var(--bad) 45%, transparent);
+}
+.badge--unprovisioned {
+  color: var(--text-dim);
+  border-style: dashed;
 }
 .chip {
   background: var(--bg-sunken);
