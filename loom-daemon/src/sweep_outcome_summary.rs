@@ -76,6 +76,11 @@ use crate::runtime_preference::CredentialSource;
 use crate::sweep_outcomes;
 use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryRecord};
 
+mod complexity;
+mod group_by;
+
+pub use group_by::GroupBy;
+
 // ============================================================================
 // Rate card identity (Issue #8060 is the refresh; this names what was used)
 // ============================================================================
@@ -126,76 +131,10 @@ pub const UNKNOWN_GROUP: &str = "unknown";
 // ============================================================================
 // Grouping
 // ============================================================================
-
-/// The `--group-by` dimension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GroupBy {
-    /// Experiment arm — explicit stamp preferred, inferred marked, unstamped
-    /// bucketed as `unknown` (see [`resolve_arm`]).
-    Arm,
-    /// Dispatched model, `default` for a record with none.
-    Model,
-    /// `owner/repo`.
-    Repo,
-    /// Emitting host. Degenerate on a local read — see the module docs.
-    Host,
-    /// UTC calendar day of the envelope's `emitted_at`.
-    Day,
-    /// The **tap** — `(runtime, credential source)` — that paid for the sweep
-    /// (Issue #8556). See [`resolve_tap`] for how a record with no explicit
-    /// `config["tap"]` stamp is placed.
-    Tap,
-    /// The Curator's complexity tier (Issue #8542): `mechanical` / `routine` /
-    /// `complex`, `unknown` for a record with no marker observed — see
-    /// [`SweepOutcomeRecord::complexity`]. This is the routing-evaluation cut:
-    /// each row's `first_pass_approval_rate` answers "does this tier's
-    /// dispatch hold the Judge first-pass rate?".
-    #[serde(rename = "complexity")]
-    Complexity,
-    /// The `model × complexity` cross-tab (Issue #8542): the compound key
-    /// `"<model>/<complexity>"`, each side defaulting exactly as its own
-    /// single-dimension grouping does (`default` / `unknown`). Answers
-    /// "within one tier, does a cheaper model hold the approval rate?" —
-    /// the question `--group-by model` and `--group-by complexity` can each
-    /// only approximate alone.
-    #[serde(rename = "model-complexity")]
-    ModelComplexity,
-}
-
-impl GroupBy {
-    /// Parse a `--group-by` value. Case-insensitive.
-    pub fn parse(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "arm" => Ok(Self::Arm),
-            "model" => Ok(Self::Model),
-            "repo" => Ok(Self::Repo),
-            "host" => Ok(Self::Host),
-            "day" => Ok(Self::Day),
-            "tap" => Ok(Self::Tap),
-            "complexity" => Ok(Self::Complexity),
-            "model-complexity" => Ok(Self::ModelComplexity),
-            other => bail!(
-                "unknown --group-by value {other:?} (expected one of: arm, model, repo, host, \
-                 day, tap, complexity, model-complexity)"
-            ),
-        }
-    }
-
-    /// The wire/display spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Arm => "arm",
-            Self::Model => "model",
-            Self::Repo => "repo",
-            Self::Host => "host",
-            Self::Day => "day",
-            Self::Tap => "tap",
-            Self::Complexity => "complexity",
-            Self::ModelComplexity => "model-complexity",
-        }
-    }
-}
+//
+// The `GroupBy` dimension enum lives in the sibling `group_by` module (see
+// the `mod group_by;` / `pub use group_by::GroupBy;` above) — split out to
+// stay under the file-size ratchet threshold.
 
 /// Where a row's arm label came from. Carried on every arm-grouped row so an
 /// inferred arm is never read as an experiment's own stamp (#8055).
@@ -221,28 +160,6 @@ impl ArmSource {
             Self::Unknown => "unknown",
         }
     }
-}
-
-/// Resolve a record's complexity-tier group label (Issue #8542): the tier
-/// verbatim when the marker was read, else [`UNKNOWN_GROUP`] — never dropped,
-/// matching [`resolve_arm`]'s "nothing is dropped for want of a group" rule.
-#[must_use]
-pub fn resolve_complexity(record: &SweepOutcomeRecord) -> String {
-    record
-        .complexity
-        .clone()
-        .unwrap_or_else(|| UNKNOWN_GROUP.to_string())
-}
-
-/// Resolve a record's `model` group label — `default` for a record with no
-/// explicit model, exactly as `GroupBy::Model` resolves it. Factored out so
-/// [`GroupBy::ModelComplexity`]'s compound key reuses the identical fold.
-#[must_use]
-pub fn resolve_model_label(record: &SweepOutcomeRecord) -> String {
-    record
-        .model
-        .clone()
-        .unwrap_or_else(|| "default".to_string())
 }
 
 /// Resolve a record's arm and where that arm came from. Never returns an
@@ -1120,10 +1037,12 @@ pub fn summarize(
                 }
                 (arm, Some(source))
             }
-            GroupBy::Model => (resolve_model_label(record), None),
-            GroupBy::Complexity => (resolve_complexity(record), None),
+            GroupBy::Model => (complexity::resolve_model_label(record), None),
+            GroupBy::Complexity => (complexity::resolve_complexity(record), None),
             GroupBy::ModelComplexity => {
-                (format!("{}/{}", resolve_model_label(record), resolve_complexity(record)), None)
+                let model = complexity::resolve_model_label(record);
+                let tier = complexity::resolve_complexity(record);
+                (format!("{model}/{tier}"), None)
             }
             GroupBy::Repo => {
                 let repo = record.repo.trim();
@@ -1167,23 +1086,7 @@ pub fn summarize(
         if doctor_engaged(record) {
             acc.doctor += 1;
         }
-        // First-pass Judge approval rate (Issue #8542): the routing-evaluation
-        // metric a `complexity`/`model-complexity` grouping exists to surface.
-        // `judge_verdicts` is `Some([])` for an observed-but-unjudged PR (a
-        // sweep that died before Judge) — that counts as "not judged", the
-        // same "unknown != zero" contract as `judge_verdicts` itself, so it
-        // must not deflate the denominator. Only a non-empty verdict list
-        // counts, and only its FIRST entry (attempt 1) settles the fold.
-        if let Some(first) = record
-            .judge_verdicts
-            .as_ref()
-            .and_then(|verdicts| verdicts.first())
-        {
-            acc.first_pass_judged += 1;
-            if first.verdict == "pass" {
-                acc.first_pass_approved += 1;
-            }
-        }
+        complexity::accumulate_first_pass(acc, record);
         if let Some(usd) = weighted_tokens_usd(record) {
             acc.weighted_usd += usd;
             acc.weighted_records += 1;
@@ -1335,14 +1238,8 @@ pub fn summarize(
             ));
         }
     }
-    if matches!(opts.group_by, GroupBy::Complexity | GroupBy::ModelComplexity)
-        && rows.iter().any(|r| r.group.contains(UNKNOWN_GROUP))
-    {
-        notes.push(
-            "records with no Curator complexity marker observed are bucketed as 'unknown' \
-             rather than dropped (issue #8542) — group counts still sum to records_grouped."
-                .to_string(),
-        );
+    if let Some(note) = complexity::unknown_group_note(opts.group_by, &rows) {
+        notes.push(note);
     }
     if !opts.merge_join_attempted {
         notes.push(
@@ -1478,9 +1375,7 @@ pub fn render_text(report: &SummaryReport) -> String {
         let merged = row
             .merged_prs
             .map_or_else(|| "n/a".to_string(), |m| m.to_string());
-        let first_pass = row
-            .first_pass_approval_rate
-            .map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r * 100.0));
+        let (first_pass, first_pass_judged) = complexity::render_first_pass_tail(row);
         let tail = format!(
             "{:>6} {:>5} {:>5} {:>5} {:>5} {:>8.1}% {:>7} {:>7} {:>7.1}% {:>7} {:>9} {:>9} {:>8} {:>8} {:>7} {:>6}",
             row.sweeps,
@@ -1498,7 +1393,7 @@ pub fn render_text(report: &SummaryReport) -> String {
             fmt_opt_f64(row.lines_added_per_merged_pr, 0),
             fmt_opt_f64(row.lines_deleted_per_merged_pr, 0),
             first_pass,
-            row.first_pass_judged,
+            first_pass_judged,
         );
         if arm {
             out.push_str(&format!(
@@ -1517,11 +1412,7 @@ pub fn render_text(report: &SummaryReport) -> String {
         "Doctor% is approximate: derived from sampled phase_durations until doctor_cycles lands \
          (#8056).\n",
     );
-    out.push_str(
-        "JDG1% is the first-pass Judge approval rate (judge_verdicts[0].verdict == \"pass\") \
-         over JDG_N judged sweeps in the group; '-' means no sweep in the group was judged \
-         (#8542).\n",
-    );
+    out.push_str(complexity::FIRST_PASS_NOTE);
     for note in &report.notes {
         out.push_str(&format!("Note: {note}\n"));
     }
