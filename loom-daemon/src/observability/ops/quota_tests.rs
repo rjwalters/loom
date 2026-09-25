@@ -1,23 +1,13 @@
-//! Tests for quota burn and pool state (Issue #8857).
+//! Tests for pool state (Issue #8857). Burn is tested beside each store
+//! under `quota/`.
 
-use std::collections::BTreeMap;
+use chrono::{DateTime, TimeZone, Utc};
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
-
-use super::{burn_points, claude_burn, BurnFold, ModelBurn, PoolAccount, QuotaState};
+use super::{api_key_accounts_in, PoolAccount, QuotaState};
 use crate::telemetry::ops::{MetricName, MetricPoint, MetricValue};
 
 fn at(secs: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_790_000_000 + secs, 0).unwrap()
-}
-
-/// One assistant record carrying usage, as Claude Code writes it.
-fn record(id: Option<&str>, model: &str, secs: i64, input: i64, output: i64) -> String {
-    let id = id.map_or(String::new(), |id| format!(r#""id":"{id}","#));
-    format!(
-        r#"{{"type":"assistant","timestamp":"{}","message":{{{id}"model":"{model}","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":100,"cache_creation":{{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":4}}}}}}}}"#,
-        at(secs).to_rfc3339()
-    )
 }
 
 fn value(point: &MetricPoint) -> i64 {
@@ -38,155 +28,6 @@ fn find<'a>(
                 .iter()
                 .all(|(k, v)| p.labels.get(*k).map(String::as_str) == Some(*v))
     })
-}
-
-// ------------------------------------------------------------------ burn
-
-#[test]
-fn streamed_chunks_count_once_at_their_maximum() {
-    let mut fold = BurnFold::default();
-    let lines = [
-        record(Some("m1"), "claude-opus", 10, 5, 1),
-        record(Some("m1"), "claude-opus", 11, 5, 40),
-        record(Some("m1"), "claude-opus", 12, 5, 30),
-    ];
-    fold.add_lines(lines.iter().map(String::as_str));
-    let burn = fold.window(at(0), at(100));
-    assert_eq!(
-        burn["claude-opus"],
-        ModelBurn {
-            input: 5,
-            output: 40,
-            cache_read: 100,
-            cache_write: 7,
-            requests: 1,
-        }
-    );
-}
-
-#[test]
-fn a_message_counts_in_the_window_of_its_first_chunk_only() {
-    let mut fold = BurnFold::default();
-    let lines = [
-        record(Some("early"), "m", 50, 10, 1),
-        // Straddles the boundary at 60: first chunk before, last after.
-        record(Some("straddle"), "m", 59, 20, 1),
-        record(Some("straddle"), "m", 61, 20, 9),
-        record(Some("late"), "m", 70, 30, 1),
-    ];
-    fold.add_lines(lines.iter().map(String::as_str));
-    let first = fold.window(at(0), at(60));
-    let second = fold.window(at(60), at(120));
-    assert_eq!(first["m"].requests, 2);
-    assert_eq!(first["m"].input, 30);
-    assert_eq!(first["m"].output, 10, "straddling message counted at its max");
-    assert_eq!(second["m"].requests, 1);
-    assert_eq!(second["m"].input, 30);
-    // The window is (start, end]: a message exactly at `end` is in, at
-    // `start` is out, so abutting windows never both count it.
-    assert_eq!(fold.window(at(50), at(59))["m"].requests, 1);
-    assert!(!fold.window(at(50), at(58)).contains_key("m"));
-}
-
-#[test]
-fn a_message_copied_into_another_transcript_counts_once() {
-    let mut fold = BurnFold::default();
-    let line = record(Some("m1"), "m", 10, 5, 5);
-    fold.add_lines([line.as_str()]);
-    fold.add_lines([line.as_str()]);
-    assert_eq!(fold.window(at(0), at(100))["m"].requests, 1);
-}
-
-#[test]
-fn records_without_an_id_are_each_one_request() {
-    let mut fold = BurnFold::default();
-    let lines = [record(None, "m", 10, 1, 1), record(None, "m", 11, 1, 1)];
-    fold.add_lines(lines.iter().map(String::as_str));
-    assert_eq!(fold.window(at(0), at(100))["m"].requests, 2);
-}
-
-#[test]
-fn synthetic_untimestamped_and_garbage_lines_are_skipped() {
-    let mut fold = BurnFold::default();
-    let untimestamped = r#"{"message":{"id":"x","model":"m","usage":{"input_tokens":9}}}"#;
-    let lines = [
-        record(Some("s"), "<synthetic>", 10, 9, 9),
-        untimestamped.to_string(),
-        "not json".to_string(),
-        r#"{"type":"user","timestamp":"2026-09-25T00:00:00Z"}"#.to_string(),
-    ];
-    fold.add_lines(lines.iter().map(String::as_str));
-    assert!(fold.window(at(-1_000_000), at(1_000_000)).is_empty());
-}
-
-#[test]
-fn burn_points_label_provider_and_model_and_skip_zeroes() {
-    let by_model: BTreeMap<String, ModelBurn> = [(
-        "claude-opus".to_string(),
-        ModelBurn {
-            input: 5,
-            output: 0,
-            cache_read: 100,
-            cache_write: 7,
-            requests: 2,
-        },
-    )]
-    .into_iter()
-    .collect();
-    let points = burn_points("claude", &by_model);
-    let names: Vec<MetricName> = points.iter().map(|p| p.name).collect();
-    assert_eq!(
-        names,
-        vec![
-            MetricName::LlmTokensInput,
-            MetricName::LlmTokensCacheRead,
-            MetricName::LlmTokensCacheWrite,
-            MetricName::LlmRequests,
-        ]
-    );
-    for point in &points {
-        assert_eq!(point.labels["provider"], "claude");
-        assert_eq!(point.labels["model"], "claude-opus");
-    }
-    assert_eq!(value(&points[3]), 2);
-}
-
-#[test]
-fn claude_burn_reads_nested_transcripts_modified_in_the_window() {
-    let dir = tempfile::tempdir().unwrap();
-    let subagents = dir.path().join("-repo").join("session-1").join("subagents");
-    std::fs::create_dir_all(&subagents).unwrap();
-    // Timestamps relative to now, since file mtimes are real.
-    let now = Utc::now();
-    let line = |id: &str, ago: i64| {
-        let mut rec = record(Some(id), "m", 0, 10, 1);
-        rec = rec.replace(&at(0).to_rfc3339(), &(now - Duration::seconds(ago)).to_rfc3339());
-        rec
-    };
-    std::fs::write(
-        dir.path().join("-repo").join("session-1.jsonl"),
-        format!("{}\n{}\n", line("old", 7200), line("new", 30)),
-    )
-    .unwrap();
-    std::fs::write(subagents.join("agent-a.jsonl"), line("sub", 20) + "\n").unwrap();
-    std::fs::write(dir.path().join("-repo").join("notes.txt"), line("txt", 10)).unwrap();
-    let burn = claude_burn(dir.path(), now - Duration::seconds(3600), now);
-    assert_eq!(burn["m"].requests, 2, "old message is outside, .txt is not a transcript");
-    assert_eq!(burn["m"].input, 20);
-}
-
-#[test]
-fn the_first_burn_window_only_anchors_and_later_ones_abut() {
-    let mut state = QuotaState::default();
-    assert_eq!(state.next_burn_window(at(1000)), None);
-    let (start, end) = state.next_burn_window(at(1300)).unwrap();
-    assert_eq!(start, at(1000 - super::MESSAGE_SETTLE_LAG_SECS));
-    assert_eq!(end, at(1300 - super::MESSAGE_SETTLE_LAG_SECS));
-    let (next_start, _) = state.next_burn_window(at(1600)).unwrap();
-    assert_eq!(next_start, end);
-    // A clock that went backwards yields nothing and keeps the anchor.
-    assert_eq!(state.next_burn_window(at(1200)), None);
-    assert_eq!(state.next_burn_window(at(1900)).unwrap().0, at(1600 - 60));
 }
 
 // ------------------------------------------------------------------ pool
@@ -332,4 +173,64 @@ fn token_snapshot_accounts_map_to_pool_accounts() {
         exhausted: true,
     };
     assert_eq!(PoolAccount::from(&state), account("claude", "agent-1", false, true));
+}
+
+/// #8941 item 5: the API-key pool's eligibility maps to usable/exhausted.
+#[test]
+fn api_key_accounts_map_eligibility_to_usable_and_exhausted() {
+    use crate::api_keys_pool::{bad_marks, paths};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("api-keys");
+    let dir = paths::provider_dir(&root, "zai");
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["ok", "dry", "broken", "off"] {
+        let body = if name == "broken" {
+            ""
+        } else {
+            "ZAI_API_KEY=fake\n"
+        };
+        let path = dir.join(format!("{name}.env"));
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    bad_marks::mark_bad(&root, "zai", "dry", "simulated exhaustion", Some(3600)).unwrap();
+    std::fs::write(dir.join(".disabled"), "off\n").unwrap();
+    let mut accounts = api_key_accounts_in(&[root]).unwrap();
+    accounts.sort_by(|a, b| a.account.cmp(&b.account));
+    assert_eq!(
+        accounts,
+        vec![
+            // Malformed: neither usable nor exhausted.
+            account("zai", "broken", false, false),
+            account("zai", "dry", false, true),
+            account("zai", "ok", true, false),
+        ],
+        "a disabled account is not in the pool"
+    );
+}
+
+/// #8941 item 1: a failed pool read carries the last good read forward
+/// instead of making every account vanish (and then count as newly
+/// exhausted on the next good read).
+#[test]
+fn a_failed_api_key_pool_read_carries_the_previous_accounts_forward() {
+    let mut state = QuotaState::default();
+    let good = vec![account("zai", "z1", false, true)];
+    assert_eq!(state.api_key_pool(Some(good.clone())), good);
+    let carried = state.api_key_pool(None);
+    let first = state.pool_points(&carried, at(0));
+    assert_eq!(
+        value(
+            find(&first, MetricName::PoolAccounts, &[("provider", "zai"), ("state", "exhausted")])
+                .unwrap()
+        ),
+        1
+    );
+    let carried = state.api_key_pool(None);
+    let second = state.pool_points(&carried, at(300));
+    assert!(find(&second, MetricName::PoolExhaustions, &[]).is_none());
 }

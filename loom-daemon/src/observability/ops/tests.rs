@@ -146,6 +146,21 @@ fn emit_metrics_since_records_the_interval_start() {
     assert_eq!(record.interval_start, Some(at(-5)));
 }
 
+#[test]
+fn emit_metrics_over_stamps_the_points_at_the_interval_end() {
+    let (queue, sink) = sink();
+    sink.emit_metrics_over(
+        vec![MetricPoint::int(MetricName::DispatchCandidates, 1)],
+        Some(at(-300)),
+        at(-60),
+    );
+    let queued = queue.0.lock().unwrap();
+    let TelemetryRecord::MetricPoints(record) = &queued[0].record else {
+        panic!("expected metric.points");
+    };
+    assert_eq!((record.interval_start, record.captured_at), (Some(at(-300)), at(-60)));
+}
+
 // ---------------------------------------------------------------- wire
 
 #[test]

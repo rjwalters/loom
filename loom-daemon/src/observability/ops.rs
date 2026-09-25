@@ -75,8 +75,20 @@ impl OpsSink {
         points: Vec<MetricPoint>,
         interval_start: Option<chrono::DateTime<Utc>>,
     ) {
+        self.emit_metrics_over(points, interval_start, Utc::now());
+    }
+
+    /// [`Self::emit_metrics_since`] with the points stamped at `end` rather
+    /// than now, so a sampler whose window ends before the sample can make
+    /// consecutive intervals abut exactly (#8941 item 2).
+    pub fn emit_metrics_over(
+        &self,
+        points: Vec<MetricPoint>,
+        interval_start: Option<chrono::DateTime<Utc>>,
+        end: chrono::DateTime<Utc>,
+    ) {
         let mut record = MetricPointsRecord {
-            captured_at: Utc::now(),
+            captured_at: end,
             interval_start,
             points,
         };
