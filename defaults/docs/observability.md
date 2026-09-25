@@ -544,6 +544,7 @@ capture, and why) so you can produce the equivalent for your own instance.
 | `dashboard/docs/deploy-runbook.md` | Deploy your own Cloudflare backend end to end |
 | `dashboard/docs/cloudflare-access.md` | Gating the authenticated view behind SSO; single-URL fallback |
 | `dashboard/docs/query-api.md` | `/api/*` vs `/public/*` routes, redaction policy, live tail |
+| `defaults/observability/cycle-time-questions.md` | Cycle-time analytics on the OTLP sinks: the canonical question set (CT1–CT8), the rollup-vs-raw-TTL retention decision, and what it deliberately cannot answer |
 | `dashboard/docs/token-analytics.md` | Burn curves, forecasting, per-repo attribution |
 | `defaults/scripts/guide-docs-telemetry.sh` | Local doc-maintenance throughput telemetry (§5b) — record + report, no daemon/Cloudflare involvement |
 | `defaults/scripts/merge-admission-telemetry.sh` | Local merge-admission-recheck outcome telemetry (§5c) — record + report, no daemon/Cloudflare involvement |

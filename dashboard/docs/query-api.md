@@ -451,6 +451,20 @@ cancels its reader. `/public/events` pipes the same stream through a
 the client (`src/redaction.ts`'s `redactLiveTailStream`) — the underlying
 poll loop and D1 query are identical to `/api/events`.
 
+## Cycle-time analytics live in the OTLP sinks, not here
+
+"What took long to ship, and where did the time go?" is answered against the
+OTLP destinations (ClickStack / SigNoz), not against this backend. The
+canonical question set, its definitions, and the standing queries are
+[`defaults/observability/cycle-time-questions.md`](../../defaults/observability/cycle-time-questions.md)
+and the two SQL artifacts beside it (Issue #8665).
+
+Why there and not here: this backend's D1 history store keeps the ingested
+record verbatim, but the durations question is a *rollup over months* of
+`sweep.outcome`'s `phase_durations`, which the OTLP sinks already receive and
+index for exactly that shape of query. Nothing about that analysis needs a new
+route, a new table, or a second copy of the data in D1.
+
 ## Not implemented here (later issues)
 
 - **`model`/`result` server-side filtering on the live tail** — `/api/events`
