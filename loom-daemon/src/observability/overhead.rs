@@ -292,7 +292,12 @@ fn run_once(root: &Path, shape: &RunShape, execution: &str) -> Result<Sample> {
         .unwrap_or(0);
     super::lifecycle::finish_execution(root, execution, "success", Default::default());
     let queue = super::queue::DurableQueue::open(root.join("overhead-queue.jsonl"), 100_000);
-    super::lifecycle::backfill(root, &queue);
+    // `Journal::drain` caps a single call at 512 journal entries (~256 spans,
+    // two entries per span). A run whose shape exceeds that cap needs more
+    // than one pass to reach EOF; loop to completion so the measured window
+    // covers the run's full export regardless of span count, not just its
+    // first ~256 spans (#8642).
+    while super::lifecycle::backfill(root, &queue) > 0 {}
     let elapsed_ns = began.elapsed().as_nanos();
 
     let spans: Vec<_> = queue

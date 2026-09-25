@@ -48,6 +48,9 @@ pub use git::is_loom_source_repo;
 // rewrite the marker-delimited managed block on its own, without running a full
 // `init`. The pattern list stays single-sourced in `post_init::EPHEMERAL_PATTERNS`.
 pub use post_init::update_gitignore;
+// The credential-bearing subset of EPHEMERAL_PATTERNS (#8005): the single
+// declared class every Loom stager must refuse regardless of `.gitignore`.
+pub use post_init::{is_credential_path, CREDENTIAL_PATTERNS};
 
 // Import the rest for internal use
 use git::{
@@ -879,3 +882,6 @@ fn verify_all_copied_files(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+#[cfg(test)]
+mod credential_class_tests;

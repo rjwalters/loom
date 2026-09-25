@@ -13,7 +13,7 @@
 # <code-lines> <path>
 1657 defaults/scripts/claude-wrapper.sh
 1184 defaults/scripts/cli/loom-daemon-start.sh
-1590 defaults/scripts/cli/loom-daemon-update.sh
+1589 defaults/scripts/cli/loom-daemon-update.sh
 1063 defaults/scripts/lib/forge-helpers.sh
 1460 defaults/scripts/merge-pr.sh
 2033 defaults/scripts/tests/test-loom-daemon-start.sh
@@ -32,7 +32,7 @@
 3655 loom-daemon/src/cli/status_render.rs
 1913 loom-daemon/src/credential_preflight.rs
 1840 loom-daemon/src/daemon_install_state.rs
-1250 loom-daemon/src/daemon_service.rs
+1248 loom-daemon/src/daemon_service.rs
 1575 loom-daemon/src/epic_supervisor.rs
 1108 loom-daemon/src/fleet/add_worker.rs
 1362 loom-daemon/src/fleet/add_worker/tests.rs
@@ -46,13 +46,13 @@
 1344 loom-daemon/src/install_self_check.rs
 3134 loom-daemon/src/ipc.rs
 4194 loom-daemon/src/ipc/tests.rs
-1226 loom-daemon/src/main.rs
+1228 loom-daemon/src/main.rs
 1788 loom-daemon/src/main_health_gate.rs
 2318 loom-daemon/src/main_health_gate/tests.rs
 1715 loom-daemon/src/orphan_process_reaper.rs
-1596 loom-daemon/src/peer_claims.rs
-2201 loom-daemon/src/role_runner.rs
-3850 loom-daemon/src/role_runner/tests.rs
+1525 loom-daemon/src/peer_claims.rs
+2136 loom-daemon/src/role_runner.rs
+3760 loom-daemon/src/role_runner/tests.rs
 2443 loom-daemon/src/safehouse.rs
 3913 loom-daemon/src/safehouse/tests.rs
 1532 loom-daemon/src/script_helpers/sweep_experiment.rs

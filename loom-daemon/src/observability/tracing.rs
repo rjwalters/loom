@@ -9,9 +9,17 @@ pub fn enabled(root: &Path) -> bool {
         return false;
     }
     let config = super::read_config(root);
+    // Tracing rides the OTLP sink (#4858/#8756): enabled when at least one
+    // CONFIGURED exporter is otlp and resolves a valid endpoint of its own.
     super::resolve_enabled(&config)
-        && super::resolve_exporter(&config) == super::ExporterKind::Otlp
-        && super::resolve_endpoint(&config).is_some_and(|endpoint| valid_endpoint(&endpoint))
+        && super::resolve_exporters(&config).into_iter().any(|entry| {
+            entry.kind == super::ExporterKind::Otlp
+                && entry
+                    .endpoint
+                    .as_deref()
+                    .or(super::resolve_endpoint(&config).as_deref())
+                    .is_some_and(valid_endpoint)
+        })
 }
 
 fn valid_endpoint(endpoint: &str) -> bool {

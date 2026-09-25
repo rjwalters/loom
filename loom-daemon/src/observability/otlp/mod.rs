@@ -3,9 +3,9 @@
 //! [`crate::telemetry::TelemetryEnvelope`] batches into the OTLP wire format,
 //! for operators with an existing OpenTelemetry stack (a self-hosted
 //! collector, Grafana, Honeycomb, …) who want to skip the native Cloudflare
-//! backend entirely. Selected via `observability.exporter = "otlp"`
-//! (`observability::resolve_exporter`) — [`super::exporter::HttpsExporter`]
-//! stays the default (`"https"`).
+//! backend entirely. Selected via `observability.exporter = "otlp"` or an
+//! `observability.exporters` entry (`observability::resolve_exporters`) —
+//! [`super::exporter::HttpsExporter`] stays the default (`"https"`).
 //!
 //! Gated behind the `otlp` Cargo feature (see `loom-daemon/Cargo.toml`): a
 //! default build never compiles `opentelemetry_proto` in, so choosing this

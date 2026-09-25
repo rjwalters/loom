@@ -148,6 +148,16 @@
   "runtimes": {
     "roles": {
       "judge": "codex"
+    },
+    "preference": [
+      "claude",
+      "gemini"
+    ],
+    "rolePreference": {
+      "judge": [
+        "codex",
+        "claude"
+      ]
     }
   },
   "observability": {

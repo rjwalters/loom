@@ -16,6 +16,89 @@ health probes also timed out despite eventual successful requests, so the final
 recipe permits 30-second probes and a 15-minute startup grace period. These are
 host-specific observations, not a backend benchmark.
 
+## Dependency status update (2026-09-23, issue #8527)
+
+At the time of this pass, #8524 (durable trace context and OTLP **span**
+export in Rust) and #8526 (the neutral collector fan-out this deployment
+sits behind) had both merged. #8525 (sweep-phase/role-attempt instrumentation,
+including repair cycles) had its implementation land in #8579, but the issue
+itself remains `loom:operator-only`: what is left there is acceptance
+*evidence* — an authorized paid GLM canary and backend-visible links for a
+real Loom execution — not missing code. #8529 (the shared SigNoz/ClickStack
+comparison) is still `loom:blocked` with no authoritative fixture yet.
+
+Inspecting the merged `loom-daemon` source (`loom-daemon/src/observability/lifecycle.rs`,
+`loom-daemon/src/sweep_registry/dispatch.rs`, `loom-daemon/src/worker_spawn/mod.rs`)
+confirms the real production code path — not a hand-built fixture — already
+creates a `loom.sweep` root span at real sweep dispatch
+(`lifecycle::prepare_execution`, called from `sweep_registry::dispatch`),
+samples real `loom.phase` transitions off the live checkpoint
+(`lifecycle::phase_transition`, called from `sweep_registry/outcome_journal.rs`),
+and opens a real `loom.role_attempt` span for every worker spawn
+(`lifecycle::worker_attempt`, called from `worker_spawn::run`). Real daemon
+spans carry `service.name = loom-daemon` (`observability/otlp/mapping.rs`),
+distinct from the `loom-trial-fixture` service name used below, so a genuine
+trace is queryable separately from this evidence's synthetic fixture once one
+has been sent through this deployment.
+
+Two in-tree Rust integration tests already exercise that real code path end
+to end (not the `telemetry::fixture` generator used for the rest of this
+evidence file): `loom-daemon/tests/successful_sweep_waterfall.rs` (a strictly
+nested successful-sweep waterfall driven by the real `sweep-checkpoint` CLI)
+and `loom-daemon/tests/lifecycle_traces.rs::actual_checkpoint_cli_preserves_rapid_judge_doctor_repair_waterfall`
+(a rejected-Judge → Doctor → successful-Judge repair sequence, driven by the
+same real CLI, asserting distinct span IDs and correct Ok/Error status on
+each Judge attempt). Both passed in this pass's worktree
+(`cargo test -p loom-daemon --features otlp --test lifecycle_traces --test
+successful_sweep_waterfall`, single-threaded to avoid an unrelated flake this
+pass's heavily contended host produced under parallel execution) against
+unmodified `main`. Both only assert against the in-process durable trace
+journal drained via `lifecycle::backfill` — neither test starts a receiver or
+makes a network call, so they prove the span/parentage/status shape, not
+delivery to a live backend.
+
+What this does **not** establish is the two acceptance boxes #8527 itself
+still needs: (1) that same real trace, actually delivered through the neutral
+collector into **this** live ClickStack deployment and queried back out of
+ClickHouse, and (2) a **genuinely** operator-authorized canary — the standalone
+mechanism for producing one without a full sweep dispatch is
+`loom-daemon telemetry-live --execute` (`loom-daemon/src/cli/telemetry_live.rs`),
+which spawns real Pi/OpenCode processes against the `zai-flash` model profile
+and therefore requires a real `ZAI_API_KEY` under operator control — the same
+credential gate that keeps #8525 itself `loom:operator-only`. This Builder
+pass has no such credential, so it could not produce either.
+
+## Credential-free reproduction test (2026-09-24, issue #8527)
+
+A follow-up pass assembled the credential-free recipe the previous entry
+above left as three verified-but-unwired pieces: `loom-daemon/tests/clickstack_trial_canary.rs`
+opens a real `lifecycle::begin` root span, drives the same rejected-Judge →
+Doctor → successful-Judge sequence as `lifecycle_traces.rs` through the real
+`sweep-checkpoint` CLI, drains the durable queue, and POSTs the result with
+the real `telemetry-export` CLI to an operator-supplied collector endpoint —
+no `ZAI_API_KEY` and no full sweep dispatch required. It is `#[ignore]`d (it
+needs `LOOM_TRIAL_COLLECTOR_ENDPOINT`/`LOOM_TRIAL_COLLECTOR_KEY_FILE`/`LOOM_TRIAL_EVIDENCE_DIR`
+and a running receiver) so CI compiles and clippy-lints it without executing
+it. This pass ran `cargo check -p loom-daemon --test clickstack_trial_canary
+--features otlp` and the same `cargo clippy --package loom-daemon --features
+otlp --all-targets -- -D warnings …` invocation CI uses against unmodified
+`main`; both were clean (clippy required one `cargo fmt` pass, applied).
+
+This pass, like the previous one, did not run the test against a live
+receiver: the shared host was running sustained `uptime` load averages of
+15–24 on an 8-core machine for the whole investigation (many concurrent Loom
+worktrees plus unrelated tenants — even the plain `cargo check` above spent
+most of its ~7 minutes blocked on the shared build-directory lock before any
+compilation started). Starting this deployment's 3 GiB/4-CPU container stack
+on top of that would very likely reproduce the multi-minute readiness delays
+already recorded above and add load to other concurrent Builder/Judge/Doctor
+sessions, so this pass did not start ClickStack either. What remains for the
+two open acceptance boxes is now exactly one command — the invocation in
+`README.md`'s "Real trace and repair-waterfall verification" section — run
+against a live deployment when either an operator supplies canary
+credentials for the fully-authorized path, or the host has headroom for a
+dedicated live-verification pass.
+
 ## Stored fixture and authentication
 
 The fixture was sent through the neutral gateway, not directly into ClickHouse.
@@ -110,10 +193,15 @@ flags; final checks therefore ran sequentially with persistent volumes retained.
 | --- | --- |
 | Log-to-trace waterfall and correlated log rows | Passed in the actual HyperDX browser UI |
 | Bootstrap-key rotation and restart persistence | Passed against the actual receiver and persisted tables/source configuration |
-| Real Loom canary and real Judge/Doctor repair trace | Requires #8524/#8525 and #8529 |
+| Real (non-fixture) production span/waterfall code path | Proven in-tree against the local durable trace journal (`successful_sweep_waterfall.rs`, `lifecycle_traces.rs`); **not yet delivered to or queried from this live deployment** — see "Dependency status update" above |
+| Real Loom canary and real Judge/Doctor repair trace, stored and queried in **this** deployment | The credential-free recipe now exists as a tested, compiled, clippy-clean in-tree test (`clickstack_trial_canary.rs`) — running it against a live receiver, or the fully-authorized `telemetry-live --execute` path (requires an operator-held `ZAI_API_KEY`, same gate as #8525's own remaining acceptance), is what remains |
 | Repeated query and ingest-to-visible latency comparison | Shared evaluation #8529 |
 
 The synthetic repair-shaped trace proves transport and schema only. It is not
-evidence that Loom emitted real lifecycle spans. Keep #8527 open until these
-remaining checks are recorded. The shared Rust fixture from #8529 is authoritative
-for the final side-by-side comparison.
+evidence that Loom emitted real lifecycle spans — that now exists in-tree
+(see above), and a reproducible credential-free recipe to route one through
+this live deployment now exists as a tested Rust integration test, but
+neither has actually been run against a live receiver yet. Keep #8527 open
+until that run is recorded.
+The shared Rust fixture from #8529 is authoritative for the final
+side-by-side comparison.

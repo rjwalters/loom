@@ -296,6 +296,53 @@ describe("renderFleetOverview — host staleness (issue #4957)", () => {
   });
 });
 
+describe("renderFleetOverview — roster-expected hosts that never reported (issue #8792)", () => {
+  const NOW = new Date("2026-08-02T12:00:00Z");
+  const base: RedactedFleetSnapshot = {
+    hosts: {
+      "host-live": { health: { record: { kind: "host.health" }, updatedAt: "2026-08-02T11:59:30Z" } },
+      "host-offline": { health: { record: { kind: "host.health" }, updatedAt: "2026-07-31T12:00:00Z" } },
+    },
+    activeSweeps: [],
+  };
+
+  it("renders a never-reported roster host as MISSING and counts it in the Hosts heading", () => {
+    const html = renderFleetOverview({ ...base, missingHosts: [{ hostId: "host-silent", state: "missing" }] }, NOW);
+    expect(html).toContain("freshness-badge--missing");
+    expect(html).toContain("MISSING");
+    expect(html).toContain("host-silent");
+    expect(html).toContain(
+      "Hosts (3): 1 live, 1 offline (host-offline, last seen 2d ago), 1 missing (host-silent)",
+    );
+  });
+
+  it("renders an unprovisioned roster host distinctly from a missing one and from an offline one", () => {
+    const html = renderFleetOverview(
+      { ...base, missingHosts: [{ hostId: "host-planned", state: "unprovisioned" }] },
+      NOW,
+    );
+    expect(html).toContain("freshness-badge--unprovisioned");
+    expect(html).toContain("UNPROVISIONED");
+    expect(html).not.toContain("freshness-badge--missing");
+    expect(html).toContain("Hosts (3): 1 live, 1 offline (host-offline, last seen 2d ago), 1 unprovisioned (host-planned)");
+  });
+
+  it("with no roster (no missingHosts) the heading and rows are unchanged", () => {
+    const html = renderFleetOverview(base, NOW);
+    expect(html).toContain("Hosts (2): 1 live, 1 offline (host-offline, last seen 2d ago)");
+    expect(html).not.toContain("MISSING");
+  });
+
+  it("a fleet where every roster host is missing still renders rows, not the empty-state placeholder", () => {
+    const html = renderFleetOverview(
+      { hosts: {}, activeSweeps: [], missingHosts: [{ hostId: "host-silent", state: "missing" }] },
+      NOW,
+    );
+    expect(html).toContain("Hosts (1): 0 live, 1 missing (host-silent)");
+    expect(html).not.toContain("No host health reported yet.");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Phantom fleet member (issue #5078): a `sweep:`-only host must never render
 // as a fleet card or inflate the header host count, and its sweeps must

@@ -53,6 +53,12 @@ pub struct ModelProfile {
     pub credential_pool: Option<String>,
     #[serde(default)]
     pub credential_targets: BTreeMap<String, CredentialTargets>,
+    /// Per-profile opt-in to credential substitution (#8674): the contained
+    /// worker receives a per-launch placeholder and its provider traffic is
+    /// routed through a host-side proxy that swaps in the real credential.
+    /// Absent (the default) means the credential is forwarded into the
+    /// container's environment exactly as before.
+    pub credential_proxy: Option<super::egress_proxy::ProfileProxy>,
     /// Non-secret provider options (region, project) merged into the harness's
     /// per-launch injected configuration under `provider.<id>.options`.
     #[serde(default)]
@@ -92,6 +98,8 @@ pub struct Selection {
     pub provider_definition: Option<Map<String, Value>>,
     /// API-key pool namespace override (#8401); see [`ModelProfile::credential_pool`].
     pub credential_pool: Option<String>,
+    /// Validated `credentialProxy` block (#8674), when the profile declares one.
+    pub credential_proxy: Option<super::egress_proxy::ProfileProxy>,
 }
 
 fn check_name(value: &str) -> Result<(), LaunchError> {
@@ -284,6 +292,32 @@ pub fn resolve(
             ));
         }
     }
+    if let Some(proxy) = &profile.credential_proxy {
+        // Fail at selection, not at dispatch: a malformed upstream is a
+        // misconfiguration that must never reach a launch that then decides
+        // what to do about it.
+        proxy.validate()?;
+        // Both counts must be 1, not just `pairs`: an array-form
+        // `credentialEnv` with a `credentialTargets` map that only covers
+        // one of its declared names still produces `pairs.len() == 1`, but
+        // `credential_sources` (the full declared set, #8437) carries the
+        // rest forward for by-name forwarding — and nothing downstream
+        // withholds a name outside the mapped pair. Refuse that shape here
+        // rather than proxy one variable while forwarding the others in the
+        // clear.
+        let declared_count = profile
+            .credential_env
+            .as_ref()
+            .map(|env| env.names().len())
+            .unwrap_or(0);
+        if mapping.pairs.len() != 1 || declared_count != 1 {
+            return Err(LaunchError::config(
+                "model profile credentialProxy requires exactly one credential variable; a \
+                 multi-variable provider has no single value to substitute, and every \
+                 credentialEnv variable it declares must be part of that single mapped pair",
+            ));
+        }
+    }
     let unset = missing(&mapping.required);
     if !unset.is_empty() {
         return Err(LaunchError::config(format!(
@@ -314,6 +348,7 @@ pub fn resolve(
         provider_options,
         provider_definition,
         credential_pool: profile.credential_pool.clone(),
+        credential_proxy: profile.credential_proxy.clone(),
     })
 }
 
@@ -334,6 +369,7 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
                 provider_options: None,
                 provider_definition: None,
                 credential_pool: None,
+                credential_proxy: None,
             });
         }
     }
@@ -380,6 +416,7 @@ mod tests {
             credential_env: Some(credential_env),
             credential_targets,
             credential_pool: None,
+            credential_proxy: None,
             provider_options: BTreeMap::new(),
             provider_definition: BTreeMap::new(),
             allowed_efforts: Vec::new(),
@@ -466,5 +503,48 @@ mod tests {
             selection.credentials,
             vec![("ZAI_API_KEY".to_string(), "ZAI_API_KEY".to_string())]
         );
+    }
+
+    /// Regression for the Judge's blocking finding on #8701: an array-form
+    /// `credentialEnv` with a `credentialTargets` map that only covers ONE
+    /// of its declared names produces exactly one `credentials` pair — the
+    /// old `mapping.pairs.len() != 1` guard alone let this through — while
+    /// `credential_sources` still carries the unmapped variable forward for
+    /// by-name forwarding, which `credentialProxy`'s "exactly one variable"
+    /// promise does not withhold. `resolve()` must refuse this shape, not
+    /// just the two-pairs-mapped shape the pre-existing test covered.
+    #[test]
+    fn credential_proxy_refuses_a_declared_but_unmapped_variable() {
+        let _guard = env_lock();
+        std::env::set_var("LOOM_TEST_8701_CRED_A", "value-a");
+        std::env::set_var("LOOM_TEST_8701_CRED_B", "value-b");
+
+        let credential_targets = BTreeMap::from([(
+            "test-runtime".to_string(),
+            CredentialTargets::Map(BTreeMap::from([(
+                "LOOM_TEST_8701_CRED_A".to_string(),
+                "MAPPED_TARGET".to_string(),
+            )])),
+        )]);
+        let mut profile = profile_with_credentials(
+            CredentialEnv::Many(vec![
+                "LOOM_TEST_8701_CRED_A".to_string(),
+                "LOOM_TEST_8701_CRED_B".to_string(),
+            ]),
+            credential_targets,
+        );
+        profile.credential_proxy = Some(super::super::egress_proxy::ProfileProxy {
+            upstream: "https://api.anthropic.com".to_string(),
+            header: super::super::egress_proxy::HeaderStyle::AuthorizationBearer,
+            base_url_env: vec!["ANTHROPIC_BASE_URL".to_string()],
+        });
+
+        let error = resolve("test-runtime", "test-profile", &profile);
+
+        std::env::remove_var("LOOM_TEST_8701_CRED_A");
+        std::env::remove_var("LOOM_TEST_8701_CRED_B");
+
+        let error = error.expect_err("a declared-but-unmapped variable must be refused");
+        assert!(error.message.contains("every credentialEnv variable"), "{}", error.message);
     }
 }

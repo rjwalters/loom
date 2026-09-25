@@ -57,7 +57,7 @@ struct Cli {
 enum Commands {
     /// Launch a worker through a native harness adapter or a legacy runtime.
     SpawnWorker(loom_daemon::worker_spawn::WorkerArgs),
-    /// Inspect worker model profiles without launching anything.
+    /// Inspect worker model profiles; run a launch behind the credential proxy.
     #[command(subcommand_required = true)]
     Worker(loom_daemon::worker_spawn::WorkerCommand),
     /// Execute one guarded native harness tool request from stdin.
@@ -272,6 +272,22 @@ enum Commands {
         #[command(subcommand)]
         action: FleetAction,
     },
+
+    /// The operator-agent persona's I/O surface (Issue #7947, Phase 3b of
+    /// #4196): read room intent, vet a typed command, relay it to the daemon.
+    ///
+    /// `concierge relay` is the ONLY sanctioned path from a natural-language
+    /// read of a room message to a daemon command, and it refuses `--verb
+    /// confirm` unconditionally — a confirmation nonce is answered by the human
+    /// it was shown to, never by the persona. Off unless
+    /// `safehouse.concierge` names at least one allowed sender; `concierge
+    /// check` reports which.
+    ///
+    /// A one-line tuple variant wrapping `ConciergeArgs` (which carries the
+    /// `#[command(subcommand)]`), for the same reason `Telemetry` above is:
+    /// this file is frozen by the file-size ratchet, so the subcommand's shape
+    /// and docs live in `cli::concierge` and only the dispatch arm is here.
+    Concierge(cli::concierge::ConciergeArgs),
 
     /// Manage insta-crash quarantines (Issue #3939): the in-memory pauses the
     /// daemon applies to issues whose sweeps insta-crash repeatedly. Connects to
@@ -1890,6 +1906,28 @@ enum ForgeAction {
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
     },
+
+    /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
+    /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
+    /// replacing its old unconditional `forge_detect_merge_method` call.
+    /// With no `--requested`, preserves today's squash > merge > rebase
+    /// auto-detect. With `--requested`, validates it against the repo's
+    /// actual allowed strategies: prints the method and exits 0 when
+    /// allowed, or names the allowed methods on stderr and exits 1 when not
+    /// — never a silent fallback to squash. GitHub only; Gitea declines
+    /// (exit 3, `EX_FORGE_DECLINED`) so `merge-pr.sh` falls back to its
+    /// shell auto-detect.
+    #[command(name = "merge-method")]
+    MergeMethod {
+        /// Repository, `owner/repo`.
+        #[arg(long, value_name = "NWO")]
+        repo: String,
+
+        /// Explicitly requested merge method. Omit to auto-detect (today's
+        /// unchanged behavior).
+        #[arg(long, value_name = "METHOD")]
+        requested: Option<String>,
+    },
 }
 
 /// Sub-actions for `loom-daemon tokens`.
@@ -2348,85 +2386,6 @@ enum AccountsAction {
     },
 }
 
-/// Sub-actions for `loom-daemon accounts session` (issue #6925).
-#[derive(Subcommand)]
-enum SessionAction {
-    /// Launch (or reuse, if already running; resume, if stopped-but-present)
-    /// the account's session container, then adopt its profile under the
-    /// ownership rule (a session-managed profile refuses further
-    /// host-direct `CODEX_HOME` use — see `accounts reauth`/`status`).
-    Start {
-        /// The account's short profile name, or its registered email
-        /// (issue #7389 -- see `accounts add --email`).
-        #[arg(value_name = "NAME")]
-        name: String,
-        /// Override the session image (default:
-        /// `ghcr.io/rjwalters/loom-worker-session:latest`).
-        #[arg(long, value_name = "IMAGE")]
-        image: Option<String>,
-        /// Directory to bind-mount read-write at the identical absolute
-        /// host path (`docker/worker/MOUNT-CONTRACT.md` §1) — normally the
-        /// parent directory holding every checkout the container will
-        /// serve, since dispatch execs with `--workdir` set to the repo.
-        /// Defaults to the `--workspace` this `loom-daemon` invocation
-        /// itself resolved (issue #7389). Deliberately NOT named
-        /// `--workspace`: `accounts --workspace` is a global `String`
-        /// argument, and a nested arg under the same id with a different
-        /// type makes clap panic at access time (issue #8517).
-        #[arg(long = "mount-workspace", value_name = "PATH")]
-        mount_workspace: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Tear down the container cleanly. Refuses an in-flight `docker exec`
-    /// unless `--force` (the #5119 restart-safety contract: never a raw
-    /// SIGKILL of active work).
-    Stop {
-        #[arg(value_name = "NAME")]
-        name: String,
-        /// Stop even if an in-flight `docker exec` is detected.
-        #[arg(long)]
-        force: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Report running/stopped and basic health (container id, uptime, mount
-    /// paths).
-    Status {
-        #[arg(value_name = "NAME")]
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Attach to the container's tmux server for interactive `codex login` /
-    /// inspection. Operator-only — never the dispatch path (headless
-    /// dispatch is a plain `docker exec`, added by a later Phase 2 issue).
-    Attach {
-        #[arg(value_name = "NAME")]
-        name: String,
-    },
-    /// "Start-if-absent, run Codex, attach" composite (issue #7389) —
-    /// what the operator-facing `codex-agent <account>` shim execs into.
-    /// Starts the session if not already running, launches `codex` in a
-    /// tmux window cwd'd to the mounted workspace, and attaches. Re-running
-    /// `shell` re-attaches to the same window rather than stacking a
-    /// second Codex process.
-    Shell {
-        /// The account's short profile name, or its registered email.
-        #[arg(value_name = "NAME")]
-        name: String,
-        /// Directory to bind-mount, same default and same naming rationale
-        /// as `session start --mount-workspace` (issue #8517).
-        #[arg(long = "mount-workspace", value_name = "PATH")]
-        mount_workspace: Option<PathBuf>,
-        /// Extra arguments passed to `codex` inside the tmux window, after
-        /// a literal `--` (default when omitted: `--yolo`, the operator's
-        /// own bare-metal invocation).
-        #[arg(last = true)]
-        args: Vec<String>,
-    },
-}
-
 /// Sub-actions for `loom-daemon claude-config` (issue #4415).
 #[derive(Subcommand)]
 enum ClaudeConfigAction {
@@ -2572,6 +2531,7 @@ async fn main() {
 }
 
 use cli::accounts::handle_accounts_command;
+use cli::accounts_session::SessionAction;
 use cli::api_keys::{handle_api_keys_command, ApiKeysAction};
 use cli::cleanup_ops::{
     handle_clean_command, handle_cleanup_command, handle_recover_orphans_command,
@@ -2807,6 +2767,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
         | Commands::JevTier { .. }
+        | Commands::Concierge(..)
         | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }
         | Commands::NoopCooldown { .. }

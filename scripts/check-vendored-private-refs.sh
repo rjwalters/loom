@@ -72,7 +72,10 @@ ALLOWED_HOST_SUFFIXES=(
   # openai.com on these two lines — a vendor Loom drives, not an
   # operator-owned deployment. Folded onto the existing lines rather than
   # given their own so this stays a zero-line change to the shell budget.
-  openai.com opentelemetry.io kimi.com moonshot.ai
+  # `chatgpt.com` is OpenAI's public product host, cited verbatim in the
+  # Codex usage-limit refusal captured for #8539 (token-pool.md and the
+  # matching assert_classify row) — same category, folded onto this line.
+  openai.com opentelemetry.io kimi.com moonshot.ai chatgpt.com
   apple.com
   npmjs.org crates.io
   biomejs.dev workers.dev

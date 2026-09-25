@@ -27,16 +27,21 @@ import {
   roleTickAggregateText,
   roleTickCompactText,
 } from "../format";
-import type { FleetView, HostStatus, HostView } from "../fleet";
+import { forgeLink, repoUrl, sweepWorkTitle, sweepWorkUrl } from "../forgeLinks";
+import { providerDisplayName, providerMark, sweepAgentMark } from "../providers";
+import type { FleetView, HostStatus, HostView, ProviderSummary } from "../fleet";
 import type { HostHealthRecord, HostProtection, ManagedRepoEntry } from "../types";
 import { emptyFleetView } from "./states";
-import { runningComputeSection, type RunningComputeOptions } from "./runningCompute";
+import { computeSubprocessList, runningComputeSection, type RunningComputeOptions } from "./runningCompute";
 
 const STATUS_LABEL: Record<HostStatus, string> = {
   ok: "OK",
   degraded: "Degraded",
+  throttled: "Throttled",
   stale: "Stale",
   unknown: "No data",
+  missing: "Missing",
+  unprovisioned: "Unprovisioned",
 };
 
 /**
@@ -47,9 +52,42 @@ const STATUS_LABEL: Record<HostStatus, string> = {
  */
 const STATUS_TITLE: Record<HostStatus, string> = {
   ok: "Reporting recently; token pool has healthy capacity",
-  degraded: "Reporting recently, but showing signs of distress",
+  degraded: "Reporting recently, but something needs attention",
+  throttled: "Healthy, but holding back new work by design (load shedding or a low token pool) — clears on its own",
   stale: "No telemetry received recently — the daemon may be stopped or offline",
   unknown: "This host has not pushed host.health or tokens.snapshot yet",
+  missing:
+    "Expected by the fleet roster and holding an active ingest key, but the backend has " +
+    "no host.health record for it at all — something that should be reporting is not",
+  unprovisioned:
+    "Expected by the fleet roster, but no active ingest key exists for it — it has not " +
+    "been enrolled yet, so it cannot report",
+};
+
+/**
+ * Roster-expected hosts (#8792 backend, #8804 here) — hosts the operator's
+ * `EXPECTED_HOSTS` roster names that have no telemetry at all.
+ *
+ * Rendered as their own card shape rather than an ordinary host card with a
+ * different badge: every `host.health` field would be `—` by definition, so a
+ * full card would be ten rows of nothing wrapped around the single fact that
+ * matters. The card says what state the host is in, why, and what to do —
+ * and `missing` and `unprovisioned` never share wording, because one is an
+ * incident to investigate and the other is a provisioning step to take.
+ */
+const ROSTER_SUBTITLE: Record<"missing" | "unprovisioned", string> = {
+  missing: "Never reported — expected by the roster, and enrolled",
+  unprovisioned: "Never reported — expected by the roster, not enrolled yet",
+};
+
+const ROSTER_DETAIL: Record<"missing" | "unprovisioned", string> = {
+  missing:
+    "An active ingest key exists for this host, but the backend holds no host.health " +
+    "record for it: its daemon may never have started, may predate telemetry export, or " +
+    "may have been silent long enough for its last record to be pruned.",
+  unprovisioned:
+    "No active ingest key exists for this host (never enrolled, or its key was revoked), " +
+    "so it cannot report yet. Provision one to bring it online — deploy runbook §8.",
 };
 
 /**
@@ -101,11 +139,50 @@ export function protectionBadge(protection: HostProtection | undefined): HTMLEle
   );
 }
 
-function tokenSummaryText(host: HostView): string {
-  const { total, exhausted, peakUsage } = host.tokens;
-  if (total === 0) return UNKNOWN;
-  const peak = peakUsage === undefined ? UNKNOWN : formatPercent(peakUsage);
-  return `${exhausted}/${total} exhausted · peak ${peak}`;
+/** One provider pool's summary line: `"17/21 exhausted · peak 100%"`, or
+ * just `"1/3 exhausted"` for a pool whose accounts report no usage fraction
+ * (Codex) — omitted rather than shown as a fake `peak 0%`. */
+export function providerPoolText(slice: ProviderSummary): string {
+  const base = `${slice.exhausted}/${slice.total} exhausted`;
+  return slice.peakUsage === undefined ? base : `${base} · peak ${formatPercent(slice.peakUsage)}`;
+}
+
+/**
+ * The token-pool section, one `<dt>/<dd>` pair per provider (`Claude`,
+ * `Codex`, …) so each provider's availability reads independently — a
+ * blended "17/21 exhausted" cannot tell "Claude is spent, Codex is fine"
+ * from the reverse, and only one of those stalls the sweeps. The label
+ * carries the provider's mark (`providers.ts`). A host that has reported no
+ * pool at all keeps the single unknown "Token pool" row it always had.
+ */
+function tokenPoolFields(host: HostView): DocumentFragment {
+  const fragment = document.createDocumentFragment();
+  if (host.tokens.providers.length === 0) {
+    fragment.appendChild(field("Token pool", UNKNOWN, "tokens.snapshot"));
+    return fragment;
+  }
+  for (const slice of host.tokens.providers) {
+    fragment.appendChild(
+      el(
+        "dt",
+        { class: "field__label field__label--provider", data: { testid: "token-pool-label", provider: slice.provider } },
+        providerMark(slice.provider, true),
+        el("span", { class: "field__label-text" }, "pool"),
+      ),
+    );
+    fragment.appendChild(
+      el(
+        "dd",
+        {
+          class: "field__value",
+          title: `tokens.snapshot — ${providerDisplayName(slice.provider)} accounts on this host`,
+          data: { testid: "token-pool-value", provider: slice.provider },
+        },
+        providerPoolText(slice),
+      ),
+    );
+  }
+  return fragment;
 }
 
 /**
@@ -230,7 +307,85 @@ function writeIdleReposOpen(hostId: string, open: boolean): void {
   }
 }
 
+/** This host's in-flight sweeps as a list, or `null` when it has none.
+ * Extracted so the roster-missing card (#8804) can show them too: a host that
+ * never sent `host.health` can still have pushed `sweep.started` records, and
+ * dropping that list would hide live work. */
+function sweepList(host: HostView, now: Date = new Date()): HTMLElement | null {
+  if (host.sweeps.length === 0) return null;
+  return el(
+    "ul",
+    { class: "card__sweeps", data: { testid: "card-sweeps" } },
+    // Every in-flight sweep, not the first three (#4868). This card is
+    // the answer to "what is the fleet doing right now"; truncating to
+    // three made that answer "click into each host" — on a working
+    // fleet it hid 22 of 31 sweeps. The card grows instead.
+    host.sweeps.map((sweep) =>
+      el(
+        "li",
+        { class: "card__sweep" },
+        // Resolved provider first; admitted runtime remains an honest
+        // fallback when older daemons have no launch attribution.
+        sweepAgentMark(sweep),
+        sweep.model ? el("span", { class: "chip", title: "Sweep launch model" }, sweep.model) : null,
+        el("span", { class: "chip" }, sweep.phase ?? "starting"),
+        // `#N` links to the sweep's work on the forge: the
+        // `feature/issue-N` branch once Builder has pushed one, the
+        // issue itself before that (Curator has no branch yet).
+        forgeLink(
+          sweep.issue === undefined ? sweep.sweepId : `#${sweep.issue}`,
+          sweepWorkUrl(sweep.repo, sweep.issue, sweep.phase),
+          "card__sweep-label",
+          sweepWorkTitle(sweep.issue, sweep.phase),
+        ),
+        sweep.repo ? forgeLink(sweep.repo, repoUrl(sweep.repo), "card__sweep-repo") : null,
+        // Issue #8835: the sweep's live Spot/batch jobs, nested beneath it.
+        // `null` for the overwhelming majority of sweeps (no compute jobs, or
+        // an emitter that does not stamp `sweepId`), so an ordinary sweep's
+        // markup is byte-identical to what it was before this feature.
+        computeSubprocessList(host.computeBySweep.get(sweep.sweepId) ?? [], now),
+      ),
+    ),
+  );
+}
+
+/**
+ * The card for a roster-expected host with no telemetry (#8804) — see
+ * `ROSTER_SUBTITLE`/`ROSTER_DETAIL` for why this is its own shape rather than
+ * an ordinary card with every field blank.
+ *
+ * `data-roster-state` (and the `card--missing`/`card--unprovisioned` class
+ * the shared `card--${status}` template already yields) is what makes the two
+ * states distinguishable from each other, and both from a host that reported
+ * and went quiet (`card--stale`).
+ */
+function rosterHostCard(
+  host: HostView,
+  state: "missing" | "unprovisioned",
+  now: Date = new Date(),
+): HTMLElement {
+  return el(
+    "article",
+    {
+      class: `card card--${state}`,
+      data: { testid: "host-card", host: host.hostId, "roster-state": state },
+    },
+    el(
+      "header",
+      { class: "card__header" },
+      el("a", { class: "card__title", href: `#/hosts/${encodeURIComponent(host.hostId)}` }, host.hostId),
+      el("div", { class: "card__badges" }, statusBadge(host.status)),
+    ),
+    el("p", { class: "card__subtitle" }, ROSTER_SUBTITLE[state]),
+    el("p", { class: "card__notice", data: { testid: "roster-state-detail" } }, ROSTER_DETAIL[state]),
+    sweepList(host, now),
+  );
+}
+
 export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
+  if (host.status === "missing" || host.status === "unprovisioned") {
+    return rosterHostCard(host, host.status, now);
+  }
   const sweepCount = host.sweeps.length;
   const repos = managedRepos(host);
   const repoCount = repos.length;
@@ -271,7 +426,9 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
       el(
         "ul",
         { class: "card__repos" },
-        idleRepos.map((repo) => el("li", { class: "card__repo" }, el("span", { class: "card__repo-label" }, repo.slug))),
+        idleRepos.map((repo) =>
+          el("li", { class: "card__repo" }, forgeLink(repo.slug, repoUrl(repo.slug), "card__repo-label")),
+        ),
         hiddenPrivateCount > 0
           ? el("li", { class: "card__repo card__repo--private" }, `+ ${hiddenPrivateCount} private`)
           : null,
@@ -314,7 +471,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
     el(
       "dl",
       { class: "card__fields card__fields--wide" },
-      field("Token pool", tokenSummaryText(host), "tokens.snapshot"),
+      tokenPoolFields(host),
       field(
         "Active sweeps",
         // "none" alone reads as "this host is idle" — but role ticks
@@ -330,29 +487,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
         "Repositories this host's daemon manages (its workspace registry, whether idle or busy)",
       ),
     ),
-    sweepCount > 0
-      ? el(
-          "ul",
-          { class: "card__sweeps", data: { testid: "card-sweeps" } },
-          // Every in-flight sweep, not the first three (#4868). This card is
-          // the answer to "what is the fleet doing right now"; truncating to
-          // three made that answer "click into each host" — on a working
-          // fleet it hid 22 of 31 sweeps. The card grows instead.
-          host.sweeps.map((sweep) =>
-            el(
-              "li",
-              { class: "card__sweep" },
-              el("span", { class: "chip" }, sweep.phase ?? "starting"),
-              el(
-                "span",
-                { class: "card__sweep-label" },
-                sweep.issue === undefined ? sweep.sweepId : `#${sweep.issue}`,
-              ),
-              sweep.repo ? el("span", { class: "card__sweep-repo" }, sweep.repo) : null,
-            ),
-          ),
-        )
-      : null,
+    sweepList(host, now),
     activeRepos.length > 0
       ? el(
           "ul",
@@ -362,7 +497,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
             return el(
               "li",
               { class: "card__repo" },
-              el("span", { class: "card__repo-label" }, repo.slug),
+              forgeLink(repo.slug, repoUrl(repo.slug), "card__repo-label"),
               el("span", { class: "chip" }, `×${count}`),
             );
           }),
@@ -372,11 +507,39 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
   );
 }
 
+const HOST_COUNT_TITLE =
+  "Every host in the fleet: those pushing telemetry, plus any named by the expected-host " +
+  "roster that have never reported — “missing” (enrolled but silent) and “unprovisioned” " +
+  "(not enrolled yet)";
+
+/**
+ * The headline host count (#8804). Roster hosts that never reported are
+ * included in the total — a fleet of five where one is silent has five hosts,
+ * and a page that says "4 hosts" is exactly the silent-host blind spot the
+ * roster exists to close — but the breakdown keeps "reporting" separate, so
+ * the total can never be misread as "N hosts are pushing telemetry".
+ *
+ * With no roster hosts (a pre-#8792 backend, no `EXPECTED_HOSTS` configured,
+ * or a roster with nothing missing) the text is byte-identical to what this
+ * headline rendered before: `"3 hosts"`.
+ */
+export function hostCountText(view: FleetView): string {
+  const rosterTotal = view.missingHosts + view.unprovisionedHosts;
+  const total = view.reportingHosts + rosterTotal;
+  const base = `${total} host${total === 1 ? "" : "s"}`;
+  if (rosterTotal === 0) return base;
+  const parts = [`${view.reportingHosts} reporting`];
+  if (view.missingHosts > 0) parts.push(`${view.missingHosts} missing`);
+  if (view.unprovisionedHosts > 0) parts.push(`${view.unprovisionedHosts} unprovisioned`);
+  return `${base} (${parts.join(", ")})`;
+}
+
 export function fleetOverviewView(
   view: FleetView,
   now: Date = new Date(),
   options: RunningComputeOptions = {},
 ): HTMLElement {
+  const rosterTotal = view.missingHosts + view.unprovisionedHosts;
   // Resolved once, then passed down, so the panel and the headline count below
   // can never disagree about who the viewer is.
   const authenticated = options.authenticated ?? isAuthenticatedViewer();
@@ -385,7 +548,14 @@ export function fleetOverviewView(
   // and nothing else, so a fleet can legitimately have running instances and
   // zero reporting hosts. Short-circuiting to the "no hosts" empty state would
   // hide the one thing that *is* running — including a leak (#8306).
-  const compute = runningComputeSection(view.activeCompute, now, { authenticated });
+  //
+  // Fed `unattributedCompute`, not `activeCompute` (#8835): a job already
+  // nested under its own sweep's card entry does not also need a row here, but
+  // every job that could NOT be nested does — that is precisely the orphaned/
+  // leaked instance this panel exists to surface. The headline count below
+  // deliberately still uses `activeCompute` (the fleet-wide total), so nesting
+  // never makes the fleet look like it is running less compute than it is.
+  const compute = runningComputeSection(view.unattributedCompute, now, { authenticated });
 
   if (view.hosts.length === 0) {
     return compute
@@ -401,8 +571,11 @@ export function fleetOverviewView(
       { class: "overview__summary", data: { testid: "fleet-summary" } },
       el(
         "span",
-        {},
-        `${view.reportingHosts} host${view.reportingHosts === 1 ? "" : "s"}`,
+        {
+          title: rosterTotal > 0 ? HOST_COUNT_TITLE : undefined,
+          data: { testid: "fleet-host-summary" },
+        },
+        hostCountText(view),
       ),
       el(
         "span",

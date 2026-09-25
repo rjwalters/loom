@@ -161,7 +161,11 @@ impl SweepRegistry {
         // resolved in the SAME single pass over the log so the two attributions
         // cannot disagree and a terminal transition still costs exactly one
         // `read_to_string`.
-        let (credential, tap_usage) = self.resolve_launch_attribution(sweep_id, issue);
+        // Issue #8659: that accounting is now the region folded per tap —
+        // `outcome()` is the launch this outcome belongs to (what both journals'
+        // one-row fields keep naming), and `breakdown()` is non-empty only when
+        // one row cannot represent the region.
+        let (credential, tap_region) = self.resolve_launch_attribution(sweep_id, issue);
         // Issue #8056: the single most-specific failure label for this
         // terminal transition, copied into the PAIRED `sweep.outcome`
         // telemetry record below so "real failure vs. <60s spawn death" is
@@ -202,7 +206,12 @@ impl SweepRegistry {
             credential: credential.clone(),
             jev_tier,
             jev_confidence,
-            tap_usage: tap_usage.clone(),
+            tap_usage: tap_region.outcome().cloned(),
+            // Empty — and so absent from the line entirely — whenever
+            // `tap_usage` above already accounts for the whole region, which is
+            // every single-record region and every re-dispatch/re-exec that
+            // re-announced the same tap (Issue #8659).
+            tap_usage_all: tap_region.breakdown().to_vec(),
             duration_sec,
         };
         if let Err(e) = sweep_outcomes::append_outcome(&path, &record) {
@@ -224,7 +233,7 @@ impl SweepRegistry {
             result,
             failure_class,
             credential,
-            tap_usage,
+            tap_region,
         );
     }
 
@@ -252,28 +261,38 @@ impl SweepRegistry {
     /// record carrying credential fields but no runtime to key a tap on is
     /// "no tap opinion", never a reason to lose the attribution #8447 already
     /// reported.
+    ///
+    /// The tap half is the region folded **per tap** (Issue #8659), not one row:
+    /// [`RegionAccounting::outcome`](crate::tap_usage::RegionAccounting::outcome)
+    /// is the launch this outcome belongs to — carrying that tap's whole share
+    /// of the region rather than only its final block, and `None` under exactly
+    /// the conditions the single row was `None` under before — while
+    /// [`RegionAccounting::breakdown`](crate::tap_usage::RegionAccounting::breakdown)
+    /// carries every tap when one row cannot represent the region. Because the
+    /// outcome row keeps the last record's own attribution (account included),
+    /// the #8447 credential half below is unchanged by the fold.
     pub(crate) fn resolve_launch_attribution(
         &self,
         sweep_id: &str,
         issue: u32,
     ) -> (
         Option<crate::launch_record::CredentialAttribution>,
-        Option<crate::tap_usage::TapAccounting>,
+        crate::tap_usage::RegionAccounting,
     ) {
         let log_path = self
             .entries
             .get(sweep_id)
             .map_or_else(|| self.compute_log_path(issue), |i| i.log_path.clone());
         let Ok(contents) = std::fs::read_to_string(log_path) else {
-            return (None, None);
+            return (None, crate::tap_usage::RegionAccounting::default());
         };
         let anchor = format!("sweep_id={sweep_id}");
-        let tap_usage = crate::tap_usage::account_launch_log(&contents, &anchor);
-        let credential = tap_usage
-            .as_ref()
+        let tap_region = crate::tap_usage::account_region_by_tap(&contents, &anchor);
+        let credential = tap_region
+            .outcome()
             .map(|accounting| accounting.tap.credential.clone())
             .or_else(|| crate::launch_record::parse_launch_credential_after(&contents, &anchor));
-        (credential, tap_usage)
+        (credential, tap_region)
     }
 
     /// The runtime/provider/profile this sweep's native harness actually
@@ -360,10 +379,13 @@ impl SweepRegistry {
     /// attribution (Issue #8447), passed in for the same reason: one log read
     /// per terminal transition, and two journals that cannot disagree.
     ///
-    /// `tap_usage` is the tap-attributed accounting off that same read (Issue
+    /// `tap_region` is the tap-attributed accounting off that same read (Issue
     /// #8556), which is what makes "how much went to the metered backstop vs.
     /// the subscriptions" answerable from this journal — see
-    /// [`crate::tap_usage`].
+    /// [`crate::tap_usage`]. Its outcome row is the launch this outcome belongs
+    /// to and is the only one this record's flat `config` map spells out (Issue
+    /// #8659); a region one row cannot represent is *flagged* here and broken
+    /// out in full on the sibling `sweep-outcomes.jsonl` line.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_outcome_telemetry_journal(
         &self,
@@ -373,7 +395,7 @@ impl SweepRegistry {
         result: telemetry::SweepResult,
         failure_class: Option<String>,
         credential: Option<crate::launch_record::CredentialAttribution>,
-        tap_usage: Option<crate::tap_usage::TapAccounting>,
+        tap_region: crate::tap_usage::RegionAccounting,
     ) {
         let info = self.entries.get(sweep_id);
         let model = info.and_then(|i| i.model.clone());
@@ -422,7 +444,18 @@ impl SweepRegistry {
         // map is how that stays distinguishable from a reported `0`. The cost
         // key is spelled `tap_cost_estimate` so no reader can mistake a harness
         // estimate for a measured charge.
-        if let Some(accounting) = &tap_usage {
+        //
+        // Issue #8659 fixes the multi-record decision here explicitly rather
+        // than by default: `config["tap"]` stays ONE tap — the launch this
+        // outcome belongs to, now carrying that tap's whole share of the region
+        // — because this map is flat strings and `--group-by tap` puts a record
+        // in exactly one bucket, so a second tap could only be spelled here by
+        // changing what a grouped row means. A region one row cannot represent
+        // is instead FLAGGED (`tap_region_keys`) and broken out per tap on the
+        // sibling `sweep-outcomes.jsonl` line (`tap_usage_all`), so a
+        // telemetry-only reader can never mistake one tap's counters for the
+        // region's total.
+        if let Some(accounting) = tap_region.outcome() {
             config.insert("tap".to_string(), accounting.key());
             let usage = &accounting.usage;
             for (key, value) in [
@@ -442,6 +475,24 @@ impl SweepRegistry {
             if usage.is_measured() {
                 config.insert("tap_usage_events".to_string(), usage.usage_events.to_string());
             }
+        }
+        // Every tap the region named, outcome's first — written only when the
+        // single `tap` key above does not account for the whole region, so a
+        // record whose region held one tap (every record written before #8659)
+        // keeps its exact key set. Present without a `tap` key at all when the
+        // region's last record was unattributable but an earlier one was: that
+        // is the one shape where the flag is the only telemetry-side signal
+        // that the region carried measurable spend.
+        if !tap_region.breakdown().is_empty() {
+            config.insert(
+                "tap_region_keys".to_string(),
+                tap_region
+                    .breakdown()
+                    .iter()
+                    .map(crate::tap_usage::TapAccounting::key)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
         // Issue #4809: attribute this sweep to the model-cost A/B experiment's
         // arm from its OWN dispatched model — the same inference the #3725

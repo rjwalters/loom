@@ -130,6 +130,7 @@
 pub mod activity;
 pub mod admission_brake;
 pub mod agent_session;
+pub mod agent_skills;
 pub mod api_keys_pool;
 pub mod auto_update;
 pub mod autonomy_marker;
@@ -139,6 +140,7 @@ pub mod capability;
 pub mod capacity;
 pub mod claim_reconciliation;
 pub mod cmd_out;
+pub mod concierge;
 pub mod config_resolver;
 pub mod cpu_headroom;
 pub mod credential_preflight;
@@ -169,7 +171,9 @@ pub mod foreign_load;
 pub mod forge_cached_list;
 pub mod forge_check_open_pr;
 pub mod forge_cmd;
+pub mod forge_events;
 pub mod forge_listing;
+pub mod forge_merge_method;
 pub mod forge_parser;
 pub mod gh_repo_env;
 pub mod git_parser;
@@ -574,3 +578,4 @@ mod tests {
 
 pub mod native_readiness;
 pub mod native_tools;
+pub mod session_exec;

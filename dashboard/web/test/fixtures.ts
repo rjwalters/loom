@@ -126,10 +126,14 @@ export function isoMinutesBefore(minutes: number, base: Date = NOW): string {
 /** A healthy, busy host: full health, a healthy token pool, two live sweeps. */
 export const HEALTHY_HOST_ID = "fleet-mac-1";
 
-/** Reports fine, but only one account is left to rotate onto (2 total, 1
- * exhausted) → `degraded`: the pool is at the edge, not just "some accounts
- * spent". */
+/** Reports, but its admission brake has been starving on load Loom does not
+ * own (#8478) → `degraded`. Its pool also has only one account left to rotate
+ * onto (2 total, 1 exhausted) — on its own that is `throttled` since #8832,
+ * so the halt is what keeps this host the fixture's degraded case. */
 export const DEGRADED_HOST_ID = "fleet-linux-2";
+export const DEGRADED_HOST_HALT_REASON =
+  "admission brake STARVING for 900s with 0 sweeps in flight (≥ this host's starvationWarnSecs 300); " +
+  "dispatch is suppressed by load Loom does not own (#8478)";
 
 /** Reports fine with a large pool and several accounts exhausted, but still
  * well clear of the degraded thresholds → `ok`. Pins #4864: a partially
@@ -203,6 +207,8 @@ export function multiHostSnapshot(): unknown {
             daemon_version: "0.16.0",
             uptime_sec: 3_600,
             logical_cpus: 8,
+            dispatch_halted: true,
+            halt_reason: DEGRADED_HOST_HALT_REASON,
             // cpu_idle_fraction / load_per_core / worktree_root_free_gb are
             // absent — the "probe could not measure" case the schema mandates
             // be rendered as unknown, never zero.
@@ -315,6 +321,7 @@ export function multiHostSnapshot(): unknown {
         enteredPhaseAt: isoMinutesBefore(4),
         model: "opus",
         effort: "high",
+        runtime: "claude",
         updatedAt: isoMinutesBefore(4),
       },
       {
@@ -326,6 +333,7 @@ export function multiHostSnapshot(): unknown {
         // No phase yet: sweep.started has arrived, sweep.phase has not.
         startedAt: isoMinutesBefore(1),
         model: "opus",
+        runtime: "codex",
         updatedAt: isoMinutesBefore(1),
       },
       {
@@ -343,22 +351,49 @@ export function multiHostSnapshot(): unknown {
 
 export const EMPTY_SNAPSHOT: unknown = { hosts: {}, activeSweeps: [] };
 
+/** Named by the roster, holds an active ingest key, has never reported →
+ * `missing` (#8792/#8804). */
+export const MISSING_HOST_ID = "fleet-silent-7";
+
+/** Named by the roster with no active ingest key → `unprovisioned`: it cannot
+ * report yet (#8792/#8804). */
+export const UNPROVISIONED_HOST_ID = "fleet-planned-8";
+
+/**
+ * `multiHostSnapshot()` plus the backend's expected-host roster diff
+ * (`missingHosts`, #8792) — one host of each state, neither of which has any
+ * entry in `hosts`.
+ *
+ * Deliberately a separate fixture rather than a field added to
+ * `multiHostSnapshot()`: every other test in this suite asserts the
+ * no-roster rendering, which must stay exactly what it was before #8804.
+ */
+export function rosterMissingSnapshot(): unknown {
+  return {
+    ...(multiHostSnapshot() as Record<string, unknown>),
+    missingHosts: [
+      { hostId: MISSING_HOST_ID, state: "missing" },
+      { hostId: UNPROVISIONED_HOST_ID, state: "unprovisioned" },
+    ],
+  };
+}
+
 /**
  * A `host.health.roles` summary with one persistent tick failure (#5022) —
- * the wire-shaped fixture `judge @ /repos/loom` failing 2 of its last 3
- * ticks, matching `.loom/docs/telemetry-schema.md`'s `roles` example. Used by
+ * the wire-shaped fixture `judge @ /repos/loom` failing 4 of its last 5
+ * ticks (above #8832's repeat threshold), matching `.loom/docs/telemetry-schema.md`'s `roles` example. Used by
  * tests that assert the dashboard surfaces a persistent role-tick failure
  * without needing a whole new fleet-wide host in `multiHostSnapshot`.
  */
 export function persistentRoleTickFailureFixture(): unknown {
   return {
-    total: 3,
+    total: 5,
     ok: 1,
     persistent: [
       {
         root: "/repos/loom",
         role: "judge",
-        failures: 2,
+        failures: 4,
         last_at: isoMinutesBefore(1),
         detail: "no-token-pool",
       },

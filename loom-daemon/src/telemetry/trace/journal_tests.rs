@@ -1,5 +1,19 @@
 use super::*;
+use std::cell::Cell;
 use std::sync::Arc;
+
+fn parent_dir_syncs() -> usize {
+    PARENT_DIR_SYNCS.with(Cell::get)
+}
+
+fn cursor_commits() -> usize {
+    CURSOR_COMMITS.with(Cell::get)
+}
+
+fn reset_barrier_counts() {
+    PARENT_DIR_SYNCS.with(|slot| slot.set(0));
+    CURSOR_COMMITS.with(|slot| slot.set(0));
+}
 
 fn start(journal: &Journal, parent: &TraceContext) -> ActiveSpan {
     journal
@@ -255,6 +269,111 @@ fn crash_between_queue_and_cursor_replays_stable_ids() {
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn parent_directory_is_synced_to_link_a_new_journal_not_on_every_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("execution.json"));
+    let sweep = |journal: &Journal| {
+        journal
+            .start(TraceContext::root(true), None, SpanName::Sweep, Utc::now(), Default::default())
+            .unwrap()
+    };
+    reset_barrier_counts();
+    // The lock that creates the journal must durably link it: the directory
+    // entry is what a later reader reaches the fsynced records through.
+    let root = sweep(&journal);
+    assert_eq!(parent_dir_syncs(), 1, "a newly created journal must be linked durably");
+    // Every lock after the first record exists finds the directory entry
+    // already durable, so the barrier buys nothing (Issue #8643).
+    let child = start(&journal, &root.record.context);
+    journal.set_owner(&root.record.context, 42).unwrap();
+    journal
+        .finish(&child, Utc::now(), SpanStatus::Ok, Default::default())
+        .unwrap();
+    journal
+        .finish(&root, Utc::now(), SpanStatus::Ok, Default::default())
+        .unwrap();
+    journal.active().unwrap();
+    assert_eq!(parent_dir_syncs(), 1, "later locks must not re-link an existing journal");
+    // A journal deleted by retirement is a new file again, and is re-linked.
+    assert_eq!(journal.drain(|_| Ok(())).unwrap(), 2);
+    assert!(journal.retire_if_drained().unwrap());
+    reset_barrier_counts();
+    sweep(&journal);
+    assert_eq!(parent_dir_syncs(), 1, "a re-created journal must be linked durably again");
+}
+
+#[test]
+fn drain_commits_the_cursor_per_delivered_record_not_per_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("execution.json"));
+    let root = TraceContext::root(true);
+    for _ in 0..3 {
+        let active = start(&journal, &root);
+        journal
+            .finish(&active, Utc::now(), SpanStatus::Ok, Default::default())
+            .unwrap();
+    }
+    // A trailing entry that delivers nothing: it still has to be scanned past
+    // so the cursor can reach EOF, but it needs no barrier of its own.
+    let trailing = start(&journal, &root);
+    journal.set_owner(&trailing.record.context, 42).unwrap();
+    journal
+        .finish(&trailing, Utc::now(), SpanStatus::Ok, Default::default())
+        .unwrap();
+    journal.set_owner(&trailing.record.context, 43).unwrap();
+    reset_barrier_counts();
+    assert_eq!(journal.drain(|_| Ok(())).unwrap(), 4);
+    // 10 journal entries, 4 of them delivered: one commit per delivery plus a
+    // single one for the undelivered tail, not one per entry (Issue #8643).
+    assert_eq!(cursor_commits(), 5);
+    assert_eq!(
+        std::fs::read_to_string(journal.path().with_extension("cursor"))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+        std::fs::metadata(journal.path()).unwrap().len(),
+        "the cursor still reaches EOF so the journal can retire"
+    );
+}
+
+#[test]
+fn a_failed_delivery_replays_only_the_record_it_failed_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("execution.json"));
+    let root = TraceContext::root(true);
+    let mut contexts = Vec::new();
+    for _ in 0..3 {
+        let active = start(&journal, &root);
+        journal
+            .finish(&active, Utc::now(), SpanStatus::Ok, Default::default())
+            .unwrap();
+        contexts.push(active.record.context);
+    }
+    let mut delivered = Vec::new();
+    assert!(journal
+        .drain(|span| {
+            delivered.push(span.context);
+            anyhow::ensure!(delivered.len() < 3, "queue unavailable");
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(delivered, contexts);
+    // Batching the cursor across *undelivered* entries must not widen the
+    // replay window: every record the queue durably accepted stays accepted.
+    let mut replayed = Vec::new();
+    assert_eq!(
+        journal
+            .drain(|span| {
+                replayed.push(span.context);
+                Ok(())
+            })
+            .unwrap(),
+        1
+    );
+    assert_eq!(replayed, contexts[2..]);
 }
 
 #[test]

@@ -374,7 +374,10 @@ pub fn capture_session_output(env: &dyn AgentEnv, session: &str, repo_root: &Pat
         log_warning(format!("Failed to capture session output: {e}"));
         return;
     }
-    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    // Issue #8504: UTC with a `Z` suffix, not host-local time, so this
+    // filename's timestamp can be compared against other Loom artifacts
+    // without knowing the host's timezone.
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%SZ");
     let kill_log = log_dir.join(format!("{session}-killed-{timestamp}.log"));
     match std::fs::write(&kill_log, output) {
         Ok(()) => log_info(format!("Captured session output to {}", kill_log.display())),
@@ -593,7 +596,9 @@ pub fn spawn_agent(env: &dyn AgentEnv, opts: &SpawnOptions, repo_root: &Path) ->
 
     // Rotate the previous log so each spawn starts from a clean file.
     if log_file.is_file() {
-        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        // Issue #8504: UTC with a `Z` suffix, not host-local time — see
+        // `capture_session_output`'s identical fix above.
+        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%SZ").to_string();
         let rotated = rotated_log_path(&log_file, &timestamp);
         if std::fs::rename(&log_file, &rotated).is_ok() {
             log_info("Rotated previous log file");

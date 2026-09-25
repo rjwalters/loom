@@ -45,6 +45,7 @@ fn trace_wire_has_hex_ids_and_preserves_parent_and_log_relationship() {
             started_at: Utc::now(),
             model: None,
             effort: None,
+            runtime: None,
         }),
     );
     log.trace_context = Some(child.clone());

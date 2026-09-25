@@ -237,6 +237,13 @@ impl SweepRegistry {
                 reason,
             },
         );
+        // Issue #7972: a self-reported no-op is a *deliberate conclusion*, not
+        // a failed attempt — and this cooldown is the correct brake for it. A
+        // standing/tracking issue that keeps legitimately concluding "still
+        // nothing to do" must therefore never accrete toward the PR-less retry
+        // bound's `loom:blocked` hold, so clear that tally here. See
+        // `super::prless_retry`'s module doc (the non-interference section).
+        self.clear_prless_retry(issue);
         // Issue #7477: broadcast the armed window fleet-wide so a peer host
         // does not immediately re-offer the same candidate this host just
         // self-reported "no actionable delta" on — see

@@ -472,6 +472,26 @@ curl -sS -X POST "$BASE/admin/hosts/<host_id>/revoke" -H "authorization: Bearer 
 Takes effect on the next request. Other hosts are unaffected. Already-stored
 records are retained (revocation stops writes, it does not erase history).
 
+### Declaring the expected host roster
+
+Without a roster, a host that has **never** reported is simply absent — the
+Durable Object has no entry for it, so it drops out of the host count instead
+of reading as unhealthy (issue #8792). Set the `EXPECTED_HOSTS` var to the
+host IDs you expect to report (commas and/or whitespace separate them):
+
+```bash
+npx wrangler deploy --var "EXPECTED_HOSTS:robb-studio,robb-pro,loom-worker-1"
+```
+
+(or uncomment `EXPECTED_HOSTS` under `[vars]` in your local `wrangler.toml`
+overlay). Keep the list itself in your own infrastructure repo alongside your
+host manifest — this repo does not track any operator's fleet. With it set,
+`/api/fleet-state`, `/public/fleet-state`, and the SSR `/` page add each roster
+host that has no health record as `missing` (enrolled, never reported) or
+`unprovisioned` (no active ingest key yet). To decommission a host, revoke it
+and drop it from the roster; a host no longer listed is never flagged. Unset
+leaves the dashboard behaving exactly as before.
+
 ### Provisioning a non-daemon emitter (e.g. 2am's elastic-compute batch runner, Issue #8304)
 
 Every host provisioned so far in this runbook is a `loom-daemon` process

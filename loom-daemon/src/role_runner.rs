@@ -530,6 +530,32 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
         default_interval_secs: 3600,
         interval_default: false,
     },
+    RoleSpec {
+        // The operator-agent persona (Issue #7947, Phase 3b of #4196).
+        //
+        // `interval_default: false` for a *stronger* reason than architect's.
+        // Architect is merely expensive to run everywhere; this role is an
+        // inbound control channel — it reads human prose out of a chat room and
+        // steers the daemon with it. A role like that must never arrive because
+        // a repo failed to pin `roles`, so it is excluded from the
+        // "unset `roles` ⇒ all defaults" fallback like architect, AND gated a
+        // second time on its own config resolving (see `role_is_config_gated`):
+        // naming it in `roles` is not enough, `safehouse.concierge` must also
+        // name at least one allowed sender. Two independent opt-ins, because
+        // one of them is a chat room.
+        //
+        // The 300s cadence is a *listening* cadence, not a work cadence: each
+        // tick is a short `concierge listen` window. Its cost bound is NOT
+        // carried in the prompt the way `architectMaxProposals` is — a daily
+        // turn budget spans sessions, so it lives in the ledger
+        // (`concierge::budget`) that `concierge budget --begin-turn` consults
+        // at the top of every session. See that module's doc for why a prompt
+        // cannot hold this particular number.
+        name: crate::concierge::CONCIERGE_ROLE,
+        prompt: "/loom:concierge",
+        default_interval_secs: 300,
+        interval_default: false,
+    },
 ];
 
 /// A stable, content-derived identifier for the running binary's
@@ -1093,272 +1119,16 @@ fn note_pre_spawn_skip(logs_dir: &Path, role: &str, reason: &str) {
             f,
             "\n==== loom-daemon role_runner: {} role={role} SKIPPED BEFORE SPAWN (#6201): {reason} \
              ====",
-            chrono::Utc::now().to_rfc3339()
+            // Issue #8504: `Z`, not `+00:00` — matches every other UTC stamp
+            // this crate writes so a reader never has to know chrono's
+            // RFC 3339 offset spelling is not the same as its Z spelling.
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
         );
     }
 }
 
-/// Run `spawn-claude.sh -p "<prompt>" --model <model> [--effort <level>]
-/// --dangerously-skip-permissions` in `workspace_root`, appending combined
-/// output to `<logs_dir>/role-<role>.log` (never a pipe — avoids the pipe-buffer
-/// deadlock pattern documented in [`crate::main_health_gate`] /
-/// [`crate::token_ranking_refresh`]) and killing it after `timeout`.
-#[allow(clippy::too_many_arguments)]
-fn run_role_with_timeout(
-    script: &Path,
-    workspace_root: &Path,
-    role: &str,
-    prompt: &str,
-    logs_dir: PathBuf,
-    timeout: Duration,
-    model: &str,
-    model_source: &str,
-    effort: &str,
-    effort_source: &str,
-    admission: Option<&crate::runtime_admission::ResolvedRuntime>,
-    load_per_core_override: Option<f64>,
-    backstop: Option<crate::runtime_preference::Reservation>,
-) -> RoleTickOutcome {
-    if let Err(e) = std::fs::create_dir_all(&logs_dir) {
-        return RoleTickOutcome::Failure(format!(
-            "could not create logs dir {}: {e}",
-            logs_dir.display()
-        ));
-    }
-    let log_path = role_log_path(&logs_dir, role);
-    // Issue #8443: this tick's own unique anchor into its per-role log — the
-    // timestamp opening this tick's header line below, reused after exit to
-    // scope `provider_health_feedback`'s terminal-result scan to only this
-    // dispatch, mirroring the sweep path's `sweep_id=` anchor (a fresh log
-    // line above the anchor never leaks into an OLDER tick's scan, and this
-    // tick's own scan never reads a STALE record left by a previous one).
-    let tick_anchor = chrono::Utc::now().to_rfc3339();
-
-    {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            // Rendered by `model_resolution::role_log_header` (#4501/#8054) —
-            // the module that resolved the pair owns how it is reported.
-            let _ = writeln!(
-                f,
-                "\n{}",
-                model_resolution::role_log_header(
-                    &tick_anchor,
-                    role,
-                    model,
-                    model_source,
-                    effort,
-                    effort_source,
-                )
-            );
-        }
-    }
-
-    let out_file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            return RoleTickOutcome::Failure(format!(
-                "could not open log {}: {e}",
-                log_path.display()
-            ))
-        }
-    };
-    let stderr_file = match out_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => return RoleTickOutcome::Failure(format!("could not clone log handle: {e}")),
-    };
-
-    let mut cmd = Command::new(script);
-    cmd.arg("-p").arg(prompt);
-    // Model pin (issue #4501): appended immediately after the prompt, exactly as
-    // `sweep_registry::spawn_child` does, so a role child never inherits the
-    // account's interactive CLI default (`fable` on the affected host — the most
-    // constrained quota tier, and the escalation ceiling rather than the floor).
-    // An empty value is treated as unset — `--model ""` must never be emitted —
-    // mirroring the same guard on the sweep-dispatch path; `resolve_role_runner_model`
-    // already filters blanks at every tier, so this is belt-and-braces.
-    if !model.is_empty() {
-        cmd.arg("--model").arg(model);
-    }
-    // Reasoning-effort pin (issue #8054): appended immediately after `--model`,
-    // exactly as `sweep_registry::dispatch`'s spawn does (#3716), so the two
-    // dispatch surfaces share one positional argv contract
-    // (`-p`, `--model`, `--effort`, `--dangerously-skip-permissions`). An empty
-    // value is treated as unset — `--effort ""` must NEVER be emitted: it would
-    // clobber the session-default effort with nothing. Unconfigured is the
-    // normal case, and it must leave the argv byte-identical to the pre-#8054
-    // argv, which is why there is no shipped default effort to fall back on.
-    if !effort.is_empty() {
-        cmd.arg("--effort").arg(effort);
-    }
-    cmd.arg("--dangerously-skip-permissions");
-    // Transient-error recovery (issue #4255): scheduled role spawns are the
-    // same unattended class as daemon-dispatched sweeps, so route them through
-    // `claude-wrapper.sh` (retry/backoff/classification, bounded by
-    // `LOOM_MAX_RETRIES`) instead of running bare `claude` that dies on the
-    // first transient API failure. `spawn-claude.sh` consumes `--use-wrapper`
-    // (not forwarded to `claude`) and execs the wrapper. Operators can force
-    // the legacy single-shot path with `LOOM_USE_WRAPPER=0`.
-    if sweep_registry::wrapper_dispatch_enabled() {
-        cmd.arg("--use-wrapper");
-    }
-    cmd.current_dir(workspace_root)
-        .env(sweep_registry::WORKSPACE_ENV, workspace_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(stderr_file));
-    // Per-owner credential routing (#5401/#5431, gap closed by #5508): a
-    // role-runner child is spawned with `current_dir(workspace_root)` above,
-    // so it must carry the SAME per-owner `GH_CONFIG_DIR` every other
-    // per-repo `gh`/`git` child-spawn call site already does — otherwise a
-    // workspace registered under a non-default owner (e.g. `2AMLogic/*`)
-    // gets the daemon's own process-global `GH_CONFIG_DIR` (an installation
-    // token scoped only to the root owner's repos) and every forge call the
-    // spawned Champion/Judge/etc. session makes 404s. A total no-op for a
-    // single-owner fleet or the root owner's own repos — see
-    // `apply_gh_config_for_root`'s doc comment.
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, workspace_root);
-    if let Some(admission) = admission {
-        // Pin the already-admitted choice so spawn-worker cannot re-resolve a
-        // different runtime after the pre-spawn decision.
-        cmd.env("LOOM_RUNTIME", &admission.runtime);
-        // Issue #4768: pin the admitted role too, mirroring
-        // `sweep_registry::spawn_child`. Without it, a Codex-runtime role
-        // child (e.g. `LOOM_ROLE` unset for a champion/curator/judge/auditor/
-        // guide tick) reaches `spawn-codex.sh` with no role signal at all,
-        // which is indistinguishable from an unrecognized role there.
-        cmd.env("LOOM_ROLE", &admission.role);
-        log::info!(
-            "role_runner: admitted role={} runtime={} source={}",
-            admission.role,
-            admission.runtime,
-            admission.source
-        );
-        // #6201: loud, at-selection diagnostic when the admitted runtime
-        // diverges from the role's own declared `suggestedWorkerType` — the
-        // signal the filed incident (curator declared `claude`, silently
-        // ran on Codex for 9 days) had nowhere to surface.
-        if let Some(msg) =
-            crate::runtime_admission::suggested_worker_type_mismatch_warning(admission)
-        {
-            log::warn!("{msg}");
-        }
-    }
-
-    // Run the child as its own process-group leader so a timeout can tear
-    // down the whole subtree (the `claude` session's tool-call
-    // subprocesses), not just the top-level `spawn-claude.sh` PID — mirrors
-    // `sweep_registry::spawn_child`'s `process_group(0)` treatment.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
-    crate::observability::lifecycle::role_command(&mut cmd);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return RoleTickOutcome::Failure(format!("could not spawn `{}`: {e}", script.display()))
-        }
-    };
-    let pid = child.id();
-    // #8555: hand this tick's metered backstop slot (the one `runtime_preflight`
-    // took, carried here by value) to the child that will spend it. No-op when
-    // no ceiling is configured or the tick did not fall through to a governed
-    // tap; every bail-out before this point dropped it, releasing it.
-    crate::runtime_preference::handoff::attach(backstop, pid);
-    crate::observability::lifecycle::role_child_spawned(pid);
-
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                crate::observability::lifecycle::role_child_exited("success");
-                // Issue #8443: feed this tick's own terminal record back into
-                // account health BEFORE reporting success — mirrors the
-                // sweep reaper calling `apply_provider_health_feedback`
-                // ahead of any re-dispatch decision.
-                provider_health_feedback::apply_role_tick_provider_health_feedback(
-                    workspace_root,
-                    &log_path,
-                    admission,
-                    &tick_anchor,
-                    status.code(),
-                );
-                // Issue #8448: exit 0 is not, by itself, evidence that a
-                // GUARDED NATIVE launch did anything. When this tick's own
-                // native event stream shows the `loom_*` binding was never
-                // offered, report the failed launch it actually was instead
-                // of a healthy `Success`. A no-opinion result (any non-native
-                // runtime, an unreadable log, an unparseable stream) leaves
-                // the pre-#8448 behaviour byte-identical — see
-                // `toolless_launch`'s module doc for the four conditions.
-                if let Some(detail) = toolless_launch::detect(&log_path, admission, &tick_anchor) {
-                    log::warn!("role_runner: {detail}");
-                    return RoleTickOutcome::Failure(detail);
-                }
-                return RoleTickOutcome::Success;
-            }
-            Ok(Some(status)) => {
-                crate::observability::lifecycle::role_child_exited(if status.code().is_some() {
-                    "failure"
-                } else {
-                    "signal"
-                });
-                // Issues #6757/#8123: prefer a purpose-built failure sentinel
-                // (naming the real cause and the role's own log path) over an
-                // arbitrary tail-window fragment of stderr, when one is
-                // present — see `describe_role_failure`.
-                let full_log = read_role_log(&log_path);
-                let detail = describe_role_failure(&full_log, &log_path);
-                // Issue #8443: same terminal-record feedback on a non-zero
-                // exit — this is the path a `TOKEN_EXHAUSTED` death actually
-                // takes.
-                provider_health_feedback::apply_role_tick_provider_health_feedback(
-                    workspace_root,
-                    &log_path,
-                    admission,
-                    &tick_anchor,
-                    status.code(),
-                );
-                return RoleTickOutcome::Failure(format!(
-                    "`{}` exited with {status}: {detail}",
-                    script.display()
-                ));
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    // Issue #6637: sample load-per-core AT the moment the
-                    // ceiling fires (not after termination — killing the
-                    // child would itself relieve load, understating what the
-                    // invocation was actually contending with). A test
-                    // override takes precedence over the live host read, so
-                    // a fake saturated/unsaturated host can be asserted
-                    // deterministically.
-                    let load_per_core =
-                        load_per_core_override.or_else(crate::cpu_headroom::load_per_core);
-                    return terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
-                }
-                std::thread::sleep(INVOCATION_POLL_INTERVAL);
-            }
-            Err(e) => {
-                return RoleTickOutcome::Failure(format!(
-                    "could not poll `{}`: {e}",
-                    script.display()
-                ))
-            }
-        }
-    }
-}
+mod launch;
+use launch::run_role_with_timeout;
 
 /// SIGTERM the timed-out child's process group, give it [`TERMINATE_GRACE`]
 /// to exit, then SIGKILL the group and reap. Never panics.
@@ -2396,6 +2166,34 @@ pub fn log_role_runner_disabled(repo_root: &Path, config: &RoleRunnerConfig) {
     log::info!("{}", disabled_role_runner_log_line(repo_root, config));
 }
 
+/// Whether `spec` is gated off for `root` by its **own** config block, beyond
+/// the role runner's own `enabled`/`roles` knobs — `Some(reason)` ⇒ do not
+/// tick (issue #7947).
+///
+/// Exactly one role has such a gate today: `concierge`, which requires
+/// `safehouse.concierge` to resolve (present, `enabled` not false, and at least
+/// one usable Matrix ID in `allowedSenders`). Naming it in
+/// `autonomous.roleRunner.roles` is deliberately **not** sufficient — an
+/// inbound control channel wired to a chat room should take two independent,
+/// explicit opt-ins, not one.
+///
+/// Written as a general predicate rather than an inline `if spec.name ==
+/// "concierge"` so that the next role with a config prerequisite has an obvious
+/// place to declare it, and so the "which roles are config-gated" question has
+/// one unit-testable answer.
+#[must_use]
+pub fn role_is_config_gated(spec: &RoleSpec, root: &Path) -> Option<&'static str> {
+    if spec.name == crate::concierge::CONCIERGE_ROLE
+        && crate::concierge::resolve_concierge_config(root).is_none()
+    {
+        return Some(
+            "safehouse.concierge does not resolve for this workspace (absent, disabled, or an \
+             empty allowedSenders); run `loom-daemon concierge check` there",
+        );
+    }
+    None
+}
+
 /// Resolve the **per-invocation architect proposal cap** (#5656) with
 /// precedence **env ([`ARCHITECT_MAX_PROPOSALS_ENV`]) > config
 /// (`autonomous.roleRunner.architectMaxProposals`, read from each root's own
@@ -3166,6 +2964,15 @@ fn decide_root_tick(
     // The root resolved enabled again — clear any stale disabled-warning so a
     // later disable re-warns (#4377).
     disabled_roots_warned.remove(root);
+    // Per-role config gate (#7947). A role whose own config block does not
+    // resolve never ticks, even when an explicit `roles` allowlist names it.
+    // Placed here — after the master switch, before sharding and the
+    // membership check — so a role that is structurally unable to do anything
+    // costs nothing further to decide about.
+    if let Some(reason) = role_is_config_gated(spec, root) {
+        log::debug!("role_runner: {} tick for {} skipped — {reason}", spec.name, root.display());
+        return None;
+    }
     // Host sharding (#6374): on a fleet, each workspace's role rotation must
     // run on exactly ONE host per interval — otherwise N dispatchers each
     // spawn the same role session over the same forge queue, which is both
@@ -3734,7 +3541,7 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
             log::warn!(
                 "role_runner: {role} tick skipped after {elapsed:.1?} — {}; next check ~{} (#7607)",
                 outcome.pool_hold_phrase(),
-                next_clear_at.to_rfc3339()
+                next_clear_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
             );
         }
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => {
@@ -3804,7 +3611,7 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
              (#7607)",
             root.display(),
             outcome.pool_hold_phrase(),
-            next_clear_at.to_rfc3339()
+            next_clear_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
         ),
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => log::warn!(
             "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {} (#5028)",
@@ -4095,7 +3902,7 @@ fn log_outcome_for_root_deduped(
                      the pool regains capacity, #7607)",
                     root.display(),
                     outcome.pool_hold_phrase(),
-                    next_clear_at.to_rfc3339()
+                    next_clear_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
                 );
             }
         }

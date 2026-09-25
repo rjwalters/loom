@@ -56,6 +56,8 @@ use std::path::PathBuf;
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
 mod envelope;
+mod sweep_identity;
+pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod trace;
 pub mod visibility;
@@ -234,6 +236,9 @@ pub enum TelemetryRecord {
     /// A sweep began (mirrors the dispatch moment of the frozen SSE topics).
     #[serde(rename = "sweep.started")]
     SweepStarted(SweepStartedRecord),
+    /// Late-resolved launch identity; enriches an existing active sweep only.
+    #[serde(rename = "sweep.identity")]
+    SweepIdentity(SweepIdentityRecord),
     /// A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
     #[serde(rename = "sweep.phase")]
     SweepPhase(SweepPhaseRecord),
@@ -257,6 +262,28 @@ pub enum TelemetryRecord {
     /// variant, and the reason [`CURRENT_SCHEMA_VERSION`] is `2`.
     #[serde(rename = "role_tick.outcome")]
     RoleTickOutcome(RoleTickOutcomeRecord),
+    /// One transcript's session shape (Issue #8757, G3 of #8714) — ids,
+    /// attribution, models, token totals, and turn/tool counts, emitted by
+    /// the transcript-ingest pass. Carries **no** prompt, tool-output, key
+    /// or email content by construction (see [`SessionSummaryRecord`]).
+    #[serde(rename = "session.summary")]
+    SessionSummary(SessionSummaryRecord),
+    /// A derived per-session anomaly/quality rollup (Issue #8760, G3 part 2
+    /// of #8714) — retry-loop detection, the longest paired tool call, a USD
+    /// cost estimate, and anomaly flags, computed from a
+    /// [`SessionSummaryRecord`] plus the
+    /// [`crate::activity::transcript_parse::ParsedTranscript`] that produced
+    /// it. See [`SessionAnalysisRecord`] for the wire-safety contract (same
+    /// as `session.summary`: no prompt, tool-output, key or email content,
+    /// ever).
+    #[serde(rename = "session.analysis")]
+    SessionAnalysis(SessionAnalysisRecord),
+    /// One of the four named event-bus topics that carried no telemetry
+    /// record kind of their own (Issue #8760, G4 of #8714): `daemon.drain.*`,
+    /// `daemon.capacity.advisory`, `daemon.preflight.advisory`, and
+    /// `epic.issue.*`. See [`DaemonEventRecord`].
+    #[serde(rename = "daemon.event")]
+    DaemonEvent(DaemonEventRecord),
     #[serde(rename = "trace.span")]
     Span(trace::SpanRecord),
 }
@@ -310,6 +337,12 @@ pub struct SweepStartedRecord {
     /// Selected reasoning-effort level, when one was chosen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Runtime adapter the sweep was dispatched on (`claude`, `codex`, …),
+    /// when the dispatch event carried one — the same value
+    /// `SweepInfo::runtime` records. Absent for a legacy dispatch that did
+    /// not name its runtime; never fabricated as `"claude"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
 }
 
 /// `sweep.phase` — a sweep advanced to a new lifecycle phase.
@@ -728,8 +761,16 @@ pub struct RoleTickOutcomeRecord {
 /// limit-window state matching what `loom-daemon tokens check --ranking` knows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenAccountState {
-    /// Token account name (the `<account>.token` basename in `.loom/tokens/`).
+    /// Token account name (the `<account>.token` basename in `.loom/tokens/`,
+    /// or the profile name from the multi-provider account registry).
     pub account: String,
+    /// Which provider's pool this account belongs to (`"claude"`, `"codex"`,
+    /// …) — the lowercase [`AccountProvider`] name. Defaults to `"claude"` on
+    /// deserialization so a record from a daemon that predates per-provider
+    /// pools (which only ever sampled the Claude `.ranking` file) still reads
+    /// as what it was.
+    #[serde(default = "default_token_provider")]
+    pub provider: String,
     /// The account's rank in the rotation pool, when ranking data exists
     /// (lower = preferred).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -752,6 +793,12 @@ pub struct TokenAccountState {
 }
 
 /// `tokens.snapshot` — a point-in-time view of the multi-account token pool.
+/// The provider a pre-per-provider `tokens.snapshot` row implicitly belonged
+/// to — see [`TokenAccountState::provider`].
+fn default_token_provider() -> String {
+    "claude".to_string()
+}
+
 /// Host-level: it references no repository, so it carries no visibility tag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenSnapshotRecord {
@@ -1081,6 +1128,264 @@ pub struct ManagedRepoEntry {
     /// `Private`, never `Public`.
     #[serde(default)]
     pub visibility: RepoVisibility,
+}
+
+/// One entry of a [`SessionSummaryRecord`]'s tool-call histogram: how many
+/// times the session invoked one named tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallCount {
+    /// Tool name exactly as the runtime recorded it (e.g. `"Bash"`) — an
+    /// allowlisted shape, never tool arguments or output.
+    pub tool: String,
+    /// Invocations of `tool` across the whole transcript.
+    pub count: u64,
+}
+
+/// `session.summary` — one transcript's session shape (Issue #8757, G3 of
+/// epic #8714). Emitted by the transcript-ingest pass
+/// ([`crate::activity::transcript_ingest`]), one record per ingested
+/// transcript (parent session or subagent), and exported through whatever
+/// exporter(s) `observability` configures — the same
+/// [`crate::observability::queue::DurableQueue`] the collector feeds.
+///
+/// # Wire safety — a summary, never a transcript excerpt
+///
+/// Every field is a count, an id, an allowlisted name, or a timestamp. The
+/// parse that produces it ([`crate::activity::transcript_parse`]) never
+/// copies message text, tool arguments, tool output, or any free-form string
+/// beyond role/model/tool **names** into the record, so no prompt, generated
+/// code, key, or email can appear on the wire for this kind. The redaction
+/// test suite pins this by fixture.
+///
+/// # Field presence contract
+///
+/// Optional fields (`role`, `issue`, `pr_number`, `outcome`,
+/// `parent_session_id`) are **omitted** when unknown, never fabricated —
+/// the same "unknown != zero" contract `host.health` established. `outcome`
+/// in particular is reserved: this pass has no positive terminal-outcome
+/// signal to read from a transcript, so it stays absent until a later slice
+/// (`session.analysis`, or registry correlation) can populate it honestly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummaryRecord {
+    /// Repository the session worked — the final path component of the
+    /// session's cwd (a Loom agent's cwd is the workspace root or a worktree
+    /// inside it; both map to the same repo name), matching
+    /// `activity::transcript_parse::repo_from_cwd`. Not an `owner/repo`
+    /// slug: the ingest pass has no forge round-trip to resolve one.
+    pub repo: String,
+    /// Visibility tag for `repo`. The schema contract (every record that
+    /// references a repository carries one) applies; the ingest pass has no
+    /// `owner/repo` slug to key [`visibility::derive_visibility`]'s cache
+    /// on, so it stamps the fail-closed default — `Private` — exactly what
+    /// every absent/unknown visibility decodes to anyway.
+    #[serde(default)]
+    pub visibility: RepoVisibility,
+    /// The session's own stable id: the transcript's `sessionId`, or the
+    /// subagent file's stem for a `subagents/` transcript whose records
+    /// carry no id of their own.
+    pub session_id: String,
+    /// The enclosing parent session's id, for a `subagents/` transcript;
+    /// absent for a parent-session transcript.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Runtime that wrote the transcript (#8664's `loom.runtime` vocabulary).
+    /// This pass reads Claude Code transcripts only, so today it is always
+    /// `"claude"`; the field exists so sibling per-runtime tails (#8669)
+    /// and this record share one shape.
+    pub runtime: String,
+    /// Attributed Loom role (`builder`, `judge`, …), when the first user
+    /// message names one (`activity::transcript_parse::attribute_role`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Issue number, when the session is a `/loom:<role> <N>` invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    /// PR number, when known. Not derivable from a transcript; reserved for
+    /// registry correlation (a later slice).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u32>,
+    /// Distinct models used across the transcript, sorted — the `(model, day)`
+    /// bucket keys collapsed to their model axis.
+    pub models: Vec<String>,
+    /// Token totals over the whole transcript — the same four counters
+    /// `activity.db`'s `resource_usage` rows already track, summed across
+    /// buckets (deduped by `message.id`, so a streamed message counts once).
+    pub tokens_input: i64,
+    /// See [`Self::tokens_input`].
+    pub tokens_output: i64,
+    /// See [`Self::tokens_input`].
+    pub tokens_cache_read: i64,
+    /// See [`Self::tokens_input`].
+    pub tokens_cache_write: i64,
+    /// Wall-clock span of the session, milliseconds — last record timestamp
+    /// minus first, across every record carrying a timestamp.
+    pub wall_ms: i64,
+    /// Real user turns: user records whose content is **not** a tool result
+    /// (the first slash-command prompt and every subsequent human turn).
+    pub turns: u64,
+    /// Tool invocations, histogram by tool name — assistant `tool_use`
+    /// content blocks, deduped by `message.id` exactly like the token
+    /// counters so a streamed message's blocks count once.
+    pub tool_calls: Vec<ToolCallCount>,
+    /// Tool results flagged `is_error` by the runtime.
+    pub tool_errors: u64,
+    /// Terminal outcome, when this pass can know one. See the struct doc:
+    /// nothing populates it yet, and it serializes away while unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+// ============================================================================
+// `session.analysis` (Issue #8760, G3 part 2 of #8714)
+// ============================================================================
+
+/// One retry-loop candidate detected in a session's tool-call order (Issue
+/// #8760): a run of [`length`](Self::length) consecutive invocations of the
+/// identical tool name (`length >= `[`RETRY_LOOP_MIN_RUN`]). Detected purely
+/// from call **order and name** — never tool arguments or output — so this
+/// is a mechanical signal to investigate, not a verdict: a session that
+/// legitimately calls the same tool several times in a row for unrelated
+/// reasons looks identical to an actual failure-retry loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryLoop {
+    /// The tool invoked repeatedly.
+    pub tool: String,
+    /// Consecutive invocations in the run.
+    pub length: u32,
+}
+
+/// Minimum consecutive same-tool run length that counts as a retry loop
+/// (Issue #8760). Two calls in a row is ordinary (e.g. `Read` then `Read` on
+/// two different files); three or more consecutive identical invocations is
+/// the threshold this analysis flags as loop-shaped.
+pub const RETRY_LOOP_MIN_RUN: u32 = 3;
+
+/// The single `tool_use` -> `tool_result` pairing with the largest elapsed
+/// wall time in the session (Issue #8760) — the wire counterpart of
+/// [`crate::activity::transcript_parse::ToolCallSpan`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LongestToolCall {
+    /// The tool that took the longest to return a result.
+    pub tool: String,
+    /// Elapsed wall time between the `tool_use` and its paired
+    /// `tool_result`, milliseconds.
+    pub duration_ms: i64,
+}
+
+/// An anomaly flag class a `session.analysis` record can carry (Issue
+/// #8760). One variant today; additive — a future flag class is a new
+/// variant, never a repurposed existing one, so an older consumer's
+/// exhaustive match degrades to a decode error on an unrecognized flag
+/// rather than silently misreading it as a known one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnomalyFlag {
+    /// Combined `tokens_input + tokens_output` for the session exceeded
+    /// [`HIGH_TOKEN_USAGE_THRESHOLD`].
+    HighTokenUsage,
+}
+
+/// Static initial calibration for [`AnomalyFlag::HighTokenUsage`] (Issue
+/// #8760): combined `tokens_input + tokens_output` above this value flags
+/// the session. A fixed round number, **not** a true per-role fleet
+/// percentile (#8714's own illustrative "tokens > p99 for role" example) —
+/// this derivation has no access to a fleet-wide token distribution, only
+/// the one session's own `session.summary` fields, so a live percentile
+/// needs a historical query this bounded, mechanical slice does not add.
+/// Chosen well above a typical multi-hour Builder/Judge session's observed
+/// token volume so the flag stays rare and worth investigating rather than
+/// routine.
+pub const HIGH_TOKEN_USAGE_THRESHOLD: i64 = 300_000;
+
+/// `session.analysis` — a derived per-session anomaly/quality rollup (Issue
+/// #8760, G3 part 2 of epic #8714), computed from a landed
+/// [`SessionSummaryRecord`] plus the
+/// [`crate::activity::transcript_parse::ParsedTranscript`] that produced it
+/// (see [`crate::activity::session_analysis::build_session_analysis`]).
+/// Rides the same transcript-ingest emission point as `session.summary`, so
+/// a still-growing session is re-analyzed on each pass that re-reads it,
+/// mirroring that record's own replace-never-append semantics.
+///
+/// **Bounded, mechanical derivation only** — retry-loop detection, the
+/// longest paired tool call, a USD cost estimate (from the existing single
+/// [`crate::activity::resource_usage::ModelPricing`] rate card, applied
+/// per-model to the transcript's own usage buckets so a multi-model session
+/// is costed correctly rather than approximated from a flat total), and a
+/// fixed-threshold anomaly flag. **No LLM-written prose summary** — that is
+/// explicitly a later slice, per #8714's own G3 proposal.
+///
+/// # Wire safety — same contract as `session.summary`
+///
+/// Every field here is a count, an id, an allowlisted tool name, a
+/// duration, or a derived dollar figure. Nothing here is, or is derived
+/// from, message text, tool arguments, tool output, or any free-form
+/// transcript content — the redaction test suite pins this by fixture,
+/// mirroring `session_summary`'s own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionAnalysisRecord {
+    /// Same value as the source `session.summary` record's `repo`.
+    pub repo: String,
+    /// Same value as the source `session.summary` record's `visibility`.
+    #[serde(default)]
+    pub visibility: RepoVisibility,
+    /// Same value as the source `session.summary` record's `session_id` —
+    /// the join key a consumer uses to correlate the two records.
+    pub session_id: String,
+    /// Same value as the source `session.summary` record's
+    /// `parent_session_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Retry-loop candidates detected in the session's tool-call order.
+    /// Empty when none were detected — never omitted, so "computed and
+    /// found none" is distinguishable on the wire from "not computed".
+    #[serde(default)]
+    pub retry_loops: Vec<RetryLoop>,
+    /// The longest paired `tool_use` -> `tool_result` call in the session.
+    /// Absent when no pair could be matched (see
+    /// [`crate::activity::transcript_parse::ParsedTranscript::longest_tool_call`]'s
+    /// doc for why that can happen) — never a fabricated zero duration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub longest_tool_call: Option<LongestToolCall>,
+    /// USD cost estimate, summed per-model across the session's own usage
+    /// buckets via the shared rate card
+    /// ([`crate::activity::resource_usage::ModelPricing`]). Absent when the
+    /// session contributed no usage buckets at all — never a fabricated
+    /// `0.0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Anomaly flags raised for this session. Empty when none were raised.
+    #[serde(default)]
+    pub anomalies: Vec<AnomalyFlag>,
+}
+
+// ============================================================================
+// `daemon.event` (Issue #8760, G4 of #8714)
+// ============================================================================
+
+/// `daemon.event` — one of the four named event-bus topics that carried no
+/// telemetry record kind of their own (Issue #8760, G4 of epic #8714):
+/// `daemon.drain.*`, `daemon.capacity.advisory`, `daemon.preflight.advisory`,
+/// and `epic.issue.*`. Host/daemon-level operational signals, not per-session
+/// user work — carries no [`RepoVisibility`] tag, the same "references no
+/// repository" contract [`TokenSnapshotRecord`]/[`HostHealthRecord`] already
+/// establish.
+///
+/// Deliberately generic — one record shape for four topic families — rather
+/// than four new per-topic record types: every one of these topics is
+/// already a small, frozen, operator-facing payload
+/// ([`crate::event_bus`]'s own documented taxonomy) with no
+/// prompt/tool-output/secret content by construction, the same shape the
+/// live SSE event-bus tail already exposes to an authenticated operator.
+/// Wrapping that payload, rather than re-typing it four times, keeps this
+/// record kind additive to an already-reviewed shape instead of forking a
+/// second schema for the same data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonEventRecord {
+    /// The exact bus topic this record mirrors, e.g.
+    /// `"daemon.drain.started"`, `"epic.issue.123.decompose"`.
+    pub topic: String,
+    /// The event's own payload, exactly as published on the bus.
+    pub payload: serde_json::Value,
 }
 
 #[cfg(test)]
