@@ -45,9 +45,17 @@
 //! Actions: write, it re-runs the workflow runs holding the stale required
 //! checks IN PLACE, so the head SHA — and the Judge verdict — survive. It
 //! falls back to [`redate`]'s push only when the forge refuses the re-run.
+//!
+//! [`loom_pr_guard`] is the pre-merge `loom:pr` review-signal guard (#7419)
+//! — the OTHER half of the verdict-label story [`labels`] tells: this one
+//! fires on `loom:pr`'s ABSENCE ("nobody reviewed this head") rather than a
+//! contradiction beside a present approval, and carries the only override
+//! flag in the family (`--allow-unapproved`) because "nobody reviewed it" and
+//! "a reviewer said no" are different acts.
 
 pub mod head_sync;
 pub mod labels;
+pub mod loom_pr_guard;
 pub mod redate;
 pub mod refs;
 pub mod rerun;

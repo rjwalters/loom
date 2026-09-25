@@ -89,6 +89,15 @@ pub(crate) enum ScriptPortCommand {
     /// deleted) or the removal failed.
     WorktreeRemove(super::worktree_remove::WorktreeRemoveArgs),
 
+    /// `worktree.sh`'s post-`git worktree add` symlink provisioning (#8195,
+    /// slice 4): root and nested `node_modules`, `worktree.linkPaths`,
+    /// `.mcp.json`, and the `info/exclude` entry each one needs so `git add
+    /// -A` cannot stage it (#3528/#5474). The part of the create path that is
+    /// all path interpolation — four `ln -s "$src" "$dst"` pairs and a
+    /// `find | read` loop — which is #7858's class. Exit 0 always: this is
+    /// best-effort by contract and the worktree already exists.
+    WorktreeLink(super::worktree_link::WorktreeLinkArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -194,6 +203,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeRemove(args) => args.run(),
+            ScriptPortCommand::WorktreeLink(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
@@ -239,6 +249,12 @@ pub(crate) enum MergePrCommand {
     /// already spent on this head, so the PR was escalated to a durable
     /// `loom:operator` hold, 1 = could not produce fresh evidence.
     RedateChecks(super::merge_pr_redate::RedateChecksArgs),
+
+    /// The pre-merge `loom:pr` review-signal guard (#7419): refuse a merge
+    /// whose current head does not carry `loom:pr`, unless
+    /// `--allow-unapproved` asserts responsibility. Exit 0 = present or
+    /// overridden (see stdout for which), 1 = absent with no override.
+    LoomPrGuard(super::merge_pr_loom_pr_guard::LoomPrGuardArgs),
 }
 
 impl MergePrCommand {
@@ -248,6 +264,7 @@ impl MergePrCommand {
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
+            MergePrCommand::LoomPrGuard(args) => args.run(),
         }
     }
 }

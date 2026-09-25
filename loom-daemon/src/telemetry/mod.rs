@@ -61,11 +61,13 @@ mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod ops;
+pub mod queue_snapshot;
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use envelope::TelemetryEnvelope;
 pub use ops::MetricPointsRecord;
+pub use queue_snapshot::QueueSnapshotRecord;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
 /// record shapes below so a Phase-2 backend ingesting a mixed-version fleet can
@@ -311,6 +313,10 @@ pub enum TelemetryRecord {
     /// see [`ops`] for the fixed name vocabulary and label policy.
     #[serde(rename = "metric.points")]
     MetricPoints(MetricPointsRecord),
+    /// The work finder's ranked ready queue as of its last tick (Issue #8852,
+    /// phase 2). Native-HTTPS only; see [`queue_snapshot`].
+    #[serde(rename = "queue.snapshot")]
+    QueueSnapshot(QueueSnapshotRecord),
 }
 
 /// A sweep's terminal result. `#[serde(default)]`-friendly variants are not

@@ -3,7 +3,7 @@
 use chrono::{TimeZone, Utc};
 use opentelemetry_proto::tonic::metrics::v1::{metric, number_data_point, AggregationTemporality};
 
-use super::super::build_metrics_request;
+use super::super::{build_logs_request, build_metrics_request};
 use crate::telemetry::ops::{MetricName, MetricPoint, MetricPointsRecord};
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
@@ -81,4 +81,36 @@ fn ops_points_group_per_host_and_empty_batches_produce_no_request() {
     let request = build_metrics_request(&batch).unwrap();
     assert_eq!(request.resource_metrics.len(), 2);
     assert!(build_metrics_request(&[points_envelope("host-a", Vec::new())]).is_none());
+}
+
+#[test]
+fn queue_gauges_map_to_otlp_gauges_and_queue_snapshot_maps_to_nothing() {
+    // Issue #8852 phase 2: SigNoz gets the queue as gauges ...
+    let batch = vec![points_envelope(
+        "host-a",
+        vec![MetricPoint::int(MetricName::QueueIssues, 3)
+            .label("state", "ready")
+            .label("reason", "deferred_capacity")],
+    )];
+    let request = build_metrics_request(&batch).unwrap();
+    let metric = &request.resource_metrics[0].scope_metrics[0].metrics[0];
+    assert_eq!(metric.name, "loom.queue.issues");
+    assert!(matches!(metric.data, Some(metric::Data::Gauge(_))));
+    // ... and the per-issue `queue.snapshot` record is native-HTTPS only.
+    let snapshot = vec![TelemetryEnvelope::new(
+        "host-a",
+        TelemetryRecord::QueueSnapshot(crate::telemetry::QueueSnapshotRecord {
+            tick_at: Utc.timestamp_opt(1_790_000_000, 0).unwrap(),
+            max_concurrent: 1,
+            seen: 0,
+            counts: crate::telemetry::queue_snapshot::QueueStateCounts::default(),
+            listing_failed: Vec::new(),
+            listing_failed_unresolved: 0,
+            rows: Vec::new(),
+            unresolved_rows: 0,
+            rows_truncated: 0,
+        }),
+    )];
+    assert!(build_logs_request(&snapshot).is_none());
+    assert!(build_metrics_request(&snapshot).is_none());
 }

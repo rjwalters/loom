@@ -93,6 +93,15 @@ pub enum MetricName {
     /// Capacity of the worktree-root volume.
     #[serde(rename = "loom.host.worktree_volume.total_bytes")]
     HostWorktreeVolumeTotalBytes,
+    // Ready-queue depth (Issue #8852, phase 2) — one contiguous block.
+    /// Ready issues on the last work-finder tick, labelled `state` and
+    /// `reason` (the queue disposition). Never labelled by issue or repo.
+    #[serde(rename = "loom.queue.issues")]
+    QueueIssues,
+    /// Repos whose ready-issue listing failed on the last tick: a non-zero
+    /// value means `loom.queue.issues` is missing their backlog.
+    #[serde(rename = "loom.queue.listing_failed_repos")]
+    QueueListingFailedRepos,
 }
 
 impl MetricName {
@@ -109,6 +118,8 @@ impl MetricName {
             Self::HostSwapTotalBytes => "loom.host.swap.total_bytes",
             Self::HostWorktreeVolumeFreeBytes => "loom.host.worktree_volume.free_bytes",
             Self::HostWorktreeVolumeTotalBytes => "loom.host.worktree_volume.total_bytes",
+            Self::QueueIssues => "loom.queue.issues",
+            Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
         }
     }
 
@@ -127,6 +138,8 @@ impl MetricName {
         match self {
             Self::DispatchDecisions | Self::DispatchCandidates => "{issue}",
             Self::DispatchMaxConcurrent => "{sweep}",
+            Self::QueueIssues => "{issue}",
+            Self::QueueListingFailedRepos => "{repository}",
             _ => "By",
         }
     }
@@ -144,6 +157,8 @@ impl MetricName {
             Self::HostSwapTotalBytes => "Swap space configured.",
             Self::HostWorktreeVolumeFreeBytes => "Free space on the worktree-root volume.",
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
+            Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
+            Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
         }
     }
 }

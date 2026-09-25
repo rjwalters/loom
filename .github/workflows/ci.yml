@@ -1136,6 +1136,8 @@ jobs:
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: merge-pr verdict-label contradiction guard (#8112, #8191 slice 2)
         run: bash defaults/scripts/tests/test-merge-pr-verdict-label-guard.sh
+      - name: merge-pr loom:pr review-signal guard (#7419, #8191 slice)
+        run: bash defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
       - name: merge-pr PR-label fetch freshness (#8550)
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh
       - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
@@ -1323,18 +1325,25 @@ jobs:
       # three pin it via loom_test_require_daemon_bin and FAIL rather than skip
       # without one.
       #
-      # Three of the 19 test-worktree-*.sh suites are now here (snapshot,
-      # stash-baseline, remove) plus the two non-`test-worktree-*` suites that
-      # drive `worktree.sh remove`. The remaining 16 exercise the CREATE path,
-      # which this slice did not touch, and stay hermetic in shell-suite-tests
-      # — which is the whole point of porting one subcommand-shaped family at a
-      # time.
+      # Four of the 19 test-worktree-*.sh suites are now here (snapshot,
+      # stash-baseline, remove and — since slice 4 — nested-symlinks) plus the
+      # two non-`test-worktree-*` suites that drive `worktree.sh remove`. The
+      # remaining 15 exercise create-path arms these slices did not touch and
+      # stay hermetic in shell-suite-tests — which is the whole point of
+      # porting one cohesive family at a time.
       - name: worktree remove verb (#3769, #4449, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-remove.sh
       - name: worktree remove squash-aware branch delete (#4889, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-remove-squash-merge.sh
       - name: cargo target-dir reclaim on worktree removal (#7239, ported in #8195)
         run: bash defaults/scripts/tests/test-cargo-target-dir-reclaim.sh
+      # Moved out of shell-suite-tests by #8195 slice 4: worktree.sh's
+      # shared-artifact symlinking (root + nested node_modules, linkPaths,
+      # .mcp.json) and its .git/info/exclude bookkeeping are now
+      # `loom-daemon worktree-link`. The suite pins the binary via
+      # loom_test_require_daemon_bin and FAILS rather than skips without one.
+      - name: worktree shared-artifact symlinks (#3528, #5474, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-nested-symlinks.sh
 
   installer-tests:
     name: Installer Integration Tests

@@ -107,6 +107,7 @@ pub mod otlp;
 pub mod outcome;
 pub mod overhead;
 pub mod queue;
+pub mod queue_snapshot;
 pub mod sender;
 pub mod session_analysis;
 pub mod session_summary;
@@ -953,6 +954,8 @@ pub fn spawn_task(
     let mut queues: Vec<Arc<DurableQueue>> = Vec::with_capacity(planned.len());
     // The OTLP-only subset, for the `ops` sink (Issue #8860).
     let mut otlp_queues: Vec<Arc<DurableQueue>> = Vec::new();
+    // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
+    let mut native_queues: Vec<Arc<DurableQueue>> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
         let name = entry.kind.name();
         let queue_path = queue_path_for(&workspace_root, name, sole);
@@ -1062,6 +1065,8 @@ pub fn spawn_task(
         statuses.insert(name.to_string(), export_status);
         if entry.kind == ExporterKind::Otlp {
             otlp_queues.push(queue.clone());
+        } else {
+            native_queues.push(queue.clone());
         }
         queues.push(queue);
         sender_handles.push(sender_handle);
@@ -1093,6 +1098,11 @@ pub fn spawn_task(
     // them. No OTLP exporter ⇒ nothing registered ⇒ every emit is a no-op.
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
+    }
+    // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
+    // HTTPS queues only, sampled by the collector below.
+    if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues, &host_id) {
+        queue_snapshot::register_global_sink(sink);
     }
     // `daemon.event` collection (Issue #8760, G4): a second, independent bus
     // subscription alongside `collector::spawn_task` below — see

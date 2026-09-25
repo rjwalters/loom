@@ -146,6 +146,7 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
         .enumerate()
         .map(|(i, r)| {
             debug_assert!(r.disposition.is_some(), "unresolved queue row #{}", r.key.number);
+            let disposition = r.disposition.unwrap_or(QueueDisposition::DeferredCapacity);
             ReadyQueueRow {
                 rank: i + 1,
                 repo: repo_name(r.key.workspace_idx, roots),
@@ -154,8 +155,10 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 urgent: r.key.urgent,
                 created_at: r.key.created_at.clone(),
                 tier: r.tier.clone(),
-                disposition: r.disposition.unwrap_or(QueueDisposition::DeferredCapacity),
+                disposition,
                 detail: r.detail.clone(),
+                state: disposition.state().to_string(),
+                reason: disposition.reason().to_string(),
             }
         })
         .collect()
