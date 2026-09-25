@@ -577,6 +577,32 @@ pub struct SweepOutcomeRecord {
     /// and same omission contract as `runtime`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// The Curator's `<!-- loom:complexity=<tier> -->` marker for this sweep's
+    /// issue (Issue #8542) — `"mechanical"`, `"routine"`, or `"complex"`. This
+    /// is what makes a model-routing decision (`sweep.tierModels` /
+    /// `sweep.optimization`, or a future classifier-driven router) evaluable
+    /// against a labeled outcome: without it, `model` alone cannot separate
+    /// "sonnet chosen by an operator override" from "sonnet chosen because the
+    /// Curator marked this issue `routine`".
+    ///
+    /// Read from the same forge marker `resolve-tier-model.sh` /
+    /// [`crate::script_helpers::sweep_experiment::extract_complexity_marker`]
+    /// already parse, via one more best-effort REST read of the sweep's own
+    /// issue body at the SAME terminal transition that reads the PR label
+    /// timeline for [`doctor_cycles`](Self::doctor_cycles) — see
+    /// `sweep_registry::outcome_journal::complexity_signal` for the fetch and
+    /// its fail-open contract (breaker-gated, `skip_label_flip`-gated, never
+    /// blocks or fails the journal append).
+    ///
+    /// Omitted — never a fabricated `"routine"` — when the issue carried no
+    /// recognized marker, the fetch failed/timed out, or `skip_label_flip` is
+    /// set. Unlike `resolve-tier-model.sh`'s own dispatch-time fold (an absent
+    /// or unrecognized marker there is a **safe default** for model
+    /// selection), this field must stay honest about "unobserved": a
+    /// classifier's evaluation needs the true absence rate, not a default
+    /// masquerading as data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<String>,
 }
 
 /// One Judge verdict on a PR, as reconstructed from the forge label timeline

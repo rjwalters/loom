@@ -955,6 +955,7 @@ mod tests {
                 runtime: None,
                 provider: None,
                 profile: None,
+                complexity: None,
             }),
         )
     }
