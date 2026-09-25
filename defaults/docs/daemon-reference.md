@@ -1941,6 +1941,45 @@ queues that drain fast. A permanently-full higher tier **will** starve lower tie
 fairness knobs (per-tier slot reservations) and cross-repo dependency awareness are
 explicit follow-ups, deferred until observed to matter.
 
+**`tier:*` labels do not affect dispatch order.** `tier:goal-advancing` and its
+siblings are triage metadata; no daemon code reads them. Only the four keys above
+order the queue.
+
+### Ready queue view (`loom-daemon queue`, #8852)
+
+Each multi-workspace tick records one row per ready `loom:issue` it listed, ranked
+by `candidate_cmp`, with what the tick did with it:
+
+- **running**: `dispatched`, `in_flight`
+- **ready** (waiting on a limit): `deferred_capacity`, `deferred_ramp_cap`,
+  `deferred_saturation`, `deferred_out_of_slice`
+- **blocked** (held by something specific to the issue or repo): `parked` (with
+  the label), `open_pr` (with the PR number), `dispatch_backoff`,
+  `open_pr_backoff`, `quarantined`, `noop_cooldown`, `declined`,
+  `prless_retry`, `peer_claim`, `recheck_interval`, `hard_exclusion`,
+  `host_constraint`, `workspace_halted` (the whole repo's dispatch is held: red
+  `main`, a gate in flight, a pre-flight or token-pool hold, a drain, or the
+  host-distress breaker; the row does not say which), `workspace_commands_missing`,
+  `dispatch_error` (with the error text)
+
+Each disposition is recorded next to the `TickReport` counter it matches, so the
+rows and the counters agree. Issues dropped before the sort are still ranked by the same
+comparator, so their rank shows where they would sit once unblocked. With repo
+sharding (#6243), an out-of-slice row can be passed over for a lower-ranked
+in-slice one; its disposition says so.
+
+The rows travel on `last_work_finder_tick.queue` in `loom-daemon status --json`,
+`health --json` and `serve`'s `/api/status`, stamped with the tick's `at`.
+`loom-daemon queue [--json]` renders them with a freshness verdict: `fresh`,
+`stale` (no tick for 5 of the daemon's reported `work_finder_interval_secs`,
+never under 5 minutes), `no_tick` (no tick yet in this daemon process, so the
+queue is unknown rather than empty) or `disabled`. A repo whose forge listing
+failed on the tick is named in `last_work_finder_tick.listing_failed`, and the
+view says the queue is INCOMPLETE rather than empty (`--json`: `complete:
+false`). The `serve`
+dashboard has a matching "Ready queue" panel. The single-workspace tick path does
+not record rows. Exporting the queue to the fleet backend is a follow-up.
+
 ## Forge-side pipeline snapshot (`status --pipeline`, #3977)
 
 `loom-daemon status` shows the *dispatch*-side picture (in-flight sweeps, the

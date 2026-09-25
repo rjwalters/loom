@@ -147,6 +147,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
             Commands::PeerClaims { json } => {
                 cli::peer_claims_cmd::handle_peer_claims_command(json).await
             }
+            // `queue` (#8852) reads the same `DaemonStatus` round-trip.
+            Commands::Queue { json } => cli::ready_queue_cmd::handle_queue_command(json).await,
             // `jev-merge-risk` POSTs to an external HTTP endpoint (Jev,
             // TypeSafe, issue #8545), so it needs the async runtime for the
             // same reason `status`/`health` do.
