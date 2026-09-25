@@ -356,10 +356,12 @@ re-seeds after a daemon restart. A re-seed reads `updatedAt` again, so it can
 include time the issue spent in a non-waiting hold that did not touch it (for
 example a peer claim). On a sharded fleet, `out_of_slice` rows count as `ready`
 on every host that lists them, so `starved{state="ready"}` can fire on a host
-that is not the slice owner. Read the host label with that in mind. The signals are `loom.queue.oldest_wait{state}`,
-`loom.queue.starved{state}` (waiting longer than `LOOM_QUEUE_STARVATION_SECS`,
+that is not the slice owner. Read the host label with that in mind. The
+signals are `loom.queue.oldest_wait{state}`, `loom.queue.starved{state}` (waiting longer than `LOOM_QUEUE_STARVATION_SECS`,
 default 21600 = 6 h), `loom.queue.starved.by_reason{reason}`, and the
-dispatch-wait delta pair `loom.queue.dispatch_wait` / `.samples`. The
+dispatch-wait delta pair `loom.queue.dispatch_wait` / `.samples`. Queue
+*depth* is `loom.queue.issues` (#8852 phase 2, below). Its `blocked` state
+also counts deliberate holds, which the dwell `blocked` state leaves out. The
 committed SigNoz alert rule is
 `defaults/observability/signoz/alerts/queue-starvation.json` in the Loom repo.
 It fires when `starved{state="ready"}` stays above 0 on a host for 15 min.

@@ -913,8 +913,13 @@ no replayed history. Pool state covers the `tokens.snapshot` accounts (Claude,
 Codex) plus every enabled API-key-pool account (Z.ai, Kimi, …), aggregated per
 provider with no `account` label; delta counters start from the second sample.
 
-The `loom.queue.*` names (#8856) measure how long ready-queue issues have
-waited. They are derived from the per-tick ready queue (#8852), and
+The dwell names (#8856) are `loom.queue.oldest_wait`, `loom.queue.starved`,
+`loom.queue.starved.by_reason` and `loom.queue.dispatch_wait[.samples]`. They
+measure how long ready-queue issues have waited; for depth, use
+`loom.queue.issues`. Their `blocked` state is narrower than the one
+`loom.queue.issues` uses, because it leaves out deliberate holds such as parks,
+open PRs and peer claims. Like depth, they are derived from the per-tick ready
+queue (#8852), and
 [`observability.md` §3c](observability.md#3c-operational-signals-from-daemon-loops-issue-8860)
 defines which rows count as waiting and where dwell starts.
 An unmeasurable host reading produces no point, never a `0`. Each work-finder
