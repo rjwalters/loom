@@ -301,6 +301,58 @@ assert_not_contains "$LOG" "repo view octocat/hello-world --json nameWithOwner,v
     "--check skips the (mutation-only) --repo preflight"
 
 echo ""
+echo "=== --check: a duplicate declared name is its own diagnostic (#8875) ==="
+
+# Simulate a pre-#4187 upgrade that left a legacy, unmarked copy of
+# `loom:issue` sitting outside the managed block alongside the current one --
+# labels.yml itself is structurally broken here independent of what the live
+# forge state is, so this must be flagged even when the live set otherwise
+# fully matches every declared entry (by construction, using the *first*
+# declared copy, since read_declared_labels/diff_declared_against_live_tsv
+# compare in file order and later entries win ties by simply re-matching).
+cat > "$SRC/.github/labels.yml" <<'EOF'
+- name: loom:issue
+  description: "legacy pre-#4187 copy"
+  color: "1D76DB"
+
+# BEGIN LOOM LABELS
+- name: loom:issue
+  description: "Approved and ready for a Builder"
+  color: "3B82F6"
+- name: loom:pr
+  description: "Approved pull request"
+  color: "10B981"
+- name: loom:operator-mechanical
+  description: "Parked pending a mechanical human action"
+  color: "F59E0B"
+# END LOOM LABELS
+EOF
+DUP_TSV=$'loom:issue\t1d76db\tlegacy pre-#4187 copy\nloom:pr\t10b981\tApproved pull request\nloom:operator-mechanical\tf59e0b\tParked pending a mechanical human action'
+run_sls --nwo owner/repo --labels "$DUP_TSV" -- --check
+assert_eq "3" "$RC" "--check exits 3 when labels.yml declares a name more than once"
+assert_contains "$OUT" "DUPLICATE     loom:issue" "the duplicated name is called out by name"
+assert_contains "$OUT" "1 duplicate name(s)" "the summary counts exactly one duplicate name"
+assert_contains "$OUT" "de-duplicate the file" \
+    "the duplicate diagnostic explains what to do about it"
+assert_not_contains "$LOG" "label create" "a duplicate name performs no mutation"
+assert_not_contains "$LOG" "label edit" "a duplicate name performs no mutation"
+
+# Restore the shared fixture for any tests that might be added below this one.
+cat > "$SRC/.github/labels.yml" <<'EOF'
+# BEGIN LOOM LABELS
+- name: loom:issue
+  description: "Approved and ready for a Builder"
+  color: "3B82F6"
+- name: loom:pr
+  description: "Approved pull request"
+  color: "10B981"
+- name: loom:operator-mechanical
+  description: "Parked pending a mechanical human action"
+  color: "F59E0B"
+# END LOOM LABELS
+EOF
+
+echo ""
 echo "=== --check: a forge lookup failure is a loud, distinct error ==="
 
 # #7745: an unreachable forge exits 4, NOT 1. The two used to share exit 1,
