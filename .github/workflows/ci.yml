@@ -1363,6 +1363,25 @@ jobs:
         run: bash defaults/scripts/tests/test-worktree-orphan-guard-spaces.sh
       - name: worktree concurrency lock + partial-state cleanup (#3380, #6014, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-concurrency.sh
+      # Moved out of shell-suite-tests by #8191's delete-branch slice:
+      # merge-pr.sh's `_maybe_delete_local_branch` now delegates to
+      # `loom-daemon merge-pr delete-branch` (the same branch_delete rule
+      # `worktree.sh remove` uses), so every suite that drives merge-pr.sh's
+      # post-merge cleanup — or, like cleanup-branches' review-branch pass,
+      # sources that function — needs the binary this job builds. All six pin
+      # it via loom_test_require_daemon_bin and FAIL rather than skip without one.
+      - name: merge-pr local-branch cleanup (#4100, #5015, ported in #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-local-branch-cleanup.sh
+      - name: merge-pr dirty-worktree guard (#5031, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-dirty-worktree-guard.sh
+      - name: merge-pr primary-checkout advice (#4171, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-primary-checkout-advice.sh
+      - name: merge-pr primary-worktree guard (#3710, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-primary-worktree-guard.sh
+      - name: merge-pr worktree-remove diagnosis (#6372, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-worktree-remove-diagnosis.sh
+      - name: cleanup-branches pr-* review-branch pass (#4405, #8191)
+        run: bash defaults/scripts/tests/test-cleanup-branches-pr-review-branch.sh
 
   installer-tests:
     name: Installer Integration Tests

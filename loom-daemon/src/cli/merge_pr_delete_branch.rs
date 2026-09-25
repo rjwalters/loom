@@ -107,6 +107,24 @@ impl Sink for ReplaySink {
     }
 }
 
+impl DeleteBranchArgs {
+    pub(crate) fn run(self) -> Result<()> {
+        let ctx = DeleteContext {
+            repo_root: &self.repo_root,
+            default_branch: self.default_branch.as_deref(),
+            cleanup_primary_checkout: !self.no_cleanup_primary,
+        };
+        let sink = ReplaySink;
+        let _outcome = branch_delete::maybe_delete_local_branch(
+            &ctx,
+            &sink,
+            &self.branch,
+            &self.expected_head_sha,
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::render;
@@ -134,23 +152,5 @@ mod tests {
     #[test]
     fn an_empty_message_still_emits_its_level() {
         assert_eq!(render("SUCCESS", ""), "SUCCESS\t\n");
-    }
-}
-
-impl DeleteBranchArgs {
-    pub(crate) fn run(self) -> Result<()> {
-        let ctx = DeleteContext {
-            repo_root: &self.repo_root,
-            default_branch: self.default_branch.as_deref(),
-            cleanup_primary_checkout: !self.no_cleanup_primary,
-        };
-        let sink = ReplaySink;
-        let _outcome = branch_delete::maybe_delete_local_branch(
-            &ctx,
-            &sink,
-            &self.branch,
-            &self.expected_head_sha,
-        );
-        Ok(())
     }
 }
