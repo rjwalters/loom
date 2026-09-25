@@ -62,7 +62,7 @@ pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod trace;
 pub mod visibility;
-pub use ci::{CiDurationRecord, CiJobRecord, CiRunRecord};
+pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use envelope::TelemetryEnvelope;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
@@ -299,6 +299,11 @@ pub enum TelemetryRecord {
     /// `loom.ci.{run,job}.duration_ms` histograms (Issue #8824).
     #[serde(rename = "ci.duration")]
     CiDuration(CiDurationRecord),
+    /// One ≤ 8 KiB chunk of a completed job's log text (Issue #8825). The
+    /// only kind carrying free text the daemon did not author — see
+    /// [`CiJobLogRecord`] for why the gateway, not the source, scrubs it.
+    #[serde(rename = "ci.job.log")]
+    CiJobLog(CiJobLogRecord),
 }
 
 /// A sweep's terminal result. `#[serde(default)]`-friendly variants are not
@@ -755,6 +760,24 @@ pub struct RoleTickOutcomeRecord {
     /// optional field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_pool: Option<String>,
+    /// Which tier of the ordered runtime-preference list this tick launched on
+    /// (Issue #8599): `0` is the most-preferred tap — nothing fell through —
+    /// and any higher value is a fall-through, so "how much work went to the
+    /// metered backstop?" is a query over this key instead of a grep of
+    /// `loom-daemon logs`. Absent whenever no preference list decided the
+    /// launch (no `runtimes.preference`/`rolePreference.<role>` configured, an
+    /// operator pin, a pre-spawn skip that never resolved a runtime) and on
+    /// every record written before #8599 — additive, no `schema_version` bump,
+    /// exactly as [`Self::gated_pool`] was in #8408.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preference_tier: Option<u32>,
+    /// The chosen tap's identity (`<runtime>[:<profile>]`) when a preference
+    /// list decided this tick (#8599) — the same rendering the
+    /// `# LOOM_RUNTIME_PREFERENCE` marker and the launch record's own `tap`
+    /// key use, so one grep finds a tap across all three. Present exactly when
+    /// [`Self::preference_tier`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preference_tap: Option<String>,
     /// Runtime adapter this tick actually launched on (Issue #8507), read off
     /// the tick's own `# LOOM_LAUNCH` record — same source and the same
     /// "absent, never a fabricated `claude` default" contract as

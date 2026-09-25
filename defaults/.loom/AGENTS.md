@@ -27,6 +27,9 @@ Secrets must stay outside every repository and worktree, including ignored
 `.env`, `.loom-local`, logs and artifacts. Use owner-only user credential files
 or an OS credential store; reference them without copying values. Never print
 secrets. `.gitignore` is insufficient. See [credential policy](.loom/docs/credential-storage.md).
+Task credentials (cloud tokens, SSH keys) follow a reference-by-name convention:
+look up `./.loom/credentials.md` (names only) before asking the operator for
+anything but a name — see [`.loom/docs/credentials.md`](.loom/docs/credentials.md).
 
 ## What is Loom?
 

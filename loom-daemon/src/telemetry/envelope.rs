@@ -52,6 +52,12 @@ impl TelemetryEnvelope {
                 TelemetryRecord::CiRun(_)
                 | TelemetryRecord::CiJob(_)
                 | TelemetryRecord::CiDuration(_) => 8,
+                // Issue #8825: `ci.job.log` ships as its own unit (phase 2 of
+                // the same epic, behind its own `logCaptureEnabled` gate), so
+                // it gets its own version — a backend that has not taught
+                // itself about free-text log bodies can refuse exactly this
+                // kind without also losing the phase-1 CI family at 8.
+                TelemetryRecord::CiJobLog(_) => 9,
                 _ => CURRENT_SCHEMA_VERSION,
             },
             emitted_at: Utc::now(),

@@ -1,6 +1,12 @@
 //! Tests for the CI telemetry poller (Issue #8824). Every test runs against
 //! the committed recorded-fixture org under
 //! `loom-daemon/tests/fixtures/ci_telemetry/` — no live network.
+//!
+//! Phase 2's job-log capture tests (#8825) live in the sibling
+//! [`job_logs`] module (named to leave `logs::` resolving to
+//! `ci_telemetry::logs`, the module under test).
+
+mod job_logs;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -14,7 +20,7 @@ use super::api::{
     classify, normalise_api_path, parse_next_link, parse_raw, ApiError, ApiResponse, GithubApi,
 };
 use super::journal::Journal;
-use super::ledger::{Ledger, UnitDraft, UnitKey};
+use super::ledger::{self, Ledger, UnitDraft, UnitKey};
 use super::poll::{backoff_until, run_cycle, CycleContext, CycleError};
 use super::records::{
     envelope_identity, job_envelopes, run_envelopes, JobsPage, RepoJson, RunsPage,
@@ -51,11 +57,23 @@ struct FixtureApi {
     overrides: Mutex<HashMap<String, ApiResponse>>,
     requests: Mutex<Vec<(String, Option<String>)>>,
     panic_at: Option<usize>,
+    /// Job-log documents (#8825), keyed by request path.
+    job_logs: Mutex<BTreeMap<String, Value>>,
+    /// Paths whose next `get_document` call fails transiently (then heals) —
+    /// the retry-after-failure seam.
+    flaky_logs: Mutex<HashMap<String, usize>>,
 }
 
 impl FixtureApi {
     fn new() -> Self {
-        let responses = fixture()["responses"]
+        let fx = fixture();
+        let responses = fx["responses"]
+            .as_object()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .collect();
+        let job_logs = fx["job_logs"]
             .as_object()
             .unwrap()
             .clone()
@@ -66,6 +84,8 @@ impl FixtureApi {
             overrides: Mutex::new(HashMap::new()),
             requests: Mutex::new(Vec::new()),
             panic_at: None,
+            job_logs: Mutex::new(job_logs),
+            flaky_logs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -74,6 +94,11 @@ impl FixtureApi {
             panic_at: Some(n),
             ..FixtureApi::new()
         }
+    }
+
+    /// Fail this job-log path's next `n` downloads, then serve it normally.
+    fn fail_log_times(&self, path: &str, n: usize) {
+        self.flaky_logs.lock().unwrap().insert(path.to_string(), n);
     }
 
     fn set_override(&self, key: &str, response: ApiResponse) {
@@ -135,6 +160,62 @@ impl GithubApi for FixtureApi {
             ..ApiResponse::default()
         })
     }
+
+    fn get_document(&self, path: &str) -> Result<ApiResponse, ApiError> {
+        {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push((path.to_string(), None));
+            let n = requests.len();
+            drop(requests);
+            assert!(self.panic_at != Some(n), "simulated process kill at request {n}");
+        }
+        {
+            let mut flaky = self.flaky_logs.lock().unwrap();
+            if let Some(remaining) = flaky.get_mut(path) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(ApiError::Transport(format!(
+                        "synthetic transient failure for {path}"
+                    )));
+                }
+            }
+        }
+        let logs = self.job_logs.lock().unwrap();
+        let Some(entry) = logs.get(path) else {
+            // Every other fixture job gets a one-line log, so a cycle with
+            // capture on exercises all 24 of them rather than only the three
+            // with committed bodies.
+            return Ok(ApiResponse {
+                status: 200,
+                body: format!("2026-09-20T09:00:00.0000000Z synthesized log for {path}\n"),
+                ..ApiResponse::default()
+            });
+        };
+        if let Some(status) = entry.get("status").and_then(Value::as_u64) {
+            return classify(
+                ApiResponse {
+                    status: u16::try_from(status).unwrap_or(500),
+                    body: "{\"message\":\"Gone\"}".into(),
+                    ..ApiResponse::default()
+                },
+                path,
+            );
+        }
+        let body = if let Some(text) = entry.get("text").and_then(Value::as_str) {
+            text.to_string()
+        } else {
+            let line = entry["repeat"].as_str().unwrap();
+            let count = usize::try_from(entry["count"].as_u64().unwrap()).unwrap();
+            (0..count)
+                .map(|n| line.replace("{n}", &n.to_string()))
+                .collect()
+        };
+        Ok(ApiResponse {
+            status: 200,
+            body,
+            ..ApiResponse::default()
+        })
+    }
 }
 
 fn now() -> DateTime<Utc> {
@@ -150,6 +231,21 @@ fn ctx(root: &Path) -> CycleContext<'_> {
         host_id: "fixture-host".to_string(),
         initial_lookback: Duration::hours(24),
         log_capture: LogCaptureGate::Off,
+        log_excluded_repos: Vec::new(),
+        log_max_bytes: logs::DEFAULT_MAX_BYTES,
+    }
+}
+
+/// The same cycle with job-log capture on (#8825). The cap is deliberately
+/// small so the fixture's one large log truncates without committing
+/// megabytes of fixture data.
+const TEST_LOG_CAP: usize = 4 * 1024;
+
+fn ctx_with_logs(root: &Path) -> CycleContext<'_> {
+    CycleContext {
+        log_capture: LogCaptureGate::On,
+        log_max_bytes: TEST_LOG_CAP,
+        ..ctx(root)
     }
 }
 
@@ -175,10 +271,26 @@ fn kind_counts(root: &Path) -> (usize, usize, usize, usize) {
             TelemetryRecord::CiJob(_) => jobs += 1,
             TelemetryRecord::CiDuration(_) => durations += 1,
             TelemetryRecord::Span(_) => spans += 1,
+            TelemetryRecord::CiJobLog(_) => {}
             other => panic!("unexpected record in CI journal: {other:?}"),
         }
     }
     (runs, jobs, durations, spans)
+}
+
+/// Every `ci.job.log` chunk in the journal, grouped by `job_id` and ordered
+/// by `chunk_index` — the reconstruction a SigNoz query performs (AC1).
+fn reconstruct_logs(root: &Path) -> BTreeMap<u64, Vec<crate::telemetry::CiJobLogRecord>> {
+    let mut by_job: BTreeMap<u64, Vec<crate::telemetry::CiJobLogRecord>> = BTreeMap::new();
+    for env in journal(root) {
+        if let TelemetryRecord::CiJobLog(record) = env.record {
+            by_job.entry(record.job_id).or_default().push(record);
+        }
+    }
+    for chunks in by_job.values_mut() {
+        chunks.sort_by_key(|chunk| chunk.chunk_index);
+    }
+    by_job
 }
 
 // ---------------------------------------------------------------------------
@@ -734,12 +846,53 @@ fn collector_allowlist_matches_the_ci_vocabulary_exactly() {
     for shared in ["loom.repo", "loom.repo.visibility"] {
         assert!(keep_keys("log").contains(shared) && keep_keys("span").contains(shared));
     }
+    // #8825: the gateway's scrub stage is scoped by this one key. If the
+    // allowlist ever dropped it, ingest would still succeed but a job log
+    // would become unreconstructable (chunk ordering is the only contract).
+    assert!(keep_keys("log").contains(crate::telemetry::ci::CI_LOG_CHUNK_MARKER_KEY));
+    assert!(CI_LOG_ATTRIBUTE_KEYS.contains(&crate::telemetry::ci::CI_LOG_CHUNK_MARKER_KEY));
+}
+
+/// The scrub-class list in the collector config and `CI_LOG_SCRUB_CLASSES`
+/// must agree, in order — the daemon-side half of #8825's "the list lives in
+/// the repo, reviewable" rule (the integration test
+/// `collector_fanout::gateway_scrubs_exactly_the_declared_ci_log_classes`
+/// asserts the same from the other side, including the scope guards).
+#[test]
+fn collector_scrub_classes_match_the_declared_list() {
+    // A class may need more than one pattern (github-token covers both the
+    // `gh*_` prefixes and `github_pat_`), so consecutive repeats collapse —
+    // but the ORDER of classes is load-bearing and is compared exactly.
+    let mut markers: Vec<String> = Vec::new();
+    for line in COLLECTOR_CONFIG
+        .lines()
+        .filter(|line| line.contains("replace_pattern(body,"))
+    {
+        let start = line.find("[REDACTED:").expect("a replacement marker");
+        let end = line[start..].find(']').expect("a closed marker") + start;
+        let class = line[start + "[REDACTED:".len()..end].to_string();
+        if markers.last() != Some(&class) {
+            markers.push(class);
+        }
+    }
+    assert_eq!(
+        markers,
+        crate::telemetry::ci::CI_LOG_SCRUB_CLASSES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect::<Vec<_>>()
+    );
+    for class in crate::telemetry::ci::CI_LOG_SCRUB_CLASSES {
+        assert_eq!(crate::telemetry::ci::scrub_marker(class), format!("[REDACTED:{class}]"));
+    }
 }
 
 #[test]
 fn records_emit_exactly_the_declared_vocabulary() {
     let dir = TempDir::new().unwrap();
-    run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
+    // Capture on, so `ci.job.log`'s keys (including the truncation marker's)
+    // are in the union too — the fixture exercises every optional field.
+    run_cycle(&ctx_with_logs(dir.path()), &FixtureApi::new()).unwrap();
     let (mut log_keys, mut span_keys, mut labels) =
         (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     for env in journal(dir.path()) {
@@ -748,6 +901,9 @@ fn records_emit_exactly_the_declared_vocabulary() {
                 log_keys.extend(r.log_attributes().into_iter().map(|(k, _)| k.to_string()))
             }
             TelemetryRecord::CiJob(r) => {
+                log_keys.extend(r.log_attributes().into_iter().map(|(k, _)| k.to_string()))
+            }
+            TelemetryRecord::CiJobLog(r) => {
                 log_keys.extend(r.log_attributes().into_iter().map(|(k, _)| k.to_string()))
             }
             TelemetryRecord::CiDuration(r) => {
@@ -777,12 +933,14 @@ fn config_defaults_are_flags_off_and_config_values_resolve() {
     assert_eq!(resolved.interval_secs, DEFAULT_INTERVAL_SECS);
     assert!(resolved.excluded_repos.is_empty());
     assert_eq!(log_capture_gate(&resolved), LogCaptureGate::Off);
+    assert_eq!(resolved.log_capture_max_bytes, logs::DEFAULT_MAX_BYTES);
+    assert!(resolved.log_capture_excluded_repos.is_empty());
 
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
     std::fs::write(
         dir.path().join(".loom/config.json"),
-        r#"{"autonomous":{"ciTelemetry":{"enabled":true,"org":"acme","intervalSecs":300,"excludedRepos":[{"repo":"infra","reason":"mirror of upstream CI"}],"logCaptureEnabled":true}}}"#,
+        r#"{"autonomous":{"ciTelemetry":{"enabled":true,"org":"acme","intervalSecs":300,"excludedRepos":[{"repo":"infra","reason":"mirror of upstream CI"}],"logCaptureEnabled":true,"logCaptureMaxBytes":131072,"logCaptureExcludedRepos":[{"repo":"vendored","reason":"third-party logs are not ours to store"}]}}}"#,
     )
     .unwrap();
     let config = read_config(dir.path());
@@ -798,10 +956,20 @@ fn config_defaults_are_flags_off_and_config_values_resolve() {
     assert!(config.refused_exclusions.is_empty());
     let resolved = resolve(&config);
     assert!(resolved.enabled || std::env::var(ENABLED_ENV).is_ok());
-    // Requested, but phase 1 refuses it by name.
+    // Phase 2 (#8825) honours the gate phase 1 refused by name.
     if std::env::var(LOG_CAPTURE_ENABLED_ENV).is_err() {
-        assert_eq!(log_capture_gate(&resolved), LogCaptureGate::RefusedNotImplemented);
+        assert_eq!(log_capture_gate(&resolved), LogCaptureGate::On);
     }
+    if std::env::var(LOG_CAPTURE_MAX_BYTES_ENV).is_err() {
+        assert_eq!(resolved.log_capture_max_bytes, 131_072);
+    }
+    assert_eq!(
+        resolved.log_capture_excluded_repos,
+        vec![RepoExclusion {
+            repo: "vendored".into(),
+            reason: "third-party logs are not ours to store".into()
+        }]
+    );
 }
 
 #[test]
@@ -818,25 +986,83 @@ fn env_overrides_config() {
         excluded_repos: Some(vec![exclusion.clone()]),
         refused_exclusions: Vec::new(),
         log_capture_enabled: Some(false),
+        log_capture_max_bytes: Some(1024),
+        log_capture_excluded_repos: Some(vec![exclusion.clone()]),
     };
     std::env::set_var(ENABLED_ENV, "1");
     std::env::set_var(ORG_ENV, "from-env");
     std::env::set_var(INTERVAL_SECS_ENV, "45");
-    // Not a recognised override: exclusions are committed-config-only.
+    std::env::set_var(LOG_CAPTURE_ENABLED_ENV, "1");
+    std::env::set_var(LOG_CAPTURE_MAX_BYTES_ENV, "2048");
+    // Not recognised overrides: exclusions are committed-config-only, both
+    // the record-level list and #8825's log-only one.
     std::env::set_var("LOOM_CI_TELEMETRY_EXCLUDED_REPOS", "x, y");
+    std::env::set_var("LOOM_CI_TELEMETRY_LOG_CAPTURE_EXCLUDED_REPOS", "x, y");
     let resolved = resolve(&config);
     for name in [
         ENABLED_ENV,
         ORG_ENV,
         INTERVAL_SECS_ENV,
+        LOG_CAPTURE_ENABLED_ENV,
+        LOG_CAPTURE_MAX_BYTES_ENV,
         "LOOM_CI_TELEMETRY_EXCLUDED_REPOS",
+        "LOOM_CI_TELEMETRY_LOG_CAPTURE_EXCLUDED_REPOS",
     ] {
         std::env::remove_var(name);
     }
     assert!(resolved.enabled);
     assert_eq!(resolved.org, "from-env");
     assert_eq!(resolved.interval_secs, 45);
-    assert_eq!(resolved.excluded_repos, vec![exclusion]);
+    assert_eq!(resolved.excluded_repos, vec![exclusion.clone()]);
+    assert!(resolved.log_capture_requested);
+    assert_eq!(resolved.log_capture_max_bytes, 2048);
+    assert_eq!(resolved.log_capture_excluded_repos, vec![exclusion]);
+}
+
+/// The log-only exclusion key gets the same discipline as `excludedRepos`:
+/// committed config, a stated reason, no env tier (#8825 + the
+/// ci-observability policy, which names log capture as the ONLY excludable
+/// signal — so it needs its own key rather than reusing the coarse one that
+/// would also drop the repo's unconditional metrics).
+#[test]
+fn log_capture_exclusions_need_a_reason_and_committed_config() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+    std::fs::create_dir_all(dir.path().join(".loom-local")).unwrap();
+    std::fs::write(
+        dir.path().join(".loom/config.json"),
+        r#"{"autonomous":{"ciTelemetry":{"logCaptureExcludedRepos":[{"repo":"kept"},{"repo":"ok","reason":"logs carry third-party secrets"}]}}}"#,
+    )
+    .unwrap();
+    let resolved = resolve(&read_config(dir.path()));
+    assert_eq!(
+        resolved.log_capture_excluded_repos,
+        vec![RepoExclusion {
+            repo: "ok".into(),
+            reason: "logs carry third-party secrets".into()
+        }]
+    );
+    assert!(resolved
+        .refused_exclusions
+        .iter()
+        .any(|refusal| refusal.starts_with("kept:")));
+
+    // A host-local tier cannot add one.
+    std::fs::write(
+        dir.path().join(".loom-local/local.json"),
+        r#"{"autonomous":{"ciTelemetry":{"logCaptureExcludedRepos":[{"repo":"sneaky","reason":"local"}]}}}"#,
+    )
+    .unwrap();
+    let resolved = resolve(&read_config(dir.path()));
+    assert!(resolved
+        .refused_exclusions
+        .iter()
+        .any(|refusal| refusal.contains(LOG_CAPTURE_EXCLUDED_REPOS_KEY)
+            && refusal.contains("committed config")));
+    assert!(resolved
+        .log_capture_excluded_repos
+        .iter()
+        .all(|exclusion| exclusion.repo != "sneaky"));
 }
 
 /// ci-observability policy: excluding a repo suppresses its unconditional

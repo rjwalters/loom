@@ -1,6 +1,6 @@
 //! The durable dedup ledger — `.loom/state/ci-telemetry/seen.jsonl`.
 //!
-//! Append-only JSONL. Four line types:
+//! Append-only JSONL. Six line types:
 //!
 //! - `unit` — one committed run or job: its `(repo, run_id, job_id)` key, a
 //!   monotonically increasing `seq`, and the exact envelopes it will emit.
@@ -12,6 +12,18 @@
 //! - `emitted` — "every unit with `seq <= through_seq` has reached the
 //!   journal". Units above it are *pending*: the next cycle replays them,
 //!   skipping any envelope the journal already holds.
+//! - `log_wanted` (#8825) — one completed job whose log should be captured,
+//!   carrying everything needed to build its `ci.job.log` records without
+//!   re-listing the run (the run is already "seen", so it is never listed
+//!   again). A job-log unit's key is the *same* `(repo, run_id, job_id)`
+//!   with `logs: true`, so log capture is a **separate** commit from the
+//!   `ci.job` record's: a failed download retries on the next cycle and the
+//!   already-emitted `ci.job` record is never redone.
+//! - `log_failure` (#8825) — cumulative failed download attempts for one
+//!   `(repo, job_id)` and the last named reason. At
+//!   [`logs::MAX_ATTEMPTS`](super::logs::MAX_ATTEMPTS) the poller stops
+//!   retrying and `status` reports the job's logs as failed — silence would
+//!   otherwise read as "captured".
 //!
 //! **Torn tail.** A crash mid-append can leave a trailing partial line. On
 //! open it is detected (bytes after the final `\n`), the file is truncated
@@ -27,18 +39,25 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::logs::LogTarget;
 use crate::telemetry::TelemetryEnvelope;
 
 /// A unit's dedup key: `(repo, run_id, job_id)` plus the run attempt.
 /// `job_id` is `None` for the run-level unit. The attempt makes a re-run of
 /// an already-recorded run a *new* run-level unit (its jobs already have
 /// fresh GitHub `job_id`s), so each attempt is emitted exactly once.
+///
+/// `logs` (#8825) splits the key space in two: `false` is the run/job
+/// **record** unit, `true` the same job's captured **log** chunks. They are
+/// committed independently, so a log-download failure retries without ever
+/// re-emitting the `ci.job` record that already landed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UnitKey {
     pub repo: String,
     pub run_id: u64,
     pub job_id: Option<u64>,
     pub attempt: u32,
+    pub logs: bool,
 }
 
 impl UnitKey {
@@ -49,6 +68,7 @@ impl UnitKey {
             run_id,
             job_id: None,
             attempt,
+            logs: false,
         }
     }
 
@@ -59,12 +79,27 @@ impl UnitKey {
             run_id,
             job_id: Some(job_id),
             attempt,
+            logs: false,
+        }
+    }
+
+    /// The `(repo, job_id)` job-log capture unit — "logs done" for that job.
+    #[must_use]
+    pub fn job_logs(repo: &str, run_id: u64, job_id: u64, attempt: u32) -> Self {
+        UnitKey {
+            logs: true,
+            ..UnitKey::job(repo, run_id, job_id, attempt)
         }
     }
 }
 
 fn first_attempt() -> u32 {
     1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Compact the ledger once it exceeds this many bytes (and nothing is
@@ -82,6 +117,10 @@ enum LedgerLine {
         job_id: Option<u64>,
         #[serde(default = "first_attempt")]
         attempt: u32,
+        /// #8825. Absent on every pre-#8825 line, which is exactly the
+        /// record-unit meaning, so an existing ledger loads unchanged.
+        #[serde(default, skip_serializing_if = "is_false")]
+        logs: bool,
         envelopes: Vec<TelemetryEnvelope>,
     },
     Seen {
@@ -92,6 +131,8 @@ enum LedgerLine {
         job_id: Option<u64>,
         #[serde(default = "first_attempt")]
         attempt: u32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        logs: bool,
     },
     Watermark {
         repo: String,
@@ -99,6 +140,17 @@ enum LedgerLine {
     },
     Emitted {
         through_seq: u64,
+    },
+    /// #8825: a completed job whose log capture is wanted but not yet done.
+    LogWanted {
+        target: LogTarget,
+    },
+    /// #8825: cumulative failed download attempts for one job's log.
+    LogFailure {
+        repo: String,
+        job_id: u64,
+        attempts: u32,
+        error: String,
     },
 }
 
@@ -193,6 +245,17 @@ pub fn append_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// One job's log-capture state, as `status` reports it (#8825).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogCounts {
+    /// Jobs whose log chunks are committed.
+    pub done: usize,
+    /// Jobs wanted and still retriable.
+    pub pending: usize,
+    /// Jobs given up on after [`logs::MAX_ATTEMPTS`](super::logs::MAX_ATTEMPTS).
+    pub failed: usize,
+}
+
 /// The loaded ledger.
 #[derive(Debug)]
 pub struct Ledger {
@@ -203,6 +266,10 @@ pub struct Ledger {
     emitted_through: u64,
     pending: Vec<PendingUnit>,
     repaired: bool,
+    /// `(repo, job_id)` → the job whose log is wanted.
+    log_wanted: BTreeMap<(String, u64), LogTarget>,
+    /// `(repo, job_id)` → (cumulative attempts, last named reason).
+    log_failures: BTreeMap<(String, u64), (u32, String)>,
 }
 
 impl Ledger {
@@ -230,6 +297,8 @@ impl Ledger {
             emitted_through: 0,
             pending: Vec::new(),
             repaired,
+            log_wanted: BTreeMap::new(),
+            log_failures: BTreeMap::new(),
         };
         let mut units: Vec<PendingUnit> = Vec::new();
         for line in lines {
@@ -240,6 +309,7 @@ impl Ledger {
                     run_id,
                     job_id,
                     attempt,
+                    logs,
                     envelopes,
                 }) => {
                     let key = UnitKey {
@@ -247,6 +317,7 @@ impl Ledger {
                         run_id,
                         job_id,
                         attempt,
+                        logs,
                     };
                     ledger.seen.insert(key.clone());
                     ledger.next_seq = ledger.next_seq.max(seq + 1);
@@ -262,12 +333,14 @@ impl Ledger {
                     run_id,
                     job_id,
                     attempt,
+                    logs,
                 }) => {
                     ledger.seen.insert(UnitKey {
                         repo,
                         run_id,
                         job_id,
                         attempt,
+                        logs,
                     });
                     ledger.next_seq = ledger.next_seq.max(seq + 1);
                 }
@@ -276,6 +349,25 @@ impl Ledger {
                 }
                 Ok(LedgerLine::Emitted { through_seq }) => {
                     ledger.emitted_through = ledger.emitted_through.max(through_seq);
+                }
+                Ok(LedgerLine::LogWanted { target }) => {
+                    ledger
+                        .log_wanted
+                        .insert((target.repo.clone(), target.job_id), target);
+                }
+                Ok(LedgerLine::LogFailure {
+                    repo,
+                    job_id,
+                    attempts,
+                    error,
+                }) => {
+                    let entry = ledger
+                        .log_failures
+                        .entry((repo, job_id))
+                        .or_insert((0, String::new()));
+                    if attempts >= entry.0 {
+                        *entry = (attempts, error);
+                    }
                 }
                 Err(error) => log::warn!(
                     "ci_telemetry: skipping unparseable ledger line in {}: {error}",
@@ -343,6 +435,7 @@ impl Ledger {
                 run_id: unit.key.run_id,
                 job_id: unit.key.job_id,
                 attempt: unit.key.attempt,
+                logs: unit.key.logs,
                 envelopes: unit.envelopes.clone(),
             };
             buffer.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
@@ -364,6 +457,154 @@ impl Ledger {
         }
         self.pending.extend(committed.iter().cloned());
         Ok(committed)
+    }
+
+    /// Record that each of `targets`' logs should be captured (#8825).
+    /// Already-wanted, already-captured and already-failed jobs are skipped,
+    /// so this is idempotent across re-polls and restarts.
+    pub fn want_logs(&mut self, targets: &[LogTarget]) -> io::Result<()> {
+        let mut buffer = String::new();
+        let mut added = Vec::new();
+        for target in targets {
+            let key = (target.repo.clone(), target.job_id);
+            if self.log_wanted.contains_key(&key)
+                || self.log_failures.contains_key(&key)
+                || self.is_seen(&UnitKey::job_logs(
+                    &target.repo,
+                    target.run_id,
+                    target.job_id,
+                    target.attempt,
+                ))
+            {
+                continue;
+            }
+            let line = LedgerLine::LogWanted {
+                target: target.clone(),
+            };
+            buffer.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
+            buffer.push('\n');
+            added.push((key, target.clone()));
+        }
+        if added.is_empty() {
+            return Ok(());
+        }
+        append_durable(&self.path, buffer.as_bytes())?;
+        self.log_wanted.extend(added);
+        Ok(())
+    }
+
+    /// Wanted job logs that are neither captured nor given up on, oldest
+    /// completion first so a backlog drains in CI order.
+    #[must_use]
+    pub fn pending_logs(&self) -> Vec<LogTarget> {
+        let mut pending: Vec<LogTarget> = self
+            .log_wanted
+            .values()
+            .filter(|target| {
+                !self.is_seen(&UnitKey::job_logs(
+                    &target.repo,
+                    target.run_id,
+                    target.job_id,
+                    target.attempt,
+                )) && self
+                    .log_failures
+                    .get(&(target.repo.clone(), target.job_id))
+                    .is_none_or(|(attempts, _)| *attempts < super::logs::MAX_ATTEMPTS)
+            })
+            .cloned()
+            .collect();
+        pending.sort_by_key(|target| (target.completed_at, target.job_id));
+        pending
+    }
+
+    /// Durably record one failed log download. At
+    /// [`logs::MAX_ATTEMPTS`](super::logs::MAX_ATTEMPTS) the job stops being
+    /// retried and is reported as failed rather than silently dropped.
+    pub fn record_log_failure(&mut self, repo: &str, job_id: u64, error: &str) -> io::Result<()> {
+        let key = (repo.to_string(), job_id);
+        let attempts = self.log_failures.get(&key).map_or(0, |(n, _)| *n) + 1;
+        let line = LedgerLine::LogFailure {
+            repo: repo.to_string(),
+            job_id,
+            attempts,
+            error: error.chars().take(300).collect(),
+        };
+        let mut text = serde_json::to_string(&line).map_err(io::Error::other)?;
+        text.push('\n');
+        append_durable(&self.path, text.as_bytes())?;
+        let error = error.chars().take(300).collect();
+        self.log_failures.insert(key, (attempts, error));
+        Ok(())
+    }
+
+    /// Log-capture totals across every repo.
+    #[must_use]
+    pub fn log_counts(&self) -> LogCounts {
+        let mut counts = LogCounts {
+            done: self.seen.iter().filter(|key| key.logs).count(),
+            ..LogCounts::default()
+        };
+        for target in self.log_wanted.values() {
+            if self.is_seen(&UnitKey::job_logs(
+                &target.repo,
+                target.run_id,
+                target.job_id,
+                target.attempt,
+            )) {
+                continue;
+            }
+            let failed = self
+                .log_failures
+                .get(&(target.repo.clone(), target.job_id))
+                .is_some_and(|(attempts, _)| *attempts >= super::logs::MAX_ATTEMPTS);
+            if failed {
+                counts.failed += 1;
+            } else {
+                counts.pending += 1;
+            }
+        }
+        counts
+    }
+
+    /// Per-repo log-capture totals, for `status`.
+    #[must_use]
+    pub fn log_counts_by_repo(&self) -> BTreeMap<String, LogCounts> {
+        let mut by_repo: BTreeMap<String, LogCounts> = BTreeMap::new();
+        for key in self.seen.iter().filter(|key| key.logs) {
+            by_repo.entry(key.repo.clone()).or_default().done += 1;
+        }
+        for target in self.log_wanted.values() {
+            if self.is_seen(&UnitKey::job_logs(
+                &target.repo,
+                target.run_id,
+                target.job_id,
+                target.attempt,
+            )) {
+                continue;
+            }
+            let entry = by_repo.entry(target.repo.clone()).or_default();
+            if self
+                .log_failures
+                .get(&(target.repo.clone(), target.job_id))
+                .is_some_and(|(attempts, _)| *attempts >= super::logs::MAX_ATTEMPTS)
+            {
+                entry.failed += 1;
+            } else {
+                entry.pending += 1;
+            }
+        }
+        by_repo
+    }
+
+    /// The most recent named log-download failure, if any.
+    #[must_use]
+    pub fn last_log_failure(&self) -> Option<(String, u64, u32, String)> {
+        self.log_failures
+            .iter()
+            .max_by_key(|(_, (attempts, _))| *attempts)
+            .map(|((repo, job_id), (attempts, error))| {
+                (repo.clone(), *job_id, *attempts, error.clone())
+            })
     }
 
     /// Durably record `repo`'s new watermark.
@@ -416,9 +657,43 @@ impl Ledger {
                 run_id: key.run_id,
                 job_id: key.job_id,
                 attempt: key.attempt,
+                logs: key.logs,
             };
             buffer.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
             buffer.push('\n');
+        }
+        // #8825: a job whose log capture is still outstanding (pending, or
+        // given up on) must survive compaction — dropping a `log_wanted`
+        // would silently abandon the capture, and dropping a `log_failure`
+        // would restart an unbounded retry loop against a log GitHub has
+        // already expired. Captured jobs need neither line: their `seen`
+        // entry above is the done marker.
+        for target in self.log_wanted.values() {
+            if self.is_seen(&UnitKey::job_logs(
+                &target.repo,
+                target.run_id,
+                target.job_id,
+                target.attempt,
+            )) {
+                continue;
+            }
+            let line = LedgerLine::LogWanted {
+                target: target.clone(),
+            };
+            buffer.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
+            buffer.push('\n');
+            if let Some((attempts, error)) =
+                self.log_failures.get(&(target.repo.clone(), target.job_id))
+            {
+                let line = LedgerLine::LogFailure {
+                    repo: target.repo.clone(),
+                    job_id: target.job_id,
+                    attempts: *attempts,
+                    error: error.clone(),
+                };
+                buffer.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
+                buffer.push('\n');
+            }
         }
         for (repo, created_at) in &self.watermarks {
             let line = LedgerLine::Watermark {

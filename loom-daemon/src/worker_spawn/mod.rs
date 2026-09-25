@@ -498,6 +498,17 @@ fn run_preflight(
         command.env("LOOM_TEST_ALLOW_SYSTEMD", "0");
     }
     writeln!(log, "spawn-worker: runtime={runtime} (from {source})\n# LOOM_RUNTIME_RESOLVED runtime={runtime}").map_err(|e| LaunchError::config(e.to_string()))?;
+    // #8599: the ordered-preference walk's own marker, verbatim as the daemon
+    // rendered and logged it, written as a SIBLING of the line above (never
+    // extra fields on it — `crash_signals::resolved_runtime_after` reads the
+    // whole rest of that line as the runtime name). Present only when a
+    // `runtimes.preference` / `rolePreference.<role>` list decided this
+    // launch, so a host without one writes a byte-identical log. This is the
+    // whole point of the variable: the tier is decided in the daemon's
+    // process, and the per-launch record is written here.
+    if let Some(marker) = nonempty_env(crate::launch_env::PREFERENCE_MARKER_ENV) {
+        writeln!(log, "{marker}").map_err(|e| LaunchError::config(e.to_string()))?;
+    }
     if is_native(&runtime) {
         writeln!(log, "# LOOM_CLI_START runtime={runtime}")
             .map_err(|e| LaunchError::config(e.to_string()))?;

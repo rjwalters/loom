@@ -72,6 +72,7 @@ only on a **breaking** wire change to the record shapes below. A backend should:
 | `6` | Adds `session.analysis` (#8760, G3 part 2 of #8714); only session-analysis envelopes use `6`. | Existing lifecycle/trace/identity/session-summary versions and shapes remain unchanged. |
 | `7` | Adds `daemon.event` (#8760, G4 of #8714); only daemon-event envelopes use `7`. | Existing lifecycle/trace/identity/session-summary/session-analysis versions and shapes remain unchanged. |
 | `8` | Adds the CI family `ci.run`, `ci.job`, `ci.duration` (#8824); only those three kinds use `8`. CI spans reuse `trace.span` at `3`. | Every earlier kind's version and shape is unchanged. |
+| `9` | Adds `ci.job.log` (#8825); only job-log chunk envelopes use `9`. | Every earlier kind's version and shape is unchanged — including the phase-1 CI family at `8`, so a backend that is not ready to ingest free-text log bodies can refuse exactly this kind without losing run/job/duration telemetry. |
 
 ## `/ingest` response (the bound-`host_id` echo)
 
@@ -151,6 +152,7 @@ records (`tokens.snapshot`, `host.health`) do not.
 | `session.summary` | repo | ingested transcript (session or subagent, Issue #8757) |
 | `tokens.snapshot` / `host.health` | host | sampling interval |
 | `ci.run` / `ci.job` / `ci.duration` | repo | completed GitHub Actions run attempt / job (Issue #8824) |
+| `ci.job.log` | repo | one ≤ 8 KiB chunk of a completed job's log (Issue #8825) |
 
 ### `sweep.started`
 
@@ -569,6 +571,8 @@ gradeable by a model or prompt experiment.
 | `effort` | string | no | The resolved reasoning-effort level (#8054). Omitted when unconfigured — the honest "inherited the runtime default", never a fabricated `"medium"`. |
 | `detail` | string | no | The failure / skip detail, matching what the in-memory ring carries. Always absent for `success`. |
 | `gated_pool` | `"claude_tokens"` / `"codex_accounts"` | no | Which credential pool gated a pre-spawn pool skip (#8408): the one the role's **admitted runtime** draws from — `.loom/tokens/` (else the shared pool) for `claude`, the `loom-daemon accounts` codex profiles for `codex`. Present only on `skipped_no_token_pool` and `skipped_pool_exhausted`; absent on every other result and on records written before #8408. Additive, so it did not bump `schema_version`. |
+| `preference_tier` | integer | no | Which tier of the ordered runtime-preference list this tick launched on (#8599): `0` is the most-preferred tap — nothing fell through — and any higher value is a fall-through, so "how much work went to the metered backstop?" is a query over this key instead of a grep of `loom-daemon logs`. Absent whenever no preference list decided the launch (no `runtimes.preference` / `rolePreference.<role>` configured, an operator `LOOM_RUNTIME` pin, or a pre-spawn skip that never resolved a runtime) and on records written before #8599. `0` is a real value, so it is emitted as `0` — never elided. Additive, so it did not bump `schema_version`. |
+| `preference_tap` | string | no | The chosen tap's identity (`<runtime>[:<profile>]`) when a preference list decided this tick (#8599) — the same rendering the `# LOOM_RUNTIME_PREFERENCE` marker and the launch record's `tap` key use, so one grep finds a tap across all three. Present exactly when `preference_tier` is. Additive, so it did not bump `schema_version`. |
 | `tokens_by_model` | array | no | Same grouped, raw (not cost-weighted) shape as `sweep.outcome`'s `tokens_by_model`, summed from the tick's own transcripts. |
 | `models_used` | string array | no | The distinct model ids in `tokens_by_model`, sorted and deduped — "did this tick's session escalate past the model it was launched with?" |
 | `actions` | object | no | Forge-mutating work observed in the transcripts: `issues_labeled`, `prs_merged`, `comments_posted`. |
@@ -803,6 +807,34 @@ One envelope per completed run attempt (`ci.run`) and per completed job
 (derived from the repo's `private` flag). The full field tables, the
 exactly-once ledger contract and the `loom.ci.*` allowlist live in
 [`ci-observability.md`](ci-observability.md). They are not duplicated here.
+
+### `ci.job.log`
+
+One ≤ 8 KiB chunk of one completed job's log text (#8825), emitted only when
+`autonomous.ciTelemetry.logCaptureEnabled` is on. A job's log is reconstructed
+by ordering the `chunk_count` records that share a `(repo, job_id)` on
+`chunk_index`.
+
+**This is the only record kind whose body is free text the daemon did not
+author.** Every other kind's body is a string this codebase wrote; this one's
+is whatever GitHub's job-log endpoint returned, forwarded unfiltered apart
+from the per-job size cap — by operator decision, the neutral OTLP gateway is
+the redaction boundary, not the source. Two invariants follow and must not be
+weakened:
+
+- **No attribute is derived from log text.** The gateway's scrub stage
+  rewrites the *body* only, so a log-derived attribute would ride straight
+  past it. That is also why there is no `step` attribute (see
+  [`ci-observability.md`](ci-observability.md) §"Why there is no `step`
+  attribute").
+- **A truncated log always reads as truncated.** `truncated` is true on
+  *every* chunk of a capped log, not only the last, so a single record read in
+  isolation can never look complete; the final marker chunk additionally
+  carries `truncation_note` naming the cap.
+
+Field tables, the chunking contract, the scrub-class list and the
+`logs_done` idempotency contract live in
+[`ci-observability.md`](ci-observability.md).
 
 ### `tokens.snapshot`
 

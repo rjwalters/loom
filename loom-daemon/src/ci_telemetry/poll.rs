@@ -27,6 +27,7 @@ use chrono::{DateTime, Duration, Utc};
 use super::api::{ApiError, GithubApi};
 use super::journal::Journal;
 use super::ledger::{Ledger, PendingUnit, UnitDraft, UnitKey, COMPACT_THRESHOLD_BYTES};
+use super::logs::{self, LogTarget};
 use super::records::{
     envelope_identity, job_envelopes, run_envelopes, JobJson, JobsPage, RepoJson, RunJson, RunsPage,
 };
@@ -44,6 +45,10 @@ pub struct CycleContext<'a> {
     pub host_id: String,
     pub initial_lookback: Duration,
     pub log_capture: LogCaptureGate,
+    /// Repos whose logs are not captured (their records/metrics still are).
+    pub log_excluded_repos: Vec<String>,
+    /// Per-job cap on captured log text (#8825).
+    pub log_max_bytes: usize,
 }
 
 impl<'a> CycleContext<'a> {
@@ -61,14 +66,40 @@ impl<'a> CycleContext<'a> {
             host_id: crate::sweep_registry::host_identity(),
             initial_lookback: Duration::hours(super::INITIAL_LOOKBACK_HOURS),
             log_capture: log_capture_gate(resolved),
+            log_excluded_repos: resolved
+                .log_capture_excluded_repos
+                .iter()
+                .map(|exclusion| exclusion.repo.clone())
+                .collect(),
+            log_max_bytes: resolved.log_capture_max_bytes,
         }
     }
 
-    fn is_excluded(&self, repo: &RepoJson) -> bool {
-        self.excluded_repos.iter().any(|excluded| {
-            excluded.eq_ignore_ascii_case(&repo.name)
-                || excluded.eq_ignore_ascii_case(&repo.full_name)
+    fn matches(names: &[String], repo: &RepoJson) -> bool {
+        names.iter().any(|name| {
+            name.eq_ignore_ascii_case(&repo.name) || name.eq_ignore_ascii_case(&repo.full_name)
         })
+    }
+
+    fn is_excluded(&self, repo: &RepoJson) -> bool {
+        Self::matches(&self.excluded_repos, repo)
+    }
+
+    /// Whether this repo's completed-job logs are captured this cycle.
+    fn captures_logs(&self, repo: &RepoJson) -> bool {
+        self.log_capture.is_on() && !Self::matches(&self.log_excluded_repos, repo)
+    }
+
+    /// Whether an already-wanted job log may still be downloaded, by
+    /// `owner/name`. Checked again at download time, not only when the want
+    /// was recorded: a log exclusion added today must take effect today, not
+    /// after the backlog it was added because of has already been captured.
+    fn may_download_log(&self, full_name: &str) -> bool {
+        let bare = full_name.rsplit('/').next().unwrap_or(full_name);
+        !self
+            .log_excluded_repos
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(full_name) || name.eq_ignore_ascii_case(bare))
     }
 }
 
@@ -80,6 +111,8 @@ pub struct CycleReport {
     pub repo_errors: Vec<String>,
     /// A torn ledger tail was detected and repaired on open.
     pub ledger_repaired: bool,
+    /// At least one job log was downloaded successfully this cycle (#8825).
+    pub logs_fetched: bool,
 }
 
 impl CycleReport {
@@ -90,6 +123,17 @@ impl CycleReport {
             "polled {} repo(s): emitted {} run(s) + {} job(s), recovered {} pending unit(s), {} request(s)",
             s.repos_polled, s.runs_emitted, s.jobs_emitted, s.recovered_units, s.requests
         );
+        if s.logs_captured > 0 || s.log_failures > 0 || s.logs_deferred > 0 || s.logs_truncated > 0
+        {
+            text.push_str(&format!(
+                "; logs: {} job(s) captured in {} chunk(s), {} truncated, {} failed, {} deferred",
+                s.logs_captured,
+                s.job_logs_emitted,
+                s.logs_truncated,
+                s.log_failures,
+                s.logs_deferred
+            ));
+        }
         if !self.repo_errors.is_empty() {
             text.push_str(&format!(
                 "; {} repo(s) failed: {}",
@@ -195,9 +239,6 @@ pub fn run_cycle(ctx: &CycleContext<'_>, api: &dyn GithubApi) -> Result<CycleRep
     let Some(_lock) = CycleLock::try_acquire(&dir)? else {
         return Err(CycleError::Busy);
     };
-    if ctx.log_capture == LogCaptureGate::RefusedNotImplemented {
-        log::warn!("ci_telemetry: logCaptureEnabled {}", ctx.log_capture.as_str());
-    }
     let mut status = state::load_status(&dir);
     let result = run_locked(ctx, api, &dir, &status);
     if matches!(result, Err(CycleError::BackingOff { .. })) {
@@ -223,6 +264,9 @@ fn record_outcome(
                 repo_errors: report.repo_errors.len(),
                 ..report.summary.clone()
             });
+            if report.logs_fetched {
+                status.last_log_fetch_at = Some(ctx.now);
+            }
             if report.repo_errors.is_empty() {
                 status.last_ok_at = Some(ctx.now);
                 status.consecutive_failures = 0;
@@ -308,10 +352,89 @@ fn run_locked(
             }
         }
     }
+    // #8825: the log pass runs over the ledger's wanted set, not over this
+    // cycle's listings, so a job whose download failed last cycle is retried
+    // here even when its repo produced no new runs.
+    if ctx.log_capture.is_on() {
+        if let Err(error) = capture_logs(ctx, api, &mut ledger, &journal, &mut report) {
+            if let Some(abort) = rate_limited(&error) {
+                return Err(abort);
+            }
+            report.repo_errors.push(format!("job-log capture: {error}"));
+        }
+    }
     if let Err(error) = ledger.compact_if_large(COMPACT_THRESHOLD_BYTES) {
         log::warn!("ci_telemetry: ledger compaction failed (will retry next cycle): {error}");
     }
     Ok(report)
+}
+
+/// Download and emit the pending job logs, at most
+/// [`logs::MAX_DOWNLOADS_PER_CYCLE`] of them.
+///
+/// Each job is independently idempotent from its `ci.job` record: the chunks
+/// commit under their own `logs: true` ledger key, so a failure here leaves
+/// the record alone and retries the download next cycle. Only a rate limit
+/// escapes — that aborts the whole cycle, as everywhere else.
+fn capture_logs(
+    ctx: &CycleContext<'_>,
+    api: &dyn GithubApi,
+    ledger: &mut Ledger,
+    journal: &Journal,
+    report: &mut CycleReport,
+) -> Result<(), ApiError> {
+    // A repo excluded from log capture *after* its jobs were already wanted
+    // must stop being downloaded now, not once the backlog drains. The
+    // `log_wanted` lines stay in the ledger (harmless, and the exclusion may
+    // be lifted), they simply are not acted on while the exclusion stands.
+    let pending: Vec<LogTarget> = ledger
+        .pending_logs()
+        .into_iter()
+        .filter(|target| ctx.may_download_log(&target.repo))
+        .collect();
+    let total_pending = pending.len();
+    for target in pending.into_iter().take(logs::MAX_DOWNLOADS_PER_CYCLE) {
+        report.summary.requests += 1;
+        let response = match api.get_document(&logs::logs_path(&target.repo, target.job_id)) {
+            Ok(response) => response,
+            Err(error @ ApiError::RateLimited { .. }) => return Err(error),
+            Err(error) => {
+                let reason = error.to_string();
+                log::warn!(
+                    "ci_telemetry: job-log download failed for {} job {}: {reason}",
+                    target.repo,
+                    target.job_id
+                );
+                ledger
+                    .record_log_failure(&target.repo, target.job_id, &reason)
+                    .map_err(|e| ApiError::Transport(e.to_string()))?;
+                report.summary.log_failures += 1;
+                continue;
+            }
+        };
+        let chunked = logs::chunk(&response.body, ctx.log_max_bytes, logs::CHUNK_BYTES);
+        if chunked.truncated {
+            report.summary.logs_truncated += 1;
+        }
+        let envelopes = logs::log_envelopes(&target, &chunked, &ctx.host_id);
+        let chunks = envelopes.len();
+        let draft = UnitDraft {
+            key: UnitKey::job_logs(&target.repo, target.run_id, target.job_id, target.attempt),
+            envelopes,
+        };
+        let committed = ledger
+            .commit(vec![draft])
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        emit(ledger, journal, &committed).map_err(|e| ApiError::Transport(e.to_string()))?;
+        if !committed.is_empty() {
+            report.summary.job_logs_emitted += chunks;
+            report.summary.logs_captured += 1;
+        }
+        report.logs_fetched = true;
+    }
+    report.summary.logs_deferred =
+        total_pending.saturating_sub(logs::MAX_DOWNLOADS_PER_CYCLE.min(total_pending));
+    Ok(())
 }
 
 /// Replay committed-but-unconfirmed units: append only the envelopes the
@@ -502,6 +625,35 @@ fn poll_repo(
             } else {
                 report.summary.runs_emitted += 1;
             }
+        }
+        // #8825: record which jobs' logs are wanted, durably, right after the
+        // records land. The download itself happens in this cycle's log pass
+        // (or a later cycle's), driven off the ledger rather than off this
+        // listing — once the run unit is committed the run is "seen" and its
+        // jobs are never listed again, so a retry has nowhere else to come
+        // from.
+        if ctx.captures_logs(repo) {
+            let wanted: Vec<LogTarget> = jobs
+                .iter()
+                .filter(|job| {
+                    committed
+                        .iter()
+                        .any(|unit| unit.key.job_id == Some(job.id) && !unit.key.logs)
+                })
+                .map(|job| LogTarget {
+                    repo: full.to_string(),
+                    visibility: repo.visibility(),
+                    run_id: run.id,
+                    job_id: job.id,
+                    attempt: job.run_attempt,
+                    workflow: run.workflow(),
+                    job: job.name.clone(),
+                    completed_at: job
+                        .completed_at
+                        .unwrap_or(job.started_at.unwrap_or(run.created_at)),
+                })
+                .collect();
+            ledger.want_logs(&wanted)?;
         }
     }
     ledger.set_watermark(full, oldest_incomplete.unwrap_or(newest))?;

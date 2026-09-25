@@ -1888,7 +1888,7 @@ pub(crate) fn park_guard_registry(
              printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
-             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$2\" != */issues/{linked_pr} ]]; then\n\
              printf '%s\\n' {labels}\n\
              exit {rest_exit}\n\
              fi\n\
@@ -1903,6 +1903,10 @@ pub(crate) fn park_guard_registry(
         state = state_probe_json("open", false),
         labels = rest_labels,
         rest_exit = rest_exit,
+        // `rest_labels` model the ISSUE's labels; the linked open PR reports
+        // none, so the reaper's PR-side park check (#8689) does not mask the
+        // issue-side 2.7 probe these fixtures exist to exercise.
+        linked_pr = if graphql_pr.is_empty() { "none" } else { graphql_pr },
     );
     std::fs::write(&fake_gh, &script).unwrap();
     let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();

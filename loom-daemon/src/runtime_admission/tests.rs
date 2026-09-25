@@ -105,6 +105,7 @@ fn suggested_worker_type_mismatch_warning_fires_only_on_real_divergence() {
             role_manifest: PathBuf::from("/role.json"),
             runtime_manifest: PathBuf::from("/runtime.json"),
             suggested_worker_type: suggested.map(str::to_string),
+            preference: None,
         };
     // No declared suggestion at all -> nothing to warn about.
     assert!(suggested_worker_type_mismatch_warning(&admitted(
