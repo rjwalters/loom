@@ -258,6 +258,14 @@ export interface ActiveComputeJob {
    * this is the synthetic ingest identity, not where the instance runs. */
   hostId: string;
   jobId: string;
+  /** The sweep that submitted this job (Issue #8835). The join key the fleet
+   * view uses to nest a job under its sweep — deliberately *not* `hostId`,
+   * which names the submitting emitter's ingest identity and need not match
+   * the sweep's own host.
+   *
+   * Absent for a job submitted outside any sweep, and for one from an emitter
+   * that predates this field; both stay in the flat "running compute" list. */
+  sweepId?: string;
   instanceId?: string;
   region?: string;
   instanceType?: string;

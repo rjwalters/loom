@@ -390,3 +390,86 @@ describe("hostDetailView — roster-missing hosts (#8804)", () => {
     );
   });
 });
+
+/**
+ * Issue #8835 — a sweep's live compute jobs, nested under its row.
+ *
+ * Host detail renders the sweeps as a flat `<table>`, where real nesting is
+ * not available, so the parent/child relationship is carried by a full-width
+ * row placed immediately after the sweep's own row.
+ */
+describe("hostDetailView — nested compute subprocesses (#8835)", () => {
+  const SWEEP_ID = "sweep-issue-8835-1";
+  const snapshot = (activeCompute: unknown[]) => ({
+    hosts: { "host-a": { health: { record: { kind: "host.health" }, updatedAt: NOW.toISOString() } } },
+    activeSweeps: [
+      {
+        hostId: "host-a",
+        sweepId: SWEEP_ID,
+        repo: "rjwalters/loom",
+        issue: 8835,
+        phase: "builder",
+        startedAt: "2026-09-19T12:00:00Z",
+      },
+    ],
+    activeCompute,
+  });
+  const computeJob = {
+    hostId: "2am-elastic",
+    jobId: "job-abc123",
+    instanceId: "i-0123456789abcdef0",
+    region: "us-east-1",
+    instanceType: "c7i.4xlarge",
+    spot: true,
+    startedAt: "2026-09-19T12:00:00Z",
+  };
+  const render = (activeCompute: unknown[]) =>
+    hostDetailView(findHost(buildFleetView(parseFleetSnapshot(snapshot(activeCompute)), NOW), "host-a")!, NOW);
+
+  it("renders the sweep's job as a subprocess row directly beneath its sweep row", () => {
+    const rendered = render([{ ...computeJob, sweepId: SWEEP_ID }]);
+    const nested = rendered.querySelector('[data-testid="sweep-subprocess-row"]');
+    expect(nested).not.toBeNull();
+    expect(nested?.getAttribute("data-sweep")).toBe(SWEEP_ID);
+    // Immediately after its own sweep row — the whole basis of the visual
+    // nesting in a flat table.
+    const sweepRowEl = rendered.querySelector('[data-testid="sweep-row"]')!;
+    expect(sweepRowEl.nextElementSibling).toBe(nested);
+
+    const entry = nested!.querySelector('[data-testid="subprocess"]')!;
+    expect(entry.getAttribute("data-job")).toBe("job-abc123");
+    // Instance type, region and the Spot flag, plus elapsed time (12:00Z of
+    // 2026-09-19 against the fixture's own `NOW`).
+    expect(entry.textContent).toContain("c7i.4xlarge · us-east-1 · spot");
+    expect(entry.textContent).toMatch(/\d/);
+  });
+
+  it("spans the full sweeps table so the nested row sits flush under its sweep", () => {
+    const rendered = render([{ ...computeJob, sweepId: SWEEP_ID }]);
+    const headers = rendered.querySelectorAll('[data-testid="sweeps-panel"] thead th').length;
+    const cell = rendered.querySelector<HTMLTableCellElement>(
+      '[data-testid="sweep-subprocess-row"] td',
+    )!;
+    expect(cell.colSpan).toBe(headers);
+  });
+
+  it("flags a leaked nested job the same way the flat list does", () => {
+    const rendered = render([{ ...computeJob, sweepId: SWEEP_ID, leaked: true }]);
+    const entry = rendered.querySelector('[data-testid="subprocess"]')!;
+    expect(entry.getAttribute("data-leaked")).toBe("true");
+    expect(entry.className).toContain("subprocess--leaked");
+    const badge = entry.querySelector('[data-testid="leaked-badge"]');
+    expect(badge?.textContent).toBe("LEAKED");
+    expect(badge?.getAttribute("role")).toBe("status");
+  });
+
+  it("adds no row at all for a sweep with no compute jobs", () => {
+    // The overwhelmingly common case: the table must look exactly as it did
+    // before this feature.
+    for (const activeCompute of [[], [{ ...computeJob, sweepId: "sweep-someone-else" }], [computeJob]]) {
+      const rendered = render(activeCompute);
+      expect(rendered.querySelector('[data-testid="sweep-subprocess-row"]')).toBeNull();
+      expect(rendered.querySelectorAll('[data-testid="sweep-row"]')).toHaveLength(1);
+    }
+  });
+});
