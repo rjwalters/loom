@@ -2118,18 +2118,9 @@ done", so it is the only place that inference can be checked.
 ```bash
 PR_NUMBER=$1
 
-# Extract linked issues using GitHub's own parser (closingIssuesReferences).
-# This is the authoritative set of issues GitHub will auto-close on merge.
-# It correctly ignores `Updates #N`, `See #N`, code-fenced text, and substring
-# traps like `Discloses #N`. The previous regex-based approach silently
-# misclassified `Updates #N` as a closing reference — see issue #3267.
-#
-# NOT negation-aware, by design (see forge_pr_close_targets's doc comment):
-# "does not fix #N" reads exactly like "fixes #N" to GitHub's own parser, so
-# LINKED_ISSUES can carry a candidate the PR author explicitly did NOT intend
-# to close (#1057). That is why every candidate below is re-checked with
-# forge_text_has_unnegated_closing_ref() before this step ever calls
-# `gh issue close`.
+# GitHub's own parser (closingIssuesReferences): the set it auto-closes on
+# merge. Ignores `Updates #N`, `See #N`, code fences, `Discloses #N` (#3267) —
+# but is NOT negation-aware, hence the #1057 check in the loop.
 source "$(git rev-parse --show-toplevel)/.loom/scripts/lib/forge-helpers.sh"
 forge_detect
 LINKED_ISSUES=$(forge_pr_close_targets "$PR_NUMBER")
@@ -2143,20 +2134,10 @@ fi
 # still readable here — it is the tree any `loom:ac-verified` marker must name.
 HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
 
-# --- Negation cross-check source text (#1057) ---
-# The two signals the AC requires: the PR body itself, and (GitHub only) the
-# squash merge commit message -- a closing keyword can live in either one.
-# Best-effort: an empty PR_NWO/PR_BODY_TEXT/MERGE_COMMIT_MSG just means that
-# signal contributes nothing, never a hard failure of this step.
-PR_NWO=$(forge_get_repo_nwo 2>/dev/null || echo "")
-PR_BODY_TEXT=$(forge_get_pr_body "$PR_NWO" "$PR_NUMBER" 2>/dev/null || echo "")
-MERGE_COMMIT_MSG=""
-if [ "$FORGE_TYPE" = "github" ]; then
-  MERGE_SHA=$(gh pr view "$PR_NUMBER" --json mergeCommit --jq '.mergeCommit.oid // empty' 2>/dev/null || echo "")
-  if [ -n "$MERGE_SHA" ]; then
-    MERGE_COMMIT_MSG=$(gh api "repos/$PR_NWO/commits/$MERGE_SHA" --jq '.commit.message // ""' 2>/dev/null || echo "")
-  fi
-fi
+# #1057 negation-check input: PR body + (GitHub) squash commit message.
+NEG_SRC=$(forge_get_pr_body "$(forge_get_repo_nwo)" "$PR_NUMBER" 2>/dev/null)
+M=$(gh pr view "$PR_NUMBER" --json mergeCommit --jq '.mergeCommit.oid // empty' 2>/dev/null)
+[ -n "$NEG_SRC" ] && [ -n "$M" ] && NEG_SRC+=$'\n'$(gh api "repos/{owner}/{repo}/commits/$M" --jq .commit.message 2>/dev/null)
 
 # Check each linked issue. Plain `gh` — NOT "$GH_READ": this runs immediately
 # after your own merge and gates a write (`gh issue close`), so it must observe
@@ -2179,21 +2160,17 @@ for issue in $LINKED_ISSUES; do
     continue   # do NOT close, do NOT confirm — next linked issue
   fi
 
-  # --- Negation cross-check (#1057) ---
-  # LINKED_ISSUES came from forge_pr_close_targets(), which mirrors GitHub's
-  # own (non-negation-aware) parser. Re-derive whether a REAL closing
-  # reference exists before treating this candidate as a genuine close.
-  if ! forge_text_has_unnegated_closing_ref "$PR_BODY_TEXT" "$issue" \
-     && ! forge_text_has_unnegated_closing_ref "$MERGE_COMMIT_MSG" "$issue"; then
-    echo "Issue #$issue: every closing-keyword reference in the PR body/commit message is negated (e.g. \"does not fix #$issue\") — not a real closing intent (#1057)"
-    ISSUE_STATE=$(gh issue view "$issue" --json state --jq '.state' 2>&1)
-    if [ "$ISSUE_STATE" = "CLOSED" ]; then
-      echo "  Issue #$issue was already auto-closed by GitHub's own (non-negation-aware) parser — reopening"
-      gh issue reopen "$issue" --comment "Reopened by Champion: PR #$PR_NUMBER's only reference to this issue is negated (e.g. \"does not fix #$issue\") — GitHub's closing-reference parser is not negation-aware and closed this issue against the PR's stated intent. See #1057."
-    else
-      echo "  Issue #$issue is $ISSUE_STATE — leaving open (not closing on a negated reference)"
-    fi
-    continue   # do NOT close — next linked issue
+  # Tri-state exit: 0 unnegated found, 1 negated-only, 3 no textual reference
+  # at all (e.g. linked only through the Development sidebar, or via
+  # `Fixes owner/repo#N` / `Closes: #N` — forms this predicate's regex cannot
+  # see). Only exit 1 means "disclaimed" (#1057); exit 3 and clap's exit 2 on
+  # an older daemon both fall through unchanged to the close logic below —
+  # conflating "never mentioned" with "mentioned and disclaimed" is exactly
+  # the bug that reopened issues GitHub had closed correctly.
+  printf '%s\n' "$NEG_SRC" | loom-daemon merge-pr-refs has-unnegated-closing-ref --issue "$issue"
+  if [ $? -eq 1 ] && [ -n "$NEG_SRC" ]; then
+    [ "$(gh issue view "$issue" --json state --jq .state)" = CLOSED ] && gh issue reopen "$issue" --comment "Reopened: PR #$PR_NUMBER only references this issue negated (#1057)."
+    continue
   fi
 
   ISSUE_STATE=$(gh issue view "$issue" --json state --jq '.state' 2>&1)
@@ -2328,11 +2305,8 @@ hold_issue_on_unverified_ac() {
     gh issue reopen "$issue"
   fi
 
-  # Idempotency guard: one comment per (PR, head SHA) hold episode. Unlike the
-  # sticky-hold precheck's `startswith` lookup (#5371), a plain full-marker
-  # `grep -F` is sufficient here because this marker embeds BOTH the PR number
-  # and the head SHA — there is no prefix to collide on, and a later comment
-  # would have to reproduce the exact pr+sha pair to false-match.
+  # Idempotency guard: one comment per (PR, head SHA) hold episode. The marker
+  # embeds both, so a plain `grep -F` cannot prefix-collide (cf. #5371).
   # Cached ("$GH_READ") — an idempotency-marker grep, not a merge gate.
   local marker="<!-- champion:ac-hold pr=$pr sha=$head_sha -->"
   if "$GH_READ" issue view "$issue" --json comments \
@@ -2345,8 +2319,7 @@ hold_issue_on_unverified_ac() {
       13) reason="a \`loom:ac-verified\` marker exists, but it names a different tree than the merged head \`$head_sha\`" ;;
       *)  reason="the acceptance-criteria classifier could not complete, so this gate fails closed" ;;
     esac
-    # Quote each unmet criterion VERBATIM — the whole point is that the human
-    # reading this can see exactly which sentence is outstanding.
+    # Quote each unmet criterion VERBATIM so a human sees which is outstanding.
     quoted=$(printf '%s\n' "$report" | awk -F'\t' 'NF{printf "> - [ ] %s\n>\n>   _(matched: `%s`)_\n", $2, $1}')
     gh issue comment "$issue" --body "$marker
 **Champion is holding this issue open.** PR #$pr merged, but this issue's own
@@ -2372,11 +2345,8 @@ so it no longer reads as live/scheduled/over-time and close normally.
 *Automated by Champion role*"
   fi
 
-  # loom:operator — the first-class "the engine has stopped, a human is the only
-  # transition out" state (see .loom/docs/label-state-machine.md). Existing
-  # label, no new one: this issue is not blocked on a dependency and is not
-  # operator-only-by-right, it is waiting on a human to perform or attest one
-  # step. Idempotent, so it is safe to reassert.
+  # loom:operator (.loom/docs/label-state-machine.md): the engine has stopped
+  # until a human performs or attests one step. Idempotent, safe to reassert.
   gh issue edit "$issue" --add-label "loom:operator"
 }
 ```
@@ -2384,11 +2354,9 @@ so it no longer reads as live/scheduled/over-time and close normally.
 **5. Fail closed on `1` (ERROR), never open.** An unreadable issue, a missing
 script, or an unparseable body means the gate **could not be evaluated** — which
 is not the same as "the criteria are met". Group it with `12`/`13` and hold, the
-same posture criterion #6 takes on an ambiguous CI read (#6211). The cost is
-asymmetric and that asymmetry is the whole design: a false hold leaves an issue
-open with a comment naming the criterion, which a human or a one-line marker
-clears in seconds; a false close is exactly the incident above, and nobody ever
-learns it happened.
+same posture criterion #6 takes on an ambiguous CI read (#6211). The asymmetry
+is the design: a false hold is cleared in seconds by a one-line marker; a false
+close is exactly the incident above, and nobody ever learns it happened.
 
 **6. What this gate does NOT catch — a clear result is not an all-clear.** The
 signal is a fixed phrase vocabulary over an AC checklist, so it cannot see: an
@@ -2399,9 +2367,8 @@ fabricates the external payload it asserts on — that last one is Judge's
 "circular fixture" smell (`judge.md` → "Live Verification and the
 Circular-Fixture Smell"), and the two
 mechanisms are complements, not substitutes. Do not extend the vocabulary to
-chase the semantic cases: the same reasoning `sweep.md`'s operator-gate scan
-gives under "What this scan does NOT catch" applies here — a broader bare-word
-list would still miss the next phrasing while flagging ordinary prose.
+chase semantic cases (cf. `sweep.md` → "What this scan does NOT catch"): a
+broader list would still miss the next phrasing while flagging ordinary prose.
 
 ### Step 5: Unblock Dependent Issues
 

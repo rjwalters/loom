@@ -325,3 +325,104 @@ fn bt8_dry_run_prefixes_every_warning_line() {
         "dry run: warning carries the [dry-run] prefix: {warnings:?}"
     );
 }
+
+// --- #1057: a negated closing keyword is not a closing intent ---
+
+#[test]
+fn plain_closing_keywords_are_unnegated_references() {
+    for body in ["Closes #42", "Fixes #42", "Resolves #42", "fixed #42"] {
+        assert!(has_unnegated_closing_ref(body, 42), "{body:?}");
+        assert_eq!(closing_ref_negation_status(body, 42), ClosingRefNegationStatus::Unnegated);
+    }
+}
+
+#[test]
+fn the_1057_repro_body_carries_no_real_closing_reference() {
+    // PR #1051's body against #909: the author's stated intent, twice, was to
+    // leave #909 open — yet GitHub's parser (and `closing_refs`) close it.
+    let body = "## Relationship to #909 (not fixed here)\n\n\
+                **does not fix #909** -- it structurally sidesteps that bug shape by reading\n\
+                the SUMMARY line on purpose. #909 is left open for its owner to close or\n\
+                subsume; nothing here depends on it.\n\nCloses #902\n";
+    assert_eq!(closing_refs(body), vec![902, 909], "the raw parser is fooled");
+    assert!(!has_unnegated_closing_ref(body, 909));
+    assert_eq!(closing_ref_negation_status(body, 909), ClosingRefNegationStatus::NegatedOnly);
+    assert!(has_unnegated_closing_ref(body, 902));
+    assert_eq!(closing_ref_negation_status(body, 902), ClosingRefNegationStatus::Unnegated);
+}
+
+#[test]
+fn negation_words_and_contractions_suppress_the_reference() {
+    for body in [
+        "This change does not resolve #42 fully; a follow-up will.",
+        "This doesn't fix #42 on its own.",
+        "This doesn’t fix #42 on its own.",
+        "We never fixed #42 in this pass.",
+    ] {
+        assert!(!has_unnegated_closing_ref(body, 42), "{body:?}");
+        assert_eq!(closing_ref_negation_status(body, 42), ClosingRefNegationStatus::NegatedOnly, "{body:?}");
+    }
+}
+
+#[test]
+fn a_negation_in_another_clause_does_not_suppress_a_genuine_close() {
+    let body = "This does not fix #42 alone. Closes #42 together with the follow-up.";
+    assert!(has_unnegated_closing_ref(body, 42));
+    // Text AFTER a genuine close in the same clause cannot negate it.
+    assert!(has_unnegated_closing_ref("Closes #42 but not #43", 42));
+}
+
+#[test]
+fn non_closing_keywords_and_other_issues_are_not_references() {
+    assert!(!has_unnegated_closing_ref("Updates #42 with more detail.", 42));
+    assert!(!has_unnegated_closing_ref("See #42", 42));
+    assert!(!has_unnegated_closing_ref("Closes #420", 42));
+    assert!(!has_unnegated_closing_ref("Discloses #42", 42));
+    assert!(!has_unnegated_closing_ref("", 42));
+}
+
+// --- Judge review on PR #8823: tri-state status, no-reference vs negated ---
+
+#[test]
+fn no_textual_reference_is_a_distinct_status_from_negated() {
+    // A body with no textual mention at all (issue linked only through the
+    // Development sidebar, say) must NOT read the same as "mentioned and
+    // disclaimed" — conflating them reopened issues GitHub had closed
+    // correctly through a channel this regex cannot see.
+    for body in ["", "Some body with no mention", "Updates #42 with more detail."] {
+        assert_eq!(
+            closing_ref_negation_status(body, 42),
+            ClosingRefNegationStatus::NoReference,
+            "{body:?}"
+        );
+    }
+}
+
+#[test]
+fn cross_repo_and_url_closing_forms_are_no_reference_not_negated() {
+    // `has_unnegated_closing_ref`'s regex only matches a bare `#N` — it does
+    // not understand `owner/repo#N` or a full issue URL. Both must report
+    // NoReference (unknown to this predicate), never NegatedOnly.
+    for body in [
+        "Fixes rjwalters/loom#42",
+        "Fixes https://github.com/rjwalters/loom/issues/42",
+        "Closes: #42",
+    ] {
+        assert_eq!(
+            closing_ref_negation_status(body, 42),
+            ClosingRefNegationStatus::NoReference,
+            "{body:?}"
+        );
+    }
+}
+
+#[test]
+fn a_distant_negation_word_in_the_same_clause_does_not_suppress_a_later_close() {
+    // The non-blocking finding from the #8823 review: a whole-clause
+    // negation scan reads this as negated because `isn't` appears somewhere
+    // earlier in the clause, even though it has nothing to do with
+    // `fixes #42`. The negation window is now limited to the two words
+    // immediately before the keyword.
+    let body = "If the lock isn't held we now return early, which fixes #42";
+    assert_eq!(closing_ref_negation_status(body, 42), ClosingRefNegationStatus::Unnegated, "{body:?}");
+}
