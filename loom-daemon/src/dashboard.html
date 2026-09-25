@@ -297,7 +297,12 @@ function renderRegistry(report) {
 // ---------------------------------------------------------------------
 
 var forgeUrlByRoot = {};
-var QUEUE_STALE_SECS = 300;
+// Stale after 5 missed ticks of the daemon's own interval, never under 300s
+// (the same rule as `loom-daemon queue`).
+function queueStaleSecs(report) {
+  var interval = report.work_finder_interval_secs > 0 ? report.work_finder_interval_secs : 60;
+  return Math.max(300, 5 * interval);
+}
 var QUEUE_STATE_PILL = { running: "green", ready: "amber", blocked: "red" };
 
 function queueState(d) {
@@ -320,13 +325,22 @@ function renderQueue(report) {
   var queue = tick.queue || [];
   var counts = { running: 0, ready: 0, blocked: 0 };
   queue.forEach(function (r) { counts[queueState(r.disposition)] += 1; });
-  var stale = age > QUEUE_STALE_SECS;
+  var stale = age > queueStaleSecs(report);
+  var failed = tick.listing_failed || [];
   body.appendChild(el("p", {}, [
     el("span", { "class": "pill " + (stale ? "red" : "green"), text: stale ? "STALE" : "fresh" }),
     document.createTextNode(" last tick " + age + "s ago, cap " + tick.max_concurrent + " — " +
       counts.running + " running, " + counts.ready + " ready, " + counts.blocked + " blocked"),
   ]));
+  if (failed.length > 0) {
+    body.appendChild(el("p", {}, [
+      el("span", { "class": "pill red", text: "INCOMPLETE" }),
+      document.createTextNode(" listing ready issues failed for " + failed.join(", ") +
+        " — their backlog is missing below"),
+    ]));
+  }
   if (queue.length === 0) {
+    if (failed.length > 0) return;
     body.appendChild(el("p", { "class": "muted", text: tick.seen === 0
       ? "no ready loom:issue work" : "this daemon did not record per-issue rows" }));
     return;

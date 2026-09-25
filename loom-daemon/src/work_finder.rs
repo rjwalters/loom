@@ -967,6 +967,7 @@ pub fn tick_summary(
 ) -> WorkFinderTickSummary {
     WorkFinderTickSummary {
         queue: ready_queue::finish(&report.queue, roots),
+        listing_failed: ready_queue::repo_names(&report.listing_failed, roots),
         at,
         max_concurrent,
         seen: report.seen,
@@ -1205,6 +1206,9 @@ pub struct TickReport {
     /// Per-issue outcomes behind the counters above (Issue #8852), recorded
     /// by the multi-workspace tick only. See [`ready_queue`].
     pub queue: Vec<ready_queue::TickQueueRow>,
+    /// Workspaces whose ready-issue listing failed this tick, so their
+    /// backlog is missing from [`Self::queue`] (Issue #8852).
+    pub listing_failed: Vec<usize>,
 }
 
 /// Log — at DEBUG, once per skipped candidate — that a candidate was dropped
@@ -2108,6 +2112,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                 // Per-workspace isolation: log, count, and move on — the other
                 // workspaces are still polled and dispatched this same tick.
                 report.errors += 1;
+                report.listing_failed.push(idx);
                 log::warn!("work_finder: listing ready issues for workspace #{idx} failed: {e}");
                 // A rate-limit failure trips the global breaker (#4429) so the
                 // NEXT tick skips its gh fan-out entirely; this tick still
@@ -2267,14 +2272,11 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                 );
                 continue;
             }
+            // One key feeds both the view and dispatch, so they cannot drift.
             ready_queue::record_candidate(q, &key, &item);
             candidates.push(PriorityCandidate {
-                workspace_idx: idx,
-                workspace_priority,
-                urgent: item.is_urgent(),
                 complexity: item.complexity().map(str::to_owned),
-                created_at: item.created_at,
-                number: item.number,
+                ..key
             });
         }
     }

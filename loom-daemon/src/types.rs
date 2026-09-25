@@ -1921,6 +1921,10 @@ pub struct WorkFinderTickSummary {
     /// pre-#8852 wire payload.
     #[serde(default)]
     pub queue: Vec<ReadyQueueRow>,
+    /// Repos whose ready-issue listing failed on this tick: their backlog is
+    /// missing from [`Self::queue`], which is then incomplete, not empty.
+    #[serde(default)]
+    pub listing_failed: Vec<String>,
 }
 
 mod ready_queue;

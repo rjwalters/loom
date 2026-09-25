@@ -1971,8 +1971,12 @@ in-slice one; its disposition says so.
 The rows travel on `last_work_finder_tick.queue` in `loom-daemon status --json`,
 `health --json` and `serve`'s `/api/status`, stamped with the tick's `at`.
 `loom-daemon queue [--json]` renders them with a freshness verdict: `fresh`,
-`stale` (tick older than 5 minutes), `no_tick` (no tick yet in this daemon
-process, so the queue is unknown rather than empty) or `disabled`. The `serve`
+`stale` (no tick for 5 of the daemon's reported `work_finder_interval_secs`,
+never under 5 minutes), `no_tick` (no tick yet in this daemon process, so the
+queue is unknown rather than empty) or `disabled`. A repo whose forge listing
+failed on the tick is named in `last_work_finder_tick.listing_failed`, and the
+view says the queue is INCOMPLETE rather than empty (`--json`: `complete:
+false`). The `serve`
 dashboard has a matching "Ready queue" panel. The single-workspace tick path does
 not record rows. Exporting the queue to the fleet backend is a follow-up.
 

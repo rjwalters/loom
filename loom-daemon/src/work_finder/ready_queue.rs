@@ -120,6 +120,19 @@ pub fn short_detail(text: &str) -> String {
     }
 }
 
+/// The display name of workspace `idx`: its repo root, or `workspace #idx`.
+fn repo_name(idx: usize, roots: &[PathBuf]) -> String {
+    roots
+        .get(idx)
+        .map_or_else(|| format!("workspace #{idx}"), |p| p.display().to_string())
+}
+
+/// Display names for a list of workspace indexes.
+#[must_use]
+pub fn repo_names(idxs: &[usize], roots: &[PathBuf]) -> Vec<String> {
+    idxs.iter().map(|i| repo_name(*i, roots)).collect()
+}
+
 /// Rank the recorded rows in dispatch order and name each row's repo.
 ///
 /// `roots[i]` is workspace `i`'s repo root; an index with no root is shown as
@@ -135,10 +148,7 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
             debug_assert!(r.disposition.is_some(), "unresolved queue row #{}", r.key.number);
             ReadyQueueRow {
                 rank: i + 1,
-                repo: roots.get(r.key.workspace_idx).map_or_else(
-                    || format!("workspace #{}", r.key.workspace_idx),
-                    |p| p.display().to_string(),
-                ),
+                repo: repo_name(r.key.workspace_idx, roots),
                 issue: r.key.number,
                 workspace_priority: r.key.workspace_priority,
                 urgent: r.key.urgent,

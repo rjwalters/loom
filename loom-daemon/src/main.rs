@@ -2637,7 +2637,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::PeerClaims { .. } | Commands::Queue { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
-            unreachable!("PeerClaims is handled in main() before handle_cli_command")
+            unreachable!("PeerClaims/Queue are handled in main() before handle_cli_command")
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }

@@ -12,6 +12,18 @@ use crate::types::{QueueDisposition, ReadyQueueRow};
 
 struct OneShotSource(Option<Vec<WorkItem>>);
 
+/// A source whose forge listing may fail (`None`).
+struct MaybeSource(Option<OneShotSource>);
+
+impl WorkSource for MaybeSource {
+    fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
+        match &mut self.0 {
+            Some(src) => src.list_ready_issues(),
+            None => Err(anyhow::anyhow!("gh: not found")),
+        }
+    }
+}
+
 impl WorkSource for OneShotSource {
     fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
         Ok(self.0.take().unwrap_or_default())
@@ -33,6 +45,11 @@ struct Disp {
     backed_off: HashSet<u32>,
     peer: HashSet<u32>,
     open_pr: HashSet<u32>,
+    quarantined: HashSet<u32>,
+    noop: HashSet<u32>,
+    declined: HashSet<u32>,
+    prless: HashSet<u32>,
+    fail: HashSet<u32>,
 }
 
 impl WorkDispatcher for Disp {
@@ -45,10 +62,25 @@ impl WorkDispatcher for Disp {
     fn peer_claimed(&self) -> HashSet<u32> {
         self.peer.clone()
     }
+    fn quarantined(&self) -> HashSet<u32> {
+        self.quarantined.clone()
+    }
+    fn noop_cooldown(&self) -> HashSet<u32> {
+        self.noop.clone()
+    }
+    fn declined(&self) -> HashSet<u32> {
+        self.declined.clone()
+    }
+    fn prless_retry(&self) -> HashSet<u32> {
+        self.prless.clone()
+    }
     fn occupancy(&self) -> usize {
         self.dispatched.len()
     }
     fn dispatch(&mut self, issue: u32, _complexity: Option<&str>) -> Result<bool> {
+        if self.fail.contains(&issue) {
+            return Err(anyhow::anyhow!("spawn failed\nsecond line"));
+        }
         if self.open_pr.contains(&issue) {
             return Err(OpenPrDispatchError { issue, pr: 900 }.into());
         }
@@ -228,4 +260,54 @@ fn pass_two_limits_resolve_to_their_own_dispositions() {
             (5, QueueDisposition::Dispatched)
         ]
     );
+}
+
+/// Brakes that live on the dispatcher, and a real dispatch failure, each get
+/// their own disposition.
+#[test]
+fn dispatcher_brakes_and_errors_get_their_own_rows() {
+    let items = (1..=5)
+        .map(|n| item(n, &["loom:issue"], &format!("2026-09-0{n}T00:00:00Z")))
+        .collect();
+    let mut multi = vec![(
+        OneShotSource(Some(items)),
+        Disp {
+            quarantined: HashSet::from([1]),
+            noop: HashSet::from([2]),
+            declined: HashSet::from([3]),
+            prless: HashSet::from([4]),
+            fail: HashSet::from([5]),
+            ..Default::default()
+        },
+    )];
+    let report = tick_multi(&mut multi, &[], 10, &[false]);
+    let q = rows(&report, &[]);
+    assert_eq!(
+        order(&q),
+        vec![
+            (1, QueueDisposition::Quarantined),
+            (2, QueueDisposition::NoopCooldown),
+            (3, QueueDisposition::Declined),
+            (4, QueueDisposition::PrlessRetry),
+            (5, QueueDisposition::DispatchError),
+        ]
+    );
+    assert_eq!(q[4].detail.as_deref(), Some("spawn failed"));
+}
+
+/// A repo whose listing fails is named on the summary, so its missing
+/// backlog reads as incomplete rather than empty.
+#[test]
+fn a_failed_listing_is_named_not_shown_as_empty() {
+    let ok = OneShotSource(Some(vec![item(2, &["loom:issue"], "2026-09-01T00:00:00Z")]));
+    let mut multi = vec![
+        (MaybeSource(None), Disp::default()),
+        (MaybeSource(Some(ok)), Disp::default()),
+    ];
+    let report = tick_multi(&mut multi, &[], 10, &[false, false]);
+    let roots = [PathBuf::from("/repo/broken"), PathBuf::from("/repo/ok")];
+    let summary = tick_summary(&report, 10, chrono::Utc::now(), &roots);
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.listing_failed, vec!["/repo/broken".to_string()]);
+    assert_eq!(order(&summary.queue), vec![(2, QueueDisposition::Dispatched)]);
 }
