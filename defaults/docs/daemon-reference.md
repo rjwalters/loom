@@ -9023,6 +9023,20 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   `roll PENDING since T — dispatch paused Dm of a 2h0m budget, N in flight, …`.
   That is what makes a host idling behind a roll visible from one poll — and, by
   diffing `paused_secs` across polls, whether the pause is still advancing.
+- **Cumulative paused time per host per day (#8652).** `status --json`'s
+  `drain.paused_by_day` is `{ "YYYY-MM-DD": secs }` — dispatch-paused seconds per
+  **UTC** day, including the elapsed portion of a pause in progress; the text
+  status prints `Roll pauses (UTC): today …, last 7d …, last N recorded day(s) …`
+  when it is non-empty. It is read from a small ledger persisted at
+  `~/.loom/drain-paused-ledger.json` (or `$LOOM_AUTO_UPDATE_STATE_DIR`, next to
+  the artifact-roll record) — not an in-memory counter or the event bus, both of
+  which the successful roll's own restart would wipe. A pause is split across
+  UTC midnight, closed *before* the supervisor exits for the relaunch, and one
+  left open by a killed daemon is reconciled on the next start (capped at the
+  4h budget). It counts every drain-flag pause (a `fleet drain` teardown
+  included). 30 days are retained, pruned on write. Ledger I/O is
+  observational only: a write failure is logged, a corrupt file starts a fresh
+  ledger with a WARN, and the #6007 fail-safe never reads it.
 - **Supervised stop/start vs. a full wait-for-zero drain (#5340).** These are two
   different tools for two different situations, not a strict "drain is always
   safer" hierarchy:

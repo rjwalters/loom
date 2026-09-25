@@ -2391,6 +2391,9 @@ pub(crate) fn print_status_human(
     } else if let Some(note) = &report.drain_note {
         println!("Drain: not draining (last: {note})");
     }
+    if let Some(line) = drain_render::paused_by_day_line(report) {
+        println!("{line}"); // #8652
+    }
 
     // Live idle-exit eligibility (#5565): a one-line summary for an operator
     // eyeballing `status` on a fleet host, matching the same determination
