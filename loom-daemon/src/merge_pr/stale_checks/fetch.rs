@@ -15,7 +15,10 @@
 //!    because a required check configured in either is invisible to the
 //!    other's API. A failure on EITHER source fails the whole lookup closed —
 //!    a surviving source's answer is a partial view, and a partial view of
-//!    what is required is not a safe input to a merge decision.
+//!    what is required is not a safe input to a merge decision. The ONE
+//!    exception is the plan gate described in
+//!    [`is_plan_gated`]: a source GitHub refuses to serve because the
+//!    repository's plan does not include it cannot be holding rules.
 //! 3. **check runs** — `GET /repos/{nwo}/commits/{sha}/check-runs`
 //!    (`per_page=100`, which covers this repo's largest rollup), projecting
 //!    `name`/`status`/`conclusion`/`started_at`.
@@ -60,6 +63,56 @@ pub struct LiveInputs {
     pub base_tip: DateTime<Utc>,
     pub required: Vec<String>,
     pub runs: Vec<CheckRun>,
+    /// Degradations the caller must SAY OUT LOUD but that do not change the
+    /// verdict — today only the plan gate of [`is_plan_gated`]. A relaxation
+    /// nobody can see is how a fail-open ships unnoticed.
+    pub notices: Vec<String>,
+}
+
+/// Is this `gh` failure GitHub declining to serve a branch-protection source
+/// because the repository's PLAN does not include it (#8844)?
+///
+/// On a **private** repository owned by a Free account or org, rulesets and
+/// classic branch protection are paid features, and
+/// `GET /repos/{nwo}/rules/branches/{branch}` answers:
+///
+/// ```text
+/// HTTP 403: Upgrade to GitHub Pro or make this repository public to enable this feature.
+/// ```
+///
+/// Treating that as a lookup failure fails the whole guard closed, which on
+/// such a repo blocks EVERY merge forever with no flag that helps — the state
+/// #8844 reports. But the guard's question has a definite answer there: a
+/// source the plan gates out cannot hold a `required_status_checks` rule, so
+/// it configures **no required contexts**, exactly like the ordinary
+/// "succeeded, returned nothing" case this fetch already treats as empty.
+///
+/// The predicate is deliberately narrow, and matches on the message GitHub
+/// sends rather than the status code: 403 alone is ambiguous (a token missing
+/// a scope, SSO enforcement, a rate-limit refusal and a plan gate all share
+/// it), while "upgrade … / make this repository public" is emitted for exactly
+/// one reason. Both fragments must be present. Anything else — network,
+/// auth scope, rate limit, 404, a malformed response — still fails closed.
+///
+/// Matching a text signature is the whole reason it stays narrow: if GitHub
+/// reworded it, this returns false and the guard fails closed again, which is
+/// the safe direction to be wrong in.
+#[must_use]
+pub fn is_plan_gated(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("upgrade to github") && lower.contains("make this repository public")
+}
+
+/// The operator-facing note for a plan-gated source, naming the source, the
+/// branch, and what the guard concluded from it.
+fn plan_gated_notice(source: &str, base_ref: &str, err: &str) -> String {
+    format!(
+        "required-check freshness guard (#8248): the {source} lookup for '{base_ref}' is \
+gated by this repository's GitHub plan ({err}). Rulesets and branch protection are \
+unavailable on a private repository on that plan, so this source cannot make any check \
+REQUIRED and is read as configuring none (#8844). Every other lookup failure still \
+refuses the merge."
+    )
 }
 
 fn parse_iso(label: &str, raw: &str) -> Result<DateTime<Utc>, String> {
@@ -98,19 +151,31 @@ fn fetch_base_tip(nwo: &str, base_ref: &str) -> Result<(String, DateTime<Utc>), 
 }
 
 /// Required status check contexts, unioned across rulesets and classic branch
-/// protection (mirroring `forge_get_required_status_check_contexts`, #8103).
-fn fetch_required(nwo: &str, base_ref: &str) -> Result<Vec<String>, String> {
+/// protection (mirroring `forge_get_required_status_check_contexts`, #8103),
+/// plus any [`plan_gated_notice`] the lookup had to record.
+///
+/// The plan gate is evaluated PER SOURCE rather than "only when both are
+/// gated": a gated source provably holds no rules of its own, and a source
+/// that answered normally is still authoritative for what it does hold.
+fn fetch_required(nwo: &str, base_ref: &str) -> Result<(Vec<String>, Vec<String>), String> {
     let (owner, repo) = split_nwo(nwo)?;
+    let mut notices: Vec<String> = Vec::new();
 
-    let ruleset = gh_api(&[
+    let ruleset = match gh_api(&[
         &format!("repos/{nwo}/rules/branches/{base_ref}"),
         "--jq",
         ".[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[]?.context",
-    ])
-    .map_err(|e| format!("ruleset lookup failed: {e}"))?;
+    ]) {
+        Ok(out) => out,
+        Err(e) if is_plan_gated(&e) => {
+            notices.push(plan_gated_notice("ruleset", base_ref, &e));
+            String::new()
+        }
+        Err(e) => return Err(format!("ruleset lookup failed: {e}")),
+    };
 
     let query = "query($owner: String!, $name: String!, $ref: String!) { repository(owner: $owner, name: $name) { ref(qualifiedName: $ref) { branchProtectionRule { requiredStatusCheckContexts } } } }";
-    let classic = gh_api(&[
+    let classic = match gh_api(&[
         "graphql",
         &format!("-fquery={query}"),
         &format!("-Fowner={owner}"),
@@ -118,8 +183,17 @@ fn fetch_required(nwo: &str, base_ref: &str) -> Result<Vec<String>, String> {
         &format!("-Fref=refs/heads/{base_ref}"),
         "--jq",
         ".data.repository.ref.branchProtectionRule.requiredStatusCheckContexts // [] | .[]",
-    ])
-    .map_err(|e| format!("classic branch-protection lookup failed: {e}"))?;
+    ]) {
+        Ok(out) => out,
+        // The same plan gate, reachable from the legacy source too: whichever
+        // API GitHub declines on plan grounds, it is declining to serve a
+        // feature the repository does not have.
+        Err(e) if is_plan_gated(&e) => {
+            notices.push(plan_gated_notice("classic branch-protection", base_ref, &e));
+            String::new()
+        }
+        Err(e) => return Err(format!("classic branch-protection lookup failed: {e}")),
+    };
 
     // Union, order-preserving, de-duplicated: a context can legitimately be
     // required by BOTH a ruleset and a classic rule.
@@ -133,7 +207,7 @@ fn fetch_required(nwo: &str, base_ref: &str) -> Result<Vec<String>, String> {
             seen.push(ctx.to_string());
         }
     }
-    Ok(seen)
+    Ok((seen, notices))
 }
 
 /// The check-runs rollup for the PR head, projected to the guard's fields.
@@ -182,12 +256,13 @@ fn fetch_check_runs(nwo: &str, head_sha: &str) -> Result<Vec<CheckRun>, String> 
 /// Gather everything [`super::assess`] needs from the live forge.
 pub fn live_inputs(nwo: &str, base_ref: &str, head_sha: &str) -> Result<LiveInputs, String> {
     let (tip_sha, base_tip) = fetch_base_tip(nwo, base_ref)?;
-    let required = fetch_required(nwo, base_ref)?;
+    let (required, notices) = fetch_required(nwo, base_ref)?;
     let runs = fetch_check_runs(nwo, head_sha)?;
     Ok(LiveInputs {
         tip_sha,
         base_tip,
         required,
         runs,
+        notices,
     })
 }
