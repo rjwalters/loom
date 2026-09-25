@@ -89,6 +89,15 @@ pub(crate) enum ScriptPortCommand {
     /// deleted) or the removal failed.
     WorktreeRemove(super::worktree_remove::WorktreeRemoveArgs),
 
+    /// `worktree.sh`'s post-`git worktree add` symlink provisioning (#8195,
+    /// slice 4): root and nested `node_modules`, `worktree.linkPaths`,
+    /// `.mcp.json`, and the `info/exclude` entry each one needs so `git add
+    /// -A` cannot stage it (#3528/#5474). The part of the create path that is
+    /// all path interpolation — four `ln -s "$src" "$dst"` pairs and a
+    /// `find | read` loop — which is #7858's class. Exit 0 always: this is
+    /// best-effort by contract and the worktree already exists.
+    WorktreeLink(super::worktree_link::WorktreeLinkArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -194,6 +203,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeRemove(args) => args.run(),
+            ScriptPortCommand::WorktreeLink(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
