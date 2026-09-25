@@ -40,9 +40,15 @@
 //! weakening the guard itself — bounded to one attempt per head, after which
 //! the PR is escalated to a durable `loom:operator` hold rather than pushed
 //! at forever.
+//!
+//! [`rerun`] (#8914) runs before [`redate`]: when the merge identity has
+//! Actions: write, it re-runs the workflow runs holding the stale required
+//! checks IN PLACE, so the head SHA — and the Judge verdict — survive. It
+//! falls back to [`redate`]'s push only when the forge refuses the re-run.
 
 pub mod head_sync;
 pub mod labels;
 pub mod redate;
 pub mod refs;
+pub mod rerun;
 pub mod stale_checks;

@@ -84,6 +84,10 @@ pub struct CheckRun {
     pub conclusion: Option<String>,
     /// When the run started; `None` until it has.
     pub started_at: Option<DateTime<Utc>>,
+    /// The GitHub Actions workflow run this check belongs to, when it is an
+    /// Actions job (`None` for any other app). The freshness verdict ignores
+    /// it; it is what the in-place re-run remedy (#8914) re-runs.
+    pub actions_run_id: Option<u64>,
 }
 
 impl CheckRun {

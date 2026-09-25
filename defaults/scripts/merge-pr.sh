@@ -113,10 +113,10 @@
 #       failure comment. See "Squash-merge detection trap" in
 #       defaults/docs/merge-pr-exit-code-exceptions.md for why ancestry checks
 #       can't verify this state after the fact.
-#   4 = stale required checks were re-dated under --redate-stale-checks
-#       (#8508): the #8248 freshness guard blocked the merge and this run
-#       pushed a tree-identical no-op commit so CI re-runs with a current
-#       timestamp. Nothing merged, nothing bypassed. Same caller contract as
+#   4 = stale required checks re-run/re-dated under --redate-stale-checks:
+#       the #8248 guard blocked the merge; this run re-ran them IN PLACE
+#       (#8914, needs Actions: write; head + loom:pr kept) or pushed a
+#       tree-identical no-op commit (#8508). Nothing bypassed. Same contract as
 #       exit 3 — re-queue, never a failure comment. Bounded to one push per
 #       head; a repeat block escalates to a loom:operator hold and returns
 #       exit 1 with the original refusal. Full rationale:
@@ -260,10 +260,10 @@ Options:
                          The bypass is always logged as a warning and, on a
                          real (non-dry-run) merge, best-effort recorded as a
                          PR comment audit trail too.
-  --redate-stale-checks  On an #8248 freshness block, push a tree-identical no-op
-                         commit so CI re-dates every check, then exit 4 without
-                         merging — never a bypass, one push per head, a repeat
-                         block escalates to a loom:operator hold (#8508).
+  --redate-stale-checks  On an #8248 freshness block, re-run the stale checks in
+                         place and merge once fresh (#8914), else push a tree-
+                         identical no-op commit and exit 4 (#8508) — never a
+                         bypass; a repeat push block escalates to loom:operator.
   --merge-method M       Request squash|merge|rebase instead of auto-detect; validated via loom-daemon against the repo's actually-allowed strategies — fails rather than silently falling back to squash if disallowed (#8845).
   --no-cleanup-primary   Skip automatic primary-checkout branch cleanup (#5015).
                          When the merged branch is checked out in the PRIMARY
@@ -327,7 +327,7 @@ Precedence (highest wins):
 Exit codes:
   0 = merged (or --help)
   1 = failed
-  4 = stale required checks were re-dated under --redate-stale-checks (#8508) — not a failure; CI is re-running, retry later
+  4 = stale required checks re-running in place (#8914) or re-dated by a push (#8508) under --redate-stale-checks — not a failure; retry later
 
 Examples:
   ./.loom/scripts/merge-pr.sh 123
@@ -1090,8 +1090,8 @@ _check_verdict_label_contradiction
 # has no actions:write, so neither an internal re-run nor `gh run rerun` can
 # re-date the check, and a PR whose branch has no new commits can never escape
 # on its own (PR #8493 failed three identical ticks that way on 2026-09-21).
-# `loom-daemon merge-pr redate-checks` pushes a TREE-IDENTICAL no-op commit,
-# which re-triggers CI; exit 0 there means "re-dated, do not merge this pass"
+# `loom-daemon merge-pr redate-checks` FIRST re-runs the stale runs in place (#8914: exit 5 = fresh, merge on; no commit, verdict kept), and only if that is refused (no Actions: write) pushes a TREE-IDENTICAL no-op commit,
+# which re-triggers CI; exit 0 there means "re-running/re-dated, do not merge this pass"
 # and becomes THIS script's exit 4. It is bounded to one push per head — a
 # second block on an already-re-dated head means CI cannot out-race the base
 # branch, and the PR is escalated to a durable loom:operator hold (exit 4 from
@@ -1131,7 +1131,7 @@ _check_verdict_label_contradiction
 # This file is at its file-size-ratchet ceiling (file-size-policy.md), so the
 # function is one dense line and the two MAX_MERGE_RETRIES/MERGE_RETRY_DELAY
 # pairs below are joined (verbatim, behavior-preserving) to offset it.
-_check_required_check_freshness() { [[ "$FORGE_TYPE" == "github" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ -n "$base_ref" ]] || base_ref="${DEFAULT_BRANCH_NAME:-main}"; msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stale-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "$base_ref")" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-STALE-CHECKS-CLEAN" ]] && return 0; if [[ $rc -ne 1 ]]; then local why=" It printed nothing, so the binary is most likely missing or predates the subcommand: build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; [[ -z "$msg" ]] || why=$'\n\n'"What it reported: $msg"; msg="Merge blocked: PR #$PR_NUMBER's required-check freshness guard (#8248) could not run — 'loom-daemon merge-pr stale-checks' exited $rc without the LOOM-STALE-CHECKS-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'every required check is fresh' from 'never checked', so only a positive clean signal is accepted.$why"; fi; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; if [[ "${REDATE_STALE_CHECKS:-false}" == "true" && $rc -eq 1 ]]; then local rd=0 out; out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr redate-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$PR_BRANCH" --expected-head-sha "$PR_HEAD_SHA" 2>&1)" || rd=$?; if [[ $rd -eq 0 ]]; then warning "$out"; warning "Exiting 4: the stale required checks were re-dated, not merged. CI is re-running on the new head; the merge is expected to be re-attempted (after a fresh Judge review, #5686) on a later pass."; exit 4; fi; msg="$msg"$'\n\n'"#8508 automated remedy did not produce fresh evidence: $out"; fi; error "$msg"; }
+_check_required_check_freshness() { [[ "$FORGE_TYPE" == "github" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ -n "$base_ref" ]] || base_ref="${DEFAULT_BRANCH_NAME:-main}"; msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stale-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "$base_ref")" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-STALE-CHECKS-CLEAN" ]] && return 0; if [[ $rc -ne 1 ]]; then local why=" It printed nothing, so the binary is most likely missing or predates the subcommand: build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; [[ -z "$msg" ]] || why=$'\n\n'"What it reported: $msg"; msg="Merge blocked: PR #$PR_NUMBER's required-check freshness guard (#8248) could not run — 'loom-daemon merge-pr stale-checks' exited $rc without the LOOM-STALE-CHECKS-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'every required check is fresh' from 'never checked', so only a positive clean signal is accepted.$why"; fi; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; if [[ "${REDATE_STALE_CHECKS:-false}" == "true" && $rc -eq 1 ]]; then local rd=0 out; out="$(LOOM_REDATE_ALLOW_PROCEED=1 "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr redate-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$PR_BRANCH" --expected-head-sha "$PR_HEAD_SHA" 2>&1)" || rd=$?; if [[ $rd -eq 5 ]]; then info "$out"; return 0; fi; if [[ $rd -eq 0 ]]; then warning "$out"; warning "Exiting 4: not merged this pass. The stale required checks are re-running in place (head and loom:pr kept, #8914) or were re-dated by a no-op push (fresh Judge review needed, #5686) — see above. Re-attempt on a later pass."; exit 4; fi; msg="$msg"$'\n\n'"#8508 automated remedy did not produce fresh evidence: $out"; fi; error "$msg"; }
 _check_required_check_freshness
 
 # ---------------------------------------------------------------------------

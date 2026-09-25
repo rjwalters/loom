@@ -37,9 +37,11 @@ fn gh_bin() -> String {
     std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
 }
 
-/// Run `gh api …` with the given args, returning stdout on success.
-fn gh_api(args: &[&str]) -> Result<String, String> {
-    let out = Command::new(gh_bin())
+/// Run `gh api …` with the given args, returning stdout on success. `gh` is
+/// the binary — a plain argument so `rerun`'s tests can inject a stub without
+/// a process-global `LOOM_GH_BIN` (which races across parallel test threads).
+fn gh_api(gh: &str, args: &[&str]) -> Result<String, String> {
+    let out = Command::new(gh)
         .arg("api")
         .args(args)
         .output()
@@ -135,12 +137,15 @@ fn split_nwo(nwo: &str) -> Result<(&str, &str), String> {
 }
 
 /// Resolve the base branch's current tip: its SHA and commit time.
-fn fetch_base_tip(nwo: &str, base_ref: &str) -> Result<(String, DateTime<Utc>), String> {
-    let out = gh_api(&[
-        &format!("repos/{nwo}/commits/{base_ref}"),
-        "--jq",
-        "[.sha, .commit.committer.date] | @tsv",
-    ])?;
+fn fetch_base_tip(gh: &str, nwo: &str, base_ref: &str) -> Result<(String, DateTime<Utc>), String> {
+    let out = gh_api(
+        gh,
+        &[
+            &format!("repos/{nwo}/commits/{base_ref}"),
+            "--jq",
+            "[.sha, .commit.committer.date] | @tsv",
+        ],
+    )?;
     let mut cols = out.split('\t');
     let sha = cols.next().unwrap_or("").trim().to_string();
     let date = cols.next().unwrap_or("").trim().to_string();
@@ -157,11 +162,15 @@ fn fetch_base_tip(nwo: &str, base_ref: &str) -> Result<(String, DateTime<Utc>), 
 /// The plan gate is evaluated PER SOURCE rather than "only when both are
 /// gated": a gated source provably holds no rules of its own, and a source
 /// that answered normally is still authoritative for what it does hold.
-fn fetch_required(nwo: &str, base_ref: &str) -> Result<(Vec<String>, Vec<String>), String> {
+fn fetch_required(
+    gh: &str,
+    nwo: &str,
+    base_ref: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
     let (owner, repo) = split_nwo(nwo)?;
     let mut notices: Vec<String> = Vec::new();
 
-    let ruleset = match gh_api(&[
+    let ruleset = match gh_api(gh, &[
         &format!("repos/{nwo}/rules/branches/{base_ref}"),
         "--jq",
         ".[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[]?.context",
@@ -175,15 +184,18 @@ fn fetch_required(nwo: &str, base_ref: &str) -> Result<(Vec<String>, Vec<String>
     };
 
     let query = "query($owner: String!, $name: String!, $ref: String!) { repository(owner: $owner, name: $name) { ref(qualifiedName: $ref) { branchProtectionRule { requiredStatusCheckContexts } } } }";
-    let classic = match gh_api(&[
-        "graphql",
-        &format!("-fquery={query}"),
-        &format!("-Fowner={owner}"),
-        &format!("-Fname={repo}"),
-        &format!("-Fref=refs/heads/{base_ref}"),
-        "--jq",
-        ".data.repository.ref.branchProtectionRule.requiredStatusCheckContexts // [] | .[]",
-    ]) {
+    let classic = match gh_api(
+        gh,
+        &[
+            "graphql",
+            &format!("-fquery={query}"),
+            &format!("-Fowner={owner}"),
+            &format!("-Fname={repo}"),
+            &format!("-Fref=refs/heads/{base_ref}"),
+            "--jq",
+            ".data.repository.ref.branchProtectionRule.requiredStatusCheckContexts // [] | .[]",
+        ],
+    ) {
         Ok(out) => out,
         // The same plan gate, reachable from the legacy source too: whichever
         // API GitHub declines on plan grounds, it is declining to serve a
@@ -211,15 +223,15 @@ fn fetch_required(nwo: &str, base_ref: &str) -> Result<(Vec<String>, Vec<String>
 }
 
 /// The check-runs rollup for the PR head, projected to the guard's fields.
-fn fetch_check_runs(nwo: &str, head_sha: &str) -> Result<Vec<CheckRun>, String> {
-    let out = gh_api(&[
+fn fetch_check_runs(gh: &str, nwo: &str, head_sha: &str) -> Result<Vec<CheckRun>, String> {
+    let out = gh_api(gh, &[
         &format!("repos/{nwo}/commits/{head_sha}/check-runs"),
         "--method",
         "GET",
         "-f",
         "per_page=100",
         "--jq",
-        "[.check_runs[]? | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at}]",
+        "[.check_runs[]? | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at, app: .app.slug, details_url: .details_url}]",
     ])?;
     let arr: serde_json::Value =
         serde_json::from_str(&out).map_err(|e| format!("check-runs response was not JSON: {e}"))?;
@@ -248,16 +260,47 @@ fn fetch_check_runs(nwo: &str, head_sha: &str) -> Result<Vec<CheckRun>, String> 
                     .and_then(|s| s.as_str())
                     .map(String::from),
                 started_at,
+                actions_run_id: actions_run_id(
+                    v.get("app").and_then(|s| s.as_str()),
+                    v.get("details_url").and_then(|s| s.as_str()),
+                ),
             })
         })
         .collect()
 }
 
+/// The GitHub Actions workflow run a check run belongs to, when it is an
+/// Actions job — the unit `POST /actions/runs/{id}/rerun` re-runs in place
+/// (#8914). Parsed from `details_url`
+/// (`https://github.com/<o>/<r>/actions/runs/<run>/job/<job>`) and only
+/// trusted when the reporting app is `github-actions`: a third-party app's
+/// check run has no workflow run to re-run, and a URL that merely looks like
+/// one must not be mistaken for one.
+#[must_use]
+pub fn actions_run_id(app_slug: Option<&str>, details_url: Option<&str>) -> Option<u64> {
+    if app_slug != Some("github-actions") {
+        return None;
+    }
+    let rest = details_url?.split("/actions/runs/").nth(1)?;
+    let id = rest.split('/').next()?;
+    id.parse::<u64>().ok()
+}
+
 /// Gather everything [`super::assess`] needs from the live forge.
 pub fn live_inputs(nwo: &str, base_ref: &str, head_sha: &str) -> Result<LiveInputs, String> {
-    let (tip_sha, base_tip) = fetch_base_tip(nwo, base_ref)?;
-    let (required, notices) = fetch_required(nwo, base_ref)?;
-    let runs = fetch_check_runs(nwo, head_sha)?;
+    live_inputs_with(&gh_bin(), nwo, base_ref, head_sha)
+}
+
+/// [`live_inputs`], parameterized on the `gh` binary (see [`gh_api`]).
+pub fn live_inputs_with(
+    gh: &str,
+    nwo: &str,
+    base_ref: &str,
+    head_sha: &str,
+) -> Result<LiveInputs, String> {
+    let (tip_sha, base_tip) = fetch_base_tip(gh, nwo, base_ref)?;
+    let (required, notices) = fetch_required(gh, nwo, base_ref)?;
+    let runs = fetch_check_runs(gh, nwo, head_sha)?;
     Ok(LiveInputs {
         tip_sha,
         base_tip,
