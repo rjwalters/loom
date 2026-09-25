@@ -36,7 +36,35 @@ pub fn drain_json(report: &DaemonStatusReport) -> serde_json::Value {
             "target": r.target,
             "then_exit": r.then_exit,
         })),
+        // #8652: `{ "YYYY-MM-DD": secs }`, UTC days, live pause included. `{}`
+        // when nothing was recorded (and from a pre-#8652 daemon).
+        "paused_by_day": report.drain_paused_by_day,
     })
+}
+
+/// The human line for #8652's per-day paused totals: today, the trailing 7
+/// days, and the whole retained window. `None` when the ledger is empty, so an
+/// idle host that never rolled prints nothing new.
+#[must_use]
+pub fn paused_by_day_line(report: &DaemonStatusReport) -> Option<String> {
+    let days = &report.drain_paused_by_day;
+    if days.is_empty() {
+        return None;
+    }
+    let today = chrono::Utc::now().date_naive();
+    let since = |n: u64| {
+        today
+            .checked_sub_days(chrono::Days::new(n))
+            .unwrap_or(today)
+    };
+    let sum_from = |from: chrono::NaiveDate| days.range(from..).map(|(_, s)| *s).sum::<u64>();
+    Some(format!(
+        "Roll pauses (UTC): today {}, last 7d {}, last {} recorded day(s) {}",
+        human_secs(days.get(&today).copied().unwrap_or(0)),
+        human_secs(sum_from(since(6))),
+        days.len(),
+        human_secs(days.values().sum()),
+    ))
 }
 
 /// The human line for an in-progress roll, or `None` when the report carries no
@@ -169,6 +197,40 @@ mod tests {
     #[test]
     fn no_live_roll_renders_no_line() {
         assert!(roll_line(&report_with(None)).is_none());
+    }
+
+    #[test]
+    fn json_carries_paused_by_day_keyed_by_utc_date() {
+        let mut report = report_with(None);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 22).unwrap();
+        report.drain_paused_by_day.insert(day, 3000);
+        let value = drain_json(&report);
+        assert_eq!(value["paused_by_day"]["2026-09-22"], serde_json::json!(3000));
+    }
+
+    #[test]
+    fn paused_by_day_is_absent_safe_from_a_pre_8652_daemon() {
+        // A pre-#8652 daemon's report JSON has no such key at all.
+        let mut wire = serde_json::to_value(report_with(None)).unwrap();
+        wire.as_object_mut().unwrap().remove("drain_paused_by_day");
+        let report: DaemonStatusReport = serde_json::from_value(wire).unwrap();
+        assert!(report.drain_paused_by_day.is_empty());
+        assert_eq!(drain_json(&report)["paused_by_day"], serde_json::json!({}));
+        assert!(paused_by_day_line(&report).is_none());
+    }
+
+    #[test]
+    fn the_paused_by_day_line_sums_today_the_week_and_the_window() {
+        let mut report = report_with(None);
+        let today = chrono::Utc::now().date_naive();
+        let ago = |n| today.checked_sub_days(chrono::Days::new(n)).unwrap();
+        report.drain_paused_by_day.insert(today, 3720);
+        report.drain_paused_by_day.insert(ago(3), 600);
+        report.drain_paused_by_day.insert(ago(20), 7200);
+        let line = paused_by_day_line(&report).unwrap();
+        assert!(line.contains("today 1h2m"), "{line}");
+        assert!(line.contains("last 7d 1h12m"), "{line}");
+        assert!(line.contains("last 3 recorded day(s) 3h12m"), "{line}");
     }
 
     #[test]
