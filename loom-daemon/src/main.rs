@@ -712,6 +712,16 @@ enum Commands {
     /// happens to be **stopped** when the clean runs gets no such
     /// protection — nothing in a process table can see it. Never point a
     /// launchd/systemd unit at a path under a build-output directory.
+    ///
+    /// **Stale native launch state** (issue #8663): unless one of the
+    /// `--*-only` flags narrows the pass, it also covers per-launch native
+    /// harness state under `~/.local/state/loom/native-tools`
+    /// (`LOOM_NATIVE_TOOLS_DIR` when set). A session directory whose recorded
+    /// harness pid is still alive on this host is never removed, whatever its
+    /// age; everything else is aged out (15 minutes once the pid has exited,
+    /// 6 hours with no usable record). `--safe` does not narrow this — a
+    /// session directory has no merged PR to check — but removal does require
+    /// `--force`/`-y`; without it the pass only reports.
     Clean {
         /// Workspace directory (repo root, or any path under it).
         #[arg(long, value_name = "PATH", default_value = ".")]
