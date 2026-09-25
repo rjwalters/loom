@@ -15,6 +15,7 @@
 - [Phases](#phases)
 - [Capture scope & exclusions](#capture-scope--exclusions)
 - [Retention](#retention)
+- [Standing queries](#standing-queries)
 - [Redaction policy](#redaction-policy)
 - [Rollout](#rollout)
 - [Phase 1 reference: runs and jobs (#8824)](#phase-1-reference-runs-and-jobs-8824)
@@ -86,7 +87,7 @@ hop is specified:
 |---|---|---|---|
 | 1 | `loom-daemon ci-telemetry` poller: `ci.run`/`ci.job` records, duration histograms, run→job traces, dedup ledger, local journal, `status` | [#8824](https://github.com/rjwalters/loom/issues/8824) | Landed — see [Phase 1 reference](#phase-1-reference-runs-and-jobs-8824) |
 | 2 | Full completed-job logs as chunked `ci.job.log` records, with secret redaction enforced at the gateway | [#8825](https://github.com/rjwalters/loom/issues/8825) | Landed — see [Phase 2 reference](#phase-2-reference-completed-job-logs-8825) |
-| 3 | SigNoz retro surfaces (`ci-queries.sql`, six saved views) and the metrics ≥30d retention split | [#8826](https://github.com/rjwalters/loom/issues/8826) (blocked by #8824/#8825) | Open |
+| 3 | SigNoz retro surfaces (`ci-queries.sql`, six saved views) and the metrics ≥30d retention split | [#8826](https://github.com/rjwalters/loom/issues/8826) | Queries, drift guard and retention policy landed — see [Standing queries](#standing-queries) and [Retention](#retention). Creating the saved views in the trial org and the logs/traces 7-day API step need the org login: [#8946](https://github.com/rjwalters/loom/issues/8946) |
 | 4 | This policy doc and its wiring | [#8827](https://github.com/rjwalters/loom/issues/8827) | This doc |
 
 Each phase adds its own reference section (config keys, dedup contract,
@@ -129,12 +130,67 @@ enforced only on a host where [Rollout](#rollout) has enabled it.
 | Metrics (`loom.ci.*.duration_ms`, outcome counts) | **≥ 30 days** | Trends are the retro asset — "is CI getting slower" needs weeks of history, and metrics are cheap relative to logs |
 | Logs (`ci.job.log`) and traces | **7 days** | Raw detail is for recent investigation; a regression is found by trend, then read in a recent run |
 
-Trends outlive raw data by design. Implementation — the SigNoz retention
-settings plus `retention.sql` for tables the pinned API misses, verified
-against effective ClickHouse DDL rather than the API setting — is owned by
-[#8826](https://github.com/rjwalters/loom/issues/8826); the signoz README's
-"Retention and operation" section documents the current (pre-#8826) seven-day
-trial setting.
+This 7-day / 30-day split is the **standing policy** (#8826). Trends outlive
+raw data by design: a regression is *found* in the metrics (weeks of
+P50/P95 history per job, and the outcome mix per workflow), then *read* in a
+recent run's `ci.run` / `ci.job` records and job log. Keeping raw logs for 30
+days would multiply the dominant storage cost to answer questions the metrics
+already answer; keeping metrics for only 7 days would make "is CI getting
+slower" unanswerable, which is the #7779 failure this policy exists to prevent.
+
+What lives where follows from the metric label allowlist: the duration
+histograms carry only `repo`, `workflow`, `job`, `runner` and `conclusion` —
+never a run id — so the 30-day horizon can say *which job* regressed and
+*since when*, and only the 7-day records can say *which run*.
+
+Mechanics, verified against effective ClickHouse DDL rather than the settings
+page: set logs 7 / traces 7 / metrics 30 days in SigNoz General Settings →
+Retention, then re-run the trial's
+[`retention.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/retention.sql),
+which sets the auxiliary tables the pinned API leaves at stale TTLs to the same
+split. Both steps, and the DDL check, are in the signoz README's "Retention and
+operation" section; the observed DDL is recorded in its `evidence.md`. As of
+#8826, the running trial's metrics are verified at 30 days. Its API-owned
+log/trace tables are still at the upstream 15 days until the settings step is
+applied with the org login
+([#8946](https://github.com/rjwalters/loom/issues/8946)).
+
+## Standing queries
+
+The retro is
+[`ci-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/ci-queries.sql):
+six numbered, parameterized sections, run in one pass from the trial's private
+bundled `clickhouse-client` (invocation in the signoz README's "CI retro
+queries"). Each has a matching saved view in the README's "Saved views" table.
+
+| # | Question | Source (horizon) |
+|---|---|---|
+| 1 | **Is build time trending up?** P50 / P95 / max job duration per repo + workflow + job, per time bucket | `loom.ci.job.duration_ms` (30 days) |
+| 2 | **Which job regressed?** Current-window P95 vs prior-window P95 per job, ranked by absolute increase; section 1 then shows *since when* | `loom.ci.job.duration_ms` (30 days) |
+| 3 | **Are runs failing or being cancelled more?** Success / failure / **cancelled** / unreported counts and ratios per workflow per bucket | `loom.ci.run.duration_ms` (30 days) |
+| 4 | **What took long right now?** The longest individual jobs, with `run_id` / `job_id` | `ci.job` records (7 days) |
+| 5 | **Which runs failed, and why?** Each failed run, its non-successful jobs, how much of each job's log was captured, and the exact Logs Explorer filter to read it | `ci.run` / `ci.job` / `ci.job.log` (7 days) |
+| 6 | **Where did a slow run's time go?** Run wall-clock vs its longest job, job count and summed job time | `ci.run` / `ci.job` records (7 days) |
+
+Rules the file follows, and any new section must too:
+
+- **Cancelled is an outcome, not noise.** Section 3 gives it its own column;
+  an unreported conclusion is `unreported`, never success.
+- **Empty is not zero.** Section 0 is a preflight: no CI series at all means
+  capture is not flowing — check `loom-daemon ci-telemetry status` — not that
+  CI was idle.
+- **Reconcile, don't silently de-duplicate, the metrics.** Delivery is at
+  least once. The record sections (4–6) de-duplicate on `run_id`/`job_id`.
+  A metric point carries no run identity, and two distinct runs finishing in
+  the same second are identical samples, so the metric sections (1–3) count
+  every stored sample, like the SigNoz UI does. Section 0b instead compares
+  metric points against distinct records: more metric points means a batch
+  was redelivered, fewer means points were lost.
+- **Vocabulary drift fails CI.** `loom-daemon/tests/signoz_trial_artifacts.rs`
+  re-derives the attribute and label vocabulary from the gateway's `keep_keys`
+  (log and datapoint contexts separately) and from the daemon's own record
+  rendering — including which SigNoz map column each key's type lands in — so
+  a query that would silently return zero rows fails the build instead.
 
 ## Redaction policy
 
