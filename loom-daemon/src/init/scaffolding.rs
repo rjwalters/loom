@@ -235,6 +235,22 @@ fn install_labels_block(
     Ok(())
 }
 
+/// The label-workflow paragraph shared verbatim by [`LOOM_ROOT_POINTER`] and
+/// [`AGENTS_ROOT_POINTER`] (issue #8846).
+///
+/// A macro rather than a `const` because both pointers are built with `concat!`,
+/// which only accepts literals — expanding one macro into both call sites is what
+/// keeps the CLAUDE.md and AGENTS.md wording from drifting apart.
+///
+/// Deliberately generic: it names only labels, roles, and the two scripts every
+/// install ships, so it is correct in any consumer repo whether or not the daemon
+/// is ever started.
+macro_rules! loom_label_workflow_pointer {
+    () => {
+        "Work is coordinated through `loom:` labels on issues and pull requests, and the same roles run either under `loom-daemon` or by hand in an attended session — daemon mode is optional. Create the labels once with `.loom/scripts/sync-labels.sh` (an install ships `.github/labels.yml` but does not create the labels on the forge). A pull request ready for review carries `loom:review-requested`; Judge reviews it and applies `loom:pr` (approved) or `loom:changes-requested`; Doctor fixes a `loom:changes-requested` pull request and returns it to `loom:review-requested`. Only a `loom:pr` pull request gets merged, and always via this repo's merge script (`.loom/scripts/merge-pr.sh`) — never a raw forge merge command such as `gh pr merge`. Full state machine: `.loom/docs/label-state-machine.md`."
+    };
+}
+
 /// The short pointer injected into root CLAUDE.md (between section markers).
 ///
 /// This block is committed to the consumer repo, so its authoritative reference
@@ -245,7 +261,19 @@ fn install_labels_block(
 /// auto-discovers that local copy when agents work in `.loom/worktrees/issue-N/`
 /// via ancestor directory traversal, so the auto-discovery behaviour is
 /// unaffected by this wording.
-pub const LOOM_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.";
+///
+/// The second paragraph is the *local* cue for the label workflow (issue #8846):
+/// a repo run in session mode (roles invoked by an attended operator, no daemon
+/// and no interval terminals) has no other in-repo statement of it. Kept to one
+/// paragraph on purpose — this is a pointer block, so it links
+/// `.loom/docs/label-state-machine.md` rather than inlining the state machine.
+/// Any wording change to that paragraph belongs in
+/// `loom_label_workflow_pointer!`, which [`AGENTS_ROOT_POINTER`] shares.
+pub const LOOM_ROOT_POINTER: &str = concat!(
+    "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.",
+    "\n\n",
+    loom_label_workflow_pointer!(),
+);
 
 /// Wrap Loom content in section markers
 pub fn wrap_loom_content(content: &str) -> String {
@@ -275,7 +303,15 @@ pub const AGENTS_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION (AGENTS) -->";
 /// `.loom/AGENTS.md` at install time. OpenAI Codex CLI (and other AGENTS.md-aware
 /// runtimes) auto-discover `AGENTS.md` via ancestor directory traversal, the
 /// direct analogue of Claude Code's `CLAUDE.md` discovery.
-pub const AGENTS_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration (dual-runtime: Claude Code reads `CLAUDE.md`; OpenAI Codex CLI and other AGENTS.md-aware runtimes read this file). See the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of the runtime-neutral guide to `.loom/AGENTS.md`.";
+///
+/// Also like [`LOOM_ROOT_POINTER`], the second paragraph is the local cue for the
+/// label workflow (issue #8846) — both pointers expand the one
+/// `loom_label_workflow_pointer!` macro, so they cannot drift apart.
+pub const AGENTS_ROOT_POINTER: &str = concat!(
+    "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration (dual-runtime: Claude Code reads `CLAUDE.md`; OpenAI Codex CLI and other AGENTS.md-aware runtimes read this file). See the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of the runtime-neutral guide to `.loom/AGENTS.md`.",
+    "\n\n",
+    loom_label_workflow_pointer!(),
+);
 
 /// Wrap AGENTS.md content in its own section markers (kept separate from
 /// [`wrap_loom_content`]/CLAUDE.md's markers — see [`AGENTS_SECTION_START`]).
