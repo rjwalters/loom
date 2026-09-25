@@ -85,10 +85,13 @@ impl Emit {
         at >= self.not_before
     }
 
-    /// Files not written since this are not tracked.
+    /// Files not written since this are not tracked. One settle lag earlier
+    /// than the next poll's `not_before` (the previous window end minus the
+    /// grace), so every record of a dropped file is history if the file is
+    /// written again and read from the start.
     #[must_use]
     pub fn active_since(self) -> DateTime<Utc> {
-        self.now - Duration::seconds(LATE_GRACE_SECS)
+        self.now - Duration::seconds(LATE_GRACE_SECS + MESSAGE_SETTLE_LAG_SECS)
     }
 }
 

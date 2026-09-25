@@ -109,3 +109,36 @@ fn a_session_spanning_two_windows_is_split_with_no_double_count() {
         (20, 200, 3, 1)
     );
 }
+
+/// Judge finding on #8956: a file that went idle past the tracking bound and
+/// is written again is read from the start; none of its already-counted
+/// records may be counted a second time, including one written just inside
+/// the settle lag of that bound.
+#[test]
+fn a_file_that_goes_idle_and_resumes_does_not_recount_old_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".kimi-code");
+    let wire = root.join("sessions/wd_repo_1/session_a/agents/main/wire.jsonl");
+    let base = Utc::now();
+    let last = base - Duration::seconds(3630);
+    append(&wire, &llm_request("k", "kimi-k2.7-code"));
+    append(&wire, &usage(last, "k", (1000, 1000, 0, 0), "turn"));
+    let mtime = std::time::SystemTime::from(last);
+    std::fs::File::options()
+        .write(true)
+        .open(&wire)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    let source = KimiSource {
+        roots: Some(vec![root]),
+        ..KimiSource::default()
+    };
+    let mut burn = Burn::new(vec![Box::new(source)]);
+    assert!(burn.sample(base - Duration::seconds(600)).is_none(), "anchor");
+    assert!(burn.sample(base).unwrap().2.is_empty());
+    append(&wire, &usage(base + Duration::seconds(10), "k", (7, 1, 0, 0), "turn"));
+    let (_, _, window) = burn.sample(base + Duration::seconds(300)).unwrap();
+    let key = ("kimi".to_string(), "kimi-k2.7-code".to_string());
+    assert_eq!((window[&key].input, window[&key].requests), (7, 1));
+}

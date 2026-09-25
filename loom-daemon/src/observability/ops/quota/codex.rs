@@ -16,18 +16,12 @@
 
 use std::path::PathBuf;
 
-use chrono::Duration;
-
 use super::burn::{BurnEvent, BurnSource, Emit, ModelBurn};
 use super::tail::TailSet;
 use crate::codex_usage::{self, Counters};
 
 /// `provider` label — the value `tokens.snapshot` uses for the Codex pool.
 pub const CODEX_PROVIDER: &str = "codex";
-
-/// How many days of date directories are scanned for new rollouts. Files
-/// already tracked are polled whatever their directory's date.
-const DISCOVERY_DAYS: i64 = 2;
 
 /// One rollout's running state.
 #[derive(Debug, Default)]
@@ -107,9 +101,10 @@ pub struct CodexSource {
 
 impl BurnSource for CodexSource {
     fn poll(&mut self, emit: Emit, out: &mut Vec<BurnEvent>) {
-        let window = (emit.now - Duration::days(DISCOVERY_DAYS), emit.now);
-        let mut paths = codex_usage::discover_rollouts(self.home.as_deref(), Some(window));
-        paths.extend(self.files.tracked().cloned());
+        // The whole tree, not recent date directories: a resumed session
+        // appends to the rollout in its start date's directory. Idle files
+        // cost one `stat` each.
+        let paths = codex_usage::discover_rollouts(self.home.as_deref(), None);
         self.files
             .poll(paths, emit.active_since(), |rollout, line| {
                 rollout.add_line(line, emit, out);

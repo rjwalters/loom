@@ -12,10 +12,11 @@
 //!   cursor, or (on Unix) one whose device/inode changed, is read again from
 //!   the start with fresh per-file state. The caller's event filter and
 //!   message-id memory keep that from re-counting.
-//! - **Only recently written files are tracked.** A file not modified within
+//! - **Only recently written files are tracked.** A file not modified since
 //!   `active_since` is dropped from the set, which bounds memory to the files
 //!   in use. If it is written again it comes back as a new file and is read
-//!   from the start; its old records are older than the caller's event filter.
+//!   from the start, so the caller's `active_since` must be no later than the
+//!   oldest record it would still count ([`super::burn::Emit::active_since`]).
 //! - **A line longer than [`MAX_LINE_BYTES`] is skipped**, never held whole.
 
 use std::collections::HashMap;
