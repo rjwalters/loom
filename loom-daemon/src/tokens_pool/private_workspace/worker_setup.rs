@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 /// Only fixed status codes cross the Docker boundary. TOML/hook diagnostics
@@ -8,6 +9,11 @@ use std::process::Command;
 pub(super) enum SetupStatus {
     Ready,
     ProfileInaccessible,
+    /// The image ships no control bundle, so there is no sealed provisioner to
+    /// establish the profile's control files with. Distinct from `Failed`
+    /// because it is the same "wrong image" condition `bundle::Status::Missing`
+    /// reports, met one step earlier — before the session exists at all.
+    ControlMissing,
     Failed,
 }
 
@@ -18,18 +24,19 @@ pub(super) struct SetupReport {
     pub status: SetupStatus,
 }
 
-pub(super) fn report() -> SetupReport {
-    let accessible = || -> std::io::Result<()> {
-        std::fs::read_dir(PROFILE)?;
-        std::fs::File::open(Path::new(PROFILE).join("auth.json"))?;
-        // This process owns the account lease. Prove effective access without
-        // changing ownership, modes, or any operator configuration.
-        let _probe = tempfile::NamedTempFile::new_in(PROFILE)?;
-        Ok(())
-    };
+fn accessible() -> std::io::Result<()> {
+    std::fs::read_dir(PROFILE)?;
+    std::fs::File::open(Path::new(PROFILE).join("auth.json"))?;
+    // This process owns the account lease. Prove effective access without
+    // changing ownership, modes, or any operator configuration.
+    let _probe = tempfile::NamedTempFile::new_in(PROFILE)?;
+    Ok(())
+}
+
+fn reported(work: impl FnOnce() -> Result<()>) -> SetupReport {
     let status = if accessible().is_err() {
         SetupStatus::ProfileInaccessible
-    } else if setup().is_ok() {
+    } else if work().is_ok() {
         SetupStatus::Ready
     } else {
         SetupStatus::Failed
@@ -38,6 +45,76 @@ pub(super) fn report() -> SetupReport {
         protocol: PROTOCOL.into(),
         status,
     }
+}
+
+pub(super) fn report() -> SetupReport {
+    reported(setup)
+}
+
+/// Host-driven, pre-session provisioning of the account profile's control
+/// files (issue #8839). Runs in a throwaway container with the profile mounted
+/// read-write and no workspace, because the session container that follows
+/// binds these files READ-ONLY — which is precisely why they cannot be written
+/// from inside it.
+///
+/// The managed registration is established for every private session, not only
+/// for a clone that happens to ship Loom's installed surface: the profile is
+/// Loom's own, the registration names a fixed image-owned bridge and a fixed
+/// workspace path, and a session that carries the guard is strictly safer than
+/// one that does not. Nothing here reads, writes or copies `auth.json`.
+pub(super) fn provision_controls() -> SetupReport {
+    let control = Path::new(bundle::CONTROL_ROOT);
+    let (helper, bridge) =
+        (control.join(bundle::PROVISIONER), control.join("hooks/guard-codex-bridge.sh"));
+    if !helper.is_file() || !bridge.is_file() {
+        return SetupReport {
+            protocol: PROTOCOL.into(),
+            status: SetupStatus::ControlMissing,
+        };
+    }
+    reported(|| provision(&helper, &bridge))
+}
+
+fn provision(helper: &Path, bridge: &Path) -> Result<()> {
+    let profile = Path::new(PROFILE);
+    // Codex's hook-trust state lives in `config.toml`, and the session binds it
+    // read-only, so it has to exist before the container is created. An empty
+    // file is exactly what the CLI itself would leave behind and carries no
+    // trust, so creating one neither fabricates nor bypasses anything; an
+    // operator's existing configuration is never rewritten.
+    let config = profile.join("config.toml");
+    if !config.exists() {
+        let file = tempfile::NamedTempFile::new_in(profile)?;
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600))?;
+        file.persist_noclobber(&config)
+            .map_err(|error| error.error)?;
+    }
+    let common = [
+        "--codex-home",
+        PROFILE,
+        "--workspace",
+        REPO,
+        "--bridge",
+        bridge.to_str().context("bridge path")?,
+    ];
+    if !bundle::managed_registration_ready(profile)
+        && !Command::new("bash")
+            .arg(helper)
+            .arg("install")
+            .args(common)
+            .output()?
+            .status
+            .success()
+    {
+        bail!("private hook provisioning failed; inspect the account locally");
+    }
+    // Prove the result rather than trusting the provisioner's exit status: the
+    // session is about to bind these files read-only, and a registration that
+    // does not name the image-owned bridge would then be frozen in place.
+    if !bundle::managed_registration_ready(profile) {
+        bail!("provisioned registration does not name the image-owned guard bridge");
+    }
+    Ok(())
 }
 
 fn setup() -> Result<()> {
@@ -83,6 +160,16 @@ fn setup() -> Result<()> {
         }
     }
     control::audit()?;
+    // A session whose profile controls are mount-protected was provisioned by
+    // the host before this container existed, and cannot be provisioned from
+    // here at all: writing the registration is `EROFS` by construction. That is
+    // not a degraded path — whether the frozen registration is the RIGHT one is
+    // decided by `bundle::observe`, which the host consults immediately after
+    // this and refuses admission on. Attempting a doomed write here would turn
+    // a correctly protected session into a setup failure.
+    if bundle::ProfileImmutability::observe(Path::new(PROFILE)).proven() {
+        return Ok(());
+    }
     // Only a repository that ships Loom's installed surface has a managed hook
     // to establish. The provisioner that is RUN, though, is the image-owned
     // copy whenever the session image carries a control bundle: it both writes

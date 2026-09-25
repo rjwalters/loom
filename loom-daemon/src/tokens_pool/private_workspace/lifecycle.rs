@@ -91,7 +91,17 @@ pub fn start(
     }
     save(&dir.join("workspace.json"), &config)?;
     match state {
-        None => docker::create(&config, image.unwrap_or(DEFAULT_SESSION_IMAGE))?,
+        None => {
+            let image = image.unwrap_or(DEFAULT_SESSION_IMAGE);
+            // The account profile's hook registration, Codex trust state and
+            // readiness receipt are established HERE, in a throwaway container
+            // carrying nothing but the profile — because the session created on
+            // the next line binds all three read-only, and a session cannot
+            // provision what it is forbidden to write (issue #8839). An
+            // already-provisioned profile is left byte-for-byte alone.
+            docker::provision_controls(&config, image)?;
+            docker::create(&config, image)?;
+        }
         Some(state) if state["State"]["Running"] != true => {
             docker::command(&["start", &config.container])?;
         }

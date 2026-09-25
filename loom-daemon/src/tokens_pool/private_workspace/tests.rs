@@ -205,12 +205,54 @@ fn config() -> Config {
 #[test]
 fn actual_mounts_privilege_and_volume_driver_options_are_enforced() {
     let config = config();
-    let good = serde_json::json!({
+    let mut good = serde_json::json!({
         "Config": {"Labels": {"loom.workspace-mode": MODE, "loom.account": config.account, "loom.repository": config.repository, "loom.workspace": REPO}, "User":"1000:1000", "Entrypoint":["/usr/bin/tini"], "Cmd":["--","/bin/sleep","infinity"]},
         "HostConfig": {"Privileged":false,"ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"]},
         "Mounts":[{"Destination":ROOT,"Type":"volume","Name":config.volume,"RW":true}, {"Destination":PROFILE,"Type":"bind","Source":config.profile,"RW":true}]
     });
+    // Every profile control file is bound read-only over its own canonical
+    // path (issue #8839): that mount point is what makes the hook registration
+    // and Codex's trust state unwritable, unremovable and unrenameable from
+    // inside the session, while `auth.json` beside them stays writable.
+    for name in bundle::PROFILE_CONTROLS {
+        good["Mounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "Destination": bundle::control_destination(name),
+                "Type": "bind",
+                "Source": config.profile.join(name),
+                "RW": false,
+            }));
+    }
+    let good = good;
     docker::validate_settings(&config, &good).unwrap();
+    // Dropping ANY one of them, or re-admitting it read-write, is refused:
+    // either shape hands the registration back to the worker.
+    for index in 2..2 + bundle::PROFILE_CONTROLS.len() {
+        let mut missing = good.clone();
+        missing["Mounts"].as_array_mut().unwrap().remove(index);
+        assert!(
+            docker::validate_settings(&config, &missing).is_err(),
+            "a session missing control mount {index} was accepted"
+        );
+        let mut writable = good.clone();
+        writable["Mounts"][index]["RW"] = true.into();
+        assert!(
+            docker::validate_settings(&config, &writable).is_err(),
+            "a writable control mount {index} was accepted"
+        );
+        // A bind that lands on the right path from the WRONG source is refused
+        // too, so a decoy file cannot stand in for the canonical one.
+        let mut decoy = good.clone();
+        decoy["Mounts"][index]["Source"] = "/tmp/decoy".into();
+        assert!(docker::validate_settings(&config, &decoy).is_err());
+    }
+    // A session created before this protection (the profile directory bound
+    // read-write and nothing else) is refused rather than silently reused.
+    let mut legacy = good.clone();
+    legacy["Mounts"].as_array_mut().unwrap().truncate(2);
+    assert!(docker::validate_settings(&config, &legacy).is_err());
     let mut bad = good.clone();
     bad["HostConfig"]["Privileged"] = true.into();
     assert!(docker::validate_settings(&config, &bad).is_err());

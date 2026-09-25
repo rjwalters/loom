@@ -161,6 +161,15 @@ RUN npm install -g "@openai/codex@${CODEX_VERSION}" \
 # inside a private session is a worker-writable path — "switch to another
 # guard" is exactly one of the routes this boundary has to close. The seal step
 # refuses to build if those two digests ever diverge.
+#
+# THIS IMAGE IS ONLY HALF THE BOUNDARY. Control v2 additionally requires the
+# account profile's hook registration ($CODEX_HOME/hooks.json), Codex's own
+# trust state (config.toml) and Loom's readiness receipt to be bound READ-ONLY
+# over their own paths — mount topology only the HOST can establish, at
+# `docker run` time. A plain `docker run` of this image therefore reports
+# `profile-mutable`, not `ready`, and that is correct: an image that claimed
+# `ready` without those binds would be claiming a protection it does not have.
+# docker/session/test-image.sh asserts both shapes.
 USER root
 COPY defaults/hooks/guard-codex-bridge.sh \
      defaults/hooks/guard-destructive-generic.sh \

@@ -8,6 +8,9 @@ pub enum WorkerCommand {
     Protocol,
     /// Materialize private helper and hook paths.
     Setup,
+    /// Materialize the account profile's control files before the session
+    /// container binds them read-only. Host-driven, in a throwaway container.
+    ProvisionControls,
     /// Report the versioned control boundary (guard code, forced policy, hook
     /// registration, readiness receipt) for host verification and binding.
     Control,
@@ -67,6 +70,9 @@ impl WorkerCommand {
         match self {
             Self::Protocol => println!("{PROTOCOL}"),
             Self::Setup => println!("{}", serde_json::to_string(&worker_setup::report())?),
+            Self::ProvisionControls => {
+                println!("{}", serde_json::to_string(&worker_setup::provision_controls())?)
+            }
             Self::Control => println!(
                 "{}",
                 serde_json::to_string(&bundle::observe(
