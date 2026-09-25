@@ -14,6 +14,7 @@ fn run(name: &str, status: &str, conclusion: Option<&str>, started: Option<&str>
         status: status.to_string(),
         conclusion: conclusion.map(String::from),
         started_at: started.map(|s| s.parse::<DateTime<Utc>>().expect("test timestamp parses")),
+        actions_run_id: None,
     }
 }
 

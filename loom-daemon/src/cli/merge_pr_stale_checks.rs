@@ -175,6 +175,7 @@ impl StaleChecksArgs {
                         .and_then(|s| s.as_str())
                         .map(String::from),
                     started_at,
+                    actions_run_id: None,
                 }
             })
             .collect();

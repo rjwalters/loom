@@ -229,13 +229,15 @@ pub(crate) enum MergePrCommand {
     /// head move (re-queue), 2 = attribution undeterminable (also re-queue).
     HeadSyncRetry(super::merge_pr_head_sync::HeadSyncRetryArgs),
 
-    /// The automated remedy for a merge the #8248 freshness guard blocked
-    /// (#8508): push a tree-identical no-op commit so CI re-runs and re-dates
-    /// every check, since the merge token lacks `actions:write` to re-run the
-    /// stale one directly. Exit 0 = pushed, 3 = branch already moved (not a
-    /// failure, re-evaluate fresh), 4 = remedy already spent on this head, so
-    /// the PR was escalated to a durable `loom:operator` hold, 1 = could not
-    /// read/write forge state.
+    /// The automated remedy for a merge the #8248 freshness guard blocked:
+    /// first re-run the workflow runs holding the stale required checks IN
+    /// PLACE (#8914, needs Actions: write; no commit, verdict kept), else push
+    /// a tree-identical no-op commit so CI re-dates every check (#8508).
+    /// Exit 5 = re-ran in place and fresh (only with --allow-proceed), 0 =
+    /// re-running in place / fresh without opt-in / pushed (re-queue), 3 =
+    /// head already moved (not a failure, re-evaluate fresh), 4 = push remedy
+    /// already spent on this head, so the PR was escalated to a durable
+    /// `loom:operator` hold, 1 = could not produce fresh evidence.
     RedateChecks(super::merge_pr_redate::RedateChecksArgs),
 }
 

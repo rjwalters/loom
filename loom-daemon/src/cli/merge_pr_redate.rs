@@ -1,8 +1,11 @@
-//! `loom-daemon merge-pr redate-checks` (#8508).
+//! `loom-daemon merge-pr redate-checks` (#8508, #8914).
 //!
-//! The automated remedy for the #8248 required-check-freshness guard: when
-//! that guard blocks a merge and the fleet has no `actions:write` to re-run
-//! the stale check directly, push a tree-identical no-op commit instead — any
+//! The automated remedy for the #8248 required-check-freshness guard. FIRST
+//! (#8914) it re-runs the workflow runs holding the stale required checks IN
+//! PLACE (`merge_pr::rerun`) — no commit, so the head SHA and the Judge
+//! verdict survive. Only when the forge refuses that (no Actions: write on the
+//! merge identity), or a stale check is not an Actions job, does it fall back
+//! to #8508: push a tree-identical no-op commit instead — any
 //! push re-triggers every `pull_request` CI run on the new head, which is
 //! exactly `stale_checks::stale_message`'s own documented remedy. When the
 //! remedy has already run against this exact head and the guard STILL blocks,
@@ -11,6 +14,9 @@
 //!
 //! | outcome | stdout | exit |
 //! |---|---|---|
+//! | re-ran in place, now fresh, caller opted in (`LOOM_REDATE_ALLOW_PROCEED=1`) | `LOOM-RERUN-FRESH …` | 5 |
+//! | re-ran in place, now fresh, no opt-in | `LOOM-RERUN-FRESH …` | 0 |
+//! | re-ran in place, still running when the wait budget ran out | `LOOM-RERUN-PENDING …` | 0 |
 //! | pushed the re-date commit | `LOOM-REDATE-PUSHED sha=<new-sha>` | 0 |
 //! | could not read/write the forge state needed | the reason | 1 |
 //! | branch already moved past `--expected-head-sha` | the reason | 3 |
@@ -22,6 +28,14 @@
 //! simply re-evaluate the PR fresh on the next pass rather than report an
 //! error or retry this push.
 //!
+//! Exit 0 always means "do not merge this pass, re-queue" — that is how every
+//! pre-#8914 `merge-pr.sh` reads it, so a newer binary under an older script
+//! stays correct. Exit 5 is the ONLY "the guard's evidence is now fresh,
+//! proceed" answer, and only a caller that sets `LOOM_REDATE_ALLOW_PROCEED=1`
+//! gets it — an env var rather than a flag so an OLDER binary under a newer
+//! script ignores it and still pushes, instead of rejecting an unknown flag
+//! and losing the remedy.
+//!
 //! Exits 1, 3 and 4 all leave the caller's original #8248 refusal standing:
 //! this subcommand never decides whether a merge may proceed, only whether
 //! fresh evidence could be produced for it. The guard is unweakened in every
@@ -29,6 +43,8 @@
 
 use anyhow::Result;
 use loom_daemon::merge_pr::redate::{remedy, RemedyOutcome, HOLD_LABEL};
+use loom_daemon::merge_pr::rerun::{rerun_in_place, RerunOutcome};
+use std::time::Duration;
 
 #[derive(clap::Args)]
 pub(crate) struct RedateChecksArgs {
@@ -51,10 +67,84 @@ pub(crate) struct RedateChecksArgs {
     /// 3 above).
     #[arg(long, value_name = "SHA")]
     expected_head_sha: String,
+
+    /// How long the in-place re-run (#8914) may wait for the re-run required
+    /// checks to come back fresh before reporting them pending (exit 0,
+    /// re-queue). 0 = trigger the re-run and return.
+    #[arg(
+        long,
+        value_name = "SECS",
+        env = "LOOM_REDATE_RERUN_WAIT_SECS",
+        default_value_t = 300
+    )]
+    rerun_wait_secs: u64,
+
+    /// Answer exit 5 (proceed with the merge) when the in-place re-run leaves
+    /// every required check fresh. Without it that case exits 0 (re-queue).
+    #[arg(long, env = "LOOM_REDATE_ALLOW_PROCEED")]
+    allow_proceed: bool,
 }
 
 impl RedateChecksArgs {
     pub(crate) fn run(self) -> Result<()> {
+        match rerun_in_place(
+            &self.repo,
+            &self.pr,
+            &self.expected_head_sha,
+            Duration::from_secs(self.rerun_wait_secs),
+            Duration::from_secs(10),
+        ) {
+            RerunOutcome::Fresh { reran } => {
+                println!(
+                    "LOOM-RERUN-FRESH pr={} head={} runs={}\nPR #{}'s stale required checks were \
+re-run in place (#8914) and are now fresh against the current base tip. No commit was pushed: \
+the head and the Judge verdict are unchanged.",
+                    self.pr,
+                    self.expected_head_sha,
+                    join_ids(&reran),
+                    self.pr
+                );
+                std::process::exit(if self.allow_proceed { 5 } else { 0 });
+            }
+            RerunOutcome::Pending { reran, waiting_on } => {
+                println!(
+                    "LOOM-RERUN-PENDING pr={} head={} runs={}\nPR #{}'s stale required checks \
+are being re-run in place (#8914), still waiting on: {}. No commit was pushed: the head and the \
+Judge verdict are unchanged; re-attempt the merge on a later pass.",
+                    self.pr,
+                    self.expected_head_sha,
+                    join_ids(&reran),
+                    self.pr,
+                    waiting_on.join(", ")
+                );
+                std::process::exit(0);
+            }
+            RerunOutcome::HeadMoved { current } => {
+                println!(
+                    "PR #{}'s head already moved to {current} — expected {} (the caller's \
+stale-evidence gate is no longer current). Not re-running; re-evaluate the PR fresh next pass.",
+                    self.pr, self.expected_head_sha
+                );
+                std::process::exit(3);
+            }
+            RerunOutcome::Failed(why) => {
+                println!(
+                    "Could not re-run PR #{}'s stale required checks in place (#8914): {why}",
+                    self.pr
+                );
+                std::process::exit(1);
+            }
+            RerunOutcome::Refused(why) | RerunOutcome::NotApplicable(why) => {
+                // The one path that falls through to the #8508 push. Say why
+                // on stderr (merge-pr.sh captures 2>&1) so an install missing
+                // Actions: write sees what it would take to keep verdicts.
+                eprintln!(
+                    "In-place re-run unavailable ({why}); falling back to the #8508 \
+tree-identical re-date push. Granting the merge identity Actions: write lets the checks be \
+re-run in place instead, keeping the head and the Judge verdict (#8914)."
+                );
+            }
+        }
         match remedy(&self.repo, &self.branch, &self.expected_head_sha, &self.pr) {
             RemedyOutcome::Pushed { new_sha } => {
                 println!("LOOM-REDATE-PUSHED sha={new_sha}");
@@ -100,4 +190,11 @@ PR fresh next pass.",
             }
         }
     }
+}
+
+fn join_ids(ids: &[u64]) -> String {
+    if ids.is_empty() {
+        return "none".to_string();
+    }
+    ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
 }
