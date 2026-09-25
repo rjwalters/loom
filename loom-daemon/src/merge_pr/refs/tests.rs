@@ -201,3 +201,127 @@ fn a_reference_number_too_large_for_u64_is_dropped_not_panicked() {
     let body = "Closes #99999999999999999999999999\n";
     assert_eq!(closing_refs(body), Vec::<u64>::new());
 }
+
+// --- backticked partial-increment trailer warning (#5690, ported #8831) ---
+//
+// Every case below is a byte-identical port of the shell suite's BT1-BT8
+// (`defaults/scripts/tests/test-merge-pr-partial-increment.sh` prior to
+// #8831) — those expectations ARE the reviewed downstream test cases
+// (rjwalters/kicad-tools#5692), ported faithfully rather than "improved".
+
+#[test]
+fn bt1_the_5690_incident_shape_is_detected_and_still_not_a_declaration() {
+    // The exact incident: PR #5686's body wrote the trailer as `Part of
+    // #5240` (whole line, wrapped in an inline code span) instead of the
+    // plain Part of #5240. The parser's answer must NOT change; the new
+    // detector is what makes the silence visible.
+    let body = "## Summary\n\nImplements the first slice.\n\n`Part of #5240`";
+    assert_eq!(
+        partial_increment_refs(body),
+        Vec::<u64>::new(),
+        "#5690 incident: backticked '`Part of #5240`' is still NOT a declaration (#5234 unchanged)"
+    );
+    assert_eq!(
+        backticked_partial_increment_trailer_refs(body),
+        vec![5240],
+        "#5690 incident: the backticked-trailer detector DOES see #5240"
+    );
+
+    let warnings = backticked_partial_increment_warnings(body, "5686", false);
+    assert!(
+        warnings.contains("Backticked partial-increment trailer (#5690)"),
+        "warning names the finding: {warnings:?}"
+    );
+    assert!(
+        warnings.contains("\"`Part of #5240`\""),
+        "warning quotes the offending line verbatim: {warnings:?}"
+    );
+    assert!(warnings.contains("#5240"), "warning names the affected issue: {warnings:?}");
+}
+
+#[test]
+fn bt2_a_plain_text_trailer_does_not_warn() {
+    // The correct shape — the one the convention asks for and the one the
+    // reset already handles — must not warn.
+    let body = "## Summary\n\nImplements the first slice.\n\nPart of #123";
+    assert_eq!(
+        backticked_partial_increment_trailer_refs(body),
+        Vec::<u64>::new(),
+        "plain-text 'Part of #123' trailer: detector finds nothing to warn about"
+    );
+    assert_eq!(backticked_partial_increment_warnings(body, "1", false), "");
+}
+
+#[test]
+fn bt3_a_mid_sentence_backticked_mention_does_not_warn() {
+    // Prose describing a hypothetical must stay silent — warning on it would
+    // train operators to ignore this warning entirely.
+    let body = "Closes #4600\n\nIf you would rather I attribute this differently, say so\nand I will switch the reference to `Part of #4574` instead.\n";
+    assert_eq!(
+        backticked_partial_increment_trailer_refs(body),
+        Vec::<u64>::new(),
+        "mid-sentence backticked 'Part of #4574' does NOT warn (not a whole-line trailer)"
+    );
+}
+
+#[test]
+fn bt4_a_line_listing_backticked_trailers_as_examples_does_not_warn() {
+    let body = "Use `Part of #123` / `Contributes to #456` for a partial increment.";
+    assert_eq!(
+        backticked_partial_increment_trailer_refs(body),
+        Vec::<u64>::new(),
+        "docs prose listing backticked trailers as examples does NOT warn"
+    );
+}
+
+#[test]
+fn bt5_a_backticked_trailer_inside_a_fenced_block_does_not_warn() {
+    let body = "Write the trailer plainly:\n\n```markdown\n`Part of #123`\n```\n\nPart of #456";
+    assert_eq!(
+        backticked_partial_increment_trailer_refs(body),
+        Vec::<u64>::new(),
+        "a backticked trailer inside a fence does NOT warn"
+    );
+}
+
+#[test]
+fn bt6_an_issue_named_by_both_shapes_is_not_warned_about() {
+    // The reset fires for it regardless via the real (plain-text) trailer.
+    let body = "Part of #123\n\n`Part of #123`";
+    assert_eq!(
+        partial_increment_refs(body),
+        vec![123],
+        "the plain-text trailer still declares #123"
+    );
+    assert_eq!(
+        backticked_partial_increment_warnings(body, "1", false),
+        "",
+        "no warning — #123 is already a parsed declaration"
+    );
+}
+
+#[test]
+fn bt7_marker_prefixed_and_numbered_list_forms() {
+    // The numbered case also proves the marker ordinal cannot leak in as an
+    // issue number (the PA6 trap), independently of `partial_increment_refs`.
+    assert_eq!(
+        backticked_partial_increment_trailer_refs("- `Contributes to #42`"),
+        vec![42],
+        "list marker: '- `Contributes to #42`' warns on #42"
+    );
+    assert_eq!(
+        backticked_partial_increment_trailer_refs("3. `Part of #789`"),
+        vec![789],
+        "numbered marker: '3. `Part of #789`' yields ONLY 789 (ordinal does not leak)"
+    );
+}
+
+#[test]
+fn bt8_dry_run_prefixes_every_warning_line() {
+    let body = "## Summary\n\nImplements the first slice.\n\n`Part of #5240`";
+    let warnings = backticked_partial_increment_warnings(body, "5686", true);
+    assert!(
+        warnings.starts_with("[dry-run] Backticked partial-increment trailer (#5690)"),
+        "dry run: warning carries the [dry-run] prefix: {warnings:?}"
+    );
+}

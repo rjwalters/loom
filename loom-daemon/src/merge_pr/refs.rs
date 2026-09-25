@@ -217,5 +217,114 @@ pub fn partial_increment_ref_snippets(text: &str, issue: u64) -> String {
     )
 }
 
+// --- Backticked partial-increment trailer detection (#5690, ported #8831) --
+//
+// #5234's inline-code-span exclusion above is CORRECT and unchanged: a
+// backticked `Part of #N` is a hypothetical mention, not a declared intent.
+// The gap it leaves is that a Builder can write the convention's exact
+// trailer text inside a code span — it reads as "a literal piece of syntax,
+// so put it in backticks" — and the PR then looks completely right to a
+// human reviewer and to Judge while silently defeating the automation:
+// [`partial_increment_refs`] returns nothing, so the #3667 `loom:building` ->
+// `loom:issue` reset no-ops with no log line anywhere and the issue is
+// stranded at `loom:building` indefinitely. That is exactly what happened
+// merging PR #5686 into #5240.
+//
+// The remedy is DETECTION, not a parser change: [`backticked_partial_increment_warnings`]
+// below is a non-blocking pre-merge warning (same advisory style as the
+// #4569/#4595 conflict warnings), so the person running the merge sees "this
+// body looks like it is trying to declare a partial increment, but the
+// declaration will not parse".
+//
+// The shape matched is deliberately MUCH narrower than the declaration anchor
+// in `partial_increment_refs`: the backticked trailer must be the ENTIRE line
+// (modulo an optional list/blockquote marker, surrounding whitespace and one
+// trailing punctuation mark). That is the shape a Builder produces when they
+// MEANT to declare, and it excludes the two prose shapes that must stay
+// silent — a mid-sentence mention ("...I will switch the reference to `Part
+// of #4574`.") and a line that merely lists backticked trailers as examples
+// ("`Part of #123` / `Contributes to #456` — non-closing trailers"). Fenced
+// code blocks are stripped first, so a documentation example never warns —
+// but inline code spans are NOT blanked, since they are the whole shape being
+// matched (unlike `partial_increment_refs`, which blanks them to look past
+// them).
+
+/// Head of the whole-line backticked-trailer shape: optional list/blockquote
+/// marker(s), a code span opening, the keyword, then `#`. Split from the tail
+/// so the ref extractor and the snippet extractor share one expression —
+/// there is no way for "what warned" and "what is quoted" to drift apart.
+const BACKTICKED_PARTIAL_HEAD: &str = r"^[[:blank:]\x0B\x0C\r]*(?:[-*+][[:blank:]\x0B\x0C\r]+|[0-9]+\.[[:blank:]\x0B\x0C\r]+|>[[:blank:]\x0B\x0C\r]*)*`+[[:blank:]\x0B\x0C\r]*(?:part of|contributes to)[[:blank:]\x0B\x0C\r]+#";
+/// Tail of the shape: the closing code span, an optional single trailing
+/// punctuation mark, then end of line.
+const BACKTICKED_PARTIAL_TAIL: &str =
+    r"[[:blank:]\x0B\x0C\r]*`+[[:blank:]\x0B\x0C\r]*[.,;:]?[[:blank:]\x0B\x0C\r]*$";
+
+/// Issue numbers that appear ONLY as a whole-line, code-span-wrapped
+/// `Part of #N` / `Contributes to #N` trailer, deduped and ascending. Like
+/// [`partial_increment_refs`], `#N` is captured directly rather than scanned
+/// for out of the whole match, so a numbered-list marker's own ordinal
+/// (`` 3. `Part of #789` ``) cannot leak in as an issue number.
+#[must_use]
+pub fn backticked_partial_increment_trailer_refs(text: &str) -> Vec<u64> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(&format!("(?im){BACKTICKED_PARTIAL_HEAD}([0-9]+){BACKTICKED_PARTIAL_TAIL}"))
+            .expect("static backticked-partial-trailer pattern")
+    });
+    let cleaned = strip_fenced_code_blocks(text);
+    let mut set: BTreeSet<u64> = BTreeSet::new();
+    for caps in re.captures_iter(&cleaned) {
+        if let Some(n) = caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok()) {
+            set.insert(n);
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// The literal offending line(s) in `text` carrying a backticked trailer for
+/// `issue`, trimmed and joined `", "` in the order they appear.
+///
+/// Deliberately NOT sorted/deduped like [`render_snippets`] — the shell this
+/// ports emitted them via a plain `awk` concatenation in encounter order, and
+/// this matches that exactly rather than "improving" it.
+#[must_use]
+pub fn backticked_partial_increment_trailer_snippets(text: &str, issue: u64) -> String {
+    let re = Regex::new(&format!("(?im){BACKTICKED_PARTIAL_HEAD}{issue}{BACKTICKED_PARTIAL_TAIL}"))
+        .expect("backticked-partial-trailer-snippet pattern");
+    let cleaned = strip_fenced_code_blocks(text);
+    re.find_iter(&cleaned)
+        .map(|m| m.as_str().trim().to_string())
+        .collect::<Vec<_>>()
+        .join("\", \"")
+}
+
+/// The non-blocking pre-merge warning text for #5690: one finding (two lines)
+/// per issue a backticked trailer names that [`partial_increment_refs`] does
+/// NOT — an issue named by BOTH shapes is not warned about, since the #3667
+/// reset fires for it regardless. Empty when there is nothing to warn about.
+///
+/// `dry_run` prefixes each line `[dry-run] `, matching the #4569/#4595
+/// conflict warnings' contract: report the would-be outcome without claiming
+/// a merge is happening.
+#[must_use]
+pub fn backticked_partial_increment_warnings(text: &str, pr_number: &str, dry_run: bool) -> String {
+    let declared: BTreeSet<u64> = partial_increment_refs(text).into_iter().collect();
+    let dr = if dry_run { "[dry-run] " } else { "" };
+    let mut out = String::new();
+    for issue in backticked_partial_increment_trailer_refs(text) {
+        if declared.contains(&issue) {
+            continue;
+        }
+        let snippet = backticked_partial_increment_trailer_snippets(text, issue);
+        out.push_str(&format!(
+            "{dr}Backticked partial-increment trailer (#5690): PR #{pr_number}'s body carries a whole-line `Part of`/`Contributes to` reference to #{issue} wrapped in a code span (\"{snippet}\"), which is NOT read as a declaration — inline code spans are deliberately excluded (#5234) so a hypothetical mention cannot be mistaken for declared intent.\n"
+        ));
+        out.push_str(&format!(
+            "  {dr}Consequence: the automatic `loom:building` -> `loom:issue` reset (#3667) will NOT run for #{issue} on merge, and nothing else logs that it was skipped — #{issue} would sit at `loom:building` until a stale-claim pass reclaims it. If #{issue} really is a partial increment, edit the PR body so the trailer is PLAIN TEXT on its own line (no backticks), then re-run this merge. If the mention was hypothetical, ignore this — nothing is blocked.\n"
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests;
