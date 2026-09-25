@@ -481,6 +481,7 @@ cleanup_partial_worktree_state() {
 # `set -e`: a failed `source` under `set -e` aborts with 1, which is the
 # REFUSAL code, so a partially-resynced `.loom/` would present as "I considered
 # your worktree and declined" rather than "this install is broken".
+# requires-daemon: worktree-remove >= 0.19.340  #8471 (#8195 slice 3) — the removal-verb port; without it the stub exits 2 and the verb refuses
 _worktree_remove_verb() {
     local helper
     helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/script-helper.sh"
