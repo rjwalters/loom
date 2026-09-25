@@ -72,6 +72,7 @@ only on a **breaking** wire change to the record shapes below. A backend should:
 | `6` | Adds `session.analysis` (#8760, G3 part 2 of #8714); only session-analysis envelopes use `6`. | Existing lifecycle/trace/identity/session-summary versions and shapes remain unchanged. |
 | `7` | Adds `daemon.event` (#8760, G4 of #8714); only daemon-event envelopes use `7`. | Existing lifecycle/trace/identity/session-summary/session-analysis versions and shapes remain unchanged. |
 | `8` | Adds the CI family `ci.run`, `ci.job`, `ci.duration` (#8824); only those three kinds use `8`. CI spans reuse `trace.span` at `3`. | Every earlier kind's version and shape is unchanged. |
+| `9` | Adds `metric.points` (#8860); only those envelopes use `9`. OTLP-only — the native HTTPS exporter never sends it. The `loom.dispatch.tick` span reuses `trace.span` at `3`. | Every earlier kind's version and shape is unchanged. |
 
 ## `/ingest` response (the bound-`host_id` echo)
 
@@ -816,6 +817,7 @@ inventing a record kind per signal. Envelopes carry `schema_version: 9`.
 | Field | Type | Notes |
 |---|---|---|
 | `captured_at` | RFC 3339 | sample instant (the OTLP data-point time) |
+| `interval_start` | RFC 3339, optional | start of the interval the batch's delta counters cover (OTLP `start_time_unix_nano`; the tick start for `loom.dispatch.decisions`); defaults to `captured_at` |
 | `points[].name` | string | closed vocabulary, `telemetry::ops::MetricName` |
 | `points[].value` | int or float | non-finite floats are dropped at export |
 | `points[].labels` | object | optional; keys limited to `reason`, `provider`, `account`, `model`, `state`; values ≤128 bytes, no control chars, ≤8 per point |
@@ -827,7 +829,7 @@ Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
 `pr_open_backoff`, `noop_cooldown`, `declined`, `prless_retry`,
 `recheck_interval`, `host_constraint`, `capacity`, `ramp_cap`, `saturation`,
 `out_of_slice`, `error`. These are the same buckets as the `work_finder: tick`
-log line and `loom-daemon health`'s last-tick summary. Every other name is a
+log line (`loom-daemon health`'s last-tick summary omits `prless_retry`). Every other name is a
 **`Gauge`**:
 
 | Metric | Unit | Cadence |

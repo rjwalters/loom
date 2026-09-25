@@ -26,6 +26,10 @@ pub(super) fn points_for(
         return None;
     };
     let time_unix_nano = nanos(record.captured_at);
+    // Delta sums need their interval start (OTLP data model); gauges leave it
+    // unset. Clamped so a skewed start never lands after the point time.
+    let delta_start =
+        nanos(record.interval_start.unwrap_or(record.captured_at)).min(time_unix_nano);
     Some(
         record
             .bounded_points()
@@ -42,6 +46,10 @@ pub(super) fn points_for(
                         .map(|(key, value)| kv_string(key, value.clone()))
                         .collect(),
                     time_unix_nano,
+                    start_time_unix_nano: match point.name.kind() {
+                        MetricKind::DeltaCounter => delta_start,
+                        MetricKind::Gauge => 0,
+                    },
                     value: Some(value),
                     ..Default::default()
                 };

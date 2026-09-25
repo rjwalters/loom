@@ -1091,11 +1091,8 @@ pub fn spawn_task(
     // ops spans through `ops::emit_*`. Registered over the OTLP queues only —
     // both kinds are OTLP-only, so an HTTPS queue would just carry and drop
     // them. No OTLP exporter ⇒ nothing registered ⇒ every emit is a no-op.
-    if !otlp_queues.is_empty() {
-        ops::register_global_ops_sink(ops::OpsSink::new(
-            Arc::new(queue::FanoutQueue::new(otlp_queues)),
-            host_id.clone(),
-        ));
+    if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
+        ops::register_global_ops_sink(sink);
     }
     // `daemon.event` collection (Issue #8760, G4): a second, independent bus
     // subscription alongside `collector::spawn_task` below — see

@@ -190,6 +190,11 @@ impl MetricPoint {
 pub struct MetricPointsRecord {
     /// When the points were sampled.
     pub captured_at: DateTime<Utc>,
+    /// Start of the interval the delta counters in this batch cover (the OTLP
+    /// `start_time_unix_nano`). `None` falls back to `captured_at`; gauges
+    /// ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_start: Option<DateTime<Utc>>,
     pub points: Vec<MetricPoint>,
 }
 

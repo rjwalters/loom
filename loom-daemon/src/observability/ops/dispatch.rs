@@ -135,5 +135,5 @@ pub fn record_tick(report: &TickReport, max_concurrent: usize, started_at: DateT
         return;
     };
     sink.emit_span(tick_span(report, max_concurrent, started_at, Utc::now()));
-    sink.emit_metrics(tick_points(report, max_concurrent));
+    sink.emit_metrics_since(tick_points(report, max_concurrent), Some(started_at));
 }

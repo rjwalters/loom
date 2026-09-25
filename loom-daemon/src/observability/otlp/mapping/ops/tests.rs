@@ -12,6 +12,7 @@ fn points_envelope(host_id: &str, points: Vec<MetricPoint>) -> TelemetryEnvelope
         host_id,
         TelemetryRecord::MetricPoints(MetricPointsRecord {
             captured_at: Utc.timestamp_opt(1_790_000_000, 0).unwrap(),
+            interval_start: Some(Utc.timestamp_opt(1_789_999_990, 0).unwrap()),
             points,
         }),
     )
@@ -40,6 +41,7 @@ fn gauges_and_delta_counters_map_to_their_fixed_otlp_kinds() {
     assert!(sum.is_monotonic);
     assert_eq!(sum.aggregation_temporality, AggregationTemporality::Delta as i32);
     assert_eq!(sum.data_points.len(), 2);
+    assert_eq!(sum.data_points[0].start_time_unix_nano, 1_789_999_990 * 1_000_000_000);
     assert_eq!(sum.data_points[0].attributes[0].key, "reason");
     let memory = metrics
         .iter()
@@ -50,6 +52,7 @@ fn gauges_and_delta_counters_map_to_their_fixed_otlp_kinds() {
         panic!("memory must be a Gauge");
     };
     assert_eq!(gauge.data_points[0].value, Some(number_data_point::Value::AsInt(4096)));
+    assert_eq!(gauge.data_points[0].start_time_unix_nano, 0, "gauges carry no interval");
 }
 
 #[test]

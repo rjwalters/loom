@@ -77,15 +77,30 @@ fn emit_span_carries_its_context_and_skips_unsampled_spans() {
 }
 
 #[test]
-fn free_functions_are_no_ops_without_a_registered_sink() {
-    // Nothing in this test binary registers the global ops sink (spawn_task
-    // tests never configure a running OTLP exporter), so both calls must
-    // return without panicking or enqueueing anywhere.
-    if super::global_ops_sink().is_none() {
-        super::emit_metrics(vec![MetricPoint::int(MetricName::DispatchCandidates, 1)]);
-        super::emit_span(tick_span(&TickReport::default(), 1, at(0), at(0)));
-        super::dispatch::record_tick(&TickReport::default(), 1, at(0));
-    }
+fn no_otlp_queue_means_no_sink_is_registered() {
+    // spawn_task registers the ops sink only from this decision, so an
+    // HTTPS-only or disabled daemon has no sink and every emit is a no-op.
+    assert!(super::sink_for_otlp_queues(Vec::new(), "host-a").is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let queue =
+        Arc::new(crate::observability::queue::DurableQueue::open(dir.path().join("q.jsonl"), 16));
+    let sink = super::sink_for_otlp_queues(vec![queue.clone()], "host-a").unwrap();
+    sink.emit_metrics(vec![MetricPoint::int(MetricName::DispatchCandidates, 1)]);
+    assert_eq!(queue.len(), 1);
+}
+
+#[test]
+fn emit_metrics_since_records_the_interval_start() {
+    let (queue, sink) = sink();
+    sink.emit_metrics_since(
+        vec![MetricPoint::int(MetricName::DispatchCandidates, 1)],
+        Some(at(-5)),
+    );
+    let queued = queue.0.lock().unwrap();
+    let TelemetryRecord::MetricPoints(record) = &queued[0].record else {
+        panic!("expected metric.points");
+    };
+    assert_eq!(record.interval_start, Some(at(-5)));
 }
 
 // ---------------------------------------------------------------- wire
@@ -96,6 +111,7 @@ fn metric_points_round_trip_through_json_with_a_kind_tag() {
         "host-a",
         TelemetryRecord::MetricPoints(MetricPointsRecord {
             captured_at: at(0),
+            interval_start: None,
             points: vec![
                 MetricPoint::int(MetricName::DispatchDecisions, 4).label("reason", "backoff"),
                 MetricPoint {
@@ -133,6 +149,7 @@ fn bounded_labels_keep_only_short_allowlisted_values() {
 fn bounded_points_drop_non_finite_doubles() {
     let record = MetricPointsRecord {
         captured_at: at(0),
+        interval_start: None,
         points: vec![
             MetricPoint {
                 name: MetricName::HostSwapUsedBytes,
@@ -171,6 +188,7 @@ fn native_https_path_drops_metric_points() {
             "host-a",
             TelemetryRecord::MetricPoints(MetricPointsRecord {
                 captured_at: at(0),
+                interval_start: None,
                 points: vec![MetricPoint::int(MetricName::DispatchCandidates, 1)],
             }),
         ),

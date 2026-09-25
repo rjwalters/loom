@@ -54,6 +54,16 @@ impl OpsSink {
 
     /// Enqueue one `metric.points` record. An empty batch enqueues nothing.
     pub fn emit_metrics(&self, points: Vec<MetricPoint>) {
+        self.emit_metrics_since(points, None);
+    }
+
+    /// [`Self::emit_metrics`] with the interval the batch's delta counters
+    /// cover starting at `interval_start`.
+    pub fn emit_metrics_since(
+        &self,
+        points: Vec<MetricPoint>,
+        interval_start: Option<chrono::DateTime<Utc>>,
+    ) {
         if points.is_empty() {
             return;
         }
@@ -61,6 +71,7 @@ impl OpsSink {
             self.host_id.clone(),
             TelemetryRecord::MetricPoints(MetricPointsRecord {
                 captured_at: Utc::now(),
+                interval_start,
                 points,
             }),
         ));
@@ -88,6 +99,20 @@ impl std::fmt::Debug for OpsSink {
 }
 
 static GLOBAL_OPS_SINK: OnceLock<OpsSink> = OnceLock::new();
+
+/// The sink to register for a daemon whose running OTLP exporters' queues are
+/// `otlp_queues`: `None` when there are none, so an HTTPS-only (or disabled)
+/// daemon never registers one and every `emit_*` stays a no-op.
+#[must_use]
+pub fn sink_for_otlp_queues(
+    otlp_queues: Vec<Arc<super::queue::DurableQueue>>,
+    host_id: &str,
+) -> Option<OpsSink> {
+    if otlp_queues.is_empty() {
+        return None;
+    }
+    Some(OpsSink::new(Arc::new(super::queue::FanoutQueue::new(otlp_queues)), host_id))
+}
 
 /// Register the process-global sink. Called once from [`super::spawn_task`]
 /// when at least one OTLP exporter started; later calls are no-ops.
