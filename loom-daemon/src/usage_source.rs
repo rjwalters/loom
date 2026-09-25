@@ -58,12 +58,16 @@ pub const KIMI_RUNTIME: &str = "kimi";
 /// exists and why it cannot perturb any other runtime.
 pub const CODEX_RUNTIME: &str = "codex";
 
+/// The `runtime` value that selects the Pi event-stream reader (Issue #8594,
+/// the Pi half). Pi is a native harness, so this is the value
+/// `worker_spawn::run` writes into its `# LOOM_LAUNCH` record.
+pub const PI_RUNTIME: &str = "pi";
+
 /// The store a given runtime's per-model token usage is read from.
 ///
 /// Deliberately an enum rather than a bare boolean: each runtime with a store
 /// of its own gets a variant, and a new variant here is the one place that has
-/// to change when the next one lands. Pi's store is still unlocated (#8594's Pi half) —
-/// see [`sweep_tokens_by_model`]'s doc for what was checked and came up empty.
+/// to change when the next one lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageSource {
     /// Claude Code's on-disk JSONL transcripts ([`crate::transcript_tokens`]).
@@ -77,6 +81,9 @@ pub enum UsageSource {
     KimiSessionStore,
     /// Codex's own rollout JSONL session store ([`crate::codex_usage`]).
     CodexSessionRollouts,
+    /// Pi's `--mode json` event stream as captured in the launch's own log
+    /// ([`crate::pi_usage`]) — not Pi's session store; see that module's doc.
+    PiLaunchStream,
 }
 
 impl UsageSource {
@@ -93,6 +100,7 @@ impl UsageSource {
             Some(OPENCODE_RUNTIME) => Self::OpenCodeSessionDb,
             Some(KIMI_RUNTIME) => Self::KimiSessionStore,
             Some(CODEX_RUNTIME) => Self::CodexSessionRollouts,
+            Some(PI_RUNTIME) => Self::PiLaunchStream,
             _ => Self::ClaudeTranscripts,
         }
     }
@@ -105,6 +113,7 @@ impl UsageSource {
             Self::OpenCodeSessionDb => "opencode-session-db",
             Self::KimiSessionStore => "kimi-session-store",
             Self::CodexSessionRollouts => "codex-session-rollouts",
+            Self::PiLaunchStream => "pi-launch-stream",
         }
     }
 
@@ -230,16 +239,9 @@ pub fn role_tick_directories(root: &Path) -> Vec<PathBuf> {
 /// the sweep's wall-clock span. `None` — never `Some(vec![])` — when the
 /// selected source found nothing attributable.
 ///
-/// **Pi is deliberately absent.** It is a native harness, so its launch record
-/// already reaches here with `runtime: "pi"`, and it falls through to the
-/// Claude reader that finds nothing for it. Wiring it needs Pi's usage schema
-/// confirmed against a live store the way `codex_usage`'s and
-/// `opencode_usage`'s "Schema provenance" sections document theirs; that has
-/// not been possible on any fleet host to date (no `pi` binary, no `~/.pi`, no
-/// captured `--mode json` usage event anywhere in this tree), and guessing a
-/// schema is worse than reporting nothing. It stays open under #8594 (#8637,
-/// the first carve-out, was closed as that issue's duplicate); the assertion
-/// in this module's own tests that flips when Pi lands is marked below.
+/// Pi reads the sweep's own per-issue log ([`crate::launch_record::sweep_log_path`]),
+/// where its `--mode json` stream is captured; `window` then selects this
+/// dispatch's messages out of every earlier one appended to the same file.
 #[must_use]
 pub fn sweep_tokens_by_model(
     runtime: Option<&str>,
@@ -271,6 +273,10 @@ pub fn sweep_tokens_by_model(
             window,
             None,
         ),
+        UsageSource::PiLaunchStream => crate::pi_usage::tokens_by_model(
+            &crate::launch_record::sweep_log_path(workspace_root, issue),
+            window,
+        ),
         UsageSource::ClaudeTranscripts => {
             let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
             crate::transcript_tokens::sum_sweep_tokens_by_model(
@@ -293,10 +299,16 @@ pub fn sweep_tokens_by_model(
 /// SCAN that also derives forge-mutating `actions`, which the caller keeps.
 /// So this returns `None` for [`UsageSource::ClaudeTranscripts`] and the
 /// caller uses [`UsageSource::is_native_store`] to pick between the two paths.
+///
+/// `log_path` is the tick's own per-role log (`role_runner::role_log_path`):
+/// the one store keyed by where the output was captured rather than by
+/// directory is Pi's ([`crate::pi_usage`]), and a role tick's log is not
+/// derivable from `root` alone.
 #[must_use]
 pub fn role_tick_tokens_by_model(
     runtime: Option<&str>,
     root: &Path,
+    log_path: &Path,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<Vec<ModelUsageTotals>> {
     match UsageSource::for_runtime(runtime) {
@@ -311,6 +323,7 @@ pub fn role_tick_tokens_by_model(
             window,
             None,
         ),
+        UsageSource::PiLaunchStream => crate::pi_usage::tokens_by_model(log_path, window),
         UsageSource::ClaudeTranscripts => None,
     }
 }
@@ -324,9 +337,11 @@ mod tests {
     fn each_mapped_runtime_selects_its_own_store_and_everything_else_stays_on_transcripts() {
         assert_eq!(UsageSource::for_runtime(Some("opencode")), UsageSource::OpenCodeSessionDb);
         assert_eq!(UsageSource::for_runtime(Some("codex")), UsageSource::CodexSessionRollouts);
+        assert_eq!(UsageSource::for_runtime(Some("pi")), UsageSource::PiLaunchStream);
         for (runtime, expected) in [
             (" opencode ", UsageSource::OpenCodeSessionDb),
             (" codex ", UsageSource::CodexSessionRollouts),
+            (" pi ", UsageSource::PiLaunchStream),
         ] {
             assert_eq!(
                 UsageSource::for_runtime(Some(runtime)),
@@ -334,10 +349,8 @@ mod tests {
                 "the launch record's value is trimmed before matching"
             );
         }
-        // `pi` is still unmapped on purpose — its store has never been
-        // confirmable against a live install (see `sweep_tokens_by_model`).
-        // THIS is the assertion #8594's Pi half flips when Pi's schema is confirmed.
-        for other in [None, Some("claude"), Some("pi"), Some("")] {
+        // Matching is exact: `pi-coding-agent` (the npm package) is not a runtime.
+        for other in [None, Some("claude"), Some("pi-coding-agent"), Some("")] {
             assert_eq!(
                 UsageSource::for_runtime(other),
                 UsageSource::ClaudeTranscripts,
@@ -377,11 +390,14 @@ mod tests {
         // `# LOOM_LAUNCH` record, so this marker is the only place its runtime
         // is recorded.
         assert_eq!(usage_runtime_fallback(None, &resolved_log("codex")).as_deref(), Some("codex"));
+        // A Pi launch normally has a record (guard 1); one that lost it — a
+        // pre-#8401 binary — still reaches its own reader through the marker.
+        assert_eq!(usage_runtime_fallback(None, &resolved_log("pi")).as_deref(), Some("pi"));
         // Guard 2: every runtime whose store is the Claude transcripts anyway
         // yields `None`, so the caller's behavior — and its payload — is
         // byte-identical to pre-#8594. `claude` is the one that matters: its
         // marker IS present in every Claude sweep log.
-        for unchanged in ["claude", "pi", "something-new"] {
+        for unchanged in ["claude", "something-new"] {
             assert_eq!(
                 usage_runtime_fallback(None, &resolved_log(unchanged)),
                 None,
@@ -409,6 +425,7 @@ mod tests {
             (UsageSource::OpenCodeSessionDb, "opencode-session-db"),
             (UsageSource::KimiSessionStore, "kimi-session-store"),
             (UsageSource::CodexSessionRollouts, "codex-session-rollouts"),
+            (UsageSource::PiLaunchStream, "pi-launch-stream"),
         ] {
             assert_eq!(source.as_str(), name);
         }
@@ -471,6 +488,7 @@ mod tests {
         assert!(UsageSource::OpenCodeSessionDb.is_native_store());
         assert!(UsageSource::KimiSessionStore.is_native_store());
         assert!(UsageSource::CodexSessionRollouts.is_native_store());
+        assert!(UsageSource::PiLaunchStream.is_native_store());
         assert!(!UsageSource::ClaudeTranscripts.is_native_store());
     }
 
@@ -479,8 +497,11 @@ mod tests {
         // The Claude arm returns None on purpose: a Claude tick's tokens come
         // from a transcript scan that ALSO derives forge-mutating `actions`,
         // which only the caller keeps. See `role_tick_tokens_by_model`'s doc.
-        assert!(role_tick_tokens_by_model(None, Path::new("/w/loom"), None).is_none());
-        assert!(role_tick_tokens_by_model(Some("claude"), Path::new("/w/loom"), None).is_none());
+        let log = Path::new("/w/loom/.loom/logs/role-curator.log");
+        assert!(role_tick_tokens_by_model(None, Path::new("/w/loom"), log, None).is_none());
+        assert!(
+            role_tick_tokens_by_model(Some("claude"), Path::new("/w/loom"), log, None).is_none()
+        );
     }
 
     #[test]
@@ -584,5 +605,70 @@ mod tests {
         assert_eq!(totals[0].cache_read, 400);
         assert_eq!(totals[0].output, 100);
         assert_eq!(ambient_only, None);
+    }
+
+    /// One Pi 0.85.1 assistant `message_end` event (shape: see
+    /// `crate::pi_usage`'s "Schema provenance").
+    fn pi_message_end(model: &str, input: i64, output: i64, at: &str) -> String {
+        let ms = at.parse::<DateTime<Utc>>().unwrap().timestamp_millis();
+        serde_json::json!({"type": "message_end", "message": {
+            "role": "assistant", "api": "openai-completions", "provider": "friendli",
+            "model": model, "stopReason": "stop", "timestamp": ms,
+            "usage": {"input": input, "output": output, "cacheRead": 10, "cacheWrite": 0,
+                "totalTokens": input + output + 10,
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}}})
+        .to_string()
+    }
+
+    /// Issue #8594's Pi half, end to end through the seam: a `pi` sweep reads
+    /// its OWN per-issue log, and only this dispatch's window of it.
+    #[test]
+    fn a_pi_sweep_reads_its_own_logs_stream_within_its_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let log = crate::launch_record::sweep_log_path(root, 8594);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let contents = [
+            "==== dispatch sweep_id=old ====".to_string(),
+            pi_message_end("zai-org/GLM-5.3", 9_000, 900, "2026-09-24T02:00:00Z"),
+            "==== dispatch sweep_id=new ====".to_string(),
+            r#"# LOOM_LAUNCH {"schema":1,"runtime":"pi","provider":"friendli"}"#.to_string(),
+            r#"{"type":"session","version":3,"id":"s-new","timestamp":"2026-09-25T02:00:00.000Z","cwd":"/w"}"#.to_string(),
+            pi_message_end("zai-org/GLM-5.3", 1_000, 100, "2026-09-25T02:01:00Z"),
+            pi_message_end("zai-org/GLM-5.3", 500, 50, "2026-09-25T02:02:00Z"),
+        ]
+        .join("\n");
+        std::fs::write(&log, contents).unwrap();
+        // A sibling issue's log is never read.
+        std::fs::write(
+            crate::launch_record::sweep_log_path(root, 8595),
+            pi_message_end("other", 7, 7, "2026-09-25T02:01:00Z"),
+        )
+        .unwrap();
+        let window = Some((
+            "2026-09-25T02:00:00Z".parse().unwrap(),
+            "2026-09-25T03:00:00Z".parse().unwrap(),
+        ));
+        let totals = sweep_tokens_by_model(Some("pi"), root, 8594, window).unwrap();
+        assert_eq!(totals.len(), 1, "{totals:?}");
+        assert_eq!(totals[0].model, "zai-org/GLM-5.3");
+        assert_eq!((totals[0].input, totals[0].output, totals[0].cache_read), (1_500, 150, 20));
+        // No log for the issue at all: unknown, not zero.
+        assert_eq!(sweep_tokens_by_model(Some("pi"), root, 1, window), None);
+    }
+
+    #[test]
+    fn a_pi_role_tick_reads_its_own_role_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let log = crate::role_runner::role_log_path(&root.join(".loom").join("logs"), "curator");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, pi_message_end("m", 30, 3, "2026-09-25T02:01:00Z")).unwrap();
+        let window = Some((
+            "2026-09-25T02:00:00Z".parse().unwrap(),
+            "2026-09-25T02:05:00Z".parse().unwrap(),
+        ));
+        let totals = role_tick_tokens_by_model(Some("pi"), root, &log, window).unwrap();
+        assert_eq!((totals[0].input, totals[0].output), (30, 3));
     }
 }
