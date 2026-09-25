@@ -163,6 +163,8 @@ Thumbs.db
 # Consumer repos keep `.claude/commands/loom/` TRACKED (real files, not a
 # symlink), so it must NOT be added to the daemon's `update_gitignore` list in
 # loom-daemon/src/init/post_init.rs.
+# Anchored with a leading `/`: an unanchored `.agents` also matches
+# `defaults/.agents/`, silently ignoring every NEW shipped skill file.
 .claude/commands
 
 # Co-install hygiene (issue #3578, sibling of #3565):
@@ -192,7 +194,9 @@ Thumbs.db
 # symlink — that is the whole point of shipping the surface), so it must NOT be
 # added to the daemon's `update_gitignore` list in
 # loom-daemon/src/init/post_init.rs.
-.agents
+# Anchored with a leading `/`: an unanchored `.agents` also matches
+# `defaults/.agents/`, silently ignoring every NEW shipped skill file.
+/.agents
 
 # Skill routing local overrides (untracked, user-specific)
 .loom/config/skill-routes.local.json
