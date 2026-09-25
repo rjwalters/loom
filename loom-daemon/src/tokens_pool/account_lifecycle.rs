@@ -365,6 +365,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
                 .context("account setup failed and new profile rollback also failed")?;
             return Err(error.context("account setup failed; new profile was removed"));
         }
+        self.populate_new_profile(&profile);
         self.status(name)
     }
 
@@ -423,7 +424,26 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
                 .context("account registry update failed and imported profile rollback failed")?;
             return Err(error.context("account registry update failed; imported profile removed"));
         }
+        self.populate_new_profile(&profile);
         self.status_without_probe(name)
+    }
+
+    /// Populate a profile from the operator's default one (issue #8672), so a
+    /// rotated account is not a blank install. Called from `add`, `import` and
+    /// `reauth` — every lifecycle verb that has just written to the profile.
+    ///
+    /// Best effort by design: the account is already registered and valid at
+    /// this point, and a registered account with an unpopulated profile beats
+    /// rolling back a successful login over a provisioning hiccup. Anything
+    /// worth saying is printed; `accounts provision <name>` retries it.
+    fn populate_new_profile(&self, profile: &Path) {
+        if let Some(note) = super::profile_provisioning::provision_new_profile_quietly(
+            &super::profile_sharing::CODEX_RULES,
+            profile,
+            &self.workspace,
+        ) {
+            eprintln!("{note}");
+        }
     }
 
     pub fn list(&self, probe: bool) -> Result<Vec<AccountStatus>> {
@@ -482,6 +502,12 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             return Err(login_failure(result));
         }
         tighten_profile_permissions(&account.credential_reference)?;
+        // Re-provision on the way out (issue #8672). A reauth is the one other
+        // moment Loom is already writing to this profile, and the profile it
+        // logged back into may never have been provisioned at all (it predates
+        // the feature) or may have drifted since. The session-managed case
+        // already bailed above, so this can never race a container.
+        self.populate_new_profile(&account.credential_reference);
         let status = self.status(name)?;
         if status.enabled != enabled {
             bail!("account enabled state changed unexpectedly during reauthentication");

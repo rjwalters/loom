@@ -132,7 +132,7 @@ pub fn shared_tokens_dir() -> Option<PathBuf> {
 
 /// Minimal `~`/`~/` expansion (Python's `Path.expanduser()` equivalent for
 /// the cases this env var realistically carries).
-fn expand_tilde(raw: &str) -> PathBuf {
+pub(super) fn expand_tilde(raw: &str) -> PathBuf {
     if let Some(rest) = raw.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);
