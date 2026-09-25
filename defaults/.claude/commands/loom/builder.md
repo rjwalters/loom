@@ -265,7 +265,7 @@ Full convention and rationale: `.loom/docs/untrusted-external-content.md`.
 ## Task Credentials: Reference by Name, Never Ask for Values
 
 A task credential outside Loom's own plumbing (cloud token, SSH key, service
-API key) is **looked up, not asked for**: check `.loom/credentials.md` (names
+API key) is **looked up, not asked for**: check `./.loom/credentials.md` (names
 only, if the repo has one) before any operator interaction. Only a genuinely
 missing credential may trigger one, and it requests the **name, shape, and
 provisioning path — never the value**; never print, commit, or quote a

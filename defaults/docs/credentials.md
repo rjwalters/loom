@@ -22,9 +22,9 @@ operator pasting a value into chat, an issue, or a PR. Both defeat the "your
 only job is to write issues and review PRs" model at exactly the moment an
 agent needs a key to make progress.
 
-## The manifest: `.loom/credentials.md`
+## The manifest: `./.loom/credentials.md`
 
-A repo may commit an optional `.loom/credentials.md` — authored by the repo
+A repo may commit an optional `./.loom/credentials.md` — authored by the repo
 owner, **names only, never values** — that lists, per credential, where an
 agent finds it:
 
@@ -36,7 +36,7 @@ Because the file holds only names, paths, and env-var identifiers — never a
 secret — it is safe to commit. A template with placeholder rows,
 `.loom/credentials.md.example`, ships with every Loom install (mirroring how
 this repo already allows `*.env.example` in-tree); copy it to
-`.loom/credentials.md` and fill in the real names for the repo.
+`./.loom/credentials.md` and fill in the real names for the repo.
 
 This is the task-credential analog of the tiering already applied to Loom's
 own config: a raw token belongs host-local and is never committed (see
@@ -48,7 +48,7 @@ useful, to commit.
 
 When a task requires a credential:
 
-1. **Check `.loom/credentials.md` first**, if the repo has one. Resolve the
+1. **Check `./.loom/credentials.md` first**, if the repo has one. Resolve the
    named env var, read the named owner-store file, or use the named
    provisioned file — whichever the manifest specifies.
 2. **Only a missing credential may trigger an operator interaction** — never
@@ -82,7 +82,7 @@ aloud to the agent, and it never lands in a commit, issue, or transcript.
    *public* keys with `label:` lines) or a private value the agent will read
    in-session but never echo.
 2. **Owner records the reference** — the env var name, the file path, or
-   both — in `.loom/credentials.md`.
+   both — in `./.loom/credentials.md`.
 3. **Agent verifies by name**, not by value: confirms the env var is set, the
    file exists with the expected mode, or a checksum/label matches. Installs
    or consumes the credential idempotently (safe to re-run without
@@ -95,7 +95,7 @@ aloud to the agent, and it never lands in a commit, issue, or transcript.
 
 **Cloud token**, already provisioned: the owner has exported
 `CLOUD_DEPLOY_TOKEN` in the shell that launches the agent, and
-`.loom/credentials.md` lists it:
+`./.loom/credentials.md` lists it:
 
 | Purpose | Reference | Usage |
 |---|---|---|
@@ -107,7 +107,7 @@ interaction needed, because the manifest already named it.
 **SSH public-key provisioning**, credential missing: a task needs a new
 deploy key installed on a remote host, and no key exists yet.
 
-1. Agent checks `.loom/credentials.md` — no entry for this key — and asks
+1. Agent checks `./.loom/credentials.md` — no entry for this key — and asks
    the operator only for the *name and shape*: "This task needs a deploy SSH
    key for `<host>`. None is provisioned yet — should I generate a keypair
    and hand you the public half to authorize, or will you provide one?"
@@ -117,7 +117,7 @@ deploy key installed on a remote host, and no key exists yet.
 3. Agent installs the public key on the target idempotently (matched by key
    blob, not by label — the label itself never has to land on the target
    host) and records the reference (file path, or "installed on `<host>`
-   under `<user>`") in `.loom/credentials.md`.
+   under `<user>`") in `./.loom/credentials.md`.
 4. Agent reports installation succeeded, with the fingerprint, not the key.
 
 The private key, if one exists, never touches the agent at any point in this
@@ -135,5 +135,5 @@ Loom's own credential handling:
   ([`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md))
   already treat a raw secret as host-local (never committed) while the *name*
   of where to find one can live in tracked config — the same distinction
-  `.loom/credentials.md` draws for task credentials outside Loom's own config
+  `./.loom/credentials.md` draws for task credentials outside Loom's own config
   surface.
