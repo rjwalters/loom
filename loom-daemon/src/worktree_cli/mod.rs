@@ -34,7 +34,16 @@
 //! `_maybe_delete_local_branch`, which `worktree.sh` used to `awk` out of the
 //! live script source and `eval` into its own process).
 //!
-//! [`branch_landed`] is the one piece this slice does NOT share with
+//! Slice 4 is [`link`]: the post-`git worktree add` provisioning family —
+//! root and nested `node_modules`, `worktree.linkPaths`, `.mcp.json`, and the
+//! `info/exclude` entry each one needs (#3528/#5474). It is the part of the
+//! create path that is *all path interpolation* — four `ln -s "$src" "$dst"`
+//! pairs, a `find … -print0 | read -d ''` loop and a `grep -qxF "$entry"
+//! "$file"` — which is precisely #7858's class, and it is the one cohesive
+//! unit in that path touching none of the arms under concurrent repair
+//! (#8351, #8702, #8486).
+//!
+//! [`branch_landed`] is the one piece slice 3 does NOT share with
 //! `worktree_ops` — [`crate::worktree_ops::landed`] is the daemon's other copy
 //! of the same ladder, keyed and scoped differently. Why they are not folded
 //! together yet, and what folding them would cost `clean --aggressive`, is
@@ -44,6 +53,7 @@ pub mod baseline;
 pub mod branch_delete;
 pub mod branch_landed;
 pub mod default_branch;
+pub mod link;
 pub mod lock;
 pub mod remove;
 pub mod snapshot;
