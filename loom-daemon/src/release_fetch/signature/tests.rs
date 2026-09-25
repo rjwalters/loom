@@ -581,6 +581,140 @@ fn macos_signed_but_invalid_fails_closed() {
     assert_eq!(result.had_authority, Some(true));
 }
 
+/// A `codesign` that HANGS: `-dv` for `hang_dv`, `--verify` for
+/// `hang_verify`. The hang is a `sleep` in a process the deadline's
+/// process-group kill reaps, so nothing outlives the test.
+fn write_hanging_fake_codesign(dir: &Path, hang_dv: bool, hang_verify: bool) -> std::path::PathBuf {
+    write_script(
+        dir,
+        "codesign",
+        &format!(
+            r#"target="${{@: -1}}"
+if [[ "$1" == "-dv" || "$1" == "-dvvv" ]]; then
+    if [[ "{hang_dv}" == "true" ]]; then
+        sleep 120
+        exit 0
+    fi
+    {{
+        echo "Executable=$target"
+        echo "Identifier=com.rjwalters.loom-daemon"
+        echo "Authority=Developer ID Application: Test Authority (TESTTEAM)"
+    }} >&2
+    exit 0
+fi
+if [[ "$1" == "--verify" ]]; then
+    if [[ "{hang_verify}" == "true" ]]; then
+        sleep 120
+        exit 0
+    fi
+    exit 0
+fi
+exit 0
+"#
+        ),
+    )
+}
+
+/// Runs `f` with [`verify_timeout`] lowered to `ms`, restoring it after. Test
+/// callers must be `#[serial]` -- the override is process-global, exactly like
+/// the `PATH` these tests already share.
+fn with_short_verify_timeout<F: FnOnce()>(ms: u64, f: F) {
+    use std::sync::atomic::Ordering;
+    VERIFY_TIMEOUT_OVERRIDE_MS.store(ms, Ordering::Relaxed);
+    f();
+    VERIFY_TIMEOUT_OVERRIDE_MS.store(0, Ordering::Relaxed);
+}
+
+/// #8754, the second `codesign` call: `codesign --verify` that never answers
+/// is UNKNOWN, not tamper evidence. It fails `succeeded()` exactly like the
+/// `signed-bad` case above -- and that is precisely why `succeeded()` alone
+/// cannot decide this: only a `codesign` that RAN and reported a bad signature
+/// may reach `Outcome::Failed`.
+#[test]
+#[serial]
+fn macos_verify_timeout_is_inconclusive_not_tamper_evidence() {
+    let dir = tempdir();
+    let fakebin = tempdir();
+    write_hanging_fake_codesign(&fakebin, false, true);
+    let bin = fake_bin_target(&dir.join("loom-daemon-aarch64-apple-darwin"));
+
+    let mut result = None;
+    with_fake_bin(&fakebin, || {
+        with_short_verify_timeout(2_000, || {
+            result = Some(verify(&VerifyInputs {
+                target: "aarch64-apple-darwin",
+                bin_path: &bin,
+                sig_path: None,
+                cert_path: None,
+                repo_root: &dir,
+                repo_slug: "rjwalters/loom",
+                tag: "v0.16.0",
+                cosign_pubkey_env: None,
+                cosign_identity_env: None,
+                cosign_oidc_issuer_env: None,
+            }));
+        });
+    });
+    let result = result.unwrap();
+    assert_eq!(result.outcome, Outcome::Skipped);
+    // A loud skip, reported as signature-present-but-unchecked -- never
+    // `Verified` (no assurance was established) and never the silent
+    // `Skipped` state (something WAS there).
+    assert_eq!(result.state, Some(SignatureState::Unavailable));
+    assert!(result.message.contains("could not be completed"), "{}", result.message);
+    assert!(result.message.contains("NOT tamper evidence"), "{}", result.message);
+    // The alarming wording reserved for a real invalid signature must NOT
+    // appear -- an operator reading this must not distrust the release.
+    assert!(!result.message.contains("treating as tamper evidence"), "{}", result.message);
+    assert!(!result.message.contains("verification FAILED"), "{}", result.message);
+    // `-dv` DID answer, so what it reported is still known.
+    assert_eq!(result.had_authority, Some(true));
+}
+
+/// #8754, the first `codesign` call: a hang in `codesign -dv` must return an
+/// inconclusive skip immediately. Before the fix it fell through with the
+/// `Unavailable`'s Display string standing in for codesign's report, then
+/// asked the same wedged `codesign` a second time -- which timed out too and
+/// produced the tamper-evidence verdict.
+#[test]
+#[serial]
+fn macos_dv_timeout_is_inconclusive_and_does_not_reach_the_verify_call() {
+    let dir = tempdir();
+    let fakebin = tempdir();
+    // `--verify` would exit 0 here: if the fix ever regresses to falling
+    // through, this test would silently PASS as `Verified`, so assert the
+    // reported state too, not just "not Failed".
+    write_hanging_fake_codesign(&fakebin, true, false);
+    let bin = fake_bin_target(&dir.join("loom-daemon-aarch64-apple-darwin"));
+
+    let mut result = None;
+    with_fake_bin(&fakebin, || {
+        with_short_verify_timeout(2_000, || {
+            result = Some(verify(&VerifyInputs {
+                target: "aarch64-apple-darwin",
+                bin_path: &bin,
+                sig_path: None,
+                cert_path: None,
+                repo_root: &dir,
+                repo_slug: "rjwalters/loom",
+                tag: "v0.16.0",
+                cosign_pubkey_env: None,
+                cosign_identity_env: None,
+                cosign_oidc_issuer_env: None,
+            }));
+        });
+    });
+    let result = result.unwrap();
+    assert_eq!(result.outcome, Outcome::Skipped);
+    assert_eq!(result.state, Some(SignatureState::Unavailable));
+    assert!(result.message.contains("could not be completed"), "{}", result.message);
+    assert!(result.message.contains("NOT tamper evidence"), "{}", result.message);
+    // Nothing was learned about the signature, so nothing is claimed about it
+    // -- `None`, not a fabricated `Some(false)` that #8008's post-provision
+    // downgrade check would read as "this artifact had no Authority".
+    assert_eq!(result.had_authority, None);
+}
+
 /// `codesign` not available at all (a Linux host resolving `aarch64-apple-
 /// darwin` verification, or a macOS host with a broken toolchain) -- best-
 /// effort soft skip, never a block.

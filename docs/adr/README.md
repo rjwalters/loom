@@ -109,6 +109,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Records the #8556 decision for a metered OpenAI-compatible key shared across every fleet host, where no per-host mechanism can bound aggregate spend (N hosts × a local ceiling of K is not a spend cap): a provider-side hard ceiling that *fails the launch* is the primary mechanism, observability-backend aggregation is a scoped fallback promoted only if a chosen provider offers alerting rather than a hard stop, and tap-attributed usage accounting — `(runtime, credential source)` — lands first because both options consume it and it answers the backstop-vs-subscription spend question on its own
   - **Key Decision**: The authoritative mechanism is the only one that can be authoritative (the provider refuses the request) over a fleet-side counter that is eventually consistent by construction, couples dispatch to backend uptime when fail-closed, and defeats its own purpose when fail-open; if the fallback is ever built it fails closed on the **metered tap only**, with a bounded staleness window rather than indefinite trust in a last-known-good counter
 
+- [ADR-0021: Consume Forge Events Through an Operator-Owned Per-Host Cursor Feed, as Prompt Pressure Over an Unchanged Polling Floor](0021-forge-event-plane.md)
+  - **Status**: Accepted
+  - **Summary**: Lifts ADR-0014's deferred "Lever C" (push GitHub events to daemons) without reopening the objection that deferred it: daemons still poll *outbound*, against an operator-owned Cloudflare Worker that receives the webhooks, so no untrusted host is ever reachable by, or known to, GitHub. Loom ships the daemon half only — a `forge_events` consumer of a per-host cursor feed that publishes one summary-only `forge.event` bus prompt per page — phased observe-only first (#8765) and wired to consumers second (#8766)
+  - **Key Decision**: The feed is additive prompt pressure over an **unchanged** polling floor, never a replacement for it — a permanently dead feed is a latency regression and nothing else; the bus payload is routing hints only (counts, sequence bounds, event-type names) so no subscriber can mistake it for forge state, and cursors from a host-mismatched feed are never applied
+
 ## Creating a New ADR
 
 When making a significant architectural decision:

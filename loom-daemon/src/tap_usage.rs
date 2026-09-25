@@ -82,6 +82,12 @@
 //! to. Usage appearing *before* the first record in a region is charged to
 //! nobody: no tap had announced itself yet, and "no opinion" beats a
 //! fabricated reading here exactly as it does everywhere else in this module.
+//!
+//! [`account_region_by_tap`] is the shape a terminal journal wants (Issue
+//! #8659): the region folded to one row per tap ([`RegionAccounting`]),
+//! outcome's tap first. It closes the residual gap slicing left behind — an
+//! earlier launch is no longer misattributed, but under a one-row reader it was
+//! not recorded at all — without ever merging two taps into one row.
 
 use std::collections::BTreeMap;
 
@@ -385,6 +391,113 @@ pub fn account_launch_logs(contents: &str, header_anchor: &str) -> Vec<TapAccoun
         .into_iter()
         .filter_map(|(tap, usage)| Some(TapAccounting { tap: tap?, usage }))
         .collect()
+}
+
+/// One region's usage folded to **one row per tap** — the shape a terminal
+/// journal needs (Issue #8659) — together with the one thing a fold alone
+/// cannot say: whether the region's *last* record, the launch its outcome
+/// belongs to, was attributable at all.
+///
+/// Slicing per record (#8633) stopped an earlier launch's usage being billed to
+/// a later launch's tap, but a one-row reader — [`account_launch_log`] and the
+/// terminal journals built on it — then recorded only the region's *last*
+/// launch, leaving the earlier ones invisible rather than wrong. Folding first
+/// closes the common multi-record shape outright: a re-dispatch or a containment
+/// re-exec re-announces the **same** tap, so its blocks belong in one row and a
+/// one-row reader loses nothing at all. A genuinely multi-tap region (a phase
+/// pinned by `runtimes.rolePreference` / `LOOM_RUNTIME_<ROLE>`) stays a *list*,
+/// because the one thing this must never do is merge unlike taps into one row —
+/// that is precisely the #8633 error, in the direction a fleet spend ceiling
+/// must never be wrong in.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RegionAccounting {
+    /// One row per tap, each carrying that tap's whole share of the region.
+    ///
+    /// Ordered with [`Self::outcome`]'s tap first when there is one, then the
+    /// remaining taps in order of first appearance. Empty exactly when
+    /// [`account_launch_logs`] is empty.
+    pub per_tap: Vec<TapAccounting>,
+    /// Whether the region's last `# LOOM_LAUNCH` record was attributable — in
+    /// which case `per_tap[0]` is its tap. See [`Self::outcome`].
+    pub outcome_attributed: bool,
+}
+
+impl RegionAccounting {
+    /// The row for the launch the region's **outcome** belongs to: its last
+    /// record, carrying that tap's whole share of the region rather than only
+    /// its final block.
+    ///
+    /// `None` under exactly the conditions [`account_launch_log`] returns `None`
+    /// — no record, or a last record naming no attributable tap. An earlier
+    /// launch is never promoted into this slot: "which tap did this sweep run
+    /// on" has no answer then, and a neighbouring tap's name is a fabricated one
+    /// (the same rule the rest of this module follows). That usage is not lost —
+    /// it is exactly what [`Self::breakdown`] carries.
+    #[must_use]
+    pub fn outcome(&self) -> Option<&TapAccounting> {
+        self.outcome_attributed.then(|| self.per_tap.first())?
+    }
+
+    /// The per-tap breakdown a one-row reader cannot represent, and **empty**
+    /// when [`Self::outcome`] already accounts for the whole region.
+    ///
+    /// Non-empty in exactly two cases: the region named more than one tap, or
+    /// its last record was unattributable while an earlier one was. That is the
+    /// invariant both journals are built on — *`breakdown` is empty ⟺ `outcome`
+    /// is the region's whole attributable usage* — so a reader never has to
+    /// consult two fields to know whether it has the full picture.
+    #[must_use]
+    pub fn breakdown(&self) -> &[TapAccounting] {
+        if self.outcome().is_some() && self.per_tap.len() <= 1 {
+            &[]
+        } else {
+            &self.per_tap
+        }
+    }
+}
+
+/// The region at/after `header_anchor` folded per tap — see
+/// [`RegionAccounting`] for the contract and Issue #8659 for why the journals
+/// want this shape rather than [`account_launch_log`]'s single row.
+///
+/// One pass over the same blocks every other reader here uses, so this cannot
+/// disagree with [`account_launch_log`] / [`account_launch_logs`] about what a
+/// region contains. Rows sharing a [`TapAttribution::key`] fold together even
+/// when they differ in a field the key omits (the account): the key is the
+/// accounting identity on purpose — see [`TapAttribution::key`] for why a fleet
+/// ceiling must not split a shared credential per account. The outcome row keeps
+/// its own record's full attribution, so the #8447 credential read off it is
+/// byte-identical to what [`account_launch_log`] reported.
+#[must_use]
+pub fn account_region_by_tap(contents: &str, header_anchor: &str) -> RegionAccounting {
+    let blocks = launch_blocks(contents, header_anchor).unwrap_or_default();
+    // The launch the region's outcome belongs to is its LAST record, exactly as
+    // `account_launch_log` reads it — `None` when that record named no tap.
+    let outcome_tap = blocks.last().and_then(|(tap, _)| tap.clone());
+    let rows: Vec<TapAccounting> = blocks
+        .into_iter()
+        .filter_map(|(tap, usage)| Some(TapAccounting { tap: tap?, usage }))
+        .collect();
+    let mut folded = fold_by_tap(&rows);
+    let mut taps: Vec<TapAttribution> = outcome_tap.iter().cloned().collect();
+    for row in &rows {
+        if !taps.iter().any(|tap| tap.key() == row.key()) {
+            taps.push(row.tap.clone());
+        }
+    }
+    // `remove` both supplies the fold and guarantees one row per key, so a tap
+    // can never be emitted twice however the region's records are ordered.
+    let per_tap = taps
+        .into_iter()
+        .filter_map(|tap| {
+            let usage = folded.remove(&tap.key())?;
+            Some(TapAccounting { tap, usage })
+        })
+        .collect();
+    RegionAccounting {
+        per_tap,
+        outcome_attributed: outcome_tap.is_some(),
+    }
 }
 
 /// Filesystem wrapper for a caller holding a log *path*. An unreadable log is

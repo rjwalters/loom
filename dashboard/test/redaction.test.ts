@@ -2,7 +2,6 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import {
-  deriveTokenPoolAggregate,
   redactActiveSweep,
   redactElasticSpend,
   redactFleetSnapshot,
@@ -90,6 +89,7 @@ describe("redactPayload — per-kind field allowlist", () => {
       started_at: "2026-07-30T12:00:00Z",
       model: "opus",
       effort: "high",
+      runtime: "codex",
       branch: "feature/issue-4703",
       issue_title: "Fix the thing",
     });
@@ -98,6 +98,7 @@ describe("redactPayload — per-kind field allowlist", () => {
       started_at: "2026-07-30T12:00:00Z",
       model: "opus",
       effort: "high",
+      runtime: "codex",
     });
   });
 
@@ -236,6 +237,17 @@ describe("redactPayload — per-kind field allowlist", () => {
       mean_usage_fraction: 0.44,
       max_usage_fraction: 0.9,
       next_limit_window_reset_at: "2026-08-02T03:00:00Z",
+      // Rows from a daemon that predates per-provider pools carry no
+      // `provider`; they are the Claude pool, and say so.
+      providers: [
+        {
+          provider: "claude",
+          account_count: 3,
+          exhausted_count: 1,
+          max_usage_fraction: 0.9,
+          next_limit_window_reset_at: "2026-08-02T03:00:00Z",
+        },
+      ],
     });
   });
 
@@ -527,6 +539,20 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redacted).toEqual({ kind: "ephemeral_compute" });
   });
 
+  // Issue #8835 added `sweep_id` to this kind. The allowlist is unchanged
+  // (`["kind"]`), which must mean the new field is withheld like every other
+  // one — a new field must not leak merely by being new.
+  it("ephemeral_compute: the #8835 sweep_id field is withheld like every other field", () => {
+    const redacted = redactPayload("ephemeral_compute", {
+      kind: "ephemeral_compute",
+      job_id: "job-abc123",
+      sweep_id: "sweep-issue-8835-1",
+      instance_type: "c7i.4xlarge",
+    });
+    expect(redacted).toEqual({ kind: "ephemeral_compute" });
+    expect(JSON.stringify(redacted)).not.toContain("sweep-issue-8835-1");
+  });
+
   it("an unrecognized (forward-compatible) kind reveals only `kind`", () => {
     const redacted = redactPayload("future.kind", {
       kind: "future.kind",
@@ -692,6 +718,29 @@ describe("redactFleetSnapshot", () => {
     // project down to and even the number of running instances is withheld.
     expect(redactFleetSnapshot(snapshot, false).activeCompute).toEqual([]);
     // The authenticated dashboard still sees the whole entry.
+    expect(redactFleetSnapshot(snapshot, true).activeCompute).toEqual([computeEntry]);
+  });
+
+  it("withholds a sweep-attributed compute entry from a public viewer too (#8835)", () => {
+    // The nesting feature only ever renders for an Access-authenticated
+    // viewer, because the public snapshot has no entries to nest in the first
+    // place. That is the property this pins — including the new `sweepId`,
+    // which must not become the one field that survives.
+    const computeEntry: ActiveComputeState = {
+      hostId: "2am-elastic",
+      jobId: "job-abc123",
+      sweepId: "sweep-issue-8835-1",
+      instanceType: "c7i.4xlarge",
+      spot: true,
+      startedAt: "2026-09-19T12:00:00Z",
+      updatedAt: "2026-09-19T12:00:00Z",
+      leaked: false,
+    };
+    const snapshot: FleetSnapshot = { hosts: {}, activeSweeps: [], activeCompute: [computeEntry] };
+
+    const publicView = redactFleetSnapshot(snapshot, false);
+    expect(publicView.activeCompute).toEqual([]);
+    expect(JSON.stringify(publicView)).not.toContain("sweep-issue-8835-1");
     expect(redactFleetSnapshot(snapshot, true).activeCompute).toEqual([computeEntry]);
   });
 
@@ -880,65 +929,6 @@ describe("redactManagedRepos", () => {
     expect(redactManagedRepos([])).toEqual([]);
   });
 });
-
-describe("deriveTokenPoolAggregate", () => {
-  it("reports null rather than a misleading zero when no account measured usage", () => {
-    expect(deriveTokenPoolAggregate({ accounts: [{ account: "a", exhausted: false }] })).toEqual({
-      account_count: 1,
-      exhausted_count: 0,
-      mean_usage_fraction: null,
-      max_usage_fraction: null,
-      next_limit_window_reset_at: null,
-    });
-  });
-
-  it("averages only over accounts that reported a usage_fraction", () => {
-    const aggregate = deriveTokenPoolAggregate({
-      accounts: [{ usage_fraction: 0.2 }, { usage_fraction: 0.8 }, { exhausted: true }],
-    });
-    expect(aggregate.mean_usage_fraction).toBe(0.5);
-    expect(aggregate.max_usage_fraction).toBe(0.8);
-    expect(aggregate.account_count).toBe(3);
-  });
-
-  it("takes the earliest limit-window reset across the pool", () => {
-    const aggregate = deriveTokenPoolAggregate({
-      accounts: [
-        { limit_window_reset_at: "2026-07-30T18:00:00Z" },
-        { limit_window_reset_at: "2026-07-30T14:00:00Z" },
-      ],
-    });
-    expect(aggregate.next_limit_window_reset_at).toBe("2026-07-30T14:00:00Z");
-  });
-
-  // This runs on a live SSE response path, so a malformed payload must
-  // degrade rather than throw and kill the stream.
-  it.each([
-    ["accounts absent", {}],
-    ["accounts not an array", { accounts: "nope" }],
-    ["accounts null", { accounts: null }],
-  ])("degrades to a zero-count aggregate when %s", (_label, payload) => {
-    expect(deriveTokenPoolAggregate(payload as Record<string, unknown>)).toEqual({
-      account_count: 0,
-      exhausted_count: 0,
-      mean_usage_fraction: null,
-      max_usage_fraction: null,
-      next_limit_window_reset_at: null,
-    });
-  });
-
-  it("ignores non-finite usage values rather than propagating NaN", () => {
-    const aggregate = deriveTokenPoolAggregate({
-      accounts: [{ usage_fraction: Number.NaN }, { usage_fraction: 0.4 }],
-    });
-    expect(aggregate.mean_usage_fraction).toBe(0.4);
-    expect(aggregate.max_usage_fraction).toBe(0.4);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Unit tests: `redactSseFrame` (live tail)
-// ---------------------------------------------------------------------------
 
 describe("redactSseFrame", () => {
   it("passes non-data frames through unchanged (retry/comment preamble, keepalive)", () => {
@@ -1208,4 +1198,17 @@ describe("GET /public/events vs GET /api/events — live tail redaction", () => 
     expect(buffer).toContain("sweep-live-public");
     await reader.cancel();
   }, 15_000);
+});
+
+
+describe("resolved sweep identity redaction", () => {
+  it("retains only runtime/provider/model for a private launch record", () => {
+    const record = { kind: "sweep.identity", repo: "secret/project", visibility: "private", issue: 42, sweep_id: "private-sweep", runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3", profile: "secret-profile", credentialAccount: "secret-account", credentialSource: "key", path: "/secret/log", branch: "secret-branch" };
+    expect(redactPayload("sweep.identity", record)).toEqual({ kind: "sweep.identity", runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3" });
+    const sweep = { hostId: "host-a", sweepId: "private-sweep", visibility: "private" as const, repo: "secret/project", issue: 42, runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3", updatedAt: "2026-09-22T00:00:00Z", profile: "secret-profile", credentialAccount: "secret-account", path: "/secret/log" };
+    const publicSweep = redactActiveSweep(sweep, false);
+    expect(publicSweep).toMatchObject({ runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3" });
+    for (const key of ["repo", "issue", "sweepId", "profile", "credentialAccount", "path"]) expect(publicSweep).not.toHaveProperty(key);
+    expect(redactActiveSweep(sweep, true).repo).toBe("secret/project");
+  });
 });

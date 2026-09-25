@@ -45,6 +45,9 @@ export function at<T>(items: readonly T[], index: number): T {
 
 export interface AccountFixture {
   account: string;
+  /** Omitted from the payload when undefined — the pre-per-provider shape
+   * that must still read as Claude. */
+  provider?: string;
   rank?: number;
   usage?: number;
   resetAt?: number;
@@ -73,6 +76,7 @@ export function tokensSnapshot(
       captured_at: new Date(at).toISOString(),
       accounts: accounts.map((account) => ({
         account: account.account,
+        ...(account.provider !== undefined && { provider: account.provider }),
         ...(account.rank !== undefined && { rank: account.rank }),
         ...(account.usage !== undefined && { usage_fraction: account.usage }),
         ...(account.resetAt !== undefined && {

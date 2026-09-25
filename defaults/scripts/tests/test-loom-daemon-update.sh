@@ -696,7 +696,16 @@ BASE_WORKDIR="$(mktemp -d)"
 # suite runs under `set -uo pipefail` with NO `-e`, so a bare call would swallow
 # both and continue with a HALF-ARMED sandbox — the exact state the helper's own
 # failure path exists to prevent — while driving the real lifecycle scripts.
-if ! live_state_sandbox_init "$BASE_WORKDIR/live-state"; then
+#
+# FIXTURE CONTAINMENT (#8712) is armed on the same line and for the same reason:
+# it declares $BASE_WORKDIR as the only place this suite's fixtures may write,
+# which closes the one damaging path the live-state sandbox does not cover — the
+# REAL checkout's `loom-daemon/target/release/loom-daemon`, where
+# `loom_resolve_self_daemon_bin` looks for the binary implementing
+# `release-fetch`. A fixture fake left there made every `--fetch` on
+# loom-worker-1 fail for hours. Same failure handling: a containment guard that
+# could not be armed is a half-armed sandbox, and this suite refuses to run.
+if ! live_state_sandbox_init "$BASE_WORKDIR/live-state" || ! loom_fixture_scratch_root "$BASE_WORKDIR"; then
     echo "FATAL: live-state sandbox init failed — refusing to run this suite against a half-armed sandbox (#6420)." >&2
     echo "  See the reason above (lib/live-state-sandbox.sh): a writable sandbox root is required, and the ambient LOOM_LAUNCHD_LABEL / LOOM_WATCHDOG_LABEL must not be the real production identities." >&2
     rm -rf "$BASE_WORKDIR"
@@ -1184,11 +1193,14 @@ fi
 # 8b. --help survives a concurrent same-path rewrite of the script file
 #     itself, repeated many times (regression test for #7201's flake).
 #
-# Builds an ISOLATED fixture copy of loom-daemon-update.sh (+ its two
-# sourced lib deps) so this scenario can safely race a background writer
-# against it without ever touching the real UPDATE_SCRIPT -- corrupting the
-# repo's own checked-in script, even transiently, would be far worse than
-# the flake this regression test exists to catch.
+# Builds an ISOLATED fixture copy of loom-daemon-update.sh (+ EVERY lib it
+# sources -- three as of #8770's bounded-run.sh; each is a hard dependency
+# that exits 1 when absent, so a lib missing from the cp below shows up here
+# as a 20/20 race failure, not as a missing-file error) so this scenario can
+# safely race a background writer against it without ever touching the real
+# UPDATE_SCRIPT -- corrupting the repo's own checked-in script, even
+# transiently, would be far worse than the flake this regression test exists
+# to catch.
 #
 # The race: launch a background `cat orig > fixture` (a same-path
 # truncate+rewrite, byte-identical content) in its own backgrounded
@@ -1213,7 +1225,7 @@ fi
 W8B="$BASE_WORKDIR/w8b"
 mkdir -p "$W8B/cli" "$W8B/lib"
 cp "$UPDATE_SCRIPT" "$W8B/cli/loom-daemon-update.sh"
-cp "$CLI_DIR/../lib/daemon-env-harvest.sh" "$CLI_DIR/../lib/locate-daemon-bin.sh" "$W8B/lib/"
+cp "$CLI_DIR/../lib/daemon-env-harvest.sh" "$CLI_DIR/../lib/locate-daemon-bin.sh" "$CLI_DIR/../lib/bounded-run.sh" "$W8B/lib/"
 FIXTURE8B="$W8B/cli/loom-daemon-update.sh"
 ORIG8B="$W8B/cli/.orig.sh"
 cp "$FIXTURE8B" "$ORIG8B"
@@ -4645,14 +4657,25 @@ fi
 #     "discovered by an operator on a degraded host" into "caught by the suite":
 #     isolation alone is unfalsifiable, since each of the previous three fixes
 #     also LOOKED complete.
+#
+#     PAIRED (#8712) with the real-build-output sentinel, because the same
+#     "isolation alone is unfalsifiable" argument applies to the one damaging
+#     path OUTSIDE `.loom`: the real checkout's
+#     `loom-daemon/target/release/loom-daemon`, where
+#     `loom_resolve_self_daemon_bin` looks for the binary that implements
+#     `release-fetch`. A fixture fake left there made every `--fetch` on
+#     loom-worker-1 fail for hours. The containment guard armed at the top of
+#     this suite should make that unreachable; the sentinel reports it (and
+#     clears it, when it is one of our own shell fakes) if it was reached
+#     anyway. See loom_fixture_assert_build_output_untouched.
 # ============================================================
 TESTS_RUN=$((TESTS_RUN + 1))
-if live_state_sandbox_assert_untouched; then
+if live_state_sandbox_assert_untouched && loom_fixture_assert_build_output_untouched; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} no live .loom daemon state path was written during the suite ($(live_state_sandbox_snapshot_size) paths guarded, #5179)"
+    echo -e "${GREEN}✓${NC} no live .loom daemon state path and no real build output was written during the suite ($(live_state_sandbox_snapshot_size) paths guarded, #5179/#8712)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} a LIVE .loom daemon state path was written during this test run (#5179 regression!)"
+    echo -e "${RED}✗${NC} a LIVE .loom daemon state path or the real build output was written during this test run (#5179/#8712 regression!)"
     echo "  sandbox in effect during the run:"
     live_state_sandbox_describe | sed 's/^/    /'
 fi

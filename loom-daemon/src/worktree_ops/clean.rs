@@ -295,7 +295,7 @@ fn gh_pr_list(repo_root: &Path, args: &[&str]) -> Option<Vec<PrRow>> {
     // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
     // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
-    let out = cmd.output().ok()?;
+    let out = gh::bounded_output(cmd, gh::GH_PROBE_TIMEOUT)?;
     if !out.status.success() {
         return None;
     }
@@ -453,7 +453,7 @@ pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
     // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
     // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
-    let out = cmd.output().ok()?;
+    let out = gh::bounded_output(cmd, gh::GH_PROBE_TIMEOUT)?;
     if !out.status.success() {
         return None;
     }
@@ -503,7 +503,7 @@ pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &s
     // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
     // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
-    let Ok(out) = cmd.output() else {
+    let Some(out) = gh::bounded_output(cmd, gh::GH_PROBE_TIMEOUT) else {
         return PrStatus::Unknown;
     };
     if !out.status.success() {
@@ -593,7 +593,7 @@ pub fn check_pr_by_number_rest(repo_root: &Path, pr_num: u32) -> PrProbe {
     // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
     // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
-    let Ok(out) = cmd.output() else {
+    let Some(out) = gh::bounded_output(cmd, gh::GH_PROBE_TIMEOUT) else {
         return PrProbe::unknown();
     };
     if !out.status.success() {

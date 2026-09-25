@@ -19,7 +19,7 @@
 //! counters. Folding by id and taking the per-counter maximum is correct for
 //! both shapes (identical repeats and genuinely growing cumulative chunks).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -78,6 +78,51 @@ pub struct ParsedTranscript {
     pub duplicate_records: usize,
     /// Usage blocks skipped because `model == "<synthetic>"`.
     pub synthetic_skipped: usize,
+    // -----------------------------------------------------------------
+    // Session shape (Issue #8757, `session.summary`). Counts and spans
+    // only — the parse never copies message text, tool arguments, or tool
+    // output into these, so the record built from them is a summary, not
+    // a transcript excerpt.
+    // -----------------------------------------------------------------
+    /// Real user turns: user records whose content is not a tool result.
+    pub turns: u64,
+    /// Assistant `tool_use` blocks by tool name, deduped on `message.id`
+    /// (a streamed message's repeated chunks restate the same blocks, so
+    /// the first occurrence counts and repeats do not).
+    pub tool_calls: BTreeMap<String, u64>,
+    /// Tool results flagged `is_error`.
+    pub tool_errors: u64,
+    /// Earliest record-level `timestamp` seen on any line of the file.
+    pub first_timestamp: Option<DateTime<Utc>>,
+    /// Latest record-level `timestamp` seen on any line of the file.
+    pub last_timestamp: Option<DateTime<Utc>>,
+    // -----------------------------------------------------------------
+    // Session analysis (Issue #8760, G3 part 2 of #8714). Order and
+    // paired-timing only — same discipline as the session-shape fields
+    // above: no tool arguments or output, ever.
+    // -----------------------------------------------------------------
+    /// Ordered tool names, one entry per counted `tool_use` block — the same
+    /// dedup discipline as `tool_calls` (a streamed message's repeated
+    /// chunks count once), kept in call order so a downstream pass can
+    /// detect a run of identical back-to-back invocations (a candidate
+    /// retry loop) without needing raw tool arguments.
+    pub tool_call_order: Vec<String>,
+    /// The tool_use -> tool_result pairing with the largest elapsed wall
+    /// time between the two records' own timestamps, matched by the content
+    /// block's own `id`/`tool_use_id` (never by content). `None` when no
+    /// pair could be matched — a transcript whose `tool_use` blocks carry no
+    /// `id` (every live Claude Code transcript does; only a hand-built
+    /// fixture omits it), or one truncated before any `tool_result` arrived.
+    pub longest_tool_call: Option<ToolCallSpan>,
+}
+
+/// One completed `tool_use` -> `tool_result` pairing (Issue #8760): the tool
+/// name and elapsed wall time between the two records' own timestamps — the
+/// unit [`ParsedTranscript::longest_tool_call`] tracks the maximum of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallSpan {
+    pub tool: String,
+    pub duration_ms: i64,
 }
 
 impl ParsedTranscript {
@@ -221,6 +266,119 @@ fn first_non_empty_str(target: &mut Option<String>, obj: &Value, key: &str) {
     }
 }
 
+/// Fold one record's session shape (Issue #8757, extended by #8760) into
+/// `parsed`: user turns, the tool-call histogram and call order, tool
+/// errors, and the `tool_use` -> `tool_result` timing pair.
+///
+/// Only structural fields are read — block `type`s, `tool_use` block `name`s
+/// and `id`s, and `tool_result` `is_error`/`tool_use_id` fields. Message
+/// text, tool arguments and tool output are never copied anywhere, which is
+/// what makes the downstream `session.summary` / `session.analysis` records
+/// summaries rather than transcript excerpts.
+///
+/// Assistant records are scanned on the **first** occurrence of their
+/// `message.id` only (a streamed message restates its blocks per chunk);
+/// records with no id are scanned once each under the same `__line_N` key
+/// convention the usage fold uses. User tool-result records are never
+/// chunk-restated, so `tool_errors` counts every flagged block directly.
+///
+/// `timestamp` is this record's own already-parsed timestamp (`None` when
+/// absent/unparseable) — threaded in rather than re-read here so this
+/// function stays a pure fold over already-extracted values, matching the
+/// rest of the parse loop.
+fn scan_session_shape(
+    parsed: &mut ParsedTranscript,
+    obj: &Value,
+    index: usize,
+    timestamp: Option<DateTime<Utc>>,
+    scanned_content_ids: &mut HashMap<String, ()>,
+    pending_tool_uses: &mut HashMap<String, (String, DateTime<Utc>)>,
+) {
+    let content = match obj.get("message").and_then(|m| m.get("content")) {
+        Some(content) => content,
+        None => return,
+    };
+    match obj.get("type").and_then(Value::as_str) {
+        Some("user") => {
+            let blocks = match content.as_array() {
+                Some(blocks) => blocks,
+                // A plain-text user message is a real turn; there is no
+                // tool-result block to inspect.
+                None => {
+                    parsed.turns += 1;
+                    return;
+                }
+            };
+            let mut is_tool_result = false;
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    continue;
+                }
+                is_tool_result = true;
+                if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+                    parsed.tool_errors += 1;
+                }
+                // Pair this result with its `tool_use` by the content
+                // block's own opaque call id (never by message text) to
+                // measure elapsed wall time (Issue #8760).
+                if let (Some(call_id), Some(end_ts)) =
+                    (block.get("tool_use_id").and_then(Value::as_str), timestamp)
+                {
+                    if let Some((tool, start_ts)) = pending_tool_uses.remove(call_id) {
+                        let duration_ms = (end_ts - start_ts).num_milliseconds().max(0);
+                        let is_longer = parsed
+                            .longest_tool_call
+                            .as_ref()
+                            .is_none_or(|current| duration_ms > current.duration_ms);
+                        if is_longer {
+                            parsed.longest_tool_call = Some(ToolCallSpan { tool, duration_ms });
+                        }
+                    }
+                }
+            }
+            // A user record carrying only tool results is the runtime's
+            // turn-boundary machinery, not a human turn.
+            if !is_tool_result {
+                parsed.turns += 1;
+            }
+        }
+        Some("assistant") => {
+            let message = obj.get("message");
+            let key = message
+                .and_then(|m| m.get("id"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("__line_{index}"));
+            if scanned_content_ids.insert(key, ()).is_some() {
+                return;
+            }
+            let Some(blocks) = content.as_array() else {
+                return;
+            };
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    continue;
+                }
+                if let Some(name) = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    *parsed.tool_calls.entry(name.to_string()).or_insert(0) += 1;
+                    parsed.tool_call_order.push(name.to_string());
+                    if let (Some(call_id), Some(start_ts)) =
+                        (block.get("id").and_then(Value::as_str), timestamp)
+                    {
+                        pending_tool_uses.insert(call_id.to_string(), (name.to_string(), start_ts));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Read `path` into deduped per-`(model, day)` totals plus its attribution
 /// metadata.
 ///
@@ -238,6 +396,15 @@ pub fn parse_transcript(path: &Path, fallback_timestamp: DateTime<Utc>) -> Parse
     let mut by_message: HashMap<String, MessageUsage> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut first_user_text: Option<String> = None;
+    // `message.id`s whose content blocks were already scanned (Issue #8757):
+    // a streamed assistant message repeats its id per chunk, so tool_use
+    // blocks are counted on the first occurrence only — the same dedupe
+    // discipline `by_message` applies to usage.
+    let mut scanned_content_ids: HashMap<String, ()> = HashMap::new();
+    // `tool_use` call ids awaiting their `tool_result` pairing (Issue
+    // #8760), keyed by the content block's own `id` — never by message
+    // text or content.
+    let mut pending_tool_uses: HashMap<String, (String, DateTime<Utc>)> = HashMap::new();
 
     for (index, raw) in text.lines().enumerate() {
         let raw = raw.trim();
@@ -252,9 +419,36 @@ pub fn parse_transcript(path: &Path, fallback_timestamp: DateTime<Utc>) -> Parse
         first_non_empty_str(&mut parsed.cwd, &obj, "cwd");
         first_non_empty_str(&mut parsed.branch, &obj, "gitBranch");
 
+        let record_timestamp: Option<DateTime<Utc>> = obj
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        if let Some(at) = record_timestamp {
+            parsed.first_timestamp = Some(
+                parsed
+                    .first_timestamp
+                    .map_or(at, |first: DateTime<Utc>| first.min(at)),
+            );
+            parsed.last_timestamp = Some(
+                parsed
+                    .last_timestamp
+                    .map_or(at, |last: DateTime<Utc>| last.max(at)),
+            );
+        }
+
         if first_user_text.is_none() && obj.get("type").and_then(Value::as_str) == Some("user") {
             first_user_text = message_text(&obj);
         }
+
+        scan_session_shape(
+            &mut parsed,
+            &obj,
+            index,
+            record_timestamp,
+            &mut scanned_content_ids,
+            &mut pending_tool_uses,
+        );
 
         let Some(record) = usage_from_record(&obj) else {
             continue;
@@ -698,5 +892,174 @@ mod tests {
             Some("lean-genius")
         );
         assert_eq!(repo_from_cwd(""), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Session shape (Issue #8757) — turns, tool histogram, tool errors,
+    // timestamp span. Counts only; never message text or tool output.
+    // ------------------------------------------------------------------
+
+    fn shape_user_line(kind: &str, is_error: bool, ts: &str) -> String {
+        let content = if kind == "tool_result" {
+            serde_json::json!([{"type": "tool_result", "tool_use_id": "t1", "is_error": is_error}])
+        } else {
+            serde_json::json!("a human turn")
+        };
+        serde_json::json!({
+            "type": "user", "timestamp": ts, "sessionId": "s1",
+            "message": {"role": "user", "content": content},
+        })
+        .to_string()
+    }
+
+    fn tool_use_line(id: &str, tool: &str, ts: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "timestamp": ts, "sessionId": "s1",
+            "message": {"id": id, "model": "m", "content": [
+                {"type": "tool_use", "name": tool, "input": {}},
+            ]},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn session_shape_counts_turns_tool_calls_errors_and_span() {
+        let file = write_transcript(&[
+            shape_user_line("text", false, "2026-09-23T04:00:00Z"),
+            tool_use_line("msg_1", "Bash", "2026-09-23T04:01:00Z"),
+            shape_user_line("tool_result", false, "2026-09-23T04:01:30Z"),
+            tool_use_line("msg_2", "Read", "2026-09-23T04:02:00Z"),
+            shape_user_line("tool_result", true, "2026-09-23T04:02:30Z"),
+            shape_user_line("text", false, "2026-09-23T04:03:00Z"),
+        ]);
+        let parsed = parse_transcript(file.path(), fallback());
+
+        assert_eq!(parsed.turns, 2, "two human turns; tool results are not turns");
+        assert_eq!(parsed.tool_errors, 1);
+        let calls: Vec<(&String, &u64)> = parsed.tool_calls.iter().collect();
+        assert_eq!(calls, vec![(&"Bash".to_string(), &1), (&"Read".to_string(), &1)]);
+        assert!(parsed
+            .first_timestamp
+            .unwrap()
+            .to_rfc3339()
+            .starts_with("2026-09-23T04:00:00"));
+        assert!(parsed
+            .last_timestamp
+            .unwrap()
+            .to_rfc3339()
+            .starts_with("2026-09-23T04:03:00"));
+    }
+
+    #[test]
+    fn a_streamed_repeat_of_an_assistant_message_counts_its_blocks_once() {
+        let file = write_transcript(&[
+            tool_use_line("msg_1", "Bash", "2026-09-23T04:00:00Z"),
+            // Same message.id restated per chunk — blocks deduped by id.
+            tool_use_line("msg_1", "Bash", "2026-09-23T04:00:05Z"),
+            tool_use_line("msg_1", "Bash", "2026-09-23T04:00:10Z"),
+        ]);
+        let parsed = parse_transcript(file.path(), fallback());
+        assert_eq!(parsed.tool_calls.get("Bash"), Some(&1));
+    }
+
+    #[test]
+    fn a_record_without_timestamps_leaves_the_span_unset() {
+        let file = write_transcript(&[serde_json::json!({
+            "type": "user", "sessionId": "s1",
+            "message": {"role": "user", "content": "hi"},
+        })
+        .to_string()]);
+        let parsed = parse_transcript(file.path(), fallback());
+        assert_eq!(parsed.first_timestamp, None);
+        assert_eq!(parsed.last_timestamp, None);
+        assert_eq!(parsed.turns, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Session analysis (Issue #8760) — ordered tool calls and the
+    // tool_use/tool_result timing pair, matched by call id.
+    // ------------------------------------------------------------------
+
+    /// A `tool_use` block carrying its own opaque call `id` (the real shape
+    /// Claude Code writes; `tool_use_line` above omits it deliberately for
+    /// the session-shape-only tests it serves).
+    fn tool_use_with_call_id(msg_id: &str, call_id: &str, tool: &str, ts: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "timestamp": ts, "sessionId": "s1",
+            "message": {"id": msg_id, "model": "m", "content": [
+                {"type": "tool_use", "id": call_id, "name": tool, "input": {}},
+            ]},
+        })
+        .to_string()
+    }
+
+    /// A `tool_result` block paired to `call_id` by `tool_use_id`.
+    fn tool_result_for_call(call_id: &str, is_error: bool, ts: &str) -> String {
+        serde_json::json!({
+            "type": "user", "timestamp": ts, "sessionId": "s1",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": call_id, "is_error": is_error},
+            ]},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn tool_calls_are_recorded_in_call_order() {
+        let file = write_transcript(&[
+            tool_use_with_call_id("m1", "c1", "Bash", "2026-09-23T04:00:00Z"),
+            tool_result_for_call("c1", false, "2026-09-23T04:00:05Z"),
+            tool_use_with_call_id("m2", "c2", "Read", "2026-09-23T04:01:00Z"),
+            tool_result_for_call("c2", false, "2026-09-23T04:01:01Z"),
+            tool_use_with_call_id("m3", "c3", "Bash", "2026-09-23T04:02:00Z"),
+            tool_result_for_call("c3", false, "2026-09-23T04:02:01Z"),
+        ]);
+        let parsed = parse_transcript(file.path(), fallback());
+        assert_eq!(parsed.tool_call_order, vec!["Bash", "Read", "Bash"]);
+    }
+
+    #[test]
+    fn the_longest_paired_tool_call_wins() {
+        let file = write_transcript(&[
+            tool_use_with_call_id("m1", "c1", "Bash", "2026-09-23T04:00:00Z"),
+            tool_result_for_call("c1", false, "2026-09-23T04:00:05Z"), // 5s
+            tool_use_with_call_id("m2", "c2", "Read", "2026-09-23T04:01:00Z"),
+            tool_result_for_call("c2", false, "2026-09-23T04:03:00Z"), // 120s
+            tool_use_with_call_id("m3", "c3", "Grep", "2026-09-23T04:04:00Z"),
+            tool_result_for_call("c3", false, "2026-09-23T04:04:02Z"), // 2s
+        ]);
+        let parsed = parse_transcript(file.path(), fallback());
+        let longest = parsed.longest_tool_call.expect("a pair was matched");
+        assert_eq!(longest.tool, "Read");
+        assert_eq!(longest.duration_ms, 120_000);
+    }
+
+    #[test]
+    fn an_unpaired_tool_use_never_yields_a_longest_call() {
+        // No matching tool_result at all: nothing to pair, so the field
+        // stays absent rather than guessing a duration of zero.
+        let file = write_transcript(&[tool_use_with_call_id(
+            "m1",
+            "c1",
+            "Bash",
+            "2026-09-23T04:00:00Z",
+        )]);
+        let parsed = parse_transcript(file.path(), fallback());
+        assert_eq!(parsed.longest_tool_call, None);
+        assert_eq!(parsed.tool_call_order, vec!["Bash"]);
+    }
+
+    #[test]
+    fn tool_use_blocks_with_no_call_id_never_pair_but_still_count() {
+        // The existing session-shape fixtures never set a block-level `id`;
+        // this must remain a legitimate, unpaired shape (older/short
+        // transcripts, or a hand-built fixture) rather than a parse error.
+        let file = write_transcript(&[
+            tool_use_line("msg_1", "Bash", "2026-09-23T04:00:00Z"),
+            shape_user_line("tool_result", false, "2026-09-23T04:00:05Z"),
+        ]);
+        let parsed = parse_transcript(file.path(), fallback());
+        assert_eq!(parsed.longest_tool_call, None);
+        assert_eq!(parsed.tool_call_order, vec!["Bash"]);
     }
 }

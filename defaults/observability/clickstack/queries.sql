@@ -31,3 +31,13 @@ GROUP BY table ORDER BY table;
 SELECT count() AS rows, uniqExact((TraceId, SpanId)) AS unique_spans
 FROM default.otel_traces
 WHERE ServiceName = 'loom-trial-fixture';
+
+-- Real (non-fixture) loom-daemon spans use ServiceName = 'loom-daemon', not
+-- the synthetic fixture above (see README.md "Real trace and
+-- repair-waterfall verification"). Substitute the actual trace ID once one
+-- has been sent through this deployment.
+SELECT SpanName, TraceId, SpanId, ParentSpanId, Timestamp, Duration,
+       StatusCode, StatusMessage, SpanAttributes
+FROM default.otel_traces
+WHERE ServiceName = 'loom-daemon'
+ORDER BY Timestamp;

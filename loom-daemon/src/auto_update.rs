@@ -145,9 +145,12 @@ use crate::event_bus::EventBus;
 use crate::ipc::DrainState;
 use crate::workspace_pool::WorkspacePool;
 
+mod failure_digest;
 mod native_probe;
 mod relaunch_verify_note;
 mod stale_repo;
+
+use failure_digest::failure_digest;
 
 // ============================================================================
 // Constants
@@ -223,9 +226,6 @@ const DEFAULT_REBUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Poll granularity while waiting for the rebuild subprocess.
 const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Max bytes of captured script output retained in a failure/roll log line.
-const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
 
 /// The clean-tree gate's base refusal reason (Issue #7608), shared between
 /// [`AutoUpdateState::decide`] (which has no path detail) and [`run_tick`]
@@ -1123,9 +1123,9 @@ fn nice_child(command: &mut Command) {
 fn nice_child(_command: &mut Command) {}
 
 /// Map a `loom-daemon-update.sh` exit code to a [`RebuildOutcome`], attaching a
-/// tail of the captured output on any non-success.
+/// [`failure_digest`] of the captured output on any non-success.
 fn classify_exit(code: Option<i32>, log_path: &Path) -> RebuildOutcome {
-    let tail = || truncate_tail(&std::fs::read_to_string(log_path).unwrap_or_default());
+    let tail = || failure_digest(&std::fs::read_to_string(log_path).unwrap_or_default());
     match code {
         Some(0) => RebuildOutcome::Success,
         // #4053: exit 4 (build-verification) and 5 (post-provision
@@ -1140,19 +1140,6 @@ fn classify_exit(code: Option<i32>, log_path: &Path) -> RebuildOutcome {
         Some(other) => RebuildOutcome::Retryable(format!("exit {other}: {}", tail())),
         None => RebuildOutcome::Retryable(format!("killed by signal: {}", tail())),
     }
-}
-
-/// Keep only the last [`MAX_OUTPUT_TAIL_BYTES`] bytes of captured output,
-/// trimmed, on a char boundary.
-fn truncate_tail(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT_TAIL_BYTES {
-        return s.trim().to_string();
-    }
-    let start = s.len() - MAX_OUTPUT_TAIL_BYTES;
-    let start = (start..s.len())
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(s.len());
-    s[start..].trim().to_string()
 }
 
 // ============================================================================

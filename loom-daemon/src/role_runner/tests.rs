@@ -1994,6 +1994,10 @@ fn test_builtin_intervals_are_per_role_not_uniform() {
             ("hermit", 600),
             ("guide", 900),
             ("architect", 3600),
+            // #7947: a *listening* cadence, not a work cadence — each tick is
+            // a short `concierge listen` window, so it sits below the 5–15 min
+            // band's intent without violating it.
+            ("concierge", 300),
         ],
         "built-in per-role intervals drifted — update defaults/docs/daemon-reference.md's \
              role-runner table in the same change (#6204)"
@@ -2533,15 +2537,18 @@ fn test_default_roles_includes_architect_as_idle_only() {
         "#5656: architect must be idle-addressable ONLY — an interval-default architect \
              floods every unpinned repo's backlog with speculative proposals"
     );
-    // Every other shipped role is an interval default; architect is the
-    // sole carve-out today.
+    // Two shipped roles are excluded from the "unset `roles` ⇒ all defaults"
+    // fallback: architect (#5656, floods the backlog) and concierge (#7947, an
+    // inbound control channel wired to a chat room). Every other role is an
+    // interval default. `concierge_gate.rs` pins WHICH two, by name.
     assert_eq!(
         DEFAULT_ROLES
             .iter()
             .filter(|s| !s.is_interval_default())
             .count(),
-        1,
-        "a new idle-only role needs its own docs/table update (see daemon-reference.md)"
+        2,
+        "a new non-interval-default role needs its own docs/table update \
+         (see daemon-reference.md)"
     );
 }
 
@@ -4911,16 +4918,13 @@ fn describe_panic_extracts_str_and_string_payloads() {
     assert_eq!(describe_panic(&*string_panic), "formatted message");
 }
 
-// ===================================================================
-// Host sharding at the dispatch surface (#6374)
-//
-// `role_shard`'s own tests pin the *arithmetic* (exactly one owner per
-// key, an even spread, the fail-safe fallbacks). These pin the thing
-// that arithmetic alone cannot: that `decide_root_tick` and
-// `plan_idle_runs` — the two surfaces that actually spend a token —
-// honor it, in the right order relative to the `LOOM_ROLE_RUNNER`
-// kill switch.
-// ===================================================================
+// Host sharding at the dispatch surface (#6374): `ShardEnvGuard` below,
+// `enabled_workspace` / `enabled_workspace_with_key`, and `tick_admitted`
+// are the shared seams for the `shard_dispatch` tests (that `decide_root_tick`
+// and `plan_idle_runs` — the two surfaces that actually spend a token —
+// honor sharding, in the right order relative to the `LOOM_ROLE_RUNNER`
+// kill switch) and the idle-edge sibling (`roster_fence`).
+// `role_shard`'s own tests pin the arithmetic itself.
 
 /// Capture and clear every env var these tests manipulate, restoring the
 /// prior values on drop so a failing assertion cannot leak state into the
@@ -4975,6 +4979,20 @@ fn enabled_workspace() -> tempfile::TempDir {
     tmp
 }
 
+/// Like [`enabled_workspace`], but with a **pinned** shard key: it
+/// arrives through `autonomous.roleRunner.shardKey`, the top-priority
+/// tier of [`crate::role_shard::resolve_shard_key`], so the workspace's
+/// slice is a fixture fact rather than a draw on the random tempdir
+/// basename (#8683).
+fn enabled_workspace_with_key(key: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(
+        tmp.path(),
+        &format!(r#"{{"autonomous":{{"roleRunner":{{"enabled":true,"shardKey":"{key}"}}}}}}"#),
+    );
+    tmp
+}
+
 /// Whether one host (identified by the ambient shard env) would spend a
 /// curator tick on `root` this interval.
 fn tick_admitted(root: &Path) -> bool {
@@ -4990,149 +5008,9 @@ fn tick_admitted(root: &Path) -> bool {
     decision.is_some()
 }
 
-/// AC1 (first half), at the dispatch surface rather than in the hash:
-/// across a two-host fleet, each workspace's curator tick is admitted by
-/// **exactly one** host per interval — never zero (the slice would go
-/// unrotated fleet-wide) and never two (the #6332 / #6352 duplication
-/// this issue exists to prevent).
-#[test]
-#[serial]
-fn two_host_fleet_admits_each_workspace_curator_tick_on_exactly_one_host() {
-    let _env = ShardEnvGuard::capture();
-    let fleet: Vec<tempfile::TempDir> = (0..12).map(|_| enabled_workspace()).collect();
-
-    for workspace in &fleet {
-        let root = workspace.path();
-        let admitting: Vec<usize> = (0..2)
-            .filter(|host| {
-                ShardEnvGuard::become_host(*host, 2);
-                tick_admitted(root)
-            })
-            .collect();
-        assert_eq!(
-            admitting.len(),
-            1,
-            "{} admitted by hosts {admitting:?}; exactly one host must run each workspace's \
-                 role tick per interval (#6374)",
-            root.display()
-        );
-    }
-}
-
-/// AC2, measured the way the incident measured it: the fleet-wide *count
-/// of role sessions spawned per interval*. Unsharded, a 4-host fleet
-/// spends 4 curator ticks per workspace; sharded, it spends 1 — the token
-/// draw scales with workspaces, not workspaces x hosts.
-#[test]
-#[serial]
-fn sharding_makes_the_fleet_wide_tick_draw_scale_with_workspaces_not_hosts() {
-    let _env = ShardEnvGuard::capture();
-    let fleet: Vec<tempfile::TempDir> = (0..12).map(|_| enabled_workspace()).collect();
-    const HOSTS: usize = 4;
-
-    // Unsharded (today's behavior, and the fail-safe fallback): every
-    // host spends a tick on every workspace.
-    let unsharded: usize = (0..HOSTS)
-        .map(|_| fleet.iter().filter(|w| tick_admitted(w.path())).count())
-        .sum();
-    assert_eq!(unsharded, fleet.len() * HOSTS);
-
-    // Sharded: the same fleet spends exactly one tick per workspace.
-    let sharded: usize = (0..HOSTS)
-        .map(|host| {
-            ShardEnvGuard::become_host(host, HOSTS);
-            fleet.iter().filter(|w| tick_admitted(w.path())).count()
-        })
-        .sum();
-    assert_eq!(
-        sharded,
-        fleet.len(),
-        "a {HOSTS}-host fleet drew {sharded} curator ticks for {} workspaces (#6374 AC2)",
-        fleet.len()
-    );
-}
-
-/// AC3: the blunt per-host kill switch keeps working, and keeps
-/// short-circuiting **before** sharding is consulted — so an operator who
-/// sets `LOOM_ROLE_RUNNER=0` gets zero ticks regardless of whether this
-/// host owns the slice. Asserted for the owning host specifically, since
-/// a non-owning host would skip for the wrong reason and prove nothing.
-#[test]
-#[serial]
-fn role_runner_env_zero_still_disables_the_host_that_owns_the_slice() {
-    let _env = ShardEnvGuard::capture();
-    let workspace = enabled_workspace();
-    let root = workspace.path();
-
-    let owner = (0..2)
-        .find(|host| {
-            ShardEnvGuard::become_host(*host, 2);
-            tick_admitted(root)
-        })
-        .expect("exactly one of the two hosts owns this workspace");
-
-    ShardEnvGuard::become_host(owner, 2);
-    assert!(tick_admitted(root), "precondition: the owning host ticks");
-
-    std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "0");
-    assert!(
-        !tick_admitted(root),
-        "LOOM_ROLE_RUNNER=0 must still disable role ticks on the host that owns the slice \
-             (#6374 AC3)"
-    );
-}
-
-/// AC3, the other direction: sharding must not *weaken* the kill switch's
-/// counterpart either — an unsharded host (no shard env at all) behaves
-/// exactly as it did before #6374, owning every workspace.
-#[test]
-#[serial]
-fn an_unsharded_host_still_ticks_every_workspace() {
-    let _env = ShardEnvGuard::capture();
-    let fleet: Vec<tempfile::TempDir> = (0..6).map(|_| enabled_workspace()).collect();
-    for workspace in &fleet {
-        assert!(
-            tick_admitted(workspace.path()),
-            "an unsharded host must keep rotating every workspace (#6374 fail-safe)"
-        );
-    }
-}
-
-/// AC1 (second half), as far as this PR's **static** assignment goes:
-/// shrinking the ring reassigns the departed host's slice to the
-/// survivors, and no workspace is left unowned by the reassignment. This
-/// is the operator-driven reassignment path (lower `shardCount`, or point
-/// the survivor at the vacated index); automatic, roster-driven
-/// reassignment on host loss is deliberately deferred to #6704 — see
-/// `role_shard`'s module docs for why.
-#[test]
-#[serial]
-fn shrinking_the_ring_reassigns_the_departed_hosts_slice_to_the_survivor() {
-    let _env = ShardEnvGuard::capture();
-    let fleet: Vec<tempfile::TempDir> = (0..12).map(|_| enabled_workspace()).collect();
-
-    // Host 1 dies. Its slice is exactly what host 0 was NOT ticking.
-    ShardEnvGuard::become_host(0, 2);
-    let orphaned: Vec<&Path> = fleet
-        .iter()
-        .map(tempfile::TempDir::path)
-        .filter(|root| !tick_admitted(root))
-        .collect();
-    assert!(!orphaned.is_empty(), "precondition: host 1 must have owned something to orphan");
-
-    // The operator shrinks the ring to the one survivor; every orphaned
-    // workspace is picked up, and nothing is dropped in the process.
-    ShardEnvGuard::become_host(0, 1);
-    for root in &fleet {
-        assert!(
-            tick_admitted(root.path()),
-            "{} must be rotated by the surviving host after the ring shrinks (#6374)",
-            root.path().display()
-        );
-    }
-}
-
+mod concierge_gate;
 mod model_resolution;
 mod prompt_cache_prefix;
 mod roster_fence;
+mod shard_dispatch;
 mod tick_ring;

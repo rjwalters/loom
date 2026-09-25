@@ -8,11 +8,14 @@ import {
   DEGRADED_HOST_ID,
   HEALTHY_HOST_ID,
   IDLE_HOST_ID,
+  MISSING_HOST_ID,
   NOW,
   PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID,
   SWEEP_ONLY_HOST_ID,
+  UNPROVISIONED_HOST_ID,
   multiHostSnapshot,
   persistentRoleTickFailureFixture,
+  rosterMissingSnapshot,
   unprotectedHostProtectionFixture,
 } from "./fixtures";
 
@@ -105,7 +108,7 @@ describe("hostDetailView — health panel", () => {
     );
     const rendered = hostDetailView(built.hosts[0]!, NOW);
     expect(fieldValue(rendered, "Role ticks")).toBe(
-      "1/3 ticks ok; 1 persistent failure(s): judge @ loom",
+      "1/5 ticks ok; 1 persistent failure(s): judge @ loom",
     );
     expect(rendered.querySelector('[data-testid="status-badge"]')?.getAttribute("data-status")).toBe(
       "degraded",
@@ -164,18 +167,20 @@ describe("hostDetailView — token panel", () => {
     expect(rows).toHaveLength(2);
     // The reset window is in the future — rendered as a countdown, not
     // clamped to "just now" the way a past-event timestamp would be.
-    expect(cells(rows[0]!)).toEqual(["agent-1", "0", "42%", "in 5h 50m", "available"]);
+    // An untagged row is the Claude pool, and the Provider column says so.
+    expect(cells(rows[0]!)).toEqual(["agent-1", "Claude", "0", "42%", "in 5h 50m", "available"]);
+    expect(rows[0]!.querySelector('[data-testid="provider-mark"]')?.getAttribute("data-provider")).toBe("claude");
     // agent-2 has no limit_window_reset_at — unknown, not a fabricated date.
-    expect(cells(rows[1]!)[3]).toBe(UNKNOWN);
+    expect(cells(rows[1]!)[4]).toBe(UNKNOWN);
   });
 
   it("marks an exhausted account", () => {
     const rows = [...detail(DEGRADED_HOST_ID).querySelectorAll('[data-testid="token-account"]')];
     expect(rows[0]!.classList.contains("row--exhausted")).toBe(true);
-    expect(cells(rows[0]!)[4]).toBe("exhausted");
+    expect(cells(rows[0]!)[5]).toBe("exhausted");
     // agent-4 reports `exhausted: false` but no usage_fraction.
-    expect(cells(rows[1]!)[2]).toBe(UNKNOWN);
-    expect(cells(rows[1]!)[4]).toBe("available");
+    expect(cells(rows[1]!)[3]).toBe(UNKNOWN);
+    expect(cells(rows[1]!)[5]).toBe("available");
   });
 
   it("counts down to an exhausted account's reset instead of showing a dash", () => {
@@ -184,11 +189,11 @@ describe("hostDetailView — token panel", () => {
     // for. With the field fed, an exhausted account answers "when does
     // capacity return?" — a multi-day countdown, not a clamped "just now".
     const rows = [...detail(DEGRADED_HOST_ID).querySelectorAll('[data-testid="token-account"]')];
-    expect(cells(rows[0]!)[4]).toBe("exhausted");
-    expect(cells(rows[0]!)[3]).toBe("in 2d 14h");
-    expect(cells(rows[0]!)[3]).not.toBe(UNKNOWN);
+    expect(cells(rows[0]!)[5]).toBe("exhausted");
+    expect(cells(rows[0]!)[4]).toBe("in 2d 14h");
+    expect(cells(rows[0]!)[4]).not.toBe(UNKNOWN);
     // The absolute instant is still available as the tooltip for a bug report.
-    const resetCell = rows[0]!.querySelectorAll("td")[3];
+    const resetCell = rows[0]!.querySelectorAll("td")[4];
     expect(resetCell?.getAttribute("title")).toBeTruthy();
   });
 
@@ -247,6 +252,7 @@ describe("hostDetailView — active sweeps", () => {
       "#4703",
       "rjwalters/loom",
       "builder",
+      "Claude",
       "opus",
       "high",
       "10m 0s",
@@ -254,17 +260,31 @@ describe("hostDetailView — active sweeps", () => {
     ]);
   });
 
+  it("links the issue cell to the sweep's forge work and the repo cell to the repo", () => {
+    const rows = [...detail(HEALTHY_HOST_ID).querySelectorAll('[data-testid="sweep-row"]')];
+    const builderTds = [...rows[0]!.querySelectorAll("td")];
+    const label = builderTds[0]!.querySelector("a")!;
+    expect(label.getAttribute("href")).toBe("https://github.com/rjwalters/loom/tree/feature/issue-4703");
+    expect(label.getAttribute("target")).toBe("_blank");
+    expect(builderTds[1]!.querySelector("a")!.getAttribute("href")).toBe("https://github.com/rjwalters/loom");
+    // No phase yet → the issue, not a branch that does not exist.
+    const startingTds = [...rows[1]!.querySelectorAll("td")];
+    expect(startingTds[0]!.querySelector("a")!.getAttribute("href")).toBe(
+      "https://github.com/rjwalters/loom/issues/4749",
+    );
+  });
+
   it("carries the absolute timestamps in tooltips", () => {
     const row = detail(HEALTHY_HOST_ID).querySelector('[data-testid="sweep-row"]')!;
     const tds = [...row.querySelectorAll("td")];
-    expect(tds[5]!.getAttribute("title")).toBe("2026-07-30 12:00:00 UTC");
-    expect(tds[6]!.getAttribute("title")).toBe("2026-07-30 12:06:00 UTC");
+    expect(tds[6]!.getAttribute("title")).toBe("2026-07-30 12:00:00 UTC");
+    expect(tds[7]!.getAttribute("title")).toBe("2026-07-30 12:06:00 UTC");
   });
 
   it("degrades a partially-reported sweep instead of blanking the row", () => {
     const rows = [...detail(HEALTHY_HOST_ID).querySelectorAll('[data-testid="sweep-row"]')];
     // sweep-issue-4749-0: no phase, no effort, no enteredPhaseAt yet.
-    expect(cells(rows[1]!)).toEqual(["#4749", "rjwalters/loom", "starting", "opus", UNKNOWN, "1m 0s", UNKNOWN]);
+    expect(cells(rows[1]!)).toEqual(["#4749", "rjwalters/loom", "starting", "Codex", "opus", UNKNOWN, "1m 0s", UNKNOWN]);
   });
 
   it("falls back to the sweep id when the issue number is unknown", () => {
@@ -318,5 +338,138 @@ describe("hostDetailView — history section (#5355)", () => {
     const history = rendered.querySelector('[data-testid="host-history-panel"]');
     expect(history).toBe(injected);
     expect(history?.querySelector('[data-testid="history-loading"]')).toBeNull();
+  });
+});
+
+
+it("renders resolved Z.ai and its model in the host sweep table", () => {
+  const host = findHost(buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW), HEALTHY_HOST_ID)!;
+  host.sweeps[0] = { ...host.sweeps[0]!, runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3" };
+  const row = hostDetailView(host, NOW).querySelector('[data-testid="sweep-row"]')!;
+  expect(row.textContent).toContain("Z.ai");
+  expect(row.textContent).toContain("glm-5.3");
+  expect(row.querySelector<HTMLElement>('[data-testid="provider-mark"]')!.title).toContain("Runtime: OpenCode");
+});
+
+// ---------------------------------------------------------------------------
+// Expected-host roster (#8792 backend → #8804 SPA)
+// ---------------------------------------------------------------------------
+
+describe("hostDetailView — roster-missing hosts (#8804)", () => {
+  const rosterDetail = (hostId: string) =>
+    hostDetailView(findHost(buildFleetView(parseFleetSnapshot(rosterMissingSnapshot()), NOW), hostId)!, NOW);
+
+  it("badges a roster host's drill-down with its own state", () => {
+    expect(
+      rosterDetail(MISSING_HOST_ID).querySelector('[data-testid="status-badge"]')?.getAttribute("data-status"),
+    ).toBe("missing");
+    expect(
+      rosterDetail(UNPROVISIONED_HOST_ID)
+        .querySelector('[data-testid="status-badge"]')
+        ?.getAttribute("data-status"),
+    ).toBe("unprovisioned");
+  });
+
+  it("says why there is no health record, instead of blaming sweep-only discovery", () => {
+    // The default notice ("known only from its sweep activity") is a plainly
+    // wrong statement about a roster host with no sweeps at all.
+    const missing = rosterDetail(MISSING_HOST_ID).querySelector('[data-testid="health-missing"]')?.textContent ?? "";
+    const unprovisioned =
+      rosterDetail(UNPROVISIONED_HOST_ID).querySelector('[data-testid="health-missing"]')?.textContent ?? "";
+    expect(missing).toContain("expected-host roster");
+    expect(missing).toContain("active ingest key");
+    expect(missing).not.toContain("sweep activity");
+    expect(unprovisioned).toContain("no active ingest key");
+    expect(unprovisioned).not.toContain("sweep activity");
+    expect(missing).not.toBe(unprovisioned);
+  });
+
+  it("leaves the sweep-only host's notice exactly as it was", () => {
+    expect(detail(SWEEP_ONLY_HOST_ID).querySelector('[data-testid="health-missing"]')?.textContent).toContain(
+      "known only from its sweep activity",
+    );
+  });
+});
+
+/**
+ * Issue #8835 — a sweep's live compute jobs, nested under its row.
+ *
+ * Host detail renders the sweeps as a flat `<table>`, where real nesting is
+ * not available, so the parent/child relationship is carried by a full-width
+ * row placed immediately after the sweep's own row.
+ */
+describe("hostDetailView — nested compute subprocesses (#8835)", () => {
+  const SWEEP_ID = "sweep-issue-8835-1";
+  const snapshot = (activeCompute: unknown[]) => ({
+    hosts: { "host-a": { health: { record: { kind: "host.health" }, updatedAt: NOW.toISOString() } } },
+    activeSweeps: [
+      {
+        hostId: "host-a",
+        sweepId: SWEEP_ID,
+        repo: "rjwalters/loom",
+        issue: 8835,
+        phase: "builder",
+        startedAt: "2026-09-19T12:00:00Z",
+      },
+    ],
+    activeCompute,
+  });
+  const computeJob = {
+    hostId: "2am-elastic",
+    jobId: "job-abc123",
+    instanceId: "i-0123456789abcdef0",
+    region: "us-east-1",
+    instanceType: "c7i.4xlarge",
+    spot: true,
+    startedAt: "2026-09-19T12:00:00Z",
+  };
+  const render = (activeCompute: unknown[]) =>
+    hostDetailView(findHost(buildFleetView(parseFleetSnapshot(snapshot(activeCompute)), NOW), "host-a")!, NOW);
+
+  it("renders the sweep's job as a subprocess row directly beneath its sweep row", () => {
+    const rendered = render([{ ...computeJob, sweepId: SWEEP_ID }]);
+    const nested = rendered.querySelector('[data-testid="sweep-subprocess-row"]');
+    expect(nested).not.toBeNull();
+    expect(nested?.getAttribute("data-sweep")).toBe(SWEEP_ID);
+    // Immediately after its own sweep row — the whole basis of the visual
+    // nesting in a flat table.
+    const sweepRowEl = rendered.querySelector('[data-testid="sweep-row"]')!;
+    expect(sweepRowEl.nextElementSibling).toBe(nested);
+
+    const entry = nested!.querySelector('[data-testid="subprocess"]')!;
+    expect(entry.getAttribute("data-job")).toBe("job-abc123");
+    // Instance type, region and the Spot flag, plus elapsed time (12:00Z of
+    // 2026-09-19 against the fixture's own `NOW`).
+    expect(entry.textContent).toContain("c7i.4xlarge · us-east-1 · spot");
+    expect(entry.textContent).toMatch(/\d/);
+  });
+
+  it("spans the full sweeps table so the nested row sits flush under its sweep", () => {
+    const rendered = render([{ ...computeJob, sweepId: SWEEP_ID }]);
+    const headers = rendered.querySelectorAll('[data-testid="sweeps-panel"] thead th').length;
+    const cell = rendered.querySelector<HTMLTableCellElement>(
+      '[data-testid="sweep-subprocess-row"] td',
+    )!;
+    expect(cell.colSpan).toBe(headers);
+  });
+
+  it("flags a leaked nested job the same way the flat list does", () => {
+    const rendered = render([{ ...computeJob, sweepId: SWEEP_ID, leaked: true }]);
+    const entry = rendered.querySelector('[data-testid="subprocess"]')!;
+    expect(entry.getAttribute("data-leaked")).toBe("true");
+    expect(entry.className).toContain("subprocess--leaked");
+    const badge = entry.querySelector('[data-testid="leaked-badge"]');
+    expect(badge?.textContent).toBe("LEAKED");
+    expect(badge?.getAttribute("role")).toBe("status");
+  });
+
+  it("adds no row at all for a sweep with no compute jobs", () => {
+    // The overwhelmingly common case: the table must look exactly as it did
+    // before this feature.
+    for (const activeCompute of [[], [{ ...computeJob, sweepId: "sweep-someone-else" }], [computeJob]]) {
+      const rendered = render(activeCompute);
+      expect(rendered.querySelector('[data-testid="sweep-subprocess-row"]')).toBeNull();
+      expect(rendered.querySelectorAll('[data-testid="sweep-row"]')).toHaveLength(1);
+    }
   });
 });

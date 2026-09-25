@@ -160,6 +160,10 @@ export interface HostHealthRecord {
  * so this side reads it as one thing: when the account's constraint lifts. */
 export interface TokenAccount {
   account?: string;
+  /** Which provider's pool this account belongs to (`"claude"`, `"codex"`,
+   * …). Absent on a row from a daemon that predates per-provider pools —
+   * such a row is a Claude account, and `fleet.ts` folds it in as one. */
+  provider?: string;
   rank?: number;
   usage_fraction?: number;
   limit_window_reset_at?: string;
@@ -182,6 +186,20 @@ export interface TokensSnapshotRecord {
   account_count?: number;
   exhausted_count?: number;
   mean_usage_fraction?: number | null;
+  max_usage_fraction?: number | null;
+  next_limit_window_reset_at?: string | null;
+  /** The public aggregate sliced per provider — see `ProviderPoolAggregate`.
+   * Absent on the authenticated shape (derive it from `accounts`) and on a
+   * public response from a backend that predates per-provider pools. */
+  providers?: ProviderPoolAggregate[];
+}
+
+/** One provider's slice of the public `tokens.snapshot` aggregate
+ * (`dashboard/src/redaction.ts`'s `ProviderPoolAggregate`). */
+export interface ProviderPoolAggregate {
+  provider?: string;
+  account_count?: number;
+  exhausted_count?: number;
   max_usage_fraction?: number | null;
   next_limit_window_reset_at?: string | null;
 }
@@ -216,6 +234,11 @@ export interface ActiveSweep {
   enteredPhaseAt?: string;
   model?: string;
   effort?: string;
+  /** Runtime adapter the sweep was dispatched on (`"claude"`, `"codex"`, …)
+   * — which agent is doing the work. Absent for a pre-runtime daemon. */
+  runtime?: string;
+  /** Provider resolved by this sweep launch (not by its child roles). */
+  provider?: string;
   updatedAt?: string;
 }
 
@@ -235,6 +258,14 @@ export interface ActiveComputeJob {
    * this is the synthetic ingest identity, not where the instance runs. */
   hostId: string;
   jobId: string;
+  /** The sweep that submitted this job (Issue #8835). The join key the fleet
+   * view uses to nest a job under its sweep — deliberately *not* `hostId`,
+   * which names the submitting emitter's ingest identity and need not match
+   * the sweep's own host.
+   *
+   * Absent for a job submitted outside any sweep, and for one from an emitter
+   * that predates this field; both stay in the flat "running compute" list. */
+  sweepId?: string;
   instanceId?: string;
   region?: string;
   instanceType?: string;
@@ -253,9 +284,40 @@ export interface ActiveComputeJob {
   leaked?: boolean;
 }
 
+/**
+ * Why a roster-expected host has no telemetry to render (Issue #8792) — the
+ * wire counterpart of `../../src/fleetState.ts`'s `MissingHostState`, which is
+ * the source of truth for what each value means:
+ *
+ *   - `missing` — an active (non-revoked) ingest key exists for it, yet the
+ *     backend holds no `health` entry: something that *should* be reporting is
+ *     not. An incident.
+ *   - `unprovisioned` — no active ingest key exists for it, so it *cannot*
+ *     report yet. A to-do, not an outage — which is why the two are rendered
+ *     distinctly and only `missing` counts toward "needs attention".
+ *
+ * A host that reported and then went quiet is neither: it still has a `health`
+ * entry and reads as `stale` through the ordinary freshness path.
+ */
+export type MissingHostState = "missing" | "unprovisioned";
+
+/** One entry of `FleetSnapshot.missingHosts`. */
+export interface MissingHost {
+  hostId: string;
+  state: MissingHostState;
+}
+
 export interface FleetSnapshot {
   hosts: Record<string, HostEntry>;
   activeSweeps: ActiveSweep[];
+  /** Roster-expected hosts with no `health` entry at all (Issue #8792): the
+   * Worker's `EXPECTED_HOSTS`-vs-reporting diff, attached in
+   * `../../src/index.ts`. Absent — not `[]` — from a backend that predates
+   * #8792 and from a deployment with no roster configured; `parse.ts` leaves
+   * the key off entirely in both cases, so "no roster" and "roster, nothing
+   * missing" stay distinguishable and a pre-#8792 payload renders exactly as
+   * it did before (#8804). */
+  missingHosts?: MissingHost[];
   /** Live `ephemeral_compute` jobs (Issue #8305). Always `[]` for an
    * unauthenticated viewer — the redaction policy withholds every field of
    * that kind, including the count (`../../src/redaction.ts`).

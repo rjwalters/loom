@@ -130,6 +130,8 @@ export interface AccountBurnCurve {
    * non-empty means the merge should not be trusted for this account. */
   divergentHosts: string[];
   account: string;
+  /** The provider pool this account belongs to — see `AccountReading.provider`. */
+  provider: string;
   /** Newest known pool rank (lower = preferred by the selector). */
   rank?: number;
   /** Every usable point across every segment, chronological. */
@@ -160,9 +162,19 @@ function clampFraction(value: number): number {
 
 interface Series {
   account: string;
+  provider: string;
   /** Every host that reported this account, in first-seen order. */
   hostIds: string[];
   readings: Array<{ at: number; hostId: string; reading: AccountReading }>;
+}
+
+/** Display/sort order for provider groups: the two the fleet runs today in
+ * the order the operator reads them, then anything new alphabetically. */
+const PROVIDER_ORDER: readonly string[] = ["claude", "codex"];
+
+export function providerSortKey(provider: string): string {
+  const index = PROVIDER_ORDER.indexOf(provider);
+  return index === -1 ? `1-${provider}` : `0-${index}`;
 }
 
 /**
@@ -183,10 +195,13 @@ export function buildBurnCurves(
   const series = new Map<string, Series>();
   for (const sample of samples) {
     for (const reading of sample.accounts) {
-      let entry = series.get(reading.account);
+      // Provider is part of the identity: a Claude `robb` and a Codex `robb`
+      // are two accounts with two quotas, never one merged series.
+      const key = `${reading.provider}\u0000${reading.account}`;
+      let entry = series.get(key);
       if (!entry) {
-        entry = { account: reading.account, hostIds: [], readings: [] };
-        series.set(reading.account, entry);
+        entry = { account: reading.account, provider: reading.provider, hostIds: [], readings: [] };
+        series.set(key, entry);
       }
       if (!entry.hostIds.includes(sample.hostId)) entry.hostIds.push(sample.hostId);
       entry.readings.push({ at: sample.at, hostId: sample.hostId, reading });
@@ -204,8 +219,10 @@ export function buildBurnCurves(
   // Stable, operator-meaningful ordering: pool rank (the selector's own
   // preference order), then name. Rank-less accounts sort last. No longer
   // grouped by host — one curve now spans every host that reported it.
+  // Provider first, so each provider's cards render as one contiguous group.
   curves.sort(
     (a, b) =>
+      providerSortKey(a.provider).localeCompare(providerSortKey(b.provider)) ||
       (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER) ||
       a.account.localeCompare(b.account),
   );
@@ -250,6 +267,7 @@ function buildCurve(entry: Series, maxSampleGapMs: number): AccountBurnCurve {
     hostIds: entry.hostIds,
     divergentHosts: findDivergentHosts(entry),
     account: entry.account,
+    provider: entry.provider,
     rank: newestDefinedRank(entry),
     points,
     segments,

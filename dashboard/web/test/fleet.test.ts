@@ -2,10 +2,18 @@ import { describe, expect, it } from "vitest";
 
 import {
   STALE_AFTER_SEC,
+  attributeComputeJobs,
   buildFleetView,
+  buildHostView,
+  degradedProviders,
   distressReason,
+  ROLE_FAILURE_DEGRADED_MIN,
+  ROLE_FAILURE_RECENT_SEC,
+  sustainedRoleFailures,
+  throttleReason,
   findHost,
   isHostDistressed,
+  isRosterMissingStatus,
   isTokenPoolDegraded,
   sortSweeps,
   summarizeTokens,
@@ -15,14 +23,18 @@ import {
   DEGRADED_HOST_ID,
   HEALTHY_HOST_ID,
   IDLE_HOST_ID,
+  MISSING_HOST_ID,
   NOW,
   PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID,
   STALE_HOST_ID,
   SWEEP_ONLY_HOST_ID,
+  UNPROVISIONED_HOST_ID,
   isoMinutesBefore,
   multiHostSnapshot,
   persistentRoleTickFailureFixture,
+  rosterMissingSnapshot,
 } from "./fixtures";
+import type { ActiveComputeJob } from "../src/types";
 
 const view = () => buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
 
@@ -182,6 +194,7 @@ describe("isTokenPoolDegraded", () => {
     exhausted,
     peakUsage: undefined,
     hasAccountDetail: true,
+    providers: [],
   });
 
   it("is not degraded when no accounts have been reported yet", () => {
@@ -207,6 +220,34 @@ describe("isTokenPoolDegraded", () => {
   it("is degraded once exhaustion crosses the 75% threshold, even with 2+ available", () => {
     expect(isTokenPoolDegraded(pool(20, 15))).toBe(true); // 5 available, 75% exhausted
   });
+
+  it("judges each provider pool on its own — a spent Claude pool is degraded however idle Codex is", () => {
+    const summary = {
+      ...pool(8, 4),
+      providers: [
+        { provider: "claude", total: 4, exhausted: 4, peakUsage: 1 },
+        { provider: "codex", total: 4, exhausted: 0, peakUsage: undefined },
+      ],
+    };
+    // Pool-wide this is 4/8 — comfortably fine — which is exactly the
+    // blended figure that would have hidden the Claude outage.
+    expect(isTokenPoolDegraded(summary)).toBe(true);
+    expect(degradedProviders(summary)).toEqual(["claude"]);
+  });
+
+  it("does not treat a single-account provider as perpetually degraded", () => {
+    const summary = {
+      ...pool(3, 0),
+      providers: [
+        { provider: "claude", total: 2, exhausted: 0, peakUsage: 0.2 },
+        { provider: "codex", total: 1, exhausted: 0, peakUsage: undefined },
+      ],
+    };
+    expect(isTokenPoolDegraded(summary)).toBe(false);
+    // …until that one account is actually spent.
+    summary.providers[1]!.exhausted = 1;
+    expect(degradedProviders(summary)).toEqual(["codex"]);
+  });
 });
 
 describe("distressReason / isHostDistressed (#4975)", () => {
@@ -223,25 +264,32 @@ describe("distressReason / isHostDistressed (#4975)", () => {
     expect(reason).toBeUndefined();
   });
 
-  it("names the breaker's own reason when dispatch is halted", () => {
-    const reason = distressReason({
+  it("does NOT treat the host-distress breaker's own halt as distress — that is throttling (#8832)", () => {
+    const record = {
       dispatch_halted: true,
       halt_reason: "load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)",
       load_per_core: 4.24,
       cpu_idle_fraction: 0,
-    });
-    expect(reason).toBe("dispatch halted: load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)");
+    };
+    expect(distressReason(record)).toBeUndefined();
+    expect(throttleReason(record)).toBe("dispatch paused: load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)");
+    expect(throttleReason({ dispatch_halted: true })).toBe("dispatch paused");
+    expect(throttleReason({ dispatch_halted: false })).toBeUndefined();
   });
 
-  it("still reports halted, generically, when dispatch_halted is true with no reason string", () => {
-    expect(distressReason({ dispatch_halted: true })).toBe("dispatch halted");
+  it("names the admission brake's foreign-load halt as distress (#8478, #8832)", () => {
+    const halt = "admission brake STARVING for 900s with 0 sweeps in flight (≥ this host's starvationWarnSecs 300); dispatch is suppressed by load Loom does not own (#8478)";
+    expect(distressReason({ dispatch_halted: true, halt_reason: halt })).toBe(`dispatch halted: ${halt}`);
   });
 
-  it("flags load/core at or above the daemon's own distress threshold even without dispatch_halted", () => {
-    // Same-number fallback for a daemon build that predates/disables the
-    // dispatch_halted field.
+  it("flags load/core at or above the daemon's own distress threshold only for a daemon that sends no dispatch_halted", () => {
+    // Same-number fallback for a daemon build that predates the field.
     expect(isHostDistressed({ load_per_core: 2.5 })).toBe(true);
     expect(isHostDistressed({ load_per_core: 2.49 })).toBe(false);
+    // #8832: when the daemon reports its own sustained verdict, one hot
+    // sample is not a second opinion.
+    expect(isHostDistressed({ load_per_core: 3.9, dispatch_halted: false })).toBe(false);
+    expect(isHostDistressed({ cpu_idle_fraction: 0, dispatch_halted: false })).toBe(false);
   });
 
   it("flags CPU idle pinned near zero even without dispatch_halted", () => {
@@ -252,11 +300,24 @@ describe("distressReason / isHostDistressed (#4975)", () => {
   });
 
   // #5022: role-tick health.
-  it("names the failing role(s) when roles has a persistent failure", () => {
-    const reason = distressReason({
-      roles: { total: 3, ok: 1, persistent: [{ root: "/repos/loom", role: "judge", failures: 2 }] },
-    });
+  it("names the failing role(s) when a persistent failure is repeated and recent", () => {
+    const reason = distressReason(
+      { roles: { total: 5, ok: 1, persistent: [{ root: "/repos/loom", role: "judge", failures: 3, last_at: isoMinutesBefore(5) }] } },
+      NOW,
+    );
     expect(reason).toBe("role tick(s) persistently failing: judge @ loom");
+  });
+
+  it("ignores a persistent pair below the repeat threshold — one or two failed ticks are a blip (#8832)", () => {
+    const roles = { total: 3, ok: 1, persistent: [{ root: "/repos/loom", role: "judge", failures: ROLE_FAILURE_DEGRADED_MIN - 1, last_at: isoMinutesBefore(1) }] };
+    expect(distressReason({ roles }, NOW)).toBeUndefined();
+  });
+
+  it("ignores a persistent pair whose latest tick is older than the recency window (#8832)", () => {
+    const stale = new Date(NOW.getTime() - (ROLE_FAILURE_RECENT_SEC + 60) * 1000).toISOString();
+    const roles = { total: 9, ok: 0, persistent: [{ root: "/repos/anvil", role: "doctor", failures: 9, last_at: stale }] };
+    expect(distressReason({ roles }, NOW)).toBeUndefined();
+    expect(sustainedRoleFailures({ roles }, NOW)).toEqual([]);
   });
 
   it("is not distressed when roles reports every tick ok", () => {
@@ -268,11 +329,14 @@ describe("distressReason / isHostDistressed (#4975)", () => {
   });
 
   it("takes priority over the load/idle heuristic fallbacks, same as dispatch_halted", () => {
-    const reason = distressReason({
-      roles: { total: 2, ok: 0, persistent: [{ root: "/repos/loom", role: "guide", failures: 2 }] },
-      load_per_core: 0.1,
-      cpu_idle_fraction: 0.9,
-    });
+    const reason = distressReason(
+      {
+        roles: { total: 3, ok: 0, persistent: [{ root: "/repos/loom", role: "guide", failures: 3, last_at: isoMinutesBefore(2) }] },
+        load_per_core: 0.1,
+        cpu_idle_fraction: 0.9,
+      },
+      NOW,
+    );
     expect(reason).toBe("role tick(s) persistently failing: guide @ loom");
   });
 });
@@ -284,14 +348,27 @@ describe("buildFleetView host-distress classification (#4975)", () => {
       activeSweeps: [],
     });
 
-  it("goes degraded when dispatch is halted, independent of the token pool", () => {
+  it("goes throttled — not degraded, not needing attention — when the host breaker pauses dispatch (#8832)", () => {
     const built = buildFleetView(
-      snapshotFor({ dispatch_halted: true, halt_reason: "host-distress breaker" }),
+      snapshotFor({ dispatch_halted: true, halt_reason: "host-distress breaker", load_per_core: 3.9 }),
       NOW,
     );
     const host = findHost(built, "h");
-    expect(host?.status).toBe("degraded");
-    expect(host?.degradedReason).toBe("dispatch halted: host-distress breaker");
+    expect(host?.status).toBe("throttled");
+    expect(host?.degradedReason).toBe("dispatch paused: host-distress breaker");
+    expect(built.needsAttention).toBe(0);
+  });
+
+  it("stays ok for a single failed role tick — the 2026-09-24 always-degraded case (#8832)", () => {
+    const built = buildFleetView(
+      snapshotFor({
+        dispatch_halted: false,
+        roles: { total: 400, ok: 399, persistent: [{ root: "/repos/loom", role: "judge", failures: 1, last_at: isoMinutesBefore(3) }] },
+      }),
+      NOW,
+    );
+    expect(findHost(built, "h")?.status).toBe("ok");
+    expect(built.needsAttention).toBe(0);
   });
 
   it("goes degraded when load/core is at the daemon's distress threshold", () => {
@@ -306,7 +383,7 @@ describe("buildFleetView host-distress classification (#4975)", () => {
     expect(host?.degradedReason).toBeUndefined();
   });
 
-  it("goes degraded when roles reports a persistent tick failure, independent of load/tokens (#5022)", () => {
+  it("goes degraded when roles reports a repeated, recent tick failure, independent of load/tokens (#5022, #8832)", () => {
     const built = buildFleetView(snapshotFor({ roles: persistentRoleTickFailureFixture() }), NOW);
     const host = findHost(built, "h");
     expect(host?.status).toBe("degraded");
@@ -336,7 +413,41 @@ describe("buildFleetView host-distress classification (#4975)", () => {
     );
     const host = findHost(built, "h");
     expect(host?.status).toBe("degraded");
-    expect(host?.degradedReason).toBe("token pool at or near exhaustion");
+    // Rows with no `provider` are the Claude pool, and the reason says so.
+    expect(host?.degradedReason).toBe("claude token pool exhausted — nothing left to dispatch on");
+  });
+});
+
+describe("buildFleetView token pool — near-empty is throttled, empty is degraded (#8832)", () => {
+  const withAccounts = (accounts: unknown[]) =>
+    parseFleetSnapshot({
+      hosts: {
+        h: {
+          health: { record: { kind: "host.health", dispatch_halted: false }, updatedAt: isoMinutesBefore(1) },
+          tokens: { record: { kind: "tokens.snapshot", accounts }, updatedAt: isoMinutesBefore(1) },
+        },
+      },
+      activeSweeps: [],
+    });
+
+  it("goes throttled, not degraded, when one account is left to rotate onto", () => {
+    const built = buildFleetView(
+      withAccounts([{ account: "a", exhausted: true }, { account: "b", exhausted: false }]),
+      NOW,
+    );
+    const host = findHost(built, "h");
+    expect(host?.status).toBe("throttled");
+    expect(host?.degradedReason).toBe("claude token pool running low");
+    expect(built.needsAttention).toBe(0);
+  });
+
+  it("goes degraded once every account in a provider is spent", () => {
+    const built = buildFleetView(
+      withAccounts([{ account: "a", exhausted: true }, { account: "b", exhausted: true }]),
+      NOW,
+    );
+    expect(findHost(built, "h")?.status).toBe("degraded");
+    expect(built.needsAttention).toBe(1);
   });
 });
 
@@ -361,7 +472,14 @@ describe("summarizeTokens", () => {
     const summary = summarizeTokens({});
     // `hasAccountDetail: true` with an empty pool: nothing is being withheld,
     // this host simply has not reported a snapshot.
-    expect(summary).toEqual({ accounts: [], total: 0, exhausted: 0, peakUsage: undefined, hasAccountDetail: true });
+    expect(summary).toEqual({
+      accounts: [],
+      total: 0,
+      exhausted: 0,
+      peakUsage: undefined,
+      hasAccountDetail: true,
+      providers: [],
+    });
   });
 
   it("reads the public aggregate when per-account rows were withheld", () => {
@@ -383,7 +501,60 @@ describe("summarizeTokens", () => {
       exhausted: 5,
       peakUsage: 0.91,
       hasAccountDetail: false,
+      // A backend that predates the per-provider aggregate: the pool was
+      // the Claude pool, so it becomes one Claude slice rather than none.
+      providers: [{ provider: "claude", total: 13, exhausted: 5, peakUsage: 0.91 }],
     });
+  });
+
+  it("reads the public per-provider aggregate when the backend sends one", () => {
+    const summary = summarizeTokens({
+      tokens: {
+        record: {
+          kind: "tokens.snapshot",
+          account_count: 5,
+          exhausted_count: 3,
+          max_usage_fraction: 1,
+          providers: [
+            { provider: "claude", account_count: 2, exhausted_count: 1, max_usage_fraction: 1 },
+            { provider: "codex", account_count: 3, exhausted_count: 2, max_usage_fraction: null },
+            // A slice too malformed to name is dropped, not rendered under a
+            // fabricated provider.
+            { account_count: 9 },
+          ],
+        },
+        updatedAt: "2026-07-30T12:00:00Z",
+      },
+    });
+    expect(summary.hasAccountDetail).toBe(false);
+    expect(summary.providers).toEqual([
+      { provider: "claude", total: 2, exhausted: 1, peakUsage: 1 },
+      { provider: "codex", total: 3, exhausted: 2, peakUsage: undefined },
+    ]);
+  });
+
+  it("splits per-account rows by provider, folding untagged rows into claude", () => {
+    const summary = summarizeTokens({
+      tokens: {
+        record: {
+          kind: "tokens.snapshot",
+          accounts: [
+            { account: "agent-1", usage_fraction: 0.5, exhausted: false },
+            { account: "agent-2", provider: "claude", usage_fraction: 0.9, exhausted: true },
+            { account: "cx-1", provider: "codex", exhausted: false },
+            { account: "cx-2", provider: "codex", exhausted: true },
+            { account: "cx-3", provider: "codex", exhausted: true },
+          ],
+        },
+        updatedAt: "2026-07-30T12:00:00Z",
+      },
+    });
+    expect(summary.total).toBe(5);
+    expect(summary.exhausted).toBe(3);
+    expect(summary.providers).toEqual([
+      { provider: "claude", total: 2, exhausted: 1, peakUsage: 0.9 },
+      { provider: "codex", total: 3, exhausted: 2, peakUsage: undefined },
+    ]);
   });
 
   it("prefers per-account rows over the aggregate when both are present", () => {
@@ -423,5 +594,272 @@ describe("sortSweeps", () => {
       { hostId: "h", sweepId: "a", startedAt: "2026-07-30T12:00:00Z" },
     ]);
     expect(sorted.map((sweep) => sweep.sweepId)).toEqual(["a", "z"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Expected-host roster (#8792 backend → #8804 SPA)
+// ---------------------------------------------------------------------------
+
+describe("buildFleetView — missingHosts (#8804)", () => {
+  const roster = () => buildFleetView(parseFleetSnapshot(rosterMissingSnapshot()), NOW);
+
+  it("adds roster hosts that never reported to the host set", () => {
+    const built = roster();
+    // 6 telemetry-derived hosts (5 reporting + 1 sweep-only), plus the two
+    // roster hosts that have no `hosts` entry at all.
+    expect(built.hosts).toHaveLength(8);
+    expect(findHost(built, MISSING_HOST_ID)?.status).toBe("missing");
+    expect(findHost(built, UNPROVISIONED_HOST_ID)?.status).toBe("unprovisioned");
+  });
+
+  it("counts roster hosts separately from reporting hosts", () => {
+    const built = roster();
+    expect(built.reportingHosts).toBe(5);
+    expect(built.missingHosts).toBe(1);
+    expect(built.unprovisionedHosts).toBe(1);
+  });
+
+  it("counts a missing host as needing attention, but not an unprovisioned one", () => {
+    // `missing` means an enrolled host is silent — an incident.
+    // `unprovisioned` means it was never enrolled — a to-do, not an outage,
+    // and flagging it would make "needs attention" permanently non-zero for
+    // any roster listing a host someone plans to add.
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {},
+        activeSweeps: [],
+        missingHosts: [
+          { hostId: "m", state: "missing" },
+          { hostId: "u", state: "unprovisioned" },
+        ],
+      }),
+      NOW,
+    );
+    expect(built.needsAttention).toBe(1);
+    expect(built.reportingHosts).toBe(0);
+  });
+
+  it("sorts missing first and unprovisioned above the data-less unknown bucket", () => {
+    const built = roster();
+    const order = built.hosts.map((host) => host.hostId);
+    expect(order[0]).toBe(MISSING_HOST_ID);
+    expect(order.indexOf(UNPROVISIONED_HOST_ID)).toBeLessThan(order.indexOf(SWEEP_ONLY_HOST_ID));
+    // The four pre-existing statuses keep their relative order.
+    expect(order.indexOf(STALE_HOST_ID)).toBeLessThan(order.indexOf(DEGRADED_HOST_ID));
+    expect(order.indexOf(DEGRADED_HOST_ID)).toBeLessThan(order.indexOf(SWEEP_ONLY_HOST_ID));
+    expect(order.indexOf(SWEEP_ONLY_HOST_ID)).toBeLessThan(order.indexOf(HEALTHY_HOST_ID));
+  });
+
+  it("keeps the sweeps of a roster host that pushed sweep records but never health", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {},
+        activeSweeps: [{ hostId: "m", sweepId: "s1", phase: "builder" }],
+        missingHosts: [{ hostId: "m", state: "missing" }],
+      }),
+      NOW,
+    );
+    const host = findHost(built, "m");
+    expect(host?.status).toBe("missing");
+    expect(host?.sweeps).toHaveLength(1);
+  });
+
+  it("never overrides live telemetry with a stale roster classification", () => {
+    // A host with a real health record is not "never reported", whatever a
+    // hand-built or racing snapshot's missingHosts claims — a card saying
+    // both "last report 2m ago" and "never reported" would be incoherent.
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: { health: { record: { kind: "host.health" }, updatedAt: isoMinutesBefore(2) } },
+          t: { tokens: { record: { kind: "tokens.snapshot", accounts: [] }, updatedAt: isoMinutesBefore(2) } },
+        },
+        activeSweeps: [],
+        missingHosts: [
+          { hostId: "h", state: "missing" },
+          { hostId: "t", state: "missing" },
+        ],
+      }),
+      NOW,
+    );
+    expect(findHost(built, "h")?.status).toBe("ok");
+    expect(findHost(built, "t")?.status).toBe("ok");
+    expect(built.missingHosts).toBe(0);
+    expect(built.reportingHosts).toBe(2);
+  });
+
+  it("leaves every count untouched when the payload carries no missingHosts", () => {
+    const withRoster = roster();
+    const without = view();
+    expect(without.missingHosts).toBe(0);
+    expect(without.unprovisionedHosts).toBe(0);
+    expect(without.hosts).toHaveLength(6);
+    expect(without.reportingHosts).toBe(withRoster.reportingHosts);
+    expect(without.needsAttention).toBe(2);
+  });
+
+  it("classifies roster state through buildHostView's own parameter", () => {
+    expect(buildHostView("h", {}, [], NOW, "missing").status).toBe("missing");
+    expect(buildHostView("h", {}, [], NOW, "unprovisioned").status).toBe("unprovisioned");
+    expect(buildHostView("h", {}, [], NOW).status).toBe("unknown");
+    expect(isRosterMissingStatus("missing")).toBe(true);
+    expect(isRosterMissingStatus("unprovisioned")).toBe(true);
+    for (const status of ["ok", "degraded", "stale", "unknown"] as const) {
+      expect(isRosterMissingStatus(status)).toBe(false);
+    }
+  });
+});
+
+/**
+ * Issue #8835 — joining live compute jobs to the sweep that submitted them.
+ *
+ * The load-bearing property here is not the nesting, it is the *partition*:
+ * every job lands in exactly one of `bySweep`/`unattributed`, so a job that
+ * cannot be attributed — the shape an orphaned, still-billing instance takes —
+ * is guaranteed to stay visible in the fleet-level "running compute" list.
+ */
+describe("attributeComputeJobs (#8835)", () => {
+  const sweep = (sweepId: string, hostId = "host-a") => ({
+    hostId,
+    sweepId,
+    startedAt: "2026-09-19T12:00:00Z",
+  });
+  const job = (jobId: string, overrides: Partial<ActiveComputeJob> = {}): ActiveComputeJob => ({
+    hostId: "2am-elastic",
+    jobId,
+    instanceType: "c7i.4xlarge",
+    spot: true,
+    startedAt: "2026-09-19T12:00:00Z",
+    ...overrides,
+  });
+
+  it("nests a job under the live sweep its sweepId names", () => {
+    const { bySweep, unattributed } = attributeComputeJobs(
+      [job("job-1", { sweepId: "sweep-issue-8835-1" })],
+      [sweep("sweep-issue-8835-1")],
+    );
+    expect(bySweep.get("sweep-issue-8835-1")?.map((entry) => entry.jobId)).toEqual(["job-1"]);
+    expect(unattributed).toEqual([]);
+  });
+
+  it("joins on sweepId ALONE — a matching hostId is not an attribution", () => {
+    // The submitter's `hostId` is its ingest identity (one synthetic id for a
+    // whole hostless elastic fleet), so a hostId match says nothing about
+    // which sweep is paying. Attributing on it would be confidently wrong.
+    const { bySweep, unattributed } = attributeComputeJobs(
+      [job("job-1", { hostId: "host-a" })],
+      [sweep("sweep-issue-8835-1", "host-a")],
+    );
+    expect(bySweep.size).toBe(0);
+    expect(unattributed.map((entry) => entry.jobId)).toEqual(["job-1"]);
+  });
+
+  it("leaves a job whose sweep is not live in the unattributed list", () => {
+    const { bySweep, unattributed } = attributeComputeJobs(
+      [job("job-gone", { sweepId: "sweep-finished-9" })],
+      [sweep("sweep-issue-8835-1")],
+    );
+    expect(bySweep.size).toBe(0);
+    expect(unattributed.map((entry) => entry.jobId)).toEqual(["job-gone"]);
+  });
+
+  it("leaves a job with no sweepId at all in the unattributed list", () => {
+    // A pre-#8835 emitter, or a submission from outside any sweep.
+    const { unattributed } = attributeComputeJobs(
+      [job("job-bare"), job("job-empty", { sweepId: "" })],
+      [sweep("sweep-issue-8835-1")],
+    );
+    expect(unattributed.map((entry) => entry.jobId)).toEqual(["job-bare", "job-empty"]);
+  });
+
+  it("partitions without dropping anything, and preserves the incoming order", () => {
+    const jobs = [
+      job("a", { sweepId: "s1" }),
+      job("b"),
+      job("c", { sweepId: "s1" }),
+      job("d", { sweepId: "s-dead" }),
+      job("e", { sweepId: "s2" }),
+    ];
+    const { bySweep, unattributed } = attributeComputeJobs(jobs, [sweep("s1"), sweep("s2")]);
+    expect(bySweep.get("s1")?.map((entry) => entry.jobId)).toEqual(["a", "c"]);
+    expect(bySweep.get("s2")?.map((entry) => entry.jobId)).toEqual(["e"]);
+    expect(unattributed.map((entry) => entry.jobId)).toEqual(["b", "d"]);
+    const total = [...bySweep.values()].reduce((sum, list) => sum + list.length, 0) + unattributed.length;
+    expect(total).toBe(jobs.length);
+  });
+});
+
+describe("buildFleetView — compute attribution (#8835)", () => {
+  const snapshot = (activeSweeps: unknown[], activeCompute: unknown[]) => ({
+    hosts: { "host-a": { health: { record: { kind: "host.health" }, updatedAt: NOW.toISOString() } } },
+    activeSweeps,
+    activeCompute,
+  });
+  const liveSweep = {
+    hostId: "host-a",
+    sweepId: "sweep-issue-8835-1",
+    issue: 8835,
+    phase: "builder",
+    startedAt: "2026-09-19T12:00:00Z",
+  };
+  const computeJob = {
+    hostId: "2am-elastic",
+    jobId: "job-1",
+    instanceType: "c7i.4xlarge",
+    spot: true,
+    startedAt: "2026-09-19T12:00:00Z",
+  };
+
+  it("hangs the job off its sweep's own host view, keyed by sweepId", () => {
+    const view = buildFleetView(
+      parseFleetSnapshot(snapshot([liveSweep], [{ ...computeJob, sweepId: liveSweep.sweepId }])),
+      NOW,
+    );
+    const host = findHost(view, "host-a")!;
+    expect([...host.computeBySweep.keys()]).toEqual([liveSweep.sweepId]);
+    expect(host.computeBySweep.get(liveSweep.sweepId)?.map((entry) => entry.jobId)).toEqual(["job-1"]);
+    // Nested, so not also listed flat.
+    expect(view.unattributedCompute).toEqual([]);
+    // …but still counted fleet-wide: nesting must not make the fleet look
+    // like it is running less compute than it is.
+    expect(view.activeCompute).toHaveLength(1);
+  });
+
+  it("keeps an unmatched job — and its leaked flag — in the flat running-compute list", () => {
+    const view = buildFleetView(
+      parseFleetSnapshot(
+        snapshot([liveSweep], [{ ...computeJob, sweepId: "sweep-long-finished", leaked: true }]),
+      ),
+      NOW,
+    );
+    expect(findHost(view, "host-a")!.computeBySweep.size).toBe(0);
+    expect(view.unattributedCompute.map((entry) => entry.jobId)).toEqual(["job-1"]);
+    expect(view.unattributedCompute[0]?.leaked).toBe(true);
+    expect(view.leakedCompute).toBe(1);
+  });
+
+  it("counts a nested leaked job in leakedCompute too, so nesting cannot hide a leak", () => {
+    const view = buildFleetView(
+      parseFleetSnapshot(snapshot([liveSweep], [{ ...computeJob, sweepId: liveSweep.sweepId, leaked: true }])),
+      NOW,
+    );
+    expect(view.leakedCompute).toBe(1);
+  });
+
+  it("retires the nested job when its completion record removes it from the snapshot", () => {
+    // The backend deletes the `compute:<jobId>` entry on the completion
+    // record (`../../src/fleetState.ts`), so "retired" reaches the UI as an
+    // absent entry — the sweep simply has no subprocesses again.
+    const view = buildFleetView(parseFleetSnapshot(snapshot([liveSweep], [])), NOW);
+    expect(findHost(view, "host-a")!.computeBySweep.size).toBe(0);
+    expect(view.activeCompute).toEqual([]);
+    expect(view.unattributedCompute).toEqual([]);
+  });
+
+  it("leaves every host's map empty on a snapshot whose emitters do not stamp sweepId", () => {
+    const view = buildFleetView(parseFleetSnapshot(snapshot([liveSweep], [computeJob])), NOW);
+    expect(view.hosts.every((host) => host.computeBySweep.size === 0)).toBe(true);
+    expect(view.unattributedCompute).toHaveLength(1);
   });
 });

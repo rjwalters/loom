@@ -298,6 +298,32 @@ const HOST_ONLY_ENV: &[&str] = &[
     "LOOM_WORKSPACE",
 ];
 
+/// Container-side environment changes a caller layers on top of the dispatch
+/// (issue #8674's credential substitution is the only producer today).
+///
+/// Deliberately data, not a dependency: this module applies the three
+/// primitives — assign by value, withhold a name, mask a host directory —
+/// without knowing what a placeholder or an egress proxy is, so the isolation
+/// rules below stay readable and the substitution logic stays testable on its
+/// own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Injection {
+    /// `-e KEY=VALUE`, emitted LAST so it outranks any by-name forwarding.
+    pub assignments: Vec<(String, String)>,
+    /// Variable names that must NOT be forwarded by name. A by-name `-e VAR`
+    /// makes docker read the value from the *dispatching* process, which is
+    /// exactly the real credential this exists to withhold.
+    pub withheld: Vec<String>,
+    /// Host directories to mask with an empty read-only tmpfs. The workspace
+    /// is bind-mounted read-write, so a per-repo API-key pool under it would
+    /// otherwise be readable inside the container even with the environment
+    /// clean.
+    pub mask_dirs: Vec<PathBuf>,
+    /// Map `host.docker.internal` to the host gateway, so the container can
+    /// reach a host-side listener on every docker flavour.
+    pub add_host_gateway: bool,
+}
+
 fn forwarded_by_name(name: &str) -> bool {
     if HOST_ONLY_ENV.contains(&name) {
         return false;
@@ -316,6 +342,11 @@ fn forwarded_by_name(name: &str) -> bool {
 /// straight from this process's environment: the key never appears in this
 /// command's argv (and therefore never in `ps`, a shell history, or a log),
 /// and nothing writes it to a file anywhere in the container.
+///
+/// `injection` (issue #8674) is what turns that last property from "not in
+/// argv" into "not in the container at all": when present it withholds the
+/// credential's names from the by-name forwarding above and assigns a
+/// placeholder in their place. See [`Injection`].
 pub fn docker_command(
     profile: &Profile,
     workspace: &Path,
@@ -323,6 +354,7 @@ pub fn docker_command(
     log: Option<&Path>,
     args: &[OsString],
     credentials: &[&str],
+    injection: Option<&Injection>,
 ) -> Result<Command, LaunchError> {
     if which_docker().is_none() {
         return Err(LaunchError::config(
@@ -346,6 +378,16 @@ pub fn docker_command(
     // is the container boundary itself, not a flag.
     for (host, container, read_only) in extra_mounts(&root, log, workspace) {
         command.arg("-v").arg(mount(&host, &container, read_only));
+    }
+    // Mask host directories the workspace mount would otherwise expose (#8674:
+    // a per-repo `.loom/api-keys/` pool). An empty tmpfs, mode 0555 — readable
+    // (so the in-container credential ladder sees "no accounts registered"
+    // rather than an unreadable pool it must fail closed on) and unwritable.
+    // Emitted AFTER the workspace mount so it nests inside it.
+    for dir in injection.iter().flat_map(|i| i.mask_dirs.iter()) {
+        command
+            .arg("--mount")
+            .arg(format!("type=tmpfs,destination={},tmpfs-mode=0555", dir.display()));
     }
     command.arg("-w").arg(cwd);
 
@@ -392,10 +434,29 @@ pub fn docker_command(
     // target point a contained worker back at a shared (or nonexistent) host
     // path — the isolation is the point of this module.
     names.retain(|name| !is_isolated_dir(name));
+    // #8674: a withheld name must never be forwarded by name — that is what
+    // would put the REAL credential in the container's environment.
+    if let Some(injection) = injection {
+        names.retain(|name| !injection.withheld.iter().any(|w| w == name));
+    }
     names.sort();
     names.dedup();
     for name in names {
         command.arg("-e").arg(name);
+    }
+    // --- Injected assignments (#8674) ------------------------------------
+    // LAST, so a later `-e KEY=VALUE` wins over any earlier by-name `-e KEY`
+    // that slipped through — the same ordering rule `ISOLATED_DIRS` relies on,
+    // applied in the opposite direction.
+    if let Some(injection) = injection {
+        if injection.add_host_gateway {
+            command
+                .arg("--add-host")
+                .arg("host.docker.internal:host-gateway");
+        }
+        for (key, value) in &injection.assignments {
+            command.arg("-e").arg(format!("{key}={value}"));
+        }
     }
 
     // --- Limits + observability labels (issue #7430's shape) -------------

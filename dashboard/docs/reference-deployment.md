@@ -9,6 +9,8 @@ following [`deploy-runbook.md`](deploy-runbook.md) and
 [`cloudflare-access.md`](cloudflare-access.md), keep a document with this
 same shape — Worker identity, database identity, your local config-overlay
 pattern, CI auto-deploy secrets (if any), Access applications, credential
-file locations, and host enrollment status — in your own repo, so the next
+file locations, and host enrollment status (including the `EXPECTED_HOSTS`
+roster you deploy with — see [`deploy-runbook.md`](deploy-runbook.md) →
+"Declaring the expected host roster") — in your own repo, so the next
 person who needs to touch your instance (redeploy, rotate a credential, add
 a host, debug an incident) does not have to rediscover it from scratch.

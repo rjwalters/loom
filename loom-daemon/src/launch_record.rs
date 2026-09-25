@@ -102,6 +102,9 @@ pub struct RuntimeAttribution {
     /// `"friendli"`, …), when the launch resolved one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Model resolved by the launch, distinct from its local profile name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// The resolved model profile name, when one was selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -130,6 +133,7 @@ pub fn parse_launch_runtime(record_json: &str) -> Option<RuntimeAttribution> {
     Some(RuntimeAttribution {
         runtime,
         provider: string("provider"),
+        model: string("model"),
         profile: string("profile"),
     })
 }

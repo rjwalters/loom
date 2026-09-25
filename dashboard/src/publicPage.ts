@@ -57,7 +57,13 @@
  * reads `/public/*`; the authenticated variant only ever reads `/api/*`.
  */
 
-import { classifyFreshness, type FreshnessInfo, type HostFreshness } from "./fleetState";
+import {
+  classifyFreshness,
+  type FreshnessInfo,
+  type HostFreshness,
+  type MissingHost,
+  type MissingHostState,
+} from "./fleetState";
 import type { HistoryQueryResult, HistoryRecord } from "./query";
 import type { PublicActiveSweep, RedactedFleetSnapshot } from "./redaction";
 
@@ -270,11 +276,44 @@ function renderHostHealthRow(
   </tr>`;
 }
 
+// ---------------------------------------------------------------------------
+// Roster-expected hosts that never reported (issue #8792) — see
+// `fleetState.ts`'s `diffExpectedRoster`/`MissingHostState` for what each
+// state means. Rendered as their own rows in the same host table (and counted
+// in the same heading) so a silent host is *visible*, never just absent.
+// ---------------------------------------------------------------------------
+
+const MISSING_LABEL: Readonly<Record<MissingHostState, string>> = {
+  missing: "MISSING",
+  unprovisioned: "UNPROVISIONED",
+};
+
+const MISSING_DETAIL: Readonly<Record<MissingHostState, string>> = {
+  missing: "expected by the roster and enrolled, but no health report on record",
+  unprovisioned: "expected by the roster, but no active ingest key — not enrolled yet",
+};
+
+function renderMissingHostRow(host: MissingHost): string {
+  return `<tr class="freshness-${host.state}">
+    <td>${escapeHtml(host.hostId)}</td>
+    <td><span class="freshness-badge freshness-badge--${host.state}">${MISSING_LABEL[host.state]}</span> <span class="muted">never reported</span></td>
+    <td>${renderSaturationBadge(undefined)}</td>
+    <td class="muted">${escapeHtml(MISSING_DETAIL[host.state])}</td>
+  </tr>`;
+}
+
 /** "3 hosts: 2 live, 1 offline (robb-pro, last seen 5h ago)" — the overview
  * heading's explicit totals (issue #4957's AC). `hostIds` is already the
  * health-bearing host set (see `renderFleetOverview`), so every id here
- * contributes a freshness bucket — nothing to skip. */
-function renderFreshnessSummary(hostIds: readonly string[], hosts: RedactedFleetSnapshot["hosts"], now: Date): string {
+ * contributes a freshness bucket — nothing to skip. `missingHosts` (issue
+ * #8792) adds named `missing`/`unprovisioned` buckets after the freshness
+ * ones. */
+function renderFreshnessSummary(
+  hostIds: readonly string[],
+  hosts: RedactedFleetSnapshot["hosts"],
+  missingHosts: readonly MissingHost[],
+  now: Date,
+): string {
   const counts: Record<HostFreshness, number> = { live: 0, stale: 0, offline: 0 };
   const offlineDescriptions: string[] = [];
   for (const hostId of hostIds) {
@@ -287,11 +326,15 @@ function renderFreshnessSummary(hostIds: readonly string[], hosts: RedactedFleet
     }
   }
   const reporting = counts.live + counts.stale + counts.offline;
-  if (reporting === 0) return "";
+  if (reporting === 0 && missingHosts.length === 0) return "";
 
   const parts = [`${counts.live} live`];
   if (counts.stale > 0) parts.push(`${counts.stale} stale`);
   if (counts.offline > 0) parts.push(`${counts.offline} offline (${offlineDescriptions.join("; ")})`);
+  for (const state of ["missing", "unprovisioned"] as const) {
+    const ids = missingHosts.filter((host) => host.state === state).map((host) => host.hostId);
+    if (ids.length > 0) parts.push(`${ids.length} ${state} (${ids.join(", ")})`);
+  }
   return `: ${parts.join(", ")}`;
 }
 
@@ -314,6 +357,13 @@ function renderFreshnessSummary(hostIds: readonly string[], hosts: RedactedFleet
  * this is the AC's "header host count reflects hosts with health data" and
  * "a host known only from activeSweeps does not render as a fleet card".
  *
+ * **Roster-expected hosts (issue #8792)**: `snapshot.missingHosts` — hosts
+ * the operator's `EXPECTED_HOSTS` roster names but that have no `health`
+ * entry — get their own `MISSING`/`UNPROVISIONED` rows in the same table and
+ * ARE counted in "Hosts (N)", so a host that never reported is visible rather
+ * than silently absent. Sweeps attributed to such a host still land in the
+ * "Unattributed sweeps" table below: the host has no health data either way.
+ *
  * **Active sweeps**: sweeps whose `hostId` is not in `hostIds` — a host with
  * no current health data, whether because its `sweep.started` arrived before
  * its first `host.health`, or because it was revoked mid-run with genuinely
@@ -329,8 +379,14 @@ export function renderFleetOverview(snapshot: RedactedFleetSnapshot, now: Date =
     .filter((id) => snapshot.hosts[id]?.health)
     .sort();
   const hostIdSet = new Set(hostIds);
-  const healthRows = hostIds
-    .map((id) => renderHostHealthRow(id, snapshot.hosts[id]?.health, now))
+  // Issue #8792: roster hosts with no health entry. `diffExpectedRoster`
+  // already excludes health-bearing hosts; the filter here only guards the
+  // count against a malformed/hand-built snapshot double-listing one.
+  const missingHosts = (snapshot.missingHosts ?? []).filter((host) => !hostIdSet.has(host.hostId));
+  const healthRows = [
+    ...hostIds.map((id) => renderHostHealthRow(id, snapshot.hosts[id]?.health, now)),
+    ...missingHosts.map(renderMissingHostRow),
+  ]
     .filter((row) => row.length > 0)
     .join("\n");
 
@@ -339,7 +395,7 @@ export function renderFleetOverview(snapshot: RedactedFleetSnapshot, now: Date =
   const sweepRows = attributedSweeps.map(renderActiveSweepRow).join("\n");
   const unattributedSweepRows = unattributedSweeps.map(renderActiveSweepRow).join("\n");
 
-  const freshnessSummary = renderFreshnessSummary(hostIds, snapshot.hosts, now);
+  const freshnessSummary = renderFreshnessSummary(hostIds, snapshot.hosts, missingHosts, now);
 
   const unattributedSection =
     unattributedSweeps.length > 0
@@ -357,7 +413,7 @@ export function renderFleetOverview(snapshot: RedactedFleetSnapshot, now: Date =
 
   return `<section id="fleet-overview">
     <h2>Fleet overview</h2>
-    <h3>Hosts (${hostIds.length})${escapeHtml(freshnessSummary)}</h3>
+    <h3>Hosts (${hostIds.length + missingHosts.length})${escapeHtml(freshnessSummary)}</h3>
     <table>
       <thead><tr><th>Host</th><th>Status</th><th>Saturation</th><th>Detail</th></tr></thead>
       <tbody>${healthRows || `<tr><td colspan="4" class="muted">No host health reported yet.</td></tr>`}</tbody>
@@ -501,6 +557,8 @@ const PAGE_STYLE = `
   .freshness-badge--live { background: #d7f5dd; color: #1a7431; }
   .freshness-badge--stale { background: #fff1cc; color: #8a6100; }
   .freshness-badge--offline { background: #f3d4d4; color: #8a1f1f; }
+  .freshness-badge--missing { background: #8a1f1f; color: #fff; }
+  .freshness-badge--unprovisioned { background: #eee; color: #555; border: 1px dashed #999; }
   tr.freshness-stale td, tr.freshness-offline td { color: #888; }
   .saturation-badge { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 0.25rem; font-size: 0.75rem; font-weight: 600; }
   .saturation-badge--idle { background: #e6effa; color: #22507a; }

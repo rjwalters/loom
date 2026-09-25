@@ -19,7 +19,7 @@ use super::{
 };
 use crate::sweep_registry::SweepRegistry;
 use crate::types::{SweepKind, SweepState};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -224,6 +224,20 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
+    /// Issues inside a live PR-less retry window (Issue #7972). Pure
+    /// in-memory read of the registry state `reap_once`'s terminal-outcome
+    /// classification maintains — no forge round trip, mirroring
+    /// `noop_cooldown()`.
+    fn prless_retry(&self) -> HashSet<u32> {
+        match self.registry.lock() {
+            Ok(reg) => reg.prless_retry_issues(chrono::Utc::now()),
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                HashSet::new()
+            }
+        }
+    }
+
     /// Whether this workspace is missing `.claude/commands/loom/sweep.md`
     /// (Issue #4027 guard 2.4, quarantined at the work-finder level by
     /// #6440). A cheap `stat` via `SweepRegistryConfig::has_sweep_command`
@@ -320,65 +334,9 @@ impl WorkDispatcher for RegistryDispatcher {
     }
 
     fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-        // Issue #6688: only the `repo_root` read needs the lock — grab it
-        // and release immediately, rather than holding the registry mutex
-        // across the whole call the way the pre-#6688 single `reg.dispatch(..)`
-        // call below used to (via `SweepRegistry::dispatch` ->
-        // `dispatch_inner`, which holds the lock across the up-to-5s
-        // account-selection poll; see `dispatch_issue_releasing_poll_lock`'s
-        // doc comment for the full hazard this avoids).
-        let repo_root = {
-            let reg = self
-                .registry
-                .lock()
-                .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
-            reg.config().workspace_root.clone()
-        };
-        // Autonomous dispatch model (issue #3944): resolve an EXPLICIT model
-        // (`autonomous.model` config > shipped non-premium default) so the
-        // spawned child never silently inherits the operator's interactive
-        // CLI default (which may be a premium tier that burns usage credits).
-        // No dispatch-param tier here — the work finder has no per-issue
-        // override — so `explicit = None`.
-        //
-        // Issue #4809: this resolution ALSO inserts the model-cost A/B
-        // experiment's forced arm model when the workspace resolves to
-        // `experiment` mode (CANARY-gated) — the daemon-native replacement
-        // for the sweep.md prose instrumentation, which never executed in a
-        // headless child and was in any case overridden by this very
-        // default-pin precedence. `off`/`observe` modes are unaffected.
-        //
-        // Issue #4827: `complexity` is the issue's real
-        // `<!-- loom:complexity=... -->` stratum, read from the body the
-        // ETag-cached REST listing already returned — so the experiment's
-        // `complex` and `routine` strata each get an independent ~50/50 A/B
-        // balance instead of the whole population being stratified as
-        // `routine`. No extra forge call: the body arrives with the listing.
-        let resolved =
-            crate::sweep_registry::resolve_autonomous_dispatch_model(&repo_root, issue, complexity);
-        // Issue #7482: this line is logged BEFORE `dispatch_issue_releasing_poll_lock`
-        // below runs the actual pre-spawn guards (open-PR #4123, park-label
-        // #4444, lease-order #6287, etc. — see `dispatch_inner`), any of
-        // which can still refuse the dispatch. So this must not claim a
-        // dispatch happened yet — it only names the *attempt*. The
-        // corresponding past-tense "dispatched issue #N" line is logged by
-        // each call site only once `dispatch()` returns `Ok(true)` (a
-        // confirmed new spawn), never here.
-        match resolved.arm {
-            Some(arm) => log::info!(
-                "work_finder: attempting issue #{issue} with arm={arm} \
-                 (complexity={}) model={} (source={})",
-                complexity.unwrap_or("routine"),
-                resolved.model,
-                resolved.source_label
-            ),
-            None => log::info!(
-                "work_finder: attempting issue #{issue} with model={} (source={})",
-                resolved.model,
-                resolved.source_label
-            ),
-        }
-        let model = resolved.model;
+        log::info!("work_finder: attempting issue #{issue}");
+        // Keep the cached complexity stratum, but resolve its model only after
+        // runtime admission. A Claude default must not become a native pin.
         // Idempotency key + the registry's claim lock make a re-dispatch of
         // an already-running issue a no-op (`was_new = false`) or a loud
         // lock-collision error.
@@ -388,11 +346,11 @@ impl WorkDispatcher for RegistryDispatcher {
         // account-selection poll no longer holds the registry mutex a
         // concurrent `DaemonStatus`/`health` IPC call's per-root
         // `registry.lock()` (`ipc.rs::build_daemon_status`) needs.
-        let outcome = crate::sweep_registry::dispatch_issue_releasing_poll_lock(
+        let outcome = crate::sweep_registry::dispatch_model_releasing_poll_lock(
             &self.registry,
             &SweepKind::Issue(issue),
             Some(key),
-            Some(&model),
+            crate::sweep_registry::DispatchModel::Autonomous { complexity },
             None,
             None,
         )?;

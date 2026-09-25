@@ -245,13 +245,78 @@ fn the_hold_a_reading_arms_uses_the_same_horizon_the_row_reports() {
 fn an_expired_reading_is_discarded_rather_than_carried_forward() {
     // The 2026-09 Claude-side trap (#7420) in Codex form: a week-old 100%
     // must not pin a healthy subscription out of rotation. Both windows'
-    // resets are long past `now`, so neither is evidence.
+    // resets are long past `now`, so neither is evidence — and since #8539
+    // "no evidence" reports as `unknown` rather than borrowing the word
+    // `available`, which this module has nothing to back.
     let profile = tempfile::tempdir().unwrap();
     let account = descriptor("work", profile.path(), true);
     let row = assess_account(&account, None, Some(&snapshot(1_000, 1.0, 1.0)), at(900_000));
-    assert_eq!(row.status, "available");
+    assert_eq!(row.status, STATUS_UNKNOWN);
+    assert_eq!(row.error.as_deref(), Some(STALE_SNAPSHOT_DETAIL));
     assert_eq!(row.s5h_utilization, None);
     assert_eq!(row.s7d_utilization, None);
+    // Still fail-open: nothing holds the account, so it stays dispatchable.
+    assert!(has_usable_account(&check::build_report(vec![row])));
+}
+
+// ---------------------------------------------------------------------------
+// #8539 acceptance box 1: "no snapshot recorded yet" is not "available"
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_account_with_no_snapshot_at_all_reads_unknown_not_available() {
+    // The exact state behind #8539: an enabled account whose profile has
+    // never written a rollout log. Before the fix this rendered as a row of
+    // dashes labelled `available` — a fully walled pool that looked healthy.
+    let profile = tempfile::tempdir().unwrap();
+    let account = descriptor("work", profile.path(), true);
+    let row = assess_account(&account, None, None, at(1_000));
+    assert_eq!(row.status, STATUS_UNKNOWN);
+    assert_eq!(row.error.as_deref(), Some(NO_SNAPSHOT_DETAIL));
+    assert_eq!(row.s5h_utilization, None);
+    assert_eq!(row.s7d_utilization, None);
+    assert_eq!(row.limit_reset(), None);
+}
+
+#[test]
+fn unknown_never_outranks_a_known_good_reading() {
+    // The ranking half of acceptance box 1. `unknown` sorts strictly after
+    // `available` (a measured reading always wins) and strictly before every
+    // known refusal (it is an absence of evidence, not a refusal).
+    assert!(check::status_rank(STATUS_UNKNOWN) > check::status_rank("available"));
+    assert!(check::status_rank(STATUS_UNKNOWN) < check::status_rank("rate_limited"));
+    assert!(check::status_rank(STATUS_UNKNOWN) < check::status_rank("exhausted"));
+    assert!(check::status_rank(STATUS_UNKNOWN) < check::status_rank("blocked"));
+
+    let profile = tempfile::tempdir().unwrap();
+    let unmeasured =
+        assess_account(&descriptor("quiet", profile.path(), true), None, None, at(1_100));
+    let measured = assess_account(
+        &descriptor("busy", profile.path(), true),
+        None,
+        Some(&snapshot(1_000, 0.2, 0.05)),
+        at(1_100),
+    );
+    // `build_report` sorts; the measured account must come first.
+    let report = check::build_report(vec![unmeasured, measured]);
+    assert_eq!(report.accounts[0].name, "busy");
+    assert_eq!(report.accounts[0].status, "available");
+    assert_eq!(report.accounts[1].name, "quiet");
+    assert_eq!(report.accounts[1].status, STATUS_UNKNOWN);
+}
+
+#[test]
+fn an_all_unknown_table_says_why_rather_than_reading_as_healthy() {
+    let profile = tempfile::tempdir().unwrap();
+    let report = check::build_report(vec![
+        assess_account(&descriptor("a", profile.path(), true), None, None, at(1_000)),
+        assess_account(&descriptor("b", profile.path(), true), None, None, at(1_000)),
+    ]);
+    let table = format_table(&report);
+    assert!(table.contains("2 unknown"), "{table}");
+    assert!(!table.contains("available"), "{table}");
+    assert!(table.contains("NOT a health claim"), "{table}");
+    assert!(table.contains("codex exec"), "{table}");
 }
 
 #[test]
@@ -294,6 +359,81 @@ fn a_recorded_exhaustion_hold_outranks_a_healthy_reading() {
     assert_eq!(row.status, "exhausted");
     assert_eq!(row.error.as_deref(), Some("plan_exhausted"));
     assert!(row.limit_reset().is_some());
+}
+
+/// #8539 acceptance box 3, end to end over the two seams that actually run in
+/// production: a dispatch refusal naming a horizon becomes a bad-mark that
+/// expires at *that* horizon, `accounts check` reports it in the `Resets at`
+/// column, and selection skips the account until then.
+#[test]
+fn a_refusal_horizon_survives_into_the_row_and_out_of_selection() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let account = descriptor("work", profile.path(), true);
+
+    // The refusal the CLI printed, rendered from a chosen instant so the
+    // assertion does not depend on the host's wall clock or timezone.
+    let now = at(1_789_984_860);
+    let horizon = now + Duration::hours(30);
+    let refusal = format!(
+        "ERROR: You've hit your usage limit. Visit \
+         https://chatgpt.com/codex/settings/usage to purchase more credits or try again at {}.",
+        horizon
+            .with_timezone(&chrono::Local)
+            .format("%B %-d, %Y %-I:%M %p")
+    );
+    let log = format!("sweep_id=current\n# LOOM_ACCOUNT name=work\n{refusal}\n");
+
+    let reset_at = crate::tokens_pool::codex_reset::exhaustion_reset_horizon(
+        &log,
+        "sweep_id=current",
+        TerminalClassification::TokenExhausted,
+    )
+    .expect("the captured refusal wording names a horizon");
+    assert_eq!(reset_at, u64::try_from(horizon.timestamp()).unwrap());
+
+    let now_epoch = u64::try_from(now.timestamp()).unwrap();
+    health::record_terminal_for_class_with_reset_at(
+        workspace.path(),
+        &account.id,
+        TerminalClassification::TokenExhausted,
+        None,
+        Some(reset_at),
+        "spawn-codex:v1",
+        now_epoch,
+    )
+    .unwrap();
+
+    // The row: exhausted, with the provider's own horizon — not a blind
+    // `now + 5h`, which is what it used to show.
+    let stored = health::account_health(workspace.path(), &account.id).unwrap();
+    let row = assess_account(&account, stored.as_ref(), None, now + Duration::seconds(60));
+    assert_eq!(row.status, "exhausted");
+    assert_eq!(row.error.as_deref(), Some("plan_exhausted"));
+    assert_eq!(row.limit_reset(), Some(iso(horizon).as_str()));
+    assert!(format_table(&check::build_report(vec![row])).contains(&iso(horizon)));
+
+    // Selection skips it for the whole hold, and only for the hold. The 5h
+    // default cooldown would have readmitted it ~25h early.
+    let inventory = [account.clone()];
+    let five_hours_on = now_epoch + 5 * 60 * 60 + 1;
+    assert!(
+        health::select_healthy_at(
+            workspace.path(),
+            AccountProvider::Codex,
+            &inventory,
+            five_hours_on
+        )
+        .is_err(),
+        "the provider's horizon, not the default cooldown, governs readmission"
+    );
+    assert!(health::select_healthy_at(
+        workspace.path(),
+        AccountProvider::Codex,
+        &inventory,
+        reset_at + 1
+    )
+    .is_ok());
 }
 
 // ---------------------------------------------------------------------------

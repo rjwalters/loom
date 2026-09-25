@@ -898,25 +898,10 @@ fn dispatch_probe(
 // Ranking + atomic write
 // ---------------------------------------------------------------------------
 
-/// Ranking rank for each status (lower sorts first). Mirrors `_STATUS_RANK`.
-///
-/// `"unsupported"` (design D6a, issue #5608) ranks worse than `"skipped"` —
-/// defense-in-depth for any sort path that sees it, even though the primary
-/// mechanism keeping it out of the selector's view is that [`format_ranking_lines`]
-/// omits it from `.ranking` entirely.
-#[must_use]
-pub fn status_rank(status: &str) -> i32 {
-    match status {
-        "available" => 0,
-        "rate_limited" => 1,
-        "exhausted" => 2,
-        "blocked" => 3,
-        "error" => 4,
-        "skipped" => 5,
-        "unsupported" => 6,
-        _ => 99,
-    }
-}
+/// The shared status-severity ordering, owned by [`super::status_order`] since
+/// issue #8539. Re-exported so `check::status_rank` stays the path every
+/// existing caller (and this module's own [`sort_key`]) already uses.
+pub use super::status_order::status_rank;
 
 /// Absent-reset sentinel so accounts without a 7d reset sort last in-bucket.
 const RESET_SENTINEL: &str = "9999-12-31T23:59:59Z";

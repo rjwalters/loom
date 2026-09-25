@@ -2075,178 +2075,8 @@ async fn cancel_sweep_nonblocking(
 /// handled inside `begin_issue_dispatch`, returned as `BeginIssueDispatch::Done`
 /// — unchanged behavior for that kind.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_sweep_nonblocking(
-    sweep_registry: &Arc<Mutex<SweepRegistry>>,
-    workspace_pool: &Arc<WorkspacePool>,
-    event_bus: &Arc<EventBus>,
-    kind: crate::types::SweepKind,
-    idempotency_key: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
-    depends_on: Option<u32>,
-    workspace_root: Option<String>,
-    force: bool,
-) -> Response {
-    // Host-distress circuit breaker (#4235) — unchanged from the previous
-    // synchronous arm; a pure, lock-free global snapshot read.
-    if !force {
-        if let Some(snap) = crate::host_breaker::global_snapshot() {
-            if snap.suppressed {
-                let releases = snap.releases_at.map_or_else(
-                    || " (host still hot — cool-down not yet started)".to_string(),
-                    |r| format!(" (cool-down releases at {r})"),
-                );
-                log::warn!(
-                    "dispatch_sweep: refused {kind:?} — host circuit breaker is {} \
-                     ({}){releases}; running work drains, new dispatch paused. \
-                     Re-run with force to override.",
-                    snap.phase.as_str(),
-                    snap.reason.as_deref().unwrap_or("sustained host distress"),
-                );
-                return Response::Error {
-                    message: format!(
-                        "dispatch_sweep refused: host circuit breaker is {} ({}).{releases} \
-                         Running work is draining and new dispatch is paused (#4235). \
-                         Re-run with force to override.",
-                        snap.phase.as_str(),
-                        snap.reason.as_deref().unwrap_or("sustained host distress"),
-                    ),
-                };
-            }
-        }
-    }
-    // GitHub rate-limit circuit breaker (#4429/#4440/#4666) — unchanged.
-    if let Some(refusal) = rate_limit_dispatch_refusal(
-        &kind,
-        crate::rate_limit_breaker::global_snapshot().as_ref(),
-        force,
-    ) {
-        return refusal;
-    }
-    // Dispatch-only resolution (Issue #4299) — unchanged.
-    let target = match resolve_dispatch_registry(
-        sweep_registry,
-        workspace_pool,
-        workspace_root.as_deref(),
-    ) {
-        Ok(target) => target,
-        Err(response) => return response,
-    };
-
-    // Phase 1 (lock-scoped): headroom advisory + model resolution (both
-    // unchanged from the previous arm) + `begin_issue_dispatch` — the FULL
-    // guard chain, claim lock, label flip, dispatch stagger, and
-    // `Command::spawn()`. Everything here is either cheap in-memory/local-fs
-    // work or (for `Issue` guards) the SAME `gh` round trips the previous
-    // single-call `dispatch()` already made under this same lock — this
-    // split changes WHEN the lock is released, not what runs under it up to
-    // this point.
-    let begin_outcome = {
-        let mut sr = target
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let repo_root = sr.config().workspace_root.clone();
-
-        let headroom = assess_dispatch_headroom(&mut sr, &repo_root);
-        let low_headroom = dispatch_would_meet_or_exceed_headroom(&headroom);
-        emit_dispatch_headroom_advisory_on_change(
-            event_bus,
-            &repo_root,
-            low_headroom,
-            &headroom,
-            &kind,
-        );
-
-        let gh_bin = sr
-            .config()
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("gh"));
-        let (resolved_model, model_source_label, arm) = match (&kind, model.as_deref()) {
-            (crate::types::SweepKind::Issue(issue), None) => {
-                let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model_lazy(
-                    &repo_root,
-                    *issue,
-                    || crate::sweep_registry::fetch_issue_complexity(&gh_bin, &repo_root, *issue),
-                );
-                (resolved.model, resolved.source_label, resolved.arm)
-            }
-            _ => {
-                let (m, s) =
-                    crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
-                (m, s.as_str(), None)
-            }
-        };
-        log::info!(
-            "dispatch_sweep: {:?} with{} model={resolved_model} (source={model_source_label}); \
-             headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
-             only, not capacity-limiting since #5270])",
-            kind,
-            arm.map_or_else(String::new, |a| format!(" arm={a}")),
-            headroom.occupancy,
-            headroom.dynamic_cap,
-            headroom.disk_headroom,
-            headroom.ram_headroom,
-            headroom.token_axis_limit
-        );
-
-        sr.begin_issue_dispatch(
-            &kind,
-            idempotency_key,
-            Some(&resolved_model),
-            effort.as_deref(),
-            depends_on,
-            None,
-        )
-    };
-
-    let prepared = match begin_outcome {
-        Err(e) => return dispatch_error_response(&kind, e),
-        Ok(BeginIssueDispatch::Done(result)) => return dispatch_result_to_response(&kind, result),
-        Ok(BeginIssueDispatch::Spawned(prepared)) => prepared,
-    };
-
-    // Phase 2 (UNLOCKED): poll the child for its account-selection log line.
-    // Run via `spawn_blocking` — `poll_and_classify_spawned_child` calls
-    // `std::thread::sleep` internally (bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`,
-    // up to 5s) and must never run inline on a tokio async worker thread.
-    let poll_result = tokio::task::spawn_blocking(move || {
-        let mut prepared = prepared;
-        let (token_name, runtime, immediate_preflight_death) = poll_and_classify_spawned_child(
-            &mut prepared.child,
-            &prepared.log_path,
-            &prepared.header_anchor,
-        );
-        (prepared, token_name, runtime, immediate_preflight_death)
-    })
-    .await;
-    let (prepared, token_name, runtime, immediate_preflight_death) = match poll_result {
-        Ok(result) => result,
-        Err(join_err) => {
-            // Extremely unlikely (a panic inside the poll) — never silently
-            // drop the ack. The spawned child is orphaned (no `self.children`
-            // entry was ever recorded — `finish_issue_dispatch` never ran),
-            // so the reaper's later journal/`/proc` scan is the recovery
-            // path (Issue #3953), matching how a `spawn_child` panic would
-            // have been handled pre-split.
-            log::error!("dispatch_sweep: poll task for {kind:?} panicked: {join_err}");
-            return Response::Error {
-                message: format!(
-                    "dispatch_sweep failed: account-selection poll panicked: {join_err}"
-                ),
-            };
-        }
-    };
-
-    // Phase 3 (lock-scoped): record the outcome.
-    let result = {
-        let mut sr = target
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sr.finish_issue_dispatch(*prepared, token_name, runtime, immediate_preflight_death)
-    };
-    dispatch_result_to_response(&kind, result)
-}
+mod private_dispatch;
+use private_dispatch::dispatch_sweep_nonblocking;
 
 /// Shared `Result<DispatchOutcome> -> Response` mapping for `DispatchSweep`
 /// (Issue #6592) — used by both `dispatch_sweep_nonblocking` and (via
@@ -2843,8 +2673,21 @@ pub fn build_daemon_status(
         // Positive export-liveness signal (#5083) — the counterpart to the
         // anomaly-only field above. Always `Some` from a daemon of this
         // vintage: an exporter that never started reports `disabled`, which is
-        // a real answer, not the silence #4830 alone could offer.
+        // a real answer, not the silence #4830 alone could offer. Since #8756
+        // this is the FIRST configured exporter's cell; the per-sink picture
+        // is the map below.
         observability_export: Some(crate::observability::global_export_status()),
+        // Per-exporter cells (#8756): one entry per configured exporter
+        // ("https", "otlp", …), each sink surfaced independently. Empty from
+        // a daemon with observability off — the singular field above already
+        // distinguishes that state.
+        observability_exports: crate::observability::global_export_statuses(),
+        // Forge event-feed consumer (ADR-0021, #8765) — same process-global
+        // snapshot pattern. Always `Some` from a daemon of this vintage: a
+        // consumer that never started reports `disabled`, so "is my cursor
+        // advancing, and if not, why" is always answered rather than inferred
+        // from an absent warning.
+        forge_events: Some(crate::forge_events::global_status()),
         // Per-repo deep-clean state (#5919) — the same process-global snapshot
         // pattern once more, projected by the module that owns the state (the
         // mapping lived here until #7990 moved it beside `snapshot()`).
@@ -4226,59 +4069,22 @@ fn handle_request(
                 &kind,
             );
 
-            // Issue #4809: an explicit `model` param always wins (unchanged
-            // precedence), but an ABSENT one for a single-issue dispatch also
-            // considers the model-cost A/B experiment's forced arm — mirroring
-            // the autonomous work-finder / epic-supervisor dispatch paths —
-            // before falling back to `autonomous.model` / the shipped default.
-            //
-            // Issue #4827: the arm is stratified by the issue's real
-            // `<!-- loom:complexity=... -->` marker. Like the epic supervisor
-            // (and unlike the work finder, which carries the body on its
-            // `WorkItem`), this handler has no cached body — so the fetch is
-            // LAZY, running only inside the `experiment` branch. `off` /
-            // `observe` dispatches make zero extra `gh` calls, and a failed
-            // fetch degrades to the unchanged `routine` stratum.
-            let gh_bin = sr
-                .config()
-                .gh_bin
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from("gh"));
-            let (resolved_model, model_source_label, arm) = match (&kind, model.as_deref()) {
-                (crate::types::SweepKind::Issue(issue), None) => {
-                    let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model_lazy(
-                        &repo_root,
-                        *issue,
-                        || {
-                            crate::sweep_registry::fetch_issue_complexity(
-                                &gh_bin, &repo_root, *issue,
-                            )
-                        },
-                    );
-                    (resolved.model, resolved.source_label, resolved.arm)
-                }
-                _ => {
-                    let (m, s) =
-                        crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
-                    (m, s.as_str(), None)
-                }
-            };
+            // Model intent survives until the shared runtime-admission boundary.
             log::info!(
-                "dispatch_sweep: {:?} with{} model={resolved_model} (source={model_source_label}); \
+                "dispatch_sweep: {:?}; \
                  headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
                  only, not capacity-limiting since #5270])",
                 kind,
-                arm.map_or_else(String::new, |a| format!(" arm={a}")),
                 headroom.occupancy,
                 headroom.dynamic_cap,
                 headroom.disk_headroom,
                 headroom.ram_headroom,
                 headroom.token_axis_limit
             );
-            match sr.dispatch(
+            match sr.dispatch_with_model(
                 &kind,
                 idempotency_key,
-                Some(&resolved_model),
+                crate::sweep_registry::DispatchModel::Request(model.as_deref()),
                 effort.as_deref(),
                 depends_on,
             ) {
