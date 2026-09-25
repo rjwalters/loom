@@ -1294,7 +1294,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // into all three dispatch producers AND into the IPC server (which sets/aborts
     // it and renders it in `loom-daemon status`). With no drain requested the flag
     // stays `false`, so every producer's halt check is byte-for-byte unchanged.
-    let drain_state = Arc::new(loom_daemon::ipc::DrainState::new());
+    // #8652: backed by the persisted paused-time ledger (see `DrainState::with_default_ledger`).
+    let drain_state = Arc::new(loom_daemon::ipc::DrainState::with_default_ledger());
     let drain_flag = drain_state.flag();
 
     // Shared role-runner in-progress guard (#4364): one set, cloned into both

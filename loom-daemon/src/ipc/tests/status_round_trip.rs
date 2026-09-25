@@ -92,6 +92,7 @@ fn test_daemon_status_request_response_round_trip() {
         drain_deadline: None,
         drain_note: None,
         drain_roll: None,
+        drain_paused_by_day: std::collections::BTreeMap::new(),
         auto_update_enabled: true,
         auto_update_last_check: Some(chrono::Utc::now()),
         auto_update_last_roll: Some(chrono::Utc::now()),

@@ -1340,6 +1340,12 @@ pub struct DaemonStatusReport {
     /// is visible to a single `loom-daemon status --json`.
     #[serde(default)]
     pub drain_roll: Option<crate::ipc::drain_roll::DrainRollStatus>,
+    /// Cumulative dispatch-paused seconds attributable to drain-and-restart
+    /// rolls, per UTC day (Issue #8652), from a ledger persisted across the
+    /// restart a successful roll performs. Includes the elapsed portion of an
+    /// in-progress pause. Empty from a pre-#8652 daemon (`#[serde(default)]`).
+    #[serde(default)]
+    pub drain_paused_by_day: std::collections::BTreeMap<chrono::NaiveDate, u64>,
     /// Whether the autonomous self-update loop (Issue #4055) is enabled for this
     /// daemon process. `false` in the common opt-out case (the loop is
     /// default-OFF). `#[serde(default)]` keeps pre-#4055 wire data / older

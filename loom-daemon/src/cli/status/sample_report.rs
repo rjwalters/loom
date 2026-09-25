@@ -63,6 +63,7 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         drain_deadline: None,
         drain_note: None,
         drain_roll: None,
+        drain_paused_by_day: std::collections::BTreeMap::new(),
         auto_update_enabled: false,
         auto_update_last_check: None,
         auto_update_last_roll: None,

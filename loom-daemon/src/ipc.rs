@@ -247,6 +247,8 @@ pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 1800;
 /// case is handled on the very first poll (no full-interval wait).
 pub const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// #8652's persisted per-UTC-day paused-dispatch ledger — write-side only.
+pub mod drain_ledger;
 /// The pending-roll policy (#6007) and its live status projection (#8514) —
 /// extracted to a sibling module because this file is over
 /// `.loom/docs/file-size-policy.md`'s threshold and frozen, and because the
@@ -279,6 +281,10 @@ pub struct DrainState {
     generation: AtomicU64,
     /// Mutable descriptor of the active/last drain, for status rendering.
     inner: Mutex<DrainDescriptor>,
+    /// #8652's paused-time ledger. Observational only: taken (never before
+    /// `inner`) at the transitions that open/close a pause, never read by the
+    /// #6007 fail-safe policy.
+    ledger: Mutex<drain_ledger::PausedLedger>,
 }
 
 /// The rendered view of the current (or most recent) drain (Issue #4090).
@@ -398,10 +404,68 @@ impl Default for DrainState {
 impl DrainState {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_ledger(drain_ledger::PausedLedger::in_memory())
+    }
+
+    /// [`Self::new`] with an explicit (typically persisted) #8652 ledger.
+    #[must_use]
+    pub fn with_ledger(ledger: drain_ledger::PausedLedger) -> Self {
         Self {
             flag: Arc::new(AtomicBool::new(false)),
             generation: AtomicU64::new(0),
             inner: Mutex::new(DrainDescriptor::default()),
+            ledger: Mutex::new(ledger),
+        }
+    }
+
+    /// [`Self::new`] loaded from the default on-disk #8652 ledger path
+    /// (`~/.loom/drain-paused-ledger.json`, or `$LOOM_AUTO_UPDATE_STATE_DIR`),
+    /// reconciling any pause a killed predecessor left open. What the real
+    /// daemon process constructs; tests use [`Self::new`] (in-memory, no I/O).
+    #[must_use]
+    pub fn with_default_ledger() -> Self {
+        Self::with_ledger(drain_ledger::PausedLedger::load(
+            drain_ledger::default_ledger_path(),
+            Utc::now(),
+        ))
+    }
+
+    /// #8652: per-UTC-day paused seconds, including the live pause's elapsed
+    /// portion. Status-only — the fail-safe never reads this.
+    #[must_use]
+    pub fn paused_by_day(&self, now: chrono::DateTime<Utc>) -> BTreeMap<chrono::NaiveDate, u64> {
+        self.lock_ledger().totals(now)
+    }
+
+    /// #8652: close the ledger's open interval. The supervisor calls this
+    /// immediately before exiting for a roll — the exit is what would otherwise
+    /// lose the interval.
+    pub fn close_paused_interval(&self, now: chrono::DateTime<Utc>) {
+        self.lock_ledger().close(now);
+    }
+
+    /// Poison-tolerant: a ledger panic must never become a drain outage.
+    fn lock_ledger(&self) -> std::sync::MutexGuard<'_, drain_ledger::PausedLedger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hand off from the descriptor lock to the ledger lock (#8652): the ledger
+    /// is taken while `inner` is still held, so ledger ops land in transition
+    /// order, then `inner` is released before the (file-writing) ledger op.
+    fn ledger_after(
+        &self,
+        inner: std::sync::MutexGuard<'_, DrainDescriptor>,
+        at: chrono::DateTime<Utc>,
+        open: bool,
+    ) {
+        let mut ledger = self.lock_ledger();
+        drop(inner);
+        if open {
+            ledger.open(at);
+        } else {
+            ledger.close(at);
         }
     }
 
@@ -530,7 +594,8 @@ impl DrainState {
         inner.note = None;
         // #6007 pending-roll bookkeeping — a fresh drain always starts with a
         // clean retry history.
-        inner.started_at = Some(Utc::now());
+        let started_at = Utc::now();
+        inner.started_at = Some(started_at);
         inner.base_timeout = timeout;
         inner.refusals = 0;
         inner.roll_pending = false;
@@ -540,6 +605,7 @@ impl DrainState {
         // observe `flag=true` with `active=false`.
         self.flag.store(true, Ordering::Relaxed);
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.ledger_after(inner, started_at, true);
         DrainBegin::Started {
             generation,
             deadline,
@@ -570,6 +636,7 @@ impl DrainState {
         });
         inner.roll_pending = false;
         inner.roll_target = None;
+        self.ledger_after(inner, Utc::now(), false);
         true
     }
 
@@ -600,6 +667,7 @@ impl DrainState {
         inner.roll_pending = false;
         inner.roll_target = None;
         inner.note = Some(note);
+        self.ledger_after(inner, Utc::now(), false);
     }
 
     /// Record a note on the active/last drain without touching any other state
@@ -663,6 +731,7 @@ impl DrainState {
                 inner.deadline = None;
                 inner.roll_pending = false;
                 inner.roll_target = None;
+                self.ledger_after(inner, now, false);
                 RollRefusal::Abandoned {
                     attempts,
                     elapsed,
@@ -1188,6 +1257,9 @@ async fn run_drain_supervisor(
                     "daemon.drain.completed",
                     serde_json::json!({ "in_flight": 0, "then_exit": then_exit }),
                 );
+                // #8652: close the paused interval BEFORE exiting — the exit is
+                // what would otherwise lose it.
+                drain.close_paused_interval(Utc::now());
                 if then_exit {
                     log::warn!("{}", drain_complete_log_line(true, "", verify_poll_secs));
                     crate::observability::shutdown::exit(drain_exit_code(true)).await;
@@ -1279,6 +1351,7 @@ async fn run_drain_supervisor(
             }
             DrainTick::TimedOutForce => {
                 let cancelled = cancel_all_in_flight(&workspace_pool, &fallback_root);
+                drain.close_paused_interval(Utc::now()); // #8652, before either exit.
                 let _ = event_bus.publish_generic(
                     "daemon.drain.timeout",
                     serde_json::json!({
@@ -2569,6 +2642,7 @@ pub fn build_daemon_status(
         drain_deadline: None,
         drain_note: None,
         drain_roll: None,
+        drain_paused_by_day: BTreeMap::new(),
         // Autonomous self-update loop status (#4055) — read from the
         // process-global snapshot the loop publishes each tick. The loop is
         // process-global (exactly one per daemon, never a per-workspace
@@ -2790,6 +2864,7 @@ pub fn build_daemon_status_with_drain(
     // for D, N in flight" — computed against the same in-flight list this
     // report already carries, so the two can never disagree.
     report.drain_roll = drain_roll::roll_status(&snap, report.in_flight.len(), Utc::now());
+    report.drain_paused_by_day = drain.paused_by_day(Utc::now()); // #8652
     report.drain_note = snap.note;
     report
 }
