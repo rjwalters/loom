@@ -581,6 +581,8 @@ mod tests {
                 roles: crate::telemetry::RoleTickHealth::default(),
                 protection: None,
                 admission_brake: None,
+                is_captain: None,
+                armed_singleton_jobs: Vec::new(),
             }),
         )
     }

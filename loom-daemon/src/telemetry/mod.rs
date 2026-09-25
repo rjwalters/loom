@@ -1103,6 +1103,34 @@ pub struct HostHealthRecord {
     /// backward-compatibility contract `protection` established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_brake: Option<AdmissionBrakeSummary>,
+    /// Whether this host is the fleet-wide singleton-job captain (Issue
+    /// #8848) — see [`crate::fleet_captain`]. Three-valued, not a bare
+    /// `bool`: `None` when this repo declares no `fleet.captain` at all
+    /// (the overwhelmingly common case; the mechanism does not apply here),
+    /// `Some(false)` when a captain IS declared and it is not this host, and
+    /// `Some(true)` when this host is the declared captain. Collapsing
+    /// "not applicable" and "not the captain" into a single `false` would
+    /// make the dashboard's "no host reporting `is_captain: true`" check
+    /// (#8848 AC5) fire on every ordinary repo that never opts into this
+    /// mechanism — the same "unknown != zero" contract every other optional
+    /// field on this struct already follows.
+    ///
+    /// `#[serde(default)]` so a record from a pre-#8848 daemon still decodes
+    /// (as `None`) rather than failing the whole envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_captain: Option<bool>,
+    /// Declared-singleton-job names currently armed on this host (Issue
+    /// #8848) — i.e. every job whose most recent
+    /// [`crate::fleet_captain::arm_singleton_job`] call resolved
+    /// [`crate::fleet_captain::CaptainGate::Armed`] here. Empty on a host
+    /// that is not the captain, on a host with no declared singleton jobs at
+    /// all, and on a pre-#8848 daemon.
+    ///
+    /// `#[serde(default)]` so a pre-#8848 record still decodes (as an empty
+    /// list) rather than failing the whole envelope — the same
+    /// backward-compatibility contract `active_sweep_ids` established.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub armed_singleton_jobs: Vec<String>,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —

@@ -1024,6 +1024,37 @@ never interpolates the `ps` clause, which would re-emit the redacted list
 through an allowlisted field and defeat the boundary. Any future free-text
 `host.health` field is bound by the same rule.
 
+**Fleet captain state (`is_captain` / `armed_singleton_jobs`, #8848).** Two
+fields describing this host's role in the fleet-wide singleton-job captain
+mechanism (`loom-daemon/src/fleet_captain.rs`) — see "Fleet captain (#8848)"
+in `daemon-reference.md` for the full design:
+
+```json
+{
+  "is_captain": true,
+  "armed_singleton_jobs": ["edge-queue-pull"]
+}
+```
+
+- `is_captain` — **three-valued, not a bare boolean**: *omitted* when this
+  repo declares no `fleet.captain` at all (the mechanism does not apply here —
+  the overwhelmingly common case, and every record from a pre-#8848 daemon),
+  `false` when a captain IS declared and it is not this host, `true` when this
+  host is the declared captain. A consumer MUST NOT collapse "omitted" and
+  `false` into one state — a fleet-wide "no host reports `is_captain: true`"
+  check must only fire once at least one host actually reports the field.
+- `armed_singleton_jobs` — declared-singleton-job names currently armed on
+  this host (i.e. each one's most recent `fleet_captain::arm_singleton_job`
+  call resolved `Armed` here). Omitted/empty on a host that is not the
+  captain, on a host with no declared singleton jobs at all, and on a record
+  from a pre-#8848 daemon.
+
+Both fields are additive (no `schema_version` bump) and pass through public
+redaction unchanged (`dashboard/src/redaction.ts`): `is_captain` describes
+this host's own role in an operator-assigned fleet-wide designation, and a
+singleton job name is an allowlisted identifier a repo declares — the same
+footing as a role name — neither names a repo, issue, branch, or operator.
+
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 
 The daemon durably records one `sweep.outcome` [`TelemetryEnvelope`] per

@@ -53,6 +53,16 @@ function bool(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+/** An array of non-empty strings, dropping any wrong-typed/empty entry
+ * rather than failing the whole field — same best-effort narrowing as every
+ * scalar helper above. `undefined` (not `[]`) when `value` itself is not an
+ * array, so an absent field stays absent rather than becoming a fabricated
+ * empty list. */
+function strArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
+}
+
 /** A `managed_repos` entry. `slug` is dropped by `stripUndefined` when
  * wrong-typed, or when the backend has already redacted it away (a private
  * repo, unauthenticated viewer) — see `ManagedRepoEntry`'s doc.
@@ -129,6 +139,8 @@ export function parseHostHealth(value: unknown): HostHealthRecord {
       : undefined,
     roles: parseRoleTickHealth(value.roles),
     protection: parseHostProtection(value.protection),
+    is_captain: bool(value.is_captain),
+    armed_singleton_jobs: strArray(value.armed_singleton_jobs),
   });
 }
 
