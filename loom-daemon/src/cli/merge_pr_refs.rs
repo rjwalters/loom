@@ -46,6 +46,25 @@ pub(crate) enum MergePrRefsCommand {
         #[arg(long, value_name = "N")]
         issue: u64,
     },
+
+    /// The non-blocking pre-merge warning for a whole-line, code-span-wrapped
+    /// `Part of #N` / `Contributes to #N` trailer (#5690, ported #8831 — backs
+    /// the inline call site in `defaults/scripts/merge-pr.sh`'s
+    /// `_check_partial_increment_close_conflict`, formerly the shell function
+    /// `_warn_backticked_partial_increment_trailers`). Computes both the
+    /// backticked and the plain-text declaration sets from the same body and
+    /// diffs them itself, so the caller passes nothing but the PR number.
+    /// Prints one finding (two lines) per undeclared backticked issue, empty
+    /// when there is nothing to warn about; always exits 0.
+    BackticksPartialIncrementWarnings {
+        #[arg(long, value_name = "N")]
+        pr: String,
+
+        /// Prefix every line `[dry-run] `, matching the #4569/#4595 conflict
+        /// warnings' contract.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 impl MergePrRefsCommand {
@@ -81,6 +100,9 @@ impl MergePrRefsCommand {
                 if !s.is_empty() {
                     println!("{s}");
                 }
+            }
+            MergePrRefsCommand::BackticksPartialIncrementWarnings { pr, dry_run } => {
+                print!("{}", refs::backticked_partial_increment_warnings(&body, &pr, dry_run));
             }
         }
         Ok(())

@@ -1345,7 +1345,22 @@ _check_partial_increment_close_conflict() {
 
   local partial_refs
   partial_refs="$(_partial_increment_refs "$pr_body")"
-  [[ -n "$partial_refs" ]] || return 0
+
+  # Backticked-trailer warning (#5690, ported to Rust #8831 —
+  # cli/merge_pr_refs.rs's `backticks-partial-increment-warnings`, which
+  # recomputes both declaration sets from $pr_body itself and diffs them, so
+  # this call passes nothing but the PR number and dry-run state). Runs BEFORE
+  # the early return below because the case it exists for is precisely the one
+  # where $partial_refs is EMPTY — a trailer the author backticked, which
+  # parses as no declaration at all. Pure text analysis, no forge calls, so
+  # the common (non-partial-increment) path still costs zero extra requests.
+  # (The three statements below share one line deliberately — #8831 pays for
+  # the daemon round trip inside the shell-budget ratchet's portable pool, and
+  # this keeps that cost at net zero. The unquoted $(...) is intentional: it
+  # expands to a single `--dry-run` token or nothing, never anything word
+  # splitting could mis-tokenize.)
+  # shellcheck disable=SC2046
+  local bt_warn="$(printf '%s\n' "$pr_body" | _mp_refs backticks-partial-increment-warnings --pr "$PR_NUMBER" $([[ "${DRY_RUN:-false}" == "true" ]] && echo --dry-run))"; [[ -z "$bt_warn" ]] || warning "$bt_warn"; [[ -n "$partial_refs" ]] || return 0
 
   # Closing references GitHub will honor on merge, from three unioned signals:
   #   1. the body's own closing keywords (quota-free regex);
