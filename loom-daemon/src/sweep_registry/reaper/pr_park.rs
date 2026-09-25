@@ -41,6 +41,23 @@
 use crate::sweep_registry::SweepRegistry;
 
 impl SweepRegistry {
+    /// Whether linked PR `pr` is parked (#8689) — logging the NOT-resuming
+    /// decision when it is. See the module docs for why a parked PR must not
+    /// be resumed and why this does not consume a resume attempt.
+    pub(crate) fn linked_pr_parked(&self, issue: u32, pr: u32, phase: &Option<String>) -> bool {
+        let Some(label) = self.linked_pr_park_label(pr) else {
+            return false;
+        };
+        log::info!(
+            "issue #{issue}: linked PR #{pr} carries `{label}` — a deliberate park (e.g. a \
+             Doctor-cycle-cap block) that the #4444 issue-side guard cannot see; NOT resuming \
+             at checkpoint phase {phase:?} (#8689). The issue is back at loom:issue with the \
+             #4123 open-PR guard in force; the parked PR is the periodic Judge/Champion \
+             roles' remit."
+        );
+        true
+    }
+
     /// The first [`PARK_LABELS`](crate::work_finder::PARK_LABELS) entry
     /// carried by pull request `pr`, or `None` when it carries none — or when
     /// the labels could not be read.
@@ -64,3 +81,12 @@ impl SweepRegistry {
             .map(|park| (*park).to_string())
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod tests;

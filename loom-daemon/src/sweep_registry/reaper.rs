@@ -1554,7 +1554,7 @@ impl SweepRegistry {
                                         .get(&issue)
                                         .copied()
                                         .unwrap_or(0);
-                                    if clean_no_progress_exit {
+                                    let skip_resume = if clean_no_progress_exit {
                                         log::warn!(
                                             "issue #{issue}: sweep exited cleanly (code 0) without \
                                              advancing its checkpoint (phase \
@@ -1566,13 +1566,7 @@ impl SweepRegistry {
                                              the open PR is the periodic Judge/Champion roles' \
                                              remit."
                                         );
-                                        events_to_emit.push(Event::SweepResumeDispatched {
-                                            issue,
-                                            pr,
-                                            checkpoint_phase: resume_phase_check.clone(),
-                                            dispatched: false,
-                                            repo: None, // stamped by emit_event (#3929)
-                                        });
+                                        true
                                     } else if attempts >= MAX_RESUME_ATTEMPTS {
                                         log::warn!(
                                             "issue #{issue}: reaper-driven resume attempts \
@@ -1582,14 +1576,8 @@ impl SweepRegistry {
                                              — NOT resuming again; leaving the PR for the \
                                              periodic Judge role / operator (#4256)"
                                         );
-                                        events_to_emit.push(Event::SweepResumeDispatched {
-                                            issue,
-                                            pr,
-                                            checkpoint_phase: resume_phase_check.clone(),
-                                            dispatched: false,
-                                            repo: None, // stamped by emit_event (#3929)
-                                        });
-                                    } else if let Some(label) = self.linked_pr_park_label(pr) {
+                                        true
+                                    } else {
                                         // PR-side park (Issue #8689). The
                                         // checkpoint DID advance — a
                                         // cap-exhausted Doctor block writes
@@ -1620,15 +1608,9 @@ impl SweepRegistry {
                                         // open-PR guard refuses ordinary
                                         // re-dispatch and the periodic
                                         // Judge/Champion roles own the PR.
-                                        log::info!(
-                                            "issue #{issue}: linked PR #{pr} carries `{label}` — a \
-                                             deliberate park (e.g. a Doctor-cycle-cap block) that \
-                                             the #4444 issue-side guard cannot see; NOT resuming \
-                                             at checkpoint phase {resume_phase_check:?} (#8689). \
-                                             The issue is back at loom:issue with the #4123 \
-                                             open-PR guard in force; the parked PR is the periodic \
-                                             Judge/Champion roles' remit."
-                                        );
+                                        self.linked_pr_parked(issue, pr, &resume_phase_check)
+                                    };
+                                    if skip_resume {
                                         events_to_emit.push(Event::SweepResumeDispatched {
                                             issue,
                                             pr,
@@ -2376,14 +2358,3 @@ mod tests;
     unused_imports
 )]
 mod claim_restore_tests;
-
-// The PR-side park family (#8689) likewise lives in its own sibling module,
-// for the same file-size-ratchet reason as `claim_restore_tests`.
-#[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::expect_used,
-    unused_imports
-)]
-mod pr_park_tests;

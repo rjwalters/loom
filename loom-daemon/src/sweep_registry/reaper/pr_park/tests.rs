@@ -6,7 +6,7 @@
 //! size (`.loom/docs/file-size-policy.md`), the same reason
 //! `claim_restore_tests.rs` exists.
 
-use super::*;
+use crate::sweep_registry::reaper::*;
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
