@@ -315,14 +315,163 @@ connect to the docker API at unix:///var/run/docker.sock`, and no trial volumes
 exist here, so nothing in this section is a live observation and no live check was
 repeated. That is also why the two open ledger rows below did not advance.
 
+## Linux/amd64 deployment, executed live (2026-09-22)
+
+Every section above was observed on macOS arm64 under Docker Desktop, which left
+two claims unexercised: that the pinned multi-platform indexes actually resolve
+and run on amd64, and that the histogram helper's amd64 branch works (the section
+on deployment identity says so explicitly — "amd64 execution was not performed on
+this host"). This section closes both on a third, independent deployment: a native
+Linux x86_64 host (Ubuntu 24.04 noble, kernel 6.x, 8 vCPU, 15 GiB RAM, Docker
+Engine 29.1.3, Compose v2.40.3), with no Docker Desktop VM in the path.
+
+Foundry **v0.2.17**'s `foundry_linux_amd64.tar.gz` matched the README's recorded
+SHA-256 (`51f41204…c0d886`) on independent download. `gauge` left
+`casting.yaml.lock` byte-unchanged, and `forge` into a scratch directory produced
+output `diff -rq`-identical to the committed `pours/` — the deterministic-render
+row now holds across two architectures and three hosts. `docker compose config`
+validated with the private env file and **failed closed without it**
+(`required variable SIGNOZ_POSTGRES_PASSWORD is missing a value`).
+
+All five pinned index digests resolved to `amd64/linux` and matched
+`casting.yaml` exactly: SigNoz `49501b04…3ee8ff`, its collector `34ecb436…204f6`,
+ClickHouse server `cacf32d6…dfd3a`, Keeper `525b8b0f…d8524`, PostgreSQL
+`a3b7f434…be30d6`. The histogram helper ran its **amd64** path in the pinned
+image and printed `histogram-quantile.tar.gz: OK` before extraction, so the
+checksum-before-extract ordering is now executed, not merely pinned, on both
+architectures.
+
+**Cold bootstrap took 67 seconds** (21:27:02Z → 21:28:09Z) from a cold image
+pull to all five services Compose-healthy, against roughly **15 minutes** for the
+same render on the arm64 Docker Desktop VM. A subsequent full stop/start took
+**30 seconds**. This is strong evidence that the earlier startup cost was a
+property of that contended VM rather than of SigNoz, and it is the distinction
+this trial is required to keep: it is a host-capacity observation, not a product
+performance verdict, and nothing here is a comparison with ClickStack.
+
+The trust boundary was verified by probe rather than by reading the render.
+Exactly one host port is published across the whole project —
+`127.0.0.1:18081` — and the host's own non-loopback address (`172.31.74.176`)
+**refused** the UI, confirming the loopback bind rather than inferring it. OTLP
+4317/4318, ClickHouse 8123/9000/9009, PostgreSQL 5432 and every Keeper port
+remained container-internal and unpublished. Only the ingester joined
+`loom-observability`, carrying the documented `signoz-otel-collector` alias.
+
+### Compose readiness is not ingestion readiness
+
+The most consequential finding of this run, and the reason the README gained a
+"Register the first user *before* expecting ingestion" step. `up -d --wait`
+reported all five services healthy, yet **the ingester's OTLP receivers were
+never open**. The gateway's SigNoz exporter failed every attempt with
+`dial tcp 172.18.0.2:4318: connect: connection refused` — DNS resolved, the port
+did not exist — while the app logged, every 30 seconds:
+
+```
+failed to find or create agent … exception.message: "cannot create agent without orgId"
+```
+
+`/api/v1/version` reported `"setupCompleted": false`. The ingester's OpAMP client
+cannot register an agent before an organization exists, so it never receives the
+effective configuration that binds its receivers. Nothing about this is visible
+in SigNoz — there is no partial data, no error surface, no empty-but-present
+service — and `docker compose ps` shows healthy throughout.
+
+The causal link was then proven rather than assumed: registering the first
+org/user via `POST /api/v1/register` flipped `setupCompleted` to `true`, the
+OpAMP errors stopped, the receiver bound, and the gateway's **already-queued**
+batches drained on their own. No re-send was issued. Delivery health afterwards
+read exactly `otelcol_exporter_sent_spans` **37**, `sent_log_records` **14** and
+`sent_metric_points` **3** for `exporter="otlp_http/signoz"` — the full manifest,
+recovered intact across the outage window.
+
+That doubles as this trial's **backend outage and recovery** evidence: the
+receiver was genuinely unavailable for roughly 40 minutes of retry backoff, and
+the shared collector's sending queue preserved all three signals with zero loss.
+The contrasting exporter in the same scrape makes the signal legible — ClickStack
+was deliberately not deployed here, and its queue stayed pinned at 15 traces / 14
+logs / 1 metric with **no** `sent` series at all. One healthy exporter and one
+dead backend are trivially distinguishable in `otelcol_exporter_*`, and
+indistinguishable from inside either product's UI.
+
+After a full stop/start the organization persisted, `setupCompleted` stayed
+`true`, and the app logged **zero** `cannot create agent without orgId` errors —
+so the gate is first-run only, not a recurring restart hazard.
+
+### Shared fixture manifest on amd64
+
+`loom-daemon telemetry-fixture --run-id 8528amd64 --start-time
+2026-09-22T21:00:00Z` (built from `9958dc7ad` with `--features otlp`) generated
+the expected 52-envelope bundle — 37 spans, 14 logs, 3 metric data points, matching
+the manifest's own `expected_distinct`. `telemetry-export` through the gateway at
+`127.0.0.1:14318` acknowledged all 52 with zero rejected/dropped in 0.42s.
+
+`fixture-queries.sql` then ran against the live backend with
+`--param_run='loom-synthetic-8528amd64'`, completing the whole file in **1.79s**
+(including `docker compose exec` overhead). Every assertion held on the first
+pass, reproducing the arm64 results under different trace IDs:
+
+- Query 0: the pinned v0.142.1 attribute/resource column names matched exactly.
+- Query 1: **37 rows, 37 unique spans, 8 traces** — no duplicate delivery.
+- Query 2: all 8 traces round-tripped by parent/child ID, including the
+  deliberate same-timestamp `synthetic/alpha` / `synthetic/beta` collision.
+- Query 3: per-repo/role/runtime/model grouping correct, with the deliberately
+  unlabeled `loom.runtime.preflight` row staying its own bucket (empty role,
+  runtime and model) instead of merging into a labeled one.
+- Query 4: the exact five-span repair chain — builder `Ok` → judge attempt 1
+  `rejected`/`Error` → doctor `Ok` → judge attempt 2 `approved`/`Ok` → merge `Ok`
+  — with distinct span IDs per attempt.
+- Query 5: exactly one root-less trace, `da14dd5676ae8643f74c8145a1c2f89e`, with
+  2 children and 0 `loom.sweep` roots.
+- Query 6: 14/14 logs matched to their span's trace/span ID.
+- Query 7: `synthetic-zero` carried both `loom.tokens.exhausted` and
+  `loom.tokens.usage_fraction` at a stored `0`; `synthetic-unknown` carried only
+  `exhausted`, with no `usage_fraction` series. Absence stayed absent, zero
+  stayed a measured zero. Metric timestamps confirmed millisecond truncation
+  (`1790110800000`) against the RFC3339 anchor.
+- Query 9: **zero** rows for the privacy sentinel across all three signals; the
+  gateway's `keep_keys` allowlist dropped `prompt.content` before storage.
+
+A timed duplicate replay under the same `run_id` produced **74 rows / still 37
+unique spans / 8 traces**, and the gateway counters doubled to 74/28/6 — at-least-
+once delivery counted honestly at both layers rather than silently deduplicated.
+
+After the restart, the preserved store still read 74 rows / 37 unique spans / 8
+traces and 28 log rows, and a *fresh* fixture (`run-id 8528amd64post`) indexed its
+37 spans within 10 seconds — so restart persistence and receiver recovery both
+hold on this architecture. Note that indexing lag is real: the first query
+immediately after export returned 0 rows. A single empty query is not evidence of
+loss.
+
+Point-in-time `docker stats` after ingestion, on native Linux rather than a
+Docker Desktop VM: ClickHouse 649.9 MiB / 2 GiB, ingester 105.6 MiB / 512 MiB,
+SigNoz app 75.2 MiB / 768 MiB, Keeper 42.5 MiB / 256 MiB, PostgreSQL 31.4 MiB /
+256 MiB, plus the gateway collector at 42.1 MiB / 512 MiB. Every service sat well
+inside its rendered `mem_limit`. Active parts across the three signal databases
+totaled **200,013 bytes** (traces 63.58 KiB / 324 rows, logs 38.99 KiB / 121 rows,
+metrics 92.76 KiB / 1,763 rows) for three fixture deliveries. These are
+small-fixture figures and are not a capacity or cost benchmark.
+
+**Not done in this session**, and deliberately not claimed: retention was left at
+the upstream defaults, so this deployment is *not* a seven-day parity
+observation — `signoz_index_v3` was confirmed rendering at the upstream
+`toIntervalSecond(1296000)` (15 days), which independently corroborates the
+README's warning that a fresh render alone does not establish parity. The prior
+sections' seven-day API + `retention.sql` + DDL verification stands on its own and
+was not repeated. No authenticated UI screenshots were captured (no browser
+automation on this host), and the UI view matrix for Loom's non-HTTP span kinds
+remains open. The entire trial project was torn down with `down --volumes` at the
+end of the session, and the host's unrelated containers were never touched.
+
 ## Acceptance ledger
 
 | Check | Status |
 | --- | --- |
 | Pinned Foundry render and configuration | Passed, including deterministic second render (reconfirmed independently above); digest pinning, casting/render agreement and the README version table are now CI-enforced |
-| Private receiver exposure and project isolation | Passed on the trial host, and now continuously enforced against the committed render — see "Rendered-deployment contract" |
-| Keeper, PostgreSQL and ClickHouse readiness | Passed on the trial VM |
-| Schema migrations and app readiness | Passed; receiver storage proof remains separate |
+| Architecture support (arm64 **and** amd64) | **Passed** — arm64 on Docker Desktop above; amd64 executed live on native Linux, all five index digests resolving to `amd64/linux` and the histogram helper's amd64 branch running its checksum-before-extract path |
+| Private receiver exposure and project isolation | Passed on the trial host, continuously enforced against the committed render (see "Rendered-deployment contract"), and additionally probed live on amd64 — the host's non-loopback address refuses the UI, and no other port is published |
+| Keeper, PostgreSQL and ClickHouse readiness | Passed on the trial VM, and on native Linux/amd64 in 67s cold / 30s restart |
+| Schema migrations and app readiness | Passed; receiver storage proof remains separate. **Compose-healthy is not ingestion-ready** — the receiver stays closed until an organization is registered; see "Compose readiness is not ingestion readiness" |
+| Backend outage and recovery through the shared collector | **Passed** — the ingester's receiver was genuinely unavailable until org registration; the gateway's queue preserved and drained all 37/14/3 signals with zero loss and no re-send, while the absent ClickStack exporter stayed visibly stuck in the same scrape |
 | Three fixture signals with matching IDs/values | Passed for the ad-hoc probe; metric timestamp precision conversion documented |
 | Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
 | Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
@@ -330,7 +479,8 @@ repeated. That is also why the two open ledger rows below did not advance.
 | Saved query artifacts for the shared fixture manifest | **Passed** — executed live above; matches the generated manifest exactly |
 | Shared fixture manifest observed in SigNoz | **Passed** — see "Shared fixture manifest, executed live" above: 37/14/3 signals, exact totals, graph, grouping, root-less detection, absence-vs-zero and privacy-sentinel queries all verified |
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
-| Repeated latency/footprint comparison | Open — shared evaluation #8529; this session did not deploy ClickStack alongside SigNoz, so no simultaneous comparison was attempted |
+| Repeated latency/footprint comparison | Open — shared evaluation #8529; neither session deployed ClickStack alongside SigNoz, so no simultaneous comparison has been attempted |
+| UI view matrix for Loom's non-HTTP span kinds | Open — Trace Explorer, Logs Explorer and Metrics Explorer are established above as the working acceptance surfaces, but which SigNoz product views degrade (service list, service map, APM/exceptions pages) for operational spans still needs the authenticated UI, which no session has had browser access to |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a
 real Loom lifecycle. Keep #8528 open until the real-canary and #8529
