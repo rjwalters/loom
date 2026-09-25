@@ -636,8 +636,20 @@ fn emit_correlated(
         .spawned()
         .then(|| resolve_runtime_attribution(&tick.root, &tick.role))
         .flatten();
+    // Issue #8594: a legacy-adapter runtime that keeps a usage store of its own
+    // (Codex) writes no `# LOOM_LAUNCH` record, so its runtime id comes from
+    // the `# LOOM_RUNTIME_RESOLVED` marker every runtime writes. Resolves to
+    // `None` for `claude`, so a Claude tick's record stays byte-identical; the
+    // record's own `runtime`/`provider`/`profile` fields are unaffected either
+    // way (they stay launch-record-sourced, via `apply_runtime_attribution`).
+    let usage_runtime = tick.result.spawned().then(|| {
+        crate::usage_source::role_tick_usage_runtime(
+            runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+            &crate::role_runner::role_log_path(&tick.root.join(".loom").join("logs"), &tick.role),
+        )
+    });
     let source = crate::usage_source::UsageSource::for_runtime(
-        runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+        usage_runtime.as_ref().and_then(|r| r.as_deref()),
     );
     let scan = tick.result.spawned().then(|| {
         if source.is_native_store() {
@@ -654,26 +666,28 @@ fn emit_correlated(
             // The predicate is `is_native_store()`, NOT an equality test
             // against one variant: an `== OpenCodeSessionDb` test would have
             // routed Kimi silently back onto the Claude transcript reader.
-            crate::usage_source::role_tick_tokens_by_model(
-                runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+            //
+            // `usage_runtime`, not the launch record alone: a legacy-adapter
+            // Codex tick has no record, only the resolved-runtime marker (#8594).
+            return crate::usage_source::role_tick_tokens_by_model(
+                usage_runtime.as_ref().and_then(|r| r.as_deref()),
                 &tick.root,
                 Some((tick.started_at, tick.ended_at)),
             )
             .map(|tokens_by_model| TranscriptScan {
                 tokens_by_model,
                 actions: None,
-            })
-        } else {
-            let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
-            let transcripts = attributed_transcripts(
-                &projects_dir,
-                &tick.root,
-                &tick.role,
-                tick.started_at,
-                tick.ended_at,
-            );
-            scan_transcripts(&transcripts)
+            });
         }
+        let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
+        let transcripts = attributed_transcripts(
+            &projects_dir,
+            &tick.root,
+            &tick.role,
+            tick.started_at,
+            tick.ended_at,
+        );
+        scan_transcripts(&transcripts)
     });
     let record = build_record(tick, repo, visibility, scan.flatten());
     let record = apply_runtime_attribution(record, runtime_attribution);
