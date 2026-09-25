@@ -1081,3 +1081,6 @@ fn rendered_text_names_the_card_and_the_relationship_to_the_old_summary() {
 
 #[cfg(test)]
 mod complexity_tests;
+
+#[cfg(test)]
+mod agreement_tests;
