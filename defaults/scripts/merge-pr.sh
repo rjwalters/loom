@@ -894,25 +894,31 @@ _check_champion_hold_state_staleness() {
   fi
 }
 
+# The decision itself (loom:pr present? overridden? blocked, and the exact
+# message) is `loom-daemon merge-pr loom-pr-guard` (Rust,
+# loom-daemon/src/merge_pr/loom_pr_guard.rs -- #7419, a slice of #8191). No
+# requires-daemon floor of its own -- same choice `redate-checks` makes later
+# in this file (see its own comment): an older binary that does not know this
+# verb exits non-zero without the CLEAN sentinel like any other guard fault,
+# and the fail-closed branch below refuses the merge exactly as if `loom:pr`
+# were genuinely absent with no override -- the safe direction, never a
+# silent pass. --allow-unapproved is threaded through as a flag because it
+# changes the VERDICT (override vs. block), not just how a verdict is
+# displayed -- unlike --dry-run, which stays entirely shell-side, wrapping
+# the same "would block" text in a warning instead of an error, same shape as
+# every other guard in this file.
 _check_loom_pr_label() {
-  local has_loom_pr=false
-
-  if printf '%s\n' "$PR_LABELS" | grep -qx 'loom:pr'; then
-    has_loom_pr=true
-  fi
-
-  if [[ "$has_loom_pr" == "true" ]]; then
+  local msg rc=0 flags=()
+  [[ "$ALLOW_UNAPPROVED" == "true" ]] && flags+=(--allow-unapproved)
+  msg="$(printf '%s\n' "$PR_LABELS" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr loom-pr-guard --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" "${flags[@]}" 2>/dev/null)" || rc=$?
+  if [[ $rc -eq 0 && "$msg" == "LOOM-PR-GUARD-CLEAN" ]]; then
     _check_champion_hold_state_staleness
     return 0
   fi
-
-  # loom:pr absent.
-  if [[ "$ALLOW_UNAPPROVED" == "true" ]]; then
-    warning "loom:pr guard: --allow-unapproved set; proceeding without loom:pr (labels: ${PR_LABELS:-<none>}; head: $PR_HEAD_SHA) — operator asserts responsibility for merging an unreviewed head"
-
+  if [[ $rc -eq 0 && "$ALLOW_UNAPPROVED" == "true" && "$msg" == "loom:pr guard:"* ]]; then
+    warning "$msg"
     if [[ "$DRY_RUN" != "true" ]]; then
-      local override_comment
-      override_comment="## Merge Proceeded Without \`loom:pr\` (Override)
+      local override_comment="## Merge Proceeded Without \`loom:pr\` (Override)
 
 PR #$PR_NUMBER was merged via \`merge-pr.sh --allow-unapproved\` while the \`loom:pr\` label was absent — no forge-visible Judge review signal existed for the head being merged.
 
@@ -923,30 +929,15 @@ The operator running this merge explicitly asserted responsibility for this over
 
 ---
 *Recorded by merge-pr.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ)*"
-      forge_gh_comment_rl_safe "$REPO_NWO" "$PR_NUMBER" "$override_comment" 2>/dev/null || \
-        warning "Could not post loom:pr override audit comment on PR #$PR_NUMBER (merge proceeds anyway; the warning above is still the log record)"
+      forge_gh_comment_rl_safe "$REPO_NWO" "$PR_NUMBER" "$override_comment" 2>/dev/null || warning "Could not post loom:pr override audit comment on PR #$PR_NUMBER (merge proceeds anyway; the warning above is still the log record)"
     fi
-
     return 0
   fi
-
-  local msg
-  msg="Merge blocked: PR #$PR_NUMBER does not carry the \`loom:pr\` label — no forge-visible signal exists that Judge reviewed the CURRENT head.
-
-Current labels: ${PR_LABELS:-<none>}
-Current head SHA: $PR_HEAD_SHA
-
-loom:pr may have been cleared by a staleness guard (e.g. after a Doctor rebase moved the head) or never applied. Get the PR (re-)reviewed by Judge and re-labeled loom:pr, then re-run this merge.
-
-If you are deliberately merging without that review signal and take responsibility for it, re-run with --allow-unapproved to bypass this guard."
-
-  # --dry-run still runs the guard and REPORTS the would-be block, but honors
-  # the dry-run contract (never exits 1) — same shape as the guards above.
+  [[ $rc -eq 1 && "$msg" == "Merge blocked:"* ]] || msg="Merge blocked: PR #$PR_NUMBER's loom:pr review-signal guard (#7419) could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr loom-pr-guard' exited $rc without a recognized verdict. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'reviewed' from 'never checked', so only a positive signal is accepted. Build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."
   if [[ "$DRY_RUN" == "true" ]]; then
-    warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: loom:pr label absent (labels: ${PR_LABELS:-<none>}; head: $PR_HEAD_SHA). Re-run with --allow-unapproved to override."
+    warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"
     return 0
   fi
-
   error "$msg"
 }
 
