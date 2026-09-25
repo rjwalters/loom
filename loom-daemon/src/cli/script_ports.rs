@@ -98,6 +98,15 @@ pub(crate) enum ScriptPortCommand {
     /// best-effort by contract and the worktree already exists.
     WorktreeLink(super::worktree_link::WorktreeLinkArgs),
 
+    /// `worktree.sh`'s crash-debris pre-flight (#8195, slice 5): the stale
+    /// `index.lock`/`HEAD.lock`/`gitdir.lock` sweep and the **orphan guard**
+    /// that `rm -rf`s an `issue-<N>` dir `git worktree list` does not know
+    /// about. The guard whose false answer deleted a LIVE worktree twice over
+    /// (#7858/#7849 — a porcelain path split on whitespace, and a candidate
+    /// resolved logically instead of physically). Exit 0 always: both shell
+    /// call sites already discard the status with `|| true`.
+    WorktreeCleanup(super::worktree_cleanup::WorktreeCleanupArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -204,6 +213,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeRemove(args) => args.run(),
             ScriptPortCommand::WorktreeLink(args) => args.run(),
+            ScriptPortCommand::WorktreeCleanup(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),

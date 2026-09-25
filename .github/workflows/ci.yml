@@ -1325,12 +1325,13 @@ jobs:
       # three pin it via loom_test_require_daemon_bin and FAIL rather than skip
       # without one.
       #
-      # Four of the 19 test-worktree-*.sh suites are now here (snapshot,
-      # stash-baseline, remove and — since slice 4 — nested-symlinks) plus the
-      # two non-`test-worktree-*` suites that drive `worktree.sh remove`. The
-      # remaining 15 exercise create-path arms these slices did not touch and
-      # stay hermetic in shell-suite-tests — which is the whole point of
-      # porting one cohesive family at a time.
+      # (Running tally as of slice 4: four of the 19 test-worktree-*.sh suites
+      # were here — snapshot, stash-baseline, remove, nested-symlinks — plus
+      # the two non-`test-worktree-*` suites that drive `worktree.sh remove`.
+      # Slice 5 adds two more; see its own note below for the current split.
+      # The rest exercise create-path arms these slices did not touch and stay
+      # hermetic in shell-suite-tests — which is the whole point of porting one
+      # cohesive family at a time.)
       - name: worktree remove verb (#3769, #4449, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-remove.sh
       - name: worktree remove squash-aware branch delete (#4889, ported in #8195)
@@ -1344,6 +1345,24 @@ jobs:
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: worktree shared-artifact symlinks (#3528, #5474, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-nested-symlinks.sh
+      # Moved out of shell-suite-tests by #8195 slice 5: worktree.sh's
+      # crash-debris pre-flight — the stale index/HEAD/gitdir.lock sweep and
+      # the ORPHAN GUARD that `rm -rf`s an unregistered issue-<N> dir — is now
+      # `loom-daemon worktree-cleanup`. Both suites below assert on that
+      # recovery actually happening, so without the binary it does not happen
+      # at all; both pin it via loom_test_require_daemon_bin and FAIL rather
+      # than skip.
+      #
+      # Six of the 19 test-worktree-*.sh suites are now here (snapshot,
+      # stash-baseline, remove, nested-symlinks and — since slice 5 —
+      # orphan-guard-spaces and concurrency) plus the two non-`test-worktree-*`
+      # suites that drive `worktree.sh remove`. The remaining 13 exercise
+      # create-path arms these slices did not touch and stay hermetic in
+      # shell-suite-tests.
+      - name: worktree orphan guard, space + symlink paths (#7849, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-orphan-guard-spaces.sh
+      - name: worktree concurrency lock + partial-state cleanup (#3380, #6014, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-concurrency.sh
 
   installer-tests:
     name: Installer Integration Tests

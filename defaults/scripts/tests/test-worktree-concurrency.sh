@@ -21,11 +21,32 @@
 #
 # Pattern follows test-worktree-sentinel.sh: throw-away bare origin + clone in a
 # mktemp dir, copy worktree.sh + lib/, exercise behaviors.
+#
+# Needs a BUILT `loom-daemon` since #8195 slice 5: the partial-state cleanup
+# Tests 2 and 3 assert on (`cleanup_partial_worktree_state`) is now a thin stub
+# over `loom-daemon worktree-cleanup`, so those two recoveries do not happen at
+# all without the binary. Every assertion below is unchanged from the shell
+# implementation — running them against the port is the equivalence evidence —
+# so this suite moved to the "Native Port Suites" CI job, which builds the
+# binary, and FAILS rather than skips without one.
+#
+# The six lock/concurrency assertions (Tests 1, 4-8) are unaffected by the port:
+# the worktree-add lock is still shell (#8226 reverted delegating it, because it
+# sits on the always-taken path). They stay here rather than splitting into a
+# second file — they share this suite's fixture, and a split would duplicate it.
+#
+# Usage:
+#   cargo build --package loom-daemon
+#   bash defaults/scripts/tests/test-worktree-concurrency.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-cleanup"
 
 WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
 
