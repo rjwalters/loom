@@ -1450,6 +1450,11 @@ can therefore make this feature stop working; it can never make it broad.
 6. The target's *physical* (symlink-resolved) path is still inside the session
    directory's physical path — so a symlink planted inside the session dir
    cannot be used as a tunnel to something outside it.
+7. The target as written contains **no `..` segment**. `..` is resolved
+   lexically by the guard but physically by the kernel, so `<session-dir>/link/../x`
+   (with `link` a symlink elsewhere) would pass 3 and 6 on its normalized
+   spelling while `rm` deletes outside the session dir. Spell targets without
+   `..`; the recipe below never needs one.
 
 Anything unprovable — no root, no session id, no marker, an unreadable or
 malformed marker, a marker naming a different session — **fails closed**: the

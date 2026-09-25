@@ -1197,11 +1197,26 @@ current_session_id() {
 }
 
 # Return 0 ONLY when $1 (an already-normalized absolute rm target) is this
-# session's own scratch directory or something under it. Every failure path
-# returns 1 (fail CLOSED) — see the six numbered conditions above.
+# session's own scratch directory or something under it. $2 is the same
+# target's RAW absolute spelling, before normalize_abs_path() ran. Every
+# failure path returns 1 (fail CLOSED) — see the six numbered conditions above.
 rm_scope_session_scratch_admits() {
-    local abs="$1"
+    local abs="$1" raw="${2-}"
     local root sid dir marker recorded pdir pabs
+    # (0) No `..` segment anywhere in the raw target (and a missing raw
+    # spelling is itself unprovable). normalize_abs_path() pops `..`
+    # LEXICALLY, but the kernel resolves it PHYSICALLY: with
+    # `<session-dir>/tunnel -> /some/dir/inner`, the target
+    # `<session-dir>/tunnel/../x` normalizes to `<session-dir>/x` — which
+    # passes (3) and (6) — while `rm` actually deletes `/some/dir/x`. Deeper
+    # nesting reaches anything the symlink's depth allows. Condition (6) can
+    # only re-check the NORMALIZED text, so the one sound fix is to never
+    # admit a target whose raw spelling needs `..` resolution at all; the
+    # documented recipe never uses one.
+    [[ -n "$raw" ]] || return 1
+    if [[ "/$raw/" == */../* ]]; then
+        return 1
+    fi
     root=$(resolve_scratch_root) || return 1
     sid=$(current_session_id) || return 1
     dir="$root/$sid"
@@ -8413,6 +8428,9 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
         elif [[ -n "$CWD" ]]; then
             ABS_PATH="$CWD/$_rmclassify"
         fi
+        # Pre-normalization spelling, for the session-scratch carve-out's
+        # `..`-segment refusal (#8460) — see rm_scope_session_scratch_admits().
+        _rm_abs_raw="$ABS_PATH"
 
         # Lexically normalize the absolute target BEFORE the protected-path
         # check. This collapses //, resolves . and .., and strips trailing
@@ -8537,6 +8555,7 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                     _rm_literal_resolved=$(rm_scope_literal_same_command_resolve "$target" "$COMMAND_RM_MKTEMP_SCAN") || true
                     if [[ -n "$_rm_literal_resolved" ]]; then
                         ABS_PATH="$_rm_literal_resolved"
+                        _rm_abs_raw="$ABS_PATH"
                         if [[ "$ABS_PATH" = /* ]]; then
                             ABS_PATH=$(normalize_abs_path "$ABS_PATH")
                         fi
@@ -8602,7 +8621,7 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                 # session's id>` and paths under it, and nothing else — not the
                 # root, not a sibling session's directory, not a symlink out.
                 # See rm_scope_session_scratch_admits()'s own block comment.
-                if [[ "$IN_SCOPE" == false ]] && rm_scope_session_scratch_admits "$ABS_PATH"; then
+                if [[ "$IN_SCOPE" == false ]] && rm_scope_session_scratch_admits "$ABS_PATH" "$_rm_abs_raw"; then
                     IN_SCOPE=true
                 fi
 

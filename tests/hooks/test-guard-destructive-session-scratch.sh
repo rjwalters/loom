@@ -251,6 +251,16 @@ ln -s "$SS_BASE/precious" "$SS_ROOT/$SID_A/tunnel"
 GUARD_TEST_SESSION_ID="$SID_A"
 ss_assert_deny "a symlink INSIDE the own session dir is not a tunnel out" \
     "rm -rf $SS_ROOT/$SID_A/tunnel/do-not-delete" "$ENV_ROOT"
+# `..` AFTER a symlink: the guard pops `..` lexically, the kernel physically.
+# `<sid>/tunnel/../cfgrepo` normalizes to `<sid>/cfgrepo` (inside, and its
+# physical form is inside too), but `rm` would delete $SS_BASE/cfgrepo.
+ss_assert_deny "a '..' after an in-dir symlink cannot tunnel out (lexical vs physical)" \
+    "rm -rf $SS_ROOT/$SID_A/tunnel/../cfgrepo" "$ENV_ROOT"
+# Any `..` segment is refused, even one that stays inside: the carve-out
+# cannot tell the two apart from the normalized spelling, and the recipe never
+# needs one.
+ss_assert_deny "any raw '..' segment in the target is refused (fail closed)" \
+    "rm -rf $SS_ROOT/$SID_A/debug/../debug" "$ENV_ROOT"
 # Conservative, and deliberately so: `rm` would unlink the symlink rather than
 # follow it, but the physical-containment test cannot distinguish the two, and
 # refusing is lossless (removing the whole session dir, which unlinks it, is
