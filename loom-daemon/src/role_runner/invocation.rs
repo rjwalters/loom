@@ -135,7 +135,13 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // `role_tick.outcome` record. Set here — after every pre-spawn bail-out
                 // above has already returned — so "resolved" never claims a model for a
                 // tick that skipped before resolving one.
-                self.resolved_model_effort = Some((model.clone(), effort.clone()));
+                // #8599: the preference stamp of the runtime this tick landed on
+                // rides along with the model/effort, so `role_tick.outcome` can
+                // report the chosen tier without re-resolving anything.
+                self.resolved_launch = Some(
+                    crate::role_tick_telemetry::ResolvedLaunch::new(&model, &effort)
+                        .with_preference(admission.as_ref().and_then(|a| a.preference.clone())),
+                );
                 run_role_with_timeout(
                     &script,
                     &self.workspace_root,
@@ -156,7 +162,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
         outcome
     }
 
-    fn resolved_model_effort(&self) -> Option<(String, String)> {
-        self.resolved_model_effort.clone()
+    fn resolved_launch(&self) -> Option<crate::role_tick_telemetry::ResolvedLaunch> {
+        self.resolved_launch.clone()
     }
 }

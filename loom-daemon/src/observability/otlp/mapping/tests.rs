@@ -641,6 +641,9 @@ fn role_tick_outcome_envelope(
             effort: None,
             detail: Some("codex-account-pool-exhausted: no account provisioned".to_string()),
             gated_pool: gated_pool.map(str::to_string),
+            // Issue #8599: no preference list decided this tick.
+            preference_tier: None,
+            preference_tap: None,
             // Issue #8507: a Claude tick writes no launch record.
             runtime: None,
             provider: None,
