@@ -5410,7 +5410,7 @@ installed on every fleet host — so "exactly one host runs this" stops being a
 per-wrapper reimplementation (2AMLogic/2am's `batch-fleet-reconcile-schedule.sh`
 and `loom-wake-pull-schedule.sh` each hand-rolled their own; others simply did
 not, which is how `loom-worker-2` ended up carrying two singleton timers
-`loom-worker-1` lacked, 2AMLogic/2am#1125):
+`loom-worker-1` lacked):
 
 ```sh
 # Refuse on every host that is not the captain:
