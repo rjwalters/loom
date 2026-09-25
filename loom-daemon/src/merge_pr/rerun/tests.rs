@@ -105,7 +105,8 @@ fn evaluate_reports_red_with_its_run_and_ignores_skipped_and_absent() {
         vec![Red {
             check: "A".to_string(),
             conclusion: "failure".to_string(),
-            run_id: Some(7)
+            run_id: Some(7),
+            started_at: Some(ts(AFTER)),
         }]
     );
     assert!(ev.stale_runs.is_empty(), "skipped is never stale green");
@@ -342,7 +343,9 @@ fn pending_after_the_rerun_reports_pending_when_the_budget_is_spent() {
 fn a_red_rerun_is_a_failure_not_a_retry() {
     let dir = tmp_dir("red");
     let before = arr(&runs_json(BEFORE, "completed", "success"));
-    let after = arr(&runs_json(AFTER, "completed", "failure"));
+    // Started after the POST (the loop compares against the wall clock at
+    // POST time), i.e. the re-run's own verdict.
+    let after = arr(&runs_json("2099-01-01T00:00:00Z", "completed", "failure"));
     let gh = stub(&dir, &before, &after, "ok");
     let (out, log) = go(&dir, &gh, 60_000);
     assert!(
@@ -410,4 +413,25 @@ fn actions_run_id_parses_only_github_actions_job_urls() {
     );
     assert_eq!(actions_run_id(Some("github-actions"), Some("https://x/y")), None);
     assert_eq!(actions_run_id(Some("github-actions"), None), None);
+}
+
+#[test]
+fn a_red_run_that_predates_the_rerun_is_not_read_as_its_verdict() {
+    // Right after the POST the old attempt's red check run can still be the
+    // latest listed; it is not the re-run's result. Later passes must keep
+    // waiting (Pending once the budget is spent), never report Failed.
+    let dir = tmp_dir("old-red");
+    let before = arr(&format!(
+        r#"{},{{"name":"B","status":"completed","conclusion":"failure","started_at":"{BEFORE}","app":"github-actions","details_url":"https://github.com/o/r/actions/runs/555/job/2"}}"#,
+        runs_json(BEFORE, "completed", "success")
+            .split("},{")
+            .next()
+            .map(|a| format!("{a}}}"))
+            .unwrap()
+    ));
+    let gh = stub(&dir, &before, &before, "ok");
+    let (out, log) = go(&dir, &gh, 300);
+    assert!(matches!(out, RerunOutcome::Pending { .. }), "{out:?}");
+    assert_never_pushes(&log);
+    let _ = fs::remove_dir_all(&dir);
 }

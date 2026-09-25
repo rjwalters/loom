@@ -56,7 +56,7 @@ use super::redate::gh_api_with;
 use super::stale_checks::fetch::live_inputs_with;
 use super::stale_checks::CheckRun;
 use chrono::{DateTime, Utc};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 /// The `gh` binary, honoring `LOOM_GH_BIN` — the same seam the sibling modules
@@ -80,6 +80,9 @@ pub struct Red {
     pub check: String,
     pub conclusion: String,
     pub run_id: Option<u64>,
+    /// When the red run started — lets the loop tell a red result of ITS
+    /// re-run from a red run that predates it.
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 /// The per-pass reading of the guard's inputs.
@@ -138,6 +141,7 @@ pub fn evaluate(base_tip: DateTime<Utc>, required: &[String], runs: &[CheckRun])
                 check: ctx.clone(),
                 conclusion: conclusion.to_string(),
                 run_id: latest.actions_run_id,
+                started_at: latest.started_at,
             });
             continue;
         }
@@ -245,7 +249,8 @@ fn rerun_in_place_with(
     poll: Duration,
 ) -> RerunOutcome {
     let deadline = Instant::now() + wait;
-    let mut reran: BTreeSet<u64> = BTreeSet::new();
+    // Workflow run -> when this call first had a re-run of it accepted.
+    let mut reran: BTreeMap<u64, DateTime<Utc>> = BTreeMap::new();
     loop {
         let (head, base_ref) = match read_pr(gh, nwo, pr) {
             Ok(v) => v,
@@ -266,11 +271,16 @@ fn rerun_in_place_with(
         if let Some(why) = ev.unknown {
             return RerunOutcome::Failed(why);
         }
-        if let Some(red) = ev
-            .red
-            .iter()
-            .find(|r| r.run_id.is_some_and(|id| reran.contains(&id)))
-        {
+        // Only a red run that STARTED after this call's re-run of its workflow
+        // run was accepted is the re-run's verdict. A red run that predates
+        // the POST (already red before, and still listed until the new
+        // attempt's check runs appear) is not; nor is red in a run this call
+        // never re-ran. Both are left to branch protection, which refuses a
+        // red required check at merge time — same as `assess()` ignores red.
+        if let Some(red) = ev.red.iter().find(|r| match (r.run_id, r.started_at) {
+            (Some(id), Some(started)) => reran.get(&id).is_some_and(|posted| started >= *posted),
+            _ => false,
+        }) {
             return RerunOutcome::Failed(format!(
                 "required check '{}' concluded {} on its in-place re-run (workflow run {}) — \
 that is current evidence against this merge, not a stale timestamp",
@@ -293,13 +303,19 @@ workflow run to re-run in place"
         }
         if ev.is_fresh() {
             return RerunOutcome::Fresh {
-                reran: reran.into_iter().collect(),
+                reran: reran.into_keys().collect(),
             };
         }
+        // Every still-stale run is (re-)POSTed, including one this call
+        // already re-ran: while that re-run is in flight GitHub answers
+        // "already running" (a wait, no cost); once it has completed and the
+        // base moved again meanwhile, its evidence is stale again and a
+        // second re-run is the only way to refresh it within the budget.
         for run_id in &ev.stale_runs {
+            let posted_at = Utc::now();
             match post_rerun(gh, nwo, *run_id) {
                 PostResult::Started => {
-                    reran.insert(*run_id);
+                    reran.entry(*run_id).or_insert(posted_at);
                 }
                 PostResult::AlreadyRunning => {}
                 PostResult::Refused(why) if reran.is_empty() => {
@@ -318,7 +334,7 @@ workflow run to re-run in place"
             let mut waiting_on = ev.pending.clone();
             waiting_on.extend(ev.stale_runs.iter().map(|r| format!("workflow run {r}")));
             return RerunOutcome::Pending {
-                reran: reran.into_iter().collect(),
+                reran: reran.into_keys().collect(),
                 waiting_on,
             };
         }

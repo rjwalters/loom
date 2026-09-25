@@ -227,7 +227,6 @@ STUB="$(make_stub stale pending)"
 LOOM_DAEMON_BIN="$STUB" run_guard
 assert_eq "4" "$LAST_RC" "re-running in place, not yet fresh -> exit 4 (re-queue)"
 assert_contains "$LAST_OUT" "loom:pr kept" "exit 4 explains the in-place case keeps the verdict"
-STUB="$(make_stub stale pushed)"
 
 # T3: the bound was reached and the PR was escalated (subcommand exit 4) ->
 # the ORIGINAL #8248 refusal still blocks the merge. The guard is not weakened
@@ -325,6 +324,17 @@ assert_eq "0" "$REDATE_HELP_RC" "real binary: 'merge-pr redate-checks --help' ex
 for opt in --pr --repo --branch --expected-head-sha --rerun-wait-secs --allow-proceed; do
     assert_contains "$REDATE_HELP" "$opt" "real binary: subcommand accepts $opt"
 done
+
+# T14 (#8914): the REAL binary accepts the exact opt-in value this script sets.
+# clap's default bool parser rejects "1" (exit 2, "invalid value"), which would
+# silently disable BOTH remedies; a stub loom-daemon cannot catch that.
+FAIL_GH="$STUB_DIR/gh-fails"; printf '#!/usr/bin/env bash\nexit 1\n' > "$FAIL_GH"; chmod +x "$FAIL_GH"
+set +e
+OPTIN_OUT="$(LOOM_REDATE_ALLOW_PROCEED=1 LOOM_GH_BIN="$FAIL_GH" "$REAL_DAEMON_BIN" merge-pr redate-checks --pr 1 --repo o/r --branch b --expected-head-sha abc --rerun-wait-secs 0 2>&1)"
+OPTIN_RC=$?
+set -e
+assert_eq "1" "$OPTIN_RC" "real binary + LOOM_REDATE_ALLOW_PROCEED=1 parses and reaches the remedy (a failing gh -> exit 1, not a clap exit 2)"
+assert_not_contains "$OPTIN_OUT" "invalid value" "the opt-in value merge-pr.sh sets is accepted"
 
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
 [[ $TESTS_FAILED -eq 0 ]]

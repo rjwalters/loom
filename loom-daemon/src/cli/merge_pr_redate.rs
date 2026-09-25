@@ -81,7 +81,16 @@ pub(crate) struct RedateChecksArgs {
 
     /// Answer exit 5 (proceed with the merge) when the in-place re-run leaves
     /// every required check fresh. Without it that case exits 0 (re-queue).
-    #[arg(long, env = "LOOM_REDATE_ALLOW_PROCEED")]
+    ///
+    /// Parsed "falsey" (`0`/`false`/`no`/`off`/empty = off, anything else =
+    /// on) so the `LOOM_REDATE_ALLOW_PROCEED=1` merge-pr.sh sets is accepted:
+    /// clap's default bool parser takes only `true`/`false` and would reject
+    /// `1` with exit 2, silently disabling BOTH remedies.
+    #[arg(
+        long,
+        env = "LOOM_REDATE_ALLOW_PROCEED",
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
     allow_proceed: bool,
 }
 
@@ -197,4 +206,48 @@ fn join_ids(ids: &[u64]) -> String {
         return "none".to_string();
     }
     ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RedateChecksArgs;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Harness {
+        #[command(flatten)]
+        args: RedateChecksArgs,
+    }
+
+    const BASE: [&str; 9] = [
+        "x",
+        "--pr",
+        "1",
+        "--repo",
+        "o/r",
+        "--branch",
+        "b",
+        "--expected-head-sha",
+        "abc",
+    ];
+
+    // `env` is process-global, so the env-driven case lives in ONE test
+    // (no parallel sibling can race it) and restores the variable.
+    #[test]
+    #[serial_test::serial]
+    fn allow_proceed_accepts_the_env_value_merge_pr_sh_sets() {
+        let prev = std::env::var_os("LOOM_REDATE_ALLOW_PROCEED");
+        for (val, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var("LOOM_REDATE_ALLOW_PROCEED", val);
+            let h = Harness::try_parse_from(BASE)
+                .unwrap_or_else(|e| panic!("LOOM_REDATE_ALLOW_PROCEED={val} must parse: {e}"));
+            assert_eq!(h.args.allow_proceed, want, "LOOM_REDATE_ALLOW_PROCEED={val}");
+        }
+        std::env::remove_var("LOOM_REDATE_ALLOW_PROCEED");
+        let h = Harness::try_parse_from(BASE).expect("parses without the opt-in");
+        assert!(!h.args.allow_proceed, "unset = no exit 5 (old-script contract)");
+        if let Some(v) = prev {
+            std::env::set_var("LOOM_REDATE_ALLOW_PROCEED", v);
+        }
+    }
 }
