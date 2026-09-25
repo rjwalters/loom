@@ -9,7 +9,10 @@
 //! the process the supervisor relaunches will even be that file.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use crate::cmd_out::{self, CmdOutcome, Unavailable};
 
 use super::out;
 use super::selfrepl;
@@ -99,11 +102,10 @@ pub fn verify_destination_artifact(
             dest_version.as_str()
         };
         out::err(&format!(
-            "Post-provision verification FAILED: destination binary at {} reports '{shown}' but the fetched release artifact reports '{}'.",
+            "Post-provision verification FAILED: destination binary at {} reports '{shown}' but the fetched release artifact reports '{}' — provisioning reported success yet the destination is NOT the freshly-fetched binary (a silent no-op roll); refusing to report success.",
             dest.display(),
             artifact_version_output
         ));
-        out::err("Provisioning reported success yet the destination is NOT the freshly-fetched binary — a silent no-op roll. Refusing to report success.");
         super::exit(5);
     }
     out::ok(&format!(
@@ -131,7 +133,23 @@ pub fn verify_destination_artifact(
     }
     // Read-then-match (#6662/#7932): NEVER `codesign … | grep -q`, which is
     // exactly the pipefail bug this whole check exists to guard against.
-    let desc = codesign_describe(dest);
+    //
+    // Bounded (#8770, the twin of #8754's `release_fetch::signature`
+    // `verify_darwin` fix): a contended host can make `codesign -dvvv` hang
+    // indefinitely. A report we could not obtain — deadline-killed, or a
+    // codesign that exited without writing anything — is "we could not
+    // check", NOT "we checked and it's bad": collapsing it into the exit-5
+    // downgrade path below is the exact #8754 conflation one layer further in.
+    let desc = match codesign_describe(dest, dest_sig_verify_timeout()) {
+        DestSig::Report(desc) => desc,
+        DestSig::Inconclusive(why) => {
+            out::warn(&format!(
+                "'codesign -dvvv' {why} for {} -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature). Treating as inconclusive, not a downgrade.",
+                dest.display()
+            ));
+            return;
+        }
+    };
     if !desc.lines().any(|l| l.starts_with("Authority=")) {
         out::err(&format!(
             "Post-provision verification FAILED: the fetched release artifact carried a Developer ID (Authority=) signature, but the provisioned destination at {} does not.",
@@ -146,19 +164,52 @@ pub fn verify_destination_artifact(
     ));
 }
 
-/// `codesign -dvvv <path> 2>&1 || true` — `codesign` writes its description to
-/// STDERR, so both streams are captured and concatenated.
-fn codesign_describe(path: &Path) -> String {
-    Command::new("codesign")
-        .arg("-dvvv")
-        .arg(path)
-        .output()
-        .map(|o| {
+/// Deadline for the post-provision `codesign -dvvv` (#8770). A local
+/// crypto/keychain operation, not a forge call, so the default mirrors
+/// `release_fetch::signature`'s own `VERIFY_TIMEOUT` (30s =
+/// [`cmd_out::DEFAULT_TIMEOUT`]). `LOOM_DAEMON_UPDATE_DEST_SIG_TIMEOUT_SECS`
+/// overrides it — the knob the pre-port shell read — so a test that needs the
+/// timeout to actually fire need not wait out the production ceiling.
+fn dest_sig_verify_timeout() -> Duration {
+    util::env_non_empty("LOOM_DAEMON_UPDATE_DEST_SIG_TIMEOUT_SECS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(cmd_out::DEFAULT_TIMEOUT, Duration::from_secs)
+}
+
+/// What the bounded `codesign -dvvv` produced.
+enum DestSig {
+    /// Ran to completion and wrote a report (possibly a negative one, e.g.
+    /// "not signed at all") — a definitive answer about `Authority=`.
+    Report(String),
+    /// No report: timed out, could not run, or exited without writing one.
+    /// The payload completes the sentence "'codesign -dvvv' …".
+    Inconclusive(String),
+}
+
+/// `codesign -dvvv <path> 2>&1` under `timeout` — `codesign` writes its
+/// description to STDERR, so both streams are captured and concatenated.
+fn codesign_describe(path: &Path, timeout: Duration) -> DestSig {
+    let mut cmd = Command::new("codesign");
+    cmd.arg("-dvvv").arg(path).stdin(Stdio::null());
+    match cmd_out::run_command(cmd, timeout) {
+        CmdOutcome::Ran(o) => {
             let mut text = String::from_utf8_lossy(&o.stdout).to_string();
             text.push_str(&String::from_utf8_lossy(&o.stderr));
-            text
-        })
-        .unwrap_or_default()
+            if text.is_empty() {
+                let rc = o
+                    .status
+                    .code()
+                    .map_or_else(|| "on a signal".to_string(), |c| c.to_string());
+                DestSig::Inconclusive(format!("exited {rc} without writing a report"))
+            } else {
+                DestSig::Report(text)
+            }
+        }
+        CmdOutcome::Unavailable(Unavailable::TimedOut { after, .. }) => {
+            DestSig::Inconclusive(format!("timed out after {}s", after.as_secs()))
+        }
+        CmdOutcome::Unavailable(u) => DestSig::Inconclusive(format!("produced no report ({u})")),
+    }
 }
 
 /// `verify_supervisor_matches_provisioned <provisioned>` (#6009).
