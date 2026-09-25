@@ -27,13 +27,18 @@
 //!
 //! # What is compared, and what is deliberately not
 //!
-//! Compared: the set of symlinks created (path → target), the exact bytes of
-//! the worktree's `info/exclude`, and the stdout lines as a SORTED multiset.
+//! Compared: the set of symlinks created (path → target), the worktree's
+//! `info/exclude` as a sorted multiset of byte-exact lines, and the stdout
+//! lines as a SORTED multiset.
 //!
-//! Not compared: stdout line ORDER. `find` emitted readdir order, which is
-//! filesystem-dependent and not reproducible; the port sorts. A test that
-//! compared order would be flaky for a reason that has nothing to do with the
-//! code. The order that *is* observable and stable — the four families, in
+//! Not compared: the ORDER of stdout lines, nor of `info/exclude` entries —
+//! one nondeterminism seen from two angles. Both are emitted in nested-
+//! `node_modules` discovery order, which on the shell side is `find`'s readdir
+//! order: filesystem-dependent and not reproducible. The port sorts. A test
+//! that compared order would be flaky for a reason that has nothing to do with
+//! the code. Everything else about both is still compared byte-exactly — see
+//! [`exclude_lines`] for why a multiset rather than a set, and what that still
+//! catches. The order that *is* observable and stable — the four families, in
 //! sequence — is asserted separately by
 //! [`family_order_is_root_then_nested_then_configured_then_mcp`], which does
 //! not need the shell to say anything about it.
@@ -506,8 +511,9 @@ fn materialise(root: &Path, s: &ParsedScenario) -> (PathBuf, PathBuf) {
 struct Observation {
     /// `worktree-relative path` → raw symlink target.
     links: BTreeMap<String, String>,
-    /// The exact bytes of `info/exclude`.
-    exclude: Vec<u8>,
+    /// `info/exclude`'s lines, each byte-exact, as a SORTED multiset — see
+    /// [`exclude_lines`] and the module docs.
+    exclude: Vec<Vec<u8>>,
     /// stdout lines, SORTED — see the module docs.
     stdout: Vec<String>,
 }
@@ -515,7 +521,8 @@ struct Observation {
 fn observe(worktree: &Path, stdout: &str) -> Observation {
     let mut links = BTreeMap::new();
     collect_links(worktree, worktree, &mut links);
-    let exclude = std::fs::read(worktree.join(".git/info/exclude")).unwrap_or_default();
+    let exclude =
+        exclude_lines(&std::fs::read(worktree.join(".git/info/exclude")).unwrap_or_default());
     let mut lines: Vec<String> = stdout.lines().map(str::to_string).collect();
     lines.sort();
     Observation {
@@ -523,6 +530,37 @@ fn observe(worktree: &Path, stdout: &str) -> Observation {
         exclude,
         stdout: lines,
     }
+}
+
+/// `info/exclude`'s contents as a sorted multiset of byte-exact lines.
+///
+/// Sorted for the *same* reason stdout is (see the module docs), and it is the
+/// same nondeterminism seen from a second angle: both the printed lines and the
+/// exclude entries are emitted in nested-`node_modules` discovery order, which
+/// on the shell side is `find`'s readdir order. `nested-several-at-once`
+/// proved it — the two sides created an identical set of symlinks and printed
+/// an identical set of lines, yet a byte comparison of the exclude file failed
+/// because `find` happened to return `apps/web` before `apps/api` while the
+/// port sorts. Nothing reads these entries in order (they are independent
+/// whole-line ignore patterns, no negations), so the order carries no meaning
+/// to preserve — but it *is* filesystem-dependent, so comparing it would make
+/// this harness flaky for a reason that has nothing to do with the code.
+///
+/// Deliberately a sorted **multiset**, not a set, and deliberately **whole
+/// byte-exact lines**, not a lossy string: a duplicate entry (the exact
+/// `grep -qxF` idempotency bug the port must not reintroduce), a missing
+/// entry, an extra entry, and a near-miss entry that differs by one byte all
+/// still fail the comparison. The only thing this discards is the order.
+fn exclude_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    // `split` on a trailing-newline-terminated file yields a final empty
+    // element; drop only that one, never an interior blank line (the
+    // `exclude-has-blank-lines` scenario asserts those survive).
+    let mut lines: Vec<Vec<u8>> = bytes.split(|b| *b == b'\n').map(<[u8]>::to_vec).collect();
+    if bytes.last() == Some(&b'\n') {
+        lines.pop();
+    }
+    lines.sort();
+    lines
 }
 
 fn collect_links(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
@@ -858,9 +896,31 @@ fn the_comparison_can_actually_fail() {
     let stdout = run_rust(&main, &worktree);
     let real = observe(&worktree, &stdout);
 
+    // The exclude comparison discards ORDER and nothing else. Prove each of
+    // the three things it must still catch, since dropping order is the one
+    // deliberate weakening in this harness (see `exclude_lines`).
+    assert!(!real.exclude.is_empty(), "the probe scenario must record an exclude entry");
+
     let mut mutated = observe(&worktree, &stdout);
-    mutated.exclude.push(b'x');
-    assert_ne!(real, mutated, "a mutated exclude file must not compare equal");
+    mutated.exclude.push(b"extra".to_vec());
+    assert_ne!(real, mutated, "an extra exclude entry must not compare equal");
+
+    let mut mutated = observe(&worktree, &stdout);
+    mutated.exclude.pop();
+    assert_ne!(real, mutated, "a missing exclude entry must not compare equal");
+
+    let mut mutated = observe(&worktree, &stdout);
+    mutated.exclude.push(real.exclude[0].clone());
+    mutated.exclude.sort();
+    assert_ne!(
+        real, mutated,
+        "a DUPLICATED exclude entry must not compare equal — a multiset, not a set"
+    );
+
+    let mut mutated = observe(&worktree, &stdout);
+    mutated.exclude[0].push(b'x');
+    mutated.exclude.sort();
+    assert_ne!(real, mutated, "a one-byte-different exclude entry must not compare equal");
 
     let mut mutated = observe(&worktree, &stdout);
     mutated.links.clear();

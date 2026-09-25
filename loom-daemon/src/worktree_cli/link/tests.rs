@@ -9,8 +9,6 @@
 
 use super::*;
 
-use std::io::Write as _;
-
 /// A throwaway directory that removes itself. `std::env::temp_dir()` + pid +
 /// a counter, so parallel test threads never collide.
 struct TempTree(PathBuf);
@@ -58,6 +56,13 @@ impl Drop for TempTree {
 // ---------------------------------------------------------------------------
 
 #[test]
+// `clippy::join_absolute_paths` fires on the two `base.join("/etc/ssh")` calls
+// below, and it is right about what they do — which is the point. They are not
+// production code doing the wrong thing; they are this test *demonstrating*
+// the hazard `concat` exists to avoid, by asserting exactly what `Path::join`
+// would have answered. Silencing the assertion instead of the lint would
+// delete the comparison that gives `concat` its reason to exist.
+#[allow(clippy::join_absolute_paths)]
 fn concat_keeps_an_absolute_entry_inside_the_base() {
     // The whole point: `Path::join` would answer `/etc/ssh` here. The shell
     // answered `"$base//etc/ssh"`, which exists only if someone built that
