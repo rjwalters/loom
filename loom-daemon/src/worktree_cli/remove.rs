@@ -362,7 +362,7 @@ pub fn run(argv: &[String]) -> i32 {
                     cleanup_primary_checkout: cleanup_primary_checkout_enabled(),
                 };
                 let _outcome: BranchOutcome =
-                    branch_delete::maybe_delete_local_branch(&ctx, &out, b);
+                    branch_delete::maybe_delete_local_branch(&ctx, &out, b, "");
                 // Re-read the ref rather than trusting the returned outcome:
                 // the shell reported `unmerged`/`deleted` from a fresh
                 // `show-ref`, and a status that disagrees with the repository

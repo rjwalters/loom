@@ -4,6 +4,12 @@ use super::*;
 
 /// `merge-pr.sh`'s `_maybe_delete_local_branch` body, or `None` outside a full
 /// checkout.
+///
+/// #8191 replaced that body with a thin call into `loom-daemon merge-pr
+/// delete-branch` — this module IS the implementation now, so there is no
+/// longer a second copy of the rule's text to drift out of sync with. What
+/// the shell body must still get right is the WIRING: it delegates rather
+/// than reimplementing, per `shell_delegates_rather_than_reimplementing` below.
 fn shell_twin_body() -> Option<String> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts/merge-pr.sh");
     let sh = std::fs::read_to_string(&script).ok()?;
@@ -19,58 +25,37 @@ fn shell_twin_body() -> Option<String> {
 // The anti-drift guarantee
 // ---------------------------------------------------------------------------
 
-/// Every operator-visible string this module emits must still exist verbatim
-/// in `merge-pr.sh`'s `_maybe_delete_local_branch`.
-///
-/// This is the whole reason it was safe to stop `eval`-ing that function out
-/// of the live script: the shell's contraption existed to avoid a second
-/// implementation, and a second implementation is only acceptable while
-/// something mechanical keeps the two aligned. Reword either side and this
-/// test names the string that moved.
-///
-/// The check is on the invariant *fragments* — bash's `$branch` and Rust's
-/// `{branch}` interpolate differently — which is also exactly what an operator
-/// and every grep-based shell assertion actually see.
+/// `merge-pr.sh`'s `_maybe_delete_local_branch` must delegate to
+/// `loom-daemon merge-pr delete-branch` — the CLI wrapper over THIS module —
+/// rather than growing a second, independent implementation. Prior to #8191
+/// this test asserted every operator-visible message string existed
+/// verbatim in both copies; now there is exactly one copy (this file), and
+/// what could drift instead is the shell quietly regaining its own logic. A
+/// literal `if [[ "$BRANCH_LANDED_VERDICT"` reappearing here would be exactly
+/// that regression.
 #[test]
-fn messages_match_the_merge_pr_shell_twin() {
+fn shell_delegates_rather_than_reimplementing() {
     let Some(body) = shell_twin_body() else {
         return;
     };
-    for fragment in [
-        "does not exist — skipping branch delete",
-        "it is the repository's default branch",
-        " — safe force-delete)",
-        "Could not query the forge for a merged PR on",
-        "and kept the conservative 'git branch -d'",
-        "Could not determine whether",
-        "keeping the conservative 'git branch -d'",
-        "may have unpushed commits",
-        "it is checked out (current HEAD or another worktree)",
-        "it is checked out in the primary repository checkout",
-        "To clean it up: git -C",
-        "automatically switched to",
-        "falling back to manual instructions",
-        "checked out at|is currently checked out|used by worktree",
-    ] {
-        assert!(
-            body.contains(fragment),
-            "merge-pr.sh's _maybe_delete_local_branch no longer contains {fragment:?} — the Rust \
-             port in branch_delete.rs has drifted from the rule it mirrors"
-        );
-    }
+    assert!(
+        body.contains("merge-pr delete-branch"),
+        "merge-pr.sh's _maybe_delete_local_branch no longer calls 'loom-daemon merge-pr \
+         delete-branch' — has it regrown its own copy of the branch_delete.rs rule?"
+    );
+    assert!(
+        !body.contains(r#"BRANCH_LANDED_VERDICT"#),
+        "merge-pr.sh's _maybe_delete_local_branch references $BRANCH_LANDED_VERDICT directly — \
+         that is the pre-#8191 inline implementation this module replaced; it should only call \
+         the daemon now"
+    );
 }
 
 /// The escalation criterion, stated as a test so it cannot be relaxed by
 /// accident: `-D` requires a `landed` verdict, and `-d` failing is NOT one.
 #[test]
 fn only_a_landed_verdict_may_escalate_to_force_delete() {
-    if let Some(body) = shell_twin_body() {
-        assert!(
-            body.contains(r#"if [[ "$BRANCH_LANDED_VERDICT" == "landed" ]]; then"#),
-            "the shell's escalation gate changed shape; re-derive the Rust arm"
-        );
-    }
-    // And on the Rust side: exactly one place chooses `-D` for the first
+    // On the Rust side: exactly one place chooses `-D` for the first
     // attempt, and it is the `Verdict::Landed` arm.
     let me = include_str!("../branch_delete.rs");
     assert_eq!(

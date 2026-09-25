@@ -265,6 +265,14 @@ pub(crate) enum MergePrCommand {
     /// `--allow-unapproved` asserts responsibility. Exit 0 = present or
     /// overridden (see stdout for which), 1 = absent with no override.
     LoomPrGuard(super::merge_pr_loom_pr_guard::LoomPrGuardArgs),
+
+    /// `_maybe_delete_local_branch` (#4100/#5015/#7812): the squash-aware
+    /// local-branch delete rule, now shared verbatim with `worktree.sh
+    /// remove` (#8195 slice 3) instead of duplicated. Always exits 0 — a
+    /// branch that could not be deleted is a `WARNING` line, not a failure —
+    /// and prints one `LEVEL<TAB>message` line per decision for the caller to
+    /// replay through its own logging (see `cli::merge_pr_delete_branch`).
+    DeleteBranch(super::merge_pr_delete_branch::DeleteBranchArgs),
 }
 
 impl MergePrCommand {
@@ -275,6 +283,7 @@ impl MergePrCommand {
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
+            MergePrCommand::DeleteBranch(args) => args.run(),
         }
     }
 }
