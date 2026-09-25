@@ -452,5 +452,439 @@ else
     fi
 fi
 
+# 12. Does the ENGINE actually INVOKE the hook? (issue #8839 acceptance
+# criterion 3.) Everything above proves the bridge denies when it is run and
+# that the registration the CLI would read names the image-owned copy — none of
+# it proves the CLI dispatches to it. A hook that is registered but never
+# invoked fails open silently, and on this CLI that is not hypothetical (see the
+# untrusted control below). So drive the REAL `codex exec` through the real hook
+# engine, with a scripted loopback model provider standing in for the model, and
+# watch what happens to a real force-push.
+#
+# Credential-free and hermetic: `--network none`, a synthetic profile holding
+# one fake string, a local bare repo as the "remote", a provider bound to
+# 127.0.0.1 that speaks a two-event Responses stream and knows nothing but the
+# one command it is told to emit. No account, no token, no model call leaves
+# the container (there is nowhere for it to go).
+#
+# Hook trust is REAL, not waived. Codex persists it only through an interactive
+# TUI decision, so this section makes that decision the way an operator does —
+# it runs the shipped TUI under tmux in a throwaway container and answers the
+# prompt — rather than passing `--dangerously-bypass-hook-trust` or writing a
+# `trusted_hash` by hand. #8839 forbids both, and neither appears anywhere in
+# this script or in shipped Loom code (`spawn-codex.sh` refuses the flag,
+# asserted by defaults/scripts/tests/test-provision-codex-hooks.sh). What is
+# measured is therefore the production path exactly as it runs.
+#
+# Two profiles, provisioned and registered identically, differing ONLY in the
+# answer given to that one prompt:
+#
+#   trusted    "Trust all and continue"          -> config.toml gains hooks.state
+#   untrusted  "Continue without trusting"       -> config.toml gains no hook trust
+#
+# and the same two turns are driven against each:
+#
+#   force-push   trusted   -> BLOCKED by the engine, remote ref unmoved
+#   benign write trusted   -> RUNS (the hook is consulted and allows, so the
+#                             block above is a decision, not a blanket refusal)
+#   force-push   untrusted -> no hook event at all, and the push LANDS
+#
+# That last one is the control that makes the first non-vacuous, and it is the
+# executable form of the fail-open finding in
+# defaults/docs/private-control-bundle.md: an untrusted hook is skipped with no
+# error, no warning and no `doctor` finding. Because the two profiles differ in
+# nothing else, the difference in outcome is attributable to hook trust alone.
+ENGINE_DIR=$(mktemp -d)
+chmod 755 "$ENGINE_DIR"
+cleanup_engine() { rm -rf "$ENGINE_DIR" 2>/dev/null || true; }
+trap 'cleanup; cleanup_protected; cleanup_engine' EXIT
+
+# An always-allow hook beside Loom's, purely to capture the payload the ENGINE
+# delivers. It is what turns "the bridge denied something" into "the bridge
+# denied the exact event this CLI version emits" — the shape is asserted below,
+# so a Codex release that renames the tool or restructures `tool_input` fails
+# here instead of silently reaching a bridge that can no longer classify it.
+# Both tmpfs mounts are `noexec` (Docker's default), so the recorder is invoked
+# via `bash <path>` and bind-mounted from the host.
+cat > "$ENGINE_DIR/recorder.sh" <<'RECORDER'
+#!/usr/bin/env bash
+cat > /workspace/engine-event.json
+exit 0
+RECORDER
+chmod 644 "$ENGINE_DIR/recorder.sh"
+
+# The TUI launcher, bind-mounted rather than inlined into the tmux command: the
+# provider override is a TOML literal full of quotes that would not survive the
+# `tmux new-session "<cmd>"` round-trip intact. The override only keeps the TUI
+# from demanding a login; no provider is listening during the trust step and
+# none is needed — the trust prompts come before any model call.
+cat > "$ENGINE_DIR/engine-tui.sh" <<'ENGINE_TUI'
+#!/usr/bin/env bash
+export HOME=/workspace/home
+export TMPDIR=/workspace/tmp
+export FIXTURE_KEY=synthetic-not-a-credential
+cd /workspace/repo || exit 1
+exec codex \
+    -c model=fixture-model \
+    -c model_provider=fixture \
+    -c 'model_providers.fixture={name="fixture",base_url="http://127.0.0.1:8099/v1",env_key="FIXTURE_KEY",wire_api="responses",request_max_retries=0,stream_max_retries=0}' \
+    -s danger-full-access
+ENGINE_TUI
+chmod 644 "$ENGINE_DIR/engine-tui.sh"
+
+# Drive that TUI to the hook-trust prompt and answer it with $1. Waits on the
+# prompt TEXT rather than on a sleep, so a slow container is slow rather than
+# flaky, and every wait is bounded. The TUI must not be piped (`stdout is not a
+# terminal`), so the pane is read back with `capture-pane`.
+cat > "$ENGINE_DIR/engine-trust.sh" <<'ENGINE_TRUST'
+set -u
+CHOICE="$1"
+export CODEX_HOME=/home/loom/.codex-profile
+export HOME=/workspace/home
+export TMPDIR=/workspace/tmp
+mkdir -p "$HOME" "$TMPDIR" /workspace/repo || exit 90
+# Codex asks about the directory it is started in, and only offers project-local
+# hooks for a real working tree, so give it one.
+git init -q -b main /workspace/repo || exit 91
+
+await() {
+    local want="$1" i
+    for i in $(seq 1 60); do
+        case "$(tmux capture-pane -p -t trust 2>/dev/null)" in
+            *"$want"*) return 0 ;;
+        esac
+        sleep 1
+    done
+    echo "TRUST_TIMEOUT waiting for: $want"
+    tmux capture-pane -p -t trust 2>/dev/null
+    return 1
+}
+
+tmux new-session -d -s trust -x 200 -y 50 "bash /opt/loom-engine-tui.sh" || exit 92
+# "Do you trust the contents of this directory?" — option 1 is preselected.
+await "trust the contents of this directory" || exit 93
+tmux send-keys -t trust Enter
+# "Hooks can run outside the sandbox after you trust them." — 2 = trust all,
+# 3 = continue without trusting.
+await "Hooks can run outside the sandbox" || exit 94
+tmux send-keys -t trust "$CHOICE"
+sleep 1
+tmux send-keys -t trust Enter
+# The TUI is up once it stops showing a prompt; either way config.toml is
+# written by then. Wait for the composer, not for a fixed delay.
+await "Ask Codex to do anything" || exit 95
+tmux kill-session -t trust 2>/dev/null
+echo "TRUST_DONE"
+ENGINE_TRUST
+chmod 644 "$ENGINE_DIR/engine-trust.sh"
+
+# Provision one profile with the image's own sealed provisioner through the same
+# endpoint the daemon drives before it creates a session (so the registration
+# under test is the production one, not one this script wrote), add the payload
+# recorder, then make the hook-trust decision $2 in the shipped TUI.
+engine_profile() {
+    local name="$1" choice="$2" dir="$ENGINE_DIR/$1" out
+    mkdir -p "$dir"
+    chmod 777 "$dir"
+    printf 'synthetic-not-a-credential\n' > "$dir/auth.json"
+    chmod 666 "$dir/auth.json"
+
+    out=$(docker run --rm --network none --user "$PROBE_USER" --read-only \
+        --cap-drop ALL --security-opt no-new-privileges \
+        --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+        --mount "type=bind,src=$dir,dst=/home/loom/.codex-profile" \
+        --env CODEX_HOME=/home/loom/.codex-profile \
+        --entrypoint loom-daemon "$IMAGE" private-workspace provision-controls 2>&1)
+    if ! echo "$out" | jq -e '.status == "ready"' >/dev/null 2>&1; then
+        fail "could not provision the '$name' engine-probe profile: $out"
+        return 1
+    fi
+
+    # Merged from INSIDE a container as uid 1000: the provisioner wrote
+    # hooks.json 0600 as the profile's owner, which is not whoever runs this
+    # script. Truncate in place rather than replacing the file, so ownership
+    # and mode survive. Registered BEFORE the trust step, so "trust all"
+    # covers the recorder too.
+    if ! out=$(docker run --rm --network none --user "$PROBE_USER" --read-only \
+        --cap-drop ALL --security-opt no-new-privileges \
+        --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+        --mount "type=bind,src=$dir,dst=/home/loom/.codex-profile" \
+        --env CODEX_HOME=/home/loom/.codex-profile \
+        --entrypoint bash "$IMAGE" -lc 'jq '"'"'.hooks.PreToolUse += [{"matcher":"*","hooks":[{"type":"command","command":"bash /opt/loom-engine-recorder.sh","timeout":30}]}]'"'"' "$CODEX_HOME/hooks.json" > /tmp/hooks.json && cat /tmp/hooks.json > "$CODEX_HOME/hooks.json"' 2>&1); then
+        fail "could not register the payload recorder in the '$name' profile: $out"
+        return 1
+    fi
+
+    # The profile is READ-WRITE here on purpose: this is the operator step that
+    # happens before a session exists, and it is the only writer of hook trust.
+    if ! out=$(docker run --rm --network none --user "$PROBE_USER" --read-only \
+        --cap-drop ALL --security-opt no-new-privileges \
+        --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+        --tmpfs /workspace:rw,size=128m,mode=1777 \
+        --mount "type=bind,src=$dir,dst=/home/loom/.codex-profile" \
+        --mount "type=bind,src=$ENGINE_DIR/engine-tui.sh,dst=/opt/loom-engine-tui.sh,readonly" \
+        --mount "type=bind,src=$ENGINE_DIR/engine-trust.sh,dst=/opt/loom-engine-trust.sh,readonly" \
+        --env CODEX_HOME=/home/loom/.codex-profile \
+        --entrypoint bash "$IMAGE" -lc "bash /opt/loom-engine-trust.sh $choice" 2>&1); then
+        fail "could not drive the shipped TUI to the hook-trust prompt for '$name': $out"
+        return 1
+    fi
+    return 0
+}
+
+engine_profile trusted 2
+engine_profile untrusted 3
+
+# Read a profile's trust state from INSIDE a container as uid 1000, never from
+# the host. The provisioner writes `config.toml` 0600 owned by uid 1000, and
+# whoever runs this script is only that uid by coincidence — it is on a
+# developer host where the login user happens to be uid 1000, and is NOT on a
+# GitHub Actions runner (uid 1001). A host-side `grep` therefore reads nothing
+# there and reports "no trust established" for a profile that is perfectly
+# trusted, which is exactly how the first version of this assertion failed in
+# CI while passing locally. Everything else in this section already crosses the
+# boundary through a container, so this does too.
+engine_trust_state() {
+    docker run --rm --network none --user "$PROBE_USER" --read-only \
+        --cap-drop ALL --security-opt no-new-privileges \
+        --mount "type=bind,src=$ENGINE_DIR/$1,dst=/home/loom/.codex-profile,readonly" \
+        --entrypoint bash "$IMAGE" -lc \
+        'if grep -q trusted_hash /home/loom/.codex-profile/config.toml 2>/dev/null; then
+             echo TRUSTED
+         else
+             echo "UNTRUSTED config.toml=[$(cat /home/loom/.codex-profile/config.toml 2>&1)]"
+         fi' 2>&1
+}
+
+# The one difference between the two profiles, asserted rather than assumed —
+# without this, a trust step that silently did nothing would make the whole
+# section a comparison of two identical sessions.
+TRUSTED_STATE=$(engine_trust_state trusted)
+UNTRUSTED_STATE=$(engine_trust_state untrusted)
+if [[ "$TRUSTED_STATE" == "TRUSTED" && "$UNTRUSTED_STATE" == UNTRUSTED* ]]; then
+    pass "the shipped TUI persisted real hook trust in one profile and not the other"
+else
+    fail "hook trust was not established exactly once by the TUI: trusted=[$TRUSTED_STATE] untrusted=[$UNTRUSTED_STATE]"
+fi
+
+# The probe body itself. Bind-mounted read-only rather than passed as a `-lc`
+# string: it carries a nested heredoc (the provider) and would not survive the
+# quoting round-trip intact.
+cat > "$ENGINE_DIR/engine-probe.sh" <<'ENGINE_PROBE'
+set -u
+CONTROL_ROOT=/opt/loom/private-control
+export CODEX_HOME=/home/loom/.codex-profile
+export HOME=/workspace/home
+export TMPDIR=/workspace/tmp
+mkdir -p "$HOME" "$TMPDIR" || exit 90
+
+MODE="$1"
+FORCE_PUSH='git push --force origin HEAD:main'
+
+# A disposable bare repo as the "remote", with `main` as the protected ref the
+# guard polices. Local on purpose: the force-push must be able to LAND in the
+# untrusted control for the trusted block to mean anything, and nothing here may
+# reach a real forge.
+git init -q --bare /workspace/remote.git || exit 91
+git init -q -b main /workspace/repo || exit 91
+cd /workspace/repo || exit 91
+git config user.email fixture@example.invalid
+git config user.name Fixture
+git config commit.gpgsign false
+git remote add origin /workspace/remote.git
+printf 'base\n' > file
+git add file
+git commit -qm base
+git push -q origin main
+# Rewrite local history so the force-push genuinely MOVES the remote ref when
+# it is allowed to run — a push that would be a no-op proves nothing.
+printf 'rewritten\n' > file
+git add file
+git commit -q --amend -m rewritten
+echo "${MODE}_BASE_REF $(git -C /workspace/remote.git rev-parse main)"
+
+# The model, scripted: one exec_command call carrying $FIXTURE_COMMAND, then a
+# final message. Loopback only; the container has no network at all.
+cat > "$TMPDIR/provider.js" <<'PROVIDER'
+const http = require('http');
+const command = process.env.FIXTURE_COMMAND;
+const usage = {input_tokens: 1, output_tokens: 1, total_tokens: 2};
+function sse(res, events) {
+  res.writeHead(200, {'Content-Type': 'text/event-stream'});
+  for (const event of events) {
+    res.write('event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n');
+  }
+  res.end();
+}
+http.createServer((req, res) => {
+  let body = '';
+  req.on('data', (chunk) => { body += chunk; });
+  req.on('end', () => {
+    if (!body.includes('function_call_output')) {
+      sse(res, [
+        {type: 'response.created', response: {id: 'r1', status: 'in_progress'}},
+        {type: 'response.output_item.done', output_index: 0, item: {
+          type: 'function_call', id: 'fc1', call_id: 'call_1',
+          name: 'exec_command', arguments: JSON.stringify({cmd: command})}},
+        {type: 'response.completed', response: {id: 'r1', status: 'completed', output: [], usage}},
+      ]);
+    } else {
+      sse(res, [
+        {type: 'response.created', response: {id: 'r2', status: 'in_progress'}},
+        {type: 'response.output_item.done', output_index: 0, item: {
+          type: 'message', id: 'm2', role: 'assistant', status: 'completed',
+          content: [{type: 'output_text', text: 'FIXTURE-TURN-DONE'}]}},
+        {type: 'response.completed', response: {id: 'r2', status: 'completed', output: [], usage}},
+      ]);
+    }
+  });
+}).listen(8099, '127.0.0.1');
+PROVIDER
+
+# The forced policy comes from the sealed manifest, never restated here, so
+# this probe cannot drift away from what the daemon actually applies.
+mapfile -t FORCED < <(jq -r '.policy | to_entries[] | "\(.key)=\(.value)"' "$CONTROL_ROOT/manifest.json")
+export FIXTURE_KEY=synthetic-not-a-credential
+
+# The provider is selected entirely through `-c` overrides, so `config.toml`
+# stays exactly what the sealed provisioner and the operator's trust decision
+# left there (and is bound read-only anyway). `danger-full-access` because THIS
+# CONTAINER is the sandbox: Codex's own sandbox needs unprivileged user
+# namespaces, which a `--cap-drop ALL` container does not have. The property
+# under test is the hook, not the sandbox. No trust flag is passed — the whole
+# point is that trust is already real in this profile.
+turn() {
+    local command="$1"
+    FIXTURE_COMMAND="$command" node "$TMPDIR/provider.js" &
+    local provider=$! i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        (exec 3<>/dev/tcp/127.0.0.1/8099) 2>/dev/null && break
+        sleep 1
+    done
+    env "${FORCED[@]}" codex exec \
+        -c model=fixture-model \
+        -c model_provider=fixture \
+        -c 'model_providers.fixture={name="fixture",base_url="http://127.0.0.1:8099/v1",env_key="FIXTURE_KEY",wire_api="responses",request_max_retries=0,stream_max_retries=0}' \
+        -C /workspace/repo -s danger-full-access "run the requested command" </dev/null 2>&1
+    kill "$provider" 2>/dev/null
+    wait "$provider" 2>/dev/null
+}
+
+rm -f /workspace/engine-event.json
+echo "${MODE}_FORCE_BEGIN"
+turn "$FORCE_PUSH"
+echo "${MODE}_FORCE_END"
+echo "${MODE}_REF_AFTER_FORCE $(git -C /workspace/remote.git rev-parse main)"
+echo "${MODE}_FORCE_EVENT $(test -s /workspace/engine-event.json && echo PRESENT || echo ABSENT)"
+echo "${MODE}_EVENT_JSON $(tr -d '\n' < /workspace/engine-event.json 2>/dev/null)"
+
+rm -f /workspace/engine-event.json /workspace/repo/allowed.txt
+echo "${MODE}_BENIGN_BEGIN"
+turn 'printf allowed > /workspace/repo/allowed.txt'
+echo "${MODE}_BENIGN_END"
+echo "${MODE}_BENIGN_MARKER $(cat /workspace/repo/allowed.txt 2>/dev/null || echo ABSENT)"
+ENGINE_PROBE
+chmod 644 "$ENGINE_DIR/engine-probe.sh"
+
+# Run the identical probe against one profile. The control files are bound
+# READ-ONLY exactly as a session binds them, which makes this also the only
+# place that proves the real CLI can still run with them frozen (it writes its
+# session state into the profile DIRECTORY around them).
+engine_run() {
+    local name="$1" mounts control
+    mounts=()
+    for control in hooks.json config.toml loom-codex-hooks.json; do
+        mounts+=(--mount "type=bind,src=$ENGINE_DIR/$name/$control,dst=/home/loom/.codex-profile/$control,readonly")
+    done
+    docker run --rm --network none --user "$PROBE_USER" --read-only \
+        --cap-drop ALL --security-opt no-new-privileges \
+        --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+        --tmpfs /workspace:rw,size=256m,mode=1777 \
+        --mount "type=bind,src=$ENGINE_DIR/$name,dst=/home/loom/.codex-profile" \
+        "${mounts[@]}" \
+        --mount "type=bind,src=$ENGINE_DIR/recorder.sh,dst=/opt/loom-engine-recorder.sh,readonly" \
+        --mount "type=bind,src=$ENGINE_DIR/engine-probe.sh,dst=/opt/loom-engine-probe.sh,readonly" \
+        --env CODEX_HOME=/home/loom/.codex-profile \
+        --entrypoint bash "$IMAGE" -lc "bash /opt/loom-engine-probe.sh $2" 2>&1
+}
+
+TRUSTED_OUT=$(engine_run trusted TRUSTED)
+UNTRUSTED_OUT=$(engine_run untrusted UNTRUSTED)
+
+# `$1` is the whole probe output, `$2` the line key. Read with bash's own
+# parameter expansion rather than `grep -m1 | cut`: under `set -o pipefail` an
+# early-exit consumer can close the pipe while the producer is still writing,
+# which reports the pipeline as failed (scripts/check-pipefail-early-exit.sh).
+# The haystack is framed with newlines so the first and last lines of the probe
+# output match the same patterns as any interior line.
+engine_line() {
+    local hay=$'\n'"$1" rest
+    rest="${hay#*$'\n'"$2" }"
+    [[ "$rest" == "$hay" ]] && return 1
+    printf '%s' "${rest%%$'\n'*}"
+}
+engine_turn() {
+    local hay=$'\n'"$1"$'\n' rest
+    rest="${hay#*$'\n'"$2"$'\n'}"
+    [[ "$rest" == "$hay" ]] && return 1
+    printf '%s' "${rest%%$'\n'"$3"$'\n'*}"
+}
+
+TRUSTED_BASE=$(engine_line "$TRUSTED_OUT" TRUSTED_BASE_REF)
+UNTRUSTED_BASE=$(engine_line "$UNTRUSTED_OUT" UNTRUSTED_BASE_REF)
+if [[ -z "$TRUSTED_BASE" || -z "$UNTRUSTED_BASE" ]]; then
+    fail "the engine probe produced no output to assert on: trusted=[$TRUSTED_OUT] untrusted=[$UNTRUSTED_OUT]"
+fi
+
+# The claim this section exists to make: the real engine, with real operator
+# trust and no waiver of any kind, dispatched to the image-owned bridge and
+# honored its deny.
+TRUSTED_FORCE=$(engine_turn "$TRUSTED_OUT" TRUSTED_FORCE_BEGIN TRUSTED_FORCE_END)
+if [[ "$TRUSTED_FORCE" == *"Command blocked by PreToolUse hook"* \
+    && "$TRUSTED_FORCE" == *"force operation targets protected branch"* ]]; then
+    pass "the real Codex CLI, with real hook trust and no waiver, invoked the image-owned bridge and blocked the force-push"
+else
+    fail "the real CLI did not block a force-push through the trusted registered hook: $TRUSTED_FORCE"
+fi
+if [[ -n "$TRUSTED_BASE" && "$(engine_line "$TRUSTED_OUT" TRUSTED_REF_AFTER_FORCE)" == "$TRUSTED_BASE" ]]; then
+    pass "the disposable remote's protected ref never moved while the hook was live"
+else
+    fail "the protected ref moved despite the hook: $TRUSTED_BASE -> $(engine_line "$TRUSTED_OUT" TRUSTED_REF_AFTER_FORCE)"
+fi
+
+# The payload the engine actually delivered. `shell`/argv was the 0.146.0
+# shape; THIS is what 0.149.1 emits, and the bridge's tool classifier and
+# command extractor must both keep handling it.
+ENGINE_EVENT=$(engine_line "$TRUSTED_OUT" TRUSTED_EVENT_JSON)
+if echo "$ENGINE_EVENT" | jq -e '.hook_event_name == "PreToolUse"
+        and .tool_name == "Bash"
+        and (.tool_input.command | type) == "string"
+        and (.tool_input.command | test("push --force"))' >/dev/null 2>&1; then
+    pass "engine-delivered pre_tool_use payload matches the shape the bridge classifies"
+else
+    fail "the engine delivered an unexpected pre_tool_use payload (update guard-codex-bridge.sh and defaults/docs/private-control-bundle.md): $ENGINE_EVENT"
+fi
+
+# An allowed call still runs, so the block above is a decision and not a
+# blanket refusal of every tool call.
+if [[ "$(engine_line "$TRUSTED_OUT" TRUSTED_BENIGN_MARKER)" == "allowed" ]]; then
+    pass "a benign tool call is allowed through the same live hook and executes"
+else
+    fail "the hook blocked a benign tool call: $(engine_turn "$TRUSTED_OUT" TRUSTED_BENIGN_BEGIN TRUSTED_BENIGN_END)"
+fi
+
+# The control. Same image, same profile contents, same probe — only the answer
+# to the hook-trust prompt differs. An UNTRUSTED hook is skipped with no error,
+# no warning and no doctor finding, and the force-push lands. That is why Loom
+# proves hook readiness itself before dispatching a mutable role, and it is what
+# makes the trusted result above a real result rather than a vacuous one.
+if [[ "$(engine_line "$UNTRUSTED_OUT" UNTRUSTED_FORCE_EVENT)" == "ABSENT" \
+    && -n "$UNTRUSTED_BASE" \
+    && "$(engine_line "$UNTRUSTED_OUT" UNTRUSTED_REF_AFTER_FORCE)" != "$UNTRUSTED_BASE" ]]; then
+    pass "without persisted hook trust the identical session runs unhooked and the escalation reproduces"
+else
+    fail "expected an untrusted hook to be skipped and the force-push to land, so the checks above are non-vacuous: $(engine_turn "$UNTRUSTED_OUT" UNTRUSTED_FORCE_BEGIN UNTRUSTED_FORCE_END)"
+fi
+
 echo "== $FAILURES failure(s) =="
 exit $((FAILURES > 0 ? 1 : 0))

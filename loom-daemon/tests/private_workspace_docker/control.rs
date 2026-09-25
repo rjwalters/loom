@@ -49,7 +49,7 @@ pub(super) fn stage(into: &std::path::Path) {
     .unwrap();
 }
 
-/// One `pre_tool_use` event in Codex's real 0.146.0-pinned input schema (every
+/// One `pre_tool_use` event in Codex's 0.146.0-pinned input schema (every
 /// required field present), carrying a shell call the guards must police.
 fn event(command: &str) -> String {
     serde_json::to_string(&serde_json::json!({
@@ -67,12 +67,45 @@ fn event(command: &str) -> String {
     .unwrap()
 }
 
+/// The same call in the shape the shipped **0.149.1** engine actually emits,
+/// transcribed field-for-field from a payload captured by an always-allow
+/// recorder hook during a real `codex exec` turn against the real session image
+/// (`docker/session/test-image.sh` §12, which re-captures and re-asserts it on
+/// every image build). It differs from the 0.146.0 form above in both places
+/// the bridge has to understand: the tool is named `Bash`, not `shell`, and
+/// `tool_input.command` is a **string** rather than an argv array. Exercising
+/// only the older shape would mean the fixtures never met a payload this CLI
+/// can produce.
+fn engine_event(command: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "session_id": "00000000-0000-0000-0000-00000000c0de",
+        "turn_id": "turn_fixture",
+        "transcript_path": "/dev/null",
+        "cwd": "/workspace/repo",
+        "hook_event_name": "PreToolUse",
+        "model": "fixture-model",
+        "permission_mode": "bypassPermissions",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "tool_use_id": "call_fixture",
+    }))
+    .unwrap()
+}
+
 impl Fixture {
     /// Run the hook exactly as Codex would: the command string taken from the
     /// profile's own `hooks.json` registration, the event on stdin. `policy`
     /// selects whether the forced private-session policy is present, which is
     /// the only difference between the reported escalation and its closure.
-    fn hook(&self, name: &str, command: &str, policy: bool) -> String {
+    /// `shape` builds the payload, so the same assertion can be made against
+    /// both the 0.146.0 schema and the shape the shipped engine emits today.
+    fn hook_with(
+        &self,
+        name: &str,
+        shape: fn(&str) -> String,
+        command: &str,
+        policy: bool,
+    ) -> String {
         let registered = self.exec(
             name,
             "jq -r '[.hooks.PreToolUse[].hooks[].command] | map(select(contains(\"guard-codex-bridge.sh\"))) | .[0]' \"$CODEX_HOME/hooks.json\"",
@@ -92,8 +125,13 @@ impl Fixture {
         };
         self.exec(
             name,
-            &format!("{env}printf '%s' {} | bash {registered}", shell_quote(&event(command))),
+            &format!("{env}printf '%s' {} | bash {registered}", shell_quote(&shape(command))),
         )
+    }
+
+    /// The 0.146.0-schema payload, which every existing assertion uses.
+    fn hook(&self, name: &str, command: &str, policy: bool) -> String {
+        self.hook_with(name, event, command, policy)
     }
 
     fn derive(&self, tag: &str, steps: &str) -> String {
@@ -380,6 +418,23 @@ fn image_owned_control_bundle_keeps_guard_code_and_policy_enforced_after_mutatio
         denied.contains("\"permissionDecision\": \"deny\"")
             || denied.contains("\"permissionDecision\":\"deny\""),
         "force-push over a protected ref must fail closed: {denied}"
+    );
+    // The same call in the shape the SHIPPED engine emits (`Bash`, string
+    // command — see `engine_event`). Both halves again: the worker's own
+    // configuration still allows it, the forced policy still denies it. A
+    // fixture that only ever used the older argv shape could pass while the
+    // bridge had stopped classifying what this CLI version actually sends.
+    assert!(
+        f.hook_with(name, engine_event, force, false)
+            .trim()
+            .is_empty(),
+        "the escalation must reproduce on the engine's own payload shape too"
+    );
+    let denied = f.hook_with(name, engine_event, force, true);
+    assert!(
+        denied.contains("\"permissionDecision\": \"deny\"")
+            || denied.contains("\"permissionDecision\":\"deny\""),
+        "the engine's own payload shape must fail closed as well: {denied}"
     );
 
     // ---- regression 2: delete the guard bridge from the clone -----------
