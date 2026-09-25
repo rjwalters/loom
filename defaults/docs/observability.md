@@ -337,6 +337,23 @@ label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or
 test enforces this. The gateway also needs its `config.yaml` refreshed, as
 [execution traces](tracing.md) describes, before new label keys survive it.
 
+**The ready queue (Issue #8852, phase 2)** is exported to both sinks, split by
+cardinality:
+
+- **SigNoz (OTLP):** every work-finder tick emits `loom.queue.issues{state,reason}`
+  gauges, one per queue disposition with zeros included, plus
+  `loom.queue.listing_failed_repos`. These use the labels already on the
+  allowlist, so no gateway change is needed. They never carry an issue number
+  or a repo.
+- **Fleet dashboard (native HTTPS):** the per-issue rows travel as the
+  `queue.snapshot` record, sampled on the `host.health` interval whenever the
+  work finder has ticked since the last snapshot. Each row carries its forge
+  `owner/repo` and its own `visibility` tag. The OTLP exporter never receives
+  this record.
+
+Both are derived from the same rows as `loom-daemon queue`. See
+[`telemetry-schema.md` → `queue.snapshot`](telemetry-schema.md#queuesnapshot).
+
 ## 4. The backend: deploy your own Cloudflare Worker
 
 The Phase-2 backend is a Cloudflare Worker (D1 for durable history, a

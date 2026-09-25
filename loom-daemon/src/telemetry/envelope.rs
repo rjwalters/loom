@@ -60,6 +60,9 @@ impl TelemetryEnvelope {
                 TelemetryRecord::CiJobLog(_) => 9,
                 // Issue #8860: `metric.points` is OTLP-only and gated alone.
                 TelemetryRecord::MetricPoints(_) => 10,
+                // Issue #8852 (phase 2): `queue.snapshot` is native-HTTPS only
+                // and gated alone.
+                TelemetryRecord::QueueSnapshot(_) => 11,
                 _ => CURRENT_SCHEMA_VERSION,
             },
             emitted_at: Utc::now(),

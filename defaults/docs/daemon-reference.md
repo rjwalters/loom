@@ -1981,7 +1981,13 @@ failed on the tick is named in `last_work_finder_tick.listing_failed`, and the
 view says the queue is INCOMPLETE rather than empty (`--json`: `complete:
 false`). The `serve`
 dashboard has a matching "Ready queue" panel. The single-workspace tick path does
-not record rows. Exporting the queue to the fleet backend is a follow-up.
+not record rows. Each row also carries daemon-derived `state` and `reason`
+strings, so clients do not keep their own copy of the mapping. With
+observability export on, the queue also reaches SigNoz as
+`loom.queue.issues{state,reason}` gauges and reaches the fleet backend as a
+`queue.snapshot` record (phase 2; see
+[`observability.md` §3c](observability.md#3c-operational-signals-from-daemon-loops-issue-8860)).
+The fleet dashboard view is phase 3.
 
 ## Forge-side pipeline snapshot (`status --pipeline`, #3977)
 

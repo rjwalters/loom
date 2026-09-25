@@ -74,6 +74,7 @@ only on a **breaking** wire change to the record shapes below. A backend should:
 | `8` | Adds the CI family `ci.run`, `ci.job`, `ci.duration` (#8824); only those three kinds use `8`. CI spans reuse `trace.span` at `3`. | Every earlier kind's version and shape is unchanged. |
 | `9` | Adds `ci.job.log` (#8825); only job-log chunk envelopes use `9`. | Every earlier kind's version and shape is unchanged — including the phase-1 CI family at `8`, so a backend that is not ready to ingest free-text log bodies can refuse exactly this kind without losing run/job/duration telemetry. |
 | `10` | Adds `metric.points` (#8860); only those envelopes use `10`. OTLP-only — the native HTTPS exporter never sends it. The `loom.dispatch.tick` span reuses `trace.span` at `3`. | Every earlier kind's version and shape is unchanged — including `ci.job.log` at `9`. |
+| `11` | Adds `queue.snapshot` (#8852 phase 2); only those envelopes use `11`. Native-HTTPS only — the OTLP exporter never sends it (SigNoz gets the queue as `loom.queue.*` gauges in `metric.points`). | Every earlier kind's version and shape is unchanged. Workers older than phase 3 store it as an unknown kind, and `/public/*` shows it as `kind` only. |
 
 ## `/ingest` response (the bound-`host_id` echo)
 
@@ -155,6 +156,7 @@ records (`tokens.snapshot`, `host.health`) do not.
 | `ci.run` / `ci.job` / `ci.duration` | repo | completed GitHub Actions run attempt / job (Issue #8824) |
 | `ci.job.log` | repo | one ≤ 8 KiB chunk of a completed job's log (Issue #8825) |
 | `metric.points` | host | daemon-loop operational sample — work-finder tick, host resources (Issue #8860; OTLP-only) |
+| `queue.snapshot` | host (rows are repo-tagged) | work finder's ranked ready queue, on the `host.health` interval when a new tick exists (Issue #8852; native-HTTPS only) |
 
 ### `sweep.started`
 
@@ -870,6 +872,19 @@ log line (`loom-daemon health`'s last-tick summary omits `prless_retry`). Every 
 | `loom.host.memory.available_bytes`, `loom.host.memory.total_bytes` | bytes | `host.health` interval |
 | `loom.host.swap.used_bytes`, `loom.host.swap.total_bytes` | bytes | `host.health` interval |
 | `loom.host.worktree_volume.free_bytes`, `loom.host.worktree_volume.total_bytes` | bytes | `host.health` interval |
+| `loom.queue.issues` | count | every work-finder tick |
+| `loom.queue.listing_failed_repos` | count | every work-finder tick |
+
+`loom.queue.issues` (Issue #8852, phase 2) is the ready-queue depth. It has
+one point per queue disposition, labelled `state` (`running`, `ready`,
+`blocked`) and `reason` (the disposition's wire name, as in
+`queue.snapshot`'s `disposition`). Every disposition is emitted every tick,
+**zeros included**, so an empty queue reads `0`. A missing series means the
+host stopped ticking or exporting. Sum by `state` for the running / ready /
+blocked split. `loom.queue.listing_failed_repos` counts the repos whose ready
+listing failed on that tick; when it is non-zero, the depth is incomplete, not
+low. Issue numbers and repos are never labels. The per-issue rows travel in
+`queue.snapshot`.
 
 An unmeasurable host reading produces no point, never a `0`. Each work-finder
 tick also emits one `loom.dispatch.tick` span. It is a new root trace per tick
@@ -878,6 +893,55 @@ that covers candidate evaluation and dispatch. Its attributes are
 `error`, `no_eligible_work`, `capacity_full`, `all_skipped`, first match
 wins), `loom.dispatch.seen`, `loom.dispatch.dispatched`,
 `loom.dispatch.errors` and `loom.dispatch.max_concurrent`.
+
+### `queue.snapshot`
+
+The work finder's ranked ready queue as of its last tick (Issue #8852, phase
+2). The rows are the same ones `loom-daemon queue` and `status --json`'s
+`last_work_finder_tick.queue` show. They are ordered by the daemon's own
+dispatch comparator: workspace priority, then `loom:urgent`, then oldest
+`createdAt`, then issue number. `tier:*` labels do not affect the order.
+Envelopes carry `schema_version: 11`. **Native-HTTPS only**: the OTLP
+exporter never receives it (the mirror of `metric.points`).
+
+The collector samples it on the `host.health` interval, and **only when the
+work finder has ticked since the previous snapshot**. A stalled work finder
+therefore shows up as an ageing `tick_at` and never as a re-stamped copy of
+an old queue. No snapshot at all means the work finder has not ticked in this
+daemon process or is disabled.
+
+| Field | Type | Notes |
+|---|---|---|
+| `tick_at` | RFC 3339 | when the described tick completed — the freshness stamp |
+| `max_concurrent` | integer | the concurrency cap that tick ran under |
+| `seen` | integer | ready issues the tick listed |
+| `counts` | object | `running` / `ready` / `blocked` over **every** row, including dropped ones |
+| `listing_failed` | array, optional | `{repo, visibility}` for each repo whose ready listing failed; its backlog is absent (incomplete, not empty) |
+| `listing_failed_unresolved` | integer | failed-listing workspaces whose slug could not be resolved |
+| `rows[]` | array | ranked rows (below), at most 200 |
+| `unresolved_rows` | integer | rows dropped because their workspace's forge slug could not be resolved |
+| `rows_truncated` | integer | rows dropped by the 200-row cap |
+
+Each row:
+
+| Field | Type | Notes |
+|---|---|---|
+| `rank` | integer | 1-based dispatch position on the host. It is not renumbered after drops, so a gap means a row was dropped |
+| `repo` | string | forge `owner/repo`, never a local path |
+| `visibility` | `public` / `private` | per row; missing or unknown decodes to `private` |
+| `issue` | integer | issue number |
+| `workspace_priority` | integer | lower dispatches first |
+| `urgent` | bool | carries `loom:urgent` |
+| `created_at` | RFC 3339, optional | issue creation time (the age ordering key) |
+| `tier` | string, optional | the `tier:*` label, informational only |
+| `disposition` | string | `dispatched`, `in_flight`, `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_out_of_slice`, `workspace_halted`, `workspace_commands_missing`, `host_constraint`, `parked`, `hard_exclusion`, `recheck_interval`, `quarantined`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `peer_claim`, `open_pr`, `dispatch_error` (unknown values are forward-compatible) |
+| `state` | string | `running` / `ready` / `blocked`, derived by the daemon so clients never keep a copy of the mapping |
+| `reason` | string | human-readable reason, also daemon-derived |
+| `detail` | string, optional | only for `parked` (the park label) and `open_pr` (`open PR #N`). Free-form dispatch-error text is never exported |
+
+Redaction: a phase-3 Worker must redact per row on `visibility`. Until it
+learns this kind, the existing unknown-kind rule applies (`/public/*` sees
+`kind` only).
 
 ### `tokens.snapshot`
 

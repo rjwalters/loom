@@ -305,7 +305,11 @@ function queueStaleSecs(report) {
 }
 var QUEUE_STATE_PILL = { running: "green", ready: "amber", blocked: "red" };
 
-function queueState(d) {
+// The daemon serializes each row's `state` and `reason` (#8852 phase 2); the
+// disposition-prefix fallback only covers payloads from older daemons.
+function queueState(row) {
+  if (row.state) return row.state;
+  var d = row.disposition;
   if (d === "dispatched" || d === "in_flight") return "running";
   if (d && d.indexOf("deferred_") === 0) return "ready";
   return "blocked";
@@ -324,7 +328,7 @@ function renderQueue(report) {
   var age = Math.max(0, Math.round((Date.now() - Date.parse(tick.at)) / 1000));
   var queue = tick.queue || [];
   var counts = { running: 0, ready: 0, blocked: 0 };
-  queue.forEach(function (r) { counts[queueState(r.disposition)] += 1; });
+  queue.forEach(function (r) { counts[queueState(r)] += 1; });
   var stale = age > queueStaleSecs(report);
   var failed = tick.listing_failed || [];
   body.appendChild(el("p", {}, [
@@ -354,7 +358,7 @@ function renderQueue(report) {
   ]);
   var tbody = el("tbody");
   queue.forEach(function (row) {
-    var state = queueState(row.disposition);
+    var state = queueState(row);
     var base = forgeUrlByRoot[row.repo];
     var issueCell = base
       ? el("td", {}, [el("a", { href: base + "/issues/" + row.issue, target: "_blank", rel: "noopener", text: "#" + row.issue })])
@@ -368,7 +372,7 @@ function renderQueue(report) {
       el("td", { text: String(row.repo).split("/").pop() }),
       el("td", { text: String(row.workspace_priority) }),
       el("td", {}, [el("span", { "class": "pill " + QUEUE_STATE_PILL[state], text: state })]),
-      el("td", { text: row.disposition.replace(/_/g, " ") + (row.detail ? " (" + row.detail + ")" : "") }),
+      el("td", { text: (row.reason || row.disposition.replace(/_/g, " ")) + (row.detail ? " (" + row.detail + ")" : "") }),
       el("td", { text: flags.join(", ") || "-" }),
     ]));
   });

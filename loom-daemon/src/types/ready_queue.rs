@@ -73,6 +73,64 @@ pub enum QueueDisposition {
 }
 
 impl QueueDisposition {
+    /// Every known disposition, in declaration order ([`Self::Unknown`]
+    /// excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
+    /// point per entry every tick, zeros included, so an empty queue reads as
+    /// `0` rather than as a missing series.
+    pub const ALL: [Self; 21] = [
+        Self::Dispatched,
+        Self::InFlight,
+        Self::DeferredCapacity,
+        Self::DeferredRampCap,
+        Self::DeferredSaturation,
+        Self::DeferredOutOfSlice,
+        Self::WorkspaceHalted,
+        Self::WorkspaceCommandsMissing,
+        Self::HostConstraint,
+        Self::Parked,
+        Self::HardExclusion,
+        Self::RecheckInterval,
+        Self::Quarantined,
+        Self::DispatchBackoff,
+        Self::OpenPrBackoff,
+        Self::NoopCooldown,
+        Self::Declined,
+        Self::PrlessRetry,
+        Self::PeerClaim,
+        Self::OpenPr,
+        Self::DispatchError,
+    ];
+
+    /// The snake_case wire name (identical to the serde form; pinned by a
+    /// test). Used as the `reason` metric label.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dispatched => "dispatched",
+            Self::InFlight => "in_flight",
+            Self::DeferredCapacity => "deferred_capacity",
+            Self::DeferredRampCap => "deferred_ramp_cap",
+            Self::DeferredSaturation => "deferred_saturation",
+            Self::DeferredOutOfSlice => "deferred_out_of_slice",
+            Self::WorkspaceHalted => "workspace_halted",
+            Self::WorkspaceCommandsMissing => "workspace_commands_missing",
+            Self::HostConstraint => "host_constraint",
+            Self::Parked => "parked",
+            Self::HardExclusion => "hard_exclusion",
+            Self::RecheckInterval => "recheck_interval",
+            Self::Quarantined => "quarantined",
+            Self::DispatchBackoff => "dispatch_backoff",
+            Self::OpenPrBackoff => "open_pr_backoff",
+            Self::NoopCooldown => "noop_cooldown",
+            Self::Declined => "declined",
+            Self::PrlessRetry => "prless_retry",
+            Self::PeerClaim => "peer_claim",
+            Self::OpenPr => "open_pr",
+            Self::DispatchError => "dispatch_error",
+            Self::Unknown => "unknown",
+        }
+    }
+
     /// Coarse state for dashboards: `running`, `ready` (waiting only on
     /// capacity-style limits), or `blocked` (something specific to the issue,
     /// its repo, or its history is holding it).
@@ -146,6 +204,14 @@ pub struct ReadyQueueRow {
     /// dispatch error text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// [`QueueDisposition::state`], serialized so clients (the `serve`
+    /// dashboard, the fleet backend) never keep their own copy of the
+    /// mapping. Empty on payloads from daemons older than phase 2.
+    #[serde(default)]
+    pub state: String,
+    /// [`QueueDisposition::reason`], serialized for the same reason.
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[cfg(test)]
@@ -162,6 +228,8 @@ mod tests {
         .unwrap();
         assert_eq!(row.disposition, QueueDisposition::Unknown);
         assert_eq!(row.created_at, None);
+        // A pre-phase-2 payload has no `state`/`reason`: they default empty.
+        assert!(row.state.is_empty() && row.reason.is_empty());
     }
 
     #[test]
@@ -171,5 +239,13 @@ mod tests {
         assert_eq!(QueueDisposition::Dispatched.state(), "running");
         assert_eq!(QueueDisposition::DeferredCapacity.state(), "ready");
         assert_eq!(QueueDisposition::OpenPr.state(), "blocked");
+    }
+
+    #[test]
+    fn as_str_matches_serde_for_every_disposition() {
+        for d in QueueDisposition::ALL {
+            assert_eq!(serde_json::to_value(d).unwrap(), serde_json::json!(d.as_str()));
+        }
+        assert_eq!(QueueDisposition::Unknown.as_str(), "unknown");
     }
 }

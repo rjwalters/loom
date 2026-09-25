@@ -18,12 +18,14 @@
 //!
 //! Emitters in this issue: [`dispatch`] (one span plus decision counters per
 //! work-finder tick) and [`host`] (memory, swap and worktree-volume gauges on
-//! the `host.health` cadence). Later emitters (#8856 dwell/starvation, #8857
+//! the `host.health` cadence), and [`queue`] (ready-queue depth per tick,
+//! #8852 phase 2). Later emitters (#8856 dwell/starvation, #8857
 //! token burn and account rotation) add a `MetricName`/`SpanName` variant and
 //! call the same two functions.
 
 pub mod dispatch;
 pub mod host;
+pub mod queue;
 
 use std::sync::{Arc, OnceLock};
 

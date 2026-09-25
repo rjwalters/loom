@@ -209,6 +209,8 @@ mod tests {
             tier: None,
             disposition: d,
             detail: None,
+            state: d.state().into(),
+            reason: d.reason().into(),
         }
     }
 
