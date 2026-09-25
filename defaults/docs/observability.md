@@ -16,6 +16,7 @@
 - [2. What gets sent: the wire schema](#2-what-gets-sent-the-wire-schema)
 - [3. Exporters: HTTPS (default) or OTLP (opt-in)](#3-exporters-https-default-or-otlp-opt-in)
 - [3b. Confirming telemetry is actually flowing](#3b-confirming-telemetry-is-actually-flowing)
+- [3c. Operational signals from daemon loops (Issue #8860)](#3c-operational-signals-from-daemon-loops-issue-8860)
 - [4. The backend: deploy your own Cloudflare Worker](#4-the-backend-deploy-your-own-cloudflare-worker)
 - [5. Authenticated vs. public: two views, one redaction policy](#5-authenticated-vs-public-two-views-one-redaction-policy)
 - [5b. Doc-maintenance throughput (Guide, local-only, issue #6136)](#5b-doc-maintenance-throughput-guide-local-only-issue-6136)
@@ -314,6 +315,28 @@ being acked", not "is every record kind being enqueued". A host can report
 `healthy` while a specific record kind is silently never queued (e.g. issue
 #5084); the two checks are complementary.
 
+## 3c. Operational signals from daemon loops (Issue #8860)
+
+`observability::ops` is the shared path every daemon loop uses to put a
+number or a span into SigNoz. `ops::emit_metrics` enqueues a `metric.points`
+record, named from a closed vocabulary with allowlisted labels, and
+`ops::emit_span` enqueues a completed span. There is no per-signal record
+kind, collector or mapping to write. The sink is registered only when at least
+one `otlp` exporter starts, and it feeds only the OTLP queues. With no OTLP
+exporter, both calls are no-ops.
+
+Current emitters are one `loom.dispatch.tick` span per work-finder tick, the
+`loom.dispatch.decisions{reason=…}` delta counter, and memory, swap and
+worktree-volume byte gauges on the `host.health` cadence. Names, kinds and
+labels are listed in
+[`telemetry-schema.md` → `metric.points`](telemetry-schema.md#metricpoints).
+To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new
+label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or
+`OPS_SPAN_ATTRIBUTE_KEYS` and the gateway collector's `keep_keys` in
+`defaults/observability/collector/config.yaml` in the same change; a contract
+test enforces this. The gateway also needs its `config.yaml` refreshed, as
+[execution traces](tracing.md) describes, before new label keys survive it.
+
 ## 4. The backend: deploy your own Cloudflare Worker
 
 The Phase-2 backend is a Cloudflare Worker (D1 for durable history, a
@@ -551,3 +574,4 @@ capture, and why) so you can produce the equivalent for your own instance.
 | `dashboard/migrations/0003_ephemeral_compute.sql` | `ephemeral_compute` schema decision + hostless-ingest provisioning rationale (§5d) |
 | `dashboard/docs/reference-deployment.md` | Generic guidance/template for recording your own instance's deployment identity in your own infrastructure repo — carries no operator identity here |
 | `loom-daemon/src/observability/mod.rs` | Config resolution, collector/queue/exporter/sender source of truth |
+| `loom-daemon/src/observability/ops.rs` | Shared `metric.points` / ops-span emission path for daemon loops (§3c) |

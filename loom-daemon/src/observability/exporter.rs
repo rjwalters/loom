@@ -242,22 +242,12 @@ impl Exporter for HttpsExporter {
     async fn emit_batch_outcome(&self, envelopes: &[TelemetryEnvelope]) -> BatchOutcome {
         match self.emit_batch(envelopes).await {
             Ok(()) => {
-                let dropped = envelopes
-                    .iter()
-                    .filter(|envelope| {
-                        matches!(envelope.record, crate::telemetry::TelemetryRecord::Span(_))
-                    })
-                    .count();
                 let mut outcome = BatchOutcome::accepted(envelopes.len());
-                outcome.exported -= dropped;
-                if dropped != 0 {
-                    outcome.signals.insert(
-                        "spans".into(),
-                        SignalCounts {
-                            dropped: dropped as u64,
-                            ..SignalCounts::default()
-                        },
-                    );
+                for envelope in envelopes {
+                    if let Some(signal) = super::tracing::otlp_only_signal(&envelope.record) {
+                        outcome.exported -= 1;
+                        outcome.signals.entry(signal.into()).or_default().dropped += 1;
+                    }
                 }
                 outcome
             }

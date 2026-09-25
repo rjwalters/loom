@@ -582,6 +582,9 @@ async fn sample_snapshots(
     let health_record =
         sample_host_health(workspace_root, daemon_started_at, workspace_pool, slug_cache).await;
     queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
+    // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
+    // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
+    super::ops::host::record(workspace_root).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

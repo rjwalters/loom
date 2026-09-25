@@ -197,6 +197,29 @@ pub fn worktree_root_disk_gb(repo_root: &Path) -> (Option<u64>, Option<u64>) {
     }
 }
 
+/// Free and total **bytes** on the worktree-root filesystem for `repo_root`,
+/// from one `df -Pk` sample (Issue #8860) — [`worktree_root_disk_gb`] without
+/// the integer-GB floor, for the OTLP host-resource gauges. Same "unknown !=
+/// zero" contract: each half is `None` when unmeasurable.
+#[must_use]
+pub fn worktree_root_disk_bytes(repo_root: &Path) -> (Option<u64>, Option<u64>) {
+    let wt_root = worktree_root(repo_root);
+    let Some(output) = df_probe_output(nearest_existing_ancestor(&wt_root)) else {
+        return (None, None);
+    };
+    let column_bytes = |index: usize| -> Option<u64> {
+        let kb: u64 = output
+            .lines()
+            .nth(1)?
+            .split_whitespace()
+            .nth(index)?
+            .parse()
+            .ok()?;
+        Some(kb.saturating_mul(1024))
+    };
+    (column_bytes(3), column_bytes(1))
+}
+
 /// The disk-headroom concurrency term: how many worktrees `free_gb` can hold at
 /// `per_gb` GB each. Pure `floor(free_gb / per_gb)`, mirroring the disk term of
 /// bash `loom_wave_size_from_disk` (`free_gb / per`). A `per_gb` of 0 is treated

@@ -60,10 +60,12 @@ mod envelope;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
+pub mod ops;
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use envelope::TelemetryEnvelope;
+pub use ops::MetricPointsRecord;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
 /// record shapes below so a Phase-2 backend ingesting a mixed-version fleet can
@@ -304,6 +306,11 @@ pub enum TelemetryRecord {
     /// [`CiJobLogRecord`] for why the gateway, not the source, scrubs it.
     #[serde(rename = "ci.job.log")]
     CiJobLog(CiJobLogRecord),
+    /// A batch of generic operational metric points (Issue #8860) — the shared
+    /// carrier any daemon loop emits through `observability::ops`. OTLP-only;
+    /// see [`ops`] for the fixed name vocabulary and label policy.
+    #[serde(rename = "metric.points")]
+    MetricPoints(MetricPointsRecord),
 }
 
 /// A sweep's terminal result. `#[serde(default)]`-friendly variants are not

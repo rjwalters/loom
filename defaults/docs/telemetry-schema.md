@@ -73,6 +73,7 @@ only on a **breaking** wire change to the record shapes below. A backend should:
 | `7` | Adds `daemon.event` (#8760, G4 of #8714); only daemon-event envelopes use `7`. | Existing lifecycle/trace/identity/session-summary/session-analysis versions and shapes remain unchanged. |
 | `8` | Adds the CI family `ci.run`, `ci.job`, `ci.duration` (#8824); only those three kinds use `8`. CI spans reuse `trace.span` at `3`. | Every earlier kind's version and shape is unchanged. |
 | `9` | Adds `ci.job.log` (#8825); only job-log chunk envelopes use `9`. | Every earlier kind's version and shape is unchanged — including the phase-1 CI family at `8`, so a backend that is not ready to ingest free-text log bodies can refuse exactly this kind without losing run/job/duration telemetry. |
+| `10` | Adds `metric.points` (#8860); only those envelopes use `10`. OTLP-only — the native HTTPS exporter never sends it. The `loom.dispatch.tick` span reuses `trace.span` at `3`. | Every earlier kind's version and shape is unchanged — including `ci.job.log` at `9`. |
 
 ## `/ingest` response (the bound-`host_id` echo)
 
@@ -153,6 +154,7 @@ records (`tokens.snapshot`, `host.health`) do not.
 | `tokens.snapshot` / `host.health` | host | sampling interval |
 | `ci.run` / `ci.job` / `ci.duration` | repo | completed GitHub Actions run attempt / job (Issue #8824) |
 | `ci.job.log` | repo | one ≤ 8 KiB chunk of a completed job's log (Issue #8825) |
+| `metric.points` | host | daemon-loop operational sample — work-finder tick, host resources (Issue #8860; OTLP-only) |
 
 ### `sweep.started`
 
@@ -835,6 +837,47 @@ weakened:
 Field tables, the chunking contract, the scrub-class list and the
 `logs_done` idempotency contract live in
 [`ci-observability.md`](ci-observability.md).
+
+### `metric.points`
+
+The generic operational-metrics carrier (Issue #8860): a batch of points any
+daemon loop emits through `loom-daemon/src/observability/ops.rs`, instead of
+inventing a record kind per signal. Envelopes carry `schema_version: 10`.
+**OTLP-only** — the native HTTPS `/ingest` exporter drops it, like
+`trace.span`, so the Cloudflare backend never sees it.
+
+| Field | Type | Notes |
+|---|---|---|
+| `captured_at` | RFC 3339 | sample instant (the OTLP data-point time) |
+| `interval_start` | RFC 3339, optional | start of the interval the batch's delta counters cover (OTLP `start_time_unix_nano`; the tick start for `loom.dispatch.decisions`); defaults to `captured_at` |
+| `points[].name` | string | closed vocabulary, `telemetry::ops::MetricName` |
+| `points[].value` | int or float | non-finite floats are dropped at export |
+| `points[].labels` | object | optional; keys limited to `reason`, `provider`, `account`, `model`, `state`; values ≤128 bytes, no control chars, ≤8 per point |
+
+Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
+**delta `Sum`**, one point per non-zero work-finder outcome per tick, labelled
+`reason` ∈ `dispatched`, `labeled`, `in_flight`, `quarantined`,
+`workspace_commands_missing`, `pr_open`, `peer_claim`, `backoff`,
+`pr_open_backoff`, `noop_cooldown`, `declined`, `prless_retry`,
+`recheck_interval`, `host_constraint`, `capacity`, `ramp_cap`, `saturation`,
+`out_of_slice`, `error`. These are the same buckets as the `work_finder: tick`
+log line (`loom-daemon health`'s last-tick summary omits `prless_retry`). Every other name is a
+**`Gauge`**:
+
+| Metric | Unit | Cadence |
+|---|---|---|
+| `loom.dispatch.candidates`, `loom.dispatch.max_concurrent` | count | every work-finder tick |
+| `loom.host.memory.available_bytes`, `loom.host.memory.total_bytes` | bytes | `host.health` interval |
+| `loom.host.swap.used_bytes`, `loom.host.swap.total_bytes` | bytes | `host.health` interval |
+| `loom.host.worktree_volume.free_bytes`, `loom.host.worktree_volume.total_bytes` | bytes | `host.health` interval |
+
+An unmeasurable host reading produces no point, never a `0`. Each work-finder
+tick also emits one `loom.dispatch.tick` span. It is a new root trace per tick
+that covers candidate evaluation and dispatch. Its attributes are
+`loom.dispatch.result` (`dispatched`, `halted_main_red`, `saturation_held`,
+`error`, `no_eligible_work`, `capacity_full`, `all_skipped`, first match
+wins), `loom.dispatch.seen`, `loom.dispatch.dispatched`,
+`loom.dispatch.errors` and `loom.dispatch.max_concurrent`.
 
 ### `tokens.snapshot`
 

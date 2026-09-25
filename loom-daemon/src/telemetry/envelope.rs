@@ -58,6 +58,8 @@ impl TelemetryEnvelope {
                 // itself about free-text log bodies can refuse exactly this
                 // kind without also losing the phase-1 CI family at 8.
                 TelemetryRecord::CiJobLog(_) => 9,
+                // Issue #8860: `metric.points` is OTLP-only and gated alone.
+                TelemetryRecord::MetricPoints(_) => 10,
                 _ => CURRENT_SCHEMA_VERSION,
             },
             emitted_at: Utc::now(),
