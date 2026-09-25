@@ -215,7 +215,7 @@ done
 CONTROL_ROOT=/opt/loom/private-control
 
 CONTROL_MANIFEST=$(docker exec "$CONTAINER_NAME" cat "$CONTROL_ROOT/manifest.json" 2>&1)
-if echo "$CONTROL_MANIFEST" | jq -e '.protocol == "loom-private-control-v1" and .control_version == 1' >/dev/null 2>&1; then
+if echo "$CONTROL_MANIFEST" | jq -e '.protocol == "loom-private-control-v1" and .control_version == 2' >/dev/null 2>&1; then
     pass "control bundle ships a sealed loom-private-control-v1 manifest"
 else
     fail "control bundle manifest missing or not loom-private-control-v1: $CONTROL_MANIFEST"
@@ -243,13 +243,102 @@ else
 fi
 
 # The worker's own view of its boundary. `observe` re-derives every sealed
-# digest and PROVES non-writability by attempting real writes, so a `ready`
-# here is evidence, not a restatement of the image's file modes.
+# digest and PROVES non-writability by attempting real writes, so its verdict
+# is evidence, not a restatement of the image's file modes.
+#
+# THIS container is deliberately not a session: it has no account profile bound
+# at all, let alone the read-only per-file binds a real session carries, so the
+# only correct answer here is `profile-mutable`. The image alone cannot make the
+# control-file claim — that half is mount topology the HOST establishes — and an
+# image that answered `ready` without it would be claiming protection it does
+# not have. The protected shape is exercised immediately below.
 CONTROL_REPORT=$(docker exec "$CONTAINER_NAME" loom-daemon private-workspace control 2>&1)
-if echo "$CONTROL_REPORT" | jq -e '.status == "ready" and (.identity | test("^[0-9a-f]{64}$"))' >/dev/null 2>&1; then
-    pass "loom-daemon private-workspace control reports a ready, bound boundary"
+if echo "$CONTROL_REPORT" | jq -e '.status == "profile-mutable"' >/dev/null 2>&1; then
+    pass "control boundary refuses a container whose profile controls are not mount-protected"
 else
-    fail "control boundary is not ready inside the shipped image: $CONTROL_REPORT"
+    fail "a container with no protected account profile did not report profile-mutable: $CONTROL_REPORT"
+fi
+
+# ...and the protected shape, against this same shipped image: a synthetic
+# profile whose three control files are bound READ-ONLY over their own paths,
+# exactly as private_workspace::docker::create binds them. `ready` here means
+# the real image's own boundary code accepted a real mount topology, and the
+# probe then proves the kernel-level property that topology exists for — a
+# worker cannot write, delete, rename away or rename over the hook registration
+# it is policed by, while `auth.json` beside it stays refreshable.
+# The synthetic profile is owned by whoever runs this script, so these probes
+# run as THAT uid rather than the session's 1000 — the property under test is
+# mount topology, which is uid-independent, and `--read-only` keeps the bundle
+# itself unwritable even if this happens to be root. Session-uid-1000 behaviour
+# against a 0700 profile is proven separately by the Rust Docker fixtures,
+# which CI runs under `setpriv --reuid=1000`.
+PROBE_USER="$(id -u):$(id -g)"
+PROTECTED_PROFILE=$(mktemp -d)
+chmod 700 "$PROTECTED_PROFILE"
+cleanup_protected() { rm -rf "$PROTECTED_PROFILE"; }
+trap 'cleanup; cleanup_protected' EXIT
+printf 'synthetic-not-a-credential\n' > "$PROTECTED_PROFILE/auth.json"
+chmod 600 "$PROTECTED_PROFILE/auth.json"
+# Provisioned by the image's OWN sealed provisioner, through the same
+# `provision-controls` endpoint the daemon drives before it creates a session.
+PROVISION_OUT=$(docker run --rm --network none --user "$PROBE_USER" --read-only \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+    --mount "type=bind,src=$PROTECTED_PROFILE,dst=/home/loom/.codex-profile" \
+    --env CODEX_HOME=/home/loom/.codex-profile \
+    --entrypoint loom-daemon "$IMAGE" private-workspace provision-controls 2>&1)
+if echo "$PROVISION_OUT" | jq -e '.status == "ready"' >/dev/null 2>&1; then
+    pass "the image's sealed provisioner establishes the profile's control files"
+else
+    fail "provision-controls did not report ready against a fresh profile: $PROVISION_OUT"
+fi
+
+PROTECTED_MOUNTS=()
+for CONTROL_FILE in hooks.json config.toml loom-codex-hooks.json; do
+    PROTECTED_MOUNTS+=(--mount "type=bind,src=$PROTECTED_PROFILE/$CONTROL_FILE,dst=/home/loom/.codex-profile/$CONTROL_FILE,readonly")
+done
+PROTECTED_REPORT=$(docker run --rm --network none --user "$PROBE_USER" --read-only \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+    --mount "type=bind,src=$PROTECTED_PROFILE,dst=/home/loom/.codex-profile" \
+    "${PROTECTED_MOUNTS[@]}" \
+    --env CODEX_HOME=/home/loom/.codex-profile \
+    --entrypoint loom-daemon "$IMAGE" private-workspace control 2>&1)
+if echo "$PROTECTED_REPORT" | jq -e '.status == "ready" and (.identity | test("^[0-9a-f]{64}$"))' >/dev/null 2>&1; then
+    pass "control boundary is ready and bound once the profile controls are bound read-only"
+else
+    fail "the protected shape is not ready inside the shipped image: $PROTECTED_REPORT"
+fi
+
+# The kernel-level property itself: on a read-only mount point a write is
+# EROFS and an unlink or rename is EBUSY, while the directory around it stays
+# writable. `set -e` is deliberately absent — each attempt is asserted to FAIL.
+FREEZE_PROBE='
+escalated() { echo "ESCALATED: $1"; exit 1; }
+for control in hooks.json config.toml loom-codex-hooks.json; do
+    path="$CODEX_HOME/$control"
+    printf attack > "$path" 2>/dev/null && escalated "wrote $control"
+    rm -f "$path" 2>/dev/null && escalated "removed $control"
+    mv "$path" "$path.stolen" 2>/dev/null && escalated "renamed $control away"
+    printf attack > "$CODEX_HOME/decoy" || escalated "profile directory is not writable"
+    mv "$CODEX_HOME/decoy" "$path" 2>/dev/null && escalated "renamed over $control"
+    rm -f "$CODEX_HOME/decoy"
+done
+printf refreshed > "$CODEX_HOME/auth.json.tmp" && mv "$CODEX_HOME/auth.json.tmp" "$CODEX_HOME/auth.json" \
+    || escalated "the canonical atomic auth refresh stopped working"
+echo FROZEN
+'
+FREEZE_OUT=$(docker run --rm --network none --user "$PROBE_USER" --read-only \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+    --mount "type=bind,src=$PROTECTED_PROFILE,dst=/home/loom/.codex-profile" \
+    "${PROTECTED_MOUNTS[@]}" \
+    --env CODEX_HOME=/home/loom/.codex-profile \
+    --entrypoint bash "$IMAGE" -lc "$FREEZE_PROBE" 2>&1)
+if [[ "$FREEZE_OUT" == *FROZEN* ]]; then
+    pass "uid 1000 cannot write, delete, rename away or rename over any profile control file"
+else
+    fail "a profile control file was reachable from inside the session: $FREEZE_OUT"
 fi
 
 if docker exec "$CONTAINER_NAME" bash -lc "
