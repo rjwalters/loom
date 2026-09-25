@@ -14,11 +14,14 @@
 //! - `release` → exit 0, always. Releasing a lock you no longer own is a
 //!   no-op by design, not an error.
 //! - `check-issue` → the DIFFERENT, per-issue sweep-claim lock cross-check
-//!   (#8553): exit 0 when free (or `--force` downgraded a live conflict to a
-//!   warning printed on stderr), exit 1 when a live conflict refused and
-//!   `--force` was not passed. On refusal, `--json` writes the refusal as a
-//!   JSON object to stdout (matching `worktree.sh`'s own `--json` contract);
-//!   without it, a human-readable message goes to stderr.
+//!   (#8553): exit 0 when free, when the live lock's `sweep_id` matches the
+//!   caller's own `$LOOM_SWEEP_ID` (#8702 — the lock's own sweep is never
+//!   refused by it), or when `--force` downgraded a live conflict from a
+//!   DIFFERENT sweep to a warning printed on stderr. Exit 1 when a live
+//!   conflict from a different sweep is refused and `--force` was not
+//!   passed. On refusal, `--json` writes the refusal as a JSON object to
+//!   stdout (matching `worktree.sh`'s own `--json` contract); without it, a
+//!   human-readable message goes to stderr.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -132,6 +135,13 @@ impl WorktreeLockCommand {
                 let Some(live) = issue_lock::check(&repo, issue) else {
                     std::process::exit(0);
                 };
+                // #8702: the sweep that itself holds this claim lock must not
+                // be refused by it -- its own worktree.sh calls (the first
+                // build and every resume/re-dispatch after) are descendants
+                // of the sweep, not a second, independently-driven session.
+                if live.owned_by(std::env::var("LOOM_SWEEP_ID").ok().as_deref()) {
+                    std::process::exit(0);
+                }
                 let age = live.age_desc();
                 if force {
                     eprintln!(

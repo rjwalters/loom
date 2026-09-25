@@ -103,3 +103,30 @@ fn age_desc_degrades_gracefully_on_an_unparsable_timestamp() {
     let live = check(d.path(), 42).expect("live");
     assert_eq!(live.age_desc(), "unknown age");
 }
+
+#[test]
+fn owned_by_the_same_sweep_id_is_true() {
+    let d = repo();
+    write_owner(d.path(), 42, std::process::id(), "sweep-issue-42-abc", "2026-01-01T00:00:00Z");
+    let live = check(d.path(), 42).expect("live");
+    assert!(
+        live.owned_by(Some("sweep-issue-42-abc")),
+        "the sweep that holds the lock must recognize itself as the owner (#8702)"
+    );
+}
+
+#[test]
+fn owned_by_a_different_sweep_id_is_false() {
+    let d = repo();
+    write_owner(d.path(), 42, std::process::id(), "sweep-issue-42-abc", "2026-01-01T00:00:00Z");
+    let live = check(d.path(), 42).expect("live");
+    assert!(!live.owned_by(Some("sweep-issue-42-other")));
+}
+
+#[test]
+fn owned_by_no_caller_sweep_id_is_false() {
+    let d = repo();
+    write_owner(d.path(), 42, std::process::id(), "sweep-issue-42-abc", "2026-01-01T00:00:00Z");
+    let live = check(d.path(), 42).expect("live");
+    assert!(!live.owned_by(None), "an unset LOOM_SWEEP_ID must still refuse (#8553)");
+}

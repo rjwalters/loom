@@ -187,9 +187,8 @@ second copy can go missing its pre-claim guard.
 - Loom-managed worktrees are auto-removed when their PR merges; user-provisioned
   worktrees are never touched — set `LOOM_PRESERVE_WORKTREE=1` to disable
   cleanup for a session.
-- Before claiming an issue, check `.loom/locks/issue-<N>/` for a live claim —
-  `worktree.sh` refuses one automatically (`--force` overrides); a runtime
-  building the worktree another way must check it itself.
+- A live `.loom/locks/issue-<N>/owner.json` means a sweep owns issue N — do
+  not claim it (`worktree.sh` enforces this).
 
 ### Merging PRs
 

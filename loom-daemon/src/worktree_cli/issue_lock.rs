@@ -53,6 +53,19 @@ pub struct LiveIssueLock {
 }
 
 impl LiveIssueLock {
+    /// True when `caller_sweep_id` (the CLI passes `$LOOM_SWEEP_ID`) names the
+    /// SAME sweep that holds this lock (#8702).
+    ///
+    /// A dispatched sweep's own `worktree.sh` calls -- the first build and
+    /// every resume/re-dispatch after -- are descendants of the sweep that
+    /// itself took this lock (`record_child_pid_in_lock` sets `owner_pid` to
+    /// the sweep's own child process), so without this exemption a sweep is
+    /// refused by its own claim on every call after the first.
+    #[must_use]
+    pub fn owned_by(&self, caller_sweep_id: Option<&str>) -> bool {
+        caller_sweep_id.is_some_and(|id| id == self.sweep_id)
+    }
+
     /// A short "3m12s"-style age for the CLI's warning/refusal text.
     /// Presentation only — never gates the live/dead verdict in [`check`].
     /// Falls back to `"unknown age"` when `acquired_at` does not parse as

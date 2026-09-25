@@ -17,6 +17,10 @@
 #      lock appears -- a second invocation for the same issue is still
 #      refused, identically to the lock-first ordering.
 #   6. --json refusal emits the documented error schema.
+#   7. #8702: a live lock whose sweep_id matches the caller's own
+#      LOOM_SWEEP_ID proceeds -- a sweep is not refused by its own claim.
+#   8. #8702: a live lock with a DIFFERENT (or unset) LOOM_SWEEP_ID still
+#      refuses -- the #8553 incident this suite exists to pin.
 #
 # Needs a BUILT loom-daemon: the check is `loom-daemon worktree-lock
 # check-issue`, reached through worktree.sh's single delegating call (this
@@ -52,7 +56,8 @@ fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo 
 
 # --- Throwaway repo setup ---------------------------------------------------
 TMP=$(mktemp -d /tmp/loom-issue-lock-test.XXXXXX)
-trap 'rm -rf "$TMP"; cd "$SCRIPTS_DIR" 2>/dev/null || true' EXIT
+FOREIGN_PID=""
+trap 'rm -rf "$TMP"; cd "$SCRIPTS_DIR" 2>/dev/null || true; [[ -n "$FOREIGN_PID" ]] && kill "$FOREIGN_PID" 2>/dev/null || true' EXIT
 
 git init -q -b main "$TMP/origin.git" --bare
 git init -q -b main "$TMP/repo"
@@ -95,6 +100,18 @@ a_dead_pid() {
     printf '%s\n' "$pid"
 }
 
+# a_foreign_pid -- spawn a background process that is alive but, unlike $$,
+# is NOT an ancestor of the worktree.sh invocations under test -- a genuinely
+# foreign owner. Stays alive until the EXIT trap kills it via $FOREIGN_PID.
+# Redirects the background process's stdio away from /dev/null explicitly:
+# left inherited, it would hold open the pipe `$(a_foreign_pid)` reads from,
+# and the substitution would hang until the 300s sleep exits.
+a_foreign_pid() {
+    sleep 300 >/dev/null 2>&1 &
+    FOREIGN_PID=$!
+    printf '%s\n' "$FOREIGN_PID"
+}
+
 # --- Test 1: no lock -> worktree creation proceeds normally ----------------
 echo "Test 1: no issue lock present -- worktree creation proceeds"
 if ./.loom/scripts/worktree.sh 301 >/tmp/wtl-out1.$$ 2>&1; then
@@ -111,7 +128,8 @@ rm -f /tmp/wtl-out1.$$
 # --- Test 2: a live lock refuses, and creates nothing -----------------------
 echo ""
 echo "Test 2: a live claim lock refuses worktree creation (#8553's incident)"
-write_issue_lock 302 $$ "sweep-issue-302-live"
+FOREIGN_PID="$(a_foreign_pid)"
+write_issue_lock 302 "$FOREIGN_PID" "sweep-issue-302-live"
 if ./.loom/scripts/worktree.sh 302 >/tmp/wtl-out2.$$ 2>&1; then
     fail "worktree.sh exited 0 despite a live claim lock (see /tmp/wtl-out2.$$)"
 else
@@ -179,6 +197,41 @@ else
     fi
 fi
 rm -f /tmp/wtl-out6.$$ /tmp/wtl-err6.$$
+
+# --- Test 7 (#8702): a matching LOOM_SWEEP_ID is exempt ---------------------
+echo ""
+echo "Test 7: a live lock whose sweep_id matches caller LOOM_SWEEP_ID proceeds (#8702)"
+FOREIGN_PID="$(a_foreign_pid)"
+write_issue_lock 306 "$FOREIGN_PID" "sweep-issue-306-self"
+if LOOM_SWEEP_ID="sweep-issue-306-self" ./.loom/scripts/worktree.sh 306 >/tmp/wtl-out7.$$ 2>&1; then
+    if [[ -f .loom/worktrees/issue-306/.loom-managed ]]; then
+        pass "the lock's own sweep (matching LOOM_SWEEP_ID) was not refused by its own claim"
+    else
+        fail "worktree.sh exited 0 but .loom-managed sentinel missing (see /tmp/wtl-out7.$$)"
+    fi
+else
+    fail "worktree.sh refused its own sweep's live lock (see /tmp/wtl-out7.$$)"
+fi
+rm -f /tmp/wtl-out7.$$
+
+# --- Test 8 (#8702): a different/unset LOOM_SWEEP_ID still refuses ---------
+echo ""
+echo "Test 8: a live lock with a DIFFERENT or unset LOOM_SWEEP_ID still refuses"
+FOREIGN_PID="$(a_foreign_pid)"
+write_issue_lock 307 "$FOREIGN_PID" "sweep-issue-307-live"
+if LOOM_SWEEP_ID="sweep-issue-307-someone-else" ./.loom/scripts/worktree.sh 307 >/tmp/wtl-out8a.$$ 2>&1; then
+    fail "a DIFFERENT LOOM_SWEEP_ID was wrongly treated as the lock's owner (see /tmp/wtl-out8a.$$)"
+else
+    pass "a different LOOM_SWEEP_ID does not exempt a foreign live lock"
+fi
+rm -f /tmp/wtl-out8a.$$
+unset LOOM_SWEEP_ID
+if ./.loom/scripts/worktree.sh 307 >/tmp/wtl-out8b.$$ 2>&1; then
+    fail "an unset LOOM_SWEEP_ID was wrongly treated as the lock's owner (see /tmp/wtl-out8b.$$)"
+else
+    pass "an unset LOOM_SWEEP_ID does not exempt a foreign live lock (#8553's original case)"
+fi
+rm -f /tmp/wtl-out8b.$$
 
 # --- Summary ----------------------------------------------------------------
 echo ""
