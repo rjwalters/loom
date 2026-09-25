@@ -114,6 +114,16 @@ export interface ActiveComputeState {
    * instance itself runs (that is `region`/`instanceId`). */
   hostId: string;
   jobId: string;
+  /** The sweep that submitted this job, when the emitter stamped one
+   * (Issue #8835). This — never `hostId` — is what the dashboard joins on to
+   * nest a job under the sweep paying for it: `hostId` is the *submitter's*
+   * ingest identity (one synthetic id for a whole hostless elastic fleet),
+   * which need not match the sweep's own host at all.
+   *
+   * Absent for a job submitted outside any sweep, and for one submitted by an
+   * emitter that predates this field — both of which must keep rendering in
+   * the flat "running compute" list rather than being dropped. */
+  sweepId?: string;
   instanceId?: string;
   region?: string;
   instanceType?: string;
@@ -712,9 +722,16 @@ export class FleetState implements DurableObject {
           break;
         }
         const existing = await this.state.storage.get<ActiveComputeState>(`compute:${jobId}`);
+        const computeSweepId = record.sweep_id;
         const entry: ActiveComputeState = {
           hostId,
           jobId,
+          // Issue #8835: the submitting sweep, when the emitter stamped one.
+          // An empty string is normalized away rather than stored — it would
+          // never match a live sweep, and storing it would make "no sweep" two
+          // distinct values for every downstream reader to handle.
+          sweepId:
+            typeof computeSweepId === "string" && computeSweepId.length > 0 ? computeSweepId : undefined,
           instanceId: typeof record.instance_id === "string" ? record.instance_id : undefined,
           region: typeof record.region === "string" ? record.region : undefined,
           instanceType: typeof record.instance_type === "string" ? record.instance_type : undefined,

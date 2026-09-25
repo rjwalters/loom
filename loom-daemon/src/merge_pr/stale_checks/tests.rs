@@ -246,6 +246,81 @@ fn timestamps_with_fractional_seconds_parse() {
     ));
 }
 
+// --- The plan gate (#8844) --------------------------------------------------
+//
+// `fetch::is_plan_gated` decides which lookup failures are a FACT ("this
+// repository's plan has no rulesets, so nothing can be required") rather than
+// an unknown. Everything else must keep failing closed, so the predicate is
+// pinned from both sides: the real message in the messages `gh` actually
+// prints, and the neighbouring 403/401/429/5xx/404 classes that share the
+// status code but not the cause.
+
+/// What `gh api` prints on stderr for the plan-gated 403, wrapped the way
+/// `fetch::gh_api` reports it (the predicate sees that whole string).
+const PLAN_GATED_STDERR: &str = "gh api repos/acme/private/rules/branches/main failed: \
+gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)";
+
+#[test]
+fn the_free_plan_403_is_recognised_as_a_plan_gate() {
+    assert!(fetch::is_plan_gated(PLAN_GATED_STDERR), "{PLAN_GATED_STDERR}");
+    // Org-owned repos get the Team/Enterprise wording; the invariant half of
+    // the message ("make this repository public") is what carries the meaning.
+    assert!(fetch::is_plan_gated(
+        "gh: Upgrade to GitHub Team or make this repository public to enable this feature. (HTTP 403)"
+    ));
+    // Case is not load-bearing.
+    assert!(fetch::is_plan_gated(
+        "UPGRADE TO GITHUB PRO OR MAKE THIS REPOSITORY PUBLIC TO ENABLE THIS FEATURE."
+    ));
+}
+
+#[test]
+fn every_other_failure_class_is_not_a_plan_gate() {
+    // Each of these is a real `gh` failure mode that must keep failing the
+    // guard CLOSED — several of them are 403s too, which is exactly why the
+    // predicate matches the message and not the status code.
+    for err in [
+        "gh: Resource not accessible by integration (HTTP 403)",
+        "gh: Must have admin rights to Repository. (HTTP 403)",
+        "gh: API rate limit exceeded for user ID 1234. (HTTP 403)",
+        "gh: Although you appear to have the correct authorization credentials, the \
+         organization has enabled OAuth App access restrictions (HTTP 403)",
+        "gh: Bad credentials (HTTP 401)",
+        "gh: Not Found (HTTP 404)",
+        "gh: Server Error (HTTP 500)",
+        "could not exec gh api: No such file or directory (os error 2)",
+        "exit 1",
+        "",
+    ] {
+        assert!(!fetch::is_plan_gated(err), "must fail closed on: {err}");
+    }
+}
+
+#[test]
+fn half_the_signature_is_not_enough() {
+    // A partial match is how a reworded-but-different message would sneak in;
+    // both fragments are required.
+    assert!(!fetch::is_plan_gated("gh: Upgrade to GitHub Pro (HTTP 403)"));
+    assert!(!fetch::is_plan_gated(
+        "gh: You must make this repository public before transferring it. (HTTP 422)"
+    ));
+}
+
+#[test]
+fn a_plan_gated_repo_has_no_required_checks_so_a_green_run_is_fresh() {
+    // The end state the gate produces: both sources empty -> `required` is
+    // empty -> nothing can be stale, which is the verdict #8844 argues is the
+    // DEFINITE answer on a plan-gated repo (not a guess).
+    let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
+    let runs = vec![run(
+        "File Size Ratchet",
+        "completed",
+        Some("success"),
+        Some(INCIDENT_RUN_STARTED),
+    )];
+    assert_eq!(assess(base_tip, &[], &runs), Verdict::Fresh);
+}
+
 #[test]
 fn latest_run_picks_max_started_at() {
     let older = run("J", "completed", Some("failure"), Some("2026-09-17T00:00:00Z"));

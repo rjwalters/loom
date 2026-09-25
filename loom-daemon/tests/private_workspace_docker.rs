@@ -7,6 +7,8 @@ use std::time::Duration;
 
 #[path = "private_workspace_docker/auth.rs"]
 mod auth;
+#[path = "private_workspace_docker/control.rs"]
+mod control;
 #[path = "private_workspace_docker/dispatch.rs"]
 mod dispatch;
 
@@ -32,6 +34,9 @@ struct Fixture {
     names: Vec<String>,
     host: PathBuf,
     repository: String,
+    /// Derived images a test builds on top of `image` (a replaced or stale
+    /// control bundle), removed with it so a failing run leaks nothing.
+    derived: std::cell::RefCell<Vec<String>>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -69,6 +74,11 @@ impl Drop for Fixture {
         let _ = Command::new("docker")
             .args(["rm", "-f", &self.server])
             .output();
+        for image in self.derived.borrow().iter() {
+            let _ = Command::new("docker")
+                .args(["image", "rm", "-f", image])
+                .output();
+        }
         let _ = Command::new("docker")
             .args(["image", "rm", &self.image])
             .output();
@@ -164,6 +174,7 @@ impl Fixture {
             ],
             host,
             repository: String::new(),
+            derived: std::cell::RefCell::new(Vec::new()),
         };
         for path in [
             "registry/.loom",
@@ -248,13 +259,22 @@ impl Fixture {
         std::fs::write(context.join("codex"), dispatch::CODEX).unwrap();
         std::fs::write(context.join("gh"), dispatch::GH).unwrap();
         std::fs::write(context.join("serve.py"), auth::SERVER).unwrap();
+        // The image-owned half of the loom-private-control-v1 boundary, staged
+        // and sealed exactly the way docker/session/Dockerfile stages it: the
+        // production guard scripts and the libraries they source, outside any
+        // clone, root-owned and unwritable (issue #8839).
+        control::stage(&context.join("control"));
         std::fs::write(context.join("Dockerfile"), r#"FROM ubuntu:24.04
 RUN apt-get update -qq && apt-get install -y --no-install-recommends git tini python3 openssl ca-certificates jq coreutils && rm -rf /var/lib/apt/lists/*
 COPY loom-daemon /usr/local/bin/loom-daemon
 COPY codex gh /usr/local/bin/
 COPY repo.git /srv/repo.git
 COPY serve.py /srv/serve.py
+COPY control /opt/loom/private-control
 RUN chmod 0755 /usr/local/bin/loom-daemon /usr/local/bin/codex /usr/local/bin/gh && openssl req -x509 -newkey rsa:2048 -nodes -keyout /srv/key.pem -out /srv/cert.pem -days 1 -subj /CN=fixture && git config --system user.name Fixture && git config --system user.email fixture@example.invalid
+RUN loom-daemon private-workspace seal-control --root /opt/loom/private-control \
+    && chown -R root:root /opt/loom/private-control \
+    && chmod -R a-w /opt/loom/private-control && chmod -R a+rX /opt/loom/private-control
 ENV GIT_SSL_NO_VERIFY=true
 WORKDIR /srv
 "#).unwrap();

@@ -49,7 +49,13 @@ pub(super) fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 
 pub(super) const CODEX: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
+# Sealing the control bundle reads the CLI version actually installed in the
+# image rather than trusting a build argument (issue #8839).
+if [[ "${1:-}" == --version ]]; then echo 'codex-cli 0.149.1'; exit 0; fi
 if [[ "${1:-}" == login ]]; then echo 'Logged in using an API key'; exit 0; fi
+# The forced private-session guard policy must reach the model's own process.
+test "${LOOM_FORCE_SCOPE:-}" = protected
+test "${LOOM_GUARD_READONLY_FASTPATH:-}" = 0
 echo "fixture-private-cwd=$PWD"
 test "$PWD" = /workspace/repo
 test "$LOOM_WORKSPACE" = /workspace/repo

@@ -17,6 +17,13 @@
 //! run is a guard reporting nothing, and "could not check" reading as
 //! "checked, fine" is the exact failure mode #8248 documents.
 //!
+//! The one lookup failure that is NOT an unknown is the plan gate of
+//! [`loom_daemon::merge_pr::stale_checks::fetch::is_plan_gated`] — GitHub
+//! refusing to serve rulesets/branch protection on a private repository whose
+//! plan does not include them. There, "no required checks exist" is a fact,
+//! not a guess, and the run reports it as a `Warning:` on **stderr** while
+//! stdout keeps carrying nothing but the sentinel (#8844).
+//!
 //! `--from-stdin` reads the same evidence the live path gathers, as a JSON
 //! object, and assesses it offline — the deterministic seam the retained suite
 //! drives (and a debug facility: paste a real PR's inputs, see the verdict).
@@ -67,10 +74,19 @@ impl StaleChecksArgs {
                 &self.base_ref,
                 &self.head_sha,
             ) {
-                Ok(inputs) => (
-                    inputs.tip_sha.clone(),
-                    assess(inputs.base_tip, &inputs.required, &inputs.runs),
-                ),
+                Ok(inputs) => {
+                    // On STDERR, always: stdout carries the CLEAN sentinel and
+                    // nothing else (callers compare it for exact equality), and
+                    // a degradation the operator cannot see is how a fail-open
+                    // ships unnoticed (#8844).
+                    for notice in &inputs.notices {
+                        eprintln!("Warning: {notice}");
+                    }
+                    (
+                        inputs.tip_sha.clone(),
+                        assess(inputs.base_tip, &inputs.required, &inputs.runs),
+                    )
+                }
                 Err(why) => (String::new(), Verdict::Unknown(why)),
             }
         };

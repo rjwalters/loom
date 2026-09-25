@@ -110,8 +110,15 @@ pub fn write_heartbeat(path: &Path) -> Result<(), String> {
         }
     }
     let now = chrono::Utc::now();
-    let contents =
-        format!("{} pid={} ts={}\n", now.timestamp(), std::process::id(), now.to_rfc3339());
+    // Issue #8504: `Z`, not `+00:00` — every UTC stamp this crate writes uses
+    // the same trailing-Z designator so a reader never has to special-case
+    // chrono's default RFC 3339 offset spelling.
+    let contents = format!(
+        "{} pid={} ts={}\n",
+        now.timestamp(),
+        std::process::id(),
+        now.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+    );
     // Temp file in the same dir so the rename is atomic (same filesystem).
     let tmp = path.with_extension(format!("heartbeat.tmp.{}", uuid::Uuid::new_v4()));
     if let Err(e) = std::fs::write(&tmp, &contents) {

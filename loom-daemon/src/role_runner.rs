@@ -1119,7 +1119,10 @@ fn note_pre_spawn_skip(logs_dir: &Path, role: &str, reason: &str) {
             f,
             "\n==== loom-daemon role_runner: {} role={role} SKIPPED BEFORE SPAWN (#6201): {reason} \
              ====",
-            chrono::Utc::now().to_rfc3339()
+            // Issue #8504: `Z`, not `+00:00` — matches every other UTC stamp
+            // this crate writes so a reader never has to know chrono's
+            // RFC 3339 offset spelling is not the same as its Z spelling.
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
         );
     }
 }
@@ -3538,7 +3541,7 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
             log::warn!(
                 "role_runner: {role} tick skipped after {elapsed:.1?} — {}; next check ~{} (#7607)",
                 outcome.pool_hold_phrase(),
-                next_clear_at.to_rfc3339()
+                next_clear_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
             );
         }
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => {
@@ -3608,7 +3611,7 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
              (#7607)",
             root.display(),
             outcome.pool_hold_phrase(),
-            next_clear_at.to_rfc3339()
+            next_clear_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
         ),
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => log::warn!(
             "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {} (#5028)",
@@ -3899,7 +3902,7 @@ fn log_outcome_for_root_deduped(
                      the pool regains capacity, #7607)",
                     root.display(),
                     outcome.pool_hold_phrase(),
-                    next_clear_at.to_rfc3339()
+                    next_clear_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
                 );
             }
         }

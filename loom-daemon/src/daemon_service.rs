@@ -2226,13 +2226,20 @@ fn setup_logging() -> Result<()> {
         .append(true)
         .open(&log_path)?;
 
+    // Issue #8504: every machine-readable timestamp `loom-daemon` writes is
+    // UTC with an explicit `Z` designator, so it can never be mistaken for
+    // (or silently drift into) the host's local time — this is the daemon's
+    // own log-line prefix, read and correlated across a fleet of hosts in
+    // different timezones. `loom_daemon::health::DAEMON_LOG_STAMP_FORMAT` is
+    // the SAME constant `health::parse_log_line_stamp` reads back with, so
+    // the write and read sides cannot drift apart.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .format(|buf, record| {
             writeln!(
                 buf,
                 "[{}] [{}] {}",
-                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
+                chrono::Utc::now().format(loom_daemon::health::DAEMON_LOG_STAMP_FORMAT),
                 record.level(),
                 record.args()
             )
