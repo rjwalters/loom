@@ -2030,8 +2030,11 @@ _wait_for_checks_then_sync_merge() {
       # A check failed — classify against branch protection. A required failing
       # check can never merge on this SHA; refuse now. A lookup failure fails
       # closed (refuse), mirroring the UNSTABLE fallback.
+      # Stderr is NOT redirected here: #8872's plan-gate relaxation warns
+      # there, and a silent fail-open is exactly what that warning exists to
+      # prevent.
       local required lookup_rc=0
-      required="$(forge_get_required_status_check_contexts "$REPO_NWO" "$base_ref" "$GH" 2>/dev/null)" || lookup_rc=$?
+      required="$(forge_get_required_status_check_contexts "$REPO_NWO" "$base_ref" "$GH")" || lookup_rc=$?
       if [[ "$lookup_rc" -ne 0 ]]; then
         error "Failed to resolve required status checks for $base_ref (rc=$lookup_rc); refusing to merge PR #$PR_NUMBER with failing check(s) while auto-merge is disabled"
       fi
@@ -2347,7 +2350,8 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     if [[ -n "$_NRC_BASE_REF" ]] && [[ "$_NRC_MERGEABLE" == "true" ]]; then
       _NRC_REQUIRED=""
       _NRC_LOOKUP_RC=0
-      _NRC_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_NRC_BASE_REF" "$GH" 2>/dev/null)" || _NRC_LOOKUP_RC=$?
+      # Stderr is NOT redirected: #8872's plan-gate relaxation warns there.
+      _NRC_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_NRC_BASE_REF" "$GH")" || _NRC_LOOKUP_RC=$?
       if [[ "$_NRC_LOOKUP_RC" -eq 0 ]] && [[ -z "$_NRC_REQUIRED" ]]; then
         info "PR #$PR_NUMBER: repo has no required status checks and PR is mergeable; falling back to immediate merge"
         unset _NRC_RECHECK_JSON _NRC_BASE_REF _NRC_MERGEABLE _NRC_REQUIRED _NRC_LOOKUP_RC 2>/dev/null || true
@@ -2565,7 +2569,8 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
           # error, missing token, unknown forge) — fail closed and refuse.
           _UNSTABLE_REQUIRED=""
           _UNSTABLE_LOOKUP_RC=0
-          _UNSTABLE_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_UNSTABLE_BASE_REF" "$GH" 2>/dev/null)" || _UNSTABLE_LOOKUP_RC=$?
+          # Stderr is NOT redirected: #8872's plan-gate relaxation warns there.
+          _UNSTABLE_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_UNSTABLE_BASE_REF" "$GH")" || _UNSTABLE_LOOKUP_RC=$?
           if [[ "$_UNSTABLE_LOOKUP_RC" -ne 0 ]]; then
             warning "Failed to resolve required status checks for $_UNSTABLE_BASE_REF (rc=$_UNSTABLE_LOOKUP_RC); preserving UNSTABLE refusal"
             error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
