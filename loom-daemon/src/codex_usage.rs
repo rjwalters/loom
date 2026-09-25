@@ -472,10 +472,10 @@ impl CodexSessionUsage {
 
 /// The four cumulative counters one `token_count` event carries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Counters {
-    input: i64,
-    cached_input: i64,
-    output: i64,
+pub(crate) struct Counters {
+    pub(crate) input: i64,
+    pub(crate) cached_input: i64,
+    pub(crate) output: i64,
 }
 
 impl Counters {
@@ -484,7 +484,7 @@ impl Counters {
     /// subset of `output_tokens` (see the module doc's provenance survey), so
     /// reading it could only invite double-counting. `total_tokens` is not read
     /// either — it is redundant with the parts.
-    fn from_total_usage(value: &serde_json::Value) -> Option<Self> {
+    pub(crate) fn from_total_usage(value: &serde_json::Value) -> Option<Self> {
         let count = |key: &str| value.get(key).and_then(serde_json::Value::as_i64);
         Some(Self {
             input: count("input_tokens")?,
@@ -499,7 +499,7 @@ impl Counters {
     /// must only ever grow; a decrease (a format change, a compaction that
     /// rebases them) is unreadable, and treating it as negative usage would
     /// silently subtract real spend from a sibling model's row.
-    fn delta(self, next: Self) -> Self {
+    pub(crate) fn delta(self, next: Self) -> Self {
         Self {
             input: (next.input - self.input).max(0),
             cached_input: (next.cached_input - self.cached_input).max(0),
@@ -639,7 +639,7 @@ pub fn fold_rollout(
 
 /// A non-empty, trimmed string field, or `None` — the "omit rather than guess"
 /// contract every reader in this tree follows.
-fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+pub(crate) fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value
         .get(key)
         .and_then(serde_json::Value::as_str)
@@ -650,7 +650,7 @@ fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
 
 /// Parse an RFC3339 instant into UTC. `None` — never "now" — for anything that
 /// does not parse.
-fn parse_instant(raw: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_instant(raw: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(raw)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
