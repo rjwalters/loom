@@ -862,7 +862,7 @@ org, every `merge-pr.sh` run stops at the #8248 required-check freshness
 guard, whatever the PR looks like:
 
 ```
-ERROR: Merge blocked: PR #N's required-check freshness guard (#8248) could not run —
+Error: Merge blocked: PR #N's required-check freshness guard (#8248) could not run —
 'loom-daemon merge-pr stale-checks' exited 2 without the LOOM-STALE-CHECKS-CLEAN signal.
 [...]
 
