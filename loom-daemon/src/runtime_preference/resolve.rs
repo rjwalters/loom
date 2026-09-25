@@ -266,6 +266,7 @@ impl<T> Resolution<T> {
             tier: chosen.tier,
             tap: chosen.tap.to_string(),
             marker,
+            model_profile: chosen.tap.model_profile.clone(),
         })
     }
 
@@ -321,6 +322,14 @@ pub struct PreferenceStamp {
     /// line a child writes into its own log is byte-identical to the one the
     /// daemon logged.
     pub marker: String,
+    /// The chosen tap's [`Tap::model_profile`], carried out so the launch
+    /// surfaces can pin `LOOM_MODEL_PROFILE` (#8602) — availability already
+    /// gates on this profile via [`crate::runtime_preference::availability`];
+    /// this is what makes launch agree with the tap that was actually
+    /// checked. `None` for a bare-runtime tap, matching `Tap::model_profile`
+    /// exactly, so a bare tap keeps pinning nothing at launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
 }
 
 /// Walk `taps` in order and take the first that is both admitted for the role

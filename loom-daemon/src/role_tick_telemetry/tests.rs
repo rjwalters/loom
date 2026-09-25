@@ -810,6 +810,7 @@ fn a_preference_resolved_tick_records_the_chosen_tier_and_tap() {
                     marker: "# LOOM_RUNTIME_PREFERENCE order=claude,codex,opencode:zai-metered \
                          tier=2 tap=opencode:zai-metered source=preference"
                         .to_string(),
+                    model_profile: Some("zai-metered".to_string()),
                 },
             )),
         ),

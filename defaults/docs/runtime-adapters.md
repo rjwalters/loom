@@ -1168,15 +1168,13 @@ ids and with completely different economics, so `modelProfile` is what
 distinguishes them. A bare runtime name is shorthand for "that runtime with
 whatever profile it would have chosen anyway".
 
-> **A `modelProfile` currently gates but does not pin.** Availability is read
-> against exactly the named profile's provider and credential pool, but nothing
-> carries the name to the launched child — the launch resolves whatever profile
-> that runtime would have used anyway, so for two profiles on *different*
-> providers the tap that ran is not the tap whose pool was checked. Bare-runtime
-> entries are unaffected (their profile is that default resolution). Pinning it
-> needs `LOOM_MODEL_PROFILE` set in the shared `launch_env::apply_launch_env`
-> helper #8599 landed, and is tracked in #8602; until it lands, prefer bare
-> entries unless the named profile *is* the runtime's default.
+> **A `modelProfile` gates *and* pins (#8602).** Availability is read against
+> exactly the named profile's provider and credential pool, and the chosen
+> tap's profile is pinned at launch via `LOOM_MODEL_PROFILE`, set in the shared
+> `launch_env::apply_launch_env` helper (#8599) beside `LOOM_RUNTIME` — the
+> same env var `worker_spawn`'s arg parser already falls back to when no
+> `--profile` flag is given. Bare-runtime entries pin nothing, matching their
+> own `modelProfile: None`.
 
 **Resolution, per launch**: walk the list and take the first tap that is
 **(a)** admitted for the role and **(b)** has a spawnable credential right now.
@@ -1341,9 +1339,10 @@ host fault to repair before the metered tier can be used again).
 > (`role_runner::runtime_preflight`). Sweep dispatch and role ticks both attach
 > the ceiling's slot to the child they spawn. The chosen tier is reported per
 > launch as well as logged (#8599): both dispatch seams pin it through the
-> shared `launch_env::apply_launch_env`, which is the seam the `modelProfile`
-> launch pin (#8602) extends rather than re-duplicates. Still to come: that
-> #8602 pin. See also the other follow-up issues on #8436.
+> shared `launch_env::apply_launch_env`, which also pins a profile-pinned tap's
+> `modelProfile` as `LOOM_MODEL_PROFILE` (#8602), so a launch always agrees
+> with the tap availability just checked. See also the other follow-up issues
+> on #8436.
 
 ### Adding a runtime adapter
 
