@@ -106,7 +106,11 @@ pub fn record(
     reason: &str,
 ) {
     let line = ledger_line(
-        &chrono::Utc::now().to_rfc3339(),
+        // Issue #8504: `Z`, not `+00:00` — matches the bash-side writer
+        // (`worktree-removal-log.sh`), which the module doc requires this
+        // stay byte-identical with, and every other UTC stamp this crate
+        // writes.
+        &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
         std::process::id(),
         mechanism,
         worktree_path,
