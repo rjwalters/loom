@@ -26,6 +26,9 @@ pub enum SpanName {
     /// One job of a GitHub Actions run, parented to its [`Self::CiRun`] span.
     #[serde(rename = "loom.ci.job")]
     CiJob,
+    /// One work-finder tick (Issue #8860) — its own root trace per tick.
+    #[serde(rename = "loom.dispatch.tick")]
+    DispatchTick,
 }
 
 impl SpanName {
@@ -40,6 +43,7 @@ impl SpanName {
             Self::Tool => "loom.tool",
             Self::CiRun => "loom.ci.run",
             Self::CiJob => "loom.ci.job",
+            Self::DispatchTick => "loom.dispatch.tick",
         }
     }
 }
@@ -111,7 +115,8 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.recovered"
                     | "loom.timing_source"
                     | "loom.tool.name"
-            ) || crate::telemetry::ci::CI_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()))
+            ) || crate::telemetry::ci::CI_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
+                || crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()))
                 && value.len() <= 256
                 && !value.chars().any(char::is_control)
         })

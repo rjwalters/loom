@@ -49,14 +49,26 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str) {
     }
 }
 
-/// Existing native ingest accepts lifecycle records, never trace-only payloads.
-/// Also strips the additive context fields for older native backend versions.
+/// The OTLP signal an OTLP-only record kind belongs to, or `None` for a kind
+/// the native HTTPS backend also accepts. Spans and `metric.points` (#8860)
+/// never reach native ingest.
+pub(super) fn otlp_only_signal(record: &crate::telemetry::TelemetryRecord) -> Option<&'static str> {
+    match record {
+        crate::telemetry::TelemetryRecord::Span(_) => Some("spans"),
+        crate::telemetry::TelemetryRecord::MetricPoints(_) => Some("metrics"),
+        _ => None,
+    }
+}
+
+/// Existing native ingest accepts lifecycle records, never OTLP-only payloads
+/// ([`otlp_only_signal`]). Also strips the additive context fields for older
+/// native backend versions.
 pub(super) fn native_envelopes(
     envelopes: &[crate::telemetry::TelemetryEnvelope],
 ) -> Vec<crate::telemetry::TelemetryEnvelope> {
     envelopes
         .iter()
-        .filter(|e| !matches!(e.record, crate::telemetry::TelemetryRecord::Span(_)))
+        .filter(|e| otlp_only_signal(&e.record).is_none())
         .cloned()
         .map(|mut envelope| {
             envelope.trace_context = None;

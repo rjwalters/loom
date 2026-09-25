@@ -101,6 +101,7 @@ pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod exporter;
 pub mod lifecycle;
+pub mod ops;
 #[cfg(feature = "otlp")]
 pub mod otlp;
 pub mod outcome;
@@ -950,6 +951,8 @@ pub fn spawn_task(
     // `async-trait`).
     let mut sender_handles = Vec::with_capacity(planned.len());
     let mut queues: Vec<Arc<DurableQueue>> = Vec::with_capacity(planned.len());
+    // The OTLP-only subset, for the `ops` sink (Issue #8860).
+    let mut otlp_queues: Vec<Arc<DurableQueue>> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
         let name = entry.kind.name();
         let queue_path = queue_path_for(&workspace_root, name, sole);
@@ -1057,6 +1060,9 @@ pub fn spawn_task(
             }
         };
         statuses.insert(name.to_string(), export_status);
+        if entry.kind == ExporterKind::Otlp {
+            otlp_queues.push(queue.clone());
+        }
         queues.push(queue);
         sender_handles.push(sender_handle);
     }
@@ -1081,6 +1087,16 @@ pub fn spawn_task(
     session_analysis::register_global_session_analysis_sink(
         session_analysis::SessionAnalysisSink::new(fanout.clone(), host_id.clone()),
     );
+    // Generic ops signals (Issue #8860): daemon loops emit `metric.points` and
+    // ops spans through `ops::emit_*`. Registered over the OTLP queues only —
+    // both kinds are OTLP-only, so an HTTPS queue would just carry and drop
+    // them. No OTLP exporter ⇒ nothing registered ⇒ every emit is a no-op.
+    if !otlp_queues.is_empty() {
+        ops::register_global_ops_sink(ops::OpsSink::new(
+            Arc::new(queue::FanoutQueue::new(otlp_queues)),
+            host_id.clone(),
+        ));
+    }
     // `daemon.event` collection (Issue #8760, G4): a second, independent bus
     // subscription alongside `collector::spawn_task` below — see
     // `daemon_event`'s module doc for why it is a separate subscriber rather

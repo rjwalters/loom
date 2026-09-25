@@ -52,6 +52,8 @@ impl TelemetryEnvelope {
                 TelemetryRecord::CiRun(_)
                 | TelemetryRecord::CiJob(_)
                 | TelemetryRecord::CiDuration(_) => 8,
+                // Issue #8860: `metric.points` is OTLP-only and gated alone.
+                TelemetryRecord::MetricPoints(_) => 9,
                 _ => CURRENT_SCHEMA_VERSION,
             },
             emitted_at: Utc::now(),

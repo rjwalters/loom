@@ -177,7 +177,9 @@ processors:
       - context: span
         statements:
           # loom.ci.run / loom.ci.job spans (#8824) add CI_SPAN_ATTRIBUTE_KEYS.
-          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name", "loom.ci.run_id", "loom.ci.workflow", "loom.ci.event", "loom.ci.conclusion", "loom.ci.job_id", "loom.ci.job", "loom.ci.runner", "loom.ci.attempts"])
+          # loom.dispatch.tick spans (#8860) add OPS_SPAN_ATTRIBUTE_KEYS
+          # (loom-daemon/src/telemetry/ops.rs, contract-tested).
+          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name", "loom.ci.run_id", "loom.ci.workflow", "loom.ci.event", "loom.ci.conclusion", "loom.ci.job_id", "loom.ci.job", "loom.ci.runner", "loom.ci.attempts", "loom.dispatch.result", "loom.dispatch.seen", "loom.dispatch.dispatched", "loom.dispatch.errors", "loom.dispatch.max_concurrent"])
       - context: spanevent
         statements:
           - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name"])
@@ -190,7 +192,10 @@ processors:
           # loom.ci.{run,job}.duration_ms histograms (#8824) add the
           # low-cardinality CI_METRIC_LABEL_KEYS: repo, workflow, job, runner,
           # conclusion — never a sha, ref, or run/issue number.
-          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion"])
+          # metric.points (#8860) adds OPS_METRIC_LABEL_KEYS: reason and
+          # provider (account/model/state were already kept). provider also
+          # stops stripping the existing loom.tokens.* per-provider label.
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider"])
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318

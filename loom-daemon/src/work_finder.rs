@@ -121,7 +121,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -135,7 +135,7 @@ use crate::sweep_registry::{
     ParkedIssueDispatchError, TokenSelectionDispatchError, WorkspaceCommandsMissingDispatchError,
 };
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
-use crate::types::{Event, WorkFinderTickSummary};
+use crate::types::Event;
 use crate::workspace_pool::WorkspacePool;
 
 // ============================================================================
@@ -227,7 +227,13 @@ pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
 pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP_LABELS";
 
 mod labels;
+mod tick_summary;
 pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
+#[cfg(test)]
+use tick_summary::reset_last_tick_summary;
+pub use tick_summary::{
+    last_tick_summary, publish_tick, publish_tick_summary, publish_tick_summary_at,
+};
 
 /// Label that promotes an issue ahead of its non-urgent siblings **within the
 /// same workspace-priority tier** (Issue #3946). Detection is best-effort: if no
@@ -905,95 +911,6 @@ pub trait WorkDispatcher {
     fn occupancy(&self) -> usize {
         self.in_flight().len()
     }
-}
-
-// ============================================================================
-// Last-tick publication (Issue #4761)
-// ============================================================================
-
-/// Process-global slot holding the most recent completed tick's summary.
-///
-/// Mirrors the "loop publishes, status reads" discipline
-/// [`crate::auto_update::global_status_snapshot`] and
-/// [`crate::host_breaker::global_snapshot`] already use: the work-finder loop
-/// writes here at the end of every tick, and `build_daemon_status` reads it
-/// back so a cross-process consumer (`loom-daemon health`) can see the last
-/// tick's dispatch/skip breakdown without scraping the daemon log.
-///
-/// `None` (the initial value) honestly means "no tick has completed in this
-/// process yet" — never "nothing was dispatched".
-static LAST_TICK: OnceLock<Mutex<Option<WorkFinderTickSummary>>> = OnceLock::new();
-
-fn last_tick_slot() -> &'static Mutex<Option<WorkFinderTickSummary>> {
-    LAST_TICK.get_or_init(|| Mutex::new(None))
-}
-
-/// Publish `report` (as run under `max_concurrent`, completed at `at`) as the
-/// most recent work-finder tick (Issue #4761). Called by both the
-/// single-workspace and multi-workspace loops so the two can never diverge on
-/// what "the last tick" means.
-pub fn publish_tick_summary_at(
-    report: &TickReport,
-    max_concurrent: usize,
-    at: chrono::DateTime<chrono::Utc>,
-) {
-    let summary = WorkFinderTickSummary {
-        at,
-        max_concurrent,
-        seen: report.seen,
-        dispatched: report.dispatched,
-        skipped_labeled: report.skipped_labeled,
-        skipped_in_flight: report.skipped_in_flight,
-        skipped_quarantined: report.skipped_quarantined,
-        skipped_workspace_commands_missing: report.skipped_workspace_commands_missing,
-        skipped_pr_open: report.skipped_pr_open,
-        skipped_peer_claim: report.skipped_peer_claim,
-        skipped_backoff: report.skipped_backoff,
-        skipped_pr_open_backoff: report.skipped_pr_open_backoff,
-        skipped_noop_cooldown: report.skipped_noop_cooldown,
-        skipped_declined: report.skipped_declined,
-        // #7972: `skipped_prless_retry` is deliberately NOT carried on the
-        // cross-process `WorkFinderTickSummary` yet — `types.rs` is over the
-        // file-size ratchet's threshold and frozen at its current size
-        // (.loom/docs/file-size-policy.md), and a wire field is not worth
-        // displacing unrelated code for. The counter IS on `TickReport` and
-        // appears as `prless-retry-skip` on the per-tick summary log line.
-        skipped_recheck_interval: report.skipped_recheck_interval,
-        skipped_host_constraint: report.skipped_host_constraint,
-        deferred_capacity: report.deferred_capacity,
-        deferred_ramp_cap: report.deferred_ramp_cap,
-        deferred_saturation: report.deferred_saturation,
-        errors: report.errors,
-        halted: report.halted,
-        saturation_held: report.saturation_held,
-        collisions: report.collisions,
-    };
-    *last_tick_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary);
-}
-
-/// [`publish_tick_summary_at`] stamped with the current wall clock.
-pub fn publish_tick_summary(report: &TickReport, max_concurrent: usize) {
-    publish_tick_summary_at(report, max_concurrent, chrono::Utc::now());
-}
-
-/// Read back the most recently published tick summary, or `None` when no tick
-/// has completed in this process (Issue #4761).
-#[must_use]
-pub fn last_tick_summary() -> Option<WorkFinderTickSummary> {
-    last_tick_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-}
-
-/// Test-only reset of the process-global last-tick slot.
-#[cfg(test)]
-fn reset_last_tick_summary() {
-    *last_tick_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 // ============================================================================
@@ -3075,6 +2992,7 @@ where
             } else {
                 log::debug!("{axis_line}");
             }
+            let tick_started = chrono::Utc::now();
             match tick_with_saturation_brake(
                 &mut source,
                 &mut dispatcher,
@@ -3086,7 +3004,7 @@ where
                 Ok(report) => {
                     // Publish before any logging so `loom-daemon health` sees the
                     // same tick the log line describes (#4761).
-                    publish_tick_summary(&report, max_concurrent);
+                    publish_tick(&report, max_concurrent, tick_started);
                     if report.halted && !was_halted {
                         log::warn!(
                             "work_finder: main-health gate halted dispatch — {} ready issue(s) \
@@ -3673,6 +3591,7 @@ pub fn spawn_multi_work_finder_task(
                 log::debug!("{axis_line}");
             }
 
+            let tick_started = chrono::Utc::now();
             let report = tick_multi_with_sharding(
                 &mut pairs,
                 &priorities,
@@ -3685,7 +3604,7 @@ pub fn spawn_multi_work_finder_task(
 
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).
-            publish_tick_summary(&report, max_concurrent);
+            publish_tick(&report, max_concurrent, tick_started);
 
             if report.halted && !was_halted {
                 log::warn!(

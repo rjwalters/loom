@@ -4,6 +4,7 @@
 
 mod ci;
 mod metadata;
+mod ops;
 
 use std::collections::BTreeMap;
 
@@ -528,6 +529,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::TokensSnapshot(_)
         | TelemetryRecord::HostHealth(_)
         | TelemetryRecord::CiDuration(_)
+        | TelemetryRecord::MetricPoints(_)
         | TelemetryRecord::Span(_) => return None,
     };
     Some(LogRecord {
@@ -758,6 +760,8 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         | TelemetryRecord::CiRun(_)
         | TelemetryRecord::CiJob(_)
         | TelemetryRecord::CiDuration(_)
+        // `metric.points` (#8860) is grouped by `ops::points_for`.
+        | TelemetryRecord::MetricPoints(_)
         | TelemetryRecord::Span(_) => Vec::new(),
     }
 }
@@ -800,7 +804,19 @@ pub(super) fn build_metrics_request(
     // CI duration histograms (Issue #8824), keyed the same way.
     type HistogramsForHost = BTreeMap<&'static str, (&'static str, Vec<HistogramDataPoint>)>;
     let mut histograms_by_host: BTreeMap<&str, HistogramsForHost> = BTreeMap::new();
+    // Generic `metric.points` (Issue #8860), keyed the same way.
+    let mut ops_by_host: BTreeMap<&str, ops::OpsMetricsForHost> = BTreeMap::new();
     for envelope in envelopes {
+        if let Some(points) = ops::points_for(envelope) {
+            if points.is_empty() {
+                continue;
+            }
+            let host_ops = ops_by_host.entry(envelope.host_id.as_str()).or_default();
+            for (name, point) in points {
+                host_ops.entry(name).or_default().push(point);
+            }
+            continue;
+        }
         if let Some((name, description, point)) = histogram_point_for(envelope) {
             histograms_by_host
                 .entry(envelope.host_id.as_str())
@@ -830,6 +846,9 @@ pub(super) fn build_metrics_request(
                 ..Default::default()
             });
         }
+    }
+    for host_id in ops_by_host.keys() {
+        by_host.entry(host_id).or_default();
     }
     if by_host.is_empty() {
         return None;
@@ -861,6 +880,9 @@ pub(super) fn build_metrics_request(
                             ..Default::default()
                         },
                     ));
+                }
+                if let Some(points) = ops_by_host.remove(host_id) {
+                    metrics.extend(ops::metrics(points));
                 }
                 ResourceMetrics {
                     resource: Some(resource_for_host(

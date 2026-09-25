@@ -151,6 +151,7 @@ records (`tokens.snapshot`, `host.health`) do not.
 | `session.summary` | repo | ingested transcript (session or subagent, Issue #8757) |
 | `tokens.snapshot` / `host.health` | host | sampling interval |
 | `ci.run` / `ci.job` / `ci.duration` | repo | completed GitHub Actions run attempt / job (Issue #8824) |
+| `metric.points` | host | daemon-loop operational sample — work-finder tick, host resources (Issue #8860; OTLP-only) |
 
 ### `sweep.started`
 
@@ -803,6 +804,46 @@ One envelope per completed run attempt (`ci.run`) and per completed job
 (derived from the repo's `private` flag). The full field tables, the
 exactly-once ledger contract and the `loom.ci.*` allowlist live in
 [`ci-observability.md`](ci-observability.md). They are not duplicated here.
+
+### `metric.points`
+
+The generic operational-metrics carrier (Issue #8860): a batch of points any
+daemon loop emits through `loom-daemon/src/observability/ops.rs`, instead of
+inventing a record kind per signal. Envelopes carry `schema_version: 9`.
+**OTLP-only** — the native HTTPS `/ingest` exporter drops it, like
+`trace.span`, so the Cloudflare backend never sees it.
+
+| Field | Type | Notes |
+|---|---|---|
+| `captured_at` | RFC 3339 | sample instant (the OTLP data-point time) |
+| `points[].name` | string | closed vocabulary, `telemetry::ops::MetricName` |
+| `points[].value` | int or float | non-finite floats are dropped at export |
+| `points[].labels` | object | optional; keys limited to `reason`, `provider`, `account`, `model`, `state`; values ≤128 bytes, no control chars, ≤8 per point |
+
+Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
+**delta `Sum`**, one point per non-zero work-finder outcome per tick, labelled
+`reason` ∈ `dispatched`, `labeled`, `in_flight`, `quarantined`,
+`workspace_commands_missing`, `pr_open`, `peer_claim`, `backoff`,
+`pr_open_backoff`, `noop_cooldown`, `declined`, `prless_retry`,
+`recheck_interval`, `host_constraint`, `capacity`, `ramp_cap`, `saturation`,
+`out_of_slice`, `error`. These are the same buckets as the `work_finder: tick`
+log line and `loom-daemon health`'s last-tick summary. Every other name is a
+**`Gauge`**:
+
+| Metric | Unit | Cadence |
+|---|---|---|
+| `loom.dispatch.candidates`, `loom.dispatch.max_concurrent` | count | every work-finder tick |
+| `loom.host.memory.available_bytes`, `loom.host.memory.total_bytes` | bytes | `host.health` interval |
+| `loom.host.swap.used_bytes`, `loom.host.swap.total_bytes` | bytes | `host.health` interval |
+| `loom.host.worktree_volume.free_bytes`, `loom.host.worktree_volume.total_bytes` | bytes | `host.health` interval |
+
+An unmeasurable host reading produces no point, never a `0`. Each work-finder
+tick also emits one `loom.dispatch.tick` span. It is a new root trace per tick
+that covers candidate evaluation and dispatch. Its attributes are
+`loom.dispatch.result` (`dispatched`, `halted_main_red`, `saturation_held`,
+`error`, `no_eligible_work`, `capacity_full`, `all_skipped`, first match
+wins), `loom.dispatch.seen`, `loom.dispatch.dispatched`,
+`loom.dispatch.errors` and `loom.dispatch.max_concurrent`.
 
 ### `tokens.snapshot`
 
