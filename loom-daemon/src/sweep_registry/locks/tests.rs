@@ -675,3 +675,98 @@ fn adopted_survivor_counts_toward_occupancy() {
         "an adopted survivor must occupy a concurrency slot"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #8720 — `tracked_sweep_identity`: the adoption evidence the
+// observability collector consults when a post-restart lifecycle event has no
+// in-process dispatch to correlate against.
+// ---------------------------------------------------------------------------
+
+/// Lock-based adoption is the path that genuinely retains the ORIGINAL
+/// dispatch id, so the evidence it yields must be that id and the lock's own
+/// `acquired_at` — never a value minted at read time.
+#[test]
+fn lock_adoption_evidence_names_the_original_sweep_id_and_start() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let acquired_at = Utc::now() - chrono::Duration::seconds(600);
+    let lock = registry.config.locks_dir().join("issue-8720");
+    std::fs::create_dir_all(&lock).unwrap();
+    let owner = LockOwner {
+        pgid: None,
+        model: None,
+        effort: None,
+        issue: 8720,
+        owner_pid: std::process::id(),
+        acquired_at: acquired_at.to_rfc3339(),
+        sweep_id: "sweep-issue-8720-original".to_string(),
+    };
+    std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
+
+    assert!(registry.reconstruct().unwrap() >= 1);
+    let identity = registry.tracked_sweep_identity(8720).unwrap();
+    assert_eq!(identity.sweep_id, "sweep-issue-8720-original");
+    assert_eq!(identity.started_at.timestamp(), acquired_at.timestamp());
+    // Nothing is claimed about an issue this registry does not track.
+    assert!(registry.tracked_sweep_identity(8721).is_none());
+}
+
+/// Journal-only recovery is covered separately because the original dispatch
+/// id is unrecoverable there: the evidence is the `journal-adopted-…` id the
+/// registry itself reports for that sweep everywhere else.
+#[test]
+fn journal_adoption_evidence_names_the_id_the_registry_reports() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let root = registry.config.workspace_root.clone();
+    let pid = std::process::id();
+    assert_eq!(registry.adopt_live_journal_sweeps(&[journal_entry(&root, 6262, pid)]), 1);
+    assert_eq!(
+        registry.tracked_sweep_identity(6262).map(|i| i.sweep_id),
+        Some(format!("journal-adopted-issue-6262-{pid}"))
+    );
+}
+
+/// A finished sweep's id is not evidence about a later event for the same
+/// issue number — re-attaching it is exactly how a retired row would be
+/// resurrected downstream. The honest unknown fallback is correct here.
+#[test]
+fn a_terminal_entry_is_not_adoption_evidence() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let root = registry.config.workspace_root.clone();
+    assert_eq!(
+        registry.adopt_live_journal_sweeps(&[journal_entry(&root, 6262, std::process::id())]),
+        1
+    );
+    assert!(registry.tracked_sweep_identity(6262).is_some());
+
+    let sweep_id = registry.list(None)[0].sweep_id.clone();
+    registry.entries.get_mut(&sweep_id).unwrap().state = SweepState::Exited {
+        code: Some(0),
+        at: Utc::now(),
+    };
+    assert!(registry.tracked_sweep_identity(6262).is_none());
+}
+
+/// Two live candidates for one issue would make any answer a coin flip, and a
+/// mis-attributed live sweep is worse than the synthesized fallback the caller
+/// already has. (The registry's own invariants make this near-unreachable —
+/// pinned so it stays a deliberate decline rather than an arbitrary pick.)
+#[test]
+fn ambiguous_live_entries_decline_to_name_an_authoritative_id() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let root = registry.config.workspace_root.clone();
+    assert_eq!(
+        registry.adopt_live_journal_sweeps(&[journal_entry(&root, 6262, std::process::id())]),
+        1
+    );
+    let mut duplicate = registry.list(None)[0].clone();
+    duplicate.sweep_id = "a-second-live-entry-for-the-same-issue".to_string();
+    registry
+        .entries
+        .insert(duplicate.sweep_id.clone(), duplicate);
+
+    assert!(registry.tracked_sweep_identity(6262).is_none());
+}

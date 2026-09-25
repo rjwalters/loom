@@ -106,6 +106,7 @@ test-guide-operator-only-exclude.sh
 test-guide-plan-body-stable-sort.sh
 test-guide-pool-pressure-defer.sh
 test-guide-superseding-block-merge-state.sh
+test-guide-urgency-rank.sh
 test-guide-work-log-debounce.sh
 test-guide-work-log-issue-out-of-order.sh
 test-guide-work-log-issue-pagination.sh
@@ -154,6 +155,7 @@ test-merge-pr-head-mismatch.sh
 test-merge-pr-help.sh
 test-merge-pr-local-branch-cleanup.sh
 test-merge-pr-loom-pr-label-guard.sh
+test-merge-pr-merge-method.sh
 test-merge-pr-merge-ordering-guard.sh
 test-merge-pr-primary-checkout-advice.sh
 test-merge-pr-primary-worktree-guard.sh
@@ -180,9 +182,11 @@ test-repo-mismatch-fallback.sh
 test-require-complexity-marker.sh
 test-require-daemon-bin.sh
 test-resolve-tier-model.sh
+test-resync-installed-agent-skills-guard.sh
 test-resync-installed-gh-config-guard.sh
 test-resync-installed-guard-check.sh
 test-resync-installed-local-fix-guard.sh
+test-resync-installed-retired-dry-run.sh
 test-resync-installed.sh
 test-review-feedback-reconciliation.sh
 test-run-ci-suites-daemon-guard.sh
@@ -211,7 +215,6 @@ test-sync-labels-repo-flag.sh
 test-urgent-flip-guard.sh
 test-verdict-staleness-guard.sh
 test-verify-install-scope.sh
-test-verify-proposal-refs.sh
 test-version-bump-workflow-identity.sh
 test-version-check-gate-callsites.sh
 test-version-check-gate.sh
@@ -277,6 +280,7 @@ tests/install/test-dry-run-preview-manifest.sh
 tests/install/test-forge-detect.sh
 tests/install/test-git-repo-detection.sh
 tests/install/test-hooks-preserve.sh
+tests/install/test-initial-commit-credential-exclusion.sh
 tests/install/test-lint-ignore-configs.sh
 tests/install/test-manifest-freshness-after-hook-wiring.sh
 tests/install/test-pnpm-runnable-check.sh

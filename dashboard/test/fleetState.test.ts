@@ -23,16 +23,20 @@
  * of them as an explicit parameter for exactly this reason.
  */
 import { env } from "cloudflare:test";
+import launchIdentity from "./fixtures/sweep-identity.json";
+import { parseActiveSweep } from "../web/src/parse";
 import { describe, expect, it } from "vitest";
 import {
   classifyAndPruneHosts,
   classifyComputeEntries,
   classifyFreshness,
+  diffExpectedRoster,
   filterRevokedHosts,
   isComputeEntryLeaked,
   isSweepEntryStale,
   LIVE_AFTER_SEC,
   OFFLINE_AFTER_SEC,
+  parseExpectedHostRoster,
   PRUNE_AFTER_MS,
   PRUNE_COMPUTE_AFTER_MS,
   selectReconciledAwaySweepKeys,
@@ -158,6 +162,84 @@ describe("classifyAndPruneHosts", () => {
     expect(pruneKeys).toEqual(["health:host-a"]);
     expect(hosts["host-a"]?.health).toBeUndefined();
     expect(hosts["host-a"]?.tokens?.freshness?.status).toBe("live");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Expected-host roster diff (Issue #8792): a roster host that has never
+// reported must surface as `missing`/`unprovisioned`, not silently vanish.
+// ---------------------------------------------------------------------------
+
+describe("parseExpectedHostRoster", () => {
+  it("returns [] for an unset or blank roster (no roster configured)", () => {
+    expect(parseExpectedHostRoster(undefined)).toEqual([]);
+    expect(parseExpectedHostRoster("")).toEqual([]);
+    expect(parseExpectedHostRoster("  ,\n ,")).toEqual([]);
+  });
+
+  it("splits on commas and/or whitespace, dedupes, and sorts", () => {
+    expect(parseExpectedHostRoster("robb-studio, robb-pro\nloom-worker-1  loom-worker-2,robb-pro")).toEqual([
+      "loom-worker-1",
+      "loom-worker-2",
+      "robb-pro",
+      "robb-studio",
+    ]);
+  });
+});
+
+describe("diffExpectedRoster", () => {
+  // A partial Durable Object snapshot: host-live and host-offline have
+  // reported (health entries); host-tokens-only has a tokens entry but no
+  // health; host-never and host-planned have no entry at all.
+  const hosts: FleetSnapshot["hosts"] = {
+    "host-live": { health: { record: { kind: "host.health" }, updatedAt: secondsAgo(60) } },
+    "host-offline": { health: { record: { kind: "host.health" }, updatedAt: secondsAgo(OFFLINE_AFTER_SEC + 60) } },
+    "host-tokens-only": { tokens: { record: { kind: "tokens.snapshot" }, updatedAt: secondsAgo(60) } },
+  };
+  const roster = ["host-live", "host-never", "host-offline", "host-planned", "host-tokens-only"];
+  const activeKeys = new Set(["host-live", "host-never", "host-offline", "host-tokens-only"]);
+
+  it("flags an enrolled roster host with zero health records as missing", () => {
+    const diff = diffExpectedRoster(hosts, roster, activeKeys);
+    expect(diff).toContainEqual({ hostId: "host-never", state: "missing" });
+  });
+
+  it("flags a roster host with no active ingest key as unprovisioned, distinct from missing", () => {
+    const diff = diffExpectedRoster(hosts, roster, activeKeys);
+    expect(diff).toContainEqual({ hostId: "host-planned", state: "unprovisioned" });
+    expect(diff).not.toContainEqual({ hostId: "host-planned", state: "missing" });
+  });
+
+  it("never lists a host that has reported — an offline host stays offline, not missing", () => {
+    const ids = diffExpectedRoster(hosts, roster, activeKeys).map((host) => host.hostId);
+    expect(ids).not.toContain("host-live");
+    expect(ids).not.toContain("host-offline");
+  });
+
+  it("treats a tokens-only host (no health) as missing — health is what the host list counts", () => {
+    expect(diffExpectedRoster(hosts, roster, activeKeys)).toContainEqual({
+      hostId: "host-tokens-only",
+      state: "missing",
+    });
+  });
+
+  it("a host removed from the roster is not rendered as missing", () => {
+    const shrunk = roster.filter((id) => id !== "host-never");
+    const ids = diffExpectedRoster(hosts, shrunk, activeKeys).map((host) => host.hostId);
+    expect(ids).not.toContain("host-never");
+  });
+
+  it("an empty roster yields no missing hosts — pre-#8792 behavior", () => {
+    expect(diffExpectedRoster(hosts, [], activeKeys)).toEqual([]);
+  });
+
+  it("filterRevokedHosts preserves an attached missingHosts list", () => {
+    const missingHosts = diffExpectedRoster(hosts, roster, activeKeys);
+    const filtered = filterRevokedHosts(
+      { hosts, activeSweeps: [], activeCompute: [], missingHosts },
+      new Set(["host-live"]),
+    );
+    expect(filtered.missingHosts).toEqual(missingHosts);
   });
 });
 
@@ -357,6 +439,50 @@ function sweepIds(snap: FleetSnapshot): string[] {
   return snap.activeSweeps.map((s) => s.sweepId).sort();
 }
 
+describe("FleetState — sweep runtime", () => {
+  it("carries sweep.started's runtime into the live entry and keeps it across sweep.phase", async () => {
+    const stub = fleetStateStub("test-runtime-carry");
+    await update(stub, "host-a", {
+      kind: "sweep.started",
+      sweep_id: "sweep-rt-1",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 1,
+      started_at: "2026-08-02T00:00:00Z",
+      runtime: "codex",
+    });
+    let snap = await snapshot(stub);
+    expect(snap.activeSweeps[0]?.runtime).toBe("codex");
+
+    await update(stub, "host-a", {
+      kind: "sweep.phase",
+      sweep_id: "sweep-rt-1",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 1,
+      phase: "builder",
+      entered_at: "2026-08-02T00:05:00Z",
+    });
+    snap = await snapshot(stub);
+    expect(snap.activeSweeps[0]?.phase).toBe("builder");
+    expect(snap.activeSweeps[0]?.runtime).toBe("codex");
+  });
+
+  it("leaves runtime absent when the daemon did not name one", async () => {
+    const stub = fleetStateStub("test-runtime-absent");
+    await update(stub, "host-a", {
+      kind: "sweep.started",
+      sweep_id: "sweep-rt-2",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 2,
+      started_at: "2026-08-02T00:00:00Z",
+    });
+    const snap = await snapshot(stub);
+    expect(snap.activeSweeps[0]).not.toHaveProperty("runtime");
+  });
+});
+
 describe("FleetState — host.health reconciliation (fix layer 2, integration)", () => {
   it("a host.health update with active_sweep_ids removes this host's entries not in the set", async () => {
     const stub = fleetStateStub("test-reconcile-basic");
@@ -478,6 +604,125 @@ describe("FleetState — host.health reconciliation (fix layer 2, integration)",
 
     const snap = await snapshot(stub);
     expect(sweepIds(snap)).toEqual(["sweep-a-1"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Adopted-sweep lifecycle correlation, from this side of the wire (issue
+// #8720). The daemon-side fix is what makes a post-restart phase carry the
+// ADOPTED sweep's own id; these pin what that id buys here, and what an
+// uncorrelated one still costs.
+// ---------------------------------------------------------------------------
+
+describe("FleetState — a sweep adopted across a daemon restart", () => {
+  const started = {
+    kind: "sweep.started",
+    sweep_id: "sweep-issue-8720-original",
+    repo: "rjwalters/loom",
+    visibility: "public",
+    issue: 8720,
+    started_at: "2026-09-22T00:00:00Z",
+    runtime: "claude",
+  };
+  const health = (ids: string[]) => ({
+    kind: "host.health",
+    captured_at: "2026-09-22T00:30:00Z",
+    daemon_version: "0.19.306",
+    uptime_sec: 60,
+    logical_cpus: 8,
+    active_sweep_ids: ids,
+  });
+
+  it("a phase carrying the adopted id updates the original row and survives reconciliation", async () => {
+    const stub = fleetStateStub("adopted-phase-reaches-original-row");
+    await update(stub, "host-a", started);
+    await update(stub, "host-a", {
+      ...launchIdentity,
+      sweep_id: started.sweep_id,
+      issue: 8720,
+    });
+
+    // Post-restart phase, correlated from registry adoption evidence.
+    await update(stub, "host-a", {
+      kind: "sweep.phase",
+      sweep_id: started.sweep_id,
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 8720,
+      phase: "judge",
+      entered_at: "2026-09-22T00:20:00Z",
+    });
+
+    let snap = await snapshot(stub);
+    expect(sweepIds(snap)).toEqual([started.sweep_id]);
+    expect(snap.activeSweeps[0]).toMatchObject({
+      phase: "judge",
+      startedAt: started.started_at,
+      runtime: launchIdentity.runtime,
+      model: launchIdentity.model,
+    });
+
+    // The daemon's own authoritative set names the adopted sweep, so
+    // reconciliation retains exactly the row the phase just updated.
+    await update(stub, "host-a", health([started.sweep_id]));
+    snap = await snapshot(stub);
+    expect(sweepIds(snap)).toEqual([started.sweep_id]);
+    expect(snap.activeSweeps[0]?.phase).toBe("judge");
+
+    await update(stub, "host-a", { kind: "sweep.completed", sweep_id: started.sweep_id });
+    expect((await snapshot(stub)).activeSweeps).toEqual([]);
+  });
+
+  it("an UNcorrelated phase splits the sweep into a second row that reconciliation then drops", async () => {
+    // The pre-#8720 shape, kept as the measured cost of the synthesized
+    // fallback: the original row keeps its stale phase while a separate
+    // `unknown-issue-N` row carries the live one, until the next host.health
+    // (which never names the synthesized id) reaps it — losing the update.
+    const stub = fleetStateStub("uncorrelated-phase-splits-the-row");
+    await update(stub, "host-a", started);
+    await update(stub, "host-a", {
+      kind: "sweep.phase",
+      sweep_id: "unknown-issue-8720",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 8720,
+      phase: "judge",
+      entered_at: "2026-09-22T00:20:00Z",
+    });
+
+    let snap = await snapshot(stub);
+    expect(sweepIds(snap)).toEqual(["sweep-issue-8720-original", "unknown-issue-8720"]);
+    expect(snap.activeSweeps.find((s) => s.sweepId === started.sweep_id)?.phase).toBeUndefined();
+
+    await update(stub, "host-a", health([started.sweep_id]));
+    snap = await snapshot(stub);
+    expect(sweepIds(snap)).toEqual([started.sweep_id]);
+    expect(snap.activeSweeps[0]?.phase).toBeUndefined();
+  });
+
+  it("a phase with no surviving original row is still not a resurrection vector for identity", async () => {
+    // Journal-only recovery after the original row aged out: the phase is the
+    // row's creator (unchanged behavior), but `sweep.identity` on its own
+    // still creates nothing.
+    const stub = fleetStateStub("adopted-phase-without-original-row");
+    const sweepId = "journal-adopted-issue-8720-4242";
+    await update(stub, "host-a", { ...launchIdentity, sweep_id: sweepId, issue: 8720 });
+    expect((await snapshot(stub)).activeSweeps).toEqual([]);
+
+    await update(stub, "host-a", {
+      kind: "sweep.phase",
+      sweep_id: sweepId,
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 8720,
+      phase: "builder",
+      entered_at: "2026-09-22T00:20:00Z",
+    });
+    await update(stub, "host-a", health([sweepId]));
+
+    const snap = await snapshot(stub);
+    expect(sweepIds(snap)).toEqual([sweepId]);
+    expect(snap.activeSweeps[0]).toMatchObject({ phase: "builder", issue: 8720 });
   });
 });
 
@@ -721,5 +966,92 @@ describe("FleetState — ephemeral_compute live state (integration)", () => {
       active_sweep_ids: ["sweep-a-1"],
     });
     expect((await snapshot(stub)).activeCompute).toHaveLength(1);
+  });
+
+  // Issue #8835: the emitter stamps the submitting sweep onto the launch
+  // record so the dashboard can nest a live instance under the sweep paying
+  // for it. The DO's only job is to carry it through untouched.
+  it("carries the submitting sweep_id through onto the live entry", async () => {
+    const stub = fleetStateStub("test-compute-sweep-id");
+    await update(stub, "host-abc", { ...LAUNCH, sweep_id: "sweep-issue-8835-1" });
+
+    const snap = await snapshot(stub);
+    expect(snap.activeCompute[0]).toMatchObject({
+      jobId: "job-abc123",
+      sweepId: "sweep-issue-8835-1",
+      // The submitter's ingest identity is NOT the sweep's host, and both are
+      // kept: the join is on sweepId, but hostId still says who reported it.
+      hostId: "host-abc",
+    });
+  });
+
+  it("round-trips sweep_id across a re-sent launch record", async () => {
+    const stub = fleetStateStub("test-compute-sweep-id-retry");
+    await update(stub, "host-abc", { ...LAUNCH, sweep_id: "sweep-issue-8835-1" });
+    await update(stub, "host-abc", { ...LAUNCH, sweep_id: "sweep-issue-8835-1" });
+
+    const snap = await snapshot(stub);
+    expect(snap.activeCompute).toHaveLength(1);
+    expect(snap.activeCompute[0]?.sweepId).toBe("sweep-issue-8835-1");
+  });
+
+  it("leaves sweepId absent for an unstamped, empty or wrong-typed sweep_id", async () => {
+    // A submission from outside any sweep, an emitter predating #8835, or a
+    // malformed payload. None of these may drop the job — an unattributable
+    // job is exactly the orphaned instance the flat list exists to surface.
+    const stub = fleetStateStub("test-compute-sweep-id-absent");
+    await update(stub, "host-abc", LAUNCH);
+    await update(stub, "host-abc", { ...LAUNCH, job_id: "job-empty", sweep_id: "" });
+    await update(stub, "host-abc", { ...LAUNCH, job_id: "job-typed", sweep_id: 42 });
+
+    const snap = await snapshot(stub);
+    expect(snap.activeCompute).toHaveLength(3);
+    expect(snap.activeCompute.every((entry) => entry.sweepId === undefined)).toBe(true);
+  });
+
+  it("retires a sweep-stamped job on its completion record like any other", async () => {
+    const stub = fleetStateStub("test-compute-sweep-id-complete");
+    await update(stub, "host-abc", { ...LAUNCH, sweep_id: "sweep-issue-8835-1" });
+    expect((await snapshot(stub)).activeCompute).toHaveLength(1);
+
+    await update(stub, "host-abc", { ...COMPLETION, sweep_id: "sweep-issue-8835-1" });
+    expect((await snapshot(stub)).activeCompute).toEqual([]);
+  });
+});
+
+
+describe("late sweep launch identity", () => {
+  it.each(["sweep.started", "sweep.phase"])("accepts unchanged identity replay after %s creates a row", async (kind) => {
+    const stub = fleetStateStub(`identity-before-${kind}`);
+    await update(stub, "host-a", launchIdentity);
+    expect((await snapshot(stub)).activeSweeps).toEqual([]);
+    await update(stub, "host-a", { kind, sweep_id: launchIdentity.sweep_id, phase: "builder", started_at: "2026-09-22T01:00:00Z", entered_at: "2026-09-22T01:01:00Z" });
+    const before = (await snapshot(stub)).activeSweeps[0]!;
+    await update(stub, "host-a", launchIdentity);
+    expect((await snapshot(stub)).activeSweeps[0]).toEqual({ ...before, runtime: launchIdentity.runtime, provider: launchIdentity.provider, model: launchIdentity.model });
+  });
+
+  it("enriches only an existing same-host sweep and preserves its phase and start", async () => {
+    const stub = fleetStateStub("launch-identity-lifecycle");
+    const identity = { ...launchIdentity, sweep_id: "active", profile: "private-profile", credentialAccount: "private-account" };
+    await update(stub, "host-a", identity);
+    expect((await snapshot(stub)).activeSweeps).toEqual([]);
+    await update(stub, "host-a", { kind: "sweep.started", sweep_id: "active", runtime: "opencode", started_at: "2026-09-22T01:00:00Z" });
+    await update(stub, "host-a", { kind: "sweep.phase", sweep_id: "active", phase: "builder", entered_at: "2026-09-22T01:01:00Z" });
+    await update(stub, "other-host", { ...identity, model: "wrong-host-model" });
+    expect((await snapshot(stub)).activeSweeps[0]!.model).toBeUndefined();
+    const beforeIdentity = (await snapshot(stub)).activeSweeps[0]!;
+    await update(stub, "host-a", identity);
+    expect((await snapshot(stub)).activeSweeps[0]).toMatchObject({ startedAt: beforeIdentity.startedAt, phase: beforeIdentity.phase, enteredPhaseAt: beforeIdentity.enteredPhaseAt, updatedAt: beforeIdentity.updatedAt });
+    await update(stub, "host-a", { ...identity, runtime: " ", provider: 7, model: "" });
+    await update(stub, "host-a", { kind: "sweep.phase", sweep_id: "active", phase: "judge" });
+    const sweep = (await snapshot(stub)).activeSweeps[0];
+    expect(sweep).toMatchObject({ runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3", phase: "judge", startedAt: "2026-09-22T01:00:00Z" });
+    expect(parseActiveSweep(sweep)).toMatchObject({ runtime: "opencode", provider: "zai-coding-plan", model: "glm-5.3" });
+    expect(sweep).not.toHaveProperty("profile");
+    expect(sweep).not.toHaveProperty("credentialAccount");
+    await update(stub, "host-a", { kind: "sweep.completed", sweep_id: "active" });
+    await update(stub, "host-a", identity);
+    expect((await snapshot(stub)).activeSweeps).toEqual([]);
   });
 });

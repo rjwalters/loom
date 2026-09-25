@@ -281,6 +281,11 @@ impl WorkspacePool {
         // why the two must differ).
         let completion_ttl = peer_claims::resolve_peer_completion_ttl(repo_root);
         inner_view.set_completion_ttl(completion_ttl);
+        // Issue #8026: how recently this host must have advertised for its own
+        // receive-quiet verdict to carry weight. Env-only (no config key) —
+        // resolved here so a host with a deliberately slow reaper can widen it
+        // without recompiling.
+        inner_view.set_advertise_activity_window(peer_claims::resolve_advertise_activity_window());
         let view = Arc::new(Mutex::new(inner_view));
         let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(safehouse::PEER_CLAIM_CHANNEL_CAP);
         let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view.clone()));
@@ -439,6 +444,13 @@ impl WorkspacePool {
         // held out of dispatch instead of being re-offered on the very next
         // tick. Independent of the three brakes above.
         registry.set_decline_cooldown_config(sweep_registry::resolve_decline_cooldown_config(root));
+        // PR-less retry bound (#7972): resolve env > config > default for this
+        // workspace, so an issue whose dispatches keep ending without a pull
+        // request is spaced out and — at the threshold — held with
+        // `loom:blocked`, instead of being re-claimed forever. Independent of
+        // the four brakes above; it is the only one keyed on "did the dispatch
+        // produce a PR" rather than on how the child died.
+        registry.set_prless_retry_config(sweep_registry::resolve_prless_retry_config(root));
         // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
         // env > config > default for this workspace, mirroring the
         // insta-crash quarantine config above.

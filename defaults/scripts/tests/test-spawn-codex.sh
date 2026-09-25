@@ -955,9 +955,14 @@ assert_classify "TOKEN_EXPIRED" \
     1 codex "invalid_api_key is TOKEN_EXPIRED"
 
 # --- TOKEN_EXHAUSTED: plan/quota exhaustion ---
-assert_classify "TOKEN_EXHAUSTED" \
-    "You've hit your usage limit. Upgrade to Pro to continue using Codex" \
-    1 codex "\"hit your usage limit\" is TOKEN_EXHAUSTED"
+# Kept on one line each (rather than the usual continuations) so the #8539
+# capture below could be added without growing this over-ratchet file.
+assert_classify "TOKEN_EXHAUSTED" "You've hit your usage limit. Upgrade to Pro to continue using Codex" 1 codex "\"hit your usage limit\" is TOKEN_EXHAUSTED"
+# The wording captured verbatim on the #8539 host (a headless `codex exec`
+# inside an account's session container, every registered account walled). The
+# horizon it names is parsed daemon-side by `tokens_pool::codex_reset`;
+# classification stays this table's job and must not regress when it is.
+assert_classify "TOKEN_EXHAUSTED" "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at September 25, 2026 3:00 PM." 1 codex "the captured usage-limit refusal, reset horizon and all, is TOKEN_EXHAUSTED (#8539)"
 assert_classify "TOKEN_EXHAUSTED" \
     "You've reached your usage limit. Increase your limits to continue using codex." \
     1 codex "\"reached your usage limit\" is TOKEN_EXHAUSTED"
@@ -1405,7 +1410,7 @@ printf '{"schema_version":1,"container_name":"loom-codex-session-session-acct","
 out="$(run_auth "LOOM_CODEX_HOME=$SESSION_PROFILE" -- -p "hi")"
 assert_contains "profile 'session-acct' is session-managed" "$out" \
     "a session-managed profile is detected via the on-disk marker"
-assert_contains "-e CARGO_INCREMENTAL=0 loom-codex-session-session-acct codex exec" "$out" \
+assert_contains "session-exec host --container loom-codex-session-session-acct" "$out" \
     "session-exec mode dispatches via docker exec into the account's container, with CARGO_INCREMENTAL=0 carried across the boundary (#6926, #8456; the --workdir/--env prefix is asserted in test-spawn-codex-session-exec.sh, #8518)"
 would_exec_line="$(printf '%s\n' "$out" | grep '^spawn-codex would-exec:' || true)"
 assert_not_contains "tmux" "$would_exec_line" \
@@ -1436,7 +1441,7 @@ NO_MARKER_PROFILE="$TMPROOT/profiles/forced"
 mkdir -p "$NO_MARKER_PROFILE"
 printf '{"token":"stub"}\n' > "$NO_MARKER_PROFILE/auth.json"
 out="$(run_auth "LOOM_CODEX_HOME=$NO_MARKER_PROFILE" LOOM_CODEX_SESSION_EXEC=1 -- -p "hi")"
-assert_contains "-e CARGO_INCREMENTAL=0 loom-codex-session-forced codex exec" "$out" \
+assert_contains "session-exec host --container loom-codex-session-forced" "$out" \
     "LOOM_CODEX_SESSION_EXEC=1 forces session-exec even without the marker file"
 assert_contains "forces session-exec mode though" "$out" \
     "LOOM_CODEX_SESSION_EXEC=1 warns that the profile was never adopted"
@@ -1550,26 +1555,20 @@ cat > "$SESSION_DOCKER_BIN/docker" <<DOCKERSHIM
 # the same fake codex shim Section 8 uses via a plain \`exec\`, so stdin/
 # stdout/stderr and the exit code all flow through exactly as they would for
 # a real container.
-if [[ "\$1" == "inspect" ]]; then
-    echo "true"
-    exit 0
-fi
-if [[ "\$1" == "exec" ]]; then
-    shift
-    # Options precede the container name (real docker exec is clap-parsed);
-    # -e/--env KEY=VALUE pairs are exported so the exec'd process sees them,
-    # the way real docker exec seeds its environment (#8456's
-    # CARGO_INCREMENTAL=0 and #8518's LOOM_WORKSPACE ride this path), and
-    # --workdir DIR is honoured with a cd, the way real docker exec starts
-    # the process in that directory (#8518).
-    while [[ "\$1" == -* ]]; do if [[ "\$1" == "--workdir" ]]; then cd "\$2"; else export "\$2"; fi; shift 2; done
-    _container="\$1"
-    shift
+case "\$1" in inspect) echo true; exit 0;; exec) shift;; *) exit 1;; esac
+while [[ "\$1" == -* ]]; do
+    case "\$1" in -i) shift;; --workdir) cd "\$2"; shift 2;; *) export "\$2"; shift 2;; esac
+done
+_container="\$1"; shift
+if [[ "\$*" == "loom-daemon session-exec protocol" ]]; then echo loom-session-exec-v1; exit 0; fi
+if [[ "\$1 \$2 \$3" == "loom-daemon session-exec worker" ]]; then
+    id="\$5"; shift 6
     printf '%s\n' "\$_container \$*" > "$SESSION_DOCKER_EXEC_ARGV"
-    exec "\$@"
+    "\$@" </dev/null; rc=\$?
+    printf '\036loom-session-clean:%s\037' "\$id" >&2
+    exit "\$rc"
 fi
-echo "unexpected docker invocation: \$*" >&2
-exit 1
+exec "\$@"
 DOCKERSHIM
 chmod +x "$SESSION_DOCKER_BIN/docker"
 
@@ -1625,7 +1624,7 @@ assert_contains "spawn-codex: transcript=$SESSION_TRANSCRIPT" "$session_transcri
 #     CODEX_INVOKE, not the file as a whole). ---
 
 TESTS_RUN=$((TESTS_RUN + 1))
-invoke_assembly="$(grep -A3 'CODEX_INVOKE=(docker exec' "$SPAWN_CODEX" || true)"
+invoke_assembly="$(grep -A3 'CODEX_INVOKE=.*session-exec host' "$SPAWN_CODEX" || true)"
 if [[ -n "$invoke_assembly" && "$invoke_assembly" != *tmux* ]]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "  ${GREEN}PASS${NC}: the session-exec dispatch invocation is assembled from docker/codex only, never tmux"

@@ -7,10 +7,13 @@
 //! bootstrap/service-loop body, which is not a CLI subcommand handler.
 
 pub(crate) mod accounts;
+pub(crate) mod accounts_session;
+mod agent_skills;
 pub(crate) mod api_keys;
 pub(crate) mod cancel;
 pub(crate) mod cleanup_ops;
 pub(crate) mod common;
+pub(crate) mod concierge;
 mod daemon_start;
 pub(crate) mod dep_classify;
 pub(crate) mod dep_recheck;
@@ -18,6 +21,7 @@ pub(crate) mod dispatch;
 pub(crate) mod dispatch_backoff;
 mod duplicate_scan;
 pub(crate) mod fleet_experiment;
+mod git_blob_lines;
 pub(crate) mod health;
 pub(crate) mod inflight;
 pub(crate) mod lease_ensure;

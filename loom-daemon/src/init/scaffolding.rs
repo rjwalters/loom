@@ -235,6 +235,22 @@ fn install_labels_block(
     Ok(())
 }
 
+/// The label-workflow paragraph shared verbatim by [`LOOM_ROOT_POINTER`] and
+/// [`AGENTS_ROOT_POINTER`] (issue #8846).
+///
+/// A macro rather than a `const` because both pointers are built with `concat!`,
+/// which only accepts literals — expanding one macro into both call sites is what
+/// keeps the CLAUDE.md and AGENTS.md wording from drifting apart.
+///
+/// Deliberately generic: it names only labels, roles, and the two scripts every
+/// install ships, so it is correct in any consumer repo whether or not the daemon
+/// is ever started.
+macro_rules! loom_label_workflow_pointer {
+    () => {
+        "Work is coordinated through `loom:` labels on issues and pull requests, and the same roles run either under `loom-daemon` or by hand in an attended session — daemon mode is optional. Create the labels once with `.loom/scripts/sync-labels.sh` (an install ships `.github/labels.yml` but does not create the labels on the forge). A pull request ready for review carries `loom:review-requested`; Judge reviews it and applies `loom:pr` (approved) or `loom:changes-requested`; Doctor fixes a `loom:changes-requested` pull request and returns it to `loom:review-requested`. Only a `loom:pr` pull request gets merged, and always via this repo's merge script (`.loom/scripts/merge-pr.sh`) — never a raw forge merge command such as `gh pr merge`. Full state machine: `.loom/docs/label-state-machine.md`."
+    };
+}
+
 /// The short pointer injected into root CLAUDE.md (between section markers).
 ///
 /// This block is committed to the consumer repo, so its authoritative reference
@@ -245,7 +261,19 @@ fn install_labels_block(
 /// auto-discovers that local copy when agents work in `.loom/worktrees/issue-N/`
 /// via ancestor directory traversal, so the auto-discovery behaviour is
 /// unaffected by this wording.
-pub const LOOM_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.";
+///
+/// The second paragraph is the *local* cue for the label workflow (issue #8846):
+/// a repo run in session mode (roles invoked by an attended operator, no daemon
+/// and no interval terminals) has no other in-repo statement of it. Kept to one
+/// paragraph on purpose — this is a pointer block, so it links
+/// `.loom/docs/label-state-machine.md` rather than inlining the state machine.
+/// Any wording change to that paragraph belongs in
+/// `loom_label_workflow_pointer!`, which [`AGENTS_ROOT_POINTER`] shares.
+pub const LOOM_ROOT_POINTER: &str = concat!(
+    "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.",
+    "\n\n",
+    loom_label_workflow_pointer!(),
+);
 
 /// Wrap Loom content in section markers
 pub fn wrap_loom_content(content: &str) -> String {
@@ -275,7 +303,15 @@ pub const AGENTS_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION (AGENTS) -->";
 /// `.loom/AGENTS.md` at install time. OpenAI Codex CLI (and other AGENTS.md-aware
 /// runtimes) auto-discover `AGENTS.md` via ancestor directory traversal, the
 /// direct analogue of Claude Code's `CLAUDE.md` discovery.
-pub const AGENTS_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration (dual-runtime: Claude Code reads `CLAUDE.md`; OpenAI Codex CLI and other AGENTS.md-aware runtimes read this file). See the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of the runtime-neutral guide to `.loom/AGENTS.md`.";
+///
+/// Also like [`LOOM_ROOT_POINTER`], the second paragraph is the local cue for the
+/// label workflow (issue #8846) — both pointers expand the one
+/// `loom_label_workflow_pointer!` macro, so they cannot drift apart.
+pub const AGENTS_ROOT_POINTER: &str = concat!(
+    "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration (dual-runtime: Claude Code reads `CLAUDE.md`; OpenAI Codex CLI and other AGENTS.md-aware runtimes read this file). See the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of the runtime-neutral guide to `.loom/AGENTS.md`.",
+    "\n\n",
+    loom_label_workflow_pointer!(),
+);
 
 /// Wrap AGENTS.md content in its own section markers (kept separate from
 /// [`wrap_loom_content`]/CLAUDE.md's markers — see [`AGENTS_SECTION_START`]).
@@ -1228,6 +1264,12 @@ pub fn setup_repository_scaffolding(
         report,
     )?;
 
+    // Install `.agents/skills/loom-<name>/SKILL.md` (issue #8673, contract
+    // point 5) — the cross-vendor skill-discovery surface Codex, Kimi Code,
+    // Mistral Vibe, and Grok read natively. Marker-gated rather than a plain
+    // `copy_directory` merge: see `install_agent_skills` below for why.
+    install_agent_skills(defaults_path, workspace_path, report)?;
+
     // Copy .github/ directory.
     //
     // `.github/labels.yml` is special-cased (issue #4187): capture its
@@ -1291,6 +1333,83 @@ pub fn setup_repository_scaffolding(
     Ok(())
 }
 
+/// Installs `.agents/skills/loom-<name>/SKILL.md` files generated by
+/// `loom-daemon generate-agent-skills` (issue #8673, contract point 5) — the
+/// cross-vendor skill-discovery surface Codex, Kimi Code, Mistral Vibe, and
+/// Grok read natively, mirroring the `AGENTS.md` handling above.
+///
+/// Unlike [`copy_directory`]'s force-merge (which distinguishes "Loom-owned"
+/// from "custom" purely by whether the relative path exists in `defaults/`),
+/// this is **marker-gated per file**: a destination `SKILL.md` is only ever
+/// written when it does not exist yet, OR it exists and starts with the
+/// `crate::agent_skills::MARKER` line — the ownership signal every generated
+/// file carries. A destination file at the same `loom-<name>/SKILL.md` path
+/// that is missing the marker (consumer-authored from scratch, or a marker a
+/// consumer deliberately removed to detach a file from generation) is left
+/// completely alone and recorded as `preserved`, never silently overwritten
+/// or reaped — the same contract `defaults/scripts/resync-installed.sh`
+/// documents for this surface, applied here at install time.
+fn install_agent_skills(
+    defaults_path: &Path,
+    workspace_path: &Path,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    let skills = match crate::agent_skills::generate_all(defaults_path) {
+        Ok(skills) => skills,
+        // A defaults/ tree with no roles/ directory (or malformed role
+        // prompts) has nothing to install — soft no-op rather than failing
+        // the whole scaffolding pass over an optional surface.
+        Err(_) => return Ok(()),
+    };
+
+    let out_root = defaults_path.join(".agents").join("skills");
+    for skill in &skills {
+        let Ok(rel) = skill.out_path.strip_prefix(&out_root) else {
+            continue;
+        };
+        let dst = workspace_path.join(".agents").join("skills").join(rel);
+        let report_name = format!(".agents/skills/{}", rel.display());
+
+        let existing = fs::read_to_string(&dst).ok();
+        match existing {
+            None => {
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+                }
+                fs::write(&dst, &skill.content)
+                    .map_err(|e| format!("Failed to write {}: {e}", dst.display()))?;
+                report.added.push(report_name);
+            }
+            Some(existing_content) if existing_content.contains(crate::agent_skills::MARKER) => {
+                if existing_content != skill.content {
+                    fs::write(&dst, &skill.content)
+                        .map_err(|e| format!("Failed to write {}: {e}", dst.display()))?;
+                    report.updated.push(report_name);
+                } else {
+                    report.preserved.push(report_name);
+                }
+            }
+            Some(_) => {
+                // No marker: consumer-authored or detached-from-generation.
+                // Never overwritten — logged as preserved so an operator can
+                // see it was deliberately skipped, not silently missed.
+                report.preserved.push(report_name);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+// A new sibling module rather than growing `scaffolding/tests.rs` in place —
+// that file sits exactly at its file-size ratchet baseline
+// (`.loom/docs/file-size-policy.md`), the same reason
+// `defaults/scripts/tests/test-resync-installed-local-fix-guard.sh` was split
+// out of `test-resync-installed.sh` rather than grown into it.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod agent_skills_tests;

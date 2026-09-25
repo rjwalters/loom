@@ -203,6 +203,22 @@ raised number usually arrives by git's own merge of the baseline file;
 narrow default of #8248 deliberately does not re-record files this change did
 not touch.)
 
+### The second legitimate increase: a new `loom-daemon` subcommand
+
+`loom-daemon/src/main.rs` is over threshold and is also the **only** place a new
+clap subcommand can be wired: one tuple variant on `Commands` plus one dispatch
+arm is an irreducible **+2**, no matter how much of the subcommand's shape is
+moved into a `cli/<name>.rs` sibling (which is what keeps it at +2 rather than
++5 — do that first, it is the mechanism the policy actually wants). Precedent:
+`347da9c8` (#8090) and #7947 each took exactly this +2 for exactly this reason.
+
+It is legitimate **only** in that narrow shape, and the disclosure bar is the
+same as for a stale-baseline bump: say in the PR description that the +2 is the
+dispatch arm for a new subcommand, name the sibling module the rest of it lives
+in, and show that the ledger total does not rise (a real subcommand usually
+retightens other entries on the way past). An increase in `main.rs` that is not
+those two lines is the ratchet slipping, as before.
+
 ## Mechanical refactors: use the language's own tooling, never text surgery
 
 When moving text — extracting a test module, splitting a file, dedenting,

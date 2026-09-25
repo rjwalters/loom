@@ -55,8 +55,11 @@
 //! Unlike transcript token ingestion (#8477, on by default — an unset host
 //! was silently losing data), this never starts on its own: it consumes real
 //! disk, and the derived data it backstops (`resource_usage`) is already
-//! preserved by #8477. An operator runs `loom-daemon archive-transcripts` by
-//! hand or on their own cron/systemd timer.
+//! preserved by #8477. An operator either runs `loom-daemon
+//! archive-transcripts` by hand, or since #8758 sets
+//! `autonomous.transcriptArchive.enabled: true` and the daemon schedules the
+//! same pass itself — see the scheduler section at the bottom of this module.
+//! Both paths write the same ledger rows under the `local` sink.
 //!
 //! # Restoring
 //!
@@ -196,6 +199,7 @@ fn is_memory_path(path: &Path) -> bool {
 fn collect_candidates(
     db: &ActivityDb,
     opts: &ArchiveOptions,
+    sink: &str,
     stats: &mut ArchiveStats,
 ) -> Result<Vec<Candidate>> {
     let now = Utc::now();
@@ -241,7 +245,7 @@ fn collect_candidates(
         }
 
         if !opts.force {
-            if let Some(entry) = lookup_ledger(db, &key)? {
+            if let Some(entry) = lookup_ledger(db, &key, sink)? {
                 let size_i64 = i64::try_from(size).unwrap_or(i64::MAX);
                 if entry.file_size == size_i64 && entry.file_mtime == mtime {
                     stats.skipped_already_archived += 1;
@@ -397,16 +401,21 @@ fn verify_archive(archive_path: &Path, manifest: &Manifest) -> Result<()> {
 
 /// Archive every eligible transcript in one pass, returning what it did.
 ///
+/// `sink` names the destination identity the ledger rows are keyed under —
+/// [`LOCAL_SINK`] for the on-disk `.tar.zst` pass both the CLI and the
+/// scheduler run; a future remote sink (#8759) will pass its own name so the
+/// same transcript can be tracked per destination.
+///
 /// # Errors
 ///
 /// Propagates SQLite, filesystem, and archive-verification failures. A
 /// verification failure leaves the ledger untouched, so the same files are
 /// retried on the next run rather than being silently marked done.
-pub fn archive(db: &ActivityDb, opts: &ArchiveOptions) -> Result<ArchiveStats> {
+pub fn archive(db: &ActivityDb, opts: &ArchiveOptions, sink: &str) -> Result<ArchiveStats> {
     let _ = db.conn.busy_timeout(Duration::from_secs(10));
 
     let mut stats = ArchiveStats::default();
-    let candidates = collect_candidates(db, opts, &mut stats)?;
+    let candidates = collect_candidates(db, opts, sink, &mut stats)?;
 
     if candidates.is_empty() {
         // No-op run, not an error: a quiet host or one that just ran has
@@ -436,6 +445,7 @@ pub fn archive(db: &ActivityDb, opts: &ArchiveOptions) -> Result<ArchiveStats> {
         upsert_ledger(
             &tx,
             &candidate.key,
+            sink,
             i64::try_from(candidate.size).unwrap_or(i64::MAX),
             candidate.mtime,
             &entry.sha256,
@@ -456,11 +466,12 @@ struct LedgerEntry {
     file_mtime: i64,
 }
 
-fn lookup_ledger(db: &ActivityDb, key: &str) -> Result<Option<LedgerEntry>> {
+fn lookup_ledger(db: &ActivityDb, key: &str, sink: &str) -> Result<Option<LedgerEntry>> {
     db.conn
         .query_row(
-            "SELECT file_size, file_mtime FROM transcript_archive WHERE transcript_path = ?1",
-            params![key],
+            "SELECT file_size, file_mtime FROM transcript_archive \
+             WHERE transcript_path = ?1 AND sink = ?2",
+            params![key, sink],
             |row| {
                 Ok(LedgerEntry {
                     file_size: row.get(0)?,
@@ -472,9 +483,11 @@ fn lookup_ledger(db: &ActivityDb, key: &str) -> Result<Option<LedgerEntry>> {
         .context("reading transcript_archive ledger")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upsert_ledger(
     conn: &rusqlite::Connection,
     key: &str,
+    sink: &str,
     file_size: i64,
     file_mtime: i64,
     sha256: &str,
@@ -482,9 +495,9 @@ fn upsert_ledger(
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO transcript_archive (\
-            transcript_path, file_size, file_mtime, sha256, archive_file, archived_at\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(transcript_path) DO UPDATE SET \
+            transcript_path, sink, file_size, file_mtime, sha256, archive_file, archived_at\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(transcript_path, sink) DO UPDATE SET \
             file_size = excluded.file_size, \
             file_mtime = excluded.file_mtime, \
             sha256 = excluded.sha256, \
@@ -492,6 +505,7 @@ fn upsert_ledger(
             archived_at = excluded.archived_at",
         params![
             key,
+            sink,
             file_size,
             file_mtime,
             sha256,
@@ -500,6 +514,300 @@ fn upsert_ledger(
         ],
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled background pass (opt-in, issue #8758)
+// ---------------------------------------------------------------------------
+
+/// The sink identity of the on-disk `.tar.zst` archive both the CLI pass and
+/// the scheduled pass write — the only sink implemented in #8758's scope. A
+/// remote sink (s3/R2) is the deliberately out-of-scope sibling sub-issue
+/// (#8759) and will ledger under its own name.
+pub const LOCAL_SINK: &str = "local";
+
+/// Default seconds between scheduled archive passes: daily. The pass exists
+/// to beat Claude Code's `cleanupPeriodDays` fuse (default 30 days), and a
+/// daily cadence against the default 24h `min_age_hours` archives a
+/// transcript on its second daily pass — days of margin against the fuse.
+pub const DEFAULT_ARCHIVE_INTERVAL_SECS: u64 = 86_400;
+
+/// The sinks this module recognizes in `autonomous.transcriptArchive.sinks`.
+fn known_sinks() -> &'static [&'static str] {
+    &[LOCAL_SINK]
+}
+
+/// The subset of `.loom/config.json` -> `autonomous.transcriptArchive` this
+/// module consumes (#8758). Each field is `Option` so an absent key falls
+/// through to the env-var / built-in-default resolution — precedence is
+/// **env > config > default** for every knob, matching
+/// [`super::transcript_ingest::TranscriptIngestConfig`].
+///
+/// Like every other `autonomous.*` block (and unlike `transcriptIngest`,
+/// whose default-on flip is documented on
+/// [`super::transcript_ingest::resolve_enabled`]), the enabled default is
+/// **off**: the pass consumes real disk, and the derived data it backstops
+/// is already preserved by ingestion (#8477).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TranscriptArchiveConfig {
+    /// `autonomous.transcriptArchive.enabled`.
+    pub enabled: Option<bool>,
+    /// `autonomous.transcriptArchive.intervalSecs` (a zero/invalid value is
+    /// dropped to `None`).
+    pub interval_secs: Option<u64>,
+    /// `autonomous.transcriptArchive.minAgeHours`.
+    pub min_age_hours: Option<i64>,
+    /// `autonomous.transcriptArchive.archiveDir`.
+    pub archive_dir: Option<PathBuf>,
+    /// `autonomous.transcriptArchive.sinks` — destination identities to
+    /// ledger under. Unknown names are warned about and dropped at resolve
+    /// time (a sink landing in #8759 must not silently disable `local`).
+    pub sinks: Option<Vec<String>>,
+}
+
+/// Read `.loom/config.json` -> `autonomous.transcriptArchive`, soft-failing
+/// every field to `None` (env/default resolution) on a missing file,
+/// malformed JSON, or a missing `autonomous`/`transcriptArchive` block —
+/// mirrors [`super::transcript_ingest::read_transcript_ingest_config`]'s
+/// soft-fail contract exactly.
+#[must_use]
+pub fn read_transcript_archive_config(repo_root: &Path) -> TranscriptArchiveConfig {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let node = crate::config_resolver::get_path(&effective, "autonomous.transcriptArchive");
+
+    TranscriptArchiveConfig {
+        enabled: node
+            .and_then(|n| n.get("enabled"))
+            .and_then(serde_json::Value::as_bool),
+        interval_secs: node
+            .and_then(|n| n.get("intervalSecs"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        min_age_hours: node
+            .and_then(|n| n.get("minAgeHours"))
+            .and_then(serde_json::Value::as_i64)
+            .filter(|&h| h >= 0),
+        archive_dir: node
+            .and_then(|n| n.get("archiveDir"))
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from),
+        sinks: node.and_then(|n| n.get("sinks")).and_then(|n| {
+            n.as_array().map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+        }),
+    }
+}
+
+/// `LOOM_TRANSCRIPT_ARCHIVE_ENABLED`'s value, when it decides the outcome
+/// outright — `None` when unset (or set to something unrecognized), deferring
+/// to [`TranscriptArchiveConfig::enabled`] / the built-in default.
+///
+/// Deliberately not `LOOM_TRANSCRIPT_ARCHIVE`: that name is already the
+/// session-transcript archival completion hook's destination-path env
+/// (`archive-transcripts.sh`, a different feature).
+#[must_use]
+fn env_enabled_override() -> Option<bool> {
+    std::env::var("LOOM_TRANSCRIPT_ARCHIVE_ENABLED")
+        .ok()
+        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+fn env_interval_secs() -> Option<u64> {
+    std::env::var("LOOM_TRANSCRIPT_ARCHIVE_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn env_min_age_hours() -> Option<i64> {
+    std::env::var("LOOM_TRANSCRIPT_ARCHIVE_MIN_AGE_HOURS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+}
+
+fn env_archive_dir() -> Option<PathBuf> {
+    let raw = std::env::var("LOOM_TRANSCRIPT_ARCHIVE_DIR").ok()?;
+    let trimmed = raw.trim().to_string();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Whether the scheduled archive pass runs, with precedence **env > config >
+/// default(false)** (#8758 — FLAGS-OFF like every `autonomous.*` toggle
+/// except `transcriptIngest`).
+#[must_use]
+pub fn resolve_enabled(config: &TranscriptArchiveConfig) -> bool {
+    env_enabled_override().or(config.enabled).unwrap_or(false)
+}
+
+/// Resolve the pass interval (seconds) with precedence **env > config >
+/// default(86_400)**.
+#[must_use]
+pub fn resolve_interval_secs(config: &TranscriptArchiveConfig) -> u64 {
+    env_interval_secs()
+        .or(config.interval_secs)
+        .unwrap_or(DEFAULT_ARCHIVE_INTERVAL_SECS)
+}
+
+/// Resolve the minimum transcript age (hours) with precedence **env >
+/// config > default(24)** — the same default as the CLI's
+/// `--min-age-hours`.
+#[must_use]
+pub fn resolve_min_age_hours(config: &TranscriptArchiveConfig) -> i64 {
+    env_min_age_hours().or(config.min_age_hours).unwrap_or(24)
+}
+
+/// Resolve the archive directory with precedence **env > config >
+/// default([`default_archive_dir`])**.
+#[must_use]
+pub fn resolve_archive_dir(config: &TranscriptArchiveConfig) -> PathBuf {
+    env_archive_dir()
+        .or_else(|| config.archive_dir.clone())
+        .unwrap_or_else(default_archive_dir)
+}
+
+/// Resolve the configured sinks to the ones this daemon implements, warning
+/// once about every unrecognized name. An unset `sinks` list defaults to
+/// `["local"]`; a configured list keeps only known names (so an operator who
+/// lists `local` plus a not-yet-landed sink still gets the local archive).
+fn resolve_sinks(config: &TranscriptArchiveConfig) -> Vec<String> {
+    let configured = config
+        .sinks
+        .clone()
+        .unwrap_or_else(|| vec![LOCAL_SINK.to_string()]);
+    let mut out = Vec::new();
+    for sink in configured {
+        if known_sinks().contains(&sink.as_str()) {
+            if !out.contains(&sink) {
+                out.push(sink);
+            }
+        } else {
+            log::warn!(
+                "transcript-archive: ignoring unrecognized sink {sink:?} \
+                 (recognized: {:?}) — the remote sink is a separate sub-issue (#8759)",
+                known_sinks()
+            );
+        }
+    }
+    out
+}
+
+/// Everything the scheduled pass needs, resolved once. Returned by
+/// [`resolve_settings`] only when the pass is enabled AND at least one
+/// recognized sink remains after [`resolve_sinks`] filtering.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduledArchiveSettings {
+    pub interval_secs: u64,
+    pub min_age_hours: i64,
+    /// `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects`, resolved at settings
+    /// time so the pass itself never depends on ambient state (and tests can
+    /// point it at a temp directory).
+    pub projects_dir: PathBuf,
+    pub archive_dir: PathBuf,
+    /// Recognized sinks to run per pass; today at most `["local"]`.
+    pub sinks: Vec<String>,
+}
+
+/// Resolve [`ScheduledArchiveSettings`], or `None` when the pass is off —
+/// disabled by config/env, or configured with a `sinks` list in which no
+/// recognized sink survives filtering (warned in [`resolve_sinks`]; running
+/// would archive under no configured destination).
+#[must_use]
+pub fn resolve_settings(config: &TranscriptArchiveConfig) -> Option<ScheduledArchiveSettings> {
+    if !resolve_enabled(config) {
+        return None;
+    }
+    let sinks = resolve_sinks(config);
+    if sinks.is_empty() {
+        log::warn!(
+            "transcript-archive: enabled but no recognized sink is configured \
+             (recognized: {:?}) — scheduled pass not started",
+            known_sinks()
+        );
+        return None;
+    }
+    Some(ScheduledArchiveSettings {
+        interval_secs: resolve_interval_secs(config),
+        min_age_hours: resolve_min_age_hours(config),
+        projects_dir: claude_projects_dir().unwrap_or_else(|| PathBuf::from("projects")),
+        archive_dir: resolve_archive_dir(config),
+        sinks,
+    })
+}
+
+/// Run one scheduled pass against `db_path` — the exact body the scheduler
+/// thread runs each tick, factored out so tests drive it without a thread.
+///
+/// A no-op (not an error) when the settings carry no `local` sink: the only
+/// pass implemented here is the local one, so there is nothing to do.
+///
+/// # Errors
+///
+/// Fails when the database cannot be opened or the archive pass itself
+/// fails; the caller (the scheduler thread) logs and retries next tick.
+pub fn run_scheduled_pass(
+    db_path: &Path,
+    settings: &ScheduledArchiveSettings,
+) -> Result<ArchiveStats> {
+    if !settings.sinks.iter().any(|s| s == LOCAL_SINK) {
+        return Ok(ArchiveStats::default());
+    }
+    let db = ActivityDb::new(db_path.to_path_buf())?;
+    let opts = ArchiveOptions {
+        projects_dir: settings.projects_dir.clone(),
+        archive_dir: settings.archive_dir.clone(),
+        min_age_hours: settings.min_age_hours,
+        ..ArchiveOptions::default()
+    };
+    archive(&db, &opts, LOCAL_SINK)
+}
+
+/// Start the periodic archive pass thread unless this host opted out.
+///
+/// Mirrors [`super::transcript_ingest::try_init_transcript_ingest`]: returns
+/// the `JoinHandle` (whose thread keeps running when the handle is dropped)
+/// or `None` when the pass is off (the default). `repo_root` is read only
+/// for [`read_transcript_archive_config`] — the pass itself is
+/// workspace-independent, reading every project's transcripts under
+/// `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`. Config is resolved exactly
+/// once, before the thread is spawned: changes require a daemon restart.
+pub fn try_init_transcript_archive(
+    db_path: &Path,
+    repo_root: &Path,
+) -> Option<std::thread::JoinHandle<()>> {
+    let config = read_transcript_archive_config(repo_root);
+    let settings = resolve_settings(&config)?;
+    let db_path = db_path.to_path_buf();
+    log::info!(
+        "📦 Transcript archive pass enabled (every {}s, min age {}h, dir {}, sinks [{}])",
+        settings.interval_secs,
+        settings.min_age_hours,
+        settings.archive_dir.display(),
+        settings.sinks.join(", ")
+    );
+    Some(std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(settings.interval_secs));
+        match run_scheduled_pass(&db_path, &settings) {
+            Ok(stats) if stats.archived > 0 => log::info!(
+                "📦 Scheduled transcript archive: {} archived ({} already archived, {} too recent, {} oversized)",
+                stats.archived,
+                stats.skipped_already_archived,
+                stats.skipped_too_recent,
+                stats.skipped_oversize
+            ),
+            Ok(_) => {}
+            Err(e) => log::error!("❌ Scheduled transcript archive pass failed: {e}"),
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -564,7 +872,7 @@ mod tests {
         );
 
         let db = open_db(home.path());
-        let stats = archive(&db, &opts(home.path())).unwrap();
+        let stats = archive(&db, &opts(home.path()), LOCAL_SINK).unwrap();
 
         assert_eq!(stats.transcripts_seen, 1);
         assert_eq!(stats.archived, 1);
@@ -608,7 +916,7 @@ mod tests {
         .unwrap();
 
         let db = open_db(home.path());
-        let stats = archive(&db, &opts(home.path())).unwrap();
+        let stats = archive(&db, &opts(home.path()), LOCAL_SINK).unwrap();
 
         // Only the real transcript was seen and archived -- the memory/
         // directory's files (even the one carrying a .jsonl extension) never
@@ -664,10 +972,10 @@ mod tests {
         );
 
         let db = open_db(home.path());
-        let first = archive(&db, &opts(home.path())).unwrap();
+        let first = archive(&db, &opts(home.path()), LOCAL_SINK).unwrap();
         assert_eq!(first.archived, 1);
 
-        let second = archive(&db, &opts(home.path())).unwrap();
+        let second = archive(&db, &opts(home.path()), LOCAL_SINK).unwrap();
         assert_eq!(second.archived, 0, "nothing new to archive");
         assert_eq!(second.skipped_already_archived, 1);
         assert!(second.archive_path.is_none(), "a no-op run writes no archive file");
@@ -681,6 +989,7 @@ mod tests {
                 force: true,
                 ..opts(home.path())
             },
+            LOCAL_SINK,
         )
         .unwrap();
         assert_eq!(forced.archived, 1);
@@ -703,6 +1012,7 @@ mod tests {
                 dry_run: true,
                 ..opts(home.path())
             },
+            LOCAL_SINK,
         )
         .unwrap();
 
@@ -731,6 +1041,7 @@ mod tests {
                 min_age_hours: 24 * 365,
                 ..opts(home.path())
             },
+            LOCAL_SINK,
         )
         .unwrap();
 
@@ -745,7 +1056,7 @@ mod tests {
         std::fs::create_dir_all(home.path().join("projects")).unwrap();
 
         let db = open_db(home.path());
-        let stats = archive(&db, &opts(home.path())).unwrap();
+        let stats = archive(&db, &opts(home.path()), LOCAL_SINK).unwrap();
 
         assert_eq!(stats.transcripts_seen, 0);
         assert_eq!(stats.archived, 0);
@@ -778,5 +1089,222 @@ mod tests {
         let bogus = home.path().join("bogus.tar.zst");
         std::fs::write(&bogus, b"not actually a tar.zst archive").unwrap();
         assert!(verify_archive(&bogus, &manifest).is_err());
+    }
+
+    #[test]
+    fn the_ledger_is_keyed_per_transcript_and_sink() {
+        let home = tempfile::tempdir().unwrap();
+        seed_transcript(
+            &home.path().join("projects"),
+            "uuid-a",
+            &[assistant_line("msg_1", "2026-09-18T04:00:00Z")],
+        );
+
+        let db = open_db(home.path());
+        let local = archive(&db, &opts(home.path()), LOCAL_SINK).unwrap();
+        assert_eq!(local.archived, 1);
+
+        // The same transcript under a different sink identity (the shape a
+        // future remote sink, #8759, will produce) is NOT skipped by the
+        // local ledger row: it gets its own row, and its own archive file.
+        let remote = archive(&db, &opts(home.path()), "s3-preview").unwrap();
+        assert_eq!(remote.archived, 1, "per-sink keying: a different sink re-archives");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM transcript_archive WHERE transcript_path LIKE '%uuid-a%'"
+            ),
+            2,
+            "one row per (transcript, sink) pair"
+        );
+
+        // And each sink's re-run stays idempotent against its own row only.
+        let local_again = archive(&db, &opts(home.path()), LOCAL_SINK).unwrap();
+        assert_eq!(local_again.skipped_already_archived, 1);
+        assert_eq!(local_again.archived, 0);
+    }
+
+    fn write_config(root: &Path, body: &str) {
+        std::fs::create_dir_all(root.join(".loom")).unwrap();
+        std::fs::write(root.join(".loom").join("config.json"), body).unwrap();
+    }
+
+    #[test]
+    fn read_transcript_archive_config_parses_the_full_block() {
+        let root = tempfile::tempdir().unwrap();
+        write_config(
+            root.path(),
+            r#"{
+  "autonomous": {
+    "transcriptArchive": {
+      "enabled": true,
+      "intervalSecs": 3600,
+      "minAgeHours": 12,
+      "archiveDir": "/tmp/archives",
+      "sinks": ["local", "s3"]
+    }
+  }
+}"#,
+        );
+
+        let config = read_transcript_archive_config(root.path());
+        assert_eq!(config.enabled, Some(true));
+        assert_eq!(config.interval_secs, Some(3600));
+        assert_eq!(config.min_age_hours, Some(12));
+        assert_eq!(config.archive_dir, Some(PathBuf::from("/tmp/archives")));
+        assert_eq!(config.sinks, Some(vec!["local".to_string(), "s3".to_string()]));
+    }
+
+    #[test]
+    fn read_transcript_archive_config_soft_fails_to_defaults() {
+        // No .loom/config.json at all, no autonomous block, and a malformed
+        // file all resolve to the same all-None config.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_transcript_archive_config(empty.path()),
+            TranscriptArchiveConfig::default()
+        );
+
+        let no_block = tempfile::tempdir().unwrap();
+        write_config(no_block.path(), r#"{"autonomous": {}}"#);
+        assert_eq!(
+            read_transcript_archive_config(no_block.path()),
+            TranscriptArchiveConfig::default()
+        );
+
+        let malformed = tempfile::tempdir().unwrap();
+        write_config(malformed.path(), "{ not json");
+        assert_eq!(
+            read_transcript_archive_config(malformed.path()),
+            TranscriptArchiveConfig::default()
+        );
+    }
+
+    #[test]
+    fn resolve_settings_is_off_by_default_and_on_when_enabled() {
+        // Off unless enabled — the FLAGS-OFF convention, unlike ingest.
+        assert!(resolve_settings(&TranscriptArchiveConfig::default()).is_none());
+        assert!(resolve_settings(&TranscriptArchiveConfig {
+            enabled: Some(false),
+            ..TranscriptArchiveConfig::default()
+        })
+        .is_none());
+
+        let settings = resolve_settings(&TranscriptArchiveConfig {
+            enabled: Some(true),
+            ..TranscriptArchiveConfig::default()
+        })
+        .expect("enabled resolves to settings");
+        assert_eq!(settings.interval_secs, DEFAULT_ARCHIVE_INTERVAL_SECS);
+        assert_eq!(settings.min_age_hours, 24);
+        assert_eq!(settings.archive_dir, default_archive_dir());
+        assert_eq!(settings.sinks, vec!["local".to_string()], "sinks default to local");
+    }
+
+    #[test]
+    fn resolve_settings_drops_unknown_sinks_and_disables_when_none_remain() {
+        let mixed = resolve_settings(&TranscriptArchiveConfig {
+            enabled: Some(true),
+            sinks: Some(vec!["s3".to_string(), "local".to_string()]),
+            ..TranscriptArchiveConfig::default()
+        })
+        .expect("local survives alongside an unrecognized sink");
+        assert_eq!(mixed.sinks, vec!["local".to_string()]);
+
+        let all_unknown = resolve_settings(&TranscriptArchiveConfig {
+            enabled: Some(true),
+            sinks: Some(vec!["s3".to_string()]),
+            ..TranscriptArchiveConfig::default()
+        });
+        assert!(all_unknown.is_none(), "nothing to archive under");
+    }
+
+    #[test]
+    fn a_scheduled_pass_archives_and_ledgers_without_manual_invocation() {
+        let home = tempfile::tempdir().unwrap();
+        seed_transcript(
+            &home.path().join("projects"),
+            "uuid-a",
+            &[assistant_line("msg_1", "2026-09-18T04:00:00Z")],
+        );
+
+        let db_path = home.path().join("activity.db");
+        let settings = ScheduledArchiveSettings {
+            interval_secs: 60,
+            min_age_hours: 0,
+            projects_dir: home.path().join("projects"),
+            archive_dir: home.path().join("archives"),
+            sinks: vec![LOCAL_SINK.to_string()],
+        };
+
+        let first = run_scheduled_pass(&db_path, &settings).unwrap();
+        assert_eq!(first.archived, 1, "the scheduled pass did the archiving");
+        assert!(first.archive_path.is_some());
+
+        // Idempotency after a "partial failure" restart: the ledger already
+        // names this transcript under the local sink, so the next scheduled
+        // pass skips it rather than re-archiving.
+        let second = run_scheduled_pass(&db_path, &settings).unwrap();
+        assert_eq!(second.archived, 0);
+        assert_eq!(second.skipped_already_archived, 1);
+        assert!(second.archive_path.is_none(), "no new archive file");
+
+        let db = ActivityDb::new(db_path).unwrap();
+        let sink: String = db
+            .conn
+            .query_row(
+                "SELECT sink FROM transcript_archive WHERE transcript_path LIKE '%uuid-a%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sink, LOCAL_SINK);
+    }
+
+    #[test]
+    fn a_scheduled_pass_without_the_local_sink_is_a_noop() {
+        let home = tempfile::tempdir().unwrap();
+        seed_transcript(
+            &home.path().join("projects"),
+            "uuid-a",
+            &[assistant_line("msg_1", "2026-09-18T04:00:00Z")],
+        );
+
+        let db_path = home.path().join("activity.db");
+        let settings = ScheduledArchiveSettings {
+            interval_secs: 60,
+            min_age_hours: 0,
+            projects_dir: home.path().join("projects"),
+            archive_dir: home.path().join("archives"),
+            sinks: vec!["not-implemented".to_string()],
+        };
+
+        let stats = run_scheduled_pass(&db_path, &settings).unwrap();
+        assert_eq!(stats, ArchiveStats::default());
+        assert!(std::fs::read_dir(home.path().join("archives")).is_err(), "nothing was written");
+    }
+
+    #[test]
+    fn a_scheduled_pass_honors_the_configured_min_age() {
+        let home = tempfile::tempdir().unwrap();
+        seed_transcript(
+            &home.path().join("projects"),
+            "uuid-a",
+            &[assistant_line("msg_1", "2026-09-18T04:00:00Z")],
+        );
+
+        let db_path = home.path().join("activity.db");
+        let settings = ScheduledArchiveSettings {
+            interval_secs: 60,
+            min_age_hours: 24 * 365,
+            projects_dir: home.path().join("projects"),
+            archive_dir: home.path().join("archives"),
+            sinks: vec![LOCAL_SINK.to_string()],
+        };
+
+        let stats = run_scheduled_pass(&db_path, &settings).unwrap();
+        assert_eq!(stats.skipped_too_recent, 1, "younger than minAgeHours");
+        assert_eq!(stats.archived, 0);
+        assert!(stats.archive_path.is_none());
     }
 }

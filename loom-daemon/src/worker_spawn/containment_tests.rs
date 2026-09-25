@@ -197,6 +197,7 @@ fn build(profile: &Profile, credentials: &[&str]) -> Vec<String> {
         None,
         &[OsString::from("-p"), OsString::from("/loom:sweep 1")],
         credentials,
+        None,
     )
     .expect("docker command");
     argv(&command)

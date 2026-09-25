@@ -100,6 +100,30 @@
       "max"
     ]
   },
+  "example-proxied-anthropic": {
+    "model": "REPLACE_WITH_ANTHROPIC_MODEL_ID",
+    "providers": {
+      "opencode": "anthropic"
+    },
+    "credentialEnv": "ANTHROPIC_API_KEY",
+    "credentialPool": "anthropic",
+    "credentialTargets": {
+      "opencode": "ANTHROPIC_AUTH_TOKEN"
+    },
+    "credentialProxy": {
+      "upstream": "https://api.anthropic.com",
+      "header": "authorization-bearer",
+      "baseUrlEnv": [
+        "ANTHROPIC_BASE_URL"
+      ]
+    },
+    "effort": "high",
+    "allowedEfforts": [
+      "low",
+      "high",
+      "max"
+    ]
+  },
   "example-openai-compatible": {
     "model": "REPLACE_WITH_MODEL_ID",
     "providers": {

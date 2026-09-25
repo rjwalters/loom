@@ -18,6 +18,12 @@ use anyhow::Result;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ScriptPortCommand {
+    /// Supervised persistent-container transport backing spawn-codex.sh.
+    #[command(subcommand)]
+    SessionExec(loom_daemon::session_exec::SessionExecCommand),
+    /// Private workspace endpoint used inside a session container.
+    #[command(subcommand)]
+    PrivateWorkspace(loom_daemon::tokens_pool::private_workspace::WorkerCommand),
     /// Durable phase completion markers and trace observations (#8525).
     SweepCheckpoint(super::sweep_checkpoint::SweepCheckpointArgs),
 
@@ -132,6 +138,24 @@ pub(crate) enum ScriptPortCommand {
     /// onto the pinned commit. Exit 0 planned/rebased, 1 a prerequisite
     /// refused with nothing mutated, 2 the rebase itself failed.
     ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
+
+    /// Generate `.agents/skills/loom-<name>/SKILL.md` from every
+    /// `defaults/roles/<name>.md` role prompt (#8673) — the cross-vendor
+    /// skill-discovery surface Codex, Kimi Code, Mistral Vibe, and Grok read
+    /// natively. Not a port either: brand-new logic, native from the start
+    /// per the shell-language policy, backing
+    /// `generate-agent-skills.sh`'s Shape-A stub.
+    GenerateAgentSkills(super::agent_skills::AgentSkillsArgs),
+
+    /// `verify-proposal-refs.sh`'s line-range check (#8656): resolve a cited
+    /// path against a rev, FOLLOWING a `120000` (symlink) tree entry to the
+    /// document it points at, and answer the range question against that
+    /// document. Since #7842 every `.loom/docs/*.md` with a `defaults/docs/`
+    /// counterpart is such a link, so the script's old `git show <rev>:<path>
+    /// | wc -l` measured the link-target STRING and reported every in-range
+    /// citation as a miss — on a script that BLOCKS FILING. Ported out of the
+    /// `contract`-category script per the shell language policy.
+    GitBlobLines(super::git_blob_lines::GitBlobLinesArgs),
 }
 
 impl ScriptPortCommand {
@@ -139,6 +163,8 @@ impl ScriptPortCommand {
     /// the stubs' callers branch on.
     pub(crate) fn run(self) -> Result<()> {
         match self {
+            ScriptPortCommand::SessionExec(args) => args.run(),
+            ScriptPortCommand::PrivateWorkspace(args) => args.run(),
             ScriptPortCommand::SweepCheckpoint(args) => args.run(),
             ScriptPortCommand::DepClassify(cmd) => cmd.run(),
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
@@ -157,6 +183,8 @@ impl ScriptPortCommand {
             ScriptPortCommand::DuplicateScan(args) => args.run(),
             ScriptPortCommand::PremiseCheck(args) => args.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
+            ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
+            ScriptPortCommand::GitBlobLines(args) => args.run(),
         }
     }
 }

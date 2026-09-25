@@ -1,10 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import { parseFleetSnapshot, parseHostProtection, parseRoleTickHealth } from "../src/parse";
+import {
+  parseActiveComputeJob,
+  parseFleetSnapshot,
+  parseHostProtection,
+  parseMissingHost,
+  parseRoleTickHealth,
+} from "../src/parse";
 import {
   HEALTHY_HOST_ID,
+  MISSING_HOST_ID,
+  UNPROVISIONED_HOST_ID,
   multiHostSnapshot,
   persistentRoleTickFailureFixture,
+  rosterMissingSnapshot,
   unprotectedHostProtectionFixture,
 } from "./fixtures";
 
@@ -157,11 +166,13 @@ describe("parseFleetSnapshot", () => {
           },
         },
       },
-      activeSweeps: [{ hostId: "h", sweepId: "s", runtime: "codex" }],
+      activeSweeps: [{ hostId: "h", sweepId: "s", runtime: "codex", sandbox: "firecracker" }],
     });
     expect(snapshot.hosts.h?.health?.record.daemon_version).toBe("99.0.0");
     expect(snapshot.hosts.h?.health?.record).not.toHaveProperty("gpu_count");
-    expect(snapshot.activeSweeps[0]).not.toHaveProperty("runtime");
+    // `runtime` is a known field now; `sandbox` stands in as the unknown one.
+    expect(snapshot.activeSweeps[0]?.runtime).toBe("codex");
+    expect(snapshot.activeSweeps[0]).not.toHaveProperty("sandbox");
   });
 
   it("narrows host.health build identity, dropping wrong-typed values (#4956)", () => {
@@ -270,13 +281,13 @@ describe("parseFleetSnapshot", () => {
       activeSweeps: [],
     });
     const roles = snapshot.hosts.h?.health?.record.roles;
-    expect(roles?.total).toBe(3);
+    expect(roles?.total).toBe(5);
     expect(roles?.ok).toBe(1);
     expect(roles?.persistent).toEqual([
       {
         root: "/repos/loom",
         role: "judge",
-        failures: 2,
+        failures: 4,
         last_at: "2026-07-30T12:09:00.000Z",
         detail: "no-token-pool",
       },
@@ -360,5 +371,139 @@ describe("parseFleetSnapshot", () => {
     expect(parseHostProtection("not-an-object")).toBeUndefined();
     expect(parseHostProtection(42)).toBeUndefined();
     expect(parseHostProtection(null)).toBeUndefined();
+  });
+});
+
+
+it("keeps unknown launch identity strings and rejects malformed or blank identity", () => {
+  const snapshot = parseFleetSnapshot({ hosts: {}, activeSweeps: [
+    { hostId: "host-a", sweepId: "future", runtime: "next-runtime", provider: "next-provider", model: "next-model" },
+    { hostId: "host-a", sweepId: "legacy", runtime: " ", provider: {}, model: 9 },
+  ] });
+  expect(snapshot.activeSweeps[0]).toMatchObject({ runtime: "next-runtime", provider: "next-provider", model: "next-model" });
+  for (const key of ["runtime", "provider", "model"]) expect(snapshot.activeSweeps[1]).not.toHaveProperty(key);
+});
+
+// ---------------------------------------------------------------------------
+// Expected-host roster (#8792 backend → #8804 SPA)
+// ---------------------------------------------------------------------------
+
+describe("parseFleetSnapshot — missingHosts (#8804)", () => {
+  it("narrows a well-formed missingHosts array", () => {
+    const snapshot = parseFleetSnapshot(rosterMissingSnapshot());
+    expect(snapshot.missingHosts).toEqual([
+      { hostId: MISSING_HOST_ID, state: "missing" },
+      { hostId: UNPROVISIONED_HOST_ID, state: "unprovisioned" },
+    ]);
+  });
+
+  it("leaves the key off entirely when the backend sends no missingHosts", () => {
+    // A pre-#8792 backend, or a deployment with no EXPECTED_HOSTS roster.
+    // Absent, not `[]`: "no roster configured" and "roster configured, every
+    // host reporting" must stay distinguishable.
+    const snapshot = parseFleetSnapshot(multiHostSnapshot());
+    expect("missingHosts" in snapshot).toBe(false);
+    expect(snapshot.missingHosts).toBeUndefined();
+  });
+
+  it("degrades a wrong-typed missingHosts sub-tree to absent instead of throwing", () => {
+    for (const missingHosts of [null, 42, "nope", { hostId: "h" }]) {
+      const snapshot = parseFleetSnapshot({ hosts: {}, activeSweeps: [], missingHosts });
+      expect(snapshot.missingHosts).toBeUndefined();
+      // One bad sub-tree must not blank the rest of the snapshot.
+      expect(snapshot.hosts).toEqual({});
+      expect(snapshot.activeSweeps).toEqual([]);
+    }
+  });
+
+  it("keeps an empty missingHosts array the backend actually sent", () => {
+    const snapshot = parseFleetSnapshot({ hosts: {}, activeSweeps: [], missingHosts: [] });
+    expect(snapshot.missingHosts).toEqual([]);
+  });
+
+  it("drops malformed entries but keeps the well-formed ones around them", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {},
+      activeSweeps: [],
+      missingHosts: [
+        { hostId: "good-1", state: "missing" },
+        // Unaddressable: no id to key or link a card by.
+        { state: "missing" },
+        { hostId: "", state: "unprovisioned" },
+        { hostId: 42, state: "missing" },
+        // Unknown/wrong-typed state: the two known states prescribe opposite
+        // operator actions, so guessing one would be worse than dropping.
+        { hostId: "bad-state", state: "decommissioned" },
+        { hostId: "bad-state-2", state: 7 },
+        { hostId: "bad-state-3" },
+        "not-an-object",
+        null,
+        { hostId: "good-2", state: "unprovisioned" },
+      ],
+    });
+    expect(snapshot.missingHosts).toEqual([
+      { hostId: "good-1", state: "missing" },
+      { hostId: "good-2", state: "unprovisioned" },
+    ]);
+  });
+
+  it("narrows one entry at a time through parseMissingHost", () => {
+    expect(parseMissingHost({ hostId: "h", state: "missing" })).toEqual({ hostId: "h", state: "missing" });
+    expect(parseMissingHost({ hostId: "h", state: "unprovisioned" })).toEqual({
+      hostId: "h",
+      state: "unprovisioned",
+    });
+    for (const bad of [undefined, null, 42, "h", [], { hostId: "h" }, { state: "missing" }]) {
+      expect(parseMissingHost(bad)).toBeUndefined();
+    }
+  });
+
+  it("ignores additive keys on a missingHosts entry rather than failing", () => {
+    // Same "additive fields are tolerated" rule the rest of this module
+    // follows: an unrecognized *key* is ignored, unlike an unrecognized
+    // `state` *value*, which changes what the entry means.
+    const snapshot = parseFleetSnapshot({
+      hosts: {},
+      activeSweeps: [],
+      missingHosts: [{ hostId: "h", state: "missing", expectedSince: "2026-09-01T00:00:00Z" }],
+    });
+    expect(snapshot.missingHosts).toEqual([{ hostId: "h", state: "missing" }]);
+  });
+});
+
+describe("parseActiveComputeJob — sweepId (#8835)", () => {
+  const base = { hostId: "2am-elastic", jobId: "job-abc123" };
+
+  it("carries the submitting sweep through, so the fleet view can join on it", () => {
+    expect(parseActiveComputeJob({ ...base, sweepId: "sweep-issue-8835-1" })).toEqual({
+      ...base,
+      sweepId: "sweep-issue-8835-1",
+    });
+  });
+
+  it("omits sweepId rather than dropping the job when it is absent or malformed", () => {
+    // A job submitted outside any sweep, or by an emitter predating #8835, is
+    // still a perfectly addressable job — it simply has no sweep to nest
+    // under. Dropping it here would hide a running (possibly leaked)
+    // instance, which is the one outcome this feature must never cause.
+    for (const bad of [undefined, null, 42, "", {}, []]) {
+      const parsed = parseActiveComputeJob({ ...base, sweepId: bad });
+      expect(parsed).toEqual(base);
+      expect(parsed && "sweepId" in parsed).toBe(false);
+    }
+  });
+
+  it("still requires hostId and jobId — sweepId alone does not make an entry addressable", () => {
+    expect(parseActiveComputeJob({ hostId: "2am-elastic", sweepId: "sweep-1" })).toBeUndefined();
+    expect(parseActiveComputeJob({ jobId: "job-1", sweepId: "sweep-1" })).toBeUndefined();
+  });
+
+  it("reaches the snapshot through parseFleetSnapshot's activeCompute list", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {},
+      activeSweeps: [],
+      activeCompute: [{ ...base, sweepId: "sweep-issue-8835-1" }],
+    });
+    expect(snapshot.activeCompute?.[0]?.sweepId).toBe("sweep-issue-8835-1");
   });
 });

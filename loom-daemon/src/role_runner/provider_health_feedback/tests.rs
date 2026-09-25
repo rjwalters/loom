@@ -298,3 +298,63 @@ category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
         "an unadmitted (test spawn_bin) tick must never write account health"
     );
 }
+
+/// #8539 call-site wiring, role-tick side: when the adapter's refusal names a
+/// reset horizon, the hold this tick records ends at *that* instant rather
+/// than at `now + LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS`.
+///
+/// The sweep path has the same assertion
+/// (`sweep_registry::provider_health_feedback_tests`). Both exist because
+/// `codex_reset`'s own tests call the parser directly, so a call site here
+/// passing the wrong contents or the wrong tick anchor would go unnoticed.
+///
+/// The horizon is derived from *now* (not a fixed date) so the test does not
+/// start asserting about the fallback cooldown once a hard-coded fixture date
+/// drifts into the past.
+#[test]
+#[serial]
+fn codex_role_tick_honours_the_refusals_own_reset_horizon() {
+    use chrono::{Local, Timelike};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    codex_judge_workspace(workspace.path());
+
+    let horizon = (Local::now() + chrono::Duration::days(2))
+        .with_minute(0)
+        .unwrap()
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
+    let rendered = horizon.format("%B %d, %Y %I:%M %p").to_string();
+    let expected_epoch = u64::try_from(horizon.timestamp()).unwrap();
+
+    write_executable(
+        &workspace.path().join(".loom/scripts/spawn-worker.sh"),
+        &format!(
+            "#!/bin/sh\n\
+             echo '# LOOM_ACCOUNT name=alice'\n\
+             echo \"ERROR: You've hit your usage limit. Visit \
+             https://chatgpt.com/codex/settings/usage to purchase more credits or \
+             try again at {rendered}.\"\n\
+             echo '# LOOM_TERMINAL_RESULT v=2 provider=codex account=alice \
+category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
+             exit 1\n"
+        ),
+    );
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    assert!(!outcome.is_success(), "{outcome:?}");
+
+    let health = tokens_pool::account_health(workspace.path(), &codex_id("alice"))
+        .unwrap()
+        .expect("a codex-runtime TOKEN_EXHAUSTED tick must write account health");
+    assert_eq!(
+        health.cooldown_until,
+        Some(expected_epoch),
+        "the hold must end at the horizon the provider's own refusal named: {health:?}"
+    );
+}

@@ -101,11 +101,16 @@ pub(super) fn apply_role_tick_provider_health_feedback(
         provider: result.provider,
         name: result.account,
     };
-    if let Err(error) = tokens_pool::record_terminal_for_model(
+    // #8539: the provider's own reset horizon, when its refusal named one —
+    // the same gate the sweep path applies, from the one function that owns it.
+    let reset_at =
+        tokens_pool::codex_reset::exhaustion_reset_horizon(&contents, tick_anchor, result.category);
+    if let Err(error) = tokens_pool::record_terminal_for_model_with_reset(
         workspace_root,
         &id,
         result.category,
         result.model.as_deref(),
+        reset_at,
         "spawn-codex:v1",
     ) {
         log::warn!(

@@ -5,6 +5,8 @@
 //! resolution, every autonomous subsystem's startup wiring, and the IPC
 //! accept loop that only returns on a startup failure.
 
+mod observer_tasks;
+
 use loom_daemon::activity::{self, ActivityDb};
 use loom_daemon::admission_brake;
 use loom_daemon::auto_update;
@@ -23,7 +25,6 @@ use loom_daemon::install_self_check;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
-use loom_daemon::observability;
 use loom_daemon::orphan_process_reaper;
 use loom_daemon::primary_checkout_reaper;
 use loom_daemon::quarantine_stash_status;
@@ -154,6 +155,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // `jev-merge-risk` (issue #8543), so it needs the async runtime
             // for the same reason.
             Commands::JevTier { issue } => loom_daemon::jev_tier::run(issue).await,
+            // `concierge` connects to safehoused over its Unix socket to read
+            // the room and to relay a vetted command (Issue #7947), so it needs
+            // the async runtime for the same reason `quarantine` does.
+            Commands::Concierge(args) => args.action.run().await,
             // `quarantine` connects to the running daemon over its Unix socket
             // (the quarantine state is in-memory), so it needs the async runtime.
             Commands::Quarantine { action } => handle_quarantine_command(action).await,
@@ -357,16 +362,19 @@ pub(crate) async fn run_daemon() -> Result<()> {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    // Start transcript token ingestion (Issue #8059; on by default since
-    // #8477 — see that module's doc for why). This is the only writer
+    // Start the background maintenance threads the activity module owns:
+    // (1) transcript token ingestion (Issue #8059; on by default since #8477
+    // — see that module's doc for why). This is the only writer
     // `resource_usage` has on a dispatch-driven host — the IPC
     // `GetTerminalOutput` path a `claude -p` sweep never traverses is the
-    // other one. `sweep_workspace` is read only to resolve
-    // `autonomous.transcriptIngest`; ingestion itself is independent of the
-    // workspace, reading every project's transcripts under
-    // `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`. Handle dropped, thread runs on.
-    let _ingest_handle =
-        activity::transcript_ingest::try_init_transcript_ingest(&db_path, &sweep_workspace);
+    // other one; (2) since #8758, the scheduled raw-transcript archive pass
+    // (opt-in via `autonomous.transcriptArchive`). For both, `sweep_workspace`
+    // is read only to resolve the `autonomous.*` config block — the passes
+    // themselves are workspace-independent, reading every project's
+    // transcripts under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`. Handles
+    // dropped, threads run on.
+    let (_ingest_handle, _transcript_archive_handle) =
+        activity::start_maintenance_threads(&db_path, &sweep_workspace);
 
     // #6499: a loud, top-of-boot-block diagnosis of the legacy
     // `.loom/config.json` tier — every existing repo's sole populated config
@@ -1100,6 +1108,18 @@ pub(crate) async fn run_daemon() -> Result<()> {
         decline_cooldown_config.warn_threshold,
         loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS
     );
+
+    // PR-less retry bound (#7972): resolve env > config > default for the
+    // default workspace so an issue whose dispatches keep ending without a
+    // pull request is spaced out and — at the threshold — held with
+    // `loom:blocked`, instead of being re-claimed forever. The only brake of
+    // the four keyed on "did the dispatch produce a PR" rather than on how the
+    // child died, which is why it catches the shape the others structurally
+    // cannot (a sweep that advances its checkpoint and still produces nothing).
+    // Resolve + set + log live in the module (`configure_prless_retry`), not
+    // inline here: `daemon_service.rs` is over the file-size ratchet's
+    // threshold and frozen at its current size (.loom/docs/file-size-policy.md).
+    sweep_registry::configure_prless_retry(&mut sweep, &sweep_workspace);
 
     // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
     // env > config > default for the default workspace so a fleet-wide,
@@ -2009,21 +2029,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
         None
     };
 
-    // Pluggable telemetry exporter (#4705, epic #4702 Phase 1). Off by
-    // default (FLAGS-OFF, `observability.enabled=true` to opt in) — a bus
-    // subscriber plus a queue-drain sender, mirroring the idle_exit wiring
-    // immediately above. `Instant::now()` here approximates daemon uptime for
-    // the periodic `host.health` sample; see `observability::spawn_task`'s
-    // doc comment for why an exact daemon-start timestamp is not threaded
-    // through for this.
-    let observability_config = observability::read_config(&sweep_workspace);
-    let _observability_handles = observability::spawn_task(
-        &observability_config,
-        sweep_workspace.clone(),
-        &event_bus,
-        std::time::Instant::now(),
-        workspace_pool.clone(),
-    );
+    // Read-only observer side channels — telemetry export (#4705) and the
+    // forge event feed (ADR-0021, #8765). Both opt-in, both off by default,
+    // neither able to change what any dispatch path does. See
+    // `observer_tasks` for why they share a call site.
+    let _observer_handles =
+        observer_tasks::spawn(&sweep_workspace, &event_bus, workspace_pool.clone());
 
     // Start IPC server. `workspace_health_states` is threaded in so the
     // `DaemonStatus` request can report each registered repo's own halt state
@@ -2100,7 +2111,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::info!(
             "Socket cleaned up, exiting {code} ({signal_name} received — no supervised relaunch)"
         );
-        observability::shutdown::exit(code).await;
+        loom_daemon::observability::shutdown::exit(code).await;
     });
 
     log::info!("Loom daemon starting...");
@@ -2211,13 +2222,20 @@ fn setup_logging() -> Result<()> {
         .append(true)
         .open(&log_path)?;
 
+    // Issue #8504: every machine-readable timestamp `loom-daemon` writes is
+    // UTC with an explicit `Z` designator, so it can never be mistaken for
+    // (or silently drift into) the host's local time — this is the daemon's
+    // own log-line prefix, read and correlated across a fleet of hosts in
+    // different timezones. `loom_daemon::health::DAEMON_LOG_STAMP_FORMAT` is
+    // the SAME constant `health::parse_log_line_stamp` reads back with, so
+    // the write and read sides cannot drift apart.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .format(|buf, record| {
             writeln!(
                 buf,
                 "[{}] [{}] {}",
-                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
+                chrono::Utc::now().format(loom_daemon::health::DAEMON_LOG_STAMP_FORMAT),
                 record.level(),
                 record.args()
             )

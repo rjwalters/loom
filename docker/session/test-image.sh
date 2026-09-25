@@ -205,5 +205,158 @@ for bin in git gh jq tmux curl claude codex node npm; do
     fi
 done
 
+# 9. Private-session control bundle (issue #8839) — the image-owned half of the
+# `loom-private-control-v1` boundary. This is the only place the claims about
+# it can be made against the REAL shipped artifacts: the real guard scripts, the
+# real hook wire protocol, and the real pinned Codex CLI. The Rust fixtures in
+# loom-daemon/tests/private_workspace_docker prove the host/lease binding on a
+# synthetic image; they cannot prove what this image actually ships.
+# Full contract, evidence and rollback: defaults/docs/private-control-bundle.md
+CONTROL_ROOT=/opt/loom/private-control
+
+CONTROL_MANIFEST=$(docker exec "$CONTAINER_NAME" cat "$CONTROL_ROOT/manifest.json" 2>&1)
+if echo "$CONTROL_MANIFEST" | jq -e '.protocol == "loom-private-control-v1" and .control_version == 1' >/dev/null 2>&1; then
+    pass "control bundle ships a sealed loom-private-control-v1 manifest"
+else
+    fail "control bundle manifest missing or not loom-private-control-v1: $CONTROL_MANIFEST"
+fi
+
+# The registration must name the IMAGE-OWNED bridge. A registration pointing
+# into the worker's own clone is the #8839 escalation: one `rm` disables it.
+EXPECTED_REGISTRATION="$CONTROL_ROOT/hooks/guard-codex-bridge.sh --project-root /workspace/repo --loom-hook-version 1"
+ACTUAL_REGISTRATION=$(echo "$CONTROL_MANIFEST" | jq -r '.registration // ""' 2>/dev/null)
+if [[ "$ACTUAL_REGISTRATION" == "$EXPECTED_REGISTRATION" ]]; then
+    pass "managed hook registration names the image-owned bridge"
+else
+    fail "registration is '$ACTUAL_REGISTRATION', expected '$EXPECTED_REGISTRATION'"
+fi
+
+# The manifest records the CLI observed at seal time, not a build argument —
+# so this assertion is what makes "0.149.1 is what the bundle was sealed
+# against" a fact about the image rather than a claim about the Dockerfile.
+SEALED_CLI=$(echo "$CONTROL_MANIFEST" | jq -r '.codex_cli // ""' 2>/dev/null)
+OBSERVED_CLI=$(docker exec "$CONTAINER_NAME" bash -lc 'codex --version' 2>&1 | tr -d '\r')
+if [[ -n "$SEALED_CLI" && "$SEALED_CLI" == "$OBSERVED_CLI" ]]; then
+    pass "control bundle was sealed against the Codex CLI this image ships: $SEALED_CLI"
+else
+    fail "sealed codex_cli '$SEALED_CLI' does not match the installed '$OBSERVED_CLI'"
+fi
+
+# The worker's own view of its boundary. `observe` re-derives every sealed
+# digest and PROVES non-writability by attempting real writes, so a `ready`
+# here is evidence, not a restatement of the image's file modes.
+CONTROL_REPORT=$(docker exec "$CONTAINER_NAME" loom-daemon private-workspace control 2>&1)
+if echo "$CONTROL_REPORT" | jq -e '.status == "ready" and (.identity | test("^[0-9a-f]{64}$"))' >/dev/null 2>&1; then
+    pass "loom-daemon private-workspace control reports a ready, bound boundary"
+else
+    fail "control boundary is not ready inside the shipped image: $CONTROL_REPORT"
+fi
+
+if docker exec "$CONTAINER_NAME" bash -lc "
+    ! (printf x > $CONTROL_ROOT/hooks/guard-codex-bridge.sh) 2>/dev/null \
+    && ! (rm -f $CONTROL_ROOT/hooks/guard-codex-bridge.sh) 2>/dev/null \
+    && ! (printf x > $CONTROL_ROOT/attack) 2>/dev/null \
+    && ! (printf x > $CONTROL_ROOT/scripts/attack) 2>/dev/null"; then
+    pass "uid 1000 cannot write, replace or delete anything in the control bundle"
+else
+    fail "the control bundle is writable by the session user — the boundary proves nothing"
+fi
+
+# `guard-destructive.sh` in the bundle must BE the vendored generic guard. The
+# dispatcher form prefers $LOOM_PROJECT_ROOT/.claude/skills/repo/hooks/…, a
+# worker-writable path — "switch to another guard" is one of the routes this
+# boundary exists to close.
+if docker exec "$CONTAINER_NAME" bash -lc "cmp -s $CONTROL_ROOT/hooks/guard-destructive.sh $CONTROL_ROOT/hooks/guard-destructive-generic.sh"; then
+    pass "bundled guard-destructive.sh is the vendored generic guard, not the dispatcher"
+else
+    fail "bundled guard-destructive.sh differs from guard-destructive-generic.sh"
+fi
+
+# 10. The #8839 regression itself, against the real guard code in this image and
+# a real Codex `pre_tool_use` event. Run twice, and BOTH halves matter: with the
+# worker's own `.loom/config.json` as the effective policy the force-push is
+# allowed (an allow is silence on this wire) — that is the reported escalation,
+# and without it this check would prove nothing; with the manifest's forced
+# policy applied to the hook's process the same call fails closed.
+PROBE_SCRIPT='
+set -u
+root=/tmp/loom-control-probe
+rm -rf "$root" && mkdir -p "$root/.loom" || exit 90
+git init -q -b main "$root" >/dev/null 2>&1 || exit 91
+printf "%s" "{\"guards\":{\"forceScope\":\"off\"}}" > "$root/.loom/config.json" || exit 92
+event="{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"shell\",\"tool_input\":{\"command\":[\"bash\",\"-lc\",\"git push --force origin HEAD:main\"],\"workdir\":\"$root\"},\"cwd\":\"$root\",\"session_id\":\"00000000-0000-0000-0000-00000000c0de\",\"tool_use_id\":\"probe\",\"turn_id\":\"probe\",\"model\":\"probe\",\"permission_mode\":\"auto\",\"transcript_path\":\"/dev/null\"}"
+bridge=CONTROL_ROOT_PLACEHOLDER/hooks/guard-codex-bridge.sh
+# The forced policy is read FROM THE SEALED MANIFEST, never restated here, so
+# this check cannot drift away from what the daemon actually applies.
+mapfile -t forced < <(jq -r ".policy | to_entries[] | \"\(.key)=\(.value)\"" CONTROL_ROOT_PLACEHOLDER/manifest.json)
+echo "--- WORKER_POLICY"
+printf "%s" "$event" | bash "$bridge" --project-root "$root" --loom-hook-version 1
+echo
+echo "--- FORCED_POLICY"
+printf "%s" "$event" | env "${forced[@]}" bash "$bridge" --project-root "$root" --loom-hook-version 1
+echo
+echo "--- END"
+'
+PROBE_OUT=$(docker exec "$CONTAINER_NAME" bash -lc "${PROBE_SCRIPT//CONTROL_ROOT_PLACEHOLDER/$CONTROL_ROOT}" 2>&1)
+WORKER_DECISION=$(echo "$PROBE_OUT" | sed -n '/--- WORKER_POLICY/,/--- FORCED_POLICY/p' | sed '1d;$d')
+FORCED_DECISION=$(echo "$PROBE_OUT" | sed -n '/--- FORCED_POLICY/,/--- END/p' | sed '1d;$d')
+
+if [[ -z "${WORKER_DECISION//[[:space:]]/}" ]]; then
+    pass "regression reproduced: worker-controlled guards.forceScope:off allows the force-push"
+else
+    fail "the #8839 escalation did not reproduce, so the check below proves nothing: $PROBE_OUT"
+fi
+
+if echo "$FORCED_DECISION" | jq -e '.hookSpecificOutput.hookEventName == "PreToolUse"
+        and .hookSpecificOutput.permissionDecision == "deny"
+        and (.hookSpecificOutput.permissionDecisionReason | length) > 0' >/dev/null 2>&1; then
+    pass "regression closed: the manifest's forced policy denies the same force-push"
+else
+    fail "force-push over a protected ref was not denied under the forced policy: $PROBE_OUT"
+fi
+
+# The deny must be expressible on THIS CLI's wire. Every key below is one the
+# shipped binary explicitly refuses (see the strings assertion next); emitting
+# any of them would turn a denial into a hook error, i.e. fail open.
+if echo "$FORCED_DECISION" | jq -e 'has("decision") or has("continue") or has("stopReason")
+        or has("suppressOutput") or (.hookSpecificOutput | has("updatedInput"))' >/dev/null 2>&1; then
+    fail "the deny payload carries a field this Codex engine refuses: $FORCED_DECISION"
+else
+    pass "deny payload is the deny-only shape this Codex engine accepts"
+fi
+
+# 11. The bridge pins its tested wire schema at 0.146.0 while this image pins a
+# newer CLI. "Newer than the floor" is not evidence, so assert the refusal set
+# the pin was derived from is still present in the binary this image ships — a
+# Codex bump that changes the wire fails HERE rather than in production.
+# `command -v codex` is npm's JS shim, and the package ships several large
+# vendored binaries (ripgrep, the code-mode host) beside the CLI itself — so
+# select the vendored `bin/codex` explicitly rather than "the first big file".
+CODEX_BIN=$(docker exec "$CONTAINER_NAME" bash -lc 'find /home/loom/.npm-global/lib/node_modules/@openai -type f -path "*/vendor/*/bin/codex" 2>/dev/null | head -1' | tr -d '\r')
+if [[ -z "$CODEX_BIN" ]]; then
+    fail "could not locate the shipped Codex binary to assert its hook wire contract"
+else
+    MISSING_WIRE=""
+    for marker in \
+        'PreToolUse hook returned unsupported permissionDecision:allow' \
+        'PreToolUse hook returned unsupported permissionDecision:ask' \
+        'PreToolUse hook returned unsupported decision:approve' \
+        'PreToolUse hook returned unsupported continue:false' \
+        'PreToolUse hook returned unsupported stopReason' \
+        'PreToolUse hook returned unsupported suppressOutput' \
+        'PreToolUse hook returned permissionDecision:deny without a non-empty permissionDecisionReason' \
+        'hooks.state."'; do
+        if ! docker exec "$CONTAINER_NAME" grep -qaF "$marker" "$CODEX_BIN"; then
+            MISSING_WIRE="$MISSING_WIRE
+  - $marker"
+        fi
+    done
+    if [[ -z "$MISSING_WIRE" ]]; then
+        pass "shipped Codex CLI still carries the pre_tool_use wire contract the bridge pins at $CODEX_MIN_VERSION"
+    else
+        fail "shipped Codex CLI no longer carries these pinned hook-protocol markers (re-establish the evidence in defaults/docs/private-control-bundle.md before bumping CODEX_VERSION):$MISSING_WIRE"
+    fi
+fi
+
 echo "== $FAILURES failure(s) =="
 exit $((FAILURES > 0 ? 1 : 0))

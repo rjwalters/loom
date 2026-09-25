@@ -23,6 +23,9 @@
  */
 
 import { el, field } from "../dom";
+import { forgeLink, repoUrl, sweepWorkTitle, sweepWorkUrl } from "../forgeLinks";
+import { accountProvider } from "../fleet";
+import { providerMark, sweepAgentMark } from "../providers";
 import {
   UNKNOWN,
   formatAbsolute,
@@ -39,8 +42,9 @@ import {
   secondsSince,
 } from "../format";
 import type { HostView } from "../fleet";
-import type { ActiveSweep, TokenAccount } from "../types";
+import type { ActiveComputeJob, ActiveSweep, TokenAccount } from "../types";
 import { protectionBadge, statusBadge } from "./fleetOverview";
+import { computeSubprocessList } from "./runningCompute";
 
 function noticeRow(message: string, testid: string): HTMLElement {
   return el("p", { class: "panel__notice", data: { testid } }, message);
@@ -58,6 +62,27 @@ function historyPlaceholder(): HTMLElement {
   );
 }
 
+/** Why this host has no `host.health` record to show. The default wording —
+ * "known only from its sweep activity" — is the sweep-only case it was
+ * written for, and would be a plainly wrong statement about a roster host
+ * with no sweeps at all, so the two roster states (#8804) say what the
+ * backend actually knows about them instead. */
+function healthMissingNotice(host: HostView): string {
+  if (host.status === "missing") {
+    return (
+      "This host is named by the fleet's expected-host roster and holds an active " +
+      "ingest key, but has never pushed a host.health record."
+    );
+  }
+  if (host.status === "unprovisioned") {
+    return (
+      "This host is named by the fleet's expected-host roster but has no active ingest " +
+      "key, so it cannot push telemetry yet — it has not been enrolled."
+    );
+  }
+  return "This host has not pushed a host.health record yet. It is known only from its sweep activity.";
+}
+
 function healthPanel(host: HostView, now: Date): HTMLElement {
   const timestamped = host.entry.health;
   if (!timestamped) {
@@ -65,11 +90,7 @@ function healthPanel(host: HostView, now: Date): HTMLElement {
       "section",
       { class: "panel", data: { testid: "health-panel" } },
       el("h2", { class: "panel__title" }, "Host health"),
-      noticeRow(
-        "This host has not pushed a host.health record yet. It is known only from " +
-          "its sweep activity.",
-        "health-missing",
-      ),
+      noticeRow(healthMissingNotice(host), "health-missing"),
     );
   }
 
@@ -141,6 +162,7 @@ function accountRow(account: TokenAccount, now: Date): HTMLElement {
       data: { testid: "token-account", account: account.account ?? "" },
     },
     el("td", {}, formatText(account.account)),
+    el("td", { class: "detail__account-provider" }, providerMark(accountProvider(account), true)),
     el("td", {}, account.rank === undefined ? UNKNOWN : String(account.rank)),
     el(
       "td",
@@ -245,6 +267,7 @@ function tokensPanel(host: HostView, now: Date): HTMLElement {
           "tr",
           {},
           el("th", {}, "Account"),
+          el("th", {}, "Provider"),
           el("th", {}, "Rank"),
           el("th", {}, "Usage"),
           el("th", {}, "Window resets"),
@@ -268,10 +291,27 @@ export function sweepRow(sweep: ActiveSweep, now: Date = new Date()): HTMLElemen
     el(
       "td",
       { title: sweep.sweepId },
-      sweep.issue === undefined ? sweep.sweepId : `#${sweep.issue}`,
+      // Same forge-link rule as the overview card: the `feature/issue-N`
+      // branch once Builder has pushed one, the issue itself before that.
+      forgeLink(
+        sweep.issue === undefined ? sweep.sweepId : `#${sweep.issue}`,
+        sweepWorkUrl(sweep.repo, sweep.issue, sweep.phase),
+        "detail__sweep-label",
+        sweepWorkTitle(sweep.issue, sweep.phase),
+      ),
     ),
-    el("td", {}, formatText(sweep.repo)),
+    el(
+      "td",
+      {},
+      sweep.repo ? forgeLink(sweep.repo, repoUrl(sweep.repo), "detail__sweep-repo") : formatText(sweep.repo),
+    ),
     el("td", {}, el("span", { class: "chip" }, sweep.phase ?? "starting")),
+    el(
+      "td",
+      { class: "detail__sweep-agent" },
+      // Resolved provider with the sweep runtime available in its tooltip.
+      sweepAgentMark(sweep, true) ?? UNKNOWN,
+    ),
     el("td", {}, formatText(sweep.model)),
     el("td", {}, formatText(sweep.effort)),
     el(
@@ -284,6 +324,43 @@ export function sweepRow(sweep: ActiveSweep, now: Date = new Date()): HTMLElemen
       { title: formatAbsolute(sweep.enteredPhaseAt) },
       inPhaseSec === undefined ? UNKNOWN : formatDuration(Math.max(0, inPhaseSec)),
     ),
+  );
+}
+
+/** Number of columns in the sweeps table — the span the nested subprocess row
+ * has to cover to sit flush under its sweep. Kept beside the `<thead>` it
+ * mirrors; a column added there without updating this leaves a visibly short
+ * row, which is why `sweepsPanel`'s header list and this constant are asserted
+ * against each other in `hostDetail.test.ts`. */
+const SWEEP_TABLE_COLUMNS = 8;
+
+/** The nested "subprocesses" row for one sweep (Issue #8835) — its live
+ * ephemeral-compute jobs, rendered as a full-width row immediately beneath the
+ * sweep's own row so the parent/child relationship survives in a flat `<table>`.
+ *
+ * `null` when the sweep has no live jobs, which is nearly every sweep: an
+ * ordinary sweep's table markup is unchanged by this feature. */
+export function sweepSubprocessRow(
+  sweep: ActiveSweep,
+  jobs: readonly ActiveComputeJob[],
+  now: Date = new Date(),
+): HTMLElement | null {
+  const list = computeSubprocessList(jobs, now);
+  if (!list) return null;
+  const cell = el(
+    "td",
+    { class: "detail__subprocesses" },
+    el("span", { class: "detail__subprocesses-label" }, "Compute"),
+    list,
+  );
+  cell.colSpan = SWEEP_TABLE_COLUMNS;
+  return el(
+    "tr",
+    {
+      class: "row row--subprocesses",
+      data: { testid: "sweep-subprocess-row", sweep: sweep.sweepId },
+    },
+    cell,
   );
 }
 
@@ -322,6 +399,7 @@ function sweepsPanel(host: HostView, now: Date): HTMLElement {
           el("th", {}, "Issue"),
           el("th", {}, "Repo"),
           el("th", {}, "Phase"),
+          el("th", {}, "Agent"),
           el("th", {}, "Model"),
           el("th", {}, "Effort"),
           el("th", {}, "Running"),
@@ -331,7 +409,12 @@ function sweepsPanel(host: HostView, now: Date): HTMLElement {
       el(
         "tbody",
         {},
-        host.sweeps.map((sweep) => sweepRow(sweep, now)),
+        // Each sweep contributes its own row plus, when it has live compute
+        // jobs, one nested subprocess row directly beneath it (#8835).
+        host.sweeps.map((sweep) => [
+          sweepRow(sweep, now),
+          sweepSubprocessRow(sweep, host.computeBySweep.get(sweep.sweepId) ?? [], now),
+        ]),
       ),
     ),
   );

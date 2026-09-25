@@ -12,6 +12,8 @@
 
 use std::path::Path;
 
+use super::report;
+
 /// The daemon's own verdict about its coordination path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -311,14 +313,51 @@ pub fn file(
 
 /// Record the filing so a later tick dedupes against it and recovery can close
 /// the exact issue: `<iso8601> <issue-ref>`, the shell's format.
-pub fn write_sentinel(sentinel: &Path, issue_ref: &str) {
+///
+/// #8649: a failed write here used to vanish via `let _ =` — the forge issue
+/// still got filed (that's a network call, not a disk write), but the
+/// sentinel that suppresses the NEXT tick's escalation never landed, so a
+/// still-ongoing degradation looked brand new every tick and refiled
+/// (#8646/#8647/#8648, one continuous episode filed three times under disk
+/// pressure). This now REPORTS the failure loudly via the same `Reporter`
+/// every other divergence in this watchdog uses, so an operator sees it in
+/// the log instead of only inferring it from duplicate issues.
+///
+/// Deliberately FAILS OPEN, same as before: the caller still treats the
+/// escalation as filed and moves on, rather than retrying or blocking on a
+/// write that may keep failing for as long as the underlying disk pressure
+/// does. A blocked escalation would trade "occasionally duplicated" for
+/// "occasionally silent", which is worse — the forge issue is the operator
+/// signal that matters, and it already landed. Fixing the disk pressure
+/// itself is out of scope (see the issue's "Suspected Cause").
+pub fn write_sentinel(sentinel: &Path, issue_ref: &str, reporter: &report::Reporter) {
     if let Some(dir) = sentinel.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            reporter.report(
+                report::Level::Warn,
+                &format!(
+                    "failed to create the parent directory for the peer-coordination sentinel \
+                     {} ({e}) — the sentinel write below will fail too, so the NEXT tick will \
+                     not see it and may re-escalate a still-ongoing degradation.",
+                    sentinel.display()
+                ),
+            );
+        }
     }
-    let _ = std::fs::write(
+    if let Err(e) = std::fs::write(
         sentinel,
         format!("{} {issue_ref}\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")),
-    );
+    ) {
+        reporter.report(
+            report::Level::Warn,
+            &format!(
+                "failed to write the peer-coordination sentinel {} for {issue_ref} ({e}) — the \
+                 forge issue was filed, but the NEXT tick cannot see this one and may treat the \
+                 still-ongoing degradation as new (#8649).",
+                sentinel.display()
+            ),
+        );
+    }
 }
 
 /// The issue reference a previous escalation recorded, if any.
@@ -349,6 +388,7 @@ pub fn dedup_comment(
     hostname: &str,
     summary: &str,
     flap: u64,
+    reporter: &report::Reporter,
 ) -> Option<String> {
     let window = dedup_window_secs();
     let gh = std::time::Duration::from_secs(60);
@@ -369,14 +409,36 @@ pub fn dedup_comment(
     reopen.args(["issue", "reopen", &cooldown.issue_ref]);
     let _ = crate::sweep_registry::output_with_timeout(reopen, gh);
 
-    write_sentinel(sentinel, &cooldown.issue_ref);
+    write_sentinel(sentinel, &cooldown.issue_ref, reporter);
+    // #8649: same fail-open-but-loud treatment as `write_sentinel` above — a
+    // failed cooldown-state write means the NEXT flap's `flap_count` resets to
+    // 1 instead of incrementing, which is a worse comment, not a worse
+    // decision (the sentinel above is what suppresses re-filing).
     if let Some(dir) = cooldown_state.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            reporter.report(
+                report::Level::Warn,
+                &format!(
+                    "failed to create the parent directory for the peer-coordination cooldown \
+                     state {} ({e}) — the write below will fail too.",
+                    cooldown_state.display()
+                ),
+            );
+        }
     }
-    let _ = std::fs::write(
+    if let Err(e) = std::fs::write(
         cooldown_state,
         format!("{} {} {flap}\n", cooldown.recovered_at, cooldown.issue_ref),
-    );
+    ) {
+        reporter.report(
+            report::Level::Warn,
+            &format!(
+                "failed to write the peer-coordination cooldown state {} ({e}) — the flap count \
+                 for this episode may under-report on the next repeat (#8649).",
+                cooldown_state.display()
+            ),
+        );
+    }
 
     Some(format!(
         "Repeat flap #{flap} within the {window}s dedup window (#7664) — commented on the \
@@ -459,6 +521,34 @@ mod tests {
             issue_ref: issue.to_string(),
             flap_count: flap,
         }
+    }
+
+    #[test]
+    fn a_failed_sentinel_write_is_reported_not_silently_eaten() {
+        // #8649: mirrors the `escalate.rs` test of the same name. The
+        // production trigger was a full disk, but a parent path that is a
+        // plain file reproduces the same `write` failure deterministically —
+        // both `create_dir_all` and the write itself fail, and the point is
+        // that the failure is REPORTED rather than dropped by `let _ =`.
+        let d = tempfile::tempdir().expect("tempdir");
+        let blocker = d.path().join("not-a-directory");
+        std::fs::write(&blocker, "x").expect("write blocker file");
+        let sentinel = blocker.join("sentinel");
+
+        let log = d.path().join("watchdog.log");
+        let reporter = report::Reporter::new(log.clone(), false);
+        write_sentinel(&sentinel, "1234", &reporter);
+
+        assert!(
+            !sentinel.exists(),
+            "the write must actually have failed for this test to prove anything"
+        );
+        let logged = std::fs::read_to_string(&log).expect("reporter must still have logged");
+        assert!(logged.contains("[WARN]"), "failure must be reported, not swallowed: {logged}");
+        assert!(
+            logged.contains("peer-coordination sentinel"),
+            "the report should name what failed: {logged}"
+        );
     }
 
     #[test]

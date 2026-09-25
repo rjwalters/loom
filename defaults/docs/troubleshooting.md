@@ -855,6 +855,53 @@ they find one — scoped to a symlink whose target resolves through a
 `loom-tools` path segment and no longer exists, so a same-named script you
 authored yourself is never touched. No manual action needed on either path.
 
+### Every merge blocked by the freshness guard on a private free-plan repo (#8844)
+
+**Symptom**: on a **private** repository owned by a GitHub Free account or
+org, every `merge-pr.sh` run stops at the #8248 required-check freshness
+guard, whatever the PR looks like:
+
+```
+Error: Merge blocked: PR #N's required-check freshness guard (#8248) could not run —
+'loom-daemon merge-pr stale-checks' exited 2 without the LOOM-STALE-CHECKS-CLEAN signal.
+[...]
+
+What it reported: Merge blocked: PR #N's required-check freshness guard (#8248) could not
+determine whether the green required checks predate the base tip — ruleset lookup failed:
+gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)
+```
+
+`merge-pr.sh` wraps the subcommand's own refusal under `What it reported:`
+(#8873); a host whose script predates that fix prints only the outer "could
+not run" paragraph, and you have to re-run the `gh api` call below to see
+which failure it was.
+
+No flag helps: `--allow-unapproved` overrides a missing review and
+`--redate-stale-checks` re-dates a stale check; neither is this condition.
+
+**Root cause**: rulesets and branch protection are paid features for private
+repositories. `GET /repos/{owner}/{repo}/rules/branches/{branch}` answers 403
+with that message, and the guard — correctly fail-closed on any lookup it
+cannot complete — refused every merge.
+
+**Fixed in `loom-daemon merge-pr stale-checks`**: that ONE message is now read
+as "this repository's plan has no rulesets, so nothing can be a *required*
+check", the lookup yields no required contexts, and the guard returns its
+`LOOM-STALE-CHECKS-CLEAN` sentinel while printing a `Warning:` on stderr
+naming the gated source. The match is on the message, never on the status
+code — a token missing a scope, SSO enforcement and a rate-limit refusal are
+all 403s too, and there required checks may genuinely exist. Every one of
+those still exits 2 and still refuses the merge.
+
+**If you still see a block here**, read the forge error quoted under `What it
+reported:`: it is a different failure (network, auth scope, rate limit, 404,
+5xx), and the refusal names it rather than telling you to rebuild a binary
+that ran fine (#8873 — the build/install remedy is offered only when the
+subcommand printed nothing at all, i.e. it is missing or too old). Fix the
+lookup — `gh api "repos/{owner}/{repo}/rules/branches/main"` reproduces it in
+one call — rather than reaching for a `LOOM_DAEMON_BIN` shim. And if the host's
+binary predates the fix, roll it (next section).
+
 ### `merge-pr.sh` refuses after a `git pull` — roll the daemon (#8285)
 
 **Symptom**: merges on ONE host stop dead, immediately after pulling `main`,
@@ -2737,12 +2784,13 @@ including mid-sweep, with zero risk to the live checkout:
 ./.loom/scripts/resync-installed.sh --output /tmp/loom-resync-staging
 cd /tmp/loom-resync-staging
 git checkout -b chore/resync-installed-$(date +%Y%m%d)
-# Never a bare `git add -A` here (#7818): `.loom/gh-config/` and
-# `.loom/gh-config-by-owner/` are the daemon-owned GH_CONFIG_DIR trees holding
-# live GitHub App installation tokens, and a bare add is exactly what swept one
-# into a public repo on 2026-08-23. The exclusions below are belt-and-braces —
-# loom-daemon's managed .gitignore block already covers both.
-git add -A -- . ':!.loom/gh-config' ':!.loom/gh-config-by-owner'
+# Never a bare `git add -A` here (#7818/#8005): the credential-bearing class
+# (post_init.rs CREDENTIAL_PATTERNS — token pool, account keys, harness auth,
+# GH_CONFIG_DIR trees) must never be staged, and a bare add is exactly what
+# swept a live installation token into a public repo on 2026-08-23. The
+# exclusions are belt-and-braces — the managed .gitignore block covers them too.
+git add -A -- . ':!.loom/claude-config' ':!.loom/tokens' ':!.loom/accounts.env' \
+  ':!.loom/api-keys' ':!.loom/gh-config' ':!.loom/gh-config-by-owner'
 git commit -m 'chore: resync installed Loom surfaces'
 git push -u origin HEAD   # open a PR from here
 cd - && git worktree remove /tmp/loom-resync-staging   # from the primary checkout when done
@@ -2751,8 +2799,8 @@ cd - && git worktree remove /tmp/loom-resync-staging   # from the primary checko
 Or skip the hand-rolled add entirely and let
 `./.loom/scripts/land-resync-commit.sh` stage and commit for you — it stages an
 explicit allowlist of resync-surface pathspecs (never `-A`), refuses to land if
-any unrelated dirt is present, and unconditionally excludes the two credential
-trees above even on a host whose `.gitignore` is stale.
+any unrelated dirt is present, and unconditionally excludes the credential class
+above even on a host whose `.gitignore` is stale.
 
 **If a credential path is already git-TRACKED, that same script stops instead
 (#8004).** Excluding it from one commit fixes nothing in that state: git applies

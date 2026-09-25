@@ -142,7 +142,13 @@ pub fn configure(
         );
     }
     super::guard::ready(root)?;
-    let binary = std::env::current_exe()?;
+    // #8707: the path every guarded `loom_*` tool call in the native session
+    // executes. A raw `current_exe()` yields the unlinked inode's ` (deleted)`
+    // path once `auto_update` stages a replacement, so a session admitted
+    // mid-roll would launch with a tool binary that does not exist — the
+    // backstop admitted but unusable. `daemon_bin_resolve` returns the same
+    // path in the ordinary case and the on-disk replacement mid-roll.
+    let binary = crate::daemon_bin_resolve::resolve_daemon_bin().map_err(anyhow::Error::msg)?;
     let state = state::prepare(root)?;
     state.configure(command, runtime)?;
     let directory = &state.directory;

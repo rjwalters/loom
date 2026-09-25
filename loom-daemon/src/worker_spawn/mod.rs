@@ -7,6 +7,7 @@ pub mod containment;
 // native tap's API-key pool is the wall, and must read the profile the launch
 // would actually use rather than re-deriving one.
 pub(crate) mod credential;
+pub mod egress_proxy;
 mod harness;
 pub mod launch_outcome;
 mod opencode_version;
@@ -132,6 +133,32 @@ impl LaunchError {
 }
 fn nonempty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Mirror only spawn-codex's model precedence. In particular, a prompt or
+/// config value that looks like `--model` is data, and `--` ends adapter flags.
+fn codex_adapter_model(args: &[std::ffi::OsString]) -> Option<String> {
+    let mut model = nonempty_env("LOOM_MODEL").or_else(|| nonempty_env("LOOM_CODEX_MODEL"));
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else { continue };
+        match arg {
+            "--" => break,
+            "-m" | "--model" => model = args.next().and_then(|s| s.to_str()).map(str::to_owned),
+            "-p" | "--prompt" | "--effort" | "-s" | "--sandbox" | "-c" | "--config" => {
+                args.next();
+            }
+            _ => {
+                if let Some(value) = arg
+                    .strip_prefix("--model=")
+                    .or_else(|| arg.strip_prefix("-m="))
+                {
+                    model = Some(value.to_owned());
+                }
+            }
+        }
+    }
+    model
 }
 
 /// Native sweep workers authenticate through their harness, not Claude's pool.
@@ -323,6 +350,13 @@ fn run_preflight(
                         .flat_map(|(source, target)| [source.as_str(), target.as_str()]),
                 )
                 .collect();
+            // #8674: with credential substitution on, the real credential is
+            // resolved HERE, on the host, and the container is given a
+            // per-launch placeholder plus a base URL pointing at a host-side
+            // proxy. `prepare` fails closed — it never silently reverts to
+            // forwarding the real value — and returns `None` only when the
+            // feature is off or the profile opts out.
+            let prepared = egress_proxy::prepare(root, &selection, &config)?;
             let mut command = containment::docker_command(
                 &profile,
                 root,
@@ -330,10 +364,18 @@ fn run_preflight(
                 options.log.as_deref(),
                 &args.args,
                 &credentials,
+                prepared.as_ref().map(|p| &p.injection),
             )?;
             let mut log = attach_log(&mut command, options.log.as_deref())?;
             writeln!(log, "{}", profile.dispatch_marker())
-                .and_then(|()| log.flush())
+                .map_err(|e| LaunchError::config(e.to_string()))?;
+            if let Some(prepared) = prepared {
+                writeln!(log, "{}", prepared.dispatch_marker())
+                    .and_then(|()| log.flush())
+                    .map_err(|e| LaunchError::config(e.to_string()))?;
+                return egress_proxy::run_with_proxy(prepared, command);
+            }
+            log.flush()
                 .map_err(|e| LaunchError::config(e.to_string()))?;
             return exec(command);
         }
@@ -398,6 +440,33 @@ fn run_preflight(
         command.args(&args.args);
         command
     };
+    let private_selection = if runtime == "codex"
+        && std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none()
+        && nonempty_env("LOOM_CODEX_NO_EXEC").is_none()
+    {
+        // Legacy adapters own their argv contract, including interactive and
+        // Codex-specific options. Read selection metadata without imposing the
+        // native harness parser's mandatory prompt or restricted flag list.
+        let model = codex_adapter_model(&args.args);
+        if let Some(role) = nonempty_env("LOOM_ROLE") {
+            crate::runtime_admission::resolve_and_admit(root, &role, Some("codex"))
+                .map_err(|e| LaunchError::config(e.diagnostic()))?;
+        }
+        crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
+            root,
+            &runtime,
+            model.as_deref(),
+            crate::tokens_pool::private_workspace::JobKind::Role,
+            None,
+            &format!("worker-{}", uuid::Uuid::new_v4()),
+        )
+        .map_err(|e| LaunchError::config(e.to_string()))?
+    } else {
+        None
+    };
+    if let Some(selection) = &private_selection {
+        selection.apply(&mut command);
+    }
     command.env("LOOM_RUNTIME", &runtime);
     // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
     // item 1). Cargo keys a crate's incremental session state by the crate's
@@ -506,4 +575,26 @@ pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
         std::process::exit(error.code);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod codex_adapter_tests {
+    #[test]
+    fn selection_reads_model_without_rejecting_legacy_arguments() {
+        for args in [
+            vec!["-m", "gpt-5", "--json"],
+            vec!["--model=gpt-5", "--unknown=literal"],
+            vec![
+                "--model", "old", "-m=gpt-5", "--prompt", "--model", "ignored",
+            ],
+            vec!["--model=gpt-5", "--config", "--model", "ignored"],
+            vec!["--model=gpt-5", "--", "--model=ignored"],
+        ] {
+            let args = args
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            assert_eq!(super::codex_adapter_model(&args).as_deref(), Some("gpt-5"));
+        }
+    }
 }
