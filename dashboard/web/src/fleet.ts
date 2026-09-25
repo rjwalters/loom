@@ -142,6 +142,16 @@ export interface HostView {
   lastReportAt: string | undefined;
   /** Seconds since `lastReportAt`, or `undefined`. */
   lastReportAgeSec: number | undefined;
+  /** This host's live ephemeral-compute jobs, keyed by the `sweepId` they
+   * were submitted from (Issue #8835) — the "subprocesses" each sweep row
+   * renders beneath itself. Only sweeps in `sweeps` appear as keys; a job
+   * whose sweep is not live on this host is not here (it stays in the
+   * fleet-level `FleetView.unattributedCompute` list instead).
+   *
+   * Empty for every host on a snapshot whose emitters do not stamp
+   * `sweepId`, which is what keeps a pre-#8835 fleet rendering exactly as
+   * before. */
+  computeBySweep: ReadonlyMap<string, ActiveComputeJob[]>;
 }
 
 export interface FleetView {
@@ -206,11 +216,31 @@ export interface FleetView {
    * `defaults/docs/observability.md` §5d), so grouping by it would pile every
    * instance in the world under a single card that has no `host.health` to
    * render beside them. The jobs are a fleet-level list of their own instead.
+   *
+   * Issue #8835 refines that without contradicting it: a job that names the
+   * sweep which submitted it (`sweepId`) *is* attributable, and renders nested
+   * under that sweep as well. This list stays the fleet-wide total either way
+   * — it is what the headline count and `leakedCompute` are derived from — and
+   * `unattributedCompute` is the subset the flat "running compute" table
+   * renders.
    */
   activeCompute: ActiveComputeJob[];
+  /** The subset of `activeCompute` that could **not** be nested under a live
+   * sweep (Issue #8835): no `sweepId` at all (an emitter predating the field,
+   * or a submission from outside any sweep), or a `sweepId` naming no sweep in
+   * `activeSweeps` (the sweep already finished, or its host stopped
+   * reporting).
+   *
+   * These are exactly the jobs with no other home on the page, so this — not
+   * `activeCompute` — is what the "running compute" table renders. An orphaned
+   * or leaked instance can therefore never be hidden by the nesting: if it has
+   * no live sweep to hide under, it is in this list. */
+  unattributedCompute: ActiveComputeJob[];
   /** How many of `activeCompute` the backend flagged as leaked — an instance
    * still billing with no completion record. The count the overview headline
-   * shows, so a leak is visible without scanning the list. */
+   * shows, so a leak is visible without scanning the list. Counted over the
+   * whole fleet, nested and unattributed alike (#8835), so nesting a job under
+   * its sweep can never quietly decrement the fleet's leak count. */
   leakedCompute: number;
 }
 
@@ -509,6 +539,7 @@ export function buildHostView(
   sweeps: ActiveSweep[],
   now: Date = new Date(),
   rosterState?: MissingHostState,
+  computeBySweep: ReadonlyMap<string, ActiveComputeJob[]> = new Map(),
 ): HostView {
   const tokens = summarizeTokens(entry);
   const lastReportAt = latestReport(entry);
@@ -545,7 +576,17 @@ export function buildHostView(
     }
   }
 
-  return { hostId, entry, sweeps, tokens, status, degradedReason, lastReportAt, lastReportAgeSec };
+  return {
+    hostId,
+    entry,
+    sweeps,
+    tokens,
+    status,
+    degradedReason,
+    lastReportAt,
+    lastReportAgeSec,
+    computeBySweep,
+  };
 }
 
 /** Sort: hosts needing attention first, then busiest, then by id so the list
@@ -563,6 +604,48 @@ const STATUS_ORDER: Record<HostStatus, number> = {
   unknown: 5,
   ok: 6,
 };
+
+/**
+ * Split live compute jobs into "nests under a live sweep" and "does not"
+ * (Issue #8835).
+ *
+ * **The join key is `sweepId` alone — never `hostId`.** A compute job's
+ * `hostId` is the *submitter's* ingest identity; the reference emitter is a
+ * hostless elastic batch runner authenticating as one synthetic id for its
+ * whole fleet, so it routinely differs from the host the submitting sweep runs
+ * on. Falling back to a `hostId` match would attribute a job to whatever
+ * sweeps happen to share that synthetic identity — i.e. confidently wrong,
+ * which is worse here than unattributed.
+ *
+ * **Nothing is dropped.** Every job lands in exactly one of the two outputs,
+ * so a job whose sweep is finished, never started, or simply never stamped —
+ * precisely the shape an orphaned, still-billing instance takes — is
+ * guaranteed to appear in the flat "running compute" list, leaked flag and
+ * all. That is the whole safety property of this function, and it is what its
+ * tests pin.
+ *
+ * `jobs` is expected pre-sorted (`sortComputeJobs`); both outputs preserve
+ * that order.
+ */
+export function attributeComputeJobs(
+  jobs: readonly ActiveComputeJob[],
+  sweeps: readonly ActiveSweep[],
+): { bySweep: Map<string, ActiveComputeJob[]>; unattributed: ActiveComputeJob[] } {
+  const liveSweepIds = new Set(sweeps.map((sweep) => sweep.sweepId));
+  const bySweep = new Map<string, ActiveComputeJob[]>();
+  const unattributed: ActiveComputeJob[] = [];
+  for (const job of jobs) {
+    const sweepId = job.sweepId;
+    if (sweepId === undefined || sweepId.length === 0 || !liveSweepIds.has(sweepId)) {
+      unattributed.push(job);
+      continue;
+    }
+    const list = bySweep.get(sweepId);
+    if (list) list.push(job);
+    else bySweep.set(sweepId, [job]);
+  }
+  return { bySweep, unattributed };
+}
 
 export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()): FleetView {
   const sweepsByHost = new Map<string, ActiveSweep[]>();
@@ -598,6 +681,16 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
     ...rosterStates.keys(),
   ]);
 
+  // `activeCompute` is absent on a snapshot parsed from a pre-#8305 backend
+  // and on any hand-built fixture that predates this field.
+  const activeCompute = sortComputeJobs(snapshot.activeCompute ?? []);
+  // Issue #8835: attribute each job to the sweep that submitted it, by
+  // `sweepId` alone. Unattributed jobs keep their fleet-level list.
+  const { bySweep: computeBySweep, unattributed: unattributedCompute } = attributeComputeJobs(
+    activeCompute,
+    snapshot.activeSweeps,
+  );
+
   const hosts = [...hostIds]
     .map((hostId) =>
       buildHostView(
@@ -606,6 +699,9 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
         sortSweeps(sweepsByHost.get(hostId) ?? []),
         now,
         rosterStates.get(hostId),
+        // Narrow the fleet-wide map to this host's own sweeps so a card never
+        // has to reason about a sweep it does not render.
+        hostComputeBySweep(computeBySweep, sweepsByHost.get(hostId) ?? []),
       ),
     )
     .sort(
@@ -614,10 +710,6 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
         b.sweeps.length - a.sweeps.length ||
         a.hostId.localeCompare(b.hostId),
     );
-
-  // `activeCompute` is absent on a snapshot parsed from a pre-#8305 backend
-  // and on any hand-built fixture that predates this field.
-  const activeCompute = sortComputeJobs(snapshot.activeCompute ?? []);
 
   return {
     hosts,
@@ -630,8 +722,24 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
     ).length,
     roleTicks: aggregateRoleTicks(hosts),
     activeCompute,
+    unattributedCompute,
     leakedCompute: activeCompute.filter((job) => job.leaked === true).length,
   };
+}
+
+/** The slice of the fleet-wide `sweepId → jobs` map belonging to one host's
+ * own sweeps (Issue #8835). Returns an empty map when this host has no sweep
+ * with nested jobs, which is the overwhelmingly common case. */
+function hostComputeBySweep(
+  bySweep: ReadonlyMap<string, ActiveComputeJob[]>,
+  sweeps: readonly ActiveSweep[],
+): ReadonlyMap<string, ActiveComputeJob[]> {
+  const scoped = new Map<string, ActiveComputeJob[]>();
+  for (const sweep of sweeps) {
+    const jobs = bySweep.get(sweep.sweepId);
+    if (jobs && jobs.length > 0) scoped.set(sweep.sweepId, jobs);
+  }
+  return scoped;
 }
 
 /** Leaked jobs first (they are the ones costing money with nobody watching),

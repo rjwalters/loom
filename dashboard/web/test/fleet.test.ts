@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   STALE_AFTER_SEC,
+  attributeComputeJobs,
   buildFleetView,
   buildHostView,
   degradedProviders,
@@ -33,6 +34,7 @@ import {
   persistentRoleTickFailureFixture,
   rosterMissingSnapshot,
 } from "./fixtures";
+import type { ActiveComputeJob } from "../src/types";
 
 const view = () => buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
 
@@ -706,5 +708,158 @@ describe("buildFleetView — missingHosts (#8804)", () => {
     for (const status of ["ok", "degraded", "stale", "unknown"] as const) {
       expect(isRosterMissingStatus(status)).toBe(false);
     }
+  });
+});
+
+/**
+ * Issue #8835 — joining live compute jobs to the sweep that submitted them.
+ *
+ * The load-bearing property here is not the nesting, it is the *partition*:
+ * every job lands in exactly one of `bySweep`/`unattributed`, so a job that
+ * cannot be attributed — the shape an orphaned, still-billing instance takes —
+ * is guaranteed to stay visible in the fleet-level "running compute" list.
+ */
+describe("attributeComputeJobs (#8835)", () => {
+  const sweep = (sweepId: string, hostId = "host-a") => ({
+    hostId,
+    sweepId,
+    startedAt: "2026-09-19T12:00:00Z",
+  });
+  const job = (jobId: string, overrides: Partial<ActiveComputeJob> = {}): ActiveComputeJob => ({
+    hostId: "2am-elastic",
+    jobId,
+    instanceType: "c7i.4xlarge",
+    spot: true,
+    startedAt: "2026-09-19T12:00:00Z",
+    ...overrides,
+  });
+
+  it("nests a job under the live sweep its sweepId names", () => {
+    const { bySweep, unattributed } = attributeComputeJobs(
+      [job("job-1", { sweepId: "sweep-issue-8835-1" })],
+      [sweep("sweep-issue-8835-1")],
+    );
+    expect(bySweep.get("sweep-issue-8835-1")?.map((entry) => entry.jobId)).toEqual(["job-1"]);
+    expect(unattributed).toEqual([]);
+  });
+
+  it("joins on sweepId ALONE — a matching hostId is not an attribution", () => {
+    // The submitter's `hostId` is its ingest identity (one synthetic id for a
+    // whole hostless elastic fleet), so a hostId match says nothing about
+    // which sweep is paying. Attributing on it would be confidently wrong.
+    const { bySweep, unattributed } = attributeComputeJobs(
+      [job("job-1", { hostId: "host-a" })],
+      [sweep("sweep-issue-8835-1", "host-a")],
+    );
+    expect(bySweep.size).toBe(0);
+    expect(unattributed.map((entry) => entry.jobId)).toEqual(["job-1"]);
+  });
+
+  it("leaves a job whose sweep is not live in the unattributed list", () => {
+    const { bySweep, unattributed } = attributeComputeJobs(
+      [job("job-gone", { sweepId: "sweep-finished-9" })],
+      [sweep("sweep-issue-8835-1")],
+    );
+    expect(bySweep.size).toBe(0);
+    expect(unattributed.map((entry) => entry.jobId)).toEqual(["job-gone"]);
+  });
+
+  it("leaves a job with no sweepId at all in the unattributed list", () => {
+    // A pre-#8835 emitter, or a submission from outside any sweep.
+    const { unattributed } = attributeComputeJobs(
+      [job("job-bare"), job("job-empty", { sweepId: "" })],
+      [sweep("sweep-issue-8835-1")],
+    );
+    expect(unattributed.map((entry) => entry.jobId)).toEqual(["job-bare", "job-empty"]);
+  });
+
+  it("partitions without dropping anything, and preserves the incoming order", () => {
+    const jobs = [
+      job("a", { sweepId: "s1" }),
+      job("b"),
+      job("c", { sweepId: "s1" }),
+      job("d", { sweepId: "s-dead" }),
+      job("e", { sweepId: "s2" }),
+    ];
+    const { bySweep, unattributed } = attributeComputeJobs(jobs, [sweep("s1"), sweep("s2")]);
+    expect(bySweep.get("s1")?.map((entry) => entry.jobId)).toEqual(["a", "c"]);
+    expect(bySweep.get("s2")?.map((entry) => entry.jobId)).toEqual(["e"]);
+    expect(unattributed.map((entry) => entry.jobId)).toEqual(["b", "d"]);
+    const total = [...bySweep.values()].reduce((sum, list) => sum + list.length, 0) + unattributed.length;
+    expect(total).toBe(jobs.length);
+  });
+});
+
+describe("buildFleetView — compute attribution (#8835)", () => {
+  const snapshot = (activeSweeps: unknown[], activeCompute: unknown[]) => ({
+    hosts: { "host-a": { health: { record: { kind: "host.health" }, updatedAt: NOW.toISOString() } } },
+    activeSweeps,
+    activeCompute,
+  });
+  const liveSweep = {
+    hostId: "host-a",
+    sweepId: "sweep-issue-8835-1",
+    issue: 8835,
+    phase: "builder",
+    startedAt: "2026-09-19T12:00:00Z",
+  };
+  const computeJob = {
+    hostId: "2am-elastic",
+    jobId: "job-1",
+    instanceType: "c7i.4xlarge",
+    spot: true,
+    startedAt: "2026-09-19T12:00:00Z",
+  };
+
+  it("hangs the job off its sweep's own host view, keyed by sweepId", () => {
+    const view = buildFleetView(
+      parseFleetSnapshot(snapshot([liveSweep], [{ ...computeJob, sweepId: liveSweep.sweepId }])),
+      NOW,
+    );
+    const host = findHost(view, "host-a")!;
+    expect([...host.computeBySweep.keys()]).toEqual([liveSweep.sweepId]);
+    expect(host.computeBySweep.get(liveSweep.sweepId)?.map((entry) => entry.jobId)).toEqual(["job-1"]);
+    // Nested, so not also listed flat.
+    expect(view.unattributedCompute).toEqual([]);
+    // …but still counted fleet-wide: nesting must not make the fleet look
+    // like it is running less compute than it is.
+    expect(view.activeCompute).toHaveLength(1);
+  });
+
+  it("keeps an unmatched job — and its leaked flag — in the flat running-compute list", () => {
+    const view = buildFleetView(
+      parseFleetSnapshot(
+        snapshot([liveSweep], [{ ...computeJob, sweepId: "sweep-long-finished", leaked: true }]),
+      ),
+      NOW,
+    );
+    expect(findHost(view, "host-a")!.computeBySweep.size).toBe(0);
+    expect(view.unattributedCompute.map((entry) => entry.jobId)).toEqual(["job-1"]);
+    expect(view.unattributedCompute[0]?.leaked).toBe(true);
+    expect(view.leakedCompute).toBe(1);
+  });
+
+  it("counts a nested leaked job in leakedCompute too, so nesting cannot hide a leak", () => {
+    const view = buildFleetView(
+      parseFleetSnapshot(snapshot([liveSweep], [{ ...computeJob, sweepId: liveSweep.sweepId, leaked: true }])),
+      NOW,
+    );
+    expect(view.leakedCompute).toBe(1);
+  });
+
+  it("retires the nested job when its completion record removes it from the snapshot", () => {
+    // The backend deletes the `compute:<jobId>` entry on the completion
+    // record (`../../src/fleetState.ts`), so "retired" reaches the UI as an
+    // absent entry — the sweep simply has no subprocesses again.
+    const view = buildFleetView(parseFleetSnapshot(snapshot([liveSweep], [])), NOW);
+    expect(findHost(view, "host-a")!.computeBySweep.size).toBe(0);
+    expect(view.activeCompute).toEqual([]);
+    expect(view.unattributedCompute).toEqual([]);
+  });
+
+  it("leaves every host's map empty on a snapshot whose emitters do not stamp sweepId", () => {
+    const view = buildFleetView(parseFleetSnapshot(snapshot([liveSweep], [computeJob])), NOW);
+    expect(view.hosts.every((host) => host.computeBySweep.size === 0)).toBe(true);
+    expect(view.unattributedCompute).toHaveLength(1);
   });
 });

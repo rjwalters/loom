@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  parseActiveComputeJob,
   parseFleetSnapshot,
   parseHostProtection,
   parseMissingHost,
@@ -467,5 +468,42 @@ describe("parseFleetSnapshot — missingHosts (#8804)", () => {
       missingHosts: [{ hostId: "h", state: "missing", expectedSince: "2026-09-01T00:00:00Z" }],
     });
     expect(snapshot.missingHosts).toEqual([{ hostId: "h", state: "missing" }]);
+  });
+});
+
+describe("parseActiveComputeJob — sweepId (#8835)", () => {
+  const base = { hostId: "2am-elastic", jobId: "job-abc123" };
+
+  it("carries the submitting sweep through, so the fleet view can join on it", () => {
+    expect(parseActiveComputeJob({ ...base, sweepId: "sweep-issue-8835-1" })).toEqual({
+      ...base,
+      sweepId: "sweep-issue-8835-1",
+    });
+  });
+
+  it("omits sweepId rather than dropping the job when it is absent or malformed", () => {
+    // A job submitted outside any sweep, or by an emitter predating #8835, is
+    // still a perfectly addressable job — it simply has no sweep to nest
+    // under. Dropping it here would hide a running (possibly leaked)
+    // instance, which is the one outcome this feature must never cause.
+    for (const bad of [undefined, null, 42, "", {}, []]) {
+      const parsed = parseActiveComputeJob({ ...base, sweepId: bad });
+      expect(parsed).toEqual(base);
+      expect(parsed && "sweepId" in parsed).toBe(false);
+    }
+  });
+
+  it("still requires hostId and jobId — sweepId alone does not make an entry addressable", () => {
+    expect(parseActiveComputeJob({ hostId: "2am-elastic", sweepId: "sweep-1" })).toBeUndefined();
+    expect(parseActiveComputeJob({ jobId: "job-1", sweepId: "sweep-1" })).toBeUndefined();
+  });
+
+  it("reaches the snapshot through parseFleetSnapshot's activeCompute list", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {},
+      activeSweeps: [],
+      activeCompute: [{ ...base, sweepId: "sweep-issue-8835-1" }],
+    });
+    expect(snapshot.activeCompute?.[0]?.sweepId).toBe("sweep-issue-8835-1");
   });
 });

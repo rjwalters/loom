@@ -32,7 +32,7 @@ import { providerDisplayName, providerMark, sweepAgentMark } from "../providers"
 import type { FleetView, HostStatus, HostView, ProviderSummary } from "../fleet";
 import type { HostHealthRecord, HostProtection, ManagedRepoEntry } from "../types";
 import { emptyFleetView } from "./states";
-import { runningComputeSection, type RunningComputeOptions } from "./runningCompute";
+import { computeSubprocessList, runningComputeSection, type RunningComputeOptions } from "./runningCompute";
 
 const STATUS_LABEL: Record<HostStatus, string> = {
   ok: "OK",
@@ -311,7 +311,7 @@ function writeIdleReposOpen(hostId: string, open: boolean): void {
  * Extracted so the roster-missing card (#8804) can show them too: a host that
  * never sent `host.health` can still have pushed `sweep.started` records, and
  * dropping that list would hide live work. */
-function sweepList(host: HostView): HTMLElement | null {
+function sweepList(host: HostView, now: Date = new Date()): HTMLElement | null {
   if (host.sweeps.length === 0) return null;
   return el(
     "ul",
@@ -339,6 +339,11 @@ function sweepList(host: HostView): HTMLElement | null {
           sweepWorkTitle(sweep.issue, sweep.phase),
         ),
         sweep.repo ? forgeLink(sweep.repo, repoUrl(sweep.repo), "card__sweep-repo") : null,
+        // Issue #8835: the sweep's live Spot/batch jobs, nested beneath it.
+        // `null` for the overwhelming majority of sweeps (no compute jobs, or
+        // an emitter that does not stamp `sweepId`), so an ordinary sweep's
+        // markup is byte-identical to what it was before this feature.
+        computeSubprocessList(host.computeBySweep.get(sweep.sweepId) ?? [], now),
       ),
     ),
   );
@@ -354,7 +359,11 @@ function sweepList(host: HostView): HTMLElement | null {
  * states distinguishable from each other, and both from a host that reported
  * and went quiet (`card--stale`).
  */
-function rosterHostCard(host: HostView, state: "missing" | "unprovisioned"): HTMLElement {
+function rosterHostCard(
+  host: HostView,
+  state: "missing" | "unprovisioned",
+  now: Date = new Date(),
+): HTMLElement {
   return el(
     "article",
     {
@@ -369,13 +378,13 @@ function rosterHostCard(host: HostView, state: "missing" | "unprovisioned"): HTM
     ),
     el("p", { class: "card__subtitle" }, ROSTER_SUBTITLE[state]),
     el("p", { class: "card__notice", data: { testid: "roster-state-detail" } }, ROSTER_DETAIL[state]),
-    sweepList(host),
+    sweepList(host, now),
   );
 }
 
 export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
   if (host.status === "missing" || host.status === "unprovisioned") {
-    return rosterHostCard(host, host.status);
+    return rosterHostCard(host, host.status, now);
   }
   const sweepCount = host.sweeps.length;
   const repos = managedRepos(host);
@@ -478,7 +487,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
         "Repositories this host's daemon manages (its workspace registry, whether idle or busy)",
       ),
     ),
-    sweepList(host),
+    sweepList(host, now),
     activeRepos.length > 0
       ? el(
           "ul",
@@ -539,7 +548,14 @@ export function fleetOverviewView(
   // and nothing else, so a fleet can legitimately have running instances and
   // zero reporting hosts. Short-circuiting to the "no hosts" empty state would
   // hide the one thing that *is* running — including a leak (#8306).
-  const compute = runningComputeSection(view.activeCompute, now, { authenticated });
+  //
+  // Fed `unattributedCompute`, not `activeCompute` (#8835): a job already
+  // nested under its own sweep's card entry does not also need a row here, but
+  // every job that could NOT be nested does — that is precisely the orphaned/
+  // leaked instance this panel exists to surface. The headline count below
+  // deliberately still uses `activeCompute` (the fleet-wide total), so nesting
+  // never makes the fleet look like it is running less compute than it is.
+  const compute = runningComputeSection(view.unattributedCompute, now, { authenticated });
 
   if (view.hosts.length === 0) {
     return compute

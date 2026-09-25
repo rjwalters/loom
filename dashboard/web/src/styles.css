@@ -330,6 +330,9 @@ a:hover {
 .card__sweep {
   display: flex;
   align-items: center;
+  /* Wraps so a sweep's nested `.subprocesses` list (#8835) lands on its own
+     line beneath the sweep rather than squeezing in beside it. */
+  flex-wrap: wrap;
   gap: 8px;
   padding: 2px 0;
   font-size: 13px;
@@ -843,6 +846,50 @@ a:hover {
 .compute-row--leaked .compute-row__age {
   color: var(--bad);
   font-weight: 600;
+}
+
+/* Nested compute "subprocesses" under a sweep (#8835) — the same markup on
+   the overview card and in the host-detail sweep table, so a job reads the
+   same wherever it is nested. Indented with a left rule rather than a bullet
+   so the parent/child relationship survives in a flat <table>, where real
+   nesting is not available. */
+.subprocesses {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0 0 0 10px;
+  border-left: 2px solid var(--border);
+  /* `.card__sweep` is a flex row; force the nested list onto its own line
+     under the sweep rather than beside it. */
+  flex-basis: 100%;
+  width: 100%;
+}
+.subprocess {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 1px 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.subprocess__shape {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+/* Same belt-and-braces as `.compute-row--leaked`: never colour alone — the
+   LEAKED badge and `data-leaked` carry the signal too. */
+.subprocess--leaked .subprocess__age {
+  color: var(--bad);
+  font-weight: 600;
+}
+.detail__subprocesses {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.detail__subprocesses-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .spend__header {
