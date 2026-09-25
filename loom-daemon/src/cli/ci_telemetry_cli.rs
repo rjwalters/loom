@@ -34,9 +34,14 @@ pub(crate) const EXIT_TEMPFAIL: i32 = 75;
 /// failed); 75 = skipped, must wait (busy lock, or org-wide rate-limit
 /// backoff).
 ///
+/// With `autonomous.ciTelemetry.logCaptureEnabled` (#8825) each completed
+/// job's full log is additionally captured as chunked `ci.job.log` records,
+/// capped per job by `logCaptureMaxBytes` (default 5 MiB) and redacted at the
+/// OTLP gateway, not here.
+///
 /// `status` reports ledger size, per-repo watermarks, records
-/// emitted/exported, and health: never-polled / ok (+age) / stale /
-/// failing (+last error).
+/// emitted/exported, log capture (done/pending/failed per repo, last fetch
+/// age), and health: never-polled / ok (+age) / stale / failing (+last error).
 ///
 /// The periodic daemon poller is `autonomous.ciTelemetry.enabled` (default
 /// false); `--once` runs regardless of that flag. See
@@ -150,6 +155,12 @@ fn status(root: &Path, json: bool) -> Result<()> {
     let cursor = export::load_cursor(root);
     let pending_export = export::pending_count(root);
     let gate = ci_telemetry::log_capture_gate(&resolved);
+    let log_counts = ledger.log_counts();
+    let log_counts_by_repo = ledger.log_counts_by_repo();
+    let last_log_failure = ledger.last_log_failure();
+    let last_log_fetch_age = poll_status
+        .last_log_fetch_at
+        .map(|at| (Utc::now() - at).num_seconds().max(0));
 
     let health_json = match &health {
         state::Health::NeverPolled => serde_json::json!({ "state": "never-polled" }),
@@ -177,7 +188,26 @@ fn status(root: &Path, json: bool) -> Result<()> {
             "org": resolved.org,
             "daemon_poller_enabled": resolved.enabled,
             "interval_secs": resolved.interval_secs,
-            "log_capture": gate.as_str(),
+            "log_capture": {
+                "state": gate.as_str(),
+                "max_bytes_per_job": resolved.log_capture_max_bytes,
+                "excluded_repos": resolved.log_capture_excluded_repos,
+                "done": log_counts.done,
+                "pending": log_counts.pending,
+                "failed": log_counts.failed,
+                "by_repo": log_counts_by_repo,
+                "last_fetch_at": poll_status.last_log_fetch_at,
+                "last_fetch_age_secs": last_log_fetch_age,
+                "last_failure": last_log_failure.as_ref().map(|(repo, job_id, attempts, error)| {
+                    serde_json::json!({
+                        "repo": repo,
+                        "job_id": job_id,
+                        "attempts": attempts,
+                        "error": error,
+                    })
+                }),
+                "chunks_emitted": counts.job_log_chunks,
+            },
             "excluded_repos": resolved.excluded_repos,
             "refused_exclusions": resolved.refused_exclusions,
             "health": health_json,
@@ -239,7 +269,34 @@ fn status(root: &Path, json: bool) -> Result<()> {
         },
         resolved.interval_secs
     );
-    println!("  log capture:    {}", gate.as_str());
+    if gate.is_on() {
+        println!(
+            "  log capture:    on (cap {} bytes/job) — {} job(s) done, {} pending, {} FAILED",
+            resolved.log_capture_max_bytes, log_counts.done, log_counts.pending, log_counts.failed
+        );
+        println!(
+            "  last log fetch: {}",
+            last_log_fetch_age
+                .map_or_else(|| "never on this host".to_string(), |age| format!("{age}s ago"),)
+        );
+        for (repo, counts) in &log_counts_by_repo {
+            println!(
+                "    {repo}: {} done, {} pending, {} failed",
+                counts.done, counts.pending, counts.failed
+            );
+        }
+        if let Some((repo, job_id, attempts, error)) = &last_log_failure {
+            println!("  last log error: {repo} job {job_id} after {attempts} attempt(s): {error}");
+        }
+        for exclusion in &resolved.log_capture_excluded_repos {
+            println!(
+                "  logs excluded:  {} — policy exception, reason: {} (records/metrics still captured)",
+                exclusion.repo, exclusion.reason
+            );
+        }
+    } else {
+        println!("  log capture:    off (autonomous.ciTelemetry.logCaptureEnabled=false)");
+    }
     for exclusion in &resolved.excluded_repos {
         println!(
             "  excluded:       {} — policy exception, reason: {}",
@@ -257,9 +314,10 @@ fn status(root: &Path, json: bool) -> Result<()> {
         ledger.path().display()
     );
     println!(
-        "  emitted:        {} run(s), {} job(s) in {}",
+        "  emitted:        {} run(s), {} job(s), {} log chunk(s) in {}",
         counts.runs,
         counts.jobs,
+        counts.job_log_chunks,
         ci_telemetry::journal_path(root).display()
     );
     println!(

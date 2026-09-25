@@ -62,7 +62,7 @@ pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod trace;
 pub mod visibility;
-pub use ci::{CiDurationRecord, CiJobRecord, CiRunRecord};
+pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use envelope::TelemetryEnvelope;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
@@ -299,6 +299,11 @@ pub enum TelemetryRecord {
     /// `loom.ci.{run,job}.duration_ms` histograms (Issue #8824).
     #[serde(rename = "ci.duration")]
     CiDuration(CiDurationRecord),
+    /// One ≤ 8 KiB chunk of a completed job's log text (Issue #8825). The
+    /// only kind carrying free text the daemon did not author — see
+    /// [`CiJobLogRecord`] for why the gateway, not the source, scrubs it.
+    #[serde(rename = "ci.job.log")]
+    CiJobLog(CiJobLogRecord),
 }
 
 /// A sweep's terminal result. `#[serde(default)]`-friendly variants are not

@@ -20,6 +20,22 @@ pub struct CycleSummary {
     pub requests: usize,
     #[serde(default)]
     pub repo_errors: usize,
+    /// Jobs whose logs were captured this cycle (#8825).
+    #[serde(default)]
+    pub logs_captured: usize,
+    /// `ci.job.log` chunk records emitted this cycle.
+    #[serde(default)]
+    pub job_logs_emitted: usize,
+    /// Jobs whose logs hit the per-job cap and were emitted truncated.
+    #[serde(default)]
+    pub logs_truncated: usize,
+    /// Log downloads that failed this cycle (each retried next cycle, up to
+    /// `logs::MAX_ATTEMPTS`).
+    #[serde(default)]
+    pub log_failures: usize,
+    /// Wanted job logs left for the next cycle by the per-cycle download cap.
+    #[serde(default)]
+    pub logs_deferred: usize,
 }
 
 /// `status.json` — every field needed to tell never-polled / ok / stale /
@@ -43,6 +59,12 @@ pub struct PollStatus {
     pub backoff_until: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cycle: Option<CycleSummary>,
+    /// When a job log was last successfully downloaded (#8825). Distinct from
+    /// `last_ok_at`: a poller can be cycling happily while log capture has
+    /// been stuck for hours, and silence there must not read as healthy
+    /// either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_log_fetch_at: Option<DateTime<Utc>>,
 }
 
 fn status_path(dir: &Path) -> PathBuf {

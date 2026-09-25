@@ -19,6 +19,8 @@ use super::records::envelope_identity;
 pub struct JournalCounts {
     pub runs: usize,
     pub jobs: usize,
+    /// `ci.job.log` chunk records (#8825).
+    pub job_log_chunks: usize,
     pub envelopes: usize,
 }
 
@@ -86,6 +88,7 @@ impl Journal {
             match env.record {
                 TelemetryRecord::CiRun(_) => counts.runs += 1,
                 TelemetryRecord::CiJob(_) => counts.jobs += 1,
+                TelemetryRecord::CiJobLog(_) => counts.job_log_chunks += 1,
                 _ => {}
             }
         }

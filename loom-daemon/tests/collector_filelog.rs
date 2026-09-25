@@ -355,6 +355,36 @@ fn filelog_retain_lists_and_privacy_allowlist_stay_within_the_reviewed_key_set()
         CONFIG.contains("\"loom.session_id\", \"loom.agent_id\", \"loom.parent_agent_id\""),
         "transform/privacy's log keep_keys must list the three new #8669 keys"
     );
+
+    // #8825: `ci.job.log` is the ONE reviewed exception to "no record kind's
+    // body reaches this collector as free text". It is named here on purpose
+    // — this test is the place a reviewer looks for the reviewed set, so an
+    // exception that is not listed here is not reviewed.
+    const BODY_EXCEPTION_KINDS: [&str; 1] = ["ci.job.log"];
+    let body_rewrites: Vec<&str> = CONFIG
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("replace_pattern(body,") || line.contains("set(body,"))
+        .collect();
+    assert!(
+        !body_rewrites.is_empty(),
+        "the #8825 ci.job.log scrub stage disappeared from the collector config"
+    );
+    for line in &body_rewrites {
+        assert!(
+            line.contains("attributes[\"loom.ci.chunk_index\"] != nil"),
+            "a body rewrite is not scoped to {BODY_EXCEPTION_KINDS:?}: {line}"
+        );
+    }
+    // Every filelog receiver must still clear its own body: the scrub stage
+    // is scoped to ci.job.log, so it is no substitute for `remove: body`.
+    assert_eq!(
+        CONFIG
+            .matches("- type: remove\n        field: body")
+            .count(),
+        3,
+        "each of the three filelog receivers must still clear its parsed body"
+    );
 }
 
 /// Static contract for #8686's host-side wiring (no Docker — this pins the

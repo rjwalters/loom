@@ -1,5 +1,17 @@
 {
- "_comment": "Recorded-shape GitHub REST fixture for loom-daemon ci_telemetry tests (#8824): a synthetic org with 2 active repos x 3 completed runs x 4 jobs, plus one archived repo that must never be polled. Keys are request paths with the `created` watermark query parameter removed; `next` mirrors the Link rel=next header. Run k of each repo lasts k*60s; job j lasts j*10s.",
+ "_comment": "Recorded-shape GitHub REST fixture for loom-daemon ci_telemetry tests (#8824): a synthetic org with 2 active repos x 3 completed runs x 4 jobs, plus one archived repo that must never be polled. Keys are request paths with the `created` watermark query parameter removed; `next` mirrors the Link rel=next header. Run k of each repo lasts k*60s; job j lasts j*10s. Job logs (#8825) live under `job_logs`, keyed by the same request path shape: `text` is served verbatim (BOM included, exactly as GitHub's text/plain job-log response arrives), `repeat` builds a large log without committing megabytes, and `status` forces a failure. A job with no entry gets a one-line synthesized log. Neither credential-shaped string below is real: they exist to prove the daemon forwards what GitHub sent, because the gateway is the redaction boundary.",
+ "job_logs": {
+  "repos/fixture-org/alpha/actions/jobs/10011/logs": {
+   "text": "﻿2026-09-20T09:00:10.1000000Z Current runner version: '2.337.0'\n2026-09-20T09:00:10.2000000Z ##[group]Run actions/checkout@v7\n2026-09-20T09:00:11.0000000Z   with:\n2026-09-20T09:00:11.1000000Z     token: ghp_FIXTUREAAAAAAAAAAAAAAAAAAAAAAAAAAA\n2026-09-20T09:00:11.2000000Z ##[endgroup]\n2026-09-20T09:00:12.0000000Z ##[group]Run cargo test --workspace\n2026-09-20T09:00:40.0000000Z test result: ok. 412 passed; 0 failed\n2026-09-20T09:00:41.0000000Z ##[error]Process completed with exit code 1.\n"
+  },
+  "repos/fixture-org/alpha/actions/jobs/10012/logs": {
+   "count": 400,
+   "repeat": "2026-09-20T09:00:20.0000000Z compiling crate number {n} of many\n"
+  },
+  "repos/fixture-org/alpha/actions/jobs/10013/logs": {
+   "status": 410
+  }
+ },
  "responses": {
   "orgs/fixture-org/repos?per_page=100&type=all": {
    "body": [

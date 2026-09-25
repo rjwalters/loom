@@ -362,6 +362,9 @@ pub fn envelope_identity(env: &TelemetryEnvelope) -> Option<String> {
             Some(format!("ci.run|{}|{}|{}", r.repo, r.run_id, r.run_attempt))
         }
         TelemetryRecord::CiJob(r) => Some(format!("ci.job|{}|{}", r.repo, r.job_id)),
+        TelemetryRecord::CiJobLog(r) => {
+            Some(format!("ci.job.log|{}|{}|{}", r.repo, r.job_id, r.chunk_index))
+        }
         TelemetryRecord::CiDuration(r) => Some(format!(
             "ci.duration|{}|{}|{}|{}",
             r.repo,
