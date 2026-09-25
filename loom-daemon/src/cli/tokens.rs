@@ -561,6 +561,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             method,
             expected_head_sha,
         },
+        ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
     };
     dispatch(cmd)
 }
