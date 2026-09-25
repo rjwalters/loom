@@ -313,6 +313,7 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
         container_id: "old".into(),
         base_revision: "abc".into(),
         host_pid: 999_999,
+        control: "d".repeat(64),
     };
     lease.begin(&job).unwrap();
     drop(lease);

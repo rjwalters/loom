@@ -307,6 +307,32 @@ pub(super) fn setup(config: &Config) -> Result<()> {
     }
 }
 
+/// Take the worker's own observation of the control boundary. Addressed by the
+/// container's immutable ID, never by its mutable Docker name: the boundary is
+/// bound to one container identity, and a rename between the identity check and
+/// this probe must not let a different worker answer for it.
+fn observe_control(id: &str) -> Result<bundle::Report> {
+    let output = command(&["exec", id, "loom-daemon", "private-workspace", "control"])
+        .context("private control endpoint unavailable; use a session image that ships the versioned control bundle")?;
+    serde_json::from_str(&output)
+        .context("private control endpoint is not the supported protocol; update the session image")
+}
+
+/// Verify the session's versioned control boundary and return the identity to
+/// bind to the account lease. Every claim in the report is re-derived inside
+/// the container from the image-owned bundle, and its view of the account
+/// profile is cross-checked here against the host's own read of the canonical
+/// profile — a container label or environment variable would prove nothing
+/// about either.
+pub(super) fn control(config: &Config, id: &str) -> Result<String> {
+    bundle::accept(&observe_control(id)?, &config.profile)
+}
+
+/// Recheck a bound control identity immediately before mutable work.
+pub(super) fn recheck_control(config: &Config, id: &str, bound: &str) -> Result<()> {
+    bundle::rebind(&observe_control(id)?, &config.profile, bound)
+}
+
 pub(super) fn prepare(config: &Config, id: &str, branch: Option<&str>) -> Result<String> {
     let mut args = vec!["exec", "--workdir", ROOT];
     // `--env NAME` copies the host process's value directly; secrets never
