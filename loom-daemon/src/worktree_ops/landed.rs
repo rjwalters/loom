@@ -220,7 +220,7 @@ fn rest_rows_to_probe(rows: Vec<RestPr>) -> Option<ForgeProbe> {
             _ => any_definitive = true,
         }
     }
-    any_definitive.then(|| ForgeProbe {
+    any_definitive.then_some(ForgeProbe {
         status: ForgeStatus::NotFound,
         head_sha: None,
         number: None,
