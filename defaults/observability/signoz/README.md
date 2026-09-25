@@ -102,9 +102,33 @@ The explicit `opamp.yaml` override is required: this pinned Foundry render
 otherwise selected PostgreSQL's hostname for the app's port 4320. Verify that
 regeneration retains the correct app endpoint, not just valid YAML.
 Inspect `docker compose ... logs` for the failing service, with credentials and
-workload content removed before sharing. Register the first local user at
-<http://localhost:18081>. Account passwords/session tokens are distinct from
-ingestion credentials. The ingester has no public host port.
+workload content removed before sharing. Account passwords/session tokens are
+distinct from ingestion credentials. The ingester has no public host port.
+
+### Register the first user *before* expecting ingestion
+
+**Compose readiness does not mean the receiver is open.** On a fresh deployment,
+`up -d --wait` reports every service healthy — the ingester included — while its
+OTLP receivers are still closed. The ingester's OpAMP client cannot register
+until an organization exists, so the app rejects it every 30s with
+`cannot create agent without orgId`, and it never applies the effective config
+that binds 4317/4318. Traffic sent in this window is refused at TCP connect
+(`connect: connection refused`), so it is **not** visible anywhere in SigNoz;
+only the neutral gateway's own `otelcol_exporter_*` series show it. Register the
+first local user at <http://localhost:18081>, or `POST /api/v1/register` with
+`{name, orgName, email, password}` (passwords must be 12+ characters with upper,
+lower, digit and symbol). Confirm, and only then send telemetry:
+
+```console
+curl --fail http://127.0.0.1:18081/api/v1/version   # expect "setupCompleted":true
+```
+
+This gate is **first-run only**: once the organization exists it survives
+restarts, and the ingester re-registers with no further errors. It is also
+recoverable rather than lossy — the gateway's sending queue holds the refused
+batches and drains them intact once the receiver opens, so registering late
+costs latency, not data. Treat `setupCompleted` as the real ingestion-readiness
+signal; a container-running or Compose-healthy result is not one.
 
 Keep deployment copies and volumes outside Loom-managed worktrees for a running
 trial: those worktrees are removed on merge. Copy the complete rendered directory

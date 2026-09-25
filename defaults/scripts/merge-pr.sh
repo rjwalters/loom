@@ -524,7 +524,16 @@ done
 # decline -- gitea repo-settings probing isn't native yet) degrades to the
 # unvalidated request as-is, same as this script's pre-#8845 posture toward
 # an unverifiable input, with a warning so the gap is visible rather than silent.
-if [[ -n "$MERGE_METHOD_REQUESTED" ]]; then if command -v loom-daemon &>/dev/null; then _MPM_RC=0; _MPM_OUT="$(loom-daemon forge merge-method --repo "$REPO_NWO" --requested "$MERGE_METHOD_REQUESTED" 2>&1)" || _MPM_RC=$?; if [[ $_MPM_RC -eq 0 ]]; then REPO_MERGE_METHOD="$_MPM_OUT"; elif [[ $_MPM_RC -eq 1 ]]; then error "Merge blocked: $_MPM_OUT"; else warning "loom-daemon forge merge-method could not validate --merge-method $MERGE_METHOD_REQUESTED (exit $_MPM_RC: $_MPM_OUT); using it unvalidated"; REPO_MERGE_METHOD="$MERGE_METHOD_REQUESTED"; fi; else warning "loom-daemon not found; using --merge-method $MERGE_METHOD_REQUESTED unvalidated"; REPO_MERGE_METHOD="$MERGE_METHOD_REQUESTED"; fi; fi
+# #8878: the binary probed and invoked is LOOM_DAEMON_BIN when set (as
+# _check_required_check_freshness already does) -- that override is exactly what
+# _mp_daemon_roll_hint tells operators to export when no released daemon carries
+# `forge merge-method` yet, so probing PATH's older binary instead threw away the
+# validation they had just built and degraded to the unvalidated path anyway.
+# The expansion is repeated inline rather than hoisted into a variable on this
+# same line: check-daemon-subcommand-versions.sh only registers a binary-holding
+# variable from a LINE-LEADING assignment, so a mid-line one would make the
+# requires-daemon marker below read as stale (verified -- it fires).
+if [[ -n "$MERGE_METHOD_REQUESTED" ]]; then if command -v "${LOOM_DAEMON_BIN:-loom-daemon}" &>/dev/null; then _MPM_RC=0; _MPM_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge merge-method --repo "$REPO_NWO" --requested "$MERGE_METHOD_REQUESTED" 2>&1)" || _MPM_RC=$?; if [[ $_MPM_RC -eq 0 ]]; then REPO_MERGE_METHOD="$_MPM_OUT"; elif [[ $_MPM_RC -eq 1 ]]; then error "Merge blocked: $_MPM_OUT"; else warning "'${LOOM_DAEMON_BIN:-loom-daemon}' forge merge-method could not validate --merge-method $MERGE_METHOD_REQUESTED (exit $_MPM_RC: $_MPM_OUT); using it unvalidated"; REPO_MERGE_METHOD="$MERGE_METHOD_REQUESTED"; fi; else warning "loom-daemon not found ('${LOOM_DAEMON_BIN:-loom-daemon}'); using --merge-method $MERGE_METHOD_REQUESTED unvalidated"; REPO_MERGE_METHOD="$MERGE_METHOD_REQUESTED"; fi; fi
 
 # Validate --worktree-path early (before any network calls) so bad input
 # fails fast. The path must be a real directory and must appear in the
@@ -1336,7 +1345,22 @@ _check_partial_increment_close_conflict() {
 
   local partial_refs
   partial_refs="$(_partial_increment_refs "$pr_body")"
-  [[ -n "$partial_refs" ]] || return 0
+
+  # Backticked-trailer warning (#5690, ported to Rust #8831 —
+  # cli/merge_pr_refs.rs's `backticks-partial-increment-warnings`, which
+  # recomputes both declaration sets from $pr_body itself and diffs them, so
+  # this call passes nothing but the PR number and dry-run state). Runs BEFORE
+  # the early return below because the case it exists for is precisely the one
+  # where $partial_refs is EMPTY — a trailer the author backticked, which
+  # parses as no declaration at all. Pure text analysis, no forge calls, so
+  # the common (non-partial-increment) path still costs zero extra requests.
+  # (The three statements below share one line deliberately — #8831 pays for
+  # the daemon round trip inside the shell-budget ratchet's portable pool, and
+  # this keeps that cost at net zero. The unquoted $(...) is intentional: it
+  # expands to a single `--dry-run` token or nothing, never anything word
+  # splitting could mis-tokenize.)
+  # shellcheck disable=SC2046
+  local bt_warn="$(printf '%s\n' "$pr_body" | _mp_refs backticks-partial-increment-warnings --pr "$PR_NUMBER" $([[ "${DRY_RUN:-false}" == "true" ]] && echo --dry-run))"; [[ -z "$bt_warn" ]] || warning "$bt_warn"; [[ -n "$partial_refs" ]] || return 0
 
   # Closing references GitHub will honor on merge, from three unioned signals:
   #   1. the body's own closing keywords (quota-free regex);

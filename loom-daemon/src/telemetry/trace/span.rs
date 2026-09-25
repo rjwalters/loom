@@ -20,6 +20,12 @@ pub enum SpanName {
     RuntimeRun,
     #[serde(rename = "loom.tool")]
     Tool,
+    /// One GitHub Actions workflow run (Issue #8824) — the root of a CI trace.
+    #[serde(rename = "loom.ci.run")]
+    CiRun,
+    /// One job of a GitHub Actions run, parented to its [`Self::CiRun`] span.
+    #[serde(rename = "loom.ci.job")]
+    CiJob,
 }
 
 impl SpanName {
@@ -32,6 +38,8 @@ impl SpanName {
             Self::RuntimePreflight => "loom.runtime.preflight",
             Self::RuntimeRun => "loom.runtime.run",
             Self::Tool => "loom.tool",
+            Self::CiRun => "loom.ci.run",
+            Self::CiJob => "loom.ci.job",
         }
     }
 }
@@ -81,7 +89,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
     attributes
         .iter()
         .filter(|(key, value)| {
-            matches!(
+            (matches!(
                 key.as_str(),
                 "loom.repo"
                     | "loom.repo.visibility"
@@ -103,7 +111,8 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.recovered"
                     | "loom.timing_source"
                     | "loom.tool.name"
-            ) && value.len() <= 256
+            ) || crate::telemetry::ci::CI_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()))
+                && value.len() <= 256
                 && !value.chars().any(char::is_control)
         })
         .map(|(key, value)| (key.clone(), value.clone()))

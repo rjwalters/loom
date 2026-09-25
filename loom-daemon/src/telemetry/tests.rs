@@ -6,6 +6,7 @@
 use super::*;
 
 mod admission_brake;
+mod complexity;
 mod daemon_event;
 mod fleet_captain;
 mod host_health_omissions;
@@ -120,6 +121,7 @@ fn sweep_outcome() -> TelemetryRecord {
         runtime: Some("opencode".to_string()),
         provider: Some("friendli".to_string()),
         profile: Some("zai-flash".to_string()),
+        complexity: Some("routine".to_string()),
     })
 }
 
@@ -250,6 +252,7 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         runtime: None,
         provider: None,
         profile: None,
+        complexity: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for field in [
@@ -262,6 +265,7 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         "runtime",
         "provider",
         "profile",
+        "complexity",
     ] {
         assert!(
             value.get(field).is_none(),
@@ -367,8 +371,10 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         runtime: None,
         provider: None,
         profile: None,
+        complexity: Some("complex".to_string()),
     };
     let value = serde_json::to_value(&record).unwrap();
+    assert_eq!(value["complexity"], "complex");
     assert_eq!(value["failure_class"], "account-exhausted:model-credits-exhausted");
     assert_eq!(value["models_used"][1], "claude-sonnet-5");
     assert_eq!(value["doctor_cycles"], 2);
@@ -413,6 +419,7 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         runtime: None,
         provider: None,
         profile: None,
+        complexity: None,
     };
 
     let unobserved = serde_json::to_value(&base).unwrap();
@@ -421,6 +428,7 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         "models_used",
         "doctor_cycles",
         "judge_verdicts",
+        "complexity",
     ] {
         assert!(
             unobserved.get(field).is_none(),
@@ -478,10 +486,15 @@ fn sweep_outcome_from_a_pre_8056_daemon_still_decodes() {
             assert_eq!(r.models_used, None);
             assert_eq!(r.doctor_cycles, None);
             assert_eq!(r.judge_verdicts, None);
+            assert_eq!(r.complexity, None);
         }
         other => panic!("expected SweepOutcome, got {other:?}"),
     }
 }
+
+// sweep.outcome Curator complexity tier (Issue #8542): see
+// `tests/complexity.rs` — extracted to a sibling module to stay inside the
+// file-size ratchet.
 
 // ------------------------------------------------------------------
 // sweep.completed per-model token usage (Issue #6384): additive,

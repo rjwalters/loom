@@ -115,6 +115,205 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// Every route a worker has to a file in a directory it owns, tried against
+/// each of the profile's control files in turn. On a read-only **mount point**
+/// all of them fail — writes with `EROFS`, unlink and rename with `EBUSY` —
+/// while the directory around them stays writable, which is what keeps the
+/// canonical atomic `auth.json` refresh working. `ESCALATED` on stdout, or a
+/// nonzero exit, means the protection did not hold.
+const FREEZE_PROBE: &str = r#"
+set -u
+escalated() { echo "ESCALATED: $1"; exit 1; }
+for control in hooks.json config.toml loom-codex-hooks.json; do
+    path="$CODEX_HOME/$control"
+    test -f "$path" || escalated "$control is absent"
+    printf attack > "$path" 2>/dev/null && escalated "wrote $control"
+    chmod 666 "$path" 2>/dev/null && escalated "chmod $control"
+    rm -f "$path" 2>/dev/null && escalated "removed $control"
+    mv "$path" "$path.stolen" 2>/dev/null && escalated "renamed $control away"
+    printf attack > "$CODEX_HOME/decoy" || escalated "profile directory is not writable"
+    mv "$CODEX_HOME/decoy" "$path" 2>/dev/null && escalated "renamed over $control"
+    rm -f "$CODEX_HOME/decoy"
+    ln -sf /dev/null "$path" 2>/dev/null && escalated "symlinked over $control"
+    ln -f "$CODEX_HOME/auth.json" "$path" 2>/dev/null && escalated "hardlinked over $control"
+done
+printf 'refreshed-synthetic\n' > "$CODEX_HOME/auth.json.tmp" \
+    && mv "$CODEX_HOME/auth.json.tmp" "$CODEX_HOME/auth.json" \
+    || escalated "the canonical atomic auth refresh stopped working"
+echo FROZEN
+"#;
+
+/// The demonstrated escalation this increment closes, stated as the worker
+/// would: remove the registration the engine reads, and every later turn of
+/// this session runs unhooked no matter what any earlier check proved.
+#[test]
+#[ignore = "requires Docker; explicitly run by CI"]
+fn profile_control_files_are_frozen_by_mount_and_an_unprotected_session_is_refused() {
+    let f = Fixture::with_adapters(true);
+    let name = &f.names[0];
+    f.start(name);
+    let profile = f.root.path().join("profiles").join(name);
+
+    // The registration exists, names the image-owned bridge, and the boundary
+    // reports the whole thing ready and bound.
+    let report: Value =
+        serde_json::from_str(&f.exec(name, "loom-daemon private-workspace control")).unwrap();
+    assert_eq!(report["status"], "ready", "{report}");
+    assert_eq!(report["control_version"], bundle::CONTROL_VERSION);
+    let registered = f.exec(
+        name,
+        "jq -r '[.hooks.PreToolUse[].hooks[].command] | map(select(contains(\"guard-codex-bridge.sh\"))) | .[0]' \"$CODEX_HOME/hooks.json\"",
+    );
+    assert_eq!(registered.trim(), bundle::registration());
+
+    // Docker's own inventory: each control file is a read-only bind of the
+    // canonical profile file onto its own path, and the profile DIRECTORY is
+    // still read-write (that is what auth refresh needs).
+    let container = format!("loom-codex-session-{name}");
+    let mounts: Value =
+        serde_json::from_str(&docker(&["inspect", "--format", "{{json .Mounts}}", &container]))
+            .unwrap();
+    let mounts = mounts.as_array().unwrap();
+    for control in bundle::PROFILE_CONTROLS {
+        let destination = bundle::control_destination(control);
+        let mount = mounts
+            .iter()
+            .find(|mount| mount["Destination"] == destination.as_str())
+            .unwrap_or_else(|| panic!("{control} is not bound at all: {mounts:?}"));
+        assert_eq!(mount["Type"], "bind", "{control}");
+        assert_eq!(mount["RW"], false, "{control}");
+        assert_eq!(mount["Source"], profile.join(control).to_str().unwrap(), "{control}");
+    }
+    assert!(mounts
+        .iter()
+        .any(|mount| mount["Destination"] == "/home/loom/.codex-profile" && mount["RW"] == true));
+
+    // The probe itself: the registration and Codex's trust state cannot be
+    // written, removed, renamed away, renamed over, chmod-ed, symlinked over or
+    // hardlinked over from inside the session — and auth refresh still works.
+    let sealed: Vec<Vec<u8>> = bundle::PROFILE_CONTROLS
+        .iter()
+        .map(|control| std::fs::read(profile.join(control)).unwrap())
+        .collect();
+    assert_eq!(f.exec(name, FREEZE_PROBE).trim(), "FROZEN");
+    for (control, before) in bundle::PROFILE_CONTROLS.iter().zip(&sealed) {
+        assert_eq!(
+            &std::fs::read(profile.join(control)).unwrap(),
+            before,
+            "{control} changed on the host"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(profile.join("auth.json"))
+            .unwrap()
+            .trim(),
+        "refreshed-synthetic"
+    );
+    // Neither the probe nor the protection moved a byte of the session's own
+    // identity: the boundary still reports the same bound identity.
+    let after: Value =
+        serde_json::from_str(&f.exec(name, "loom-daemon private-workspace control")).unwrap();
+    assert_eq!(after["identity"], report["identity"]);
+
+    // ---- a session that does NOT carry the protection is refused ----------
+    // Built by hand with every other containment setting identical, because
+    // that is exactly the shape an older daemon (or a hand-started container)
+    // produces: the profile bound read-write and nothing else. Both halves of
+    // the enforcement must refuse it independently.
+    let unprotected = &f.names[1];
+    f.start(unprotected);
+    f.cli(&["session", "stop", unprotected, "--json"]);
+    let peer = format!("loom-codex-session-{unprotected}");
+    docker(&[
+        "run",
+        "-d",
+        "--name",
+        &peer,
+        "--user",
+        "1000:1000",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,size=512m",
+        "--mount",
+        &format!("type=volume,src=loom-codex-workspace-{unprotected},dst=/workspace"),
+        "--mount",
+        &format!(
+            "type=bind,src={},dst=/home/loom/.codex-profile",
+            f.root.path().join("profiles").join(unprotected).display()
+        ),
+        "--mount",
+        &format!(
+            "type=bind,src={},dst=/run/loom-gh,readonly",
+            f.root.path().join("forge").display()
+        ),
+        "--label",
+        "loom.workspace-mode=private-clone",
+        "--label",
+        "loom.workspace=/workspace/repo",
+        "--label",
+        &format!("loom.account={unprotected}"),
+        "--label",
+        &format!("loom.repository={}", f.repository),
+        "--env",
+        "CODEX_HOME=/home/loom/.codex-profile",
+        "--env",
+        "GH_CONFIG_DIR=/run/loom-gh",
+        "--entrypoint",
+        "/usr/bin/tini",
+        &f.image,
+        "--",
+        "/bin/sleep",
+        "infinity",
+    ]);
+    // 1. The host refuses it on Docker's own mount inventory, before any
+    //    in-container code is trusted to describe itself.
+    let refused = f.job(unprotected, "role", "true").output().unwrap();
+    assert!(!refused.status.success(), "an unprotected session was admitted");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("bound read-only"), "{stderr}");
+    // 2. And the boundary refuses it from inside, on the live mount table,
+    //    even though the registration's CONTENT is still perfectly correct —
+    //    which is the whole point: content that can be replaced mid-session is
+    //    not enforcement, and a check that only detects it runs too late.
+    let exposed: Value = serde_json::from_str(&docker(&[
+        "exec",
+        &peer,
+        "loom-daemon",
+        "private-workspace",
+        "control",
+    ]))
+    .unwrap();
+    assert_eq!(exposed["status"], "profile-mutable", "{exposed}");
+    assert_eq!(exposed["identity"], "");
+    assert_eq!(
+        docker(&[
+            "exec",
+            &peer,
+            "sh",
+            "-c",
+            "jq -r '[.hooks.PreToolUse[].hooks[].command] | map(select(contains(\"guard-codex-bridge.sh\"))) | .[0]' \"$CODEX_HOME/hooks.json\"",
+        ])
+        .trim(),
+        bundle::registration(),
+        "the unprotected session's registration content is correct; only its reachability differs"
+    );
+    // ...and the escalation is real there: the same probe that is refused
+    // above succeeds against the unprotected profile.
+    let escalated = Command::new("docker")
+        .args(["exec", &peer, "sh", "-c", "rm -f \"$CODEX_HOME/hooks.json\" && test ! -e \"$CODEX_HOME/hooks.json\" && echo UNHOOKED"])
+        .output()
+        .unwrap();
+    assert!(
+        checked(escalated).contains("UNHOOKED"),
+        "the unprotected shape must still reproduce the escalation, or the check above proves nothing"
+    );
+    docker(&["rm", "-f", &peer]);
+}
+
 #[test]
 #[ignore = "requires Docker; explicitly run by CI"]
 fn image_owned_control_bundle_keeps_guard_code_and_policy_enforced_after_mutation() {
@@ -302,12 +501,16 @@ fn image_owned_control_bundle_keeps_guard_code_and_policy_enforced_after_mutatio
         assert!(!refused.status.success(), "{image} was admitted");
         let stderr = String::from_utf8_lossy(&refused.stderr);
         assert!(stderr.contains(expected), "{image}: {stderr}");
-        // The refusal happens AFTER the container exists, and deliberately
-        // leaves it in place rather than resetting an account's session behind
-        // the operator. Clearing it explicitly here is what that refusal's own
-        // message instructs ("stop the idle container before recreating it
-        // with the requested image"), and it is what lets the next unsupported
-        // image be admitted far enough to be refused on its own merits.
+        // A bundle that is present but unusable (mutated, stale) is refused
+        // after the container exists, and deliberately leaves it in place
+        // rather than resetting an account's session behind the operator; an
+        // image with no bundle at all is refused one step earlier still, at the
+        // pre-create provisioning of the profile's control files, so no
+        // container is created for it. `session stop` is correct in both cases
+        // — it is what that refusal's own message instructs ("stop the idle
+        // container before recreating it with the requested image"), and it is
+        // what lets the next unsupported image be admitted far enough to be
+        // refused on its own merits.
         checked(
             f.command(&["session", "stop", &f.names[1], "--json"])
                 .output()

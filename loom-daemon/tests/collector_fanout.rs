@@ -428,3 +428,46 @@ fn queue_retry_storage_and_credentials_fail_visibly() {
         assert!(!logs.contains("wrong-backend-key"));
     }
 }
+
+/// Issue #8824 fan-out contract, no Docker: the gateway's `transform/privacy`
+/// allowlists must forward every CI attribute and metric label the poller
+/// emits — and, for the `loom.ci.*` namespace, nothing else. A key the
+/// gateway strips makes a SigNoz CI query silently return zero rows.
+#[test]
+fn gateway_forwards_exactly_the_ci_telemetry_vocabulary() {
+    use loom_daemon::telemetry::ci::{
+        CI_LOG_ATTRIBUTE_KEYS, CI_METRIC_LABEL_KEYS, CI_SPAN_ATTRIBUTE_KEYS,
+    };
+    use std::collections::BTreeSet;
+    fn keep(context: &str) -> BTreeSet<String> {
+        let mut current = "";
+        let mut keys = BTreeSet::new();
+        for line in CONFIG.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("- context:") {
+                current = rest.trim();
+            }
+            if current == context && line.contains("keep_keys(") {
+                keys.extend(line.split('"').skip(1).step_by(2).map(str::to_owned));
+            }
+        }
+        keys
+    }
+    let ci = |keys: BTreeSet<String>| -> BTreeSet<String> {
+        keys.into_iter()
+            .filter(|k| k.starts_with("loom.ci."))
+            .collect()
+    };
+    let owned =
+        |keys: &[&str]| -> BTreeSet<String> { keys.iter().map(|k| (*k).to_owned()).collect() };
+    for key in CI_LOG_ATTRIBUTE_KEYS {
+        assert!(keep("log").contains(*key), "log keep_keys drops {key}");
+    }
+    for key in CI_SPAN_ATTRIBUTE_KEYS {
+        assert!(keep("span").contains(*key), "span keep_keys drops {key}");
+    }
+    for label in CI_METRIC_LABEL_KEYS {
+        assert!(keep("datapoint").contains(*label), "datapoint keep_keys drops {label}");
+    }
+    assert_eq!(ci(keep("log")), owned(CI_LOG_ATTRIBUTE_KEYS));
+    assert_eq!(ci(keep("span")), owned(CI_SPAN_ATTRIBUTE_KEYS));
+}

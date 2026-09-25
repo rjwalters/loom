@@ -6,6 +6,10 @@ use super::*;
 /// #8222) — the source of the record's `judge_verdicts` and `doctor_cycles`.
 pub(crate) mod label_timeline;
 
+/// The Curator complexity-tier signal read off the sweep's issue body (Issue
+/// #8542) — the source of the record's `complexity`.
+pub(crate) mod complexity_signal;
+
 /// One observed lifecycle-phase transition for a live sweep (Issue #4704):
 /// the checkpoint phase marker and the instant [`SweepRegistry::reap_once`]
 /// first observed it.
@@ -652,6 +656,12 @@ impl SweepRegistry {
             (Some(signals.doctor_cycles), Some(signals.judge_verdicts))
         });
 
+        // Curator complexity tier (Issue #8542), read off the sweep's own
+        // issue body — see `complexity_signal`'s module doc for why this is a
+        // separate forge read from the PR timeline above rather than a
+        // dispatch-time plumb, and its identical fail-open contract.
+        let complexity = self.fetch_complexity_signal(issue);
+
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
             visibility,
@@ -678,6 +688,7 @@ impl SweepRegistry {
                 .as_ref()
                 .and_then(|r| r.provider.clone()),
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
+            complexity,
         };
         let result_name = serde_json::to_value(result)
             .ok()
@@ -1017,3 +1028,14 @@ mod runtime_tests;
     unused_imports
 )]
 mod tap_usage_tests;
+
+// End-to-end tests for the #8542 complexity-marker sourcing, in their own
+// sibling file for the same file-size reason as `timeline_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod complexity_tests;

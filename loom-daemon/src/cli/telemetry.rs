@@ -106,6 +106,9 @@ pub(crate) enum TelemetryCommand {
     /// matching size/mtime on a later run. Opt-in and operator-driven — never
     /// started automatically.
     ArchiveTranscripts(super::transcript_archive_cli::ArchiveTranscriptsArgs),
+
+    // Issue #8824 — help text lives on `CiTelemetryArgs` itself.
+    CiTelemetry(super::ci_telemetry_cli::CiTelemetryArgs),
 }
 
 impl TelemetryCommand {
@@ -138,6 +141,7 @@ impl TelemetryCommand {
             TelemetryCommand::UsageReport(args) => args.run(),
             TelemetryCommand::OpencodeUsage(args) => args.run(),
             TelemetryCommand::ArchiveTranscripts(args) => args.run(),
+            TelemetryCommand::CiTelemetry(args) => args.run(),
         }
     }
 }
