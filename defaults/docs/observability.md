@@ -337,6 +337,7 @@ values) is applied at emit, before the durable queue, and again at export;
 `MetricPoint::label` debug-asserts the key allowlist. Names, kinds and
 labels are listed in
 [`telemetry-schema.md` → `metric.points`](telemetry-schema.md#metricpoints).
+
 **Queue dwell and starvation (#8856).** Each multi-workspace tick also emits
 `loom.queue.*` from the same per-issue ready-queue rows that `loom-daemon queue`
 shows (#8852). A row is *waiting* in one of two states. `ready` means only
@@ -351,7 +352,11 @@ first tick an issue is seen waiting, then stays fixed. Applying `loom:issue`
 bumps `updatedAt`, so dwell is a **lower bound**: it can under-report and never
 over-reports. The clock is dropped when the issue leaves the listing, is
 dispatched, or stops waiting. It is kept across a failed listing, and it
-re-seeds after a daemon restart. The signals are `loom.queue.oldest_wait{state}`,
+re-seeds after a daemon restart. A re-seed reads `updatedAt` again, so it can
+include time the issue spent in a non-waiting hold that did not touch it (for
+example a peer claim). On a sharded fleet, `out_of_slice` rows count as `ready`
+on every host that lists them, so `starved{state="ready"}` can fire on a host
+that is not the slice owner. Read the host label with that in mind. The signals are `loom.queue.oldest_wait{state}`,
 `loom.queue.starved{state}` (waiting longer than `LOOM_QUEUE_STARVATION_SECS`,
 default 21600 = 6 h), `loom.queue.starved.by_reason{reason}`, and the
 dispatch-wait delta pair `loom.queue.dispatch_wait` / `.samples`. The

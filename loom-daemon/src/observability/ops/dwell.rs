@@ -18,6 +18,9 @@
 //!
 //! A clock is dropped when the issue leaves the listing, is dispatched, starts
 //! running, or moves to a state that is not waiting (see [`wait_class`]). A
+//! later re-seed reads `updatedAt` again, so it may include time the issue
+//! spent in a non-waiting hold that did not touch it (a peer claim, say);
+//! that is still a lower bound on time since `loom:issue` was applied. A
 //! workspace whose listing failed this tick keeps its clocks, so a transient
 //! `gh` failure does not reset dwell. A daemon restart loses the clocks; they
 //! re-seed from `updatedAt`, which is still a lower bound. A per-issue
