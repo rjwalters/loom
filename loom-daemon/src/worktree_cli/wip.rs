@@ -111,6 +111,7 @@ pub struct Out {
 
 const RED: &str = "\x1b[0;31m";
 const GREEN: &str = "\x1b[0;32m";
+const YELLOW: &str = "\x1b[1;33m";
 const BLUE: &str = "\x1b[0;34m";
 const NC: &str = "\x1b[0m";
 
@@ -138,6 +139,17 @@ impl Out {
             eprintln!("{GREEN}✓ {msg}{NC}");
         } else {
             println!("{GREEN}✓ {msg}{NC}");
+        }
+    }
+
+    /// Mirrors `print_warning` / the `remove` verb's `_rm_warning` (#8195
+    /// slice 3): advisory, never fatal, and stderr-routed under `--json` for
+    /// the same stdout-purity reason as [`Out::info`].
+    pub fn warning(&self, msg: &str) {
+        if self.json {
+            eprintln!("{YELLOW}⚠ {msg}{NC}");
+        } else {
+            println!("{YELLOW}⚠ {msg}{NC}");
         }
     }
 

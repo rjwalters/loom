@@ -68,5 +68,6 @@ pub(crate) mod watch;
 mod watchdog;
 pub(crate) mod workspace_fleet;
 pub(crate) mod worktree_lock;
+pub(crate) mod worktree_remove;
 mod worktree_state;
 pub(crate) mod worktree_wip;
