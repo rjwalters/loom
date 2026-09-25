@@ -635,14 +635,36 @@ engine_profile() {
 engine_profile trusted 2
 engine_profile untrusted 3
 
+# Read a profile's trust state from INSIDE a container as uid 1000, never from
+# the host. The provisioner writes `config.toml` 0600 owned by uid 1000, and
+# whoever runs this script is only that uid by coincidence — it is on a
+# developer host where the login user happens to be uid 1000, and is NOT on a
+# GitHub Actions runner (uid 1001). A host-side `grep` therefore reads nothing
+# there and reports "no trust established" for a profile that is perfectly
+# trusted, which is exactly how the first version of this assertion failed in
+# CI while passing locally. Everything else in this section already crosses the
+# boundary through a container, so this does too.
+engine_trust_state() {
+    docker run --rm --network none --user "$PROBE_USER" --read-only \
+        --cap-drop ALL --security-opt no-new-privileges \
+        --mount "type=bind,src=$ENGINE_DIR/$1,dst=/home/loom/.codex-profile,readonly" \
+        --entrypoint bash "$IMAGE" -lc \
+        'if grep -q trusted_hash /home/loom/.codex-profile/config.toml 2>/dev/null; then
+             echo TRUSTED
+         else
+             echo "UNTRUSTED config.toml=[$(cat /home/loom/.codex-profile/config.toml 2>&1)]"
+         fi' 2>&1
+}
+
 # The one difference between the two profiles, asserted rather than assumed —
 # without this, a trust step that silently did nothing would make the whole
 # section a comparison of two identical sessions.
-if grep -q 'trusted_hash' "$ENGINE_DIR/trusted/config.toml" 2>/dev/null \
-    && ! grep -q 'trusted_hash' "$ENGINE_DIR/untrusted/config.toml" 2>/dev/null; then
+TRUSTED_STATE=$(engine_trust_state trusted)
+UNTRUSTED_STATE=$(engine_trust_state untrusted)
+if [[ "$TRUSTED_STATE" == "TRUSTED" && "$UNTRUSTED_STATE" == UNTRUSTED* ]]; then
     pass "the shipped TUI persisted real hook trust in one profile and not the other"
 else
-    fail "hook trust was not established exactly once by the TUI: trusted=[$(cat "$ENGINE_DIR/trusted/config.toml" 2>/dev/null)] untrusted=[$(cat "$ENGINE_DIR/untrusted/config.toml" 2>/dev/null)]"
+    fail "hook trust was not established exactly once by the TUI: trusted=[$TRUSTED_STATE] untrusted=[$UNTRUSTED_STATE]"
 fi
 
 # The probe body itself. Bind-mounted read-only rather than passed as a `-lc`
