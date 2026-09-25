@@ -1,6 +1,6 @@
 /**
- * Hash-based routing (`#/`, `#/hosts/<hostId>`, `#/charts`, `#/tokens`,
- * `#/spend`, `#/feed`).
+ * Hash-based routing (`#/`, `#/hosts/<hostId>`, `#/queue`, `#/charts`,
+ * `#/tokens`, `#/spend`, `#/feed`).
  *
  * Hash routing rather than the History API is a deliberate deploy-shape
  * decision, not laziness. The UI ships as Workers Assets on the *same* Worker
@@ -17,6 +17,9 @@
 export type Route =
   | { name: "overview" }
   | { name: "host"; hostId: string }
+  /** The fleet work queue (Issue #8852) — a view over the polled snapshot,
+   * like `overview`/`host`, not a self-fetching panel. */
+  | { name: "queue" }
   | { name: "charts" }
   | { name: "tokens" }
   | { name: "spend" }
@@ -47,6 +50,7 @@ export function parseRoute(hash: string): Route {
 
   const panel = PANEL_ROUTES[path];
   if (panel) return { name: panel };
+  if (path === "/queue") return { name: "queue" };
 
   const match = /^\/hosts\/(.+)$/.exec(path);
   // Anything unrecognized falls back to the overview rather than erroring —
@@ -62,7 +66,7 @@ export function parseRoute(hash: string): Route {
 
 export function routeToHash(route: Route): string {
   if (route.name === "host") return `#/hosts/${encodeURIComponent(route.hostId)}`;
-  if (isPanelRoute(route)) return `#/${route.name}`;
+  if (isPanelRoute(route) || route.name === "queue") return `#/${route.name}`;
   return "#/";
 }
 

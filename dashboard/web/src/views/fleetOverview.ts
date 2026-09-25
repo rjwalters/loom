@@ -33,6 +33,7 @@ import type { FleetView, HostStatus, HostView, ProviderSummary } from "../fleet"
 import type { HostHealthRecord, HostProtection, ManagedRepoEntry } from "../types";
 import { emptyFleetView } from "./states";
 import { computeSubprocessList, runningComputeSection, type RunningComputeOptions } from "./runningCompute";
+import { workQueueSummarySection } from "./workQueue";
 
 const STATUS_LABEL: Record<HostStatus, string> = {
   ok: "OK",
@@ -679,6 +680,8 @@ export function fleetOverviewView(
         : null,
     ),
     compute,
+    // Issue #8852: null until some host reports a queue.
+    workQueueSummarySection(view, now),
     el(
       "div",
       { class: "overview__grid" },

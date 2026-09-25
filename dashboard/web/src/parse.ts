@@ -34,6 +34,7 @@ import type {
   TokensSnapshotRecord,
   Timestamped,
 } from "./types";
+import { parseQueueSnapshot } from "./queueParse";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -294,6 +295,9 @@ export function parseFleetSnapshot(value: unknown): FleetSnapshot {
       if (health) entry.health = health;
       const tokens = parseTimestamped(raw.tokens, parseTokensSnapshot);
       if (tokens) entry.tokens = tokens;
+      // Issue #8852: a queue with no parseable `tick_at` is dropped, not shown.
+      const queue = parseTimestamped(raw.queue, parseQueueSnapshot);
+      if (queue?.record) entry.queue = { record: queue.record, updatedAt: queue.updatedAt };
       snapshot.hosts[hostId] = entry;
     }
   }
