@@ -43,6 +43,17 @@
 //! unit in that path touching none of the arms under concurrent repair
 //! (#8351, #8702, #8486).
 //!
+//! Slice 5 is [`cleanup`]: the crash-debris pre-flight, and with it the
+//! **orphan guard** — the predicate whose false answer `rm -rf`s a worktree
+//! directory. It is the site of #7858/#7849, the data-loss class the issue
+//! leads with: a `git worktree list --porcelain` path split on whitespace
+//! (truncating at the first space) and a candidate resolved logically instead
+//! of physically, either of which made a LIVE worktree with uncommitted work
+//! in it read as an unregistered orphan. Both halves are structural here, and
+//! the porcelain read is now literally [`branch_delete::parse_worktree_porcelain`]
+//! — the shell's own comment said it "mirrors" that function, and mirroring is
+//! what drifts.
+//!
 //! [`branch_landed`] is the one piece slice 3 does NOT share with
 //! `worktree_ops` — [`crate::worktree_ops::landed`] is the daemon's other copy
 //! of the same ladder, keyed and scoped differently. Why they are not folded
@@ -52,6 +63,7 @@
 pub mod baseline;
 pub mod branch_delete;
 pub mod branch_landed;
+pub mod cleanup;
 pub mod default_branch;
 pub mod link;
 pub mod lock;
