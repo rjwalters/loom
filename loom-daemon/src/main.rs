@@ -192,6 +192,15 @@ enum Commands {
         json: bool,
     },
 
+    /// Show the work finder's ready queue in its real dispatch order
+    /// (workspace priority, `loom:urgent`, oldest first) with what the last
+    /// tick did with each issue and why, plus a freshness line (Issue #8852).
+    Queue {
+        /// Emit machine-readable JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// One-shot consolidated fleet vitals with an exit-code contract for watch
     /// loops (Issue #4761): trusted liveness, dispatch state, token pool,
     /// role-tick health, queue depth, and merge throughput — one structured
@@ -2625,7 +2634,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             // sync handler.
             unreachable!("Health is handled in main() before handle_cli_command")
         }
-        Commands::PeerClaims { .. } => {
+        Commands::PeerClaims { .. } | Commands::Queue { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("PeerClaims is handled in main() before handle_cli_command")

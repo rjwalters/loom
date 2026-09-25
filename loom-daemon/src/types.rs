@@ -1916,7 +1916,15 @@ pub struct WorkFinderTickSummary {
     /// compatible (an absent field parses as `0`).
     #[serde(default)]
     pub collisions: u64,
+    /// Every ready issue this tick saw, in dispatch order, with what happened
+    /// to it (Issue #8852). Empty for a single-workspace tick and for a
+    /// pre-#8852 wire payload.
+    #[serde(default)]
+    pub queue: Vec<ReadyQueueRow>,
 }
+
+mod ready_queue;
+pub use ready_queue::{QueueDisposition, ReadyQueueRow};
 
 impl WorkFinderTickSummary {
     /// The single-line skip-reason summary `loom-daemon health` renders —
