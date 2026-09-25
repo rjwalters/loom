@@ -30,6 +30,9 @@ pub struct TickQueueRow {
     pub disposition: Option<QueueDisposition>,
     /// Specifics (park label, open PR number, error text).
     pub detail: Option<String>,
+    /// The issue's `updatedAt` from the listing, which seeds its queue-dwell
+    /// clock (#8856, `observability::ops::dwell`).
+    pub updated_at: Option<String>,
 }
 
 fn tier_of(item: &WorkItem) -> Option<String> {
@@ -62,6 +65,7 @@ pub fn record_skip(
         tier: tier_of(item),
         disposition: Some(disposition),
         detail,
+        updated_at: item.updated_at.clone(),
     });
 }
 
@@ -76,6 +80,7 @@ pub fn record_candidate(rows: &mut Vec<TickQueueRow>, key: &PriorityCandidate, i
         tier: tier_of(item),
         disposition: None,
         detail: None,
+        updated_at: item.updated_at.clone(),
     });
 }
 

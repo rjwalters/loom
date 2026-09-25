@@ -16,14 +16,16 @@
 //! exporter configured, nothing is registered and both calls return
 //! immediately without allocating a record (the FLAGS-OFF posture).
 //!
-//! Emitters in this issue: [`dispatch`] (one span plus decision counters per
-//! work-finder tick) and [`host`] (memory, swap and worktree-volume gauges on
-//! the `host.health` cadence), [`queue`] (ready-queue depth per tick,
-//! #8852 phase 2) and [`quota`] (#8857: token burn and pool exhaustion on the
-//! `host.health` cadence). Later emitters (#8856 dwell/starvation) add a
-//! `MetricName`/`SpanName` variant and call the same two functions.
+//! Emitters: [`dispatch`] (one span plus decision counters per work-finder
+//! tick), [`host`] (memory, swap and worktree-volume gauges on the
+//! `host.health` cadence), [`queue`] (ready-queue depth per tick, #8852
+//! phase 2), [`quota`] (#8857: token burn and pool exhaustion on the
+//! `host.health` cadence) and [`dwell`] (ready-queue wait and starvation per
+//! multi-workspace tick, #8856). A new emitter adds a `MetricName`/`SpanName`
+//! variant and calls the same two functions.
 
 pub mod dispatch;
+pub mod dwell;
 pub mod host;
 pub mod queue;
 pub mod quota;

@@ -75,6 +75,22 @@ pub enum MetricName {
     /// The dynamic concurrency cap the tick ran under.
     #[serde(rename = "loom.dispatch.max_concurrent")]
     DispatchMaxConcurrent,
+    /// Age of the oldest waiting ready-queue row, labelled `state` (#8856).
+    #[serde(rename = "loom.queue.oldest_wait")]
+    QueueOldestWait,
+    /// Waiting ready-queue rows older than the starvation threshold,
+    /// labelled `state` (#8856).
+    #[serde(rename = "loom.queue.starved")]
+    QueueStarved,
+    /// Starved rows per queue disposition, labelled `reason` (#8856).
+    #[serde(rename = "loom.queue.starved.by_reason")]
+    QueueStarvedByReason,
+    /// Summed queue dwell of the issues dispatched in one tick (#8856).
+    #[serde(rename = "loom.queue.dispatch_wait")]
+    QueueDispatchWait,
+    /// Issues contributing to `loom.queue.dispatch_wait` (#8856).
+    #[serde(rename = "loom.queue.dispatch_wait.samples")]
+    QueueDispatchWaitSamples,
     /// Memory available for new allocations without swapping.
     #[serde(rename = "loom.host.memory.available_bytes")]
     HostMemoryAvailableBytes,
@@ -140,6 +156,11 @@ impl MetricName {
             Self::DispatchDecisions => "loom.dispatch.decisions",
             Self::DispatchCandidates => "loom.dispatch.candidates",
             Self::DispatchMaxConcurrent => "loom.dispatch.max_concurrent",
+            Self::QueueOldestWait => "loom.queue.oldest_wait",
+            Self::QueueStarved => "loom.queue.starved",
+            Self::QueueStarvedByReason => "loom.queue.starved.by_reason",
+            Self::QueueDispatchWait => "loom.queue.dispatch_wait",
+            Self::QueueDispatchWaitSamples => "loom.queue.dispatch_wait.samples",
             Self::HostMemoryAvailableBytes => "loom.host.memory.available_bytes",
             Self::HostMemoryTotalBytes => "loom.host.memory.total_bytes",
             Self::HostSwapUsedBytes => "loom.host.swap.used_bytes",
@@ -171,7 +192,9 @@ impl MetricName {
             | Self::LlmTokensCacheWrite
             | Self::LlmRequests
             | Self::PoolExhaustions
-            | Self::PoolExhaustedSeconds => MetricKind::DeltaCounter,
+            | Self::PoolExhaustedSeconds
+            | Self::QueueDispatchWait
+            | Self::QueueDispatchWaitSamples => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -180,7 +203,11 @@ impl MetricName {
     #[must_use]
     pub fn unit(self) -> &'static str {
         match self {
-            Self::DispatchDecisions | Self::DispatchCandidates => "{issue}",
+            Self::DispatchDecisions
+            | Self::DispatchCandidates
+            | Self::QueueStarved
+            | Self::QueueStarvedByReason
+            | Self::QueueDispatchWaitSamples => "{issue}",
             Self::DispatchMaxConcurrent => "{sweep}",
             Self::QueueIssues => "{issue}",
             Self::QueueListingFailedRepos => "{repository}",
@@ -192,6 +219,7 @@ impl MetricName {
             Self::PoolAccounts | Self::PoolExhaustions => "{account}",
             Self::PoolExhausted => "1",
             Self::PoolExhaustedSeconds => "s",
+            Self::QueueOldestWait | Self::QueueDispatchWait => "s",
             _ => "By",
         }
     }
@@ -203,6 +231,11 @@ impl MetricName {
             Self::DispatchDecisions => "Work-finder candidate outcomes per tick, by reason.",
             Self::DispatchCandidates => "Ready candidates seen by one work-finder tick.",
             Self::DispatchMaxConcurrent => "Dynamic concurrency cap for the work-finder tick.",
+            Self::QueueOldestWait => "Age of the oldest waiting ready-queue issue, by state.",
+            Self::QueueStarved => "Waiting ready-queue issues past the starvation threshold.",
+            Self::QueueStarvedByReason => "Starved ready-queue issues by queue disposition.",
+            Self::QueueDispatchWait => "Summed queue dwell of the issues dispatched per tick.",
+            Self::QueueDispatchWaitSamples => "Issues counted in loom.queue.dispatch_wait.",
             Self::HostMemoryAvailableBytes => "Memory available without swapping.",
             Self::HostMemoryTotalBytes => "Physical memory installed.",
             Self::HostSwapUsedBytes => "Swap space in use.",

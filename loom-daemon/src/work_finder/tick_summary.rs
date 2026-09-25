@@ -125,9 +125,9 @@ pub(super) fn reset_last_tick_summary() {
 /// End-of-tick seam for both work-finder loops: publish the summary for
 /// `loom-daemon health` (#4761), then export the tick as OTLP telemetry
 /// (#8860 — a no-op unless an OTLP exporter is running), including the
-/// ready-queue depth gauges (#8852 phase 2). `started_at` is when the tick's
-/// candidate evaluation began; `roots` names each ready-queue row's repo
-/// (#8852 — empty for the single-workspace loop).
+/// ready-queue depth gauges (#8852 phase 2) and dwell signals (#8856).
+/// `started_at` is when the tick's candidate evaluation began; `roots` names
+/// each ready-queue row's repo (#8852 — empty for the single-workspace loop).
 pub fn publish_tick(
     report: &TickReport,
     max_concurrent: usize,
@@ -138,4 +138,6 @@ pub fn publish_tick(
     crate::observability::ops::queue::record_queue(&summary);
     store_tick_summary(summary);
     crate::observability::ops::dispatch::record_tick(report, max_concurrent, started_at);
+    // #8856: queue dwell and starvation, from the same per-issue rows.
+    crate::observability::ops::dwell::record_tick(report, roots, started_at);
 }
