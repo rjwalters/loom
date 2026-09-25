@@ -1,7 +1,7 @@
-//! CI (GitHub Actions) telemetry record kinds (Issue #8824, phase 1 of the
-//! build/CI observability work under epic #8522).
+//! CI (GitHub Actions) telemetry record kinds (Issue #8824 phase 1, #8825
+//! phase 2, of the build/CI observability work under epic #8522).
 //!
-//! Three record kinds, all produced by `crate::ci_telemetry`'s poller:
+//! Four record kinds, all produced by `crate::ci_telemetry`'s poller:
 //!
 //! - `ci.run` ([`CiRunRecord`]) — one completed workflow run.
 //! - `ci.job` ([`CiJobRecord`]) — one completed job of a run (every attempt's
@@ -12,6 +12,13 @@
 //!   because every envelope maps to exactly **one** OTLP signal (the OTLP
 //!   exporter's retry loop acknowledges contiguous same-signal prefixes), so a
 //!   `ci.run` log record cannot also be a histogram data point.
+//! - `ci.job.log` ([`CiJobLogRecord`], #8825) — one ≤ 8 KiB chunk of one
+//!   completed job's log text. **The only Loom record kind whose body is
+//!   free text the daemon did not author**, which is exactly why the gateway
+//!   carries a `ci.job.log`-scoped scrub stage ([`CI_LOG_SCRUB_CLASSES`])
+//!   ahead of the shared allowlist: the daemon deliberately forwards what
+//!   GitHub sent, chunked and size-capped, and the **gateway** is the
+//!   redaction boundary.
 //!
 //! # Attribute discipline (#8669 allowlist precedent)
 //!
@@ -49,7 +56,51 @@ pub const CI_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.ci.runner",
     "loom.ci.attempts",
     "loom.ci.timed_out",
+    // `ci.job.log` (#8825). `loom.ci.chunk_index` doubles as the gateway's
+    // "this is a job-log chunk" predicate — the scrub stage in
+    // `defaults/observability/collector/config.yaml` is scoped by exactly
+    // that key's presence, so it can never touch another kind's body.
+    "loom.ci.chunk_index",
+    "loom.ci.chunk_count",
+    "loom.ci.log_bytes_total",
+    "loom.ci.truncated",
+    "loom.ci.truncation_note",
 ];
+
+/// The attribute whose presence marks a log record as a `ci.job.log` chunk.
+/// The gateway's scrub stage is scoped by this key and nothing else, so the
+/// body exception cannot silently widen to another record kind.
+pub const CI_LOG_CHUNK_MARKER_KEY: &str = "loom.ci.chunk_index";
+
+/// Every secret class the gateway scrubs out of a `ci.job.log` body, in the
+/// order the collector applies them. Each becomes `[REDACTED:<class>]`.
+///
+/// **This list is the reviewable source of truth.** A new secret family is
+/// added here, to `defaults/observability/collector/config.yaml`, and to the
+/// contract test **in the same PR** — the static contract test
+/// (`collector_fanout::gateway_scrubs_exactly_the_declared_ci_log_classes`)
+/// fails if the two ever disagree, in either direction.
+///
+/// Order matters: `authorization` consumes the remainder of an
+/// `Authorization:` header line before `bearer-token` can leave its value
+/// behind, and every earlier class consumes its own key name so the broad
+/// `credential` assignment rule cannot re-redact an existing marker.
+pub const CI_LOG_SCRUB_CLASSES: &[&str] = &[
+    "authorization",
+    "bearer-token",
+    "github-token",
+    "anthropic-key",
+    "api-key",
+    "aws-access-key-id",
+    "aws-secret-access-key",
+    "credential",
+];
+
+/// The `[REDACTED:<class>]` marker for one [`CI_LOG_SCRUB_CLASSES`] entry.
+#[must_use]
+pub fn scrub_marker(class: &str) -> String {
+    format!("[REDACTED:{class}]")
+}
 
 /// Every `loom.ci.*` span attribute key the CI run/job spans can carry. The
 /// gateway's span `keep_keys` must list exactly these `loom.ci.*` keys
@@ -195,6 +246,78 @@ impl CiJobRecord {
         out.push(("loom.ci.started_at", CiAttr::Str(self.started_at.to_rfc3339())));
         out.push(("loom.ci.completed_at", CiAttr::Str(self.completed_at.to_rfc3339())));
         out.push(("loom.ci.duration_ms", CiAttr::Int(self.duration_ms)));
+        out
+    }
+}
+
+/// One ≤ 8 KiB chunk of one completed job's log text (`ci.job.log`, #8825).
+///
+/// # The body is free text, on purpose
+///
+/// Every other record kind's body is a string this daemon authored. This
+/// one's is whatever GitHub's job-log endpoint returned, forwarded unfiltered
+/// apart from the per-job size cap — the operator decision for #8825 is that
+/// the **gateway** is the redaction boundary, not the source. Nothing in this
+/// struct may ever move log text into an *attribute*: the gateway's scrub
+/// stage rewrites the body only, so a log-derived attribute would ride
+/// straight past it. That is why there is no `step` attribute here — see
+/// `defaults/docs/ci-observability.md` §"Why there is no `step` attribute".
+///
+/// # Reconstruction contract
+///
+/// A job's log is `ORDER BY chunk_index` over the `chunk_count` records
+/// sharing one `(repo, job_id)`. `truncated` is true on **every** chunk of a
+/// capped log (not just the last), so a single record read in isolation can
+/// never read as a complete log; the final marker chunk additionally carries
+/// `truncation_note` naming the cap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CiJobLogRecord {
+    pub repo: String,
+    #[serde(default)]
+    pub visibility: RepoVisibility,
+    pub run_id: u64,
+    pub job_id: u64,
+    /// The parent run's workflow name.
+    pub workflow: String,
+    /// Job name.
+    pub job: String,
+    /// 0-based position of this chunk in the job's log.
+    pub chunk_index: u32,
+    /// How many chunks the job's log was split into, marker chunk included.
+    pub chunk_count: u32,
+    /// Bytes of log text GitHub returned for this job, before the cap.
+    pub log_bytes_total: u64,
+    /// True on every chunk of a log that hit the per-job cap.
+    pub truncated: bool,
+    /// Present only on the final marker chunk of a truncated log; names the
+    /// cap that truncated it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_note: Option<String>,
+    /// The job's completion instant — the event time every chunk is stamped
+    /// at, so logs land beside their `ci.job` record rather than at poll time.
+    pub completed_at: DateTime<Utc>,
+    /// This chunk's log text. **Never** promoted to an attribute.
+    pub text: String,
+}
+
+impl CiJobLogRecord {
+    /// The `loom.ci.*` log attributes, in a stable order. No attribute here
+    /// is derived from log text.
+    #[must_use]
+    pub fn log_attributes(&self) -> Vec<(&'static str, CiAttr)> {
+        let mut out = vec![
+            ("loom.ci.run_id", CiAttr::Int(clamp_i64(self.run_id))),
+            ("loom.ci.job_id", CiAttr::Int(clamp_i64(self.job_id))),
+            ("loom.ci.workflow", CiAttr::Str(self.workflow.clone())),
+            ("loom.ci.job", CiAttr::Str(self.job.clone())),
+            ("loom.ci.chunk_index", CiAttr::Int(i64::from(self.chunk_index))),
+            ("loom.ci.chunk_count", CiAttr::Int(i64::from(self.chunk_count))),
+            ("loom.ci.log_bytes_total", CiAttr::Int(clamp_i64(self.log_bytes_total))),
+            ("loom.ci.truncated", CiAttr::Bool(self.truncated)),
+        ];
+        if let Some(note) = &self.truncation_note {
+            out.push(("loom.ci.truncation_note", CiAttr::Str(note.clone())));
+        }
         out
     }
 }

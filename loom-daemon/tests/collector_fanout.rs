@@ -206,6 +206,61 @@ fn fixture(signal: &str, id: &str) -> String {
         r#"{{"{resource_key}":[{{"resource":{resource},"{scope_key}":[{{"{records_key}":[{record}]}}]}}]}}"#
     )
 }
+/// One `(scrub class, sentinel secret)` pair for the #8825 redaction
+/// contract. Every value is a synthetic fixture string — never a real
+/// credential — shaped to match exactly one class in the gateway's
+/// `transform/ci_log_redaction` stage.
+///
+/// The AWS access-key sentinel is **assembled** rather than written out:
+/// GitHub's own push protection matches `AKIA[0-9A-Z]{16}` on the literal and
+/// refuses the push even for an obviously synthetic fixture (verified
+/// 2026-09-25 — the first push of this file was rejected). It still *is* that
+/// shape at runtime, which is what the gateway is being tested against.
+const SCRUB_SENTINELS: &[(&str, &str)] = &[
+    ("authorization", "Authorization: token LOOMFIXTUREauthheadervalue"),
+    ("bearer-token", "Bearer LOOMFIXTUREbearertoken0123456789"),
+    ("github-token", "ghp_LOOMFIXTUREAAAAAAAAAAAAAAAAAAAAAAAA"),
+    ("github-token", "github_pat_LOOMFIXTURE0000000000AAAAAAAAAA"),
+    ("anthropic-key", "sk-ant-api03-LOOMFIXTUREAAAAAAAAAAAA"),
+    ("api-key", "api_key=sk-LOOMFIXTUREAAAAAAAAAAAAAAAA"),
+    ("aws-access-key-id", concat!("AKI", "A", "LOOMFIXTUREAAAAA")),
+    (
+        "aws-secret-access-key",
+        "aws_secret_access_key=LOOMFIXTUREaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ),
+    ("credential", "password=LOOMFIXTUREpassword"),
+];
+
+/// A build-log line the scrubber must leave byte-identical: it mentions
+/// tokens and secrets in prose, which is not the same thing as carrying one.
+const CLEAN_LOG_LINE: &str =
+    "2026-09-25T09:00:00.0000000Z ##[group]Run cargo test --workspace -- --nocapture";
+
+/// A `ci.job.log` OTLP logs payload whose body is `text`. The
+/// `loom.ci.chunk_index` attribute is the predicate the gateway's scrub stage
+/// is scoped by, so it is what makes this batch a job-log batch at all.
+fn ci_log_fixture(text: &str) -> String {
+    let body = serde_json_escape(text);
+    let resource = r#"{"attributes":[{"key":"service.name","value":{"stringValue":"loom-daemon"}},{"key":"host.id","value":{"stringValue":"fixture-host"}}]}"#;
+    let attrs = r#"[{"key":"loom.repo","value":{"stringValue":"fixture-org/alpha"}},{"key":"loom.repo.visibility","value":{"stringValue":"private"}},{"key":"loom.ci.run_id","value":{"intValue":"1001"}},{"key":"loom.ci.job_id","value":{"intValue":"10011"}},{"key":"loom.ci.job","value":{"stringValue":"build"}},{"key":"loom.ci.chunk_index","value":{"intValue":"0"}},{"key":"loom.ci.chunk_count","value":{"intValue":"1"}},{"key":"loom.ci.log_bytes_total","value":{"intValue":"4096"}},{"key":"loom.ci.truncated","value":{"boolValue":false}},{"key":"loom.ci.unlisted","value":{"stringValue":"MUST-NOT-EXPORT"}}]"#;
+    format!(
+        r#"{{"resourceLogs":[{{"resource":{resource},"scopeLogs":[{{"logRecords":[{{"timeUnixNano":"1790000000000000000","eventName":"ci.job.log","body":{{"stringValue":"{body}"}},"attributes":{attrs}}}]}}]}}]}}"#
+    )
+}
+
+/// Minimal JSON string escaping for the fixture bodies (ASCII, newlines).
+fn serde_json_escape(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '"' => "\\\"".to_string(),
+            '\\' => "\\\\".to_string(),
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
 struct Response {
     status: u16,
     body: String,
@@ -427,6 +482,147 @@ fn queue_retry_storage_and_credentials_fail_visibly() {
         assert!(!logs.contains("fixture-loom-key"));
         assert!(!logs.contains("wrong-backend-key"));
     }
+}
+
+/// Issue #8825 acceptance criterion 2, the half that needs a real Collector:
+/// a synthesized `ci.job.log` batch carrying one sentinel per scrub class
+/// must arrive at **both** sinks with every sentinel replaced by its
+/// `[REDACTED:<class>]` marker and **zero raw secret bytes** anywhere in the
+/// exported output.
+///
+/// Both halves of that are asserted on purpose: absence alone would also pass
+/// if the gateway simply dropped the record, which is a different (and also
+/// wrong) outcome, so the marker must be present too. A clean build-log line
+/// in the same batch must survive byte-identical — a scrubber that eats
+/// ordinary log text is useless for the job this exists to do.
+#[test]
+#[ignore = "requires Docker; starts three isolated pinned Collector containers"]
+fn ci_job_log_bodies_are_scrubbed_at_the_gateway_before_both_sinks() {
+    let mut trial = Trial::new();
+    let a = trial.start("clickstack", &sink_config(true), "clickstack-collector");
+    let b = trial.start("signoz", &sink_config(false), "signoz-otel-collector");
+    let config = CONFIG
+        .replace("limit_mib: 384", "limit_mib: 160")
+        .replace("spike_limit_mib: 96", "spike_limit_mib: 32");
+    ready(&trial.endpoint(&a, "4318"));
+    ready(&trial.endpoint(&b, "4318"));
+    let gateway = trial.start("gateway", &config, "gateway");
+    let endpoint = trial.endpoint(&gateway, "4318");
+    ready(&endpoint);
+
+    // One chunk body: a liveness marker, the clean line, then one line per
+    // sentinel — exactly the shape a real job log has.
+    let mut lines = vec![
+        "ci-log-redaction-canary".to_string(),
+        CLEAN_LOG_LINE.to_string(),
+    ];
+    for (class, sentinel) in SCRUB_SENTINELS {
+        lines.push(format!("2026-09-25T09:00:01.0000000Z [{class}] {sentinel}"));
+    }
+    let body = lines.join("\n");
+    let response =
+        http(&format!("{endpoint}/v1/logs"), Some(&ci_log_fixture(&body)), "fixture-loom-key");
+    assert!(response.success(), "gateway refused the ci.job.log batch: {}", response.body);
+
+    for sink in ["clickstack", "signoz"] {
+        trial.wait_for(sink, "ci-log-redaction-canary");
+        let data = trial.contents(sink);
+        for (class, sentinel) in SCRUB_SENTINELS {
+            assert!(
+                !data.contains(sentinel),
+                "{sink}: raw {class} secret survived the gateway: {sentinel}"
+            );
+            assert!(
+                data.contains(&format!("[REDACTED:{class}]")),
+                "{sink}: no [REDACTED:{class}] marker — a dropped record is not a redacted one"
+            );
+        }
+        // A clean build-log line is forwarded untouched.
+        assert!(
+            data.contains(CLEAN_LOG_LINE),
+            "{sink}: a clean build-log line was mangled by the scrubber"
+        );
+        // No regression in the general allowlist: an attribute outside the
+        // reviewed `loom.ci.*` set is still stripped, on this kind too.
+        assert!(!data.contains("MUST-NOT-EXPORT"));
+        assert!(!data.contains("loom.ci.unlisted"));
+        // The identity attributes a reconstruction query needs did survive.
+        assert!(data.contains("loom.ci.chunk_index"));
+        assert!(data.contains("loom.ci.job_id"));
+    }
+}
+
+/// Issue #8825, no Docker: the scrub-class list in the collector config and
+/// `CI_LOG_SCRUB_CLASSES` in the daemon must name the same set, in the same
+/// order, and every statement must be scoped to `ci.job.log` alone.
+///
+/// This is the "fail closed on an unlisted pattern" half of the design made
+/// mechanical: a new secret family cannot be added to one side only, and a
+/// statement cannot quietly lose its scope guard and start rewriting another
+/// kind's body.
+#[test]
+fn gateway_scrubs_exactly_the_declared_ci_log_classes() {
+    use loom_daemon::telemetry::ci::{CI_LOG_CHUNK_MARKER_KEY, CI_LOG_SCRUB_CLASSES};
+
+    let statements: Vec<&str> = CONFIG
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("replace_pattern(body,"))
+        .collect();
+    assert!(
+        statements.len() >= CI_LOG_SCRUB_CLASSES.len(),
+        "the collector has fewer body-rewriting statements than declared scrub classes"
+    );
+    let guard = format!("attributes[\"{CI_LOG_CHUNK_MARKER_KEY}\"] != nil and IsString(body)");
+    // A class may need more than one pattern, so consecutive repeats
+    // collapse; the class ORDER is load-bearing and compared exactly.
+    let mut classes: Vec<String> = Vec::new();
+    for statement in &statements {
+        assert!(
+            statement.contains(&guard),
+            "a body rewrite is not scoped to ci.job.log records: {statement}"
+        );
+        let start = statement
+            .find("[REDACTED:")
+            .expect("every body rewrite replaces with a [REDACTED:<class>] marker");
+        let end = statement[start..].find(']').expect("a closed marker") + start;
+        let class = statement[start + "[REDACTED:".len()..end].to_string();
+        if classes.last() != Some(&class) {
+            classes.push(class);
+        }
+    }
+    assert_eq!(
+        classes,
+        CI_LOG_SCRUB_CLASSES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect::<Vec<String>>(),
+        "the collector's scrub classes and CI_LOG_SCRUB_CLASSES disagree"
+    );
+
+    // The stage must run, and must run before the shared allowlist: a secret
+    // has to be gone before any later stage can copy or export its body.
+    let pipeline = CONFIG
+        .lines()
+        .find(|line| {
+            line.trim()
+                .starts_with("processors: [memory_limiter, transform/")
+        })
+        .expect("logs pipeline processors line");
+    let scrub = pipeline
+        .find("transform/ci_log_redaction")
+        .expect("transform/ci_log_redaction must be in the logs pipeline");
+    let privacy = pipeline
+        .find("transform/privacy")
+        .expect("transform/privacy must be in the logs pipeline");
+    assert!(scrub < privacy, "the scrub stage must precede transform/privacy: {pipeline}");
+
+    // The exception is named where a reviewer reading the allowlist will see
+    // it, not only in a commit message.
+    assert!(
+        CONFIG.contains("`ci.job.log` (#8825) carries a GitHub Actions job"),
+        "config.yaml must state the ci.job.log body exception beside the allowlist"
+    );
 }
 
 /// Issue #8824 fan-out contract, no Docker: the gateway's `transform/privacy`

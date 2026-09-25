@@ -166,6 +166,9 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     let observed_time_unix_nano = nanos(envelope.emitted_at);
     let mut time_unix_nano = observed_time_unix_nano;
+    // Only `ci.job.log` (#8825) sets this; every other kind's body stays the
+    // event name it has always been, byte-identical on the wire.
+    let mut body_override: Option<String> = None;
     let (event_name, severity, _body, attributes) = match &envelope.record {
         TelemetryRecord::SweepStarted(r) => {
             let mut attributes = vec![
@@ -525,6 +528,15 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             time_unix_nano = completed_at;
             (event_name, severity, String::new(), attributes)
         }
+        TelemetryRecord::CiJobLog(r) => {
+            // Issue #8825: the one kind whose body is NOT its event name —
+            // it is the chunk's raw log text, which the gateway's
+            // `ci.job.log`-scoped scrub stage redacts before either sink.
+            let (event_name, severity, completed_at, attributes) = ci::log_parts(&envelope.record)?;
+            time_unix_nano = completed_at;
+            body_override = Some(r.text.clone());
+            (event_name, severity, String::new(), attributes)
+        }
         TelemetryRecord::TokensSnapshot(_)
         | TelemetryRecord::HostHealth(_)
         | TelemetryRecord::CiDuration(_)
@@ -535,7 +547,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         observed_time_unix_nano,
         severity_number: severity as i32,
         severity_text: severity_text(severity).to_string(),
-        body: Some(any_string(event_name)),
+        body: Some(any_string(body_override.unwrap_or_else(|| event_name.to_string()))),
         attributes: metadata::bounded(attributes),
         event_name: event_name.to_string(),
         trace_id: envelope
@@ -754,10 +766,15 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         | TelemetryRecord::SessionAnalysis(_)
         | TelemetryRecord::DaemonEvent(_)
         // CI runs/jobs are log records; `ci.duration` is a histogram point
-        // (see `histogram_point_for`), never a gauge.
+        // (see `histogram_point_for`), never a gauge. A `ci.job.log` chunk
+        // (#8825) is a log record too — and deliberately produces no metric
+        // at all: every number it could offer (chunk size, byte total) is
+        // already an attribute on the record, and a per-chunk gauge would
+        // make log volume look like a host sample.
         | TelemetryRecord::CiRun(_)
         | TelemetryRecord::CiJob(_)
         | TelemetryRecord::CiDuration(_)
+        | TelemetryRecord::CiJobLog(_)
         | TelemetryRecord::Span(_) => Vec::new(),
     }
 }

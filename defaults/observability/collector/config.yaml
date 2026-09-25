@@ -147,8 +147,62 @@ processors:
     check_interval: 1s
     limit_mib: 384
     spike_limit_mib: 96
+  # ---------------------------------------------------------------------
+  # ci.job.log secret scrubbing (#8825) — THE REDACTION BOUNDARY.
+  #
+  # `ci.job.log` is the one and only record kind whose body is free text the
+  # daemon did not author: GitHub Actions job logs, forwarded unfiltered
+  # apart from a per-job size cap, because the operator decision for #8825
+  # makes this collector — not the source — responsible for redaction.
+  #
+  # Scope. Every statement is guarded by `attributes["loom.ci.chunk_index"]
+  # != nil and IsString(body)`. That attribute is emitted by, and only by,
+  # ci.job.log chunks (CI_LOG_CHUNK_MARKER_KEY in
+  # loom-daemon/src/telemetry/ci.rs), so no other kind's body can ever be
+  # rewritten here, and a non-string body is left alone rather than erroring
+  # the batch. This stage runs BEFORE transform/privacy so a secret is gone
+  # before anything else touches the record.
+  #
+  # The class list below is the reviewable source of truth together with
+  # CI_LOG_SCRUB_CLASSES in loom-daemon/src/telemetry/ci.rs; the contract
+  # test `collector_fanout::gateway_scrubs_exactly_the_declared_ci_log_classes`
+  # fails if the two disagree in either direction, so a new secret family is
+  # added HERE, to that constant, and to the test in the same PR.
+  #
+  # Order matters and is load-bearing:
+  #   1. `authorization` eats the rest of an `Authorization:` header line
+  #      before anything can leave its value behind.
+  #   2. `bearer-token` catches `Bearer <token>` anywhere else.
+  #   3..7 each consume their own key name along with the value.
+  #   8. `credential` is the broad `name=value` sweep; its value pattern
+  #      excludes `[` so it can never re-redact an earlier `[REDACTED:...]`
+  #      marker into a less specific one.
+  # Every statement below is a YAML SINGLE-quoted scalar on purpose: it reaches
+  # OTTL verbatim (only '' -> ' is unescaped), so the backslash escapes in the
+  # regexes are OTTL's, not YAML's. A double-quoted scalar would consume them
+  # twice and silently change what is matched.
+  transform/ci_log_redaction:
+    error_mode: propagate
+    log_statements:
+      - context: log
+        statements:
+          - 'replace_pattern(body, "(?i)authorization[\"'' ]*[:=].*", "[REDACTED:authorization]") where attributes["loom.ci.chunk_index"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?i)bearer\\s+[A-Za-z0-9._~+/-]{16,}=*", "[REDACTED:bearer-token]") where attributes["loom.ci.chunk_index"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}", "[REDACTED:github-token]") where attributes["loom.ci.chunk_index"] != nil and IsString(body)'
+          - 'replace_pattern(body, "github_pat_[A-Za-z0-9_]{20,}", "[REDACTED:github-token]") where attributes["loom.ci.chunk_index"] != nil and IsString(body)'
+          - 'replace_pattern(body, "sk-ant-[A-Za-z0-9_-]{16,}", "[REDACTED:anthropic-key]") where attributes["loom.ci.chunk_index"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?i)(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token)[\"'' ]*[:=][\"'' ]*sk-[A-Za-z0-9_-]{16,}", "[REDACTED:api-key]") where attributes["loom.ci.chunk_index"] != nil and IsString(body)'
+          - 'replace_pattern(body, "AKIA[0-9A-Z]{16}", "[REDACTED:aws-access-key-id]") where attributes["loom.ci.chunk_index"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?i)aws_secret_access_key[\"'' ]*[:=][\"'' ]*[A-Za-z0-9/+=]{40}", "[REDACTED:aws-secret-access-key]") where attributes["loom.ci.chunk_index"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?i)(?:password|passwd|secret|token|api[_-]?key)[\"'' ]*[:=][\"'' ]*[^\\s\"''&\\[]{6,}", "[REDACTED:credential]") where attributes["loom.ci.chunk_index"] != nil and IsString(body)'
   # Allow only Loom's structured operational attributes. Source-side privacy
-  # enforcement still owns free-text bodies, span names and nested values.
+  # enforcement owns free-text bodies, span names and nested values for every
+  # record kind EXCEPT ONE: `ci.job.log` (#8825) carries a GitHub Actions job
+  # log as its body, by operator decision, and is scrubbed by
+  # transform/ci_log_redaction above — which runs first, and is scoped to that
+  # kind alone. That is the whole exception: no other kind's body is touched
+  # here or there, and no `ci.job.log` attribute is derived from log text, so
+  # the allowlist below stays the only gate on attributes.
   transform/privacy:
     error_mode: propagate
     log_statements:
@@ -166,10 +220,14 @@ processors:
           # daemon.event (#8760, G4) adds loom.topic and loom.payload — the
           # payload is already-reviewed, small, operator-facing event-bus
           # JSON (never transcript content), carried whole as one string.
-          # ci.run / ci.job (#8824) add exactly the loom.ci.* keys below —
-          # CI_LOG_ATTRIBUTE_KEYS in loom-daemon/src/telemetry/ci.rs, asserted
-          # byte-for-byte by the ci_telemetry contract test.
-          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name", "loom.duration_sec", "loom.total_duration_sec", "loom.phase_durations", "loom.models_used", "loom.tokens_by_model", "loom.judge_verdicts", "loom.tokens_in", "loom.tokens_out", "loom.lines_added", "loom.lines_deleted", "loom.config.runtime", "loom.config.provider", "loom.config.configured_model", "loom.config.arm", "loom.gated_pool", "loom.actions.comments_posted", "loom.actions.issues_labeled", "loom.actions.prs_merged", "loom.session_id", "loom.agent_id", "loom.parent_agent_id", "loom.parent_session_id", "loom.wall_ms", "loom.turns", "loom.tool_calls", "loom.tool_errors", "loom.outcome", "loom.tokens.input", "loom.tokens.output", "loom.tokens.cache_read", "loom.tokens.cache_write", "loom.cost_usd", "loom.retry_loops", "loom.longest_tool_call.tool", "loom.longest_tool_call.duration_ms", "loom.anomalies", "loom.topic", "loom.payload", "loom.ci.run_id", "loom.ci.run_attempt", "loom.ci.workflow", "loom.ci.ref", "loom.ci.head_sha", "loom.ci.event", "loom.ci.status", "loom.ci.conclusion", "loom.ci.triggered_by", "loom.ci.started_at", "loom.ci.completed_at", "loom.ci.duration_ms", "loom.ci.job_id", "loom.ci.job", "loom.ci.runner", "loom.ci.attempts", "loom.ci.timed_out"])
+          # ci.run / ci.job (#8824) and ci.job.log (#8825) add exactly the
+          # loom.ci.* keys below — CI_LOG_ATTRIBUTE_KEYS in
+          # loom-daemon/src/telemetry/ci.rs, asserted byte-for-byte by the
+          # ci_telemetry contract test. loom.ci.chunk_index is additionally the
+          # predicate transform/ci_log_redaction is scoped by, so dropping it
+          # here would break nothing at ingest but WOULD make a job log
+          # unreconstructable (chunk ordering is the only contract).
+          - keep_keys(attributes, ["loom.repo", "loom.repo.visibility", "loom.sweep_id", "loom.issue", "loom.pr_number", "loom.role", "loom.phase", "loom.attempt", "loom.runtime", "loom.provider", "loom.model", "loom.configured_model", "loom.result", "loom.failure_class", "loom.effort", "loom.doctor_cycles", "loom.judge_verdict", "loom.recovered", "loom.timing_source", "loom.tool.name", "loom.duration_sec", "loom.total_duration_sec", "loom.phase_durations", "loom.models_used", "loom.tokens_by_model", "loom.judge_verdicts", "loom.tokens_in", "loom.tokens_out", "loom.lines_added", "loom.lines_deleted", "loom.config.runtime", "loom.config.provider", "loom.config.configured_model", "loom.config.arm", "loom.gated_pool", "loom.actions.comments_posted", "loom.actions.issues_labeled", "loom.actions.prs_merged", "loom.session_id", "loom.agent_id", "loom.parent_agent_id", "loom.parent_session_id", "loom.wall_ms", "loom.turns", "loom.tool_calls", "loom.tool_errors", "loom.outcome", "loom.tokens.input", "loom.tokens.output", "loom.tokens.cache_read", "loom.tokens.cache_write", "loom.cost_usd", "loom.retry_loops", "loom.longest_tool_call.tool", "loom.longest_tool_call.duration_ms", "loom.anomalies", "loom.topic", "loom.payload", "loom.ci.run_id", "loom.ci.run_attempt", "loom.ci.workflow", "loom.ci.ref", "loom.ci.head_sha", "loom.ci.event", "loom.ci.status", "loom.ci.conclusion", "loom.ci.triggered_by", "loom.ci.started_at", "loom.ci.completed_at", "loom.ci.duration_ms", "loom.ci.job_id", "loom.ci.job", "loom.ci.runner", "loom.ci.attempts", "loom.ci.timed_out", "loom.ci.chunk_index", "loom.ci.chunk_count", "loom.ci.log_bytes_total", "loom.ci.truncated", "loom.ci.truncation_note"])
     trace_statements:
       - context: resource
         statements:
@@ -235,8 +293,11 @@ service:
                 port: 8888
   pipelines:
     logs:
+      # transform/ci_log_redaction MUST stay ahead of transform/privacy: it is
+      # the #8825 redaction boundary, and a secret has to be gone before any
+      # later stage can copy, log or export the body it lives in.
       receivers: [otlp, file_log/codex, file_log/pi, file_log/claude]
-      processors: [memory_limiter, transform/privacy]
+      processors: [memory_limiter, transform/ci_log_redaction, transform/privacy]
       exporters: [otlp_http/clickstack, otlp_http/signoz]
     metrics:
       receivers: [otlp]
