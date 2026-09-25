@@ -496,6 +496,113 @@ _pmd_is_real_binary() {
   esac
 }
 
+# _pmd_verify_binary_loadable <bin> [cap_secs]
+#
+# Issue #8837: after copying <bin> into place, confirm it actually LOADS on
+# this host before treating the install as successful. `install`/`cp`
+# succeeding only means the BYTES landed at the destination — it says
+# nothing about whether the dynamic linker can resolve every symbol version
+# the binary references. The 2026-09-24 incident: a cross-host prebuilt
+# requiring GLIBC_2.38/2.39 copied cleanly onto a glibc-2.35 worker, then
+# failed EVERY invocation with "version `GLIBC_2.38' not found" — including
+# the self-repair scripts that would otherwise have caught it.
+# `loom-daemon/src/release_fetch/glibc.rs` (AC1) already refuses an
+# incompatible FETCHED artifact before it ever reaches this function; this
+# is the second, independent layer that also catches a host-native `cargo
+# build` artifact (which never goes through AC1's fetch-time check at all)
+# and any bug in that check.
+#
+# Captures <bin>'s stdout+stderr (NOT discarded with `2>/dev/null` — the
+# whole point is surfacing a `GLIBC_x.y' not found` message that a caller's
+# existing `--version 2>/dev/null` calls elsewhere in this file would
+# otherwise swallow into the string "unknown"). Bounded by a hard wall-clock
+# cap (default 10s), using the same background+poll+kill shape
+# `_pmd_codesign_capped` above already established — an unattended install
+# must never hang on a wedged binary.
+#
+# Returns 0 when <bin> answers `--version` non-interactively within the cap
+# with exit 0 and non-empty stdout; 1 otherwise (with the captured output
+# already warned to the caller).
+_pmd_verify_binary_loadable() {
+  local bin="$1"
+  local cap_secs="${2:-10}"
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/loom-daemon-loadcheck.XXXXXX" 2>/dev/null || echo "/tmp/loom-daemon-loadcheck.$$")"
+
+  "$bin" --version >"$out_file" 2>&1 &
+  local pid=$!
+  local waited=0
+  local timed_out=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= cap_secs )); then
+      kill -9 "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      timed_out=1
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  local rc=0
+  if [[ "$timed_out" -eq 1 ]]; then
+    rc=124
+  else
+    wait "$pid" 2>/dev/null || rc=$?
+  fi
+
+  local out=""
+  # `$(< file)` is bash's own builtin fast-read (no `cat` subprocess) --
+  # deliberate: this runs on the same restricted-PATH install surface
+  # `_pmd_is_real_binary` already accommodates (a container image missing
+  # ordinary coreutils), so reading the captured output must not add a NEW
+  # external-tool dependency of its own.
+  [[ -f "$out_file" ]] && out="$(<"$out_file")"
+  rm -f "$out_file"
+
+  if [[ "$rc" -eq 0 && -n "$out" ]]; then
+    return 0
+  fi
+
+  _pmd_warn "post-install loadability check FAILED for $bin (exit $rc):"
+  if [[ -n "$out" ]]; then
+    while IFS= read -r line; do
+      _pmd_warn "  $line"
+    done <<<"$out"
+  else
+    _pmd_warn "  (no output)"
+  fi
+  return 1
+}
+
+# _pmd_quarantine_unloadable <dest_bin>
+#
+# Issue #8837 AC2: move an installed-but-unloadable <dest_bin> aside as
+# <dest_bin>.badglibc-<YYYYMMDD> instead of leaving a bricked binary at the
+# path every consumer (loom-daemon-start.sh, and the self-repair scripts
+# themselves, per the 2026-09-24 incident) resolves via `command -v
+# loom-daemon`. The naming matches the operator's own manual remediation
+# that day (`~/.local/bin/loom-daemon.badglibc-20260924`) — an auditable
+# trail of what happened and when, not a silent `rm`.
+#
+# A same-day repeat quarantine (e.g. a retried install that fails again)
+# gets a numeric suffix rather than clobbering the first one, so evidence
+# from an earlier failed attempt is never silently lost.
+_pmd_quarantine_unloadable() {
+  local dest_bin="$1"
+  local quarantine_path="${dest_bin}.badglibc-$(date +%Y%m%d)"
+  local n=2
+  while [[ -e "$quarantine_path" ]]; do
+    quarantine_path="${dest_bin}.badglibc-$(date +%Y%m%d)-$n"
+    n=$((n + 1))
+  done
+  if mv -f "$dest_bin" "$quarantine_path" 2>/dev/null; then
+    _pmd_warn "quarantined unloadable binary: $dest_bin -> $quarantine_path"
+  else
+    _pmd_warn "could not quarantine unloadable binary at $dest_bin (mv failed) — remove it manually before the next install"
+  fi
+}
+
 # _pmd_defaults_dest_dir
 #
 # Resolves the machine-level location `loom-daemon`'s own `defaults/`
@@ -586,6 +693,15 @@ _pmd_provision_defaults_payload() {
 # non-zero return (a repo can still run the daemon via an explicit
 # LOOM_DAEMON_BIN or an in-repo build).
 #
+# Issue #8837 AC2: a copy that lands but does not LOAD (e.g. a binary built
+# against a newer GLIBC than this host provides) is also a soft failure, not
+# a success — the copied bytes are verified with `<dest_bin> --version`
+# after every install/upgrade, and an unloadable result is quarantined to
+# `<dest_bin>.badglibc-<date>` rather than left in place. When a previous
+# working binary existed at <dest_bin>, it is restored so the host is never
+# left with nothing runnable at that path; see `_pmd_verify_binary_loadable`
+# and `_pmd_quarantine_unloadable` above.
+#
 # When <defaults_src_dir> is given and exists, it is ALSO mirrored to a
 # machine-level location (`_pmd_defaults_dest_dir`) so `loom-daemon init`
 # has a working recovery path even on a host with no on-host `loom` git
@@ -660,10 +776,44 @@ provision_machine_daemon() {
     return 1
   fi
 
+  # Issue #8837 AC2: back up whatever binary is CURRENTLY at $dest_bin
+  # (before it is overwritten below) so that a post-copy loadability failure
+  # can restore it rather than leave the host with nothing at all. Only
+  # meaningful for an upgrade — a fresh install has no prior binary to save.
+  local preupdate_backup=""
+  if [[ -x "$dest_bin" ]]; then
+    preupdate_backup="$(mktemp "${TMPDIR:-/tmp}/loom-daemon-preupdate.XXXXXX" 2>/dev/null || true)"
+    if [[ -n "$preupdate_backup" ]] && ! cp -f "$dest_bin" "$preupdate_backup" 2>/dev/null; then
+      preupdate_backup=""
+    fi
+  fi
+
   # Prefer install(1) for the atomic mode-set; fall back to cp + chmod.
   if install -m 755 "$src_bin" "$dest_bin" 2>/dev/null || \
      { cp -f "$src_bin" "$dest_bin" 2>/dev/null && chmod 755 "$dest_bin" 2>/dev/null; }; then
     _pmd_ok "installed loom-daemon → $dest_bin ($src_ver)"
+
+    # Issue #8837 AC2: the bytes landed, but do they actually LOAD on this
+    # host? Defense-in-depth alongside AC1's fetch-time GLIBC gate
+    # (loom-daemon/src/release_fetch/glibc.rs) — this is the layer that also
+    # catches a host-native `cargo build` artifact, which never goes through
+    # AC1's check at all, and any bug in it.
+    if ! _pmd_verify_binary_loadable "$dest_bin"; then
+      _pmd_quarantine_unloadable "$dest_bin"
+      if [[ -n "$preupdate_backup" ]]; then
+        if cp -f "$preupdate_backup" "$dest_bin" 2>/dev/null && chmod 755 "$dest_bin" 2>/dev/null; then
+          _pmd_warn "restored the previous working binary at $dest_bin"
+        else
+          _pmd_warn "could not restore the previous working binary — $dest_bin is now ABSENT; re-run install/self-update once a compatible build is available"
+        fi
+      else
+        _pmd_warn "no previous working binary to restore — $dest_bin is now ABSENT (fresh install); set LOOM_DAEMON_BIN=$src_bin or re-run install once a compatible build is available"
+      fi
+      rm -f "$preupdate_backup" 2>/dev/null
+      return 1
+    fi
+    rm -f "$preupdate_backup" 2>/dev/null
+
     # Belt-and-braces (#4016): the source binary passed to this function is
     # signed by loom-daemon-update.sh's own signing step before it gets here,
     # but this covers the installer-only path (install.sh / install-loom.sh),
@@ -676,6 +826,7 @@ provision_machine_daemon() {
     _pmd_cleanup_retired_shims "$dest_dir"
     _pmd_provision_defaults_payload "$defaults_src_dir"
   else
+    rm -f "$preupdate_backup" 2>/dev/null
     _pmd_warn "failed to install loom-daemon to $dest_bin"
     _pmd_warn "set LOOM_DAEMON_BIN=$src_bin in the consumer env to run the daemon"
     return 1
