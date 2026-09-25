@@ -41,34 +41,31 @@
 //!    changed which credential path a probe uses would be changing the forge
 //!    contract under cover of a refactor.
 //!
-//! # Why this is NOT [`crate::worktree_ops::landed`]
+//! # The one Rust ladder (#8470)
 //!
-//! That module is the daemon's other Rust copy of the same #7812 ladder, and
-//! this slice deliberately does not fold into it — stated here rather than
-//! discovered by a reviewer, because "reuse `worktree_ops`, do not re-derive
-//! it" is this port's own instruction and this is the one place it is not
-//! followed.
+//! This is the daemon's ONLY Rust implementation of the #7812 ladder.
+//! [`crate::worktree_ops::landed`] used to be a second, independently-written
+//! copy for `clean --aggressive`; since #8470 it is an adapter over
+//! [`ladder`] that owns no git or forge rung of its own. The two call sites
+//! differ only in what they hand the ladder, never in how it decides:
 //!
-//! The two are not interchangeable today, in a direction that matters:
-//!
-//! - **Different key.** `landed::probe` takes an `issue_num` and probes the
-//!   forge for `feature/issue-<n>`. `worktree.sh remove` deletes whatever
-//!   branch the worktree had attached — `worktree.sh <N> <custom-branch>`
-//!   allows any name — so the primitive it needs is keyed on a branch *name*.
-//! - **Different strictness.** This module requires the merged PR's head SHA
-//!   to still equal the local tip (#7872's `merged-head-mismatch` rung);
-//!   `landed::probe` treats any merged PR for the name as `Rewritten`. So
-//!   this one is the *stricter* of the two, and routing `clean --aggressive`
-//!   through it would change what that bulk reaper reaps.
-//! - **Different output.** `_maybe_delete_local_branch`'s messages — which
-//!   `test-worktree-remove-squash-merge.sh` asserts verbatim — are keyed on
-//!   the evidence token and the `forge_status` side-channel. `Landed` carries
-//!   neither.
-//!
-//! Converging them means making `clean --aggressive` stricter, which is a
-//! behaviour change to an unattended bulk `rm -rf` path and belongs in its own
-//! issue with its own evidence, not in a slice whose whole claim is that the
-//! retained suites pass unchanged. Tracked in #8470.
+//! - **Key.** `worktree.sh remove` passes a branch *name* ([`probe`]), which
+//!   is resolved to a tip here. `clean --aggressive` already knows the
+//!   worktree's HEAD, and expresses its issue number as the forge key
+//!   `feature/issue-<n>` at its own call site ([`ladder`] with
+//!   `forge_key: None` for a worktree with no issue branch).
+//! - **Strictness.** There is one rule now: a merged PR proves `landed` only
+//!   when its head SHA still equals the local tip (#7872's
+//!   `merged-head-mismatch` rung). Before #8470 `clean --aggressive` treated
+//!   *any* merged PR for the name as landed; it now keeps a worktree whose
+//!   branch moved past its merged head (unless the tree rung proves the extra
+//!   commits carry nothing new). That is the one deliberate behaviour change
+//!   of the convergence, and it is pinned by the aggressive suite.
+//! - **Output.** The full [`Answer`] (evidence token + `forge_status`
+//!   side-channel) is what `branch_delete`'s verbatim messages key on;
+//!   `worktree_ops::landed` reconstructs its `Reachable` / `Rewritten` split
+//!   from [`Answer::evidence`] so `clean --aggressive` keeps its two removal
+//!   reasons.
 
 use std::path::Path;
 use std::process::Command;
@@ -264,17 +261,53 @@ pub fn probe_with_caps(
     forge: &dyn Fn(&str) -> ForgeProbe,
     caps: Caps,
 ) -> Answer {
-    let mut answer = Answer::unknown();
     if branch.is_empty() {
-        return answer;
+        return Answer::unknown();
     }
 
     let tip = resolve_branch(repo, branch);
     let default_sha = resolve_default(repo, default_name);
+    ladder(
+        repo,
+        tip.as_deref(),
+        default_sha.as_deref(),
+        Some(branch),
+        hint_sha,
+        forge,
+        caps,
+    )
+}
+
+/// The ladder itself, over already-resolved inputs — the single decision
+/// procedure both [`probe`] (keyed on a branch name) and
+/// [`crate::worktree_ops::landed`] (keyed on a worktree HEAD plus
+/// `feature/issue-<n>`) run.
+///
+/// - `tip` / `default_sha` — commits, already resolved; `None` (or empty)
+///   means "could not be resolved", and every local rung that needs one is
+///   skipped rather than answered.
+/// - `forge_key` — the branch name the forge rung asks about. `None` skips the
+///   forge entirely (`forge_status` stays [`ForgeStatus::Skipped`]): there is
+///   no name to ask about, so only the two local rungs can answer.
+/// - `hint_sha` — a caller-known merged-PR head SHA (rung 2); non-empty
+///   replaces the forge round-trip.
+#[must_use]
+pub fn ladder(
+    repo: &Path,
+    tip: Option<&str>,
+    default_sha: Option<&str>,
+    forge_key: Option<&str>,
+    hint_sha: &str,
+    forge: &dyn Fn(&str) -> ForgeProbe,
+    caps: Caps,
+) -> Answer {
+    let mut answer = Answer::unknown();
+    let tip = tip.filter(|t| !t.is_empty());
+    let default_sha = default_sha.filter(|d| !d.is_empty());
 
     // Rung 1: ancestry. Proves `landed` only; its falsity proves nothing —
     // which is exactly the trap the four private heuristics fell into.
-    if let (Some(tip), Some(default_sha)) = (tip.as_deref(), default_sha.as_deref()) {
+    if let (Some(tip), Some(default_sha)) = (tip, default_sha) {
         if git_ok(repo, &["merge-base", "--is-ancestor", tip, default_sha]) {
             answer.verdict = Verdict::Landed;
             answer.evidence = Evidence::Ancestor;
@@ -283,9 +316,22 @@ pub fn probe_with_caps(
     }
 
     let mut forge_answered_negative = false;
-    if hint_sha.is_empty() {
+    if !hint_sha.is_empty() {
+        // Rung 2: the caller's already-known merged-PR head SHA.
+        answer.forge_status = ForgeStatus::Hinted;
+        answer.pr_head_sha = Some(hint_sha.to_string());
+        if tip.is_some_and(|t| t == hint_sha) {
+            answer.verdict = Verdict::Landed;
+            answer.evidence = Evidence::MergedHeadMatch;
+            return answer;
+        }
+        // The caller already knows the merged head and the tip is not it; no
+        // forge round-trip can add anything.
+        answer.evidence = Evidence::MergedHeadMismatch;
+        forge_answered_negative = true;
+    } else if let Some(key) = forge_key.filter(|k| !k.is_empty()) {
         // Rung 3: the forge.
-        let p = forge(branch);
+        let p = forge(key);
         answer.forge_status = p.status;
         match p.status {
             ForgeStatus::Found => {
@@ -294,8 +340,8 @@ pub fn probe_with_caps(
                 // #7872: require an ACTUAL tip match. A branch name that
                 // resolves to no local ref is the case with the LEAST
                 // evidence, not a free pass.
-                if let (Some(tip), Some(sha)) = (tip.as_deref(), p.head_sha.as_deref()) {
-                    if !tip.is_empty() && tip == sha {
+                if let (Some(tip), Some(sha)) = (tip, p.head_sha.as_deref()) {
+                    if tip == sha {
                         answer.verdict = Verdict::Landed;
                         answer.evidence = Evidence::ForgeMergedPr;
                         return answer;
@@ -311,23 +357,11 @@ pub fn probe_with_caps(
             // `unavailable` — only the tree check can answer now.
             _ => {}
         }
-    } else {
-        // Rung 2: the caller's already-known merged-PR head SHA.
-        answer.forge_status = ForgeStatus::Hinted;
-        answer.pr_head_sha = Some(hint_sha.to_string());
-        if tip.as_deref().is_some_and(|t| t == hint_sha) {
-            answer.verdict = Verdict::Landed;
-            answer.evidence = Evidence::MergedHeadMatch;
-            return answer;
-        }
-        // The caller already knows the merged head and the tip is not it; no
-        // forge round-trip can add anything.
-        answer.evidence = Evidence::MergedHeadMismatch;
-        forge_answered_negative = true;
     }
+    // No hint and no forge key: the forge rung is skipped, not failed.
 
     // Rung 4: tree equality. Squash/rebase/merge-commit proof, fully offline.
-    if let (Some(tip), Some(default_sha)) = (tip.as_deref(), default_sha.as_deref()) {
+    if let (Some(tip), Some(default_sha)) = (tip, default_sha) {
         if caps.merge_tree {
             match merge_tree_write_tree(repo, default_sha, tip) {
                 MergeTree::Tree(merged) => {
@@ -512,6 +546,13 @@ fn resolve_default(repo: &Path, name: Option<&str>) -> Option<String> {
         }
     }
     None
+}
+
+/// Resolve any rev to a commit SHA — the resolver [`ladder`]'s callers use to
+/// hand it already-resolved inputs.
+#[must_use]
+pub fn resolve_commit(repo: &Path, rev: &str) -> Option<String> {
+    commit(repo, rev)
 }
 
 fn commit(repo: &Path, rev: &str) -> Option<String> {

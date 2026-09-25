@@ -54,11 +54,10 @@
 //! — the shell's own comment said it "mirrors" that function, and mirroring is
 //! what drifts.
 //!
-//! [`branch_landed`] is the one piece slice 3 does NOT share with
-//! `worktree_ops` — [`crate::worktree_ops::landed`] is the daemon's other copy
-//! of the same ladder, keyed and scoped differently. Why they are not folded
-//! together yet, and what folding them would cost `clean --aggressive`, is
-//! argued in [`branch_landed`]'s own module doc; convergence is #8470.
+//! [`branch_landed`] is the daemon's ONE Rust copy of that ladder:
+//! [`crate::worktree_ops::landed`] (`clean --aggressive`) is an adapter over
+//! [`branch_landed::ladder`] since #8470 — see [`branch_landed`]'s module doc
+//! for how the two call sites differ and the strictness change it made.
 
 pub mod baseline;
 pub mod branch_delete;
