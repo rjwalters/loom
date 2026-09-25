@@ -62,6 +62,27 @@ fn removes_all_three_stale_locks_and_reports_cleaned() {
 }
 
 #[test]
+fn each_lock_is_swept_on_its_own_not_only_alongside_the_others() {
+    // The sweep is a loop over all three names with no dependence between the
+    // iterations, and every one of them must fire when it is the ONLY lock
+    // present. Pinned per-name rather than left to
+    // `removes_all_three_stale_locks_and_reports_cleaned`, which cannot tell a
+    // correct loop from one that needs a sibling to have matched first.
+    for lock in STALE_LOCKS {
+        let dir = tmpdir(&format!("lock-{lock}-only"));
+        let admin = dir.join("worktrees").join("issue-42");
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(admin.join(lock), b"").unwrap();
+
+        assert!(
+            remove_stale_locks(&admin, &quiet()),
+            "a lone {lock} must report that something was cleaned"
+        );
+        assert!(!admin.join(lock).exists(), "a lone {lock} survived the stale-lock sweep");
+    }
+}
+
+#[test]
 fn absent_locks_are_not_a_reason_to_prune() {
     let dir = tmpdir("nolocks");
     let admin = dir.join("worktrees").join("issue-42");

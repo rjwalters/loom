@@ -46,6 +46,20 @@
 //! the ordinary reason that an index file records mtimes. Commit SHAs are
 //! pinned identical across the two trees by fixing author/committer identity
 //! and date, so the ref files that *are* compared match byte-for-byte.
+//! Under `.git/worktrees/**` the manifest records kind and path but **not**
+//! contents, because `git worktree add` writes mtime-bearing files there; see
+//! [`GitScope`]. That is enough to compare the stale-lock sweep, whose locks
+//! are empty files and whose whole question is which of them still exist.
+//!
+//! Until #8195 slice 5's Doctor pass, 2 above silently excluded the very
+//! directory the stale-lock sweep acts on: `walk` treated `.git` itself as an
+//! excluded internal, so it never descended into it and no lock file was ever
+//! in a manifest. The sweep was therefore compared only by the warnings it
+//! printed, and the three cases named for a *survival*
+//! (`lock-other-issue-untouched`, `lock-sweep-leaves-other-files`, and the
+//! admin dir a prune removes) asserted nothing whatsoever. Both that and the
+//! narrower "the manifest must not descend into the rest of `.git`" are now
+//! pinned by [`the_comparison_can_actually_fail`].
 //!
 //! # Not compared
 //!
@@ -361,6 +375,31 @@ fn materialise(root: &Path, case: &Scenario) -> (PathBuf, PathBuf) {
     let repo = root.join(case.repo);
     fs::create_dir_all(&repo).expect("mkdir repo");
     run_git(&repo, &["init", "-q", "-b", "main"]);
+    // Keep git's own background maintenance off these fixtures. Two measured
+    // facts, not a precaution against something hypothetical:
+    //
+    //   * `git maintenance run --auto` PRUNES a broken
+    //     `.git/worktrees/issue-<N>` admin dir — and "an admin dir holding
+    //     nothing but a lock file" is exactly the shape every stale-lock case
+    //     in this corpus is made of (no `gitdir`, therefore broken).
+    //   * `git commit` spawns `git maintenance run --auto --quiet --detach`.
+    //     Verified with `GIT_TRACE=1`: 3 spawn lines without these two config
+    //     settings, 0 with them.
+    //
+    // The detached form was inert on the git this was measured against (2.55.0
+    // — it decides there is nothing to do before it forks, so it never reaches
+    // the prune), which is why this is not being offered as the cause of any
+    // particular failure. It is that the corpus writes its lock files *after*
+    // the commit, into the one directory a process the harness neither started
+    // nor waits for is known to delete — and since `.git/worktrees/**` is now
+    // part of the comparison (see `git_scope`), a fixture that can evaporate on
+    // its own is a green-or-red decision made by something outside the test.
+    //
+    // Turned off rather than tolerated: the cleanup under test runs its own
+    // explicit `git worktree prune`, which neither setting affects, so nothing
+    // being compared is weakened. Set on BOTH trees, so they stay identical.
+    run_git(&repo, &["config", "maintenance.auto", "false"]);
+    run_git(&repo, &["config", "gc.auto", "0"]);
     fs::write(repo.join("README.md"), b"seed\n").expect("seed");
     run_git(&repo, &["add", "README.md"]);
     run_git(&repo, &["commit", "-q", "-m", "init"]);
@@ -478,31 +517,71 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
             out.push(format!("symlink\t{rel}\t{}", normalise(&target.to_string_lossy(), root)));
             continue;
         }
-        if meta.is_dir() {
-            out.push(format!("dir\t{rel}"));
-            if is_excluded_git_internal(&rel) {
-                continue;
+        let kind = if meta.is_dir() { "dir" } else { "file" };
+        match git_scope(&rel) {
+            // Recorded by name and kind, never descended into.
+            GitScope::Internal => out.push(format!("{kind}\t{rel}")),
+            GitScope::WorktreeAdmin => {
+                out.push(format!("{kind}\t{rel}"));
+                if meta.is_dir() {
+                    walk(root, &path, out);
+                }
             }
-            walk(root, &path, out);
-            continue;
+            GitScope::Outside => {
+                if meta.is_dir() {
+                    out.push(format!("dir\t{rel}"));
+                    walk(root, &path, out);
+                } else {
+                    let contents = fs::read(&path).unwrap_or_default();
+                    out.push(format!(
+                        "file\t{rel}\t{}",
+                        normalise(&String::from_utf8_lossy(&contents), root)
+                    ));
+                }
+            }
         }
-        if is_excluded_git_internal(&rel) {
-            out.push(format!("file\t{rel}"));
-            continue;
-        }
-        let contents = fs::read(&path).unwrap_or_default();
-        out.push(format!("file\t{rel}\t{}", normalise(&String::from_utf8_lossy(&contents), root)));
     }
 }
 
-/// Inside a `.git` directory but outside `worktrees/`: recorded by name only
-/// (an index file records mtimes, a log records timestamps).
-fn is_excluded_git_internal(rel: &str) -> bool {
+/// How [`walk`] treats one path, which turns entirely on where it sits
+/// relative to a `.git` directory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GitScope {
+    /// Outside `.git` entirely: kind, path AND contents are all compared.
+    Outside,
+    /// `.git` itself, or anything under `.git/worktrees/` — the only part of
+    /// git's internals this function writes to, and the part the stale-lock
+    /// sweep is judged by. Kind and path are compared; **contents are not**.
+    ///
+    /// Not contents because `git worktree add` writes mtime-bearing files
+    /// (`index`, `logs/HEAD`) into an admin dir, so their bytes differ between
+    /// two trees that are otherwise identical. Existence is the whole signal
+    /// wanted here anyway: a lock file is empty, and the only questions asked
+    /// of it are "did the sweep remove it" and "did it leave its neighbours
+    /// alone".
+    WorktreeAdmin,
+    /// Inside `.git` but outside `worktrees/`: recorded by name only and never
+    /// descended into (an index file records mtimes, a log records
+    /// timestamps).
+    Internal,
+}
+
+fn git_scope(rel: &str) -> GitScope {
     let parts: Vec<&str> = rel.split('/').collect();
     let Some(idx) = parts.iter().position(|p| *p == ".git") else {
-        return false;
+        return GitScope::Outside;
     };
-    parts.get(idx + 1).copied() != Some("worktrees")
+    match parts.get(idx + 1) {
+        // `.git` ITSELF is the gateway to `worktrees/`, so descending into it
+        // is what makes the admin dirs reachable at all. This arm used to
+        // classify `.git` as an excluded internal, which meant `walk` never
+        // entered it and NOTHING under `.git/worktrees/**` was ever compared —
+        // the stale-lock sweep's entire filesystem effect went unmeasured, and
+        // `lock-other-issue-untouched` / `lock-sweep-leaves-other-files`
+        // asserted nothing at all about the survival they are named for.
+        None | Some(&"worktrees") => GitScope::WorktreeAdmin,
+        Some(_) => GitScope::Internal,
+    }
 }
 
 fn normalise(text: &str, root: &Path) -> String {
@@ -626,6 +705,26 @@ struct Observation {
     stdout: Vec<String>,
     manifest: Vec<String>,
     porcelain: Vec<String>,
+    /// The `.git/worktrees/**` entries as they stood the instant *before* this
+    /// side ran — the stale-lock sweep's own input, sampled per side rather
+    /// than once for both.
+    ///
+    /// The pre-run identity assert already proves the two trees agreed when it
+    /// looked; this closes the remaining window between that snapshot and the
+    /// implementation actually reading the directory. Without it, "the shell
+    /// cleaned a HEAD.lock and the port printed nothing" is indistinguishable
+    /// between *the port did not sweep the lock* and *the lock was not there
+    /// to sweep* — the two answers point at opposite files, and a CI run that
+    /// cannot be reproduced afterwards is the only chance to tell them apart.
+    admin_before: Vec<String>,
+}
+
+/// The `.git/worktrees/**` slice of a manifest.
+fn admin_entries(root: &Path) -> Vec<String> {
+    manifest(root)
+        .into_iter()
+        .filter(|e| e.contains(".git/worktrees"))
+        .collect()
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -660,7 +759,10 @@ fn observe(case: &Scenario, scratch: &Path) -> (Observation, Observation) {
     let shell_physical = fs::canonicalize(&shell_cwd).expect("canonicalise shell cwd");
     let rust_physical = fs::canonicalize(&rust_cwd).expect("canonicalise rust cwd");
 
+    // Sampled per side, immediately before that side runs — not once for both.
+    let shell_admin_before = admin_entries(&shell_root);
     let shell_stdout = run_shell(&shell_physical, &shell_cwd, case.issue, case.quiet);
+    let rust_admin_before = admin_entries(&rust_root);
     let rust_stdout = run_rust(&rust_physical, &rust_cwd, case.issue, case.quiet);
 
     (
@@ -668,11 +770,13 @@ fn observe(case: &Scenario, scratch: &Path) -> (Observation, Observation) {
             stdout: stdout_lines(&shell_stdout, &shell_root),
             manifest: manifest(&shell_root),
             porcelain: porcelain(&shell_repo, &shell_root),
+            admin_before: shell_admin_before,
         },
         Observation {
             stdout: stdout_lines(&rust_stdout, &rust_root),
             manifest: manifest(&rust_root),
             porcelain: porcelain(&rust_repo, &rust_root),
+            admin_before: rust_admin_before,
         },
     )
 }
@@ -703,8 +807,11 @@ fn rust_agrees_with_the_retired_shell_on_every_corpus_case() {
 
         assert_eq!(
             shell.stdout, rust.stdout,
-            "[{}] stdout diverged\n  shell: {:#?}\n  rust:  {:#?}",
-            case.name, shell.stdout, rust.stdout
+            "[{}] stdout diverged\n  shell: {:#?}\n  rust:  {:#?}\n\
+             each side's .git/worktrees/** as it stood the instant before that \
+             side ran — if these differ, the fixture moved and the divergence \
+             is the harness's, not the port's:\n  shell: {:#?}\n  rust:  {:#?}",
+            case.name, shell.stdout, rust.stdout, shell.admin_before, rust.admin_before,
         );
         assert_eq!(
             shell.manifest,
@@ -799,6 +906,37 @@ fn the_comparison_can_actually_fail() {
     seen.insert(normalise("/a/b", Path::new("/a")), 1);
     seen.insert(normalise("/a/c", Path::new("/a")), 2);
     assert_eq!(seen.len(), 2, "normalise() collapsed distinct paths");
+
+    // …and the manifest must actually SEE a worktree admin dir. This is the
+    // discriminating-power floor for comparison 2 on the stale-lock sweep:
+    // while `walk` treated `.git` itself as an excluded internal it never
+    // descended into it, so no lock file was ever in the manifest and the
+    // sweep's filesystem effect was compared only by the warnings it printed.
+    // A green run proved nothing about the locks it did not remove.
+    fs::create_dir_all(root.join("repo/.git/worktrees/issue-42")).unwrap();
+    fs::create_dir_all(root.join("repo/.git/objects/ab")).unwrap();
+    fs::write(root.join("repo/.git/worktrees/issue-42/HEAD.lock"), b"").unwrap();
+    fs::write(root.join("repo/.git/objects/ab/cdef"), b"loose").unwrap();
+    let m = manifest(&root);
+    assert!(
+        m.iter()
+            .any(|e| e == "file\trepo/.git/worktrees/issue-42/HEAD.lock"),
+        "manifest() cannot see a stale lock under .git/worktrees/**: {m:#?}"
+    );
+    // …while the rest of `.git` stays name-only and unwalked, so an index's
+    // mtimes and a log's timestamps never reach the comparison.
+    assert!(
+        m.iter().any(|e| e == "dir\trepo/.git/objects"),
+        "manifest() dropped .git's other internals entirely: {m:#?}"
+    );
+    assert!(
+        !m.iter().any(|e| e.contains("objects/ab")),
+        "manifest() descended into .git internals it must only name: {m:#?}"
+    );
+    assert_eq!(git_scope("repo/.git"), GitScope::WorktreeAdmin);
+    assert_eq!(git_scope("repo/.git/worktrees/issue-42"), GitScope::WorktreeAdmin);
+    assert_eq!(git_scope("repo/.git/objects"), GitScope::Internal);
+    assert_eq!(git_scope("repo/.loom/worktrees/issue-42"), GitScope::Outside);
 
     let _ = fs::remove_dir_all(&root);
 }
