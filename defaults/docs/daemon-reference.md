@@ -4126,6 +4126,15 @@ concurrency ceiling 5" and share it with the team:
       "minAgeHours": 24,
       "archiveDir": "~/.loom/transcript-archives",
       "sinks": ["local"]
+    },
+    "ciTelemetry": {
+      "enabled": true,
+      "org": "2amlogic",
+      "intervalSecs": 120,
+      "excludedRepos": [],
+      "logCaptureEnabled": false,
+      "logCaptureMaxBytes": 5242880,
+      "logCaptureExcludedRepos": []
     }
   }
 }
@@ -4249,6 +4258,13 @@ knobs not yet audited here.
 | `autonomous.transcriptArchive.archiveDir` | `LOOM_TRANSCRIPT_ARCHIVE_DIR` | `~/.loom/transcript-archives` | Where the scheduled pass writes its `.tar.zst` + `.manifest.json` pairs (same default as the CLI's `--archive-dir`). **Restart required** |
 | `autonomous.transcriptArchive.sinks` | *(config only)* | `["local"]` | Destination identities to ledger under. `local` is the only sink implemented (#8758's scope); unknown names are warned about and dropped, and an enabled pass whose list retains no recognized sink does not start — a future remote sink (#8759) listing must never silently disable `local`. **Restart required** |
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
+| `autonomous.ciTelemetry.enabled` | `LOOM_CI_TELEMETRY_ENABLED` | `false` | Periodic GitHub Actions run/job capture (#8824, phase 2 #8825). Read-only observer: it can never change a dispatch, claim, or merge decision. **Restart required** — `spawn_task` resolves the whole block once, before the poller task is spawned; it is never re-read inside the poll loop. See [`ci-observability.md`](ci-observability.md) |
+| `autonomous.ciTelemetry`.`org` | `LOOM_CI_TELEMETRY_ORG` | `2amlogic` | The org whose repos are auto-discovered and polled. Empty → default. **Restart required** — same one-time `spawn_task` resolution as `enabled` |
+| `autonomous.ciTelemetry.intervalSecs` | `LOOM_CI_TELEMETRY_INTERVAL_SECS` | `120` | Poll cadence. Zero/invalid → default. **Restart required** — the resolved `Duration` is baked into the `tokio::time::interval` ticker at spawn time |
+| `autonomous.ciTelemetry.excludedRepos` | *(config only)* | `[]` | **Log-capture-only** exclusions (phase 2, #8825); each entry needs `repo` **and** a non-empty `reason` — a refused entry logs a `warn!` naming why and excludes nothing. Run/job records and duration metrics are never excludable (#8827's standing policy). **Restart required** — read once by `spawn_task` |
+| `autonomous.ciTelemetry.logCaptureEnabled` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_ENABLED` | `false` | Phase 2 (#8825) gate. **Restart required** — resolved once by `spawn_task` before the poll loop starts |
+| `autonomous.ciTelemetry.logCaptureMaxBytes` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_MAX_BYTES` | `5242880` (5 MiB) | Per-job cap on captured log text. Zero/invalid → default. **Restart required** |
+| `autonomous.ciTelemetry.logCaptureExcludedRepos` | *(config only)* | `[]` | Repos excluded from **log capture only** — their `ci.run`/`ci.job` records and duration metrics are still captured unconditionally, same admission rule (`repo` + non-empty `reason`) as `excludedRepos`. Distinct key from `excludedRepos` deliberately: excluding a repo there would also drop its metrics, which the ci-observability policy forbids. **Restart required** |
 
 ### Idle exit for remote hosts (#4467)
 
