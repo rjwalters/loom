@@ -227,12 +227,15 @@ pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
 pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP_LABELS";
 
 mod labels;
+pub mod ready_queue;
 mod tick_summary;
+use crate::types::QueueDisposition as Qd;
 pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
 #[cfg(test)]
 use tick_summary::reset_last_tick_summary;
 pub use tick_summary::{
     last_tick_summary, publish_tick, publish_tick_summary, publish_tick_summary_at,
+    publish_tick_summary_with_roots_at, tick_summary,
 };
 
 /// Label that promotes an issue ahead of its non-urgent siblings **within the
@@ -1093,6 +1096,12 @@ pub struct TickReport {
     /// re-evaluated (and, if still out-of-slice with the slice non-empty,
     /// deferred again) on the next tick.
     pub deferred_out_of_slice: usize,
+    /// Per-issue outcomes behind the counters above (Issue #8852), recorded
+    /// by the multi-workspace tick only. See [`ready_queue`].
+    pub queue: Vec<ready_queue::TickQueueRow>,
+    /// Workspaces whose ready-issue listing failed this tick, so their
+    /// backlog is missing from [`Self::queue`] (Issue #8852).
+    pub listing_failed: Vec<usize>,
 }
 
 /// Log — at DEBUG, once per skipped candidate — that a candidate was dropped
@@ -1996,6 +2005,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                 // Per-workspace isolation: log, count, and move on — the other
                 // workspaces are still polled and dispatched this same tick.
                 report.errors += 1;
+                report.listing_failed.push(idx);
                 log::warn!("work_finder: listing ready issues for workspace #{idx} failed: {e}");
                 // A rate-limit failure trips the global breaker (#4429) so the
                 // NEXT tick skips its gh fan-out entirely; this tick still
@@ -2005,12 +2015,21 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             }
         };
         report.seen += ready.len();
+        let workspace_priority = priorities
+            .get(idx)
+            .copied()
+            .unwrap_or(DEFAULT_WORKSPACE_PRIORITY);
+        let q = &mut report.queue;
 
         // Per-repo main-health gate (#3930): a red repo skips only its own
         // dispatch loop this tick. `seen` above still reflects its backlog so the
         // caller can log "backlog is N but halted"; its in-flight sweeps stay in
         // the global occupancy seed and are never touched.
         if halted.get(idx).copied().unwrap_or(false) {
+            for item in &ready {
+                let key = ready_queue::key_of(idx, workspace_priority, item);
+                ready_queue::record_skip(q, key, item, Qd::WorkspaceHalted, None);
+            }
             continue;
         }
 
@@ -2021,17 +2040,21 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         // candidates only to have each one individually refused.
         if commands_missing[idx] {
             report.skipped_workspace_commands_missing += ready.len();
+            for item in &ready {
+                let key = ready_queue::key_of(idx, workspace_priority, item);
+                ready_queue::record_skip(q, key, item, Qd::WorkspaceCommandsMissing, None);
+            }
             continue;
         }
 
         let in_flight = &in_flights[idx];
-        let workspace_priority = priorities
-            .get(idx)
-            .copied()
-            .unwrap_or(DEFAULT_WORKSPACE_PRIORITY);
         let now = chrono::Utc::now();
 
         for item in ready {
+            let key = ready_queue::key_of(idx, workspace_priority, &item);
+            let mut skip = |d: Qd, detail: Option<String>| {
+                ready_queue::record_skip(q, key.clone(), &item, d, detail);
+            };
             // Host-affinity constraint (#7456) — checked first, before any
             // other filter, mirroring `tick_with_saturation_brake`'s step 0b:
             // see that step's comment for the full rationale (no claim flip,
@@ -2039,6 +2062,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             let host_constraint = item.host_constraint();
             if !host_constraint.matches(&current_host_ids[idx]) {
                 report.skipped_host_constraint += 1;
+                skip(Qd::HostConstraint, Some(host_constraint.describe()));
                 log::info!(
                     "work_finder: skipping issue #{} — requires host {}, this is {}",
                     item.number,
@@ -2052,6 +2076,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                 &held_capability_sets[idx],
             ) {
                 report.skipped_labeled += 1;
+                skip(Qd::Parked, ready_queue::park_label(&item, &extra_skip_label_sets[idx]));
                 log_capability_gap(&item, &held_capability_sets[idx]);
                 continue;
             }
@@ -2061,6 +2086,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             // never claim, never spend a session).
             if let Some(rule) = crate::hard_exclusion::declining_label(&item.labels) {
                 report.skipped_declined += 1;
+                skip(Qd::HardExclusion, Some(rule.to_string()));
                 log_hard_exclusion_skip(item.number, rule);
                 continue;
             }
@@ -2070,16 +2096,19 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             // independent of and never reading `noop_cooldown` state.
             if item.is_within_recheck_interval(now) {
                 report.skipped_recheck_interval += 1;
+                skip(Qd::RecheckInterval, None);
                 continue;
             }
             if in_flight.contains(&item.number) {
                 report.skipped_in_flight += 1;
+                skip(Qd::InFlight, None);
                 continue;
             }
             // Insta-crash quarantine (#3939): drop before the candidate ever
             // enters the global queue, so it consumes no shared slot.
             if quarantined_sets[idx].contains(&item.number) {
                 report.skipped_quarantined += 1;
+                skip(Qd::Quarantined, None);
                 continue;
             }
             // Dispatch backoff (#4485): a failing issue inside its backoff
@@ -2090,8 +2119,10 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             if backed_off_sets[idx].contains(&item.number) {
                 if pr_open_backed_off_sets[idx].contains(&item.number) {
                     report.skipped_pr_open_backoff += 1;
+                    skip(Qd::OpenPrBackoff, None);
                 } else {
                     report.skipped_backoff += 1;
+                    skip(Qd::DispatchBackoff, None);
                 }
                 continue;
             }
@@ -2101,6 +2132,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             // independently of both.
             if noop_cooldown_sets[idx].contains(&item.number) {
                 report.skipped_noop_cooldown += 1;
+                skip(Qd::NoopCooldown, None);
                 continue;
             }
             // Hard-exclusion decline cooldown (#7528): a previous sweep for
@@ -2109,6 +2141,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             // above and independently of all of them.
             if declined_sets[idx].contains(&item.number) {
                 report.skipped_declined += 1;
+                skip(Qd::Declined, None);
                 continue;
             }
             // PR-less retry window (#7972): a previous dispatch claimed this
@@ -2117,12 +2150,14 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             // all of them.
             if prless_retry_sets[idx].contains(&item.number) {
                 report.skipped_prless_retry += 1;
+                skip(Qd::PrlessRetry, None);
                 continue;
             }
             // Peer soft claim (#4028): a peer host is already building it — drop
             // before the global queue so it consumes no shared slot.
             if peer_claimed_sets[idx].contains(&item.number) {
                 report.skipped_peer_claim += 1;
+                skip(Qd::PeerClaim, None);
                 log::info!(
                     "work_finder: skipping issue #{} — a peer host advertised a soft claim \
                      over safehouse (#4028)",
@@ -2130,13 +2165,11 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                 );
                 continue;
             }
+            // One key feeds both the view and dispatch, so they cannot drift.
+            ready_queue::record_candidate(q, &key, &item);
             candidates.push(PriorityCandidate {
-                workspace_idx: idx,
-                workspace_priority,
-                urgent: item.is_urgent(),
                 complexity: item.complexity().map(str::to_owned),
-                created_at: item.created_at,
-                number: item.number,
+                ..key
             });
         }
     }
@@ -2164,6 +2197,9 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                 out_of_slice
             } else {
                 report.deferred_out_of_slice += out_of_slice.len();
+                for c in &out_of_slice {
+                    ready_queue::resolve(&mut report.queue, c, Qd::DeferredOutOfSlice, None);
+                }
                 in_slice
             }
         }
@@ -2181,8 +2217,10 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         // Saturation admission brake (#4903) — daemon-global, checked before the
         // shared cap so the deferral names the host rather than a cap that is
         // not binding. In-flight sweeps across every workspace are untouched.
+        let q = &mut report.queue;
         if saturation_held {
             report.deferred_saturation += 1;
+            ready_queue::resolve(q, &cand, Qd::DeferredSaturation, None);
             continue;
         }
         // Shared global cap across all workspaces — defer once the combined
@@ -2190,12 +2228,14 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         // ready items.
         if occupancy >= max_concurrent {
             report.deferred_capacity += 1;
+            ready_queue::resolve(q, &cand, Qd::DeferredCapacity, None);
             continue;
         }
         // Shared global ramp cap (#4234) — independent of the concurrency cap
         // above; see `tick_with_admission_cap`.
         if admitted_this_tick >= max_admissions_per_tick {
             report.deferred_ramp_cap += 1;
+            ready_queue::resolve(q, &cand, Qd::DeferredRampCap, None);
             continue;
         }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
@@ -2205,17 +2245,22 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                 // rationale: past-tense line only on a confirmed new spawn.
                 log::info!("work_finder: dispatched issue #{}", cand.number);
                 report.dispatched += 1;
+                ready_queue::resolve(q, &cand, Qd::Dispatched, None);
                 occupancy += 1;
                 admitted_this_tick += 1;
             }
             Ok(false) => {
                 report.skipped_in_flight += 1;
+                ready_queue::resolve(q, &cand, Qd::InFlight, None);
             }
             Err(e) => {
+                let why = Some(ready_queue::short_detail(&e.to_string()));
                 // Open-PR guard refusal (#4123) — see the single-workspace
                 // `tick` for the rationale. A skip, not a failure.
                 if let Some(open_pr) = e.downcast_ref::<OpenPrDispatchError>() {
                     report.skipped_pr_open += 1;
+                    let pr = Some(format!("open PR #{}", open_pr.pr));
+                    ready_queue::resolve(q, &cand, Qd::OpenPr, pr);
                     // #6350 AC: name the open PR, not just "an open linked
                     // PR" — see the single-workspace `tick` for the rationale
                     // (this guard is a forge probe, so it holds cross-host).
@@ -2229,6 +2274,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                     // Park-label guard refusal (#4444) — see the single-workspace
                     // `tick` for the rationale. A labeled-skip, not a failure.
                     report.skipped_labeled += 1;
+                    ready_queue::resolve(q, &cand, Qd::Parked, Some(parked.label.to_string()));
                     log::info!(
                         "work_finder: skipping issue #{} — it carries `{}` on the forge \
                          (#4444 park-label guard; the candidate listing was stale)",
@@ -2239,11 +2285,13 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                     // Dispatch backoff refusal (#4485) — see the single-workspace
                     // `tick` for the rationale. A skip, not a failure.
                     report.skipped_backoff += 1;
+                    ready_queue::resolve(q, &cand, Qd::DispatchBackoff, why);
                     log::info!("work_finder: skipping issue #{} — {e}", cand.number);
                 } else if e.downcast_ref::<LiveClaimDispatchError>().is_some() {
                     // Live-claim guard refusal (#4556) — see the single-workspace
                     // `tick` for the rationale. An in-flight skip, not a failure.
                     report.skipped_in_flight += 1;
+                    ready_queue::resolve(q, &cand, Qd::InFlight, why);
                     log::warn!("work_finder: skipping issue #{} — {e}", cand.number);
                 } else if e.downcast_ref::<LeaseOrderDispatchError>().is_some() {
                     // Lease-order tie-break loss (#6287) — see the
@@ -2252,6 +2300,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                     // (#6350), so this lands on the same `skipped_backoff`
                     // counter that window governs.
                     report.skipped_backoff += 1;
+                    ready_queue::resolve(q, &cand, Qd::DispatchBackoff, why);
                     log::info!("work_finder: skipping issue #{} — {e}", cand.number);
                 } else if e
                     .downcast_ref::<WorkspaceCommandsMissingDispatchError>()
@@ -2263,6 +2312,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                     // candidate from this workspace; reaching here means the
                     // condition appeared mid-tick, still a deliberate skip.
                     report.skipped_workspace_commands_missing += 1;
+                    ready_queue::resolve(q, &cand, Qd::WorkspaceCommandsMissing, why);
                     log::warn!("work_finder: skipping issue #{} — {e}", cand.number);
                 } else if e.downcast_ref::<TokenSelectionDispatchError>().is_some() {
                     // Empty/unusable token pool (#6614) — see the
@@ -2272,6 +2322,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                     // just armed the per-issue backoff plus the cross-issue
                     // counter behind the #4386/#5030 workspace hold.
                     report.errors += 1;
+                    ready_queue::resolve(q, &cand, Qd::DispatchError, why);
                     log::warn!(
                         "work_finder: dispatch for issue #{} died at token selection — the token \
                          pool is empty or every account is bad-marked (#6614): {e}",
@@ -2279,6 +2330,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                     );
                 } else {
                     report.errors += 1;
+                    ready_queue::resolve(q, &cand, Qd::DispatchError, why);
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);
                 }
             }
@@ -3004,7 +3056,7 @@ where
                 Ok(report) => {
                     // Publish before any logging so `loom-daemon health` sees the
                     // same tick the log line describes (#4761).
-                    publish_tick(&report, max_concurrent, tick_started);
+                    publish_tick(&report, max_concurrent, tick_started, &[]);
                     if report.halted && !was_halted {
                         log::warn!(
                             "work_finder: main-health gate halted dispatch — {} ready issue(s) \
@@ -3604,7 +3656,7 @@ pub fn spawn_multi_work_finder_task(
 
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).
-            publish_tick(&report, max_concurrent, tick_started);
+            publish_tick(&report, max_concurrent, tick_started, &roots);
 
             if report.halted && !was_halted {
                 log::warn!(

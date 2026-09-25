@@ -954,12 +954,13 @@ pub trait RoleInvocationRunner {
     /// a [`RoleTickOutcome::Failure`], never a propagated error.
     fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome;
 
-    /// `(model, effort)` as resolved by the most recent [`invoke`](Self::invoke),
-    /// or `None` when that invocation bailed out before resolving them (Issue
-    /// #8056). Defaulted so a test double implementing only `invoke` is
-    /// unaffected — a `None` here simply omits both keys from the emitted
-    /// `role_tick.outcome` record, which is the honest reading.
-    fn resolved_model_effort(&self) -> Option<(String, String)> {
+    /// What the most recent [`invoke`](Self::invoke) resolved — model, effort
+    /// (#8056) and the ordered-preference stamp (#8599) — or `None` when that
+    /// invocation bailed out before resolving a launch at all. Defaulted so a
+    /// test double implementing only `invoke` is unaffected: a `None` omits
+    /// every one of those keys from the emitted `role_tick.outcome` record,
+    /// which is the honest reading.
+    fn resolved_launch(&self) -> Option<crate::role_tick_telemetry::ResolvedLaunch> {
         None
     }
 }
@@ -986,15 +987,15 @@ pub struct ScriptRoleInvocationRunner {
     /// the live host via [`crate::cpu_headroom::load_per_core`] at the
     /// moment the timeout fires — see [`run_role_with_timeout`].
     load_per_core_override: Option<f64>,
-    /// `(model, effort)` as actually resolved by the most recent [`invoke`]
-    /// (Issue #8056) — recorded rather than re-read so the `role_tick.outcome`
-    /// record can never disagree with what was launched (the #7894 unpinned
-    /// reconciliation and the `with_model` test override both land here, and
-    /// neither is visible to a fresh config read). `None` until an invocation
-    /// gets past its pre-spawn preflights.
+    /// What the most recent [`invoke`] actually resolved (#8056, extended by
+    /// #8599 to the preference tier) — recorded rather than re-read so the
+    /// `role_tick.outcome` record can never disagree with what was launched
+    /// (the #7894 unpinned reconciliation and the `with_model` test override
+    /// both land here, and neither is visible to a fresh config read). `None`
+    /// until an invocation gets past its pre-spawn preflights.
     ///
     /// [`invoke`]: RoleInvocationRunner::invoke
-    resolved_model_effort: Option<(String, String)>,
+    resolved_launch: Option<crate::role_tick_telemetry::ResolvedLaunch>,
     trace_context: Option<crate::telemetry::trace::TraceContext>,
 }
 
@@ -1008,7 +1009,7 @@ impl ScriptRoleInvocationRunner {
             timeout: DEFAULT_ROLE_TIMEOUT,
             model: None,
             load_per_core_override: None,
-            resolved_model_effort: None,
+            resolved_launch: None,
             trace_context: None,
         }
     }
@@ -3423,7 +3424,7 @@ pub fn spawn_multi_role_task(
                         name,
                         started_at,
                         &outcome,
-                        runner.resolved_model_effort(),
+                        runner.resolved_launch(),
                         runner.trace_context.clone(),
                     );
                     outcome

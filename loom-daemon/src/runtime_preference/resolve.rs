@@ -254,6 +254,21 @@ impl<T> Resolution<T> {
         line
     }
 
+    /// The [`PreferenceStamp`] for this walk — `None` when every listed tap
+    /// was skipped, since there is then no chosen tier to report (the
+    /// fail-closed case is reported by [`Self::exhausted_diagnostic`]
+    /// instead). `source` is the wire name of the config key that supplied the
+    /// list, as it appears in the marker's own `source=` field.
+    #[must_use]
+    pub fn stamp(&self, source: &str) -> Option<PreferenceStamp> {
+        let marker = format!("{} source={source}", self.marker_line());
+        self.chosen.as_ref().map(|chosen| PreferenceStamp {
+            tier: chosen.tier,
+            tap: chosen.tap.to_string(),
+            marker,
+        })
+    }
+
     /// Operator-facing text for the fail-closed case: every listed tap was
     /// skipped, so the caller holds/skips exactly as it does today.
     ///
@@ -279,6 +294,34 @@ impl<T> Resolution<T> {
 /// for why this is a sibling of `# LOOM_RUNTIME_RESOLVED` rather than extra
 /// fields on it.
 pub const PREFERENCE_LOG_MARKER: &str = "# LOOM_RUNTIME_PREFERENCE ";
+
+/// What the ordered walk decided, in the shape the **launch surfaces** need
+/// (Issue #8599).
+///
+/// [`Resolution`] is the resolver's own full answer — generic over the
+/// admission type, carrying every skipped tap. This is the small, owned,
+/// serializable residue that rides along with the admitted runtime so the
+/// per-sweep launch record and the `role_tick.outcome` record can report the
+/// tier the daemon chose, instead of that fact living only in `loom-daemon
+/// logs`. Pure data: nothing here re-derives a decision, and
+/// [`Self::marker`] is verbatim what [`Resolution::marker_line`] produced.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreferenceStamp {
+    /// 0-based position of the chosen tap in the configured order. `0` is the
+    /// most-preferred entry, i.e. nothing fell through; any other value is a
+    /// fall-through, which is the number "how much work is going to the
+    /// metered backstop?" reduces to counting.
+    pub tier: usize,
+    /// `<runtime>[:<profile>]` identity of the chosen tap — the same rendering
+    /// [`Tap`]'s `Display` produces everywhere else, so one grep finds it
+    /// across the marker, the launch record and the tap-usage accounting.
+    pub tap: String,
+    /// The full `# LOOM_RUNTIME_PREFERENCE …` marker line for this decision,
+    /// including its `source=` field. Carried rather than re-rendered so the
+    /// line a child writes into its own log is byte-identical to the one the
+    /// daemon logged.
+    pub marker: String,
+}
 
 /// Walk `taps` in order and take the first that is both admitted for the role
 /// and has a spawnable credential right now.

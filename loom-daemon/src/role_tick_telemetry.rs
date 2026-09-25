@@ -110,6 +110,55 @@ pub struct RoleTickTelemetry {
     /// Which credential pool gated a pre-spawn pool skip (Issue #8408) — see
     /// [`RoleTickOutcome::gated_pool`]. `None` for every other result.
     pub gated_pool: Option<String>,
+    /// Tier of the ordered-preference list this tick launched on (Issue
+    /// #8599), when a list chose its tap. `None` on the static path.
+    pub preference_tier: Option<u32>,
+    /// The chosen tap's `<runtime>[:<profile>]` identity (Issue #8599).
+    /// Present exactly when [`Self::preference_tier`] is.
+    pub preference_tap: Option<String>,
+}
+
+/// What one role invocation actually resolved before it spawned — the input
+/// the runner hands to [`emit_for_tick`].
+///
+/// A struct rather than the `(model, effort)` tuple #8056 started with: the
+/// runner's accessor lives in `role_runner.rs`, which is at its
+/// `file-size-baseline.txt` ceiling, so widening the tuple for #8599's
+/// preference tier would have cost lines that file has none of. Adding a field
+/// here costs `role_runner.rs` nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedLaunch {
+    /// The model the invocation resolved (empty ⇒ reported as absent).
+    pub model: String,
+    /// The reasoning effort it resolved (empty ⇒ reported as absent).
+    pub effort: String,
+    /// The ordered-preference stamp of the runtime it launched on, when a
+    /// preference list chose it (#8599).
+    pub preference: Option<crate::runtime_preference::PreferenceStamp>,
+}
+
+impl ResolvedLaunch {
+    /// The `(model, effort)` pair every invocation resolves, with no
+    /// preference stamp — the shape a launch on the static path has.
+    #[must_use]
+    pub fn new(model: &str, effort: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            effort: effort.to_string(),
+            preference: None,
+        }
+    }
+
+    /// Attach the ordered-preference stamp carried by the admitted runtime
+    /// ([`crate::runtime_admission::ResolvedRuntime::preference`]).
+    #[must_use]
+    pub fn with_preference(
+        mut self,
+        preference: Option<crate::runtime_preference::PreferenceStamp>,
+    ) -> Self {
+        self.preference = preference;
+        self
+    }
 }
 
 /// Project one [`crate::role_runner::RoleTickOutcome`] onto the
@@ -176,8 +225,8 @@ pub fn classify(outcome: &RoleTickOutcome) -> (RoleTickResult, Option<String>) {
 /// Emit the `role_tick.outcome` record for one just-finished tick.
 ///
 /// The role runner's whole entry point: it owns only the four facts it has in
-/// scope (root, role, start instant, outcome) plus the runner's own resolved
-/// `(model, effort)`; every projection, attribution, and write decision lives
+/// scope (root, role, start instant, outcome) plus the runner's own
+/// [`ResolvedLaunch`]; every projection, attribution, and write decision lives
 /// here. Keeping the mapping on this side is what lets `role_runner.rs` —
 /// which is at its `file-size-baseline.txt` ceiling — carry a single call.
 ///
@@ -187,9 +236,9 @@ pub fn emit_for_tick(
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
-    resolved_model_effort: Option<(String, String)>,
+    resolved: Option<ResolvedLaunch>,
 ) {
-    emit_for_tick_correlated(root, role, started_at, outcome, resolved_model_effort, None);
+    emit_for_tick_correlated(root, role, started_at, outcome, resolved, None);
 }
 
 pub fn emit_for_tick_correlated(
@@ -197,14 +246,18 @@ pub fn emit_for_tick_correlated(
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
-    resolved_model_effort: Option<(String, String)>,
+    resolved: Option<ResolvedLaunch>,
     trace_context: Option<crate::telemetry::trace::TraceContext>,
 ) {
     let (result, detail) = classify(outcome);
-    let (model, effort) = match resolved_model_effort {
-        Some((model, effort)) => (Some(model), Some(effort)),
+    let (model, effort) = match &resolved {
+        Some(resolved) => (Some(resolved.model.clone()), Some(resolved.effort.clone())),
         None => (None, None),
     };
+    // #8599: a tick that never resolved a launch has no tier to report, and a
+    // launch the preference list did not decide has none either — absent, not
+    // a fabricated `0`, which would read as "chose the top tap".
+    let preference = resolved.and_then(|resolved| resolved.preference);
     emit_correlated(
         &RoleTickTelemetry {
             root: root.to_path_buf(),
@@ -216,6 +269,10 @@ pub fn emit_for_tick_correlated(
             effort,
             detail,
             gated_pool: outcome.gated_pool().map(str::to_string),
+            preference_tier: preference
+                .as_ref()
+                .and_then(|stamp| u32::try_from(stamp.tier).ok()),
+            preference_tap: preference.map(|stamp| stamp.tap),
         },
         trace_context,
     );
@@ -308,7 +365,8 @@ pub struct TranscriptScan {
     /// record itself: absent means "no scanner ran over an attributable
     /// transcript", a present zero means "a transcript was read and no such
     /// command appeared". A token source that answers `tokens_by_model`
-    /// *without* a transcript — [`crate::usage_source::UsageSource::OpenCodeSessionDb`]
+    /// *without* a transcript — every source for which
+    /// [`crate::usage_source::UsageSource::is_native_store`] is true
     /// — must leave this `None` rather than synthesize
     /// `RoleTickActions::default()`, which would publish an unmeasured tick as
     /// a genuine zero.
@@ -499,6 +557,8 @@ pub fn build_record(
         effort: tick.effort.clone().filter(|e| !e.is_empty()),
         detail: tick.detail.clone().filter(|d| !d.is_empty()),
         gated_pool: tick.gated_pool.clone().filter(|p| !p.is_empty()),
+        preference_tier: tick.preference_tier,
+        preference_tap: tick.preference_tap.clone().filter(|t| !t.is_empty()),
         // Populated by `emit` via `apply_runtime_attribution` (Issue #8507):
         // that resolution needs a filesystem read this function deliberately
         // stays free of (see the doc comment above).
@@ -580,20 +640,24 @@ fn emit_correlated(
         runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
     );
     let scan = tick.result.spawned().then(|| {
-        if source == crate::usage_source::UsageSource::OpenCodeSessionDb {
-            // OpenCode's session store answers `tokens_by_model` but has no
-            // transcript for this scanner to derive forge-mutating `actions`
-            // from. `actions` is therefore `None` — *unmeasured*, not an
-            // observed zero: publishing `{issues_labeled: 0, …}` here would be
-            // indistinguishable from a genuinely quiet Claude tick and would
-            // make a GLM/OpenCode trial's role ticks read as real zeroes
-            // (#8507). Deriving real per-command actions from the native JSON
-            // event stream is follow-up work (see `crate::opencode_usage`'s
-            // module doc).
-            crate::opencode_usage::tokens_by_model(
-                &crate::usage_source::role_tick_directories(&tick.root),
+        if source.is_native_store() {
+            // A native harness's own session store answers `tokens_by_model`
+            // but has no transcript for this scanner to derive forge-mutating
+            // `actions` from. `actions` is therefore `None` — *unmeasured*,
+            // not an observed zero: publishing `{issues_labeled: 0, …}` here
+            // would be indistinguishable from a genuinely quiet Claude tick
+            // and would make a GLM/OpenCode (or Kimi) trial's role ticks read
+            // as real zeroes (#8507, #8564). Deriving real per-command actions
+            // from the native JSON event stream is follow-up work (see
+            // `crate::opencode_usage`'s and `crate::kimi_usage`'s module docs).
+            //
+            // The predicate is `is_native_store()`, NOT an equality test
+            // against one variant: an `== OpenCodeSessionDb` test would have
+            // routed Kimi silently back onto the Claude transcript reader.
+            crate::usage_source::role_tick_tokens_by_model(
+                runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+                &tick.root,
                 Some((tick.started_at, tick.ended_at)),
-                None,
             )
             .map(|tokens_by_model| TranscriptScan {
                 tokens_by_model,

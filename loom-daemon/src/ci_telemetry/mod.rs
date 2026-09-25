@@ -1,10 +1,14 @@
-//! GitHub Actions CI telemetry poller (Issue #8824 — phase 1 of 3 of the
-//! build/CI observability work under epic #8522).
+//! GitHub Actions CI telemetry poller (Issue #8824 phase 1, #8825 phase 2, of
+//! the build/CI observability work under epic #8522).
 //!
 //! Captures every completed GitHub Actions **run** and **job** of one forge
 //! org as first-class telemetry: `ci.run` / `ci.job` log records, the
 //! `loom.ci.{run,job}.duration_ms` histograms (via `ci.duration`), and one
-//! trace per run with one span per job. The records land in a local journal
+//! trace per run with one span per job. With `logCaptureEnabled` (#8825) it
+//! additionally captures each completed job's **full log** as chunked
+//! `ci.job.log` records ([`logs`]) — unfiltered apart from a per-job size
+//! cap, because the neutral OTLP gateway, not this poller, is the redaction
+//! boundary. The records land in a local journal
 //! (`.loom/logs/ci-telemetry.jsonl`) unconditionally, and the daemon's
 //! existing observability backfill pass ([`export::backfill`]) offers them to
 //! whichever exporter(s) `observability.*` configures — no new transport.
@@ -41,6 +45,7 @@ pub mod api;
 pub mod export;
 pub mod journal;
 pub mod ledger;
+pub mod logs;
 pub mod poll;
 pub mod records;
 pub mod state;
@@ -59,6 +64,10 @@ pub const INTERVAL_SECS_ENV: &str = "LOOM_CI_TELEMETRY_INTERVAL_SECS";
 // config with a recorded reason, never in a host-local tier (env included).
 /// `autonomous.ciTelemetry.logCaptureEnabled` env override.
 pub const LOG_CAPTURE_ENABLED_ENV: &str = "LOOM_CI_TELEMETRY_LOG_CAPTURE_ENABLED";
+/// `autonomous.ciTelemetry.logCaptureMaxBytes` env override.
+pub const LOG_CAPTURE_MAX_BYTES_ENV: &str = "LOOM_CI_TELEMETRY_LOG_CAPTURE_MAX_BYTES";
+// `autonomous.ciTelemetry.logCaptureExcludedRepos` deliberately has NO env
+// override, for the same reason `excludedRepos` has none.
 
 /// Default org when no tier sets one.
 pub const DEFAULT_ORG: &str = "2amlogic";
@@ -69,6 +78,16 @@ pub const INITIAL_LOOKBACK_HOURS: i64 = 24;
 
 /// Dotted path of the repo-exclusion key.
 pub const EXCLUDED_REPOS_KEY: &str = "autonomous.ciTelemetry.excludedRepos";
+
+/// Dotted path of the **log-only** repo-exclusion key (#8825).
+///
+/// The ci-observability policy makes run/job records and duration metrics
+/// unconditional and names log capture as the *only* excludable signal. That
+/// needs its own key: excluding a repo with [`EXCLUDED_REPOS_KEY`] to stop
+/// capturing its logs would also stop its metrics, which is itself a policy
+/// violation. Same discipline — committed config only, `{repo, reason}`, no
+/// env override.
+pub const LOG_CAPTURE_EXCLUDED_REPOS_KEY: &str = "autonomous.ciTelemetry.logCaptureExcludedRepos";
 
 /// One admitted `excludedRepos` entry: the repo (bare `name` or
 /// `owner/name`, matched case-insensitively) and the reason recorded with it.
@@ -94,6 +113,10 @@ pub struct CiTelemetryConfig {
     /// reason. A refused entry excludes nothing — the repo is still polled.
     pub refused_exclusions: Vec<String>,
     pub log_capture_enabled: Option<bool>,
+    /// Per-job cap on captured log text (#8825).
+    pub log_capture_max_bytes: Option<usize>,
+    /// Repos whose **logs** are not captured (records and metrics still are).
+    pub log_capture_excluded_repos: Option<Vec<RepoExclusion>>,
 }
 
 /// Split an `excludedRepos` value into admitted entries and named refusals.
@@ -126,12 +149,14 @@ pub fn parse_exclusions(value: &serde_json::Value) -> (Vec<RepoExclusion>, Vec<S
     (admitted, refused)
 }
 
-/// Read `excludedRepos` from the **committed** tiers only (`.loom/config.json`
-/// deep-merged with `.loom-project/project.json`). A value that a host-local
-/// or shared-defaults tier adds or changes is refused by name.
+/// Read an exclusion list from the **committed** tiers only
+/// (`.loom/config.json` deep-merged with `.loom-project/project.json`). A
+/// value that a host-local or shared-defaults tier adds or changes is refused
+/// by name.
 fn read_exclusions(
     root: &Path,
     effective: &serde_json::Value,
+    key: &str,
 ) -> (Vec<RepoExclusion>, Vec<String>) {
     use crate::config_resolver::{
         deep_merge, get_path, soft_read_json_object, LEGACY_CONFIG_REL, PROJECT_CONFIG_REL,
@@ -140,14 +165,14 @@ fn read_exclusions(
         &soft_read_json_object(&root.join(LEGACY_CONFIG_REL)),
         &soft_read_json_object(&root.join(PROJECT_CONFIG_REL)),
     );
-    let committed_value = get_path(&committed, EXCLUDED_REPOS_KEY);
-    let effective_value = get_path(effective, EXCLUDED_REPOS_KEY);
+    let committed_value = get_path(&committed, key);
+    let effective_value = get_path(effective, key);
     let (admitted, mut refused) = committed_value.map(parse_exclusions).unwrap_or_default();
     if effective_value.is_some() && effective_value != committed_value {
-        let source = crate::config_resolver::source_of(root, EXCLUDED_REPOS_KEY)
+        let source = crate::config_resolver::source_of(root, key)
             .map_or_else(|| "a non-committed tier".to_string(), |p| p.display().to_string());
         refused.push(format!(
-            "{EXCLUDED_REPOS_KEY} from {source}: refused — exclusions must live in committed config"
+            "{key} from {source}: refused — exclusions must live in committed config"
         ));
     }
     (admitted, refused)
@@ -160,7 +185,10 @@ pub fn read_config(root: &Path) -> CiTelemetryConfig {
     let Some(block) = crate::config_resolver::get_path(&config, "autonomous.ciTelemetry") else {
         return CiTelemetryConfig::default();
     };
-    let (admitted, refused_exclusions) = read_exclusions(root, &config);
+    let (admitted, mut refused_exclusions) = read_exclusions(root, &config, EXCLUDED_REPOS_KEY);
+    let (log_excluded, log_refused) =
+        read_exclusions(root, &config, LOG_CAPTURE_EXCLUDED_REPOS_KEY);
+    refused_exclusions.extend(log_refused);
     CiTelemetryConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
         org: block
@@ -178,6 +206,12 @@ pub fn read_config(root: &Path) -> CiTelemetryConfig {
         log_capture_enabled: block
             .get("logCaptureEnabled")
             .and_then(serde_json::Value::as_bool),
+        log_capture_max_bytes: block
+            .get("logCaptureMaxBytes")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|v| *v > 0)
+            .and_then(|v| usize::try_from(v).ok()),
+        log_capture_excluded_repos: (!log_excluded.is_empty()).then_some(log_excluded),
     }
 }
 
@@ -205,9 +239,13 @@ pub struct ResolvedCiTelemetry {
     pub excluded_repos: Vec<RepoExclusion>,
     /// Refused `excludedRepos` entries (named reasons); they exclude nothing.
     pub refused_exclusions: Vec<String>,
-    /// Whether phase-2 job-log capture was *requested*. This phase refuses
-    /// to honour it — see [`log_capture_gate`].
+    /// Whether job-log capture is on (#8825; default **false**, FLAGS-OFF).
     pub log_capture_requested: bool,
+    /// Per-job cap on captured log text.
+    pub log_capture_max_bytes: usize,
+    /// Repos excluded from **log** capture only; their `ci.run`/`ci.job`
+    /// records and duration metrics are still captured unconditionally.
+    pub log_capture_excluded_repos: Vec<RepoExclusion>,
 }
 
 /// Resolve every knob, **env > config > default**.
@@ -228,19 +266,26 @@ pub fn resolve(config: &CiTelemetryConfig) -> ResolvedCiTelemetry {
         log_capture_requested: env_bool(LOG_CAPTURE_ENABLED_ENV)
             .or(config.log_capture_enabled)
             .unwrap_or(false),
+        log_capture_max_bytes: env_nonempty(LOG_CAPTURE_MAX_BYTES_ENV)
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| *v > 0)
+            .or(config.log_capture_max_bytes)
+            .unwrap_or(logs::DEFAULT_MAX_BYTES),
+        log_capture_excluded_repos: config
+            .log_capture_excluded_repos
+            .clone()
+            .unwrap_or_default(),
     }
 }
 
-/// Phase-1 job-log capture gate. Log download is phase 2 of this work
-/// (non-goal of #8824): the config key exists so the follow-on can flip it,
-/// but this build has **no** log-capture code path, so a request is refused
-/// by name rather than half-honoured.
+/// The job-log capture gate. Phase 1 (#8824) shipped the config key with no
+/// code behind it and refused a request by name; phase 2 (#8825) honours it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogCaptureGate {
-    /// Not requested (the default).
+    /// Not requested (the default — FLAGS-OFF).
     Off,
-    /// Requested via `logCaptureEnabled`, refused: not implemented in phase 1.
-    RefusedNotImplemented,
+    /// Requested via `logCaptureEnabled` and honoured.
+    On,
 }
 
 impl LogCaptureGate {
@@ -248,10 +293,13 @@ impl LogCaptureGate {
     pub fn as_str(self) -> &'static str {
         match self {
             LogCaptureGate::Off => "off",
-            LogCaptureGate::RefusedNotImplemented => {
-                "requested but refused: job-log capture is not implemented in phase 1 (#8824)"
-            }
+            LogCaptureGate::On => "on",
         }
+    }
+
+    #[must_use]
+    pub fn is_on(self) -> bool {
+        self == LogCaptureGate::On
     }
 }
 
@@ -259,7 +307,7 @@ impl LogCaptureGate {
 #[must_use]
 pub fn log_capture_gate(resolved: &ResolvedCiTelemetry) -> LogCaptureGate {
     if resolved.log_capture_requested {
-        LogCaptureGate::RefusedNotImplemented
+        LogCaptureGate::On
     } else {
         LogCaptureGate::Off
     }
@@ -288,10 +336,11 @@ pub fn spawn_task(root: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
         log::debug!("ci_telemetry: disabled (set autonomous.ciTelemetry.enabled=true to opt in)");
         return None;
     }
-    if log_capture_gate(&resolved) == LogCaptureGate::RefusedNotImplemented {
-        log::warn!(
-            "ci_telemetry: logCaptureEnabled={}",
-            LogCaptureGate::RefusedNotImplemented.as_str()
+    if log_capture_gate(&resolved).is_on() {
+        log::info!(
+            "ci_telemetry: job-log capture enabled (cap {} bytes/job, excluded: {:?})",
+            resolved.log_capture_max_bytes,
+            resolved.log_capture_excluded_repos
         );
     }
     for refusal in &resolved.refused_exclusions {

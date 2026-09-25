@@ -35,6 +35,8 @@ fn host_health_with(brake: Option<AdmissionBrakeSummary>) -> TelemetryRecord {
         roles: RoleTickHealth::default(),
         protection: None,
         admission_brake: brake,
+        is_captain: None,
+        armed_singleton_jobs: Vec::new(),
     })
 }
 

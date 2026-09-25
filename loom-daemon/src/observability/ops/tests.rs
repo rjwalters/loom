@@ -48,7 +48,7 @@ fn emit_metrics_enqueues_one_metric_points_envelope_for_this_host() {
     let queued = queue.0.lock().unwrap();
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].host_id, "host-a");
-    assert_eq!(queued[0].schema_version, 9);
+    assert_eq!(queued[0].schema_version, 10);
     let TelemetryRecord::MetricPoints(record) = &queued[0].record else {
         panic!("expected metric.points, got {:?}", queued[0].record);
     };

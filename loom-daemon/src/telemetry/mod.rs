@@ -63,7 +63,7 @@ pub mod fixture;
 pub mod ops;
 pub mod trace;
 pub mod visibility;
-pub use ci::{CiDurationRecord, CiJobRecord, CiRunRecord};
+pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use envelope::TelemetryEnvelope;
 pub use ops::MetricPointsRecord;
 
@@ -301,6 +301,11 @@ pub enum TelemetryRecord {
     /// `loom.ci.{run,job}.duration_ms` histograms (Issue #8824).
     #[serde(rename = "ci.duration")]
     CiDuration(CiDurationRecord),
+    /// One ≤ 8 KiB chunk of a completed job's log text (Issue #8825). The
+    /// only kind carrying free text the daemon did not author — see
+    /// [`CiJobLogRecord`] for why the gateway, not the source, scrubs it.
+    #[serde(rename = "ci.job.log")]
+    CiJobLog(CiJobLogRecord),
     /// A batch of generic operational metric points (Issue #8860) — the shared
     /// carrier any daemon loop emits through `observability::ops`. OTLP-only;
     /// see [`ops`] for the fixed name vocabulary and label policy.
@@ -762,6 +767,24 @@ pub struct RoleTickOutcomeRecord {
     /// optional field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_pool: Option<String>,
+    /// Which tier of the ordered runtime-preference list this tick launched on
+    /// (Issue #8599): `0` is the most-preferred tap — nothing fell through —
+    /// and any higher value is a fall-through, so "how much work went to the
+    /// metered backstop?" is a query over this key instead of a grep of
+    /// `loom-daemon logs`. Absent whenever no preference list decided the
+    /// launch (no `runtimes.preference`/`rolePreference.<role>` configured, an
+    /// operator pin, a pre-spawn skip that never resolved a runtime) and on
+    /// every record written before #8599 — additive, no `schema_version` bump,
+    /// exactly as [`Self::gated_pool`] was in #8408.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preference_tier: Option<u32>,
+    /// The chosen tap's identity (`<runtime>[:<profile>]`) when a preference
+    /// list decided this tick (#8599) — the same rendering the
+    /// `# LOOM_RUNTIME_PREFERENCE` marker and the launch record's own `tap`
+    /// key use, so one grep finds a tap across all three. Present exactly when
+    /// [`Self::preference_tier`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preference_tap: Option<String>,
     /// Runtime adapter this tick actually launched on (Issue #8507), read off
     /// the tick's own `# LOOM_LAUNCH` record — same source and the same
     /// "absent, never a fabricated `claude` default" contract as
@@ -1149,6 +1172,34 @@ pub struct HostHealthRecord {
     /// backward-compatibility contract `protection` established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_brake: Option<AdmissionBrakeSummary>,
+    /// Whether this host is the fleet-wide singleton-job captain (Issue
+    /// #8848) — see [`crate::fleet_captain`]. Three-valued, not a bare
+    /// `bool`: `None` when this repo declares no `fleet.captain` at all
+    /// (the overwhelmingly common case; the mechanism does not apply here),
+    /// `Some(false)` when a captain IS declared and it is not this host, and
+    /// `Some(true)` when this host is the declared captain. Collapsing
+    /// "not applicable" and "not the captain" into a single `false` would
+    /// make the dashboard's "no host reporting `is_captain: true`" check
+    /// (#8848 AC5) fire on every ordinary repo that never opts into this
+    /// mechanism — the same "unknown != zero" contract every other optional
+    /// field on this struct already follows.
+    ///
+    /// `#[serde(default)]` so a record from a pre-#8848 daemon still decodes
+    /// (as `None`) rather than failing the whole envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_captain: Option<bool>,
+    /// Declared-singleton-job names currently armed on this host (Issue
+    /// #8848) — i.e. every job whose most recent
+    /// [`crate::fleet_captain::arm_singleton_job`] call resolved
+    /// [`crate::fleet_captain::CaptainGate::Armed`] here. Empty on a host
+    /// that is not the captain, on a host with no declared singleton jobs at
+    /// all, and on a pre-#8848 daemon.
+    ///
+    /// `#[serde(default)]` so a pre-#8848 record still decodes (as an empty
+    /// list) rather than failing the whole envelope — the same
+    /// backward-compatibility contract `active_sweep_ids` established.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub armed_singleton_jobs: Vec<String>,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —

@@ -462,6 +462,112 @@ automation on this host), and the UI view matrix for Loom's non-HTTP span kinds
 remains open. The entire trial project was torn down with `down --volumes` at the
 end of the session, and the host's unrelated containers were never touched.
 
+## UI view matrix, verified via authenticated API probes (2026-09-25)
+
+Every prior session recorded the UI view matrix as open because none had
+browser access. This session did not either, but reached the same conclusion
+by a different, still-live-backend method: the exact backend routes each
+SigNoz product page calls (identified by reading the pinned
+[v0.142.1 frontend source](https://github.com/SigNoz/signoz/tree/v0.142.1/frontend/src)),
+called directly with a real session token from a fourth independent
+deployment (same host as the "Linux/amd64 deployment" section above, a fresh
+`docker compose ... up -d --wait` with an unmodified render — `diff -rq`
+against the committed `pours/` was not repeated this time since architecture
+parity is already established twice; org registration, once again, was
+required before the ingester's receivers opened). This is real backend data,
+not an inferred claim, but it is not a screenshot: the browser-only gap
+itself is not closed by this session.
+
+Login is `POST /api/v2/sessions/email_password` with `orgId` (returned from
+`/api/v1/register`), not the `/api/v1/login` a stale doc might suggest — that
+path returns the SPA shell, not JSON, and is easy to mistake for a working
+but-empty response.
+
+A fresh `telemetry-fixture`/`telemetry-export` run (`run-id 8528e`) delivered
+the full 37/14/3 manifest (confirmed by the gateway's own
+`otelcol_exporter_sent_*{exporter="otlp_http/signoz"}` counters and by
+`fixture-queries.sql`, which passed every assertion identically to the prior
+two live runs). Against that data:
+
+- **Service List / APM overview — populates.** `POST /api/v2/services`
+  (the `ServiceTraces` fallback path `frontend/src/api/metrics/getService.ts`
+  calls; the alternate `ServiceMetrics` path behind the `USE_SPAN_METRICS`
+  feature flag was not separately probed) returned
+  `{"serviceName":"loom-daemon","numCalls":7,"numErrors":3,"errorRate":42.86,"p99":48.8s,"avgDuration":18.6s,"dataWarning":{"topLevelOps":["overflow_operation","loom.sweep"]}}`.
+  `numCalls` is exactly 7 — the manifest's 8 traces minus the one deliberate
+  root-less trace, confirming this view aggregates real root spans rather than
+  guessing from any HTTP convention. Loom's spans carry no `http.method`,
+  `rpc.system` or any other RED-metric semantic convention; this view works
+  anyway because the ingester's own trace pipeline
+  (`deployment/ingester/ingester.yaml`) runs every incoming span through
+  `signozspanmetrics/delta` unconditionally, regardless of span kind — SigNoz
+  computes its own RED metrics from root-span latency/status, it does not
+  require the OTel HTTP/RPC conventions the Services page's name suggests.
+- **Exceptions ("All Errors") — stays empty.** `POST /api/v1/countErrors`
+  returned `0` and `POST /api/v1/listErrors` returned `null` against the same
+  window. Root cause, confirmed by reading both sides: this view indexes span
+  *events* named `exception` (`exception.type`/`exception.message`), and
+  `loom-daemon`'s OTLP mapping
+  (`loom-daemon/src/observability/otlp/mapping.rs`) never emits one — Loom
+  surfaces a failed attempt as span `status=Error` plus a correlated
+  `ERROR`-level log, which is what Trace Explorer's already-passing
+  correlation (see the ad-hoc probe screenshots, and query 4/6 in the shared
+  fixture section above) actually uses. The three status-`Error` root spans
+  counted in `numErrors` above are exactly the ones this page cannot show.
+- **Service Map — stays empty, but this trial cannot attribute why.**
+  `POST /api/v1/dependency_graph` returned `[]`. `ingester.yaml` configures no
+  service-graph/topology connector at all (only `signozspanmetrics/delta`), so
+  this is expected independent of span kind — but the shared fixture is also
+  single-service (`loom-daemon` calling itself), so a caller/callee edge would
+  never be produced by *any* connector against this data. This row cannot be
+  called a Loom-specific limitation from this evidence; it needs either a
+  service-graph connector or a multi-service fixture to mean anything.
+
+### A same-session finding: a saturated, deliberately-absent second backend can mask a healthy one's delivery
+
+While preparing this investigation, the shared gateway
+(`defaults/observability/collector`) was pointed at this host's real, live
+`~/.claude/projects` for `LOOM_CLAUDE_PROJECTS_DIR` — a mistake specific to
+this shared 8-vCPU dispatch worker, which runs several concurrent agent
+sessions writing to that directory continuously; a single-tenant trial host
+would not reproduce this. The `file_log/claude` receiver ingested over 1,600
+real log lines in under a minute, which alone filled the **disconnected**
+`otlp_http/clickstack` exporter's `sending_queue` (`queue_size: 1000`) —
+ClickStack was intentionally never deployed in this SigNoz-only trial, so
+every one of its retries failed by design. Once that queue was full, the
+OTLP receiver's fan-out `ConsumeLogs` began returning `503` to *any* new
+client for the whole request — including this session's own
+`telemetry-export` — even though the fan-out's SigNoz branch kept succeeding
+and its own queue stayed at `0`. Because `sending_queue` is
+`file_storage`-backed (by design, so a real backend outage survives a
+restart — see "Backend outage and recovery" above), the stuck ClickStack
+queue also survived `docker compose ... down`/`up -d` and kept failing new
+requests until `LOOM_COLLECTOR_STATE_DIR` was pointed at a fresh directory.
+
+Two things were checked and are worth stating plainly. First, privacy: the
+`file_log/claude` receiver's own `retain`/`remove: field: body` operators ran
+before the shared `transform/privacy` processor even saw the data, so no
+transcript content left the receiver — a direct ClickHouse read of the
+resulting `signoz_logs` rows shows only `loom.runtime`/`loom.session_id`
+attributes and an empty `body`, matching the design in `config.yaml`, not
+leaked prompt/tool content. Second, the collector container itself also went
+into a `docker compose restart` loop (exit 137) under the load, consistent
+with hitting its 512 MiB `mem_limit`. Filed as
+[#8903](https://github.com/rjwalters/loom/issues/8903): the fan-out's
+per-request status conflates independent destinations, there is no
+documented way to reset one exporter's persisted queue without the other's,
+and the `file_log/*` receivers have no volume safeguard against a busy real
+session directory — none of this is SigNoz-specific; it is the shared
+collector built in #8526.
+
+The rest of this session's deployment used `LOOM_CLAUDE_PROJECTS_DIR`/
+`LOOM_PI_SESSIONS_DIR`/`LOOM_CODEX_SESSIONS_DIR` pointed at empty scratch
+directories instead, and the fresh state directory above, before the fixture
+run reported earlier in this section. As with every prior session, the
+complete trial project (including the gateway) was torn down with
+`down --volumes` / `down` at the end, and the host's unrelated containers
+were never touched.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -480,7 +586,7 @@ end of the session, and the host's unrelated containers were never touched.
 | Shared fixture manifest observed in SigNoz | **Passed** — see "Shared fixture manifest, executed live" above: 37/14/3 signals, exact totals, graph, grouping, root-less detection, absence-vs-zero and privacy-sentinel queries all verified |
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
 | Repeated latency/footprint comparison | Open — shared evaluation #8529; neither session deployed ClickStack alongside SigNoz, so no simultaneous comparison has been attempted |
-| UI view matrix for Loom's non-HTTP span kinds | Open — Trace Explorer, Logs Explorer and Metrics Explorer are established above as the working acceptance surfaces, but which SigNoz product views degrade (service list, service map, APM/exceptions pages) for operational spans still needs the authenticated UI, which no session has had browser access to |
+| UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty but is confounded by the fixture being single-service and no service-graph connector being configured — not attributable to span kind from this evidence. No screenshot has been captured on any session |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a
 real Loom lifecycle. Keep #8528 open until the real-canary and #8529

@@ -2,9 +2,10 @@
 //! #8860), split out of `work_finder.rs` (which is frozen by the file-size
 //! ratchet) so both tick loops share one publication seam.
 
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use super::TickReport;
+use super::{ready_queue, TickReport};
 use crate::types::WorkFinderTickSummary;
 
 /// Process-global slot holding the most recent completed tick's summary.
@@ -33,7 +34,35 @@ pub fn publish_tick_summary_at(
     max_concurrent: usize,
     at: chrono::DateTime<chrono::Utc>,
 ) {
-    let summary = WorkFinderTickSummary {
+    publish_tick_summary_with_roots_at(report, max_concurrent, at, &[]);
+}
+
+/// [`publish_tick_summary_at`] that also names each queue row's repo from
+/// `roots` (workspace index -> repo root, Issue #8852).
+pub fn publish_tick_summary_with_roots_at(
+    report: &TickReport,
+    max_concurrent: usize,
+    at: chrono::DateTime<chrono::Utc>,
+    roots: &[PathBuf],
+) {
+    let summary = tick_summary(report, max_concurrent, at, roots);
+    *last_tick_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary);
+}
+
+/// The wire summary of `report` (pure; [`publish_tick_summary_with_roots_at`]
+/// stores it).
+#[must_use]
+pub fn tick_summary(
+    report: &TickReport,
+    max_concurrent: usize,
+    at: chrono::DateTime<chrono::Utc>,
+    roots: &[PathBuf],
+) -> WorkFinderTickSummary {
+    WorkFinderTickSummary {
+        queue: ready_queue::finish(&report.queue, roots),
+        listing_failed: ready_queue::repo_names(&report.listing_failed, roots),
         at,
         max_concurrent,
         seen: report.seen,
@@ -63,10 +92,7 @@ pub fn publish_tick_summary_at(
         halted: report.halted,
         saturation_held: report.saturation_held,
         collisions: report.collisions,
-    };
-    *last_tick_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary);
+    }
 }
 
 /// [`publish_tick_summary_at`] stamped with the current wall clock.
@@ -95,12 +121,14 @@ pub(super) fn reset_last_tick_summary() {
 /// End-of-tick seam for both work-finder loops: publish the summary for
 /// `loom-daemon health` (#4761), then export the tick as OTLP telemetry
 /// (#8860 — a no-op unless an OTLP exporter is running). `started_at` is when
-/// the tick's candidate evaluation began.
+/// the tick's candidate evaluation began; `roots` names each ready-queue row's
+/// repo (#8852 — empty for the single-workspace loop).
 pub fn publish_tick(
     report: &TickReport,
     max_concurrent: usize,
     started_at: chrono::DateTime<chrono::Utc>,
+    roots: &[PathBuf],
 ) {
-    publish_tick_summary(report, max_concurrent);
+    publish_tick_summary_with_roots_at(report, max_concurrent, chrono::Utc::now(), roots);
     crate::observability::ops::dispatch::record_tick(report, max_concurrent, started_at);
 }

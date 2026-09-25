@@ -141,8 +141,6 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
-use crate::event_bus::EventBus;
-use crate::ipc::DrainState;
 use crate::workspace_pool::WorkspacePool;
 
 mod failure_digest;
@@ -537,6 +535,16 @@ mod artifact_verdict;
 
 pub use artifact_verdict::{classify_artifact, ArtifactVerdict};
 
+/// The roll trigger (`DrainTrigger`/`IpcDrainTrigger`) and the pure
+/// supersede-not-stack decision — both moved to sibling modules (#8514) because
+/// this file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
+mod drain_trigger;
+// `pub` because `DrainTrigger::armed_roll` names `supersede::ArmedRoll` in a
+// publicly re-exported trait.
+pub mod supersede;
+
+pub use drain_trigger::{DrainTrigger, IpcDrainTrigger};
+
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.
 ///
@@ -673,29 +681,6 @@ pub trait AutoUpdateProbe: Send {
     /// gate-4 deadline forced the rebuild while sweeps are still in flight, so
     /// the build yields CPU to them instead of competing for it.
     fn rebuild(&mut self, low_priority: bool) -> RebuildOutcome;
-}
-
-/// Triggers the roll through #4090's drain path — separated from
-/// [`AutoUpdateProbe`] because in production it needs a tokio runtime handle to
-/// spawn the drain supervisor. Returns `true` when the drain was accepted.
-pub trait DrainTrigger: Send {
-    fn trigger(&self) -> bool;
-
-    /// Whether a drain-and-restart is **already** armed (Issue #6007).
-    ///
-    /// Since a refused roll deadline now *retains* its intent (dispatch stays
-    /// paused and the restart re-arms itself when in-flight reaches zero), an
-    /// auto-update tick that fires while that is pending has nothing useful to
-    /// do: the fresh binary is already provisioned and the restart is already
-    /// coming. Rebuilding again would burn CPU competing with the very in-flight
-    /// sweeps the roll is waiting on — the #4929 nicing exists precisely because
-    /// that competition is harmful.
-    ///
-    /// Defaults to `false` so a caller with no drain state (tests, alternative
-    /// triggers) behaves exactly as before.
-    fn roll_in_progress(&self) -> bool {
-        false
-    }
 }
 
 /// The production [`AutoUpdateProbe`]: reads [`crate::self_update`] for
@@ -884,87 +869,6 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
             ));
         };
         run_update_script(&script, &root, self.timeout, low_priority)
-    }
-}
-
-/// The production [`DrainTrigger`]: calls [`crate::ipc::handle_drain_request`]
-/// (the #4090 primitive) inside a captured runtime handle so the supervisor it
-/// spawns resolves a runtime even when invoked from a blocking thread.
-pub struct IpcDrainTrigger {
-    drain: Arc<DrainState>,
-    workspace_pool: Arc<WorkspacePool>,
-    fallback_root: PathBuf,
-    event_bus: Arc<EventBus>,
-    handle: tokio::runtime::Handle,
-}
-
-impl IpcDrainTrigger {
-    #[must_use]
-    pub fn new(
-        drain: Arc<DrainState>,
-        workspace_pool: Arc<WorkspacePool>,
-        fallback_root: PathBuf,
-        event_bus: Arc<EventBus>,
-        handle: tokio::runtime::Handle,
-    ) -> Self {
-        Self {
-            drain,
-            workspace_pool,
-            fallback_root,
-            event_bus,
-            handle,
-        }
-    }
-}
-
-impl DrainTrigger for IpcDrainTrigger {
-    fn trigger(&self) -> bool {
-        // Enter the runtime so `handle_drain_request`'s internal `tokio::spawn`
-        // of the drain supervisor resolves a runtime from a blocking thread.
-        // `timeout_secs=None` uses the default drain deadline;
-        // `force_after_timeout=false` is the fail-safe — if in-flight sweeps do
-        // not drain by the deadline the roll is refused and dispatch resumes,
-        // never killing a sweep.
-        let _guard = self.handle.enter();
-        // `then_exit=false`: this is the #4090 roll trigger — the daemon must
-        // restart (relaunch into the freshly-rebuilt binary), never stop for
-        // good. `then_exit: true` is `fleet drain`'s (#4343) teardown-only path.
-        let resp = crate::ipc::handle_drain_request(
-            &self.drain,
-            &self.workspace_pool,
-            &self.fallback_root,
-            &self.event_bus,
-            None,
-            false,
-            false,
-        );
-        // Issue #4521: the reply's `then_exit` reports the ACTIVE drain's
-        // terminal action, not this request's. `true` here means an operator
-        // teardown drain (`--drain --then-exit`) was already in flight, so this
-        // roll piggybacks on a drain that will STOP the daemon rather than
-        // relaunch it into the freshly-built binary. That is intentional
-        // (then-exit is never downgraded — the host is being torn down), but it
-        // must not be silent: the new binary will not be picked up until the
-        // daemon is started again.
-        if let crate::types::Response::DaemonDrain {
-            accepted: true,
-            then_exit: true,
-            ..
-        } = &resp
-        {
-            log::warn!(
-                "auto-update roll joined an in-progress then-exit (teardown) drain: the daemon \
-                 will STOP when drained and will NOT relaunch into the rebuilt binary. Start it \
-                 again to pick up the update."
-            );
-        }
-        matches!(resp, crate::types::Response::DaemonDrain { accepted: true, .. })
-    }
-
-    fn roll_in_progress(&self) -> bool {
-        // `is_draining()` covers both an in-progress first-attempt drain and a
-        // retained (pending) roll — in either case a restart is already armed.
-        self.drain.is_draining()
     }
 }
 
@@ -1873,20 +1777,35 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
     // already armed — including one *retained* across a refused deadline
     // (dispatch paused, restart re-arming itself at quiescence) — needs no second
     // rebuild; the binary is provisioned and the restart is coming.
+    //
+    // Issue #8514 narrows that skip by exactly one case: a **pending** roll
+    // whose artifact has since been overtaken by a newer release is superseded
+    // rather than waited out, so the host does not spend its paused-dispatch
+    // budget converging on a binary that is already stale. Every other shape —
+    // a first-attempt drain, a teardown, an untargeted operator drain, no newer
+    // artifact — still skips, byte-for-byte as before.
     if trigger.roll_in_progress() {
-        let note = "a drain-and-restart roll is already armed (dispatch paused, waiting for \
-                    in-flight sweeps to reach zero) — skipping this tick"
-            .to_string();
-        log::info!("auto_update: {note}");
-        status.publish(state.snapshot(
-            true,
-            last_check,
-            note,
-            &ArtifactResolution::Unresolved(
-                "roll already armed — not resolved this tick".to_string(),
-            ),
-        ));
-        return;
+        let armed_artifact = probe.resolve_artifact();
+        match supersede::decide_armed_roll(trigger.armed_roll().as_ref(), &armed_artifact) {
+            supersede::ArmedRollAction::Skip(note) => {
+                log::info!("auto_update: {note}");
+                status.publish(state.snapshot(true, last_check, note, &armed_artifact));
+                return;
+            }
+            supersede::ArmedRollAction::Supersede { from, to } => {
+                let note = supersede::supersede_note(&from, &to);
+                log::warn!("auto_update: {note}");
+                if !trigger.supersede_roll(&from, &to) {
+                    // The roll completed or was abandoned between the two reads
+                    // — nothing to supersede, and this tick has no armed roll to
+                    // cooperate with any more. Fall through and decide normally.
+                    log::info!(
+                        "auto_update: the pending roll to {from} ended on its own before it could \
+                         be superseded — continuing this tick normally"
+                    );
+                }
+            }
+        }
     }
     // Issue #7609: the artifact question is asked FIRST and answered
     // independently of the source checkout — it is the whole point that a
@@ -1966,7 +1885,10 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                 );
             }
             let outcome = probe.rebuild(low_priority);
-            let drain_accepted = matches!(outcome, RebuildOutcome::Success) && trigger.trigger();
+            // `None`: a source-path roll has no release-artifact identity, so it
+            // is never a supersede candidate (#8514).
+            let drain_accepted =
+                matches!(outcome, RebuildOutcome::Success) && trigger.trigger_for(None);
             let mut note = state.record_rebuild(now, &outcome, drain_accepted);
             if low_priority {
                 note = format!(
@@ -2001,13 +1923,17 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                 }
             );
             let outcome = probe.fetch_artifact(low_priority);
-            let drain_accepted = matches!(outcome, RebuildOutcome::Success) && trigger.trigger();
             let info = match &artifact {
                 ArtifactResolution::Resolved(info) => info.clone(),
                 // Unreachable: a `FetchArtifact` decision is only ever
                 // produced from a `Resolved` artifact.
                 ArtifactResolution::Unresolved(_) => ArtifactInfo::default(),
             };
+            // #8514: label the roll with the artifact identity it is rolling to,
+            // so a later tick can tell a still-current pending roll from one a
+            // newer release has overtaken.
+            let drain_accepted = matches!(outcome, RebuildOutcome::Success)
+                && trigger.trigger_for(Some(&supersede::artifact_roll_target(&info)));
             let mut note = state.record_artifact_roll(now, &outcome, drain_accepted, &info);
             if low_priority {
                 note = format!(

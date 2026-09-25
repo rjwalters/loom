@@ -195,6 +195,8 @@ fn host_health_envelope() -> TelemetryEnvelope {
             },
             protection: None,
             admission_brake: None,
+            is_captain: None,
+            armed_singleton_jobs: Vec::new(),
         }),
     )
 }
@@ -511,6 +513,8 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         roles: crate::telemetry::RoleTickHealth::default(),
         protection: None,
         admission_brake: None,
+        is_captain: None,
+        armed_singleton_jobs: Vec::new(),
     };
     let batch = vec![envelope(
         "host-c",
@@ -637,6 +641,9 @@ fn role_tick_outcome_envelope(
             effort: None,
             detail: Some("codex-account-pool-exhausted: no account provisioned".to_string()),
             gated_pool: gated_pool.map(str::to_string),
+            // Issue #8599: no preference list decided this tick.
+            preference_tier: None,
+            preference_tap: None,
             // Issue #8507: a Claude tick writes no launch record.
             runtime: None,
             provider: None,

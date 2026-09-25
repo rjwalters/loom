@@ -76,6 +76,17 @@ impl std::error::Error for ApiError {}
 /// `orgs/2amlogic/repos?per_page=100`).
 pub trait GithubApi: Send + Sync {
     fn get(&self, path: &str, etag: Option<&str>) -> Result<ApiResponse, ApiError>;
+
+    /// `GET` a plain-text document rather than a JSON body — the completed-job
+    /// log endpoint (Issue #8825), which answers `302` to a signed blob URL.
+    ///
+    /// Two differences from [`get`](Self::get), both verified live on
+    /// 2026-09-25: the final response comes from blob storage, so it carries
+    /// **no** `ETag`/`X-RateLimit-*` headers (a rate limit can only surface on
+    /// the pre-redirect GitHub response, which `classify` still catches); and
+    /// the body routinely contains terminal escape sequences, which `gh api`
+    /// refuses to emit unless told otherwise.
+    fn get_document(&self, path: &str) -> Result<ApiResponse, ApiError>;
 }
 
 /// Bound a detail string so an HTML error page never floods a status file.
@@ -185,15 +196,13 @@ impl GhCliApi {
     }
 }
 
-impl GithubApi for GhCliApi {
-    fn get(&self, path: &str, etag: Option<&str>) -> Result<ApiResponse, ApiError> {
+impl GhCliApi {
+    /// Run one `gh api --include …` invocation and classify its output.
+    fn run(&self, path: &str, extra: &[&str]) -> Result<ApiResponse, ApiError> {
         let mut cmd = Command::new(&self.gh_bin);
-        cmd.arg("api")
-            .arg("--include")
-            .arg("-H")
-            .arg("Accept: application/vnd.github+json");
-        if let Some(etag) = etag {
-            cmd.arg("-H").arg(format!("If-None-Match: {etag}"));
+        cmd.arg("api").arg("--include");
+        for argument in extra {
+            cmd.arg(argument);
         }
         cmd.arg(path).stdout(Stdio::piped()).stderr(Stdio::piped());
         let output = cmd.output().map_err(|e| {
@@ -214,6 +223,40 @@ impl GithubApi for GhCliApi {
                 "gh api {path} produced no HTTP response: {}",
                 bounded(&stderr)
             ))),
+        }
+    }
+}
+
+/// `gh` refuses to emit a body containing terminal escape sequences without
+/// `--allow-escape-sequences`; a `gh` that predates the flag rejects it as
+/// unknown. Either way the failure text names the flag, so the fallback is
+/// keyed on that rather than on a version probe.
+fn mentions_unknown_escape_flag(detail: &str) -> bool {
+    let lowered = detail.to_ascii_lowercase();
+    lowered.contains("allow-escape-sequences")
+        && (lowered.contains("unknown flag") || lowered.contains("unknown command"))
+}
+
+impl GithubApi for GhCliApi {
+    fn get(&self, path: &str, etag: Option<&str>) -> Result<ApiResponse, ApiError> {
+        let header = etag.map(|etag| format!("If-None-Match: {etag}"));
+        let mut extra = vec!["-H", "Accept: application/vnd.github+json"];
+        if let Some(header) = &header {
+            extra.extend_from_slice(&["-H", header.as_str()]);
+        }
+        self.run(path, &extra)
+    }
+
+    fn get_document(&self, path: &str) -> Result<ApiResponse, ApiError> {
+        match self.run(path, &["--allow-escape-sequences"]) {
+            Err(ApiError::Transport(detail)) if mentions_unknown_escape_flag(&detail) => {
+                log::warn!(
+                    "ci_telemetry: this gh has no --allow-escape-sequences; a job log containing \
+terminal escapes will be refused by gh rather than captured (upgrade gh to capture it)"
+                );
+                self.run(path, &[])
+            }
+            other => other,
         }
     }
 }

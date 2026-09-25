@@ -3,6 +3,12 @@
 //! `loom.ci.{run,job}.duration_ms` delta histograms. The attribute and label
 //! vocabulary is owned by [`crate::telemetry::ci`] — this module only renders
 //! it, so the gateway allowlist contract has a single source.
+//!
+//! `ci.job.log` (#8825) is a log record too, and the one kind whose **body**
+//! is not its event name: it carries the chunk's raw log text, unscrubbed,
+//! because the gateway is the redaction boundary. That mapping is rendered in
+//! the parent module (`body_override` in `log_record_for`) and contract-tested
+//! here.
 
 use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
@@ -50,9 +56,9 @@ fn severity_for(conclusion: Option<&str>) -> SeverityNumber {
 }
 
 /// `(event_name, severity, event time, attributes)` for a `ci.run` /
-/// `ci.job` record; `None` for every other kind. The event time is the
-/// run/job's own `completed_at`, not the envelope's emission instant — a
-/// backfilled record must land at the moment CI finished.
+/// `ci.job` / `ci.job.log` record; `None` for every other kind. The event
+/// time is the run/job's own `completed_at`, not the envelope's emission
+/// instant — a backfilled record must land at the moment CI finished.
 pub(super) fn log_parts(
     record: &TelemetryRecord,
 ) -> Option<(&'static str, SeverityNumber, u64, Vec<KeyValue>)> {
@@ -73,6 +79,13 @@ pub(super) fn log_parts(
             r.completed_at,
             r.log_attributes(),
         ),
+        // Issue #8825. A log chunk carries no conclusion of its own (its job's
+        // `ci.job` record does), so it is always Info severity — severity must
+        // never be inferred from the log text, which is unscrubbed at this
+        // point in the pipeline.
+        TelemetryRecord::CiJobLog(r) => {
+            ("ci.job.log", &r.repo, r.visibility, None, r.completed_at, r.log_attributes())
+        }
         _ => return None,
     };
     let mut attributes = vec![
@@ -121,6 +134,7 @@ pub(super) fn histogram_point(record: &CiDurationRecord) -> HistogramDataPoint {
 mod tests {
     use std::collections::BTreeSet;
 
+    use opentelemetry_proto::tonic::common::v1::any_value;
     use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 
     use super::super::{build_logs_request, build_metrics_request};
@@ -203,6 +217,78 @@ mod tests {
             job.time_unix_nano,
             u64::try_from(completed.timestamp_nanos_opt().unwrap()).unwrap()
         );
+    }
+
+    /// A `ci.job.log` chunk (#8825) maps to a **log** record whose body is the
+    /// chunk's raw text — *not* its event name, the way every other kind's
+    /// body is — and to no metric at all. The secret-shaped line survives the
+    /// daemon on purpose: redaction happens at the gateway, and a scrubber
+    /// here would make it ambiguous which of the two is authoritative.
+    #[test]
+    fn ci_job_log_chunks_become_log_records_whose_body_is_the_raw_chunk_text() {
+        // Two lines, chunked at a size that fits one of them, so the
+        // multi-chunk reconstruction path is what is asserted.
+        let text = "09:00:11 token: ghp_FIXTUREAAAAAAAAAAAA\n09:00:12 done\n";
+        let target = crate::ci_telemetry::logs::LogTarget {
+            repo: "org/alpha".into(),
+            visibility: crate::telemetry::RepoVisibility::Private,
+            run_id: 7,
+            job_id: 71,
+            attempt: 1,
+            workflow: "CI".into(),
+            job: "test".into(),
+            completed_at: chrono::DateTime::parse_from_rfc3339("2026-09-20T09:00:55Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let chunked = crate::ci_telemetry::logs::chunk(text, 1024, 48);
+        let envelopes = crate::ci_telemetry::logs::log_envelopes(&target, &chunked, "host-a");
+        assert!(envelopes.len() > 1, "the fixture must exercise more than one chunk");
+        assert!(envelopes.iter().all(|env| signal_for(env) == Signal::Logs));
+        assert!(
+            build_metrics_request(&envelopes).is_none(),
+            "a log chunk must not become a metric of any kind"
+        );
+
+        let request = build_logs_request(&envelopes).unwrap();
+        let records = request.resource_logs[0].scope_logs[0].log_records.clone();
+        assert_eq!(records.len(), envelopes.len());
+        let completed = u64::try_from(target.completed_at.timestamp_nanos_opt().unwrap()).unwrap();
+        let mut body = String::new();
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record.event_name, "ci.job.log");
+            assert_eq!(record.time_unix_nano, completed, "chunks land at job completion");
+            assert!(!record.trace_id.is_empty(), "chunks correlate to their job span");
+            let Some(any_value::Value::StringValue(chunk)) =
+                record.body.as_ref().and_then(|body| body.value.clone())
+            else {
+                panic!("chunk {index} has no string body");
+            };
+            assert_eq!(chunk, chunked.chunks[index], "the body IS the chunk text");
+            body.push_str(&chunk);
+            for kv in &record.attributes {
+                assert!(
+                    CI_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
+                        || kv.key == "loom.repo"
+                        || kv.key == "loom.repo.visibility",
+                    "unexpected attribute {}",
+                    kv.key
+                );
+                // No attribute may carry log text: the gateway rewrites
+                // bodies only, so an attribute would ride past the scrubber.
+                if let Some(any_value::Value::StringValue(value)) =
+                    kv.value.as_ref().and_then(|v| v.value.clone())
+                {
+                    assert!(
+                        !value.contains("ghp_"),
+                        "attribute {} carries log text: {value}",
+                        kv.key
+                    );
+                }
+            }
+        }
+        assert_eq!(body, text, "ordering by chunk_index reproduces the log");
+        assert!(body.contains("ghp_FIXTUREAAAAAAAAAAAA"), "the daemon does not scrub");
     }
 
     #[test]

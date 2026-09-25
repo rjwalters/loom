@@ -8,6 +8,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
+mod drain_render;
 mod forge_events_line;
 mod holds;
 mod model_class;
@@ -436,11 +437,8 @@ pub(crate) fn build_status_json_value(
         // Scheduled drain-and-restart state (#4090). `draining: false` in the
         // common case; `note` carries the last transition (timeout refusal /
         // abort) so a scripted consumer sees why a drain ended without a restart.
-        "drain": {
-            "draining": report.draining,
-            "deadline": report.drain_deadline,
-            "note": report.drain_note,
-        },
+        // #8514 adds the live `roll` sub-object (null when no drain is active).
+        "drain": drain_render::drain_json(report),
         // Per-repo breakdown across every registered managed workspace (#3930).
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
             "root": r.root,
@@ -2377,6 +2375,13 @@ pub(crate) fn print_status_human(
             },
         );
         println!("Drain: DRAINING ({} sweep(s) remaining, {deadline})", report.in_flight.len());
+        // #8514: the live roll state — how long dispatch has actually been
+        // paused, against what budget, for which artifact. A host idling behind
+        // a roll is now visible from one `status`, not only from a note that
+        // happened to be written at the last transition.
+        if let Some(line) = drain_render::roll_line(report) {
+            println!("{line}");
+        }
         // #6007: while a drain is ACTIVE the note is where a retained ("pending")
         // roll explains itself — a roll that already survived a deadline refusal
         // and re-armed must not read identically to a first-attempt drain.
