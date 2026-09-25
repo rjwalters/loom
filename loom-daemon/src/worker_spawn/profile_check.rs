@@ -85,7 +85,7 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
             };
             if !is_set {
                 if let Some(status) = pool_status(&root, &profile, source) {
-                    if !status.would_supply() {
+                    if status.would_refuse() {
                         pool_would_refuse = true;
                     }
                     let _ = write!(state, "; {status}");
@@ -123,9 +123,14 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
 
 /// Whether an unset `source` credential variable would be supplied by this
 /// host's API-key pool — namespace and selectable count, secret-free.
-/// `None` when no pool applies at all (the provider is not pooled here, or
-/// nothing derives a namespace), in which case the caller's existing
-/// unset/required-variable handling is unchanged.
+/// `None` only when nothing derives a namespace at all (an invalid explicit
+/// `credentialPool`, or a variable name with no recognizable provider stem),
+/// in which case the caller's existing unset/required-variable handling is
+/// unchanged. A namespace that derives but holds no accounts is reported as
+/// [`PoolStatus::Unregistered`] rather than `None` (#8711): a bundled
+/// quick-tap preset on a host with nothing registered yet must still NAME the
+/// namespace the operator has to run `api-keys add` against, which is the one
+/// thing a bare `unset` never told them.
 fn pool_status(root: &Path, profile: &profiles::ModelProfile, source: &str) -> Option<PoolStatus> {
     let provider = credential::pool_provider(profile.credential_pool.as_deref(), source)?;
     // Secret-free by construction ([`crate::api_keys_pool::ProviderHealth`]
@@ -139,8 +144,9 @@ fn pool_status(root: &Path, profile: &profiles::ModelProfile, source: &str) -> O
     if entry.total == 0 {
         // Not opted into pool management on this host — the harness's own
         // credential store applies instead, exactly as `credential::resolve`
-        // treats a missing pool directory.
-        return None;
+        // treats a missing pool directory. Reported, not refused: the launch
+        // this describes still proceeds.
+        return Some(PoolStatus::Unregistered { provider });
     }
     Some(PoolStatus::Pooled {
         provider,
@@ -157,6 +163,12 @@ enum PoolStatus {
         selectable: usize,
         total: usize,
     },
+    /// The namespace derives but this host has registered nothing in it. Not
+    /// a refusal — `credential::resolve` falls through to the harness's own
+    /// credential store exactly as if no pool existed.
+    Unregistered {
+        provider: String,
+    },
     Unreadable {
         provider: String,
         problem: String,
@@ -168,6 +180,17 @@ impl PoolStatus {
     /// NOT hit `credential::resolve`'s fail-closed exit 78.
     fn would_supply(&self) -> bool {
         matches!(self, Self::Pooled { selectable, .. } if *selectable > 0)
+    }
+
+    /// `true` when a real spawn would fail closed at 78 here. Deliberately not
+    /// `!would_supply()`: an [`Self::Unregistered`] namespace supplies nothing
+    /// AND refuses nothing — the launch proceeds on the harness's own auth
+    /// store, so reporting it must not flip the profile to unresolvable.
+    fn would_refuse(&self) -> bool {
+        match self {
+            Self::Unregistered { .. } => false,
+            other => !other.would_supply(),
+        }
     }
 }
 
@@ -186,6 +209,11 @@ impl std::fmt::Display for PoolStatus {
                 } else {
                     ""
                 }
+            ),
+            Self::Unregistered { provider } => write!(
+                f,
+                "pool {provider}: no accounts registered here — harness auth store \
+                 applies; add one with `loom-daemon api-keys add {provider} <account>`"
             ),
             Self::Unreadable { provider, problem } => {
                 write!(f, "pool {provider}: UNREADABLE — {problem} — spawn would refuse at 78")
@@ -264,12 +292,42 @@ mod tests {
     }
 
     /// A provider with no registered accounts is not pooled at all on this
-    /// host — the caller's ordinary unset-variable handling applies, exactly
-    /// as `credential::resolve` leaves it to the harness's own auth store.
+    /// host — `credential::resolve` leaves it to the harness's own auth store,
+    /// so this must NOT read as a refusal. It still names the namespace
+    /// (#8711), which is what makes a bundled quick-tap preset self-describing
+    /// on a host that has registered nothing yet.
     #[test]
-    fn pool_status_is_none_when_the_provider_is_not_pooled() {
+    fn pool_status_names_an_unregistered_namespace_without_refusing() {
         let workspace = tempfile::tempdir().unwrap();
-        assert!(pool_status(workspace.path(), &profile(None), "ZAI_API_KEY").is_none());
+        let status = pool_status(workspace.path(), &profile(None), "ZAI_API_KEY").unwrap();
+        assert!(!status.would_supply());
+        assert!(!status.would_refuse(), "an unregistered pool must not refuse a launch");
+        let text = status.to_string();
+        assert!(text.contains("pool zai: no accounts registered here"), "{text}");
+        assert!(text.contains("api-keys add zai"), "{text}");
+    }
+
+    /// The namespace an unregistered quick-tap preset names is the one
+    /// `api-keys add` takes, derived from the profile's own `credentialEnv`.
+    #[test]
+    fn pool_status_names_the_quick_tap_presets_own_namespaces() {
+        let workspace = tempfile::tempdir().unwrap();
+        for (variable, namespace) in [
+            ("CEREBRAS_API_KEY", "cerebras"),
+            ("GEMINI_API_KEY", "gemini"),
+        ] {
+            let status = pool_status(workspace.path(), &profile(None), variable).unwrap();
+            assert!(!status.would_refuse());
+            assert!(status.to_string().contains(&format!("pool {namespace}:")), "{status}");
+        }
+    }
+
+    /// Nothing derives a namespace from this variable, so the caller's
+    /// ordinary unset-variable handling applies unchanged.
+    #[test]
+    fn pool_status_is_none_when_no_namespace_derives() {
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(pool_status(workspace.path(), &profile(None), "_API_KEY").is_none());
     }
 
     /// An explicit `credentialPool` override is honoured over the derivation

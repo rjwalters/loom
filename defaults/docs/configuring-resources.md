@@ -495,6 +495,14 @@ tier on it fails closed at exit `78`.
 
 ### The flash profile is the one indirection point
 
+**Shortcut:** the bundled `quick-flash` preset (#8711) is exactly this profile,
+already in the binary — `"runtimes": {"default": "pi", "defaultModelProfile":
+"quick-flash"}` and nothing else, with `loom-daemon api-keys add gemini <account>`
+for the key. Write the object below when you want a different flash generation,
+a `-latest` alias, or a second provider binding; a configured profile of the
+same name shadows the bundled one. Preset inventory and the backstop recipe:
+[`runtime-model-trials.md`](runtime-model-trials.md) §More models.
+
 Define it once under `runtimes.modelProfiles` and make it the default:
 
 ```json

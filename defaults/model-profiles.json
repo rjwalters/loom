@@ -18,6 +18,30 @@
       "opencode": "ZHIPU_API_KEY"
     }
   },
+  "quick-cerebras": {
+    "model": "gpt-oss-120b",
+    "providers": {
+      "pi": "cerebras"
+    },
+    "credentialEnv": "CEREBRAS_API_KEY",
+    "credentialPool": "cerebras",
+    "credentialTargets": {
+      "pi": "CEREBRAS_API_KEY"
+    }
+  },
+  "quick-flash": {
+    "model": "gemini-3.5-flash",
+    "providers": {
+      "pi": "google",
+      "opencode": "google"
+    },
+    "credentialEnv": "GEMINI_API_KEY",
+    "credentialPool": "gemini",
+    "credentialTargets": {
+      "pi": "GEMINI_API_KEY",
+      "opencode": "GEMINI_API_KEY"
+    }
+  },
   "example-bedrock": {
     "model": "REPLACE_WITH_BEDROCK_MODEL_ID",
     "providers": {
