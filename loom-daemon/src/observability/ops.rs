@@ -18,14 +18,15 @@
 //!
 //! Emitters in this issue: [`dispatch`] (one span plus decision counters per
 //! work-finder tick) and [`host`] (memory, swap and worktree-volume gauges on
-//! the `host.health` cadence), and [`queue`] (ready-queue depth per tick,
-//! #8852 phase 2). Later emitters (#8856 dwell/starvation, #8857
-//! token burn and account rotation) add a `MetricName`/`SpanName` variant and
-//! call the same two functions.
+//! the `host.health` cadence), [`queue`] (ready-queue depth per tick,
+//! #8852 phase 2) and [`quota`] (#8857: token burn and pool exhaustion on the
+//! `host.health` cadence). Later emitters (#8856 dwell/starvation) add a
+//! `MetricName`/`SpanName` variant and call the same two functions.
 
 pub mod dispatch;
 pub mod host;
 pub mod queue;
+pub mod quota;
 
 use std::sync::{Arc, OnceLock};
 
@@ -61,21 +62,29 @@ impl OpsSink {
 
     /// [`Self::emit_metrics`] with the interval the batch's delta counters
     /// cover starting at `interval_start`.
+    ///
+    /// Policy ([`MetricPointsRecord::bounded_points`]) is applied here, before
+    /// the record reaches the on-disk queue, as well as again at export: a
+    /// non-finite double would otherwise serialise as `null` and poison the
+    /// whole queued batch on reload (#8857). A batch that bounds to nothing
+    /// enqueues nothing.
     pub fn emit_metrics_since(
         &self,
         points: Vec<MetricPoint>,
         interval_start: Option<chrono::DateTime<Utc>>,
     ) {
-        if points.is_empty() {
+        let mut record = MetricPointsRecord {
+            captured_at: Utc::now(),
+            interval_start,
+            points,
+        };
+        record.points = record.bounded_points();
+        if record.points.is_empty() {
             return;
         }
         self.queue.offer(TelemetryEnvelope::new(
             self.host_id.clone(),
-            TelemetryRecord::MetricPoints(MetricPointsRecord {
-                captured_at: Utc::now(),
-                interval_start,
-                points,
-            }),
+            TelemetryRecord::MetricPoints(record),
         ));
     }
 
