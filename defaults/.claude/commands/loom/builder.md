@@ -878,7 +878,7 @@ If no downstream cap is documented, ask in the PR description rather than assumi
 
 **A dispatched sweep/daemon child inherits `LOOM_FORCE_SCOPE=protected` and `LOOM_GUARD_DECISION_LOG=1`** from the dispatcher's own process environment (set in `loom-daemon-start.sh` to let a headless agent force-push/reset-hard its own branch without stalling on an unanswerable guard ASK). These are agent-wide — inherited by *every* subprocess you run, not just your own git operations.
 
-**Consequence**: if the repo you are working in ships its own guard-hook test suite that asserts the guard's *factory-default* behavior (default force-push/reset-hard `ask` tier, decision-log off by default — e.g. a suite named like `test-guard-destructive*.sh`), your ambient environment overrides exactly the defaults that suite is testing. Running that suite as a dispatched agent can produce dozens of failures that do **not** reproduce in a clean human shell on the identical commit — this has already caused a Builder to misread the failures as "main is broken" and close a valid, unrelated issue as a false duplicate (#5388).
+**Consequence**: a repo's own guard-hook suite asserting the guard's *factory-default* behavior (force-push/reset-hard `ask` tier, decision-log off — e.g. `test-guard-destructive*.sh`) can fail by the dozen where a clean shell on the same commit does **not**. A Builder once misread that as "main is broken" and closed a valid issue as a false duplicate (#5388).
 
 **Before drawing any conclusion from a failing test suite** (especially one where the failures don't match what the issue/PR under investigation would plausibly cause), check your own environment first:
 
@@ -893,6 +893,10 @@ env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <test-suite-command>
 ```
 
 Full background: `.loom/docs/guard-hooks.md` → "Known consequence".
+
+| File | Load when |
+|---|---|
+| [`cargo-target-isolation.md`](cargo-target-isolation.md) | Before a local cargo result counts as "tests pass": a shared target dir may hold another worktree's binary (#8457). |
 
 ## Guidelines
 
