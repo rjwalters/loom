@@ -57,6 +57,15 @@ name: Build and Release
 # run) loudly — it never silently drops just that platform's artifact while
 # reporting overall success.
 #
+# The Linux legs (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`) pin
+# `os: ubuntu-22.04` rather than `ubuntu-latest` (#8842): a shipped binary's
+# glibc requirement tracks the runner it was built on, and `ubuntu-latest` is
+# a moving label that silently rolled to a newer glibc floor than the fleet's
+# oldest worker supports — the root cause of the 2026-09-24 incident (#8837)
+# where a cross-host prebuilt bricked a glibc-2.35 worker. See
+# .loom/docs/release-glibc-floor.md for the decided floor and its own
+# release-time verification step.
+#
 # `build-worker-image` (#5325, multi-arch #7388) publishes
 # `ghcr.io/rjwalters/loom-worker` — a pinned OCI base image for fleet workers
 # — alongside the raw binary/checksum artifacts above. It is a SEPARATE
@@ -261,20 +270,58 @@ jobs:
             os: macos-14 # Apple Silicon runner (native build)
             cross: false
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest # native build
+            # Pinned, not `ubuntu-latest` (#8842): the shipped binary's glibc
+            # requirement tracks whatever glibc THIS runner ships, and
+            # `ubuntu-latest` is a moving label — it silently rolled from
+            # Ubuntu 22.04 (glibc 2.35) to 24.04 (glibc 2.39) well before
+            # 2026-09-24, which is exactly what bricked a glibc-2.35 fleet
+            # worker that day (#8837). `ubuntu-22.04` pins the build host's
+            # glibc floor to the documented minimum instead — see
+            # .loom/docs/release-glibc-floor.md for the decided floor and how to
+            # change it.
+            os: ubuntu-22.04 # native build
             cross: false
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            # Same pin, same reason: the cross-compilation toolchain below
+            # (`gcc-aarch64-linux-gnu`) links against ITS runner's sysroot, so
+            # an unpinned `ubuntu-latest` here would drift this artifact's
+            # glibc floor exactly like the native x86_64 build above — the
+            # aarch64 leg is not exempt just because it cross-compiles.
+            os: ubuntu-22.04
             # No native aarch64 Linux runner assumption is made here — cross
             # compile via an aarch64 gcc/binutils toolchain instead, which
-            # works on any ubuntu-latest runner regardless of arm64-runner
-            # availability for this repo/org.
+            # works on any pinned-version Ubuntu runner regardless of
+            # arm64-runner availability for this repo/org.
             cross: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.tag || github.ref }}
+
+      # Cheap release-time gate (#8842, complements the `ubuntu-22.04` pin
+      # above): confirm the runner this build actually landed on still
+      # reports the documented glibc floor (.loom/docs/release-glibc-floor.md)
+      # rather than trusting the OS-version label alone. This is what
+      # catches it loudly, at build time, if a pinned `ubuntu-22.04` label is
+      # ever retired/rerouted by GitHub Actions to a newer image — the exact
+      # kind of silent drift `ubuntu-latest` already did once (#8837) — before
+      # a newer-glibc artifact ships to the fleet again.
+      - name: Verify build host glibc floor
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        run: |
+          set -euo pipefail
+          floor_major=2
+          floor_minor=35
+          host_version="$(ldd --version | head -n1 | awk '{print $NF}')"
+          host_major="$(printf '%s' "$host_version" | cut -d. -f1)"
+          host_minor="$(printf '%s' "$host_version" | cut -d. -f2)"
+          echo "Build host glibc: ${host_version} (documented floor: ${floor_major}.${floor_minor})"
+          if [ "$host_major" -gt "$floor_major" ] || { [ "$host_major" -eq "$floor_major" ] && [ "$host_minor" -gt "$floor_minor" ]; }; then
+            echo "::error::Build host glibc ${host_version} is newer than the documented floor ${floor_major}.${floor_minor} — this runner has drifted (see .loom/docs/release-glibc-floor.md). The shipped ${{ matrix.target }} binary would require a newer glibc than the fleet's oldest supported host provides. Re-pin the runner (or lower workers) before releasing."
+            exit 1
+          fi
+          echo "OK: build host glibc is within the documented floor."
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
