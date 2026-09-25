@@ -220,6 +220,15 @@ pub fn worktree_root_disk_bytes(repo_root: &Path) -> (Option<u64>, Option<u64>) 
     (column_bytes(3), column_bytes(1))
 }
 
+/// Whole GB (integer floor) from a byte count — the same rounding
+/// [`parse_df_available_gb`]/[`parse_df_total_gb`] apply to `df -Pk`'s 1K
+/// blocks, so a GB figure derived from [`worktree_root_disk_bytes`] equals the
+/// one [`worktree_root_disk_gb`] would report for the same sample (#8857).
+#[must_use]
+pub fn bytes_to_whole_gb(bytes: u64) -> u64 {
+    bytes / (1024 * 1024 * 1024)
+}
+
 /// The disk-headroom concurrency term: how many worktrees `free_gb` can hold at
 /// `per_gb` GB each. Pure `floor(free_gb / per_gb)`, mirroring the disk term of
 /// bash `loom_wave_size_from_disk` (`free_gb / per`). A `per_gb` of 0 is treated

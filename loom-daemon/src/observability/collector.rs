@@ -578,13 +578,29 @@ async fn sample_snapshots(
     token_record
         .accounts
         .extend(sample_registry_provider_accounts(workspace_root));
+    // Token burn + per-provider pool state (Issue #8857), through the
+    // OTLP-only ops sink — a no-op (no reads at all) without an OTLP exporter.
+    super::ops::quota::record(workspace_root, &token_record.accounts).await;
     queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::TokensSnapshot(token_record)));
-    let health_record =
-        sample_host_health(workspace_root, daemon_started_at, workspace_pool, slug_cache).await;
+    // ONE `df -Pk` sample per tick feeds both host.health's GB fields and the
+    // ops byte gauges (#8857 — it used to run twice).
+    let root = workspace_root.to_path_buf();
+    let worktree_volume =
+        tokio::task::spawn_blocking(move || crate::disk_headroom::worktree_root_disk_bytes(&root))
+            .await
+            .unwrap_or((None, None));
+    let health_record = sample_host_health(
+        workspace_root,
+        daemon_started_at,
+        workspace_pool,
+        slug_cache,
+        worktree_volume,
+    )
+    .await;
     queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
-    super::ops::host::record(workspace_root).await;
+    super::ops::host::record(worktree_volume).await;
     // The work finder's ranked ready queue (Issue #8852, phase 2) — native
     // HTTPS only, and only when the work finder has ticked since last time.
     super::queue_snapshot::record(slug_cache).await;
@@ -712,6 +728,7 @@ async fn sample_host_health(
     started_at: Instant,
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
+    worktree_volume_bytes: (Option<u64>, Option<u64>),
 ) -> HostHealthRecord {
     // CPU idle refresh can block ~1s on macOS (`iostat`) — dispatched through
     // `spawn_blocking` per the exact pattern `work_finder`'s dynamic-cap tick
@@ -733,9 +750,17 @@ async fn sample_host_health(
     );
     // Free AND total (#5356) come from the SAME `df -Pk` sample — one
     // subprocess spawn, not two — so the pair can never disagree about which
-    // filesystem or point in time they describe.
-    let (worktree_root_free_gb, worktree_root_total_gb) =
-        crate::disk_headroom::worktree_root_disk_gb(workspace_root);
+    // filesystem or point in time they describe. The caller took that sample
+    // in bytes (#8857) so the ops gauges share it; GB here is the same integer
+    // floor `disk_headroom::parse_df_*_gb` applies (`kb / 1024 / 1024`).
+    let (worktree_root_free_gb, worktree_root_total_gb) = (
+        worktree_volume_bytes
+            .0
+            .map(crate::disk_headroom::bytes_to_whole_gb),
+        worktree_volume_bytes
+            .1
+            .map(crate::disk_headroom::bytes_to_whole_gb),
+    );
     // Fleet captain (#8848): `is_captain` is this host's gate outcome against
     // `root`'s declared `fleet.captain`, and `armed_singleton_jobs` is this
     // process's own live registry of jobs that most recently resolved

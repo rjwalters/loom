@@ -326,10 +326,51 @@ one `otlp` exporter starts, and it feeds only the OTLP queues. With no OTLP
 exporter, both calls are no-ops.
 
 Current emitters are one `loom.dispatch.tick` span per work-finder tick, the
-`loom.dispatch.decisions{reason=…}` delta counter, and memory, swap and
-worktree-volume byte gauges on the `host.health` cadence. Names, kinds and
+`loom.dispatch.decisions{reason=…}` delta counter, memory, swap and
+worktree-volume byte gauges on the `host.health` cadence, and (Issue #8857)
+per-provider/model token burn (`loom.llm.tokens.*`, `loom.llm.requests`) plus
+pool state (`loom.pool.accounts`, `loom.pool.exhausted`,
+`loom.pool.exhaustions`, `loom.pool.exhausted_seconds`) on the same cadence.
+TPM/RPM are rates over the burn counters, and exhausted-pool downtime is the
+sum of `loom.pool.exhausted_seconds`. Policy (allowlisted labels, finite
+values) is applied at emit, before the durable queue, and again at export;
+`MetricPoint::label` debug-asserts the key allowlist. Names, kinds and
 labels are listed in
 [`telemetry-schema.md` → `metric.points`](telemetry-schema.md#metricpoints).
+
+**Queue dwell and starvation (#8856).** Each multi-workspace tick also emits
+`loom.queue.*` from the same per-issue ready-queue rows that `loom-daemon queue`
+shows (#8852). A row is *waiting* in one of two states. `ready` means only
+capacity is holding it: the concurrency cap, the admission ramp, the saturation
+brake, or the repo slice. `blocked` means an automatic hold: a halted repo,
+missing sweep command, quarantine, dispatch backoff, no-op cooldown, PR-less
+retry, or a dispatch error. Running rows are not waiting. Neither are rows held
+deliberately or elsewhere: a park or hard-exclusion label, a decline, another
+host's affinity or claim, an open PR, or the issue's own recheck interval.
+The dwell clock needs no forge calls. It starts at `min(now, updatedAt)` the
+first tick an issue is seen waiting, then stays fixed. Applying `loom:issue`
+bumps `updatedAt`, so dwell is a **lower bound**: it can under-report and never
+over-reports. The clock is dropped when the issue leaves the listing, is
+dispatched, or stops waiting. It is kept across a failed listing, and it
+re-seeds after a daemon restart. A re-seed reads `updatedAt` again, so it can
+include time the issue spent in a non-waiting hold that did not touch it (for
+example a peer claim). On a sharded fleet, `out_of_slice` rows count as `ready`
+on every host that lists them, so `starved{state="ready"}` can fire on a host
+that is not the slice owner. Read the host label with that in mind. The
+signals are `loom.queue.oldest_wait{state}`, `loom.queue.starved{state}` (waiting longer than `LOOM_QUEUE_STARVATION_SECS`,
+default 21600 = 6 h), `loom.queue.starved.by_reason{reason}`, and the
+dispatch-wait delta pair `loom.queue.dispatch_wait` / `.samples`. Queue
+*depth* is `loom.queue.issues` (#8852 phase 2, below). Its `blocked` state
+also counts deliberate holds, which the dwell `blocked` state leaves out. The
+committed SigNoz alert rule is
+`defaults/observability/signoz/alerts/queue-starvation.json` in the Loom repo.
+It fires when `starved{state="ready"}` stays above 0 on a host for 15 min.
+Import it with `POST /api/v1/rules` or paste its query into a new ClickHouse
+alert. The rule's shape has not yet been tested against a live SigNoz. Standing queries are in
+`defaults/observability/signoz/queue-dwell.sql`.
+Completed-sweep phase durations are covered by the cycle-time rollup. Worker
+idle gap and forge label-transition dwell are tracked in #8929.
+
 To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new
 label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or
 `OPS_SPAN_ATTRIBUTE_KEYS` and the gateway collector's `keep_keys` in

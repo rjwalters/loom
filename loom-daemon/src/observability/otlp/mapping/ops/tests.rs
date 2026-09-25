@@ -57,12 +57,11 @@ fn gauges_and_delta_counters_map_to_their_fixed_otlp_kinds() {
 
 #[test]
 fn non_allowlisted_labels_are_dropped_at_export() {
-    let batch = vec![points_envelope(
-        "host-a",
-        vec![MetricPoint::int(MetricName::DispatchDecisions, 1)
-            .label("reason", "error")
-            .label("issue", "8860")],
-    )];
+    // Inserted directly, as a record restored from an older on-disk queue
+    // could carry it: `MetricPoint::label` debug-asserts the allowlist (#8857).
+    let mut point = MetricPoint::int(MetricName::DispatchDecisions, 1).label("reason", "error");
+    point.labels.insert("issue".into(), "8860".into());
+    let batch = vec![points_envelope("host-a", vec![point])];
     let request = build_metrics_request(&batch).unwrap();
     let point = match &request.resource_metrics[0].scope_metrics[0].metrics[0].data {
         Some(metric::Data::Sum(sum)) => sum.data_points[0].clone(),
