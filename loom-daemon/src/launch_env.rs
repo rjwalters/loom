@@ -12,8 +12,9 @@
 //!
 //! Collapsing the two copies here is what makes room for a third pin — the
 //! preference marker #8599 carries to the child — without growing either
-//! dispatch surface. It is also the seam #8602 extends to pin a tap's
-//! `modelProfile`, rather than re-duplicating the block a third time.
+//! dispatch surface. #8602 reuses the same seam to pin a profile-pinned tap's
+//! `modelProfile` (`LOOM_MODEL_PROFILE`), rather than re-duplicating the
+//! block a third time.
 //!
 //! # Why the marker travels in the environment
 //!
@@ -59,6 +60,14 @@ pub fn apply_launch_env(cmd: &mut Command, admission: Option<&ResolvedRuntime>, 
     // invariant).
     if let Some(preference) = &admission.preference {
         cmd.env(PREFERENCE_MARKER_ENV, &preference.marker);
+        // #8602: pin the chosen tap's model profile so the child resolves the
+        // exact profile availability just gated on, not whatever the runtime
+        // would default to. `worker_spawn::mod.rs`'s arg parser already falls
+        // back to this var when no `--profile` flag is given. Absent for a
+        // bare-runtime tap (`model_profile: None`), so it pins nothing there.
+        if let Some(profile) = &preference.model_profile {
+            cmd.env("LOOM_MODEL_PROFILE", profile);
+        }
     }
     log::info!(
         "{context}: admitted role={} runtime={} source={}",
@@ -101,6 +110,20 @@ mod tests {
             marker: "# LOOM_RUNTIME_PREFERENCE order=claude,codex,opencode:zai-metered tier=2 \
                      tap=opencode:zai-metered source=preference"
                 .into(),
+            model_profile: Some("zai-metered".into()),
+        }
+    }
+
+    /// A chosen bare-runtime tap: no `modelProfile` named in the preference
+    /// entry, so nothing should be pinned at launch (#8602).
+    fn bare_stamp() -> PreferenceStamp {
+        PreferenceStamp {
+            tier: 0,
+            tap: "claude".into(),
+            marker: "# LOOM_RUNTIME_PREFERENCE order=claude,codex tier=0 tap=claude \
+                     source=preference"
+                .into(),
+            model_profile: None,
         }
     }
 
@@ -127,6 +150,43 @@ mod tests {
             !env_of(&without)
                 .iter()
                 .any(|(name, _)| name == PREFERENCE_MARKER_ENV),
+            "{:?}",
+            env_of(&without)
+        );
+    }
+
+    /// #8602: a profile-pinned tap (`{"runtime": "opencode", "modelProfile":
+    /// "zai-metered"}`) must launch with that exact profile pinned, and a
+    /// chosen bare-runtime tap must pin nothing — matching `Tap::model_profile`
+    /// being `None` for it, so the "absent config is byte-identical" invariant
+    /// holds for this env var too.
+    #[test]
+    fn the_model_profile_is_pinned_only_when_the_chosen_tap_names_one() {
+        let mut profile_pinned = Command::new("/bin/true");
+        apply_launch_env(&mut profile_pinned, Some(&admitted(Some(stamp()))), "test");
+        assert!(
+            env_of(&profile_pinned).contains(&("LOOM_MODEL_PROFILE".into(), "zai-metered".into())),
+            "{:?}",
+            env_of(&profile_pinned)
+        );
+
+        let mut bare = Command::new("/bin/true");
+        apply_launch_env(&mut bare, Some(&admitted(Some(bare_stamp()))), "test");
+        assert!(
+            !env_of(&bare)
+                .iter()
+                .any(|(name, _)| name == "LOOM_MODEL_PROFILE"),
+            "{:?}",
+            env_of(&bare)
+        );
+
+        // No preference resolution at all (static path): also no pin.
+        let mut without = Command::new("/bin/true");
+        apply_launch_env(&mut without, Some(&admitted(None)), "test");
+        assert!(
+            !env_of(&without)
+                .iter()
+                .any(|(name, _)| name == "LOOM_MODEL_PROFILE"),
             "{:?}",
             env_of(&without)
         );
