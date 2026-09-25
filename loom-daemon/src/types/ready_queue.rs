@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 /// What the work finder did with one ready issue on its most recent tick.
 ///
-/// Every variant maps to exactly one `TickReport` counter, so the rows and
-/// the aggregate counts can never tell different stories. Unknown values
+/// Each variant is recorded next to the `TickReport` counter bump it
+/// matches (except `WorkspaceHalted`, which has only the tick-wide `halted`
+/// flag), so the rows and the aggregate counts agree. Unknown values
 /// (a newer daemon's variant read by an older client) parse as
 /// [`Self::Unknown`] rather than failing the whole status payload.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -32,7 +33,11 @@ pub enum QueueDisposition {
     /// Waiting: outside this host's preferred repo slice while the slice still
     /// had work (repo sharding, #6243).
     DeferredOutOfSlice,
-    /// Blocked: its repo's `main` is verified red (main-health gate).
+    /// Blocked: the work finder is holding dispatch for its whole repo. The
+    /// hold has several possible causes (verified-red `main`, a main-health
+    /// gate still running, a pre-flight advisory hold, an unusable token pool,
+    /// a scheduled drain, the host-distress breaker); the row does not say
+    /// which.
     WorkspaceHalted,
     /// Blocked: its workspace is missing `.claude/commands/loom/sweep.md`.
     WorkspaceCommandsMissing,
@@ -93,7 +98,9 @@ impl QueueDisposition {
             Self::DeferredRampCap => "waiting: per-tick admission cap reached",
             Self::DeferredSaturation => "waiting: host saturated (admission brake)",
             Self::DeferredOutOfSlice => "waiting: outside this host's repo slice",
-            Self::WorkspaceHalted => "blocked: repo main is red (main-health gate)",
+            Self::WorkspaceHalted => {
+                "blocked: repo dispatch held (red main, gate, token pool, drain or breaker)"
+            }
             Self::WorkspaceCommandsMissing => "blocked: workspace missing sweep command",
             Self::HostConstraint => "not for this host (host affinity)",
             Self::Parked => "blocked: skip/park label",

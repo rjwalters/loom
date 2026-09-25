@@ -131,19 +131,22 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
     sorted
         .into_iter()
         .enumerate()
-        .map(|(i, r)| ReadyQueueRow {
-            rank: i + 1,
-            repo: roots.get(r.key.workspace_idx).map_or_else(
-                || format!("workspace #{}", r.key.workspace_idx),
-                |p| p.display().to_string(),
-            ),
-            issue: r.key.number,
-            workspace_priority: r.key.workspace_priority,
-            urgent: r.key.urgent,
-            created_at: r.key.created_at.clone(),
-            tier: r.tier.clone(),
-            disposition: r.disposition.unwrap_or(QueueDisposition::DeferredCapacity),
-            detail: r.detail.clone(),
+        .map(|(i, r)| {
+            debug_assert!(r.disposition.is_some(), "unresolved queue row #{}", r.key.number);
+            ReadyQueueRow {
+                rank: i + 1,
+                repo: roots.get(r.key.workspace_idx).map_or_else(
+                    || format!("workspace #{}", r.key.workspace_idx),
+                    |p| p.display().to_string(),
+                ),
+                issue: r.key.number,
+                workspace_priority: r.key.workspace_priority,
+                urgent: r.key.urgent,
+                created_at: r.key.created_at.clone(),
+                tier: r.tier.clone(),
+                disposition: r.disposition.unwrap_or(QueueDisposition::DeferredCapacity),
+                detail: r.detail.clone(),
+            }
         })
         .collect()
 }
