@@ -111,6 +111,10 @@ mod decline_cooldown;
 mod dispatch;
 mod guards;
 mod heartbeat_broadcast;
+/// Claim-episode membership for the lease-order tie-break (Issue #8840).
+mod lease_episode;
+#[cfg(test)]
+mod lease_episode_dispatch_tests;
 mod locks;
 mod model;
 mod noop_cooldown;
