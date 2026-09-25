@@ -94,10 +94,15 @@ pub(super) fn validate_runtime_labels(obj: &Map<String, Value>) -> Result<()> {
 /// the flat `tokens` this has a single source and degrades straight to `None`
 /// when it comes up empty: opted out via `LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS=0`,
 /// nothing attributable found, or the lookup timed out. `runtime` is the
-/// sweep's own `# LOOM_LAUNCH` value; `None` (a Claude spawn) keeps the
-/// pre-#8507 transcript reader. Runs on the blocking pool under the same
-/// [`TOKEN_LOOKUP_TIMEOUT`] as every other token lookup, so a pathological
-/// store can never delay a completion past the lookup budget.
+/// sweep's own `# LOOM_LAUNCH` value; `None` (a Claude or legacy-adapter
+/// spawn) is resolved once more through
+/// [`crate::usage_source::sweep_usage_runtime`], which recovers the runtime id
+/// of a legacy adapter that keeps a usage store of its own (Codex, #8594) from
+/// the log marker every runtime writes — and deliberately yields `None` for
+/// Claude, keeping the pre-#8507 transcript reader and a byte-identical
+/// payload. Runs on the blocking pool under the same [`TOKEN_LOOKUP_TIMEOUT`]
+/// as every other token lookup, so a pathological store can never delay a
+/// completion past the lookup budget.
 pub(super) async fn fetch_tokens_by_model(
     runtime: Option<&str>,
     workspace_root: &str,
@@ -110,6 +115,7 @@ pub(super) async fn fetch_tokens_by_model(
     let root = PathBuf::from(workspace_root);
     let runtime = runtime.map(str::to_owned);
     let scan = tokio::task::spawn_blocking(move || {
+        let runtime = crate::usage_source::sweep_usage_runtime(runtime.as_deref(), &root, issue);
         crate::usage_source::sweep_tokens_by_model(runtime.as_deref(), &root, issue, Some(window))
     });
     tokio::time::timeout(TOKEN_LOOKUP_TIMEOUT, scan)

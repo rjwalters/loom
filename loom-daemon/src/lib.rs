@@ -141,6 +141,7 @@ pub mod capacity;
 pub mod ci_telemetry;
 pub mod claim_reconciliation;
 pub mod cmd_out;
+pub mod codex_usage;
 pub mod concierge;
 pub mod config_resolver;
 pub mod cpu_headroom;

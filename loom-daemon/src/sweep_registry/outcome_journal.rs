@@ -623,9 +623,23 @@ impl SweepRegistry {
         // the pre-#8507 behavior for every Claude sweep; an `opencode` launch
         // instead reads OpenCode's own session store, scoped to this sweep's
         // directories and the same wall-clock window.
+        //
+        // Issue #8594: a legacy-adapter runtime that keeps a usage store of its
+        // own (Codex) writes no `# LOOM_LAUNCH` record, so its runtime id is
+        // recovered from the `# LOOM_RUNTIME_RESOLVED` marker every runtime
+        // writes — `sweep_usage_runtime`, which deliberately yields `None` for
+        // `claude` and is therefore payload-preserving. The usage SOURCE only:
+        // this record's own `runtime`/`provider`/`profile` fields stay
+        // launch-record-sourced (`apply_runtime_attribution` below), because
+        // the marker carries no provider or profile to publish.
+        let usage_runtime = crate::usage_source::sweep_usage_runtime(
+            runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+            &self.config.workspace_root,
+            issue,
+        );
         let tokens_by_model = started_at.and_then(|started_at| {
             crate::usage_source::sweep_tokens_by_model(
-                runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+                usage_runtime.as_deref(),
                 &self.config.workspace_root,
                 issue,
                 Some((started_at, Utc::now())),

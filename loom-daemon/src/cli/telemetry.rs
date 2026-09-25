@@ -93,6 +93,16 @@ pub(crate) enum TelemetryCommand {
     /// `credential`/`account` tables in the same file.
     OpencodeUsage(super::opencode_usage_cli::OpencodeUsageArgs),
 
+    /// Per-model token usage from Codex's own rollout session store (Issue
+    /// #8594).
+    ///
+    /// The Codex sibling of `opencode-usage`, with the same two jobs
+    /// (backfill, and verifying what a sweep's `tokens_by_model` will carry).
+    /// Read-only — the reader's whole file-open surface refuses any path
+    /// outside `sessions/**/rollout-*.jsonl`, so `$CODEX_HOME`'s `auth.json`,
+    /// `config.toml` and `history.jsonl` are unreachable from it.
+    CodexUsage(super::codex_usage_cli::CodexUsageArgs),
+
     /// Roll raw Claude Code transcripts into a verified, incremental
     /// `.tar.zst` archive before Claude Code's `cleanupPeriodDays` fuse
     /// deletes them (#8494, split from #8477's item 5).
@@ -140,6 +150,7 @@ impl TelemetryCommand {
             TelemetryCommand::IngestTranscripts(args) => args.run(),
             TelemetryCommand::UsageReport(args) => args.run(),
             TelemetryCommand::OpencodeUsage(args) => args.run(),
+            TelemetryCommand::CodexUsage(args) => args.run(),
             TelemetryCommand::ArchiveTranscripts(args) => args.run(),
             TelemetryCommand::CiTelemetry(args) => args.run(),
         }
