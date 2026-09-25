@@ -11,10 +11,9 @@
 //! Sources, with no new crate dependency (the [`crate::ram_headroom`]
 //! precedent): Linux reads `/proc/meminfo`; macOS uses `vm_stat` (free +
 //! inactive pages, the `MemAvailable` analogue), `sysctl -n hw.memsize` and
-//! `sysctl -n vm.swapusage`. The worktree volume comes from the same `df -Pk`
-//! probe `host.health` uses ([`crate::disk_headroom::worktree_root_disk_bytes`]).
-
-use std::path::Path;
+//! `sysctl -n vm.swapusage`. The worktree volume is the same single `df -Pk`
+//! sample `host.health` reads ([`crate::disk_headroom::worktree_root_disk_bytes`]),
+//! handed in by the collector.
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 
@@ -148,12 +147,16 @@ fn sample_memory() -> HostResources {
     HostResources::default()
 }
 
-/// Sample every resource. Blocking (subprocesses on macOS, `df` everywhere):
-/// call from `spawn_blocking`.
+/// Sample memory and swap, and combine them with the worktree-volume
+/// `(free, total)` bytes the caller already probed. Blocking (subprocesses on
+/// macOS): call from `spawn_blocking`.
+///
+/// The volume reading is passed in rather than probed here so one `df` sample
+/// per `host.health` tick serves both `host.health`'s GB fields and these
+/// byte gauges (#8857; it used to run `df` twice per tick).
 #[must_use]
-pub fn sample(workspace_root: &Path) -> HostResources {
-    let (worktree_volume_free, worktree_volume_total) =
-        crate::disk_headroom::worktree_root_disk_bytes(workspace_root);
+pub fn sample(worktree_volume: (Option<u64>, Option<u64>)) -> HostResources {
+    let (worktree_volume_free, worktree_volume_total) = worktree_volume;
     HostResources {
         worktree_volume_free,
         worktree_volume_total,
@@ -162,13 +165,12 @@ pub fn sample(workspace_root: &Path) -> HostResources {
 }
 
 /// Sample and export, when an ops sink is registered. Async so the collector
-/// can await it; the probes run on the blocking pool.
-pub async fn record(workspace_root: &Path) {
+/// can await it; the memory probes run on the blocking pool.
+pub async fn record(worktree_volume: (Option<u64>, Option<u64>)) {
     let Some(sink) = super::global_ops_sink() else {
         return;
     };
-    let root = workspace_root.to_path_buf();
-    if let Ok(resources) = tokio::task::spawn_blocking(move || sample(&root)).await {
+    if let Ok(resources) = tokio::task::spawn_blocking(move || sample(worktree_volume)).await {
         sink.emit_metrics(resources.points());
     }
 }

@@ -102,6 +102,34 @@ pub enum MetricName {
     /// value means `loom.queue.issues` is missing their backlog.
     #[serde(rename = "loom.queue.listing_failed_repos")]
     QueueListingFailedRepos,
+    // ---- Quota burn and pool state (Issue #8857) ------------------------
+    /// Uncached input tokens consumed since the previous sample.
+    #[serde(rename = "loom.llm.tokens.input")]
+    LlmTokensInput,
+    /// Output tokens produced since the previous sample.
+    #[serde(rename = "loom.llm.tokens.output")]
+    LlmTokensOutput,
+    /// Cache-read input tokens since the previous sample.
+    #[serde(rename = "loom.llm.tokens.cache_read")]
+    LlmTokensCacheRead,
+    /// Cache-write input tokens since the previous sample.
+    #[serde(rename = "loom.llm.tokens.cache_write")]
+    LlmTokensCacheWrite,
+    /// Model API responses (distinct message ids) since the previous sample.
+    #[serde(rename = "loom.llm.requests")]
+    LlmRequests,
+    /// Accounts in a provider's pool, labelled `state` = `usable`/`exhausted`.
+    #[serde(rename = "loom.pool.accounts")]
+    PoolAccounts,
+    /// 1 when a provider's pool has exhausted accounts and none usable.
+    #[serde(rename = "loom.pool.exhausted")]
+    PoolExhausted,
+    /// Accounts that became exhausted since the previous sample.
+    #[serde(rename = "loom.pool.exhaustions")]
+    PoolExhaustions,
+    /// Seconds since the previous sample the pool read as exhausted.
+    #[serde(rename = "loom.pool.exhausted_seconds")]
+    PoolExhaustedSeconds,
 }
 
 impl MetricName {
@@ -120,6 +148,15 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "loom.host.worktree_volume.total_bytes",
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
+            Self::LlmTokensInput => "loom.llm.tokens.input",
+            Self::LlmTokensOutput => "loom.llm.tokens.output",
+            Self::LlmTokensCacheRead => "loom.llm.tokens.cache_read",
+            Self::LlmTokensCacheWrite => "loom.llm.tokens.cache_write",
+            Self::LlmRequests => "loom.llm.requests",
+            Self::PoolAccounts => "loom.pool.accounts",
+            Self::PoolExhausted => "loom.pool.exhausted",
+            Self::PoolExhaustions => "loom.pool.exhaustions",
+            Self::PoolExhaustedSeconds => "loom.pool.exhausted_seconds",
         }
     }
 
@@ -127,7 +164,14 @@ impl MetricName {
     #[must_use]
     pub fn kind(self) -> MetricKind {
         match self {
-            Self::DispatchDecisions => MetricKind::DeltaCounter,
+            Self::DispatchDecisions
+            | Self::LlmTokensInput
+            | Self::LlmTokensOutput
+            | Self::LlmTokensCacheRead
+            | Self::LlmTokensCacheWrite
+            | Self::LlmRequests
+            | Self::PoolExhaustions
+            | Self::PoolExhaustedSeconds => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -140,6 +184,14 @@ impl MetricName {
             Self::DispatchMaxConcurrent => "{sweep}",
             Self::QueueIssues => "{issue}",
             Self::QueueListingFailedRepos => "{repository}",
+            Self::LlmTokensInput
+            | Self::LlmTokensOutput
+            | Self::LlmTokensCacheRead
+            | Self::LlmTokensCacheWrite => "{token}",
+            Self::LlmRequests => "{request}",
+            Self::PoolAccounts | Self::PoolExhaustions => "{account}",
+            Self::PoolExhausted => "1",
+            Self::PoolExhaustedSeconds => "s",
             _ => "By",
         }
     }
@@ -159,6 +211,15 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
             Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
             Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
+            Self::LlmTokensInput => "Uncached input tokens consumed, by provider and model.",
+            Self::LlmTokensOutput => "Output tokens produced, by provider and model.",
+            Self::LlmTokensCacheRead => "Cache-read input tokens, by provider and model.",
+            Self::LlmTokensCacheWrite => "Cache-write input tokens, by provider and model.",
+            Self::LlmRequests => "Model API responses, by provider and model.",
+            Self::PoolAccounts => "Enabled pool accounts by provider and state.",
+            Self::PoolExhausted => "1 when no account in the provider's pool is usable.",
+            Self::PoolExhaustions => "Accounts that became exhausted since the last sample.",
+            Self::PoolExhaustedSeconds => "Seconds the provider's pool read as exhausted.",
         }
     }
 }
@@ -191,9 +252,15 @@ impl MetricPoint {
         }
     }
 
-    /// Add one label (builder style). Policy is applied at export, not here.
+    /// Add one label (builder style). Value policy is applied at emit and
+    /// again at export; an unallowlisted key is a programming error, caught in
+    /// debug builds here and dropped by [`bounded_labels`] in release.
     #[must_use]
     pub fn label(mut self, key: &str, value: impl Into<String>) -> Self {
+        debug_assert!(
+            OPS_METRIC_LABEL_KEYS.contains(&key),
+            "metric label key {key:?} is not in OPS_METRIC_LABEL_KEYS"
+        );
         self.labels.insert(key.to_string(), value.into());
         self
     }

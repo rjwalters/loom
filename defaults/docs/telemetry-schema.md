@@ -853,7 +853,7 @@ inventing a record kind per signal. Envelopes carry `schema_version: 10`.
 | `captured_at` | RFC 3339 | sample instant (the OTLP data-point time) |
 | `interval_start` | RFC 3339, optional | start of the interval the batch's delta counters cover (OTLP `start_time_unix_nano`; the tick start for `loom.dispatch.decisions`); defaults to `captured_at` |
 | `points[].name` | string | closed vocabulary, `telemetry::ops::MetricName` |
-| `points[].value` | int or float | non-finite floats are dropped at export |
+| `points[].value` | int or float | non-finite floats are dropped before the queue (at emit) and again at export |
 | `points[].labels` | object | optional; keys limited to `reason`, `provider`, `account`, `model`, `state`; values ≤128 bytes, no control chars, ≤8 per point |
 
 Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
@@ -885,6 +885,27 @@ blocked split. `loom.queue.listing_failed_repos` counts the repos whose ready
 listing failed on that tick; when it is non-zero, the depth is incomplete, not
 low. Issue numbers and repos are never labels. The per-issue rows travel in
 `queue.snapshot`.
+
+Quota burn and pool state (Issue #8857, `observability/ops/quota.rs`), all on
+the 5-minute snapshot cadence:
+
+| Metric | Kind | Unit | Labels | Meaning |
+|---|---|---|---|---|
+| `loom.llm.tokens.input`, `.output`, `.cache_read`, `.cache_write` | delta `Sum` | `{token}` | `provider`, `model` | tokens spent host-wide since the previous sample |
+| `loom.llm.requests` | delta `Sum` | `{request}` | `provider`, `model` | model API responses (distinct `message.id`s) in the same interval |
+| `loom.pool.accounts` | `Gauge` | `{account}` | `provider`, `state` ∈ `usable`, `exhausted` | enabled accounts in each provider's pool |
+| `loom.pool.exhausted` | `Gauge` | `1` | `provider` | `1` when the pool has an exhausted account and no usable one |
+| `loom.pool.exhaustions` | delta `Sum` | `{account}` | `provider` | accounts newly exhausted since the previous sample |
+| `loom.pool.exhausted_seconds` | delta `Sum` | `s` | `provider` | the interval, credited when the pool read exhausted at its start (sample-and-hold downtime) |
+
+Burn is read from the Claude transcript store only for now (`provider=claude`;
+Codex/OpenCode/Kimi are #8930). A message counts in the window its first record
+falls in, windows end 60 s before the sample and abut, and the first sample
+after daemon start only anchors the window, so TPM/RPM are
+`rate(loom.llm.tokens.*)`/`rate(loom.llm.requests)` with no double count and
+no replayed history. Pool state covers the `tokens.snapshot` accounts (Claude,
+Codex) plus every enabled API-key-pool account (Z.ai, Kimi, …), aggregated per
+provider with no `account` label; delta counters start from the second sample.
 
 An unmeasurable host reading produces no point, never a `0`. Each work-finder
 tick also emits one `loom.dispatch.tick` span. It is a new root trace per tick

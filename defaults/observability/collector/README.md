@@ -111,8 +111,8 @@ Claude Code's own attribute names (`session.id`, `user.email`,
 still applies unmodified to this path — it keeps only the resource keys
 (`service.name`, `service.version`, `service.instance.id`, `host.id`) and the
 explicit `loom.*` log/span allowlist, plus the small non-namespaced
-`metric_statements` datapoint keys (`account`, `rank`, `pool`, `slot`,
-`model`, `window`, `state`). Anything else Claude Code sends — including
+`metric_statements` datapoint keys listed under "Privacy and remote
+deployment" below. Anything else Claude Code sends — including
 fields with real user identity like `user.email` — is dropped before either
 backend, by the same fail-closed `keep_keys` behavior documented in "Privacy
 and remote deployment" below. That is a feature, not a bug: it means this
@@ -340,6 +340,21 @@ The gateway's shared allowlist removes unknown resource, record, span-event and
 metric attributes before both exporters. Free-text `loom.detail` is excluded.
 Only low-cardinality metric labels are permitted; trace IDs and issue numbers
 remain in logs/spans.
+
+The datapoint allowlist in `config.yaml` is exactly: `account`, `rank`,
+`pool`, `slot`, `model`, `window`, `state` (token-pool and Claude Code
+metrics); `repo`, `workflow`, `job`, `runner`, `conclusion` (the
+`loom.ci.*` duration histograms, #8824); and `reason`, `provider` (the
+`metric.points` ops path, #8860 — its `OPS_METRIC_LABEL_KEYS` are `reason`,
+`provider`, `account`, `model`, `state`). A contract test in
+`loom-daemon/src/observability/ops/tests.rs` fails if `OPS_METRIC_LABEL_KEYS`
+gains a key this list lacks. `metric.points` values are additionally bounded
+at the source: at most 8 labels per point, values ≤128 bytes with no control
+characters, finite numbers only — enforced when the daemon enqueues the point
+and again when it exports it (#8857). The #8857 quota metrics
+(`loom.llm.tokens.*`, `loom.llm.requests`, `loom.pool.*`) carry only
+`provider`, `model` and `state`: per-provider aggregates, never an account
+name or credential.
 
 **The body policy, exactly** (rewritten for #8825; this used to read "does not
 accept raw shell output, prompts or model completions", which is no longer the

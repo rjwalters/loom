@@ -56,6 +56,49 @@ fn emit_metrics_enqueues_one_metric_points_envelope_for_this_host() {
 }
 
 #[test]
+fn emit_applies_policy_before_the_queue() {
+    // #8857: a NaN serialises as `null` and would poison the queued batch on
+    // reload, so bounding happens at emit, not only at export.
+    let (queue, sink) = sink();
+    let mut oversize = MetricPoint::int(MetricName::PoolAccounts, 1).label("provider", "x");
+    oversize.labels.insert("provider".into(), "p".repeat(129));
+    oversize.labels.insert("issue".into(), "8857".into());
+    sink.emit_metrics(vec![
+        MetricPoint {
+            name: MetricName::HostSwapUsedBytes,
+            value: MetricValue::Double(f64::NAN),
+            labels: BTreeMap::new(),
+        },
+        oversize,
+    ]);
+    let queued = queue.0.lock().unwrap();
+    let TelemetryRecord::MetricPoints(record) = &queued[0].record else {
+        panic!("expected metric.points");
+    };
+    assert_eq!(record.points.len(), 1, "the NaN point never reaches the queue");
+    assert!(record.points[0].labels.is_empty(), "oversize and unallowlisted labels dropped");
+    assert!(!serde_json::to_string(&queued[0]).unwrap().contains("null"));
+}
+
+#[test]
+fn a_batch_that_bounds_to_nothing_enqueues_nothing() {
+    let (queue, sink) = sink();
+    sink.emit_metrics(vec![MetricPoint {
+        name: MetricName::HostSwapUsedBytes,
+        value: MetricValue::Double(f64::INFINITY),
+        labels: BTreeMap::new(),
+    }]);
+    assert!(queue.0.lock().unwrap().is_empty());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "not in OPS_METRIC_LABEL_KEYS")]
+fn labelling_with_an_unallowlisted_key_is_caught_in_debug_builds() {
+    let _ = MetricPoint::int(MetricName::PoolAccounts, 1).label("issue", "8857");
+}
+
+#[test]
 fn emit_metrics_with_no_points_enqueues_nothing() {
     let (queue, sink) = sink();
     sink.emit_metrics(Vec::new());
@@ -178,6 +221,15 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::HostWorktreeVolumeTotalBytes,
         MetricName::QueueIssues,
         MetricName::QueueListingFailedRepos,
+        MetricName::LlmTokensInput,
+        MetricName::LlmTokensOutput,
+        MetricName::LlmTokensCacheRead,
+        MetricName::LlmTokensCacheWrite,
+        MetricName::LlmRequests,
+        MetricName::PoolAccounts,
+        MetricName::PoolExhausted,
+        MetricName::PoolExhaustions,
+        MetricName::PoolExhaustedSeconds,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }
