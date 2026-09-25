@@ -360,7 +360,11 @@ fn negation_words_and_contractions_suppress_the_reference() {
         "We never fixed #42 in this pass.",
     ] {
         assert!(!has_unnegated_closing_ref(body, 42), "{body:?}");
-        assert_eq!(closing_ref_negation_status(body, 42), ClosingRefNegationStatus::NegatedOnly, "{body:?}");
+        assert_eq!(
+            closing_ref_negation_status(body, 42),
+            ClosingRefNegationStatus::NegatedOnly,
+            "{body:?}"
+        );
     }
 }
 
@@ -389,7 +393,11 @@ fn no_textual_reference_is_a_distinct_status_from_negated() {
     // Development sidebar, say) must NOT read the same as "mentioned and
     // disclaimed" — conflating them reopened issues GitHub had closed
     // correctly through a channel this regex cannot see.
-    for body in ["", "Some body with no mention", "Updates #42 with more detail."] {
+    for body in [
+        "",
+        "Some body with no mention",
+        "Updates #42 with more detail.",
+    ] {
         assert_eq!(
             closing_ref_negation_status(body, 42),
             ClosingRefNegationStatus::NoReference,
@@ -424,5 +432,9 @@ fn a_distant_negation_word_in_the_same_clause_does_not_suppress_a_later_close() 
     // `fixes #42`. The negation window is now limited to the two words
     // immediately before the keyword.
     let body = "If the lock isn't held we now return early, which fixes #42";
-    assert_eq!(closing_ref_negation_status(body, 42), ClosingRefNegationStatus::Unnegated, "{body:?}");
+    assert_eq!(
+        closing_ref_negation_status(body, 42),
+        ClosingRefNegationStatus::Unnegated,
+        "{body:?}"
+    );
 }
