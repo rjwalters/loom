@@ -1082,10 +1082,24 @@ _check_verdict_label_contradiction
 # window is the same one every non-ratchet change already runs in, and is not
 # the 22-hour exposure this guard exists to close.
 #
+# PLAN-GATED REPOSITORIES (#8844): on a PRIVATE repo owned by a GitHub Free
+# account or org, `GET /repos/{nwo}/rules/branches/{branch}` answers "HTTP 403:
+# Upgrade to GitHub Pro or make this repository public to enable this feature."
+# That used to fail the guard closed, i.e. block EVERY merge on such a repo
+# with no flag that helped. The daemon now recognises that ONE message (not the
+# status code — a missing token scope is a 403 too) as "this repository's plan
+# has no rulesets, so nothing can be a REQUIRED check", returns CLEAN, and says
+# so as a `Warning:` on stderr. Which is why the invocation below no longer
+# discards stderr: stdout still has to be exactly the sentinel (it is compared
+# for equality), so stderr is the only place that warning can go, and a
+# relaxation nobody sees is how a fail-open ships unnoticed. Every other
+# failure (network, auth scope, rate limit, 404, 5xx) still exits 2 and still
+# refuses the merge — and now prints what the forge actually said.
+#
 # This file is at its file-size-ratchet ceiling (file-size-policy.md), so the
 # function is one dense line and the two MAX_MERGE_RETRIES/MERGE_RETRY_DELAY
 # pairs below are joined (verbatim, behavior-preserving) to offset it.
-_check_required_check_freshness() { [[ "$FORGE_TYPE" == "github" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ -n "$base_ref" ]] || base_ref="${DEFAULT_BRANCH_NAME:-main}"; msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stale-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "$base_ref" 2>/dev/null)" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-STALE-CHECKS-CLEAN" ]] && return 0; [[ $rc -eq 1 ]] || msg="Merge blocked: PR #$PR_NUMBER's required-check freshness guard (#8248) could not run — 'loom-daemon merge-pr stale-checks' exited $rc without the LOOM-STALE-CHECKS-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'every required check is fresh' from 'never checked', so only a positive clean signal is accepted. Build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; if [[ "${REDATE_STALE_CHECKS:-false}" == "true" && $rc -eq 1 ]]; then local rd=0 out; out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr redate-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$PR_BRANCH" --expected-head-sha "$PR_HEAD_SHA" 2>&1)" || rd=$?; if [[ $rd -eq 0 ]]; then warning "$out"; warning "Exiting 4: the stale required checks were re-dated, not merged. CI is re-running on the new head; the merge is expected to be re-attempted (after a fresh Judge review, #5686) on a later pass."; exit 4; fi; msg="$msg"$'\n\n'"#8508 automated remedy did not produce fresh evidence: $out"; fi; error "$msg"; }
+_check_required_check_freshness() { [[ "$FORGE_TYPE" == "github" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ -n "$base_ref" ]] || base_ref="${DEFAULT_BRANCH_NAME:-main}"; msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stale-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "$base_ref")" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-STALE-CHECKS-CLEAN" ]] && return 0; [[ $rc -eq 1 ]] || msg="Merge blocked: PR #$PR_NUMBER's required-check freshness guard (#8248) could not run — 'loom-daemon merge-pr stale-checks' exited $rc without the LOOM-STALE-CHECKS-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'every required check is fresh' from 'never checked', so only a positive clean signal is accepted. Build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; if [[ "${REDATE_STALE_CHECKS:-false}" == "true" && $rc -eq 1 ]]; then local rd=0 out; out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr redate-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$PR_BRANCH" --expected-head-sha "$PR_HEAD_SHA" 2>&1)" || rd=$?; if [[ $rd -eq 0 ]]; then warning "$out"; warning "Exiting 4: the stale required checks were re-dated, not merged. CI is re-running on the new head; the merge is expected to be re-attempted (after a fresh Judge review, #5686) on a later pass."; exit 4; fi; msg="$msg"$'\n\n'"#8508 automated remedy did not produce fresh evidence: $out"; fi; error "$msg"; }
 _check_required_check_freshness
 
 # ---------------------------------------------------------------------------
