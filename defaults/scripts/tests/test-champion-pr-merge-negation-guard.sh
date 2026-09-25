@@ -14,13 +14,19 @@
 # THE FIX
 #
 # `loom-daemon merge-pr-refs has-unnegated-closing-ref --issue N` (text on
-# stdin; exit 0 = a real, unnegated closing reference exists, 1 = none or every
-# one is negated). Step 4 runs it per LINKED_ISSUES candidate over the PR body
-# plus the squash merge commit message, BEFORE `gh issue close`, and on exit 1
-# skips the close and reopens an issue GitHub already closed. The predicate's
-# logic is covered by Rust unit tests (loom-daemon/src/merge_pr/refs/tests.rs,
-# including the exact PR #1051 body); this suite pins the WIRING so a future
-# edit cannot silently drop the cross-check or the reopen self-heal.
+# stdin) is a TRI-STATE predicate: exit 0 = an unnegated closing reference
+# exists, 1 = every reference found is negated, 3 = no textual reference to
+# the issue at all (e.g. it is linked only through the PR's Development
+# sidebar, or via `Fixes owner/repo#N` / `Closes: #N` -- forms the regex
+# cannot see). Distinguishing 1 from 3 matters: an earlier, two-state version
+# of this predicate conflated "never mentioned" with "mentioned and
+# disclaimed", so a PR closing an issue through one of those unseen channels
+# was wrongly reopened. Step 4 runs it per LINKED_ISSUES candidate over the PR
+# body plus the squash merge commit message, BEFORE `gh issue close`, and
+# reopens on exit 1 only. The predicate's logic is covered by Rust unit tests
+# (loom-daemon/src/merge_pr/refs/tests.rs, including the exact PR #1051 body
+# and the no-reference/cross-repo cases); this suite pins the WIRING so a
+# future edit cannot silently drop the cross-check or the reopen self-heal.
 #
 # Hermetic: greps the shipped doc. No forge, no network, no tokens.
 

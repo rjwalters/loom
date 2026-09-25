@@ -2106,14 +2106,13 @@ fi
 
 ### Step 4: Verify Issue Auto-Close
 
-After successful merge, verify that linked issues were automatically closed by GitHub.
+After merge, verify linked issues were auto-closed by GitHub.
 
 **Before confirming (or forcing) any linked issue's close, run the Out-of-Band
-Acceptance-Criteria Gate for that issue** — the subsection immediately below this
-code block defines it. Merging a PR proves the criteria CI can check; it proves
-nothing about a criterion that names a live external source, a real scheduled
-run, or an observation over time. This step is where "PR merged" becomes "issue
-done", so it is the only place that inference can be checked.
+Acceptance-Criteria Gate for that issue** (defined just below). Merging proves
+only what CI can check — nothing about a criterion naming a live external
+source, a scheduled run, or an observation over time. This is where "PR
+merged" becomes "issue done", the only place that inference can be checked.
 
 ```bash
 PR_NUMBER=$1
@@ -2160,13 +2159,9 @@ for issue in $LINKED_ISSUES; do
     continue   # do NOT close, do NOT confirm — next linked issue
   fi
 
-  # Tri-state exit: 0 unnegated found, 1 negated-only, 3 no textual reference
-  # at all (e.g. linked only through the Development sidebar, or via
-  # `Fixes owner/repo#N` / `Closes: #N` — forms this predicate's regex cannot
-  # see). Only exit 1 means "disclaimed" (#1057); exit 3 and clap's exit 2 on
-  # an older daemon both fall through unchanged to the close logic below —
-  # conflating "never mentioned" with "mentioned and disclaimed" is exactly
-  # the bug that reopened issues GitHub had closed correctly.
+  # Tri-state exit (#1057): 0 unnegated, 1 negated-only, 3 no textual
+  # reference (e.g. Development-sidebar-only link). Only 1 means disclaimed;
+  # 3 and an older daemon's clap exit 2 fall through to the close below.
   printf '%s\n' "$NEG_SRC" | loom-daemon merge-pr-refs has-unnegated-closing-ref --issue "$issue"
   if [ $? -eq 1 ] && [ -n "$NEG_SRC" ]; then
     [ "$(gh issue view "$issue" --json state --jq .state)" = CLOSED ] && gh issue reopen "$issue" --comment "Reopened: PR #$PR_NUMBER only references this issue negated (#1057)."
