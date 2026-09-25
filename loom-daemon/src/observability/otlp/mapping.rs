@@ -542,6 +542,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::HostHealth(_)
         | TelemetryRecord::CiDuration(_)
         | TelemetryRecord::MetricPoints(_)
+        // `queue.snapshot` (#8852) is native-HTTPS only; SigNoz gets the
+        // queue as `loom.queue.*` gauges through `metric.points`.
+        | TelemetryRecord::QueueSnapshot(_)
         | TelemetryRecord::Span(_) => return None,
     };
     Some(LogRecord {
@@ -779,6 +782,7 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         | TelemetryRecord::CiJobLog(_)
         // `metric.points` (#8860) is grouped by `ops::points_for`.
         | TelemetryRecord::MetricPoints(_)
+        | TelemetryRecord::QueueSnapshot(_)
         | TelemetryRecord::Span(_) => Vec::new(),
     }
 }

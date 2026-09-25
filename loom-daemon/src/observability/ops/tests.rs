@@ -176,6 +176,8 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::HostSwapTotalBytes,
         MetricName::HostWorktreeVolumeFreeBytes,
         MetricName::HostWorktreeVolumeTotalBytes,
+        MetricName::QueueIssues,
+        MetricName::QueueListingFailedRepos,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }
@@ -373,4 +375,81 @@ fn gateway_collector_keeps_every_ops_label_and_span_attribute() {
     for key in OPS_SPAN_ATTRIBUTE_KEYS {
         assert!(span.contains(*key), "collector span keep_keys lacks {key}");
     }
+}
+
+// Ready-queue depth gauges (Issue #8852, phase 2).
+
+fn queue_summary(
+    dispositions: &[crate::types::QueueDisposition],
+) -> crate::types::WorkFinderTickSummary {
+    crate::types::WorkFinderTickSummary {
+        queue: dispositions
+            .iter()
+            .enumerate()
+            .map(|(i, d)| crate::types::ReadyQueueRow {
+                rank: i + 1,
+                repo: "/r".into(),
+                issue: u32::try_from(i).unwrap(),
+                workspace_priority: 100,
+                urgent: false,
+                created_at: None,
+                tier: None,
+                disposition: *d,
+                detail: None,
+                state: d.state().into(),
+                reason: d.reason().into(),
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
+    use crate::types::QueueDisposition as Qd;
+    let mut summary = queue_summary(&[
+        Qd::Dispatched,
+        Qd::DeferredCapacity,
+        Qd::DeferredCapacity,
+        Qd::OpenPr,
+    ]);
+    summary.listing_failed = vec!["/r2".into()];
+    let points = super::queue::queue_points(&summary);
+    assert_eq!(points.len(), Qd::ALL.len() + 1);
+    let value = |reason: &str| {
+        points
+            .iter()
+            .find(|p| {
+                p.name == MetricName::QueueIssues
+                    && p.labels.get("reason").map(String::as_str) == Some(reason)
+            })
+            .map(|p| p.value)
+            .unwrap()
+    };
+    assert_eq!(value("deferred_capacity"), MetricValue::Int(2));
+    assert_eq!(value("dispatched"), MetricValue::Int(1));
+    assert_eq!(value("peer_claim"), MetricValue::Int(0));
+    let open_pr = points
+        .iter()
+        .find(|p| p.labels.get("reason").map(String::as_str) == Some("open_pr"))
+        .unwrap();
+    assert_eq!(open_pr.labels.get("state").map(String::as_str), Some("blocked"));
+    let failed = points
+        .iter()
+        .find(|p| p.name == MetricName::QueueListingFailedRepos)
+        .unwrap();
+    assert_eq!(failed.value, MetricValue::Int(1));
+    for point in &points {
+        // Every label survives the export policy unchanged: only allowlisted,
+        // bounded keys (state, reason), never an issue number or repo.
+        assert_eq!(bounded_labels(&point.labels), point.labels);
+        assert!(point.labels.keys().all(|k| k == "state" || k == "reason"));
+    }
+}
+
+#[test]
+fn an_empty_queue_reads_as_zeros_not_as_missing() {
+    let points = super::queue::queue_points(&queue_summary(&[]));
+    assert!(!points.is_empty());
+    assert!(points.iter().all(|p| p.value == MetricValue::Int(0)));
 }

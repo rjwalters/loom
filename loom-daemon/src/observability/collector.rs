@@ -491,7 +491,7 @@ fn terminal_records(
 /// [`fetch_repo_slug`] with a process-lifetime cache keyed by workspace root
 /// path (a repo's slug does not change while the daemon runs — same
 /// rationale as [`crate::safehouse`]'s own `slug_cache`).
-async fn resolve_repo_slug_cached(
+pub(super) async fn resolve_repo_slug_cached(
     cache: &mut HashMap<String, String>,
     workspace_root: &str,
 ) -> Option<String> {
@@ -542,7 +542,7 @@ async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
 /// it is distinguishable in the daemon log from an ordinary probe failure
 /// (which `visibility.rs` itself now logs) rather than looking identical to
 /// "repo is actually private".
-async fn resolve_visibility(slug: &str) -> RepoVisibility {
+pub(super) async fn resolve_visibility(slug: &str) -> RepoVisibility {
     let owned = slug.to_string();
     match tokio::task::spawn_blocking(move || derive_visibility(&owned)).await {
         Ok(visibility) => visibility,
@@ -585,6 +585,9 @@ async fn sample_snapshots(
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
     super::ops::host::record(workspace_root).await;
+    // The work finder's ranked ready queue (Issue #8852, phase 2) — native
+    // HTTPS only, and only when the work finder has ticked since last time.
+    super::queue_snapshot::record(slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
