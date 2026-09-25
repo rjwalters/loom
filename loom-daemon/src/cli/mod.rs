@@ -22,6 +22,7 @@ pub(crate) mod dep_recheck;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_backoff;
 mod duplicate_scan;
+mod fleet_captain_cmd;
 pub(crate) mod fleet_experiment;
 mod git_blob_lines;
 pub(crate) mod health;

@@ -730,6 +730,14 @@ async fn sample_host_health(
     // filesystem or point in time they describe.
     let (worktree_root_free_gb, worktree_root_total_gb) =
         crate::disk_headroom::worktree_root_disk_gb(workspace_root);
+    // Fleet captain (#8848): `is_captain` is this host's gate outcome against
+    // `root`'s declared `fleet.captain`, and `armed_singleton_jobs` is this
+    // process's own live registry of jobs that most recently resolved
+    // `CaptainGate::Armed` here — see `crate::fleet_captain`'s module doc.
+    let captain_gate = crate::fleet_captain::resolve_gate_for_root(
+        workspace_root,
+        &crate::sweep_registry::host_identity(),
+    );
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -752,6 +760,8 @@ async fn sample_host_health(
         roles: sample_role_tick_health(&crate::role_runner::role_tick_records()),
         protection: sample_host_protection().await,
         admission_brake,
+        is_captain: captain_gate.is_captain_flag(),
+        armed_singleton_jobs: crate::fleet_captain::armed_singleton_job_names(),
     }
 }
 

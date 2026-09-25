@@ -326,6 +326,45 @@ pub fn daemon_delegated_to(repo_root: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Dotted key read by [`fleet_captain`].
+const FLEET_CAPTAIN_KEY: &str = "fleet.captain";
+
+/// Read the `fleet.captain` config key for `repo_root` (Issue #8848): the
+/// fleet host id (compared against
+/// [`crate::sweep_registry::host_identity`]) that runs declared singleton
+/// jobs — see [`crate::fleet_captain`] for the gating logic this feeds.
+///
+/// **Belongs in the tracked `.loom/config.json`, not a host-local env var**
+/// — mirrors the `autonomous.roleRunner.shardCount`/`shardKey` "identical
+/// fleet-wide, tracked" precedent (`defaults/docs/daemon-reference.md`'s
+/// "Role-runner host sharding" section), NOT the `shardIndex` "must differ
+/// per host" pattern: every host in the fleet must agree on who the captain
+/// is, and a committed file is identical fleet-wide by construction. Read
+/// through [`resolve_effective_config`] like every other knob here, so an
+/// untracked `.loom-local/local.json` override (or the private/shared
+/// defaults tier) still layers on top in the usual precedence order — this
+/// function does not itself enforce the tracked-tier convention the way
+/// [`crate::role_shard`]'s `shardIndex` refusal does for the opposite case,
+/// because a fleet-wide value read from any tier is still fleet-wide-safe by
+/// construction; it is only a **host-local** value read from the *tracked*
+/// tier that is a fleet-breaking misconfiguration.
+///
+/// Soft-fails to `None` — "no captain declared", the default and
+/// behavior-unchanged case for every repo today — on a missing key, a
+/// missing/malformed config file, a non-string value, or a blank/
+/// whitespace-only string (trimmed before returning).
+#[must_use]
+pub fn fleet_captain(repo_root: &Path) -> Option<String> {
+    let effective = resolve_effective_config(repo_root);
+    let raw = get_path(&effective, FLEET_CAPTAIN_KEY).and_then(Value::as_str)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -736,6 +775,82 @@ mod tests {
         let delegate = daemon_delegated_to(dir.path());
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
         assert_eq!(delegate, None);
+    }
+
+    // ===== fleet_captain (#8848) =====
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_reads_the_configured_host_id() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"fleet": {"captain": "loom-worker-1"}}"#,
+        );
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, Some("loom-worker-1".to_string()));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_default_off_when_key_absent() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"nextAgentNumber": 3}"#);
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            captain, None,
+            "no fleet.captain declared must leave today's behavior unchanged"
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_missing_config_file_is_none() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, None);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_wrong_type_soft_fails_to_none() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"fleet": {"captain": 42}}"#);
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, None);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_blank_string_soft_fails_to_none() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"fleet": {"captain": "   "}}"#);
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, None);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_trims_whitespace() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"fleet": {"captain": "  loom-worker-2  "}}"#,
+        );
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, Some("loom-worker-2".to_string()));
     }
 
     // ===== Cross-language conformance fixture (#4039 AC) =====

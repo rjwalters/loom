@@ -160,6 +160,16 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     // "describes the machine, not the work" reasoning as `dispatch_halted`/
     // `halt_reason` directly above.
     "protection",
+    // Fleet captain state (#8848): whether this host is the assigned
+    // singleton-job captain, and the names of the singleton jobs currently
+    // armed here. Neither names a repo, issue, branch, or operator — a job
+    // name is an allowlisted identifier a repo declares
+    // (`crate::fleet_captain::arm_singleton_job`'s `job_name`), the same
+    // footing as a role name in `roles` above — so both are allowed through
+    // directly, unlike `managed_repos`/`roles` below which carry a
+    // repo/path and route through a dedicated redaction derivation instead.
+    "is_captain",
+    "armed_singleton_jobs",
     // Saturation admission-brake state (#8478) is deliberately ABSENT here:
     // its scalars are machine detail (same footing as `dispatch_halted`), but
     // its `top_cpu_consumers` names the executables running on the host —

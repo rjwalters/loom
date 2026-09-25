@@ -152,6 +152,13 @@ export interface HostView {
    * `sweepId`, which is what keeps a pre-#8835 fleet rendering exactly as
    * before. */
   computeBySweep: ReadonlyMap<string, ActiveComputeJob[]>;
+  /** Singleton job names reported armed on this host while it is NOT the
+   * fleet captain (#8848) — see `singletonsArmedOnNonCaptain`. Empty on
+   * every ordinary host; a nonempty list here is an anomaly worth flagging,
+   * not routine "degraded" status (the captain gate is daemon-side and
+   * fail-closed by construction, so this should self-heal within one tick
+   * once the reporting host re-evaluates). */
+  armedSingletonsOnNonCaptain: string[];
 }
 
 export interface FleetView {
@@ -242,6 +249,14 @@ export interface FleetView {
    * whole fleet, nested and unattributed alike (#8835), so nesting a job under
    * its sweep can never quietly decrement the fleet's leak count. */
   leakedCompute: number;
+  /** #8848: `true` once this fleet has opted into the `fleet.captain`
+   * mechanism (at least one reporting host sends `is_captain` at all) but
+   * NO host currently reports `is_captain: true` — a typo'd/decommissioned
+   * captain id, or one that has simply never reported `host.health`. `false`
+   * for the overwhelmingly common case of a fleet that never declared
+   * `fleet.captain` at all, since no host sends the field then — see
+   * `noCaptainReporting`. */
+  noCaptainReporting: boolean;
 }
 
 /**
@@ -513,6 +528,52 @@ export function isHostDistressed(health: HostHealthRecord | undefined, now: Date
   return distressReason(health, now) !== undefined;
 }
 
+/**
+ * Singleton job names `health` reports armed while this host is NOT the
+ * fleet captain (#8848) — `[]` whenever `health.is_captain` is `true` (this
+ * host IS the captain, so anything armed here is expected) or the record
+ * carries no `armed_singleton_jobs` at all.
+ *
+ * This should be rare by construction: the daemon's own
+ * `fleet_captain::arm_singleton_job` clears a job's name from its registry
+ * the moment a tick no longer resolves `CaptainGate::Armed`, so a nonempty
+ * result here means either a telemetry snapshot mid-flight across a
+ * `fleet.captain` reassignment (self-heals within one more tick) or a bug on
+ * the reporting host — either way worth surfacing, per the issue's own
+ * acceptance criterion (a).
+ */
+export function singletonsArmedOnNonCaptain(health: HostHealthRecord | undefined): string[] {
+  if (!health || health.is_captain === true) return [];
+  return health.armed_singleton_jobs ?? [];
+}
+
+/**
+ * Fleet-wide "no host reports `is_captain: true`" flag (#8848 acceptance
+ * criterion (b)) — `true` only once this fleet has actually opted into the
+ * mechanism.
+ *
+ * **Participation-gated, not unconditional.** `is_captain` is three-valued
+ * (`HostHealthRecord`'s own doc): `undefined` means "this repo declares no
+ * `fleet.captain` at all", which is the default, behavior-unchanged state
+ * for the overwhelmingly common fleet that never opts in — flagging that
+ * case would put a permanent false alarm on every ordinary dashboard. So
+ * this only returns `true` once at least one reporting host sends
+ * `is_captain` at all (i.e. `fleet.captain` IS declared, fleet-wide, since
+ * every host reads the same tracked config) and none of them is `true` —
+ * exactly the typo'd/decommissioned-captain-id edge case the issue's test
+ * plan calls out.
+ */
+export function noCaptainReporting(hosts: readonly HostView[]): boolean {
+  let participates = false;
+  for (const host of hosts) {
+    const isCaptain = host.entry.health?.record.is_captain;
+    if (isCaptain === undefined) continue;
+    participates = true;
+    if (isCaptain === true) return false;
+  }
+  return participates;
+}
+
 /** Newest of the two `updatedAt`s. String compare is safe here *only* because
  * both are backend-generated `new Date().toISOString()` values — fixed-width
  * UTC, so lexicographic order is chronological order. */
@@ -586,6 +647,7 @@ export function buildHostView(
     lastReportAt,
     lastReportAgeSec,
     computeBySweep,
+    armedSingletonsOnNonCaptain: singletonsArmedOnNonCaptain(entry.health?.record),
   };
 }
 
@@ -724,6 +786,7 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
     activeCompute,
     unattributedCompute,
     leakedCompute: activeCompute.filter((job) => job.leaked === true).length,
+    noCaptainReporting: noCaptainReporting(hosts),
   };
 }
 

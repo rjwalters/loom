@@ -1109,6 +1109,8 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         roles: roles_health,
         protection: None,
         admission_brake: None,
+        is_captain: None,
+        armed_singleton_jobs: Vec::new(),
     };
     assert_eq!(
         host_health.roles.persistent.len(),

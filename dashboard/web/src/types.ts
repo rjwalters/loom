@@ -148,6 +148,20 @@ export interface HostHealthRecord {
    * from a pre-#5352 daemon, or one whose probe could not construct a report
    * — never render its absence as "unprotected". */
   protection?: HostProtection;
+  /** Whether this host is the fleet-wide singleton-job captain (#8848) —
+   * three-valued on purpose, mirroring the daemon's own
+   * `HostHealthRecord::is_captain` contract: `undefined` when this repo
+   * declares no `fleet.captain` at all (the mechanism does not apply here —
+   * the overwhelmingly common case), `false` when a captain IS declared and
+   * it is not this host, `true` when this host is the declared captain.
+   * Never collapse `undefined` and `false` — a fleet-wide "no host reports
+   * `is_captain: true`" check must only fire once at least one host reports
+   * the field at all (i.e. a captain is actually configured). */
+  is_captain?: boolean;
+  /** Declared-singleton-job names currently armed on this host (#8848).
+   * Empty/absent on a host that is not the captain, on a host with no
+   * declared singleton jobs, and on a pre-#8848 daemon. */
+  armed_singleton_jobs?: string[];
 }
 
 /** One account inside a `tokens.snapshot`. Only `exhausted` is always sent;

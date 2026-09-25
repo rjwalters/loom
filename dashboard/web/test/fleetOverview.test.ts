@@ -765,6 +765,7 @@ describe("hostCountText (#8804)", () => {
     activeCompute: [],
     unattributedCompute: [],
     leakedCompute: 0,
+    noCaptainReporting: false,
   };
 
   it("renders the pre-#8804 wording when no roster host is missing", () => {
