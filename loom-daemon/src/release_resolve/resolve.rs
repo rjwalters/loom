@@ -284,21 +284,12 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
     let listed = asset_names(root, &repo, None);
     let names: Vec<String> = listed.clone().unwrap_or_default();
     if !names.contains(&bin_name) || !names.contains(&sha_name) {
-        // Only on the failure path: one extra `gh` call buys the difference
-        // between "this platform is unbuilt" and "come back in three minutes"
-        // (#8515). A successful resolution already fetches this below.
-        let age = release_age_minutes(
-            fetch_published_at(&tag, &repo, root).as_deref(),
-            chrono::Utc::now(),
-        );
-        return Resolution::Unresolved(no_artifact_reason(
-            &tag,
+        return Resolution::Unresolved(classify_no_artifact(
+            root,
             &repo,
+            &tag,
             &target,
-            &bin_name,
-            &sha_name,
             listed.as_ref().map(Vec::len),
-            age,
         ));
     }
 
@@ -320,6 +311,54 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
         source_version: read_source_version(root),
         source_commit: read_source_commit(root),
     }))
+}
+
+/// Why `tag` of `repo` offers no artifact for `target` — the #8515
+/// classification (release age + asset count, "still uploading" vs "genuinely
+/// unbuilt") for a release the CALLER already resolved (#8654).
+///
+/// Backs `loom-daemon release-explain`, which `loom-daemon-update.sh`'s
+/// `fetch_resolve_latest` consults on its no-artifact path so a forced
+/// `--fetch` refusal carries the same wording the daemon's own resolver emits.
+/// Pinned to `tag` rather than re-reading `releases/latest`: the shell already
+/// decided which release it is refusing, and a Latest promoted between the two
+/// reads must not make the explanation describe a different release.
+///
+/// `None` when `tag` DOES carry both assets for `target` — nothing to explain,
+/// and the caller keeps whatever reason it already had.
+#[must_use]
+pub fn explain_no_artifact(root: &Path, repo: &str, tag: &str, target: &str) -> Option<String> {
+    let bin_name = format!("loom-daemon-{target}");
+    let sha_name = format!("{bin_name}.sha256");
+    let listed = asset_names(root, repo, Some(tag));
+    if listed
+        .as_ref()
+        .is_some_and(|n| n.contains(&bin_name) && n.contains(&sha_name))
+    {
+        return None;
+    }
+    Some(classify_no_artifact(root, repo, tag, target, listed.as_ref().map(Vec::len)))
+}
+
+/// The one place the no-artifact reason is assembled, shared by [`resolve`]
+/// and [`explain_no_artifact`] so the two can never word the same release
+/// differently.
+///
+/// Only on the failure path: one extra `gh` call (the publish time) buys the
+/// difference between "this platform is unbuilt" and "come back in three
+/// minutes" (#8515).
+fn classify_no_artifact(
+    root: &Path,
+    repo: &str,
+    tag: &str,
+    target: &str,
+    asset_count: Option<usize>,
+) -> String {
+    let bin_name = format!("loom-daemon-{target}");
+    let sha_name = format!("{bin_name}.sha256");
+    let age =
+        release_age_minutes(fetch_published_at(tag, repo, root).as_deref(), chrono::Utc::now());
+    no_artifact_reason(tag, repo, target, &bin_name, &sha_name, asset_count, age)
 }
 
 /// Minutes since `published_at` (an RFC3339 timestamp as `gh` reports it), or

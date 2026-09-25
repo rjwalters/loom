@@ -1168,6 +1168,11 @@ jobs:
       # they need the binary this job builds.
       - name: loom-daemon-update post-provision signature check (#8008, #8770)
         run: bash defaults/scripts/tests/test-loom-daemon-update-dest-signature.sh
+      # #8654: the forced --fetch refusal classifies a missing artifact via
+      # `loom-daemon release-explain` (still uploading vs genuinely unbuilt)
+      # and degrades to the flat reason without it, so it needs this build.
+      - name: loom-daemon-update --fetch refusal classification (#8654)
+        run: bash defaults/scripts/tests/test-loom-daemon-update-fetch-refusal.sh
       # #8712: the fixture library is the subject, not any one flow. A fake
       # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
       # loom-daemon/target/release/ stalled a fleet host's auto_update for
