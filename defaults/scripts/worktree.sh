@@ -539,7 +539,7 @@ _worktree_dirty_lines() {
             path = substr($0, 4)
             gsub(/^"/, "", path); gsub(/"$/, "", path)
             if (path == ".loom-managed"      || path == ".loom-in-use" ||
-                path == ".loom-checkpoint"   || path == ".no-changes-needed") next
+                path == ".loom-checkpoint"   || path == ".no-changes-needed" || path == ".loom-cargo-target-dir") next
             print
         }
     ' || true
@@ -697,28 +697,23 @@ remove_worktree_command() {
     # whole reason `_rm_info`/`_rm_warning` exist.
     _rm_report_target_dir() {
         local record="$1" status path detail
-        status="$(printf '%s' "$record" | cut -f1)"
-        path="$(printf '%s' "$record" | cut -f2)"
-        detail="$(printf '%s' "$record" | cut -f3)"
+        # Size-ratchet-neutral offset for this issue's added lines
+        # (#8458 / file-size-policy.md): one tab-split read replaces three `cut`
+        # subshells (`detail` is last, so it absorbs any trailing tabs), and the
+        # case arms are one line each. Behaviour is byte-identical.
+        IFS=$'\t' read -r status path detail <<<"$record"
         target_dir_status="$status"
         target_dir_path="$path"
         case "$status" in
-            reclaimed)
-                _rm_success "Reclaimed redirected cargo target dir: $path ($detail)" ;;
-            would-reclaim)
-                _rm_info "Would reclaim redirected cargo target dir: $path ($detail)" ;;
-            shared)
-                _rm_info "Keeping redirected cargo target dir $path — still used by $detail" ;;
-            protected)
-                _rm_warning "Keeping redirected cargo target dir $path — $detail still using it" ;;
-            refused)
-                _rm_warning "Refusing to reclaim cargo target dir $path — $detail" ;;
-            failed)
-                _rm_warning "Could not reclaim redirected cargo target dir $path — $detail" ;;
-            *)
-                # `inside` / `absent`: the overwhelmingly common, uninteresting
-                # cases (no redirect configured). Silent by design.
-                : ;;
+            reclaimed)     _rm_success "Reclaimed redirected cargo target dir: $path ($detail)" ;;
+            would-reclaim) _rm_info "Would reclaim redirected cargo target dir: $path ($detail)" ;;
+            shared)        _rm_info "Keeping redirected cargo target dir $path — still used by $detail" ;;
+            protected)     _rm_warning "Keeping redirected cargo target dir $path — $detail still using it" ;;
+            refused)       _rm_warning "Refusing to reclaim cargo target dir $path — $detail" ;;
+            failed)        _rm_warning "Could not reclaim redirected cargo target dir $path — $detail" ;;
+            # `inside` / `absent`: the overwhelmingly common, uninteresting
+            # cases (no redirect configured). Silent by design.
+            *)             : ;;
         esac
     }
 
@@ -977,6 +972,7 @@ remove_worktree_command() {
 # considered your tree and declined" rather than "this install is broken". The
 # explicit check below reports 2 instead — the one thing the exit codes must
 # never do is lie about which of those happened.
+# requires-daemon: cargo-target-dir optional  #8458 — per-worktree CARGO_TARGET_DIR; a host whose binary predates it (or has none) simply gets no per-worktree dir, which is the pre-#8458 behaviour
 # requires-daemon: worktree-wip >= 0.19.224  #8433 (#8195 slice 2) — the WIP-verb port; without it the stub exits 2 and the verbs refuse
 _worktree_wip_verb() {
     local verb="$1"
@@ -2479,6 +2475,28 @@ if _try_worktree_add; then
             fi
         fi
     fi
+
+    # #8458: give this worktree its own Cargo target dir under the otherwise
+    # shared root and record it in the `.loom-cargo-target-dir` marker, so the
+    # removal paths (step 6c below, merge-pr.sh, `loom-daemon clean`, the reaper)
+    # can attribute and reclaim it. Off unless the repo opts in; a pure no-op on
+    # a host whose Cargo output is not redirected outside the worktree.
+    #
+    # Sets LOOM_WORKTREE_CARGO_TARGET_DIR for the post-worktree hook below —
+    # NOT CARGO_TARGET_DIR, which would make the hook's main-workspace binary
+    # lookup miss and reintroduce #6013/#6014's rebuild storm.
+    #
+    # Always `|| true`: the daemon binary may not be built yet (this runs at
+    # worktree creation, before the hook that seeds one), and a build-cache
+    # optimisation must never fail a worktree creation. Empty stdout means
+    # "no directory" — the subcommand exits 0 for every not-applicable case.
+    # `--report`'s stderr is deliberately NOT swallowed (stdout is the directory,
+    # which `--json` mode needs clean): it is the one operator-visible sign the
+    # scheme is on. Exporting an empty value is harmless — every consumer tests
+    # `-n` — so no second statement is needed to unset it.
+    _pwt_bin="$(loom_locate_daemon_bin "$MAIN_WORKSPACE_DIR" 2>/dev/null || true)"
+    [[ -z "${_pwt_bin:-}" ]] || export LOOM_WORKTREE_CARGO_TARGET_DIR="$("$_pwt_bin" cargo-target-dir \
+        provision --repo-root "$MAIN_WORKSPACE_DIR" --report "$ABS_WORKTREE_PATH" || true)"
 
     # Run project-specific post-worktree hook if it exists
     # This allows projects to add custom setup steps (e.g., pnpm install, lake exe cache get)

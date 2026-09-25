@@ -551,6 +551,61 @@ if [[ -f "$_sleep_inhibit_config_lib" ]]; then
     fi
 fi
 
+# --- Per-worktree cargo target dir (issue #8458) ---
+#
+# requires-daemon: cargo-target-dir optional  #8458 — a host whose binary predates it (or has none) exports nothing and keeps the host's own cargo resolution, i.e. the pre-#8458 behaviour
+#
+# When a repo opts in (`cargo.perWorktreeTargetDir`, env override
+# `LOOM_PER_WORKTREE_TARGET_DIR`) and this spawn owns a specific issue's sweep,
+# export that issue worktree's own `CARGO_TARGET_DIR` for the whole sweep. This is
+# the delivery half of the scheme `worktree.sh` provisions and the removal paths
+# reclaim — see `lib/cargo-target-dir.sh` § "Per-worktree target dirs".
+#
+# Why it has to be here rather than "wherever cargo runs": the agents whose test
+# verdicts #8453 recorded as FALSE (a Judge run with 12 failures that passed
+# 194/194 in isolation) invoke `cargo test` themselves, as ordinary subprocesses
+# of this spawn. The only place Loom can put a variable all of them inherit is
+# this process's environment. Cargo keys workspace artifacts by absolute source
+# path anyway, so nothing is lost by isolating them; what IS shared — third-party
+# crates — is shared through the `rustc-wrapper` (sccache) these hosts configure.
+#
+# Deliberately scoped to a claim-owning spawn (`LOOM_SWEEP_CLAIM_OWNED`): a
+# role-runner tick or an operator's interactive spawn has no single worktree to
+# attribute a target dir to, and must keep the host's own resolution.
+#
+# The value is DERIVED, not read from the worktree: this runs BEFORE the sweep
+# creates the worktree, so there is no marker to read yet. The derivation is
+# idempotent, so when `worktree.sh` later re-resolves this exported value as its
+# "root" it writes a marker naming this same directory rather than nesting a
+# second level.
+#
+# `--issue` rather than a pre-derived worktree path: resolving the worktree root
+# (env > `worktree.root` config > `.loom/worktrees`) is creation-time delivery
+# logic with a Rust twin (`worktree_root::worktree_root`) already inside the
+# binary this line invokes, so it belongs on that side of the boundary — there is
+# no removal path here that has to resolve it in bash.
+#
+# `cargo-target-dir path` exits 0 and prints nothing for every not-applicable
+# case (feature off, host not redirected, path not attributable), so an empty
+# answer is simply "leave the host's own resolution alone".
+#
+# locate-daemon-bin.sh is sourced here rather than relying on the token-selection
+# source further down: this block must run BEFORE the containerized-dispatch
+# block (which re-resolves CARGO_TARGET_DIR to decide what to mount and
+# re-execs), and that source is after it. Sourcing twice only redefines a
+# function.
+if [[ -n "${LOOM_SWEEP_CLAIM_OWNED:-}" && -z "${LOOM_SPAWN_CONTAINERIZED:-}" && -f "${WORKSPACE}/Cargo.toml" ]]; then
+    # shellcheck source=lib/locate-daemon-bin.sh
+    source "${_script_dir}/lib/locate-daemon-bin.sh"
+    _pw_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null || true)"
+    _pw_dir="$([[ -n "${_pw_bin:-}" ]] && "$_pw_bin" cargo-target-dir path --repo-root "$WORKSPACE" \
+        --create --issue "$LOOM_SWEEP_CLAIM_OWNED" 2>/dev/null || true)"
+    if [[ -n "$_pw_dir" ]]; then
+        export CARGO_TARGET_DIR="$_pw_dir"
+        log_info "spawn-claude: per-worktree CARGO_TARGET_DIR=${_pw_dir} (issue #8458)"
+    fi
+fi
+
 # --- Containerized dispatch mode (issue #7429, epic #6896 Phase 3) ---
 #
 # Config-selectable, initially OFF: `.loom/config.json` ->
