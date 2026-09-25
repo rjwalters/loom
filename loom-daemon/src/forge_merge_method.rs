@@ -1,5 +1,5 @@
 //! `loom-daemon forge merge-method` (#8845) — resolve/validate the merge
-//! method `merge-pr.sh` passes to `forge_merge_pr` / `forge auto-merge`.
+//! method `merge-pr.sh` passes to `forge_merge_pr`.
 //!
 //! Split out of [`crate::forge_cmd`] as a sibling module per the file-size
 //! ratchet (`scripts/check-file-size-budget.sh` / `.loom/docs/file-size-policy.md`)

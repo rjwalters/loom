@@ -12,27 +12,15 @@
 //! a quota is spent by every session on the host (dispatched, role tick or
 //! interactive), so every session counts. Per-execution attribution is #8908.
 //!
-//! Only the Claude transcript store is read today (#8930 extends this to the
-//! Codex, OpenCode and Kimi stores, whose existing readers fold whole sessions
-//! by *creation* time and so cannot give an interval rate). The fold:
-//!
-//! - Every `*.jsonl` under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/`
-//!   (including `subagents/`) modified since the window start is read.
-//! - Records are decoded by the shared
-//!   [`usage_from_record`](crate::script_helpers::transcript_usage::usage_from_record)
-//!   and grouped by `message.id` — streamed chunks restate cumulative usage,
-//!   so each counter takes its maximum, exactly as
-//!   `activity::transcript_parse` dedupes. The grouping is global across files,
-//!   so a message copied into a resumed session counts once.
-//! - A message counts in the window its **first** record falls in. The window
-//!   ends [`MESSAGE_SETTLE_LAG_SECS`] before now so a message's later chunks
-//!   are on disk before it is counted; consecutive windows abut, so every
-//!   message is counted exactly once.
-//! - One distinct message id is one API response: that is `loom.llm.requests`.
-//! - `<synthetic>` records (Claude Code's internal echoes) are skipped.
-//!
-//! The first sample after the daemon starts only anchors the window: history
-//! is never replayed as a burst.
+//! Every subscription store on the host is read incrementally through one
+//! seam ([`burn`]): Claude transcripts ([`claude`]), Codex rollouts
+//! ([`codex`]), OpenCode's SQLite store, which carries the Z.ai GLM plan
+//! ([`opencode`]), and Kimi wire logs ([`kimi`]). Each poll reads only what was
+//! written since the previous one ([`tail`] keeps a byte cursor per file), and
+//! each event is counted once, in the window its own timestamp falls in.
+//! Windows end a settle lag before the sample, abut, and are exported with
+//! that end as the point time. The first sample only anchors the window:
+//! history is never replayed as a burst.
 //!
 //! # Pool state — `loom.pool.*`
 //!
@@ -52,202 +40,23 @@
 //! Only per-provider aggregates: no account label, which keeps cardinality
 //! fixed. Per-account state is already `loom.tokens.exhausted`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+pub mod burn;
+pub mod claude;
+pub mod codex;
+pub mod kimi;
+pub mod opencode;
+pub mod tail;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 
-use crate::script_helpers::transcript_usage::usage_from_record;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::telemetry::TokenAccountState;
-
-/// `provider` label for the Claude transcript store — the same value
-/// `tokens.snapshot` uses for the Claude pool.
-pub const CLAUDE_PROVIDER: &str = "claude";
-
-/// How far behind now the burn window ends, so a message's streamed chunks
-/// are all written before it is counted.
-pub const MESSAGE_SETTLE_LAG_SECS: i64 = 60;
-
-/// `projects/<slug>/<session>/subagents/<agent>.jsonl` is three levels deep;
-/// one spare level, and no unbounded walk.
-const MAX_WALK_DEPTH: usize = 4;
-
-/// Token and request totals for one model over one window.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModelBurn {
-    pub input: i64,
-    pub output: i64,
-    pub cache_read: i64,
-    pub cache_write: i64,
-    pub requests: i64,
-}
-
-/// One API message, deduped across its streamed chunks.
-#[derive(Debug, Clone)]
-struct Message {
-    first_at: DateTime<Utc>,
-    model: String,
-    usage: ModelBurn,
-}
-
-/// Messages keyed by `message.id` (or a per-line key when a record has none),
-/// accumulated across every transcript read in one sample.
-#[derive(Debug, Default)]
-pub struct BurnFold {
-    messages: HashMap<String, Message>,
-    anonymous: usize,
-}
-
-impl BurnFold {
-    /// Fold one transcript's lines. Unparseable lines, records without usage
-    /// or a timestamp, and `<synthetic>` records are skipped.
-    pub fn add_lines<'a>(&mut self, lines: impl IntoIterator<Item = &'a str>) {
-        for line in lines {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let Some(record) = usage_from_record(&value) else {
-                continue;
-            };
-            if record.synthetic {
-                continue;
-            }
-            let Some(at) = record
-                .timestamp
-                .as_deref()
-                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-            else {
-                continue;
-            };
-            let key = record.message_id.clone().unwrap_or_else(|| {
-                self.anonymous += 1;
-                format!("__anonymous_{}", self.anonymous)
-            });
-            let usage = ModelBurn {
-                input: record.input,
-                output: record.output,
-                cache_read: record.cache_read,
-                cache_write: record.cache_write_5m.saturating_add(record.cache_write_1h),
-                requests: 1,
-            };
-            match self.messages.get_mut(&key) {
-                Some(message) => {
-                    message.first_at = message.first_at.min(at);
-                    let seen = &mut message.usage;
-                    seen.input = seen.input.max(usage.input);
-                    seen.output = seen.output.max(usage.output);
-                    seen.cache_read = seen.cache_read.max(usage.cache_read);
-                    seen.cache_write = seen.cache_write.max(usage.cache_write);
-                }
-                None => {
-                    self.messages.insert(
-                        key,
-                        Message {
-                            first_at: at,
-                            model: record.model,
-                            usage,
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    /// Per-model totals of the messages whose first record falls in
-    /// `(start, end]`.
-    #[must_use]
-    pub fn window(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> BTreeMap<String, ModelBurn> {
-        let mut by_model: BTreeMap<String, ModelBurn> = BTreeMap::new();
-        for message in self.messages.values() {
-            if message.first_at <= start || message.first_at > end {
-                continue;
-            }
-            let total = by_model.entry(message.model.clone()).or_default();
-            total.input = total.input.saturating_add(message.usage.input);
-            total.output = total.output.saturating_add(message.usage.output);
-            total.cache_read = total.cache_read.saturating_add(message.usage.cache_read);
-            total.cache_write = total.cache_write.saturating_add(message.usage.cache_write);
-            total.requests = total.requests.saturating_add(message.usage.requests);
-        }
-        by_model
-    }
-}
-
-/// Delta-counter points for one provider's per-model burn. Zero counters are
-/// not emitted.
-#[must_use]
-pub fn burn_points(provider: &str, by_model: &BTreeMap<String, ModelBurn>) -> Vec<MetricPoint> {
-    let mut points = Vec::new();
-    for (model, burn) in by_model {
-        for (name, value) in [
-            (MetricName::LlmTokensInput, burn.input),
-            (MetricName::LlmTokensOutput, burn.output),
-            (MetricName::LlmTokensCacheRead, burn.cache_read),
-            (MetricName::LlmTokensCacheWrite, burn.cache_write),
-            (MetricName::LlmRequests, burn.requests),
-        ] {
-            if value > 0 {
-                points.push(
-                    MetricPoint::int(name, value)
-                        .label("provider", provider)
-                        .label("model", model.as_str()),
-                );
-            }
-        }
-    }
-    points
-}
-
-/// `*.jsonl` files under `dir` (depth-bounded, symlinks not followed)
-/// modified at or after `since`.
-fn transcripts_modified_since(dir: &Path, since: DateTime<Utc>) -> Vec<PathBuf> {
-    fn walk(dir: &Path, depth: usize, since: DateTime<Utc>, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if file_type.is_dir() {
-                if depth < MAX_WALK_DEPTH {
-                    walk(&path, depth + 1, since, out);
-                }
-            } else if file_type.is_file()
-                && path.extension().is_some_and(|ext| ext == "jsonl")
-                && entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|modified| DateTime::<Utc>::from(modified) >= since)
-            {
-                out.push(path);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(dir, 1, since, &mut out);
-    out
-}
-
-/// Claude burn over `(start, end]`, read from `projects_dir`.
-#[must_use]
-pub fn claude_burn(
-    projects_dir: &Path,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> BTreeMap<String, ModelBurn> {
-    let mut fold = BurnFold::default();
-    for path in transcripts_modified_since(projects_dir, start) {
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            fold.add_lines(contents.lines());
-        }
-    }
-    fold.window(start, end)
-}
+pub use burn::{burn_points, Burn, ModelBurn, MESSAGE_SETTLE_LAG_SECS};
+pub use claude::CLAUDE_PROVIDER;
 
 /// One account's standing in its provider's pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,50 +78,48 @@ impl From<&TokenAccountState> for PoolAccount {
     }
 }
 
-/// Every enabled API-key-pool account (Z.ai, Kimi, …). An unreadable pool is
-/// unknown, so it contributes nothing rather than a fabricated empty pool.
-fn api_key_accounts(workspace_root: &Path) -> Vec<PoolAccount> {
+/// Every enabled API-key-pool account (Z.ai, Kimi, …) under `roots`, or
+/// `None` when the pool cannot be read: unknown, not empty.
+fn api_key_accounts_in(roots: &[PathBuf]) -> Option<Vec<PoolAccount>> {
     use crate::api_keys_pool::Ineligible;
-    crate::api_keys_pool::list_accounts(workspace_root, None)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|account| account.enabled)
-        .map(|account| PoolAccount {
-            usable: matches!(account.ineligible, None | Some(Ineligible::AtCapacity)),
-            exhausted: account.ineligible == Some(Ineligible::Exhausted),
-            provider: account.provider,
-            account: account.name,
-        })
-        .collect()
+    let accounts = crate::api_keys_pool::select::list_accounts_in(roots, None).ok()?;
+    Some(
+        accounts
+            .into_iter()
+            .filter(|account| account.enabled)
+            .map(|account| PoolAccount {
+                usable: matches!(account.ineligible, None | Some(Ineligible::AtCapacity)),
+                exhausted: account.ineligible == Some(Ineligible::Exhausted),
+                provider: account.provider,
+                account: account.name,
+            })
+            .collect(),
+    )
 }
 
 /// What the previous sample saw, so the next one can emit deltas.
 #[derive(Debug, Default)]
 pub struct QuotaState {
-    /// End of the last burn window; `None` until the first sample anchors it.
-    burn_until: Option<DateTime<Utc>>,
     /// When the previous pool sample was taken.
     last_pool_sample: Option<DateTime<Utc>>,
     /// Exhausted accounts per provider at the previous sample.
     exhausted: BTreeMap<String, BTreeSet<String>>,
     /// Providers whose pool read exhausted at the previous sample.
     pools_exhausted: BTreeSet<String>,
+    /// The last API-key pool read that succeeded.
+    api_keys: Vec<PoolAccount>,
 }
 
 impl QuotaState {
-    /// Advance the burn window to `now - lag` and return it, or `None` on
-    /// the anchoring first sample (or when the clock went backwards).
-    pub fn next_burn_window(
-        &mut self,
-        now: DateTime<Utc>,
-    ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-        let end = now - Duration::seconds(MESSAGE_SETTLE_LAG_SECS);
-        let start = self.burn_until.replace(end)?;
-        if end <= start {
-            self.burn_until = Some(start);
-            return None;
+    /// The API-key pool accounts to sample: this read when it succeeded, else
+    /// the last good one. A transient read failure must not make every
+    /// account vanish for a tick and then count as newly exhausted on the
+    /// next (#8941 item 1).
+    pub fn api_key_pool(&mut self, read: Option<Vec<PoolAccount>>) -> Vec<PoolAccount> {
+        if let Some(accounts) = read {
+            self.api_keys = accounts;
         }
-        Some((start, end))
+        self.api_keys.clone()
     }
 
     /// Pool gauges and deltas for `accounts` at `now`, advancing the state.
@@ -390,31 +197,32 @@ impl QuotaState {
 }
 
 static STATE: Mutex<Option<QuotaState>> = Mutex::new(None);
+static BURN: Mutex<Option<Burn>> = Mutex::new(None);
 
 /// One sample's two batches and the interval each one's deltas cover.
 struct Sample {
-    burn: Vec<MetricPoint>,
-    burn_start: Option<DateTime<Utc>>,
+    burn: Option<(DateTime<Utc>, DateTime<Utc>, Vec<MetricPoint>)>,
     pool: Vec<MetricPoint>,
     pool_start: Option<DateTime<Utc>>,
 }
 
 fn sample(workspace_root: &Path, mut accounts: Vec<PoolAccount>, now: DateTime<Utc>) -> Sample {
-    accounts.extend(api_key_accounts(workspace_root));
-    let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-    let state = guard.get_or_insert_with(QuotaState::default);
-    let pool_start = state.last_pool_sample;
-    let pool = state.pool_points(&accounts, now);
-    let (burn, burn_start) =
-        match (state.next_burn_window(now), crate::transcript_tokens::claude_projects_dir()) {
-            (Some((start, end)), Some(dir)) => {
-                (burn_points(CLAUDE_PROVIDER, &claude_burn(&dir, start, end)), Some(start))
-            }
-            _ => (Vec::new(), None),
-        };
+    let api_keys = api_key_accounts_in(&crate::api_keys_pool::paths::pool_roots(workspace_root));
+    let (pool, pool_start) = {
+        let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = guard.get_or_insert_with(QuotaState::default);
+        accounts.extend(state.api_key_pool(api_keys));
+        let pool_start = state.last_pool_sample;
+        (state.pool_points(&accounts, now), pool_start)
+    };
+    let burn = BURN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(Burn::host)
+        .sample(now)
+        .map(|(start, end, burn)| (start, end, burn_points(&burn)));
     Sample {
         burn,
-        burn_start,
         pool,
         pool_start,
     }
@@ -422,7 +230,7 @@ fn sample(workspace_root: &Path, mut accounts: Vec<PoolAccount>, now: DateTime<U
 
 /// Sample and export, when an ops sink is registered. `accounts` is the
 /// `tokens.snapshot` account list the collector already built this tick.
-/// Returns before any read when no OTLP exporter is running.
+/// Returns before any store is read when no OTLP exporter is running.
 pub async fn record(workspace_root: &Path, accounts: &[TokenAccountState]) {
     let Some(sink) = super::global_ops_sink() else {
         return;
@@ -431,7 +239,10 @@ pub async fn record(workspace_root: &Path, accounts: &[TokenAccountState]) {
     let accounts: Vec<PoolAccount> = accounts.iter().map(PoolAccount::from).collect();
     let now = Utc::now();
     if let Ok(sample) = tokio::task::spawn_blocking(move || sample(&root, accounts, now)).await {
-        sink.emit_metrics_since(sample.burn, sample.burn_start);
+        if let Some((start, end, points)) = sample.burn {
+            // Stamped at the window end, so consecutive intervals abut.
+            sink.emit_metrics_over(points, Some(start), end);
+        }
         sink.emit_metrics_since(sample.pool, sample.pool_start);
     }
 }
