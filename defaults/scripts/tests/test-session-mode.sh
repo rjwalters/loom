@@ -18,8 +18,8 @@
 #
 #   Group 2 (always runs; subject is SHIPPED): loom-start.sh's existing
 #     check_config() still refuses to start on `terminals: []` (the guard #8884
-#     deliberately did NOT duplicate), and diagnoses a session-mode repo as
-#     session mode rather than as a broken install.
+#     deliberately did NOT duplicate), and its hint names session mode as one of
+#     the two causes so a session-mode operator is not sent into a reinstall.
 #
 #   Group 3 (source-tree only): ./install.sh and scripts/install-loom.sh accept
 #     `--mode session|default`, reject anything else, and advertise the flag in
@@ -166,15 +166,15 @@ else
 fi
 
 # ============================================================================
-# Group 2: loom-start.sh's EXISTING refusal still fires, and diagnoses session
-#          mode as session mode
+# Group 2: loom-start.sh's EXISTING refusal still fires, and its hint names
+#          session mode as one of the two causes
 # ============================================================================
 #
 # #8884 deliberately added no new "refuse to start" guard: check_config() has
 # refused on an empty `terminals` array since the config-tiering work. This
 # group is the regression lock on that (the feature depends on it) plus the one
-# thing #8884 did change there — the diagnosis, because "have you initialized
-# Loom?" would send a session-mode operator into a needless reinstall.
+# thing #8884 did change there — the hint, because "have you initialized Loom?"
+# ALONE would send a session-mode operator into a needless reinstall.
 echo ""
 echo "Test group 2: loom-start.sh refuses to start, and says WHY (#8884)"
 
@@ -218,32 +218,38 @@ if grep -q 'No Loom config with a non-empty' <<<"$OUT"; then
 else
     fail "(#8884) the pre-existing refusal message changed (out=$OUT)"
 fi
-if grep -q 'SESSION MODE' <<<"$OUT"; then
-    pass "(#8884) the refusal diagnoses session mode explicitly"
+if grep -q 'session-mode.md' <<<"$OUT"; then
+    pass "(#8884) the refusal points a session-mode operator at the session-mode doc"
 else
-    fail "(#8884) the refusal does not mention session mode (out=$OUT)"
+    fail "(#8884) the refusal does not mention session mode at all (out=$OUT)"
 fi
 if grep -q 'install-loom.sh' <<<"$OUT"; then
-    fail "(#8884) the refusal still tells a session-mode operator to reinstall Loom (out=$OUT)"
+    pass "(#8884) the refusal still names the not-installed cause too (both causes stated)"
 else
-    pass "(#8884) the refusal does not send a session-mode operator into a reinstall"
+    fail "(#8884) the refusal dropped the 'have you installed Loom?' cause (out=$OUT)"
 fi
 
-# A repo with NO config at all must keep the original diagnosis: session mode is
-# opt-in via the marker, never inferred from an empty/absent terminals array.
+# The hint names BOTH causes unconditionally rather than branching on
+# `.mode == "session"`: loom-start.sh is `contract` shell in epic #7810's
+# portable pool, which may not grow, so a static line that costs zero code lines
+# is preferred over a 7-line conditional (see the comment at the refusal). The
+# consequence under test: a repo with no session marker at all still gets the
+# original advice, and the session-mode pointer is present but not a claim ABOUT
+# this repo -- session mode is never INFERRED from an empty terminals array,
+# because nothing here reads the marker.
 PLAIN_REPO="$WORKDIR/plain-start"
 mkdir -p "$PLAIN_REPO/.loom"
 printf '{"version": "2", "terminals": []}\n' > "$PLAIN_REPO/.loom/config.json"
 OUT="$(run_check_config "$PLAIN_REPO")"
-if grep -q 'SESSION MODE' <<<"$OUT"; then
-    fail "(#8884) session mode was INFERRED from an empty terminals array (out=$OUT)"
-else
-    pass "(#8884) an empty terminals array alone is not treated as session mode"
-fi
 if grep -q 'Have you initialized Loom' <<<"$OUT"; then
     pass "(#8884) a non-session repo keeps the original 'have you initialized Loom?' advice"
 else
     fail "(#8884) the original advice was lost for a non-session repo (out=$OUT)"
+fi
+if ! grep -q 'jq -r .*\.mode' "$LOOM_START"; then
+    pass "(#8884) loom-start.sh adds no \`.mode\` branch (epic #7810: portable pool may not grow)"
+else
+    fail "(#8884) loom-start.sh grew a session-mode conditional — that is portable-pool growth"
 fi
 
 # ============================================================================

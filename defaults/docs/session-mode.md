@@ -48,8 +48,18 @@ The tmux pool already refuses to start on an empty `terminals` array:
 `.loom/scripts/start-daemon.sh` → `.loom/bin/loom start`) hard-fails with
 "Error: No Loom config with a non-empty \`terminals\` array found in any tier."
 Session mode reuses that guard rather than adding a second one — the only change
-#8884 made there is the **diagnosis**: a session-mode repo is told it is in
-session mode, instead of being told to reinstall Loom.
+#8884 made there is the **hint** under it, which now names both causes ("have you
+initialized Loom, or is this a session-mode install?") and points here, instead of
+telling every operator who lands there to reinstall Loom.
+
+That hint is stated unconditionally rather than behind a `.mode == "session"`
+test. `loom-start.sh` is `contract` shell in epic #7810's portable pool, which may
+not grow (`loom-daemon shell-budget --check` enforces it) — and a conditional
+diagnosis is not worth 7 portable lines when a static line naming both causes
+carries the same
+operator out of the same dead end. A consequence worth stating: session mode is
+never *inferred* from an empty `terminals` array, because nothing on that path
+reads the marker.
 
 ### Scope: install-time writes, not runtime vetoes
 
