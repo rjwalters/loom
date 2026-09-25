@@ -239,6 +239,12 @@ pub(crate) enum MergePrCommand {
     /// already spent on this head, so the PR was escalated to a durable
     /// `loom:operator` hold, 1 = could not produce fresh evidence.
     RedateChecks(super::merge_pr_redate::RedateChecksArgs),
+
+    /// The pre-merge `loom:pr` review-signal guard (#7419): refuse a merge
+    /// whose current head does not carry `loom:pr`, unless
+    /// `--allow-unapproved` asserts responsibility. Exit 0 = present or
+    /// overridden (see stdout for which), 1 = absent with no override.
+    LoomPrGuard(super::merge_pr_loom_pr_guard::LoomPrGuardArgs),
 }
 
 impl MergePrCommand {
@@ -248,6 +254,7 @@ impl MergePrCommand {
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
+            MergePrCommand::LoomPrGuard(args) => args.run(),
         }
     }
 }
