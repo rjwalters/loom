@@ -1,0 +1,34 @@
+{
+  "alert": "Loom ready queue starved",
+  "alertType": "METRIC_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "15m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "SELECT toStartOfInterval(toDateTime(intDiv(s.unix_milli, 1000)), INTERVAL 1 MINUTE) AS ts,\n       JSONExtractString(t.labels, 'host.id') AS host,\n       max(s.value) AS value\nFROM signoz_metrics.samples_v4 AS s\nINNER JOIN signoz_metrics.time_series_v4 AS t USING (fingerprint)\nWHERE s.metric_name = 'loom.queue.starved'\n  AND JSONExtractString(t.labels, 'state') = 'ready'\n  AND s.unix_milli >= {{.start_timestamp_ms}}\n  AND s.unix_milli < {{.end_timestamp_ms}}\nGROUP BY ts, host\nORDER BY ts",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "2",
+    "target": 0
+  },
+  "labels": {
+    "severity": "warning",
+    "loom_signal": "queue_starvation"
+  },
+  "annotations": {
+    "summary": "Loom ready work starved",
+    "description": "{{$value}} ready issue(s) on one host (see the alert's host label) have waited past LOOM_QUEUE_STARVATION_SECS (default 6 h). They were held only by capacity (concurrency cap, admission ramp, saturation brake or repo slice) for the whole 15 min window. Run `loom-daemon queue` on that host to see which issues and why. Issue #8856."
+  },
+  "disabled": false
+}
