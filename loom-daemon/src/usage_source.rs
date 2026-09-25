@@ -62,7 +62,7 @@ pub const CODEX_RUNTIME: &str = "codex";
 ///
 /// Deliberately an enum rather than a bare boolean: each runtime with a store
 /// of its own gets a variant, and a new variant here is the one place that has
-/// to change when the next one lands. Pi's store is still unlocated (#8637) —
+/// to change when the next one lands. Pi's store is still unlocated (#8594's Pi half) —
 /// see [`sweep_tokens_by_model`]'s doc for what was checked and came up empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageSource {
@@ -237,8 +237,9 @@ pub fn role_tick_directories(root: &Path) -> Vec<PathBuf> {
 /// `opencode_usage`'s "Schema provenance" sections document theirs; that has
 /// not been possible on any fleet host to date (no `pi` binary, no `~/.pi`, no
 /// captured `--mode json` usage event anywhere in this tree), and guessing a
-/// schema is worse than reporting nothing. Tracked in #8637, which also names
-/// the assertion in this module's own tests that flips when Pi lands.
+/// schema is worse than reporting nothing. It stays open under #8594 (#8637,
+/// the first carve-out, was closed as that issue's duplicate); the assertion
+/// in this module's own tests that flips when Pi lands is marked below.
 #[must_use]
 pub fn sweep_tokens_by_model(
     runtime: Option<&str>,
@@ -335,7 +336,7 @@ mod tests {
         }
         // `pi` is still unmapped on purpose — its store has never been
         // confirmable against a live install (see `sweep_tokens_by_model`).
-        // THIS is the assertion #8637 flips when Pi's schema is confirmed.
+        // THIS is the assertion #8594's Pi half flips when Pi's schema is confirmed.
         for other in [None, Some("claude"), Some("pi"), Some("")] {
             assert_eq!(
                 UsageSource::for_runtime(other),
@@ -529,5 +530,59 @@ mod tests {
         assert_eq!(role_tick_usage_runtime(None, &log).as_deref(), Some("codex"));
         assert_eq!(role_tick_usage_runtime(Some("pi"), &log).as_deref(), Some("pi"));
         assert_eq!(role_tick_usage_runtime(None, &tmp.path().join("absent.log")), None);
+    }
+
+    /// Issue #8594 (review of PR #8641): a pool-selected Codex sweep runs with
+    /// `CODEX_HOME=<~/.loom/codex-profiles/<name>>` in the CHILD's env only, so
+    /// its rollouts are not under the daemon's own ambient home. The sweep's
+    /// `tokens_by_model` must still find them through the profile root.
+    #[serial_test::serial(codex_home_env)]
+    #[test]
+    fn a_codex_sweep_finds_rollouts_under_a_pooled_profile_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("repo");
+        let profiles = tmp.path().join("codex-profiles");
+        // The daemon's ambient home: exists, holds nothing for this sweep.
+        let ambient = tmp.path().join("ambient-codex");
+        std::fs::create_dir_all(ambient.join("sessions")).unwrap();
+        let day = profiles.join("work-2").join("sessions/2026/09/20");
+        std::fs::create_dir_all(&day).unwrap();
+        let cwd = workspace.to_str().unwrap();
+        let lines = [
+            serde_json::json!({"type": "session_meta", "payload": {
+                "session_id": "s-1", "timestamp": "2026-09-21T02:00:00Z",
+                "cwd": cwd, "model_provider": "openai"}}),
+            serde_json::json!({"type": "turn_context", "payload": {"cwd": cwd, "model": "gpt-5"}}),
+            serde_json::json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 1_000, "cached_input_tokens": 400,
+                    "output_tokens": 100, "reasoning_output_tokens": 10}}}}),
+        ];
+        std::fs::write(
+            day.join("rollout-2026-09-20T19-00-00-s-1.jsonl"),
+            lines.map(|l| l.to_string()).join("\n"),
+        )
+        .unwrap();
+
+        std::env::remove_var(crate::codex_usage::CODEX_HOME_ENV);
+        std::env::set_var(crate::codex_usage::CODEX_NATIVE_HOME_ENV, &ambient);
+        std::env::set_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV, &profiles);
+        let window = Some((
+            "2026-09-21T01:00:00Z".parse().unwrap(),
+            "2026-09-21T03:00:00Z".parse().unwrap(),
+        ));
+        let found = sweep_tokens_by_model(Some("codex"), &workspace, 8594, window);
+        // Without the profile root the ambient home alone finds nothing.
+        std::env::set_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV, "");
+        let ambient_only = sweep_tokens_by_model(Some("codex"), &workspace, 8594, window);
+        std::env::remove_var(crate::codex_usage::CODEX_NATIVE_HOME_ENV);
+        std::env::remove_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV);
+
+        let totals = found.expect("the pooled profile's rollout must be found");
+        assert_eq!(totals.len(), 1, "{totals:?}");
+        assert_eq!(totals[0].model, "gpt-5");
+        assert_eq!(totals[0].input, 600);
+        assert_eq!(totals[0].cache_read, 400);
+        assert_eq!(totals[0].output, 100);
+        assert_eq!(ambient_only, None);
     }
 }

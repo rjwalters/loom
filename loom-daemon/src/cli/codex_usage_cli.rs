@@ -24,6 +24,12 @@
 //! `config.toml`, `history.jsonl` and SQLite stores are unreachable from here.
 //! This command adds no file read of its own.
 //!
+//! It scans the same home set the daemon does
+//! ([`loom_daemon::codex_usage::codex_homes`]): the ambient `$CODEX_HOME` (or
+//! `~/.codex`) **and** every pooled profile under `~/.loom/codex-profiles/`,
+//! which is where a pool-selected sweep's rollouts actually land. Set
+//! `LOOM_CODEX_HOME` to pin exactly one home instead.
+//!
 //! # `--session-id`, the exact-attribution path
 //!
 //! Unlike OpenCode's store, Codex's rollouts carry the session id, so
@@ -91,7 +97,7 @@ impl CodexUsageArgs {
     pub(crate) fn run(self) -> Result<()> {
         let window = self.window()?;
         let filter = self.filter()?;
-        let home = codex_usage::codex_home(None);
+        let homes = codex_usage::codex_homes(None);
         let rollouts = codex_usage::discover_rollouts(None, window);
         let sessions = codex_usage::sessions(&filter, window, None);
         let totals = codex_usage::fold_sessions(sessions.clone()).unwrap_or_default();
@@ -100,7 +106,7 @@ impl CodexUsageArgs {
             println!(
                 "{}",
                 serde_json::json!({
-                    "codex_home": home,
+                    "codex_homes": homes,
                     "rollouts_scanned": rollouts.len(),
                     "directories": filter.directories,
                     "session_ids": filter.ids,
@@ -115,11 +121,14 @@ impl CodexUsageArgs {
             return Ok(());
         }
 
-        let Some(home) = home else {
+        if homes.is_empty() {
             println!("No $CODEX_HOME resolved (set LOOM_CODEX_HOME to pin one).");
             return Ok(());
-        };
-        println!("Session store: {}", home.join(codex_usage::SESSIONS_DIR).display());
+        }
+        println!("Session stores:");
+        for home in &homes {
+            println!("  {}", home.join(codex_usage::SESSIONS_DIR).display());
+        }
         println!("Rollouts scanned: {}", rollouts.len());
         if !filter.directories.is_empty() {
             println!("Attributed directories:");

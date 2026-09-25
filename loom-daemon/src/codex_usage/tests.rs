@@ -643,6 +643,98 @@ fn codex_home_prefers_the_loom_override_then_codex_own_then_the_default() {
     // A blank override is not an override.
     std::env::set_var(CODEX_HOME_ENV, "");
     assert_eq!(codex_home(Some(Path::new("/h"))), Some(PathBuf::from("/native/codex")));
+    // Leave nothing behind for a later test in this process (plain `cargo
+    // test` shares one env across every `#[serial]` group).
+    clear_home_env();
+}
+
+// ---------------------------------------------------------------------------
+// Pooled profile homes (review of PR #8641)
+// ---------------------------------------------------------------------------
+
+/// `LOOM_CODEX_PROFILE_ROOT` cleared too, so an injected `home` decides the
+/// profile root and the operator's real pool is never reached.
+fn clear_all_home_env() {
+    clear_home_env();
+    std::env::remove_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV);
+}
+
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn codex_homes_is_the_ambient_home_plus_every_pooled_profile_unless_pinned() {
+    clear_all_home_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let profiles = tmp.path().join(".loom/codex-profiles");
+    std::fs::create_dir_all(profiles.join("work-b")).unwrap();
+    std::fs::create_dir_all(profiles.join("work-a")).unwrap();
+    // A stray file beside the profiles is not a home.
+    std::fs::write(profiles.join("notes.txt"), "x").unwrap();
+    assert_eq!(
+        codex_homes(Some(tmp.path())),
+        vec![
+            tmp.path().join(".codex"),
+            profiles.join("work-a"),
+            profiles.join("work-b"),
+        ]
+    );
+    // A profile that IS the ambient home is listed once.
+    std::env::set_var(CODEX_NATIVE_HOME_ENV, profiles.join("work-a"));
+    assert_eq!(
+        codex_homes(Some(tmp.path())),
+        vec![profiles.join("work-a"), profiles.join("work-b")]
+    );
+    // The explicit Loom pin is exact: it replaces the whole set.
+    std::env::set_var(CODEX_HOME_ENV, "/pinned/codex");
+    assert_eq!(codex_homes(Some(tmp.path())), vec![PathBuf::from("/pinned/codex")]);
+    // An explicitly empty profile root disables the profile scan.
+    clear_all_home_env();
+    std::env::set_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV, "");
+    assert_eq!(codex_homes(Some(tmp.path())), vec![tmp.path().join(".codex")]);
+    clear_all_home_env();
+}
+
+#[cfg(unix)]
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn profile_rollouts_are_read_and_a_symlinked_shared_tree_is_counted_once() {
+    clear_all_home_env();
+    let tmp = tempfile::tempdir().unwrap();
+    // The default account's home, holding one session.
+    let default_home = seed_codex_home(
+        tmp.path(),
+        &[(
+            "2026/09/20",
+            "rollout-a.jsonl",
+            rollout("/w", "2026-09-21T02:00:00Z", "a", "gpt-5", &[(1_000, 400, 100, 0)]),
+        )],
+    );
+    let profiles = tmp.path().join(".loom/codex-profiles");
+    // A provisioned profile (#8694): `sessions/` symlinked to the default's.
+    let shared = profiles.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::os::unix::fs::symlink(default_home.join(SESSIONS_DIR), shared.join(SESSIONS_DIR)).unwrap();
+    // An unprovisioned profile: its own store, and its own poisoned siblings.
+    let own_root = tmp.path().join("own-profile-seed");
+    let own = seed_codex_home(
+        &own_root,
+        &[(
+            "2026/09/20",
+            "rollout-b.jsonl",
+            rollout("/w", "2026-09-21T02:30:00Z", "b", "gpt-5", &[(50, 0, 5, 0)]),
+        )],
+    );
+    std::fs::rename(&own, profiles.join("own")).unwrap();
+
+    let filter = SessionFilter::directories(&[PathBuf::from("/w")]);
+    let rows = sessions(&filter, None, Some(tmp.path()));
+    assert_eq!(rows.len(), 2, "one row per distinct rollout file: {rows:?}");
+    assert!(!format!("{rows:?}").contains(PLANTED_SECRET));
+    assert_eq!(discover_rollouts(Some(tmp.path()), None).len(), 2);
+    let totals = tokens_by_model(&filter, None, Some(tmp.path())).unwrap();
+    assert_eq!(totals[0].input, (1_000 - 400) + 50);
+    assert_eq!(totals[0].cache_read, 400);
+    assert_eq!(totals[0].output, 105);
+    clear_all_home_env();
 }
 
 // ---------------------------------------------------------------------------

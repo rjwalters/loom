@@ -35,6 +35,30 @@
 //! planted secret in every credential-bearing sibling and asserts none of them
 //! is opened and none of their bytes reaches the output.
 //!
+//! # Which `$CODEX_HOME`: every home a launch could have written to
+//!
+//! A daemon-dispatched Codex sweep does **not** write under the daemon's own
+//! `$CODEX_HOME`. `spawn-codex.sh`'s managed headless path runs
+//! `loom-daemon tokens select --provider codex --export`, which exports
+//! `CODEX_HOME=<pool profile dir>` (`~/.loom/codex-profiles/<name>`) into the
+//! **child's** env only, so the rollouts land in
+//! `<profile>/sessions/<YYYY>/<MM>/<DD>/`. A reader that looked only at the
+//! daemon's ambient home would miss every pool-selected launch.
+//!
+//! So [`codex_homes`] returns the ambient home (`CODEX_HOME`, else
+//! `~/.codex`) **plus** every directory directly under the pooled-profile root
+//! ([`crate::tokens_pool::paths::codex_profile_root`], `LOOM_CODEX_PROFILE_ROOT`
+//! overridable). Scanning homes the launch did not use is safe: every row
+//! must still match the caller's `session_meta.cwd` set and window (or exact
+//! session ids), so another profile's sessions cannot be misattributed. A
+//! provisioned profile symlinks its `sessions/` to the default account's
+//! (#8694), so the same rollout can be reachable through two homes; each file
+//! is read once, keyed by its canonical path. The explicit
+//! [`CODEX_HOME_ENV`] (`LOOM_CODEX_HOME`) pin is exact — it replaces the whole
+//! set rather than joining it. The [`is_rollout_path`] gate is applied per
+//! home, so a profile's own `auth.json` is exactly as unreachable as the
+//! default home's.
+//!
 //! # Session identification
 //!
 //! A sweep's or role tick's own Codex sessions are identified by the rollout's
@@ -109,7 +133,7 @@
 //! (every decode failure is treated as "no data", never a panic and never a
 //! fabricated reading).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -172,6 +196,56 @@ pub fn codex_home(home: Option<&Path>) -> Option<PathBuf> {
     )
 }
 
+/// Every `$CODEX_HOME` a Codex launch on this host could have written its
+/// rollouts under — see the module doc's "Which `$CODEX_HOME`" section.
+///
+/// An explicit [`CODEX_HOME_ENV`] pin is exact and returns only itself.
+/// Otherwise: [`codex_home`]'s ambient home first, then every directory
+/// directly under the pooled-profile root, sorted, de-duplicated by canonical
+/// path. Homes that do not exist are kept (they contribute nothing), so the
+/// result names what was consulted.
+///
+/// `home` is injectable for tests: with it given and `LOOM_CODEX_PROFILE_ROOT`
+/// unset, the profile root is `<home>/.loom/codex-profiles`, so a test never
+/// reaches the operator's real pool.
+#[must_use]
+pub fn codex_homes(home: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(pinned) = std::env::var_os(CODEX_HOME_ENV).map(PathBuf::from) {
+        if !pinned.as_os_str().is_empty() {
+            return vec![pinned];
+        }
+    }
+    let mut homes: Vec<PathBuf> = codex_home(home).into_iter().collect();
+    if let Some(root) = profile_root(home) {
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            let mut profiles: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect();
+            profiles.sort();
+            homes.extend(profiles);
+        }
+    }
+    let mut seen = HashSet::new();
+    homes.retain(|h| seen.insert(h.canonicalize().unwrap_or_else(|_| h.clone())));
+    homes
+}
+
+/// The pooled Codex profile root: the tokens-pool resolver when
+/// `LOOM_CODEX_PROFILE_ROOT` is set or no `home` was injected, else
+/// `<home>/.loom/codex-profiles` (the resolver's own default shape).
+fn profile_root(home: Option<&Path>) -> Option<PathBuf> {
+    match home {
+        Some(home)
+            if std::env::var_os(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV).is_none() =>
+        {
+            Some(home.join(".loom").join("codex-profiles"))
+        }
+        _ => crate::tokens_pool::paths::codex_profile_root(),
+    }
+}
+
 /// Whether `path` is one this module is allowed to open: a file directly under
 /// the `<codex_home>/sessions/` subtree whose name is `rollout-*.jsonl`.
 ///
@@ -189,7 +263,41 @@ pub fn is_rollout_path(codex_home: &Path, path: &Path) -> bool {
         .is_some_and(|n| n.starts_with(ROLLOUT_PREFIX) && n.ends_with(ROLLOUT_SUFFIX))
 }
 
-/// Every rollout file that could hold a session inside `window`, under
+/// Every rollout file that could hold a session inside `window`, across every
+/// home [`codex_homes`] names.
+///
+/// Each file appears once even when two homes reach it (a provisioned
+/// profile's `sessions/` symlinks to the default account's, #8694).
+#[must_use]
+pub fn discover_rollouts(
+    home: Option<&Path>,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Vec<PathBuf> {
+    discover_home_rollouts(home, window)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// [`discover_rollouts`], paired with the home each path was found under —
+/// the home [`read_rollout`]'s gate must check it against.
+fn discover_home_rollouts(
+    home: Option<&Path>,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut seen = HashSet::new();
+    let mut found = Vec::new();
+    for codex_home in codex_homes(home) {
+        for path in rollouts_under(&codex_home, window) {
+            if seen.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
+                found.push((codex_home.clone(), path));
+            }
+        }
+    }
+    found
+}
+
+/// Every rollout file that could hold a session inside `window`, under one
 /// `$CODEX_HOME`.
 ///
 /// Only `<sessions>/<YYYY>/<MM>/<DD>/` directories whose date falls inside the
@@ -199,14 +307,10 @@ pub fn is_rollout_path(codex_home: &Path, path: &Path) -> bool {
 /// [`read_rollout`] is ever given.
 ///
 /// Sorted, so output is deterministic for tests and operator diffs.
-#[must_use]
-pub fn discover_rollouts(
-    home: Option<&Path>,
+fn rollouts_under(
+    codex_home: &Path,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Vec<PathBuf> {
-    let Some(codex_home) = codex_home(home) else {
-        return Vec::new();
-    };
     let sessions = codex_home.join(SESSIONS_DIR);
     let allowed_dates = window.map(|(start, end)| {
         (
@@ -235,7 +339,7 @@ pub fn discover_rollouts(
                 };
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file() && is_rollout_path(&codex_home, &path) {
+                    if path.is_file() && is_rollout_path(codex_home, &path) {
                         found.push(path);
                     }
                 }
@@ -552,7 +656,7 @@ fn parse_instant(raw: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// Every attributable session row across `$CODEX_HOME`'s rollout store, sorted
+/// Every attributable session row across every [`codex_homes`] rollout store, sorted
 /// oldest-first.
 ///
 /// The listing counterpart of [`tokens_by_model`], for the `codex-usage` CLI's
@@ -567,12 +671,9 @@ pub fn sessions(
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     home: Option<&Path>,
 ) -> Vec<CodexSessionUsage> {
-    let Some(root) = codex_home(home) else {
-        return Vec::new();
-    };
-    let mut all: Vec<CodexSessionUsage> = discover_rollouts(home, window)
+    let mut all: Vec<CodexSessionUsage> = discover_home_rollouts(home, window)
         .into_iter()
-        .filter_map(|path| read_rollout(&root, &path))
+        .filter_map(|(root, path)| read_rollout(&root, &path))
         .flat_map(|lines| fold_rollout(&lines, filter, window))
         .collect();
     all.sort_by(|a, b| {
@@ -584,7 +685,7 @@ pub fn sessions(
 }
 
 /// Per-`(model, speed, service_tier)` token totals for `filter` across
-/// `$CODEX_HOME`'s rollout store (Issue #8594) — the Codex counterpart of
+/// every [`codex_homes`] rollout store (Issue #8594) — the Codex counterpart of
 /// [`crate::opencode_usage::tokens_by_model`], reached through the
 /// runtime-dispatch seam in [`crate::usage_source`].
 ///
