@@ -2981,3 +2981,11 @@ pub fn format_age(secs: i64) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+// Issue #8504's UTC-`Z` regression coverage: kept out of `tests.rs` itself
+// (already over `.loom/docs/file-size-policy.md`'s threshold and frozen) by
+// declaring it here instead, at its existing file path under `health/tests/`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "health/tests/log_format_tests.rs"]
+mod log_format_tests;

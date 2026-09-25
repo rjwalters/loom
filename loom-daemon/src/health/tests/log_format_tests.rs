@@ -1,14 +1,16 @@
 //! Issue #8504: `daemon.log`'s line-prefix timestamp must always be UTC with
 //! a trailing `Z` designator, never host-local time.
 //!
-//! Split out of the parent `health/tests.rs` rather than appended to it: that
-//! file is over the `.loom/docs/file-size-policy.md` threshold and therefore
-//! frozen at its current size, so new cases go in a sibling module (mirrors
+//! Split out of `health/tests.rs` rather than appended to it: that file is
+//! over the `.loom/docs/file-size-policy.md` threshold and therefore frozen
+//! at its current size, so new cases go in a sibling module instead (mirrors
 //! `model_class_tests`'s own doc comment for the same reason).
 //!
-//! A child module of `tests`, not of `health`, so it inherits the parent's
-//! `use super::*;` re-export of `health`'s public items (`log_now()` stays
-//! local to `tests.rs` itself, so this module defines its own equivalent).
+//! Declared as a child module of `health` (not of `tests`, despite living
+//! under `health/tests/` on disk — see the `#[path]` declaration in
+//! `health.rs`), so it inherits `use super::*;` directly from `health`'s own
+//! public items (`log_now()` stays local to `tests.rs` itself, so this
+//! module defines its own equivalent).
 
 use super::*;
 

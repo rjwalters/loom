@@ -1204,11 +1204,6 @@ fn log_probe_clamps_a_future_stamp_to_zero() {
     assert_eq!(work_finder_log_tick_age_secs(log, log_now()), Some(0));
 }
 
-// Issue #8504's "stamp lacking the trailing Z must not parse" and
-// "DAEMON_LOG_STAMP_FORMAT always renders a Z" regressions live in the
-// sibling `log_format_tests` module (a NEW file, not here) so this
-// already-over-threshold file does not grow (#7711).
-
 #[test]
 fn dispatch_flags_a_halted_gate() {
     let mut inputs = healthy_inputs();
@@ -3180,5 +3175,3 @@ mod auto_update_stale_repo;
 
 #[cfg(test)]
 mod model_class_tests;
-
-mod log_format_tests;
