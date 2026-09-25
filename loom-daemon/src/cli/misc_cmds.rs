@@ -14,6 +14,7 @@ pub(crate) fn run_init(
     workspace: String,
     defaults: String,
     force: bool,
+    mode: loom_daemon::init::InstallMode,
     dry_run: bool,
 ) -> Result<()> {
     let workspace_path = std::path::Path::new(&workspace);
@@ -33,6 +34,7 @@ pub(crate) fn run_init(
         println!("  Workspace: {workspace_str}");
         println!("  Defaults:  {defaults}");
         println!("  Force:     {force}");
+        println!("  Mode:      {mode:?}");
         println!("\nActions that would be performed:");
         println!("  1. Validate {workspace_str} is a git repository");
         println!("  2. Copy .loom/ configuration from {defaults}");
@@ -44,8 +46,11 @@ pub(crate) fn run_init(
     println!("Initializing Loom workspace...");
     println!("  Workspace: {workspace_str}");
     println!("  Defaults:  {defaults}");
+    if mode.is_session() {
+        println!("  Mode:      session (no tmux agent pool, no daemon-tier work generation)");
+    }
 
-    match loom_daemon::init::initialize_workspace(workspace_str, &defaults, force) {
+    match loom_daemon::init::initialize_workspace_with_mode(workspace_str, &defaults, force, mode) {
         Ok(report) => {
             if report.is_self_install {
                 println!("\nLoom source repository detected!");
