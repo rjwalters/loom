@@ -14,8 +14,11 @@
 //!    the watermark.
 //!
 //! A rate limit anywhere aborts the whole cycle (the org backs off, never a
-//! single repo). Any other per-repo failure is recorded and the cycle moves on
-//! to the next repo; `--once` still exits non-zero naming it.
+//! single repo). So does a rejected credential (#8850) — a property of the
+//! host, not the repo, so every remaining repo would fail identically — but
+//! under its own named reason and without touching the rate-limit breaker.
+//! Any other per-repo failure is recorded and the cycle moves on to the next
+//! repo; `--once` still exits non-zero naming it.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -158,6 +161,15 @@ pub enum CycleError {
         until: DateTime<Utc>,
         detail: String,
     },
+    /// The forge rejected this host's credential (#8850). Aborts the cycle
+    /// with no further per-repo request; the operator response is to renew
+    /// or rotate the credential, not to wait, so no backoff is recorded and
+    /// the rate-limit breaker is not notified. `progress` is what the cycle
+    /// had already committed (and emitted) before the credential died.
+    CredentialRejected {
+        detail: String,
+        progress: Box<CycleSummary>,
+    },
     /// Repo discovery failed (nothing can be polled without it).
     Discovery(ApiError),
     /// Ledger/journal/state I/O failed.
@@ -180,6 +192,12 @@ impl fmt::Display for CycleError {
                 f,
                 "rate-limited: backing off the whole org until {} ({detail})",
                 until.to_rfc3339()
+            ),
+            CycleError::CredentialRejected { detail, progress } => write!(
+                f,
+                "credential-rejected: the forge rejected this host's credential; aborted the \
+org cycle after {} repo(s), {} run(s) + {} job(s) — renew or rotate it ({detail})",
+                progress.repos_polled, progress.runs_emitted, progress.jobs_emitted
             ),
             CycleError::Discovery(error) => write!(f, "discovery-failed: {error}"),
             CycleError::Io(error) => write!(f, "io-failed: {error}"),
@@ -212,6 +230,44 @@ impl From<io::Error> for RepoError {
     fn from(error: io::Error) -> Self {
         RepoError::Io(error)
     }
+}
+
+/// Whether an API failure's text says the credential itself was rejected.
+///
+/// Deliberately narrow — the two messages `gh`/GitHub emit for a dead or
+/// insufficient token. A 404 is NOT included: that genuinely is per-repo (a
+/// repo the token cannot see, in an org listing it can).
+#[must_use]
+pub fn indicates_credential_failure(detail: &str) -> bool {
+    let lowered = detail.to_ascii_lowercase();
+    lowered.contains("bad credentials") || lowered.contains("requires authentication")
+}
+
+/// Whether `error` is a credential rejection. Only an HTTP error body or
+/// `gh`'s own transport stderr is inspected — never a parse failure, whose
+/// detail can quote arbitrary 2xx response content.
+fn is_credential_rejection(error: &ApiError) -> bool {
+    match error {
+        ApiError::Http { detail, .. } | ApiError::Transport(detail) => {
+            indicates_credential_failure(detail)
+        }
+        ApiError::RateLimited { .. } | ApiError::Parse { .. } => false,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread's cycles notified the rate-limit breaker —
+    /// the seam the #8850 tests use to prove a credential rejection never does.
+    pub(crate) static BREAKER_NOTIFICATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Tell the process-global rate-limit breaker about a genuine rate limit.
+fn notify_breaker(detail: &str) {
+    #[cfg(test)]
+    BREAKER_NOTIFICATIONS.with(|n| n.set(n.get() + 1));
+    crate::rate_limit_breaker::global_observe_failure(detail, "ci_telemetry");
 }
 
 /// Backoff for a rate limit: `Retry-After` wins, then the primary-limit
@@ -285,8 +341,13 @@ fn record_outcome(
             status.last_error = Some(error.to_string());
             status.last_error_at = Some(ctx.now);
             status.consecutive_failures += 1;
-            if let CycleError::RateLimited { until, .. } = error {
-                status.backoff_until = Some(*until);
+            match error {
+                CycleError::RateLimited { until, .. } => status.backoff_until = Some(*until),
+                // What was committed before the credential died still counts.
+                CycleError::CredentialRejected { progress, .. } => {
+                    status.last_cycle = Some((**progress).clone());
+                }
+                _ => {}
             }
         }
     }
@@ -313,14 +374,27 @@ fn run_locked(
         return Err(CycleError::BackingOff { until: None });
     }
 
-    let rate_limited = |error: &ApiError| -> Option<CycleError> {
+    // Whether `error` ends the whole cycle: a rate limit (the org backs off,
+    // and the shared breaker hears about it) or a rejected credential (named
+    // separately, and deliberately NOT fed to the breaker — a dead token is
+    // not a spent quota, #8850).
+    let org_wide = |error: &ApiError, report: &CycleReport| -> Option<CycleError> {
+        if is_credential_rejection(error) {
+            return Some(CycleError::CredentialRejected {
+                detail: error.to_string(),
+                progress: Box::new(CycleSummary {
+                    repo_errors: report.repo_errors.len(),
+                    ..report.summary.clone()
+                }),
+            });
+        }
         if let ApiError::RateLimited {
             retry_after_secs,
             reset_epoch,
             detail,
         } = error
         {
-            crate::rate_limit_breaker::global_observe_failure(detail, "ci_telemetry");
+            notify_breaker(detail);
             return Some(CycleError::RateLimited {
                 until: backoff_until(
                     ctx.now,
@@ -336,14 +410,14 @@ fn run_locked(
 
     let repos = match discover(api, &ctx.org, dir, &mut report.summary.requests) {
         Ok(repos) => repos,
-        Err(error) => return Err(rate_limited(&error).unwrap_or(CycleError::Discovery(error))),
+        Err(error) => return Err(org_wide(&error, &report).unwrap_or(CycleError::Discovery(error))),
     };
     for repo in repos.iter().filter(|r| !r.archived && !ctx.is_excluded(r)) {
         match poll_repo(ctx, api, &mut ledger, &journal, repo, &mut report) {
             Ok(()) => report.summary.repos_polled += 1,
             Err(RepoError::Io(error)) => return Err(CycleError::Io(error)),
             Err(RepoError::Api(error)) => {
-                if let Some(abort) = rate_limited(&error) {
+                if let Some(abort) = org_wide(&error, &report) {
                     return Err(abort);
                 }
                 report
@@ -357,7 +431,7 @@ fn run_locked(
     // here even when its repo produced no new runs.
     if ctx.log_capture.is_on() {
         if let Err(error) = capture_logs(ctx, api, &mut ledger, &journal, &mut report) {
-            if let Some(abort) = rate_limited(&error) {
+            if let Some(abort) = org_wide(&error, &report) {
                 return Err(abort);
             }
             report.repo_errors.push(format!("job-log capture: {error}"));
@@ -374,8 +448,9 @@ fn run_locked(
 ///
 /// Each job is independently idempotent from its `ci.job` record: the chunks
 /// commit under their own `logs: true` ledger key, so a failure here leaves
-/// the record alone and retries the download next cycle. Only a rate limit
-/// escapes — that aborts the whole cycle, as everywhere else.
+/// the record alone and retries the download next cycle. Only a rate limit or
+/// a rejected credential escapes — that aborts the whole cycle, as everywhere
+/// else (a dead token is not the job's fault, so it is not recorded as one).
 fn capture_logs(
     ctx: &CycleContext<'_>,
     api: &dyn GithubApi,
@@ -398,6 +473,7 @@ fn capture_logs(
         let response = match api.get_document(&logs::logs_path(&target.repo, target.job_id)) {
             Ok(response) => response,
             Err(error @ ApiError::RateLimited { .. }) => return Err(error),
+            Err(error) if is_credential_rejection(&error) => return Err(error),
             Err(error) => {
                 let reason = error.to_string();
                 log::warn!(
