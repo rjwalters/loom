@@ -46,6 +46,12 @@ impl TelemetryEnvelope {
                 // backend.
                 TelemetryRecord::SessionAnalysis(_) => 6,
                 TelemetryRecord::DaemonEvent(_) => 7,
+                // Issue #8824: the CI record family (`ci.run`, `ci.job`,
+                // `ci.duration`) shares one gate — it ships as one unit
+                // and only its own envelopes carry 8.
+                TelemetryRecord::CiRun(_)
+                | TelemetryRecord::CiJob(_)
+                | TelemetryRecord::CiDuration(_) => 8,
                 _ => CURRENT_SCHEMA_VERSION,
             },
             emitted_at: Utc::now(),

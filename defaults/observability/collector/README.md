@@ -259,6 +259,16 @@ counts/ids/allowlisted tool names — never transcript content, same as
 `epic.issue.*` event-bus payload, carried whole as one JSON string rather than
 re-typed per topic — see `crate::event_bus`'s frozen taxonomy).
 
+Issue #8824 (CI telemetry, phase 1) adds three record kinds — `ci.run`,
+`ci.job` (log records) and `ci.duration` (the `loom.ci.run.duration_ms` /
+`loom.ci.job.duration_ms` delta histograms) — plus `loom.ci.run` /
+`loom.ci.job` spans. The log, span and datapoint allowlists gain exactly the
+constants in `loom-daemon/src/telemetry/ci.rs` (`CI_LOG_ATTRIBUTE_KEYS`,
+`CI_SPAN_ATTRIBUTE_KEYS`, `CI_METRIC_LABEL_KEYS`); the `ci_telemetry`
+contract test fails if this config and those constants ever disagree. Metric
+labels are the low-cardinality `repo`, `workflow`, `job`, `runner`,
+`conclusion` only. See `defaults/docs/ci-observability.md`.
+
 | Source | Path tailed (in-container) | `loom.*` fields populated |
 | --- | --- | --- |
 | Codex | `/var/lib/loom-sessions/codex/**/*.jsonl` | `runtime` (static `"codex"`), `session_id` (from a `session_meta` record), `model` (from a `turn_context` record) — both paths still unverified, no sample existed on the verifying host |

@@ -55,12 +55,14 @@ use std::path::PathBuf;
 
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
+pub mod ci;
 mod envelope;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod trace;
 pub mod visibility;
+pub use ci::{CiDurationRecord, CiJobRecord, CiRunRecord};
 pub use envelope::TelemetryEnvelope;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
@@ -286,6 +288,17 @@ pub enum TelemetryRecord {
     DaemonEvent(DaemonEventRecord),
     #[serde(rename = "trace.span")]
     Span(trace::SpanRecord),
+    /// One completed GitHub Actions workflow run (Issue #8824). See
+    /// [`ci`] for the CI record family and its attribute allowlist.
+    #[serde(rename = "ci.run")]
+    CiRun(CiRunRecord),
+    /// One completed job of a GitHub Actions run (Issue #8824).
+    #[serde(rename = "ci.job")]
+    CiJob(CiJobRecord),
+    /// One CI run/job duration sample — the carrier for the
+    /// `loom.ci.{run,job}.duration_ms` histograms (Issue #8824).
+    #[serde(rename = "ci.duration")]
+    CiDuration(CiDurationRecord),
 }
 
 /// A sweep's terminal result. `#[serde(default)]`-friendly variants are not

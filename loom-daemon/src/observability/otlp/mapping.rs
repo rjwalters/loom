@@ -2,6 +2,7 @@
 //! parent module's doc comment for the mapping table this file implements;
 //! this module is the field-by-field implementation plus its unit tests.
 
+mod ci;
 mod metadata;
 
 use std::collections::BTreeMap;
@@ -14,7 +15,8 @@ use opentelemetry_proto::tonic::common::v1::{
 };
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber};
 use opentelemetry_proto::tonic::metrics::v1::{
-    metric, number_data_point, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+    metric, number_data_point, AggregationTemporality, Gauge, Histogram, HistogramDataPoint,
+    Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
@@ -162,7 +164,8 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 /// two host-level record kinds (`tokens.snapshot`, `host.health`) — those
 /// become metrics instead (see [`metric_samples_for`]).
 fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
-    let time_unix_nano = nanos(envelope.emitted_at);
+    let observed_time_unix_nano = nanos(envelope.emitted_at);
+    let mut time_unix_nano = observed_time_unix_nano;
     let (event_name, severity, _body, attributes) = match &envelope.record {
         TelemetryRecord::SweepStarted(r) => {
             let mut attributes = vec![
@@ -515,13 +518,21 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes,
             )
         }
+        TelemetryRecord::CiRun(_) | TelemetryRecord::CiJob(_) => {
+            // Issue #8824: CI runs/jobs are events stamped at their own
+            // `completed_at` (see `ci::log_parts`).
+            let (event_name, severity, completed_at, attributes) = ci::log_parts(&envelope.record)?;
+            time_unix_nano = completed_at;
+            (event_name, severity, String::new(), attributes)
+        }
         TelemetryRecord::TokensSnapshot(_)
         | TelemetryRecord::HostHealth(_)
+        | TelemetryRecord::CiDuration(_)
         | TelemetryRecord::Span(_) => return None,
     };
     Some(LogRecord {
         time_unix_nano,
-        observed_time_unix_nano: time_unix_nano,
+        observed_time_unix_nano,
         severity_number: severity as i32,
         severity_text: severity_text(severity).to_string(),
         body: Some(any_string(event_name)),
@@ -742,8 +753,28 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
         | TelemetryRecord::SessionSummary(_)
         | TelemetryRecord::SessionAnalysis(_)
         | TelemetryRecord::DaemonEvent(_)
+        // CI runs/jobs are log records; `ci.duration` is a histogram point
+        // (see `histogram_point_for`), never a gauge.
+        | TelemetryRecord::CiRun(_)
+        | TelemetryRecord::CiJob(_)
+        | TelemetryRecord::CiDuration(_)
         | TelemetryRecord::Span(_) => Vec::new(),
     }
+}
+
+/// `(name, description, data point)` for a `ci.duration` envelope (Issue
+/// #8824); `None` for every other kind.
+fn histogram_point_for(
+    envelope: &TelemetryEnvelope,
+) -> Option<(&'static str, &'static str, HistogramDataPoint)> {
+    let TelemetryRecord::CiDuration(record) = &envelope.record else {
+        return None;
+    };
+    let description = match record.metric {
+        crate::telemetry::ci::CiDurationMetric::Run => "GitHub Actions workflow run duration.",
+        crate::telemetry::ci::CiDurationMetric::Job => "GitHub Actions job duration.",
+    };
+    Some((record.metric.metric_name(), description, ci::histogram_point(record)))
 }
 
 /// Groups every host-level envelope in `envelopes` into one
@@ -766,7 +797,21 @@ pub(super) fn build_metrics_request(
     type MetricsForHost =
         BTreeMap<&'static str, (&'static str, &'static str, Vec<NumberDataPoint>)>;
     let mut by_host: BTreeMap<&str, MetricsForHost> = BTreeMap::new();
+    // CI duration histograms (Issue #8824), keyed the same way.
+    type HistogramsForHost = BTreeMap<&'static str, (&'static str, Vec<HistogramDataPoint>)>;
+    let mut histograms_by_host: BTreeMap<&str, HistogramsForHost> = BTreeMap::new();
     for envelope in envelopes {
+        if let Some((name, description, point)) = histogram_point_for(envelope) {
+            histograms_by_host
+                .entry(envelope.host_id.as_str())
+                .or_default()
+                .entry(name)
+                .or_insert((description, Vec::new()))
+                .1
+                .push(point);
+            by_host.entry(envelope.host_id.as_str()).or_default();
+            continue;
+        }
         let samples = metric_samples_for(envelope);
         if samples.is_empty() {
             continue;
@@ -789,32 +834,47 @@ pub(super) fn build_metrics_request(
     if by_host.is_empty() {
         return None;
     }
-    let resource_metrics = by_host
-        .into_iter()
-        .map(|(host_id, metrics)| {
-            let metrics = metrics
-                .into_iter()
-                .map(|(name, (description, unit, data_points))| Metric {
-                    name: name.to_string(),
-                    description: description.to_string(),
-                    unit: unit.to_string(),
-                    data: Some(metric::Data::Gauge(Gauge { data_points })),
+    let resource_metrics =
+        by_host
+            .into_iter()
+            .map(|(host_id, metrics)| {
+                let mut metrics: Vec<Metric> = metrics
+                    .into_iter()
+                    .map(|(name, (description, unit, data_points))| Metric {
+                        name: name.to_string(),
+                        description: description.to_string(),
+                        unit: unit.to_string(),
+                        data: Some(metric::Data::Gauge(Gauge { data_points })),
+                        ..Default::default()
+                    })
+                    .collect();
+                if let Some(histograms) = histograms_by_host.remove(host_id) {
+                    metrics.extend(histograms.into_iter().map(
+                        |(name, (description, data_points))| Metric {
+                            name: name.to_string(),
+                            description: description.to_string(),
+                            unit: "ms".to_string(),
+                            data: Some(metric::Data::Histogram(Histogram {
+                                data_points,
+                                aggregation_temporality: AggregationTemporality::Delta as i32,
+                            })),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                ResourceMetrics {
+                    resource: Some(resource_for_host(
+                        host_id,
+                        daemon_version_by_host.get(host_id).copied(),
+                    )),
+                    scope_metrics: vec![ScopeMetrics {
+                        metrics,
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                })
-                .collect();
-            ResourceMetrics {
-                resource: Some(resource_for_host(
-                    host_id,
-                    daemon_version_by_host.get(host_id).copied(),
-                )),
-                scope_metrics: vec![ScopeMetrics {
-                    metrics,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }
-        })
-        .collect();
+                }
+            })
+            .collect();
     Some(ExportMetricsServiceRequest { resource_metrics })
 }
 

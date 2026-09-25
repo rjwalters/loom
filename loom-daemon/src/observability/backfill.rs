@@ -302,7 +302,12 @@ pub fn run_backfill_pass_all(
     }
     roots
         .iter()
-        .map(|root| run_backfill_pass(root, queue) + super::lifecycle::backfill(root, queue))
+        .map(|root| {
+            run_backfill_pass(root, queue)
+                + super::lifecycle::backfill(root, queue)
+                // Issue #8824: the CI telemetry journal rides the same pass.
+                + crate::ci_telemetry::export::backfill(root, queue)
+        })
         .sum()
 }
 

@@ -138,6 +138,7 @@ pub mod build_slot;
 pub mod calibrate;
 pub mod capability;
 pub mod capacity;
+pub mod ci_telemetry;
 pub mod claim_reconciliation;
 pub mod cmd_out;
 pub mod concierge;
