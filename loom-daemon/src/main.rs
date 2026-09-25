@@ -889,11 +889,11 @@ enum Commands {
     /// (`loom_tools.auto_merge`) Python CLIs (epic #4081 Phase 3, family 3).
     ///
     /// GitHub is native: `issue`/`pr`/`auth` are a byte-identical passthrough
-    /// to `gh`, and `auto-merge` enables auto-merge via the
+    /// to `gh`, and `auto-merge` (OPERATOR-ONLY since #8410/#8427 — no Loom
+    /// merge path calls it) arms GitHub's server-side auto-merge via the
     /// `enablePullRequestAutoMerge` GraphQL mutation (no working-tree
-    /// checkout). Gitea declines with exit code 3 so the caller's shell path
-    /// (`merge-pr.sh`'s `forge_auto_merge`, or the `gh` read fallback) carries
-    /// it. Forge config resolves from the canonical repo root (never a
+    /// checkout). Gitea declines with exit code 3 (the `gh` read fallback
+    /// carries reads; there is no Gitea auto-merge arm). Forge config resolves from the canonical repo root (never a
     /// worktree CWD); see `forge_cmd.rs` for the full #4061 semantics.
     ///
     /// NOTE (#5047): the byte-identical passthrough means `forge issue
@@ -1890,12 +1890,26 @@ enum ForgeAction {
         issue: u32,
     },
 
-    /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]` —
-    /// enable auto-merge for a PR (formerly `loom-auto-merge`). GitHub:
-    /// `enablePullRequestAutoMerge` GraphQL mutation. Gitea: declines (exit
-    /// 3) → shell `forge_auto_merge`. `--poll-interval` / `--timeout` are
-    /// accepted for CLI compatibility and ignored on GitHub (the server
-    /// queues the merge).
+    /// OPERATOR-ONLY: arm GitHub's server-side auto-merge for a PR. Not a
+    /// Loom merge path — use `merge-pr.sh` instead.
+    ///
+    /// SAFETY CAVEAT (#8410, #8427): once armed, GitHub merges the PR as soon
+    /// as the branch ruleset's REQUIRED checks pass. It does NOT re-read the
+    /// `loom:pr` label, a later `loom:verdict-stale` / `loom:changes-requested`
+    /// revocation, or any non-required test suite — PR #8220 merged exactly
+    /// that way over a revoked verdict with five suites still running. No Loom
+    /// merge path arms a server-side merge: `merge-pr.sh --auto` waits for the
+    /// head's check-runs to settle, re-validates, and merges in-process. Use
+    /// this verb only when a human deliberately wants a queued merge and
+    /// accepts that it bypasses Loom's merge-time gates. Kept (rather than
+    /// deleted) as a CLI compatibility surface for installed pre-#8410
+    /// `merge-pr.sh` copies.
+    ///
+    /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]`
+    /// (formerly `loom-auto-merge`). GitHub: `enablePullRequestAutoMerge`
+    /// GraphQL mutation. Gitea: declines (exit 3) — there is no Gitea arm.
+    /// `--poll-interval` / `--timeout` are accepted for CLI compatibility and
+    /// ignored (the server queues the merge).
     #[command(name = "auto-merge")]
     AutoMerge {
         /// Pull request number.
@@ -1915,13 +1929,13 @@ enum ForgeAction {
         #[arg(long, value_name = "SHA")]
         expected_head_sha: Option<String>,
 
-        /// Seconds between CI polls (Gitea shell path only). Accepted for
-        /// compatibility; unused on the GitHub native path.
+        /// Seconds between CI polls. Accepted for CLI compatibility only;
+        /// ignored (the retired Gitea shell poller was its only reader).
         #[arg(long, value_name = "SECONDS")]
         poll_interval: Option<u64>,
 
-        /// Max seconds to wait for CI (Gitea shell path only). Accepted for
-        /// compatibility; unused on the GitHub native path.
+        /// Max seconds to wait for CI. Accepted for CLI compatibility only;
+        /// ignored (the retired Gitea shell poller was its only reader).
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
     },

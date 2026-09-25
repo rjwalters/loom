@@ -155,10 +155,11 @@ error_head_moved() {
 # one means the PR's BASE fell behind and a rebase-and-retry is correct;
 # this one means the PR's OWN head moved, so retrying would either fail again
 # or silently merge a different diff than the one that was approved). String
-# provenance is documented on forge_merge_pr / forge_auto_merge in
-# lib/forge-helpers.sh — GitHub REST and Gitea are verified against each
-# forge's own source/spec; the GitHub GraphQL (auto-merge) string is
-# best-effort pending a live-incident confirmation.
+# provenance is documented on forge_merge_pr in lib/forge-helpers.sh —
+# GitHub REST and Gitea are verified against each forge's own source/spec; the
+# GitHub GraphQL (auto-merge) string, from the retired server-side arm (#8427),
+# is best-effort and kept only so an operator-armed merge's error still
+# classifies.
 _is_head_mismatch_response() {
   echo "$1" | grep -Eiq 'Head branch was modified\.|head out of date|expectedHeadOid'
 }
@@ -2223,9 +2224,9 @@ _revalidate_merge_guards() {
 }
 
 if [[ "$AUTO_MERGE" == "true" ]]; then
-  # Bounded poll window (#3664). Reuses the same env-var names/semantics as the
-  # shell Gitea auto-merge poller (forge_auto_merge in lib/forge-helpers.sh) so
-  # both forges share configuration. Defaults: 30s interval, 600s ceiling —
+  # Bounded poll window (#3664). The env-var names/semantics date from the
+  # retired shell Gitea auto-merge poller (removed by #8427) and are kept for
+  # config compatibility. Defaults: 30s interval, 600s ceiling —
   # raise LOOM_AUTO_MERGE_TIMEOUT on a repo whose CI runs longer than that.
   LOOM_AUTO_MERGE_POLL_INTERVAL="${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}"
   LOOM_AUTO_MERGE_TIMEOUT="${LOOM_AUTO_MERGE_TIMEOUT:-600}"
