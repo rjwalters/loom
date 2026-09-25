@@ -206,26 +206,21 @@ check_config() {
     if [[ "$has_terminals" != "true" ]]; then
         echo -e "${RED}Error: No Loom config with a non-empty \`terminals\` array found in any tier.${NC}" >&2
         echo "" >&2
-        # Session mode (#8884) reaches this refusal BY DESIGN: the install wrote
-        # `terminals: []` on purpose. The refusal itself is unchanged (this
-        # function is the guard session mode relies on -- #8884 deliberately
-        # added no second one); only the diagnosis is, because "have you
-        # initialized Loom?" is actively wrong advice for a repo that installed
-        # itself this way and would send an operator into a needless reinstall.
-        if [[ "$(echo "$EFFECTIVE_CONFIG" | jq -r '.mode // ""' 2>/dev/null)" == "session" ]]; then
-            echo "This repository is installed in SESSION MODE (\`\"mode\": \"session\"\` in .loom/config.json):" >&2
-            echo "roles are invoked by an attended operator, so no tmux agent pool is configured." >&2
-            echo "This refusal is expected -- use the slash commands (/loom:builder, /loom:sweep, ...)" >&2
-            echo "instead. See .loom/docs/session-mode.md to leave session mode." >&2
-            exit 1
-        fi
         echo "Searched (lowest to highest precedence):" >&2
         while IFS= read -r tier_path; do
             echo "  - $tier_path" >&2
         done < <(_loom_start_config_tiers "$REPO_ROOT")
         echo "" >&2
-        echo "Have you initialized Loom in this repository?" >&2
-        echo "Run: ./scripts/install-loom.sh" >&2
+        # A SESSION MODE install (#8884) reaches this refusal BY DESIGN -- it
+        # wrote `terminals: []` on purpose -- so the hint names both causes
+        # rather than sending such an operator into a needless reinstall. It is
+        # stated unconditionally, not behind a `.mode == "session"` test: this
+        # file is `contract` shell in epic #7810's portable pool, which may not
+        # grow, and a static line costs nothing while a branch costs 7 lines.
+        # The refusal itself is unchanged -- #8884 deliberately added no second
+        # guard, because this function already is the guard.
+        echo "Have you initialized Loom here (./scripts/install-loom.sh)? A session-mode" >&2
+        echo "install (\`\"mode\": \"session\"\`) lands here by design -- see .loom/docs/session-mode.md." >&2
         exit 1
     fi
 }
