@@ -73,6 +73,28 @@ fn run(command: &mut Command) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// True once something on `address` answers as an HTTP server. Any HTTP status
+/// counts: the point is that the OTLP receiver owns the socket, which a TCP
+/// connect to a Docker-published port cannot establish.
+fn receiver_ready(address: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut stream) = std::net::TcpStream::connect(address) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    if stream
+        .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut bytes = [0; 64];
+    stream
+        .read(&mut bytes)
+        .is_ok_and(|n| n >= 5 && &bytes[..5] == b"HTTP/")
+}
+
 fn observability_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../defaults/observability")
@@ -144,8 +166,34 @@ impl Stack {
         stack
     }
 
+    /// The collector's own output. It logs to stderr, so both streams are kept;
+    /// this is diagnostics for a failure message and never asserts itself.
+    fn collector_logs(&self) -> String {
+        Command::new("docker")
+            .args(["logs", &self.collector])
+            .output()
+            .map_or_else(
+                |error| format!("<docker logs failed: {error}>"),
+                |output| {
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                },
+            )
+    }
+
     /// The collector exits non-zero when its exporter cannot reach ClickHouse,
     /// so a dead container is reported with its logs instead of as a timeout.
+    ///
+    /// Readiness is an HTTP answer, not a TCP connect. Docker's port publisher
+    /// accepts on the host port as soon as the container starts, before the
+    /// OTLP receiver inside is listening, and the collector starts its
+    /// receiver only after the ClickHouse exporter has created its schema. A
+    /// bare connect therefore reports ready early, and every export in that
+    /// gap is reset (#8829: all 7 envelopes `retry_scheduled`, `transport
+    /// failed`). Same probe as `otlp_collector.rs`.
     fn wait_for_collector(&self) -> String {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -159,7 +207,7 @@ impl Stack {
                 state.trim() == "running",
                 "collector is {} — logs:\n{}",
                 state.trim(),
-                run(Command::new("docker").args(["logs", &self.collector]))
+                self.collector_logs()
             );
             let port = Command::new("docker")
                 .args(["port", &self.collector, "4318/tcp"])
@@ -172,11 +220,15 @@ impl Stack {
                     .unwrap_or_default()
                     .trim()
                     .to_owned();
-                if !address.is_empty() && std::net::TcpStream::connect(&address).is_ok() {
+                if !address.is_empty() && receiver_ready(&address) {
                     return address;
                 }
             }
-            assert!(Instant::now() < deadline, "collector never published 4318");
+            assert!(
+                Instant::now() < deadline,
+                "collector's OTLP receiver never answered HTTP on 4318 — logs:\n{}",
+                self.collector_logs()
+            );
             std::thread::sleep(Duration::from_millis(250));
         }
     }
@@ -313,14 +365,25 @@ fn committed_cycle_time_artifacts_answer_the_canonical_questions_on_real_exporte
     std::fs::write(&envelopes, render_fixture(&template, now)).unwrap();
     let key = workdir.path().join("key");
     std::fs::write(&key, "synthetic-test-key\n").unwrap();
-    run(Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+    let export = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
         .arg("telemetry-export")
         .arg("--input")
         .arg(&envelopes)
         .arg("--endpoint")
         .arg(format!("http://{address}"))
         .arg("--key-file")
-        .arg(&key));
+        .arg(&key)
+        .output()
+        .unwrap();
+    // The exporter never copies receiver text into its diagnostics, so the
+    // collector's side of a refused batch is only visible in its own logs.
+    assert!(
+        export.status.success(),
+        "telemetry-export failed: {}\n{}\ncollector logs:\n{}",
+        String::from_utf8_lossy(&export.stdout),
+        String::from_utf8_lossy(&export.stderr),
+        stack.collector_logs()
+    );
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
