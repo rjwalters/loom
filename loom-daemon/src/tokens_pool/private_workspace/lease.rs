@@ -12,6 +12,11 @@ pub struct Job {
     pub container_id: String,
     pub base_revision: String,
     pub host_pid: u32,
+    /// Control-boundary identity bound at admission (issue #8839). Defaulted so
+    /// a lease written before this protocol still deserializes — as an empty
+    /// identity, which every recheck refuses rather than treating as proven.
+    #[serde(default)]
+    pub control: String,
 }
 
 /// The open file owns process exclusion; the durable JSON owns uncertainty

@@ -140,6 +140,57 @@ RUN npm install -g "@openai/codex@${CODEX_VERSION}" \
          exit 1; \
        fi
 
+# --- Private-session control bundle (issue #8839) ----------------------
+# The image-owned half of the `loom-private-control-v1` boundary: every guard
+# script a private Codex session's `pre_tool_use` hook executes, plus every
+# library those guards source, staged OUTSIDE the worker's clone and sealed by
+# digest. A private session's registered hook names
+# /opt/loom/private-control/hooks/guard-codex-bridge.sh, so deleting or
+# rewriting the copies in the worker's own writable clone changes nothing about
+# enforcement — the demonstrated escalation in #8839.
+#
+# root-owned + `chmod a-w` + the container's read-only rootfs
+# (`session_lifecycle`/`private_workspace::docker::create` runs with
+# `--read-only` and uid 1000) are three independent reasons the worker cannot
+# write here; `loom-daemon private-workspace control` additionally PROVES
+# non-writability at every admission rather than trusting any of them.
+#
+# guard-destructive.sh is deliberately a COPY OF THE GENERIC GUARD, not the
+# dispatcher: the dispatcher prefers
+# $LOOM_PROJECT_ROOT/.claude/skills/repo/hooks/guard-destructive.sh, which
+# inside a private session is a worker-writable path — "switch to another
+# guard" is exactly one of the routes this boundary has to close. The seal step
+# refuses to build if those two digests ever diverge.
+USER root
+COPY defaults/hooks/guard-codex-bridge.sh \
+     defaults/hooks/guard-destructive-generic.sh \
+     defaults/hooks/guard-loom-workflow.sh \
+     defaults/hooks/guard-worktree-paths.sh \
+     /opt/loom/private-control/hooks/
+COPY defaults/hooks/guard-destructive-generic.sh /opt/loom/private-control/hooks/guard-destructive.sh
+COPY defaults/scripts/lib/canonical-path.sh \
+     defaults/scripts/lib/config-resolver.sh \
+     defaults/scripts/lib/default-branch.sh \
+     defaults/scripts/lib/installed-file-guard.sh \
+     defaults/scripts/lib/worktree-root.sh \
+     /opt/loom/private-control/scripts/lib/
+# The hook provisioner is sealed here too, because it both WRITES and CHECKS
+# the readiness evidence: running the clone's copy would let a worker certify
+# its own readiness by replacing one tracked file. Sealed beside the bridge, so
+# its own default resolution ($SCRIPT_DIR/../hooks/guard-codex-bridge.sh)
+# already lands inside this bundle.
+COPY defaults/scripts/provision-codex-hooks.sh /opt/loom/private-control/scripts/
+# Seal with the Codex CLI actually installed above on PATH — the manifest
+# records the OBSERVED version, never the build argument, so a bumped pin
+# cannot claim compatibility it did not demonstrate. Fails the build if the
+# CLI is missing, below the schema floor, or if any declared asset is absent.
+RUN PATH="/home/loom/.npm-global/bin:${PATH}" \
+      loom-daemon private-workspace seal-control --root /opt/loom/private-control \
+    && chown -R root:root /opt/loom/private-control \
+    && chmod -R a-w /opt/loom/private-control \
+    && chmod -R a+rX /opt/loom/private-control
+USER loom
+
 # --- CODEX_HOME convention --------------------------------------------
 # Empty at build time (mount point, not baked content) — a per-account
 # Codex profile volume binds over this path at container-start time

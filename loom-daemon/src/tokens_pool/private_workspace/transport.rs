@@ -60,6 +60,10 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
     if state["Id"] != job.container_id || args.container != config.container {
         bail!("private session identity changed before spawn");
     }
+    // Immediately before launch, on the exact container/lease being launched:
+    // guard code, forced policy, hook registration and readiness receipt must
+    // still hash to the identity bound at admission (issue #8839).
+    docker::recheck_control(&config, &job.container_id, &job.control)?;
     args.container = job.container_id.clone();
     args.workdir = REPO.into();
     args.env = child_env(&args.env, &config, &job)?;
@@ -148,6 +152,12 @@ fn child_env(input: &[String], config: &Config, job: &lease::Job) -> Result<Vec<
     if let Some(issue) = job.issue {
         env.push(format!("LOOM_PRIVATE_ISSUE={issue}"));
     }
+    // Forced guard policy and the bound control identity. Both are set by this
+    // host on the container process itself, so no worker-writable configuration
+    // tier can weaken a guard category and no in-container process can forge
+    // the identity its own boundary is rechecked against (issue #8839).
+    env.extend(bundle::policy_env());
+    env.push(format!("LOOM_PRIVATE_CONTROL={}", job.control));
     for name in FORGE_ENV {
         if std::env::var_os(name).is_some() {
             env.push(name.into());
@@ -181,6 +191,7 @@ mod tests {
             container_id: "a".repeat(64),
             base_revision: String::new(),
             host_pid: 1,
+            control: "b".repeat(64),
         };
         let env = child_env(
             &[

@@ -45,8 +45,12 @@ fn setup() -> Result<()> {
     if repo.canonicalize()? != repo || !repo.join(".git").is_dir() {
         bail!("private setup requires the owned clone");
     }
+    let control = Path::new(bundle::CONTROL_ROOT);
     // Loom's own source installs ignored helper symlinks. Consumer repositories
     // carry installed helpers in Git. Never copy host scripts into the worker.
+    // `.loom/hooks` is the one entry that may point OUT of the clone: when the
+    // image ships a control bundle, the worker's own view of the guards is that
+    // read-only bundle rather than the writable `defaults/hooks` it could edit.
     for (installed, source) in [
         (".loom/scripts", "defaults/scripts"),
         (".loom/hooks", "defaults/hooks"),
@@ -54,36 +58,70 @@ fn setup() -> Result<()> {
         (".claude/commands/loom", "defaults/.claude/commands/loom"),
     ] {
         let target = repo.join(installed);
+        // Redirect only a link this setup would have created anyway. A clone
+        // whose repository ships no `defaults/hooks` gets no new path here:
+        // materializing one would leave the clone untracked-dirty, which the
+        // next admission's `prepare` correctly refuses.
+        let bundled = installed == ".loom/hooks" && control.join("hooks").is_dir();
         if !target.exists() && repo.join(source).is_dir() {
             std::fs::create_dir_all(target.parent().unwrap())?;
-            std::os::unix::fs::symlink(repo.join(source), &target)?;
+            let link = if bundled {
+                control.join("hooks")
+            } else {
+                repo.join(source)
+            };
+            std::os::unix::fs::symlink(link, &target)?;
         }
-        if !target.canonicalize()?.starts_with(repo) {
-            bail!("installed private helper escaped its clone");
+        // A helper that does not exist cannot escape anything: a repository
+        // carrying no installed Loom surface at all is a supported private
+        // clone, it simply has no managed guard registration to establish.
+        if target.exists() {
+            let resolved = target.canonicalize()?;
+            if !resolved.starts_with(repo) && !resolved.starts_with(control) {
+                bail!("installed private helper escaped its clone");
+            }
         }
     }
     control::audit()?;
-    let helper = repo.join(".loom/scripts/provision-codex-hooks.sh");
-    if helper.is_file() {
-        let status = Command::new("bash")
+    // Only a repository that ships Loom's installed surface has a managed hook
+    // to establish. The provisioner that is RUN, though, is the image-owned
+    // copy whenever the session image carries a control bundle: it both writes
+    // and checks the readiness evidence, so executing the clone's copy would
+    // let a worker certify its own readiness by replacing one tracked file.
+    if !repo
+        .join(".loom/scripts/provision-codex-hooks.sh")
+        .is_file()
+    {
+        return Ok(());
+    }
+    let bundled = control.join(bundle::PROVISIONER);
+    let helper = if bundled.is_file() {
+        bundled
+    } else {
+        repo.join(".loom/scripts/provision-codex-hooks.sh")
+    };
+    // Register the image-owned bridge explicitly. Without it the managed entry
+    // would name a path inside the clone, where deleting one file removes
+    // enforcement for the whole session (issue #8839).
+    let bridge = control.join("hooks/guard-codex-bridge.sh");
+    let mut common = vec!["--codex-home", PROFILE, "--workspace", REPO];
+    if bridge.is_file() {
+        common.extend(["--bridge", bridge.to_str().context("bridge path")?]);
+    }
+    let status = Command::new("bash")
+        .arg(&helper)
+        .arg("verify")
+        .args(&common)
+        .arg("--json")
+        .output()?;
+    if !status.status.success() {
+        let result = Command::new("bash")
             .arg(&helper)
-            .args([
-                "verify",
-                "--codex-home",
-                PROFILE,
-                "--workspace",
-                REPO,
-                "--json",
-            ])
+            .arg("install")
+            .args(&common)
             .output()?;
-        if !status.status.success() {
-            let result = Command::new("bash")
-                .arg(&helper)
-                .args(["install", "--codex-home", PROFILE, "--workspace", REPO])
-                .output()?;
-            if !result.status.success() {
-                bail!("private hook provisioning failed; inspect the account locally");
-            }
+        if !result.status.success() {
+            bail!("private hook provisioning failed; inspect the account locally");
         }
     }
     Ok(())
@@ -102,8 +140,32 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
             .map_err(|e| anyhow::anyhow!(e.diagnostic()))?;
     }
     let (bin, args) = command.split_first().context("private command missing")?;
-    let error = Command::new(bin).args(args).current_dir(REPO).exec();
+    let mut child = Command::new(bin);
+    child.args(args).current_dir(REPO);
+    // The last check before the model runs, on the boundary the host bound at
+    // admission. Nothing has started yet — the session was proven idle — so a
+    // boundary that is Ready here is the boundary Codex will read its hook
+    // registration from, and the forced policy is applied on this exact exec.
+    control_boundary(&mut child)?;
+    let error = child.exec();
     Err(error.into())
+}
+
+/// Recheck the bound control identity in-container and force the pinned policy.
+/// The bound identity arrives in this process's environment from the host's
+/// `docker exec`, which the worker cannot write.
+fn control_boundary(child: &mut Command) -> Result<()> {
+    let bound = std::env::var("LOOM_PRIVATE_CONTROL").unwrap_or_default();
+    let root = Path::new(bundle::CONTROL_ROOT);
+    if bound.is_empty() && bundle::manifest(root)?.is_none() {
+        // A session image without the control boundary keeps the pre-#8839
+        // behavior of host and shared-mount sessions: unchanged, and still
+        // gated by the unchanged `partial` hook/worktree-isolation capability.
+        return Ok(());
+    }
+    bundle::rebind(&bundle::observe(root, Path::new(PROFILE)), Path::new(PROFILE), &bound)?;
+    bundle::apply_policy(child);
+    Ok(())
 }
 
 pub(super) fn check_host_job() -> Result<()> {

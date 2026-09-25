@@ -49,7 +49,10 @@ pub(super) fn run_role_with_timeout(
     // dispatch, mirroring the sweep path's `sweep_id=` anchor (a fresh log
     // line above the anchor never leaks into an OLDER tick's scan, and this
     // tick's own scan never reads a STALE record left by a previous one).
-    let tick_anchor = chrono::Utc::now().to_rfc3339();
+    // Issue #8504: `Z`, not `+00:00`, matching every other UTC stamp this
+    // crate writes — `tick_anchor` is used purely as an opaque string anchor
+    // (never re-parsed as a datetime), so this is a pure formatting change.
+    let tick_anchor = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
 
     {
         use std::io::Write;

@@ -157,6 +157,13 @@ impl SweepRegistry {
             cmd.arg("--use-wrapper");
         }
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"));
+        // Issue #8835: the sweep's own id, bare and unprefixed, so anything
+        // the sweep spawns can attribute its work back to the sweep that
+        // caused it — see [`child_env_markers::SWEEP_ID_ENV`] for why it is a
+        // second variable rather than a derivation of LOOM_TERMINAL_ID, and
+        // why it is set for every dispatch kind while the two `Issue`-scoped
+        // markers below are not.
+        cmd.env(child_env_markers::SWEEP_ID_ENV, sweep_id);
         // The two `Issue`-scoped child markers — `LOOM_SWEEP_CLAIM_OWNED`
         // (#3823/#4111/#5342) and the lease-renewal capability marker
         // (#7672) — are set for an `Issue` dispatch and *cleared* for a

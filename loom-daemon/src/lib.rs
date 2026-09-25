@@ -173,6 +173,7 @@ pub mod forge_check_open_pr;
 pub mod forge_cmd;
 pub mod forge_events;
 pub mod forge_listing;
+pub mod forge_merge_method;
 pub mod forge_parser;
 pub mod gh_repo_env;
 pub mod git_parser;

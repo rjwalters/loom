@@ -26,6 +26,7 @@ import {
   persistentRoleTickFailureFixture,
   rosterMissingSnapshot,
   unprotectedHostProtectionFixture,
+  DEGRADED_HOST_HALT_REASON,
 } from "./fixtures";
 
 const view = () => buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
@@ -198,7 +199,7 @@ describe("hostCard", () => {
     expect(codexLabel.textContent).toBe("Codexpool");
     // The degraded badge names the spent provider, not a blended pool.
     expect(card.querySelector('[data-testid="status-badge"]')?.getAttribute("title")).toBe(
-      "claude token pool at or near exhaustion",
+      "claude token pool exhausted — nothing left to dispatch on",
     );
   });
 
@@ -245,7 +246,7 @@ describe("hostCard", () => {
         hosts: {
           h: {
             health: {
-              record: { kind: "host.health", dispatch_halted: true, halt_reason: "host-distress breaker" },
+              record: { kind: "host.health", dispatch_halted: true, halt_reason: DEGRADED_HOST_HALT_REASON },
               updatedAt: isoMinutesBefore(1),
             },
           },
@@ -257,7 +258,30 @@ describe("hostCard", () => {
     const card = hostCard(findHost(built, "h")!, NOW);
     const badge = card.querySelector('[data-testid="status-badge"]');
     expect(badge?.getAttribute("data-status")).toBe("degraded");
-    expect(badge?.getAttribute("title")).toBe("dispatch halted: host-distress breaker");
+    expect(badge?.getAttribute("title")).toBe(`dispatch halted: ${DEGRADED_HOST_HALT_REASON}`);
+  });
+
+  it("badges a breaker-paused host 'Throttled', naming the pause in its tooltip (#8832)", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: {
+              record: { kind: "host.health", dispatch_halted: true, halt_reason: "host-distress breaker" },
+              updatedAt: isoMinutesBefore(1),
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    const card = hostCard(findHost(built, "h")!, NOW);
+    const badge = card.querySelector('[data-testid="status-badge"]');
+    expect(badge?.getAttribute("data-status")).toBe("throttled");
+    expect(badge?.textContent).toBe("Throttled");
+    expect(badge?.getAttribute("title")).toBe("dispatch paused: host-distress breaker");
+    expect(card.classList.contains("card--throttled")).toBe(true);
   });
 
   it("falls back to a generic tooltip when a degraded host has no specific reason recorded", () => {
@@ -739,6 +763,7 @@ describe("hostCountText (#8804)", () => {
     needsAttention: 0,
     roleTicks: undefined,
     activeCompute: [],
+    unattributedCompute: [],
     leakedCompute: 0,
   };
 
@@ -758,5 +783,78 @@ describe("hostCountText (#8804)", () => {
     expect(hostCountText({ ...base, reportingHosts: 0, missingHosts: 3, unprovisionedHosts: 1 })).toBe(
       "4 hosts (0 reporting, 3 missing, 1 unprovisioned)",
     );
+  });
+});
+
+/**
+ * Issue #8835 — a sweep's live compute jobs, nested under it on the overview
+ * card, and the flat "running compute" panel narrowed to what could not be
+ * nested.
+ */
+describe("fleetOverviewView — nested compute subprocesses (#8835)", () => {
+  const SWEEP_ID = "sweep-issue-8835-1";
+  const snapshot = (activeCompute: unknown[]) => ({
+    hosts: { "host-a": { health: { record: { kind: "host.health" }, updatedAt: NOW.toISOString() } } },
+    activeSweeps: [
+      {
+        hostId: "host-a",
+        sweepId: SWEEP_ID,
+        repo: "rjwalters/loom",
+        issue: 8835,
+        phase: "builder",
+        startedAt: "2026-09-19T12:00:00Z",
+      },
+    ],
+    activeCompute,
+  });
+  const computeJob = {
+    hostId: "2am-elastic",
+    jobId: "job-abc123",
+    instanceType: "c7i.4xlarge",
+    region: "us-east-1",
+    spot: true,
+    startedAt: "2026-09-19T12:00:00Z",
+  };
+  const render = (activeCompute: unknown[]) =>
+    fleetOverviewView(buildFleetView(parseFleetSnapshot(snapshot(activeCompute)), NOW), NOW, {
+      authenticated: true,
+    });
+
+  it("nests the job under its sweep in the card's sweep list", () => {
+    const rendered = render([{ ...computeJob, sweepId: SWEEP_ID }]);
+    const sweepEntry = rendered.querySelector('[data-testid="card-sweeps"] .card__sweep')!;
+    const nested = sweepEntry.querySelector('[data-testid="sweep-subprocesses"]');
+    expect(nested).not.toBeNull();
+    const entry = nested!.querySelector('[data-testid="subprocess"]')!;
+    expect(entry.getAttribute("data-job")).toBe("job-abc123");
+    expect(entry.textContent).toContain("c7i.4xlarge · us-east-1 · spot");
+  });
+
+  it("drops the nested job from the flat running-compute panel but not from the headline count", () => {
+    const rendered = render([{ ...computeJob, sweepId: SWEEP_ID }]);
+    // Nothing left unattributed, so the panel has nothing to say and does not
+    // render — but the fleet is still visibly running one job.
+    expect(rendered.querySelector('[data-testid="running-compute"]')).toBeNull();
+    expect(rendered.querySelector('[data-testid="fleet-compute-summary"]')?.textContent).toBe("1 compute job");
+  });
+
+  it("keeps an unattributable job in the running-compute panel, leak flag and all", () => {
+    // The safety property: a job whose sweep is not live has no card entry to
+    // hide under, so it must still be listed — and still flagged.
+    const rendered = render([{ ...computeJob, sweepId: "sweep-long-finished", leaked: true }]);
+    expect(rendered.querySelector('[data-testid="card-sweeps"] [data-testid="sweep-subprocesses"]')).toBeNull();
+    const panel = rendered.querySelector('[data-testid="running-compute"]')!;
+    expect(panel.querySelector('[data-testid="compute-row"]')?.getAttribute("data-job")).toBe("job-abc123");
+    expect(panel.querySelector('[data-testid="compute-leaked-count"]')?.textContent).toBe("1 possibly leaked");
+    expect(rendered.querySelector('[data-testid="fleet-compute-summary"]')?.textContent).toBe(
+      "1 compute job · 1 possibly leaked",
+    );
+  });
+
+  it("renders a sweep with no compute jobs exactly as before", () => {
+    const rendered = render([]);
+    const sweepEntry = rendered.querySelector('[data-testid="card-sweeps"] .card__sweep')!;
+    expect(sweepEntry.querySelector('[data-testid="sweep-subprocesses"]')).toBeNull();
+    expect(rendered.querySelector('[data-testid="running-compute"]')).toBeNull();
   });
 });
