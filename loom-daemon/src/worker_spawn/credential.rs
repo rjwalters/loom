@@ -99,6 +99,21 @@ impl Resolved {
             command.env(target, value);
         }
     }
+
+    /// The value resolved for one child variable.
+    ///
+    /// The single exception to "the value only ever reaches the child's
+    /// environment" (issue #8674): the egress proxy holds the credential on
+    /// the HOST and hands the child a placeholder, which is strictly less
+    /// exposure than [`Self::apply`] — the value never crosses the container
+    /// boundary at all. Deliberately `pub(super)`, so the only callers are
+    /// inside `worker_spawn`.
+    pub(super) fn value_for(&self, target: &str) -> Option<&std::ffi::OsStr> {
+        self.injected
+            .iter()
+            .find(|(name, _)| name == target)
+            .map(|(_, value)| value.as_os_str())
+    }
 }
 
 /// The pool provider namespace a profile's credential belongs to: an explicit
@@ -236,6 +251,7 @@ mod tests {
             provider_options: None,
             provider_definition: None,
             credential_pool: pool.map(str::to_string),
+            credential_proxy: None,
         }
     }
 

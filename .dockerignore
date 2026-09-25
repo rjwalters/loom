@@ -17,3 +17,25 @@
 !dist/**
 !docker/
 !docker/**
+# The private-session control bundle (issue #8839): docker/session/Dockerfile
+# stages these exact files into an image-owned, digest-sealed
+# /opt/loom/private-control/ so a private Codex session's guard code, the
+# libraries those guards source, and the hook provisioner all live OUTSIDE the
+# worker-writable clone. Enumerated file-by-file rather than as `!defaults/**`
+# on purpose: nothing else under defaults/ (roles, docs, slash commands,
+# runtimes) belongs in a session image, and an allow-all here would let a
+# future wildcard COPY pull it in silently. Every entry below is also named in
+# bundle.rs's sealed asset list, and `seal-control` fails the build if one is
+# missing — so a stale allowlist entry cannot degrade into a bundle that ships
+# a guard without the library it sources.
+!defaults/
+!defaults/hooks/guard-codex-bridge.sh
+!defaults/hooks/guard-destructive-generic.sh
+!defaults/hooks/guard-loom-workflow.sh
+!defaults/hooks/guard-worktree-paths.sh
+!defaults/scripts/provision-codex-hooks.sh
+!defaults/scripts/lib/canonical-path.sh
+!defaults/scripts/lib/config-resolver.sh
+!defaults/scripts/lib/default-branch.sh
+!defaults/scripts/lib/installed-file-guard.sh
+!defaults/scripts/lib/worktree-root.sh

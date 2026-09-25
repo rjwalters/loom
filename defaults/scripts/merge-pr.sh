@@ -265,6 +265,7 @@ Options:
                          commit so CI re-dates every check, then exit 4 without
                          merging — never a bypass, one push per head, a repeat
                          block escalates to a loom:operator hold (#8508).
+  --merge-method M       Request squash|merge|rebase instead of auto-detect; validated via loom-daemon against the repo's actually-allowed strategies — fails rather than silently falling back to squash if disallowed (#8845).
   --no-cleanup-primary   Skip automatic primary-checkout branch cleanup (#5015).
                          When the merged branch is checked out in the PRIMARY
                          repo checkout (not a worktree), the script normally
@@ -475,6 +476,9 @@ ALLOW_STACKED_CHILDREN=false
 # (_check_loom_pr_label below). Off by default — a missing loom:pr label
 # hard-blocks the merge unless the operator explicitly opts in here.
 ALLOW_UNAPPROVED=false
+# MERGE_METHOD_REQUESTED (#8845): explicit --merge-method override, resolved
+# against REPO_MERGE_METHOD (set above from auto-detect) once parsing is done.
+MERGE_METHOD_REQUESTED=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -495,20 +499,41 @@ while [[ $# -gt 0 ]]; do
     --allow-stacked-children) ALLOW_STACKED_CHILDREN=true; shift ;;
     --allow-unapproved) ALLOW_UNAPPROVED=true; shift ;;
     --redate-stale-checks) REDATE_STALE_CHECKS=true; shift ;;
+    # #8845's --merge-method arm is paid for by flattening the `*)` positional
+    # arm below onto one line — the shell-budget ratchet's option 2
+    # (.loom/docs/shell-language-policy.md), same offsetting convention
+    # --worktree-path and _check_required_check_freshness already document in
+    # this file. Validation here is vocabulary-only (mirrors PR_NUMBER's own
+    # ^[0-9]+$ check below); which methods the REPO actually allows is decided
+    # in loom-daemon (loom-daemon/src/forge_cmd.rs), not here.
+    --merge-method) [[ $# -lt 2 ]] && error "--merge-method requires a value"; case "$2" in squash|merge|rebase) ;; *) error "--merge-method must be one of: squash, merge, rebase (got: $2)" ;; esac; MERGE_METHOD_REQUESTED="$2"; shift 2 ;;
     -*)  error "Unknown option: $1" ;;
-    *)
-      if [[ -z "$PR_NUMBER" ]]; then
-        PR_NUMBER="$1"
-      else
-        error "Unexpected argument: $1"
-      fi
-      shift
-      ;;
+    *) if [[ -z "$PR_NUMBER" ]]; then PR_NUMBER="$1"; else error "Unexpected argument: $1"; fi; shift ;;
   esac
 done
 
-[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--no-cleanup-primary] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children] [--allow-unapproved] [--redate-stale-checks]"
+[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--no-cleanup-primary] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children] [--allow-unapproved] [--redate-stale-checks] [--merge-method squash|merge|rebase]"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || error "PR number must be numeric: $PR_NUMBER"
+
+# #8845: an explicit --merge-method overrides REPO_MERGE_METHOD's auto-detect
+# above, but only after loom-daemon VALIDATES it against the repo's actually
+# allowed strategies (loom-daemon/src/forge_cmd.rs, `forge merge-method`) --
+# exit 0 = allowed (its stdout is the method, unchanged); exit 1 = requested
+# but disallowed, a hard refusal naming the allowed set (never a silent
+# fallback to squash, the #8845 bug); any other exit (no daemon, or a Gitea
+# decline -- gitea repo-settings probing isn't native yet) degrades to the
+# unvalidated request as-is, same as this script's pre-#8845 posture toward
+# an unverifiable input, with a warning so the gap is visible rather than silent.
+# #8878: the binary probed and invoked is LOOM_DAEMON_BIN when set (as
+# _check_required_check_freshness already does) -- that override is exactly what
+# _mp_daemon_roll_hint tells operators to export when no released daemon carries
+# `forge merge-method` yet, so probing PATH's older binary instead threw away the
+# validation they had just built and degraded to the unvalidated path anyway.
+# The expansion is repeated inline rather than hoisted into a variable on this
+# same line: check-daemon-subcommand-versions.sh only registers a binary-holding
+# variable from a LINE-LEADING assignment, so a mid-line one would make the
+# requires-daemon marker below read as stale (verified -- it fires).
+if [[ -n "$MERGE_METHOD_REQUESTED" ]]; then if command -v "${LOOM_DAEMON_BIN:-loom-daemon}" &>/dev/null; then _MPM_RC=0; _MPM_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge merge-method --repo "$REPO_NWO" --requested "$MERGE_METHOD_REQUESTED" 2>&1)" || _MPM_RC=$?; if [[ $_MPM_RC -eq 0 ]]; then REPO_MERGE_METHOD="$_MPM_OUT"; elif [[ $_MPM_RC -eq 1 ]]; then error "Merge blocked: $_MPM_OUT"; else warning "'${LOOM_DAEMON_BIN:-loom-daemon}' forge merge-method could not validate --merge-method $MERGE_METHOD_REQUESTED (exit $_MPM_RC: $_MPM_OUT); using it unvalidated"; REPO_MERGE_METHOD="$MERGE_METHOD_REQUESTED"; fi; else warning "loom-daemon not found ('${LOOM_DAEMON_BIN:-loom-daemon}'); using --merge-method $MERGE_METHOD_REQUESTED unvalidated"; REPO_MERGE_METHOD="$MERGE_METHOD_REQUESTED"; fi; fi
 
 # Validate --worktree-path early (before any network calls) so bad input
 # fails fast. The path must be a real directory and must appear in the
@@ -992,6 +1017,7 @@ _check_loom_pr_label
 #
 # requires-daemon: merge-pr >= 0.19.172   verdict-contradiction guard (#8112, landed in #8124)
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
+# requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 #
 # _mp_daemon_roll_hint <subcommand> [resolved-bin] -- the concrete, host-local
 # remediation for "your loom-daemon is too old for <subcommand>": the declared
@@ -1082,10 +1108,29 @@ _check_verdict_label_contradiction
 # window is the same one every non-ratchet change already runs in, and is not
 # the 22-hour exposure this guard exists to close.
 #
+# PLAN-GATED REPOSITORIES (#8844): on a PRIVATE repo owned by a GitHub Free
+# account or org, `GET /repos/{nwo}/rules/branches/{branch}` answers "HTTP 403:
+# Upgrade to GitHub Pro or make this repository public to enable this feature."
+# That used to fail the guard closed, i.e. block EVERY merge on such a repo
+# with no flag that helped. The daemon now recognises that ONE message (not the
+# status code — a missing token scope is a 403 too) as "this repository's plan
+# has no rulesets, so nothing can be a REQUIRED check", returns CLEAN, and says
+# so as a `Warning:` on stderr. Which is why the invocation below no longer
+# discards stderr: stdout still has to be exactly the sentinel (it is compared
+# for equality), so stderr is the only place that warning can go, and a
+# relaxation nobody sees is how a fail-open ships unnoticed. Every other
+# failure (network, auth scope, rate limit, 404, 5xx) still exits 2 and still
+# refuses the merge. That exit-2 reason arrives on STDOUT (the daemon captures
+# gh's own stderr internally), which is why the refusal below QUOTES the
+# captured $msg instead of overwriting it (#8873) — otherwise the operator got
+# a generic "could not run" naming neither the forge's complaint nor the real
+# remedy. The build/install remedy is only offered when the subcommand printed
+# NOTHING (missing binary, rc=127, or one too old to know the subcommand).
+#
 # This file is at its file-size-ratchet ceiling (file-size-policy.md), so the
 # function is one dense line and the two MAX_MERGE_RETRIES/MERGE_RETRY_DELAY
 # pairs below are joined (verbatim, behavior-preserving) to offset it.
-_check_required_check_freshness() { [[ "$FORGE_TYPE" == "github" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ -n "$base_ref" ]] || base_ref="${DEFAULT_BRANCH_NAME:-main}"; msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stale-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "$base_ref" 2>/dev/null)" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-STALE-CHECKS-CLEAN" ]] && return 0; [[ $rc -eq 1 ]] || msg="Merge blocked: PR #$PR_NUMBER's required-check freshness guard (#8248) could not run — 'loom-daemon merge-pr stale-checks' exited $rc without the LOOM-STALE-CHECKS-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'every required check is fresh' from 'never checked', so only a positive clean signal is accepted. Build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; if [[ "${REDATE_STALE_CHECKS:-false}" == "true" && $rc -eq 1 ]]; then local rd=0 out; out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr redate-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$PR_BRANCH" --expected-head-sha "$PR_HEAD_SHA" 2>&1)" || rd=$?; if [[ $rd -eq 0 ]]; then warning "$out"; warning "Exiting 4: the stale required checks were re-dated, not merged. CI is re-running on the new head; the merge is expected to be re-attempted (after a fresh Judge review, #5686) on a later pass."; exit 4; fi; msg="$msg"$'\n\n'"#8508 automated remedy did not produce fresh evidence: $out"; fi; error "$msg"; }
+_check_required_check_freshness() { [[ "$FORGE_TYPE" == "github" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ -n "$base_ref" ]] || base_ref="${DEFAULT_BRANCH_NAME:-main}"; msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stale-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "$base_ref")" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-STALE-CHECKS-CLEAN" ]] && return 0; if [[ $rc -ne 1 ]]; then local why=" It printed nothing, so the binary is most likely missing or predates the subcommand: build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; [[ -z "$msg" ]] || why=$'\n\n'"What it reported: $msg"; msg="Merge blocked: PR #$PR_NUMBER's required-check freshness guard (#8248) could not run — 'loom-daemon merge-pr stale-checks' exited $rc without the LOOM-STALE-CHECKS-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'every required check is fresh' from 'never checked', so only a positive clean signal is accepted.$why"; fi; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; if [[ "${REDATE_STALE_CHECKS:-false}" == "true" && $rc -eq 1 ]]; then local rd=0 out; out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr redate-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$PR_BRANCH" --expected-head-sha "$PR_HEAD_SHA" 2>&1)" || rd=$?; if [[ $rd -eq 0 ]]; then warning "$out"; warning "Exiting 4: the stale required checks were re-dated, not merged. CI is re-running on the new head; the merge is expected to be re-attempted (after a fresh Judge review, #5686) on a later pass."; exit 4; fi; msg="$msg"$'\n\n'"#8508 automated remedy did not produce fresh evidence: $out"; fi; error "$msg"; }
 _check_required_check_freshness
 
 # ---------------------------------------------------------------------------
@@ -2009,8 +2054,11 @@ _wait_for_checks_then_sync_merge() {
       # A check failed — classify against branch protection. A required failing
       # check can never merge on this SHA; refuse now. A lookup failure fails
       # closed (refuse), mirroring the UNSTABLE fallback.
+      # Stderr is NOT redirected here: #8872's plan-gate relaxation warns
+      # there, and a silent fail-open is exactly what that warning exists to
+      # prevent.
       local required lookup_rc=0
-      required="$(forge_get_required_status_check_contexts "$REPO_NWO" "$base_ref" "$GH" 2>/dev/null)" || lookup_rc=$?
+      required="$(forge_get_required_status_check_contexts "$REPO_NWO" "$base_ref" "$GH")" || lookup_rc=$?
       if [[ "$lookup_rc" -ne 0 ]]; then
         error "Failed to resolve required status checks for $base_ref (rc=$lookup_rc); refusing to merge PR #$PR_NUMBER with failing check(s) while auto-merge is disabled"
       fi
@@ -2326,7 +2374,8 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     if [[ -n "$_NRC_BASE_REF" ]] && [[ "$_NRC_MERGEABLE" == "true" ]]; then
       _NRC_REQUIRED=""
       _NRC_LOOKUP_RC=0
-      _NRC_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_NRC_BASE_REF" "$GH" 2>/dev/null)" || _NRC_LOOKUP_RC=$?
+      # Stderr is NOT redirected: #8872's plan-gate relaxation warns there.
+      _NRC_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_NRC_BASE_REF" "$GH")" || _NRC_LOOKUP_RC=$?
       if [[ "$_NRC_LOOKUP_RC" -eq 0 ]] && [[ -z "$_NRC_REQUIRED" ]]; then
         info "PR #$PR_NUMBER: repo has no required status checks and PR is mergeable; falling back to immediate merge"
         unset _NRC_RECHECK_JSON _NRC_BASE_REF _NRC_MERGEABLE _NRC_REQUIRED _NRC_LOOKUP_RC 2>/dev/null || true
@@ -2544,7 +2593,8 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
           # error, missing token, unknown forge) — fail closed and refuse.
           _UNSTABLE_REQUIRED=""
           _UNSTABLE_LOOKUP_RC=0
-          _UNSTABLE_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_UNSTABLE_BASE_REF" "$GH" 2>/dev/null)" || _UNSTABLE_LOOKUP_RC=$?
+          # Stderr is NOT redirected: #8872's plan-gate relaxation warns there.
+          _UNSTABLE_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_UNSTABLE_BASE_REF" "$GH")" || _UNSTABLE_LOOKUP_RC=$?
           if [[ "$_UNSTABLE_LOOKUP_RC" -ne 0 ]]; then
             warning "Failed to resolve required status checks for $_UNSTABLE_BASE_REF (rc=$_UNSTABLE_LOOKUP_RC); preserving UNSTABLE refusal"
             error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"

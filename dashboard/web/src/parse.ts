@@ -226,6 +226,10 @@ export function parseActiveComputeJob(value: unknown): ActiveComputeJob | undefi
   return stripUndefined<ActiveComputeJob>({
     hostId,
     jobId,
+    // Issue #8835. Unlike `hostId`/`jobId` this is optional and non-fatal: a
+    // job with no `sweepId` is perfectly addressable, it simply has no sweep
+    // to nest under and stays in the flat "running compute" list.
+    sweepId: str(value.sweepId),
     instanceId: str(value.instanceId),
     region: str(value.region),
     instanceType: str(value.instanceType),

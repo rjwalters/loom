@@ -1304,13 +1304,52 @@ byte-for-byte as before. This is also a check that has been **diagnostic-only
 since #6317** — #6286's lease record is the sole gate on stale-claim
 reclamation — so a false DEGRADED costs auto-filed watchdog noise, not safety.
 
-**What it does not fix.** The converse case: *this* host busy while its
-**peers** are idle, which is the shape #8276's data showed (150+ dispatches
-per data point throughout its own "degraded" window). No local signal can
-separate "peers are quiet because idle" from "peers are quiet because my
-receive path is broken". Only a periodic liveness heartbeat from idle hosts
-can, and that is a wire-protocol change tracked separately in **#8736**
-rather than smuggled into this fix.
+**The converse case, closed by a liveness heartbeat (#8736).** This host busy
+while its **peers** are idle is the shape #8276's data showed (150+ dispatches
+per data point throughout its own "degraded" window) — and it recurred after
+this idle gate shipped, on two more hosts (`robb-studio` #8509, `robb-pro`
+#8709: `0 received` against hundreds of self-advertised ads, both post-fix).
+No local signal can separate "peers are quiet because idle" from "peers are
+quiet because my receive path is broken" from `received`/`quiet_for` alone —
+an idle peer transmits nothing, same as an unreachable one.
+
+The fix: a `ClaimKind::Heartbeat` ad, published by
+`SweepRegistry::publish_peer_heartbeat` on **every** reaper tick regardless of
+live-sweep count — unlike `Advertise`, which stays entirely dispatch-gated.
+`evaluate_coordination`'s receive-quiet anchor now takes whichever of
+`last_received_at`/`last_heartbeat_received_at` is more recent, so a fleet of
+genuinely idle-but-alive peers keeps this host's verdict healthy. A
+heartbeat is folded into its own bookkeeping
+(`PeerClaimView::observe_heartbeat_at`) and deliberately never touches
+`counters.received` or the sustained-receive recovery threshold — proving a
+peer is alive is a weaker claim than proving a genuine dispatch claim
+arrived, and recovering from an already-DEGRADED verdict still requires the
+latter. A truly one-way receive path still receives neither claims nor
+heartbeats, so the genuine-break signature above is unaffected.
+
+**That "unaffected" case stopped being hypothetical (#8886).** Both fixes
+above landed (#8739 2026-09-23, #8817 2026-09-24), and two independent
+per-host trackers went DEGRADED again afterward showing exactly this
+signature — `robb-studio` (#8509, flap #10, `0 received / 4373 advertised`)
+and `ip-172-31-74-176` (#8779, flap #6, `0 received / 1782 advertised`), both
+well after both merges. On both hosts the local daemon's own safehouse RPC
+socket reports `state: "connected"` — healthy — so a genuine break here, if
+one exists, lives **above** the RPC link: inside the `safehoused` sidecar's
+own Matrix sync/room-membership state, which the client protocol this daemon
+speaks does not expose at all.
+
+Confirmed by inspecting `loom-daemon/src/safehouse.rs` directly (2026-09-25):
+the only ops this client issues are `hello`, `send`, and `create_room`, and
+every reply it parses is limited to `ok`/`error`/`id` (plus, for
+`create_room`, a room-identity key). None carry a last-successful-Matrix-sync
+timestamp, a room member count, or any other sidecar-side mesh-health signal
+— so `SafehouseStatus` (`loom-daemon/src/types.rs`) cannot be extended with
+one today without a protocol change on the `rjwalters/safehouse` side.
+That capability request has been filed as #8888 (external, since this repo
+does not vendor `rjwalters/safehouse` and cannot implement its side). Until
+it lands, telling "genuine mesh break" apart from "still-undiscovered local
+false positive" for `robb-studio`/`ip-172-31-74-176` needs live host SSH —
+routed to #8889 (`loom:operator-mechanical`) rather than guessed at here.
 
 ### Fleet-wide completion dedup: reusing the peer-claim channel (#6352)
 

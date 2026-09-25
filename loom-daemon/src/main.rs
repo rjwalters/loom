@@ -57,7 +57,7 @@ struct Cli {
 enum Commands {
     /// Launch a worker through a native harness adapter or a legacy runtime.
     SpawnWorker(loom_daemon::worker_spawn::WorkerArgs),
-    /// Inspect worker model profiles without launching anything.
+    /// Inspect worker model profiles; run a launch behind the credential proxy.
     #[command(subcommand_required = true)]
     Worker(loom_daemon::worker_spawn::WorkerCommand),
     /// Execute one guarded native harness tool request from stdin.
@@ -1905,6 +1905,28 @@ enum ForgeAction {
         /// compatibility; unused on the GitHub native path.
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
+    },
+
+    /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
+    /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
+    /// replacing its old unconditional `forge_detect_merge_method` call.
+    /// With no `--requested`, preserves today's squash > merge > rebase
+    /// auto-detect. With `--requested`, validates it against the repo's
+    /// actual allowed strategies: prints the method and exits 0 when
+    /// allowed, or names the allowed methods on stderr and exits 1 when not
+    /// — never a silent fallback to squash. GitHub only; Gitea declines
+    /// (exit 3, `EX_FORGE_DECLINED`) so `merge-pr.sh` falls back to its
+    /// shell auto-detect.
+    #[command(name = "merge-method")]
+    MergeMethod {
+        /// Repository, `owner/repo`.
+        #[arg(long, value_name = "NWO")]
+        repo: String,
+
+        /// Explicitly requested merge method. Omit to auto-detect (today's
+        /// unchanged behavior).
+        #[arg(long, value_name = "METHOD")]
+        requested: Option<String>,
     },
 }
 

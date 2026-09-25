@@ -309,6 +309,15 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
                              claim(s) (#4431)"
                         );
                     }
+                    // Liveness heartbeat (Issue #8736): published every tick
+                    // regardless of live-sweep count — unlike the
+                    // dispatch-claim re-advertise above, which only fires for
+                    // `Running`/`Pending` entries. Closes the converse of the
+                    // #8026 idle gate: this host busy, its peers idle. Silent
+                    // by design (no per-tick log line) — see
+                    // `heartbeat_broadcast`'s module doc for the cost/cadence
+                    // tradeoff.
+                    r.publish_peer_heartbeat();
                     // Peer-coordination health (Issue #6157): evaluate on
                     // this same cadence, right after re-advertising, so
                     // the DEGRADED grace window is measured in reaper-tick

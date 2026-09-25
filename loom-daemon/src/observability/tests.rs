@@ -693,7 +693,7 @@ async fn spawn_task_enabled_with_unreadable_ingest_key_file_returns_none() {
 
 #[tokio::test]
 #[serial]
-async fn spawn_task_fully_configured_spawns_two_tasks() {
+async fn spawn_task_fully_configured_spawns_three_tasks() {
     clear_env();
     let bus = EventBus::new();
     let dir = tempdir().unwrap();
@@ -709,7 +709,9 @@ async fn spawn_task_fully_configured_spawns_two_tasks() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
     let handles = handles.expect("fully configured ⇒ spawn_task must return Some");
-    assert_eq!(handles.len(), 2, "collector + sender");
+    // Issue #8760: `daemon_event::spawn_task` adds a third handle alongside
+    // `collector`'s and the sender's.
+    assert_eq!(handles.len(), 3, "collector + daemon_event collector + sender");
     for handle in handles {
         handle.abort();
     }
@@ -738,7 +740,9 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool())
             .expect("fully configured ⇒ spawn_task must return Some");
-    assert_eq!(handles.len(), 3, "collector + one sender per exporter");
+    // Issue #8760: `daemon_event::spawn_task` adds one more handle alongside
+    // `collector`'s and one sender per exporter.
+    assert_eq!(handles.len(), 4, "collector + daemon_event collector + one sender per exporter");
     let statuses = global_export_statuses();
     assert_eq!(
         statuses.keys().collect::<Vec<_>>(),
@@ -773,7 +777,8 @@ async fn spawn_task_two_exporters_isolate_the_unbuildable_kind() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool())
             .expect("the https exporter is fully configured and must still run");
-    assert_eq!(handles.len(), 2, "collector + only the https sender");
+    // Issue #8760: `daemon_event::spawn_task` adds one more handle.
+    assert_eq!(handles.len(), 3, "collector + daemon_event collector + only the https sender");
     let statuses = global_export_statuses();
     assert_eq!(
         statuses["otlp"].state,
@@ -860,13 +865,13 @@ async fn malformed_otlp_configuration_has_no_collector_or_queue_activity() {
 }
 
 /// The `otlp`-feature counterpart of
-/// `spawn_task_fully_configured_spawns_two_tasks`: `exporter=otlp`
-/// with the feature compiled in spawns the same collector+sender pair,
-/// just wired to `otlp::OtlpExporter` instead of `HttpsExporter`.
+/// `spawn_task_fully_configured_spawns_three_tasks`: `exporter=otlp`
+/// with the feature compiled in spawns the same collector+daemon_event+sender
+/// trio, just wired to `otlp::OtlpExporter` instead of `HttpsExporter`.
 #[cfg(feature = "otlp")]
 #[tokio::test]
 #[serial]
-async fn spawn_task_otlp_exporter_spawns_two_tasks() {
+async fn spawn_task_otlp_exporter_spawns_three_tasks() {
     clear_env();
     let bus = EventBus::new();
     let dir = tempdir().unwrap();
@@ -883,7 +888,7 @@ async fn spawn_task_otlp_exporter_spawns_two_tasks() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
     let handles = handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
-    assert_eq!(handles.len(), 2, "collector + sender");
+    assert_eq!(handles.len(), 3, "collector + daemon_event collector + sender");
     for handle in handles {
         handle.abort();
     }

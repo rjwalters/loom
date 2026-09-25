@@ -330,3 +330,6 @@ CI. It builds synthetic credential-free fixtures and proves clone/worktree
 operations, persistence, host/peer write denial, job exclusion, and retained
 dirty/unpublished work. On macOS, supply a Linux build of the worker endpoint
 with `LOOM_TEST_LINUX_BIN`; `LOOM_TEST_HOST_BIN` optionally selects the host build.
+
+See [private session dispatch](../../defaults/docs/private-session-dispatch.md) for
+scheduled roles, durable issue recovery, and the v1 host-control boundary.

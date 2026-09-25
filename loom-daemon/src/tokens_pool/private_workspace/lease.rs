@@ -12,6 +12,11 @@ pub struct Job {
     pub container_id: String,
     pub base_revision: String,
     pub host_pid: u32,
+    /// Control-boundary identity bound at admission (issue #8839). Defaulted so
+    /// a lease written before this protocol still deserializes — as an empty
+    /// identity, which every recheck refuses rather than treating as proven.
+    #[serde(default)]
+    pub control: String,
 }
 
 /// The open file owns process exclusion; the durable JSON owns uncertainty
@@ -22,6 +27,13 @@ pub(super) struct Lease {
 }
 
 impl Lease {
+    pub(super) fn fd(&self) -> i32 {
+        self._file.as_raw_fd()
+    }
+    pub(super) fn from_file(file: File, dir: PathBuf) -> Self {
+        Self { _file: file, dir }
+    }
+
     pub fn acquire(dir: &Path) -> Result<Self> {
         std::fs::DirBuilder::new()
             .recursive(true)

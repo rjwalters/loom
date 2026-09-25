@@ -183,7 +183,8 @@ only Curator may be skipped.
 Slow correct job over clever fast one. **Never cancel verification of a distinct
 commit** — superseding is for PR branches; every `main` commit is distinct work.
 Path-filtering is an optimisation, not a correctness tool; one mechanism per
-behaviour. Rules + the incidents behind them: [`ci-principles`](.loom/docs/ci-principles.md).
+behaviour. Rules + incidents: [`ci-principles`](.loom/docs/ci-principles.md).
+All org CI is captured in SigNoz: [`ci-observability`](.loom/docs/ci-observability.md).
 
 ### Builder Workflow
 
@@ -307,7 +308,7 @@ Completed-migration history (v0.10.0 shepherd/daemon deprecation, the Rust `loom
 
 - **Repository**: https://github.com/rjwalters/loom · **Roles**: `.loom/roles/*.md` · **Labels**: `.github/labels.yml` · **Scripts**: `.loom/scripts/`
 - **Docs**: [daemon-reference](.loom/docs/daemon-reference.md) · [token-pool](.loom/docs/token-pool.md) · [troubleshooting](.loom/docs/troubleshooting.md) ·
-  [build-gate](.loom/docs/build-gate.md) · [ci-principles](.loom/docs/ci-principles.md) · [safehouse](.loom/docs/safehouse.md) ·
+  [safehouse](.loom/docs/safehouse.md) ·
   [forge-auth](.loom/docs/forge-authentication.md) / [github-auth](.loom/docs/github-authentication.md) ·
   [blame-issue](.loom/docs/blame-issue.md) · [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md) · [verification-recipes](.loom/docs/verification-recipes.md)
 

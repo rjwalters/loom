@@ -270,6 +270,7 @@ fn symlinked_git_objects_and_refs_are_refused_without_modification() {
 }
 
 #[test]
+#[serial_test::serial(private_workspace_fork)]
 fn account_lease_is_exclusive_across_role_sweep_interactive_and_repo_claims() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("account-a");
@@ -300,6 +301,7 @@ fn account_lease_is_exclusive_across_role_sweep_interactive_and_repo_claims() {
 }
 
 #[test]
+#[serial_test::serial(private_workspace_fork)]
 fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner() {
     let root = tempfile::tempdir().unwrap();
     let lease = lease::Lease::acquire(root.path()).unwrap();
@@ -311,6 +313,7 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
         container_id: "old".into(),
         base_revision: "abc".into(),
         host_pid: 999_999,
+        control: "d".repeat(64),
     };
     lease.begin(&job).unwrap();
     drop(lease);

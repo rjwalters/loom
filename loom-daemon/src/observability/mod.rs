@@ -35,6 +35,16 @@
 //!   sink the transcript-ingest thread pushes `session.summary` records
 //!   onto, sharing this same [`queue::DurableQueue`] so the new record kind
 //!   rides whichever exporter is configured with no egress code of its own.
+//! - [`session_analysis`] (Issue #8760, G3 part 2 of #8714) — the same
+//!   process-global-sink pattern as `session_summary`, one slice later: the
+//!   transcript-ingest thread pushes the derived `session.analysis` rollup
+//!   (retry loops, longest tool call, USD cost, anomaly flags) alongside
+//!   each `session.summary` it emits.
+//! - [`daemon_event`] (Issue #8760, G4 of #8714) — a second, narrower
+//!   [`crate::event_bus::EventBus`] subscriber alongside [`collector`],
+//!   covering the four named topics that carried no telemetry record kind
+//!   at all: `daemon.drain.*`, `daemon.capacity.advisory`,
+//!   `daemon.preflight.advisory`, `epic.issue.*`.
 //!
 //! # Off by default (FLAGS-OFF posture)
 //!
@@ -87,6 +97,7 @@
 
 pub mod backfill;
 pub mod collector;
+pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod exporter;
 pub mod lifecycle;
@@ -96,6 +107,7 @@ pub mod outcome;
 pub mod overhead;
 pub mod queue;
 pub mod sender;
+pub mod session_analysis;
 pub mod session_summary;
 pub mod shutdown;
 pub mod tracing;
@@ -1064,6 +1076,16 @@ pub fn spawn_task(
     session_summary::register_global_session_summary_sink(
         session_summary::SessionSummarySink::new(fanout.clone(), host_id.clone()),
     );
+    // `session.analysis` emission (Issue #8760): same wiring, one slice
+    // later — see `session_analysis`'s module doc.
+    session_analysis::register_global_session_analysis_sink(
+        session_analysis::SessionAnalysisSink::new(fanout.clone(), host_id.clone()),
+    );
+    // `daemon.event` collection (Issue #8760, G4): a second, independent bus
+    // subscription alongside `collector::spawn_task` below — see
+    // `daemon_event`'s module doc for why it is a separate subscriber rather
+    // than folded into `collector`.
+    let daemon_event_handle = daemon_event::spawn_task(bus, fanout.clone(), host_id.clone());
     let collector_handle = collector::spawn_task(
         bus,
         fanout,
@@ -1078,8 +1100,9 @@ pub fn spawn_task(
     // `disabled` on the status wire stays truthful (Issue #5083).
     register_global_export_statuses(statuses.clone());
     register_global_export_status(primary_status_for(&entries, &statuses));
-    let mut handles = Vec::with_capacity(sender_handles.len() + 1);
+    let mut handles = Vec::with_capacity(sender_handles.len() + 2);
     handles.push(collector_handle);
+    handles.push(daemon_event_handle);
     handles.extend(sender_handles);
     Some(handles)
 }

@@ -19,6 +19,16 @@
  * process, not a machine with a `host.health` panel to sit beside. Grouping by
  * it would pile every instance under one card that has nothing else to show.
  *
+ * Issue #8835 narrows that without overturning it. A job that names the *sweep*
+ * which submitted it (`sweepId`) does have a home — under that sweep, as a
+ * nested subprocess ({@link computeSubprocessList}, rendered by both the
+ * overview card and host detail). What still has no home, and therefore still
+ * belongs in this fleet-level list, is every job that cannot be attributed:
+ * no `sweepId`, or one naming a sweep that is no longer live. `fleet.ts`'s
+ * `unattributedCompute` is exactly that set, and it is what this panel is
+ * handed — which is what makes "an orphaned instance is never hidden" true by
+ * construction rather than by vigilance.
+ *
  * ## Leaked vs. running (parent #8257 AC 4)
  *
  * A leaked job is one whose completion record never arrived within
@@ -98,6 +108,81 @@ export function instanceShapeText(job: ActiveComputeJob): string {
   return parts.length > 0 ? parts.join(" · ") : UNKNOWN;
 }
 
+/** The LEAKED chip, shared by the flat table's rows and the nested
+ * subprocess entries (#8835) so a leak looks identical wherever a job is
+ * rendered — same `role="status"`, same `data-testid` hook, same wording. */
+function leakedBadge(): HTMLElement {
+  return el(
+    "span",
+    {
+      class: "badge badge--leaked",
+      role: "status",
+      title:
+        "No completion record for over 24 hours — this instance may still be running " +
+        "and billing. Check the cloud console and terminate it if it is orphaned.",
+      data: { testid: "leaked-badge" },
+    },
+    "LEAKED",
+  );
+}
+
+/**
+ * One sweep's live compute jobs, rendered as a nested "subprocesses" list
+ * (Issue #8835).
+ *
+ * Shared verbatim by the fleet-overview card (`fleetOverview.ts`'s sweep list)
+ * and by host detail (`hostDetail.ts`'s sweep row) so a job looks the same
+ * wherever it is nested, and so the "is this leaked" signal cannot drift
+ * between the two surfaces.
+ *
+ * Each entry carries the instance shape (type · region · spot), how long it
+ * has been running, and the LEAKED chip when the backend flagged it — the same
+ * four facts the flat table shows, minus the job id, which is the one thing a
+ * reader already has context for here (they are looking at the sweep that
+ * submitted it). The id stays on `data-job` as the test hook and in the
+ * tooltip.
+ *
+ * Returns `null` for an empty list: a sweep with no compute jobs — nearly
+ * every sweep — must render exactly as it did before this feature, with no
+ * empty `<ul>` and no "no subprocesses" note.
+ *
+ * Nothing here is gated on the viewer being signed in, because nothing reaches
+ * it otherwise: `/public/fleet-state` returns `activeCompute: []` for an
+ * unauthenticated viewer (`../../src/redaction.ts`), so `buildFleetView`'s
+ * join has nothing to nest and every sweep gets `null` here.
+ */
+export function computeSubprocessList(
+  jobs: readonly ActiveComputeJob[],
+  now: Date = new Date(),
+): HTMLElement | null {
+  if (jobs.length === 0) return null;
+  return el(
+    "ul",
+    { class: "subprocesses", data: { testid: "sweep-subprocesses" } },
+    jobs.map((job) => {
+      const leaked = job.leaked === true;
+      return el(
+        "li",
+        {
+          class: `subprocess${leaked ? " subprocess--leaked" : ""}`,
+          title: `Compute job ${job.jobId}`,
+          data: { testid: "subprocess", job: job.jobId, leaked: String(leaked) },
+        },
+        el("span", { class: "subprocess__shape" }, instanceShapeText(job)),
+        el(
+          "span",
+          {
+            class: "subprocess__age",
+            title: job.startedAt ? `Started ${formatAbsolute(job.startedAt)}` : undefined,
+          },
+          runningForText(job, now),
+        ),
+        leaked ? leakedBadge() : null,
+      );
+    }),
+  );
+}
+
 function jobRow(job: ActiveComputeJob, now: Date): HTMLElement {
   const leaked = job.leaked === true;
   return el(
@@ -110,20 +195,7 @@ function jobRow(job: ActiveComputeJob, now: Date): HTMLElement {
       "td",
       { class: "compute-row__job" },
       el("span", { class: "compute-row__job-id" }, job.jobId),
-      leaked
-        ? el(
-            "span",
-            {
-              class: "badge badge--leaked",
-              role: "status",
-              title:
-                "No completion record for over 24 hours — this instance may still be running " +
-                "and billing. Check the cloud console and terminate it if it is orphaned.",
-              data: { testid: "leaked-badge" },
-            },
-            "LEAKED",
-          )
-        : null,
+      leaked ? leakedBadge() : null,
     ),
     el("td", { class: "compute-row__instance" }, formatText(job.instanceId)),
     el("td", { class: "compute-row__shape" }, instanceShapeText(job)),

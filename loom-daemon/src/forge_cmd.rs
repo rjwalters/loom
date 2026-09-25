@@ -11,6 +11,8 @@
 //!   read/query surface (`issue list/view`, `pr list`, `auth status`).
 //! - `forge auto-merge <pr> [--method …]` — the merge path behind
 //!   `merge-pr.sh` (formerly `loom-auto-merge`).
+//! - `forge merge-method --repo <nwo> [--requested …]` — resolve/validate the
+//!   merge method `merge-pr.sh` passes to the two call sites above (#8845).
 //!
 //! # NOT a cache — the passthrough burns full GraphQL (#5056)
 //!
@@ -75,7 +77,7 @@ use crate::config_resolver::{get_path, resolve_effective_config};
 /// #7810 PR 2: these were unbounded, each with its own ad-hoc error handling
 /// (`.ok()?`, `Err(_) => return base`, bespoke `match`). The handling is kept
 /// where it was — only the execution management is now shared.
-const FORGE_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const FORGE_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Exit code the native subcommands use to signal "this forge is not handled
 /// natively; fall back to the shell path". Distinct from a genuine failure
@@ -388,7 +390,7 @@ pub fn gitea_config_from_forge(forge: &Value) -> Result<GiteaConfig> {
 // ---------------------------------------------------------------------------
 
 /// Resolve the `gh` binary name (honoring `LOOM_GH_BIN` for tests / overrides).
-fn gh_bin() -> String {
+pub(crate) fn gh_bin() -> String {
     std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
 }
 
@@ -724,6 +726,14 @@ pub enum ForgeCmd {
         /// (unguarded) behavior.
         expected_head_sha: Option<String>,
     },
+    /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
+    /// (#8845) — resolve/validate the merge method `merge-pr.sh` should pass
+    /// to `forge_merge_pr`/`forge auto-merge`. See
+    /// [`crate::forge_merge_method::handle_merge_method`].
+    MergeMethod {
+        repo: String,
+        requested: Option<String>,
+    },
 }
 
 /// Dispatch a parsed `forge` subcommand. Handlers exit the process directly
@@ -750,6 +760,9 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             method,
             expected_head_sha,
         } => handle_auto_merge(pr, &method, expected_head_sha.as_deref()),
+        ForgeCmd::MergeMethod { repo, requested } => {
+            crate::forge_merge_method::handle_merge_method(&repo, requested.as_deref())
+        }
     }
 }
 

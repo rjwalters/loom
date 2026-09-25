@@ -10,7 +10,7 @@ pub fn configured(workspace: &Path, name: &str) -> Result<bool> {
         .exists())
 }
 
-fn resolve(workspace: &Path, name: &str) -> Result<(Config, PathBuf)> {
+pub(super) fn resolve(workspace: &Path, name: &str) -> Result<(Config, PathBuf)> {
     let account = account(workspace, name)?;
     let dir = state_dir(&account.credential_reference)?;
     let config =
@@ -104,6 +104,12 @@ pub fn start(
     // Adopt before any probe: even an image/protocol failure must not permit
     // a host-direct process to refresh this profile behind its new owner.
     docker::prepare(&config, id, None)?;
+    // A session may not come up at all unless its image ships a control
+    // boundary this host supports: provisioning the managed hook and then
+    // discovering the bundle is missing/stale would leave an apparently ready
+    // session whose guard code lives in worker-writable paths (issue #8839).
+    docker::setup(&config)?;
+    docker::control(&config, id)?;
     snapshot(config, &dir)
 }
 
@@ -182,17 +188,24 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
         container_id: id.to_owned(),
         base_revision: String::new(),
         host_pid: std::process::id(),
+        control: String::new(),
     };
     // Publish before clone/fetch/branch operations; a host crash cannot turn a
     // still-running preparation exec into an apparently free account.
     lease.begin(&job)?;
     job.base_revision = docker::prepare(&config, id, args.branch.as_deref())?;
+    job.control = docker::control(&config, id)?;
     lease.begin(&job)?;
-    let env = FORGE_ENV
+    let mut env: Vec<String> = FORGE_ENV
         .iter()
         .filter(|name| std::env::var_os(name).is_some())
         .map(|name| (*name).to_owned())
         .collect();
+    // Supervised jobs are mutable work too: carry the same forced guard policy
+    // and the bound identity the adapter path carries.
+    env.extend(bundle::policy_env());
+    env.push(format!("LOOM_PRIVATE_CONTROL={}", job.control));
+    docker::recheck_control(&config, id, &job.control)?;
     let code = crate::session_exec::run_host(crate::session_exec::HostArgs {
         owner_pid: None,
         container: config.container.clone(),

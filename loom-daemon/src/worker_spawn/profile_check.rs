@@ -44,6 +44,13 @@ enum WorkerCommand {
     /// provider event, first tool, completion) — which are reported as
     /// unknown-with-a-reason rather than estimated.
     Readiness(crate::native_readiness::measure::ReadinessArgs),
+
+    /// Run a command (normally a `docker run`) behind the credential egress
+    /// proxy (#8697): the real credential in `--credential-env` is swapped for
+    /// a per-launch placeholder in the command's environment, and a host-side
+    /// listener substitutes it back on the way to `--upstream`. Used by
+    /// `spawn-claude.sh`'s contained dispatch; fails closed (exit 78).
+    ProxyExec(super::egress_proxy::exec::ExecArgs),
 }
 
 fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), LaunchError> {
@@ -191,6 +198,7 @@ pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
     let (name, runtime) = match args.command {
         WorkerCommand::ProfileCheck { name, runtime } => (name, runtime),
         WorkerCommand::Readiness(args) => return args.run(),
+        WorkerCommand::ProxyExec(args) => return super::egress_proxy::exec::cli(args),
     };
     match report(name.as_deref(), runtime.as_deref()) {
         Ok((text, resolvable)) => {
@@ -218,6 +226,7 @@ mod tests {
             effort: None,
             credential_env: None,
             credential_pool: credential_pool.map(str::to_string),
+            credential_proxy: None,
             credential_targets: std::collections::BTreeMap::new(),
             provider_options: std::collections::BTreeMap::new(),
             provider_definition: std::collections::BTreeMap::new(),

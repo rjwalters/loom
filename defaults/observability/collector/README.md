@@ -72,6 +72,67 @@ private Docker network. Managed SigNoz requires a separate TLS endpoint and
 `signoz-ingestion-key` secret; change a local config copy and validate it. Never
 forward incoming client authorization to either backend.
 
+## Claude Code native OTLP (interactive sessions)
+
+Interactive `claude` launches (a human at a terminal, not a `loom-daemon`
+sweep) never touch the daemon's own exporter config above. Claude Code has
+its **own** built-in OTLP exporter, gated by `CLAUDE_CODE_ENABLE_TELEMETRY`,
+that can point at this same gateway ingress independently. This is the
+canonical wiring for that case (#8668); it does not change, replace or
+interact with the daemon canary in the next section.
+
+Export this env block before launching `claude` (a shell profile, direnv, or
+a wrapper script — never a tracked file, since the header carries the bearer
+token):
+
+```dotenv
+CLAUDE_CODE_ENABLE_TELEMETRY=1
+OTEL_METRICS_EXPORTER=otlp
+OTEL_LOGS_EXPORTER=otlp
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:14318
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<Loom ingest key>
+```
+
+`<Loom ingest key>` is the same plaintext value provisioned into
+`LOOM_COLLECTOR_INGEST_KEY_FILE` above (`cat` the file into the export rather
+than typing the key literally, and keep it out of shell history the same way
+as any other secret). `http://127.0.0.1:14318` is this recipe's host-loopback
+ingress from "Start and validate" above; the receiver only accepts OTLP HTTP
+(no gRPC), hence `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`. Claude Code
+appends the standard `/v1/metrics` and `/v1/logs` paths to
+`OTEL_EXPORTER_OTLP_ENDPOINT` itself; do not include them. The gateway must
+already be running (`docker compose ... --profile trial up -d`) — this env
+block has nothing to fail into if it is not.
+
+Claude Code's own attribute names (`session.id`, `user.email`,
+`organization.id`, per-metric `model`, tool/event names, etc.) are **not**
+`loom.*`-prefixed. The shared `transform/privacy` processor in `config.yaml`
+still applies unmodified to this path — it keeps only the resource keys
+(`service.name`, `service.version`, `service.instance.id`, `host.id`) and the
+explicit `loom.*` log/span allowlist, plus the small non-namespaced
+`metric_statements` datapoint keys (`account`, `rank`, `pool`, `slot`,
+`model`, `window`, `state`). Anything else Claude Code sends — including
+fields with real user identity like `user.email` — is dropped before either
+backend, by the same fail-closed `keep_keys` behavior documented in "Privacy
+and remote deployment" below. That is a feature, not a bug: it means this
+wiring is safe to turn on without first auditing Claude Code's exact
+attribute set, but also that most of Claude Code's own tool-call/token-usage
+context will not survive as queryable attributes until a follow-up maps it
+onto `loom.*` names (tracked separately — see #8664 item 2, the filelog-tail
+path, which defines the new `loom.session_id` / `loom.agent_id` attributes
+this wiring does not add). Confirm delivery through the mechanisms in
+"Delivery limits and diagnostics" below — `otelcol_receiver_accepted_log_records`
+/ `otelcol_receiver_accepted_metric_points` at `:18888/metrics` incrementing,
+or a backend query by the session's approximate timestamp — rather than by
+expecting Claude Code's native attribute names to appear.
+
+This never modifies the `loom-daemon` telemetry path (`sweep.*`,
+`role_tick.outcome`, `tokens.snapshot`, `host.health` — see
+[`.loom/docs/observability.md`](../../docs/observability.md)) or the daemon
+canary below; it is additive, opt-in, and scoped to interactive `claude`
+sessions only.
+
 ## Canary and rollback
 
 First check that your `loom-daemon` was built with the `otlp` feature. Set these
@@ -186,6 +247,17 @@ record's level, not the root of the chain; walking `agent_id` -> matching
 `parent_agent_id` across records reconstructs the full chain regardless of
 depth). `loom.runtime`, `loom.provider`, `loom.model` and `loom.duration_sec`
 are reused from the existing schema.
+
+Issue #8760 (G3 part 2 / G4 of #8714) adds two more record kinds and six more
+allowlisted attributes: `session.analysis`'s `loom.cost_usd`,
+`loom.retry_loops`, `loom.longest_tool_call.tool`,
+`loom.longest_tool_call.duration_ms`, `loom.anomalies` (all derived from
+counts/ids/allowlisted tool names — never transcript content, same as
+`session.summary`); and `daemon.event`'s `loom.topic` /
+`loom.payload` (the latter is the already-reviewed, small, operator-facing
+`daemon.drain.*` / `daemon.capacity.advisory` / `daemon.preflight.advisory` /
+`epic.issue.*` event-bus payload, carried whole as one JSON string rather than
+re-typed per topic — see `crate::event_bus`'s frozen taxonomy).
 
 | Source | Path tailed (in-container) | `loom.*` fields populated |
 | --- | --- | --- |

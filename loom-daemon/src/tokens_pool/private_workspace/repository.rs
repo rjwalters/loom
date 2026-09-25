@@ -6,6 +6,32 @@ use std::process::{Command, Stdio};
 #[derive(clap::Subcommand)]
 pub enum WorkerCommand {
     Protocol,
+    /// Materialize private helper and hook paths.
+    Setup,
+    /// Report the versioned control boundary (guard code, forced policy, hook
+    /// registration, readiness receipt) for host verification and binding.
+    Control,
+    /// Seal a staged control bundle at image build time (never at runtime).
+    SealControl {
+        #[arg(long, default_value = bundle::CONTROL_ROOT)]
+        root: PathBuf,
+    },
+    /// Read only, bounded checkpoint and Git metadata.
+    Snapshot {
+        #[arg(long)]
+        issue: Option<u64>,
+    },
+    /// Refuse unsupported host execution from private workers.
+    CheckHostJob,
+    /// Validate direct adapter entry before any host Codex probe or launch.
+    CheckAdapter {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
+    Execute {
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     Prepare(PrepareArgs),
     /// Git credential-helper protocol; output goes only to Git's private pipe.
     Credential {
@@ -40,6 +66,26 @@ impl WorkerCommand {
     pub fn run(self) -> Result<()> {
         match self {
             Self::Protocol => println!("{PROTOCOL}"),
+            Self::Setup => println!("{}", serde_json::to_string(&worker_setup::report())?),
+            Self::Control => println!(
+                "{}",
+                serde_json::to_string(&bundle::observe(
+                    Path::new(bundle::CONTROL_ROOT),
+                    Path::new(PROFILE)
+                ))?
+            ),
+            Self::SealControl { root } => {
+                println!("{}", serde_json::to_string(&bundle::seal(&root)?)?)
+            }
+            Self::Snapshot { issue } => {
+                println!("{}", serde_json::to_string(&export::snapshot(issue)?)?)
+            }
+            Self::CheckHostJob => worker_setup::check_host_job()?,
+            Self::CheckAdapter { profile } => {
+                adapter::check_environment()?;
+                adapter::check(profile.as_deref())?;
+            }
+            Self::Execute { command } => worker_setup::execute(command)?,
             Self::Prepare(args) => {
                 repository_url(&args.repository)?;
                 match prepare(Path::new(ROOT), &args) {
@@ -185,7 +231,13 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
         if git(&repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_ok() {
             git(&repo, &["switch", branch])?;
         } else {
-            git(&repo, &["switch", "--create", branch, &revision])?;
+            let remote_branch = format!("refs/remotes/origin/{branch}");
+            let start = if git(&repo, &["show-ref", "--verify", &remote_branch]).is_ok() {
+                &remote_branch
+            } else {
+                &revision
+            };
+            git(&repo, &["switch", "--create", branch, start])?;
         }
     } else {
         git(&repo, &["switch", "--detach", &revision])?;

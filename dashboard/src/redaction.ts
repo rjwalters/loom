@@ -196,12 +196,20 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // NO fields survive to `/public/*` for this kind — explicitly listed here
   // (identical to `DEFAULT_ALLOWLIST`) rather than left to the unrecognized-
   // kind fallback, so this is a stated policy decision, not an omission a
-  // future reader has to infer. Also unlike every repo-scoped kind above,
-  // `ephemeral_compute` carries no `repo`/`issue`/`sweep_id` at all
-  // (`extractRecordFields` leaves all three `undefined` for it — see
+  // future reader has to infer. Unlike every repo-scoped kind above,
+  // `ephemeral_compute` still carries no `repo`/`issue` at all
+  // (`extractRecordFields` leaves both `undefined` for it — see
   // `telemetry.ts`), so there is no repo-identifying field to redact down
   // to even on the authenticated `/api/*` surface's own terms; the
   // allowlist boundary here is about the compute-spend fields themselves.
+  //
+  // Issue #8835 added ONE indexed field to this kind — `sweep_id`, the sweep
+  // that submitted the job, which is what lets the authenticated dashboard
+  // nest a live instance under the sweep paying for it. It changes nothing
+  // here on purpose: the allowlist stays `["kind"]`, so `sweep_id` is
+  // withheld from `/public/*` exactly like every other field of this kind,
+  // and the public `activeCompute` list stays empty. `redaction.test.ts`
+  // pins that a new field cannot leak by being new.
   ephemeral_compute: ["kind"],
 };
 
