@@ -83,11 +83,14 @@ fn burn_points_label_provider_and_model_and_skip_zeroes() {
     assert!(matches!(points[3].value, MetricValue::Int(2)));
 }
 
+/// One poll's `(not_before, now)`.
+type PollBounds = (DateTime<Utc>, DateTime<Utc>);
+
 /// A source that replays scripted events and records each poll's bounds.
 #[derive(Clone, Default)]
 struct Scripted {
     events: Arc<Mutex<Vec<BurnEvent>>>,
-    polls: Arc<Mutex<Vec<(DateTime<Utc>, DateTime<Utc>)>>>,
+    polls: Arc<Mutex<Vec<PollBounds>>>,
 }
 
 impl BurnSource for Scripted {

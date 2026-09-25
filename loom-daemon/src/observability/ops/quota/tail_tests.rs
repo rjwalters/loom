@@ -89,7 +89,7 @@ fn files_not_written_recently_or_no_longer_listed_are_dropped() {
         panic!("a file older than the activity bound is not read");
     });
     assert_eq!(set.tracked().count(), 0);
-    poll(&mut set, &[path.clone()]);
+    poll(&mut set, std::slice::from_ref(&path));
     assert_eq!(set.tracked().count(), 1);
     poll(&mut set, &[]);
     assert_eq!(set.tracked().count(), 0);
