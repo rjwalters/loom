@@ -8,6 +8,14 @@ pub enum WorkerCommand {
     Protocol,
     /// Materialize private helper and hook paths.
     Setup,
+    /// Report the versioned control boundary (guard code, forced policy, hook
+    /// registration, readiness receipt) for host verification and binding.
+    Control,
+    /// Seal a staged control bundle at image build time (never at runtime).
+    SealControl {
+        #[arg(long, default_value = bundle::CONTROL_ROOT)]
+        root: PathBuf,
+    },
     /// Read only, bounded checkpoint and Git metadata.
     Snapshot {
         #[arg(long)]
@@ -59,6 +67,16 @@ impl WorkerCommand {
         match self {
             Self::Protocol => println!("{PROTOCOL}"),
             Self::Setup => println!("{}", serde_json::to_string(&worker_setup::report())?),
+            Self::Control => println!(
+                "{}",
+                serde_json::to_string(&bundle::observe(
+                    Path::new(bundle::CONTROL_ROOT),
+                    Path::new(PROFILE)
+                ))?
+            ),
+            Self::SealControl { root } => {
+                println!("{}", serde_json::to_string(&bundle::seal(&root)?)?)
+            }
             Self::Snapshot { issue } => {
                 println!("{}", serde_json::to_string(&export::snapshot(issue)?)?)
             }

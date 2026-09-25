@@ -158,11 +158,15 @@ impl Selection {
             container_id: id.into(),
             base_revision: String::new(),
             host_pid: std::process::id(),
+            control: String::new(),
         };
         lease.begin(&job)?;
         // The issue helper owns creation of its worktree/branch in the clone.
         job.base_revision = docker::prepare(&config, id, None)?;
         docker::setup(&config)?;
+        // Bind the verified control boundary to this account/container/lease
+        // BEFORE any mutable work is admitted. Spawn rechecks the same identity.
+        job.control = docker::control(&config, id)?;
         lease.begin(&job)?;
         let record = export::record_prepared(root, &config, &job)?;
         selection.prepared = Some(Prepared {
@@ -284,6 +288,7 @@ mod tests {
                 container_id: "a".repeat(64),
                 base_revision: String::new(),
                 host_pid: std::process::id(),
+                control: "c".repeat(64),
             })
             .unwrap();
         Selection {

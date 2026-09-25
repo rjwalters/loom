@@ -2,6 +2,7 @@
 //! coordination stays outside repositories; bounded recovery metadata stays
 //! with the logical host repository. Runtime capability admission is unchanged.
 mod adapter;
+pub mod bundle;
 mod control;
 pub mod dispatch;
 mod docker;
