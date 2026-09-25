@@ -62,6 +62,7 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         draining: false,
         drain_deadline: None,
         drain_note: None,
+        drain_roll: None,
         auto_update_enabled: false,
         auto_update_last_check: None,
         auto_update_last_roll: None,

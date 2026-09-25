@@ -247,27 +247,18 @@ pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 1800;
 /// case is handled on the very first poll (no full-interval wait).
 pub const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Multiplier applied to the requested drain timeout to size the **total**
-/// paused-dispatch budget a *retained* ("pending") roll may spend across all of
-/// its automatic re-arms (Issue #6007).
-///
-/// Sizing the budget from the operator's own `--timeout` — rather than from a
-/// flat constant — keeps a deliberately short drain short: `--timeout 60` buys a
-/// 240s budget, not four hours.
-pub const DRAIN_PENDING_BUDGET_MULTIPLIER: u64 = 4;
+/// The pending-roll policy (#6007) and its live status projection (#8514) —
+/// extracted to a sibling module because this file is over
+/// `.loom/docs/file-size-policy.md`'s threshold and frozen, and because the
+/// projection belongs next to the policy whose state it renders. Re-exported
+/// verbatim so every existing `crate::ipc::…` caller is unchanged.
+pub mod drain_roll;
 
-/// Absolute cap on the pending-roll budget, however large a `--timeout` was
-/// requested (Issue #6007). A host must never stop taking work for longer than
-/// this on account of a version roll.
-pub const MAX_DRAIN_PENDING_BUDGET_SECS: u64 = 4 * 3600;
-
-/// Cap on any single re-armed retry window (Issue #6007) — the windows widen
-/// geometrically, and this stops the widening.
-pub const MAX_DRAIN_RETRY_WINDOW_SECS: u64 = 2 * 3600;
-
-/// A retry window shorter than this is not worth re-arming: the remaining budget
-/// is spent, so the roll is abandoned instead (Issue #6007).
-pub const MIN_DRAIN_RETRY_WINDOW_SECS: u64 = 60;
+pub use drain_roll::{
+    drain_pending_budget, drain_refusal_decision, drain_refusal_path, DrainRollStatus,
+    RefusalDecision, RefusalPath, DRAIN_PENDING_BUDGET_MULTIPLIER, MAX_DRAIN_PENDING_BUDGET_SECS,
+    MAX_DRAIN_RETRY_WINDOW_SECS, MIN_DRAIN_RETRY_WINDOW_SECS,
+};
 
 /// Shared drain-and-restart coordination state (Issue #4090).
 ///
@@ -323,6 +314,17 @@ pub struct DrainDescriptor {
     /// busy host converging on a new binary without an operator re-issuing
     /// `restart --drain` with a bigger `--timeout`.
     pub roll_pending: bool,
+    /// The artifact identity this roll was triggered for (Issue #8514), set by
+    /// the auto-updater immediately after its trigger is accepted (see
+    /// [`DrainState::set_roll_target`]). `None` for any drain the auto-updater
+    /// did not arm — an operator `restart --drain`, a `fleet drain` teardown,
+    /// or a source-path roll with no artifact identity.
+    ///
+    /// It exists so a later auto-update tick can ask "is the roll that is
+    /// already armed the one for *this* artifact?" and supersede a roll whose
+    /// target has been overtaken by a newer release, instead of waiting out a
+    /// pause for a binary that is already stale.
+    pub roll_target: Option<String>,
 }
 
 /// Outcome of [`DrainState::begin`].
@@ -357,19 +359,6 @@ pub enum DrainBegin {
     },
 }
 
-/// What a pending-roll deadline refusal decided to do (Issue #6007). Pure
-/// counterpart of [`drain_refusal_decision`], so the widen-then-give-up policy
-/// is unit-testable without driving a real supervisor to a real deadline.
-#[derive(Debug, PartialEq, Eq)]
-pub enum RefusalDecision {
-    /// Retain the roll: keep dispatch paused and re-arm the deadline `window`
-    /// from now.
-    Defer { window: Duration },
-    /// The paused-dispatch budget is spent — discard the roll intent and resume
-    /// dispatch (the pre-#6007 terminal behavior).
-    Abandon,
-}
-
 /// The outcome [`DrainState::refuse_roll_deadline`] applied (Issue #6007).
 #[derive(Debug, PartialEq, Eq)]
 pub enum RollRefusal {
@@ -395,77 +384,6 @@ pub enum RollRefusal {
         /// Total paused-dispatch budget that was available.
         budget: Duration,
     },
-}
-
-/// Which fail-safe path a [`DrainTick::TimedOutRefuse`] tick takes (Issue #6007).
-#[derive(Debug, PartialEq, Eq)]
-pub enum RefusalPath {
-    /// **Relaunch (roll) drains**: retain the intent — keep dispatch paused and
-    /// re-arm the deadline ([`DrainState::refuse_roll_deadline`]).
-    RetainRoll,
-    /// **Then-exit (teardown) drains**: resume dispatch immediately and discard
-    /// the intent — the pre-#6007 behavior, kept byte-for-byte because
-    /// `fleet drain` orchestrates teardowns over SSH and detects a remote refusal
-    /// by observing `drain.draining == false` on a still-reachable daemon.
-    ResumeDispatch,
-}
-
-/// Pick the fail-safe path for a refused deadline (Issue #6007). Extracted as a
-/// pure function so the roll-vs-teardown split is a test assertion rather than a
-/// branch only reachable by driving a real supervisor to a real deadline.
-#[must_use]
-pub fn drain_refusal_path(then_exit: bool) -> RefusalPath {
-    if then_exit {
-        RefusalPath::ResumeDispatch
-    } else {
-        RefusalPath::RetainRoll
-    }
-}
-
-/// Total paused-dispatch budget a retained ("pending") roll may spend, derived
-/// from the operator's requested drain timeout (Issue #6007).
-#[must_use]
-pub fn drain_pending_budget(base: Duration) -> Duration {
-    let scaled = base
-        .as_secs()
-        .saturating_mul(DRAIN_PENDING_BUDGET_MULTIPLIER);
-    Duration::from_secs(scaled.min(MAX_DRAIN_PENDING_BUDGET_SECS))
-}
-
-/// Decide what a deadline refusal on a **relaunch (roll)** drain should do
-/// (Issue #6007): re-arm a widened window, or give up because the total
-/// paused-dispatch budget is spent.
-///
-/// The windows widen geometrically from the operator's own `--timeout`
-/// (`base * 2^attempt`), each capped at [`MAX_DRAIN_RETRY_WINDOW_SECS`] and at
-/// whatever budget remains — this is the operator's manual
-/// "re-run with a larger `--timeout`" workaround, automated. When less than
-/// [`MIN_DRAIN_RETRY_WINDOW_SECS`] of budget remains there is nothing useful
-/// left to wait for, so the roll is abandoned and dispatch resumes rather than
-/// starving the host of work indefinitely.
-#[must_use]
-pub fn drain_refusal_decision(
-    base: Duration,
-    refusals_so_far: u32,
-    elapsed: Duration,
-) -> RefusalDecision {
-    let budget = drain_pending_budget(base);
-    let remaining = budget.saturating_sub(elapsed).as_secs();
-    if remaining < MIN_DRAIN_RETRY_WINDOW_SECS {
-        return RefusalDecision::Abandon;
-    }
-    // `min(16)` only guards the shift; the widened value is capped immediately
-    // below anyway.
-    let widened = base
-        .as_secs()
-        .saturating_mul(1u64 << refusals_so_far.saturating_add(1).min(16));
-    let window = widened
-        .min(MAX_DRAIN_RETRY_WINDOW_SECS)
-        .min(remaining)
-        .max(MIN_DRAIN_RETRY_WINDOW_SECS);
-    RefusalDecision::Defer {
-        window: Duration::from_secs(window),
-    }
 }
 
 impl Default for DrainState {
@@ -616,6 +534,8 @@ impl DrainState {
         inner.base_timeout = timeout;
         inner.refusals = 0;
         inner.roll_pending = false;
+        // #8514: a fresh drain has no target until whoever armed it records one.
+        inner.roll_target = None;
         // Set the flag while holding the descriptor lock so status can never
         // observe `flag=true` with `active=false`.
         self.flag.store(true, Ordering::Relaxed);
@@ -649,7 +569,23 @@ impl DrainState {
             "drain aborted by operator — dispatch resumed".to_string()
         });
         inner.roll_pending = false;
+        inner.roll_target = None;
         true
+    }
+
+    /// Record which artifact the **active** drain is rolling to (Issue #8514).
+    ///
+    /// Called by the auto-updater right after its trigger is accepted, so a
+    /// later tick can compare the roll that is already armed against a freshly
+    /// resolved release and supersede it when it has been overtaken. A no-op
+    /// when no drain is active — there is nothing to label — and deliberately
+    /// **not** applied to a teardown (`then_exit`) drain: `fleet drain`'s
+    /// teardown is never superseded by a newer binary.
+    pub fn set_roll_target(&self, target: Option<String>) {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        if inner.active && !inner.then_exit {
+            inner.roll_target = target;
+        }
     }
 
     /// The supervisor's fail-safe timeout path: clear the flag, bump the
@@ -662,6 +598,7 @@ impl DrainState {
         inner.active = false;
         inner.deadline = None;
         inner.roll_pending = false;
+        inner.roll_target = None;
         inner.note = Some(note);
     }
 
@@ -725,6 +662,7 @@ impl DrainState {
                 inner.active = false;
                 inner.deadline = None;
                 inner.roll_pending = false;
+                inner.roll_target = None;
                 RollRefusal::Abandoned {
                     attempts,
                     elapsed,
@@ -2630,6 +2568,7 @@ pub fn build_daemon_status(
         draining: false,
         drain_deadline: None,
         drain_note: None,
+        drain_roll: None,
         // Autonomous self-update loop status (#4055) — read from the
         // process-global snapshot the loop publishes each tick. The loop is
         // process-global (exactly one per daemon, never a per-workspace
@@ -2847,6 +2786,10 @@ pub fn build_daemon_status_with_drain(
     let snap = drain.snapshot();
     report.draining = drain.is_draining();
     report.drain_deadline = snap.deadline;
+    // #8514: the live roll projection — "roll pending since T, dispatch paused
+    // for D, N in flight" — computed against the same in-flight list this
+    // report already carries, so the two can never disagree.
+    report.drain_roll = drain_roll::roll_status(&snap, report.in_flight.len(), Utc::now());
     report.drain_note = snap.note;
     report
 }
