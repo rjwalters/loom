@@ -229,12 +229,24 @@ impl Decision {
     /// tier out of the daemon log and into the per-launch records: the launch
     /// surfaces read it off [`ResolvedRuntime::preference`] rather than
     /// re-resolving anything.
+    ///
+    /// The stamped marker is [`Self::marker_line`] verbatim — the exact line
+    /// the daemon logs, including the `backstop=` reservation summary (#8555)
+    /// when the chosen tap holds a metered slot — so the launch record and the
+    /// daemon log can never disagree.
     #[must_use]
     pub fn stamp(&self) -> Option<PreferenceStamp> {
-        match self {
-            Self::Static { .. } => None,
-            Self::Preference { source, resolution } => resolution.stamp(source.as_str()),
+        let Self::Preference {
+            source, resolution, ..
+        } = self
+        else {
+            return None;
+        };
+        let mut stamp = resolution.stamp(source.as_str())?;
+        if let Some(line) = self.marker_line() {
+            stamp.marker = line;
         }
+        Some(stamp)
     }
 
     /// Collapse this decision into the ordinary admission shape every
