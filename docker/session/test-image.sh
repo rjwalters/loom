@@ -266,19 +266,24 @@ fi
 # probe then proves the kernel-level property that topology exists for — a
 # worker cannot write, delete, rename away or rename over the hook registration
 # it is policed by, while `auth.json` beside it stays refreshable.
-# The synthetic profile is owned by whoever runs this script, so these probes
-# run as THAT uid rather than the session's 1000 — the property under test is
-# mount topology, which is uid-independent, and `--read-only` keeps the bundle
-# itself unwritable even if this happens to be root. Session-uid-1000 behaviour
-# against a 0700 profile is proven separately by the Rust Docker fixtures,
-# which CI runs under `setpriv --reuid=1000`.
-PROBE_USER="$(id -u):$(id -g)"
+# These probes run as the session's own uid 1000, exactly as production does,
+# NOT as whoever invokes this script: an account profile is only accessible to
+# its owner, so a probe pinned to the caller's uid passes on a developer box
+# that happens to be uid 1000 and reports `profile-inaccessible` on any host
+# where it is not (a GitHub runner, for one). The synthetic throwaway profile is
+# therefore made reachable by MODE rather than by ownership — it holds one fake
+# string and never a credential, and directory permissions are not the property
+# under test here (mount topology is, and that is uid- and mode-independent).
+# The production shape — a 0700 profile with 0600 auth.json, owned by and
+# reached as uid 1000 — is proven separately by the Rust Docker fixtures, which
+# CI runs under `setpriv --reuid=1000`.
+PROBE_USER="1000:1000"
 PROTECTED_PROFILE=$(mktemp -d)
-chmod 700 "$PROTECTED_PROFILE"
-cleanup_protected() { rm -rf "$PROTECTED_PROFILE"; }
+chmod 777 "$PROTECTED_PROFILE"
+cleanup_protected() { rm -rf "$PROTECTED_PROFILE" 2>/dev/null || true; }
 trap 'cleanup; cleanup_protected' EXIT
 printf 'synthetic-not-a-credential\n' > "$PROTECTED_PROFILE/auth.json"
-chmod 600 "$PROTECTED_PROFILE/auth.json"
+chmod 666 "$PROTECTED_PROFILE/auth.json"
 # Provisioned by the image's OWN sealed provisioner, through the same
 # `provision-controls` endpoint the daemon drives before it creates a session.
 PROVISION_OUT=$(docker run --rm --network none --user "$PROBE_USER" --read-only \
