@@ -46,7 +46,7 @@
 # no such translation -- LOOM_GENERIC_MODEL_FLAG is already spawn-generic.sh's
 # own hook.
 #
-# requires-daemon: runtime-launch-env >= 0.19.357   #8671 — the launch-shape
+# requires-daemon: runtime-launch-env >= 0.19.384   #8671 — the launch-shape
 # port. A resolved binary predating it exits non-zero with clap's
 # "unrecognized subcommand", so the manifest supplies no defaults at all.
 # Declared as a HARD floor rather than `optional` because the degrade is only
@@ -75,11 +75,11 @@ BIN="$(loom_daemon_self_bin_override || loom_locate_daemon_bin "$REPO_ROOT")"
 LAUNCH_RC=127
 if [[ -n "$BIN" ]]; then
     set +e
-    LAUNCH_ENV="$("$BIN" runtime-launch-env --runtime "$RUNTIME_NAME" 2>&1)"
+    LAUNCH_ENV="$("$BIN" runtime-launch-env --runtime "$RUNTIME_NAME")"  # stderr is NOT eval'd
     LAUNCH_RC=$?
     set -e
     if [[ "$LAUNCH_RC" -eq 78 ]]; then
-        echo "spawn-generic-launch($RUNTIME_NAME): $LAUNCH_ENV" >&2
+        echo "spawn-generic-launch($RUNTIME_NAME): manifest launch shape rejected (see above)" >&2
         exit 78
     elif [[ "$LAUNCH_RC" -eq 0 ]]; then
         eval "$LAUNCH_ENV"
