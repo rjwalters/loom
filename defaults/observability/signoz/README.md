@@ -126,9 +126,12 @@ curl --fail http://127.0.0.1:18081/api/v1/version   # expect "setupCompleted":tr
 This gate is **first-run only**: once the organization exists it survives
 restarts, and the ingester re-registers with no further errors. It is also
 recoverable rather than lossy — the gateway's sending queue holds the refused
-batches and drains them intact once the receiver opens, so registering late
-costs latency, not data. Treat `setupCompleted` as the real ingestion-readiness
-signal; a container-running or Compose-healthy result is not one.
+batches and drains them intact once the receiver opens, as long as the backlog
+fits that persistent queue (`queue_size: 1000` requests, with
+`block_on_overflow: false`, so an overflow **drops** the excess rather than
+back-pressuring the producer). Register before pointing real fleet traffic at
+the gateway. Treat `setupCompleted` as the real ingestion-readiness signal; a
+container-running or Compose-healthy result is not one.
 
 Keep deployment copies and volumes outside Loom-managed worktrees for a running
 trial: those worktrees are removed on merge. Copy the complete rendered directory
