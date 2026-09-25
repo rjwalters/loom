@@ -51,13 +51,41 @@ fn record_path(root: &Path, issue: Option<u64>, owner: &str) -> Result<PathBuf> 
         }
     });
     let dir = root.join(".loom/private-jobs");
-    safe_parent(&dir)?;
+    safe_parent(root, &dir)?;
     Ok(dir.join(format!("{key}.json")))
 }
 
-fn safe_parent(path: &Path) -> Result<()> {
-    for parent in path.ancestors() {
-        if std::fs::symlink_metadata(parent).is_ok_and(|m| m.file_type().is_symlink()) {
+/// Rejects a traversal or a symlink among the path components *below* `root`.
+///
+/// Those components are the only ones worker-side data can create, and they are
+/// what this hardening defends: a worker that plants `.loom -> /somewhere/host`
+/// inside its clone must not be able to redirect a host-side control write out
+/// of that clone.
+///
+/// The prefix up to and including `root` is host-chosen and is trusted. It must
+/// be: on macOS a default `TMPDIR` sits under `/var/folders/...`, and both
+/// `/var -> /private/var` and `/tmp -> /private/tmp` are platform symlinks no
+/// worker could have planted. Walking *all* ancestors therefore rejected every
+/// private-workspace call on a macOS host (#8870), which failed the build gate
+/// for every builder on every issue. Scoping the walk to `root`'s descendants
+/// restores that host without granting a blanket symlink allowance: any symlink
+/// component the worker can actually reach is still refused.
+fn safe_parent(root: &Path, path: &Path) -> Result<()> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        bail!("private export destination escapes its root");
+    };
+    // `strip_prefix` is lexical, so a `..` component could otherwise climb back
+    // out of a path that still starts with `root`.
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        bail!("private export destination contains a traversal component");
+    }
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        cursor.push(component);
+        if std::fs::symlink_metadata(&cursor).is_ok_and(|m| m.file_type().is_symlink()) {
             bail!("private export destination contains a symlink");
         }
     }
@@ -80,7 +108,7 @@ pub(super) fn check_failover(root: &Path, issue: Option<u64>, account: &str) -> 
     let Some(issue) = issue else { return Ok(()) };
     let path = record_path(root, Some(issue), "")?;
     if path.exists() {
-        let record: Record = serde_json::from_slice(&read_small(&path)?)?;
+        let record: Record = serde_json::from_slice(&read_small(root, &path)?)?;
         if record.account != account {
             bail!("private job requires recovery on account {}; automatic account/runtime failover cannot transfer its account-owned checkpoint", record.account);
         }
@@ -89,13 +117,16 @@ pub(super) fn check_failover(root: &Path, issue: Option<u64>, account: &str) -> 
 }
 
 pub(super) struct PreparedRecord {
+    /// The trusted host root this record lives under; `safe_parent` is scoped
+    /// to it so a worker-planted symlink still cannot redirect a rollback.
+    root: PathBuf,
     path: PathBuf,
     previous: Option<Vec<u8>>,
     owner: std::cell::RefCell<String>,
 }
 impl PreparedRecord {
     pub(super) fn rebind(&self, owner: &str) -> Result<()> {
-        let mut record: Record = serde_json::from_slice(&read_small(&self.path)?)?;
+        let mut record: Record = serde_json::from_slice(&read_small(&self.root, &self.path)?)?;
         if record.owner != *self.owner.borrow() || record.outcome != "prepared" {
             bail!("prepared export owner changed");
         }
@@ -105,7 +136,7 @@ impl PreparedRecord {
         Ok(())
     }
     pub(super) fn rollback(&self) -> Result<()> {
-        let record: Record = serde_json::from_slice(&read_small(&self.path)?)?;
+        let record: Record = serde_json::from_slice(&read_small(&self.root, &self.path)?)?;
         if record.owner != *self.owner.borrow() || record.outcome != "prepared" {
             return Ok(());
         }
@@ -127,7 +158,7 @@ pub(super) fn record_prepared(
     let prior_path = record_path(root, job.issue, &job.owner)?;
     std::fs::create_dir_all(prior_path.parent().unwrap())?;
     let previous = if prior_path.exists() {
-        Some(read_small(&prior_path)?)
+        Some(read_small(root, &prior_path)?)
     } else {
         None
     };
@@ -150,6 +181,7 @@ pub(super) fn record_prepared(
     };
     save(&prior_path, &record)?;
     Ok(PreparedRecord {
+        root: root.to_path_buf(),
         path: prior_path,
         previous,
         owner: std::cell::RefCell::new(job.owner.clone()),
@@ -158,7 +190,7 @@ pub(super) fn record_prepared(
 
 pub(super) fn update(root: &Path, config: &Config, job: &lease::Job, outcome: &str) -> Result<()> {
     let path = record_path(root, job.issue, &job.owner)?;
-    let mut record: Record = serde_json::from_slice(&read_small(&path)?)?;
+    let mut record: Record = serde_json::from_slice(&read_small(root, &path)?)?;
     if record.account != config.account
         || record.container_id != job.container_id
         || record.owner != job.owner
@@ -186,10 +218,10 @@ pub(super) fn update(root: &Path, config: &Config, job: &lease::Job, outcome: &s
             validate(&snapshot, job.issue)?;
             if let (Some(issue), Some(checkpoint)) = (job.issue, &snapshot.checkpoint) {
                 let dir = root.join(".loom/sweep-checkpoint");
-                safe_parent(&dir)?;
+                safe_parent(root, &dir)?;
                 std::fs::create_dir_all(&dir)?;
                 let destination = dir.join(format!("issue-{issue}.json"));
-                let previous = read_small(&destination)
+                let previous = read_small(root, &destination)
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<Checkpoint>(&bytes).ok());
                 if previous.as_ref() != Some(checkpoint) {
@@ -261,9 +293,12 @@ fn validate(snapshot: &Snapshot, issue: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-fn read_small(path: &Path) -> Result<Vec<u8>> {
+/// Reads a bounded control record. `root` is the trusted host directory the
+/// record must live under (see [`safe_parent`]); `O_NOFOLLOW` additionally
+/// refuses the final component even if it raced into a symlink after the walk.
+fn read_small(root: &Path, path: &Path) -> Result<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt;
-    safe_parent(path)?;
+    safe_parent(root, path)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -315,7 +350,7 @@ pub(super) fn snapshot(issue: Option<u64>) -> Result<Snapshot> {
         .map(|n| repo.join(format!(".loom/sweep-checkpoint/issue-{n}.json")))
         .filter(|p| p.exists())
         .map(|p| -> Result<Checkpoint> {
-            let value: Value = serde_json::from_slice(&read_small(&p)?)?;
+            let value: Value = serde_json::from_slice(&read_small(repo, &p)?)?;
             Ok(Checkpoint {
                 task_id: value["task_id"].as_str().unwrap_or_default().into(),
                 timestamp: value["timestamp"]
@@ -405,11 +440,63 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.path().join(".loom")).unwrap();
         assert!(record_path(root.path(), Some(7), "owner").is_err());
         std::fs::write(outside.path().join("large"), vec![b'x'; 65537]).unwrap();
-        assert!(read_small(&outside.path().join("large")).is_err());
+        assert!(read_small(outside.path(), &outside.path().join("large")).is_err());
         std::fs::write(outside.path().join("keep"), "precious").unwrap();
         std::os::unix::fs::symlink(outside.path().join("keep"), root.path().join("link")).unwrap();
-        assert!(read_small(&root.path().join("link")).is_err());
+        assert!(read_small(root.path(), &root.path().join("link")).is_err());
         assert_eq!(std::fs::read_to_string(outside.path().join("keep")).unwrap(), "precious");
+    }
+    /// A symlinked *prefix* is the host's own business — macOS resolves a
+    /// default `TMPDIR` through `/var -> /private/var`, and rejecting that
+    /// failed every private-workspace call (and so the whole build gate) on
+    /// every macOS host (#8870). Only components below the trusted root, which
+    /// are the ones worker data can create, stay refused.
+    #[test]
+    fn platform_symlinked_root_prefix_is_allowed_but_worker_symlinks_are_not() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("private");
+        std::fs::create_dir_all(real.join("clone")).unwrap();
+        // Stand in for macOS's `/var -> /private/var`: reach the same clone
+        // through a symlinked ancestor the worker never controls.
+        std::os::unix::fs::symlink(&real, base.path().join("link")).unwrap();
+        let root = base.path().join("link/clone");
+
+        let path =
+            record_path(&root, Some(7), "owner").expect("a symlinked host prefix is trusted");
+        assert!(path.ends_with(".loom/private-jobs/issue-7.json"));
+        assert!(check_failover(&root, Some(7), "any").is_ok());
+
+        // The allowance must not extend below the root: the same clone, reached
+        // through the same benign prefix, still refuses a planted symlink.
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, real.join("clone/.loom")).unwrap();
+        assert!(record_path(&root, Some(7), "owner").is_err());
+        std::fs::write(outside.join("secret"), "precious").unwrap();
+        assert!(read_small(&root, &root.join(".loom/secret")).is_err());
+
+        // A planted symlink deeper than the first component below the root is
+        // refused too: the walk covers every descendant component, it does not
+        // spot-check one level.
+        std::fs::remove_file(real.join("clone/.loom")).unwrap();
+        std::fs::create_dir_all(real.join("clone/.loom")).unwrap();
+        std::os::unix::fs::symlink(&outside, real.join("clone/.loom/private-jobs")).unwrap();
+        assert!(record_path(&root, Some(7), "owner").is_err());
+        assert_eq!(std::fs::read_to_string(outside.join("secret")).unwrap(), "precious");
+        assert!(!outside.join("issue-7.json").exists());
+    }
+    #[test]
+    fn export_paths_reject_traversal_and_foreign_roots() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("clone")).unwrap();
+        let clone = root.path().join("clone");
+        assert!(safe_parent(&clone, &clone.join(".loom")).is_ok());
+        // Lexically still under `clone`, but it climbs back out.
+        assert!(safe_parent(&clone, &clone.join("../escape")).is_err());
+        // Not under the trusted root at all: refused rather than trivially
+        // accepted for having no components to walk.
+        assert!(safe_parent(&clone, root.path()).is_err());
+        assert!(safe_parent(&clone, Path::new("/etc/passwd")).is_err());
     }
     #[test]
     fn abandoned_preparation_rolls_back_only_its_matching_host_record() {
@@ -430,6 +517,7 @@ mod tests {
         };
         save(&path, &record).unwrap();
         let token = PreparedRecord {
+            root: root.path().to_path_buf(),
             path: path.clone(),
             previous: None,
             owner: std::cell::RefCell::new(record.owner.clone()),
@@ -443,19 +531,21 @@ mod tests {
         };
         save(&path, &record).unwrap();
         let token = PreparedRecord {
+            root: root.path().to_path_buf(),
             path: path.clone(),
             previous: Some(serde_json::to_vec(&prior).unwrap()),
             owner: std::cell::RefCell::new(record.owner.clone()),
         };
         token.rollback().unwrap();
-        let restored: Record = serde_json::from_slice(&read_small(&path).unwrap()).unwrap();
+        let restored: Record =
+            serde_json::from_slice(&read_small(root.path(), &path).unwrap()).unwrap();
         assert_eq!(restored.owner, "prior-owner");
         assert_eq!(restored.outcome, "failed");
         // Another attempt replaced the prepared record; an older Drop cannot
         // erase its recovery association.
         token.rollback().unwrap();
         assert_eq!(
-            serde_json::from_slice::<Record>(&read_small(&path).unwrap())
+            serde_json::from_slice::<Record>(&read_small(root.path(), &path).unwrap())
                 .unwrap()
                 .owner,
             "prior-owner"
