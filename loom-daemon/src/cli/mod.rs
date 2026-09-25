@@ -17,6 +17,7 @@ pub(crate) mod cleanup_ops;
 pub(crate) mod common;
 pub(crate) mod concierge;
 mod daemon_start;
+mod daemon_update;
 pub(crate) mod dep_classify;
 pub(crate) mod dep_recheck;
 pub(crate) mod dispatch;

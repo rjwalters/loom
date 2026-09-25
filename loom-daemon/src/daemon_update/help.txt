@@ -1,0 +1,393 @@
+loom-daemon-update.sh - Self-update the RAW loom-daemon process (Issue #3968)
+
+Closes the "self-update gap" observed during the 2026-07-25/26 canary
+rollout: the daemon's self-repair loop filed AND fixed 16 of its own
+defects, but every merged fix only took effect after an operator manually
+rebuilt the Rust binary, reprovisioned it, and restarted the process. This
+script is the single operator command that does all three, in order,
+preserving the FLAGS-OFF/opt-in autonomy contract across the restart.
+
+Staleness detection strategy (primary, zero-network): compare the git
+commit BAKED INTO the currently-resolved `loom-daemon` binary (embedded at
+build time via build.rs -> LOOM_DAEMON_GIT_COMMIT, surfaced in
+`loom-daemon --version`) against the LOCAL source tree's current HEAD short
+commit. This answers the directly actionable question — "would rebuilding
+right now produce a different binary?" — without touching the network.
+
+Checkout freshness (default, ff-first — #4330): the whole point of running
+this script is to get the daemon onto the LATEST code, so before resolving
+the local HEAD used for the staleness comparison above, this script attempts
+a bounded, best-effort `git fetch` of origin/<default-branch> and, if local
+HEAD is behind, a `git merge --ff-only`. On success the rebuild below builds
+the freshly-synced HEAD. If the ff-merge cannot apply (diverged local
+commits, or a dirty tracked file conflicts with the incoming change) the
+script ABORTS (exit 1) rather than guessing or hard-resetting — a stale
+rebuild silently missing merged commits (the 2026-07-29 incident this issue
+closes) is worse than a loud abort asking the operator to resolve it by
+hand. A fetch failure/timeout (offline, network degraded) is NOT treated as
+"behind" — the script warns and proceeds with local HEAD as-is, so this
+check never makes the script hard-network-dependent. `--allow-stale`
+restores the pre-#4330 build-what's-here behavior (skips the fetch+merge
+entirely) for deliberate use (bisecting, testing a local patch) — see below.
+
+It:
+  - detects whether the resolved binary is stale vs. the local source tree
+    (or, in artifact-fetch mode, vs. the latest GitHub Release — see below),
+  - Artifact-fetch mode (Epic #4990 Phase 3, #5020, ON by default, opt out
+    with --no-fetch): resolves the latest GitHub Release with version >=
+    the installed daemon and, when that release publishes an artifact for
+    this host's platform, downloads + verifies it (checksum unconditional,
+    signature when present) INSTEAD of rebuilding from source — a
+    saturated host with no Rust toolchain converges on a release alone.
+    Resolution failure of any kind (unrecognized platform, no `gh` CLI, no
+    Releases yet, API unreachable, no artifact for this platform) SOFTLY
+    falls back to the rebuild path below (--fetch instead hard-fails).
+  - rebuilds (`cargo build --release`) in loom-daemon/ when stale (or
+    --force) AND no artifact was fetched,
+  - provisions the fresh binary to wherever the resolved binary lives
+    (LOOM_DAEMON_BIN override, else the machine-level ~/.local/bin install
+    via scripts/install/provision-daemon.sh, matching #3922's convention),
+  - reads the flags loom-daemon-start.sh persisted at the last invocation
+    (.loom/.daemon.flags, #3968) and restarts with EXACTLY those flags —
+    never more, never fewer. A daemon that was NOT running is left
+    stopped (this script never widens FLAGS-OFF by starting autonomy that
+    wasn't already running).
+
+Stale-entry-point advisory (#4079 hardening, epic #4081 Phase 4 / #4557):
+on every path — including --check, --dry-run, and an up-to-date no-op — this
+script scans PATH for `loom-*` executables that do NOT resolve to the
+loom-daemon binary it just resolved, and WARNS about each one. This is the
+#4079 failure mode: a long-gone `pip install -e loom-tools` left frozen
+console scripts in ~/.local/bin that kept shadowing the Rust binary's own
+entry points, so agents ran ancient logic while `--version` looked fresh.
+Since #4557 deleted that Python package, nothing regenerates such scripts
+ever again. The warning ALSO fires when PATH holds more than one
+`loom-daemon` (the first shadows the rest). It is advisory only: nothing is
+deleted, PATH is untouched, and the exit code is unaffected. The
+auto-generated `loom-clean`/`loom-recover-orphans`/`loom-claim` shims
+(#4272/#4275) pointing at the resolved binary are never flagged. (`loom-search`
+was allowlisted here as a legitimate non-daemon Python console script from
+#4557 through #4969 — #4970 retired that package too, so a `loom-search` on
+PATH is now exactly the #4079 failure shape and IS flagged, like any other
+stale entry point.) Suppress with LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1.
+
+Launchd-managed daemons (#4042): on Darwin the daemon is commonly launchd-
+managed (default since #3972/#4054), in which case NEITHER .loom/.daemon.pid
+nor .loom/.daemon.flags reliably reflects "is it running" — the pid file goes
+stale after any KeepAlive:SuccessfulExit relaunch, and a hand-bootstrapped
+daemon has no state files at all. This script therefore checks the launchd job
+state (`launchctl print <domain>/<label>`, where <domain> is
+resolve_launchd_domain()'s gui/<uid> ↦ user/<uid> pick — #4130 — mirroring
+loom-daemon-stop.sh) AHEAD of the pid-file tier when resolving whether/how the
+daemon is running.
+When launchd-managed, it restarts via the `loom-daemon restart` primitive
+(#4077 — sends Request::RestartDaemon over the IPC socket; the supervised
+daemon exits 0 and launchd relaunches it onto the fresh binary with the
+plist's persisted ProgramArguments/EnvironmentVariables). .daemon.flags is NOT
+consulted in this mode (the plist's EnvironmentVariables IS the durable flag
+source), and no "restarting FLAGS-OFF" warning fires. If the running (old)
+binary predates #4077 and refuses the request, this script REFUSES LOUDLY
+(exit 6) and prints how to re-render the plist + relaunch under supervision
+(loom-daemon-update.sh --relaunch), rather than reporting a half-update — the
+exact #4011 silent-autonomy-loss class this closes. The old advice to bootstrap
+the EXISTING plist was itself a bug (#4118): it relaunched under the STALE plist
+(no KeepAlive:SuccessfulExit, no LOOM_DAEMON_SUPERVISOR), so every subsequent
+roll hit the same exit 6 forever. It was ALSO documented (here, through
+2026-08-03) as killing in-flight sweeps via bootout tearing down the job tree
+— that claim is STALE (#5081): since #3800 (2026-07-22) every sweep is spawned
+as its OWN process group (`Command::process_group(0)`), and launchd's bootout
+tears down the job's process group specifically, so a detached sweep is never
+reached by it — it reparents to pid 1 and keeps running. Confirmed both by
+code (dispatch.rs, `#4980`'s persisted pgid relies on this same fact) and by
+observation (three bootout+bootstrap cycles on 2026-08-03, #5081). --relaunch
+is still the recommended path here, but for a DIFFERENT reason: `launchctl
+bootout` is asynchronous, and a hand-run bootstrap immediately after it can
+race the still-in-progress teardown and fail with "Bootstrap failed: 5:
+Input/output error", leaving the daemon down until a retry. --relaunch
+re-renders via loom-daemon-start.sh (installing the supervised keys) while
+preserving the live plist's LOOM_* autonomy env; loom-daemon-start.sh's own
+bootout+bootstrap sequence settles after bootout, retries the bootstrap step
+on that specific race, and verifies the relaunched job's live pid + reported
+environment before reporting success (#5081) — a hand-typed bootout+bootstrap
+gets none of that safety net.
+
+systemd --user-managed daemons (Linux, #4260 sub-issue C): the exact same
+ownership-tiering + supervised-restart contract, ported to the systemd --user
+service loom-daemon-start.sh installs (#4268). A `systemd --user` unit's pid
+also goes stale on every `Restart=on-success` relaunch, so it is checked at the
+SAME tier as launchd, ahead of the pid-file tier. The restart itself is driven
+by the identical `loom-daemon restart` IPC primitive (recognized daemon-side by
+`detect_supervisor()` since #4267/PR #4298 when `LOOM_DAEMON_SUPERVISOR=systemd`
+is present — baked into the rendered unit by loom-daemon-start.sh); a clean
+exit 0 lets systemd's `Restart=on-success` relaunch onto the fresh binary.
+That ack is verified, not trusted (#4950, mirroring #4232's launchd
+verification): the script polls for a NEW, live MainPID within a bounded
+window before reporting success, and — if the unit does not come back on its
+own — self-heals via `systemctl --user reset-failed <unit> && systemctl --user
+start <unit>` before giving up (exit 7). #5119 widened that self-heal: on a
+busy host the daemon's clean exit can leave the unit sitting in
+`deactivating (stop-sigterm)` for the full TimeoutStopSec while systemd reaps
+the sweep/role children still in the service cgroup — far past the pid poll on
+a STALE unit (default 90s). The verifier now WAITS for a transitional stop to
+settle (LOOM_DAEMON_STOP_SETTLE_SECS), then self-heals ANY non-`active` settled
+state (`failed` — the #4950 stop-timeout shape — as well as `inactive`),
+instead of the pre-#5119 behavior of only acting on an already-`failed`
+snapshot and otherwise "refusing to guess" (which left the 2026-08-03
+loom-worker-1 daemon down until a hand `reset-failed && start`). On a
+refused restart (a pre-#4267 binary with no RestartDaemon handler, or a dead
+socket), the script refuses loudly (exit 6) exactly like launchd, and
+--relaunch (or LOOM_DAEMON_UPDATE_RELAUNCH=1) re-renders the unit and forces
+the relaunch: it harvests the live unit's `Environment=` LOOM_*/token lines,
+SIGTERMs the running daemon (so sweep children reparent instead of being torn
+down), then re-invokes loom-daemon-start.sh — which re-renders the unit
+(installing `LOOM_DAEMON_SUPERVISOR=systemd`), reloads, and `enable --now`s it
+onto a now-inactive unit, i.e. a genuine restart. `LOOM_DAEMON_SYSTEMD=0`
+disables ALL systemd interaction symmetrically with loom-daemon-start.sh
+--no-systemd / loom-daemon-stop.sh, so a --no-systemd install is never probed
+via systemctl and follows the PID-file/nohup restart path instead. Darwin
+behavior is entirely unaffected — this tier is inert unless
+`is_linux_systemd()` (lib/systemd-user.sh) resolves true.
+
+Usage:
+  ./.loom/scripts/cli/loom-daemon-update.sh              Detect, rebuild if stale, provision, restart (preserving flags)
+  ./.loom/scripts/cli/loom-daemon-update.sh --check       Detect only; exit 0 (up to date) or 3 (update available); no writes
+  ./.loom/scripts/cli/loom-daemon-update.sh --dry-run     Print the plan without building/provisioning/restarting
+  ./.loom/scripts/cli/loom-daemon-update.sh --force       Rebuild + provision + restart even if already up to date
+  ./.loom/scripts/cli/loom-daemon-update.sh --no-restart  Rebuild + provision only; leave the running daemon untouched
+  ./.loom/scripts/cli/loom-daemon-update.sh --relaunch    Launchd/systemd only: after a refused restart, re-render the plist/unit and relaunch under supervision (SIGTERMs the daemon so sweep children reparent; preserves the live LOOM_* env)
+  ./.loom/scripts/cli/loom-daemon-update.sh --drain        Launchd/systemd only (Issue #5138): restart via the existing `loom-daemon restart --drain` primitive (#4090) instead of an immediate restart — pauses dispatch, waits for every in-flight sweep to finish (so sweep.completed/sweep.outcome telemetry is never lost, #5084), THEN relaunches. On systemd this is now the DEFAULT (see below) because an immediate restart there is actively destructive (#5119), not merely lossy — this flag is for opting IN on launchd, or for being explicit on systemd. A drain that cannot finish within its timeout leaves the CURRENT (pre-update) binary running rather than cancelling sweeps (fail-safe, unchanged from #4090) and this script says so clearly (exit 8). Same as LOOM_DAEMON_UPDATE_DRAIN=1. Combine with the single-invocation roll this issue closes: build + provision + drain-restart in one command, no more manual `--no-restart` then `loom-daemon restart --drain` two-step (that workaround still works unchanged, see --no-restart above).
+  ./.loom/scripts/cli/loom-daemon-update.sh --timeout SECS Passthrough to `loom-daemon restart --drain --timeout SECS` (only meaningful with an active drain, explicit or systemd-default): max seconds to wait for in-flight sweeps before the fail-safe refuses the restart (daemon default: tens of minutes, currently 1800s). Ignored (with no error) when no drain is active.
+  ./.loom/scripts/cli/loom-daemon-update.sh --force-after-timeout  Passthrough to `loom-daemon restart --drain --force-after-timeout` (only meaningful with an active drain): on a drain timeout, cancel the remaining in-flight sweep(s) and restart anyway instead of refusing. Without this, a drain timeout keeps the daemon running its PRE-update binary (the fail-safe) and this script exits 8. Ignored (with no error) when no drain is active.
+  ./.loom/scripts/cli/loom-daemon-update.sh --restart-now   Systemd only (Issue #5138): opt OUT of the systemd drain-by-default behavior above and restart IMMEDIATELY (the pre-#5138 behavior on every supervisor) — for an operator who has confirmed nothing is in flight and wants the roll to finish as fast as possible. Mutually exclusive with --drain (exit 1 if both are given). No effect on launchd (already the default there) or the bare pid-file/nohup path (which never speaks the drain primitive at all).
+  ./.loom/scripts/cli/loom-daemon-update.sh --allow-stale Skip the default ff-first sync with origin/<default-branch> and build the current (possibly stale) checkout as-is (#4330) — for deliberate use: bisecting, testing a local patch
+  ./.loom/scripts/cli/loom-daemon-update.sh --auto-resolve-safe-abort  When the ff-only sync would otherwise hard-abort (#4330), auto-perform the fix IF the blocking state classifies as safe (#4951): content-identical diverged commits with an otherwise-CLEAN working tree (`git reset --hard origin/<default-branch>`), or dirty tracked files that are ALL Loom-managed installed copies (`git checkout --` them + re-run resync-installed.sh). Any other cause (genuine content divergence, any unmanaged dirty file, or a dirty tracked file co-existing with the content-identical divergence) still hard-aborts unchanged — this flag never widens what's classified as safe, only whether the safe cases are printed (default) or performed
+  ./.loom/scripts/cli/loom-daemon-update.sh --fetch        Artifact-fetch mode (Epic #4990 Phase 3, #5020): REQUIRE a verified GitHub Release artifact for this host's platform (resolve latest Release >= installed version, download, verify checksum unconditionally + signature when present, provision) instead of `cargo build --release`; hard-fails (exit 1) rather than silently falling back to a source build when no matching artifact resolves. Same as LOOM_DAEMON_UPDATE_FETCH=1.
+  ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch      Disable artifact-fetch mode entirely; always use the local source-build path (pre-#5020 behavior). Same as LOOM_DAEMON_UPDATE_FETCH=0.
+  ./.loom/scripts/cli/loom-daemon-update.sh --resolve-json  READ-ONLY resolution (Issue #7609): resolve the latest Release artifact for this host's platform and print ONE JSON object on stdout describing it (tag/version/published_at/asset sha256) alongside the installed binary (path/version/commit/sha256) and the source tree's VERSION — then exit WITHOUT fetching, building, provisioning, or restarting anything (no `git fetch`/ff-sync either). Every other line this script prints goes to stderr in this mode, so stdout is pure JSON. Exit 0 when a release artifact resolved, 1 when it did not (`.ok` says which, `.reason` says why). This is the query `loom-daemon`'s auto_update loop drives its artifact-first tick from, so the resolution logic lives here once instead of being duplicated in Rust.
+  ./.loom/scripts/cli/loom-daemon-update.sh --prune-stale-entry-points  Remove exactly the PATH entries the stale-entry-point advisory below (#4079/#4557) classifies as a "Python console script (stale pip/pipx editable install)" — a frozen console script left behind by the retired pip/pipx package (epic #4081 Phase 4 / #4557) that never resolves to the current loom-daemon binary and so is never touched by an update again. Conservative by construction: it reuses the SAME classification the advisory already computes, so `loom-daemon` itself and the auto-generated bash-wrapper shims (`loom-clean`/`loom-recover-orphans`/`loom-claim`, #4272/#4275 — including a STALE shim whose target moved) are never candidates, only ever reported. Standalone: performs the prune, reports what it removed, and exits — no build/provision/restart. Idempotent (a second run finds nothing to remove) and reports "nothing to prune" when the PATH is already clean. Honors LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 (a no-op, matching the check it would otherwise act on) (#5139).
+  ./.loom/scripts/cli/loom-daemon-update.sh --help
+
+Environment:
+  LOOM_DAEMON_UPDATE_FETCH  Artifact-fetch precedence (Epic #4990 Phase 3,
+                         #5020): 1/true/yes forces it (same as --fetch,
+                         hard-fails without a matching artifact); 0/false/no
+                         disables it (same as --no-fetch); unset (default)
+                         is "auto" — prefer a verified artifact when one
+                         resolves, else soft-fall-back to the source build.
+  LOOM_DAEMON_UPDATE_GH_REPO  Override the "owner/repo" slug used to
+                         resolve GitHub Releases (else parsed from the
+                         `origin` git remote).
+  LOOM_DAEMON_UPDATE_TARGET  Override the release target triple this host
+                         resolves to (else auto-detected from `uname -s -m`,
+                         e.g. aarch64-apple-darwin) — mainly for tests.
+  LOOM_DAEMON_UPDATE_COSIGN_PUBKEY  Path to the cosign public key used to
+                         verify a Linux release's detached `.sig` (else a
+                         conventional checked-in `.loom/cosign.pub` /
+                         `defaults/cosign.pub` if present). Consulted ONLY
+                         for a `.sig` with no sibling `.pem` certificate:
+                         releases signed keylessly (the default since
+                         #5054) carry a certificate and are verified against
+                         the signer identity below, with no key material
+                         distributed on either side.
+  LOOM_DAEMON_UPDATE_COSIGN_IDENTITY  Pin one EXACT expected keyless signer
+                         identity (cosign --certificate-identity). Default:
+                         unset — the expected identity is DERIVED from the
+                         release being fetched, as the regexp
+                         ^https://github\.com/<slug>/\.github/workflows/[^@]+@refs/tags/<tag>$
+                         ("a workflow in the release repo, run at exactly
+                         this release's tag").
+  LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER  Expected keyless certificate issuer
+                         (default https://token.actions.githubusercontent.com,
+                         i.e. GitHub Actions' OIDC provider).
+  LOOM_PID_FILE         #6386: the pid file consulted for liveness detection,
+                         TIER 1 -- ahead of the $PWD/machine-derived
+                         "<state home>/.daemon.pid". Same precedence
+                         loom-daemon-stop.sh (which this script delegates the
+                         restart's stop half to), loom-daemon-watchdog.sh and
+                         the daemon itself use, so the restart can never plan
+                         against a different file than the stop acts on.
+  LOOM_DAEMON_BIN       Path to the loom-daemon binary (else auto-detected,
+                         same resolution as loom-daemon-start.sh). When set,
+                         the fresh binary is provisioned directly to this
+                         exact path instead of the machine-level default.
+  LOOM_DAEMON_BIN_DIR   Machine-level install dir (default ~/.local/bin),
+                         forwarded to provision-daemon.sh.
+  LOOM_SKIP_STALE_ENTRY_POINT_CHECK  1/true/yes suppresses the advisory
+                         stale-`loom-*`-entry-point warning described below.
+  LOOM_SKIP_IDLE_SHUTDOWN_NOTICE  1/true/yes suppresses the advisory
+                         post-update idle-shutdown cron-guard notice (#4697):
+                         "this host will power itself off after N idle
+                         minutes" when a `fleet add-worker
+                         --idle-shutdown-minutes` guard is installed. Silent
+                         (no notice at all) when no such guard exists.
+  LOOM_DAEMON_LAUNCHD    macOS only: 0/false/no disables ALL launchd interaction
+                         (ownership detection + launchd restart), symmetric with
+                         loom-daemon-start.sh / loom-daemon-stop.sh. A daemon
+                         started with --no-launchd / LOOM_DAEMON_LAUNCHD=0 gets
+                         an update that never reads the machine-global launchd
+                         domain and follows the PID-file/nohup restart path.
+  LOOM_LAUNCHD_LABEL     macOS only: the LaunchAgent label to inspect/restart
+                         (default com.rjwalters.loom-daemon).
+  LOOM_LAUNCHD_DOMAIN    macOS only: pin the launchd domain (gui/<uid> or
+                         user/<uid>); else auto-resolved gui→user (#4130),
+                         matching loom-daemon-start.sh / -stop.sh.
+  LOOM_DAEMON_SYSTEMD    Linux only: 0/false/no disables ALL systemd interaction
+                         (ownership detection + systemd restart), symmetric with
+                         loom-daemon-start.sh --no-systemd / loom-daemon-stop.sh
+                         (#4268). A daemon started with --no-systemd /
+                         LOOM_DAEMON_SYSTEMD=0 gets an update that never invokes
+                         systemctl and follows the PID-file/nohup restart path.
+  LOOM_SYSTEMD_UNIT      Linux only: the systemd --user unit to inspect/restart
+                         (default loom-daemon.service); must match the start's.
+  LOOM_DAEMON_UPDATE_RELAUNCH  Launchd/systemd only: 1/true/yes is equivalent to
+                         passing --relaunch (opt in to the re-render + relaunch
+                         on a refused restart).
+  LOOM_DAEMON_UPDATE_DRAIN  Launchd/systemd only (Issue #5138): 1/true/yes is
+                         equivalent to passing --drain. Has no effect on
+                         systemd's own default (already drained unless
+                         --restart-now/LOOM_DAEMON_UPDATE_RESTART_NOW is given) —
+                         it exists mainly to opt IN on launchd, or in a script
+                         that wants to be explicit.
+  LOOM_DAEMON_UPDATE_RESTART_NOW  Systemd only (Issue #5138): 1/true/yes is
+                         equivalent to passing --restart-now (opt OUT of the
+                         systemd drain-by-default and restart immediately).
+  LOOM_DAEMON_DRAIN_POLL_SECS  Seconds this script polls for the supervisor to
+                         relaunch a NEW, live pid after a drain-mode restart is
+                         accepted (#5138), before treating it as either the
+                         fail-safe (no --force-after-timeout: leaves the
+                         pre-update binary running, exit 8) or an unconfirmed
+                         failure (--force-after-timeout: falls through to the
+                         same self-heal fallback a plain restart uses).
+                         Default: the drain's own --timeout (or the daemon's
+                         built-in default, 1800s) plus a 60s grace buffer —
+                         long enough that a real drain is never mistaken for a
+                         hang. If LOOM_DAEMON_RESTART_POLL_SECS (below) is ALSO
+                         set, it wins over this default (drain or not) — an
+                         explicit poll-window override always takes
+                         precedence over either default.
+  LOOM_MACHINE_CHECKOUT  Machine mode (Epic #3835 Phase 3b, #4229): set by the
+                         `scripts/loom` dispatcher to the resolved
+                         ~/.local/share/loom checkout before it execs this
+                         script. When set, THIS is the source tree rebuilt
+                         from (overriding the $PWD-based find_repo_root()
+                         below), so `loom update` works from any directory --
+                         a consumer repo, or no repo at all -- instead of
+                         requiring $PWD to already be inside a Loom source
+                         checkout. Direct invocation of this script (no
+                         dispatcher -- the existing dev workflow) never sets
+                         it and is unaffected.
+  LOOM_DAEMON_RESTART_POLL_SECS  macOS/launchd (#4232) AND Linux/systemd
+                         (#4950): seconds to poll for a NEW, live pid after a
+                         `restart` ack before falling back to the
+                         supervisor's self-heal (`launchctl kickstart` on
+                         launchd; `systemctl --user reset-failed && start` on
+                         systemd, and only when the unit is `failed`)
+                         (default 30).
+  LOOM_DAEMON_RESTART_POLL_INTERVAL  Poll interval in seconds between pid
+                         checks (default 1; may be fractional, e.g. 0.5).
+  LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS  macOS/launchd (#4232) AND
+                         Linux/systemd (#4950): seconds to re-poll for a new,
+                         live pid after the self-heal fallback before giving
+                         up (default 15).
+  LOOM_DAEMON_STOP_SETTLE_SECS  Linux/systemd (#5119): after the pid poll
+                         expires, seconds to wait for a still-transitioning
+                         unit (ActiveState=deactivating/activating) to SETTLE
+                         into a terminal state before running the reset-failed+
+                         start self-heal. Sized to exceed systemd's default 90s
+                         TimeoutStopSec so a stale unit's slow SIGTERM→SIGKILL
+                         cgroup teardown is waited out rather than mistaken for
+                         "refusing to guess" (default 100).
+
+Exit codes:
+  0  up to date (no-op) OR rebuild+provision+restart succeeded
+  1  usage error / not a source checkout / build or provision failure /
+     the default ff-first sync with origin/<default-branch> could not apply
+     (diverged local commits, a dirty tracked file conflicting with the
+     incoming change, or HEAD is not on <default-branch>) — the script
+     NEVER guesses or hard-resets; resolve manually or pass --allow-stale
+     (#4330). Two of the ff-abort causes classify as safely resolvable
+     (#4951): content-identical diverged commits with an otherwise-CLEAN
+     working tree, or dirty tracked files that are ALL Loom-managed
+     installed copies — by default these still
+     exit 1 but the abort message names the exact safe command; pass
+     --auto-resolve-safe-abort to have the script perform it instead (exit
+     0 on success). Any other cause still hard-aborts unchanged. Also used
+     by artifact-fetch mode (#5020) for: a checksum mismatch on a
+     downloaded artifact (unconditional — leaves the running daemon
+     untouched), a signature-verification failure on a PRESENT signature
+     (distinct from "unsigned", which is not an error), and --fetch given
+     with no matching release artifact resolvable (refuses to silently
+     fall back to a source build). Also used by --prune-stale-entry-points
+     (#5139) if any candidate path failed to `rm` (permissions, a race) —
+     the paths that DID remove successfully are still reported individually
+     above the error.
+     Also used by --resolve-json (#7609) when NO release artifact resolved
+     for this host's platform — that is an ordinary, expected outcome (no
+     Releases yet, an unreachable API, an unbuilt platform), not a fault:
+     the JSON object is still printed on stdout with `.ok=false` and a
+     `.reason`, and callers are expected to read the JSON rather than
+     branch on the exit code alone.
+  3  (--check only) update available
+  4  build verification FAILED: the freshly-built binary's embedded commit
+     does not match the source HEAD it was built from. This is a BUILD-SYSTEM
+     defect (a stale baked-in commit — e.g. a build.rs watch-set bug), NOT a
+     compile failure, and retrying cannot fix it; the script refuses to
+     provision the mis-stamped binary (#4053).
+  5  post-provision verification FAILED: the destination binary after a
+     claimed-successful provision is not the expected build (a silent no-op
+     roll — "reports success while shipping nothing"). Distinct from both a
+     compile failure and a provisioning soft-failure (#4053).
+  6  supervised restart FAILED: the daemon is launchd- or systemd-managed but
+     the running (old) binary refused the `loom-daemon restart` IPC request (a
+     pre-#4077/#4267 binary with no RestartDaemon handler, or a dead socket).
+     The fresh binary IS provisioned but the OLD one is still running; the
+     script refuses to report success. Without --relaunch it prints how to
+     re-render the plist/unit and relaunch under supervision, then exits 6;
+     with --relaunch (or LOOM_DAEMON_UPDATE_RELAUNCH=1) it performs that
+     re-render+relaunch itself, propagating loom-daemon-start.sh's exit code
+     (#4042, #4118, #4260 sub-issue C).
+  7  restart ACK'd but never took effect: the running (old) binary accepted
+     the `restart` IPC request (exit 0), but the supervisor never relaunched
+     the job/unit onto a NEW, live pid within the poll window, AND the
+     self-heal fallback also failed to bring it up within its own poll
+     window. On launchd (#4232) the fallback is a plain `launchctl
+     kickstart` (never -k). On systemd (#4950/#5119) the fallback is
+     `systemctl --user reset-failed <unit> && systemctl --user start <unit>`,
+     tried whenever the unit is NOT `active` — the confirmed-`failed`
+     `Result=timeout` stop escalation #4950 closes, AND (#5119) a unit still
+     stuck `deactivating`/`inactive` when the poll expired: after the poll the
+     script now WAITS up to LOOM_DAEMON_STOP_SETTLE_SECS for a transitional
+     unit's stop to complete, then self-heals the settled non-`active` state
+     rather than "refusing to guess" and leaving the daemon down (systemd never
+     auto-relaunches a failed/stopped unit even under `Restart=on-success`).
+     Only a genuinely `active` unit on an unobserved pid is left untouched. The
+     fresh binary IS provisioned, but the daemon's live status
+     is NOT confirmed — this is the "restart scheduled but the supervisor
+     silently never relaunched" outage class these issues close; the script
+     refuses to report success on the ack alone. A drain-mode restart
+     (--drain, or the systemd default, #5138) reaches this code ONLY when
+     --force-after-timeout was also given and the forced restart still never
+     took effect — see exit 8 for the (expected, not a failure) case where a
+     drain timed out WITHOUT --force-after-timeout.
+  8  drain fail-safe preserved (Issue #5138, launchd/systemd only): a
+     drain-mode restart (--drain, or the systemd default) timed out WITHOUT
+     --force-after-timeout, and the daemon's own fail-safe (#4090) held:
+     dispatch resumed, no in-flight sweep was cancelled or killed, and
+     loom-daemon is STILL RUNNING its PRE-update binary (pid unchanged from
+     before the restart request). This is NOT a failure — it is the drain
+     primitive refusing to choose between "cancel work" and "restart" on the
+     operator's behalf, exactly as designed. The freshly-built/provisioned
+     binary IS staged at the resolved destination; it just was not activated
+     this run. On a #6007+ daemon the roll is RETAINED (dispatch stays paused
+     and the restart re-arms itself when in-flight reaches zero), so this exit
+     means "not yet", not "not ever": the script says so and there is nothing
+     to re-run. Against an older daemon (or when the status probe cannot
+     confirm the pending roll) the historical advice still applies — re-run
+     once the in-flight sweep(s) finish, or re-run with
+     --force-after-timeout to force the roll through immediately.
+
+See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
+(SIGTERM -> grace -> SIGKILL; in-flight sweeps survive by design — this
+script relies on that: stopping+restarting the dispatcher never kills
+dispatched work), scripts/install/provision-daemon.sh (machine-level
+provisioning, #3922).

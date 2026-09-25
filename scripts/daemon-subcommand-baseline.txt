@@ -23,7 +23,6 @@ defaults/scripts/claude-wrapper.sh	retry-classify
 defaults/scripts/claude-wrapper.sh	tokens
 defaults/scripts/clean.sh	clean
 defaults/scripts/cleanup.sh	cleanup
-defaults/scripts/cli/loom-daemon-update.sh	release-fetch
 defaults/scripts/cli/loom-daemon-watchdog.sh	daemon-watchdog
 defaults/scripts/cli/loom-help.sh	status
 defaults/scripts/cli/loom-status.sh	status

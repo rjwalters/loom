@@ -146,7 +146,13 @@ use crate::ipc::DrainState;
 use crate::workspace_pool::WorkspacePool;
 
 mod failure_digest;
-mod native_probe;
+/// `pub(crate)` rather than private since #8088: `daemon_update::selfrepl`
+/// reuses [`native_probe::running_binary`] rather than re-deriving it. That
+/// function's contract — `None` on the kernel's ` (deleted)` marker — exists
+/// for exactly the self-replacement hazard the `daemon-update` port had to
+/// design for (#8017), so a second derivation would be a second thing to keep
+/// right. Still crate-internal: nothing here is part of the public API.
+pub(crate) mod native_probe;
 mod relaunch_verify_note;
 mod stale_repo;
 

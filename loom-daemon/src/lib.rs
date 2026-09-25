@@ -156,6 +156,7 @@ pub mod daemon_start;
 /// ratchet freezes at its current line count
 /// (`.loom/docs/file-size-policy.md`).
 pub mod daemon_startup_reconciliation;
+pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
