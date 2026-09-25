@@ -46,7 +46,7 @@
 # no such translation -- LOOM_GENERIC_MODEL_FLAG is already spawn-generic.sh's
 # own hook.
 #
-# requires-daemon: runtime-launch-env >= 0.19.297   #8671 — the launch-shape
+# requires-daemon: runtime-launch-env >= 0.19.357   #8671 — the launch-shape
 # port. A resolved binary predating it exits non-zero with clap's
 # "unrecognized subcommand", so the manifest supplies no defaults at all.
 # Declared as a HARD floor rather than `optional` because the degrade is only
